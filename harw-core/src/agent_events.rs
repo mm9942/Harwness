@@ -266,6 +266,12 @@ impl crate::ModelProvider for UsageReportingProvider {
     fn pinned_provider_id(&self) -> Option<String> {
         self.inner.pinned_provider_id()
     }
+
+    /// Reicht die Drossel-Wartezeit des umhüllten Providers durch; die Hülle
+    /// hat keine eigenen Limits.
+    fn pacing_wait(&self) -> Option<std::time::Duration> {
+        self.inner.pacing_wait()
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +325,45 @@ mod tests {
             event.kind,
             AgentEventKind::InternalUsage { ref purpose, .. } if purpose == "title"
         ));
+        Ok(())
+    }
+
+    /// Test-Provider mit fester Drossel-Wartezeit.
+    struct PacedProvider {
+        echo: crate::model::EchoModelProvider,
+        wait: std::time::Duration,
+    }
+
+    impl crate::ModelProvider for PacedProvider {
+        fn respond<'a>(&'a self, request: crate::ModelRequest) -> crate::ModelFuture<'a> {
+            crate::ModelProvider::respond(&self.echo, request)
+        }
+
+        fn pacing_wait(&self) -> Option<std::time::Duration> {
+            Some(self.wait)
+        }
+    }
+
+    #[test]
+    fn usage_reporting_provider_forwards_pacing_wait() -> Result<(), Box<dyn std::error::Error>> {
+        let wait = std::time::Duration::from_millis(250);
+        let paced = UsageReportingProvider::new(
+            std::sync::Arc::new(PacedProvider {
+                echo: crate::model::EchoModelProvider::new("hi"),
+                wait,
+            }),
+            AgentEventHub::new(4),
+            SessionId::try_from_str("s-4")?,
+            "title",
+        );
+        assert_eq!(crate::ModelProvider::pacing_wait(&paced), Some(wait));
+        let unpaced = UsageReportingProvider::new(
+            std::sync::Arc::new(crate::model::EchoModelProvider::new("hi")),
+            AgentEventHub::new(4),
+            SessionId::try_from_str("s-5")?,
+            "title",
+        );
+        assert_eq!(crate::ModelProvider::pacing_wait(&unpaced), None);
         Ok(())
     }
 

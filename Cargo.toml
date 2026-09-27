@@ -195,11 +195,11 @@ tracing = "0.1.44"
 
 # Syscalls ohne libc: fanotify im Dateisystem-Wächter.
 rustix = "1.1.4"
-# CryptGuard 3.1 is not on crates.io yet: git (pinned rev) until it is published (see
-# docs/architecture/crypto-drift-report.md, D3). Cargo.lock pins the commit.
-crypt_guard = { git = "https://github.com/mm9942/crypt_guard", rev = "9b2df9a59a238b5bde0ebbccb1b16e0b0764b241", default-features = false, features = ["ml-kem-backend", "ml-dsa-backend"] }
-crypt_guard_service = { git = "https://github.com/mm9942/crypt_guard", rev = "9b2df9a59a238b5bde0ebbccb1b16e0b0764b241", features = ["ml-dsa"] }
-crypt_guard_hyper = { git = "https://github.com/mm9942/crypt_guard", rev = "9b2df9a59a238b5bde0ebbccb1b16e0b0764b241" }
+# CryptGuard 3.1.0 is published on crates.io as of R15 (see
+# docs/planning/90-migration-ledger/MIGRATION_LEDGER.md, MIG-015); no git source needed anymore.
+crypt_guard = { version = "3.1.0", default-features = false, features = ["ml-kem-backend", "ml-dsa-backend"] }
+crypt_guard_service = { version = "3.1.0", features = ["ml-dsa"] }
+crypt_guard_hyper = { version = "3.1.0" }
 procfs = { version = "0.18.0", default-features = false }
 landlock = "0.4.7"
 cap-std = "3.4.6"

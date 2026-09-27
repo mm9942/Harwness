@@ -18,8 +18,9 @@ Copilot zugewiesen wird. Jedes Issue führt zu einem PR gegen **`dev`**.
 Regeln für alle Aufgaben: [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md).
 Die Aufgabentexte unten sind auf Englisch und werden als Issue-Text genutzt.
 
-Reihenfolge: C-01 bis C-05 sind unabhängig voneinander. C-06 und C-07 setzen
-voraus, dass R14 auf `dev` liegt. C-08 ist nur ein Vorschlag, kein Code.
+Reihenfolge: C-01 bis C-05 sind unabhängig voneinander. C-07 setzt voraus,
+dass R14 auf `dev` liegt; C-06 und C-09 sind in R15 erledigt. C-08 ist nur
+ein Vorschlag, kein Code.
 
 ## Schwerpunkt für Copilot: Branches und README
 
@@ -65,10 +66,10 @@ beyond what is wrong. No book titles, authors or quotes.
 | C-03 | Architektur-Docs nach R14 nachziehen | klein |
 | C-04 | `HARW-DRIVER-006`: WorkDriver-Werkzeug ohne `[work_driver]` | klein |
 | C-05 | Beispiel `driven-orchestrator` als Test absichern | klein |
-| C-06 | Provider-Pacing-Hook für TPM-Grenzen | mittel |
+| C-06 | Provider-Pacing-Hook für TPM-Grenzen — erledigt (R15) | mittel |
 | C-07 | Auth-Hub: Test für Verbindungs-Lebensdauer | klein |
 | C-08 | Vorschlag DEC-009: Schreibrechte pro Pfad in der Sandbox | nur Text |
-| C-09 | Sandbox-Verify-Runner für den work driver verdrahten | mittel |
+| C-09 | Sandbox-Verify-Runner für den work driver verdrahten — erledigt (R15) | mittel |
 | C-10 | Vorschlag DEC-010: „Cloud Home“ für flüchtige Container | nur Text |
 
 ---
@@ -154,6 +155,8 @@ roles.
 
 ## C-06 — Provider pacing hook for TPM limits (after R14 is on `dev`)
 
+**Status:** erledigt in R15 (`ModelProvider::pacing_wait`, HTTP-Provider über `ProviderRateLimiter`, Pause im Work Driver vor jedem Wellen-Chunk; siehe DEC-003).
+
 **Why:** the work driver's job worker can't reach
 `ProviderRateLimiter::pending_wait` / `wait_for_slot`
 (`harw-provider-http/src/rate_limiter.rs`) through `dyn ModelProvider`. It
@@ -202,6 +205,8 @@ No code changes.
 links DEC-004, DEC-006 and DEC-007.
 
 ## C-09 — Wire a sandboxed verify runner into the job worker (after R14 is on `dev`)
+
+**Status:** erledigt in R15 (`harw-cli/src/verify_sandbox.rs`, sandboxed Verify-Runner im Work-Driver-Job; ohne Runner bleibt `fallback_verifier`).
 
 **Why:** the work driver job (`harw-cli/src/job_worker_work_driver.rs`) can't
 reach the sandboxed `CoordinatorVerifyRunner`

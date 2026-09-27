@@ -47,11 +47,19 @@
 //! - Between spawn and cgroup attach the child runs for a few microseconds
 //!   outside the cgroup unless the trampoline backend is used (it joins
 //!   the cgroup itself before `exec`).
+//! - A job cgroup whose last member keeps running past `remove_cgroup`'s
+//!   retry budget is not removed there and then; it is recorded instead of
+//!   only logged. Once the first attempt starts, and only when a cgroup
+//!   root is configured, a background task retries every recorded leftover
+//!   on a fixed interval; [`LinuxExecutor::sweep_leftover_cgroups`] is also
+//!   callable directly (e.g. from a test, or a caller that wants a sweep on
+//!   its own schedule instead).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harw_job_core::{
@@ -91,6 +99,11 @@ const EVENT_CAPACITY: usize = 64;
 
 /// Attempts to remove a job cgroup whose members are still exiting.
 const CGROUP_REMOVE_ATTEMPTS: u32 = 50;
+
+/// How often the leftover-cgroup background task (spawned lazily on the
+/// first attempt, see [`LinuxExecutor::ensure_leftover_sweep`]) retries
+/// every cgroup [`remove_cgroup`] could not remove.
+const LEFTOVER_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Sandbox backend of the [`LinuxExecutor`].
 #[derive(Debug, Clone, Default)]
@@ -149,6 +162,13 @@ impl Default for LinuxExecutorOptions {
 pub struct LinuxExecutor {
     options: LinuxExecutorOptions,
     cgroup: Option<Arc<CgroupV2Fs>>,
+    /// Job cgroups [`remove_cgroup`] could not remove within its retry
+    /// budget; retried by [`LinuxExecutor::sweep_leftover_cgroups`] instead
+    /// of leaking silently for the life of the host.
+    leftovers: LeftoverRegistry,
+    /// Guards [`LinuxExecutor::ensure_leftover_sweep`] so the background
+    /// sweep task is spawned at most once.
+    sweep_spawned: AtomicBool,
 }
 
 /// What to exec, before it becomes a [`Command`].
@@ -312,9 +332,54 @@ fn weaker(a: EnforcementState, b: EnforcementState) -> EnforcementState {
     if rank(a) <= rank(b) { a } else { b }
 }
 
+/// A job cgroup that stayed busy past every [`remove_cgroup`] attempt.
+/// Tracked so [`LinuxExecutor::sweep_leftover_cgroups`] can retry it later
+/// instead of only logging the leak: no other code path in this crate
+/// sweeps a delegated root's stale `harw-job-*` children (unlike
+/// `harw-job-store`'s temp-file sweep, there is no cgroup equivalent).
+struct LeftoverCgroup {
+    backend: Arc<dyn CgroupBackend>,
+    name: String,
+}
+
+impl std::fmt::Debug for LeftoverCgroup {
+    // `CgroupBackend` is not `Debug`; only the name is diagnostic anyway.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeftoverCgroup")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Job cgroups [`remove_cgroup`] could not remove, retried by
+/// [`LinuxExecutor::sweep_leftover_cgroups`].
+type LeftoverRegistry = Arc<Mutex<Vec<LeftoverCgroup>>>;
+
+/// Records a job cgroup in `leftovers` (when given) so
+/// [`LinuxExecutor::sweep_leftover_cgroups`] retries it later instead of
+/// letting the caller's failure discard it silently.
+fn push_leftover(
+    leftovers: Option<&LeftoverRegistry>,
+    backend: Arc<dyn CgroupBackend>,
+    name: String,
+) {
+    let Some(registry) = leftovers else {
+        return;
+    };
+    match registry.lock() {
+        Ok(mut registry) => registry.push(LeftoverCgroup { backend, name }),
+        Err(error) => {
+            tracing::warn!(%error, "leftover cgroup registry poisoned; leak untracked");
+        }
+    }
+}
+
 /// Removes a job cgroup after its job ended: kill stragglers, then retry
-/// removal while members are still exiting.
-async fn remove_cgroup(cgroup: JobCgroup) {
+/// removal while members are still exiting. If every attempt still finds it
+/// busy, the cgroup is recorded in `leftovers` (when given) instead of only
+/// logged, so [`LinuxExecutor::sweep_leftover_cgroups`] can retry it once
+/// its last member has actually exited.
+async fn remove_cgroup(cgroup: JobCgroup, leftovers: Option<&LeftoverRegistry>) {
     let (backend, handle) = cgroup.into_parts();
     if let Err(error) = backend.kill(&handle) {
         tracing::debug!(cgroup = handle.proc_path(), %error, "cgroup kill before removal failed");
@@ -330,6 +395,10 @@ async fn remove_cgroup(cgroup: JobCgroup) {
                     Ok(reopened) => handle = reopened,
                     Err(error) => {
                         tracing::warn!(cgroup = name, %error, "cannot reopen busy job cgroup");
+                        // Same leak class as exhaustion below: still busy,
+                        // just discovered while trying to reopen it instead
+                        // of while removing it.
+                        push_leftover(leftovers, backend, name);
                         return;
                     }
                 }
@@ -340,7 +409,47 @@ async fn remove_cgroup(cgroup: JobCgroup) {
             }
         }
     }
-    tracing::warn!("job cgroup still busy; left in place");
+    let name = handle.name().to_owned();
+    tracing::warn!(cgroup = name, "job cgroup still busy; left in place");
+    push_leftover(leftovers, backend, name);
+}
+
+/// Core of [`LinuxExecutor::sweep_leftover_cgroups`]: a free function (not
+/// a method) so the background task
+/// [`LinuxExecutor::ensure_leftover_sweep`] spawns can run it against a
+/// cloned registry without borrowing the executor.
+async fn sweep_registry(leftovers: &LeftoverRegistry) {
+    let pending = match leftovers.lock() {
+        Ok(mut leftovers) => std::mem::take(&mut *leftovers),
+        Err(error) => {
+            tracing::warn!(%error, "leftover cgroup registry poisoned; sweep skipped");
+            return;
+        }
+    };
+    for leftover in pending {
+        match leftover.backend.reopen(&leftover.name) {
+            Ok(handle) => {
+                remove_cgroup(
+                    JobCgroup::new(Arc::clone(&leftover.backend), handle),
+                    Some(leftovers),
+                )
+                .await;
+            }
+            // Gone already: removed by an earlier sweep, or the kernel
+            // dropped it once its last member actually exited.
+            Err(CgroupError::NotFound { .. }) => {}
+            Err(error) => {
+                tracing::warn!(
+                    cgroup = leftover.name,
+                    %error,
+                    "cannot reopen leftover job cgroup"
+                );
+                if let Ok(mut leftovers) = leftovers.lock() {
+                    leftovers.push(leftover);
+                }
+            }
+        }
+    }
 }
 
 /// Supervisor-backed [`AttemptControl`].
@@ -362,6 +471,10 @@ struct AfterExit {
     recovered_cgroup: Option<RecoveredCgroup>,
     /// Supervision note reported as the first event (recovery fallback).
     note: Option<String>,
+    /// Registry for a cgroup [`remove_cgroup`] could not remove; shared
+    /// with the owning [`LinuxExecutor`] so
+    /// [`LinuxExecutor::sweep_leftover_cgroups`] can retry it later.
+    leftovers: LeftoverRegistry,
 }
 
 /// The job cgroup of a recovered attempt, reopened and path-verified.
@@ -374,17 +487,27 @@ struct RecoveredCgroup {
 impl RecoveredCgroup {
     /// Kills every remaining member (after re-verifying that the handle is
     /// the persisted cgroup) and removes the cgroup.
-    async fn kill_and_remove(self) {
+    async fn kill_and_remove(self, leftovers: &LeftoverRegistry) {
         let killed = self
             .identity
             .kill_job_verified(&*self.backend, &self.handle);
         match killed {
-            Ok(_) => remove_cgroup(JobCgroup::new(self.backend, self.handle)).await,
-            Err(error) => tracing::warn!(
-                cgroup = self.handle.proc_path(),
-                %error,
-                "recovered job cgroup was not killed"
-            ),
+            Ok(_) => {
+                remove_cgroup(JobCgroup::new(self.backend, self.handle), Some(leftovers)).await;
+            }
+            Err(error) => {
+                // Not killed: same leak class as a job cgroup `remove_cgroup`
+                // could not remove, so it is recorded the same way instead of
+                // only logged; the next sweep retries the kill too (it goes
+                // through `remove_cgroup`, which kills before it removes).
+                let name = self.handle.name().to_owned();
+                tracing::warn!(
+                    cgroup = self.handle.proc_path(),
+                    %error,
+                    "recovered job cgroup was not killed; queued for a later sweep retry"
+                );
+                push_leftover(Some(leftovers), self.backend, name);
+            }
         }
     }
 }
@@ -501,14 +624,14 @@ async fn forward(
         Ok(process) => {
             if let SupervisedTarget::Group(mut group) = process.into_target() {
                 if let Some(cgroup) = group.take_cgroup() {
-                    remove_cgroup(cgroup).await;
+                    remove_cgroup(cgroup, Some(&after.leftovers)).await;
                 }
             }
         }
         Err(error) => tracing::warn!(%error, "supervisor task failed"),
     }
     if let Some(cgroup) = after.recovered_cgroup.take() {
-        cgroup.kill_and_remove().await;
+        cgroup.kill_and_remove(&after.leftovers).await;
     }
     let sandbox = after.late_report();
     let _ = sender
@@ -549,13 +672,79 @@ impl LinuxExecutor {
             Some(root) => Some(Arc::new(CgroupV2Fs::open(root).map_err(cgroup_error)?)),
             None => None,
         };
-        Ok(Self { options, cgroup })
+        Ok(Self {
+            options,
+            cgroup,
+            leftovers: LeftoverRegistry::default(),
+            sweep_spawned: AtomicBool::new(false),
+        })
     }
 
     /// The options.
     #[must_use]
     pub fn options(&self) -> &LinuxExecutorOptions {
         &self.options
+    }
+
+    /// Number of job cgroups that stayed busy past every removal attempt
+    /// and are still waiting for a sweep — a metric for callers that want
+    /// to alert on the leak the module docs' recovery section describes,
+    /// instead of relying on the log line `remove_cgroup` emits on
+    /// exhaustion.
+    #[must_use]
+    pub fn leftover_cgroup_count(&self) -> usize {
+        self.leftovers
+            .lock()
+            .map(|leftovers| leftovers.len())
+            .unwrap_or(0)
+    }
+
+    /// Retries removal of every job cgroup that stayed busy past
+    /// `remove_cgroup`'s retry budget (`CGROUP_REMOVE_ATTEMPTS`, ~0.5s).
+    /// [`Self::ensure_leftover_sweep`] already calls this on
+    /// [`LEFTOVER_SWEEP_INTERVAL`] once the first attempt starts; this
+    /// method stays public so a test, or a caller that wants a sweep on its
+    /// own schedule instead, can call it directly. A cgroup still busy is
+    /// queued again for the next call instead of being dropped.
+    pub async fn sweep_leftover_cgroups(&self) {
+        sweep_registry(&self.leftovers).await;
+    }
+
+    /// Spawns the background task that calls [`Self::sweep_leftover_cgroups`]
+    /// on [`LEFTOVER_SWEEP_INTERVAL`]; a no-op after the first call, and
+    /// also a no-op when no cgroup root is configured (`self.cgroup` is
+    /// fixed at construction, and without a root `create_cgroup` and
+    /// recovery's `reopen_job_cgroup` never produce a leftover, so there is
+    /// nothing to sweep).
+    ///
+    /// Called from [`Self::supervise`] (so on every `start`/`reattach`)
+    /// instead of from [`Self::new`]: some callers build the executor
+    /// before entering a Tokio runtime — `harw serve` builds the sandboxed
+    /// verify runner during startup, before it builds and enters its own
+    /// runtime — where `tokio::spawn` would panic. By the time an attempt
+    /// runs, the executor is always driven from inside a runtime
+    /// (`Self::supervise` already relies on that for its own
+    /// `tokio::spawn`), so spawning here is safe.
+    ///
+    /// The spawn-once guard runs before the cgroup-root check on purpose:
+    /// `self.cgroup` never changes after construction, so checking it
+    /// first or second has the same outcome, and checking the guard first
+    /// keeps it exercisable in a plain (non-async) test even when there is
+    /// no cgroup root and thus no Tokio runtime required.
+    fn ensure_leftover_sweep(&self) {
+        if self.sweep_spawned.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.cgroup.is_none() {
+            return;
+        }
+        let leftovers = Arc::clone(&self.leftovers);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LEFTOVER_SWEEP_INTERVAL).await;
+                sweep_registry(&leftovers).await;
+            }
+        });
     }
 
     fn status_path(&self, ctx: &AttemptContext) -> Option<PathBuf> {
@@ -703,6 +892,11 @@ impl LinuxExecutor {
         stderr: Option<std::process::ChildStderr>,
         after: AfterExit,
     ) -> AttemptRun {
+        // Every `start`/`reattach` funnels through here, and by now the
+        // executor is always driven from inside a Tokio runtime (the
+        // `tokio::spawn` below already relies on that), so this is the
+        // first point where arming the background sweep is safe.
+        self.ensure_leftover_sweep();
         let (handle, events) = Supervisor::spawn(process, stdout, stderr, self.supervisor_config());
         let control = Arc::new(SupervisorControl {
             canceller: handle.canceller(),
@@ -857,6 +1051,7 @@ impl Executor for LinuxExecutor {
                 resource_limits,
                 recovered_cgroup: None,
                 note: None,
+                leftovers: Arc::clone(&self.leftovers),
             },
         );
         Ok(StartedAttempt {
@@ -883,10 +1078,25 @@ impl Executor for LinuxExecutor {
         ctx: &AttemptContext,
     ) -> Result<AttemptRun, RuntimeError> {
         let process = identity.open_verified().map_err(recovery_error)?;
-        let process = AsyncLinuxProcess::new(process).map_err(|error| RuntimeError::Os {
-            operation: "adopt recovered process",
-            detail: error.to_string(),
-        })?;
+        // `process` is already identity-verified (pidfd + start-time match,
+        // `open_verified` above): unlike an unregistered `start()` failure,
+        // leaving it running here would orphan a *proven* job outside every
+        // supervision, budget and deadline enforcement. On adoption failure
+        // it is therefore abandoned the same way `start()` abandons a
+        // process it could not register with the reactor, instead of being
+        // dropped unsignalled (module docs, "never signal what we can't
+        // prove" — this one already is proven).
+        let process = match AsyncLinuxProcess::new(process) {
+            Ok(process) => process,
+            Err(error) => {
+                let detail = error.error.to_string();
+                abandon(*error.target);
+                return Err(RuntimeError::Os {
+                    operation: "adopt recovered process",
+                    detail,
+                });
+            }
+        };
         // Only for a verified live process: reopen its job cgroup so that
         // termination reaches every descendant.
         let backend = self
@@ -929,6 +1139,7 @@ impl Executor for LinuxExecutor {
                 resource_limits: EnforcementState::NotEnforced,
                 recovered_cgroup,
                 note,
+                leftovers: Arc::clone(&self.leftovers),
             },
         ))
     }
@@ -954,15 +1165,22 @@ impl Executor for LinuxExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{CgroupRecovery, Launch, cgroup_name, reopen_job_cgroup, weaker};
+    use super::{
+        CgroupRecovery, LeftoverCgroup, LeftoverRegistry, Launch, LinuxExecutor,
+        LinuxExecutorOptions, RecoveredCgroup, cgroup_name, remove_cgroup, reopen_job_cgroup,
+        weaker,
+    };
     use crate::coordinator::executor::AttemptContext;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_job_core::{AttemptId, EnforcementState, RunnerId};
     use harw_job_linux::cgroup::{CgroupBackend, CgroupHandle, CgroupSpec, CgroupStats};
+    use harw_job_linux::group::JobCgroup;
     use harw_job_linux::{CgroupError, LinuxProcess, LinuxRecoveryIdentity};
     use harw_types::WorkId;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// A backend whose `reopen` yields a handle with `proc_path` (or
     /// fails); every other operation fails.
@@ -1014,6 +1232,61 @@ mod tests {
 
         fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
             Err(denied(group.name()))
+        }
+    }
+
+    /// A backend for `remove_cgroup`/`sweep_leftover_cgroups`: `kill` and
+    /// `reopen` always succeed, `remove` stays [`CgroupError::Busy`] for
+    /// the first `busy_calls` calls and then succeeds (every other
+    /// operation fails, unused by these tests).
+    struct FlakyRemoveBackend {
+        proc_path: String,
+        remove_calls: AtomicU32,
+        busy_calls: u32,
+    }
+
+    impl CgroupBackend for FlakyRemoveBackend {
+        fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+            Err(denied(&spec.name))
+        }
+
+        fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+            Ok(CgroupHandle::new(name.to_owned(), self.proc_path.clone(), None))
+        }
+
+        fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn kill(&self, _group: &CgroupHandle) -> Result<(), CgroupError> {
+            Ok(())
+        }
+
+        fn stats(&self, group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
+            let call = self.remove_calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.busy_calls {
+                Err(CgroupError::Busy {
+                    path: group.name().to_owned(),
+                })
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1151,5 +1424,258 @@ mod tests {
             )
         );
         assert_eq!(launch.env, vec![("K".to_owned(), "V".to_owned())]);
+    }
+
+    /// Regression for the finding that a job cgroup still busy past every
+    /// `remove_cgroup` attempt was only logged, with no way to retry it
+    /// later: it must now be recorded in the leftover registry instead.
+    #[tokio::test]
+    async fn remove_cgroup_leaves_a_leftover_when_never_free() -> TestResult {
+        let backend: Arc<dyn CgroupBackend> = Arc::new(FlakyRemoveBackend {
+            proc_path: JOB_CGROUP.to_owned(),
+            remove_calls: AtomicU32::new(0),
+            busy_calls: u32::MAX,
+        });
+        let handle = CgroupHandle::new("harw-job-j-e1".to_owned(), JOB_CGROUP.to_owned(), None);
+        let leftovers: LeftoverRegistry = LeftoverRegistry::default();
+        remove_cgroup(JobCgroup::new(backend, handle), Some(&leftovers)).await;
+        let recorded = leftovers.lock().map_err(ctx("lock leftovers"))?;
+        let leftover = recorded
+            .first()
+            .ok_or(TestError::Missing("leftover cgroup"))?;
+        assert_eq!(leftover.name, "harw-job-j-e1");
+        Ok(())
+    }
+
+    /// Without a registry, exhaustion still only logs — same behaviour as
+    /// before this fix, for callers that never wire the registry up.
+    #[tokio::test]
+    async fn remove_cgroup_without_a_registry_does_not_panic() {
+        let backend: Arc<dyn CgroupBackend> = Arc::new(FlakyRemoveBackend {
+            proc_path: JOB_CGROUP.to_owned(),
+            remove_calls: AtomicU32::new(0),
+            busy_calls: u32::MAX,
+        });
+        let handle = CgroupHandle::new("harw-job-j-e1".to_owned(), JOB_CGROUP.to_owned(), None);
+        remove_cgroup(JobCgroup::new(backend, handle), None).await;
+    }
+
+    /// `remove` always reports Busy; `reopen` always fails. Exercises
+    /// `remove_cgroup`'s reopen-failure path inside its retry loop, not the
+    /// exhaustion path below it: this used to only log and return, leaking
+    /// the cgroup outside the registry even though it is the same class of
+    /// defect as running out of removal attempts.
+    struct ReopenAlwaysFailsBackend;
+
+    impl CgroupBackend for ReopenAlwaysFailsBackend {
+        fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+            Err(denied(&spec.name))
+        }
+
+        fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+            Err(denied(name))
+        }
+
+        fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn kill(&self, _group: &CgroupHandle) -> Result<(), CgroupError> {
+            Ok(())
+        }
+
+        fn stats(&self, group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
+            Err(CgroupError::Busy {
+                path: group.name().to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_cgroup_leaves_a_leftover_when_reopen_fails_mid_retry() -> TestResult {
+        let backend: Arc<dyn CgroupBackend> = Arc::new(ReopenAlwaysFailsBackend);
+        let handle = CgroupHandle::new("harw-job-j-e1".to_owned(), JOB_CGROUP.to_owned(), None);
+        let leftovers: LeftoverRegistry = LeftoverRegistry::default();
+        remove_cgroup(JobCgroup::new(backend, handle), Some(&leftovers)).await;
+        let recorded = leftovers.lock().map_err(ctx("lock leftovers"))?;
+        let leftover = recorded
+            .first()
+            .ok_or(TestError::Missing("leftover cgroup"))?;
+        assert_eq!(leftover.name, "harw-job-j-e1");
+        Ok(())
+    }
+
+    /// Regression for the finding that a recovered attempt whose cgroup
+    /// could not even be killed was only logged, with no way to retry it
+    /// later: it must now be recorded in the leftover registry too, just
+    /// like a plain `remove_cgroup` exhaustion.
+    #[tokio::test]
+    async fn recovered_cgroup_kill_failure_leaves_a_leftover() -> TestResult {
+        let context = attempt_context()?;
+        // `identity.cgroup_path` deliberately does not match the handle's
+        // `proc_path`, so `kill_job_verified` fails on the identity check
+        // before it ever touches the backend — deterministic, no real pid
+        // needed.
+        let persisted = identity(&context, Some(JOB_CGROUP));
+        let backend: Arc<dyn CgroupBackend> = Arc::new(ReopenAlwaysFailsBackend);
+        let handle = CgroupHandle::new("harw-job-j-e1".to_owned(), "/other/path".to_owned(), None);
+        let recovered = RecoveredCgroup {
+            backend,
+            handle,
+            identity: persisted,
+        };
+        let leftovers: LeftoverRegistry = LeftoverRegistry::default();
+        recovered.kill_and_remove(&leftovers).await;
+        let recorded = leftovers.lock().map_err(ctx("lock leftovers"))?;
+        let leftover = recorded
+            .first()
+            .ok_or(TestError::Missing("leftover cgroup"))?;
+        assert_eq!(leftover.name, "harw-job-j-e1");
+        Ok(())
+    }
+
+    /// [`LinuxExecutor::ensure_leftover_sweep`] must stay safe to call
+    /// without a Tokio runtime when there is nothing to sweep, and must not
+    /// re-arm on a second call.
+    #[test]
+    fn ensure_leftover_sweep_is_idempotent_and_skips_without_a_cgroup_root() {
+        let executor = LinuxExecutor {
+            options: LinuxExecutorOptions::default(),
+            cgroup: None,
+            leftovers: LeftoverRegistry::default(),
+            sweep_spawned: AtomicBool::new(false),
+        };
+        executor.ensure_leftover_sweep();
+        assert!(executor.sweep_spawned.load(Ordering::SeqCst));
+        // Idempotent: a second call must not panic (e.g. by trying to
+        // spawn again) and must leave the guard set.
+        executor.ensure_leftover_sweep();
+        assert!(executor.sweep_spawned.load(Ordering::SeqCst));
+    }
+
+    /// [`LinuxExecutor::sweep_leftover_cgroups`] retries a leftover and
+    /// clears it once the cgroup is no longer busy.
+    #[tokio::test]
+    async fn sweep_leftover_cgroups_clears_a_cgroup_once_it_frees() -> TestResult {
+        let backend: Arc<dyn CgroupBackend> = Arc::new(FlakyRemoveBackend {
+            proc_path: JOB_CGROUP.to_owned(),
+            remove_calls: AtomicU32::new(0),
+            busy_calls: 0, // free on the very first retry
+        });
+        let executor = LinuxExecutor {
+            options: LinuxExecutorOptions::default(),
+            cgroup: None,
+            leftovers: Arc::new(Mutex::new(vec![LeftoverCgroup {
+                backend,
+                name: "harw-job-j-e1".to_owned(),
+            }])),
+            sweep_spawned: AtomicBool::new(false),
+        };
+        assert_eq!(executor.leftover_cgroup_count(), 1);
+        executor.sweep_leftover_cgroups().await;
+        assert_eq!(executor.leftover_cgroup_count(), 0);
+        Ok(())
+    }
+
+    /// A leftover whose cgroup cannot be reopened (still busy on the
+    /// filesystem, but not gone) is queued again instead of being dropped.
+    #[tokio::test]
+    async fn sweep_leftover_cgroups_requeues_when_reopen_still_fails() -> TestResult {
+        let backend: Arc<dyn CgroupBackend> = Arc::new(FakeBackend { proc_path: None });
+        let executor = LinuxExecutor {
+            options: LinuxExecutorOptions::default(),
+            cgroup: None,
+            leftovers: Arc::new(Mutex::new(vec![LeftoverCgroup {
+                backend,
+                name: "harw-job-j-e1".to_owned(),
+            }])),
+            sweep_spawned: AtomicBool::new(false),
+        };
+        executor.sweep_leftover_cgroups().await;
+        assert_eq!(executor.leftover_cgroup_count(), 1);
+        Ok(())
+    }
+
+    /// A leftover whose cgroup is already gone (removed by an earlier sweep,
+    /// or by the kernel once its last member exited) is dropped, not
+    /// requeued forever.
+    #[tokio::test]
+    async fn sweep_leftover_cgroups_drops_a_cgroup_that_is_already_gone() -> TestResult {
+        /// `reopen` always reports the cgroup gone; every other operation
+        /// is unused by this test.
+        struct GoneBackend;
+
+        impl CgroupBackend for GoneBackend {
+            fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+                Err(denied(&spec.name))
+            }
+
+            fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+                Err(CgroupError::NotFound {
+                    path: name.to_owned(),
+                })
+            }
+
+            fn attach(
+                &self,
+                group: &CgroupHandle,
+                _process: &LinuxProcess,
+            ) -> Result<(), CgroupError> {
+                Err(denied(group.name()))
+            }
+
+            fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+                Err(denied(group.name()))
+            }
+
+            fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+                Err(denied(group.name()))
+            }
+
+            fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+                Err(denied(group.name()))
+            }
+
+            fn kill(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+                Err(denied(group.name()))
+            }
+
+            fn stats(&self, group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+                Err(denied(group.name()))
+            }
+
+            fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
+                Err(denied(group.name()))
+            }
+        }
+
+        let executor = LinuxExecutor {
+            options: LinuxExecutorOptions::default(),
+            cgroup: None,
+            leftovers: Arc::new(Mutex::new(vec![LeftoverCgroup {
+                backend: Arc::new(GoneBackend),
+                name: "harw-job-j-e1".to_owned(),
+            }])),
+            sweep_spawned: AtomicBool::new(false),
+        };
+        executor.sweep_leftover_cgroups().await;
+        assert_eq!(executor.leftover_cgroup_count(), 0);
+        Ok(())
     }
 }

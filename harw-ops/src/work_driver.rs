@@ -45,8 +45,13 @@
 //! `enqueue`'s goal lookup goes through
 //! [`harw_plan::tenant_scope::ScopedGoalStore`] with the same scope rule as
 //! `goal.rs`, so a scoped caller cannot enqueue on a foreign tenant's goal
-//! (it fails exactly like an unknown goal). An unscoped (single-user) caller
-//! keeps seeing untenanted goals unchanged.
+//! (it fails exactly like an unknown goal). The "one active run per goal"
+//! guard ([`active_run_for_goal`]) is scoped the same way, through
+//! [`crate::job_tenant::admits_job`]: `goal_id` alone carries no tenant
+//! qualification, so without this a same-named goal of a foreign tenant
+//! could block a caller's own run and leak the foreign job's id. An
+//! unscoped (single-user) caller keeps seeing untenanted goals and every
+//! tenant's active runs unchanged.
 //!
 //! # State sidecar
 //! The job worker publishes its round state as [`WorkDriverState`] under
@@ -664,7 +669,7 @@ async fn work_driver_enqueue(
         (None, bound) => bound.map(|plan| plan.as_str().to_owned()),
     };
 
-    if let Some(existing) = active_run_for_goal(jobs, &goal_id)? {
+    if let Some(existing) = active_run_for_goal(ctx, jobs, &goal_id)? {
         return Err(OpError::Execution(format!(
             "goal `{goal_id}` is already driven by job `{existing}`; stop it first \
              (work_driver.stop)"
@@ -755,7 +760,19 @@ fn admission_record(
 }
 
 /// The id of a non-terminal WorkDriver job on `goal_id`, if any.
-fn active_run_for_goal(jobs: &JobStore, goal_id: &str) -> Result<Option<WorkId>, OpError> {
+///
+/// `goal_id` alone carries no tenant qualification (H12): without a tenant
+/// check a scoped caller could be blocked by — and learn the job id of — a
+/// same-named goal of a foreign tenant. This scan therefore applies the same
+/// visibility rule as every other job-reading path in this module
+/// (`crate::job_tenant::admits_job`): a scoped caller only ever sees, and is
+/// only ever blocked by, its own tenant's active runs; an unscoped
+/// (single-user) caller keeps seeing every tenant's runs unchanged.
+fn active_run_for_goal(
+    ctx: &OpContext,
+    jobs: &JobStore,
+    goal_id: &str,
+) -> Result<Option<WorkId>, OpError> {
     let mut query = JobListQuery {
         states: Some(vec![
             JobState::Pending,
@@ -777,7 +794,8 @@ fn active_run_for_goal(jobs: &JobStore, goal_id: &str) -> Result<Option<WorkId>,
                 .get("goal_id")
                 .and_then(serde_json::Value::as_str)
                 == Some(goal_id);
-            if is_work_driver_job(record) && same_goal {
+            let visible = crate::job_tenant::admits_job(ctx, record);
+            if is_work_driver_job(record) && same_goal && visible {
                 return Ok(Some(record.job.id.clone()));
             }
         }
@@ -1865,6 +1883,100 @@ judge_role = "critic"
         assert!(
             page.jobs.is_empty(),
             "no job may be admitted against a foreign goal"
+        );
+        Ok(())
+    }
+
+    /// A `Ready` work_driver job for `tenant` driving `goal_id`, admitted
+    /// directly into a `JobStore` (bypassing `work_driver.enqueue` itself) —
+    /// used to simulate a foreign tenant's already-active run.
+    fn foreign_active_job(id: &str, tenant: &str, goal_id: &str) -> StoredJob {
+        let now = Timestamp::now();
+        let mut job = Job::new(
+            WorkId::from_str(id),
+            JobKind::Custom(WORK_DRIVER_JOB_KIND.to_owned()),
+            Budget::unbounded(),
+            RetryPolicy {
+                max_attempts: 1,
+                base_delay: SignedDuration::from_secs(1),
+                factor: 1.0,
+                max_delay: SignedDuration::from_secs(1),
+            },
+            now,
+        );
+        job.state = JobState::Ready;
+        StoredJob {
+            job,
+            scope: JobScope::new(
+                TenantId::from_str(tenant),
+                WorkspaceId::from_str("ws"),
+                ApprovalActor::Operator {
+                    id: "test-operator".to_owned(),
+                },
+            ),
+            input: serde_json::json!({ "goal_id": goal_id }),
+            submitted_at: now,
+            not_before: now,
+            lease: None,
+            lease_epoch: 0,
+            completion: None,
+            cancellation: None,
+            revision: 0,
+            trace: None,
+        }
+    }
+
+    /// H12 regression for the active-run guard: a same-named goal of a
+    /// foreign tenant must neither block a scoped caller's own run nor leak
+    /// the foreign job's id — the same rule `load_driver_job` already
+    /// applies to single-job reads (see module docs, `Job kind and payload`).
+    #[tokio::test]
+    async fn a_same_named_goal_of_a_foreign_tenant_does_not_block_or_leak() -> TestResult {
+        // tenant-a already drives its own goal `GOAL`, admitted directly
+        // (not through `enqueue`, which would itself be scoped to tenant-a).
+        let fx = fixture_scoped(GoalStatus::Active, Some("tenant-b"), Some("tenant-b"))?;
+        let foreign_id = "job-tenant-a-active-run";
+        fx.jobs
+            .admit(&foreign_active_job(foreign_id, "tenant-a", GOAL))
+            .map_err(ctx("admit tenant-a's active run"))?;
+
+        // tenant-b's own, unrelated goal happens to share the same id.
+        let output = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({ "goal_id": GOAL }),
+        )
+        .await
+        .map_err(ctx("enqueue must not be blocked by a foreign tenant's run"))?;
+
+        let rendered = format!("{output:?}");
+        assert!(
+            !rendered.contains(foreign_id),
+            "response must not leak the foreign tenant's job id: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Unscoped (single-user) behaviour is unchanged by the H12 fix above:
+    /// without a tenant scope the caller still sees every tenant's active
+    /// runs and is still blocked by one on the same goal id.
+    #[tokio::test]
+    async fn an_unscoped_caller_is_still_blocked_by_any_tenants_active_run() -> TestResult {
+        let fx = fixture(true, GoalStatus::Active)?;
+        let existing_id = "job-tenant-x-active-run";
+        fx.jobs
+            .admit(&foreign_active_job(existing_id, "tenant-x", GOAL))
+            .map_err(ctx("admit tenant-x's active run"))?;
+
+        let result = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({ "goal_id": GOAL }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OpError::Execution(ref message)) if message.contains(existing_id)),
+            "expected an active-run refusal naming the existing job, got {result:?}"
         );
         Ok(())
     }
