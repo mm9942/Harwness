@@ -49,6 +49,23 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
    - Add a ledger entry.
    - Commit, push, PR to `dev`.
 
+## Commit rhythm (batched at verified checkpoints)
+- **When to commit:** at the **end of each workflow**, and in between whenever
+  about **90 verifications** have finished since the last commit, counted
+  across all running workflows. There must also be no fixer or repair agent
+  writing. Counter: count the completed `verify:*` labels in all
+  `journal.jsonl` files. Busy writers are `fix:*`/`repair:*` labels that
+  started but have no result yet.
+- **Planning and research:** once a note has passed its critic or review,
+  commit it straight to `dev` (docs only).
+- **Fix batches:** once the files have passed review (fixer → reviewer →
+  repair if needed), commit them to the working branch and push. Do not
+  commit them to `dev`.
+- **Central build green:** open a PR to `dev` or fast-forward `dev`.
+- **Rules:** Commit with `--no-verify`, because the pre-commit hook runs
+  `git add -u`, and name the files explicitly. Never commit a file while a
+  fixer is still writing to it.
+
 ## Watching during the run
 - Read the journals under `…/subagents/workflows/<run>/journal.jsonl`:
   - `started` and `result` per label;
