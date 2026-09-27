@@ -18,9 +18,10 @@
 //! ([`goal_report`]) → [`WorkDriveInput`] → [`WorkDriver::decide`] → Schritte:
 //! - `Delegate`/`Continue`/`Respawn` bilden **eine Welle** und laufen
 //!   gleichzeitig, höchstens [`RunMemory::parallel_now`] auf einmal
-//!   ([`execute_wave`]). `Continue` schickt nur das knappe Feedback an
-//!   **dieselbe** durable Session (Cache-Regel); `Respawn` bekommt eine rein
-//!   textuelle Übergabe.
+//!   ([`execute_wave`]); vor jedem Block wartet die Welle, solange der
+//!   Provider eine Wartezeit meldet ([`ProviderPacing`]). `Continue` schickt
+//!   nur das knappe Feedback an **dieselbe** durable Session (Cache-Regel);
+//!   `Respawn` bekommt eine rein textuelle Übergabe.
 //! - `Verify`: genau ein zentraler Lauf über `spec.verify` plus die
 //!   `Command`-Schritte des Goals über `VerificationExecutor`; bestandene
 //!   Nachweise gehen per `GoalAction::AttachEvidence` an das Goal.
@@ -46,9 +47,15 @@
 //! - `owned_paths` gesetzt → `{ReadWorkspace, WriteWorkspace}`. Die
 //!   Rechte-/Sandbox-Schicht kennt **keine** pfadgenaue Schreibfreigabe;
 //!   durchgesetzt wird der Schreibbereich deshalb mit dem vorhandenen
-//!   Plan-Knoten-Mechanismus (Workspace-Schnappschuss vor/nach der Welle,
-//!   `validate_patch` gegen die `owned_paths`). Ein Verstoß blockiert die
-//!   Worker der Welle und eskaliert an den Menschen (fail closed).
+//!   Plan-Knoten-Mechanismus (Workspace-Schnappschuss vor/nach jedem
+//!   gleichzeitig laufenden Block der Welle, `validate_patch` gegen die
+//!   `owned_paths` **dieses Blocks** — nicht die der ganzen Welle, sonst
+//!   deckte die erlaubte Vereinigung auch `owned_paths` ab, die erst in
+//!   einem späteren oder einem schon abgeschlossenen Block derselben Welle
+//!   laufen). Ein Verstoß blockiert die Worker der Welle und eskaliert an
+//!   den Menschen (fail closed); Worker, die *gleichzeitig* im selben Block
+//!   laufen, bleiben dabei nur über ihre deklarierten `owned_paths`
+//!   unterscheidbar (s. o., keine pfadgenaue Sandbox).
 //!
 //! # Provider-Grenzen
 //! Worker laufen im Prozess über **denselben** Provider wie der Rest des
@@ -70,8 +77,8 @@
 //!
 //! # Testbarkeit
 //! Die Runde hängt nur an kleinen Traits ([`GoalAccess`], [`WorkerSpawner`],
-//! [`VerificationRunner`], [`Judge`], [`WriteScopeGuard`], [`Pacer`]); die
-//! Produktionsadapter stehen am Dateiende.
+//! [`VerificationRunner`], [`Judge`], [`WriteScopeGuard`], [`Pacer`],
+//! [`ProviderPacing`]); die Produktionsadapter stehen am Dateiende.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -159,16 +166,29 @@ const RESERVED_PROVIDER_SLOTS: usize = 1;
 /// Erneute Versuche einer Welle nach HTTP 429 innerhalb einer Runde.
 const MAX_RATE_LIMIT_RETRIES: u32 = 4;
 
+/// Höchstzahl erneuter Abfragen von [`ProviderPacing::pacing_wait`] vor
+/// einem Block. Deckelt **nicht** die gemeldete Wartezeit selbst (die wird
+/// ungekappt abgewartet), sondern nur die Zahl der Wiederholungen: bricht
+/// `Pacer::pause` durch einen Abbruch vorzeitig ab (`CancellablePacer`),
+/// meldet der Provider ohne echten Zeitablauf oft weiter eine Wartezeit,
+/// sonst würde die Welle spinnen, statt den Abbruch beim nächsten
+/// Worker-Start als `WorkerReply::Cancelled` bemerken zu lassen. Bei
+/// normalem Zeitablauf (Sekunden bis Stunden pro Wartezeit) ist dieser
+/// Deckel praktisch unerreichbar.
+const MAX_PACING_POLLS: u32 = 1_000;
+
 /// Basis des exponentiellen Backoffs nach HTTP 429.
 const RATE_LIMIT_BASE_BACKOFF_SECS: u64 = 5;
 
-/// Obergrenze eines einzelnen Backoffs.
+/// Obergrenze eines einzelnen Backoffs nach HTTP 429 (`rate_limit_backoff`).
+/// Gilt **nicht** für die proaktive Provider-Taktung ([`ProviderPacing`]):
+/// deren gemeldete Wartezeit wird in `execute_wave` ungekappt abgewartet.
 const RATE_LIMIT_MAX_BACKOFF_SECS: u64 = 300;
 
 /// Wandzeit eines Laufs ohne eigenes Budget (wie `WorkDriveLimits::default`).
 const DEFAULT_RUN_WALL: SignedDuration = SignedDuration::from_hours(4);
 
-/// Grund, mit dem der Produktions-Verifier jeden Befehl ablehnt.
+/// Grund, mit dem der Verifier ohne Sandbox-Backend jeden Befehl ablehnt.
 const NO_VERIFY_SANDBOX: &str = "the job worker has no sandbox backend for verification commands \
 (no job coordinator with a Landlock/bwrap executor is wired in); commands are never run unsandboxed";
 
@@ -557,6 +577,14 @@ pub(super) trait Pacer: Send + Sync {
     fn pause<'a>(&'a self, wait: Duration) -> BoxFuture<'a, ()>;
 }
 
+/// Fragt den Provider, wie lange vor der nächsten Anfrage zu warten ist
+/// (`ModelProvider::pacing_wait`: gemeldete Limits, 429-Abkühlung,
+/// TPM/RPM-Budgets); injiziert, damit Tests keinen Provider brauchen.
+pub(super) trait ProviderPacing: Send + Sync {
+    /// Wartezeit vor dem nächsten Start; `None`: sofort.
+    fn pacing_wait(&self) -> Option<Duration>;
+}
+
 /// Die Ports einer Runde.
 pub(super) struct DrivePorts<'a> {
     /// Goal und Plan.
@@ -571,6 +599,8 @@ pub(super) struct DrivePorts<'a> {
     pub(super) scope_guard: &'a dyn WriteScopeGuard,
     /// Backoff.
     pub(super) pacer: &'a dyn Pacer,
+    /// Provider-Taktung vor jedem Worker-Block.
+    pub(super) pacing: &'a dyn ProviderPacing,
 }
 
 /// Ende einer Runde.
@@ -1043,7 +1073,17 @@ async fn execute_wave(
         .iter()
         .map(|request| request.worker_id.clone())
         .collect();
-    ports.scope_guard.before_wave();
+
+    // Schreibbereich je gleichzeitig laufendem Block, nicht je Welle: sonst
+    // deckt die erlaubte Vereinigung auch die `owned_paths` von Workern ab,
+    // die in einem *anderen* Block derselben Welle laufen (vorher oder
+    // nachher, nie gleichzeitig mit diesem) — ein Schreiben dorthin wäre dann
+    // unsichtbar (kein Verstoß, stillschweigend dem falschen Besitzer
+    // zugeschrieben). Innerhalb *desselben* gleichzeitig laufenden Blocks
+    // bleibt eine Zuordnung nur über die deklarierten `owned_paths` möglich
+    // (die Sandbox kennt keine pfadgenaue Schreibfreigabe, s. Moduldoku).
+    let mut changed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut violations: Vec<String> = Vec::new();
 
     let mut pending = requests;
     let mut retries = 0_u32;
@@ -1054,8 +1094,28 @@ async fn execute_wave(
         let mut retry_after = 0_u64;
         let mut index = 0;
         while index < pending.len() {
+            // Erst starten, wenn der Provider wieder Kapazität meldet; nach
+            // jeder Wartezeit erneut abfragen (das Kontingent füllt sich mit
+            // der Zeit weiter), statt die Wartezeit auf den Deckel des
+            // reaktiven 429-Backoffs zu kappen — TPM-/RPM-Kontingente sind
+            // vertraglich vereinbarte Grenzen (DEC-003), keine Näherung. Der
+            // Iterationsdeckel greift nur, wenn `pause` durch einen Abbruch
+            // ohne echten Zeitablauf immer wieder vorzeitig endet.
+            let mut pacing_polls = 0_u32;
+            while let Some(wait) = ports.pacing.pacing_wait().filter(|wait| !wait.is_zero()) {
+                ports.pacer.pause(wait).await;
+                pacing_polls = pacing_polls.saturating_add(1);
+                if pacing_polls >= MAX_PACING_POLLS {
+                    break;
+                }
+            }
             let end = index.saturating_add(width).min(pending.len());
             let chunk = &pending[index..end];
+            let chunk_owners: Vec<(String, Vec<String>)> = chunk
+                .iter()
+                .map(|request| (request.worker_id.clone(), request.owned_paths.clone()))
+                .collect();
+            ports.scope_guard.before_wave();
             let futures: Vec<BoxFuture<'_, WorkerRun>> = chunk
                 .iter()
                 .map(|request| ports.workers.run(request.clone()))
@@ -1101,6 +1161,11 @@ async fn execute_wave(
                     ),
                 }
             }
+            let chunk_changes = ports.scope_guard.after_wave(&chunk_owners);
+            for (worker_id, paths) in chunk_changes.changed {
+                changed.entry(worker_id).or_default().extend(paths);
+            }
+            violations.extend(chunk_changes.violations);
             index = end;
             if chunk_limited && index < pending.len() {
                 // Nicht in dasselbe Limit hineinstarten.
@@ -1151,14 +1216,7 @@ async fn execute_wave(
     state.verification = VerificationState::NotRun;
     state.last_judge = None;
 
-    let owners: Vec<(String, Vec<String>)> = state
-        .workers
-        .iter()
-        .filter(|worker| wave_ids.contains(&worker.worker_id))
-        .map(|worker| (worker.worker_id.clone(), worker.scope.owned_paths.clone()))
-        .collect();
-    let changes = ports.scope_guard.after_wave(&owners);
-    for (worker_id, paths) in changes.changed {
+    for (worker_id, paths) in changed {
         if let Some(result) = state
             .workers
             .iter_mut()
@@ -1172,16 +1230,16 @@ async fn execute_wave(
             }
         }
     }
-    if !changes.violations.is_empty() {
+    if !violations.is_empty() {
         let reason = clip(
             &format!(
                 "Schreibbereich verletzt: {}. Bitte die Änderungen prüfen, dann freigeben.",
-                changes.violations.join("; ")
+                violations.join("; ")
             ),
             MAX_OUTCOME_REASON_CHARS,
         );
         tracing::error!(
-            violations = changes.violations.len(),
+            violations = violations.len(),
             "work-driver wave wrote outside its owned paths"
         );
         for worker in &mut state.workers {
@@ -1315,7 +1373,19 @@ async fn run_verification(
         .collect();
     if !fresh.is_empty() {
         if let Err(reason) = ports.goals.attach_evidence(&input.goal_id, &fresh) {
+            // Fail closed wie jeder andere Verifikationsausgang dieser
+            // Funktion: ohne die angehängte Evidenz bliebe das Kriterium in
+            // `evaluate_goal` für immer offen und die Runde würde mit
+            // identischem Feedback endlos wiederholt, statt den Menschen auf
+            // den eigentlichen Fehler (Goal-Speicher) hinzuweisen.
             tracing::warn!(goal = %input.goal_id, reason = %reason, "work-driver could not attach verification evidence");
+            state.last_rationale.push(format!(
+                "verification: bestandene Nachweise konnten nicht am Goal hinterlegt werden ({reason})"
+            ));
+            return Some(RoundEnd::Finish(needs_input(&format!(
+                "Die zentrale Verifikation ist bestanden, aber die Nachweise ließen sich nicht am \
+                 Goal hinterlegen: {reason}. Nach Abhilfe freigeben, dann wird erneut verifiziert."
+            ))));
         }
     }
     state.verification = match report.verdict {
@@ -1778,22 +1848,18 @@ fn verdict_from_object(object: &str) -> Option<JudgeVerdict> {
 ///
 /// # Description
 /// 1. Das erste JSON-Objekt mit `passed`/`met`/`verified` gewinnt.
-/// 2. Sonst ein Klartext-Marker `PASSED` bzw. `FAILED` (ohne Groß-/
-///    Kleinschreibung, als eigenes Wort; `FAILED` gewinnt bei beiden).
-/// 3. Sonst `passed: false` mit dem Rohtext als Kommentar.
+/// 2. Sonst `passed: false` mit dem Rohtext als Kommentar: `JUDGE_INSTRUCTION`
+///    verlangt vom Bewerter ausschließlich JSON, ein Klartext-Fallback ist
+///    daher nur die letzte Absicherung. Ein früherer Klartext-Marker-Scan auf
+///    bloße Wörter wie „PASSED"/„FAILED" träfe auch verneinte Formulierungen
+///    ohne das Wort „FAILED" (z. B. „hat … noch nicht PASSED") als
+///    `passed: true` — das widerspricht „im Zweifel nicht bestanden".
 pub(super) fn parse_verdict(text: &str) -> JudgeVerdict {
     if let Some(verdict) = json_objects(text).into_iter().find_map(verdict_from_object) {
         return verdict;
     }
-    let words: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_uppercase)
-        .collect();
-    let failed = words.iter().any(|word| word == "FAILED");
-    let passed = words.iter().any(|word| word == "PASSED");
     JudgeVerdict {
-        passed: passed && !failed,
+        passed: false,
         comment: clip(text.trim(), MAX_OUTCOME_REASON_CHARS),
         missing: Vec::new(),
     }
@@ -1888,22 +1954,40 @@ fn owned_rules(owned_paths: &[String]) -> Vec<PathRule> {
 }
 
 /// Ordnet geänderte Pfade den Workern zu und meldet Pfade außerhalb aller
-/// `owned_paths` (über `harw_plan::admission::validate_patch`).
+/// `owned_paths` (über `harw_plan::admission::validate_patch`) sowie Pfade,
+/// die mehr als ein `owned_paths` derselben Prüfung treffen: `owned_paths`
+/// sollen laut Vertrag disjunkt sein, eine Überlappung ist deshalb fail
+/// closed ein Verstoß statt einer stillschweigenden Mehrfachzuschreibung.
 pub(super) fn attribute_changes(
     diff: &UnifiedDiff,
     owners: &[(String, Vec<String>)],
 ) -> WaveChanges {
     let mut changed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut ambiguous: Vec<String> = Vec::new();
     for file in &diff.files {
-        for (worker_id, owned) in owners {
-            if owned_rules(owned)
-                .iter()
-                .any(|rule| rule.matches(&file.path))
-            {
+        let matched: Vec<String> = owners
+            .iter()
+            .filter(|(_, owned)| {
+                owned_rules(owned)
+                    .iter()
+                    .any(|rule| rule.matches(&file.path))
+            })
+            .map(|(worker_id, _)| worker_id.clone())
+            .collect();
+        match matched.as_slice() {
+            [] => {}
+            [worker_id] => {
                 changed
                     .entry(worker_id.clone())
                     .or_default()
                     .push(file.path.clone());
+            }
+            many => {
+                ambiguous.push(format!(
+                    "'{}' liegt in mehreren owned_paths der Welle ({})",
+                    file.path,
+                    many.join(", ")
+                ));
             }
         }
     }
@@ -1918,7 +2002,7 @@ pub(super) fn attribute_changes(
         forbidden_paths: Vec::new(),
     };
     let report = validate_patch(&contract, diff);
-    let violations = report
+    let mut violations: Vec<String> = report
         .violations
         .iter()
         .map(|violation| match violation {
@@ -1933,6 +2017,7 @@ pub(super) fn attribute_changes(
             }
         })
         .collect();
+    violations.extend(ambiguous);
     WaveChanges {
         changed,
         violations,
@@ -2052,7 +2137,23 @@ pub(super) async fn execute_work_driver_claim(
         control: Arc::clone(&control),
         deadline,
     };
-    let verifier = fallback_verifier(runtime_root, &work_id);
+    let sandboxed = context
+        .verify_runner
+        .as_ref()
+        .map(|runner| ExecutorVerifier {
+            executor: VerificationExecutor::new(
+                runner.clone(),
+                VerifyConfig::new(runtime_root.cwd.clone(), DRIVER_ACTOR),
+            ),
+        });
+    let fallback;
+    let verifier: &dyn VerificationRunner = match sandboxed.as_ref() {
+        Some(sandboxed) => sandboxed,
+        None => {
+            fallback = fallback_verifier(runtime_root, &work_id);
+            &fallback
+        }
+    };
     let judge_model: Arc<dyn ModelProvider> = match config.judge {
         Some((provider_id, model)) => Arc::new(harw_core::PinnedModelProvider::new(
             Arc::clone(&budgeted),
@@ -2078,13 +2179,16 @@ pub(super) async fn execute_work_driver_claim(
     let pacer = CancellablePacer {
         control: Arc::clone(&control),
     };
+    // Derselbe Provider wie die Worker (die Budget-Hülle reicht durch).
+    let pacing = ModelPacing(Arc::clone(&budgeted));
     let ports = DrivePorts {
         goals: &goal_access,
         workers: &spawner,
-        verifier: &verifier,
+        verifier,
         judge: &judge,
         scope_guard: &guard,
         pacer: &pacer,
+        pacing: &pacing,
     };
     let cancellation = control.cancellation();
     let cancelled = move || *cancellation.borrow();
@@ -2355,6 +2459,10 @@ impl ModelProvider for MeteredModelProvider {
     fn pinned_provider_id(&self) -> Option<String> {
         self.inner.pinned_provider_id()
     }
+
+    fn pacing_wait(&self) -> Option<Duration> {
+        self.inner.pacing_wait()
+    }
 }
 
 /// Ein [`ModelProvider`], der jede Anfrage auf `max_output_tokens` deckelt
@@ -2376,6 +2484,10 @@ impl ModelProvider for OutputCappedProvider {
 
     fn pinned_provider_id(&self) -> Option<String> {
         self.inner.pinned_provider_id()
+    }
+
+    fn pacing_wait(&self) -> Option<Duration> {
+        self.inner.pacing_wait()
     }
 }
 
@@ -2609,22 +2721,18 @@ async fn drive_worker_turn(
     }
 }
 
-/// Der Verifier eines Laufs, solange dem Job-Worker kein Sandbox-Backend
-/// übergeben wird.
+/// Der Verifier eines Laufs, wenn dem Job-Worker kein Sandbox-Backend
+/// übergeben wurde (`JobWorkerContext::verify_runner` ist `None`).
 ///
 /// # Description
-/// Der sandboxte Produktions-Runner ist
-/// `harw_plan_bridge::verify_exec::CoordinatorVerifyRunner` über einen
-/// `harw_job_runtime::Coordinator` (Store + `LinuxExecutor` mit
-/// `LinuxSandboxBackend::LandlockTrampoline`/`Bwrap`, Workspace-Wurzel =
-/// `runtime_root.cwd`). Weder CLI noch Runtime bauen heute einen solchen
-/// Coordinator, und `execute_work_driver_claim` bekommt keinen Handle darauf
-/// (`JobWorkerContext` trägt keinen). Deshalb läuft hier `NoSandboxRunner`:
-/// jeder `Command`-Schritt ist Unverifiable (nie unsandboxed auf dem Host),
-/// nur `Artifact`-Schritte werden geprüft; ein Lauf mit Befehlen eskaliert
-/// mit [`NO_VERIFY_SANDBOX`] an den Menschen. Sobald ein Runner übergeben
-/// wird, ersetzt `ExecutorVerifier { executor: VerificationExecutor::new(
-/// runner, VerifyConfig::new(cwd, DRIVER_ACTOR)) }` diesen Aufruf.
+/// Mit Backend verifiziert `execute_work_driver_claim` über
+/// `ExecutorVerifier { executor: VerificationExecutor::new(runner,
+/// VerifyConfig::new(cwd, DRIVER_ACTOR)) }` mit dem
+/// `crate::verify_sandbox::SandboxVerifier` des Kontexts (Workspace-Wurzel =
+/// `runtime_root.cwd`). Ohne Backend läuft hier `NoSandboxRunner`: jeder
+/// `Command`-Schritt ist Unverifiable (nie unsandboxed auf dem Host), nur
+/// `Artifact`-Schritte werden geprüft; ein Lauf mit Befehlen eskaliert mit
+/// [`NO_VERIFY_SANDBOX`] an den Menschen.
 fn fallback_verifier(
     runtime_root: &JobRuntimeRoot,
     work_id: &WorkId,
@@ -2759,6 +2867,15 @@ impl Judge for ConversationJudge<'_> {
     }
 }
 
+/// [`ProviderPacing`] über den Provider des Laufs.
+struct ModelPacing(Arc<dyn ModelProvider>);
+
+impl ProviderPacing for ModelPacing {
+    fn pacing_wait(&self) -> Option<Duration> {
+        self.0.pacing_wait()
+    }
+}
+
 /// [`Pacer`] mit `tokio::time::sleep`, vorzeitig beendet durch einen Abbruch.
 struct CancellablePacer {
     control: Arc<WorkerExecutionControl>,
@@ -2872,9 +2989,13 @@ impl WriteScopeGuard for WorkspaceScopeGuard {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx, some_or};
-    use harw_job_runtime::{Budget, Job, JobScope, RetryPolicy, StoredJob};
+    use harw_job_runtime::{
+        Budget, EnforcementState, Job, JobScope, RetryPolicy, SandboxReport, StoredJob,
+    };
     use harw_plan::admission::{FileChange, PatchFile};
     use harw_plan::{Criterion, EvidenceKind, GoalId, GoalStatus, InMemoryGoalStore};
+    use harw_plan_bridge::WorkScope;
+    use harw_plan_bridge::verify_exec::{CommandExit, CommandRequest, CommandRun, RunnerError};
     use harw_session_store::{ClaimRequest, CompleteRequest};
     use harw_types::WorkspaceId;
     use std::collections::VecDeque;
@@ -2883,12 +3004,16 @@ mod tests {
 
     struct FakeGoals {
         goal: Mutex<Goal>,
+        /// Gesetzt: der nächste `attach_evidence` schlägt mit dieser
+        /// Fehlermeldung fehl (Goal-Speicher nicht erreichbar o. Ä.).
+        fail_attach: Mutex<Option<String>>,
     }
 
     impl FakeGoals {
         fn new(goal: Goal) -> Self {
             Self {
                 goal: Mutex::new(goal),
+                fail_attach: Mutex::new(None),
             }
         }
 
@@ -2897,6 +3022,13 @@ mod tests {
                 .lock()
                 .map(|goal| goal.clone())
                 .map_err(|_| TestError::Unexpected("goal lock poisoned".to_owned()))
+        }
+
+        /// Lässt jeden folgenden `attach_evidence`-Aufruf mit `reason` fehlschlagen.
+        fn fail_attach_evidence(&self, reason: &str) {
+            if let Ok(mut fail_attach) = self.fail_attach.lock() {
+                *fail_attach = Some(reason.to_owned());
+            }
         }
     }
 
@@ -2915,6 +3047,14 @@ mod tests {
         }
 
         fn attach_evidence(&self, _goal_id: &str, evidence: &[EvidenceRef]) -> Result<(), String> {
+            if let Some(reason) = self
+                .fail_attach
+                .lock()
+                .map_err(|_| "poisoned".to_owned())?
+                .clone()
+            {
+                return Err(reason);
+            }
             let mut goal = self.goal.lock().map_err(|_| "poisoned".to_owned())?;
             goal.evidence.extend(evidence.iter().cloned());
             Ok(())
@@ -3045,10 +3185,14 @@ mod tests {
     /// One recorded wave: (worker id, changed paths) per worker.
     type Wave = Vec<(String, Vec<String>)>;
 
-    #[derive(Default)]
     struct FakeGuard {
         violations: Mutex<Vec<String>>,
         waves: Mutex<Vec<Wave>>,
+        /// Ein `UnifiedDiff` je `after_wave`-Aufruf (FIFO); erschöpft: leerer
+        /// Diff (keine Änderungen). Läuft durch die echte
+        /// `attribute_changes`, damit Tests reale Block-Grenzen prüfen
+        /// können, statt nur die übergebenen `owners` mitzuschreiben.
+        diffs: Mutex<VecDeque<UnifiedDiff>>,
     }
 
     impl FakeGuard {
@@ -3056,6 +3200,25 @@ mod tests {
             Self {
                 violations: Mutex::new(vec![violation.to_owned()]),
                 waves: Mutex::new(Vec::new()),
+                diffs: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        fn with_diffs(diffs: Vec<UnifiedDiff>) -> Self {
+            Self {
+                violations: Mutex::new(Vec::new()),
+                waves: Mutex::new(Vec::new()),
+                diffs: Mutex::new(diffs.into()),
+            }
+        }
+    }
+
+    impl Default for FakeGuard {
+        fn default() -> Self {
+            Self {
+                violations: Mutex::new(Vec::new()),
+                waves: Mutex::new(Vec::new()),
+                diffs: Mutex::new(VecDeque::new()),
             }
         }
     }
@@ -3067,14 +3230,27 @@ mod tests {
             if let Ok(mut waves) = self.waves.lock() {
                 waves.push(owners.to_vec());
             }
-            WaveChanges {
-                changed: BTreeMap::new(),
-                violations: self
-                    .violations
-                    .lock()
-                    .map(|mut violations| std::mem::take(&mut *violations))
-                    .unwrap_or_default(),
+            let preset = self
+                .violations
+                .lock()
+                .map(|mut violations| std::mem::take(&mut *violations))
+                .unwrap_or_default();
+            if !preset.is_empty() {
+                return WaveChanges {
+                    changed: BTreeMap::new(),
+                    violations: preset,
+                };
             }
+            let diff = self
+                .diffs
+                .lock()
+                .ok()
+                .and_then(|mut diffs| diffs.pop_front())
+                .unwrap_or_else(|| UnifiedDiff {
+                    base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+                    files: Vec::new(),
+                });
+            attribute_changes(&diff, owners)
         }
     }
 
@@ -3102,6 +3278,109 @@ mod tests {
         }
     }
 
+    /// Provider-Taktung: liefert `wait` bei der ersten Abfrage, danach `None`
+    /// (das Kontingent gilt als aufgefüllt) — bildet nach, dass ein
+    /// TPM-/RPM-Kontingent mit der Zeit von selbst wieder frei wird, ohne
+    /// dass ein Fake eine echte Uhr bräuchte. Standard: keine Wartezeit.
+    #[derive(Default)]
+    struct FakePacing {
+        wait: Mutex<Option<Duration>>,
+        polls: Mutex<u32>,
+    }
+
+    impl FakePacing {
+        fn once(wait: Option<Duration>) -> Self {
+            Self {
+                wait: Mutex::new(wait),
+                polls: Mutex::new(0),
+            }
+        }
+
+        fn polls(&self) -> u32 {
+            self.polls.lock().map(|polls| *polls).unwrap_or(0)
+        }
+    }
+
+    impl ProviderPacing for FakePacing {
+        fn pacing_wait(&self) -> Option<Duration> {
+            if let Ok(mut polls) = self.polls.lock() {
+                *polls = polls.saturating_add(1);
+            }
+            self.wait.lock().ok().and_then(|mut wait| wait.take())
+        }
+    }
+
+    /// Spawner, der je Start die Zahl der bis dahin gemachten Pausen merkt.
+    struct PauseAwareSpawner<'a> {
+        pacer: &'a FakePacer,
+        pauses_at_start: Mutex<Vec<usize>>,
+    }
+
+    impl<'a> PauseAwareSpawner<'a> {
+        fn new(pacer: &'a FakePacer) -> Self {
+            Self {
+                pacer,
+                pauses_at_start: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn pauses_at_start(&self) -> TestResult<Vec<usize>> {
+            self.pauses_at_start
+                .lock()
+                .map(|seen| seen.clone())
+                .map_err(|_| TestError::Unexpected("spawner lock poisoned".to_owned()))
+        }
+    }
+
+    impl WorkerSpawner for PauseAwareSpawner<'_> {
+        fn run<'a>(&'a self, _request: WorkerRequest) -> BoxFuture<'a, WorkerRun> {
+            Box::pin(async move {
+                if let Ok(mut seen) = self.pauses_at_start.lock() {
+                    seen.push(self.pacer.pauses().len());
+                }
+                WorkerRun {
+                    reply: done_reply("fertig"),
+                    usage: WorkerUsage::default(),
+                }
+            })
+        }
+    }
+
+    /// Skriptbarer Verifikations-Runner (voll sandboxed, Exit 0); merkt sich
+    /// jeden Befehlstext.
+    #[derive(Default)]
+    struct PassingRunner {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl PassingRunner {
+        fn seen(&self) -> TestResult<Vec<String>> {
+            self.seen
+                .lock()
+                .map(|seen| seen.clone())
+                .map_err(|_| TestError::Unexpected("runner lock poisoned".to_owned()))
+        }
+    }
+
+    impl VerifyRunner for PassingRunner {
+        async fn run(&self, request: &CommandRequest) -> Result<CommandRun, RunnerError> {
+            self.seen
+                .lock()
+                .map_err(|_| RunnerError::Backend {
+                    reason: "fake runner lock poisoned".to_owned(),
+                })?
+                .push(request.raw.clone());
+            Ok(CommandRun {
+                exit: CommandExit::Exited(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                upstream_truncated: false,
+                sandbox: SandboxReport::uniform(EnforcementState::Enforced),
+                locator: None,
+            })
+        }
+    }
+
     /// Alle Fakes einer Testrunde.
     struct Fakes {
         goals: FakeGoals,
@@ -3110,6 +3389,7 @@ mod tests {
         judge: FakeJudge,
         guard: FakeGuard,
         pacer: FakePacer,
+        pacing: FakePacing,
     }
 
     impl Fakes {
@@ -3121,6 +3401,7 @@ mod tests {
                 judge: FakeJudge::replying("{}"),
                 guard: FakeGuard::default(),
                 pacer: FakePacer::default(),
+                pacing: FakePacing::default(),
             }
         }
 
@@ -3132,6 +3413,7 @@ mod tests {
                 judge: &self.judge,
                 scope_guard: &self.guard,
                 pacer: &self.pacer,
+                pacing: &self.pacing,
             }
         }
     }
@@ -3250,6 +3532,34 @@ mod tests {
 
     fn memory_for(input: &WorkDriverJobInput, provider_cap: Option<usize>) -> RunMemory {
         RunMemory::new(&input.spec, provider_cap, Timestamp::now())
+    }
+
+    /// Minimaler Worker-Zustand mit `owned_paths` (sonst leer/frisch).
+    fn worker_state(worker_id: &str, owned_paths: Vec<String>) -> WorkerState {
+        WorkerState {
+            worker_id: worker_id.to_owned(),
+            scope: WorkScope {
+                id: worker_id.to_owned(),
+                summary: String::new(),
+                owned_paths,
+                criteria: Vec::new(),
+            },
+            attempts: 0,
+            last_result: None,
+            context_tokens_used: 0,
+            cache_hit_ratio: None,
+        }
+    }
+
+    /// Ein frischer, nicht fortgesetzter Auftrag an `worker_id`.
+    fn worker_request(worker_id: &str, owned_paths: Vec<String>) -> WorkerRequest {
+        WorkerRequest {
+            worker_id: worker_id.to_owned(),
+            role: "implementer".to_owned(),
+            owned_paths,
+            text: "tu was".to_owned(),
+            continuation: false,
+        }
     }
 
     struct Harness {
@@ -3450,6 +3760,164 @@ mod tests {
                 .contains("Fehlschlag: cargo clippy --workspace")
         );
         assert_eq!(state_of(&harness)?.verification, VerificationState::NotRun);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sandboxed_executor_verifier_passes_commands_with_evidence() -> TestResult {
+        let harness = harness()?;
+        let workspace = tempfile::tempdir().map_err(ctx("workspace dir"))?;
+        let cmd = "cargo test -p parser umlaut";
+        let fakes = Fakes::new(goal(vec![command_criterion("Umlaute gehen", cmd)]));
+        let verifier = ExecutorVerifier {
+            executor: VerificationExecutor::new(
+                PassingRunner::default(),
+                VerifyConfig::new(workspace.path(), DRIVER_ACTOR),
+            ),
+        };
+        let ports = DrivePorts {
+            verifier: &verifier,
+            ..fakes.ports()
+        };
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        // Runde 1: Welle; Runde 2: zentrale Verifikation über den Executor.
+        let outcome = outcome_of(
+            run_rounds(
+                &harness.store,
+                &work_id(),
+                &input,
+                &ports,
+                &mut memory,
+                None,
+                &not_cancelled,
+            )
+            .await,
+        )?;
+        // Mit Sandbox-Runner keine Eskalation mangels Backend.
+        assert!(
+            matches!(outcome, JobOutcome::Succeeded { .. }),
+            "expected success, got {outcome:?}"
+        );
+
+        let seen = verifier.executor.runner().seen()?;
+        assert!(seen.iter().any(|raw| raw == cmd), "ran: {seen:?}");
+        assert!(seen.iter().any(|raw| raw == "cargo clippy --workspace"));
+        assert_eq!(state_of(&harness)?.verification, VerificationState::Passed);
+        let goal = fakes.goals.snapshot()?;
+        assert!(
+            goal.evidence
+                .iter()
+                .any(|found| found.locator == cmd && found.actor == DRIVER_ACTOR),
+            "evidence: {:?}",
+            goal.evidence
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provider_pacing_pauses_before_the_first_worker_starts() -> TestResult {
+        let harness = harness()?;
+        let mut fakes = Fakes::new(goal(vec![
+            command_criterion("ASCII bleibt", "cargo test -p parser ascii"),
+            command_criterion("Umlaute gehen", "cargo test -p parser umlaut"),
+        ]));
+        fakes.pacing = FakePacing::once(Some(Duration::from_secs(9)));
+        let spawner = PauseAwareSpawner::new(&fakes.pacer);
+        let ports = DrivePorts {
+            workers: &spawner,
+            ..fakes.ports()
+        };
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        step(&harness, &input, &ports, &mut memory, 1).await;
+
+        // Ein Block (Breite 4 ≥ 2 Worker): genau eine Pause, vor jedem Start
+        // (die zweite Abfrage danach meldet keine Wartezeit mehr).
+        assert_eq!(fakes.pacer.pauses(), vec![Duration::from_secs(9)]);
+        assert_eq!(spawner.pauses_at_start()?, vec![1, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provider_pacing_waits_the_full_reported_duration_and_ignores_zero_or_none()
+    -> TestResult {
+        let input = input(10);
+        for (wait, expected) in [
+            (None, Vec::new()),
+            (Some(Duration::ZERO), Vec::new()),
+            // Ein volles TPM-/RPM-Kontingentfenster (1 h, wie
+            // `budget::MAX_REPORTED_WAIT` bei harw-provider-http) wird in
+            // voller Länge abgewartet, nicht auf den 429-Backoff-Deckel
+            // (`RATE_LIMIT_MAX_BACKOFF_SECS` = 300 s) gekappt.
+            (
+                Some(Duration::from_secs(3_600)),
+                vec![Duration::from_secs(3_600)],
+            ),
+        ] {
+            let harness = harness()?;
+            let mut fakes = Fakes::new(goal(vec![command_criterion(
+                "Umlaute gehen",
+                "cargo test -p parser umlaut",
+            )]));
+            fakes.pacing = FakePacing::once(wait);
+            let mut memory = memory_for(&input, None);
+            step(&harness, &input, &fakes.ports(), &mut memory, 1).await;
+            assert_eq!(fakes.pacer.pauses(), expected, "pacing {wait:?}");
+            assert_eq!(fakes.spawner.calls()?.len(), 1);
+            // Nach der Wartezeit fragt die Welle erneut ab (mindestens ein
+            // zweiter Poll), statt nach einer einzigen, gekappten Pause
+            // blind zu starten.
+            if wait.filter(|wait| !wait.is_zero()).is_some() {
+                assert!(fakes.pacing.polls() >= 2, "polls {wait:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Meldet immer eine Wartezeit; bildet nach, dass `Pacer::pause` (etwa
+    /// nach einem Abbruch) ohne echten Zeitablauf vorzeitig endet und der
+    /// Provider deshalb nie „aufgefüllt" erscheint.
+    struct AlwaysWaitingPacing;
+
+    impl ProviderPacing for AlwaysWaitingPacing {
+        fn pacing_wait(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pacing_poll_cap_stops_a_spin_and_dispatches_anyway() -> TestResult {
+        // Ohne echten Zeitablauf (Fake-Pacer wartet nicht) meldet
+        // `AlwaysWaitingPacing` endlos eine Wartezeit — ohne Deckel würde die
+        // Welle hier für immer spinnen, statt einen Abbruch beim
+        // Worker-Start (`WorkerReply::Cancelled`) überhaupt bemerken zu
+        // können.
+        let mut state = new_state(&work_id(), Timestamp::now());
+        state.workers.push(worker_state("w0", Vec::new()));
+        let requests = vec![worker_request("w0", Vec::new())];
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        let spawner = FakeSpawner::with_replies(vec![done_reply("fertig")]);
+        let pacer = FakePacer::default();
+        let pacing = AlwaysWaitingPacing;
+        let guard = FakeGuard::default();
+        let judge = FakeJudge::replying("{}");
+        let goals = FakeGoals::new(goal(Vec::new()));
+        let verifier = FakeVerifier::with_reports(Vec::new());
+        let ports = DrivePorts {
+            goals: &goals,
+            workers: &spawner,
+            verifier: &verifier,
+            judge: &judge,
+            scope_guard: &guard,
+            pacer: &pacer,
+            pacing: &pacing,
+        };
+        let end = execute_wave(&mut state, &mut memory, &ports, requests).await;
+        assert_eq!(end, None);
+        assert_eq!(pacer.pauses().len(), MAX_PACING_POLLS as usize);
+        assert_eq!(spawner.calls()?.len(), 1, "dispatches despite the cap");
         Ok(())
     }
 
@@ -3802,6 +4270,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_a_failed_attach_evidence_after_a_green_run_escalates_instead_of_looping()
+    -> TestResult {
+        let harness = harness()?;
+        let cmd = "cargo test -p parser umlaut";
+        let mut fakes = Fakes::new(goal(vec![command_criterion("Umlaute gehen", cmd)]));
+        fakes.verifier = FakeVerifier::with_reports(vec![VerificationReport {
+            verdict: VerifyVerdict::Passed,
+            failing: Vec::new(),
+            unverifiable: Vec::new(),
+            evidence: vec![evidence(cmd)],
+        }]);
+        fakes.goals.fail_attach_evidence("store unavailable");
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        let outcome = outcome_of(
+            run_rounds(
+                &harness.store,
+                &work_id(),
+                &input,
+                &fakes.ports(),
+                &mut memory,
+                None,
+                &not_cancelled,
+            )
+            .await,
+        )?;
+        // Fail closed wie jeder andere Verifikationsausgang dieser Funktion:
+        // ohne die angehängte Evidenz bliebe das Kriterium für immer offen
+        // und die Runde würde sonst mit identischem Feedback endlos laufen.
+        let JobOutcome::Blocked { reason } = outcome else {
+            return Err(TestError::Unexpected(format!(
+                "expected blocked, got {outcome:?}"
+            )));
+        };
+        assert!(reason.contains("store unavailable"), "{reason}");
+        let state = state_of(&harness)?;
+        assert_ne!(state.verification, VerificationState::Passed);
+        assert!(
+            state
+                .last_rationale
+                .iter()
+                .any(|line| line.contains("store unavailable")),
+            "{:?}",
+            state.last_rationale
+        );
+        // Die Evidenz selbst wurde nicht angehängt.
+        let goal = fakes.goals.snapshot()?;
+        assert!(goal.evidence.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn test_parallelism_follows_the_provider_cap_and_aimd() {
         let input = input(10);
@@ -3889,6 +4409,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_write_into_a_different_blocks_owned_path_is_caught_across_blocks()
+    -> TestResult {
+        // Wellenbreite 1: w0 und w1 laufen in getrennten, nacheinander
+        // ausgeführten Blöcken derselben Welle, nie gleichzeitig.
+        let mut state = new_state(&work_id(), Timestamp::now());
+        state.workers.push(worker_state("w0", vec!["a".to_owned()]));
+        state.workers.push(worker_state("w1", vec!["b".to_owned()]));
+        let requests = vec![
+            worker_request("w0", vec!["a".to_owned()]),
+            worker_request("w1", vec!["b".to_owned()]),
+        ];
+        let spec = WorkDriverSpec {
+            max_parallel_workers: 1,
+            ..spec(10)
+        };
+        let mut memory = RunMemory::new(&spec, None, Timestamp::now());
+        let spawner = FakeSpawner::with_replies(vec![done_reply("a erledigt"), done_reply("b erledigt")]);
+        // Block 1 (nur w0 läuft) verändert tatsächlich `b/x` — eine
+        // Scope-Flucht in den Bereich von w1, der in diesem Block noch nicht
+        // einmal gestartet ist. Die alte, wellenweite Vereinigung hätte das
+        // klaglos w1 zugeschrieben (siehe Kontrollrechnung unten); die
+        // block-genaue Prüfung erkennt es als Verstoß.
+        let guard = FakeGuard::with_diffs(vec![
+            UnifiedDiff {
+                base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+                files: vec![PatchFile {
+                    path: "b/x".to_owned(),
+                    source_path: None,
+                    change: FileChange::Modified,
+                }],
+            },
+            UnifiedDiff {
+                base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+                files: Vec::new(),
+            },
+        ]);
+        let pacer = FakePacer::default();
+        let pacing = FakePacing::default();
+        let judge = FakeJudge::replying("{}");
+        let goals = FakeGoals::new(goal(Vec::new()));
+        let verifier = FakeVerifier::with_reports(Vec::new());
+        let ports = DrivePorts {
+            goals: &goals,
+            workers: &spawner,
+            verifier: &verifier,
+            judge: &judge,
+            scope_guard: &guard,
+            pacer: &pacer,
+            pacing: &pacing,
+        };
+        let requests_len = requests.len();
+        let end = execute_wave(&mut state, &mut memory, &ports, requests).await;
+        assert_eq!(end, None);
+        assert_eq!(spawner.calls()?.len(), requests_len);
+        for worker_id in ["w0", "w1"] {
+            let outcome = state
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id == worker_id)
+                .and_then(|worker| worker.last_result.as_ref())
+                .map(|result| &result.outcome);
+            assert!(
+                matches!(outcome, Some(WorkerOutcome::Blocked { .. })),
+                "{worker_id}: {outcome:?}"
+            );
+        }
+
+        // Kontrollrechnung: dieselbe Änderung gegen die alte, wellenweite
+        // Vereinigung (beide Besitzer gleichzeitig erlaubt) zeigt keinen
+        // Verstoß und schreibt die Datei stillschweigend w1 zu — genau die
+        // Lücke, die die block-genaue Prüfung oben schließt.
+        let wide_owners = vec![
+            ("w0".to_owned(), vec!["a".to_owned()]),
+            ("w1".to_owned(), vec!["b".to_owned()]),
+        ];
+        let wide_diff = UnifiedDiff {
+            base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+            files: vec![PatchFile {
+                path: "b/x".to_owned(),
+                source_path: None,
+                change: FileChange::Modified,
+            }],
+        };
+        let wide = attribute_changes(&wide_diff, &wide_owners);
+        assert!(wide.violations.is_empty());
+        assert_eq!(wide.changed.get("w1"), Some(&vec!["b/x".to_owned()]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_cancellation_between_rounds_stops_without_a_worker_call() -> TestResult {
         let harness = harness()?;
         let fakes = Fakes::new(goal(vec![command_criterion("a", "cargo test a")]));
@@ -3952,6 +4562,29 @@ mod tests {
         assert!(!changes.changed.contains_key("w2"));
         assert_eq!(changes.violations.len(), 1);
         assert!(changes.violations[0].contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_attribute_changes_treats_overlapping_owned_paths_as_a_violation() {
+        // `owned_paths` sollen laut Vertrag disjunkt sein; überlappen sie
+        // sich dennoch, ist eine stillschweigende Mehrfachzuschreibung fail
+        // closed keine Option.
+        let diff = UnifiedDiff {
+            base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+            files: vec![PatchFile {
+                path: "src/parser/mod.rs".to_owned(),
+                source_path: None,
+                change: FileChange::Modified,
+            }],
+        };
+        let owners = vec![
+            ("w0".to_owned(), vec!["src/parser".to_owned()]),
+            ("w1".to_owned(), vec!["src/parser".to_owned()]),
+        ];
+        let changes = attribute_changes(&diff, &owners);
+        assert!(changes.changed.is_empty());
+        assert_eq!(changes.violations.len(), 1);
+        assert!(changes.violations[0].contains("src/parser/mod.rs"));
     }
 
     fn input_for_tenant(tenant: Option<&str>) -> WorkDriverJobInput {
@@ -4054,8 +4687,15 @@ mod tests {
         let first_bool_wins =
             parse_verdict(r#"{"note": "x"} und dann {"passed": false, "comment": "c"}"#);
         assert!(!first_bool_wins.passed);
-        assert!(parse_verdict("Ergebnis: PASSED").passed);
+        // Kein JSON-Objekt: fail closed, auch wenn das bloße Wort "PASSED"
+        // vorkommt (kein Klartext-Marker-Scan mehr).
+        assert!(!parse_verdict("Ergebnis: PASSED").passed);
         assert!(!parse_verdict("passed? no — FAILED").passed);
+        // Verneinte Formulierung ohne das Wort "FAILED": hätte der alte
+        // Klartext-Scan als `passed: true` gelesen.
+        assert!(
+            !parse_verdict("This has not passed review yet; more tests are needed.").passed
+        );
         let nothing = parse_verdict("Ich kann das nicht beurteilen.");
         assert!(!nothing.passed);
         assert_eq!(nothing.comment, "Ich kann das nicht beurteilen.");

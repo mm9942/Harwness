@@ -68,6 +68,7 @@ mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
 mod uia_bootstrap;
+mod verify_sandbox;
 mod web;
 mod worker_cancellation;
 
@@ -1317,6 +1318,12 @@ fn serve_mcp(
         }),
         None => None,
     };
+    // Verify-Befehle der Work-Driver-Wellen laufen gesandboxt unter demselben
+    // Home und Arbeitsverzeichnis wie `runtime_root`. Nicht fatal: ohne Home
+    // oder ohne baubaren Runner greift der bisherige Fallback-Verifier.
+    let verify_runner = runtime_root
+        .as_ref()
+        .and_then(|root| verify_sandbox::build(&root.home, &root.cwd));
     // Kanban-Karten (Plan D2) liegen im Wissensspeicher des Profils, dessen
     // Job-Speicher dieser Dienst bedient (`<storage_root>/knowledge`). Ohne
     // HARW-Home bleiben `kanban_card`-Jobs unberührt.
@@ -1330,6 +1337,7 @@ fn serve_mcp(
         configured_submitters,
         runtime_root,
         knowledge,
+        verify_runner,
     });
 
     // Zwei Runtimes (G-054): der Listener behält seine `current_thread`-Runtime

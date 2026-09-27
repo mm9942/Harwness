@@ -585,10 +585,11 @@ mod tests {
     }
 
     #[test]
-    fn test_has_live_row_plus_thirteen_roles() {
-        // Runde 5, Teil E: `auto-classifier` ist die dreizehnte Rolle.
+    fn test_has_live_row_plus_every_role() {
+        // Live-Zeile plus eine Zeile je `ModelRole` (seit R14 inklusive
+        // `work-driver-judge`); die Zahl folgt `ModelRole::ALL`.
         let view = view();
-        assert_eq!(view.rows.len(), 14);
+        assert_eq!(view.rows.len(), ModelRole::ALL.len() + 1);
         assert_eq!(view.rows[0].key, None);
         assert_eq!(view.rows[0].label, LIVE_LABEL);
     }
@@ -632,7 +633,7 @@ mod tests {
         for _ in 0..50 {
             view.on_key(key(KeyCode::Down));
         }
-        assert_eq!(view.selected, 13);
+        assert_eq!(view.selected, ModelRole::ALL.len());
         for _ in 0..50 {
             view.on_key(key(KeyCode::Char('k')));
         }
@@ -689,7 +690,7 @@ mod tests {
     fn test_apply_data_ignores_garbage() {
         let mut view = view();
         view.apply_data(&serde_json::json!({"foo": 1}));
-        assert_eq!(view.rows.len(), 14);
+        assert_eq!(view.rows.len(), ModelRole::ALL.len() + 1);
     }
 
     #[test]

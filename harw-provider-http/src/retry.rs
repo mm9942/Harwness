@@ -647,6 +647,19 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
     fn pinned_provider_id(&self) -> Option<String> {
         self.inner.pinned_provider_id()
     }
+
+    /// Reicht die Pacing-Wartezeit des umhüllten Providers durch.
+    ///
+    /// # Description
+    /// Die Retry-Hülle kennt selbst keine Limits; ohne Durchreichen sähen
+    /// Aufrufer hinter ihr nie die Header-, 429- oder Budget-Wartezeit des
+    /// inneren HTTP-Providers.
+    ///
+    /// # Returns
+    /// `self.inner.pacing_wait()`.
+    fn pacing_wait(&self) -> Option<Duration> {
+        self.inner.pacing_wait()
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +849,35 @@ mod tests {
             policy(),
         );
         assert_eq!(pinned.pinned_model_id().as_deref(), Some("pinned-model"));
+    }
+
+    // Provider mit fester Pacing-Wartezeit — nur für den Durchreich-Test.
+    struct PacedProvider {
+        wait: Option<Duration>,
+    }
+
+    impl ModelProvider for PacedProvider {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async { Ok(ModelResponse::text("paced")) })
+        }
+
+        fn pacing_wait(&self) -> Option<Duration> {
+            self.wait
+        }
+    }
+
+    #[test]
+    fn test_pacing_wait_is_forwarded_to_the_inner_provider() {
+        let idle = RetryingProvider::new(PacedProvider { wait: None }, policy());
+        assert_eq!(idle.pacing_wait(), None);
+
+        let paced = RetryingProvider::new(
+            PacedProvider {
+                wait: Some(Duration::from_millis(1_500)),
+            },
+            policy(),
+        );
+        assert_eq!(paced.pacing_wait(), Some(Duration::from_millis(1_500)));
     }
 
     // Provider, der `delay` lang "arbeitet" bevor er erfolgreich antwortet —
