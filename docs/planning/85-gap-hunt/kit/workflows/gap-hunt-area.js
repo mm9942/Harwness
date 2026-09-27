@@ -5,7 +5,7 @@ export const meta = {
   phases: [
     { title: 'Find', detail: 'Opus finders, one per pattern lens (fail-open, correctness/concurrency, rules/drift)' },
     { title: 'Critic', detail: 'Opus completeness critic: what did the finders miss?' },
-    { title: 'Verify', detail: 'reproduce + intent; scope lens only as tie-breaker (sonnet)' },
+    { title: 'Verify', detail: 'tiered by catalog P9/P10: M3 intent-only, critical/high intent+scope(+exploit for M1), rest intent+reproduce; tie-breaker on split (sonnet)' },
   ],
 }
 
@@ -16,6 +16,7 @@ export const meta = {
 //   exclude  paths hunted elsewhere in parallel (do not report)
 //   catalog  pattern catalog path (default docs/planning/85-gap-hunt/patterns.md)
 //   rules    extra binding code rules (default: the workspace rules below)
+//   verify   'tiered' (default, catalog P9/P10) or 'classic' (reproduce+intent for every finding)
 const A = args || {}
 const CATALOG = A.catalog || 'docs/planning/85-gap-hunt/patterns.md'
 const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid(unsafe), no unwrap/expect/panic! in library code OR tests/doctests (tests return TestResult), no third-party types in public APIs, hand-written error types, match the file\'s comment language, no book titles/authors/quotes anywhere'
@@ -68,9 +69,25 @@ const LENSES_FIND = A.lenses || [
 ]
 const LENSES_VERIFY = [
   { key: 'reproduce', text: 'Correctness / does-it-reproduce: read the cited code yourself on the current working tree. Default to real=false if the evidence does not hold.' },
-  { key: 'intent', text: 'Intent: is this deliberate/documented (decisions, guides, comments) or handled elsewhere (grep callers and other layers)? If so real=false.' },
+  { key: 'intent', text: 'Intent: is this deliberate/documented (decisions, guides, comments) or handled elsewhere (grep callers and other layers)? If so real=false. For doc drift (M3) confirm cheaply by grepping the cited text and the code it describes.' },
   { key: 'scope', text: 'Fix scope and risk: genuine defect worth fixing now (not style noise), and fixable by editing ONLY the primary file without breaking callers elsewhere? fixable_in_one_file=false if other files must change.' },
+  { key: 'exploit', text: 'Exploitability (adversarial): name a concrete input, caller or config that an untrusted party controls and that reaches the flaw. If no untrusted party can reach it, real=false and say "defence in depth" in the reason.' },
 ]
+const lens = k => LENSES_VERIFY.find(l => l.key === k)
+
+// Which lenses judge a finding (catalog P9/P10): intent is the only lens that
+// really discriminates, reproduce almost never refutes precise Opus finders,
+// M3 survives 98 % and is cheap to confirm by grep, critical/high survive
+// 100 % and need a scope/risk check rather than an existence proof. The
+// second list is the tie-breaker when the first votes split.
+const plan = f => {
+  if (A.verify === 'classic') return [['reproduce', 'intent'], 'scope']
+  if (String(f.pattern || '').startsWith('M3')) return [['intent'], 'reproduce']
+  if (f.severity === 'critical' || f.severity === 'high') {
+    return [String(f.pattern || '').startsWith('M1') ? ['intent', 'scope', 'exploit'] : ['intent', 'scope'], 'reproduce']
+  }
+  return [['intent', 'reproduce'], 'scope']
+}
 
 const norm = p => String(p || '').replace(/^\/.*?\/(?=[^/]+\/src\/|docs\/|dod\/|deploy\/|xtask\/|Cargo\.toml)/, '').replace(/^\.\//, '')
 const seen = new Set()
@@ -91,19 +108,28 @@ single_file: ${f.single_file}; other files: ${(f.other_files || []).join(', ') |
   { label: `verify:${l.key}:${f.file.split('/').pop()}:${f.line}`, phase: 'Verify', schema: VERDICT, model: 'sonnet', agentType: 'focused-explorer' })
 
 const judge = async f => {
-  const first = (await parallel([LENSES_VERIFY[0], LENSES_VERIFY[1]].map(l => () => verifyOne(f, l)))).filter(Boolean)
+  const [firstKeys, tieKey] = plan(f)
+  const run = k => verifyOne(f, lens(k)).then(v => (v ? { ...v, lens: k } : null))
+  const first = (await parallel(firstKeys.map(k => () => run(k)))).filter(Boolean)
   let votes = first
-  const agree = first.length === 2 && first[0].real === first[1].real
-  const fixAgree = first.length === 2 && first[0].fixable_in_one_file === first[1].fixable_in_one_file
-  if (!(agree && (!first[0].real || fixAgree))) {
-    const third = await verifyOne(f, LENSES_VERIFY[2])
-    votes = [...first, third].filter(Boolean)
+  const yes = key => first.filter(v => v[key]).length
+  const tied = key => 2 * yes(key) === first.length
+  // Missing votes, an exact tie on "real", or a real finding whose one-file
+  // verdicts tie: ask the tie-breaker lens. An odd panel never ties.
+  if (first.length < firstKeys.length || tied('real') || (2 * yes('real') > first.length && tied('fixable_in_one_file'))) {
+    const tie = await run(tieKey)
+    votes = [...first, tie].filter(Boolean)
+  }
+  if (votes.length === 0) {
+    rejected.push({ file: f.file, line: f.line, title: f.title, reasons: ['no verifier answered'] })
+    return
   }
   const need = Math.floor(votes.length / 2) + 1
   const real = votes.filter(v => v.real).length >= need
   const oneFile = f.single_file && votes.filter(v => v.fixable_in_one_file).length >= need
-  if (real) confirmed.push({ ...f, oneFile, votes: votes.map(v => v.real), reasons: votes.map(v => v.reason) })
-  else rejected.push({ file: f.file, line: f.line, title: f.title, reasons: votes.map(v => v.reason) })
+  const tally = votes.map(v => ({ lens: v.lens, real: v.real }))
+  if (real) confirmed.push({ ...f, oneFile, votes: tally, reasons: votes.map(v => v.reason) })
+  else rejected.push({ file: f.file, line: f.line, title: f.title, votes: tally, reasons: votes.map(v => v.reason) })
 }
 
 // Dedup by file + 20-line bucket, ignoring category (several lenses often
