@@ -4,6 +4,8 @@ All notable changes to this workspace are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project uses
 Semantic Versioning within the 0.x pre-release range.
 
+## [0.8.0] — Unreleased
+
 ## [Unreleased]
 
 ### One systemd source of truth (Crypto Masterplan v2 H10)
