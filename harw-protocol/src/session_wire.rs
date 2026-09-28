@@ -12,16 +12,33 @@
 //! - [`SessionFrame`] is additive: an unknown `kind` decodes to
 //!   [`SessionFrame::Unknown`] so older clients render a neutral line instead
 //!   of dropping the stream.
+//!
+//! Wire minor 2 adds the R18 tool gateway vocabulary (contract
+//! `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md`):
+//! `tool.*` methods for agent principals, `gateway.*` methods for gateway
+//! inspection/administration and the caps `tool_call`, `gateway_read`,
+//! `gateway_admin`. There is still no generic operation execution (W00 D5).
 
-use harw_types::{ApprovalId, DeviceId, ReviewDecision, SessionId, TenantId, TurnId};
+use harw_types::{ApprovalId, DeviceId, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 
 use crate::approvals::ApprovalRequest;
 use crate::events::{SessionEvent, TurnEvent};
+use crate::items::{ResultTrust, ToolCallResult, ToolPlacement};
 
 /// Minor version of the session wire. Major stays at the
 /// [`crate::ProtocolVersion`] major (1).
-pub const SESSION_WIRE_MINOR: u32 = 1;
+///
+/// - 1: W00 session control plane.
+/// - 2: R18 tool gateway (`tool.*`, `gateway.*`, caps `tool_call`,
+///   `gateway_read`, `gateway_admin`).
+pub const SESSION_WIRE_MINOR: u32 = 2;
+
+/// First wire minor that knows the R18 caps and methods. A host masks the
+/// R18 caps out of every grant negotiated below this minor
+/// ([`ClientCaps::for_wire_minor`]), so a minor-1 client never sees a caps
+/// field it cannot decode.
+pub const TOOL_GATEWAY_WIRE_MINOR: u32 = 2;
 
 /// Exact WebSocket subprotocol for the session control plane.
 pub const SESSION_WS_SUBPROTOCOL: &str = "harw.session.v1";
@@ -37,6 +54,10 @@ pub mod features {
     pub const HISTORY: &str = "history";
     /// The host emits [`super::SessionFrame::Child`] frames.
     pub const CHILD_FRAMES: &str = "child_frames";
+    /// The host serves `tool.list`/`tool.call`/`tool.cancel` (R18 D-A).
+    pub const TOOLS: &str = "tools";
+    /// The host serves the `gateway.*` methods (R18 D-B).
+    pub const GATEWAY: &str = "gateway";
 }
 
 /// Position in a session stream.
@@ -74,8 +95,18 @@ impl Cursor {
     }
 }
 
+// serde `skip_serializing_if` needs a `fn(&T) -> bool`.
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Capabilities of one client on one host. Effective caps are always an
 /// intersection, never a union (see [`ClientCaps::intersect`]).
+///
+/// The three R18 caps (`tool_call`, `gateway_read`, `gateway_admin`) are
+/// `serde(default)` and are not serialized while `false`, so the minor-1
+/// wire shape stays byte-identical for every client that is not granted
+/// one of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientCaps {
@@ -87,6 +118,18 @@ pub struct ClientCaps {
     pub approve: bool,
     /// settings, `session.close`, creating sessions for others.
     pub control: bool,
+    /// `tool.list`, `tool.call`, `tool.cancel` (R18 D-A). Admission
+    /// additionally requires an agent principal with a tool grant; the cap
+    /// alone never admits a call. Never part of a tier ceiling.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_call: bool,
+    /// Read-only `gateway.*` methods (R18 D-B).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gateway_read: bool,
+    /// Mutating `gateway.*` methods (R18 D-B). Implies nothing about
+    /// `gateway_read`; a host grants both explicitly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gateway_admin: bool,
 }
 
 impl ClientCaps {
@@ -96,14 +139,15 @@ impl ClientCaps {
         steer: false,
         approve: false,
         control: false,
+        tool_call: false,
+        gateway_read: false,
+        gateway_admin: false,
     };
 
     /// Watch only.
     pub const OBSERVE: Self = Self {
         observe: true,
-        steer: false,
-        approve: false,
-        control: false,
+        ..Self::NONE
     };
 
     /// Observe, steer and approve (operator).
@@ -111,15 +155,39 @@ impl ClientCaps {
         observe: true,
         steer: true,
         approve: true,
-        control: false,
+        ..Self::NONE
     };
 
-    /// Every capability.
+    /// Every W00 session capability (observe, steer, approve, control).
+    ///
+    /// Deliberately **without** the R18 caps: tier ceilings are built from
+    /// this constant, and a human tier must never carry `tool_call`. Gateway
+    /// caps are added to a ceiling explicitly ([`Self::with`]).
     pub const ALL: Self = Self {
         observe: true,
         steer: true,
         approve: true,
         control: true,
+        ..Self::NONE
+    };
+
+    /// Only `tool_call` (R18 D-A).
+    pub const TOOL_CALL: Self = Self {
+        tool_call: true,
+        ..Self::NONE
+    };
+
+    /// Only `gateway_read` (R18 D-B).
+    pub const GATEWAY_READ: Self = Self {
+        gateway_read: true,
+        ..Self::NONE
+    };
+
+    /// `gateway_read` and `gateway_admin` (R18 D-B).
+    pub const GATEWAY_ADMIN: Self = Self {
+        gateway_read: true,
+        gateway_admin: true,
+        ..Self::NONE
     };
 
     /// Capabilities present in both sets. Requested caps can only narrow.
@@ -130,6 +198,45 @@ impl ClientCaps {
             steer: self.steer && other.steer,
             approve: self.approve && other.approve,
             control: self.control && other.control,
+            tool_call: self.tool_call && other.tool_call,
+            gateway_read: self.gateway_read && other.gateway_read,
+            gateway_admin: self.gateway_admin && other.gateway_admin,
+        }
+    }
+
+    /// Adds `other` to a host-side **ceiling**.
+    ///
+    /// Only for composing a ceiling from fixed constants when a listener
+    /// builds an identity (e.g. `caps_for_tier(tier).with(GATEWAY_READ)`).
+    /// Never apply it to client-requested caps: effective caps stay
+    /// `requested ∩ ceiling`.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self {
+            observe: self.observe || other.observe,
+            steer: self.steer || other.steer,
+            approve: self.approve || other.approve,
+            control: self.control || other.control,
+            tool_call: self.tool_call || other.tool_call,
+            gateway_read: self.gateway_read || other.gateway_read,
+            gateway_admin: self.gateway_admin || other.gateway_admin,
+        }
+    }
+
+    /// Caps as they may be granted at the negotiated wire `minor`: below
+    /// [`TOOL_GATEWAY_WIRE_MINOR`] the R18 caps are masked out, so an older
+    /// client never receives a caps field it cannot decode and never holds
+    /// a right it cannot name.
+    #[must_use]
+    pub const fn for_wire_minor(self, minor: u32) -> Self {
+        if minor >= TOOL_GATEWAY_WIRE_MINOR {
+            return self;
+        }
+        Self {
+            tool_call: false,
+            gateway_read: false,
+            gateway_admin: false,
+            ..self
         }
     }
 
@@ -140,6 +247,9 @@ impl ClientCaps {
             && (!self.steer || ceiling.steer)
             && (!self.approve || ceiling.approve)
             && (!self.control || ceiling.control)
+            && (!self.tool_call || ceiling.tool_call)
+            && (!self.gateway_read || ceiling.gateway_read)
+            && (!self.gateway_admin || ceiling.gateway_admin)
     }
 }
 
@@ -549,6 +659,306 @@ pub struct SetEffortParams {
     pub effort: String,
 }
 
+// ---------------------------------------------------------------------------
+// R18 tool gateway: `tool.*` (D-A) and `gateway.*` (D-B)
+// ---------------------------------------------------------------------------
+
+/// Organizational role of an agent principal on the wire (R18 §3).
+///
+/// Mirrors `harw_agent_dsl::roles::AgentRoleId` value for value (same
+/// kebab-case names); `harw-protocol` cannot depend on the DSL crate, so the
+/// mapping lives at the composition root and is pinned by a test there. An
+/// unknown role decodes to [`AgentRole::Unknown`], and admission treats
+/// `Unknown` like "no agent" (fail closed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRole {
+    /// The User Interface Agent: the only role that holds `tool.call`
+    /// rights of its own.
+    UserInterface,
+    RootOrchestrator,
+    ChildOrchestrator,
+    Worker,
+    UiaWorker,
+    AgentSteward,
+    /// A role this version does not know. Never admitted to `tool.*`.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether the gateway asks a human before running a tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApproval {
+    /// Runs without asking (read-only tools, free `gateway.*` reads).
+    Never,
+    /// The gateway approval policy decides per call (scope, effect, risk,
+    /// auto mode).
+    Policy,
+    /// Every call asks (`approval = "always"`, e.g. `gateway.*` mutations).
+    Always,
+    /// A requirement this version does not know. A client must treat it
+    /// like [`ToolApproval::Always`] when it renders or plans.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One tool as the gateway offers it to an agent principal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDescriptor {
+    /// Stable tool name (`fs.read`, `shell.exec`, `gateway.status`, ...).
+    pub name: String,
+    /// Model-facing description.
+    pub description: String,
+    /// JSON schema of the `arguments` object.
+    pub input_schema: serde_json::Value,
+    /// Approval requirement applied by the gateway.
+    pub approval: ToolApproval,
+    /// Where calls of this tool run. Always [`ToolPlacement::Gateway`] for
+    /// tools served by the gateway tool host.
+    pub placement: ToolPlacement,
+    /// Independent calls may run concurrently.
+    #[serde(default)]
+    pub parallel_safe: bool,
+}
+
+/// `tool.list`: the tools the calling agent principal may call in `session_id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolListParams {
+    pub session_id: SessionId,
+}
+
+/// Result of `tool.list`: exactly the caller's granted tool set, never more.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolListResult {
+    pub tools: Vec<ToolDescriptor>,
+}
+
+/// `tool.call`: run one tool in the gateway tool host.
+///
+/// Carries no identity: the principal, its role, parent and grant come from
+/// the connection ([`crate::session_port::ToolPort`] implementations read
+/// them from the authenticated identity).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallParams {
+    /// Session the call belongs to; must be bound to the calling principal.
+    pub session_id: SessionId,
+    /// Turn the call belongs to (execution context, event correlation).
+    pub turn_id: TurnId,
+    /// Model-issued call id; unique per session while in flight.
+    pub call_id: ToolCallId,
+    pub tool_name: String,
+    /// Tool arguments as the model produced them. Validated against the
+    /// tool's `input_schema` by the gateway; a schema violation is a
+    /// completed call with [`ToolCallResult::Error`], not a wire error.
+    pub arguments: serde_json::Value,
+    /// Call of the parent agent this call is delegated under (UIA
+    /// delegation chain), if any.
+    #[serde(default)]
+    pub parent_call_id: Option<ToolCallId>,
+}
+
+/// Result of `tool.call`: the call ran (successfully or not).
+///
+/// Refusals before execution (unknown tool, not granted, sandbox
+/// unavailable, draining, duplicate call id) are wire errors
+/// ([`error_codes`]), never a result frame, and never fall back to host
+/// execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallResultFrame {
+    pub call_id: ToolCallId,
+    pub result: ToolCallResult,
+    /// Set by the gateway tool host; the caller copies it into
+    /// `TurnEvent::ToolCallCompleted::placement`.
+    pub placement: ToolPlacement,
+    pub duration_ms: u64,
+    /// Provenance of `result`; defaults to `Untrusted` (fail closed).
+    #[serde(default)]
+    pub trust: ResultTrust,
+}
+
+/// `tool.cancel`: cancel an in-flight `tool.call` of the same principal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCancelParams {
+    pub session_id: SessionId,
+    pub call_id: ToolCallId,
+}
+
+/// Result of `gateway.status`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayStatus {
+    pub host_epoch: u64,
+    /// Gateway node label, when configured.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// The host is draining: new turns and tool calls are refused.
+    pub draining: bool,
+    pub connections: u32,
+    pub sessions: u32,
+    pub running_turns: u32,
+    pub listeners: u32,
+    /// Tools the gateway tool host serves (before per-principal grants).
+    pub tools: u32,
+    /// A sandbox backend for gateway-side tool execution is available.
+    /// `false` means every `tool.call` is refused with
+    /// [`error_codes::TOOL_SANDBOX_UNAVAILABLE`].
+    pub sandbox_available: bool,
+}
+
+/// Who is behind a connection, as `gateway.connections.list` shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrincipalSummary {
+    /// A human client (local uid or enrolled device).
+    Device {
+        #[serde(default)]
+        device: Option<DeviceId>,
+    },
+    /// An agent principal (R18 §3).
+    Agent {
+        /// Gateway-issued agent principal id.
+        agent: String,
+        role: AgentRole,
+        /// Agent principal id of the delegating parent, if any.
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    /// A principal kind this version does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One live connection (`gateway.connections.list`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConnectionInfo {
+    /// Process-unique connection id (the host's `ConnectionId`).
+    pub connection: u64,
+    pub label: String,
+    pub principal: PrincipalSummary,
+    #[serde(default)]
+    pub tenant: Option<TenantId>,
+    /// Granted caps after hello (`None` before hello).
+    #[serde(default)]
+    pub granted: Option<ClientCaps>,
+    /// Number of attached sessions.
+    pub attached: u32,
+    pub since: jiff::Timestamp,
+}
+
+/// Result of `gateway.connections.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConnectionsResult {
+    pub connections: Vec<GatewayConnectionInfo>,
+}
+
+/// Kind of a gateway listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerKind {
+    /// AF_UNIX socket with `SO_PEERCRED` (W00 D3).
+    LocalUds,
+    /// WebSocket over the authenticated node transport (W00 D4).
+    Node,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One listener (`gateway.listeners.list`, `gateway.listeners.set`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayListenerInfo {
+    /// Stable listener name from the gateway configuration.
+    pub name: String,
+    pub kind: ListenerKind,
+    /// Socket path or node locator. Never contains a secret.
+    pub address: String,
+    pub enabled: bool,
+}
+
+/// Result of `gateway.listeners.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayListenersResult {
+    pub listeners: Vec<GatewayListenerInfo>,
+}
+
+/// Effective tool grant of one agent principal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayToolRights {
+    /// Agent principal id.
+    pub agent: String,
+    pub role: AgentRole,
+    /// Granted tool names, sorted, without duplicates.
+    pub tools: Vec<String>,
+}
+
+/// Result of `gateway.tools.list`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayToolsResult {
+    /// Every tool the gateway tool host serves.
+    pub tools: Vec<ToolDescriptor>,
+    /// Current grants of the connected agent principals.
+    pub grants: Vec<GatewayToolRights>,
+}
+
+/// `gateway.connections.revoke`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRevokeParams {
+    pub connection: u64,
+    pub reason: String,
+}
+
+/// Result of `gateway.connections.revoke`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRevokeResult {
+    /// `false` when the connection was already gone.
+    pub revoked: bool,
+}
+
+/// `gateway.drain`: stop admitting new turns and tool calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayDrainParams {
+    /// Sent to clients in `SessionFrame::HostDraining`.
+    pub retry_after_ms: u64,
+}
+
+/// `gateway.listeners.set`: enable or disable a configured listener.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayListenerSetParams {
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// `gateway.tools.grant` (replace) and `gateway.tools.narrow` (remove).
+///
+/// `grant` replaces the agent's grant with `tools`, which must lie within
+/// the agent's ceiling (its parent's grant, or the configured UIA ceiling);
+/// a name outside the ceiling is refused, never silently dropped. `narrow`
+/// removes `tools` from the current grant and always succeeds for known
+/// agents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayToolRightsParams {
+    /// Agent principal id.
+    pub agent: String,
+    pub tools: Vec<String>,
+}
+
 /// Stable application error codes carried in [`crate::WireError::code`].
 pub mod error_codes {
     /// A method other than `session.hello` arrived before hello.
@@ -561,6 +971,17 @@ pub mod error_codes {
     pub const REVOKED: i32 = -32004;
     /// Too many requests in flight on this connection.
     pub const BUSY: i32 = -32005;
+    /// R18: `tool.call` names a tool the gateway tool host does not serve.
+    pub const TOOL_UNKNOWN: i32 = -32010;
+    /// R18: the tool exists but is outside the caller's tool grant.
+    pub const TOOL_NOT_GRANTED: i32 = -32011;
+    /// R18: no gateway-side sandbox is available; the call is refused and
+    /// never runs on the host instead.
+    pub const TOOL_SANDBOX_UNAVAILABLE: i32 = -32012;
+    /// R18: the host is draining and admits no new turn or tool call.
+    pub const HOST_DRAINING: i32 = -32013;
+    /// R18: `call_id` is already in flight in this session.
+    pub const TOOL_CALL_DUPLICATE: i32 = -32014;
     /// JSON-RPC: method not found.
     pub const METHOD_NOT_FOUND: i32 = -32601;
     /// JSON-RPC: invalid params.
@@ -724,6 +1145,136 @@ mod tests {
         assert_eq!(params.profile, StreamProfile::Full);
         assert_eq!(params.from, None);
         Ok(())
+    }
+
+    #[test]
+    fn r18_caps_are_never_part_of_all_and_mask_below_minor_two() {
+        const { assert!(!ClientCaps::ALL.tool_call) };
+        const { assert!(!ClientCaps::ALL.gateway_read) };
+        const { assert!(!ClientCaps::ALL.gateway_admin) };
+        let ceiling = ClientCaps::ALL.with(ClientCaps::GATEWAY_ADMIN);
+        assert!(ceiling.gateway_read && ceiling.gateway_admin && ceiling.control);
+        assert!(!ceiling.tool_call);
+        // Requested caps still only narrow.
+        let requested = ClientCaps::TOOL_CALL.with(ClientCaps::OBSERVE);
+        let granted = requested.intersect(ceiling);
+        assert_eq!(granted, ClientCaps::OBSERVE);
+        assert!(!ClientCaps::TOOL_CALL.is_within(ClientCaps::ALL));
+        assert!(ClientCaps::GATEWAY_READ.is_within(ceiling));
+        // Minor 1 never sees an R18 cap.
+        let agent = ClientCaps::OPERATE.with(ClientCaps::TOOL_CALL);
+        assert_eq!(agent.for_wire_minor(1), ClientCaps::OPERATE);
+        assert_eq!(agent.for_wire_minor(TOOL_GATEWAY_WIRE_MINOR), agent);
+    }
+
+    #[test]
+    fn r18_caps_keep_the_minor_one_shape_when_false() -> TestResult {
+        let json = ctx(serde_json::to_value(ClientCaps::ALL), "encode")?;
+        assert_eq!(
+            json,
+            serde_json::json!({"observe": true, "steer": true, "approve": true, "control": true})
+        );
+        let old: ClientCaps = ctx(
+            serde_json::from_str(
+                r#"{"observe":true,"steer":false,"approve":false,"control":false}"#,
+            ),
+            "decode minor-1 caps",
+        )?;
+        assert_eq!(old, ClientCaps::OBSERVE);
+        let agent = ClientCaps::OBSERVE.with(ClientCaps::TOOL_CALL);
+        let json = ctx(serde_json::to_value(agent), "encode agent caps")?;
+        assert_eq!(json["tool_call"], serde_json::json!(true));
+        assert!(json.get("gateway_admin").is_none());
+        let back: ClientCaps = ctx(serde_json::from_value(json), "decode agent caps")?;
+        assert_eq!(back, agent);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_params_round_trip_and_reject_identity_fields() -> TestResult {
+        let params = ToolCallParams {
+            session_id: sid("s-1")?,
+            turn_id: ctx(TurnId::try_from_str("t-1"), "turn id")?,
+            call_id: ctx(ToolCallId::try_from_str("c-1"), "call id")?,
+            tool_name: "fs.read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            parent_call_id: None,
+        };
+        let json = ctx(serde_json::to_value(&params), "encode")?;
+        let back: ToolCallParams = ctx(serde_json::from_value(json.clone()), "decode")?;
+        assert_eq!(back, params);
+        let mut forged = json;
+        forged["principal"] = serde_json::json!("agent:uia");
+        assert!(serde_json::from_value::<ToolCallParams>(forged).is_err());
+        let minimal =
+            r#"{"session_id":"s","turn_id":"t","call_id":"c","tool_name":"x","arguments":{}}"#;
+        let decoded: ToolCallParams = ctx(serde_json::from_str(minimal), "decode minimal")?;
+        assert_eq!(decoded.parent_call_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_result_frame_round_trips_with_placement_and_default_trust() -> TestResult {
+        let json = r#"{"call_id":"c-1","result":{"status":"success","value":1},"placement":{"kind":"gateway","node":"gw"},"duration_ms":4}"#;
+        let frame: ToolCallResultFrame = ctx(serde_json::from_str(json), "decode")?;
+        assert_eq!(frame.trust, ResultTrust::Untrusted);
+        assert_eq!(
+            frame.placement,
+            ToolPlacement::Gateway {
+                node: Some("gw".into())
+            }
+        );
+        let again: ToolCallResultFrame = ctx(
+            serde_json::from_value(ctx(serde_json::to_value(&frame), "encode")?),
+            "decode again",
+        )?;
+        assert_eq!(again, frame);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_descriptor_unknown_approval_and_role_decode_to_unknown() -> TestResult {
+        let json = r#"{"name":"gateway.drain","description":"d","input_schema":{"type":"object"},"approval":"quorum","placement":{"kind":"gateway"}}"#;
+        let descriptor: ToolDescriptor = ctx(serde_json::from_str(json), "decode")?;
+        assert_eq!(descriptor.approval, ToolApproval::Unknown);
+        assert!(!descriptor.parallel_safe);
+        let role: AgentRole = ctx(serde_json::from_str(r#""user-interface""#), "role")?;
+        assert_eq!(role, AgentRole::UserInterface);
+        let future: AgentRole = ctx(serde_json::from_str(r#""hub-steward""#), "future role")?;
+        assert_eq!(future, AgentRole::Unknown);
+        let principal: PrincipalSummary = ctx(
+            serde_json::from_str(
+                r#"{"kind":"agent","agent":"a-1","role":"worker","parent":"a-0"}"#,
+            ),
+            "principal",
+        )?;
+        assert!(matches!(
+            principal,
+            PrincipalSummary::Agent { role: AgentRole::Worker, ref parent, .. } if parent.as_deref() == Some("a-0")
+        ));
+        let other: PrincipalSummary = ctx(
+            serde_json::from_str(r#"{"kind":"service","id":"x"}"#),
+            "unknown principal",
+        )?;
+        assert_eq!(other, PrincipalSummary::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_params_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<GatewayToolRightsParams>(
+                r#"{"agent":"a","tools":["fs.read"],"tenant":"t"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<GatewayRevokeParams>(
+                r#"{"connection":1,"reason":"r","actor":"uid:0"}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<GatewayDrainParams>(r#"{"retry_after_ms":10}"#).is_ok());
     }
 
     #[test]

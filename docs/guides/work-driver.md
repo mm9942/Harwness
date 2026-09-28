@@ -1,18 +1,21 @@
 # Driving workers to a goal: the WorkDriver
 
-> Status: partially implemented. In the tree today: the `[work_driver]`
-> table and its lowering (`harw-agent-dsl`, DSL §8.3), the pure decision
-> core `WorkDriver::decide` (`harw-plan-bridge/src/work_driver.rs`), the
-> sandboxed `VerificationExecutor` (`harw-plan-bridge/src/verify_exec.rs`)
-> and the `work_driver.enqueue` / `.status` / `.stop` operations
-> (`harw-ops/src/work_driver.rs`), which admit, observe and cancel a
-> durable job of kind `work_driver`, and the job worker under `harw serve`
-> that executes one driver round per claim
-> (`harw-cli/src/job_worker_work_driver.rs`), with sandboxed verification
-> (§6) and provider pacing (§5). Not yet in the tree: admission of the
-> `work_driver.*` tools into a custom orchestrator's tool list (a
-> definition that extends `child-orchestrator-base@1` inherits the base's
-> `[tools]`, and the runtime clamps it under that base).
+> Status: implemented. In the tree: the `[work_driver]` table and its
+> lowering (`harw-agent-dsl`, DSL §8.3); the pure decision core
+> `WorkDriver::decide` (`harw-plan-bridge/src/work_driver.rs`); the
+> sandboxed `VerificationExecutor` (`harw-plan-bridge/src/verify_exec.rs`);
+> the `work_driver.enqueue` / `.status` / `.stop` operations and the
+> worker report tool `work_driver.report` (`harw-ops/src/work_driver.rs`);
+> and the job worker under `harw serve` that drives the rounds of one run
+> in one claim (`harw-cli/src/job_worker_work_driver.rs`), with sandboxed
+> verification (§7), provider pacing (§6) and a configurable number of
+> concurrent runs (§6). R18 (contract
+> `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §8) replaced
+> the free-text status line of workers by the report tool (§4), and lets
+> the UIA start a run (§2). Open: a custom orchestrator that extends
+> `child-orchestrator-base@1` inherits the base's `[tools]`, and the runtime
+> clamps it under that base — whether `work_driver.*` reaches its tool list
+> depends on that base.
 
 The WorkDriver is a supervisor loop. Given the current `Active` goal, it
 hands small, isolated pieces of work to worker agents, runs one central
@@ -27,9 +30,10 @@ declares the goal achieved; it proposes that to a human.
 
 ## 1. Who may run it
 
-Only an orchestrator whose definition has a `[work_driver]` table. The
-table is authority, not behavior: it grants no new right, it only uses the
-right to delegate the definition already has. Lowering therefore requires
+An orchestrator whose definition has a `[work_driver]` table, and the UIA
+(§2). The table is authority, not behavior: it grants no new right, it
+only uses the right to delegate the definition already has. Lowering
+therefore requires
 
 - an orchestrator role (one that may spawn workers),
 - a spawn depth above 0,
@@ -68,6 +72,15 @@ It is started by the orchestrator itself through the model tool
 /api/work-driver/enqueue` on an orchestrator's behalf). Both surfaces
 always require approval.
 
+**The UIA** may start a run too (R18 F6): the runtime gives the UIA root
+the caller `WorkDriverCaller::for_uia` — the UIA definition's own
+`[work_driver]` table if it has one, otherwise the default spec
+`WorkDriverCaller::uia_default_spec` (DSL defaults: 8 rounds, 4 parallel
+workers, 4 attempts, stall 2; worker role `implementer`; no judge role; no
+own `verify` commands; no own budgets). The run is recorded with
+`orchestrator_role = "user-interface"`. Nothing else changes: the tool asks
+a human on every call and overrides can only narrow.
+
 | Tool | Does | Approval |
 |---|---|---|
 | `work_driver.enqueue` | admits a durable `work_driver` job for the current goal, returns its job id | always |
@@ -82,8 +95,9 @@ Arguments of `work_driver.enqueue`:
 | `plan_id` | plan to drive against; defaults to the plan bound to the goal, and must match it if both are set |
 | `overrides` | optional limits for this run: `max_iterations`, `max_parallel_workers`, `max_attempts_per_worker`, `stall_iterations`, `token_budget`, `wall_budget_secs` |
 
-The call fails closed, in this order: no `[work_driver]` in the caller's IR
-(`NotAvailable`, before any store is touched); a missing `goal_id`; an
+The call fails closed, in this order: no caller (no `[work_driver]` in the
+caller's IR and not the UIA: `NotAvailable`, before any store is touched);
+a missing `goal_id`; an
 override that would widen a limit; no job store, goal tooling disabled
 (`[tools.plan] enabled = true` is needed) or no principal; a goal that is
 not the current one or not `Active`; a plan mismatch; another active run on
@@ -110,8 +124,8 @@ the first round has not finished.
 is injected; wall time is `now - started_at`). Workers, criteria and scope
 hints are sorted first, so the same snapshot always yields the same plan.
 Its input is the goal, its evaluation report, the round number, the
-current workers, optional scope hints, usage so far, the limits, the
-wave's verification state and an optional judge verdict. Its output is an
+current workers, scope hints (derived from the plan, see §5), usage so far,
+the limits, the wave's verification state and an optional judge verdict. Its output is an
 ordered list of steps plus one rationale line per decision. Executing the
 steps is the caller's job.
 
@@ -121,7 +135,7 @@ The decision runs in this order:
 2. **Ready to propose**: every worker is settled (`Done` or `Blocked`), all
    evidence-decidable criteria are met, no invariant is violated, the
    wave's verification passed, and — if criteria remain that only the
-   judge can decide — the judge said `met`. The only step is
+   judge can decide — the judge said `passed`. The only step is
    `ProposeAchieved`.
 3. **A limit is hit** (checked in this order: rounds, tokens, wall time,
    stall): the only step is `GiveUp` with the limit and its numbers. A
@@ -142,7 +156,9 @@ The decision runs in this order:
 6. **Running wave**: a worker that reported `Partial` is continued with its
    open criteria; one that reported `Failed` is respawned with a handoff.
 7. **Delegate** open criteria that no worker covers yet, into the free
-   slots.
+   slots. A worker covers the criteria of its scope plus the ones it
+   reported in `criteria_addressed` (§4); the open ones among them are its
+   feedback.
 
 `Continue` becomes `Respawn` when the worker's context exceeds the respawn
 threshold or its continuation chain has used up `max_attempts_per_worker`.
@@ -161,21 +177,73 @@ threshold or its continuation chain has used up `max_attempts_per_worker`.
 Between rounds the caller carries the state: a worker that got
 `Delegate`/`Continue`/`Respawn` is running again, `attempts` resets on
 respawn, verification and judge verdict reset whenever the wave gets new
-work, the goal is re-evaluated after `Verify`, and rounds without a newly
-met criterion are counted for the stall limit.
+work, the goal is re-evaluated after `Verify`, and rounds without progress
+are counted for the stall limit (§6).
 
-## 4. Design principles
+## 4. How a worker reports: `work_driver.report`
+
+Every WorkDriver worker turn — and only those — gets the tool
+`work_driver.report`. The worker ends its turn by calling it; a status line
+or JSON block in its text is not read.
+
+| Argument | Meaning |
+|---|---|
+| `status` (required) | `done` (scope finished, ready for the central verification), `partial` (continue later), `blocked` (a human must decide), `failed` (hard failure) |
+| `summary` (required) | short summary; must not be empty |
+| `criteria_addressed` | indices of the goal's acceptance criteria the worker worked on (as numbered in its task) |
+| `changed_paths` | workspace-relative files it changed (`/`, no absolute path, no `..`, no `:`) |
+| `blockers` | open questions; required (non-empty) for `blocked` |
+
+- Unknown fields and invalid values are rejected as a tool error that names
+  the rule; the worker can correct and call again. A rejected report is not
+  recorded. A top-level `null` counts as absent.
+- The last valid report of the turn wins.
+- `blocked`/`failed` carry the blockers (joined with `; `), else the
+  summary, as their reason; `changed_paths` become the worker's artifacts,
+  merged with the files the driver saw change.
+- **No report** → the turn counts as `partial` with the summary
+  `no report: <last text>` and the suggestion to call the tool. It is never
+  read as `done`.
+- `criteria_addressed` only steers routing (who gets feedback on which
+  criterion, which criterion counts as covered). Criteria and the goal are
+  only ever met by verification or a human.
+
+The first task of a worker is structured: `## Goal`, `## Scope`,
+`## Acceptance criteria` (index, description, `verified by: …`),
+`## Owned paths`, `## Notes` (e.g. the judge's gaps), `## Rules`, the
+central `verify` commands of the run, and `## Report` (the contract
+above). Follow-ups send only `## Driver feedback` (and an
+`## Operator answer` after an escalation). The worker's role shapes its
+turn: a read-only role (`harw_ops::kanban::role_access`) never writes, and
+the instructions of a custom role definition lead its stable prompt
+prefix.
+
+## 5. Design principles
 
 **Smallest isolated scopes.** Every open criterion becomes its own scope
-unless a scope hint groups it with others. A scope without a hint owns the
-artifact paths of its criterion's verification steps; a scope that owns no
-path is told to read and report only.
+unless a scope hint groups it with others. Scope hints come from the plan
+bound to the goal (`scope_hints_from_plan`): a plan node whose
+`write_scope` names concrete paths (globs are skipped; a symbol entry
+counts with its file) and that carries one of the goal's acceptance
+criteria (same description, or same verification steps) becomes the hint
+`plan-<node id>`. A scope without a hint owns the artifact paths of its
+criterion's verification steps. A criterion without such paths — for
+example one verified only by a command — gets the **workspace scope**
+(`.`): its worker may change any file that no other worker owns. The
+judge-followup scope is a workspace scope as well.
 
 **Parallel workers, disjoint owned paths.** Each scope owns paths that only
 its worker changes. Two scopes overlap when a path equals another or lies
 inside its directory. A new scope that overlaps a running worker is
 deferred to a later round; two new scopes of the same round that overlap
 are merged into one. At most `max_parallel_workers` workers exist at once.
+The workspace scope overlaps nothing in this check; instead the job worker
+runs at most one workspace-scope worker per concurrently running block,
+and after each block it checks every changed file: a file in a block
+worker's own paths belongs to it, any other file belongs to the block's
+workspace-scope worker, and a file in the paths of any other worker of the
+run — or with no owner at all — blocks the whole run for a human (fail
+closed).
 
 **Continue the same worker.** Follow-up work goes to the worker that
 already holds the scope, as short appended feedback: only the open criteria
@@ -199,13 +267,14 @@ with a manual one, cannot be decided from evidence. They go to the judge
 only after verification is green and all other evidence is complete. The
 question starts with a fixed lead sentence and then lists the criteria by
 index and description, so repeated judge calls share their prefix. The
-verdict (`met`, `rationale`, `missing`) feeds back into the loop.
+verdict (`passed`, `comment`, `missing`; the old names `met` and
+`rationale` are still read) feeds back into the loop.
 
 **Never sets `Achieved`.** The driver only proposes. Only a human actor may
 move a goal to `Achieved`: the user confirms the proposal with
 `/goal achieve <reason>`. The model cannot call that action.
 
-## 5. Limits
+## 6. Limits
 
 Every limit is absolute: reached means `GiveUp`.
 
@@ -214,7 +283,7 @@ Every limit is absolute: reached means `GiveUp`.
 | rounds | `max_iterations` | the round number reaches it |
 | tokens | `token_budget` | tokens used over all workers reach it |
 | wall time | `wall_budget_secs` | `now - started_at` reaches it |
-| stall | `stall_iterations` | that many consecutive rounds without a newly met criterion |
+| stall | `stall_iterations` | that many consecutive rounds without progress: after a verification, progress is a new maximum of met criteria **or** a new minimum of failing verification steps; the first measurement of a claim only sets the baseline |
 | parallelism | `max_parallel_workers` | further scopes wait for a free slot |
 | continuation chain | `max_attempts_per_worker` | the worker is respawned instead of continued |
 
@@ -235,7 +304,13 @@ working around them ([DEC-003](../planning/70-decisions/DEC-003-provider-limits.
   continues after `Retry-After` or an exponential, capped back-off, without
   using up an attempt.
 
-## 6. Verification
+**Concurrent runs.** A run holds its claim for all its rounds, so the job
+worker drives `work_driver` jobs in their own lane. The lane size is
+`JobWorkerOptions::max_work_driver_runs`: 2 by default, never above
+`[jobs] max_running` (`JobWorkerOptions::from_config`). While the lane is
+full, further `work_driver` jobs stay `Ready`.
+
+## 7. Verification
 
 `VerificationExecutor` runs one verification per call over a list of
 steps, sequentially, at wave level. It never reports "passed" without
@@ -268,9 +343,13 @@ evidence:
   `Unverifiable` before it reaches the runner. Write one command per
   `verify` entry.
 - An unknown exit, a runner error or an empty run is `Unverifiable`.
-- **Artifact** steps check existence and a content digest under the
-  workspace root. **Trace** and **manual** steps are always `Unverifiable`
-  here; manual criteria go to the judge.
+- **Artifact** steps of the goal's criteria and invariants are part of
+  every central verification (deduplicated by path): each checks existence
+  and a content digest under the workspace root. A passed artifact becomes
+  evidence of kind `diff` with the step's path as locator, which is how the
+  goal evaluation matches it. **Trace** and **manual** steps are not sent
+  to the executor (they would always be `Unverifiable`); manual criteria go
+  to the judge.
 
 Each executed command yields an evidence reference whose kind is inferred
 from the command (`cargo test`/`nextest` → `CargoTest`, `cargo clippy` →
@@ -278,7 +357,13 @@ from the command (`cargo test`/`nextest` → `CargoTest`, `cargo clippy` →
 become the `failing` list that the driver routes back to the workers whose
 paths they mention.
 
-## 7. Example
+**Judge answers.** The judge must answer with a JSON verdict
+(`passed`, optional `comment`, `missing`). An answer without one is not
+read as "not passed": the verdict stays open and the next round asks
+again, reminding it of the format. After 3 such answers in a row the run
+escalates (`work_driver:NeedsInput`) with the reason and the last answer.
+
+## 8. Example
 
 [`examples/agents/driven-orchestrator/`](../../examples/agents/driven-orchestrator/)
 is a child orchestrator on `child-orchestrator-base@1` with a

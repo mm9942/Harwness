@@ -94,8 +94,8 @@ use ratatui::text::{Line, Span};
 
 use harw_extension_api::ToolCall;
 use harw_plan::goal::GoalReport;
-use harw_plan::{Plan, PlanNodeStatus};
-use harw_protocol::items::ToolCallResult;
+use harw_plan::{Plan, PlanNode, PlanNodeStatus, TaskId};
+use harw_protocol::items::{ToolCallResult, ToolPlacement};
 
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::style;
@@ -880,6 +880,13 @@ const PLAN_GRAPH_MAX_NODES: usize = 25;
 /// bevor char-sicher mit [`truncate_chars`] gekürzt wird.
 const PLAN_GRAPH_OBJECTIVE_PREVIEW_CHARS: usize = 48;
 
+/// Höchstzahl der in der Delta-Darstellung einzeln gezeigten geänderten
+/// Knoten; darüber nennt eine Sammelzeile den Rest (R18 F4).
+const PLAN_GRAPH_MAX_CHANGED: usize = 5;
+
+/// Breite des Fortschrittsbalkens in Zeichen.
+const PLAN_GRAPH_PROGRESS_BAR_CHARS: usize = 10;
+
 /// Zeigt eine kompakte Übersicht eines `harw_plan::Plan` an.
 ///
 /// # Beschreibung
@@ -892,28 +899,191 @@ const PLAN_GRAPH_OBJECTIVE_PREVIEW_CHARS: usize = 48;
 /// Entwurfs-/terminale Knoten (`Draft`, `Superseded`, `Invalidated`) eine
 /// gedimmte Farbe.
 ///
-/// Enthält der Plan mehr als [`PLAN_GRAPH_MAX_NODES`] Knoten, werden nur die
-/// ersten [`PLAN_GRAPH_MAX_NODES`] gerendert; eine abschließende, gedimmte
-/// Sammelzeile nennt die Anzahl der ausgelassenen Knoten sowie die
-/// Gesamtzahl — ein Terminal, das hunderte Zeilen ausspuckt, ist
-/// unbrauchbar.
+/// Zwei Formen (R18 F4, vorher druckte jeder `plan step` alle 95 Knoten
+/// neu):
+/// - **Vollbild** ([`PlanGraphCell::full`], erster gezeigter Stand eines
+///   Plans): Knotenliste, eingeklappt höchstens [`PLAN_GRAPH_MAX_NODES`]
+///   Knoten plus Sammelzeile mit der Zahl der ausgelassenen Knoten.
+/// - **Delta** ([`PlanGraphCell::delta`], jeder weitere Stand desselben
+///   Plans): eingeklappt nur eine Fortschrittszeile und die gegenüber dem
+///   vorigen Stand geänderten Knoten; die vollständige Liste erst
+///   ausgeklappt (Ctrl+O, [`PlanGraphCell::set_expanded`]).
+///
+/// Ausgeklappt zeigen beide Formen alle Knoten.
 ///
 /// # Felder
 /// - `plan` (`harw_plan::Plan`): der darzustellende Plan.
+/// - `changed` (`Option<Vec<TaskId>>`): `None` = Vollbild; `Some` = Delta mit
+///   den geänderten bzw. neuen Knoten in Plan-Reihenfolge.
+/// - `removed` (`usize`): im Delta entfernte Knoten.
+/// - `expanded` (`bool`): Nutzer-Umschalter (Ctrl+O).
 ///
 /// # Spec-Referenz
 /// AP W5-01 — `harw-plan/src/types.rs::{Plan, PlanNode, PlanNodeStatus,
-/// PlanNodeKind}`.
+/// PlanNodeKind}`; R18 F4.
 #[derive(Debug, Clone)]
 pub(crate) struct PlanGraphCell {
     /// Der darzustellende Plan.
     pub plan: Plan,
+    /// Geänderte Knoten gegenüber dem vorigen Stand; `None` = Vollbild.
+    pub changed: Option<Vec<TaskId>>,
+    /// Zahl der gegenüber dem vorigen Stand entfernten Knoten.
+    pub removed: usize,
+    /// Nutzer-Umschalter (Ctrl+O): `true` zeigt alle Knoten.
+    pub expanded: bool,
+}
+
+/// Geteilte Plan-Zelle (`Arc<Mutex<PlanGraphCell>>`), damit `app.rs` sie
+/// per Ctrl+O auf-/zuklappen kann (wie [`SharedReasoningCell`]).
+pub(crate) type SharedPlanGraphCell = Arc<Mutex<PlanGraphCell>>;
+
+impl PlanGraphCell {
+    /// Vollbild eines erstmals gezeigten Plans.
+    #[must_use]
+    pub(crate) fn full(plan: Plan) -> Self {
+        Self {
+            plan,
+            changed: None,
+            removed: 0,
+            expanded: false,
+        }
+    }
+
+    /// Delta gegenüber `previous`.
+    ///
+    /// # Beschreibung
+    /// Ist `previous` ein anderer Plan (andere ID), entsteht ein Vollbild.
+    /// Sonst gilt ein Knoten als geändert, wenn er neu ist oder sich Status,
+    /// Art, Welle, Ziel oder die Zahl der Belege unterscheiden.
+    #[must_use]
+    pub(crate) fn delta(previous: &Plan, plan: Plan) -> Self {
+        if previous.id != plan.id {
+            return Self::full(plan);
+        }
+        let changed: Vec<TaskId> = plan
+            .nodes
+            .iter()
+            .filter(|node| {
+                previous
+                    .nodes
+                    .iter()
+                    .find(|old| old.id == node.id)
+                    .is_none_or(|old| {
+                        old.status != node.status
+                            || old.kind != node.kind
+                            || old.wave != node.wave
+                            || old.objective != node.objective
+                            || old.evidence.len() != node.evidence.len()
+                    })
+            })
+            .map(|node| node.id.clone())
+            .collect();
+        let removed = previous
+            .nodes
+            .iter()
+            .filter(|old| !plan.nodes.iter().any(|node| node.id == old.id))
+            .count();
+        Self {
+            plan,
+            changed: Some(changed),
+            removed,
+            expanded: false,
+        }
+    }
+
+    /// Setzt den Ausklapp-Zustand (Ctrl+O).
+    pub(crate) fn set_expanded(&mut self, expanded: bool) {
+        self.expanded = expanded;
+    }
+
+    /// Liefert den Ausklapp-Zustand.
+    #[must_use]
+    pub(crate) fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Erzeugt die geteilte Variante (siehe [`SharedPlanGraphCell`]).
+    #[must_use]
+    pub(crate) fn into_shared(self) -> SharedPlanGraphCell {
+        Arc::new(Mutex::new(self))
+    }
+
+    /// Fortschrittszeile: `Plan <id> @<rev> · ▰▰▱▱ 3/10 erledigt (30 %)`.
+    fn progress_text(&self) -> String {
+        let total = self.plan.nodes.len();
+        let done = self
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.status == PlanNodeStatus::Completed)
+            .count();
+        let percent = (done * 100).checked_div(total).unwrap_or(0);
+        let filled = (done * PLAN_GRAPH_PROGRESS_BAR_CHARS)
+            .checked_div(total)
+            .unwrap_or(0);
+        let bar = format!(
+            "{}{}",
+            "▰".repeat(filled),
+            "▱".repeat(PLAN_GRAPH_PROGRESS_BAR_CHARS.saturating_sub(filled))
+        );
+        format!(
+            "Plan {} @{} · {bar} {done}/{total} erledigt ({percent} %)",
+            sanitize_inline(self.plan.id.as_str()),
+            self.plan.revision
+        )
+    }
+
+    /// Hängt die Zeilen eines Knotens statusgefärbt und umgebrochen an.
+    fn push_node(
+        lines: &mut Vec<Line<'static>>,
+        node: &PlanNode,
+        text_width: u16,
+        theme: style::Theme,
+    ) {
+        let node_style = match node.status {
+            PlanNodeStatus::Completed => style::success_style(theme),
+            PlanNodeStatus::Blocked => style::error_style(theme),
+            PlanNodeStatus::Ready => style::selected_style(theme),
+            PlanNodeStatus::InProgress => style::warning_style(theme),
+            PlanNodeStatus::Draft | PlanNodeStatus::Superseded | PlanNodeStatus::Invalidated => {
+                style::dim_style(theme)
+            }
+        };
+
+        let wave_display = node
+            .wave
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "–".to_owned());
+        let objective_preview = sanitize_inline(&truncate_chars(
+            &node.objective,
+            PLAN_GRAPH_OBJECTIVE_PREVIEW_CHARS,
+        ));
+        let node_text = format!(
+            "{id} · {kind:?} · {status:?} · Welle {wave_display} · {objective_preview}",
+            id = sanitize_inline(node.id.as_ref()),
+            kind = node.kind,
+            status = node.status,
+        );
+
+        let wrapped = wrap_plain(&node_text, text_width);
+        for (i, line) in wrapped.into_iter().enumerate() {
+            let raw: String = line
+                .spans
+                .into_iter()
+                .map(|s| s.content.into_owned())
+                .collect();
+            let content = if i == 0 {
+                format!("● {raw}")
+            } else {
+                format!("  {raw}")
+            };
+            lines.push(Line::from(Span::styled(content, node_style)));
+        }
+    }
 }
 
 impl HistoryCell for PlanGraphCell {
-    /// Rendert je Knoten eine vollständig statusgefärbte, wortweise
-    /// umgebrochene Zeile; kürzt bei Überlänge auf [`PLAN_GRAPH_MAX_NODES`]
-    /// Knoten und nennt die Zahl der ausgelassenen Knoten.
+    /// Rendert Vollbild bzw. Delta (siehe Typdokumentation).
     ///
     /// # Argumente
     /// - `width` (`u16`): Gesamtbreite in Spalten (inklusive Glyph-Präfix).
@@ -924,67 +1094,84 @@ impl HistoryCell for PlanGraphCell {
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
         let prefix_len = 2_u16;
         let text_width = width.saturating_sub(prefix_len).max(1);
+        let dim = style::dim_style(theme);
         let mut lines: Vec<Line<'static>> = Vec::new();
-
         let total = self.plan.nodes.len();
-        let visible = total.min(PLAN_GRAPH_MAX_NODES);
 
-        for node in self.plan.nodes.iter().take(visible) {
-            let node_style = match node.status {
-                PlanNodeStatus::Completed => style::success_style(theme),
-                PlanNodeStatus::Blocked => style::error_style(theme),
-                PlanNodeStatus::Ready => style::selected_style(theme),
-                PlanNodeStatus::InProgress => style::warning_style(theme),
-                PlanNodeStatus::Draft
-                | PlanNodeStatus::Superseded
-                | PlanNodeStatus::Invalidated => style::dim_style(theme),
-            };
-
-            let wave_display = node
-                .wave
-                .map(|w| w.to_string())
-                .unwrap_or_else(|| "–".to_owned());
-            let objective_preview = sanitize_inline(&truncate_chars(
-                &node.objective,
-                PLAN_GRAPH_OBJECTIVE_PREVIEW_CHARS,
-            ));
-            let node_text = format!(
-                "{id} · {kind:?} · {status:?} · Welle {wave_display} · {objective_preview}",
-                id = sanitize_inline(node.id.as_ref()),
-                kind = node.kind,
-                status = node.status,
-            );
-
-            let wrapped = wrap_plain(&node_text, text_width);
-            for (i, line) in wrapped.into_iter().enumerate() {
-                let raw: String = line
-                    .spans
-                    .into_iter()
-                    .map(|s| s.content.into_owned())
-                    .collect();
-                let content = if i == 0 {
-                    format!("● {raw}")
-                } else {
-                    format!("  {raw}")
-                };
-                lines.push(Line::from(Span::styled(content, node_style)));
+        if let (Some(changed), false) = (&self.changed, self.expanded) {
+            for piece in wrap_plain(&self.progress_text(), width.max(1)) {
+                let raw: String = piece.spans.iter().map(|s| s.content.as_ref()).collect();
+                lines.push(Line::from(Span::styled(raw, dim)));
             }
+            let changed_nodes: Vec<&PlanNode> = self
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| changed.contains(&node.id))
+                .collect();
+            for node in changed_nodes.iter().take(PLAN_GRAPH_MAX_CHANGED) {
+                Self::push_node(&mut lines, node, text_width, theme);
+            }
+            let mut notes: Vec<String> = Vec::new();
+            if changed_nodes.len() > PLAN_GRAPH_MAX_CHANGED {
+                notes.push(format!(
+                    "{} weitere geänderte Knoten",
+                    changed_nodes.len() - PLAN_GRAPH_MAX_CHANGED
+                ));
+            }
+            if changed_nodes.is_empty() {
+                notes.push("keine Knotenänderung".to_owned());
+            }
+            if self.removed > 0 {
+                notes.push(format!("{} Knoten entfernt", self.removed));
+            }
+            notes.push(format!("{total} Knoten · ctrl+o zum Ausklappen"));
+            let note = format!("… {}", notes.join(" · "));
+            for piece in wrap_plain(&note, width.max(1)) {
+                let raw: String = piece.spans.iter().map(|s| s.content.as_ref()).collect();
+                lines.push(Line::from(Span::styled(raw, dim)));
+            }
+            return lines;
         }
 
-        if total > PLAN_GRAPH_MAX_NODES {
-            let elided = total - PLAN_GRAPH_MAX_NODES;
+        if self.changed.is_some() {
+            // Ausgeklapptes Delta: Fortschritt vor der vollständigen Liste.
+            lines.push(Line::from(Span::styled(self.progress_text(), dim)));
+        }
+        let visible = if self.expanded {
+            total
+        } else {
+            total.min(PLAN_GRAPH_MAX_NODES)
+        };
+        for node in self.plan.nodes.iter().take(visible) {
+            Self::push_node(&mut lines, node, text_width, theme);
+        }
+
+        if total > visible {
+            let elided = total - visible;
             let note = format!("… {elided} weitere Knoten ausgeblendet (insgesamt {total})");
-            lines.push(Line::from(Span::styled(note, style::dim_style(theme))));
+            lines.push(Line::from(Span::styled(note, dim)));
         }
 
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "(keine Knoten im Plan)",
-                style::dim_style(theme),
-            )));
+            lines.push(Line::from(Span::styled("(keine Knoten im Plan)", dim)));
         }
 
         lines
+    }
+}
+
+impl HistoryCell for SharedPlanGraphCell {
+    /// Delegiert an die geteilte [`PlanGraphCell`]; ein vergifteter Lock
+    /// ergibt eine sichtbare Hinweiszeile statt eines Panics.
+    fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        match self.lock() {
+            Ok(guard) => guard.display_lines(width, theme),
+            Err(_) => vec![Line::from(Span::styled(
+                "⚠ Plan-Zelle nicht lesbar (Sperre vergiftet)".to_owned(),
+                style::warning_style(theme),
+            ))],
+        }
     }
 }
 
@@ -1398,7 +1585,7 @@ pub(crate) enum ToolVerbosity {
 /// # Felder
 /// - `tool_name` (`String`): roher Werkzeugname (z. B. `"shell.exec"`).
 /// - `label` (`String`): vorab über [`tool_label`] berechnetes Klartext-Label
-///   (z. B. `"Bash(git status)"`), niemals rohes JSON.
+///   (z. B. `"Shell(git status)"`), niemals rohes JSON.
 /// - `state` ([`ToolState`]): Laufzeitstatus.
 /// - `duration_ms` (`Option<u64>`): Laufzeit in Millisekunden, `None` solange
 ///   `state == Running`.
@@ -1415,6 +1602,8 @@ pub(crate) enum ToolVerbosity {
 ///   [`ToolCell::set_approval_note`].
 /// - `full_output` (`Vec<String>`): vollständige Ausgabezeilen für die
 ///   ausgeklappte Darstellung.
+/// - `placement` (`Option<ToolPlacement>`): Ausführungsort (R18 D-D), in der
+///   Kopfzeile als ` · host`/` · sandbox`/` · gateway` gezeigt.
 ///
 /// Zusätzlich hält die Zelle die rohe, kompakte JSON-Serialisierung der
 /// Aufrufargumente (`arguments_json`) — **nicht** Teil der oben zitierten
@@ -1455,6 +1644,10 @@ pub(crate) struct ToolCell {
     /// Rohe, kompakte JSON-Serialisierung der Aufrufargumente (nur für
     /// [`ToolVerbosity::Verbose`], siehe Typdokumentation oben).
     arguments_json: String,
+    /// Wo der Aufruf lief (R18 D-D): aus `ToolCallCompleted::placement`,
+    /// ersatzweise aus `executed_on` im Ergebnis. `None` = unbekannt; die
+    /// Kopfzeile zeigt dann keinen Ort statt „host“ zu raten.
+    pub placement: Option<ToolPlacement>,
 }
 
 /// Geteilte Zelle eines Werkzeugaufrufs (`Arc<Mutex<ToolCell>>`).
@@ -1469,7 +1662,16 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 /// niemals rohes JSON.
 ///
 /// # Beschreibung
-/// - `shell.exec` → `Bash(<Befehl, erste Zeile, max. 120 Zeichen>)`.
+/// - `shell.exec` → `Shell(<Befehl, erste Zeile, max. 120 Zeichen>)` —
+///   bewusst nicht `Bash(…)`: `shell.exec` läuft unter `/bin/sh` (POSIX sh,
+///   R18 F3). Beginnt in der ersten Zeile ein Heredoc (`<<'EOF'`), wird sein
+///   Rumpf zu `… heredoc N Zeilen` eingeklappt (R18 F7), siehe
+///   [`shell_label`].
+/// - `job.start` → `Job(<Name>)`; der Befehl erscheint nur ausgeklappt im
+///   Ergebnis. `job.wait` → `job.wait(<id>, ≤Ns)`, `job.status`/`job.logs`/
+///   `job.stop` → `job.<aktion>(<id>)`, `job.list` → `job.list(<art>)`.
+/// - `plan {action: …}` → `plan(<aktion> <knoten> → <zustand>)`, siehe
+///   [`plan_tool_label`].
 /// - `fs.read` → `Read(<Pfad>)`.
 /// - `fs.search`/`fs.grep` → `Search("<Muster>" in <Pfad oder .>)`.
 /// - `fs.list`/`fs.glob` → `List(<Pfad>)`.
@@ -1500,7 +1702,7 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 ///   nutzt.
 ///
 /// # Rückgabe
-/// `String`, z. B. `"Bash(git status --short)"`, `"Read(src/app.rs)"`,
+/// `String`, z. B. `"Shell(git status --short)"`, `"Read(src/app.rs)"`,
 /// `"Search(\"TODO\" in src)"`, `"Agent(explorer)"`.
 pub(crate) fn tool_label(call: &ToolCall) -> String {
     let tool_name = call.name.as_str();
@@ -1512,11 +1714,34 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
     };
 
     match tool_name {
-        "shell.exec" => {
-            let command = str_arg("command").unwrap_or("");
-            let first_line = command.lines().next().unwrap_or("");
-            format!("Bash({})", truncate_chars(first_line, 120))
+        "shell.exec" => shell_label(str_arg("command").unwrap_or("")),
+        "job.start" => {
+            let name = str_arg("name").map(str::trim).unwrap_or("");
+            if name.is_empty() {
+                "Job(unbenannt)".to_owned()
+            } else {
+                format!("Job({})", truncate_chars(name, 60))
+            }
         }
+        "job.wait" => {
+            let id = str_arg("job_id").unwrap_or("?");
+            match object
+                .and_then(|entries| entries.get("timeout_secs"))
+                .and_then(|v| v.as_u64())
+            {
+                Some(secs) => format!("job.wait({id}, ≤{secs}s)"),
+                None => format!("job.wait({id})"),
+            }
+        }
+        "job.status" | "job.logs" => format!("{tool_name}({})", str_arg("job_id").unwrap_or("?")),
+        "job.stop" => match str_arg("signal") {
+            Some(signal) if !signal.is_empty() => {
+                format!("job.stop({}, {signal})", str_arg("job_id").unwrap_or("?"))
+            }
+            _ => format!("job.stop({})", str_arg("job_id").unwrap_or("?")),
+        },
+        "job.list" => format!("job.list({})", str_arg("kind").unwrap_or("")),
+        "plan" if str_arg("action").is_some() => plan_tool_label(call),
         "fs.read" => format!("Read({})", str_arg("path").unwrap_or("")),
         "fs.search" | "fs.grep" => format!(
             "Search(\"{}\" in {})",
@@ -1542,6 +1767,103 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
             format!("Agent({})", str_arg("agent").unwrap_or_default())
         }
         _ => unknown_tool_label(call),
+    }
+}
+
+/// Höchstlänge der ersten Befehlszeile im `Shell(…)`-Label.
+const SHELL_LABEL_MAX_CHARS: usize = 120;
+
+/// Label für `shell.exec`: `Shell(<erste Zeile>)`, bei einem Heredoc mit
+/// eingeklapptem Rumpf.
+///
+/// # Beschreibung
+/// `shell.exec` läuft unter `/bin/sh -c` (POSIX sh, nicht bash; R18 F3),
+/// darum `Shell(…)`. Öffnet die erste Zeile ein Heredoc (`<<EOF`,
+/// `<<'EOF'`, `<<-"EOF"`), zeigt das Label nur diese Zeile und hängt
+/// `… heredoc N Zeilen` an, statt den Rumpf zu verschlucken oder über
+/// mehrere Zeilen zu drucken (R18 F7, `python3 - <<'EOF'`). Andere
+/// mehrzeilige Befehle zeigen wie bisher nur die erste Zeile.
+///
+/// # Argumente
+/// - `command` (`&str`): der rohe Befehlstext.
+///
+/// # Rückgabe
+/// Das unsanitisierte Label, z. B. `"Shell(python3 - <<'EOF' … heredoc 12 Zeilen)"`.
+fn shell_label(command: &str) -> String {
+    let first_line = command.lines().next().unwrap_or("");
+    let head = truncate_chars(first_line, SHELL_LABEL_MAX_CHARS);
+    match heredoc_body_lines(command) {
+        Some(count) => format!("Shell({head} … heredoc {count} Zeilen)"),
+        None => format!("Shell({head})"),
+    }
+}
+
+/// Zählt die Rumpfzeilen eines in der ersten Befehlszeile geöffneten
+/// Heredocs.
+///
+/// # Beschreibung
+/// Rein zeichenbasiert, kein Shell-Parser: sucht `<<` in der ersten Zeile,
+/// überspringt ein optionales `-` (`<<-`), Leerraum und ein Anführungszeichen
+/// und liest das Trennwort (`[A-Za-z0-9_]`). Gezählt werden die Zeilen nach
+/// der ersten bis vor die Zeile, die (ohne führende Tabs/Leerzeichen) genau
+/// das Trennwort ist; fehlt diese, zählen alle übrigen Zeilen. `<<<`
+/// (Here-String) und ein mit einer Ziffer beginnendes Wort (`1<<2`) sind
+/// kein Heredoc.
+///
+/// # Rückgabe
+/// `Some(N)` bei einem Heredoc (auch `N = 0`), sonst `None`.
+fn heredoc_body_lines(command: &str) -> Option<usize> {
+    let mut lines = command.lines();
+    let first = lines.next()?;
+    let start = first.find("<<")?;
+    let rest = &first[start + 2..];
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let rest = rest.trim_start_matches(['\'', '"', '\\']);
+    let delimiter: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    // Leeres oder mit Ziffer beginnendes Wort: kein Heredoc (z. B. die
+    // Arithmetik `$((1<<2))`).
+    if delimiter.is_empty() || delimiter.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let count = lines.take_while(|line| line.trim() != delimiter).count();
+    Some(count)
+}
+
+/// Label für das Plan-Werkzeug (`plan {action: …}`), kompakt statt aller
+/// Argumente (R18 F4).
+///
+/// # Beschreibung
+/// - `step`/`status` → `plan(step <knoten> → <zustand>)`,
+/// - Aktionen mit Knoten-ID → `plan(<aktion> <knoten>)`,
+/// - sonst `plan(<aktion>)`.
+///
+/// Der Beleg (`evidence`) und das Ziel erscheinen nicht im Label; sie stehen
+/// im (aufklappbaren) Ergebnis.
+fn plan_tool_label(call: &ToolCall) -> String {
+    let object = call.arguments.as_object();
+    let str_arg = |key: &str| -> Option<&str> {
+        object
+            .and_then(|entries| entries.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let action = str_arg("action").unwrap_or("?");
+    let target = str_arg("state").or_else(|| str_arg("status"));
+    match (str_arg("id"), target) {
+        (Some(id), Some(state)) => format!(
+            "plan({action} {} → {})",
+            truncate_chars(id, 40),
+            truncate_chars(state, 20)
+        ),
+        (Some(id), None) => format!("plan({action} {})", truncate_chars(id, 40)),
+        _ => format!("plan({action})"),
     }
 }
 
@@ -1590,6 +1912,41 @@ fn unknown_tool_label(call: &ToolCall) -> String {
         parts.push(format!("{key}: {rendered}"));
     }
     format!("{tool_name}({})", parts.join(", "))
+}
+
+/// Kurzform des Ausführungsorts für die Kopfzeile einer [`ToolCell`]
+/// (R18 D-D): `host`, `sandbox`, `gateway` bzw. `gateway <knoten>`,
+/// `unknown` für eine unbekannte Ortsart (nie als `host` geraten).
+pub(crate) fn placement_badge(placement: &ToolPlacement) -> String {
+    match placement {
+        ToolPlacement::Gateway { node: Some(node) } if !node.trim().is_empty() => {
+            format!("gateway {}", truncate_chars(node.trim(), 32))
+        }
+        other => other.label().to_owned(),
+    }
+}
+
+/// Ersatz-Ort aus dem Ergebnis: `executed_on` (`"host"`, `"sandbox"`,
+/// `"gateway"`) auf oberster Ebene oder unter `status` (`job.wait`).
+/// Andere Werte ergeben `None` — geraten wird nicht.
+fn placement_from_result(result: &ToolCallResult) -> Option<ToolPlacement> {
+    let ToolCallResult::Success { value } = result else {
+        return None;
+    };
+    let executed_on = value
+        .get("executed_on")
+        .or_else(|| {
+            value
+                .get("status")
+                .and_then(|status| status.get("executed_on"))
+        })
+        .and_then(|v| v.as_str())?;
+    match executed_on {
+        "host" => Some(ToolPlacement::Host),
+        "sandbox" => Some(ToolPlacement::Sandbox),
+        "gateway" => Some(ToolPlacement::Gateway { node: None }),
+        _ => None,
+    }
 }
 
 /// Extrahiert den Seitenangaben-Teil aus der Kopfzeile eines
@@ -1711,7 +2068,61 @@ impl ToolCell {
             approval_note: None,
             full_output: Vec::new(),
             arguments_json: call.arguments.to_string(),
+            placement: None,
         }
+    }
+
+    /// Erzeugt eine laufende Zelle aus Werkzeugname und fertigem Label, ohne
+    /// die Argumente zu halten.
+    ///
+    /// # Beschreibung
+    /// Für die Spur der Agenten-Detailansicht (`agent_monitor.rs`): sie merkt
+    /// sich je Aufruf nur Name und [`tool_label`] und wertet das Ergebnis
+    /// erst bei `ToolCallCompleted` über [`ToolCell::complete_at`] aus — die
+    /// (möglicherweise großen) Argumente bleiben so nicht im Speicher.
+    /// [`ToolVerbosity::Verbose`] zeigt für eine solche Zelle keine Argumente.
+    pub(crate) fn labelled(tool_name: &str, label: String) -> Self {
+        Self {
+            tool_name: tool_name.to_owned(),
+            label,
+            state: ToolState::Running,
+            duration_ms: None,
+            preview: Vec::new(),
+            hidden_lines: 0,
+            summary: None,
+            expanded: false,
+            approval_note: None,
+            full_output: Vec::new(),
+            arguments_json: String::new(),
+            placement: None,
+        }
+    }
+
+    /// Einzeiliger Ausgang einer abgeschlossenen Zelle (roh, unsanitisiert):
+    /// Dauer, Ort (falls bekannt) und Zusammenfassung bzw. erste
+    /// Vorschauzeile, getrennt durch ` · `, z. B. `"42ms · sandbox · exit 1"`.
+    ///
+    /// # Rückgabe
+    /// Leer, solange der Aufruf läuft und nichts bekannt ist.
+    #[must_use]
+    pub(crate) fn compact_outcome(&self) -> String {
+        let tail = self.header_tail();
+        let mut parts: Vec<String> = Vec::new();
+        let head = tail.trim_start_matches(" · ");
+        if !head.is_empty() {
+            parts.push(head.to_owned());
+        }
+        let detail = self
+            .summary
+            .clone()
+            .or_else(|| self.preview.first().cloned());
+        if let Some(detail) = detail {
+            let detail = detail.trim().to_owned();
+            if !detail.is_empty() {
+                parts.push(detail);
+            }
+        }
+        parts.join(" · ")
     }
 
     /// Übernimmt die echten Aufrufdaten für eine beim Resume zunächst
@@ -1770,6 +2181,9 @@ impl ToolCell {
     ///   `summary`-Feld, außer bei `explore.projects`), `preview` je Eintrag
     ///   eine Zeile (`root (kind)`, `path (kind)`, `from → to (kind)`),
     ///   `full_output` das formatierte JSON ([`pretty_print_json`]).
+    /// - `job.start`/`job.status`/`job.wait`: `summary` aus Ausgang
+    ///   (`job.wait`), Job-ID, Zustand und Exit-Code; keine `preview`, der
+    ///   Befehl (`Befehl: …`), `cwd` und die letzten Zeilen nur ausgeklappt.
     /// - alle anderen Werkzeuge: `summary = None`, `preview` die ersten drei
     ///   Zeilen einer kompakten Klartext-Darstellung (Zeichenketten
     ///   unverändert, Objekte als `schlüssel: wert`-Zeilen).
@@ -1783,6 +2197,28 @@ impl ToolCell {
     /// - `result` (`&ToolCallResult`): das vom Kern festgehaltene Ergebnis.
     /// - `duration_ms` (`u64`): Laufzeit des Aufrufs in Millisekunden.
     pub(crate) fn complete(&mut self, result: &ToolCallResult, duration_ms: u64) {
+        self.complete_at(result, duration_ms, None);
+    }
+
+    /// Wie [`ToolCell::complete`], zusätzlich mit dem Ausführungsort aus
+    /// `TurnEvent::ToolCallCompleted::placement` (R18 D-D).
+    ///
+    /// # Beschreibung
+    /// `placement` hat Vorrang; fehlt es, gilt `executed_on` im Ergebnis
+    /// (`job.*` liefert `"host"`/`"sandbox"`, bei `job.wait` unter `status`).
+    /// Fehlt beides, bleibt der Ort unbekannt (`None`).
+    ///
+    /// # Argumente
+    /// - `result`, `duration_ms`: wie bei [`ToolCell::complete`].
+    /// - `placement` (`Option<&ToolPlacement>`): vom ausführenden Teil
+    ///   gesetzter Ort, `None` bei älteren Sendern.
+    pub(crate) fn complete_at(
+        &mut self,
+        result: &ToolCallResult,
+        duration_ms: u64,
+        placement: Option<&ToolPlacement>,
+    ) {
+        self.placement = placement.cloned().or_else(|| placement_from_result(result));
         self.duration_ms = Some(duration_ms);
         match result {
             ToolCallResult::Error { message } => self.apply_error(message),
@@ -2030,6 +2466,48 @@ impl ToolCell {
                 self.hidden_lines = changed.len().saturating_sub(self.preview.len());
                 self.full_output = diff;
             }
+            // R18 D-D: `job.*` zeigt Job, Zustand und Ausgang; der Befehl
+            // steht nur in der ausgeklappten Darstellung, nie in der
+            // eingeklappten Zelle.
+            "job.start" | "job.status" | "job.wait" if value.is_object() => {
+                let status = value
+                    .get("status")
+                    .filter(|status| status.is_object())
+                    .unwrap_or(value);
+                let field = |key: &str| status.get(key).and_then(|v| v.as_str());
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(outcome) = value.get("outcome").and_then(|v| v.as_str()) {
+                    parts.push(outcome.to_owned());
+                }
+                parts.extend(field("job_id").map(str::to_owned));
+                parts.extend(field("state").map(str::to_owned));
+                if let Some(code) = status.get("exit_code").and_then(|v| v.as_i64()) {
+                    parts.push(format!("exit {code}"));
+                }
+                let mut lines: Vec<String> = Vec::new();
+                if let Some(command) = field("command") {
+                    lines.push(format!("Befehl: {command}"));
+                }
+                if let Some(cwd) = field("cwd") {
+                    lines.push(format!("cwd: {cwd}"));
+                }
+                if let Some(last) = status.get("last_lines").and_then(|v| v.as_array()) {
+                    lines.extend(
+                        last.iter()
+                            .filter_map(|line| line.as_str())
+                            .map(str::to_owned),
+                    );
+                }
+                self.state = ToolState::Succeeded;
+                self.summary = if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" · "))
+                };
+                self.preview = Vec::new();
+                self.hidden_lines = lines.len();
+                self.full_output = lines;
+            }
             "fs.search" | "fs.grep" => {
                 let count = value
                     .get("matches")
@@ -2088,8 +2566,9 @@ impl ToolCell {
         self.expanded = expanded;
     }
 
-    /// Baut den Dauer-/Freigabe-Anhang der Kopfzeile (roh, unsanitisiert):
-    /// ` · {duration}ms`/`s` wenn abgeschlossen, danach ` · {approval_note}`.
+    /// Baut den Dauer-/Ort-/Freigabe-Anhang der Kopfzeile (roh,
+    /// unsanitisiert): ` · {duration}ms`/`s` wenn abgeschlossen, danach
+    /// ` · {ort}` (R18 D-D, nur wenn bekannt) und ` · {approval_note}`.
     /// Leer, solange der Aufruf noch läuft und keine Notiz gesetzt ist.
     fn header_tail(&self) -> String {
         let mut text = String::new();
@@ -2099,6 +2578,10 @@ impl ToolCell {
             } else {
                 text.push_str(&format!(" · {:.1}s", duration_ms as f64 / 1000.0));
             }
+        }
+        if let Some(placement) = &self.placement {
+            text.push_str(" · ");
+            text.push_str(&placement_badge(placement));
         }
         if let Some(note) = &self.approval_note {
             text.push_str(&format!(" · {note}"));
@@ -3133,7 +3616,7 @@ mod tests {
             "Auth-Modul refactorn",
         );
         let plan = make_plan(vec![node]);
-        let cell = PlanGraphCell { plan };
+        let cell = PlanGraphCell::full(plan);
         let lines = cell.display_lines(120, style::Theme::Dark);
         let rendered = lines_to_strings(&lines);
         let joined = rendered.join("\n");
@@ -3154,7 +3637,7 @@ mod tests {
             .map(|i| make_plan_node(&format!("t-{i}"), PlanNodeStatus::Draft, None, "Ziel"))
             .collect();
         let plan = make_plan(nodes);
-        let cell = PlanGraphCell { plan };
+        let cell = PlanGraphCell::full(plan);
         let lines = cell.display_lines(120, style::Theme::Dark);
 
         assert_eq!(
@@ -3179,10 +3662,93 @@ mod tests {
     #[test]
     fn test_plan_graph_cell_empty_plan_shows_placeholder() {
         let plan = make_plan(vec![]);
-        let cell = PlanGraphCell { plan };
+        let cell = PlanGraphCell::full(plan);
         let lines = cell.display_lines(80, style::Theme::Dark);
         let rendered = lines_to_strings(&lines);
         assert_eq!(rendered, vec!["(keine Knoten im Plan)".to_owned()]);
+    }
+
+    /// TUI-03: ein weiterer Stand desselben Plans zeigt eingeklappt nur
+    /// Fortschritt und den geänderten Knoten; ausgeklappt alle Knoten.
+    #[test]
+    fn test_plan_graph_cell_delta_shows_only_changed_node() {
+        let total_nodes = 95;
+        let before: Vec<PlanNode> = (0..total_nodes)
+            .map(|i| make_plan_node(&format!("t-{i}"), PlanNodeStatus::Ready, None, "Ziel"))
+            .collect();
+        let mut after = before.clone();
+        after[3].status = PlanNodeStatus::Completed;
+        after[3].objective = "Schritt drei erledigt".to_owned();
+        let previous = make_plan(before);
+        let mut cell = PlanGraphCell::delta(&previous, make_plan(after));
+        assert_eq!(
+            cell.changed.as_ref().map(Vec::len),
+            Some(1),
+            "genau ein Knoten geändert"
+        );
+
+        let collapsed = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
+        assert_eq!(
+            collapsed.len(),
+            3,
+            "Fortschritt + Knoten + Hinweis: {collapsed:?}"
+        );
+        assert!(
+            collapsed[0].contains("1/95 erledigt (1 %)"),
+            "war: {collapsed:?}"
+        );
+        assert!(
+            collapsed[1].starts_with("● t-3 ·") && collapsed[1].contains("Schritt drei erledigt"),
+            "war: {collapsed:?}"
+        );
+        assert_eq!(
+            collapsed[2], "… 95 Knoten · ctrl+o zum Ausklappen",
+            "war: {collapsed:?}"
+        );
+        assert!(
+            !collapsed
+                .iter()
+                .any(|l| l.contains("weitere Knoten ausgeblendet")),
+            "war: {collapsed:?}"
+        );
+
+        cell.set_expanded(true);
+        let expanded = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
+        assert_eq!(expanded.len(), total_nodes + 1, "Fortschritt + alle Knoten");
+        assert!(expanded[0].contains("1/95 erledigt"), "war: {expanded:?}");
+    }
+
+    /// Delta ohne Knotenänderung und mit entfernten Knoten nennt beides; ein
+    /// anderer Plan ergibt ein Vollbild.
+    #[test]
+    fn test_plan_graph_cell_delta_notes_and_plan_switch() {
+        let previous = make_plan(vec![
+            make_plan_node("t-1", PlanNodeStatus::Ready, None, "a"),
+            make_plan_node("t-2", PlanNodeStatus::Ready, None, "b"),
+        ]);
+        let same = make_plan(vec![make_plan_node(
+            "t-1",
+            PlanNodeStatus::Ready,
+            None,
+            "a",
+        )]);
+        let cell = PlanGraphCell::delta(&previous, same);
+        let rendered = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
+        assert_eq!(
+            rendered.last().map(String::as_str),
+            Some("… keine Knotenänderung · 1 Knoten entfernt · 1 Knoten · ctrl+o zum Ausklappen"),
+            "war: {rendered:?}"
+        );
+
+        let mut other = make_plan(vec![make_plan_node(
+            "x-1",
+            PlanNodeStatus::Ready,
+            None,
+            "c",
+        )]);
+        other.id = PlanId::new("p-anders");
+        let switched = PlanGraphCell::delta(&previous, other);
+        assert!(switched.changed.is_none(), "anderer Plan → Vollbild");
     }
 
     // ── Sanitisierung aller Zelltypen (W1-08) ───────────────────────────
@@ -3233,9 +3799,7 @@ mod tests {
                     duration_ms: 1,
                 },
             }),
-            Box::new(PlanGraphCell {
-                plan: make_plan(vec![plan_node]),
-            }),
+            Box::new(PlanGraphCell::full(make_plan(vec![plan_node]))),
             Box::new(GoalCell {
                 statement: HOSTILE.to_owned(),
                 report: GoalReport {
@@ -3446,14 +4010,15 @@ mod tests {
         }
     }
 
-    /// `shell.exec` wird zu `Bash(<erste Zeile>)`, nicht zu rohem JSON.
+    /// TUI-02: `shell.exec` wird zu `Shell(<erste Zeile>)` (läuft unter
+    /// `/bin/sh`, nicht bash), nicht zu rohem JSON.
     #[test]
-    fn test_tool_label_shell_exec_is_bash_first_line() {
+    fn test_tool_label_shell_exec_is_shell_first_line() {
         let call = make_tool_call(
             "shell.exec",
             harw_tools::serde_json::json!({ "command": "git status --short\necho done" }),
         );
-        assert_eq!(tool_label(&call), "Bash(git status --short)");
+        assert_eq!(tool_label(&call), "Shell(git status --short)");
     }
 
     /// `shell.exec` kürzt die erste Zeile auf 120 Zeichen.
@@ -3465,9 +4030,230 @@ mod tests {
             harw_tools::serde_json::json!({ "command": long_command }),
         );
         let label = tool_label(&call);
-        assert!(label.starts_with("Bash("), "war: {label:?}");
-        // "Bash(" + 120 Zeichen (119 'x' + Ellipse) + ")".
-        assert_eq!(label.chars().count(), "Bash(".len() + 120 + 1);
+        assert!(label.starts_with("Shell("), "war: {label:?}");
+        // "Shell(" + 120 Zeichen (119 'x' + Ellipse) + ")".
+        assert_eq!(label.chars().count(), "Shell(".len() + 120 + 1);
+    }
+
+    /// TUI-04: ein Heredoc-Rumpf wird im Label zu `… heredoc N Zeilen`
+    /// eingeklappt; nur die öffnende Zeile bleibt sichtbar.
+    #[test]
+    fn test_tool_label_shell_exec_collapses_heredoc_body() {
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({
+                "command": "cd crate && python3 - <<'EOF'\nimport sys\nprint(1)\nprint(2)\nEOF\necho fertig"
+            }),
+        );
+        assert_eq!(
+            tool_label(&call),
+            "Shell(cd crate && python3 - <<'EOF' … heredoc 3 Zeilen)"
+        );
+
+        // `<<-"END"` mit eingerücktem Trenner; danach ohne Trenner: alle übrigen Zeilen.
+        let dashed = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "cat <<-\"END\" > f\n\ta\n\tEND" }),
+        );
+        assert_eq!(
+            tool_label(&dashed),
+            "Shell(cat <<-\"END\" > f … heredoc 1 Zeilen)"
+        );
+        let unterminated = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "cat <<EOF\na\nb" }),
+        );
+        assert_eq!(
+            tool_label(&unterminated),
+            "Shell(cat <<EOF … heredoc 2 Zeilen)"
+        );
+
+        // Ein Here-String ist kein Heredoc.
+        let here_string = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "grep x <<< \"$v\"\nzwei" }),
+        );
+        assert_eq!(tool_label(&here_string), "Shell(grep x <<< \"$v\")");
+    }
+
+    /// TUI-04: die Werkzeugzelle zeigt den Heredoc-Rumpf nicht, auch nicht
+    /// ausgeklappt in der Kopfzeile.
+    #[test]
+    fn test_tool_cell_shell_heredoc_body_not_rendered() {
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({
+                "command": "python3 - <<'EOF'\ngeheimer_rumpf = 1\nEOF"
+            }),
+        );
+        let mut cell = ToolCell::started(&call);
+        cell.complete(
+            &harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+                "exit_code": 0, "stdout": "ok", "stderr": ""
+            })),
+            7,
+        );
+        cell.set_expanded(true);
+        let lines = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
+        assert!(
+            lines[0].starts_with("● Shell(python3 - <<'EOF' … heredoc 1 Zeilen) · 7ms"),
+            "war: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("geheimer_rumpf")),
+            "war: {lines:?}"
+        );
+    }
+
+    /// `job.*` erhalten eigene Label; der Befehl steht nicht im Label.
+    #[test]
+    fn test_tool_label_job_tools() {
+        let start = make_tool_call(
+            "job.start",
+            harw_tools::serde_json::json!({ "name": "ladybird build", "command": "cmake --build out" }),
+        );
+        assert_eq!(tool_label(&start), "Job(ladybird build)");
+        let unnamed = make_tool_call(
+            "job.start",
+            harw_tools::serde_json::json!({ "command": "make" }),
+        );
+        assert_eq!(tool_label(&unnamed), "Job(unbenannt)");
+        let wait = make_tool_call(
+            "job.wait",
+            harw_tools::serde_json::json!({ "job_id": "job-1", "timeout_secs": 60 }),
+        );
+        assert_eq!(tool_label(&wait), "job.wait(job-1, ≤60s)");
+        let status = make_tool_call(
+            "job.status",
+            harw_tools::serde_json::json!({ "job_id": "job-1" }),
+        );
+        assert_eq!(tool_label(&status), "job.status(job-1)");
+        let logs = make_tool_call(
+            "job.logs",
+            harw_tools::serde_json::json!({ "job_id": "job-1", "tail": 50 }),
+        );
+        assert_eq!(tool_label(&logs), "job.logs(job-1)");
+        let stop = make_tool_call(
+            "job.stop",
+            harw_tools::serde_json::json!({ "job_id": "job-1", "signal": "KILL" }),
+        );
+        assert_eq!(tool_label(&stop), "job.stop(job-1, KILL)");
+        let list = make_tool_call(
+            "job.list",
+            harw_tools::serde_json::json!({ "kind": "process" }),
+        );
+        assert_eq!(tool_label(&list), "job.list(process)");
+    }
+
+    /// `job.start`: eingeklappt Job-ID/Zustand und Ort, der Befehl erst
+    /// ausgeklappt; der Ort kommt ersatzweise aus `executed_on`.
+    #[test]
+    fn test_tool_cell_job_start_hides_command_until_expanded() {
+        let call = make_tool_call(
+            "job.start",
+            harw_tools::serde_json::json!({ "name": "build", "command": "cargo build --release" }),
+        );
+        let mut cell = ToolCell::started(&call);
+        cell.complete(
+            &harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+                "job_id": "job-7",
+                "state": "running",
+                "command": "cargo build --release",
+                "executed_on": "sandbox",
+            })),
+            3,
+        );
+        assert_eq!(cell.placement, Some(ToolPlacement::Sandbox));
+        let collapsed = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
+        assert!(
+            collapsed[0].starts_with("● Job(build) · 3ms · sandbox"),
+            "war: {collapsed:?}"
+        );
+        assert!(
+            collapsed.iter().any(|l| l.contains("job-7 · running")),
+            "war: {collapsed:?}"
+        );
+        assert!(
+            !collapsed.iter().any(|l| l.contains("cargo build")),
+            "Befehl darf eingeklappt nicht erscheinen: {collapsed:?}"
+        );
+        cell.set_expanded(true);
+        let expanded = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
+        assert!(
+            expanded
+                .iter()
+                .any(|l| l.contains("Befehl: cargo build --release")),
+            "war: {expanded:?}"
+        );
+    }
+
+    /// TUI-01: der Ort aus dem Ereignis erscheint in der Kopfzeile und hat
+    /// Vorrang vor `executed_on`; ohne beides erscheint kein Ort.
+    #[test]
+    fn test_tool_cell_placement_badge() {
+        let call = make_tool_call(
+            "fs.write",
+            harw_tools::serde_json::json!({ "path": "a.txt" }),
+        );
+        let ok = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "executed_on": "host"
+        }));
+
+        let mut gateway = ToolCell::started(&call);
+        gateway.complete_at(
+            &ok,
+            12,
+            Some(&ToolPlacement::Gateway {
+                node: Some("gw-1".to_owned()),
+            }),
+        );
+        let lines = lines_to_strings(&gateway.display_lines(80, style::Theme::Dark));
+        assert!(
+            lines[0].starts_with("● Write(a.txt) · 12ms · gateway gw-1"),
+            "war: {lines:?}"
+        );
+
+        let mut sandbox = ToolCell::started(&call);
+        sandbox.complete_at(&ok, 12, Some(&ToolPlacement::Sandbox));
+        let lines = lines_to_strings(&sandbox.display_lines(80, style::Theme::Dark));
+        assert!(lines[0].contains("· sandbox"), "war: {lines:?}");
+        assert!(!lines[0].contains("host"), "war: {lines:?}");
+
+        let mut none = ToolCell::started(&call);
+        none.complete_at(
+            &harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+                "ok": true
+            })),
+            12,
+            None,
+        );
+        assert_eq!(none.placement, None);
+        let lines = lines_to_strings(&none.display_lines(80, style::Theme::Dark));
+        for badge in ["host", "sandbox", "gateway", "unknown"] {
+            assert!(!lines[0].contains(badge), "war: {lines:?}");
+        }
+
+        let mut unknown = ToolCell::started(&call);
+        unknown.complete_at(&ok, 12, Some(&ToolPlacement::Unknown));
+        let lines = lines_to_strings(&unknown.display_lines(80, style::Theme::Dark));
+        assert!(lines[0].ends_with("· unknown"), "war: {lines:?}");
+    }
+
+    /// `plan {action: step}` erhält ein kompaktes Label mit Knoten und Zustand.
+    #[test]
+    fn test_tool_label_plan_step() {
+        let call = make_tool_call(
+            "plan",
+            harw_tools::serde_json::json!({
+                "action": "step", "id": "t-12", "state": "done", "evidence": "cargo_test:cargo test"
+            }),
+        );
+        assert_eq!(tool_label(&call), "plan(step t-12 → done)");
+        let inspect = make_tool_call(
+            "plan",
+            harw_tools::serde_json::json!({ "action": "inspect" }),
+        );
+        assert_eq!(tool_label(&inspect), "plan(inspect)");
     }
 
     /// `fs.read`, `fs.write`, `fs.list`/`fs.glob` und `fs.search`/`fs.grep`
@@ -3598,7 +4384,7 @@ mod tests {
         assert_eq!(cell.hidden_lines, 1);
 
         let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
-        assert!(lines[0].starts_with("● Bash(ls) · 42ms"), "war: {lines:?}");
+        assert!(lines[0].starts_with("● Shell(ls) · 42ms"), "war: {lines:?}");
         assert!(
             lines
                 .iter()
@@ -3626,7 +4412,7 @@ mod tests {
         assert_eq!(cell.summary.as_deref(), Some("exit 1"));
 
         let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
-        assert!(lines[0].contains("Bash(false)"), "war: {lines:?}");
+        assert!(lines[0].contains("Shell(false)"), "war: {lines:?}");
         assert!(lines.iter().any(|l| l.contains("exit 1")), "war: {lines:?}");
     }
 

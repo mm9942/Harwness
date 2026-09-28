@@ -2904,6 +2904,9 @@ mod agents_build_tests {
                 stragglers_reaped: false,
                 log_truncated: false,
                 launch_warnings: Vec::new(),
+                origin_call_id: None,
+                origin_tool: None,
+                owner_agent: None,
             };
             Ok(harw_tool_job::JobStatus {
                 meta,

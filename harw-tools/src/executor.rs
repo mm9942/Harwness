@@ -16,10 +16,97 @@ use harw_types::cancel::CancelToken;
 use harw_types::{SessionId, TurnId};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// Boxed Future, das ein [`ToolExecutor`] zurückgibt.
 pub type ToolExecutorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolOutput, ToolsError>> + Send + 'a>>;
+
+/// Boxed Future von [`ToolExecutor::execute_placed`].
+pub type PlacedToolExecutorFuture<'a> = Pin<Box<dyn Future<Output = PlacedToolOutput> + Send + 'a>>;
+
+/// JSON-Feld, mit dem ein sandboxierter Harness-Ausführer (`shell.exec`)
+/// eine genehmigte Host-Ausführung kennzeichnet (`"executed_on": "host"`).
+pub const EXECUTED_ON_FIELD: &str = "executed_on";
+
+/// Wo ein Tool-Aufruf tatsächlich lief (R18 D-D, Vertrag
+/// `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §5).
+///
+/// # Beschreibung
+/// Das Vokabular dieses Crates für `harw_protocol::items::ToolPlacement`:
+/// `harw-tools` hängt nicht von `harw-protocol` ab, deshalb bildet
+/// `harw-core` diesen Wert beim Melden von `ToolCallCompleted` ab. Den Wert
+/// setzt immer die ausführende Seite (Ausführer-Metadaten bzw. die
+/// Ergebnis-Frame des Gateways), nie das Modell.
+///
+/// - `Host`: lief lokal außerhalb jeder Sandbox (genehmigte Host-Eskalation).
+/// - `Sandbox`: lief in der lokalen Sandbox des Agentenprozesses.
+/// - `Gateway`: lief im Gateway-Tool-Host (dort immer sandboxiert).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExecutionPlacement {
+    /// Lokaler Host, außerhalb jeder Sandbox.
+    Host,
+    /// Lokale Sandbox des Agentenprozesses.
+    Sandbox,
+    /// Gateway-Tool-Host.
+    Gateway {
+        /// Knotenname des Gateways, falls bekannt.
+        node: Option<String>,
+    },
+}
+
+impl ExecutionPlacement {
+    /// Leitet die Platzierung eines lokal beendeten Aufrufs aus den
+    /// Ausführer-Metadaten ab.
+    ///
+    /// # Beschreibung
+    /// Nur ein Ausführer, der selbst [`ExecutionPlacement::Sandbox`] meldet,
+    /// darf über das Ausgabefeld [`EXECUTED_ON_FIELD`] (`"host"`) auf
+    /// [`ExecutionPlacement::Host`] umschalten — das ist genau die genehmigte
+    /// Host-Eskalation von `shell.exec`. Jeder andere Ausführer behält seine
+    /// deklarierte Platzierung; eine Ausgabe allein (etwa JSON eines
+    /// Fremdwerkzeugs) kann nie eine Platzierung erfinden.
+    ///
+    /// # Argumente
+    /// - `declared`: [`ToolExecutor::placement`] des Ausführers.
+    /// - `output`: das Ergebnis des Aufrufs.
+    ///
+    /// # Rückgabe
+    /// Die Platzierung, oder `None` („unbekannt“), wenn der Ausführer keine
+    /// deklariert.
+    #[must_use]
+    pub fn resolve_local(
+        declared: Option<ExecutionPlacement>,
+        output: &Result<ToolOutput, ToolsError>,
+    ) -> Option<ExecutionPlacement> {
+        match declared {
+            Some(ExecutionPlacement::Sandbox) => {
+                let on_host = matches!(
+                    output,
+                    Ok(ToolOutput::Json { content })
+                        if content.get(EXECUTED_ON_FIELD).and_then(serde_json::Value::as_str)
+                            == Some("host")
+                );
+                Some(if on_host {
+                    ExecutionPlacement::Host
+                } else {
+                    ExecutionPlacement::Sandbox
+                })
+            }
+            other => other,
+        }
+    }
+}
+
+/// Ergebnis von [`ToolExecutor::execute_placed`]: Ausgabe plus Platzierung.
+#[derive(Debug)]
+pub struct PlacedToolOutput {
+    /// Die Ausgabe, exakt wie [`ToolExecutor::execute`] sie liefert.
+    pub output: Result<ToolOutput, ToolsError>,
+    /// Wo der Aufruf lief; `None` heißt unbekannt (Oberflächen zeigen dann
+    /// keine Platzierung statt `host` zu raten).
+    pub placement: Option<ExecutionPlacement>,
+}
 
 /// Immutable execution authority established by the harness, not by a model
 /// response or inbound channel payload.
@@ -171,6 +258,77 @@ pub trait ToolExecutor: Send + Sync {
     fn as_context_load_executor(&self) -> Option<&crate::context_load::ContextLoadExecutor> {
         None
     }
+
+    /// Platzierungs-Metadaten dieses Ausführers (R18 D-D).
+    ///
+    /// # Beschreibung
+    /// Vorgabe `None` („unbekannt“): jeder bestehende Implementierer
+    /// kompiliert unverändert weiter und meldet keine Platzierung. Ein
+    /// sandboxierter lokaler Ausführer meldet
+    /// [`ExecutionPlacement::Sandbox`] (siehe [`PlacedToolExecutor`]), der
+    /// entfernte Proxy (`harw-tool-remote`) [`ExecutionPlacement::Gateway`].
+    fn placement(&self) -> Option<ExecutionPlacement> {
+        None
+    }
+
+    /// Führt den Aufruf aus und meldet zusätzlich, wo er lief.
+    ///
+    /// # Beschreibung
+    /// Die Vorgabe ruft [`Self::execute`] und leitet die Platzierung über
+    /// [`ExecutionPlacement::resolve_local`] aus [`Self::placement`] ab. Ein
+    /// Ausführer, der die Platzierung erst aus der Antwort kennt (der
+    /// Gateway-Proxy kopiert sie aus der Ergebnis-Frame), überschreibt diese
+    /// Methode.
+    fn execute_placed<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> PlacedToolExecutorFuture<'a> {
+        Box::pin(async move {
+            let output = self.execute(context, call).await;
+            let placement = ExecutionPlacement::resolve_local(self.placement(), &output);
+            PlacedToolOutput { output, placement }
+        })
+    }
+}
+
+/// Hängt einem bestehenden Ausführer feste Platzierungs-Metadaten an.
+///
+/// # Beschreibung
+/// Für Ausführer aus fremden Crates, die ihre Platzierung nicht selbst
+/// melden (z. B. `shell.exec`, das immer in der Sandbox startet und nur
+/// über eine genehmigte Eskalation auf den Host wechselt). Alles außer
+/// [`ToolExecutor::placement`] wird unverändert an den inneren Ausführer
+/// weitergereicht.
+pub struct PlacedToolExecutor {
+    inner: Arc<dyn ToolExecutor>,
+    placement: ExecutionPlacement,
+}
+
+impl PlacedToolExecutor {
+    /// Umhüllt `inner` mit der Platzierung `placement`.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ToolExecutor>, placement: ExecutionPlacement) -> Self {
+        Self { inner, placement }
+    }
+}
+
+impl ToolExecutor for PlacedToolExecutor {
+    fn execute<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        self.inner.execute(context, call)
+    }
+
+    fn as_context_load_executor(&self) -> Option<&crate::context_load::ContextLoadExecutor> {
+        self.inner.as_context_load_executor()
+    }
+
+    fn placement(&self) -> Option<ExecutionPlacement> {
+        Some(self.placement.clone())
+    }
 }
 
 /// Extension-Trait, der jeden [`ToolExecutor`] um einen `tracing`-instrumentierten
@@ -236,6 +394,16 @@ pub trait TracedToolExecutor: ToolExecutor {
         context: &'a ToolExecutionContext,
         call: &'a ToolCall,
     ) -> ToolExecutorFuture<'a>;
+
+    /// Wie [`Self::traced_execute`], aber über [`ToolExecutor::execute_placed`]:
+    /// liefert zusätzlich die Platzierung des Aufrufs (R18 D-D). Dieselbe
+    /// Redaction-Regel; das Event `tool.execute.done` trägt zusätzlich nur
+    /// das Feld `placement` (`host`/`sandbox`/`gateway`/`unknown`).
+    fn traced_execute_placed<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> PlacedToolExecutorFuture<'a>;
 }
 
 impl<T: ToolExecutor + ?Sized> TracedToolExecutor for T {
@@ -270,12 +438,54 @@ impl<T: ToolExecutor + ?Sized> TracedToolExecutor for T {
             .instrument(span),
         )
     }
+
+    fn traced_execute_placed<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> PlacedToolExecutorFuture<'a> {
+        use tracing::Instrument as _;
+
+        // Capture only the byte-length of the serialized arguments — never the value itself.
+        let tool_name = call.name.as_str().to_owned();
+        let arg_bytes = call.arguments.to_string().len();
+
+        let span = tracing::info_span!(
+            "tool.execute",
+            tool = %tool_name,
+            arg_bytes,
+        );
+
+        Box::pin(
+            async move {
+                let start = std::time::Instant::now();
+                let placed = self.execute_placed(context, call).await;
+                tracing::info!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    status = if placed.output.is_ok() { "ok" } else { "err" },
+                    placement = match &placed.placement {
+                        Some(ExecutionPlacement::Host) => "host",
+                        Some(ExecutionPlacement::Sandbox) => "sandbox",
+                        Some(ExecutionPlacement::Gateway { .. }) => "gateway",
+                        None => "unknown",
+                    },
+                    "tool.execute.done",
+                );
+                placed
+            }
+            .instrument(span),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolExecutionContext, ToolExecutor, ToolExecutorFuture};
+    use super::{
+        EXECUTED_ON_FIELD, ExecutionPlacement, PlacedToolExecutor, ToolExecutionContext,
+        ToolExecutor, ToolExecutorFuture, TracedToolExecutor,
+    };
     use crate::call::ToolCall;
+    use crate::error::ToolsError;
     use crate::output::ToolOutput;
     use crate::spec::ToolName;
     use crate::test_support::{TestError, TestResult, ctx};
@@ -284,7 +494,10 @@ mod tests {
     };
     use harw_types::cancel::CancelToken;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
 
     /// Ein `ToolExecutor`, der `as_context_load_executor` nicht überschreibt —
     /// der Fall, den die Vorgabe `None` unverändert kompilieren und
@@ -401,6 +614,109 @@ mod tests {
             without_cancel, with_cancel,
             "two contexts that differ only in `cancel` (None vs. Some) must still be equal"
         );
+        Ok(())
+    }
+
+    /// Ein Ausführer, der wie `shell.exec` nach einer genehmigten
+    /// Host-Eskalation `"executed_on": "host"` meldet.
+    struct HostMarkerExecutor;
+
+    impl ToolExecutor for HostMarkerExecutor {
+        fn execute<'a>(
+            &'a self,
+            _context: &'a ToolExecutionContext,
+            _call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            Box::pin(async {
+                Ok(ToolOutput::json(
+                    serde_json::json!({ "exit_code": 0, EXECUTED_ON_FIELD: "host" }),
+                ))
+            })
+        }
+    }
+
+    /// Pollt ein sofort fertiges Future einmal (dieses Crate hat kein tokio).
+    fn ready<F: Future>(future: F) -> TestResult<F::Output> {
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => Ok(output),
+            Poll::Pending => Err(TestError::Unexpected(
+                "the test future was expected to be ready".to_owned(),
+            )),
+        }
+    }
+
+    fn noop_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("shell.exec"),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn test_resolve_local_upgrades_only_a_sandboxed_executor_to_host() {
+        let host_marker: Result<ToolOutput, ToolsError> = Ok(ToolOutput::json(
+            serde_json::json!({ EXECUTED_ON_FIELD: "host" }),
+        ));
+        let plain: Result<ToolOutput, ToolsError> =
+            Ok(ToolOutput::json(serde_json::json!({ "exit_code": 0 })));
+
+        assert_eq!(
+            ExecutionPlacement::resolve_local(Some(ExecutionPlacement::Sandbox), &host_marker),
+            Some(ExecutionPlacement::Host)
+        );
+        assert_eq!(
+            ExecutionPlacement::resolve_local(Some(ExecutionPlacement::Sandbox), &plain),
+            Some(ExecutionPlacement::Sandbox)
+        );
+        assert_eq!(
+            ExecutionPlacement::resolve_local(
+                Some(ExecutionPlacement::Sandbox),
+                &Err(ToolsError::Cancelled)
+            ),
+            Some(ExecutionPlacement::Sandbox)
+        );
+        // Eine Ausgabe allein erfindet nie eine Platzierung.
+        assert_eq!(ExecutionPlacement::resolve_local(None, &host_marker), None);
+        let gateway = ExecutionPlacement::Gateway {
+            node: Some("gw-1".to_owned()),
+        };
+        assert_eq!(
+            ExecutionPlacement::resolve_local(Some(gateway.clone()), &host_marker),
+            Some(gateway)
+        );
+    }
+
+    #[test]
+    fn test_default_execute_placed_reports_no_placement() -> TestResult {
+        let ctx = make_ctx("default_execute_placed")?;
+        let call = noop_call();
+
+        let placed = ready(NoopExecutor.execute_placed(&ctx, &call))?;
+
+        assert!(placed.output.is_ok());
+        assert_eq!(placed.placement, None);
+        assert_eq!(NoopExecutor.placement(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_placed_executor_reports_sandbox_and_host_escalation() -> TestResult {
+        let ctx = make_ctx("placed_executor")?;
+        let call = noop_call();
+        let sandboxed =
+            PlacedToolExecutor::new(Arc::new(NoopExecutor), ExecutionPlacement::Sandbox);
+        let escalated =
+            PlacedToolExecutor::new(Arc::new(HostMarkerExecutor), ExecutionPlacement::Sandbox);
+
+        let in_sandbox = ready(sandboxed.traced_execute_placed(&ctx, &call))?;
+        let on_host = ready(escalated.traced_execute_placed(&ctx, &call))?;
+
+        assert_eq!(in_sandbox.placement, Some(ExecutionPlacement::Sandbox));
+        assert_eq!(on_host.placement, Some(ExecutionPlacement::Host));
+        assert!(sandboxed.as_context_load_executor().is_none());
         Ok(())
     }
 }

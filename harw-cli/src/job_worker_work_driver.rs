@@ -15,7 +15,9 @@
 //! Goal und Plan (mandantengefiltert über `ScopedGoalStore`/`ScopedPlanStore`
 //! mit `WorkDriverJobInput::tenant`, dem von `work_driver.enqueue` gestempelten
 //! Mandanten des Aufrufers; `None` = ungefiltert, Einzelnutzer) → `evaluate_goal` mit der Goal-Evidenz
-//! ([`goal_report`]) → [`WorkDriveInput`] → [`WorkDriver::decide`] → Schritte:
+//! ([`goal_report`]) → [`WorkDriveInput`] (Scope-Hinweise aus dem Plan:
+//! `harw_plan_bridge::scope_hints_from_plan`, `write_scope` der Knoten, die
+//! ein Goal-Kriterium tragen) → [`WorkDriver::decide`] → Schritte:
 //! - `Delegate`/`Continue`/`Respawn` bilden **eine Welle** und laufen
 //!   gleichzeitig, höchstens [`RunMemory::parallel_now`] auf einmal
 //!   ([`execute_wave`]); vor jedem Block wartet die Welle, solange der
@@ -23,13 +25,18 @@
 //!   nur das knappe Feedback an **dieselbe** durable Session (Cache-Regel);
 //!   `Respawn` bekommt eine rein textuelle Übergabe.
 //! - `Verify`: genau ein zentraler Lauf über `spec.verify` plus die
-//!   `Command`-Schritte des Goals über `VerificationExecutor`; bestandene
-//!   Nachweise gehen per `GoalAction::AttachEvidence` an das Goal.
+//!   `Command`- und `Artifact`-Schritte des Goals über `VerificationExecutor`;
+//!   bestandene Nachweise gehen per `GoalAction::AttachEvidence` an das Goal
+//!   (ein `Artifact`-Nachweis als `EvidenceKind::Diff` mit dem Pfad als
+//!   Lokator, so wie `evaluate_goal` ihn zuordnet).
 //! - `Judge`: ein eigener kleiner Worker ohne Werkzeuge (eigenes Modell über
 //!   `InternalModelPoint::WorkDriverJudge`), dessen Gespräch über die Runden
 //!   fortgeführt wird (stabiler Präfix `JUDGE_INSTRUCTION` + Kriterien, danach
-//!   nur der variable Teil); die Antwort wird tolerant geparst, im Zweifel
-//!   „nicht bestanden".
+//!   nur der variable Teil). Eine Antwort ohne auswertbares Urteil wird
+//!   höchstens [`MAX_UNPARSABLE_VERDICTS`]-mal in Folge hingenommen (die
+//!   nächste Runde fragt erneut, mit dem Hinweis auf das JSON-Format); danach
+//!   eskaliert der Lauf mit ausdrücklichem Grund, statt als „nicht
+//!   bestanden" weiterzulaufen.
 //! - `Verify` an der Workspace-Sperre (`VerifyRunOutcome::Busy`): kein
 //!   Fehlschlag; dieselbe Runde läuft nach einer Pause erneut.
 //! - `Escalate`: Job endet `Blocked { work_driver:NeedsInput: … }`; nach
@@ -38,12 +45,35 @@
 //!   Hinweis auf `/goal achieve` — der Status wird **nie** gesetzt.
 //! - `GiveUp`: `Failed` mit Grenze und Messwerten.
 //!
+//! # Rückgabe der Worker (R18 D-E)
+//! Jeder Worker-Turn bekommt das Werkzeug `work_driver.report`
+//! (`harw_ops::work_driver::WorkerReportToolProvider`, über einen
+//! [`ReportToolContributor`] nur in diese Montage gehängt); der letzte gültige
+//! Bericht des Turns wird zu `WorkerReport::into_summary`. Fehlt er, gilt
+//! `WorkerResultSummary::no_report` (`Partial`, „no report") — Freitext wird
+//! nie gedeutet. Die gemeldeten `criteria_addressed` fließen ins Routing von
+//! `decide`, nie in den Goal-Status.
+//!
+//! # Fortschritt (Stillstandsgrenze)
+//! Eine Runde nach einer Verifikation zählt als Fortschritt, wenn mehr
+//! Kriterien erfüllt sind als bisher bestenfalls **oder** weniger
+//! Verifikationsschritte fehlschlagen als bisher bestenfalls
+//! ([`RunMemory`]). Der erste Messwert je Claim setzt nur die Basis.
+//!
 //! # Rechte der Worker (verengt, nie erweitert)
 //! - Kein Worker baut oder führt Prozesse aus: schreibende Worker laufen mit
 //!   `RegistryProfile::WorkspaceEdit` (nur `fs.*`, `doc.*`, `explore.*`,
 //!   Workspace-`deps.*`), lesende mit `ReadOnlyExplore`; die Sandbox trägt
 //!   nie `ExecuteProcess` oder `NetworkAccess`.
+//! - Die Rolle (`spec.worker_role`) bestimmt mit: eine lesende Rolle
+//!   (`harw_ops::kanban::role_access`) schreibt nie; die Anweisungen ihrer
+//!   Definition (`AgentRoster::instructions`) stehen im stabilen Präfix des
+//!   Workers.
 //! - `owned_paths` leer → nur lesen (`{ReadWorkspace}`).
+//! - `owned_paths` = Workspace-Scope (`harw_plan_bridge::WORKSPACE_SCOPE`,
+//!   Kriterium ohne Pfad) → schreiben überall, wo kein anderer Worker Pfade
+//!   besitzt: höchstens ein solcher Worker je gleichzeitig laufendem Block,
+//!   die Pfade aller anderen Worker sind für ihn verboten.
 //! - `owned_paths` gesetzt → `{ReadWorkspace, WriteWorkspace}`. Die
 //!   Rechte-/Sandbox-Schicht kennt **keine** pfadgenaue Schreibfreigabe;
 //!   durchgesetzt wird der Schreibbereich deshalb mit dem vorhandenen
@@ -70,10 +100,11 @@
 //! Versuchsverbrauch.
 //!
 //! # Modellunabhängig
-//! Fortschritt misst der Treiber nur an generischen Artefakten: letzter
-//! Antworttext, geänderte Dateien (aus dem Dateisystem), Verifikation,
-//! Bewerterurteil. Werkzeugnamen, -zahlen oder Provider-Traces werden nie
-//! gelesen; der Verlauf einer Session bleibt unberührt.
+//! Fortschritt misst der Treiber nur an generischen Artefakten: dem
+//! strukturierten Bericht (`work_driver.report`), geänderten Dateien (aus dem
+//! Dateisystem), Verifikation, Bewerterurteil. Andere Werkzeugnamen, -zahlen
+//! oder Provider-Traces werden nie gelesen; der Verlauf einer Session bleibt
+//! unberührt.
 //!
 //! # Testbarkeit
 //! Die Runde hängt nur an kleinen Traits ([`GoalAccess`], [`WorkerSpawner`],
@@ -96,7 +127,8 @@ use harw_job_runtime::{JobClaim, JobKind, JobOutcome, WorkId};
 use harw_ops::kanban::{RoleAccess, role_access};
 use harw_ops::work_driver::{
     WORK_DRIVER_INPUT_SCHEMA_VERSION, WORK_DRIVER_STATE_SCHEMA_VERSION, WorkDriverJobInput,
-    WorkDriverState, WorkDriverUsage, read_state_sidecar, write_state_sidecar,
+    WorkDriverState, WorkDriverUsage, WorkerReportSlot, WorkerReportToolProvider,
+    read_state_sidecar, write_state_sidecar,
 };
 use harw_plan::admission::{MutationContract, PathRule, RepoRevision, UnifiedDiff, validate_patch};
 use harw_plan::goal::{GoalReport, evaluate_goal};
@@ -111,23 +143,24 @@ use harw_plan_bridge::verify_exec::{
 };
 use harw_plan_bridge::work_driver::JUDGE_INSTRUCTION;
 use harw_plan_bridge::{
-    BudgetUsageSnapshot, GiveUpReason, JudgeVerdict, VerificationState, WorkDriveInput,
-    WorkDriveLimits, WorkDriveStep, WorkDriver, WorkerOutcome, WorkerResultSummary, WorkerState,
-    offset_from_timestamp,
+    BudgetUsageSnapshot, GiveUpReason, JudgeVerdict, VerificationState, WORK_DRIVER_REPORT_TOOL,
+    WORKSPACE_SCOPE, WorkDriveInput, WorkDriveLimits, WorkDriveStep, WorkDriver, WorkScope,
+    WorkerOutcome, WorkerReport, WorkerResultSummary, WorkerState, is_workspace_scope,
+    offset_from_timestamp, scope_hints_from_plan,
 };
 use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
 use harw_runtime::RuntimeNarrowing;
+use harw_runtime::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND;
 use harw_session_store::JobStore;
 use harw_types::{ApprovalActor, ModelId, ProviderId, SessionId, TenantId};
 use jiff::{SignedDuration, Timestamp};
-use serde::Deserialize;
 
 use super::{
     BudgetedModelProvider, FileFingerprint, JobRuntimeRoot, JobWorkerContext, MISSING_RUNTIME_ROOT,
     PauseDisposition, PlanNodeServices, PromptTokenLedger, TurnSetup, WorkerExecutionControl,
-    assemble_job_turn, check_claim_fence, check_input_declared_scope, diff_snapshots,
-    job_state_store, last_assistant_text, paused_turn_outcome, sanitize_failure,
+    assemble_job_turn, assemble_job_turn_with, check_claim_fence, check_input_declared_scope,
+    diff_snapshots, job_state_store, last_assistant_text, paused_turn_outcome, sanitize_failure,
     snapshot_workspace,
 };
 use crate::runtime_jobs::{JobAssemblyInputs, JobEntry, job_assembly, job_principal, job_sandbox};
@@ -192,20 +225,29 @@ const DEFAULT_RUN_WALL: SignedDuration = SignedDuration::from_hours(4);
 const NO_VERIFY_SANDBOX: &str = "the job worker has no sandbox backend for verification commands \
 (no job coordinator with a Landlock/bwrap executor is wired in); commands are never run unsandboxed";
 
-/// Fester Rückgabevertrag am Ende jeder Erstaufgabe (Teil des stabilen Präfixes).
-///
-/// Modellunabhängig: eine schlichte Statuszeile genügt; der JSON-Block ist
-/// optional.
-pub(super) const RETURN_CONTRACT: &str = "Rückgabe: Schließe mit einer Statuszeile ab — \
-`Status: done` (oder `please verify`), `Status: partial` oder `Status: blocked: <konkrete \
-Frage>` — und nenne kurz, was du geändert hast und was offen ist. Optional zusätzlich ein \
-JSON-Block {\"outcome\": \"done|partial|blocked|failed\", \"summary\": \"…\", \
-\"artifacts\": [\"…\"], \"blockers\": [\"…\"], \"suggested_next\": \"…\"}. Baue und teste \
-nicht selbst: die zentrale Verifikation läuft einmal pro Welle.";
+/// Fester Rückgabevertrag am Ende jeder Erstaufgabe (Teil des stabilen
+/// Präfixes, R18 D-E): das Ende jedes Turns ist ein Aufruf von
+/// `work_driver.report`; Freitext wird nicht gelesen.
+pub(super) const RETURN_CONTRACT: &str = "## Report\nEnd every turn by calling the tool \
+`work_driver.report` with: `status` (`done` = scope finished and ready for the central \
+verification, `partial` = continue later, `blocked` = a human must decide, `failed` = hard \
+failure), `criteria_addressed` (the criterion indices above you worked on), `changed_paths` \
+(workspace-relative files you changed), `summary` (short, not empty) and `blockers` (required \
+for `blocked`: the concrete questions). An invalid report comes back as a tool error: fix it \
+and call again; the last valid call counts. Without a report your turn counts as `partial` with \
+the reason \"no report\".";
 
 /// Fortsetzungstext nach einem Provider-Rate-Limit (Verlauf bleibt unberührt).
-const RESUME_AFTER_RATE_LIMIT: &str = "Fortsetzen: der letzte Versuch endete an einem \
-Provider-Rate-Limit. Arbeite an deiner Aufgabe weiter und schließe wieder mit der Statuszeile ab.";
+const RESUME_AFTER_RATE_LIMIT: &str = "Resume: your last attempt ended at a provider rate \
+limit. Continue your task and finish again by calling `work_driver.report`.";
+
+/// Aufeinanderfolgende Bewerterantworten ohne auswertbares Urteil, nach
+/// denen der Lauf eskaliert (davor fragt die nächste Runde erneut).
+const MAX_UNPARSABLE_VERDICTS: u32 = 3;
+
+/// Zusatz der Bewerterfrage nach einer unauswertbaren Antwort.
+const JUDGE_FORMAT_REMINDER: &str = "Your previous answer contained no JSON verdict. Answer ONLY \
+with {\"passed\": bool, \"comment\": string, \"missing\": [string]}.";
 
 /// Trenner zwischen stabilem Präfix und variablem Teil der Bewerterfrage.
 const JUDGE_SEPARATOR: &str = "\n---\n";
@@ -299,8 +341,16 @@ pub(super) struct RunMemory {
     current: usize,
     /// Größte gesehene Zahl erfüllter Kriterien (`None` bis zur ersten Runde).
     best_met: Option<usize>,
+    /// Kleinste gesehene Zahl fehlgeschlagener Verifikationsschritte (`None`
+    /// bis zur ersten ausgewerteten Verifikation dieses Claims).
+    best_failed_steps: Option<usize>,
+    /// Fehlgeschlagene Schritte der letzten Verifikation, noch nicht mit
+    /// [`Self::best_failed_steps`] verglichen.
+    last_failed_steps: Option<usize>,
     /// Nach einer Verifikation: in der nächsten Runde Fortschritt messen.
     progress_pending: bool,
+    /// Bewerterantworten ohne auswertbares Urteil in Folge.
+    unparsable_verdicts: u32,
     /// Operator-Antworten für die nächste Fortsetzung eines Workers.
     operator_notes: BTreeMap<String, String>,
     /// Worker, deren letzter Turn am Rate-Limit endete (kein Versuchsverbrauch).
@@ -330,7 +380,10 @@ impl RunMemory {
             ceiling,
             current: ceiling,
             best_met: None,
+            best_failed_steps: None,
+            last_failed_steps: None,
             progress_pending: false,
+            unparsable_verdicts: 0,
             operator_notes: BTreeMap::new(),
             rate_limit_pending: BTreeSet::new(),
             worker_tokens: BTreeMap::new(),
@@ -350,6 +403,30 @@ impl RunMemory {
     /// Multiplikativ verringern (HTTP 429).
     fn on_rate_limited(&mut self) {
         self.current = (self.current / 2).max(1);
+    }
+
+    /// Wertet den Stand zu Rundenbeginn aus (`met` = erfüllte Kriterien).
+    ///
+    /// # Returns
+    /// `Some(true)`/`Some(false)` (Fortschritt ja/nein), wenn seit der
+    /// letzten Runde eine Verifikation lief und eine Basis besteht; sonst
+    /// `None` (erste Runde des Claims, oder keine Verifikation dazwischen).
+    /// Fortschritt ist ein neues Maximum erfüllter Kriterien oder ein neues
+    /// Minimum fehlgeschlagener Verifikationsschritte.
+    fn record_round(&mut self, met: usize) -> Option<bool> {
+        let pending = std::mem::take(&mut self.progress_pending);
+        let failed = self.last_failed_steps.take();
+        let baseline = self.best_met.is_some();
+        let met_improved = self.best_met.is_some_and(|best| met > best);
+        self.best_met = Some(self.best_met.map_or(met, |best| best.max(met)));
+        let verify_improved = match (self.best_failed_steps, failed) {
+            (Some(best), Some(now)) => now < best,
+            _ => false,
+        };
+        if let Some(now) = failed {
+            self.best_failed_steps = Some(self.best_failed_steps.map_or(now, |best| best.min(now)));
+        }
+        (pending && baseline).then_some(met_improved || verify_improved)
     }
 
     /// Additiv erhöhen (saubere Welle), nie über die Obergrenze.
@@ -414,19 +491,30 @@ pub(super) struct WorkerRequest {
     pub(super) worker_id: String,
     /// Rolle des Workers.
     pub(super) role: String,
-    /// Pfade, die der Worker ändern darf (leer: nur lesen).
+    /// Pfade, die der Worker ändern darf (leer: nur lesen;
+    /// [`WORKSPACE_SCOPE`]: alles, was kein anderer Worker besitzt).
     pub(super) owned_paths: Vec<String>,
     /// Der anzuhängende Nutzertext.
     pub(super) text: String,
     /// `true`: Fortsetzung einer bestehenden Session (nur Feedback).
     pub(super) continuation: bool,
+    /// Zahl der Akzeptanzkriterien des Goals (Prüfung von
+    /// `criteria_addressed` in `work_driver.report`).
+    pub(super) criteria_total: usize,
 }
 
 /// Wie ein Worker-Turn endete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WorkerReply {
-    /// Abgeschlossen mit dem letzten Assistententext.
-    Text(String),
+    /// Abgeschlossen: letzter Assistententext und der letzte gültige
+    /// `work_driver.report` des Turns (`None`: der Worker hat nicht
+    /// berichtet).
+    Completed {
+        /// Letzter Assistententext (nur für den „no report"-Fall).
+        text: String,
+        /// Der Bericht, falls einer vorliegt.
+        report: Option<WorkerReport>,
+    },
     /// Pausiert (Freigabe/Handoff), im Job nicht fortsetzbar.
     Paused(String),
     /// Gescheitert.
@@ -491,8 +579,12 @@ pub(super) struct VerificationReport {
     pub(super) failing: Vec<String>,
     /// Gründe nicht nachweisbarer Schritte.
     pub(super) unverifiable: Vec<String>,
-    /// Erfüllungsnachweise (Lokator von `Command`-Schritten = Befehlstext).
+    /// Erfüllungsnachweise (Lokator von `Command`-Schritten = Befehlstext,
+    /// von `Artifact`-Schritten = Pfad).
     pub(super) evidence: Vec<EvidenceRef>,
+    /// Zahl der fehlgeschlagenen Schritte (Fortschrittsmaß, siehe
+    /// [`RunMemory::record_round`]); `failing` zählt dagegen Zeilen.
+    pub(super) failed_steps: usize,
 }
 
 /// Führt die zentrale Verifikation aus (`harw_plan_bridge::verify_exec`).
@@ -565,10 +657,12 @@ pub(super) struct WaveChanges {
 
 /// Setzt den Schreibbereich der Worker einer Welle durch.
 pub(super) trait WriteScopeGuard: Send + Sync {
-    /// Vor der Welle (Schnappschuss).
+    /// Vor dem Block (Schnappschuss).
     fn before_wave(&self);
-    /// Nach der Welle: `owners` = (Worker, `owned_paths`) der Welle.
-    fn after_wave(&self, owners: &[(String, Vec<String>)]) -> WaveChanges;
+    /// Nach dem Block: `owners` = (Worker, `owned_paths`) des gleichzeitig
+    /// gelaufenen Blocks, `foreign` = `owned_paths` aller übrigen Worker
+    /// des Laufs (für diesen Block verboten).
+    fn after_wave(&self, owners: &[(String, Vec<String>)], foreign: &[String]) -> WaveChanges;
 }
 
 /// Wartet (Backoff nach Rate-Limit); injiziert, damit Tests nicht schlafen.
@@ -800,30 +894,26 @@ pub(super) async fn drive_round(
         Err(reason) => return RoundEnd::Finish(JobOutcome::Failed { reason }),
     };
 
-    let met = report.criteria_met.len();
-    match memory.best_met {
-        None => memory.best_met = Some(met),
-        Some(best) => {
-            if memory.progress_pending {
-                if met > best {
-                    state.usage.iterations_without_progress = 0;
-                } else {
-                    state.usage.iterations_without_progress =
-                        state.usage.iterations_without_progress.saturating_add(1);
-                }
-            }
-            memory.best_met = Some(best.max(met));
+    match memory.record_round(report.criteria_met.len()) {
+        Some(true) => state.usage.iterations_without_progress = 0,
+        Some(false) => {
+            state.usage.iterations_without_progress =
+                state.usage.iterations_without_progress.saturating_add(1);
         }
+        None => {}
     }
-    memory.progress_pending = false;
 
+    let scope_hints: Vec<WorkScope> = plan
+        .as_ref()
+        .map(|plan| scope_hints_from_plan(&goal, plan))
+        .unwrap_or_default();
     let worker_role = Some(input.spec.worker_role.trim()).filter(|role| !role.is_empty());
     let decided = WorkDriver::decide(&WorkDriveInput {
         goal: &goal,
         report: &report,
         iteration: state.iteration,
         workers: &state.workers,
-        scope_hints: &[],
+        scope_hints: &scope_hints,
         usage: BudgetUsageSnapshot {
             tokens_used: state.usage.tokens_used,
             started_at: offset_from_timestamp(memory.started_at),
@@ -874,6 +964,7 @@ async fn execute_steps(
         return RoundEnd::Finish(needs_input(&questions.join(" / ")));
     }
 
+    let criteria_total = goal.acceptance_criteria.len();
     let mut wave: Vec<WorkerRequest> = Vec::new();
     let mut after_wave: Vec<WorkDriveStep> = Vec::new();
     for step in steps {
@@ -924,8 +1015,9 @@ async fn execute_steps(
                     worker_id,
                     role,
                     owned_paths,
-                    text: first_task_text(&task),
+                    text: first_task_text(&task, &input.spec.verify),
                     continuation: false,
+                    criteria_total,
                 });
             }
             WorkDriveStep::Continue {
@@ -955,6 +1047,7 @@ async fn execute_steps(
                     owned_paths: worker.scope.owned_paths.clone(),
                     text,
                     continuation: true,
+                    criteria_total,
                 });
             }
             WorkDriveStep::Respawn {
@@ -965,7 +1058,7 @@ async fn execute_steps(
                 let note = memory.operator_notes.remove(&worker_id);
                 memory.rate_limit_pending.remove(&worker_id);
                 let new_id = allocate_worker_id(state, memory);
-                let verification = verification_label(&state.verification);
+                let verification = worker_verification_text(&state.verification);
                 let Some(worker) = state
                     .workers
                     .iter_mut()
@@ -985,16 +1078,19 @@ async fn execute_steps(
                     cache_hit_ratio: None,
                 };
                 // Reine Textübergabe: nie Provider-Traces des Vorgängers.
-                let mut text = format!("{handoff}\nLetzte Verifikation: {verification}");
+                let mut text = format!(
+                    "## Handoff from your predecessor\n{handoff}\n\n## Last central verification\n{verification}"
+                );
                 if let Some(note) = note {
-                    text.push_str(&format!("\nAntwort des Operators: {note}"));
+                    text.push_str(&format!("\n\n## Operator answer\n{note}"));
                 }
                 wave.push(WorkerRequest {
                     worker_id: new_id,
                     role: worker_role_of(input),
                     owned_paths: scope.owned_paths,
-                    text: first_task_text(&text),
+                    text: first_task_text(&text, &input.spec.verify),
                     continuation: false,
+                    criteria_total,
                 });
             }
             step @ (WorkDriveStep::Verify { .. } | WorkDriveStep::Judge { .. }) => {
@@ -1057,9 +1153,42 @@ fn worker_role_of(input: &WorkDriverJobInput) -> String {
     }
 }
 
+/// Ende des nächsten gleichzeitig laufenden Blocks ab `start`: höchstens
+/// `width` Aufträge und höchstens ein Workspace-Worker
+/// ([`WORKSPACE_SCOPE`]) — zwei solche Worker gleichzeitig wären in der
+/// Schreibbereichsprüfung nicht zu unterscheiden. Mindestens ein Auftrag.
+fn chunk_end(pending: &[WorkerRequest], start: usize, width: usize) -> usize {
+    let mut end = start;
+    let mut has_workspace = false;
+    for request in pending.iter().skip(start).take(width.max(1)) {
+        let workspace = is_workspace_scope(&request.owned_paths);
+        if workspace && has_workspace {
+            break;
+        }
+        has_workspace |= workspace;
+        end = end.saturating_add(1);
+    }
+    end.max(start.saturating_add(1)).min(pending.len())
+}
+
+/// `owned_paths` aller Worker des Laufs außerhalb des Blocks `owners` (ohne
+/// den Workspace-Scope): für den Block verboten.
+fn foreign_paths(state: &WorkDriverState, owners: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut foreign: Vec<String> = state
+        .workers
+        .iter()
+        .filter(|worker| !owners.iter().any(|(id, _)| *id == worker.worker_id))
+        .flat_map(|worker| worker.scope.owned_paths.iter().cloned())
+        .filter(|path| path.trim() != WORKSPACE_SCOPE)
+        .collect();
+    foreign.sort();
+    foreign.dedup();
+    foreign
+}
+
 /// Führt die Worker-Turns einer Welle aus: gleichzeitig in Blöcken der
-/// aktuellen Wellenbreite, 429 mit Backoff und Fortsetzung, danach die
-/// Schreibbereichsprüfung.
+/// aktuellen Wellenbreite (höchstens ein Workspace-Worker je Block), 429 mit
+/// Backoff und Fortsetzung, danach die Schreibbereichsprüfung je Block.
 async fn execute_wave(
     state: &mut WorkDriverState,
     memory: &mut RunMemory,
@@ -1109,12 +1238,13 @@ async fn execute_wave(
                     break;
                 }
             }
-            let end = index.saturating_add(width).min(pending.len());
+            let end = chunk_end(&pending, index, width);
             let chunk = &pending[index..end];
             let chunk_owners: Vec<(String, Vec<String>)> = chunk
                 .iter()
                 .map(|request| (request.worker_id.clone(), request.owned_paths.clone()))
                 .collect();
+            let foreign = foreign_paths(state, &chunk_owners);
             ports.scope_guard.before_wave();
             let futures: Vec<BoxFuture<'_, WorkerRun>> = chunk
                 .iter()
@@ -1136,8 +1266,18 @@ async fn execute_wave(
                         chunk_limited = true;
                         limited.push(request.clone());
                     }
-                    WorkerReply::Text(text) => {
-                        set_result(state, &request.worker_id, parse_worker_return(&text));
+                    WorkerReply::Completed { text, report } => {
+                        let summary = match report {
+                            Some(report) => report.into_summary(),
+                            None => {
+                                tracing::info!(worker = %request.worker_id, "work-driver worker ended without work_driver.report");
+                                WorkerResultSummary::no_report(&clip(
+                                    text.trim(),
+                                    WORKER_TEXT_CLIP_CHARS,
+                                ))
+                            }
+                        };
+                        set_result(state, &request.worker_id, summary);
                     }
                     WorkerReply::Paused(reason) => set_result(
                         state,
@@ -1161,7 +1301,7 @@ async fn execute_wave(
                     ),
                 }
             }
-            let chunk_changes = ports.scope_guard.after_wave(&chunk_owners);
+            let chunk_changes = ports.scope_guard.after_wave(&chunk_owners, &foreign);
             for (worker_id, paths) in chunk_changes.changed {
                 changed.entry(worker_id).or_default().extend(paths);
             }
@@ -1193,6 +1333,7 @@ async fn execute_wave(
                             .to_owned(),
                         artifacts: Vec::new(),
                         suggested_next: None,
+                        criteria_addressed: Vec::new(),
                     },
                 );
             }
@@ -1244,10 +1385,10 @@ async fn execute_wave(
         );
         for worker in &mut state.workers {
             if wave_ids.contains(&worker.worker_id) {
-                let summary = worker
+                let (summary, criteria_addressed) = worker
                     .last_result
                     .as_ref()
-                    .map(|result| result.summary.clone())
+                    .map(|result| (result.summary.clone(), result.criteria_addressed.clone()))
                     .unwrap_or_default();
                 worker.last_result = Some(WorkerResultSummary {
                     outcome: WorkerOutcome::Blocked {
@@ -1256,6 +1397,7 @@ async fn execute_wave(
                     summary,
                     artifacts: Vec::new(),
                     suggested_next: None,
+                    criteria_addressed,
                 });
             }
         }
@@ -1318,6 +1460,7 @@ fn reason_summary(outcome: WorkerOutcome, reason: &str) -> WorkerResultSummary {
         summary: clip(reason, WORKER_TEXT_CLIP_CHARS),
         artifacts: Vec::new(),
         suggested_next: None,
+        criteria_addressed: Vec::new(),
     }
 }
 
@@ -1388,6 +1531,12 @@ async fn run_verification(
             ))));
         }
     }
+    if matches!(
+        report.verdict,
+        VerifyVerdict::Passed | VerifyVerdict::Failed
+    ) {
+        memory.last_failed_steps = Some(report.failed_steps);
+    }
     state.verification = match report.verdict {
         VerifyVerdict::Passed => VerificationState::Passed,
         VerifyVerdict::Failed => VerificationState::Failed {
@@ -1406,6 +1555,12 @@ async fn run_verification(
 }
 
 /// Ein Bewerteraufruf; 429 → Backoff und später erneut, Ausfall → Eskalation.
+///
+/// # Description
+/// Eine Antwort ohne auswertbares Urteil ([`parse_verdict`] `None`) ist kein
+/// „nicht bestanden": das Urteil bleibt offen, die nächste Runde fragt erneut
+/// (mit [`JUDGE_FORMAT_REMINDER`]). Nach [`MAX_UNPARSABLE_VERDICTS`] solchen
+/// Antworten in Folge eskaliert der Lauf mit ausdrücklichem Grund.
 async fn run_judge(
     input: &WorkDriverJobInput,
     goal: &Goal,
@@ -1415,12 +1570,37 @@ async fn run_judge(
     memory: &mut RunMemory,
     ports: &DrivePorts<'_>,
 ) -> Option<RoundEnd> {
-    let request = judge_request(&input.spec, goal, criteria, question, state);
+    let mut request = judge_request(&input.spec, goal, criteria, question, state);
+    if memory.unparsable_verdicts > 0 {
+        request.variable = format!("{JUDGE_FORMAT_REMINDER}\n{}", request.variable);
+    }
     match ports.judge.judge(&request).await {
         Ok(reply) => {
             state.usage.tokens_used = state.usage.tokens_used.saturating_add(reply.tokens);
-            state.last_judge = Some(parse_verdict(&reply.text));
-            None
+            match parse_verdict(&reply.text) {
+                Some(verdict) => {
+                    memory.unparsable_verdicts = 0;
+                    state.last_judge = Some(verdict);
+                    None
+                }
+                None => {
+                    memory.unparsable_verdicts = memory.unparsable_verdicts.saturating_add(1);
+                    state.last_judge = None;
+                    let excerpt = clip(reply.text.trim(), MAX_OUTCOME_REASON_CHARS / 2);
+                    state.last_rationale.push(format!(
+                        "judge: kein auswertbares Urteil ({} von {MAX_UNPARSABLE_VERDICTS}): {excerpt}",
+                        memory.unparsable_verdicts
+                    ));
+                    if memory.unparsable_verdicts >= MAX_UNPARSABLE_VERDICTS {
+                        return Some(RoundEnd::Finish(needs_input(&format!(
+                            "Der Bewerter lieferte {MAX_UNPARSABLE_VERDICTS}-mal in Folge kein \
+                             auswertbares Urteil (erwartet: JSON mit `passed`); zuletzt: \
+                             {excerpt}. Bewerter-Modell prüfen, dann freigeben."
+                        ))));
+                    }
+                    None
+                }
+            }
         }
         Err(JudgeError::RateLimited { retry_after_secs }) => {
             state.rate_limited = state.rate_limited.saturating_add(1);
@@ -1438,8 +1618,12 @@ async fn run_judge(
     }
 }
 
-/// `spec.verify` plus die `Command`-Schritte aller Kriterien und Invarianten,
-/// in dieser Reihenfolge, ohne doppelte Befehle.
+/// `spec.verify` plus die `Command`- und `Artifact`-Schritte aller Kriterien
+/// und Invarianten, in dieser Reihenfolge, ohne doppelte Befehle bzw. Pfade.
+///
+/// `TraceEvent`- und `Manual`-Schritte fehlen bewusst: der Executor meldet
+/// sie immer als nicht nachweisbar (das eskalierte jeden Lauf); manuelle
+/// Kriterien entscheidet der Bewerter.
 pub(super) fn verification_steps(spec: &WorkDriverSpec, goal: &Goal) -> Vec<VerificationStep> {
     let mut steps: Vec<VerificationStep> = Vec::new();
     let from_goal = goal
@@ -1451,18 +1635,20 @@ pub(super) fn verification_steps(spec: &WorkDriverSpec, goal: &Goal) -> Vec<Veri
                 .iter()
                 .flat_map(|invariant| invariant.verification.iter()),
         )
-        .filter(|step| matches!(step, VerificationStep::Command { .. }))
         .cloned();
     for step in steps_from_commands(&spec.verify)
         .into_iter()
         .chain(from_goal)
     {
-        let VerificationStep::Command { cmd, .. } = &step else {
-            continue;
+        let known = match &step {
+            VerificationStep::Command { cmd, .. } => steps.iter().any(|existing| {
+                matches!(existing, VerificationStep::Command { cmd: other, .. } if other == cmd)
+            }),
+            VerificationStep::Artifact { path } => steps.iter().any(|existing| {
+                matches!(existing, VerificationStep::Artifact { path: other } if other == path)
+            }),
+            VerificationStep::TraceEvent { .. } | VerificationStep::Manual { .. } => continue,
         };
-        let known = steps.iter().any(|existing| {
-            matches!(existing, VerificationStep::Command { cmd: other, .. } if other == cmd)
-        });
         if !known {
             steps.push(step);
         }
@@ -1526,18 +1712,33 @@ pub(super) fn goal_report(goal: &Goal, plan: Option<&Plan>) -> Result<GoalReport
 // Texte und Parser
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Erste Nachricht eines (neuen) Workers: Aufgabe + fester Rückgabevertrag.
-fn first_task_text(task: &str) -> String {
-    format!("{task}\n\n{RETURN_CONTRACT}")
+/// Erste Nachricht eines (neuen) Workers: Aufgabe, die zentralen
+/// Verifikationsbefehle der Spec (falls vorhanden) und der feste
+/// Rückgabevertrag.
+fn first_task_text(task: &str, verify: &[String]) -> String {
+    let commands: Vec<&str> = verify
+        .iter()
+        .map(|command| command.trim())
+        .filter(|command| !command.is_empty())
+        .collect();
+    if commands.is_empty() {
+        return format!("{task}\n\n{RETURN_CONTRACT}");
+    }
+    format!(
+        "{task}\n\n## Central verification (the driver runs these, not you)\n- `{}`\n\n{RETURN_CONTRACT}",
+        commands.join("`\n- `")
+    )
 }
 
 /// Fortsetzung: **nur** Feedback (und ggf. die Operator-Antwort), nie das Ziel.
 pub(super) fn continue_text(feedback: &str, note: Option<&str>) -> String {
-    let mut text = format!("Rückmeldung des Treibers:\n{feedback}");
+    let mut text = format!("## Driver feedback\n{feedback}");
     if let Some(note) = note {
-        text.push_str(&format!("\nAntwort des Operators: {note}"));
+        text.push_str(&format!("\n\n## Operator answer\n{note}"));
     }
-    text.push_str("\nArbeite in deinem Scope weiter und schließe wieder mit der Statuszeile ab.");
+    text.push_str(&format!(
+        "\n\nContinue within your scope and finish again by calling `{WORK_DRIVER_REPORT_TOOL}`."
+    ));
     text
 }
 
@@ -1568,141 +1769,6 @@ fn clip(text: &str, max: usize) -> String {
     let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
     clipped.push('…');
     clipped
-}
-
-/// Rohform einer optionalen JSON-Rückgabe (ReturnEnvelope-artig).
-#[derive(Debug, Deserialize)]
-struct RawReturn {
-    outcome: String,
-    #[serde(default)]
-    summary: String,
-    #[serde(default)]
-    artifacts: Vec<String>,
-    #[serde(default)]
-    blockers: Vec<String>,
-    #[serde(default)]
-    suggested_next: Option<String>,
-}
-
-/// Der JSON-Teil einer Antwort: der letzte ```json-Block, sonst der Bereich
-/// vom ersten `{` bis zur letzten `}`.
-fn json_body(text: &str) -> Option<&str> {
-    if let Some(start) = text.rfind("```json") {
-        let rest = &text[start + "```json".len()..];
-        if let Some(end) = rest.find("```") {
-            return Some(rest[..end].trim());
-        }
-    }
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    (end > start).then(|| &text[start..=end])
-}
-
-/// Klartext-Marker einer Statuszeile (ohne Groß-/Kleinschreibung).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Marker {
-    Done,
-    Partial,
-    Blocked(String),
-}
-
-/// Marker für „fertig" (auch „bitte verifizieren").
-const DONE_MARKERS: [&str; 3] = ["done", "please verify", "bitte verifizieren"];
-/// Marker für „teilweise".
-const PARTIAL_MARKERS: [&str; 2] = ["partial", "teilweise"];
-/// Marker für „blockiert" (die Frage folgt dahinter).
-const BLOCKED_MARKERS: [&str; 2] = ["blocked", "blockiert"];
-
-/// Sucht die letzte Statuszeile (`done`, `please verify`, `partial`,
-/// `blocked: …` — auch hinter `Status:`/`Outcome:` und Markdown-Zeichen),
-/// ohne Groß-/Kleinschreibung. ASCII-Kleinschreibung hält die Byte-Offsets
-/// von Original und Vergleichstext gleich.
-fn plain_marker(text: &str) -> Option<Marker> {
-    let mut found = None;
-    for line in text.lines() {
-        let original = line
-            .trim()
-            .trim_start_matches(['*', '#', '-', '>', '`'])
-            .trim();
-        let lower = original.to_ascii_lowercase();
-        let prefix_len = ["status:", "outcome:", "ergebnis:", "result:"]
-            .iter()
-            .find(|prefix| lower.starts_with(**prefix))
-            .map_or(0, |prefix| prefix.len());
-        let body = lower.get(prefix_len..).unwrap_or_default().trim_start();
-        let body_start = lower.len() - body.len();
-        let body = body.trim_end_matches(['*', '`', '.', ' ']);
-        if DONE_MARKERS.iter().any(|marker| body.starts_with(marker)) {
-            found = Some(Marker::Done);
-        } else if PARTIAL_MARKERS
-            .iter()
-            .any(|marker| body.starts_with(marker))
-        {
-            found = Some(Marker::Partial);
-        } else if let Some(marker) = BLOCKED_MARKERS
-            .iter()
-            .find(|marker| body.starts_with(**marker))
-        {
-            let question = original
-                .get(body_start + marker.len()..)
-                .unwrap_or_default()
-                .trim_start_matches([':', ' ', '-', '*', '`'])
-                .trim_end_matches(['*', '`'])
-                .trim();
-            found = Some(Marker::Blocked(if question.is_empty() {
-                original.to_owned()
-            } else {
-                question.to_owned()
-            }));
-        }
-    }
-    found
-}
-
-/// Deutet die letzte Worker-Antwort tolerant: JSON-Block, sonst Statuszeile,
-/// sonst „keine Aussage" (`Partial`, kein Fehler).
-pub(super) fn parse_worker_return(text: &str) -> WorkerResultSummary {
-    let summary = clip(text.trim(), WORKER_TEXT_CLIP_CHARS);
-    if let Some(raw) = json_body(text).and_then(|body| serde_json::from_str::<RawReturn>(body).ok())
-    {
-        let outcome_text = raw.outcome.trim().to_lowercase();
-        let summary = if raw.summary.trim().is_empty() {
-            summary
-        } else {
-            clip(raw.summary.trim(), WORKER_TEXT_CLIP_CHARS)
-        };
-        let outcome = match outcome_text.as_str() {
-            "done" | "success" | "succeeded" | "please verify" => WorkerOutcome::Done,
-            "blocked" => WorkerOutcome::Blocked {
-                reason: if raw.blockers.is_empty() {
-                    summary.clone()
-                } else {
-                    raw.blockers.join("; ")
-                },
-            },
-            "failed" | "failure" => WorkerOutcome::Failed {
-                reason: summary.clone(),
-            },
-            _ => WorkerOutcome::Partial,
-        };
-        return WorkerResultSummary {
-            outcome,
-            summary,
-            artifacts: raw.artifacts,
-            suggested_next: raw.suggested_next.filter(|next| !next.trim().is_empty()),
-        };
-    }
-    let outcome = match plain_marker(text) {
-        Some(Marker::Done) => WorkerOutcome::Done,
-        Some(Marker::Blocked(reason)) => WorkerOutcome::Blocked { reason },
-        Some(Marker::Partial) | None => WorkerOutcome::Partial,
-    };
-    WorkerResultSummary {
-        outcome,
-        summary,
-        artifacts: Vec::new(),
-        suggested_next: None,
-    }
 }
 
 /// Baut die Bewerterfrage: stabiler Präfix (`JUDGE_INSTRUCTION`, Rolle, Ziel,
@@ -1757,6 +1823,15 @@ pub(super) fn judge_request(
         variable.push_str(&format!("\nEvidenz am Goal: {}", evidence.join("; ")));
     }
     JudgeRequest { prefix, variable }
+}
+
+/// Verifikationsstand für den Text an einen Worker (die Aufgabe ist englisch).
+fn worker_verification_text(state: &VerificationState) -> String {
+    match state {
+        VerificationState::NotRun => "not run yet".to_owned(),
+        VerificationState::Passed => "passed".to_owned(),
+        VerificationState::Failed { failing } => format!("failed:\n- {}", failing.join("\n- ")),
+    }
 }
 
 fn verification_label(state: &VerificationState) -> String {
@@ -1847,46 +1922,47 @@ fn verdict_from_object(object: &str) -> Option<JudgeVerdict> {
 /// Parst das Urteil tolerant und modellunabhängig, fail closed.
 ///
 /// # Description
-/// 1. Das erste JSON-Objekt mit `passed`/`met`/`verified` gewinnt.
-/// 2. Sonst `passed: false` mit dem Rohtext als Kommentar: `JUDGE_INSTRUCTION`
-///    verlangt vom Bewerter ausschließlich JSON, ein Klartext-Fallback ist
-///    daher nur die letzte Absicherung. Ein früherer Klartext-Marker-Scan auf
-///    bloße Wörter wie „PASSED"/„FAILED" träfe auch verneinte Formulierungen
-///    ohne das Wort „FAILED" (z. B. „hat … noch nicht PASSED") als
-///    `passed: true` — das widerspricht „im Zweifel nicht bestanden".
-pub(super) fn parse_verdict(text: &str) -> JudgeVerdict {
-    if let Some(verdict) = json_objects(text).into_iter().find_map(verdict_from_object) {
-        return verdict;
-    }
-    JudgeVerdict {
-        passed: false,
-        comment: clip(text.trim(), MAX_OUTCOME_REASON_CHARS),
-        missing: Vec::new(),
-    }
+/// Das erste JSON-Objekt mit `passed`/`met`/`verified` (bool) gewinnt. Ohne
+/// ein solches Objekt `None`: kein Urteil — weder „bestanden" noch still
+/// „nicht bestanden" ([`run_judge`] fragt begrenzt erneut, dann Eskalation).
+/// Ein Klartext-Marker-Scan auf bloße Wörter wie „PASSED"/„FAILED" träfe
+/// auch verneinte Formulierungen (z. B. „hat … noch nicht PASSED") und wird
+/// deshalb nicht versucht.
+pub(super) fn parse_verdict(text: &str) -> Option<JudgeVerdict> {
+    json_objects(text).into_iter().find_map(verdict_from_object)
 }
 
 /// Übersetzt einen Verifikationslauf in einen [`VerificationReport`].
 ///
 /// # Description
-/// Nachweise bestandener `Command`-Schritte bekommen den Befehlstext als
-/// Lokator: `evaluate_goal` ordnet `Command`-Schritte über `locator == cmd`
-/// zu, der Executor vergibt dagegen `verify-command:<cmd>` bzw. den
-/// Runner-Lokator.
+/// Nachweise bestandener Schritte werden so gestellt, wie `evaluate_goal`
+/// sie zuordnet: `Command` mit dem Befehlstext als Lokator (der Executor
+/// vergibt `verify-command:<cmd>` bzw. den Runner-Lokator), `Artifact` als
+/// `EvidenceKind::Diff` mit dem Pfad des
+/// Schritts als Lokator (der Executor vergibt `Other` und
+/// `workspace:<pfad>`); der Inhalts-Digest bleibt erhalten.
 pub(super) fn report_from_run(run: &VerifyRun) -> VerificationReport {
     let mut failing = Vec::new();
     let mut unverifiable = Vec::new();
     let mut evidence = Vec::new();
+    let mut failed_steps = 0_usize;
     for report in &run.steps {
         let label = step_label(&report.step);
         match &report.outcome {
             VerifyOutcome::Passed { evidence: found } => {
                 let mut found = found.clone();
-                if let VerificationStep::Command { cmd, .. } = &report.step {
-                    found.locator = cmd.clone();
+                match &report.step {
+                    VerificationStep::Command { cmd, .. } => found.locator = cmd.clone(),
+                    VerificationStep::Artifact { path } => {
+                        found.kind = harw_plan::EvidenceKind::Diff;
+                        found.locator = path.clone();
+                    }
+                    VerificationStep::TraceEvent { .. } | VerificationStep::Manual { .. } => {}
                 }
                 evidence.push(found);
             }
             VerifyOutcome::Failed { failure, .. } => {
+                failed_steps = failed_steps.saturating_add(1);
                 failing.push(format!("{label}: {failure}"));
                 if let Some(trace) = &report.trace {
                     let tail = String::from_utf8_lossy(&trace.stderr_tail);
@@ -1925,6 +2001,7 @@ pub(super) fn report_from_run(run: &VerifyRun) -> VerificationReport {
         failing,
         unverifiable,
         evidence,
+        failed_steps,
     }
 }
 
@@ -1938,14 +2015,22 @@ fn step_label(step: &VerificationStep) -> String {
 }
 
 /// Regeln für die `owned_paths` eines Scopes: die Datei selbst oder alles
-/// darunter.
+/// darunter; der Workspace-Scope ([`WORKSPACE_SCOPE`]) erlaubt alles
+/// (`**`) — was davon anderen Workern gehört, verbietet
+/// [`attribute_changes`] über `foreign`.
 fn owned_rules(owned_paths: &[String]) -> Vec<PathRule> {
     owned_paths
         .iter()
-        .map(|path| path.trim().trim_start_matches("./").trim_end_matches('/'))
-        .filter(|path| !path.is_empty())
+        .map(|path| path.trim())
         .flat_map(|path| {
-            [
+            if path == WORKSPACE_SCOPE {
+                return vec![PathRule::Glob("**".to_owned())];
+            }
+            let path = path.trim_start_matches("./").trim_end_matches('/');
+            if path.is_empty() {
+                return Vec::new();
+            }
+            vec![
                 PathRule::Exact(path.to_owned()),
                 PathRule::DirectoryPrefix(path.to_owned()),
             ]
@@ -1953,28 +2038,54 @@ fn owned_rules(owned_paths: &[String]) -> Vec<PathRule> {
         .collect()
 }
 
-/// Ordnet geänderte Pfade den Workern zu und meldet Pfade außerhalb aller
-/// `owned_paths` (über `harw_plan::admission::validate_patch`) sowie Pfade,
-/// die mehr als ein `owned_paths` derselben Prüfung treffen: `owned_paths`
-/// sollen laut Vertrag disjunkt sein, eine Überlappung ist deshalb fail
-/// closed ein Verstoß statt einer stillschweigenden Mehrfachzuschreibung.
+/// Ordnet geänderte Pfade den Workern eines gleichzeitig gelaufenen Blocks
+/// zu und meldet Verstöße.
+///
+/// # Description
+/// - Ein Pfad in den konkreten `owned_paths` genau eines Workers gehört ihm;
+///   trifft er mehrere, ist das fail closed ein Verstoß (`owned_paths` sollen
+///   laut Vertrag disjunkt sein) statt einer stillen Mehrfachzuschreibung.
+/// - Ein Pfad außerhalb aller konkreten `owned_paths` gehört dem einen
+///   Workspace-Worker des Blocks ([`WORKSPACE_SCOPE`]); gibt es mehrere, ist
+///   er nicht zuzuordnen (Verstoß).
+/// - Verstöße prüft `harw_plan::admission::validate_patch`: erlaubt ist die
+///   Vereinigung der Block-Regeln, verboten sind die `owned_paths` aller
+///   übrigen Worker des Laufs (`foreign`, Vorrang vor „erlaubt").
 pub(super) fn attribute_changes(
     diff: &UnifiedDiff,
     owners: &[(String, Vec<String>)],
+    foreign: &[String],
 ) -> WaveChanges {
     let mut changed: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut ambiguous: Vec<String> = Vec::new();
+    let concrete = |owned: &[String]| -> Vec<String> {
+        owned
+            .iter()
+            .filter(|path| path.trim() != WORKSPACE_SCOPE)
+            .cloned()
+            .collect()
+    };
+    let workspace_owners: Vec<String> = owners
+        .iter()
+        .filter(|(_, owned)| is_workspace_scope(owned))
+        .map(|(worker_id, _)| worker_id.clone())
+        .collect();
     for file in &diff.files {
         let matched: Vec<String> = owners
             .iter()
             .filter(|(_, owned)| {
-                owned_rules(owned)
+                owned_rules(&concrete(owned.as_slice()))
                     .iter()
                     .any(|rule| rule.matches(&file.path))
             })
             .map(|(worker_id, _)| worker_id.clone())
             .collect();
-        match matched.as_slice() {
+        let candidates: Vec<String> = if matched.is_empty() {
+            workspace_owners.clone()
+        } else {
+            matched
+        };
+        match candidates.as_slice() {
             [] => {}
             [worker_id] => {
                 changed
@@ -1999,7 +2110,7 @@ pub(super) fn attribute_changes(
             .iter()
             .flat_map(|(_, owned)| owned_rules(owned))
             .collect(),
-        forbidden_paths: Vec::new(),
+        forbidden_paths: owned_rules(&concrete(foreign)),
     };
     let report = validate_patch(&contract, diff);
     let mut violations: Vec<String> = report
@@ -2009,8 +2120,8 @@ pub(super) fn attribute_changes(
             harw_plan::admission::ScopeViolation::OutsideAllowed { path } => {
                 format!("'{path}' liegt außerhalb der owned_paths der Welle")
             }
-            harw_plan::admission::ScopeViolation::Forbidden { path, rule } => {
-                format!("'{path}' trifft die verbotene Regel {rule:?}")
+            harw_plan::admission::ScopeViolation::Forbidden { path, .. } => {
+                format!("'{path}' gehört einem anderen Worker des Laufs")
             }
             harw_plan::admission::ScopeViolation::BaseRevisionMismatch { .. } => {
                 "Schnappschüsse passen nicht zusammen".to_owned()
@@ -2018,6 +2129,16 @@ pub(super) fn attribute_changes(
         })
         .collect();
     violations.extend(ambiguous);
+    // Ein verbotener Pfad ist als Verstoß gemeldet und wird niemandem als
+    // Artefakt zugeschrieben (er fiele sonst an den Workspace-Worker).
+    for paths in changed.values_mut() {
+        paths.retain(|path| {
+            !report.violations.iter().any(|violation| {
+                matches!(violation, harw_plan::admission::ScopeViolation::Forbidden { path: bad, .. } if bad == path)
+            })
+        });
+    }
+    changed.retain(|_, paths| !paths.is_empty());
     WaveChanges {
         changed,
         violations,
@@ -2114,6 +2235,7 @@ pub(super) async fn execute_work_driver_claim(
         &provider,
         &submitter,
         &work_id,
+        &worker_role_of(&driver_input),
     );
     let mut memory = RunMemory::new(&driver_input.spec, config.provider_cap, record.submitted_at);
     let guard = match WorkspaceScopeGuard::new(runtime_root, context, &job_store) {
@@ -2136,6 +2258,7 @@ pub(super) async fn execute_work_driver_claim(
         submitter: submitter.clone(),
         control: Arc::clone(&control),
         deadline,
+        role_instructions: config.worker_instructions.clone(),
     };
     let sandboxed = context
         .verify_runner
@@ -2218,13 +2341,17 @@ struct RunConfig {
     /// Minimum aus `max_concurrency` und `rate_limit.max_concurrent` des
     /// Providers, über den die Worker laufen.
     provider_cap: Option<usize>,
+    /// Anweisungen der Worker-Rolle aus ihrer Definition; `None` ohne
+    /// Definition bzw. ohne Anweisungen.
+    worker_instructions: Option<String>,
 }
 
 /// Liest Bewerter-Modell und Provider-Grenze aus einer werkzeuglosen
 /// Prompt-Montage (dieselbe Konfiguration, die jeder Job-Turn sieht).
 ///
 /// Alle Worker laufen über den Provider des Dienstes (`ModelSource::Override`);
-/// seine Grenzen gelten, nicht die einer Rollen-Modell-Wahl.
+/// seine Grenzen gelten, nicht die einer Rollen-Modell-Wahl. Aus derselben
+/// Montage kommen die Anweisungen der Worker-Rolle (`worker_role`).
 fn load_run_config(
     context: &JobWorkerContext,
     runtime_root: &JobRuntimeRoot,
@@ -2232,6 +2359,7 @@ fn load_run_config(
     provider: &Arc<dyn ModelProvider>,
     submitter: &str,
     work_id: &WorkId,
+    worker_role: &str,
 ) -> RunConfig {
     let assembly = job_assembly(JobAssemblyInputs {
         entry: JobEntry::Prompt,
@@ -2244,13 +2372,20 @@ fn load_run_config(
         model: Arc::clone(provider),
         narrowing: None,
     });
-    let config = match assembly {
-        Ok(assembly) => Arc::clone(assembly.config()),
+    let (config, worker_instructions) = match assembly {
+        Ok(assembly) => (
+            Arc::clone(assembly.config()),
+            assembly
+                .agent_roster()
+                .instructions(worker_role)
+                .map(str::to_owned),
+        ),
         Err(error) => {
             tracing::warn!(error = %error, "work-driver could not read the configuration");
             return RunConfig {
                 judge: None,
                 provider_cap: None,
+                worker_instructions: None,
             };
         }
     };
@@ -2282,6 +2417,7 @@ fn load_run_config(
     RunConfig {
         judge,
         provider_cap,
+        worker_instructions,
     }
 }
 
@@ -2515,6 +2651,9 @@ struct JobTurnSpawner<'a> {
     submitter: String,
     control: Arc<WorkerExecutionControl>,
     deadline: tokio::time::Instant,
+    /// Anweisungen der Worker-Rolle aus ihrer Definition
+    /// (`AgentRoster::instructions`), falls vorhanden.
+    role_instructions: Option<String>,
 }
 
 impl WorkerSpawner for JobTurnSpawner<'_> {
@@ -2532,7 +2671,9 @@ impl JobTurnSpawner<'_> {
             "work-driver worker turn"
         );
         let (metered, meter) = MeteredModelProvider::new(Arc::clone(&self.provider));
-        let reply = match self.prepare(&request, Arc::new(metered)) {
+        // Eine Ablage je Turn: nur ein Bericht *dieses* Turns zählt.
+        let slot = Arc::new(WorkerReportSlot::new());
+        let reply = match self.prepare(&request, Arc::new(metered), &slot) {
             Ok((setup, model)) => {
                 drive_worker_turn(
                     setup,
@@ -2545,6 +2686,13 @@ impl JobTurnSpawner<'_> {
                 .await
             }
             Err(reason) => WorkerReply::Failed(reason),
+        };
+        let reply = match reply {
+            WorkerReply::Completed { text, .. } => WorkerReply::Completed {
+                text,
+                report: slot.take(),
+            },
+            other => other,
         };
         let usage = meter_snapshot(&meter);
         let reply = match (reply, usage.rate_limited) {
@@ -2566,11 +2714,13 @@ impl JobTurnSpawner<'_> {
 
     /// Montiert die Runtime des Worker-Turns, verengt auf Lesen bzw.
     /// Lesen + Schreiben (nur mit `owned_paths` und schreibender Rolle), ohne
-    /// Prozess-, Netz- oder Host-Rechte.
+    /// Prozess-, Netz- oder Host-Rechte, plus `work_driver.report` über
+    /// `slot` ([`ReportToolContributor`], nur in dieser Montage).
     fn prepare(
         &self,
         request: &WorkerRequest,
         model: Arc<dyn ModelProvider>,
+        slot: &Arc<WorkerReportSlot>,
     ) -> Result<(TurnSetup, Arc<dyn ModelProvider>), String> {
         let writes = !request.owned_paths.is_empty()
             && !matches!(role_access(&request.role), RoleAccess::ReadOnly);
@@ -2592,13 +2742,25 @@ impl JobTurnSpawner<'_> {
             )
         };
         let sandbox = job_sandbox(entry, &self.runtime_root.cwd)?;
+        let writable: &[String] = if writes { &request.owned_paths } else { &[] };
         let narrowing = RuntimeNarrowing {
             registry_profile: profile,
-            identity: worker_identity(&request.role, profile, &request.owned_paths),
+            identity: worker_identity(
+                &request.role,
+                profile,
+                writable,
+                self.role_instructions.as_deref(),
+            ),
             permissions: sandbox.permissions().clone(),
             workspace_root: Some(sandbox.workspace().canonical_root().to_path_buf()),
         };
-        assemble_job_turn(
+        let report_tool: Arc<dyn AssemblyContributor> = Arc::new(ReportToolContributor {
+            provider: Arc::new(WorkerReportToolProvider::new(
+                Arc::clone(slot),
+                request.criteria_total,
+            )),
+        });
+        assemble_job_turn_with(
             JobAssemblyInputs {
                 entry,
                 home: &self.runtime_root.home,
@@ -2612,38 +2774,78 @@ impl JobTurnSpawner<'_> {
             },
             PauseDisposition::Blocked,
             Some(&sandbox),
+            vec![report_tool],
         )
     }
 }
 
+/// Hängt `work_driver.report` in die Montage **eines** WorkDriver-Worker-Turns
+/// (R18 D-E). Kein Registry-Profil und keine andere Job-Art bekommt das
+/// Werkzeug; der Beitrag vergibt keine Rechte (das Werkzeug schreibt nur in
+/// seine [`WorkerReportSlot`]).
+struct ReportToolContributor {
+    provider: Arc<WorkerReportToolProvider>,
+}
+
+impl AssemblyContributor for ReportToolContributor {
+    fn contribute(
+        &self,
+        _inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> harw_runtime::RuntimeResult<()> {
+        let concrete = Arc::clone(&self.provider);
+        let provider: Arc<dyn harw_extension_api::ToolProvider> = concrete;
+        parts.registry = std::mem::take(&mut parts.registry).tool_provider(provider);
+        Ok(())
+    }
+}
+
 /// Identität eines Worker-Agenten; stabil je Rolle und Scope (Cache-Präfix).
+///
+/// # Arguments
+/// - `owned_paths`: der wirksame Schreibbereich (leer: nur lesen).
+/// - `instructions`: Anweisungen der Rollendefinition; stehen vorn im
+///   stabilen Präfix.
 fn worker_identity(
     role: &str,
     profile: RegistryProfile,
     owned_paths: &[String],
+    instructions: Option<&str>,
 ) -> IdentityOverrides {
     let write_rule = if owned_paths.is_empty() {
         "You may only read the workspace; do not change any file.".to_owned()
+    } else if is_workspace_scope(owned_paths) {
+        "You may change files anywhere in the workspace except paths other workers own; every          change is checked after the wave and a change in a foreign path blocks the whole run."
+            .to_owned()
     } else {
         format!(
             "Change only these paths: {}. Changes elsewhere block the whole run.",
             owned_paths.join(", ")
         )
     };
+    let mut extra_context: Vec<String> = instructions
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("Instructions of your role '{role}':\n{text}"))
+        .into_iter()
+        .collect();
+    extra_context.extend([
+        "You run unattended inside a durable job. There is no user: an approval request ends your turn as blocked."
+            .to_owned(),
+        write_rule,
+        "Never build or run tests: one central verification runs per wave over the combined state."
+            .to_owned(),
+        format!(
+            "Finish every turn by calling the tool `{WORK_DRIVER_REPORT_TOOL}`; a status line in your text is not read."
+        ),
+    ]);
     IdentityOverrides {
         agent_name: Some(format!("work-driver-{role}")),
         role_description: Some(format!(
             "{} working one scope of a work-driver run as role '{role}'",
             profile.role_description()
         )),
-        extra_context: vec![
-            "You run unattended inside a durable job. There is no user: an approval request ends your turn as blocked."
-                .to_owned(),
-            write_rule,
-            "Never build or run tests: one central verification runs per wave. If you want a build, end with 'please verify'."
-                .to_owned(),
-            "Finish every turn with the status line described in your task.".to_owned(),
-        ],
+        extra_context,
         organizational_role: Some(AgentRoleId::Worker),
     }
 }
@@ -2703,7 +2905,10 @@ async fn drive_worker_turn(
     };
     match joined {
         Ok(Ok(TurnOutcome::Completed)) => match durable_store.load_history(&session_id).await {
-            Ok(history) => WorkerReply::Text(last_assistant_text(&history)),
+            Ok(history) => WorkerReply::Completed {
+                text: last_assistant_text(&history),
+                report: None,
+            },
             Err(error) => WorkerReply::Failed(sanitize_failure(&error.to_string())),
         },
         Ok(Ok(paused)) => match paused_turn_outcome(&paused, pause) {
@@ -2776,6 +2981,7 @@ impl<R: VerifyRunner + Send + Sync> VerificationRunner for ExecutorVerifier<R> {
                         waited.as_secs()
                     )],
                     evidence: Vec::new(),
+                    failed_steps: 0,
                 },
             }
         })
@@ -2848,7 +3054,7 @@ impl Judge for ConversationJudge<'_> {
             };
             let usage = meter_snapshot(&meter);
             match (reply, usage.rate_limited) {
-                (WorkerReply::Text(text), _) => Ok(JudgeReply {
+                (WorkerReply::Completed { text, .. }, _) => Ok(JudgeReply {
                     text,
                     tokens: usage.tokens,
                 }),
@@ -2963,7 +3169,7 @@ impl WriteScopeGuard for WorkspaceScopeGuard {
         }
     }
 
-    fn after_wave(&self, owners: &[(String, Vec<String>)]) -> WaveChanges {
+    fn after_wave(&self, owners: &[(String, Vec<String>)], foreign: &[String]) -> WaveChanges {
         let before = match self.before.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -2981,7 +3187,7 @@ impl WriteScopeGuard for WorkspaceScopeGuard {
             &after,
         );
         diff.files.retain(|file| !self.is_excluded(&file.path));
-        attribute_changes(&diff, owners)
+        attribute_changes(&diff, owners, foreign)
     }
 }
 
@@ -2994,7 +3200,7 @@ mod tests {
     };
     use harw_plan::admission::{FileChange, PatchFile};
     use harw_plan::{Criterion, EvidenceKind, GoalId, GoalStatus, InMemoryGoalStore};
-    use harw_plan_bridge::WorkScope;
+    use harw_plan_bridge::WorkerReportStatus;
     use harw_plan_bridge::verify_exec::{CommandExit, CommandRequest, CommandRun, RunnerError};
     use harw_session_store::{ClaimRequest, CompleteRequest};
     use harw_types::WorkspaceId;
@@ -3226,7 +3432,7 @@ mod tests {
     impl WriteScopeGuard for FakeGuard {
         fn before_wave(&self) {}
 
-        fn after_wave(&self, owners: &[(String, Vec<String>)]) -> WaveChanges {
+        fn after_wave(&self, owners: &[(String, Vec<String>)], foreign: &[String]) -> WaveChanges {
             if let Ok(mut waves) = self.waves.lock() {
                 waves.push(owners.to_vec());
             }
@@ -3250,7 +3456,7 @@ mod tests {
                     base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
                     files: Vec::new(),
                 });
-            attribute_changes(&diff, owners)
+            attribute_changes(&diff, owners, foreign)
         }
     }
 
@@ -3423,18 +3629,34 @@ mod tests {
     const STATEMENT: &str = "Der Parser akzeptiert UTF-8 vollständig";
     const JOB: &str = "wd-run";
 
+    /// Ein abgeschlossener Turn mit einem `work_driver.report` dieses Status.
+    fn reported(status: WorkerReportStatus, summary: &str, blockers: Vec<String>) -> WorkerReply {
+        WorkerReply::Completed {
+            text: format!("{summary} (Freitext, wird nicht gelesen)"),
+            report: Some(WorkerReport {
+                status,
+                criteria_addressed: Vec::new(),
+                changed_paths: Vec::new(),
+                summary: summary.to_owned(),
+                blockers,
+            }),
+        }
+    }
+
     fn done_reply(summary: &str) -> WorkerReply {
-        WorkerReply::Text(format!("{summary}\nStatus: done"))
+        reported(WorkerReportStatus::Done, summary, Vec::new())
     }
 
     fn partial_reply() -> WorkerReply {
-        WorkerReply::Text("Halb fertig.\nStatus: partial".to_owned())
+        reported(WorkerReportStatus::Partial, "Halb fertig.", Vec::new())
     }
 
     fn blocked_reply(question: &str) -> WorkerReply {
-        WorkerReply::Text(format!(
-            "Ich komme nicht weiter.\nStatus: blocked: {question}"
-        ))
+        reported(
+            WorkerReportStatus::Blocked,
+            "Ich komme nicht weiter.",
+            vec![question.to_owned()],
+        )
     }
 
     fn passed_report() -> VerificationReport {
@@ -3443,6 +3665,19 @@ mod tests {
             failing: Vec::new(),
             unverifiable: Vec::new(),
             evidence: Vec::new(),
+            failed_steps: 0,
+        }
+    }
+
+    fn failed_report(steps: usize) -> VerificationReport {
+        VerificationReport {
+            verdict: VerifyVerdict::Failed,
+            failing: (0..steps)
+                .map(|step| format!("cargo test t{step}: exit code 1, expected 0"))
+                .collect(),
+            unverifiable: Vec::new(),
+            evidence: Vec::new(),
+            failed_steps: steps,
         }
     }
 
@@ -3559,6 +3794,7 @@ mod tests {
             owned_paths,
             text: "tu was".to_owned(),
             continuation: false,
+            criteria_total: 1,
         }
     }
 
@@ -3734,6 +3970,7 @@ mod tests {
             failing: vec!["cargo clippy --workspace: exit code 1, expected 0".to_owned()],
             unverifiable: Vec::new(),
             evidence: Vec::new(),
+            failed_steps: 1,
         }]);
         let input = input(10);
         let mut memory = memory_for(&input, None);
@@ -3832,8 +4069,9 @@ mod tests {
         let mut memory = memory_for(&input, None);
         step(&harness, &input, &ports, &mut memory, 1).await;
 
-        // Ein Block (Breite 4 ≥ 2 Worker): genau eine Pause, vor jedem Start
-        // (die zweite Abfrage danach meldet keine Wartezeit mehr).
+        // Zwei Workspace-Worker (reine `Command`-Kriterien) laufen in zwei
+        // Blöcken: genau eine Pause, vor jedem Start (jede weitere Abfrage
+        // meldet keine Wartezeit mehr).
         assert_eq!(fakes.pacer.pauses(), vec![Duration::from_secs(9)]);
         assert_eq!(spawner.pauses_at_start()?, vec![1, 1]);
         Ok(())
@@ -3975,6 +4213,7 @@ mod tests {
             failing: Vec::new(),
             unverifiable: Vec::new(),
             evidence: vec![evidence(cmd)],
+            failed_steps: 0,
         }]);
         let input = input(10);
         let mut memory = memory_for(&input, None);
@@ -4163,7 +4402,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls[1].continuation);
         assert_eq!(calls[0].worker_id, calls[1].worker_id);
-        assert!(calls[1].text.contains("Antwort des Operators: Unicode 15"));
+        assert!(calls[1].text.contains("## Operator answer\nUnicode 15"));
         Ok(())
     }
 
@@ -4243,6 +4482,7 @@ mod tests {
                 failing: Vec::new(),
                 unverifiable: vec!["workspace lock .harw/verify.lock held for 600 s".to_owned()],
                 evidence: Vec::new(),
+                failed_steps: 0,
             },
             passed_report(),
         ]);
@@ -4281,6 +4521,7 @@ mod tests {
             failing: Vec::new(),
             unverifiable: Vec::new(),
             evidence: vec![evidence(cmd)],
+            failed_steps: 0,
         }]);
         fakes.goals.fail_attach_evidence("store unavailable");
         let input = input(10);
@@ -4493,7 +4734,7 @@ mod tests {
                 change: FileChange::Modified,
             }],
         };
-        let wide = attribute_changes(&wide_diff, &wide_owners);
+        let wide = attribute_changes(&wide_diff, &wide_owners, &[]);
         assert!(wide.violations.is_empty());
         assert_eq!(wide.changed.get("w1"), Some(&vec!["b/x".to_owned()]));
         Ok(())
@@ -4551,7 +4792,7 @@ mod tests {
             ("w1".to_owned(), vec!["docs/a.md".to_owned()]),
             ("w2".to_owned(), Vec::new()),
         ];
-        let changes = attribute_changes(&diff, &owners);
+        let changes = attribute_changes(&diff, &owners, &[]);
         assert_eq!(
             changes.changed.get("w0"),
             Some(&vec!["src/parser/mod.rs".to_owned()])
@@ -4582,7 +4823,7 @@ mod tests {
             ("w0".to_owned(), vec!["src/parser".to_owned()]),
             ("w1".to_owned(), vec!["src/parser".to_owned()]),
         ];
-        let changes = attribute_changes(&diff, &owners);
+        let changes = attribute_changes(&diff, &owners, &[]);
         assert!(changes.changed.is_empty());
         assert_eq!(changes.violations.len(), 1);
         assert!(changes.violations[0].contains("src/parser/mod.rs"));
@@ -4668,36 +4909,50 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_verdict_is_tolerant_and_fails_closed() {
-        let passed = parse_verdict(r#"{"passed": true, "comment": "belegt"}"#);
+    fn test_parse_verdict_is_tolerant_and_fails_closed() -> TestResult {
+        let passed = some_or(
+            parse_verdict(r#"{"passed": true, "comment": "belegt"}"#),
+            "passed verdict",
+        )?;
         assert!(passed.passed);
         assert_eq!(passed.comment, "belegt");
         assert!(passed.missing.is_empty());
-        let minimal = parse_verdict(r#"{"passed": false}"#);
+        let minimal = some_or(parse_verdict(r#"{"passed": false}"#), "minimal verdict")?;
         assert!(!minimal.passed);
         assert!(minimal.comment.is_empty());
         assert!(minimal.missing.is_empty());
-        let old = parse_verdict(r#"{"met": false, "rationale": "r", "missing": ["a"]}"#);
+        let old = some_or(
+            parse_verdict(r#"{"met": false, "rationale": "r", "missing": ["a"]}"#),
+            "old field names",
+        )?;
         assert!(!old.passed);
         assert_eq!(old.comment, "r");
         assert_eq!(old.missing, vec!["a".to_owned()]);
-        let prose =
-            parse_verdict("Hier mein Urteil: {\"verified\": true, \"comment\": \"ok {x}\"} Ende.");
+        let prose = some_or(
+            parse_verdict("Hier mein Urteil: {\"verified\": true, \"comment\": \"ok {x}\"} Ende."),
+            "verdict in prose",
+        )?;
         assert!(prose.passed);
         assert_eq!(prose.comment, "ok {x}");
-        let first_bool_wins =
-            parse_verdict(r#"{"note": "x"} und dann {"passed": false, "comment": "c"}"#);
+        let first_bool_wins = some_or(
+            parse_verdict(r#"{"note": "x"} und dann {"passed": false, "comment": "c"}"#),
+            "first object with a bool",
+        )?;
         assert!(!first_bool_wins.passed);
-        // Kein JSON-Objekt: fail closed, auch wenn das bloße Wort "PASSED"
-        // vorkommt (kein Klartext-Marker-Scan mehr).
-        assert!(!parse_verdict("Ergebnis: PASSED").passed);
-        assert!(!parse_verdict("passed? no — FAILED").passed);
-        // Verneinte Formulierung ohne das Wort "FAILED": hätte der alte
-        // Klartext-Scan als `passed: true` gelesen.
-        assert!(!parse_verdict("This has not passed review yet; more tests are needed.").passed);
-        let nothing = parse_verdict("Ich kann das nicht beurteilen.");
-        assert!(!nothing.passed);
-        assert_eq!(nothing.comment, "Ich kann das nicht beurteilen.");
+        // Kein JSON-Urteil: kein Urteil — weder bestanden noch still „nicht
+        // bestanden", auch wenn das bloße Wort "PASSED" vorkommt (kein
+        // Klartext-Marker-Scan).
+        for text in [
+            "Ergebnis: PASSED",
+            "passed? no — FAILED",
+            "This has not passed review yet; more tests are needed.",
+            "Ich kann das nicht beurteilen.",
+            "{}",
+            r#"{"passed": "yes"}"#,
+        ] {
+            assert_eq!(parse_verdict(text), None, "{text}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -4716,34 +4971,6 @@ mod tests {
         assert_eq!(first.prefix, second.prefix);
         assert_ne!(first.variable, second.variable);
         assert!(second.variable.contains("Frage: Frage 2"));
-    }
-
-    #[test]
-    fn test_parse_worker_return_is_tolerant_and_model_agnostic() {
-        let json = parse_worker_return(
-            "Text\n```json\n{\"outcome\": \"done\", \"summary\": \"ok\", \"artifacts\": [\"a.rs\"], \"suggested_next\": \"Tests\"}\n```",
-        );
-        assert_eq!(json.outcome, WorkerOutcome::Done);
-        assert_eq!(json.artifacts, vec!["a.rs".to_owned()]);
-        assert_eq!(json.suggested_next.as_deref(), Some("Tests"));
-
-        let verify = parse_worker_return("Habe die Funktion angepasst.\n**PLEASE VERIFY**");
-        assert_eq!(verify.outcome, WorkerOutcome::Done);
-        let status = parse_worker_return("Fertig mit dem Umbau.\nStatus: Done.");
-        assert_eq!(status.outcome, WorkerOutcome::Done);
-        let blocked = parse_worker_return("Status: BLOCKED: Welche API-Version?");
-        assert_eq!(
-            blocked.outcome,
-            WorkerOutcome::Blocked {
-                reason: "Welche API-Version?".to_owned()
-            }
-        );
-        let none = parse_worker_return("Ich habe etwas gemacht, was getan werden musste.");
-        assert_eq!(none.outcome, WorkerOutcome::Partial);
-        assert_eq!(
-            none.summary,
-            "Ich habe etwas gemacht, was getan werden musste."
-        );
     }
 
     #[test]
@@ -4816,6 +5043,448 @@ mod tests {
         assert_eq!(limits.token_budget, 5_000);
         assert_eq!(limits.wall_budget.whole_seconds(), 90);
         assert_eq!(limits.max_parallel_workers, 4);
+    }
+
+    // ── R18 P4: report tool, scopes, verification, stall, judge ───────────
+
+    /// WD-01: a turn that called `work_driver.report` ends with exactly
+    /// `WorkerReport::into_summary`; its free text is not read.
+    #[tokio::test]
+    async fn test_wd01_a_reported_turn_becomes_the_report_summary() -> TestResult {
+        let harness = harness()?;
+        let mut fakes = Fakes::new(goal(vec![
+            command_criterion("a", "cargo test a"),
+            command_criterion("b", "cargo test b"),
+        ]));
+        let report = WorkerReport {
+            status: WorkerReportStatus::Blocked,
+            criteria_addressed: vec![1, 0],
+            changed_paths: vec!["src/x.rs".to_owned()],
+            summary: "halb erledigt".to_owned(),
+            blockers: vec!["Welche API?".to_owned()],
+        };
+        fakes.spawner = FakeSpawner::with_replies(vec![WorkerReply::Completed {
+            text: "Status: done".to_owned(),
+            report: Some(report.clone()),
+        }]);
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        step(&harness, &input, &fakes.ports(), &mut memory, 1).await;
+
+        let calls = fakes.spawner.calls()?;
+        assert!(calls.iter().all(|call| call.criteria_total == 2));
+        let state = state_of(&harness)?;
+        assert_eq!(
+            state.workers[0].last_result.as_ref(),
+            Some(&report.into_summary())
+        );
+        Ok(())
+    }
+
+    /// WD-02: a turn without a report is `Partial` with the explicit reason
+    /// "no report" — never read as `Done` from a status line.
+    #[tokio::test]
+    async fn test_wd02_a_turn_without_report_is_partial_with_no_report() -> TestResult {
+        let harness = harness()?;
+        let mut fakes = Fakes::new(goal(vec![command_criterion("a", "cargo test a")]));
+        fakes.spawner = FakeSpawner::with_replies(vec![WorkerReply::Completed {
+            text: "Fertig.\nStatus: done".to_owned(),
+            report: None,
+        }]);
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        step(&harness, &input, &fakes.ports(), &mut memory, 1).await;
+
+        let state = state_of(&harness)?;
+        let result = some_or(state.workers[0].last_result.clone(), "worker result")?;
+        assert_eq!(result.outcome, WorkerOutcome::Partial);
+        assert!(
+            result
+                .summary
+                .starts_with(harw_plan_bridge::NO_REPORT_REASON),
+            "{}",
+            result.summary
+        );
+        assert!(result.summary.contains("Status: done"));
+        assert!(
+            result
+                .suggested_next
+                .as_deref()
+                .is_some_and(|next| next.contains(WORK_DRIVER_REPORT_TOOL))
+        );
+        // Die nächste Runde setzt denselben Worker fort, statt zu verifizieren.
+        step(&harness, &input, &fakes.ports(), &mut memory, 1).await;
+        assert_eq!(fakes.verifier.calls(), 0);
+        assert!(fakes.spawner.calls()?[1].continuation);
+        Ok(())
+    }
+
+    #[test]
+    fn test_task_texts_carry_the_verification_and_the_report_contract() {
+        let text = first_task_text(
+            "## Goal\nx",
+            &[
+                "cargo test".to_owned(),
+                " ".to_owned(),
+                "cargo clippy".to_owned(),
+            ],
+        );
+        assert!(
+            text.contains(
+                "## Central verification (the driver runs these, not you)\n- `cargo test`\n- `cargo clippy`\n\n## Report"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with(RETURN_CONTRACT));
+        assert!(RETURN_CONTRACT.contains(WORK_DRIVER_REPORT_TOOL));
+        assert!(!RETURN_CONTRACT.contains("Status:"));
+        assert_eq!(first_task_text("t", &[]), format!("t\n\n{RETURN_CONTRACT}"));
+
+        let feedback = continue_text("Offen: [0] a", Some("ja"));
+        assert!(feedback.starts_with("## Driver feedback\nOffen: [0] a"));
+        assert!(feedback.contains("## Operator answer\nja"));
+        assert!(feedback.contains(WORK_DRIVER_REPORT_TOOL));
+        assert!(RESUME_AFTER_RATE_LIMIT.contains(WORK_DRIVER_REPORT_TOOL));
+    }
+
+    #[test]
+    fn test_worker_identity_uses_the_role_instructions_and_the_write_scope() {
+        let wide = worker_identity(
+            "implementer",
+            RegistryProfile::WorkspaceEdit,
+            &[WORKSPACE_SCOPE.to_owned()],
+            Some(" Arbeite sorgfältig. "),
+        );
+        assert_eq!(
+            wide.extra_context.first().map(String::as_str),
+            Some("Instructions of your role 'implementer':\nArbeite sorgfältig.")
+        );
+        assert!(
+            wide.extra_context
+                .iter()
+                .any(|line| line
+                    .contains("anywhere in the workspace except paths other workers own"))
+        );
+        assert!(
+            wide.extra_context
+                .last()
+                .is_some_and(|line| line.contains(WORK_DRIVER_REPORT_TOOL))
+        );
+        let reader = worker_identity("explorer", RegistryProfile::ReadOnlyExplore, &[], None);
+        assert!(
+            reader
+                .extra_context
+                .first()
+                .is_some_and(|line| line.starts_with("You run unattended"))
+        );
+        assert!(
+            reader
+                .extra_context
+                .iter()
+                .any(|line| line.contains("only read the workspace"))
+        );
+        let narrow = worker_identity(
+            "implementer",
+            RegistryProfile::WorkspaceEdit,
+            &["src/a".to_owned()],
+            None,
+        );
+        assert!(
+            narrow
+                .extra_context
+                .iter()
+                .any(|line| line.contains("Change only these paths: src/a."))
+        );
+    }
+
+    #[test]
+    fn test_blocks_hold_at_most_one_workspace_worker() {
+        let wide = |id: &str| worker_request(id, vec![WORKSPACE_SCOPE.to_owned()]);
+        let pending = vec![
+            wide("w0"),
+            worker_request("w1", vec!["a".to_owned()]),
+            wide("w2"),
+            wide("w3"),
+        ];
+        assert_eq!(chunk_end(&pending, 0, 4), 2);
+        assert_eq!(chunk_end(&pending, 2, 4), 3);
+        assert_eq!(chunk_end(&pending, 3, 4), 4);
+        assert_eq!(chunk_end(&pending, 0, 1), 1);
+        assert_eq!(
+            chunk_end(&pending, 1, 0),
+            2,
+            "at least one request per block"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_workspace_workers_never_run_in_the_same_block() -> TestResult {
+        let mut state = new_state(&work_id(), Timestamp::now());
+        state
+            .workers
+            .push(worker_state("w0", vec![WORKSPACE_SCOPE.to_owned()]));
+        state
+            .workers
+            .push(worker_state("w1", vec![WORKSPACE_SCOPE.to_owned()]));
+        state
+            .workers
+            .push(worker_state("w2", vec!["docs".to_owned()]));
+        let requests = vec![
+            worker_request("w0", vec![WORKSPACE_SCOPE.to_owned()]),
+            worker_request("w1", vec![WORKSPACE_SCOPE.to_owned()]),
+        ];
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        let fakes = Fakes::new(goal(Vec::new()));
+        let end = execute_wave(&mut state, &mut memory, &fakes.ports(), requests).await;
+        assert_eq!(end, None);
+        let waves = fakes
+            .guard
+            .waves
+            .lock()
+            .map(|waves| waves.clone())
+            .map_err(|_| TestError::Unexpected("guard lock".to_owned()))?;
+        assert_eq!(
+            waves,
+            vec![
+                vec![("w0".to_owned(), vec![WORKSPACE_SCOPE.to_owned()])],
+                vec![("w1".to_owned(), vec![WORKSPACE_SCOPE.to_owned()])],
+            ]
+        );
+        let foreign = foreign_paths(&state, &waves[0]);
+        assert_eq!(foreign, vec!["docs".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_worker_owns_the_rest_but_never_a_foreign_path() {
+        let file = |path: &str| PatchFile {
+            path: path.to_owned(),
+            source_path: None,
+            change: FileChange::Modified,
+        };
+        let diff = UnifiedDiff {
+            base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+            files: vec![file("src/a/x.rs"), file("README.md"), file("docs/y.md")],
+        };
+        let owners = vec![
+            ("w0".to_owned(), vec![WORKSPACE_SCOPE.to_owned()]),
+            ("w1".to_owned(), vec!["src/a".to_owned()]),
+        ];
+        let changes = attribute_changes(&diff, &owners, &["docs".to_owned()]);
+        assert_eq!(
+            changes.changed.get("w0"),
+            Some(&vec!["README.md".to_owned()])
+        );
+        assert_eq!(
+            changes.changed.get("w1"),
+            Some(&vec!["src/a/x.rs".to_owned()])
+        );
+        assert_eq!(changes.violations.len(), 1, "{:?}", changes.violations);
+        assert!(changes.violations[0].contains("docs/y.md"));
+        assert!(changes.violations[0].contains("anderen Worker"));
+
+        // Zwei Workspace-Worker in einem Block: nicht zuzuordnen, fail closed.
+        let two = vec![
+            ("w0".to_owned(), vec![WORKSPACE_SCOPE.to_owned()]),
+            ("w1".to_owned(), vec![WORKSPACE_SCOPE.to_owned()]),
+        ];
+        let readme = UnifiedDiff {
+            base_revision: RepoRevision(SCOPE_GUARD_REVISION.to_owned()),
+            files: vec![file("README.md")],
+        };
+        let ambiguous = attribute_changes(&readme, &two, &[]);
+        assert!(ambiguous.changed.is_empty());
+        assert_eq!(ambiguous.violations.len(), 1);
+    }
+
+    #[test]
+    fn test_verification_steps_include_artifacts_but_not_manual_steps() {
+        let goal = goal(vec![
+            artifact_criterion("a", "src/a.rs"),
+            artifact_criterion("b", "src/a.rs"),
+            command_criterion("c", "cargo test -p parser"),
+            manual_criterion("d"),
+        ]);
+        let steps = verification_steps(&spec(5), &goal);
+        let artifacts: Vec<&str> = steps
+            .iter()
+            .filter_map(|step| match step {
+                VerificationStep::Artifact { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(artifacts, vec!["src/a.rs"]);
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, VerificationStep::Manual { .. }))
+        );
+        assert_eq!(steps.len(), 3, "{steps:?}");
+    }
+
+    #[test]
+    fn test_report_from_run_maps_artifact_evidence_the_way_evaluate_goal_reads_it() -> TestResult {
+        use harw_plan_bridge::verify_exec::StepReport;
+        let mut found = evidence("x");
+        found.kind = EvidenceKind::Other;
+        found.locator = "workspace:src/a.rs".to_owned();
+        let run = VerifyRun {
+            steps: vec![StepReport {
+                index: 0,
+                step: VerificationStep::Artifact {
+                    path: "src/a.rs".to_owned(),
+                },
+                outcome: VerifyOutcome::Passed { evidence: found },
+                trace: None,
+            }],
+            skipped: 0,
+        };
+        let report = report_from_run(&run);
+        assert_eq!(report.verdict, VerifyVerdict::Passed);
+        assert_eq!(report.failed_steps, 0);
+        let mut goal = goal(vec![artifact_criterion("a", "src/a.rs")]);
+        goal.evidence = report.evidence;
+        let evaluated = goal_report(&goal, None).map_err(TestError::Unexpected)?;
+        assert_eq!(evaluated.criteria_met, vec![0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_artifact_criterion_is_verified_centrally_and_proposed() -> TestResult {
+        let harness = harness()?;
+        let workspace = tempfile::tempdir().map_err(ctx("workspace dir"))?;
+        std::fs::create_dir_all(workspace.path().join("src")).map_err(ctx("src dir"))?;
+        std::fs::write(workspace.path().join("src/parser.rs"), "fn parse() {}")
+            .map_err(ctx("artifact"))?;
+        let fakes = Fakes::new(goal(vec![artifact_criterion(
+            "Parser-Datei",
+            "src/parser.rs",
+        )]));
+        let verifier = ExecutorVerifier {
+            executor: VerificationExecutor::new(
+                PassingRunner::default(),
+                VerifyConfig::new(workspace.path(), DRIVER_ACTOR),
+            ),
+        };
+        let ports = DrivePorts {
+            verifier: &verifier,
+            ..fakes.ports()
+        };
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        let outcome = outcome_of(
+            run_rounds(
+                &harness.store,
+                &work_id(),
+                &input,
+                &ports,
+                &mut memory,
+                None,
+                &not_cancelled,
+            )
+            .await,
+        )?;
+        assert!(
+            matches!(outcome, JobOutcome::Succeeded { .. }),
+            "expected success, got {outcome:?}"
+        );
+        let goal = fakes.goals.snapshot()?;
+        assert!(
+            goal.evidence
+                .iter()
+                .any(|found| found.kind == EvidenceKind::Diff && found.locator == "src/parser.rs"),
+            "evidence: {:?}",
+            goal.evidence
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fewer_failing_verification_steps_count_as_progress() -> TestResult {
+        for (second, expected) in [(1, 0), (3, 2)] {
+            let harness = harness()?;
+            let mut fakes = Fakes::new(goal(vec![command_criterion("a", "cargo test a")]));
+            fakes.verifier =
+                FakeVerifier::with_reports(vec![failed_report(3), failed_report(second)]);
+            let input = input(20);
+            let mut memory = memory_for(&input, None);
+            // R1 Welle, R2 Verify (3 rot), R3 Basis + Fortsetzung, R4 Verify.
+            step(&harness, &input, &fakes.ports(), &mut memory, 3).await;
+            assert_eq!(state_of(&harness)?.usage.iterations_without_progress, 1);
+            step(&harness, &input, &fakes.ports(), &mut memory, 2).await;
+            assert_eq!(fakes.verifier.calls(), 2);
+            assert_eq!(
+                state_of(&harness)?.usage.iterations_without_progress,
+                expected,
+                "second verification with {second} failing steps"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_round_sets_baselines_before_it_counts() {
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        assert_eq!(memory.record_round(0), None, "first round: baseline only");
+        memory.progress_pending = true;
+        memory.last_failed_steps = Some(4);
+        assert_eq!(
+            memory.record_round(0),
+            Some(false),
+            "first verification: baseline"
+        );
+        memory.progress_pending = true;
+        memory.last_failed_steps = Some(4);
+        assert_eq!(memory.record_round(1), Some(true), "a newly met criterion");
+        memory.progress_pending = true;
+        memory.last_failed_steps = Some(2);
+        assert_eq!(memory.record_round(1), Some(true), "fewer failing steps");
+        memory.progress_pending = true;
+        memory.last_failed_steps = Some(3);
+        assert_eq!(memory.record_round(1), Some(false), "worse than the best");
+        assert_eq!(memory.record_round(1), None, "no verification in between");
+    }
+
+    #[tokio::test]
+    async fn test_an_unparsable_judge_is_asked_again_then_escalates() -> TestResult {
+        let harness = harness()?;
+        let mut fakes = Fakes::new(goal(vec![manual_criterion("Doku erklärt BOM-Verhalten")]));
+        fakes.judge = FakeJudge::replying("Das kann ich nicht beurteilen.");
+        let input = input(20);
+        let mut memory = memory_for(&input, None);
+        let outcome = outcome_of(
+            run_rounds(
+                &harness.store,
+                &work_id(),
+                &input,
+                &fakes.ports(),
+                &mut memory,
+                None,
+                &not_cancelled,
+            )
+            .await,
+        )?;
+        let JobOutcome::Blocked { reason } = outcome else {
+            return Err(TestError::Unexpected(format!(
+                "expected blocked, got {outcome:?}"
+            )));
+        };
+        assert!(reason.starts_with("work_driver:NeedsInput"), "{reason}");
+        assert!(reason.contains("kein auswertbares Urteil"), "{reason}");
+        let requests = fakes.judge.requests()?;
+        assert_eq!(requests.len(), MAX_UNPARSABLE_VERDICTS as usize);
+        assert!(!requests[0].variable.starts_with(JUDGE_FORMAT_REMINDER));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.variable.starts_with(JUDGE_FORMAT_REMINDER))
+        );
+        let state = state_of(&harness)?;
+        assert_eq!(state.last_judge, None, "no verdict was invented");
+        assert_eq!(fakes.spawner.calls()?.len(), 1, "no worker was re-driven");
+        Ok(())
     }
 
     #[tokio::test]

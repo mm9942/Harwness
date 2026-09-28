@@ -30,7 +30,9 @@
 //!    vorher über [`redact_text`]/[`redact_value`] von Geheimnissen
 //!    bereinigt. Ausgabe: `{decision, category, reason}`.
 //!    Fehler, Zeitlimit ([`CLASSIFIER_TIMEOUT`]), unparsebare Antwort oder
-//!    kein Modell → `ask`, nie `allow`.
+//!    kein Modell → `ask`, nie `allow`. R18 F2: eine leere Antwort wird
+//!    einmal wiederholt, danach einmal das Ersatzmodell gefragt
+//!    ([`ClassifierBackend::fallback`]); sonst `ask` mit benannter Ursache.
 //! 4. **Umwandlung** (Runde 6, Teil A1): kann jemand gefragt werden (Wurzel
 //!    bzw. Kind mit Freigabe-Kanal der TUI), wird ein `deny` zu `ask` mit
 //!    erhaltenem Grund. **Kinder ohne Pausenrecht und ohne Kanal** bekommen
@@ -71,7 +73,7 @@ use harw_config::{
 };
 use harw_core::PinnedModelProvider;
 use harw_core::model::ModelProvider;
-use harw_core::one_shot::complete_text;
+use harw_core::one_shot::{OneShotError, complete_text};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 use harw_extension_api::auto_mode::{
     AutoApprovalGate, AutoDecision, AutoDecisionLog, AutoLogEntry, AutoSessionContext, AutoVerdict,
@@ -1339,6 +1341,13 @@ pub trait ClassifierBackend: Send + Sync {
     fn timeout(&self) -> Option<Duration> {
         None
     }
+
+    /// R18 F2: Ersatz-Anbindung, die nach zwei leeren Antworten dieser
+    /// Anbindung genau einmal gefragt wird. `None`: kein Ersatz, nach zwei
+    /// leeren Antworten gilt `ask`.
+    fn fallback(&self) -> Option<Arc<dyn ClassifierBackend>> {
+        None
+    }
 }
 
 /// [`ClassifierBackend`] über einen [`ModelProvider`].
@@ -1347,6 +1356,8 @@ pub struct ModelClassifierBackend {
     model: String,
     /// Runde 7, Teil L4: eigenes Zeitlimit (siehe [`classifier_timeout_for`]).
     timeout: Option<Duration>,
+    /// R18 F2: Ersatzmodell (siehe [`harw_config::resolve_auto_classifier_fallback`]).
+    fallback: Option<Arc<dyn ClassifierBackend>>,
 }
 
 impl std::fmt::Debug for ModelClassifierBackend {
@@ -1354,6 +1365,10 @@ impl std::fmt::Debug for ModelClassifierBackend {
         f.debug_struct("ModelClassifierBackend")
             .field("model", &self.model)
             .field("timeout", &self.timeout)
+            .field(
+                "fallback",
+                &self.fallback.as_ref().map(|backend| backend.label()),
+            )
             .finish()
     }
 }
@@ -1366,7 +1381,15 @@ impl ModelClassifierBackend {
             provider,
             model: model.into(),
             timeout: None,
+            fallback: None,
         }
+    }
+
+    /// R18 F2: setzt die Ersatz-Anbindung für leere Antworten.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: Arc<dyn ClassifierBackend>) -> Self {
+        self.fallback = Some(fallback);
+        self
     }
 
     /// Setzt das eigene Zeitlimit dieser Anbindung (Runde 7, Teil L4).
@@ -1384,6 +1407,10 @@ impl ModelClassifierBackend {
     /// Ohne Auswahl fällt die Anbindung auf das Hauptmodell `root_model`
     /// zurück; fehlt auch das, gibt es keinen Klassifizierer (→ `ask`).
     ///
+    /// R18 F2: ist ein vom Klassifizierer verschiedenes Hauptmodell
+    /// konfiguriert ([`harw_config::resolve_auto_classifier_fallback`]),
+    /// wird es als Ersatz für leere Antworten angehängt (gleiches Zeitlimit).
+    ///
     /// # Arguments
     /// - `config` (`&ResolvedConfig`): die Konfiguration.
     /// - `root` (`Arc<dyn ModelProvider>`): der Wurzel-Provider.
@@ -1397,6 +1424,8 @@ impl ModelClassifierBackend {
         let selection = classifier_model_selection(config);
         let timeout =
             classifier_timeout_for(config, selection.as_ref().and_then(|(p, _)| p.as_deref()));
+        let fallback_choice = harw_config::resolve_auto_classifier_fallback(config);
+        let fallback_root = Arc::clone(&root);
         let backend = match selection {
             Some((provider, model)) => {
                 let pinned = PinnedModelProvider::new(
@@ -1410,7 +1439,23 @@ impl ModelClassifierBackend {
                 .filter(|model| !model.trim().is_empty())
                 .map(|model| Self::new(root, model)),
         };
-        backend.map(|backend| backend.with_timeout(timeout))
+        let backend = backend.map(|backend| backend.with_timeout(timeout))?;
+        // Dasselbe Modell (etwa das Hauptmodell ohne eigene Auswahl) ist kein
+        // Ersatz.
+        let fallback = fallback_choice
+            .filter(|(_, model)| model.as_str() != backend.model.as_str())
+            .map(|(provider, model)| {
+                let pinned = PinnedModelProvider::new(
+                    fallback_root,
+                    provider.as_deref().map(ProviderId::from),
+                    Some(ModelId::from(model.as_str())),
+                );
+                Self::new(Arc::new(pinned), model).with_timeout(timeout)
+            });
+        Some(match fallback {
+            Some(fallback) => backend.with_fallback(Arc::new(fallback)),
+            None => backend,
+        })
     }
 }
 
@@ -1425,7 +1470,13 @@ impl ClassifierBackend for ModelClassifierBackend {
                 CLASSIFIER_MAX_OUTPUT_TOKENS,
             )
             .await
-            .map_err(|error| error.to_string())
+            .or_else(|error| match error {
+                // R18 F2: eine leere Antwort ist kein Fehler des Aufrufs,
+                // sondern ein leerer Text — `classify_with` wiederholt dann
+                // einmal und fragt danach das Ersatzmodell.
+                OneShotError::EmptyResponse => Ok(String::new()),
+                other => Err(other.to_string()),
+            })
         })
     }
 
@@ -1435,6 +1486,10 @@ impl ClassifierBackend for ModelClassifierBackend {
 
     fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    fn fallback(&self) -> Option<Arc<dyn ClassifierBackend>> {
+        self.fallback.clone()
     }
 }
 
@@ -1494,7 +1549,43 @@ pub fn classifier_model_selection(config: &ResolvedConfig) -> Option<(Option<Str
     }
 }
 
+/// Ergebnis eines einzelnen Klassifizierer-Aufrufs.
+enum Attempt {
+    /// Ein Urteil (auch `fallback_ask` bei Fehler, Zeitlimit, unlesbarer
+    /// Antwort).
+    Verdict(AutoVerdict),
+    /// R18 F2: die Anbindung hat mit leerem Text geantwortet.
+    Empty,
+}
+
+/// Ein Aufruf der Anbindung mit Zeitlimit.
+async fn classify_once(backend: &dyn ClassifierBackend, user: &str, timeout: Duration) -> Attempt {
+    match tokio::time::timeout(timeout, backend.complete(CLASSIFIER_SYSTEM_PROMPT, user)).await {
+        Err(_elapsed) => Attempt::Verdict(AutoVerdict::fallback_ask(format!(
+            "Klassifizierer antwortete nicht binnen {} ms",
+            timeout.as_millis()
+        ))),
+        Ok(Err(error)) => Attempt::Verdict(AutoVerdict::fallback_ask(format!(
+            "Klassifizierer-Fehler: {}",
+            one_line(&error, MAX_REASON_CHARS)
+        ))),
+        Ok(Ok(text)) if text.trim().is_empty() => Attempt::Empty,
+        Ok(Ok(text)) => {
+            Attempt::Verdict(parse_verdict(&text).unwrap_or_else(|| {
+                AutoVerdict::fallback_ask("unlesbare Antwort des Klassifizierers")
+            }))
+        }
+    }
+}
+
 /// Befragt die Anbindung mit Zeitlimit; jeder Fehlschlag ergibt `ask`.
+///
+/// # Beschreibung
+/// R18 F2: eine leere Antwort wird genau einmal wiederholt. Ist auch die
+/// Wiederholung leer, wird die Ersatz-Anbindung ([`ClassifierBackend::fallback`])
+/// genau einmal gefragt; ohne Ersatz oder bei erneut leerer Antwort gilt
+/// `ask` mit einem Grund, der die Ursache (leere Antworten) und die
+/// befragten Modelle nennt. Nie `allow` ohne ein gelesenes Urteil.
 async fn classify_with(
     backend: &dyn ClassifierBackend,
     user: &str,
@@ -1504,17 +1595,26 @@ async fn classify_with(
     if tokio::runtime::Handle::try_current().is_err() {
         return AutoVerdict::fallback_ask("keine Laufzeit für das Zeitlimit des Klassifizierers");
     }
-    match tokio::time::timeout(timeout, backend.complete(CLASSIFIER_SYSTEM_PROMPT, user)).await {
-        Err(_elapsed) => AutoVerdict::fallback_ask(format!(
-            "Klassifizierer antwortete nicht binnen {} ms",
-            timeout.as_millis()
+    for _ in 0..2 {
+        if let Attempt::Verdict(verdict) = classify_once(backend, user, timeout).await {
+            return verdict;
+        }
+    }
+    let primary = one_line(&backend.label(), MAX_CATEGORY_CHARS);
+    let Some(fallback) = backend.fallback() else {
+        return AutoVerdict::fallback_ask(format!(
+            "Klassifizierer-Modell {primary} lieferte zweimal eine leere Antwort; \
+             kein Ersatzmodell konfiguriert"
+        ));
+    };
+    let fallback_timeout = fallback.timeout().unwrap_or(timeout);
+    match classify_once(fallback.as_ref(), user, fallback_timeout).await {
+        Attempt::Verdict(verdict) => verdict,
+        Attempt::Empty => AutoVerdict::fallback_ask(format!(
+            "Klassifizierer-Modell {primary} lieferte zweimal eine leere Antwort, \
+             Ersatzmodell {} ebenfalls",
+            one_line(&fallback.label(), MAX_CATEGORY_CHARS)
         )),
-        Ok(Err(error)) => AutoVerdict::fallback_ask(format!(
-            "Klassifizierer-Fehler: {}",
-            one_line(&error, MAX_REASON_CHARS)
-        )),
-        Ok(Ok(text)) => parse_verdict(&text)
-            .unwrap_or_else(|| AutoVerdict::fallback_ask("unlesbare Antwort des Klassifizierers")),
     }
 }
 
@@ -2274,6 +2374,143 @@ mod tests {
             assert_eq!(verdict.decision, AutoDecision::Ask, "{verdict:?}");
             assert_eq!(verdict.source, VerdictSource::Fallback, "{verdict:?}");
         }
+        Ok(())
+    }
+
+    // ── R18 F2: leere Antwort → Wiederholung, Ersatzmodell, ask ───────────
+
+    /// Backend-Doppel mit einer Folge von Antworten (danach leer), einem
+    /// Aufrufzähler und optionalem Ersatz.
+    struct ScriptedBackend {
+        label: &'static str,
+        replies: Mutex<std::collections::VecDeque<String>>,
+        calls: std::sync::atomic::AtomicUsize,
+        fallback: Option<Arc<ScriptedBackend>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(
+            label: &'static str,
+            replies: &[&str],
+            fallback: Option<Arc<ScriptedBackend>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                label,
+                replies: Mutex::new(replies.iter().map(|reply| (*reply).to_owned()).collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fallback,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ClassifierBackend for ScriptedBackend {
+        fn complete<'a>(&'a self, _system: &'a str, _user: &'a str) -> ClassifierFuture<'a> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reply = self
+                .replies
+                .lock()
+                .ok()
+                .and_then(|mut replies| replies.pop_front())
+                .unwrap_or_default();
+            Box::pin(async move { Ok(reply) })
+        }
+
+        fn label(&self) -> String {
+            self.label.to_owned()
+        }
+
+        fn fallback(&self) -> Option<Arc<dyn ClassifierBackend>> {
+            self.fallback
+                .as_ref()
+                .map(|backend| Arc::clone(backend) as Arc<dyn ClassifierBackend>)
+        }
+    }
+
+    fn scripted_handle(backend: Arc<ScriptedBackend>) -> AutoModeHandle {
+        let handle = AutoModeHandle::new(ApprovalModeCell::new(ApprovalMode::Delegated), ctx())
+            .with_classifier_timeout(Duration::from_millis(200));
+        handle.install_backend(backend);
+        handle
+    }
+
+    const ALLOW_REPLY: &str = r#"{"decision":"allow","category":"ok","reason":"passt"}"#;
+
+    /// EX-01: eine leere Antwort wird genau einmal wiederholt.
+    #[test]
+    fn an_empty_reply_is_retried_once() -> TestResult {
+        let primary = ScriptedBackend::new("primary", &["", ALLOW_REPLY], None);
+        let handle = scripted_handle(Arc::clone(&primary));
+        let verdict = run(handle.root_gate().decide(&shell("cargo build")))?;
+        assert_eq!(verdict.decision, AutoDecision::Allow, "{verdict:?}");
+        assert_eq!(primary.calls(), 2);
+        Ok(())
+    }
+
+    /// EX-01: nach zwei leeren Antworten entscheidet das Ersatzmodell.
+    #[test]
+    fn two_empty_replies_ask_the_fallback_model_once() -> TestResult {
+        let fallback = ScriptedBackend::new("fallback", &[ALLOW_REPLY], None);
+        let primary = ScriptedBackend::new("primary", &["", "  "], Some(Arc::clone(&fallback)));
+        let handle = scripted_handle(Arc::clone(&primary));
+        let verdict = run(handle.root_gate().decide(&shell("cargo build")))?;
+        assert_eq!(verdict.decision, AutoDecision::Allow, "{verdict:?}");
+        assert_eq!(primary.calls(), 2);
+        assert_eq!(fallback.calls(), 1);
+        Ok(())
+    }
+
+    /// EX-01/EX-02: ohne Ersatz bzw. mit leerem Ersatz gilt `ask` (nie
+    /// `allow`), und der Grund nennt die Ursache und die Modelle.
+    #[test]
+    fn empty_replies_without_usable_fallback_ask_with_a_named_cause() -> TestResult {
+        let primary = ScriptedBackend::new("primary", &[], None);
+        let handle = scripted_handle(Arc::clone(&primary));
+        let verdict = run(handle.root_gate().decide(&shell("cargo build")))?;
+        assert_eq!(verdict.decision, AutoDecision::Ask, "{verdict:?}");
+        assert_eq!(verdict.source, VerdictSource::Fallback);
+        assert_eq!(verdict.category, "classifier-unavailable");
+        assert!(
+            verdict.reason.contains("leere Antwort"),
+            "{}",
+            verdict.reason
+        );
+        assert!(verdict.reason.contains("primary"), "{}", verdict.reason);
+        assert!(
+            verdict.reason.contains("kein Ersatzmodell"),
+            "{}",
+            verdict.reason
+        );
+        assert_eq!(primary.calls(), 2);
+
+        let fallback = ScriptedBackend::new("fallback", &[], None);
+        let primary = ScriptedBackend::new("primary", &[], Some(Arc::clone(&fallback)));
+        let handle = scripted_handle(Arc::clone(&primary));
+        let verdict = run(handle.root_gate().decide(&shell("cargo build")))?;
+        assert_eq!(verdict.decision, AutoDecision::Ask, "{verdict:?}");
+        assert!(verdict.reason.contains("fallback"), "{}", verdict.reason);
+        assert!(
+            verdict.reason.contains("leere Antwort"),
+            "{}",
+            verdict.reason
+        );
+        assert_eq!(primary.calls(), 2);
+        assert_eq!(fallback.calls(), 1);
+        Ok(())
+    }
+
+    /// Ein Fehler (keine leere Antwort) wird nicht wiederholt.
+    #[test]
+    fn a_classifier_error_is_not_retried() -> TestResult {
+        let backend = StubBackend::replying(Err("HTTP 500"));
+        let handle = handle_with(Some(Arc::clone(&backend)));
+        let verdict = run(handle.root_gate().decide(&shell("cargo build")))?;
+        assert_eq!(verdict.decision, AutoDecision::Ask, "{verdict:?}");
+        assert!(verdict.reason.contains("HTTP 500"), "{}", verdict.reason);
+        assert_eq!(backend.prompts().len(), 1);
         Ok(())
     }
 

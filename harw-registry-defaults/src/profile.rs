@@ -743,6 +743,54 @@ pub const MATRIX_GAME_MASTER_TOOLS: &[&str] = &[
     "matrix.add_fact",
 ];
 
+// ── R18: Gateway-Werkzeuge und WorkDriver-Bericht ───────────────────────────
+
+/// Die lesenden `gateway.*`-Werkzeuge (R18-Vertrag §6, D-B): die fünf
+/// port-gestützten Leseoperationen (`harw_ops::gateway_ops::GATEWAY_READ_OPS`)
+/// und die vier Diagnoseoperationen ohne Port
+/// (`harw_ops::gateway_ops::GATEWAY_DIAGNOSTICS_OPS`). Alle deklarieren
+/// `model_tool(readonly, approval = "none")` und stehen in
+/// [`crate::AUTO_APPROVED_TOOLS`]; der Abgleich mit der echten
+/// Operations-Registry liegt in `harw-ops/tests/gateway_ops.rs` (dieses Crate
+/// darf `harw-ops` nicht sehen).
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Die Runtime hängt sie über ihre Gateway-Contributors ausschließlich an
+/// eine UIA-Wurzel (`harw-runtime/src/contributors.rs`).
+pub const GATEWAY_READ_TOOLS: &[&str] = &[
+    "gateway.status",
+    "gateway.connections.list",
+    "gateway.sessions.list",
+    "gateway.listeners.list",
+    "gateway.tools.list",
+    "gateway.channels.list",
+    "gateway.channels.connect_info",
+    "gateway.health",
+    "gateway.logs",
+];
+
+/// Die mutierenden `gateway.*`-Werkzeuge (R18-Vertrag §6, D-B). Alle
+/// deklarieren `model_tool(approval = "always")` und stehen in
+/// [`crate::ALWAYS_ASK_TOOLS`]: unter `ask`/`auto` fragt jeder Aufruf, auch
+/// gegen eine passende Allow-Regel. Die Freigabe erweitert nie die Rechte —
+/// das Gateway prüft weiter `gateway_admin` und den Mandanten des Aufrufers.
+pub const GATEWAY_MUTATION_TOOLS: &[&str] = &[
+    "gateway.connections.revoke",
+    "gateway.drain",
+    "gateway.listeners.set",
+    "gateway.tools.grant",
+    "gateway.tools.narrow",
+];
+
+/// Das Rückgabewerkzeug der WorkDriver-Worker (R18-Vertrag §8, D-E,
+/// `harw_plan_bridge::WORK_DRIVER_REPORT_TOOL`). Es schreibt nur den Bericht
+/// in den Slot des eigenen Worker-Turns (kein Workspace, kein Prozess, kein
+/// Netz) und steht in [`crate::AUTO_APPROVED_TOOLS`]: der Worker läuft
+/// unbeaufsichtigt im Job, eine Rückfrage würde jede Runde als „blocked"
+/// beenden. Registriert nur in der Worker-Montage von `harw-cli`
+/// (`job_worker_work_driver.rs`), nie über ein [`RegistryProfile`].
+pub const WORK_DRIVER_REPORT_TOOLS: &[&str] = &["work_driver.report"];
+
 /// Liefert [`MATRIX_GAME_MASTER_TOOLS`] für [`role_names::MATRIX_GAME_MASTER`],
 /// sonst nichts.
 ///
@@ -1319,6 +1367,12 @@ pub enum RegistryProfile {
     /// ausgewertete Befund-Batches als Parameter bekommen (`[tools].admitted
     /// = []`), etwa die vier `security-*-triage`-Rollen (siehe
     /// [`role_names::SECURITY_EGRESS_TRIAGE`] u. a.).
+    ///
+    /// Zugleich die lokale Grundlage eines an ein Gateway angebundenen
+    /// Agenten (R18 D-A): dort montiert die Runtime `NoTools` plus
+    /// ausschließlich den entfernten Proxy aus `harw-tool-remote`
+    /// (`harw_runtime::assembly::RuntimeAssemblyBuilder::remote_tools`);
+    /// kein lokaler Ausführer steht daneben.
     NoTools,
     /// Genau `fs.*` (alle sieben Werkzeuge, inklusive `fs.write`) plus
     /// `doc.read_pdf` — kein `shell.exec`, kein `web.*`, kein `deps.*`, kein
@@ -2557,7 +2611,13 @@ fn profile_tool_providers(
         let jobs = host_permits
             .and_then(|wiring| wiring.jobs.as_ref())
             .map(|jobs| Arc::new(jobs.tool_provider(&shell)) as Arc<dyn ToolProvider>);
-        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(shell)];
+        // R18 D-D: `shell.exec` startet immer in der Sandbox; eine genehmigte
+        // Host-Eskalation meldet es selbst über `"executed_on": "host"`.
+        // Die Hülle trägt genau diese Metadaten zur Fertigmeldung
+        // (`ToolCallCompleted::placement`), damit die TUI `sandbox`/`host`
+        // statt der Befehlszeile zeigen kann.
+        let mut providers: Vec<Arc<dyn ToolProvider>> =
+            vec![Arc::new(SandboxPlacedToolProvider::new(Arc::new(shell)))];
         providers.extend(jobs);
         providers
     };
@@ -2812,6 +2872,51 @@ fn profile_tool_providers(
             let latex: Arc<dyn ToolProvider> = Arc::new(LatexToolProvider::new());
             vec![filesystem, doc, latex]
         }
+    }
+}
+
+/// Meldet für jedes Werkzeug eines lokal sandboxierten Providers die
+/// Platzierung `sandbox` (R18 D-D, Vertrag
+/// `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §5).
+///
+/// # Beschreibung
+/// Jeder Ausführer des inneren Providers wird in
+/// [`harw_tools::executor::PlacedToolExecutor`] gehüllt; eine genehmigte
+/// Host-Eskalation (`"executed_on": "host"`) wird daraus beim Melden zu
+/// `host` ([`harw_tools::executor::ExecutionPlacement::resolve_local`]).
+/// Werkzeugliste und Parallelitätszusage bleiben unverändert.
+///
+/// # Nebenläufigkeit
+/// Thread-sicher; kein veränderlicher Zustand.
+pub struct SandboxPlacedToolProvider {
+    /// Der sandboxierte Provider (heute `ShellToolProvider`).
+    inner: Arc<dyn ToolProvider>,
+}
+
+impl SandboxPlacedToolProvider {
+    /// Hüllt `inner`.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ToolProvider>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ToolProvider for SandboxPlacedToolProvider {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.inner.tools()
+    }
+
+    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+        self.inner.executor(name).map(|executor| {
+            Arc::new(harw_tools::executor::PlacedToolExecutor::new(
+                executor,
+                harw_tools::executor::ExecutionPlacement::Sandbox,
+            )) as Arc<dyn ToolExecutor>
+        })
+    }
+
+    fn parallel_safe(&self, name: &ToolName) -> bool {
+        self.inner.parallel_safe(name)
     }
 }
 
@@ -3524,6 +3629,36 @@ mod tests {
     fn assemble(profile: RegistryProfile) -> TestResult<AssembledRegistry> {
         let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
         assemble_registry(profile, cwd, IdentityOverrides::default()).map_err(ctx("assemble"))
+    }
+
+    /// R18 D-D (RP-T6): `shell.exec` trägt die Platzierungs-Metadaten
+    /// `sandbox` (die Host-Eskalation leitet `resolve_local` daraus ab);
+    /// ein Werkzeug ohne Metadaten bleibt „unbekannt“ statt `host`.
+    #[test]
+    fn test_shell_exec_carries_sandbox_placement_metadata() -> TestResult {
+        use harw_tools::executor::ExecutionPlacement;
+
+        for profile in [RegistryProfile::Full, RegistryProfile::ShellExecution] {
+            let assembled = assemble(profile)?;
+            let executor_of = |name: &str| {
+                assembled
+                    .registry
+                    .tool_providers()
+                    .iter()
+                    .find_map(|provider| provider.executor(&ToolName::new(name)))
+            };
+            let shell = executor_of("shell.exec").ok_or(TestError::Missing("shell.exec"))?;
+            assert_eq!(
+                shell.placement(),
+                Some(ExecutionPlacement::Sandbox),
+                "{profile:?}"
+            );
+            if profile == RegistryProfile::Full {
+                let read = executor_of("fs.read").ok_or(TestError::Missing("fs.read"))?;
+                assert_eq!(read.placement(), None);
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -1,21 +1,27 @@
 //! Connection driver tests (W00 §9: WS-02, WS-03, WS-05, WS-06, WS-07,
-//! REV-01 at the transport level) over an in-memory duplex socket.
+//! REV-01 at the transport level; R18 TG-11/TG-12 at the transport level)
+//! over an in-memory duplex socket.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use harw_protocol::methods::{
-    METHOD_SESSION_ATTACH, METHOD_SESSION_HELLO, METHOD_SESSION_LIST, METHOD_TURN_SUBMIT,
+    METHOD_GATEWAY_STATUS, METHOD_SESSION_ATTACH, METHOD_SESSION_HELLO, METHOD_SESSION_LIST,
+    METHOD_TOOL_CALL, METHOD_TURN_SUBMIT,
 };
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, HelloAck, HelloParams,
-    HistoryParams, InterruptParams, RespondResult, SessionSummary, SetEffortParams, SetModeParams,
-    SetModelParams, SubmitParams, SubmitResult, error_codes,
+    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, GatewayConnectionsResult,
+    GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult,
+    GatewayRevokeParams, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
+    GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams, HistoryParams,
+    InterruptParams, RespondResult, SessionSummary, SetEffortParams, SetModeParams, SetModelParams,
+    SubmitParams, SubmitResult, error_codes,
 };
 use harw_protocol::{
-    ClientCaps, Cursor, FrameEnvelope, FrameSource, HostedState, PortError, PortFuture,
-    ProtocolVersion, RequestEnvelope, ResponseEnvelope, SessionFrame, SessionPort, WireMessage,
+    ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState, PortError,
+    PortFuture, ProtocolVersion, RequestEnvelope, ResponseEnvelope, SessionFrame, SessionPort,
+    WireMessage,
 };
 use harw_types::SessionId;
 use tokio::sync::{Mutex, Notify, mpsc, watch};
@@ -23,8 +29,9 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use super::{ConnectionEnd, serve_connection};
+use super::{ConnectionEnd, serve_connection, serve_connection_with};
 use crate::codec::CloseReason;
+use crate::dispatch::Ports;
 use crate::limits::WsLimits;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -42,6 +49,7 @@ impl FrameSource for ChannelSource {
 struct FakePort {
     sources: Mutex<Vec<mpsc::Receiver<FrameEnvelope>>>,
     release: Arc<Notify>,
+    hello_caps: ClientCaps,
 }
 
 fn summary(session_id: SessionId) -> SessionSummary {
@@ -63,7 +71,7 @@ impl SessionPort for FakePort {
                 wire_minor: params.wire_minor.min(1),
                 features: vec![],
                 host_epoch: 1,
-                granted: ClientCaps::OPERATE,
+                granted: self.hello_caps,
             })
         })
     }
@@ -151,6 +159,7 @@ async fn harness(limits: WsLimits, attachments: usize, capacity: usize) -> Harne
     let port = Arc::new(FakePort {
         sources: Mutex::new(receivers),
         release: Arc::clone(&release),
+        hello_caps: ClientCaps::OPERATE,
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(serve_connection(server, port, limits, shutdown_rx));
@@ -445,5 +454,126 @@ async fn revoked_frame_closes_the_connection() -> TestResult {
         Received::Closed(Some(code)) if code == CloseReason::Revoked.code()
     ));
     assert_eq!(h.server.await?, ConnectionEnd::Closed(CloseReason::Revoked));
+    Ok(())
+}
+
+/// Gateway port that counts calls and answers every one `NotFound`.
+#[derive(Default)]
+struct CountingGateway {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingGateway {
+    fn miss<T: Send + 'static>(&self) -> PortFuture<'_, T> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err(PortError::NotFound) })
+    }
+
+    fn count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl GatewayPort for CountingGateway {
+    fn status(&self) -> PortFuture<'_, GatewayStatus> {
+        self.miss()
+    }
+    fn connections(&self) -> PortFuture<'_, GatewayConnectionsResult> {
+        self.miss()
+    }
+    fn sessions(&self) -> PortFuture<'_, Vec<SessionSummary>> {
+        self.miss()
+    }
+    fn listeners(&self) -> PortFuture<'_, GatewayListenersResult> {
+        self.miss()
+    }
+    fn tools(&self) -> PortFuture<'_, GatewayToolsResult> {
+        self.miss()
+    }
+    fn revoke_connection(&self, _: GatewayRevokeParams) -> PortFuture<'_, GatewayRevokeResult> {
+        self.miss()
+    }
+    fn drain(&self, _: GatewayDrainParams) -> PortFuture<'_, GatewayStatus> {
+        self.miss()
+    }
+    fn set_listener(&self, _: GatewayListenerSetParams) -> PortFuture<'_, GatewayListenerInfo> {
+        self.miss()
+    }
+    fn grant_tools(&self, _: GatewayToolRightsParams) -> PortFuture<'_, GatewayToolRights> {
+        self.miss()
+    }
+    fn narrow_tools(&self, _: GatewayToolRightsParams) -> PortFuture<'_, GatewayToolRights> {
+        self.miss()
+    }
+}
+
+/// TG-12 at the transport level: the caps the host granted at hello gate
+/// `gateway.*` before the port; `tool.*` without a tool port is
+/// `METHOD_NOT_FOUND`; nothing R18 passes the hello gate.
+#[tokio::test]
+async fn r18_methods_follow_the_caps_granted_at_hello() -> TestResult {
+    let cases = [
+        (ClientCaps::OPERATE, error_codes::DENIED, 0),
+        (
+            ClientCaps::OPERATE.with(ClientCaps::GATEWAY_READ),
+            error_codes::NOT_FOUND,
+            1,
+        ),
+    ];
+    for (caps, expected, port_calls) in cases {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let session = Arc::new(FakePort {
+            sources: Mutex::new(Vec::new()),
+            release: Arc::new(Notify::new()),
+            hello_caps: caps,
+        });
+        let gateway = Arc::new(CountingGateway::default());
+        let ports = Ports {
+            session,
+            tools: None,
+            gateway: Some(Arc::clone(&gateway) as Arc<dyn GatewayPort>),
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = tokio::spawn(serve_connection_with(
+            server,
+            ports,
+            WsLimits::default(),
+            shutdown_rx,
+        ));
+
+        client
+            .send(request(
+                "0",
+                METHOD_GATEWAY_STATUS,
+                serde_json::Value::Null,
+            )?)
+            .await?;
+        let early = response(&mut client).await?;
+        assert_eq!(
+            early.error.map(|e| e.code),
+            Some(error_codes::HELLO_REQUIRED)
+        );
+        say_hello(&mut client).await?;
+        client
+            .send(request(
+                "1",
+                METHOD_GATEWAY_STATUS,
+                serde_json::Value::Null,
+            )?)
+            .await?;
+        let status = response(&mut client).await?;
+        assert_eq!(status.error.map(|e| e.code), Some(expected));
+        client
+            .send(request("2", METHOD_TOOL_CALL, serde_json::json!({}))?)
+            .await?;
+        let tool = response(&mut client).await?;
+        assert_eq!(
+            tool.error.map(|e| e.code),
+            Some(error_codes::METHOD_NOT_FOUND)
+        );
+        assert_eq!(gateway.count(), port_calls);
+    }
     Ok(())
 }

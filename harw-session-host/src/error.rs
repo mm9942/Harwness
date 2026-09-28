@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use harw_protocol::PortError;
+use harw_protocol::{PortError, ToolRefusal};
 
 /// Why a host operation failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,12 @@ pub enum HostError {
     Storage(String),
     /// The runtime driver failed.
     Driver(String),
+    /// R18: a `tool.call` was refused before it ran (unknown tool, not
+    /// granted, sandbox unavailable, draining, duplicate call id).
+    ToolRefused {
+        refusal: ToolRefusal,
+        detail: String,
+    },
 }
 
 impl fmt::Display for HostError {
@@ -34,6 +40,9 @@ impl fmt::Display for HostError {
             Self::Protocol(detail) => write!(f, "protocol: {detail}"),
             Self::Storage(detail) => write!(f, "storage: {detail}"),
             Self::Driver(detail) => write!(f, "driver: {detail}"),
+            Self::ToolRefused { refusal, detail } => {
+                write!(f, "tool refused ({}): {detail}", refusal.code())
+            }
         }
     }
 }
@@ -48,6 +57,7 @@ impl From<HostError> for PortError {
             HostError::NotFound => Self::NotFound,
             HostError::Revoked => Self::Revoked,
             HostError::Protocol(detail) => Self::Protocol(detail),
+            HostError::ToolRefused { refusal, detail } => Self::ToolRefused { refusal, detail },
             // Storage and driver details stay on the host (logs); the client
             // only learns that the host failed.
             HostError::Storage(_) | HostError::Driver(_) => Self::Transport("host error".into()),

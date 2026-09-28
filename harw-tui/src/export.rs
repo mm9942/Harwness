@@ -291,7 +291,7 @@ pub enum ExportEntry {
     User(String),
     /// Antwort von harw.
     Assistant(String),
-    /// Werkzeugaufruf mit Label (z. B. `Bash(git status)`) und optionaler Zusammenfassung.
+    /// Werkzeugaufruf mit Label (z. B. `Shell(git status)`) und optionaler Zusammenfassung.
     Tool {
         /// Kurzes, einzeiliges Label des Werkzeugaufrufs.
         label: String,
@@ -1778,12 +1778,12 @@ mod tests {
     #[test]
     fn test_render_markdown_tool_entries_default_to_enabled() {
         let entries = vec![ExportEntry::Tool {
-            label: "Bash(git status)".to_owned(),
+            label: "Shell(git status)".to_owned(),
             summary: Some("0 Dateien geändert".to_owned()),
         }];
 
         let default = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
-        assert!(default.contains("- ⚙ Bash(git status)"));
+        assert!(default.contains("- ⚙ Shell(git status)"));
         assert!(default.contains("0 Dateien geändert"));
 
         let opts = ExportOptions {

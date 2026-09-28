@@ -197,8 +197,8 @@ use crate::export::{
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
     AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell, PlanGraphCell,
-    ReasoningHistoryCell, SharedReasoningCell, SharedToolCell, SubAgentCell, SubAgentStatus,
-    ToolCell, ToolGroupCell, ToolState, ToolVerbosity, UserHistoryCell,
+    ReasoningHistoryCell, SharedPlanGraphCell, SharedReasoningCell, SharedToolCell, SubAgentCell,
+    SubAgentStatus, ToolCell, ToolGroupCell, ToolState, ToolVerbosity, UserHistoryCell,
 };
 use crate::host_permit_dialog::{HostPermitPrompt, HostPermitPromptReceiver, HostPermitVariant};
 use crate::keybindings::{KeyAction, KeyBindings};
@@ -460,6 +460,9 @@ enum ToolCellHandle {
     /// Eine einklappbare Reasoning-Zelle (Ctrl+O klappt sie wie
     /// Werkzeugzellen auf/zu).
     Reasoning(SharedReasoningCell),
+    /// Eine Plan-Zelle; ausgeklappt zeigt sie alle Knoten statt nur des
+    /// Deltas (R18 F4).
+    Plan(SharedPlanGraphCell),
 }
 
 impl ToolCellHandle {
@@ -473,6 +476,10 @@ impl ToolCellHandle {
             Self::Single(cell) => cell.lock().map(|guard| guard.expanded).unwrap_or(false),
             Self::Group(group) => group.lock().map(|guard| guard.expanded).unwrap_or(false),
             Self::Reasoning(cell) => cell
+                .lock()
+                .map(|guard| guard.is_expanded())
+                .unwrap_or(false),
+            Self::Plan(cell) => cell
                 .lock()
                 .map(|guard| guard.is_expanded())
                 .unwrap_or(false),
@@ -493,6 +500,11 @@ impl ToolCellHandle {
                 }
             }
             Self::Reasoning(cell) => {
+                if let Ok(mut guard) = cell.lock() {
+                    guard.set_expanded(expanded);
+                }
+            }
+            Self::Plan(cell) => {
                 if let Ok(mut guard) = cell.lock() {
                     guard.set_expanded(expanded);
                 }
@@ -545,8 +557,10 @@ impl HistoryCell for ToolHistoryCell {
                     style::warning_style(theme),
                 ))],
             },
-            // Reasoning-Zellen rendern sich selbst (Verbosity irrelevant).
+            // Reasoning- und Plan-Zellen rendern sich selbst (Verbosity
+            // irrelevant).
             ToolCellHandle::Reasoning(cell) => cell.display_lines(width, theme),
+            ToolCellHandle::Plan(cell) => cell.display_lines(width, theme),
         }
     }
 }
@@ -1194,6 +1208,10 @@ pub struct ChatApp {
     /// sofern noch erweiterbar; `None` schließt implizit jede vorherige
     /// Gruppe (Plan Schritt 2 „Gruppierung").
     open_tool_group: Option<Arc<Mutex<ToolGroupCell>>>,
+    /// Zuletzt als Zelle gezeigter Plan-Stand: der nächste
+    /// `TurnEvent::PlanUpdated` desselben Plans rendert nur das Delta
+    /// (R18 F4).
+    last_shown_plan: Option<harw_plan::Plan>,
     /// Runde 5, Teil I: Live-Blöcke der Kind-Agenten (Orchestratoren) unter
     /// ihrer Agent-Zeile; siehe [`crate::child_stream`].
     child_stream: crate::child_stream::ChildStreamRegistry,
@@ -1489,6 +1507,7 @@ impl ChatApp {
             tool_verbosity: ToolVerbosity::Compact,
             tool_cells: Vec::new(),
             open_tool_group: None,
+            last_shown_plan: None,
             // Runde 5, Teil I.
             child_stream: crate::child_stream::ChildStreamRegistry::default(),
             ctrl_o_expand_last_armed: false,
@@ -2468,6 +2487,20 @@ impl ChatApp {
         self.tool_cells.push(ToolCellHandle::Reasoning(shared));
     }
 
+    /// Hängt eine Plan-Zelle an (R18 F4): Vollbild beim ersten Stand eines
+    /// Plans, sonst das Delta zum zuletzt gezeigten Stand; merkt sie für
+    /// Ctrl+O vor.
+    fn push_plan_cell(&mut self, plan: harw_plan::Plan) {
+        let cell = match self.last_shown_plan.as_ref() {
+            Some(previous) => PlanGraphCell::delta(previous, plan.clone()),
+            None => PlanGraphCell::full(plan.clone()),
+        };
+        self.last_shown_plan = Some(plan);
+        let shared = cell.into_shared();
+        self.push_cell(Box::new(Arc::clone(&shared)));
+        self.tool_cells.push(ToolCellHandle::Plan(shared));
+    }
+
     /// Gibt `true` zurück, wenn mindestens eine Werkzeug- oder Reasoning-Zelle eingeklappt ist
     /// (Statuszeilen-Hinweis auf Ctrl+O, Plan Schritt 5).
     #[must_use]
@@ -3314,6 +3347,9 @@ impl ChatApp {
         self.cells.clear();
         self.tool_cells.clear();
         self.open_tool_group = None;
+        // Nach `/clear` ist kein Plan mehr sichtbar: der nächste Stand kommt
+        // wieder als Vollbild.
+        self.last_shown_plan = None;
         self.ctrl_o_expand_last_armed = false;
         self.live_stream.clear();
         self.live_reasoning.clear();
@@ -5481,6 +5517,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             call_id,
             result,
             duration_ms,
+            placement,
             ..
         } => {
             let cell = match state.pending_tool_cells.get(&call_id).cloned() {
@@ -5535,7 +5572,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             // kein Backfill von `duration_ms` hier mehr.
             let export_entry = match cell.lock() {
                 Ok(mut guard) => {
-                    guard.complete(&result, duration_ms);
+                    // R18 D-D: der Ort kommt vom ausführenden Teil.
+                    guard.complete_at(&result, duration_ms, placement.as_ref());
                     Some(export_tool_result_entry(
                         &call_id,
                         tool_name,
@@ -5810,7 +5848,10 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                         status: None,
                         agent: None,
                     }));
-                    app.push_cell(Box::new(PlanGraphCell { plan }));
+                    // R18 F4: jeder weitere Stand desselben Plans zeigt nur
+                    // Fortschritt und geänderte Knoten; Ctrl+O klappt die
+                    // vollständige Liste auf.
+                    app.push_plan_cell(plan);
                 }
                 Some(Err(error)) => {
                     tracing::warn!(
@@ -13263,6 +13304,7 @@ forbidden = [{forbidden}]
                 call_id: call_id.clone(),
                 result: ToolCallResult::error("nicht gefunden"),
                 duration_ms: 42,
+                placement: None,
             }
         ));
 
@@ -13401,6 +13443,50 @@ forbidden = [{forbidden}]
         let rendered = rendered_cells(&app);
         assert!(rendered.contains("plan-7"));
         assert!(rendered.contains("Knoten ergänzt"));
+        Ok(())
+    }
+
+    /// TUI-03 (R18 F4): der erste Stand eines Plans kommt als Vollbild, jeder
+    /// weitere als Delta, das Ctrl+O aufklappt; `/clear` setzt zurück.
+    #[test]
+    fn plan_cells_render_a_delta_after_the_first_state() -> TestResult {
+        let mut app = test_chat_app()?;
+        let plan = || harw_plan::Plan {
+            id: harw_plan::PlanId::new("p-delta"),
+            revision: harw_plan::RevisionId::new(1),
+            parent_revision: None,
+            goal_statement: "Ziel".to_owned(),
+            goal_id: None,
+            nodes: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
+        };
+
+        app.push_plan_cell(plan());
+        let first = rendered_cells(&app);
+        assert!(first.contains("(keine Knoten im Plan)"), "{first}");
+        assert!(!first.contains("keine Knotenänderung"), "{first}");
+
+        app.push_plan_cell(plan());
+        let second = rendered_cells(&app);
+        assert!(
+            second.contains("keine Knotenänderung · 0 Knoten · ctrl+o zum Ausklappen"),
+            "{second}"
+        );
+        // Ctrl+O klappt die letzte (Delta-)Zelle auf: Fortschritt statt Hinweis.
+        assert!(app.toggle_tool_cells());
+        let expanded = rendered_cells(&app);
+        assert!(!expanded.contains("keine Knotenänderung"), "{expanded}");
+        assert!(expanded.contains("0/0 erledigt (0 %)"), "{expanded}");
+
+        app.clear_transcript();
+        app.push_plan_cell(plan());
+        let after_clear = rendered_cells(&app);
+        assert!(
+            !after_clear.contains("keine Knotenänderung"),
+            "{after_clear}"
+        );
         Ok(())
     }
 
@@ -14641,6 +14727,7 @@ forbidden = [{forbidden}]
             runtime: "1m15s".to_owned(),
             active: true,
             failed: false,
+            reason: None,
         }
     }
 

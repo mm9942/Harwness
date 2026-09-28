@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use harw_tool_job::{Caller, JobEvent, JobId, JobManager, JobStatus};
+use harw_tool_job::{Caller, JobEvent, JobId, JobManager, JobState, JobStatus};
 use harw_types::SessionId;
 
 use super::background_agents::enqueue_background_notice;
@@ -192,34 +192,74 @@ pub(crate) fn poll(app: &mut ChatApp) -> bool {
     any || refreshed
 }
 
+/// Höchstlänge (Zeichen) der zitierten letzten Ausgabezeile eines
+/// fehlgeschlagenen Jobs in der Systemzeile.
+const FAILED_TAIL_CHARS: usize = 120;
+
 /// Einzeilige Systemzeile für Start, Ende und Hinweise eines Jobs;
 /// Fortschritt und Fehlerzeilen zeigt nur das Panel.
+///
+/// # Beschreibung
+/// Der Start nennt den startenden Werkzeugaufruf, sofern das Ereignis ihn
+/// trägt (`origin_tool`/`origin_call_id`, R18 TUI-07); das Ende eines
+/// fehlgeschlagenen Jobs nennt Signal und letzte Ausgabezeile als Grund
+/// (R18 F9), nie den Befehl.
 fn system_line(event: &JobEvent) -> Option<String> {
     match event {
         JobEvent::Started {
             job_id,
             name,
             executed_on_host,
+            origin_call_id,
+            origin_tool,
             ..
-        } => Some(format!(
-            "⚙ Job {job_id} „{name}“ gestartet ({})",
-            if *executed_on_host { "Host" } else { "Sandbox" }
-        )),
+        } => {
+            let origin = match (origin_tool, origin_call_id) {
+                (Some(tool), Some(call_id)) => format!(" · Aufruf {tool} {call_id}"),
+                (Some(tool), None) => format!(" · Aufruf {tool}"),
+                (None, Some(call_id)) => format!(" · Aufruf {call_id}"),
+                (None, None) => String::new(),
+            };
+            Some(format!(
+                "⚙ Job {job_id} „{name}“ gestartet ({}){origin}",
+                if *executed_on_host { "Host" } else { "Sandbox" }
+            ))
+        }
         JobEvent::Finished {
             job_id,
             name,
             state,
             exit_code,
+            signal,
             duration_secs,
-            ..
-        } => Some(format!(
-            "⚙ Job {job_id} „{name}“ beendet: {} nach {}{}",
-            harw_ops::jobs::state_label(*state),
-            harw_tool_job::format_duration(*duration_secs),
-            exit_code
-                .map(|code| format!(", Exit-Code {code}"))
-                .unwrap_or_default()
-        )),
+            tail,
+        } => {
+            let mut line = format!(
+                "⚙ Job {job_id} „{name}“ beendet: {} nach {}{}",
+                harw_ops::jobs::state_label(*state),
+                harw_tool_job::format_duration(*duration_secs),
+                exit_code
+                    .map(|code| format!(", Exit-Code {code}"))
+                    .unwrap_or_default()
+            );
+            if matches!(state, JobState::Failed | JobState::Unknown) {
+                if let Some(signal) = signal {
+                    line.push_str(&format!(", Signal {signal}"));
+                }
+                let last = tail
+                    .iter()
+                    .rev()
+                    .map(|entry| entry.trim())
+                    .find(|entry| !entry.is_empty());
+                if let Some(last) = last {
+                    line.push_str(&format!(
+                        " – {}",
+                        crate::history_cell::truncate_chars(last, FAILED_TAIL_CHARS)
+                    ));
+                }
+            }
+            Some(line)
+        }
         JobEvent::Warning {
             job_id,
             name,
@@ -521,6 +561,57 @@ mod tests {
         let _ = manager
             .stop(&id, Caller::Operator, harw_tool_job::JobSignal::Kill)
             .await;
+        Ok(())
+    }
+
+    /// TUI-05 (R18 F9): das Ende eines fehlgeschlagenen Jobs nennt den
+    /// Grund (Signal, letzte Ausgabezeile); der Start nennt den Aufruf.
+    #[test]
+    fn job_system_lines_show_reason_and_origin() -> TestResult {
+        let job_id = JobId::parse("job-9").ok_or(TestError::Missing("job id"))?;
+        let started = system_line(&JobEvent::Started {
+            job_id: job_id.clone(),
+            name: "tests".into(),
+            command: "cargo test".into(),
+            pid: Some(1),
+            executed_on_host: false,
+            origin_call_id: Some("call-9".into()),
+            origin_tool: Some("job.start".into()),
+            owner_agent: None,
+        })
+        .ok_or(TestError::Missing("Startzeile"))?;
+        assert_eq!(
+            started,
+            "⚙ Job job-9 „tests“ gestartet (Sandbox) · Aufruf job.start call-9"
+        );
+        assert!(!started.contains("cargo test"), "{started}");
+
+        let failed = system_line(&JobEvent::Finished {
+            job_id: job_id.clone(),
+            name: "tests".into(),
+            state: JobState::Failed,
+            exit_code: Some(101),
+            signal: None,
+            duration_secs: 5,
+            tail: vec!["error: test failed".into(), "  ".into()],
+        })
+        .ok_or(TestError::Missing("Endzeile"))?;
+        assert!(
+            failed.ends_with(", Exit-Code 101 – error: test failed"),
+            "{failed}"
+        );
+
+        let ok = system_line(&JobEvent::Finished {
+            job_id,
+            name: "tests".into(),
+            state: JobState::Succeeded,
+            exit_code: Some(0),
+            signal: None,
+            duration_secs: 5,
+            tail: vec!["ok".into()],
+        })
+        .ok_or(TestError::Missing("Endzeile"))?;
+        assert!(!ok.contains(" – "), "{ok}");
         Ok(())
     }
 

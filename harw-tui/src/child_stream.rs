@@ -567,6 +567,7 @@ impl ChildStreamBlock {
                 call_id,
                 result,
                 duration_ms,
+                placement,
                 ..
             } => {
                 let Some(cell) = self.pending_tools.remove(call_id) else {
@@ -575,7 +576,8 @@ impl ChildStreamBlock {
                 let redacted = redact_result(result);
                 match cell.lock() {
                     Ok(mut guard) => {
-                        guard.complete(&redacted, *duration_ms);
+                        // R18 D-D: Ort wie im Hauptverlauf zeigen.
+                        guard.complete_at(&redacted, *duration_ms, placement.as_ref());
                         true
                     }
                     Err(_) => false,
@@ -846,8 +848,9 @@ fn visible_text(content: &[ContentPart]) -> String {
     visible
 }
 
-/// Redigiert ein Werkzeugergebnis wie der Export.
-fn redact_result(result: &ToolCallResult) -> ToolCallResult {
+/// Redigiert ein Werkzeugergebnis wie der Export (auch für die Spur der
+/// Agenten-Detailansicht, `agent_monitor.rs`).
+pub(crate) fn redact_result(result: &ToolCallResult) -> ToolCallResult {
     match result {
         ToolCallResult::Success { value } => ToolCallResult::success(redact_json_value(value)),
         ToolCallResult::Error { message } => ToolCallResult::error(redact_text(message)),
@@ -1169,6 +1172,7 @@ mod tests {
             call_id: call_id.clone(),
             result,
             duration_ms: 7,
+            placement: None,
         }
     }
 

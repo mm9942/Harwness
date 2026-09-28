@@ -1411,6 +1411,12 @@ pub struct RuntimeAssemblyBuilder {
     /// Agenten-übergreifender Live-Bus; ohne expliziten Aufruf legt
     /// [`Self::build`] einen frischen an.
     agent_events: Option<harw_core::AgentEventHub>,
+    /// R18 D-A: der entfernte Werkzeugsatz eines an ein Gateway angebundenen
+    /// Laufs ([`Self::remote_tools`]); `None` ist der lokale Lauf.
+    remote_tools: Option<Arc<harw_tool_remote::RemoteToolProvider>>,
+    /// R18 D-B: der Gateway-Port eines mit dem Gateway verbundenen Laufs
+    /// ([`Self::gateway_port`]); `None` heißt „nicht verbunden".
+    gateway_port: Option<Arc<dyn harw_protocol::GatewayPort>>,
 }
 
 impl std::fmt::Debug for RuntimeAssemblyBuilder {
@@ -1435,6 +1441,14 @@ impl std::fmt::Debug for RuntimeAssemblyBuilder {
             .field("project_facts", &self.project_facts.is_some())
             .field("global_facts", &self.global_facts.is_some())
             .field("extra_lifecycle_hooks", &self.extra_lifecycle_hooks.len())
+            .field(
+                "remote_tools",
+                &self
+                    .remote_tools
+                    .as_ref()
+                    .map(|remote| remote.tool_names().len()),
+            )
+            .field("gateway_port", &self.gateway_port.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1639,6 +1653,61 @@ impl RuntimeAssemblyBuilder {
         self
     }
 
+    /// Bindet den Lauf an ein Gateway: Werkzeuge laufen nur noch dort (R18
+    /// D-A, Vertrag `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md`
+    /// §1, §10 P2).
+    ///
+    /// # Beschreibung
+    /// Fail closed, durchgesetzt in [`Self::build`]:
+    /// - die Einstiegszeile wird zu [`EntryProfile::for_tool_gateway`]:
+    ///   [`RegistryProfile::NoTools`], keine Operations-Modell-Werkzeuge,
+    ///   kein Spawner (Unteragenten erreichen Werkzeuge nur über die
+    ///   Delegation der UIA im Gateway, nie über eine lokale Kind-Registry);
+    /// - jeder dennoch montierte lokale `ToolProvider` (Contributors,
+    ///   Wurzel-Extras) wird vor dem Bau der Registry auf null Werkzeuge
+    ///   gefiltert;
+    /// - danach wird genau `provider` registriert. Ein vom Gateway
+    ///   abgelehnter Aufruf wird zu einem Fehlerergebnis, nie zu einer
+    ///   lokalen Ausführung.
+    ///
+    /// Eine [`Self::narrowing`] bleibt zulässig, solange sie `NoTools`
+    /// verlangt.
+    ///
+    /// # Argumente
+    /// - `provider`: aus `tool.list` gebaut
+    ///   ([`harw_tool_remote::RemoteToolProvider::connect`]); ein zweiter
+    ///   Aufruf ersetzt den ersten.
+    #[must_use]
+    pub fn remote_tools(mut self, provider: harw_tool_remote::RemoteToolProvider) -> Self {
+        self.remote_tools = Some(Arc::new(provider));
+        self
+    }
+
+    /// R18 D-B: bindet den Gateway-Port eines mit dem Gateway verbundenen
+    /// Laufs.
+    ///
+    /// # Beschreibung
+    /// Hängt beim ersten Aufruf einen
+    /// [`crate::contributors::GatewayContributor`] an (er registriert die
+    /// port-gestützten `gateway.*`-Operationen, nur für eine UIA-Wurzel) und
+    /// legt den Port als [`crate::services::RuntimeServicesParts::gateway`]
+    /// ab — auf Slash, Modell-Werkzeug und Web, nie auf Job
+    /// ([`crate::services::ServiceSurface::allows_gateway`]). Ein zweiter
+    /// Aufruf ersetzt nur den Port; der Contributor bleibt einmalig (er liest
+    /// den Port nicht, er registriert nur die Operationen). Ohne Aufruf gibt
+    /// es weder die Operationen noch den Dienst.
+    #[must_use]
+    pub fn gateway_port(mut self, port: Arc<dyn harw_protocol::GatewayPort>) -> Self {
+        if self.gateway_port.is_none() {
+            self.contributors
+                .push(Arc::new(crate::contributors::GatewayContributor::new(
+                    Arc::clone(&port),
+                )));
+        }
+        self.gateway_port = Some(port);
+        self
+    }
+
     /// Montiert den Lauf.
     ///
     /// # Rückgabe
@@ -1687,6 +1756,8 @@ impl RuntimeAssemblyBuilder {
             global_facts,
             extra_lifecycle_hooks,
             agent_events,
+            remote_tools,
+            gateway_port,
         } = self;
         let agent_events = agent_events.unwrap_or_default();
 
@@ -1704,6 +1775,13 @@ impl RuntimeAssemblyBuilder {
         let profile = match spec.embedded.as_ref() {
             Some(embedded) => crate::spec::EntryProfile::for_embedded(embedded.rights()),
             None => spec.entry.profile(),
+        };
+        // R18 D-A: ein an ein Gateway angebundener Lauf führt nichts lokal
+        // aus (siehe `RuntimeAssemblyBuilder::remote_tools`).
+        let profile = if remote_tools.is_some() {
+            profile.for_tool_gateway()
+        } else {
+            profile
         };
 
         // 0. Verengung des Aufrufers — fail-closed, bevor irgendetwas gelesen
@@ -2785,6 +2863,8 @@ impl RuntimeAssemblyBuilder {
             // fehlende oder ungültige Sektion ergibt `None` (Warnung, nie ein
             // Montagefehler); es wird hier kein Socket geöffnet.
             infrastructure: crate::infrastructure::build_infrastructure(&config),
+            // R18 D-B: nur mit `RuntimeAssemblyBuilder::gateway_port`.
+            gateway: gateway_port,
         });
         // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
         // `with_home_context` legt nur dann einen eigenen an, wenn hier
@@ -2857,25 +2937,27 @@ impl RuntimeAssemblyBuilder {
             }
             None => services,
         };
-        // R14: `work_driver.enqueue` liest seinen Aufrufer-Anker nur, wenn die
-        // Wurzel ein expliziter Agent ist (`agent_ir`), nie über die UIA und
-        // nie für Kind- oder Job-Sessions — die bekommen ihre eigene
-        // `WorkDriverCaller`-Instanz anderswo. Der Rollenname ist derselbe
-        // wie `spawn_context.organizational_role` (siehe dort: bei gesetztem
-        // `agent_ir` ist das exakt `ir.role()`).
-        let services = services.with_work_driver_caller(
-            agent_ir
-                .as_ref()
-                .and_then(|ir| {
-                    harw_ops::work_driver::WorkDriverCaller::from_executable(
-                        harw_core::delegation_visibility::role_label(
-                            spawn_context.organizational_role,
-                        ),
-                        ir,
-                    )
-                })
-                .map(Arc::new),
-        );
+        // R14: `work_driver.enqueue` liest seinen Aufrufer-Anker an der
+        // Wurzel — für einen expliziten Agenten (`agent_ir`, nur mit eigener
+        // `[work_driver]`-Sektion) und, seit R18 F6 (P4), für die UIA
+        // (`uia_ir`): sie bekommt **immer** einen Anker, mit ihrer eigenen
+        // Sektion oder sonst der UIA-Vorgabe (`WorkDriverCaller::for_uia`);
+        // `work_driver.enqueue` fragt dort immer (`approval = "always"`).
+        // Nie für Kind- oder Job-Sessions — die bekommen ihre eigene
+        // `WorkDriverCaller`-Instanz anderswo. Der Rollenname des expliziten
+        // Agenten ist derselbe wie `spawn_context.organizational_role`
+        // (siehe dort: das ist exakt `ir.role()` der aktiven Wurzel-IR).
+        let work_driver_caller = match (agent_ir.as_ref(), uia_ir.as_ref()) {
+            (Some(ir), _) => harw_ops::work_driver::WorkDriverCaller::from_executable(
+                harw_core::delegation_visibility::role_label(spawn_context.organizational_role),
+                ir,
+            ),
+            (None, Some(uia)) => Some(harw_ops::work_driver::WorkDriverCaller::for_uia(
+                uia.work_driver.as_ref(),
+            )),
+            (None, None) => None,
+        };
+        let services = services.with_work_driver_caller(work_driver_caller.map(Arc::new));
         let services = Arc::new(services);
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
@@ -3230,6 +3312,21 @@ impl RuntimeAssemblyBuilder {
             })
         } else {
             registry_builder
+        };
+        // R18 D-A: an ein Gateway gebunden gibt es keinen lokalen Ausführer.
+        // Jeder bis hierher montierte Provider (Contributors, Wurzel-Extras)
+        // wird auf null Werkzeuge gefiltert; danach steht genau der entfernte
+        // Proxy in der Registry.
+        let registry_builder = match remote_tools.as_ref() {
+            Some(remote) => registry_builder
+                .map_tool_providers(|provider| {
+                    Arc::new(harw_registry_defaults::RestrictedToolProvider::new(
+                        provider,
+                        &[],
+                    ))
+                })
+                .tool_provider(Arc::clone(remote) as Arc<dyn harw_extension_api::ToolProvider>),
+            None => registry_builder,
         };
         let registry = registry_builder.build();
         let tools = registered_tool_names(&registry);
@@ -5320,6 +5417,8 @@ impl RuntimeAssembly {
             global_facts: None,
             extra_lifecycle_hooks: Vec::new(),
             agent_events: None,
+            remote_tools: None,
+            gateway_port: None,
         }
     }
 

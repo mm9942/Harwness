@@ -284,7 +284,10 @@ async fn requested_caps_only_narrow() -> TestResult {
         })
         .await?;
     assert_eq!(ack.granted, ClientCaps::OBSERVE);
-    assert_eq!(ack.wire_minor, 1);
+    assert_eq!(
+        ack.wire_minor,
+        harw_protocol::session_wire::SESSION_WIRE_MINOR
+    );
 
     let owner = fx.host.connect(local(2, PermissionTier::Owner))?;
     let ack = owner
@@ -685,6 +688,61 @@ async fn drain_tells_clients_to_come_back() -> TestResult {
     })
     .await?;
     assert!(fx.host.connect(local(2, PermissionTier::Operator)).is_err());
+    Ok(())
+}
+
+/// R18 §7: while draining, new submissions are refused in band; the
+/// W00 caps and tenant admission still come first.
+#[tokio::test]
+async fn drain_refuses_new_submissions() -> TestResult {
+    let fx = fixture()?;
+    let client = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = client.create(CreateParams::default()).await?.session_id;
+    fx.host.drain(10);
+    assert!(fx.host.is_draining());
+    let result = client
+        .submit(submit(&session, "hi", "m1", Cursor::default()))
+        .await?;
+    assert!(matches!(result, SubmitResult::Denied { .. }));
+    assert_eq!(fx.driver.turns.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// R18 §2.3: a minor-1 hello never carries an R18 cap, even when the
+/// ceiling holds one; features of minor 2 are not negotiated at minor 1.
+#[tokio::test]
+async fn minor_one_hello_masks_r18_caps_and_features() -> TestResult {
+    let fx = fixture()?;
+    let mut identity = local(1, PermissionTier::Owner);
+    identity.caps = identity.caps.with(crate::identity::gateway_caps_for_tier(
+        PermissionTier::Owner,
+    ));
+    let old = fx.host.connect(identity.clone())?;
+    let ack = old
+        .hello(HelloParams {
+            client_label: "old".into(),
+            wire_minor: 1,
+            features: vec!["gateway".into(), "compact".into()],
+            requested_caps: None,
+        })
+        .await?;
+    assert_eq!(ack.granted, ClientCaps::ALL);
+    assert_eq!(ack.features, vec!["compact".to_owned()]);
+    let new = fx.host.connect(ClientIdentity {
+        connection: crate::identity::ConnectionId::next(),
+        ..identity
+    })?;
+    let ack = new
+        .hello(HelloParams {
+            client_label: "new".into(),
+            wire_minor: 2,
+            features: vec!["gateway".into()],
+            requested_caps: None,
+        })
+        .await?;
+    assert!(ack.granted.gateway_read && ack.granted.gateway_admin);
+    assert!(!ack.granted.tool_call);
+    assert_eq!(ack.features, vec!["gateway".to_owned()]);
     Ok(())
 }
 

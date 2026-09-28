@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_authority::NetworkScope;
 use harw_config::ResolvedConfig;
 use harw_core::SpawnContext;
@@ -33,6 +34,7 @@ use harw_extension_api::ExtensionRegistryBuilder;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_operations::registry::OperationRegistry;
 use harw_project_discovery::ProjectContext;
+use harw_protocol::GatewayPort;
 
 use crate::assembly::{SessionLifecycleHook, TurnLimits};
 use crate::config::ConfigTrustReport;
@@ -141,6 +143,8 @@ pub trait AssemblyContributor: Send + Sync {
 ///   Werkzeuge `mcp.<server>.<tool>` (No-op ohne aktive `[mcps.*]`).
 /// - [`InfrastructureContributor`]: die `infra.*`-Operationen, wenn
 ///   `[infrastructure]` konfiguriert ist (No-op ohne die Sektion).
+/// - [`GatewayDiagnosticsContributor`][]: `gateway.health`/`gateway.logs`/
+///   `gateway.channels.*` für eine UIA-Wurzel (No-op für jede andere Wurzel).
 /// - [`BrowserRootContributor`] (Feature `browser`): `browser.*` für die
 ///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
 #[must_use]
@@ -150,6 +154,7 @@ pub fn default_contributors() -> Vec<Arc<dyn AssemblyContributor>> {
     let mut contributors: Vec<Arc<dyn AssemblyContributor>> = vec![
         Arc::new(crate::mcp_wiring::McpContributor),
         Arc::new(InfrastructureContributor),
+        Arc::new(GatewayDiagnosticsContributor),
     ];
     #[cfg(feature = "browser")]
     contributors.push(Arc::new(BrowserRootContributor));
@@ -202,6 +207,127 @@ impl AssemblyContributor for InfrastructureContributor {
     }
 }
 
+/// Ob eine Wurzel die `gateway.*`-Operationen bekommt (R18 D-B).
+///
+/// # Beschreibung
+/// Nur die User-Interface-Agent-Wurzel (`AgentRoleId::UserInterface`) — sie
+/// ist nach R18 D-A die einzige Rolle mit eigenen Werkzeugrechten am Gateway;
+/// Unteragenten und Worker erreichen das Gateway nie über diese Fläche. Ein
+/// Einstieg mit [`OperationSurface::None`] bekommt, wie bei
+/// [`InfrastructureContributor`], nichts.
+fn gateway_ops_wanted(role: AgentRoleId, operations: OperationSurface) -> bool {
+    role == AgentRoleId::UserInterface && operations != OperationSurface::None
+}
+
+/// Registriert die zehn port-gestützten `gateway.*`-Operationen des
+/// R18-Vertrags (§6), wenn die Laufzeit mit einem Gateway verbunden ist.
+///
+/// # Beschreibung
+/// Muster wie [`InfrastructureContributor`]: **Registrierung gated,
+/// Verfügbarkeit über den Dienst.** Der Contributor existiert nur, wenn der
+/// Einstieg einen `Arc<dyn GatewayPort>` hat — er ist deshalb **nicht** Teil
+/// von [`default_contributors`], sondern wird vom verbundenen Einstieg über
+/// [`crate::assembly::RuntimeAssemblyBuilder::gateway_port`] angehängt. Ohne
+/// Gateway gibt es ihn nicht, und die Operationen erscheinen weder als
+/// Modell-Werkzeug noch in `/help` oder als Web-Route.
+///
+/// Registriert wird nur für die UIA-Wurzel ([`gateway_ops_wanted`]). Lesende
+/// Operationen sind freie Modell-Werkzeuge, mutierende tragen
+/// `approval = "always"`; die Schlüsseloperationen (`infra.auth.keys.*`)
+/// bleiben ohne Modellfläche (Regel in `harw_ops::infra`).
+///
+/// Der Port selbst liegt als `Arc<dyn GatewayPort>` in den Service-Maps der
+/// Flächen Slash, Modell-Werkzeug und Web (nie Job,
+/// [`crate::services::ServiceSurface::allows_gateway`]);
+/// [`AssemblyParts`] trägt bewusst keine Dienste, deshalb setzt
+/// [`crate::assembly::RuntimeAssemblyBuilder::gateway_port`] beides: diesen
+/// Contributor und `RuntimeServicesParts::gateway`. Solange der Dienst fehlt,
+/// melden alle zehn Operationen `OpError::NotAvailable` („gateway not
+/// configured") — fail closed.
+///
+/// Ein Registrierungskonflikt wird als Warnung gemeldet und bricht die
+/// Montage nicht ab.
+pub struct GatewayContributor {
+    port: Arc<dyn GatewayPort>,
+}
+
+impl GatewayContributor {
+    /// Contributor für eine mit dem Gateway verbundene Laufzeit.
+    #[must_use]
+    pub fn new(port: Arc<dyn GatewayPort>) -> Self {
+        Self { port }
+    }
+
+    /// Der Gateway-Port, den die Montage in die Service-Maps legt.
+    #[must_use]
+    pub fn port(&self) -> &Arc<dyn GatewayPort> {
+        &self.port
+    }
+}
+
+impl std::fmt::Debug for GatewayContributor {
+    /// Der Port ist ein Trait-Objekt ohne `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayContributor").finish_non_exhaustive()
+    }
+}
+
+impl AssemblyContributor for GatewayContributor {
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()> {
+        if !gateway_ops_wanted(
+            inputs.spawn_context.organizational_role,
+            inputs.profile.operations,
+        ) {
+            return Ok(());
+        }
+        if let Err(error) = harw_ops::gateway_ops::register_gateway(&mut parts.operations) {
+            tracing::warn!(%error, "runtime.gateway_operations_not_registered");
+        }
+        Ok(())
+    }
+}
+
+/// Registriert die lokale Gateway-Diagnose (`gateway.health`,
+/// `gateway.logs`, `gateway.channels.list`, `gateway.channels.connect_info`)
+/// für die UIA-Wurzel.
+///
+/// # Beschreibung
+/// Sie lesen nur das gebundene harw-Home (Daemon-Prozess, Sockets,
+/// Logdateien) über den überall liegenden `ResolvedHomeContext` bzw. die
+/// Kanal-Konfiguration (`Arc<ResolvedConfig>`) und brauchen keinen
+/// Gateway-Port; deshalb Teil von [`default_contributors`] (F1: „wie binde ich
+/// einen Kanal an" wird gerade ohne verbundenes Gateway gefragt). Nur die
+/// UIA-Wurzel bekommt sie ([`gateway_ops_wanted`]) — sie beantworten dort die
+/// Frage „wie steht es um die Gateway-Kommunikation", für die eine UIA
+/// sonst `ps`/`ls`/`tail` über die Shell bemühen müsste.
+#[derive(Debug, Default)]
+pub struct GatewayDiagnosticsContributor;
+
+impl AssemblyContributor for GatewayDiagnosticsContributor {
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()> {
+        if !gateway_ops_wanted(
+            inputs.spawn_context.organizational_role,
+            inputs.profile.operations,
+        ) {
+            return Ok(());
+        }
+        if let Err(error) =
+            harw_ops::gateway_ops::register_gateway_diagnostics(&mut parts.operations)
+        {
+            tracing::warn!(%error, "runtime.gateway_diagnostics_not_registered");
+        }
+        Ok(())
+    }
+}
+
 /// Hängt die Browser-Werkzeuge (Firefox/geckodriver, WebDriver BiDi) an die
 /// Wurzel-Registry, sofern `[browser].enabled` und `[browser].roles` die
 /// Rolle `root` enthält. Kinder bekommen sie rollenweise in
@@ -245,8 +371,34 @@ mod tests {
 
     #[test]
     fn default_contributors_include_infrastructure() {
-        // MCP + Infrastruktur, plus Browser mit Feature `browser`.
-        let expected = if cfg!(feature = "browser") { 3 } else { 2 };
+        // MCP + Infrastruktur + Gateway-Diagnose, plus Browser mit Feature
+        // `browser`.
+        let expected = if cfg!(feature = "browser") { 4 } else { 3 };
         assert_eq!(default_contributors().len(), expected);
+    }
+
+    /// R18 D-B: `gateway.*` nur für die UIA-Wurzel und nie ohne
+    /// Operationsfläche.
+    #[test]
+    fn gateway_ops_reach_only_the_uia_root() {
+        for surface in [
+            OperationSurface::AllWithModelTools,
+            OperationSurface::CommandsOnly,
+        ] {
+            assert!(gateway_ops_wanted(AgentRoleId::UserInterface, surface));
+            for role in [
+                AgentRoleId::RootOrchestrator,
+                AgentRoleId::ChildOrchestrator,
+                AgentRoleId::Worker,
+                AgentRoleId::UiaWorker,
+                AgentRoleId::AgentSteward,
+            ] {
+                assert!(!gateway_ops_wanted(role, surface), "{role:?}");
+            }
+        }
+        assert!(!gateway_ops_wanted(
+            AgentRoleId::UserInterface,
+            OperationSurface::None
+        ));
     }
 }
