@@ -683,6 +683,39 @@ fn test_web_rejects_config_dir_flag() {
 /// Zerlegt `harw web …` in (socket, system, systemd_socket, socket_group).
 type WebFlags = (Option<PathBuf>, bool, bool, Option<String>);
 
+#[test]
+fn web_tailnet_flag_parses_with_default_and_explicit_port() -> TestResult {
+    for (args, port) in [
+        (&["harw", "web", "--tailnet"][..], 8443),
+        (
+            &["harw", "web", "--tailnet", "--tailnet-port", "9443"][..],
+            9443,
+        ),
+    ] {
+        let cli = Cli::try_parse_from(args).map_err(ctx("`harw web --tailnet` sollte parsen"))?;
+        match cli.command {
+            Some(Command::Web {
+                tailnet,
+                tailnet_port,
+                ..
+            }) => {
+                assert!(tailnet);
+                assert_eq!(tailnet_port, port);
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete web, bekam {other:?}"
+                )));
+            }
+        }
+    }
+    assert!(
+        Cli::try_parse_from(["harw", "web", "--tailnet-port", "9443"]).is_err(),
+        "--tailnet-port ohne --tailnet muss abgelehnt werden"
+    );
+    Ok(())
+}
+
 fn parse_web(args: &[&str]) -> TestResult<WebFlags> {
     let cli = Cli::try_parse_from(args).map_err(ctx("`harw web …` sollte parsen"))?;
     match cli.command {
@@ -691,6 +724,7 @@ fn parse_web(args: &[&str]) -> TestResult<WebFlags> {
             system,
             systemd_socket,
             socket_group,
+            ..
         }) => Ok((socket, system, systemd_socket, socket_group)),
         other => Err(TestError::Unexpected(format!(
             "erwartete web, bekam {other:?}"

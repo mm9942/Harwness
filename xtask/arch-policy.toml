@@ -370,6 +370,8 @@ layer = "A"
 layer = "A"
 [packages."harw-tui"]
 layer = "A"
+[packages."harw-tailscale"]
+layer = "A"
 [packages."harw-web"]
 layer = "A"
 [packages."harwness-sdk"]

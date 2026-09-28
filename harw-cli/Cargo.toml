@@ -130,6 +130,7 @@ harw-observe = { path = "../harw-observe" }
 # Bottom-up-Befund: `harw-web` hatte null Produktionskonsumenten. `src/web.rs`
 # ist die Komposition, die den Unix-Socket-Server aus derselben
 # `harw-operations`-Registry baut, die auch `harw-cli` sonst zusammenstellt.
+harw-tailscale = { path = "../harw-tailscale" }
 harw-web = { path = "../harw-web" }
 # Ermittelt die eigene UID für `harw_web::authz::StaticUidTierMap` — dieselbe
 # Crate wie `harw-web`s eigenes `SO_PEERCRED`, hier nur das `process`-Feature
