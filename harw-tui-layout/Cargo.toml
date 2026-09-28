@@ -1,0 +1,16 @@
+[package]
+publish.workspace = true
+name = "harw-tui-layout"
+description = "Pure terminal-geometry classification for harw-tui: wide/portrait-dock/summary/compact placement and dock-split geometry; no I/O, no dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Bewusst leer: reine Geometrie ohne Laufzeit-, I/O- oder Fremdtyp-Abhaengigkeit
+# (Ring F, xtask/arch-policy.toml). Siehe docs/planning/68-mobile-tui/README.md.
+
+[lints]
+workspace = true
