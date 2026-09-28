@@ -3588,8 +3588,9 @@ mod tests {
     }
 
     /// Z1-R2-03: `harw serve` muss `file:`-Credentials auflösen, die
-    /// `harw onboard` (`onboarding.rs` `write_secret_file`) und `harw-oauth`
-    /// unterhalb von `<home>/secrets/` anlegen. Ohne Home bleibt der Pfad
+    /// ältere `harw onboard`-Versionen (heute versiegelt über
+    /// `onboarding.rs` `store_provider_key`) und `harw-oauth` unterhalb von
+    /// `<home>/secrets/` angelegt haben. Ohne Home bleibt der Pfad
     /// bewusst fail-closed
     /// (`harw_provider_http::FILE_CREDENTIAL_NO_HOME_REASON`).
     #[test]
