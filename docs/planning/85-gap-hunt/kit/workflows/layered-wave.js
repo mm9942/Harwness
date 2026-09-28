@@ -204,6 +204,8 @@ async function runLevel(label, level) {
 phase('Macro')
 let plan = A.plan || null
 if (!plan) {
+  // A planner that never produces a valid plan ends the wave as no-plan
+  // instead of aborting the workflow.
   plan = await agent(`Repository root: ${ROOT} (a git checkout on its own branch). Read files only under it; run git as \`${GIT} …\`. Do not edit anything. ${BUILD_RULE}
 
 You are the macro planner. Goal ${GOAL.id}: ${GOAL.statement}
@@ -224,6 +226,7 @@ Turn this into units that one contract wave each can build:
 - Every acceptance criterion is served by at least one unit (criteria ids); mark units at a trust boundary security=true.
 - If the goal needs an owner decision (UX, security trade-off, new dependency), list it in decisions_needed and plan nothing that depends on it.`,
     { label: `macro:${KEY}`, phase: 'Macro', schema: PLAN, model: MODELS === 'tiered' ? 'opus' : 'sonnet', agentType: 'focused-explorer' })
+    .catch(error => { log(`${KEY}: macro planner failed: ${String(error && error.message || error).slice(0, 200)}`); return null })
 }
 if (!plan) {
   log(`${KEY}: NOT complete; no macro plan`)
