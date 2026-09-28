@@ -170,9 +170,7 @@ fn parse_keyring_reference(reference: &str) -> Option<(&str, &str)> {
 ///
 /// This compatibility wrapper preserves the fail-closed behavior for
 /// `secrets:` references.
-// Vorgesehener Aufrufer: `harw doctor` (main.rs, fn `doctor`), sobald die
-// Konfigurationsprüfung credential_ref-Auflösung ohne Secret-Store abdeckt.
-#[allow(dead_code)]
+// Caller: `mcp::check` (mcp.rs), also `harw mcp check`.
 pub fn resolve_mcp_credential(reference: &SecretRef) -> Result<Vec<u8>, McpCredentialError> {
     resolve_mcp_credential_with_resolver(reference, None)
 }

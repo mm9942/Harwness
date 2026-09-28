@@ -20,22 +20,28 @@
 //! Chunking und kein Einbetten — das übernimmt [`crate::build_index`] mit
 //! dem Ergebnis dieses Moduls als Eingabe.
 //!
-//! # Warum `visibility_of_scope` nur zwei Buckets kennt
+//! # Warum `visibility_of_scope` fail-closed abbildet
 //! [`harw_knowledge::VisibilityScope`] hat vier Varianten
-//! (`SelfOnly`, `DescendantTree`, `ExplicitlyGranted`, `OperatorOnly`); die
-//! vollständige Durchsetzung aller vier ist laut `harw-knowledge`s eigener
-//! Modul-Dokumentation (`harw-knowledge/src/visibility.rs`) explizit
-//! `harw-policy`s Aufgabe, die zum Zeitpunkt dieses Knotens (AW5-08) noch
-//! nicht existiert. Diese Funktion trifft deshalb bewusst nur die eine
-//! Unterscheidung, die der Knoten beweisen muss: `OperatorOnly` landet im
-//! getrennten `operator-only`-Index, alles andere im gewöhnlichen
-//! `workspace`-Index. Das ist eine bewusste Verengung, keine versehentliche
-//! Lücke — sie ist konservativ in die sichere Richtung (mehr Material im
-//! restriktiveren Bucket wäre der falsche Fehler; hier gilt das Gegenteil
-//! nicht: nur explizit `OperatorOnly` erhält den Schutz). Eine feinere
-//! Aufteilung (etwa ein eigener Bucket je `ExplicitlyGranted`-Rollenliste)
-//! bleibt einem späteren Knoten vorbehalten, sobald `harw-policy` die
-//! zugehörige Zugriffsprüfung liefert.
+//! (`SelfOnly`, `DescendantTree`, `ExplicitlyGranted`, `OperatorOnly`).
+//! `harw-knowledge`s kanonische Leseprüfung
+//! (`VisibilityScope::visible_to_caller`) lässt `SelfOnly`,
+//! `DescendantTree` und `ExplicitlyGranted` für jeden Aufrufer scheitern —
+//! der Aufrufkontext trägt keine Identität, die diese Scopes belegen könnte
+//! —, und `OperatorOnly` sieht nur ein Operator. Keine Variante ist damit
+//! ausdrücklich für Agenten freigegeben; der `workspace`-Bucket ist aber
+//! genau der, den `lens.ask` jedem Agenten öffnet. [`visibility_of_scope`]
+//! bildet deshalb **jede** Variante auf den `operator-only`-Bucket ab (nur
+//! lokaler Embedder, nicht im Agenten-Lesebereich). Zusätzlich lassen
+//! [`collect_palace_documents`] und [`collect_diary_documents`] nur
+//! Artefakte bis zu [`visibility_of_scope`] durch, die die Palace-Lesesperre
+//! (`harw_knowledge::memory::palace::is_agent_readable`: Palace-Knoten mit
+//! Status `established`) passieren; `provisional`, `superseded` und jeder
+//! Diary-Eintrag landen unabhängig von ihrer Scope in `operator-only`. Ob
+//! lesbare Knoten je in den `workspace`-Bucket wandern dürfen, ist eine
+//! eigene Produktentscheidung (etwa mit einer ausdrücklich agententeilbaren
+//! Scope oder einer Zugriffsprüfung aus `harw-policy`). Indizes, die noch
+//! nach der früheren Abbildung (alles außer `OperatorOnly` → `workspace`)
+//! gebaut wurden, brauchen `harw lens build --force`.
 //!
 //! # Nebenläufigkeit
 //! [`RawDocument`] ist reine Daten (`Clone`, `PartialEq`) ohne interne
@@ -61,7 +67,8 @@
 
 use std::path::{Path, PathBuf};
 
-use harw_knowledge::{ArtifactKind, KnowledgeIndex, VisibilityScope};
+use harw_knowledge::memory::palace::is_agent_readable;
+use harw_knowledge::{ArtifactKind, KnowledgeArtifact, KnowledgeIndex, VisibilityScope};
 use harw_lens_types::SourceRef;
 
 use crate::error::SourceResult;
@@ -89,34 +96,49 @@ pub struct RawDocument {
 /// Bildet eine [`VisibilityScope`] auf einen Sichtbarkeits-Bucket-Namen ab.
 ///
 /// # Description
-/// Siehe den `# Warum visibility_of_scope nur zwei Buckets kennt`-Abschnitt
-/// der Moduldokumentation für die Begründung dieser bewussten Verengung auf
-/// zwei Buckets.
+/// Fail-closed: keine Variante ist ausdrücklich für Agenten freigegeben,
+/// also landet jede im `operator-only`-Bucket. Siehe den
+/// `# Warum visibility_of_scope fail-closed abbildet`-Abschnitt der
+/// Moduldokumentation für die Begründung.
 ///
 /// # Arguments
 /// - `scope` (`&VisibilityScope`): die Sichtbarkeit eines
 ///   [`harw_knowledge::KnowledgeArtifact`].
 ///
 /// # Returns
-/// [`OPERATOR_ONLY_VISIBILITY`](crate::OPERATOR_ONLY_VISIBILITY) für
-/// [`VisibilityScope::OperatorOnly`], sonst
-/// [`DEFAULT_VISIBILITY`](crate::DEFAULT_VISIBILITY).
+/// [`OPERATOR_ONLY_VISIBILITY`](crate::OPERATOR_ONLY_VISIBILITY) für jede
+/// Variante; [`DEFAULT_VISIBILITY`](crate::DEFAULT_VISIBILITY) erst für eine
+/// künftige, ausdrücklich agententeilbare Variante.
 ///
 /// # Examples
 /// ```rust
 /// use harw_knowledge::VisibilityScope;
-/// use harw_lens_source::{visibility_of_scope, DEFAULT_VISIBILITY, OPERATOR_ONLY_VISIBILITY};
+/// use harw_lens_source::{visibility_of_scope, OPERATOR_ONLY_VISIBILITY};
 ///
 /// assert_eq!(visibility_of_scope(&VisibilityScope::OperatorOnly), OPERATOR_ONLY_VISIBILITY);
-/// assert_eq!(visibility_of_scope(&VisibilityScope::SelfOnly), DEFAULT_VISIBILITY);
+/// assert_eq!(visibility_of_scope(&VisibilityScope::SelfOnly), OPERATOR_ONLY_VISIBILITY);
 /// ```
 #[must_use]
 pub fn visibility_of_scope(scope: &VisibilityScope) -> &'static str {
+    // Bewusst ohne `_`-Arm: eine neue Variante erzwingt hier eine eigene
+    // Entscheidung, statt still in einen Bucket zu fallen.
     match scope {
-        VisibilityScope::OperatorOnly => OPERATOR_ONLY_VISIBILITY,
         VisibilityScope::SelfOnly
         | VisibilityScope::DescendantTree
-        | VisibilityScope::ExplicitlyGranted(_) => DEFAULT_VISIBILITY,
+        | VisibilityScope::ExplicitlyGranted(_)
+        | VisibilityScope::OperatorOnly => OPERATOR_ONLY_VISIBILITY,
+    }
+}
+
+/// Bucket eines Palace-/Diary-Artefakts für [`collect_palace_documents`]
+/// und [`collect_diary_documents`]: nur was die Palace-Lesesperre
+/// ([`is_agent_readable`]) passiert, wird nach [`visibility_of_scope`]
+/// eingeordnet; alles andere landet in `operator-only`.
+fn artifact_visibility(artifact: &KnowledgeArtifact) -> &'static str {
+    if is_agent_readable(artifact) {
+        visibility_of_scope(&artifact.frontmatter.visibility)
+    } else {
+        OPERATOR_ONLY_VISIBILITY
     }
 }
 
@@ -128,10 +150,13 @@ pub fn visibility_of_scope(scope: &VisibilityScope) -> &'static str {
 /// (Datei- wie Verzeichnis-Symlinks) werden nie befolgt — ein
 /// Verzeichnis-Symlink könnte sonst aus `root` hinausführen oder einen Zyklus
 /// einführen, ein Datei-Symlink könnte eine fremde Datei als Quelle
-/// erscheinen lassen. Jede gefundene Datei wird vollständig als UTF-8
-/// eingelesen; das Ergebnis ist nach dem `root`-relativen Pfad sortiert, für
-/// deterministische Build-Reihenfolge unabhängig von der
-/// Verzeichnis-Iterationsreihenfolge des Betriebssystems. Jedes
+/// erscheinen lassen. Dateien über 1 MiB (`DESIGN_DOC_MAX_BYTES`) sowie
+/// Dateien, die kein valides UTF-8 sind, werden übersprungen statt die
+/// ganze Erfassung abzubrechen (wie bei [`collect_code_sources`]); jede
+/// übrige Datei wird vollständig eingelesen. Das Ergebnis ist nach dem
+/// `root`-relativen Pfad sortiert, für deterministische Build-Reihenfolge
+/// unabhängig von der Verzeichnis-Iterationsreihenfolge des
+/// Betriebssystems. Jedes
 /// [`RawDocument`] erhält
 /// [`DEFAULT_VISIBILITY`](crate::DEFAULT_VISIBILITY) — Design-Dokumente
 /// tragen in diesem Knoten keine artefaktweise Sichtbarkeit.
@@ -147,8 +172,8 @@ pub fn visibility_of_scope(scope: &VisibilityScope) -> &'static str {
 ///
 /// # Errors
 /// - [`crate::SourceError::Io`]: ein Dateisystemzugriff (Lesen des
-///   Verzeichnisses, einer Datei, oder `canonicalize`) schlägt fehl, oder
-///   eine Datei ist kein valides UTF-8.
+///   Verzeichnisses, einer Datei, oder `canonicalize`) schlägt fehl (nicht
+///   aber ungültiges UTF-8 — solche Dateien werden übersprungen).
 ///
 /// # Examples
 /// ```rust,no_run
@@ -172,7 +197,11 @@ pub fn collect_design_docs(root: &Path) -> SourceResult<Vec<RawDocument>> {
 
     let mut documents = Vec::with_capacity(files.len());
     for path in files {
-        let text = std::fs::read_to_string(&path)?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(error) => return Err(error.into()),
+        };
         let relative = path.strip_prefix(root).unwrap_or(path.as_path());
         let display_path = relative
             .to_string_lossy()
@@ -186,8 +215,15 @@ pub fn collect_design_docs(root: &Path) -> SourceResult<Vec<RawDocument>> {
     Ok(documents)
 }
 
+/// Obergrenze in Bytes für eine einzelne von [`collect_design_docs`]
+/// erfasste Datei (1 MiB, wie [`CODE_SOURCE_MAX_BYTES`]): größere
+/// `.md`-Dateien sind in aller Regel generiert und würden sonst vollständig
+/// in den Speicher geladen.
+const DESIGN_DOC_MAX_BYTES: u64 = 1024 * 1024;
+
 /// Rekursive Hilfsfunktion für [`collect_design_docs`]: sammelt reguläre
-/// `.md`-Dateien unterhalb von `dir`, ohne Symlinks zu befolgen.
+/// `.md`-Dateien bis [`DESIGN_DOC_MAX_BYTES`] unterhalb von `dir`, ohne
+/// Symlinks zu befolgen.
 fn walk_markdown_files(
     dir: &Path,
     canonical_root: &Path,
@@ -201,13 +237,17 @@ fn walk_markdown_files(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let file_type = std::fs::symlink_metadata(&path)?.file_type();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
         }
         if file_type.is_dir() {
             walk_markdown_files(&path, canonical_root, out)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+        } else if file_type.is_file()
+            && metadata.len() <= DESIGN_DOC_MAX_BYTES
+            && path.extension().is_some_and(|ext| ext == "md")
+        {
             out.push(path);
         }
     }
@@ -475,9 +515,11 @@ fn walk_code_files(
 /// usw. gehören nicht in diesen Index) und bildet jeden Treffer auf ein
 /// [`RawDocument`] ab: `source` wird [`SourceRef::Artifact`] mit der
 /// Artefakt-Id, `text` ist der bereits Frontmatter-freie Markdown-Body
-/// ([`harw_knowledge::KnowledgeArtifact::body`]), `visibility` kommt aus
-/// [`visibility_of_scope`] über
-/// [`harw_knowledge::Frontmatter::visibility`]. Das Ergebnis wird nach
+/// ([`harw_knowledge::KnowledgeArtifact::body`]), `visibility` ist
+/// fail-closed `operator-only`: nur ein Knoten, der
+/// [`harw_knowledge::memory::palace::is_agent_readable`] passiert, wird über
+/// [`visibility_of_scope`] aus [`harw_knowledge::Frontmatter::visibility`]
+/// eingeordnet (siehe Moduldokumentation). Das Ergebnis wird nach
 /// Artefakt-Id sortiert — [`KnowledgeIndex::iter`] iteriert über eine
 /// `HashMap` und liefert deshalb keine stabile Reihenfolge; ohne diese
 /// Sortierung wäre die Build-Reihenfolge (und damit die Reihenfolge der
@@ -498,7 +540,7 @@ fn walk_code_files(
 ///     ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, KnowledgeIndex, VisibilityScope,
 /// };
 /// use harw_knowledge::AgentId;
-/// use harw_lens_source::collect_palace_documents;
+/// use harw_lens_source::{collect_palace_documents, OPERATOR_ONLY_VISIBILITY};
 ///
 /// let mut index = KnowledgeIndex::new();
 /// let frontmatter = Frontmatter::new(
@@ -516,6 +558,7 @@ fn walk_code_files(
 /// let documents = collect_palace_documents(&index);
 /// assert_eq!(documents.len(), 1);
 /// assert_eq!(documents[0].text, "deployment detail");
+/// assert_eq!(documents[0].visibility, OPERATOR_ONLY_VISIBILITY);
 /// ```
 #[must_use]
 pub fn collect_palace_documents(index: &KnowledgeIndex) -> Vec<RawDocument> {
@@ -527,7 +570,7 @@ pub fn collect_palace_documents(index: &KnowledgeIndex) -> Vec<RawDocument> {
                 id: artifact.id.as_str().to_owned(),
             },
             text: artifact.body.clone(),
-            visibility: visibility_of_scope(&artifact.frontmatter.visibility).to_owned(),
+            visibility: artifact_visibility(artifact).to_owned(),
         })
         .collect();
     documents.sort_by_key(|d| source_sort_key(&d.source));
@@ -541,10 +584,11 @@ pub fn collect_palace_documents(index: &KnowledgeIndex) -> Vec<RawDocument> {
 /// Wörtlich [`collect_palace_documents`] mit vertauschtem
 /// `ArtifactKind`-Filter (`DiaryEntry` statt `PalaceNode`): dieselbe
 /// Struktur (Frontmatter mit `VisibilityScope`, Frontmatter-freier
-/// Markdown-Body), dieselbe [`visibility_of_scope`]-Zuordnung, dieselbe
+/// Markdown-Body), dieselbe fail-closed Bucket-Zuordnung, dieselbe
 /// Sortierung nach `SourceRef`, aus demselben Grund (`KnowledgeIndex::iter`
 /// iteriert über eine `HashMap`, also ohne stabile Reihenfolge ohne diese
-/// Sortierung).
+/// Sortierung). Weil [`harw_knowledge::memory::palace::is_agent_readable`]
+/// nur Palace-Knoten freigibt, landet jeder Diary-Eintrag in `operator-only`.
 ///
 /// # Arguments
 /// - `index` (`&KnowledgeIndex`): der bereits aufgebaute Wissensindex.
@@ -588,7 +632,7 @@ pub fn collect_diary_documents(index: &KnowledgeIndex) -> Vec<RawDocument> {
                 id: artifact.id.as_str().to_owned(),
             },
             text: artifact.body.clone(),
-            visibility: visibility_of_scope(&artifact.frontmatter.visibility).to_owned(),
+            visibility: artifact_visibility(artifact).to_owned(),
         })
         .collect();
     documents.sort_by_key(|d| source_sort_key(&d.source));
@@ -610,7 +654,8 @@ fn source_sort_key(source: &SourceRef) -> String {
 mod tests {
     use super::*;
     use crate::test_support::TestResult;
-    use harw_knowledge::{AgentId, ArtifactId, Frontmatter, KnowledgeArtifact};
+    use harw_knowledge::memory::palace::{PalaceStatus, set_status};
+    use harw_knowledge::{AgentId, ArtifactId, Frontmatter};
 
     fn frontmatter(scope: VisibilityScope) -> Frontmatter {
         Frontmatter::new(AgentId::new("agent"), scope, jiff::Timestamp::now())
@@ -625,19 +670,22 @@ mod tests {
         Ok(())
     }
 
+    /// Keine Scope ist ausdrücklich agententeilbar: auch `SelfOnly`,
+    /// `DescendantTree` und `ExplicitlyGranted` dürfen nie im
+    /// `workspace`-Bucket landen, den `lens.ask` jedem Agenten öffnet.
     #[test]
-    fn test_visibility_of_scope_maps_every_other_scope_to_default_bucket() -> TestResult {
+    fn test_visibility_of_scope_maps_restricted_scopes_to_operator_bucket() -> TestResult {
         assert_eq!(
             visibility_of_scope(&VisibilityScope::SelfOnly),
-            DEFAULT_VISIBILITY
+            OPERATOR_ONLY_VISIBILITY
         );
         assert_eq!(
             visibility_of_scope(&VisibilityScope::DescendantTree),
-            DEFAULT_VISIBILITY
+            OPERATOR_ONLY_VISIBILITY
         );
         assert_eq!(
             visibility_of_scope(&VisibilityScope::ExplicitlyGranted(Vec::new())),
-            DEFAULT_VISIBILITY
+            OPERATOR_ONLY_VISIBILITY
         );
         Ok(())
     }
@@ -672,6 +720,85 @@ mod tests {
             }
         );
         assert_eq!(documents[0].visibility, DEFAULT_VISIBILITY);
+        Ok(())
+    }
+
+    /// Eine einzelne kaputte oder riesige `.md`-Datei darf die Erfassung
+    /// nicht abbrechen: sie wird übersprungen, der Rest bleibt erfasst.
+    #[test]
+    fn test_collect_design_docs_skips_invalid_utf8_and_oversized_files() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("a.md"), "# Valid\n")?;
+        std::fs::write(dir.path().join("b.md"), [0xff_u8, 0xfe])?;
+        assert_eq!(DESIGN_DOC_MAX_BYTES, 1024 * 1024);
+        std::fs::write(dir.path().join("c.md"), "a".repeat(1024 * 1024 + 1))?;
+
+        let documents = collect_design_docs(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].source,
+            SourceRef::File {
+                path: "a.md".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    /// Kein Palace-Knoten landet im `workspace`-Bucket: weder unreviewte
+    /// (`provisional`, ohne Status), ersetzte (`superseded`) noch
+    /// `established` Knoten mit einer Scope, die die Palace-Lesesperre
+    /// verbirgt.
+    #[test]
+    fn test_collect_palace_documents_keeps_every_node_out_of_workspace_bucket() -> TestResult {
+        let cases = [
+            (
+                "palace/provisional-self",
+                VisibilityScope::SelfOnly,
+                Some(PalaceStatus::Provisional),
+            ),
+            (
+                "palace/unmarked-tree",
+                VisibilityScope::DescendantTree,
+                None,
+            ),
+            (
+                "palace/established-granted",
+                VisibilityScope::ExplicitlyGranted(Vec::new()),
+                Some(PalaceStatus::Established),
+            ),
+            (
+                "palace/superseded-self",
+                VisibilityScope::SelfOnly,
+                Some(PalaceStatus::Superseded),
+            ),
+            (
+                "palace/established-operator",
+                VisibilityScope::OperatorOnly,
+                Some(PalaceStatus::Established),
+            ),
+        ];
+        let mut index = KnowledgeIndex::new();
+        for (id, scope, status) in cases {
+            let mut node_frontmatter = frontmatter(scope);
+            if let Some(status) = status {
+                set_status(&mut node_frontmatter, status);
+            }
+            index.insert(KnowledgeArtifact::new(
+                ArtifactId::new(id),
+                ArtifactKind::PalaceNode,
+                node_frontmatter,
+                id,
+            ));
+        }
+
+        let documents = collect_palace_documents(&index);
+        assert_eq!(documents.len(), 5);
+        assert!(
+            documents
+                .iter()
+                .all(|d| d.visibility == OPERATOR_ONLY_VISIBILITY),
+            "{documents:?}"
+        );
         Ok(())
     }
 
@@ -771,6 +898,8 @@ mod tests {
                 id: "diary/a".to_owned()
             }
         );
+        // Diary-Einträge passieren die Palace-Lesesperre nie.
+        assert_eq!(documents[0].visibility, OPERATOR_ONLY_VISIBILITY);
         Ok(())
     }
 

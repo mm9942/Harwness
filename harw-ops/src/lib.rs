@@ -291,7 +291,7 @@ fn compact_unavailable_output() -> OpOutput {
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
 /// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
 /// provider-concurrency, uia-worker-model, uia-effort, sandbox-lease, models,
-/// workbench, kanban, diary, palace, dream`.
+/// workbench, kanban, diary, palace, dream, learn, matrix, jobs`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -998,6 +998,7 @@ mod tests {
             "/dream",
             "/learn",
             "/matrix",
+            "/jobs",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
