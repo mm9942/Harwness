@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install Harwness from get.harw.dev: a prebuilt release when the mirror has
-# one for this machine, else the source archive built with make install.
+# Install Harwness from get.harw.dev: built from the release's source tarball
+# by default, or a prebuilt release with --binary.
 # Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
 set -euo pipefail
 
@@ -19,24 +19,21 @@ Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
        curl -fsSL https://get.harw.dev/harw/install.sh | bash -s -- --binary
        bash scripts/install.sh [--source | --binary]
 
-The piped installer downloads and extracts Harwness-main.zip, installs
-Rustup with the stable default toolchain when needed, installs missing
-Linux build dependencies including Bubblewrap, then runs make install.
+Without an argument the piped installer builds from source: it downloads
+the release's harwness-<version>-source.tar.gz (tag from
+$HARW_BASE_URL/version.json or /latest, checked against SHA256SUMS) or, when
+the mirror publishes none, Harwness-main.zip. It installs Rustup with the
+stable default toolchain when needed, installs missing Linux build
+dependencies including Bubblewrap, then runs make install.
 
-Without an argument the piped installer first looks for a prebuilt release
-on the mirror ($HARW_BASE_URL/version.json or /latest, then
-$HARW_BASE_URL/<tag>/...) for this
-machine (x86_64 or aarch64 Linux, aarch64 Termux). Only when there is none it
-builds from source: from the release's harwness-<version>-source.tar.gz
-(checked against SHA256SUMS) when published, else from Harwness-main.zip.
-
---binary installs harw, killer and harw-agent-runner from a release and
-fails instead of falling back to a source build (no Rust toolchain): it
+--binary (opt-in) installs harw, killer and harw-agent-runner from a
+prebuilt release and fails instead of falling back to a source build (no
+Rust toolchain): it needs glibc (x86_64 or aarch64 Linux) or Termux,
 downloads harw-<tag>-<target>.tar.gz and SHA256SUMS, refuses a tarball whose
-checksum does not match or that lacks a binary, and only then replaces an
-existing installation. The mirror is the default source; with
-HARW_RELEASES_URL set it reads a GitHub-style release layout
-(<url>/download/<tag>/...) instead.
+checksum does not match, that lacks a binary or whose harw does not run
+here, and only then replaces an existing installation. The mirror is the
+default source; with HARW_RELEASES_URL set it reads a GitHub-style release
+layout (<url>/download/<tag>/...) instead.
 
 Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME,
 HARW_RELEASE_TAG (default: the latest release), HARW_RELEASES_URL.
@@ -220,14 +217,22 @@ release_target_or_none() {
   esac
   if [ "$(uname -o 2>/dev/null)" = Android ]; then
     printf '%s-linux-android\n' "$arch"
-  else
+  elif has_glibc; then
     printf '%s-unknown-linux-gnu\n' "$arch"
+  else
+    return 1
   fi
+}
+
+# The *-unknown-linux-gnu releases need glibc and its loader; musl systems
+# such as Alpine build from source instead.
+has_glibc() {
+  getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc'
 }
 
 release_target() {
   release_target_or_none \
-    || die "no release build for architecture $(uname -m); use the source installer"
+    || die "no release build for $(uname -m) $(has_glibc && echo glibc || echo "without glibc (e.g. musl)"); use the source installer (no argument)"
 }
 
 # URL of one release file: the mirror layout (<base>/<tag>/<file>, written by
@@ -274,24 +279,6 @@ release_tag() {
   else
     mirror_latest_tag || die "no release published at $base_url (missing $base_url/latest)"
   fi
-}
-
-# True when the mirror has a prebuilt release for this machine: `latest`
-# names a tag and its SHA256SUMS lists harw-<tag>-<target>.tar.gz.
-mirror_has_binary_release() {
-  local target tag sums
-  [ -z "${HARW_RELEASES_URL:-}" ] || return 1
-  target="$(release_target_or_none)" || return 1
-  tag="${HARW_RELEASE_TAG:-$(mirror_latest_tag)}" || return 1
-  [ -n "$tag" ] || return 1
-  sums="$(mktemp)"
-  if fetch_quiet "$base_url/$tag/SHA256SUMS" "$sums" \
-    && grep -Eq "[[:space:]]\*?(\./)?harw-$tag-$target\.tar\.gz\$" "$sums"; then
-    rm -f "$sums"
-    return 0
-  fi
-  rm -f "$sums"
-  return 1
 }
 
 # Tag whose source tarball the mirror publishes: `latest` (or
@@ -364,6 +351,17 @@ record_installed_version() {
     || log "could not write $file; harw checks for updates on its next start"
 }
 
+# Makes ~/.local/bin reachable in new shells (both install paths).
+setup_path() {
+  [ "$install_dir" = "$HOME/.local/bin" ] || return 0
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$rc" ] || continue
+    if ! grep -q 'added by harw installer' "$rc"; then
+      printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"  # added by harw installer' >> "$rc"
+    fi
+  done
+}
+
 install_binary_release() {
   # work_dir stays global: the EXIT trap runs after this function returned.
   local target tag name unpacked binary runner_dir
@@ -397,6 +395,12 @@ install_binary_release() {
   for binary in $binaries; do
     [ -f "$unpacked/$binary" ] || die "$name.tar.gz has no $binary; nothing installed"
   done
+  # Run the new harw from the staging directory first: a release that cannot
+  # execute here (missing loader, wrong libc) must not replace a working
+  # installation.
+  chmod 0755 "$unpacked/harw"
+  "$unpacked/harw" --version >/dev/null 2>&1 \
+    || die "harw from $name.tar.gz does not run on this system; nothing installed (use the source installer: no argument)"
   mkdir -p "$install_dir"
   for binary in $binaries; do
     install -m 0755 "$unpacked/$binary" "$install_dir/$binary"
@@ -406,6 +410,7 @@ install_binary_release() {
   install -m 0755 "$unpacked/harw-agent-runner" "$runner_dir/harw-agent-runner"
   "$install_dir/harw" agent install-record --bindir "$install_dir" \
     || log "could not record the installation; harw update falls back to the running binary's directory"
+  setup_path
   record_installed_version "$tag"
   log "Harwness $tag installed into $install_dir"
   "$install_dir/harw" --version
@@ -416,15 +421,6 @@ releases_url="${HARW_RELEASES_URL:-https://github.com/mm9942/Harwness/releases}"
 if [ "${1:-}" = --binary ]; then
   install_binary_release
   exit 0
-fi
-# Piped without an argument: a prebuilt release when the mirror has one for
-# this machine, so no Rust toolchain is needed; otherwise build from source.
-if [ -z "${1:-}" ]; then
-  if mirror_has_binary_release; then
-    install_binary_release
-    exit 0
-  fi
-  log "No prebuilt release for this machine on $base_url; building from source"
 fi
 
 checkout=""
@@ -504,14 +500,7 @@ else
 fi
 (cd "$checkout" && make install BINDIR="$install_dir")
 
-if [ "$install_dir" = "$HOME/.local/bin" ]; then
-  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [ -f "$rc" ] || continue
-    if ! grep -q 'added by harw installer' "$rc"; then
-      printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"  # added by harw installer' >> "$rc"
-    fi
-  done
-fi
+setup_path
 
 record_installed_version "${source_tag:-}"
 log "Harwness installed from $checkout"

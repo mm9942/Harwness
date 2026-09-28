@@ -125,11 +125,11 @@ esac
 class MirrorBinaryInstallTests(unittest.TestCase):
     TAG = "v9.9.9"
 
-    def test_piped_install_prefers_mirror_release_on_x86_64(self):
+    def test_binary_flag_installs_mirror_release_on_x86_64(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.publish(root, ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"])
-            result, urls = self.run_installer(root, "x86_64")
+            result, urls = self.run_installer(root, "x86_64", "--binary")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"{self.TAG}/harw-{self.TAG}-x86_64-unknown-linux-gnu.tar.gz", urls)
             self.assertNotIn("Harwness-main.zip", urls)
@@ -138,32 +138,78 @@ class MirrorBinaryInstallTests(unittest.TestCase):
                 self.assertTrue((root / "home/.local/bin" / binary).is_file(), binary)
             self.assertIn("harw-test x86_64-unknown-linux-gnu", result.stdout)
 
-    def test_piped_install_selects_the_aarch64_tarball(self):
+    def test_binary_flag_selects_the_aarch64_tarball(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.publish(root, ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"])
-            result, urls = self.run_installer(root, "aarch64")
+            result, urls = self.run_installer(root, "aarch64", "--binary")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"harw-{self.TAG}-aarch64-unknown-linux-gnu.tar.gz", urls)
             self.assertNotIn("x86_64-unknown-linux-gnu.tar.gz", urls)
             self.assertIn("harw-test aarch64-unknown-linux-gnu", result.stdout)
 
-    def test_missing_tarball_for_this_machine_falls_back_to_source(self):
+    def test_default_builds_from_source_even_when_a_release_exists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"], source=True)
+            result, urls = self.run_installer(root, "x86_64")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"{self.TAG}/harwness-9.9.9-source.tar.gz", urls)
+            self.assertNotIn("x86_64-unknown-linux-gnu.tar.gz", urls)
+            self.assertTrue((root / "make").exists())
+            self.assertIn("harw-test source", result.stdout)
+
+    def test_default_without_any_source_archive_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.publish(root, ["x86_64-unknown-linux-gnu"])
-            result, urls = self.run_installer(root, "aarch64")
-            # No zip is published either: the source path must fail with a
-            # clear message after the binary probe, not with a bare curl error.
+            result, urls = self.run_installer(root, "x86_64")
+            # Neither a source tarball nor the zip is published: a clear
+            # message, not a bare curl error, and no binary fallback.
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("building from source", result.stdout)
             self.assertIn("Harwness-main.zip", urls)
+            self.assertNotIn("x86_64-unknown-linux-gnu.tar.gz", urls)
             self.assertIn("no source archive published there", result.stderr)
+
+    def test_binary_flag_refuses_a_system_without_glibc(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"])
+            result, urls = self.run_installer(root, "x86_64", "--binary", glibc=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("without glibc", result.stderr)
+            self.assertNotIn(".tar.gz", urls)
+            self.assertFalse((root / "home/.local/bin/harw").exists())
+
+    def test_release_that_cannot_run_keeps_the_old_installation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"], runnable=False)
+            old = root / "home/.local/bin/harw"
+            old.parent.mkdir(parents=True)
+            old.write_text("#!/bin/sh\necho harw-old\n")
+            old.chmod(0o755)
+            result, _ = self.run_installer(root, "x86_64", "--binary")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not run on this system; nothing installed", result.stderr)
+            self.assertEqual(old.read_text(), "#!/bin/sh\necho harw-old\n")
+            self.assertFalse((root / "home/.local/bin/killer").exists())
+
+    def test_binary_install_on_a_fresh_home_sets_up_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"])
+            (root / "home").mkdir()
+            (root / "home/.bashrc").write_text("# existing config\n")
+            result, _ = self.run_installer(root, "x86_64", "--binary")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("added by harw installer", (root / "home/.bashrc").read_text())
 
     def test_source_path_prefers_the_versioned_source_tarball(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.publish(root, ["x86_64-unknown-linux-gnu"], source=True)
+            (root / "mirror/Harwness-main.zip").write_bytes(b"not used")
             result, urls = self.run_installer(root, "aarch64")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"{self.TAG}/harwness-9.9.9-source.tar.gz", urls)
@@ -196,7 +242,7 @@ class MirrorBinaryInstallTests(unittest.TestCase):
                 f"{self.TAG}/harw-{self.TAG}-x86_64-unknown-linux-gnu.tar.gz",
             )
             self.assertEqual(manifest["source"]["file"], f"{self.TAG}/harwness-9.9.9-source.tar.gz")
-            result, urls = self.run_installer(root, "x86_64")
+            result, urls = self.run_installer(root, "x86_64", "--binary")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("mirror.example/harw/version.json", urls)
             self.assertNotIn("mirror.example/harw/latest", urls)
@@ -206,7 +252,7 @@ class MirrorBinaryInstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.publish(root, ["x86_64-unknown-linux-gnu"])
-            result, _ = self.run_installer(root, "x86_64")
+            result, _ = self.run_installer(root, "x86_64", "--binary")
             self.assertEqual(result.returncode, 0, result.stderr)
             record = root / "home/.harw/version.json"
             info = json.loads(record.read_text())
@@ -215,7 +261,7 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertRegex(info["last_checked_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
             # A later install keeps an existing record (it may hold a dismissal).
             record.write_text('{"latest_version":"9.9.9","last_checked_at":"2026-01-01T00:00:00Z","dismissed_version":"9.9.9"}\n')
-            result, _ = self.run_installer(root, "x86_64")
+            result, _ = self.run_installer(root, "x86_64", "--binary")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(record.read_text())["dismissed_version"], "9.9.9")
 
@@ -233,12 +279,12 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.publish(root, ["x86_64-unknown-linux-gnu"])
             tarball = root / "mirror" / self.TAG / f"harw-{self.TAG}-x86_64-unknown-linux-gnu.tar.gz"
             tarball.write_bytes(tarball.read_bytes() + b"tampered")
-            result, _ = self.run_installer(root, "x86_64")
+            result, _ = self.run_installer(root, "x86_64", "--binary")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("checksum", result.stderr)
             self.assertFalse((root / "home/.local/bin/harw").exists())
 
-    def publish(self, root, targets, source=False, manifest=False):
+    def publish(self, root, targets, source=False, manifest=False, runnable=True):
         """Writes the release.yml `mirror` layout for self.TAG below root/mirror.
 
         With manifest, the mirror names the tag only in version.json (written by
@@ -261,7 +307,10 @@ class MirrorBinaryInstallTests(unittest.TestCase):
                         '#!/bin/sh\n'
                         f'[ "$1" = --version ] && echo "harw-test {target}"\n'
                         'exit 0\n'
-                    ).encode()
+                    ).encode() if runnable else (
+                        # Like an ELF whose loader is missing on this system.
+                        b'#!/nonexistent/ld-linux.so.2\n'
+                    )
                     info = tarfile.TarInfo(f"{name}/{binary}")
                     info.size, info.mode = len(body), 0o755
                     tar.addfile(info, io.BytesIO(body))
@@ -288,11 +337,15 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             )
             (root / "mirror" / "version.json").write_text(written.stdout)
 
-    def run_installer(self, root, machine, *args):
+    def run_installer(self, root, machine, *args, glibc=True):
         home, mocks = root / "home", root / "mocks"
         home.mkdir(exist_ok=True)
         mocks.mkdir(exist_ok=True)
         SourceInstallTests.executable(mocks / "curl", MIRROR_CURL)
+        SourceInstallTests.executable(
+            mocks / "getconf",
+            "#!/bin/sh\necho 'glibc 2.39'\n" if glibc else "#!/bin/sh\nexit 1\n",
+        )
         SourceInstallTests.executable(mocks / "uname", f"""#!/bin/sh
 case "$1" in
   -m) echo {machine} ;;
