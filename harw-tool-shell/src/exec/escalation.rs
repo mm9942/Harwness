@@ -37,7 +37,9 @@ use crate::host_escalation::{
     SandboxDenial, audit_escalation, classify_sandbox_denial, denial_hint,
 };
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitVariant};
+use super::platform::{self, HostPolicy};
 use harw_authority::{Permission, SandboxSpec};
+use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{HostApprovalScope, ProcessEnvironment, ProcessPermitRequest};
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
@@ -261,7 +263,16 @@ impl EscalatingShellExecutor {
             .host_permit_registry
             .as_ref()
             .is_some_and(|registry| registry.is_session_approved(session));
-        if covered {
+        // Android-Anbindung: ohne Sandbox erlaubt
+        // `ApprovalMode::FullAccess` Host-Ausführung ohne Rückfrage — dieselbe
+        // Politik wie `ShellExecutor::determine_effective_host`
+        // ([`platform::host_policy`]), hier nur für den `request_host`-Weg.
+        let mode = self.inner.approval_mode.as_ref().map(ApprovalModeCell::get);
+        let host_without_prompt = matches!(
+            platform::host_policy(self.inner.exec_platform, false, mode),
+            HostPolicy::HostWithoutPrompt
+        );
+        if covered || host_without_prompt {
             audit_escalation(
                 &requester,
                 &args.command,

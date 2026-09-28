@@ -59,6 +59,7 @@ use crate::capture::{BoundedCapture, DrainEnd};
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_authority::{Permission, SandboxSpec};
+use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::contributors::ToolProvider;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
@@ -100,6 +101,10 @@ mod operator;
 // (`job.start` in `harw-tool-job`), ohne Wanduhr-Zeitlimit.
 mod background;
 pub use background::BackgroundLaunch;
+// Android-Anbindung: einzige `cfg!(target_os = "android")`-Abfrage des
+// Crates, dazu die reine `host_policy`-Entscheidungsfunktion.
+mod platform;
+pub use platform::ExecPlatform;
 pub use operator::{
     OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome,
     operator_escalation_message, run_operator_command,
@@ -158,6 +163,14 @@ const NO_UI_APPROVAL_MSG: &str = "shell.exec: host execution requires local UI a
 /// Antwort.
 const HOST_PERMIT_DENIED_MSG: &str = "shell.exec: host execution was not approved (denied, \
      timed out, or the answer channel was dropped)";
+/// Ablehnungsnachricht auf Plattformen ohne Sandbox (Android/Termux), wenn
+/// weder eine laufende Host-Arbeitsphase noch eine Einmalfreigabe vorliegt
+/// und kein Fragekanal angehängt ist: es gibt hier keinen Sandbox-Rückfall,
+/// also bleibt nur die Ablehnung (fail-closed).
+const NO_SANDBOX_NO_APPROVAL_MSG: &str =
+    "shell.exec: this platform has no sandbox (bwrap/user namespaces unavailable); host \
+     execution needs your approval — once or for a host work phase (end it with Ctrl+H) — but \
+     no approval channel is attached here (fail-closed)";
 
 // ── ShellExecError ────────────────────────────────────────────────────────────
 
@@ -319,6 +332,20 @@ pub struct ShellExecutor {
     /// der Host-Pfad (Plan Teil B1) ignoriert dieses Feld, weil dort ohnehin
     /// kein `bwrap` läuft und die Umgebung bereits vollständig geerbt wird.
     host_path: Option<HostPathBinding>,
+    /// Plattform, auf der dieser Build läuft (Android-Anbindung). Bestimmt
+    /// zusammen mit [`Self::sandbox_profile`] und [`Self::approval_mode`]
+    /// über [`platform::host_policy`], welcher der bestehenden Host-Wege in
+    /// [`Self::determine_effective_host`] gilt. Vorgabe
+    /// [`ExecPlatform::current`]; auf [`ExecPlatform::Sandboxed`] (Linux und
+    /// jedes andere Nicht-Android-Ziel) bleibt jedes Verhalten unverändert.
+    exec_platform: ExecPlatform,
+    /// Laufzeit-lebendige Freigabemodus-Zelle
+    /// ([`harw_extension_api::approval_mode::ApprovalModeCell`]).
+    /// Nur auf [`ExecPlatform::NoSandbox`] gelesen: dort erlaubt
+    /// [`harw_extension_api::ApprovalMode::FullAccess`] Host-Ausführung ohne
+    /// Rückfrage. `None` verhält sich wie jeder andere Modus (Rückfrage
+    /// nötig). Auf [`ExecPlatform::Sandboxed`] wirkungslos.
+    approval_mode: Option<ApprovalModeCell>,
 }
 
 impl ShellExecutor {
@@ -590,26 +617,81 @@ impl ShellExecutor {
     /// present — returns `false`: the caller then falls through to the
     /// unchanged Bubblewrap path.
     ///
+    /// Plattform-Android-Anbindung: auf [`ExecPlatform::Sandboxed`] (Linux und
+    /// jedes andere Nicht-Android-Ziel) ist dies weiterhin die einzige
+    /// beschriebene Verzweigung — [`platform::host_policy`] ordnet Host-Profil
+    /// stets [`platform::HostPolicy::RequireApproval`] und jedes andere Profil
+    /// stets [`platform::HostPolicy::SandboxUnlessLease`] zu, unabhängig vom
+    /// Freigabemodus. Auf [`ExecPlatform::NoSandbox`] (Android/Termux, keine
+    /// Bubblewrap-Sandbox) gibt es diese Fälle zusätzlich:
+    /// - [`platform::HostPolicy::HostWithoutPrompt`]:
+    ///   [`harw_extension_api::ApprovalMode::FullAccess`] erlaubt
+    ///   Host-Ausführung ohne Rückfrage (einzige Stelle, die das je tut) —
+    ///   quittiert mit einem [`tracing::info!`]-Audit-Eintrag.
+    /// - [`platform::HostPolicy::RequireApproval`] (jeder andere
+    ///   Freigabemodus): erst eine laufende Sitzungsphase oder Einmalfreigabe
+    ///   der Registry, sonst — nur wenn Ledger, Registry **und** Fragekanal
+    ///   alle angehängt sind — dieselbe Rückfrage wie im Host-Profil
+    ///   ([`Self::authorize_host_command`]); ohne einen vollständigen Kanal
+    ///   wird sofort abgelehnt (fail-closed, kein 300-Sekunden-Warten auf
+    ///   niemanden).
+    ///
     /// # Errors
     /// Returns the same `Err(String)` as [`Self::authorize_host_command`]
     /// when the profile is [`SandboxProfile::Host`] and authorization is
     /// denied (fail-closed; propagated to the caller as a `ToolOutput::error`
-    /// without falling back to any other path).
+    /// without falling back to any other path). On [`ExecPlatform::NoSandbox`]
+    /// without a complete approval channel, returns
+    /// [`NO_SANDBOX_NO_APPROVAL_MSG`] instead.
     async fn determine_effective_host(
         &self,
         args: &ShellExecArgs,
         sandbox: &SandboxSpec,
         session_id: &str,
     ) -> Result<bool, String> {
-        if self.sandbox_profile.is_host() {
-            self.authorize_host_command(args, sandbox, session_id)
-                .await?;
-            return Ok(true);
+        let mode = self.approval_mode.as_ref().map(ApprovalModeCell::get);
+        match platform::host_policy(self.exec_platform, self.sandbox_profile.is_host(), mode) {
+            platform::HostPolicy::SandboxUnlessLease => {
+                Ok(self.host_permit_registry.as_ref().is_some_and(|registry| {
+                    registry.is_session_approved(session_id) || registry.take_single_use(session_id)
+                }))
+            }
+            platform::HostPolicy::HostWithoutPrompt => {
+                info!(
+                    session_id,
+                    exec_platform = ?self.exec_platform,
+                    "shell.exec: no sandbox on this platform; ApprovalMode::FullAccess grants \
+                     host execution without prompt"
+                );
+                Ok(true)
+            }
+            platform::HostPolicy::RequireApproval if self.sandbox_profile.is_host() => {
+                self.authorize_host_command(args, sandbox, session_id)
+                    .await?;
+                Ok(true)
+            }
+            platform::HostPolicy::RequireApproval => {
+                let covered = self.host_permit_registry.as_ref().is_some_and(|registry| {
+                    registry.is_session_approved(session_id) || registry.take_single_use(session_id)
+                });
+                if covered {
+                    return Ok(true);
+                }
+                // Nur fragen, wenn Ledger, Registry und Fragekanal alle
+                // angehängt sind — sonst hört niemand zu und ein Warten auf
+                // die Antwort wäre sinnlos (fail-closed, siehe Moduldoku).
+                let has_channel = self.permit_ledger.is_some()
+                    && self.host_permit_registry.is_some()
+                    && self.host_permit_prompts.is_some();
+                if has_channel {
+                    self.authorize_host_command(args, sandbox, session_id)
+                        .await?;
+                    Ok(true)
+                } else {
+                    Err(NO_SANDBOX_NO_APPROVAL_MSG.to_owned())
+                }
+            }
         }
-
-        Ok(self.host_permit_registry.as_ref().is_some_and(|registry| {
-            registry.is_session_approved(session_id) || registry.take_single_use(session_id)
-        }))
     }
 
     /// Executes the shell command described by `args` in the given sandbox.
@@ -816,8 +898,12 @@ impl ShellExecutor {
         // Nur der `prlimit`-Teil von `resolve_limits` ist hier relevant: die tmpfs-
         // Größe gilt ausschließlich für den bwrap-Plan (kein bwrap läuft hier), wird
         // aber weiterhin mitvalidiert, damit dieselbe `ShellLimits::validate`-Regel wie
-        // im bwrap-Pfad gilt.
-        let (_tmpfs_size, prlimit) = match self.resolve_limits() {
+        // im bwrap-Pfad gilt. Android-Anbindung: auf `ExecPlatform::NoSandbox` (Termux)
+        // ist `prlimit` typischerweise gar nicht paketiert und es gibt keinen
+        // Sandbox-Rückfall, den `require_rlimits` sonst schützt — dort ist ein
+        // fehlendes `prlimit` deshalb bewusst kein Fehler ([`Self::resolve_host_limits`]).
+        // Auf `ExecPlatform::Sandboxed` bleibt `require_rlimits` unverändert wirksam.
+        let (_tmpfs_size, prlimit) = match self.resolve_host_limits() {
             Ok(resolved) => resolved,
             Err(err) => {
                 let err = ShellExecError::ResourceLimits(err);
@@ -832,7 +918,8 @@ impl ShellExecutor {
         }
 
         let setsid = resolve_setsid();
-        let (program, shell_args) = host_shell_argv(setsid, &args.command);
+        let shell = resolve_host_shell(self.exec_platform);
+        let (program, shell_args) = host_shell_argv_with_shell(setsid, &shell, &args.command);
         // Runde 5, Teil N: RLIMIT_CPU wächst mit dem gewährten Zeitlimit.
         let limits = timeouts::limits_for(self.limits, effective_timeout);
         let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
@@ -1022,6 +1109,32 @@ impl ShellExecutor {
         Ok((tmpfs_size, prlimit))
     }
 
+    /// Wie [`Self::resolve_limits`], aber für den Host-Pfad
+    /// ([`Self::run_host_command`], [`ShellToolProvider::prepare_background_launch`]):
+    /// auf [`ExecPlatform::NoSandbox`] gilt ein fehlendes `prlimit` als
+    /// erwartbar (Android/Termux paketiert es typischerweise nicht) und wird
+    /// nie zum Fehler, unabhängig von [`ShellLimits::require_rlimits`] — es
+    /// gibt dort keinen Sandbox-Rückfall, den die strenge Vorgabe sonst
+    /// schützt. Die übrigen Grenzwerte (`as_bytes`, `cpu_secs`, …) werden
+    /// unverändert geprüft; eine echte Fehlkonfiguration (z. B. `nofile = 0`)
+    /// bleibt also weiterhin ein Fehler. Auf [`ExecPlatform::Sandboxed`]
+    /// verhält sich dies byte-identisch zu [`Self::resolve_limits`].
+    fn resolve_host_limits(&self) -> Result<(NonZeroU64, Option<PathBuf>), ShellLimitsError> {
+        match self.exec_platform {
+            ExecPlatform::Sandboxed => self.resolve_limits(),
+            ExecPlatform::NoSandbox => {
+                let limits = ShellLimits {
+                    require_rlimits: false,
+                    ..self.limits
+                };
+                limits.validate()?;
+                let tmpfs_size = limits.tmpfs_size()?;
+                let prlimit = limits.resolve_prlimit()?;
+                Ok((tmpfs_size, prlimit))
+            }
+        }
+    }
+
     /// JSON-Ergebnis eines beendeten (oder wegen Ausgabeüberlauf getöteten) Prozesses.
     ///
     /// `killed_by_output_limit` ist der Kürzungshinweis für den Aufrufer: Die Ausgabe ist
@@ -1169,20 +1282,64 @@ fn is_executable_file(path: &Path) -> bool {
 /// Argumentliste (ohne `program` selbst), in der Reihenfolge, in der sie an
 /// `TokioCommand::args` übergeben werden.
 fn host_shell_argv(setsid: Option<&Path>, command: &str) -> (PathBuf, Vec<OsString>) {
+    host_shell_argv_with_shell(setsid, Path::new("/bin/sh"), command)
+}
+
+/// Wie [`host_shell_argv`], aber mit einem explizit aufgelösten Shell-Pfad
+/// statt des fest verdrahteten `/bin/sh` (Android-Anbindung, siehe
+/// [`resolve_host_shell`]). `host_shell_argv` bleibt für Aufrufer, die
+/// weiterhin ausschließlich `/bin/sh` meinen (z. B. `exec::operator`, dessen
+/// `!`-Befehle unverändert nur auf gewöhnlichem Linux/Host laufen), byte-
+/// identisch zu vorher.
+fn host_shell_argv_with_shell(
+    setsid: Option<&Path>,
+    shell: &Path,
+    command: &str,
+) -> (PathBuf, Vec<OsString>) {
     match setsid {
         Some(setsid) => (
             setsid.to_path_buf(),
             vec![
                 OsString::from("--wait"),
-                OsString::from("/bin/sh"),
+                shell.as_os_str().to_owned(),
                 OsString::from("-c"),
                 OsString::from(command),
             ],
         ),
         None => (
-            PathBuf::from("/bin/sh"),
+            shell.to_path_buf(),
             vec![OsString::from("-c"), OsString::from(command)],
         ),
+    }
+}
+
+/// Löst den Host-Shell-Pfad auf.
+///
+/// # Description
+/// Auf [`ExecPlatform::Sandboxed`] (Linux und jedes andere Nicht-Android-Ziel)
+/// immer `/bin/sh`, unverändert und ohne Existenzprüfung — byte-identisch zum
+/// bisherigen Verhalten. Auf [`ExecPlatform::NoSandbox`] (Android/Termux, wo
+/// `/bin/sh` fehlen kann) der erste vorhandene Pfad von `/bin/sh`,
+/// `$PREFIX/bin/sh` (Termux-Präfix aus der Umgebungsvariable `PREFIX`) oder
+/// `/system/bin/sh`; existiert keiner, bleibt `/bin/sh` als Rückfall (der
+/// Start scheitert dann mit einer klaren `ENOENT`-Fehlermeldung statt eines
+/// stillen Ausweichens auf ein anderes Verhalten).
+///
+/// Reine Funktion ohne Prozessstart — unit-testbar ohne Spawn.
+fn resolve_host_shell(platform: ExecPlatform) -> PathBuf {
+    match platform {
+        ExecPlatform::Sandboxed => PathBuf::from("/bin/sh"),
+        ExecPlatform::NoSandbox => {
+            let mut candidates = vec![PathBuf::from("/bin/sh")];
+            if let Some(prefix) = std::env::var_os("PREFIX") {
+                candidates.push(PathBuf::from(prefix).join("bin/sh"));
+            }
+            candidates.push(PathBuf::from("/system/bin/sh"));
+            candidates
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+        }
     }
 }
 
@@ -1391,6 +1548,14 @@ pub struct ShellToolProvider {
     /// `run_command` tatsächlich einen `bwrap`-Plan baut; wirkungslos für den
     /// Host-Pfad, der ohnehin ohne `bwrap` läuft.
     pub host_path: Option<HostPathBinding>,
+    /// Plattform, auf der dieser Build läuft (Android-Anbindung); siehe
+    /// [`Self::with_exec_platform`]. Vorgabe [`ExecPlatform::current`].
+    pub exec_platform: ExecPlatform,
+    /// Laufzeit-lebendige Freigabemodus-Zelle; siehe
+    /// [`Self::with_approval_mode`]. Nur auf [`ExecPlatform::NoSandbox`]
+    /// gelesen (Android/Termux); auf [`ExecPlatform::Sandboxed`] (Linux)
+    /// wirkungslos.
+    pub approval_mode: Option<ApprovalModeCell>,
     /// Verdrahtung für Host-Mode-Anfragen (`request_host`)
     /// aus dem Agentenbaum; nur die TUI setzt sie
     /// ([`Self::with_host_escalation`]). `None` heißt: jede Anfrage endet
@@ -1498,6 +1663,35 @@ impl ShellToolProvider {
         self
     }
 
+    /// Setzt die Plattform, auf der dieser Build läuft (Android-Anbindung).
+    ///
+    /// # Description
+    /// Ohne diesen Aufruf gilt [`ExecPlatform::current`] — die tatsächliche
+    /// Ziel-Plattform dieses Builds. Ein Test kann hier explizit
+    /// [`ExecPlatform::NoSandbox`] erzwingen, um den Android-Pfad auf Linux zu
+    /// prüfen, ohne für Android zu kompilieren.
+    #[must_use]
+    pub fn with_exec_platform(mut self, platform: ExecPlatform) -> Self {
+        self.exec_platform = platform;
+        self
+    }
+
+    /// Hängt die laufzeit-lebendige Freigabemodus-Zelle an.
+    ///
+    /// # Description
+    /// Nur auf [`ExecPlatform::NoSandbox`] gelesen (Android/Termux ohne
+    /// Bubblewrap-Sandbox): dort erlaubt
+    /// [`harw_extension_api::ApprovalMode::FullAccess`] Host-Ausführung ohne
+    /// Rückfrage (siehe [`ShellExecutor::determine_effective_host`]). Auf
+    /// [`ExecPlatform::Sandboxed`] (Linux und jedes andere Nicht-Android-Ziel)
+    /// bleibt das Verhalten unverändert, unabhängig vom Freigabemodus. Ohne
+    /// diesen Aufruf bleibt [`Self::approval_mode`] `None`.
+    #[must_use]
+    pub fn with_approval_mode(mut self, mode: ApprovalModeCell) -> Self {
+        self.approval_mode = Some(mode);
+        self
+    }
+
     /// Runde 5, Teil N: erlaubt Host-Mode-Anfragen (`shell.exec` mit
     /// `request_host`) über den angehängten Host-Permit-Fragekanal. Wirkt
     /// nur zusammen mit Ledger, Registry und Fragekanal; ändert nichts am
@@ -1543,6 +1737,8 @@ impl ShellToolProvider {
             preselected_permit_variant: self.preselected_permit_variant,
             host_permit_timeout: self.host_permit_timeout,
             host_path: self.host_path.clone(),
+            exec_platform: self.exec_platform,
+            approval_mode: self.approval_mode.clone(),
         }
     }
 
@@ -1626,6 +1822,8 @@ impl Default for ShellToolProvider {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::current(),
+            approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         }
@@ -1839,6 +2037,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         };
 
         for command in ["", " ", "\t\n"] {
@@ -1868,6 +2068,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1895,6 +2097,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -2116,6 +2320,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         };
         let capture = BoundedCapture::new(16);
 
@@ -2147,6 +2353,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         };
         let (mut writer, mut stdout) = tokio::io::duplex(1024);
         let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
@@ -2195,6 +2403,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         };
         let args = ShellExecArgs {
             command: "echo must_not_run".to_owned(),
@@ -2387,6 +2597,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
@@ -2488,6 +2700,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
@@ -2532,6 +2746,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
@@ -2578,6 +2794,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
@@ -2672,6 +2890,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         }
     }
 
@@ -3233,6 +3453,121 @@ mod tests {
         assert!(provider.permit_ledger.is_some());
     }
 
+    // ── Android-Anbindung: `determine_effective_host` auf `ExecPlatform::NoSandbox` ──
+    // Diese Tests laufen auf Linux-CI (siehe Brief): `ExecPlatform::NoSandbox`
+    // wird hier bewusst erzwungen, ohne für Android zu kompilieren.
+
+    use harw_extension_api::ApprovalMode;
+
+    /// Baut einen `ShellExecutor` mit expliziter Plattform/Freigabemodus für
+    /// die Android-Anbindung; alle übrigen Felder wie [`plain_executor`],
+    /// aber ohne Sandbox-Profil-Kopplung (immer `Strict`).
+    fn executor_for_platform(
+        exec_platform: ExecPlatform,
+        approval_mode: Option<ApprovalModeCell>,
+        host_permit_registry: Option<Arc<HostPermitSessionRegistry>>,
+        host_permit_prompts: Option<HostPermitPromptSender>,
+    ) -> ShellExecutor {
+        ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry,
+            host_permit_prompts,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
+            exec_platform,
+            approval_mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_sandbox_without_lease_or_channel_fails_closed_fast() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let executor =
+            executor_for_platform(ExecPlatform::NoSandbox, None, None, None);
+        let args = args_for("echo must_not_run");
+
+        let started = std::time::Instant::now();
+        let result = executor
+            .determine_effective_host(&args, &sandbox, "no-channel-session")
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no listener must fail immediately, never wait for the 300s prompt timeout"
+        );
+        match result {
+            Err(message) => assert_eq!(message, NO_SANDBOX_NO_APPROVAL_MSG),
+            Ok(host) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected fail-closed Err, got Ok({host})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_sandbox_with_session_lease_runs_on_host() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved("leased-session");
+        let executor =
+            executor_for_platform(ExecPlatform::NoSandbox, None, Some(registry), None);
+        let args = args_for("echo leased_ok");
+
+        let host = executor
+            .determine_effective_host(&args, &sandbox, "leased-session")
+            .await
+            .map_err(|message| TestError::Unexpected(format!("must not deny: {message}")))?;
+        assert!(host, "an active session lease must run on the host");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_sandbox_full_access_runs_on_host_without_prompt() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let mode = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        // Kein Ledger, keine Registry, kein Fragekanal — `FullAccess` allein
+        // reicht auf `NoSandbox`, ohne jede Rückfrage.
+        let executor = executor_for_platform(ExecPlatform::NoSandbox, Some(mode), None, None);
+        let args = args_for("echo full_access_ok");
+
+        let host = executor
+            .determine_effective_host(&args, &sandbox, "full-access-session")
+            .await
+            .map_err(|message| TestError::Unexpected(format!("must not deny: {message}")))?;
+        assert!(host, "ApprovalMode::FullAccess must run on the host without a prompt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sandboxed_full_access_non_host_profile_stays_sandboxed() -> TestResult {
+        // Linux-Verhalten bleibt unverändert: `ApprovalMode::FullAccess` wird
+        // auf `ExecPlatform::Sandboxed` nicht ausgewertet.
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let mode = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        let executor = executor_for_platform(ExecPlatform::Sandboxed, Some(mode), None, None);
+        let args = args_for("echo sandboxed_ok");
+
+        let host = executor
+            .determine_effective_host(&args, &sandbox, "sandboxed-session")
+            .await
+            .map_err(|message| TestError::Unexpected(format!("must not deny: {message}")))?;
+        assert!(
+            !host,
+            "FullAccess on a sandboxed platform must not skip the sandbox for a non-host profile"
+        );
+        Ok(())
+    }
+
     // ── authorize_host_command: gemerkter Permit / mehrere Anträge ─────────
 
     fn host_executor(
@@ -3250,6 +3585,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
         }
     }
 

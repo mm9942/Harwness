@@ -49,7 +49,8 @@
 //! der Job trotzdem mit harw (`--die-with-parent`).
 
 use super::{
-    ShellExecArgs, ShellExecError, ShellToolProvider, host_shell_argv, resolve_setsid, timeouts,
+    ShellExecArgs, ShellExecError, ShellToolProvider, host_shell_argv_with_shell,
+    resolve_host_shell, resolve_setsid, timeouts,
 };
 use crate::limits::launch_command;
 use harw_authority::Permission;
@@ -255,7 +256,16 @@ impl ShellToolProvider {
                 ToolOutput::error(message)
             })?;
 
-        let (tmpfs_size, prlimit) = executor.resolve_limits().map_err(|err| {
+        // Android-Anbindung: auf dem Host-Pfad ist ein fehlendes `prlimit`
+        // (Termux paketiert es typischerweise nicht) auf `ExecPlatform::NoSandbox`
+        // bewusst kein Fehler ([`ShellExecutor::resolve_host_limits`]); der
+        // Bubblewrap-Zweig behält unverändert die strenge Vorgabe.
+        let (tmpfs_size, prlimit) = if effective_host {
+            executor.resolve_host_limits()
+        } else {
+            executor.resolve_limits()
+        }
+        .map_err(|err| {
             let err = ShellExecError::ResourceLimits(err);
             warn!(error = %err, tool_name, "background launch: resource limits unavailable");
             ToolOutput::error(err.to_string())
@@ -271,7 +281,8 @@ impl ShellToolProvider {
 
         let mut launched = if effective_host {
             let setsid = resolve_setsid();
-            let (program, shell_args) = host_shell_argv(setsid, command);
+            let shell = resolve_host_shell(executor.exec_platform);
+            let (program, shell_args) = host_shell_argv_with_shell(setsid, &shell, command);
             let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
             let mut launched = TokioCommand::new(&launch.program);
             launched.args(&launch.args);
@@ -335,8 +346,67 @@ impl ShellToolProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecPlatform;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
+    use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+    use harw_tools::ToolExecutionContext;
+    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::os::unix::ffi::OsStringExt;
+    use tempfile::TempDir;
+
+    /// Wie die gleichnamigen Helfer in `exec.rs`, hier lokal für die
+    /// Android-Anbindungstests dieses Moduls.
+    fn make_sandbox(dir: &TempDir, permissions: Vec<Permission>) -> TestResult<SandboxSpec> {
+        let ws = dir.path().join("project");
+        std::fs::create_dir_all(&ws).map_err(ctx("project subdir"))?;
+        let registry = WorkspaceRegistry::build(
+            dir.path(),
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("project"),
+                root: ws,
+            }],
+        )
+        .map_err(ctx("registry build"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("project"),
+            )
+            .map_err(ctx("resolve"))?;
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
+    }
+
+    /// Android-Anbindung: ohne Sandbox erlaubt `ApprovalMode::FullAccess`
+    /// dem Hintergrund-Start denselben Host-Pfad wie `shell.exec`, ohne
+    /// Ledger/Registry/Fragekanal und ohne Rückfrage.
+    #[tokio::test]
+    async fn test_background_launch_no_sandbox_full_access_runs_on_host() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let mode = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        let provider = ShellToolProvider::default()
+            .with_exec_platform(ExecPlatform::NoSandbox)
+            .with_approval_mode(mode);
+
+        let launch = provider
+            .prepare_background_launch(&context, "echo bg_full_access_ok", "job.start", 5)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("must not be denied: {output:?}")))?;
+
+        assert!(
+            launch.executed_on_host(),
+            "NoSandbox + ApprovalMode::FullAccess must run the background job on the host"
+        );
+        Ok(())
+    }
 
     /// Variablennamen aus der Ausgabe von `env` (Werte werden verworfen).
     fn env_names(stdout: &[u8]) -> Vec<String> {
