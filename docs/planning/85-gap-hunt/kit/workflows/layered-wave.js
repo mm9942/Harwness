@@ -193,7 +193,7 @@ async function runLevel(label, level) {
     goal: {
       id: `${GOAL.id}.${label}`.toLowerCase(),
       statement: `${GOAL.statement} (level ${label}: ${level.map(u => u.id).join(', ')})`,
-      criteria: level.map(u => ({ id: u.id, text: `Unit ${u.id} is delivered as specified: ${u.spec}` })),
+      criteria: level.map(u => ({ id: u.id, text: `Unit ${u.id} is delivered as specified in its own files (${u.files.join(', ')}): ${u.spec}${u.kind === 'leaf' ? ' Workspace membership, ring entries and callers are delivered by a later wiring level; do not count their absence against this unit.' : ''}` })),
       invariants: GOAL.invariants,
     },
     clusters: level.map(u => ({ id: u.id, files: u.files, findings: [specFinding(u)] })),
@@ -270,7 +270,7 @@ if (!stopped) {
 
 You check wave ${KEY} against its goal. Goal ${GOAL.id}: ${GOAL.statement}
 Read \`${GIT} diff ${BASE} -- ${files.join(' ')}\` (new files included via \`${GIT} status\`) and the tests in it.
-For every acceptance criterion answer met, not-met or unknown; met needs evidence: a repo-relative file:line or a test name.
+For every acceptance criterion answer met, not-met or unknown, using exactly these ids and no others: ${GOAL.criteria.map(c => c.id).join(', ')}; met needs evidence: a repo-relative file:line or a test name.
 ${GOAL.criteria.map(c => `- ${c.id}: ${c.text}`).join('\n')}
 List under deltas every contradiction between code/tests/gates and planning docs.`,
     { label: `goal:${KEY}`, phase: 'Goal', schema: COVERAGE, model: 'sonnet', agentType: 'focused-explorer' })

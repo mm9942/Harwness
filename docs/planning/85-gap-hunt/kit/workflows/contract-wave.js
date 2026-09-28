@@ -317,7 +317,7 @@ if (waveFiles.length) {
   goalCheck = await agent(`${CONTEXT}
 
 You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${waveFiles.join(' ')}\` and the tests in it. Do not edit.
-For every acceptance criterion, answer met, not-met or unknown. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
+For every acceptance criterion, answer met, not-met or unknown, using exactly these criterion ids and no others: ${GOAL.criteria.map(c => c.id).join(', ')}. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
     { label: `goal:${A.key}`, phase: 'Goal', schema: COVERAGE, model: 'sonnet', agentType: 'focused-explorer' })
 }
 const coverage = waveFiles.length ? coverageOf(goalCheck) : []
