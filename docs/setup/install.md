@@ -10,8 +10,10 @@ platform notes) see [`docs/setup/build-prerequisites.md`](build-prerequisites.md
 
 ## Requirements
 
-- **Platform:** Linux. The source installer works on the host architecture
-  supported by the repository's pinned Rust toolchain.
+- **Platform:** Linux, and Android under Termux (arm64, see
+  [Android (Termux, no root)](#android-termux-no-root)). The source
+  installer works on the host architecture supported by the repository's
+  pinned Rust toolchain.
 - **Sandbox:** [bubblewrap](https://github.com/containers/bubblewrap)
   (`bwrap`) and util-linux, for the sandboxed execution the harness uses to
   run agent commands. The source installer installs the distribution package
@@ -87,6 +89,33 @@ Finally the script runs `make install BINDIR=…`. Unknown package managers
 produce a manual-install error listing what is missing. The source archive
 is fetched over HTTPS; a separate checksum is not published for it yet.
 `HARW_INSTALL_DIR` defaults to `~/.local/bin`. See `--help` for overrides.
+
+#### Android (Termux, no root)
+
+The same one-liner works in [Termux](https://termux.dev) on an arm64
+phone. The installer detects Termux (`uname -o` = `Android`) and then:
+
+- installs missing build tools with `pkg install` (no root, no sudo):
+  `rust clang make cmake pkg-config git binutils`. `rust` comes from
+  Termux because rustup has no Android host toolchain; the pinned
+  `rust-toolchain.toml` is therefore not applied, any Rust ≥ 1.85 builds.
+- does **not** require `bwrap`, `prlimit` or the D-Bus development files.
+  Android has no bubblewrap and no user namespaces, and the keyring does not
+  use D-Bus there; secrets live in the encrypted SecretStore.
+- builds and installs `harw` and `harw-agent-runner` only. `killer` needs
+  Linux procfs and pidfd and is skipped (`make install` detects Android).
+
+Without a sandbox, harw runs shell commands on the host **only after your
+approval**: once per command, or a host phase that you end with Ctrl+H.
+Without an approval channel (non-interactive use) commands are refused.
+In FullAccess mode an Android build runs them on the host without asking.
+Linux builds are unaffected: there FullAccess stays sandboxed.
+
+```sh
+pkg install -y curl
+curl -fsSL https://get.harw.dev/harw/install.sh | bash
+harw doctor
+```
 
 ### (c) From source via `make install`
 

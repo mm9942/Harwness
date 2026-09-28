@@ -50,10 +50,22 @@ as_root() {
   fi
 }
 
+# Termux on Android: uname -s says Linux, uname -o says Android. Termux
+# installs packages without root (`pkg`), has no bubblewrap, no user
+# namespaces and no prlimit, and links no D-Bus (the keyring uses its
+# Android fallback, secrets live in the encrypted SecretStore).
+is_termux() {
+  [ "$(uname -o 2>/dev/null)" = Android ]
+}
+
 install_packages() {
   local phase="$1"
   local packages=()
-  if command -v apt-get >/dev/null 2>&1; then
+  if is_termux; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(rust clang make cmake pkg-config git binutils); fi
+    pkg install -y "${packages[@]}"
+  elif command -v apt-get >/dev/null 2>&1; then
     if [ "$phase" = unzip ]; then
       packages=(unzip)
     else
@@ -114,6 +126,26 @@ install_linux_dependencies() {
     command -v "$tool" >/dev/null 2>&1 || die "$tool is still missing after package installation"
   done
   pkg-config --exists dbus-1 || die "dbus-1 development files are still missing"
+}
+
+# Build dependencies on Termux: the Rust toolchain from Termux (rustup has
+# no Android host toolchain), a C toolchain and cmake for aws-lc-sys. Not
+# needed: bwrap, prlimit, dbus-1 (no sandbox and no D-Bus on Android).
+install_termux_dependencies() {
+  local missing=() tool
+  for tool in cargo rustc make cc pkg-config cmake git; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    log "Installing missing Termux packages for: ${missing[*]}"
+    install_packages build
+    for tool in cargo rustc make cc pkg-config cmake git; do
+      command -v "$tool" >/dev/null 2>&1 || die "$tool is still missing after pkg install"
+    done
+  fi
+  log "Android/Termux: no sandbox (no bubblewrap, no user namespaces)."
+  log "  Shell commands run on the host only after your approval (once, or a"
+  log "  host phase you end with Ctrl+H). In FullAccess mode they run without asking."
 }
 
 fetch() {
@@ -259,10 +291,18 @@ else
   fi
 fi
 
-ensure_rustup "$work_dir"
-install_linux_dependencies
+if is_termux; then
+  install_termux_dependencies
+else
+  ensure_rustup "$work_dir"
+  install_linux_dependencies
+fi
 mkdir -p "$install_dir"
-log "Building in $checkout with its pinned Rust toolchain"
+if is_termux; then
+  log "Building in $checkout with the Termux Rust toolchain (killer is Linux-only and skipped)"
+else
+  log "Building in $checkout with its pinned Rust toolchain"
+fi
 (cd "$checkout" && make install BINDIR="$install_dir")
 
 if [ "$install_dir" = "$HOME/.local/bin" ]; then

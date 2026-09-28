@@ -62,8 +62,13 @@ fmt: ## Format check without changing anything
 check: ## Fast type check of the whole workspace
 	$(CARGO) check --workspace --all-features
 
-build: ## Release-build harw, killer and the agent runner
-	$(CARGO) build --release --bin harw --bin killer
+# killer needs Linux procfs and pidfd (compile_error! elsewhere). Termux on
+# Android reports `uname -o` = Android and builds harw + the runner only.
+HOST_IS_ANDROID := $(filter Android,$(shell uname -o 2>/dev/null))
+HOST_BINS = --bin harw $(if $(HOST_IS_ANDROID),,--bin killer)
+
+build: ## Release-build harw, killer (not on Android) and the agent runner
+	$(CARGO) build --release $(HOST_BINS)
 	$(CARGO) build --profile release-runner --bin harw-agent-runner
 
 # HARW_HOME follows the same default the Rust side uses (harw-home::paths,
@@ -86,11 +91,11 @@ HARW_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
 
 install: build ## Install harw, killer and the agent runner into BINDIR (default ~/.local/bin)
 	install -Dm755 target/release/harw $(BINDIR)/harw
-	install -Dm755 target/release/killer $(BINDIR)/killer
+	$(if $(HOST_IS_ANDROID),,install -Dm755 target/release/killer $(BINDIR)/killer)
 	install -Dm755 target/release-runner/harw-agent-runner $(BINDIR)/harw-agent-runner
 	install -Dm755 target/release-runner/harw-agent-runner \
 		"$(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
-	@echo "Installed $(BINDIR)/harw, $(BINDIR)/killer and $(BINDIR)/harw-agent-runner"
+	@echo "Installed $(BINDIR)/harw, $(if $(HOST_IS_ANDROID),,$(BINDIR)/killer and )$(BINDIR)/harw-agent-runner"
 	@echo "Runner copy: $(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
 	@case ":$$PATH:" in \
 		*":$(BINDIR):"*) ;; \
