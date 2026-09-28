@@ -2265,7 +2265,11 @@ impl RuntimeAssemblyBuilder {
         // für Orchestratoren. Andere Einstiege enden mit ihrem Prozess und
         // bekommen keine Jobs.
         let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
-            match crate::job_wiring::SessionJobs::open(&home_project.state_dir()) {
+            // `[jobs] max_running` — Höchstzahl laufender Jobs dieser Sitzung.
+            match crate::job_wiring::SessionJobs::open(
+                &home_project.state_dir(),
+                config.harness.jobs.effective_max_running(),
+            ) {
                 Ok((jobs, receiver)) => (Some(jobs), Some(receiver)),
                 Err(error) => {
                     tracing::warn!(error = %error, "runtime.jobs.open_failed");

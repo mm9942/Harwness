@@ -402,13 +402,31 @@ limit. Merge behavior is the same as `[agents]`.
 max_timeout_secs = 900
 ```
 
+### 1.23 `[jobs]` (`harness_config.rs`, `JobsToml`)
+
+| TOML path | Type | Default | Allowed | Merge today |
+|---|---|---|---|---|
+| `jobs.max_running` | `Option<u32>` | `16` | 1–256 | `MinBound` for the untrusted project (`merge_jobs`) |
+
+Upper bound on concurrently running `job.start` background processes per
+harw instance. When it is reached, `job.start` fails with an error that names
+`[jobs] max_running`. A value outside 1–256 is a configuration error at parse
+time, not clamped. Home and profile set freely, including upward; an
+untrusted project may only lower it — an attempt to raise it is ignored and
+reported as a `ScopeDiagnostic`.
+
+```toml
+[jobs]
+max_running = 16
+```
+
 **Total documented `HarnessConfig` fields at the time of the original
 analysis: 111** — leaf fields including nested types such as
 `McpPrincipalToml`, `RuleToml`, `CargoSandboxToml`/`TmuxSandboxToml`,
 `InternalModelChoice`, `OnboardingSeen`; plus `base_dir` as an extra table row
 in Section 1.1, which is **not a TOML field** (`#[serde(skip)]`, so not
 counted). The current, authoritative count is `FIELD_TABLE.len()` in
-`harw-config/src/scope.rs` (114 at last check; it grows as fields are added
+`harw-config/src/scope.rs` (120 at last check; it grows as fields are added
 and this document is not re-counted on every addition).
 
 Parsed from the same `config.toml`, with the same layer mechanics, but
@@ -938,6 +956,9 @@ all Profile / `ProfileReplaces`.
 all Profile / `MinBound`, security-critical.
 
 **1.22 `[shell]`** (1): `shell.max_timeout_secs` — Profile / `MinBound`,
+security-critical.
+
+**1.23 `[jobs]`** (1): `jobs.max_running` — Profile / `MinBound`, not
 security-critical.
 
 **Distribution as implemented (`FIELD_TABLE`, `harw-config/src/scope.rs`,

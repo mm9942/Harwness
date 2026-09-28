@@ -10,7 +10,8 @@
 //! - `job.stop {job_id, signal?}` — TERM (bzw. INT/HUP/KILL) an die ganze
 //!   Prozessgruppe, nach der Gnadenfrist SIGKILL (kein `ExecuteProcess`
 //!   nötig: nur eigene Jobs bzw. die der Nachfahren)
-//! - `job.list {}`
+//! - `job.list {kind?}` — ohne `kind` nur die Übersicht je Art mit Zählern
+//!   pro Zustand; mit `kind` die Zeilen dieser Art
 //! - `job.wait {job_id, timeout_secs}` — begrenzt bis Ende oder Meilenstein
 //!
 //! # Rechte
