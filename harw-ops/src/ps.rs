@@ -6,7 +6,7 @@
 //! (`/ps`) und als schreibgeschütztes Modell-Tool ohne Approval-Anforderung.
 //!
 //! # Schlüsseltypen
-//! - [`PsArgs`] — optionaler Statusfilter für die Abfrage.
+//! - [`PsArgs`] — optionaler Statusfilter und optionale Art (`work`/`process`).
 //! - [`PsOperation`] — generierter Unit-Struct, impl [`harw_operations::Operation`].
 //!
 //! # Nebenläufigkeit
@@ -28,6 +28,11 @@
 //!   `meta.json`-Dateien unter `<projekt>/.harw/state/jobs` (Pfad aus dem
 //!   [`harw_home::ResolvedHomeContext`]) und legt dabei nichts an.
 //!
+//! Ohne Art (`/ps`, `/ps running`) zeigt die Operation nur die Übersicht:
+//! je Art eine Zeile mit Zählern pro Zustand (`work: 1 pending · 2 ready`,
+//! `process: none`) und den Hinweis auf `/ps work|process [status]`. Erst mit
+//! Art erscheinen die einzelnen Zeilen genau dieser Art.
+//!
 //! Jede Zeile ist tabulatorgetrennt: ID, Art, Zustand, `owner` (besitzende
 //! Agenten-Sitzung), `profile` (`host`/`bwrap`), `end` (Endgrund) und `rev`
 //! (Store-Revision); nicht zutreffende Felder stehen als `-`. Befehl, Name,
@@ -45,7 +50,7 @@ use harw_job_runtime::JobState;
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_session_store::{JobListQuery, JobStore};
-use harw_tool_job::model::META_FILE;
+use harw_tool_job::model::{JobEndReason, META_FILE};
 use harw_tool_job::{Caller, JobManager, JobManagerConfig, JobMeta, JobState as ProcessState};
 use std::fs::File;
 use std::io::Read;
@@ -80,6 +85,61 @@ pub struct PsArgs {
     #[serde(default)]
     #[raw(first)]
     pub status: Option<String>,
+    /// Art der Zeilen: `work` oder `process`. `None` (Standard) zeigt nur die
+    /// Übersicht je Art mit Zählern pro Zustand, keine einzelnen Zeilen.
+    /// Roh-Aufrufe dürfen die Art zuerst nennen (`/ps process running`).
+    #[serde(default)]
+    #[raw(nth = 1)]
+    pub kind: Option<String>,
+}
+
+/// Art einer `/ps`-Zeile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Durable Arbeitsaufträge aus dem [`JobStore`].
+    Work,
+    /// `job.start`-Hintergrundprozesse.
+    Process,
+}
+
+fn parse_kind(value: &str) -> Option<Kind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "work" => Some(Kind::Work),
+        "process" => Some(Kind::Process),
+        _ => None,
+    }
+}
+
+/// Ordnet Art und Status aus [`PsArgs`] zu.
+///
+/// Roh-Tokens kommen positionsweise an (`status` = erstes, `kind` = zweites
+/// Token). Ist das erste Token eine Art, ist das zweite der Status; so
+/// funktionieren `/ps work`, `/ps process running` und `/ps running work`.
+///
+/// # Fehler
+/// [`OpError::InvalidArguments`] für eine unbekannte Art.
+fn split_kind(args: PsArgs) -> Result<(Option<Kind>, Option<String>), OpError> {
+    let PsArgs { status, kind } = args;
+    if let Some(kind_from_status) = status.as_deref().and_then(parse_kind) {
+        if let Some(second) = kind.as_deref() {
+            if parse_kind(second).is_some() {
+                return Err(OpError::InvalidArguments(format!(
+                    "two job kinds given: `{}` and `{second}`",
+                    status.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+        return Ok((Some(kind_from_status), kind));
+    }
+    match kind {
+        None => Ok((None, status)),
+        Some(value) => match parse_kind(&value) {
+            Some(parsed) => Ok((Some(parsed), status)),
+            None => Err(OpError::InvalidArguments(format!(
+                "unknown job kind `{value}` (expected `work` or `process`)"
+            ))),
+        },
+    }
 }
 
 /// Listet alle laufenden Jobs und Kindprozesse.
@@ -91,18 +151,20 @@ pub struct PsArgs {
 /// aus `<projekt>/.harw/state/jobs/<id>/meta.json`; Zustände einer abgestürzten
 /// harw-Instanz erscheinen dabei so, wie sie gespeichert sind.
 ///
+/// Ohne Art liefert sie nur die Übersicht je Art mit Zählern pro Zustand
+/// (siehe Moduldoku); mit Art (`kind`) die Zeilen genau dieser Art.
+///
 /// Jede Zeile ist tabulatorgetrennt: ID, Art (`work`/`process`), Zustand,
 /// `owner <sitzung>`, `profile <host|bwrap>`, `end <endgrund>` und
-/// `rev <revision>`; nicht zutreffende Felder stehen als `-`. Zuerst stehen die
-/// `work`-Zeilen in Store-Reihenfolge, danach die `process`-Zeilen sortiert
-/// nach ID. Befehl, Name, Arbeitsverzeichnis und Umgebungsvariablen werden nie
+/// `rev <revision>`; nicht zutreffende Felder stehen als `-`. `work`-Zeilen
+/// stehen in Store-Reihenfolge, `process`-Zeilen sortiert nach ID. Befehl, Name, Arbeitsverzeichnis und Umgebungsvariablen werden nie
 /// ausgegeben. Mandantengebundene Aufrufer sehen keine `process`-Zeilen (H12).
 /// Sind beide Listen leer, lautet die Ausgabe `No jobs.`.
 ///
 /// # Argumente
 /// - `ctx` (`&OpContext`): Liefert den erforderlichen `Arc<JobStore>` und
 ///   optional `Arc<JobManager>` bzw. `Arc<harw_home::ResolvedHomeContext>`.
-/// - `args` (`PsArgs`): Optionaler Statusfilter.
+/// - `args` (`PsArgs`): Optionaler Statusfilter und optionale Art.
 ///
 /// # Rückgabe
 /// [`OpOutput`] mit einer Zeile pro durable Job und Hintergrundprozess.
@@ -132,21 +194,30 @@ pub struct PsArgs {
     web(path = "/api/ps", method = "get", approval = "none")
 )]
 async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
-    let states = args.status.as_deref().map(parse_state).transpose()?;
+    let (kind, status) = split_kind(args)?;
+    let states = status.as_deref().map(parse_state).transpose()?;
     let store = ctx
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
     // H12: mandantengebundene Aufrufer sehen nur Jobs des eigenen Mandanten.
-    let jobs = crate::job_tenant::list_visible_jobs(
-        ctx,
-        store,
-        JobListQuery {
-            states: states.map(|state| vec![state]),
-            ..JobListQuery::default()
-        },
-    )
-    .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?;
-    let mut processes = process_jobs(ctx)?;
+    let jobs = if kind == Some(Kind::Process) {
+        Vec::new()
+    } else {
+        crate::job_tenant::list_visible_jobs(
+            ctx,
+            store,
+            JobListQuery {
+                states: states.map(|state| vec![state]),
+                ..JobListQuery::default()
+            },
+        )
+        .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?
+    };
+    let mut processes = if kind == Some(Kind::Work) {
+        Vec::new()
+    } else {
+        process_jobs(ctx)?
+    };
     if let Some(filter) = states {
         processes.retain(|meta| process_matches(filter, meta.state));
     }
@@ -154,29 +225,75 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     if jobs.is_empty() && processes.is_empty() {
         return Ok(OpOutput::from("No jobs.".to_owned()));
     }
-    let work_rows = jobs.iter().map(|record| {
-        format!(
-            "{}\twork\t{:?}\towner -\tprofile -\tend -\trev {}",
-            record.job.id, record.job.state, record.revision
-        )
-    });
-    // Nur ID, Zustand, Besitzer, Profil und Endgrund: Befehl, Name, cwd und
-    // Umgebungsnamen bleiben draußen, Umgebungswerte kennt `meta.json` nicht.
-    let process_rows = processes.iter().map(|meta| {
-        format!(
-            "{}\tprocess\t{}\towner {}\tprofile {}\tend {}\trev -",
-            meta.job_id,
-            meta.state.as_str(),
-            meta.owner.session,
-            process_profile(meta),
-            process_end_reason(meta)
-        )
-    });
-    let text = work_rows
-        .chain(process_rows)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let Some(kind) = kind else {
+        return Ok(OpOutput::from(summary(&jobs, &processes)));
+    };
+    let text = match kind {
+        Kind::Work => jobs
+            .iter()
+            .map(|record| {
+                format!(
+                    "{}\twork\t{:?}\towner -\tprofile -\tend -\trev {}",
+                    record.job.id, record.job.state, record.revision
+                )
+            })
+            .collect::<Vec<_>>(),
+        // Nur ID, Zustand, Besitzer, Profil und Endgrund: Befehl, Name, cwd und
+        // Umgebungsnamen bleiben draußen, Umgebungswerte kennt `meta.json` nicht.
+        Kind::Process => processes
+            .iter()
+            .map(|meta| {
+                format!(
+                    "{}\tprocess\t{}\towner {}\tprofile {}\tend {}\trev -",
+                    meta.job_id,
+                    meta.state.as_str(),
+                    meta.owner.session,
+                    process_profile(meta),
+                    process_end_reason(meta)
+                )
+            })
+            .collect(),
+    }
+    .join("\n");
     Ok(OpOutput::from(text))
+}
+
+/// Übersicht ohne Art: je Art eine Zeile mit Zählern pro Zustand, danach der
+/// Hinweis auf die Detailansicht.
+///
+/// Zustände erscheinen in der Reihenfolge ihres ersten Auftretens (Store-
+/// Reihenfolge bzw. sortiert nach ID), damit die Ausgabe stabil bleibt.
+fn summary(jobs: &[harw_job_runtime::StoredJob], processes: &[JobMeta]) -> String {
+    let work = count_states(
+        jobs.iter()
+            .map(|record| format!("{:?}", record.job.state).to_ascii_lowercase()),
+    );
+    let process = count_states(processes.iter().map(|meta| meta.state.as_str().to_owned()));
+    [
+        format!("work: {work}"),
+        format!("process: {process}"),
+        "Details: /ps work|process [status]".to_owned(),
+    ]
+    .join("\n")
+}
+
+/// `2 running · 1 failed` oder `none` für eine leere Art.
+fn count_states(states: impl Iterator<Item = String>) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for state in states {
+        match counts.iter_mut().find(|(known, _)| *known == state) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((state, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(state, count)| format!("{count} {state}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Sammelt die `job.start`-Hintergrundprozesse für `/ps`.
@@ -258,40 +375,16 @@ fn read_meta_capped(path: &Path) -> Option<JobMeta> {
     serde_json::from_slice::<JobMeta>(&bytes).ok()
 }
 
-/// Sandbox-Profil eines Hintergrundprozesses: `host` ohne `bwrap`, sonst
-/// `bwrap`.
+/// Sandbox-Profil eines Hintergrundprozesses (`host`/`bwrap`), aus
+/// [`JobMeta::sandbox_profile`].
 fn process_profile(meta: &JobMeta) -> &'static str {
-    if meta.executed_on_host {
-        "host"
-    } else {
-        "bwrap"
-    }
+    meta.sandbox_profile()
 }
 
-/// Endgrund eines Hintergrundprozesses, abgeleitet aus `meta.json`.
-///
-/// # Beschreibung
-/// `-` für nicht beendete Jobs; sonst in dieser Reihenfolge `launch-error`,
-/// `stopped`, `signal`, `exited`, `unknown`. Sobald der Job-Kern Endgrund
-/// (einschließlich `timeout`) selbst speichert, ersetzen diese Felder die
-/// Ableitung hier.
+/// Endgrund eines Hintergrundprozesses aus [`JobMeta::end_reason`]; `-` für
+/// nicht beendete Jobs und beendete ohne erkennbares Ergebnis.
 fn process_end_reason(meta: &JobMeta) -> &'static str {
-    if !meta.state.is_terminal() {
-        return "-";
-    }
-    if meta.launch_error.is_some() {
-        "launch-error"
-    } else if meta.state == ProcessState::Stopped || meta.stop_requested {
-        "stopped"
-    } else if meta.signal.is_some() {
-        "signal"
-    } else if meta.exit_code.is_some() {
-        "exited"
-    } else if meta.state == ProcessState::Unknown {
-        "unknown"
-    } else {
-        "-"
-    }
+    meta.end_reason().map_or("-", JobEndReason::as_str)
 }
 
 /// Ob ein Hintergrundprozess im Zustand `state` zum Filter `filter` passt
@@ -457,6 +550,7 @@ mod tests {
             &ctx,
             PsArgs {
                 status: Some("unknown".to_owned()),
+                kind: Some("work".to_owned()),
             },
         )
         .await;
@@ -475,7 +569,7 @@ mod tests {
             )?)
             .map_err(ctx("admit job-pending"))?;
         let (ctx, _root) = test_context(Some(store))?;
-        let output = ps(&ctx, PsArgs::default())
+        let output = ps(&ctx, PsArgs { kind: Some("work".to_owned()), ..PsArgs::default() })
             .await
             .map_err(crate::test_support::ctx("ps"))?;
         assert!(
@@ -506,6 +600,7 @@ mod tests {
             &ctx,
             PsArgs {
                 status: Some("waiting".to_owned()),
+                kind: Some("work".to_owned()),
             },
         )
         .await
@@ -523,7 +618,7 @@ mod tests {
         use crate::job_tenant::fixtures::{JOB_A, JOB_B, context, two_tenants};
         let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
         let op_ctx = context(&jobs, None)?;
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        let output = ps(&op_ctx, PsArgs { kind: Some("work".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
         assert!(output.text.contains(JOB_A), "{}", output.text);
         assert!(output.text.contains(JOB_B), "{}", output.text);
         Ok(())
@@ -534,7 +629,7 @@ mod tests {
         use crate::job_tenant::fixtures::{JOB_A, JOB_B, TENANT_A, context, two_tenants};
         let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
         let op_ctx = context(&jobs, Some(TENANT_A))?;
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        let output = ps(&op_ctx, PsArgs { kind: Some("work".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
         assert!(output.text.contains(JOB_A), "{}", output.text);
         assert!(!output.text.contains(JOB_B), "{}", output.text);
         Ok(())
@@ -656,22 +751,106 @@ mod tests {
     const PROCESS_ROW: &str =
         "job-proc-1\tprocess\tsucceeded\towner agent-x\tprofile host\tend exited\trev -";
 
+    fn with_kind(kind: &str) -> PsArgs {
+        PsArgs {
+            kind: Some(kind.to_owned()),
+            ..PsArgs::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ps_without_kind_shows_only_category_summary() -> TestResult {
+        let (_home_dir, home) = home_fixture()?;
+        write_succeeded_process(&home)?;
+        let op_ctx = mixed_context(&home, None)?;
+        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        assert_eq!(
+            output.text,
+            "work: 1 pending\nprocess: 1 succeeded\nDetails: /ps work|process [status]"
+        );
+        assert!(!output.text.contains("job-pending"), "{}", output.text);
+        assert!(!output.text.contains("job-proc-1"), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ps_summary_marks_empty_kind_as_none() -> TestResult {
+        let (_home_dir, home) = home_fixture()?;
+        let op_ctx = mixed_context(&home, None)?;
+        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        assert_eq!(
+            output.text,
+            "work: 1 pending\nprocess: none\nDetails: /ps work|process [status]"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ps_lists_work_and_process_jobs_with_kind() -> TestResult {
         let (_home_dir, home) = home_fixture()?;
         write_succeeded_process(&home)?;
         let op_ctx = mixed_context(&home, None)?;
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
-        assert!(
-            output.text.contains("job-pending\twork\t"),
-            "{}",
-            output.text
+        let work = ps(&op_ctx, with_kind("work")).await.map_err(ctx("ps work"))?;
+        assert_eq!(
+            work.text,
+            "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0"
         );
-        assert!(output.text.contains(PROCESS_ROW), "{}", output.text);
-        // Arbeitsaufträge zuerst, dann Hintergrundprozesse.
-        let lines: Vec<&str> = output.text.lines().collect();
-        assert_eq!(lines.len(), 2, "{}", output.text);
-        assert_eq!(lines.get(1).copied(), Some(PROCESS_ROW));
+        let process = ps(&op_ctx, with_kind("process"))
+            .await
+            .map_err(ctx("ps process"))?;
+        assert_eq!(process.text, PROCESS_ROW);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ps_raw_args_accept_kind_first_or_second() -> TestResult {
+        let (_home_dir, home) = home_fixture()?;
+        write_succeeded_process(&home)?;
+        let op_ctx = mixed_context(&home, None)?;
+        for tokens in [["process", "finished"], ["finished", "process"]] {
+            let args = PsArgs::from_raw_args(&toks(&tokens))
+                .map_err(|error| TestError::Unexpected(format!("{error}")))?;
+            let output = ps(&op_ctx, args).await.map_err(ctx("ps raw"))?;
+            assert_eq!(output.text, PROCESS_ROW, "{tokens:?}");
+        }
+        let args = PsArgs::from_raw_args(&toks(&["process", "running"]))
+            .map_err(|error| TestError::Unexpected(format!("{error}")))?;
+        let output = ps(&op_ctx, args).await.map_err(ctx("ps running"))?;
+        assert_eq!(output.text, "No jobs.");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ps_json_args_carry_kind_and_status() -> TestResult {
+        let (_home_dir, home) = home_fixture()?;
+        write_succeeded_process(&home)?;
+        let op_ctx = mixed_context(&home, None)?;
+        let args: PsArgs =
+            serde_json::from_value(serde_json::json!({"kind": "work", "status": "pending"}))
+                .map_err(ctx("parse json args"))?;
+        let output = ps(&op_ctx, args).await.map_err(ctx("ps json"))?;
+        assert_eq!(
+            output.text,
+            "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ps_rejects_unknown_or_double_kind() -> TestResult {
+        let (_home_dir, home) = home_fixture()?;
+        let op_ctx = mixed_context(&home, None)?;
+        let unknown = ps(&op_ctx, with_kind("threads")).await;
+        assert!(matches!(unknown, Err(OpError::InvalidArguments(_))));
+        let double = ps(
+            &op_ctx,
+            PsArgs {
+                status: Some("work".to_owned()),
+                kind: Some("process".to_owned()),
+            },
+        )
+        .await;
+        assert!(matches!(double, Err(OpError::InvalidArguments(_))));
         Ok(())
     }
 
@@ -680,13 +859,14 @@ mod tests {
         let (_home_dir, home) = home_fixture()?;
         write_succeeded_process(&home)?;
         let op_ctx = mixed_context(&home, Some("test-tenant"))?;
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
-        assert!(!output.text.contains("job-proc-1"), "{}", output.text);
-        assert!(
-            output.text.contains("job-pending\twork\t"),
-            "{}",
-            output.text
-        );
+        let process = ps(&op_ctx, with_kind("process"))
+            .await
+            .map_err(ctx("ps process"))?;
+        assert_eq!(process.text, "No jobs.");
+        let work = ps(&op_ctx, with_kind("work")).await.map_err(ctx("ps work"))?;
+        assert!(work.text.contains("job-pending\twork\t"), "{}", work.text);
+        let summary = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        assert!(summary.text.contains("process: none"), "{}", summary.text);
         Ok(())
     }
 
@@ -699,6 +879,7 @@ mod tests {
             &op_ctx,
             PsArgs {
                 status: Some("running".to_owned()),
+                kind: Some("process".to_owned()),
             },
         )
         .await
@@ -708,6 +889,7 @@ mod tests {
             &op_ctx,
             PsArgs {
                 status: Some("finished".to_owned()),
+                kind: Some("process".to_owned()),
             },
         )
         .await
@@ -725,7 +907,7 @@ mod tests {
         assert!(missing.is_empty());
         assert!(!jobs_dir.exists());
         let op_ctx = mixed_context(&home, None)?;
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        let output = ps(&op_ctx, PsArgs { kind: Some("process".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
         assert!(!output.text.contains("\tprocess\t"), "{}", output.text);
 
         // Verzeichnisname passt nicht zur job_id bzw. ungültiges JSON.
@@ -733,7 +915,7 @@ mod tests {
         write_job_file(&home, "job-bad", b"{ not json")?;
         let listed = read_process_jobs(&jobs_dir).map_err(ctx("read jobs dir"))?;
         assert!(listed.is_empty(), "{listed:?}");
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        let output = ps(&op_ctx, PsArgs { kind: Some("process".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
         for absent in ["job-x", "job-y", "job-bad", "\tprocess\t"] {
             assert!(!output.text.contains(absent), "{absent}: {}", output.text);
         }
@@ -751,6 +933,7 @@ mod tests {
             ("stopped", serde_json::json!({"signal": 15}), "stopped"),
             ("failed", serde_json::json!({"stop_requested": true}), "stopped"),
             ("failed", serde_json::json!({"signal": 9}), "signal"),
+            ("failed", serde_json::json!({"signal": 24}), "timeout"),
             ("failed", serde_json::json!({"exit_code": 2}), "exited"),
             ("succeeded", serde_json::json!({"exit_code": 0}), "exited"),
             ("unknown", serde_json::json!({}), "unknown"),
@@ -781,7 +964,7 @@ mod tests {
         let (_home_dir, home) = home_fixture()?;
         write_succeeded_process(&home)?;
         let op_ctx = mixed_context(&home, None)?;
-        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        let output = ps(&op_ctx, PsArgs { kind: Some("process".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
         assert!(output.text.contains("job-proc-1"), "{}", output.text);
         for sentinel in [
             "SENTINEL_CMD",

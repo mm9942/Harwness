@@ -618,7 +618,7 @@ pub fn discover_config(layers: &[PathBuf]) -> ConfigResult<ResolvedConfig> {
 /// | `policy.default_visibility_scope` (`self` vor `everyone`), `permissions.default_mode` (`ask` < `auto` < `full`), `tools.doc.remote_ocr` (`off` < `ask` < `on`) | nur ein strengerer Wert; `permissions.default_mode` ohne vertrauten Wert gegen `auto` |
 /// | `session.retention_days`, `research.max_fetch_bytes`, `research.fetch_timeout_secs`, `tools.plan.max_nodes`, `tools.plan.max_expand_depth`, die sieben `guards.*`-Schwellen | Minimum, nur Werte > 0; die `guards.*`-Schwellen ohne vertrauten Wert gegen die Vorgaben 2/3/4/8/6/4/5 (`repeated_failure_warn`/`_abort`, `no_progress_rounds_warn`/`_abort`, `plan_stale_rounds`, `orchestrator_read_warn`/`_limit`) |
 /// | `permissions.approval_timeout_secs`, `permissions.auto_classifier_timeout_secs`, `compaction.absolute_ceiling_tokens` | Minimum gegen den vertrauten Wert; ohne einen solchen wird der erste Wert übernommen |
-/// | `host.sudo_session_minutes`, `agents.max_*`, `shell.max_timeout_secs` | nur Senken, gegen den vertrauten Wert oder die Vorgabe |
+/// | `host.sudo_session_minutes`, `agents.max_*`, `shell.max_timeout_secs`, `jobs.max_running` | nur Senken, gegen den vertrauten Wert oder die Vorgabe |
 /// | `[network]`, `[browser]`, `[dod]` | nur verengend (`merge_restricted_*`) |
 ///
 /// Nie übernommen werden insbesondere `providers/`, `models/`, `auth.toml`,

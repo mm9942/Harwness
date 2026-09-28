@@ -1494,7 +1494,7 @@ fn test_jobs_list_show_cancel_retry_parse() -> TestResult {
     assert!(matches!(
         list.command,
         Some(Command::Jobs {
-            action: JobsAction::List { filter: None }
+            action: JobsAction::List { filter: None, .. }
         })
     ));
 
@@ -1503,7 +1503,7 @@ fn test_jobs_list_show_cancel_retry_parse() -> TestResult {
     assert!(matches!(
         filtered.command,
         Some(Command::Jobs {
-            action: JobsAction::List { filter: Some(f) }
+            action: JobsAction::List { filter: Some(f), .. }
         }) if f == "offen"
     ));
 
