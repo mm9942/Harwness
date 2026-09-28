@@ -37,9 +37,17 @@ pub const RUNNER_BINARY: &str = "harw-agent-runner";
 /// directory name under `runners/` and the `--target` default.
 #[must_use]
 pub fn host_target() -> String {
-    let arch = std::env::consts::ARCH;
-    match std::env::consts::OS {
+    target_triple(std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// Target triple for an `arch`/`os` pair as `std::env::consts` spells them.
+fn target_triple(arch: &str, os: &str) -> String {
+    match os {
         "linux" => format!("{arch}-unknown-linux-gnu"),
+        // Android triples have no `unknown`: `aarch64-linux-android`, as
+        // `rustc -vV` under Termux, `make install`, the release packaging
+        // and `install.sh --binary` spell it.
+        "android" => format!("{arch}-linux-android"),
         "macos" => format!("{arch}-apple-darwin"),
         "windows" => format!("{arch}-pc-windows-msvc"),
         other => format!("{arch}-unknown-{other}"),
@@ -297,6 +305,13 @@ mod tests {
             ))
         );
         assert_eq!(env.resolve(Path::new("out")), PathBuf::from("/w/out"));
+    }
+
+    #[test]
+    fn test_target_triple_matches_rustc_spelling() {
+        assert_eq!(target_triple("aarch64", "android"), "aarch64-linux-android");
+        assert_eq!(target_triple("x86_64", "linux"), "x86_64-unknown-linux-gnu");
+        assert_eq!(target_triple("aarch64", "macos"), "aarch64-apple-darwin");
     }
 
     #[test]

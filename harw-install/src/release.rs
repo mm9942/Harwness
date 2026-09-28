@@ -93,6 +93,9 @@ pub enum ReleaseError {
         /// Tatsächlich berechnet.
         actual: String,
     },
+    /// Das Release-Archiv enthält einen unzulässigen Eintrag oder ist kein
+    /// gültiges `.tar.gz` (siehe [`validate_release_archive`]).
+    UnsafeArchive(String),
 }
 
 impl fmt::Display for ReleaseError {
@@ -112,6 +115,9 @@ impl fmt::Display for ReleaseError {
                 f,
                 "Prüfsumme von `{name}` stimmt nicht (erwartet {expected}, berechnet {actual})"
             ),
+            Self::UnsafeArchive(detail) => {
+                write!(f, "Release-Archiv abgelehnt, nichts entpackt: {detail}")
+            }
         }
     }
 }
@@ -287,6 +293,97 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Obergrenze für den entpackten Inhalt eines Release-Archivs (512 MiB).
+const MAX_UNPACKED_BYTES: u64 = 512 << 20;
+
+/// Prüft ein Release-Tarball (`.tar.gz`) vor dem Entpacken.
+///
+/// # Description
+/// `SHA256SUMS` stammt aus derselben Release wie das Archiv und belegt nur,
+/// dass die Bytes zueinander passen, nicht dass die Einträge harmlos sind.
+/// Deshalb liest diese Funktion jeden ustar-Kopf und lässt nur zu:
+/// reguläre Dateien (`0`/`\0`) und Verzeichnisse (`5`), deren Pfad relativ
+/// ist, keine `..`- oder leeren Segmente enthält und unter genau einem
+/// Wurzelverzeichnis `root` liegt (`harw-<tag>-<ziel>/`). Links, Geräte,
+/// FIFOs, GNU-Langnamen und pax-Köpfe werden abgelehnt (fail closed), ebenso
+/// ein entpackter Inhalt über 512 MiB.
+///
+/// # Errors
+/// [`ReleaseError::UnsafeArchive`] mit dem ersten unzulässigen Eintrag bzw.
+/// einer Beschreibung des Formatfehlers.
+pub fn validate_release_archive(gz: &[u8], root: &str) -> Result<(), ReleaseError> {
+    use std::io::Read as _;
+
+    let unsafe_archive = |reason: String| ReleaseError::UnsafeArchive(reason);
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(gz)
+        .take(MAX_UNPACKED_BYTES + 1)
+        .read_to_end(&mut tar)
+        .map_err(|error| unsafe_archive(format!("kein gültiges gzip: {error}")))?;
+    if tar.len() as u64 > MAX_UNPACKED_BYTES {
+        return Err(unsafe_archive("entpackt größer als 512 MiB".to_owned()));
+    }
+    let mut offset = 0usize;
+    let mut entries = 0usize;
+    while offset + 512 <= tar.len() {
+        let header = &tar[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let field = |range: std::ops::Range<usize>| {
+            let raw = &header[range];
+            let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        };
+        let name = field(0..100);
+        let prefix = field(345..500);
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let size_text = field(124..136);
+        let size = u64::from_str_radix(size_text.trim(), 8)
+            .map_err(|_| unsafe_archive(format!("`{path}`: ungültige Größe `{size_text}`")))?;
+        let kind = header[156];
+        match kind {
+            b'0' | 0 | b'5' => {}
+            other => {
+                return Err(unsafe_archive(format!(
+                    "`{path}`: Eintragstyp `{}` ist nicht erlaubt (nur Dateien und Verzeichnisse)",
+                    char::from(other)
+                )));
+            }
+        }
+        let trimmed = path.strip_suffix('/').unwrap_or(&path);
+        let mut segments = trimmed.split('/');
+        let first = segments.next().unwrap_or_default();
+        if path.starts_with('/') || first != root {
+            return Err(unsafe_archive(format!(
+                "`{path}` liegt nicht unter `{root}/`"
+            )));
+        }
+        if segments.any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+            return Err(unsafe_archive(format!(
+                "`{path}` enthält ein unzulässiges Segment"
+            )));
+        }
+        entries += 1;
+        let data_blocks = usize::try_from(size.div_ceil(512))
+            .map_err(|_| unsafe_archive(format!("`{path}`: Größe zu groß")))?;
+        offset = offset
+            .checked_add(512 + data_blocks * 512)
+            .ok_or_else(|| unsafe_archive(format!("`{path}`: Größe zu groß")))?;
+    }
+    if offset > tar.len() {
+        return Err(unsafe_archive("Archiv ist abgeschnitten".to_owned()));
+    }
+    if entries == 0 {
+        return Err(unsafe_archive("Archiv ist leer".to_owned()));
+    }
+    Ok(())
+}
+
 /// Hinweis für den Chat-Start, falls eine neuere Version bekannt ist.
 ///
 /// # Description
@@ -313,6 +410,83 @@ pub fn update_notice(info: &VersionInfo, current: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult};
+
+    /// Ein ustar-Eintrag: Kopf (Name, Größe, Typ) plus auf 512 Byte
+    /// aufgefüllte Daten. Die Prüfsumme bleibt leer, der Validator liest sie
+    /// nicht.
+    fn tar_entry(path: &str, kind: u8, data: &[u8]) -> Vec<u8> {
+        let mut header = vec![0u8; 512];
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        let size = format!("{:011o}", data.len());
+        header[124..135].copy_from_slice(size.as_bytes());
+        header[156] = kind;
+        let mut out = header;
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out
+    }
+
+    fn gz_archive(entries: &[Vec<u8>]) -> TestResult<Vec<u8>> {
+        use std::io::Write as _;
+        let mut tar: Vec<u8> = entries.concat();
+        tar.extend_from_slice(&[0u8; 1024]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder
+            .write_all(&tar)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        encoder
+            .finish()
+            .map_err(|error| TestError::Unexpected(error.to_string()))
+    }
+
+    const ROOT: &str = "harw-v0.8.0-x86_64-unknown-linux-gnu";
+
+    #[test]
+    fn validate_release_archive_accepts_files_and_dirs_under_root() -> TestResult {
+        let archive = gz_archive(&[
+            tar_entry(&format!("{ROOT}/"), b'5', b""),
+            tar_entry(&format!("{ROOT}/harw"), b'0', b"\x7fELF binary"),
+            tar_entry(&format!("{ROOT}/README.md"), 0, b"text"),
+        ])?;
+        validate_release_archive(&archive, ROOT)
+            .map_err(|error| TestError::Unexpected(error.to_string()))
+    }
+
+    #[test]
+    fn validate_release_archive_rejects_traversal_links_and_foreign_roots() -> TestResult {
+        let cases = [
+            tar_entry(&format!("{ROOT}/../evil"), b'0', b"x"),
+            tar_entry("/etc/passwd", b'0', b"x"),
+            tar_entry("other-root/harw", b'0', b"x"),
+            tar_entry(&format!("{ROOT}/link"), b'2', b""),
+            tar_entry(&format!("{ROOT}/hard"), b'1', b""),
+            tar_entry(&format!("{ROOT}//x"), b'0', b"x"),
+            tar_entry("././@LongLink", b'L', b"x"),
+        ];
+        for entry in cases {
+            let archive = gz_archive(&[entry])?;
+            let result = validate_release_archive(&archive, ROOT);
+            assert!(
+                matches!(result, Err(ReleaseError::UnsafeArchive(_))),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_release_archive_rejects_garbage_and_empty() -> TestResult {
+        assert!(matches!(
+            validate_release_archive(b"not gzip", ROOT),
+            Err(ReleaseError::UnsafeArchive(_))
+        ));
+        let empty = gz_archive(&[])?;
+        assert!(matches!(
+            validate_release_archive(&empty, ROOT),
+            Err(ReleaseError::UnsafeArchive(_))
+        ));
+        Ok(())
+    }
 
     fn release_json(tag: &str, prerelease: bool) -> String {
         serde_json::json!({

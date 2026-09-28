@@ -57,7 +57,7 @@ pub use error::{DoctorError, InstallError, MigrationError, PathError, ServiceErr
 pub use migration::{ConfigMigration, MigrationRunner};
 pub use pathscope::PathScope;
 pub use platform::{Os, Platform};
-pub use release::{ReleaseAsset, ReleaseError, ReleaseInfo};
+pub use release::{ReleaseAsset, ReleaseError, ReleaseInfo, validate_release_archive};
 pub use service::{
     ServiceKind, ServiceManager, ServiceSpec, ServiceStatus, detect_service_manager,
 };

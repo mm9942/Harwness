@@ -213,6 +213,32 @@ latest_release_tag() {
   esac
 }
 
+# The checksum comes from the same release as the archive and does not make
+# its members safe. Before unpacking, every member must be a regular file or
+# a directory under "$2/", without "..", "." or empty path segments.
+check_release_archive() {
+  local archive="$1" root="$2" listing member path types
+  listing="$(tar -tzf "$archive")" || die "$root.tar.gz is not a readable archive; nothing installed"
+  [ -n "$listing" ] || die "$root.tar.gz is empty; nothing installed"
+  while IFS= read -r member; do
+    path="${member%/}"
+    case "$path" in
+      "$root"|"$root"/*) ;;
+      *) die "$root.tar.gz: member '$member' is outside $root/; nothing installed" ;;
+    esac
+    case "/$path/" in
+      */../*|*/./*|*//*) die "$root.tar.gz: unsafe member '$member'; nothing installed" ;;
+    esac
+  done <<LISTING
+$listing
+LISTING
+  types="$(LC_ALL=C tar -tvzf "$archive" | cut -c1 | LC_ALL=C sort -u | tr -d '\n')"
+  case "$types" in
+    -|d|-d) ;;
+    *) die "$root.tar.gz contains links or special files; nothing installed" ;;
+  esac
+}
+
 install_binary_release() {
   local target tag name work_dir unpacked binary runner_dir
   target="$(release_target)"
@@ -233,9 +259,10 @@ install_binary_release() {
       shasum -a 256 -c "$name.sha256" >/dev/null
     fi
   ) || die "checksum of $name.tar.gz does not match SHA256SUMS; nothing installed"
+  check_release_archive "$work_dir/$name.tar.gz" "$name"
   tar -xzf "$work_dir/$name.tar.gz" -C "$work_dir"
   unpacked="$work_dir/$name"
-  [ -d "$unpacked" ] || unpacked="$work_dir"
+  [ -d "$unpacked" ] || die "$name.tar.gz has no $name/ directory; nothing installed"
   # killer is Linux-only (procfs, pidfd); Android releases ship without it.
   binaries="harw harw-agent-runner"
   case "$target" in *-android) ;; *) binaries="$binaries killer" ;; esac

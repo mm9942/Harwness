@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+flate2 = "1.1.9"
 getrandom = "0.4.3"
 harw-config = { path = "../harw-config" }
 harw-home = { path = "../harw-home" }

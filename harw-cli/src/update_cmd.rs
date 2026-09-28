@@ -357,6 +357,11 @@ fn install_release(
     let tarball = http_get(&tarball_asset.url, FOREGROUND_TIMEOUT, false)?
         .ok_or_else(|| format!("{name} fehlt"))?;
     verify_sha256sums(&sums, &name, &tarball).map_err(|error| error.to_string())?;
+    // Die Prüfsumme stammt aus derselben Release und macht die Einträge
+    // nicht harmlos: vor `tar` jeden Eintrag prüfen (nur Dateien und
+    // Verzeichnisse unter `harw-<tag>-<ziel>/`, kein `..`, keine Links).
+    let root = name.strip_suffix(".tar.gz").unwrap_or(&name);
+    harw_install::validate_release_archive(&tarball, root).map_err(|error| error.to_string())?;
 
     let staging = Staging::create(&bindir)?;
     let archive = staging.path().join(&name);

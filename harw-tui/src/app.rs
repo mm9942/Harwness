@@ -9580,8 +9580,14 @@ fn render_viewport(
         // unterhalb des Docks in denselben Puffer — sie liegen also immer
         // über (zeitlich nach) dem Dock, nie darin. Diese Reihenfolge darf
         // eine spätere Änderung nicht umdrehen.
-        let queue_height =
-            (queue_lines.len() as u16).min(area.height.saturating_sub(input_height + 4));
+        // Das Dock belegt seine Höhe bereits fest: ohne ihren Abzug könnten
+        // Dock + Warteschlange + Status + Composer die Fläche übersteigen und
+        // Statuszeile und Composer aus dem Bild schieben.
+        let queue_height = (queue_lines.len() as u16).min(
+            area.height
+                .saturating_sub(input_height + 4)
+                .saturating_sub(dock_area.height),
+        );
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -14643,6 +14649,58 @@ forbidden = [{forbidden}]
     /// Breite, und Statuszeile sowie Composer bleiben am unteren Rand — die
     /// gleiche Reihenfolge, die `harw-tui-layout::classify` für dieses Format
     /// vorschreibt (`Placement::PortraitDock`).
+    /// Copilot-Review #48: eine lange Warteschlange darf im Portrait-Dock
+    /// Statuszeile und Composer nicht aus dem Bild schieben, denn die
+    /// Dock-Höhe ist schon fest vergeben.
+    #[test]
+    fn long_queue_under_portrait_dock_keeps_status_and_composer_visible() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.agent_monitor.set_jobs(vec![dock_test_job()]);
+        for index in 0..60 {
+            app.pending_turns
+                .push_back(format!("wartende-nachricht-{index}"));
+        }
+        // Portrait-Minimum (28 Zeilen) mit mehrzeiligem Composer: Dock,
+        // volle Warteschlange, Status und Composer überschreiten zusammen
+        // die Höhe, wenn die Dock-Höhe nicht abgezogen wird.
+        app.input
+            .insert_str("zeile 1\nzeile 2\nzeile 3\nzeile 4\nzeile 5\nletzte-zeile");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 28))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let shown = rows.join("\n");
+        assert!(
+            app.last_regions
+                .get()
+                .agents
+                .is_some_and(|dock| dock.y == 0),
+            "Portrait-Dock oben erwartet: {shown}"
+        );
+        let last_rows = &rows[rows
+            .len()
+            .saturating_sub(usize::from(input_height_for_test(&app, 64)) + 1)..];
+        assert!(
+            last_rows.iter().any(|row| row.contains("Ask")),
+            "Statuszeile muss trotz langer Warteschlange unten sichtbar bleiben: {shown}"
+        );
+        assert!(
+            shown.contains("letzte-zeile"),
+            "die letzte Composer-Zeile muss sichtbar bleiben: {shown}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn render_viewport_at_80x40_pins_a_top_dock_full_width_chat_below_and_status_composer_at_bottom()
     -> TestResult {

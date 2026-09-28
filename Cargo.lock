@@ -2852,6 +2852,7 @@ dependencies = [
 name = "harw-install"
 version = "0.8.0"
 dependencies = [
+ "flate2",
  "getrandom 0.4.3",
  "harw-config",
  "harw-home",

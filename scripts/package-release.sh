@@ -42,7 +42,9 @@ stage="$work/$stage_name"
 mkdir -p "$stage"
 cp "${binaries[@]}" "$stage/"
 cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
-tar -C "$work" -czf "$dist/$stage_name.tar.gz" "$stage_name"
+# ustar only: harw update and install.sh --binary reject GNU long-name and
+# pax headers, links and special files before unpacking.
+tar --format=ustar -C "$work" -czf "$dist/$stage_name.tar.gz" "$stage_name"
 
 (
   cd "$dist"
