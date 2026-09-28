@@ -131,6 +131,35 @@ Harw uses:
   git (`docs/planning/85-gap-hunt/coordination/` on its own branch), not
   through chat.
 
+## Layered waves: macro → leaf crates → wiring
+Features that add or change several crates run as `layered-wave`, not as one
+large contract wave:
+- **Macro.** One read-only planner turns the goal and the design documents
+  into units with dependencies. A **leaf** unit builds exactly one crate:
+  every file lies under that crate's directory, and one crate appears in
+  only one leaf unit. A **wiring** unit connects finished crates in the
+  composition roots: harw-runtime assembly, harw-cli, harw-tui, harw-config,
+  the root `Cargo.toml` and `xtask/arch-policy.toml`.
+- **Plan gate.** The plan is rejected before any coder starts if a file sits
+  in two units, a leaf file is outside its crate, a crate is split, a leaf
+  depends on wiring, the dependencies form a cycle or name unknown units, or
+  an acceptance criterion has no unit. The same happens when the plan still
+  lists owner decisions.
+- **Levels.** Leaf units run level by level in dependency order (Kahn), then
+  wiring. Each level is one `contract-wave` (nested `workflow()`) whose goal
+  has one criterion per unit. A level starts only when the previous one is
+  complete, so a failed leaf is never wired.
+- **Goal.** The real acceptance criteria are checked once over the whole
+  diff against the pinned base; `achieved` stays human-only.
+- **No builds.** As in every wave, agents never build. The main session runs
+  **one** central build, sequentially, after every wave has finished, and
+  fixes what is red itself.
+
+## Owner decisions travel as data (catalog P21)
+Pass decisions the owner already made as `decided: [..]` to `contract-wave`
+and `layered-wave`. They appear in the contract/macro prompt as resolved, so
+a planner does not stop the wave again on a question that has been answered.
+
 ## Commit rhythm (batched at verified checkpoints)
 - **When to commit:** at the **end of each workflow**, and in between whenever
   about **90 verifications** have finished since the last commit, counted

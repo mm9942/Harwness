@@ -379,3 +379,14 @@ zwischen Agenten, nicht in der Programmlogik.
 - Der zentrale Build läuft über einen eingefrorenen SHA und wird dafür
   protokolliert (`kit/gate_record.py`). Jede Änderung danach macht den Lauf
   ungültig.
+
+### P21 — Entschiedene Fragen kommen als Frage zurück
+Die Secrets-Welle hielt zweimal vor dem Coden an. Beim zweiten Mal waren fünf
+Entscheidungen der Nutzerin schon getroffen, standen aber nur als Fließtext in
+Goal und Befund. Der Planer las sie als offene Punkte, stellte teils dieselben
+Fragen neu und setzte `feasible=false`.
+
+**Gegenmittel:**
+- Getroffene Entscheidungen gehen als eigenes Feld `decided` in die Welle und
+  stehen im Vertragsprompt ausdrücklich als erledigt.
+- Nur eine neue, unvorhergesehene Blockade darf `feasible=false` auslösen.
