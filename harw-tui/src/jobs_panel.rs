@@ -497,8 +497,7 @@ mod tests {
         let launch = status_of(
             &meta_json(
                 "failed",
-                r#""launch_error":"bwrap: No such file
-mehr","#,
+                r#""launch_error":"bwrap: No such file\nmehr","#,
                 r#"{"session":"uia"}"#,
             ),
             &[],

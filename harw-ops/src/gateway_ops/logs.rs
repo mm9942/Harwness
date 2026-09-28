@@ -677,7 +677,7 @@ mod tests {
         let path = dir.path().join("tui.log");
         std::fs::write(&path, "first line\nsecond line\nthird\n").map_err(ctx("write log"))?;
         let tail = read_tail(&path, 10).map_err(ctx("read_tail"))?;
-        assert_eq!(tail.size, 30);
+        assert_eq!(tail.size, 29);
         assert_eq!(tail.scanned, 10);
         assert_eq!(tail.text, "third\n");
         Ok(())
