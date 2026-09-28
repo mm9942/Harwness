@@ -16,6 +16,9 @@ export const meta = {
 //   clusters  [{id, files: [repo-relative paths], findings: [verified findings]}], file-disjoint
 //   catalog   pattern catalog path (default docs/planning/85-gap-hunt/patterns.md)
 //   rules     binding code rules (default: the workspace rules below)
+//   decided   owner decisions already made, one string each; the contract
+//             prompt lists them as resolved so the planner does not raise
+//             them again (catalog P21)
 const A = args || {}
 const CATALOG = A.catalog || 'docs/planning/85-gap-hunt/patterns.md'
 const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid(unsafe), no unwrap/expect/panic! in library code OR tests/doctests (tests return TestResult and use the crate helpers), no third-party types in public APIs, hand-written error types, match the file\'s comment language and density, no book titles/authors/quotes anywhere; ring rules in xtask/arch-policy.toml (a crate may depend only on the rings its ring allows)'
@@ -190,6 +193,7 @@ const describe = fs => fs.map((f, i) => `${i + 1}. [${f.severity}, ${f.pattern}]
    Test idea: ${f.test_idea || '-'}`).join('\n')
 
 const reports = []
+const DECIDED = (A.decided || []).map(String).filter(d => d.trim())
 
 // The declared cluster (c.files) is the trusted input; the contract's file list
 // is model output. Both are normalized; the contract must list every declared
@@ -210,7 +214,7 @@ Cluster ${c.id}. Declared files (fixed set): ${declaredOf(c).join(', ')}
 Findings:
 ${describe(c.findings)}
 
-The file set is fixed: list every declared file exactly once in files, and no other file. For a declared file that needs no edit, set change=false and say why in its instructions.${uncoveredOf(c).length ? ` The findings also name files outside the cluster: ${uncoveredOf(c).join(', ')}. Plan no edit there; if a finding cannot be fixed inside the declared files, set feasible=false and say which file it needs.` : ''}
+${DECIDED.length ? `Owner decisions already made (resolved; follow them, never list them under decisions_needed again):\n${DECIDED.map(d => `- ${d}`).join('\n')}\n` : ''}The file set is fixed: list every declared file exactly once in files, and no other file. For a declared file that needs no edit, set change=false and say why in its instructions.${uncoveredOf(c).length ? ` The findings also name files outside the cluster: ${uncoveredOf(c).join(', ')}. Plan no edit there; if a finding cannot be fixed inside the declared files, set feasible=false and say which file it needs.` : ''}
 Write a contract that one coder per file can follow without talking to the others:
 - For each file that must change: the exact edits (new/changed signatures verbatim, behaviour, error variants, doc comments to update) and the tests to add in that file (TestResult, no unwrap/expect/panic).
 - Keep public APIs stable unless a finding requires otherwise; if a signature changes, list every caller file in this cluster and its edit. A caller outside the cluster must not break: if one would, set feasible=false and name it.
@@ -245,7 +249,7 @@ Update every doc/comment in this file that describes the changed behaviour. Code
     const missingCoders = toCode.filter((fp, i) => !codedAll[i]).map(fp => norm(fp.file))
     const review = await agent(`${CONTEXT}
 
-You review one contract wave cluster. Read \`${GIT} diff -- ${declared.join(' ')}\` and the contract below. Do not edit.
+You review one contract wave cluster. Read \`${GIT} diff -- ${declared.join(' ')}\` and the contract below. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
 Contract ${c.id}: ${contract.summary}
 ${contract.files.map(f => `- ${norm(f.file)}${f.change === false ? ' (no change)' : ''}: ${f.instructions}`).join('\n')}
 Coder reports: ${JSON.stringify(coded)}
@@ -288,7 +292,7 @@ Fix these minimally. If a problem needs another file, report it under deviations
     if (missingRepairs.length) { reports.push({ ...base, repairs, status: 'unresolved', reason: `no repair result for ${missingRepairs.join(', ')}` }); return null }
     const recheck = await agent(`${CONTEXT}
 
-You re-review one contract wave cluster after its repair pass. Read \`${GIT} diff -- ${declared.join(' ')}\`. Do not edit.
+You re-review one contract wave cluster after its repair pass. Read \`${GIT} diff -- ${declared.join(' ')}\`. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
 Contract ${c.id}: ${contract.summary}
 ${contract.files.map(f => `- ${norm(f.file)}${f.change === false ? ' (no change)' : ''}: ${f.instructions}`).join('\n')}
 The first review found:
@@ -312,8 +316,8 @@ if (waveFiles.length) {
   phase('Goal')
   goalCheck = await agent(`${CONTEXT}
 
-You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${waveFiles.join(' ')}\` and the tests in it. Do not edit.
-For every acceptance criterion, answer met, not-met or unknown. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
+You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${waveFiles.join(' ')}\` and the tests in it. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
+For every acceptance criterion, answer met, not-met or unknown, using exactly these criterion ids and no others: ${GOAL.criteria.map(c => c.id).join(', ')}. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
     { label: `goal:${A.key}`, phase: 'Goal', schema: COVERAGE, model: 'sonnet', agentType: 'focused-explorer' })
 }
 const coverage = waveFiles.length ? coverageOf(goalCheck) : []
