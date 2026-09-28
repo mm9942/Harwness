@@ -86,6 +86,51 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
   the merge. A re-cut wave gets a new name; a manifest is never edited.
 - The gate logic has tests: `node kit/tests/workflow-gates.test.js`.
 
+## Goal contract: Sonnet 5 waves (catalog P19/P20)
+Writing waves (`gap-fix`, `contract-wave`) follow the goal/plan method that
+Harw uses:
+- **Goal and base are required args.**
+  - `goal: {id, statement, criteria: [{id, text}], invariants?}`
+  - `base`: the pinned base commit, 7–40 hex digits.
+  - A wave without either refuses to start.
+- **Invariants.** Every agent prompt carries the goal, its criteria and these
+  fixed invariants:
+  - code, tests and gates win over planning docs, and contradictions go into
+    `deltas`, never reconciled silently;
+  - only a state merged into `dev` is CURRENT;
+  - no security-relevant change is done without a regression test and a
+    passed re-review;
+  - the wave never declares the goal achieved.
+- **Goal check.** After the files or clusters and the ripple, a read-only
+  goal check reads `git diff <base>` and answers every criterion with `met`,
+  `not-met` or `unknown`. `met` needs evidence: a file:line or a test name.
+  `complete` requires every criterion `met` with evidence, on top of the
+  earlier gates.
+- **Result.** The wave returns `coverage`, `deltas`, `goal`, `base`,
+  `achieved: false` and `achieve: 'human-only'`.
+- **Security gate.** A file or cluster with a critical/high finding counts as
+  `ok`/`repaired` only when the (re-)review names the regression test in the
+  diff (`regression_test`). Otherwise it ends `unverified`.
+- **Models.** `models: 'sonnet'` is the default: every agent runs on Sonnet 5.
+  `models: 'tiered'` restores Opus for contracts, critical/high fixes, review
+  of contracts, and ripple.
+- **Parallelism.** `maxParallel` (default 3) caps files or clusters in
+  flight. Size it to the token budget, not to CPUs, so one session limit does
+  not stop every wave in the same stage.
+- **Manifest.** `wave_manifest.py` writes schema 2 with `goal` (criteria,
+  coverage, deltas, `achieved: false`). It refuses a `--base` that is not the
+  wave's pinned base.
+- **Frozen gates.** After the last merge, freeze the integration SHA and run
+  the central build there with a clean tree. Record it with
+  `kit/gate_record.py record --repo DIR --sha SHA --goal ID fmt=0 clippy=0 …`,
+  which writes an immutable `waves/gates-<sha12>.json`. Every step must be
+  listed. `gate_record.py check` accepts the record only while nothing but
+  gate records changed after the frozen SHA; anything else needs a full new
+  run.
+- **Coordination.** One writer per branch. Notes between sessions go through
+  git (`docs/planning/85-gap-hunt/coordination/` on its own branch), not
+  through chat.
+
 ## Commit rhythm (batched at verified checkpoints)
 - **When to commit:** at the **end of each workflow**, and in between whenever
   about **90 verifications** have finished since the last commit, counted
