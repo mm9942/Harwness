@@ -6941,20 +6941,47 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         // Plain Enter ohne Auswahl: getippte Zeile absenden — mit aufgelösten
         // Paste-Platzhaltern, sonst bekäme das Modell nur
         // `[Pasted text #<id> +<n> lines]` statt des eingefügten Texts.
+        // Erst klassifizieren, dann leeren: eine von `classify_line`
+        // abgelehnte Zeile (unterminiertes Quote, ungültiges Escape, ...)
+        // bleibt sonst weder im Composer noch in der History erhalten —
+        // genau das gemeldete "Nachricht war weg, musste neu getippt
+        // werden". Der Composer wird deshalb nur in den akzeptierten
+        // Zweigen (Quit/Ignore/Chat/Command) geleert.
         let line = app.input.submission_text();
-        app.input.clear();
-        app.command_popup = None;
-        app.mention_popup = None;
         match classify_line(&line) {
-            LineAction::Quit => bus.send(HarwEvent::Quit),
-            LineAction::Ignore => {}
-            LineAction::System(text) => bus.send(HarwEvent::SystemMessage(text)),
+            LineAction::Quit => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
+                bus.send(HarwEvent::Quit);
+            }
+            LineAction::Ignore => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
+            }
+            LineAction::System(text) => {
+                // Composer bleibt unangetastet — inklusive Paste-Platzhalter
+                // —, damit die Zeile korrigiert oder erneut abgeschickt
+                // werden kann; Popups schließen hier bewusst nicht, ein
+                // offener `/`-Vorschlag bleibt also sichtbar. Trotzdem in
+                // die History aufnehmen, damit Pfeil-Hoch die abgelehnte
+                // Zeile ebenfalls findet.
+                app.remember_input(&line);
+                bus.send(HarwEvent::SystemMessage(text));
+            }
             LineAction::Chat(text) => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
                 app.remember_input(&line);
                 app.scroll.force_follow();
                 bus.send(HarwEvent::Submit(text));
             }
             LineAction::Command(raw) => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
                 app.remember_input(&line);
                 app.scroll.force_follow();
                 bus.send(HarwEvent::Command(raw));
@@ -7049,7 +7076,15 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 match classify_line(&text) {
                     LineAction::Quit => bus.send(HarwEvent::Quit),
                     LineAction::Ignore => {}
-                    LineAction::System(msg) => bus.send(HarwEvent::SystemMessage(msg)),
+                    LineAction::System(msg) => {
+                        // Puffer wurde vom InputEditor schon geleert — die
+                        // abgelehnte Zeile geht sonst verloren. Wie
+                        // `recall_last_pending_turn` per `insert_paste`
+                        // zurückholen, damit sie korrigiert werden kann.
+                        app.input.insert_paste(&text);
+                        app.sync_popup();
+                        bus.send(HarwEvent::SystemMessage(msg));
+                    }
                     LineAction::Chat(chat_text) => bus.send(HarwEvent::Submit(chat_text)),
                     LineAction::Command(raw) => bus.send(HarwEvent::Command(raw)),
                 }
@@ -9086,7 +9121,15 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
                     BusyKeyOutcome::Redraw
                 }
                 LineAction::Command(raw) => route_busy_command(app, raw),
-                LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {
+                LineAction::Quit | LineAction::Ignore => BusyKeyOutcome::Redraw,
+                LineAction::System(message) => {
+                    // Der Puffer wurde vom InputEditor schon geleert; ohne
+                    // Rückholung und Systemzeile verschwindet eine während
+                    // des Turns abgelehnte Eingabe (z. B. unterminiertes
+                    // Quote) kommentarlos.
+                    app.push_system_text_exported(&message);
+                    app.input.insert_paste(&text);
+                    app.sync_popup();
                     BusyKeyOutcome::Redraw
                 }
             }
@@ -11191,6 +11234,36 @@ mod tests {
         );
         assert_eq!(app.input.text(), "xnext prompt");
         assert!(app.deferred_input.is_empty());
+        Ok(())
+    }
+
+    /// Feldbericht: während eines laufenden Turns verschwand eine von
+    /// `classify_line` abgelehnte Zeile (hier: unterminiertes Quote)
+    /// kommentarlos — `queue_busy_key` behandelte `LineAction::System`
+    /// bisher genauso wie `Quit`/`Ignore`. Jetzt kommt die Zeile in den
+    /// Composer zurück, und eine Systemzeile erklärt die Ablehnung.
+    #[test]
+    fn busy_enter_keeps_rejected_line_and_shows_system_line() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.input.insert_str("/x 'a");
+
+        let outcome = handle_busy_event(
+            &mut app,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(outcome, BusyKeyOutcome::Redraw);
+
+        assert_eq!(app.input(), "/x 'a");
+        assert!(app.pending_turns.is_empty());
+        let message = app
+            .export_entries
+            .last()
+            .and_then(|entry| match entry {
+                ExportEntry::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .ok_or(TestError::Missing("export status message"))?;
+        assert!(message.starts_with("Eingabe abgelehnt"), "{message}");
         Ok(())
     }
 
@@ -13831,6 +13904,39 @@ forbidden = [{forbidden}]
         app.input.insert_str("/model switch x");
         app.sync_popup();
         assert!(app.command_popup.is_none());
+        Ok(())
+    }
+
+    /// Feldbericht: eine von `classify_line` abgelehnte Zeile (hier der
+    /// reservierte `$`-Präfix) darf nicht verschwinden — plain Enter im
+    /// Leerlauf lässt sie im Composer stehen und legt sie in die History,
+    /// statt sie zusammen mit dem Puffer wegzuwerfen.
+    #[test]
+    fn idle_enter_keeps_rejected_line_in_composer_and_history() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.input.insert_str("$nope");
+        let (bus, mut receiver) = harw_event_channel();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(handle_key(&mut app, enter, &bus));
+
+        assert_eq!(app.input(), "$nope");
+        match receiver.try_recv() {
+            Ok(HarwEvent::SystemMessage(message)) => {
+                assert!(message.starts_with("Eingabe abgelehnt"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete SystemMessage, bekam {other:?}"
+                )));
+            }
+        }
+        assert!(receiver.try_recv().is_err());
+
+        // Up-Pfeil findet die abgelehnte Zeile trotzdem in der History.
+        app.input.clear();
+        assert!(app.input.history_back());
+        assert_eq!(app.input(), "$nope");
         Ok(())
     }
 
