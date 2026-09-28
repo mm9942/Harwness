@@ -1,20 +1,58 @@
 //! CLI composition for configured `secrets:` provider credentials.
 //!
-//! This module is deliberately narrow: it only opens the sealed store when an
-//! enabled provider actually needs it, and it never falls back to the legacy
-//! plaintext `<home>/secrets` directory.
+//! Reading: the sealed store is opened only when an enabled provider actually
+//! needs it (its `auth` or one of its `credential_pool` entries is a
+//! `secrets:` reference).
+//!
+//! Writing: every secret harw itself stores goes through
+//! [`SecretStoreWriter`] and comes back as `secrets:<uuid>`. New secrets are
+//! sealed as `KmsWrappedV3` through the AuthHub (hub key
+//! `harw.secrets-kek/dek-kek`) when `[infrastructure].auth_socket` is set,
+//! otherwise as local `DekWrappedV2` records under a KEK that harw bootstraps
+//! itself (`<home>/keys/secrets.kek`, recorded as `[kek]` in `auth.toml`)
+//! when none is configured. An unreachable hub fails the write; there is no
+//! V2 fallback for a configured hub and never a plaintext fallback to the
+//! legacy `<home>/secrets` directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use harw_config::{KekConfig, KekProvenance as ConfigKekProvenance, ResolvedConfig, SecretRef};
+use harw_config::{
+    AuthConfig, ConfigWriter, InfrastructureSection, KekConfig,
+    KekProvenance as ConfigKekProvenance, ProviderToml, ResolvedConfig, SecretRef,
+};
+use harw_infra_client::{
+    AuthHubClient, AuthHubDekWrapper, InfraClientError, InfrastructureAvailability, KeyProfile,
+    KeyRef, KeyState, RemoteErrorKind,
+};
 use harw_provider_http::SecretResolver;
 use harw_secrets::audit::chain::PersistedChainStatus;
 use harw_secrets::{
-    AuditResult, CryptoPolicy, KekProvenance, KeyVersion, SecretStore, SecretsError,
-    load_kek_material,
+    AuditResult, CryptoPolicy, KekProvenance, KeyVersion, SecretEnvelopeFormat, SecretStore,
+    SecretsError, load_kek_material,
 };
 use secrecy::SecretString;
 use secrecy_08::ExposeSecret as _;
+
+/// AuthHub namespace of the secrets KEK (`HarwKeyPurpose::SecretsKek`).
+pub(crate) const SECRETS_KEK_NAMESPACE: &str = "harw.secrets-kek";
+
+/// AuthHub key id of the DEK-wrapping KEK inside [`SECRETS_KEK_NAMESPACE`].
+pub(crate) const SECRETS_KEK_KEY_ID: &str = "dek-kek";
+
+/// Root of the sealed store below `<home>`, distinct from the legacy
+/// plaintext `<home>/secrets` directory.
+const SEALED_STORE_DIR: &str = "sealed-secrets";
+
+/// Directory below `<home>` for the KEK harw bootstraps itself.
+const BOOTSTRAP_KEK_DIR: &str = "keys";
+
+/// File name of the bootstrapped key-file KEK inside [`BOOTSTRAP_KEK_DIR`].
+const BOOTSTRAP_KEK_FILE: &str = "secrets.kek";
+
+/// Name of the short-lived thread that talks to the AuthHub while a writer
+/// is opened.
+const HUB_BRIDGE_THREAD_NAME: &str = "harw-secrets-kek";
 
 /// A synchronous provider-secret resolver backed by the sealed secret store.
 pub struct ConfiguredSecretResolver {
@@ -59,9 +97,16 @@ fn resolve_error_message(error: SecretsError) -> String {
 /// Opens a sealed provider-secret resolver when an enabled provider needs one.
 ///
 /// The sealed store is rooted at `<home>/sealed-secrets`, intentionally
-/// distinct from the legacy plaintext `<home>/secrets` directory. KEK material
-/// is loaded only after configuration proves that at least one enabled provider
-/// has an `auth = "secrets:…"` reference.
+/// distinct from the legacy plaintext `<home>/secrets` directory. Nothing is
+/// opened unless configuration proves that at least one enabled provider has
+/// a `secrets:` reference, either as `auth` or as a `credential_pool` entry.
+///
+/// Without a hub the configured KEK is required and V2 records resolve
+/// exactly as before. With `[infrastructure].auth_socket` the store
+/// additionally gets the AuthHub DEK wrapper so V3 records open; the KEK is
+/// then optional (without it, V2 records fail closed). The wrapper's
+/// generation is taken from the V3 records already in the store, so opening
+/// makes no network call.
 pub fn open_configured_secret_resolver(
     home: &Path,
     config: &ResolvedConfig,
@@ -70,25 +115,484 @@ pub fn open_configured_secret_resolver(
         return Ok(None);
     }
 
-    let kek = config
-        .auth
-        .kek
-        .as_ref()
-        .ok_or_else(|| "enabled sealed-secret provider requires a configured KEK".to_owned())?;
+    let store = match select_secret_sealing(config)? {
+        SecretSealing::LocalV2 => {
+            let kek = config.auth.kek.as_ref().ok_or_else(|| {
+                "enabled sealed-secret provider requires a configured KEK".to_owned()
+            })?;
+            open_store_with_kek(home, kek)?
+        }
+        SecretSealing::AuthHubV3 => open_hub_reader_store(home, config)?,
+    };
+
+    Ok(Some(ConfiguredSecretResolver::new(store)))
+}
+
+/// Opens the sealed store with the local KEK `kek` (V1/V2 records).
+fn open_store_with_kek(home: &Path, kek: &KekConfig) -> Result<SecretStore, String> {
     let provenance = configured_kek_provenance(kek)?;
     let policy = CryptoPolicy::strongest();
     let key_material = load_kek_material(&policy, &provenance)
         .map_err(|_| "sealed secret resolver could not load KEK material".to_owned())?;
-    let store = SecretStore::open_with_key_material(
-        home.join("sealed-secrets"),
+    SecretStore::open_with_key_material(
+        home.join(SEALED_STORE_DIR),
         policy,
         provenance,
         KeyVersion::initial(),
         key_material,
     )
-    .map_err(|_| "sealed secret resolver could not open sealed secret store".to_owned())?;
+    .map_err(|_| "sealed secret resolver could not open sealed secret store".to_owned())
+}
 
-    Ok(Some(ConfiguredSecretResolver::new(store)))
+/// Opens the sealed store for reading with the AuthHub DEK wrapper attached.
+///
+/// A configured KEK is loaded as well so V2 records keep resolving; without
+/// one the store is opened with the nominal key-file provenance and V2 reads
+/// fail closed. No network call happens here.
+fn open_hub_reader_store(home: &Path, config: &ResolvedConfig) -> Result<SecretStore, String> {
+    let section = config
+        .infrastructure
+        .as_ref()
+        .ok_or_else(|| "AuthHub sealing requires an [infrastructure] section".to_owned())?;
+    let client = authhub_client(section)?;
+    let store = match config.auth.kek.as_ref() {
+        Some(kek) => open_store_with_kek(home, kek)?,
+        None => SecretStore::open(
+            home.join(SEALED_STORE_DIR),
+            CryptoPolicy::strongest(),
+            nominal_kek_provenance(home),
+            KeyVersion::initial(),
+        )
+        .map_err(|_| "sealed secret resolver could not open sealed secret store".to_owned())?,
+    };
+    let generation = v3_reader_generation(&store);
+    let wrapper = AuthHubDekWrapper::new(client, &secrets_kek_ref()?, generation)
+        .map_err(|_| "AuthHub DEK wrapper could not be configured".to_owned())?;
+    Ok(store.with_dek_wrapper(Arc::new(wrapper)))
+}
+
+/// How new secrets are sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretSealing {
+    /// Local `DekWrappedV2` record under a KEK from `[kek]` (bootstrapped by
+    /// harw when none is configured).
+    LocalV2,
+    /// `KmsWrappedV3` record whose DEK the AuthHub wraps.
+    AuthHubV3,
+}
+
+/// Chooses the sealing for new secrets from `[infrastructure]`. Pure, no I/O.
+///
+/// # Errors
+/// `token_file` without `auth_socket`: the configuration is ambiguous, so no
+/// sealing is chosen (and nothing is written).
+pub(crate) fn select_secret_sealing(config: &ResolvedConfig) -> Result<SecretSealing, String> {
+    let Some(section) = config.infrastructure.as_ref() else {
+        return Ok(SecretSealing::LocalV2);
+    };
+    match (&section.auth_socket, &section.token_file) {
+        (Some(_), _) => Ok(SecretSealing::AuthHubV3),
+        (None, Some(_)) => Err(
+            "[infrastructure] token_file requires auth_socket; refusing to choose a secret sealing"
+                .to_owned(),
+        ),
+        (None, None) => Ok(SecretSealing::LocalV2),
+    }
+}
+
+/// A sealed store opened for writing new secrets.
+pub(crate) struct SecretStoreWriter {
+    store: SecretStore,
+}
+
+/// Opens the sealed store for writing, with the sealing
+/// [`select_secret_sealing`] chooses.
+///
+/// - AuthHub: the hub key `harw.secrets-kek/dek-kek` is described (and
+///   created once if the hub reports it missing); an unreachable hub or any
+///   other hub error fails here. There is never a V2 fallback.
+/// - Local: the configured KEK is used; without one harw bootstraps a
+///   key-file KEK (see [`ensure_local_kek`]).
+///
+/// # Errors
+/// A `String` naming references or paths, never secret bytes.
+pub(crate) fn open_secret_store_for_writing(
+    home: &Path,
+    config: &ResolvedConfig,
+) -> Result<SecretStoreWriter, String> {
+    let store = match select_secret_sealing(config)? {
+        SecretSealing::AuthHubV3 => {
+            let section = config
+                .infrastructure
+                .as_ref()
+                .ok_or_else(|| "AuthHub sealing requires an [infrastructure] section".to_owned())?;
+            let client = authhub_client(section)?;
+            let key = secrets_kek_ref()?;
+            let generation = ensure_hub_key_generation(&client, &key)?;
+            let store = SecretStore::open(
+                home.join(SEALED_STORE_DIR),
+                CryptoPolicy::strongest(),
+                nominal_kek_provenance(home),
+                KeyVersion::initial(),
+            )
+            .map_err(|_| "sealed secret store could not be opened".to_owned())?;
+            let wrapper = AuthHubDekWrapper::new(client, &key, generation)
+                .map_err(|_| "AuthHub DEK wrapper could not be configured".to_owned())?;
+            store.with_dek_wrapper(Arc::new(wrapper))
+        }
+        SecretSealing::LocalV2 => {
+            let kek = ensure_local_kek(home, config)?;
+            open_store_with_kek(home, &kek)?
+        }
+    };
+    Ok(SecretStoreWriter { store })
+}
+
+impl SecretStoreWriter {
+    /// Seals `value` as a new secret and returns its `secrets:<uuid>`
+    /// reference.
+    ///
+    /// # Errors
+    /// An empty or whitespace-only value, or a failed seal/persist. The
+    /// message never contains the value.
+    pub(crate) fn store(
+        &mut self,
+        name: &str,
+        purpose: &str,
+        value: &SecretString,
+    ) -> Result<SecretRef, String> {
+        let exposed = secrecy::ExposeSecret::expose_secret(value);
+        if exposed.trim().is_empty() {
+            return Err("refusing to store an empty secret".to_owned());
+        }
+        let boxed = secrecy_08::SecretBox::new(exposed.as_bytes().to_vec().into_boxed_slice());
+        let id = self
+            .store
+            .create(name, purpose, &boxed)
+            .map_err(store_error_message)?;
+        Ok(SecretRef::Secrets(id.to_string()))
+    }
+}
+
+/// Opens the store for writing and seals `value` once, see
+/// [`open_secret_store_for_writing`] and [`SecretStoreWriter::store`].
+pub(crate) fn store_secret(
+    home: &Path,
+    config: &ResolvedConfig,
+    name: &str,
+    purpose: &str,
+    value: &SecretString,
+) -> Result<SecretRef, String> {
+    open_secret_store_for_writing(home, config)?.store(name, purpose, value)
+}
+
+/// Maps a store error on create to a message without secret content. The
+/// DEK wrapper's reason is payload-free and is kept.
+fn store_error_message(error: SecretsError) -> String {
+    match error {
+        SecretsError::DekWrapperUnavailable { reason, .. } => {
+            format!("sealed secret could not be stored: {reason}")
+        }
+        _ => "sealed secret could not be stored".to_owned(),
+    }
+}
+
+/// Nominal provenance of a store whose writes go through the AuthHub. It is
+/// never loaded; V1/V2 reads through such a store fail closed.
+fn nominal_kek_provenance(home: &Path) -> KekProvenance {
+    KekProvenance::KeyFile {
+        path: home.join(BOOTSTRAP_KEK_DIR).join(BOOTSTRAP_KEK_FILE),
+    }
+}
+
+/// Builds the AuthHub client from `[infrastructure]`. Opens no socket.
+fn authhub_client(section: &InfrastructureSection) -> Result<AuthHubClient, String> {
+    let availability = InfrastructureAvailability::from_config(
+        &harw_runtime::infrastructure::client_config(section),
+    )
+    .map_err(|error| format!("[infrastructure] is invalid: {error}"))?;
+    availability
+        .auth
+        .ok_or_else(|| "[infrastructure] configures no auth_socket".to_owned())
+}
+
+/// Latest version of the hub key `harw.secrets-kek/dek-kek`.
+fn secrets_kek_ref() -> Result<KeyRef, String> {
+    KeyRef::latest(SECRETS_KEK_NAMESPACE, SECRETS_KEK_KEY_ID).map_err(|error| {
+        format!("AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} is invalid: {error}")
+    })
+}
+
+/// Determines the 0-based generation of the hub key `key`, creating the key
+/// once when the hub reports it missing.
+///
+/// The async client runs on one short-lived thread with its own
+/// current-thread runtime, so this works from plain threads and from inside
+/// a tokio runtime alike.
+///
+/// # Errors
+/// Any hub error other than a missing key (unavailable, timeout,
+/// unauthenticated, …), a key that is not enabled or has another profile,
+/// and a failed bridge thread. Never falls back to local sealing.
+fn ensure_hub_key_generation(client: &AuthHubClient, key: &KeyRef) -> Result<u32, String> {
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name(HUB_BRIDGE_THREAD_NAME.to_owned())
+            .spawn_scoped(scope, move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "AuthHub bridge thread failed".to_owned())?;
+                runtime.block_on(hub_key_generation(client, key))
+            });
+        match spawned {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err("AuthHub bridge thread failed".to_owned())),
+            Err(_) => Err("AuthHub bridge thread failed".to_owned()),
+        }
+    })
+}
+
+/// Describe, and on not-found generate exactly once (a `409` from generate
+/// means a concurrent creation: describe once more).
+async fn hub_key_generation(client: &AuthHubClient, key: &KeyRef) -> Result<u32, String> {
+    match client.describe(key).await {
+        Ok(description) => described_generation(&description),
+        Err(InfraClientError::NotFound) => {
+            match client.generate_key(key, KeyProfile::PqHpkeDefault).await {
+                Ok(created) => generation_of_version(created.key.version()),
+                Err(InfraClientError::Remote(RemoteErrorKind::Conflict)) => {
+                    match client.describe(key).await {
+                        Ok(description) => described_generation(&description),
+                        Err(error) => Err(hub_key_unavailable(error)),
+                    }
+                }
+                Err(error) => Err(format!(
+                    "AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} could not be created: {error}"
+                )),
+            }
+        }
+        Err(error) => Err(hub_key_unavailable(error)),
+    }
+}
+
+/// Checks a described hub key (enabled, `pq-hpke-default`) and returns its
+/// 0-based generation.
+fn described_generation(description: &harw_infra_client::KeyDescription) -> Result<u32, String> {
+    if description.state != KeyState::Enabled {
+        return Err(format!(
+            "AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} is not enabled"
+        ));
+    }
+    if description.profile() != Some(KeyProfile::PqHpkeDefault) {
+        return Err(format!(
+            "AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} does not use the pq-hpke-default profile"
+        ));
+    }
+    generation_of_version(description.key.version())
+}
+
+/// Hub key version (1-based) to Harwness generation (0-based).
+fn generation_of_version(version: Option<u32>) -> Result<u32, String> {
+    version
+        .and_then(|version| version.checked_sub(1))
+        .ok_or_else(|| {
+            format!(
+                "AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} reported no key version"
+            )
+        })
+}
+
+fn hub_key_unavailable(error: InfraClientError) -> String {
+    format!("AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} unavailable: {error}")
+}
+
+/// Highest generation of `harw.secrets-kek/dek-kek` among the V3 records
+/// already in `store`, `0` when there is none. Pure: the reader opens
+/// without dialling the hub.
+fn v3_reader_generation(store: &SecretStore) -> u32 {
+    let key_id = format!("{SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID}");
+    store
+        .list()
+        .iter()
+        .filter_map(|metadata| store.record(&metadata.id).ok())
+        .filter(|record| {
+            record.envelope_format == SecretEnvelopeFormat::KmsWrappedV3
+                && record.key_id.as_deref() == Some(key_id.as_str())
+        })
+        .filter_map(|record| record.key_generation)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Returns the local KEK for writing, bootstrapping one when none exists.
+///
+/// Order: the resolved `[kek]`; a `[kek]` read fresh from the active
+/// profile's or the root `auth.toml` (the resolved config may be stale within
+/// one process); otherwise a new key file `<home>/keys/secrets.kek` (32
+/// random bytes, `0600`, directory `0700`), recorded as
+/// `[kek] provenance = "key_file"` in `<home>/auth.toml` and, if it exists,
+/// in the active profile's `auth.toml`. An existing `[kek]` or key file is
+/// never overwritten.
+///
+/// # Errors
+/// Unreadable or invalid `auth.toml`, a failed bootstrap or config write, or
+/// a platform without key-file KEK support. Messages name paths only.
+fn ensure_local_kek(home: &Path, config: &ResolvedConfig) -> Result<KekConfig, String> {
+    if let Some(kek) = config.auth.kek.as_ref() {
+        return Ok(kek.clone());
+    }
+
+    let root_auth = harw_home::auth_path(home);
+    let profile_auth = active_profile_auth_path(home)?;
+    if let Some(kek) = read_auth_kek(&profile_auth)? {
+        return Ok(kek);
+    }
+    if let Some(kek) = read_auth_kek(&root_auth)? {
+        // A profile `auth.toml` replaces the root one as a whole, so the
+        // root `[kek]` only takes effect there once it is recorded as well.
+        if profile_auth.exists() {
+            write_kek_section(&profile_auth, &kek)?;
+        }
+        return Ok(kek);
+    }
+
+    let key_path = bootstrap_key_file(home)?;
+    let kek = KekConfig {
+        provenance: ConfigKekProvenance::KeyFile,
+        key_file_path: Some(key_path.to_string_lossy().into_owned()),
+        keyring_entry: None,
+        env_seed_var: None,
+    };
+    write_kek_section(&root_auth, &kek)?;
+    if profile_auth.exists() {
+        write_kek_section(&profile_auth, &kek)?;
+    }
+    Ok(kek)
+}
+
+/// `auth.toml` of the active profile (it may not exist).
+fn active_profile_auth_path(home: &Path) -> Result<PathBuf, String> {
+    let name = harw_home::active_profile_name(home);
+    harw_home::profile_dir(home, &name)
+        .map(|dir| harw_home::auth_path(&dir))
+        .map_err(|_| format!("active profile '{name}' has an invalid name"))
+}
+
+/// `[kek]` of the `auth.toml` at `path`, `None` when the file or the table
+/// is missing.
+fn read_auth_kek(path: &Path) -> Result<Option<KekConfig>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(format!("could not read '{}'", path.display())),
+    };
+    let auth: AuthConfig = toml::from_str(&content)
+        .map_err(|_| format!("'{}' is not a valid auth.toml", path.display()))?;
+    Ok(auth.kek)
+}
+
+/// Records `kek` as `[kek]` in the `auth.toml` at `path` through
+/// [`ConfigWriter`], unless a `[kek]` provenance is already there.
+fn write_kek_section(path: &Path, kek: &KekConfig) -> Result<(), String> {
+    let write_error = || format!("could not record [kek] in '{}'", path.display());
+    let mut writer = ConfigWriter::open(path).map_err(|_| write_error())?;
+    if writer.get_value("kek.provenance").is_some() {
+        return Ok(());
+    }
+    let provenance = match kek.provenance {
+        ConfigKekProvenance::KeyFile => "key_file",
+        ConfigKekProvenance::Keyring => "keyring",
+        ConfigKekProvenance::EnvSeed => "env_seed",
+    };
+    writer
+        .set_value("kek.provenance", toml_edit::value(provenance))
+        .map_err(|_| write_error())?;
+    let fields = [
+        ("kek.key_file_path", kek.key_file_path.as_deref()),
+        ("kek.keyring_entry", kek.keyring_entry.as_deref()),
+        ("kek.env_seed_var", kek.env_seed_var.as_deref()),
+    ];
+    for (key, field) in fields
+        .into_iter()
+        .filter_map(|(key, field)| field.map(|field| (key, field)))
+    {
+        writer
+            .set_value(key, toml_edit::value(field))
+            .map_err(|_| write_error())?;
+    }
+    writer.save().map_err(|_| write_error())
+}
+
+/// Creates `<home>/keys/secrets.kek` (32 random bytes, `0600`) below a real
+/// `0700` directory, or reuses an existing key file without touching it.
+/// Returns the absolute key path.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn bootstrap_key_file(home: &Path) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let keys_dir = home.join(BOOTSTRAP_KEK_DIR);
+    let dir_error = || format!("could not prepare KEK directory '{}'", keys_dir.display());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&keys_dir)
+        .map_err(|_| dir_error())?;
+    let metadata = std::fs::symlink_metadata(&keys_dir).map_err(|_| dir_error())?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "KEK directory '{}' is not a real directory",
+            keys_dir.display()
+        ));
+    }
+    std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| dir_error())?;
+    let keys_dir = std::fs::canonicalize(&keys_dir).map_err(|_| dir_error())?;
+    let key_path = keys_dir.join(BOOTSTRAP_KEK_FILE);
+
+    match std::fs::symlink_metadata(&key_path) {
+        Ok(_) => return Ok(key_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(format!("could not inspect key file '{}'", key_path.display())),
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(key_path),
+        Err(_) => return Err(format!("could not create key file '{}'", key_path.display())),
+    };
+
+    let mut seed = secrecy::SecretBox::new(Box::new([0u8; 32]));
+    let written = getrandom::fill(secrecy::ExposeSecretMut::expose_secret_mut(&mut seed))
+        .map_err(|_| "the system random source failed".to_owned())
+        .and_then(|()| {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .and_then(|()| file.write_all(secrecy::ExposeSecret::expose_secret(&seed)))
+                .and_then(|()| file.sync_all())
+                .map_err(|_| format!("could not write key file '{}'", key_path.display()))
+        });
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&key_path);
+        return Err(error);
+    }
+    std::fs::File::open(&keys_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| dir_error())?;
+    Ok(key_path)
+}
+
+/// Key-file KEKs are only supported where `harw-secrets` can open them
+/// safely; elsewhere nothing is created.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn bootstrap_key_file(_home: &Path) -> Result<PathBuf, String> {
+    Err("no [kek] configured and a key-file KEK is not supported on this platform; configure [kek] provenance keyring or env_seed in auth.toml".to_owned())
 }
 
 /// Öffnet — falls nötig — den versiegelten Secret-Resolver, ausgewertet nur
@@ -107,7 +611,9 @@ pub fn open_configured_secret_resolver(
 /// behandelt). Diese Funktion wertet die KEK-Pflicht stattdessen
 /// **verzögert** aus: nur, wenn der tatsächlich gewählte Provider
 /// (`config.harness.default_provider`) existiert, aktiviert ist und selbst
-/// eine `secrets:`-Referenz trägt. Fehlt `default_provider`, existiert der
+/// eine `secrets:`-Referenz trägt — als `auth` oder als Eintrag seines
+/// `credential_pool` (auch ein Pool-Eintrag zählt, siehe
+/// [`provider_uses_sealed_secret`]). Fehlt `default_provider`, existiert der
 /// referenzierte Provider nicht (hängende Referenz), ist er deaktiviert
 /// oder nutzt er kein `secrets:`, verlangt diese Funktion kein KEK und öffnet
 /// nichts.
@@ -145,7 +651,7 @@ pub fn open_configured_secret_resolver_for_active_provider(
         // das ein KEK verlangen könnte.
         return Ok(None);
     };
-    if !(provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_)))) {
+    if !provider_uses_sealed_secret(provider_id, provider, &config.auth) {
         return Ok(None);
     }
     open_configured_secret_resolver(home, config)
@@ -158,8 +664,8 @@ pub fn open_configured_secret_resolver_for_active_provider(
 /// # Description
 /// Öffnet den versiegelten Speicher **exakt** über [`open_configured_secret_resolver`]
 /// — dasselbe Gate (nur wenn ein aktivierter Provider tatsächlich eine
-/// `secrets:`-Referenz nutzt und ein KEK konfiguriert ist), dieselbe
-/// KEK-Auflösung, derselbe Pfad — und ruft anschließend
+/// `secrets:`-Referenz nutzt und ein KEK oder ein AuthHub konfiguriert ist),
+/// dieselbe KEK-Auflösung, derselbe Pfad — und ruft anschließend
 /// [`SecretStore::verify_persisted_audit_chain`] auf. Das ist ein bewusster
 /// Wechsel gegenüber der vorherigen Fassung dieser Funktion (die
 /// [`SecretStore::audit_log`] zurückgab): jene Kette ist die **im Speicher
@@ -225,8 +731,24 @@ pub fn configured_secret_store_persisted_audit_chain_status(
 fn configured_provider_uses_sealed_secret(config: &ResolvedConfig) -> bool {
     config
         .providers
-        .values()
-        .any(|provider| provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_))))
+        .iter()
+        .any(|(provider_id, provider)| provider_uses_sealed_secret(provider_id, provider, &config.auth))
+}
+
+/// `true` when `provider` is enabled and needs the sealed store: its `auth`
+/// or one of its `credential_pool` entries is a `secrets:` reference.
+pub(crate) fn provider_uses_sealed_secret(
+    provider_id: &str,
+    provider: &ProviderToml,
+    auth: &AuthConfig,
+) -> bool {
+    provider.enabled
+        && (matches!(&provider.auth, Some(SecretRef::Secrets(_)))
+            || auth.credential_pool.get(provider_id).is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| matches!(entry.secret, SecretRef::Secrets(_)))
+            }))
 }
 
 fn configured_kek_provenance(kek: &KekConfig) -> Result<KekProvenance, String> {
@@ -279,21 +801,24 @@ fn expand_leading_home(path: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use harw_config::{KekConfig, KekProvenance as ConfigKekProvenance, ProviderToml};
+    use harw_config::{
+        CredentialEntry, InfrastructureSection, KekConfig, KekProvenance as ConfigKekProvenance,
+        ProviderToml, SecretRef,
+    };
     use harw_secrets::audit::chain::PersistedChainStatus;
     use harw_secrets::{
         AuditError, CryptoPolicy, KekProvenance, KeyVersion, SecretStore, load_kek_material,
     };
-    use secrecy::ExposeSecret as _;
+    use secrecy::{ExposeSecret as _, SecretString};
     use secrecy_08::SecretBox;
     use tempfile::TempDir;
 
     use super::{
-        ConfiguredSecretResolver, SecretResolver,
+        ConfiguredSecretResolver, SECRETS_KEK_NAMESPACE, SecretResolver, SecretSealing,
         configured_secret_store_persisted_audit_chain_status, open_configured_secret_resolver,
-        open_configured_secret_resolver_for_active_provider,
+        open_configured_secret_resolver_for_active_provider, select_secret_sealing, store_secret,
     };
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -746,6 +1271,444 @@ mod tests {
             .map_err(ctx("resolve the sealed secret"))?;
         assert_eq!(resolved.expose_secret(), "utf8-token");
         Ok(())
+    }
+
+    #[test]
+    fn select_secret_sealing_table() -> TestResult {
+        let socket = || Some(PathBuf::from("/run/harw/infra/secure.sock"));
+        let token = || Some(PathBuf::from("/run/harw/infra/token"));
+        let cases = [
+            (None, Some(SecretSealing::LocalV2)),
+            (
+                Some(InfrastructureSection {
+                    network_socket: Some(PathBuf::from("/run/harw/infra/network.sock")),
+                    ..InfrastructureSection::default()
+                }),
+                Some(SecretSealing::LocalV2),
+            ),
+            (
+                Some(InfrastructureSection {
+                    auth_socket: socket(),
+                    ..InfrastructureSection::default()
+                }),
+                Some(SecretSealing::AuthHubV3),
+            ),
+            (
+                Some(InfrastructureSection {
+                    auth_socket: socket(),
+                    token_file: token(),
+                    ..InfrastructureSection::default()
+                }),
+                Some(SecretSealing::AuthHubV3),
+            ),
+            (
+                Some(InfrastructureSection {
+                    token_file: token(),
+                    ..InfrastructureSection::default()
+                }),
+                None,
+            ),
+        ];
+        for (infrastructure, expected) in cases {
+            let config = harw_config::ResolvedConfig {
+                infrastructure,
+                ..harw_config::ResolvedConfig::default()
+            };
+            let actual = select_secret_sealing(&config);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(actual.map_err(ctx("sealing is selectable"))?, expected);
+                }
+                None => {
+                    let Err(error) = actual else {
+                        return Err(TestError::Unexpected(
+                            "token_file without auth_socket must not select a sealing".into(),
+                        ));
+                    };
+                    assert!(error.contains("token_file requires auth_socket"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn store_secret_bootstraps_kek_and_round_trips() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let config = harw_config::ResolvedConfig::default();
+        let value = SecretString::from("sk-bootstrap-value".to_owned());
+
+        let reference = store_secret(
+            home.path(),
+            &config,
+            "provider-openai",
+            "provider-auth",
+            &value,
+        )
+        .map_err(ctx("store the secret with a bootstrapped KEK"))?;
+        let SecretRef::Secrets(id) = &reference else {
+            return Err(TestError::Unexpected(format!(
+                "expected a secrets: reference, got {reference}"
+            )));
+        };
+        harw_secrets::SecretId::parse(id).map_err(ctx("secret id is a UUID"))?;
+
+        let keys_dir = home.path().join("keys");
+        let key_path = keys_dir.join("secrets.kek");
+        let key_metadata = fs::metadata(&key_path).map_err(ctx("bootstrapped key file"))?;
+        assert_eq!(key_metadata.len(), 32);
+        assert_eq!(key_metadata.permissions().mode() & 0o777, 0o600);
+        let dir_metadata = fs::metadata(&keys_dir).map_err(ctx("bootstrapped key directory"))?;
+        assert_eq!(dir_metadata.permissions().mode() & 0o777, 0o700);
+
+        let auth_path = home.path().join("auth.toml");
+        let auth_before = fs::read_to_string(&auth_path).map_err(ctx("auth.toml was written"))?;
+        let auth: harw_config::AuthConfig =
+            toml::from_str(&auth_before).map_err(ctx("auth.toml parses"))?;
+        let kek = auth.kek.ok_or(TestError::Missing("[kek] was recorded"))?;
+        assert!(matches!(kek.provenance, ConfigKekProvenance::KeyFile));
+        let canonical_key = fs::canonicalize(&key_path)
+            .map_err(ctx("canonical key path"))?
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(kek.key_file_path.as_deref(), Some(canonical_key.as_str()));
+
+        let mut read_config = harw_config::ResolvedConfig {
+            auth: harw_config::AuthConfig {
+                kek: Some(kek),
+                ..harw_config::AuthConfig::default()
+            },
+            ..harw_config::ResolvedConfig::default()
+        };
+        read_config
+            .providers
+            .insert("openai".to_owned(), provider_with_auth(&reference.to_string())?);
+        let resolver = open_configured_secret_resolver(home.path(), &read_config)
+            .map_err(ctx("the recorded KEK opens the store"))?
+            .ok_or(TestError::Missing("provider uses secrets:"))?;
+        let resolved = resolver
+            .resolve(&reference.to_string())
+            .map_err(ctx("resolve the stored secret"))?;
+        assert_eq!(resolved.expose_secret(), "sk-bootstrap-value");
+
+        let key_before = fs::read(&key_path).map_err(ctx("read key file"))?;
+        store_secret(
+            home.path(),
+            &config,
+            "provider-openai-second",
+            "provider-auth",
+            &SecretString::from("sk-second-value".to_owned()),
+        )
+        .map_err(ctx("a stale config reuses the recorded KEK"))?;
+        assert_eq!(
+            fs::read(&key_path).map_err(ctx("re-read key file"))?,
+            key_before
+        );
+        assert_eq!(
+            fs::read_to_string(&auth_path).map_err(ctx("re-read auth.toml"))?,
+            auth_before
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn existing_key_file_is_never_overwritten() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let keys_dir = home.path().join("keys");
+        fs::create_dir(&keys_dir).map_err(ctx("create key directory"))?;
+        fs::set_permissions(&keys_dir, fs::Permissions::from_mode(0o700))
+            .map_err(ctx("restrict key directory"))?;
+        let key_path = keys_dir.join("secrets.kek");
+        let existing = [0x5A_u8; 32];
+        fs::write(&key_path, existing).map_err(ctx("write existing key file"))?;
+        set_private_permissions(&key_path)?;
+
+        store_secret(
+            home.path(),
+            &harw_config::ResolvedConfig::default(),
+            "provider-openai",
+            "provider-auth",
+            &SecretString::from("sk-existing-key-value".to_owned()),
+        )
+        .map_err(ctx("store under the existing key file"))?;
+
+        assert_eq!(
+            fs::read(&key_path).map_err(ctx("re-read key file"))?,
+            existing.to_vec()
+        );
+        let auth: harw_config::AuthConfig = toml::from_str(
+            &fs::read_to_string(home.path().join("auth.toml")).map_err(ctx("read auth.toml"))?,
+        )
+        .map_err(ctx("auth.toml parses"))?;
+        let kek = auth.kek.ok_or(TestError::Missing("[kek] was recorded"))?;
+        assert!(matches!(kek.provenance, ConfigKekProvenance::KeyFile));
+        let canonical_key = fs::canonicalize(&key_path)
+            .map_err(ctx("canonical key path"))?
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(kek.key_file_path.as_deref(), Some(canonical_key.as_str()));
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn existing_kek_in_auth_toml_is_kept() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
+        let auth_path = home.path().join("auth.toml");
+        let auth_before = format!(
+            "[kek]\nprovenance = \"key_file\"\nkey_file_path = \"{}\"\n",
+            key_path.display()
+        );
+        fs::write(&auth_path, &auth_before).map_err(ctx("write auth.toml"))?;
+
+        let reference = store_secret(
+            home.path(),
+            &harw_config::ResolvedConfig::default(),
+            "provider-openai",
+            "provider-auth",
+            &SecretString::from("sk-configured-kek-value".to_owned()),
+        )
+        .map_err(ctx("store under the configured KEK"))?;
+
+        assert!(matches!(reference, SecretRef::Secrets(_)));
+        assert!(!home.path().join("keys").exists());
+        assert_eq!(
+            fs::read_to_string(&auth_path).map_err(ctx("re-read auth.toml"))?,
+            auth_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unreachable_hub_fails_closed_without_record() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let config = harw_config::ResolvedConfig {
+            infrastructure: Some(InfrastructureSection {
+                auth_socket: Some(home.path().join("missing.sock")),
+                ..InfrastructureSection::default()
+            }),
+            ..harw_config::ResolvedConfig::default()
+        };
+
+        let result = store_secret(
+            home.path(),
+            &config,
+            "provider-openai",
+            "provider-auth",
+            &SecretString::from("sk-unreachable-value".to_owned()),
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "an unreachable hub must fail the write".into(),
+            ));
+        };
+        assert!(error.contains("harw.secrets-kek/dek-kek"));
+        assert!(!error.contains("sk-unreachable-value"));
+        assert!(!home.path().join("sealed-secrets").join("secrets").exists());
+        assert!(!home.path().join("keys").exists());
+        assert!(!home.path().join("auth.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn token_file_without_auth_socket_fails_write() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let config = harw_config::ResolvedConfig {
+            infrastructure: Some(InfrastructureSection {
+                token_file: Some(home.path().join("token")),
+                ..InfrastructureSection::default()
+            }),
+            ..harw_config::ResolvedConfig::default()
+        };
+
+        let result = store_secret(
+            home.path(),
+            &config,
+            "provider-openai",
+            "provider-auth",
+            &SecretString::from("sk-token-file-value".to_owned()),
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "token_file without auth_socket must fail the write".into(),
+            ));
+        };
+        assert!(error.contains("token_file requires auth_socket"));
+        assert!(!home.path().join("keys").exists());
+        assert!(!home.path().join("auth.toml").exists());
+        assert!(!home.path().join("sealed-secrets").exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn reader_attaches_wrapper_when_hub_configured() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
+        {
+            let mut store = store_with_test_kek(home.path(), &key_path)?;
+            store
+                .create(
+                    "provider-token",
+                    "provider authentication",
+                    &SecretBox::new(b"utf8-token".to_vec().into_boxed_slice()),
+                )
+                .map_err(ctx("seal test token"))?;
+        }
+        let mut config = sealed_provider_config()?;
+        config.auth.kek = Some(key_file_kek(&key_path));
+        config.infrastructure = Some(InfrastructureSection {
+            auth_socket: Some(home.path().join("missing.sock")),
+            ..InfrastructureSection::default()
+        });
+
+        let resolver = open_configured_secret_resolver(home.path(), &config)
+            .map_err(ctx("the reader opens without dialling the hub"))?
+            .ok_or(TestError::Missing("sealed provider is configured"))?;
+        assert!(resolver.store.dek_wrapper().is_some());
+        let resolved = resolver
+            .resolve("secrets:provider-token")
+            .map_err(ctx("a V2 record still resolves"))?;
+        assert_eq!(resolved.expose_secret(), "utf8-token");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn compat_read_side_unchanged() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
+        {
+            let mut store = store_with_test_kek(home.path(), &key_path)?;
+            store
+                .create(
+                    "provider-token",
+                    "provider authentication",
+                    &SecretBox::new(b"sealed-token".to_vec().into_boxed_slice()),
+                )
+                .map_err(ctx("seal test token"))?;
+        }
+        let secrets_dir = home.path().join("secrets");
+        fs::create_dir(&secrets_dir).map_err(ctx("create plaintext secrets directory"))?;
+        let key_file = secrets_dir.join("x.key");
+        fs::write(&key_file, b"file-token\n").map_err(ctx("write plaintext key file"))?;
+        set_private_permissions(&key_file)?;
+        let json_file = secrets_dir.join("x.json");
+        fs::write(&json_file, br#"{"k":"json-token"}"#).map_err(ctx("write JSON key file"))?;
+        set_private_permissions(&json_file)?;
+
+        let env_var = "HARW_TEST_SECRET_STORE_COMPAT_ENV_7F3A";
+        let mut config = sealed_provider_config()?;
+        config.auth.kek = Some(key_file_kek(&key_path));
+        config
+            .env_layer
+            .insert(env_var.to_owned(), "env-token".to_owned());
+        let resolver = open_configured_secret_resolver(home.path(), &config)
+            .map_err(ctx("the configured KEK opens the store"))?
+            .ok_or(TestError::Missing("sealed provider is configured"))?;
+
+        let plaintext_refs = [
+            (format!("file:{}", key_file.display()), "file-token"),
+            (
+                format!("file-json:{}#/k", json_file.display()),
+                "json-token",
+            ),
+            (format!("env:{env_var}"), "env-token"),
+        ];
+        for (reference, expected) in plaintext_refs {
+            let provider = provider_with_auth(&reference)?;
+            let without = harw_provider_http::resolve_provider_credential(
+                &provider,
+                &config.env_layer,
+                Some(home.path()),
+                None,
+            )
+            .map_err(ctx("plaintext reference resolves without the store"))?
+            .ok_or(TestError::Missing("provider has auth"))?;
+            let with = harw_provider_http::resolve_provider_credential(
+                &provider,
+                &config.env_layer,
+                Some(home.path()),
+                Some(&resolver as &dyn SecretResolver),
+            )
+            .map_err(ctx("plaintext reference resolves next to the store"))?
+            .ok_or(TestError::Missing("provider has auth"))?;
+            assert_eq!(without.expose_secret(), expected);
+            assert_eq!(with.expose_secret(), expected);
+        }
+
+        let sealed = provider_with_auth("secrets:provider-token")?;
+        let resolved = harw_provider_http::resolve_provider_credential(
+            &sealed,
+            &config.env_layer,
+            Some(home.path()),
+            Some(&resolver as &dyn SecretResolver),
+        )
+        .map_err(ctx("a V2 secrets: reference resolves"))?
+        .ok_or(TestError::Missing("provider has auth"))?;
+        assert_eq!(resolved.expose_secret(), "sealed-token");
+        Ok(())
+    }
+
+    #[test]
+    fn credential_pool_secrets_entry_requires_kek() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert(
+            "pooled".to_owned(),
+            provider_with_auth("env:HARW_TEST_POOLED_PROVIDER_TOKEN")?,
+        );
+        config.auth.credential_pool.insert(
+            "pooled".to_owned(),
+            vec![CredentialEntry {
+                secret: SecretRef::Secrets("pool-token".to_owned()),
+                label: None,
+                priority: 0,
+                base_url: None,
+            }],
+        );
+
+        let result = open_configured_secret_resolver(home.path(), &config);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a secrets: pool entry without KEK must fail closed".into(),
+            ));
+        };
+        assert!(error.contains("requires a configured KEK"));
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_kek_namespace_matches_purpose() -> TestResult {
+        assert_eq!(
+            harw_dod_encrypt::HarwKeyPurpose::SecretsKek.namespace(),
+            SECRETS_KEK_NAMESPACE
+        );
+        Ok(())
+    }
+
+    fn provider_with_auth(reference: &str) -> TestResult<ProviderToml> {
+        toml::from_str::<ProviderToml>(&format!(
+            "name = \"compat\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"{reference}\"\n"
+        ))
+        .map_err(ctx("valid test provider"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn key_file_kek(key_path: &Path) -> KekConfig {
+        KekConfig {
+            provenance: ConfigKekProvenance::KeyFile,
+            key_file_path: Some(key_path.to_string_lossy().into_owned()),
+            keyring_entry: None,
+            env_seed_var: None,
+        }
     }
 
     fn store_with_test_kek(home: &Path, key_path: &Path) -> TestResult<SecretStore> {
