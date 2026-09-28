@@ -1,11 +1,12 @@
 export const meta = {
   name: 'gap-fix',
-  description: 'Fix verified single-file findings: one fixer per file (Opus for critical/high), adversarial review with lessons checklist, one repair pass, final cross-file ripple check; no builds',
+  description: 'Fix verified single-file findings toward one goal with acceptance criteria and a pinned base: one fixer per file (Sonnet 5 by default), adversarial review with lessons checklist, one repair pass, cross-file ripple check, goal check with evidence per criterion; no builds',
   whenToUse: 'After gap-hunt-area runs were consolidated. Pass findings for a DISJOINT file set; run several gap-fix workflows in parallel only if their file sets do not overlap. Multi-file findings go to a contract wave instead.',
   phases: [
     { title: 'Fix', detail: 'one agent per file, edits only that file' },
     { title: 'Review', detail: 'adversarial review, one repair pass, re-review of the repair' },
-    { title: 'Ripple', detail: 'Opus cross-file consistency check over the diff (read-only)' },
+    { title: 'Ripple', detail: 'cross-file consistency check over the diff (read-only)' },
+    { title: 'Goal', detail: 'evidence per acceptance criterion against the pinned base (read-only)' },
   ],
 }
 
@@ -52,7 +53,99 @@ function checkRoot(root) {
 const ROOT = checkRoot(A.root)
 const GIT = `git -C '${ROOT}'`
 const WHERE = `Repository root: ${ROOT} (a git checkout on its own branch). Every path below is relative to that root: read and edit files only under it, and run git as \`${GIT} …\`. Never touch the same path in any other checkout.`
-const CONTEXT = `${WHERE} Binding code rules: ${RULES}. Pattern catalog: ${CATALOG}. ${BUILD_RULE}`
+// Goal contract (catalog P19/P20): a writing wave serves one goal with
+// acceptance criteria and runs against one pinned base. The wave reports
+// evidence per criterion; it never declares the goal achieved, that stays
+// human-only. `complete` additionally requires every criterion `met` with
+// evidence from a goal check over `git diff <base>`.
+//   goal        {id, statement, criteria: [{id, text}], invariants?: [string]} (required)
+//   base        pinned base commit, 7-40 hex digits (required)
+//   models      'sonnet' (default: every agent runs on Sonnet 5) or 'tiered'
+//               (Opus for contracts, critical/high fixes, ripple)
+//   maxParallel files or clusters in flight at once (default 3): size it to
+//               the token budget, not to CPUs, so one session limit cannot
+//               stop every wave in the same stage (catalog P19)
+function checkGoal(goal) {
+  const g = goal || {}
+  const idOk = s => typeof s === 'string' && /^[a-z0-9][a-z0-9._-]*$/.test(s)
+  if (!idOk(g.id)) throw new Error('goal.id is required ([a-z0-9._-]); a writing wave serves one goal')
+  if (!String(g.statement || '').trim()) throw new Error('goal.statement is required')
+  const criteria = Array.isArray(g.criteria) ? g.criteria : []
+  if (!criteria.length) throw new Error('goal.criteria must name at least one acceptance criterion')
+  const seen = new Set()
+  for (const c of criteria) {
+    if (!c || !idOk(c.id) || !String(c.text || '').trim()) throw new Error('every criterion needs an id ([a-z0-9._-]) and a text')
+    if (seen.has(c.id)) throw new Error(`duplicate criterion id ${c.id}`)
+    seen.add(c.id)
+  }
+  return { id: g.id, statement: String(g.statement).trim(), criteria, invariants: (g.invariants || []).map(String) }
+}
+function checkBase(base) {
+  const b = String(base || '')
+  if (!/^[0-9a-f]{7,40}$/.test(b)) throw new Error('base is required: the pinned base commit as 7-40 lowercase hex digits')
+  return b
+}
+const GOAL = checkGoal(A.goal)
+const BASE = checkBase(A.base)
+const MODELS = A.models || 'sonnet'
+if (MODELS !== 'sonnet' && MODELS !== 'tiered') throw new Error("models must be 'sonnet' or 'tiered'")
+const pick = strong => MODELS === 'tiered' ? strong : 'sonnet'
+const MAX_PARALLEL = Number.isInteger(A.maxParallel) && A.maxParallel > 0 ? A.maxParallel : 3
+const FIXED_INVARIANTS = [
+  'Repo code, tests and executable gates win over planning documents. A contradiction between them is reported under deltas, never reconciled silently.',
+  'Only a state merged into dev is CURRENT. The integration branch and wave manifests are PLANNED until then.',
+  'No security-relevant change counts as done without a regression test and a passed re-review.',
+  'You never declare the goal achieved; you report evidence.',
+]
+const GOAL_TEXT = `Goal ${GOAL.id}: ${GOAL.statement}
+Pinned base: ${BASE}. Compare against it (\`git diff ${BASE}\`), never against a later state.
+Acceptance criteria:
+${GOAL.criteria.map(c => `- ${c.id}: ${c.text}`).join('\n')}
+Invariants:
+${[...GOAL.invariants, ...FIXED_INVARIANTS].map(i => `- ${i}`).join('\n')}`
+const COVERAGE = {
+  type: 'object',
+  properties: {
+    criteria: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          status: { type: 'string', enum: ['met', 'not-met', 'unknown'] },
+          evidence: { type: 'string', description: 'repo-relative file:line or test name that shows the criterion holds; empty unless met' },
+        },
+        required: ['id', 'status', 'evidence'],
+      },
+    },
+    deltas: { type: 'array', items: { type: 'string' }, description: 'contradictions between code/tests/gates and planning docs, not reconciled' },
+  },
+  required: ['criteria', 'deltas'],
+}
+// Runs items through a pipeline in batches of MAX_PARALLEL, in order.
+async function batched(items, ...stages) {
+  const out = []
+  for (let i = 0; i < items.length; i += MAX_PARALLEL) {
+    const part = await pipeline(items.slice(i, i + MAX_PARALLEL), ...stages.map(s => (v, it, j) => s(v, it, i + j)))
+    out.push(...part)
+  }
+  return out
+}
+// One criterion counts only as `met` with evidence; a missing answer, a
+// missing criterion or an unknown id never counts.
+function coverageOf(answer) {
+  const got = new Map(((answer && answer.criteria) || []).map(c => [c.id, c]))
+  return GOAL.criteria.map(c => {
+    const a = got.get(c.id)
+    if (!a) return { id: c.id, status: 'unknown', evidence: '', reason: answer ? 'not answered' : 'no goal check' }
+    const met = a.status === 'met' && String(a.evidence || '').trim() !== ''
+    return { id: c.id, status: met ? 'met' : (a.status === 'met' ? 'unknown' : a.status), evidence: String(a.evidence || ''), ...(a.status === 'met' && !met ? { reason: 'met without evidence' } : {}) }
+  })
+}
+const SECURITY = f => f.severity === 'critical' || f.severity === 'high'
+const CONTEXT = `${WHERE}
+${GOAL_TEXT}
+Binding code rules: ${RULES}. Pattern catalog: ${CATALOG}. ${BUILD_RULE}`
 
 // Lessons from earlier hunts (catalog P1/P2): fixes caused follow-up findings.
 const FIX_RULES = `
@@ -73,13 +166,19 @@ const FIXED = {
     fixed: { type: 'array', items: { type: 'string' } },
     skipped: { type: 'array', items: { type: 'object', properties: { title: { type: 'string' }, reason: { type: 'string' } }, required: ['title', 'reason'] } },
     tests_added: { type: 'array', items: { type: 'string' } },
+    deltas: { type: 'array', items: { type: 'string' }, description: 'contradictions between code/tests/gates and planning docs, not reconciled' },
     notes: { type: 'string' },
   },
   required: ['file', 'fixed', 'skipped', 'tests_added'],
 }
 const REVIEW = {
   type: 'object',
-  properties: { ok: { type: 'boolean' }, problems: { type: 'array', items: { type: 'string' } } },
+  properties: {
+    ok: { type: 'boolean' },
+    problems: { type: 'array', items: { type: 'string' } },
+    regression_test: { type: 'string', description: 'name of the test in the diff that fails without the fix of a critical/high finding; empty if there is none' },
+    deltas: { type: 'array', items: { type: 'string' } },
+  },
   required: ['ok', 'problems'],
 }
 const RIPPLE = {
@@ -110,14 +209,14 @@ log(`${A.key || 'batch'}: ${groups.length} files, ${(A.findings || []).length} f
 
 const fixReports = []
 const reviewReports = []
-const results = await pipeline(groups,
+const results = await batched(groups,
   ([file, fs]) => REVIEW_ONLY.has(file) ? { file, fixed: [], skipped: [], notes: 'fix already applied in the working tree (reviewOnly)' } : agent(`${CONTEXT}
 
 You are a fixer. Edit ONLY this one file: ${file}.${PARTIAL.has(file) ? ` An earlier fixer for this file died mid-run and may have left a partial edit: read \`${GIT} diff -- ${file}\` first, then complete or correct that edit rather than starting over.` : ''} Do not create or edit any other file. Use the Edit tool (no temp files). Never commit.
 Fix these verified findings (skip one only if the fix would be riskier than the defect, and say why):
 ${fs.map((f, i) => `${i + 1}. [${f.severity}] ${f.title} (line ${f.line})\n   ${f.description}\n   Evidence: ${f.evidence}\n   Fix: ${f.fix}\n   Test idea: ${f.test_idea || '-'}`).join('\n')}
 Add or adjust tests in this file's test module where sensible. Keep public signatures stable unless a finding requires otherwise; callers in other files must still compile.${FIX_RULES}`,
-    { label: `fix:${file}`, phase: 'Fix', schema: FIXED, model: fs.some(f => f.severity === 'critical' || f.severity === 'high') ? 'opus' : 'sonnet', agentType: 'focused-coder' }),
+    { label: `fix:${file}`, phase: 'Fix', schema: FIXED, model: pick(fs.some(SECURITY) ? 'opus' : 'sonnet'), agentType: 'focused-coder' }),
   (fixRes, [file, fs]) => {
     if (fixRes) fixReports.push(fixRes)
     const review = agent(`${CONTEXT}
@@ -125,7 +224,7 @@ Add or adjust tests in this file's test module where sensible. Keep public signa
 You are an adversarial reviewer of a just-made fix. File: ${file}. Inspect \`${GIT} diff -- ${file}\` (it may contain earlier unrelated edits; focus on these findings):
 ${fs.map(f => `- ${f.title}: ${f.fix}`).join('\n')}
 Fixer report: ${JSON.stringify(fixRes || {})}
-Check by reading: the defect is really fixed; no new bug; binding rules hold; cfgs compile on all target platforms; no dead code that clippy -D warnings rejects; callers in other files still compile (grep); comment language matches. Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
+Check by reading: the defect is really fixed;${fs.some(SECURITY) ? ' this file carries a critical/high finding, so name in regression_test the test in the diff that fails without the fix (empty if there is none; that blocks the file);' : ''} no new bug; binding rules hold; cfgs compile on all target platforms; no dead code that clippy -D warnings rejects; callers in other files still compile (grep); comment language matches. Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
       { label: `review:${file}`, phase: 'Review', schema: REVIEW, model: 'sonnet', agentType: 'focused-explorer' })
     return review.then(rev => ({ rev, fixRes }))
   },
@@ -136,6 +235,11 @@ Check by reading: the defect is really fixed; no new bug; binding rules hold; cf
     if (rev) reviewReports.push({ file, ...rev })
     if (!fixRes) return { file, status: 'unverified', reason: 'no fixer report' }
     if (!rev) return { file, status: 'unverified', reason: 'no review' }
+    // Security invariant: a critical/high finding counts as done only with a
+    // regression test the (re-)review names.
+    const needsTest = fs.some(SECURITY)
+    const tested = r => !needsTest || String((r && r.regression_test) || '').trim() !== ''
+    if (rev.ok && !tested(rev)) return { file, status: 'unverified', reason: 'critical/high finding without a named regression test' }
     if (rev.ok) return { file, status: 'ok' }
     if (!(rev.problems || []).length) return { file, status: 'unverified', reason: 'review returned ok=false without naming a problem' }
     const repair = await agent(`${CONTEXT}
@@ -153,10 +257,11 @@ You re-review a repaired fix. File: ${file}. Inspect \`${GIT} diff -- ${file}\`.
 Repair report: ${JSON.stringify(repair)}
 Findings the file must fix:
 ${fs.map(f => `- ${f.title}: ${f.fix}`).join('\n')}
-Check that every problem above is resolved and that the repair introduced no new one. Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
+Check that every problem above is resolved and that the repair introduced no new one.${fs.some(SECURITY) ? ' This file carries a critical/high finding: name in regression_test the test in the diff that fails without the fix (empty if there is none).' : ''} Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
       { label: `rereview:${file}`, phase: 'Review', schema: REVIEW, model: 'sonnet', agentType: 'focused-explorer' })
     if (!recheck) return { file, status: 'unresolved', reason: 'no re-review after repair', problems: rev.problems }
     reviewReports.push({ file, rereview: true, ...recheck })
+    if (recheck.ok && !tested(recheck)) return { file, status: 'unverified', reason: 'critical/high finding without a named regression test' }
     return recheck.ok ? { file, status: 'repaired' } : { file, status: 'unresolved', reason: 're-review still finds problems', problems: recheck.problems }
   },
 )
@@ -167,7 +272,17 @@ if (A.ripple !== false && groups.length) {
   ripple = await agent(`${CONTEXT}
 
 You are the cross-file consistency checker. Files just changed by one-file fixers: ${groups.map(g => g[0]).join(', ')}. Read \`${GIT} diff\` for them and look ONLY for cross-file ripple: callers/tests elsewhere that no longer match a changed signature or behaviour, docs/comments/ledger/guides elsewhere describing the old behaviour, pub helpers without any production caller, the same issue fixed twice in conflicting ways, anything that would fail to compile or fail clippy -D warnings across files. Do not edit. Put only concrete problems into items, each with a repo-relative file and line; put what you checked and found clean into summary. Every item blocks this wave until it is fixed and re-verified, moved into a contract wave, or rejected by verification.`,
-    { label: `ripple:${A.key || 'batch'}`, phase: 'Ripple', schema: RIPPLE, model: 'opus', agentType: 'focused-explorer' })
+    { label: `ripple:${A.key || 'batch'}`, phase: 'Ripple', schema: RIPPLE, model: pick('opus'), agentType: 'focused-explorer' })
+}
+
+let goalCheck = null
+if (groups.length) {
+  phase('Goal')
+  goalCheck = await agent(`${CONTEXT}
+
+You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${groups.map(g => g[0]).join(' ')}\` and the tests in it. Do not edit.
+For every acceptance criterion, answer met, not-met or unknown. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
+    { label: `goal:${A.key || 'batch'}`, phase: 'Goal', schema: COVERAGE, model: 'sonnet', agentType: 'focused-explorer' })
 }
 
 // Completion signal for committing/merging the wave: every file ok or
@@ -182,6 +297,9 @@ const files = groups.map(([file], i) => results[i] || { file, status: 'unverifie
 const open = files.filter(f => f.status !== 'ok' && f.status !== 'repaired')
 const rippleItems = ripple ? (ripple.items || []).map((item, i) => ({ id: `${KEY}-R${i + 1}`, ...item, file: norm(item.file) })) : []
 const rippleStatus = A.ripple === false || !groups.length ? 'skipped' : (!ripple ? 'missing' : (rippleItems.length ? 'findings' : 'clear'))
-const complete = open.length === 0 && (rippleStatus === 'clear' || rippleStatus === 'skipped')
-log(`${KEY}: ${complete ? 'complete' : 'NOT complete'}; ${files.length - open.length}/${files.length} files done, ripple ${rippleStatus}${rippleItems.length ? ` (${rippleItems.length} open items)` : ''}`)
-return { key: KEY, complete, open, files, fixReports, reviewReports, rippleStatus, ripple: rippleItems, rippleSummary: ripple ? ripple.summary || '' : null }
+const coverage = groups.length ? coverageOf(goalCheck) : []
+const covered = coverage.every(c => c.status === 'met')
+const deltas = [...new Set([...fixReports, ...reviewReports, goalCheck || {}].flatMap(r => r.deltas || []))]
+const complete = open.length === 0 && (rippleStatus === 'clear' || rippleStatus === 'skipped') && covered
+log(`${KEY}: ${complete ? 'complete' : 'NOT complete'}; ${files.length - open.length}/${files.length} files done, ripple ${rippleStatus}${rippleItems.length ? ` (${rippleItems.length} open items)` : ''}, goal ${GOAL.id} ${coverage.filter(c => c.status === 'met').length}/${GOAL.criteria.length} criteria met`)
+return { key: KEY, goal: GOAL.id, base: BASE, achieved: false, achieve: 'human-only', coverage, deltas, complete, open, files, fixReports, reviewReports, rippleStatus, ripple: rippleItems, rippleSummary: ripple ? ripple.summary || '' : null }
