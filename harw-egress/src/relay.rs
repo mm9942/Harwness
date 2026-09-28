@@ -1289,9 +1289,7 @@ mod tests {
 
     #[test]
     fn test_copy_until_stopped_retries_interrupted() -> TestResult {
-        let mut reader = InterruptOnceThenEof {
-            interrupted: false,
-        };
+        let mut reader = InterruptOnceThenEof { interrupted: false };
         let mut writer: Vec<u8> = Vec::new();
         let stop = AtomicBool::new(false);
         copy_until_stopped(
@@ -1301,7 +1299,9 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(10),
         )
-        .map_err(ctx("Interrupted sollte wiederholt werden, nicht fehlschlagen"))?;
+        .map_err(ctx(
+            "Interrupted sollte wiederholt werden, nicht fehlschlagen",
+        ))?;
         assert!(writer.is_empty());
         Ok(())
     }

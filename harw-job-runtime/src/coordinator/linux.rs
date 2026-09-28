@@ -1166,7 +1166,7 @@ impl Executor for LinuxExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        CgroupRecovery, LeftoverCgroup, LeftoverRegistry, Launch, LinuxExecutor,
+        CgroupRecovery, Launch, LeftoverCgroup, LeftoverRegistry, LinuxExecutor,
         LinuxExecutorOptions, RecoveredCgroup, cgroup_name, remove_cgroup, reopen_job_cgroup,
         weaker,
     };
@@ -1251,7 +1251,11 @@ mod tests {
         }
 
         fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
-            Ok(CgroupHandle::new(name.to_owned(), self.proc_path.clone(), None))
+            Ok(CgroupHandle::new(
+                name.to_owned(),
+                self.proc_path.clone(),
+                None,
+            ))
         }
 
         fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {

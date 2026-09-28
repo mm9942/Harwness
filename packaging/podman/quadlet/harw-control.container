@@ -3,7 +3,7 @@
 # Result:     systemd --user unit "harw-control.service" managed by podman.
 #
 # Preconditions:
-#   - podman build -t harw:local -f deploy/Containerfile .   (from repo root)
+#   - podman build -t harw:local -f packaging/podman/Containerfile .   (from repo root)
 #   - bwrap works in this container: user/mount namespaces are the default in
 #     rootless podman; do NOT add userns=host or seccomp filters that block
 #     unshare(2).

@@ -291,8 +291,7 @@ mod tests {
         std::fs::create_dir_all(&dir).map_err(ctx("create directory"))?;
         let target = dir.join("private.json");
 
-        write_private_file_atomically(&target, b"{\"fresh\":true}")
-            .map_err(ctx("atomic write"))?;
+        write_private_file_atomically(&target, b"{\"fresh\":true}").map_err(ctx("atomic write"))?;
 
         let stored = std::fs::read(&target).map_err(ctx("read target"))?;
         assert!(stored == b"{\"fresh\":true}", "stored bytes mismatch");

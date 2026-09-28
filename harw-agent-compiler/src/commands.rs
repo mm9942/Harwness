@@ -1520,7 +1520,10 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let exe = Path::new(output.json["executable"].as_str().ok_or("executable")?);
         assert_ne!(exe.parent(), Some(temp_dir.as_path()));
-        assert_eq!(exe.parent().and_then(Path::parent), Some(temp_dir.as_path()));
+        assert_eq!(
+            exe.parent().and_then(Path::parent),
+            Some(temp_dir.as_path())
+        );
         assert!(!exe.exists(), "{} was not removed", exe.display());
         let private = exe.parent().ok_or("parent")?;
         assert!(!private.exists(), "{} was not removed", private.display());

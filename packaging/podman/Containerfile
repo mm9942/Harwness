@@ -1,5 +1,5 @@
 # Containerfile for the harw control binary (harw web / gateway entrypoint).
-# Context: repo root (Harwness-dev/), build: podman build -t harw:local -f deploy/Containerfile .
+# Context: repo root (Harwness-dev/), build: podman build -t harw:local -f packaging/podman/Containerfile .
 # Source binary: target/release/harw (x86-64, dynamically linked, glibc).
 # trixie: the release binary requires GLIBC >= 2.38 (bookworm ships 2.36).
 FROM debian:trixie-slim
@@ -27,7 +27,7 @@ WORKDIR /home/harw
 ENV HARW_HOME=/home/harw/.harw
 
 # Control plane entrypoint: `harw web` binds its sockets inside the container.
-# Ports are published by the Quadlet unit (deploy/quadlet/harw-control.container),
+# Ports are published by the Quadlet unit (packaging/podman/quadlet/harw-control.container),
 # not here — keep the image placement-agnostic.
 EXPOSE 1337
 ENTRYPOINT ["/usr/bin/harw"]

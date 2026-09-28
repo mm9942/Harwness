@@ -1986,8 +1986,8 @@ mod tests {
     /// öffentlichem DNS-Namen an einem Fetcher mit Freigaben; eine
     /// freigegebene (Eltern-)Domain besteht.
     #[test]
-    fn test_redirect_approval_gate_skips_start_non_public_ungated_and_granted_targets()
-    -> TestResult {
+    fn test_redirect_approval_gate_skips_start_non_public_ungated_and_granted_targets() -> TestResult
+    {
         let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let hosts = ["127.0.0.1", "exfil.example.org"];
         let access = open_approvals();

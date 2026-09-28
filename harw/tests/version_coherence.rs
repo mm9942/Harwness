@@ -1,17 +1,17 @@
 //! Slice 14 — Workspace version coherence integration test.
 //!
 //! Spec source: "Workspace-Versionen, interne Dependency-Versionen und
-//! Lockfile sind konsistent." (0.3.0; Slice 14).
+//! Lockfile sind konsistent." (Slice 14; seit 0.8.0 gegen 0.8.0).
 //!
 //! Asserts:
 //!   1. Every workspace-owned package (`harw` or `harw-*`) reports version
-//!      `0.3.0` (resolved from its own `Cargo.toml`).
-//!   2. No workspace package is still on `0.1.0`.
-//!   3. `Cargo.lock` confirms every internal package resolves to `0.3.0`.
+//!      `0.8.0` (resolved from its own `Cargo.toml`).
+//!   2. No workspace package is still on the previous `0.3.0`.
+//!   3. `Cargo.lock` confirms every internal package resolves to `0.8.0`.
 //!   4. The workspace root `Cargo.toml` contains the version string exactly
 //!      once; no member `Cargo.toml` contains it at all (they inherit via
 //!      `version.workspace = true`).
-//!   5. No member `Cargo.toml` contains a bare `version = "0.1.0"` pin.
+//!   5. No member `Cargo.toml` contains a bare `version = "0.3.0"` pin.
 //!
 //! # Befund G-080 (Korrektur)
 //! Diese Datei rief bis zu dieser Korrektur `cargo_metadata::MetadataCommand`
@@ -45,8 +45,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_VERSION: &str = "0.3.0";
-const OLD_VERSION: &str = "0.1.0";
+const EXPECTED_VERSION: &str = "0.8.0";
+const OLD_VERSION: &str = "0.3.0";
 
 /// Walk up from `start` until a directory contains a `Cargo.toml` that has
 /// the `[workspace]` table.  Returns the path to that directory.
@@ -368,7 +368,7 @@ fn slice14_workspace_version_is_consistent() -> TestResult {
         member_violations.join("\n")
     );
 
-    // ── Assertion 5: no member Cargo.toml has a bare `version = "0.1.0"`
+    // ── Assertion 5: no member Cargo.toml has a bare `version = "0.3.0"`
     // pin ─────────────────────────────────────────────────────────────
     let old_pin_violations: Vec<String> = workspace_packages
         .iter()

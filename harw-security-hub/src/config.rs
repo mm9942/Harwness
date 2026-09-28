@@ -480,7 +480,10 @@ mod tests {
         // A test runner is root in some containers; only then may an
         // arbitrary temp file legitimately pass the root-ownership check.
         let owned_by_root = metadata.uid() == 0;
-        assert_eq!(check_trusted_metadata(&metadata, true).is_ok(), owned_by_root);
+        assert_eq!(
+            check_trusted_metadata(&metadata, true).is_ok(),
+            owned_by_root
+        );
         Ok(())
     }
 

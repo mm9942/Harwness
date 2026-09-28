@@ -376,7 +376,9 @@ impl PlanDir {
             Err(error) => return Err(open_error(&self.root, &error)),
         };
         // fstat auf dem Deskriptor: `open_beneath` lässt auch reguläre Dateien zu.
-        let meta = dir.metadata().map_err(|error| io_error(&self.root, &error))?;
+        let meta = dir
+            .metadata()
+            .map_err(|error| io_error(&self.root, &error))?;
         if !meta.is_dir() {
             return Err(io_error(
                 &self.root,
@@ -393,7 +395,9 @@ impl PlanDir {
     /// [`PlanFileError::Symlink`], wenn der Pfad inzwischen ein Symlink ist;
     /// [`PlanFileError::Io`], wenn er fehlt oder etwas anderes nennt.
     fn verify_pinned(&self, dir: &File) -> PlanFileResult<()> {
-        let pinned = dir.metadata().map_err(|error| io_error(&self.root, &error))?;
+        let pinned = dir
+            .metadata()
+            .map_err(|error| io_error(&self.root, &error))?;
         match std::fs::symlink_metadata(&self.root) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 Err(PlanFileError::Symlink(self.root.clone()))
@@ -828,8 +832,7 @@ mod tests {
         let harw_temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let target = harw_temp.path().join("ziel");
         std::fs::create_dir_all(target.join("plans")).map_err(ctx("target"))?;
-        std::fs::write(target.join("plans").join("geheim.md"), "GEHEIM")
-            .map_err(ctx("secret"))?;
+        std::fs::write(target.join("plans").join("geheim.md"), "GEHEIM").map_err(ctx("secret"))?;
         let harw = harw_temp.path().join(".harw");
         std::os::unix::fs::symlink(&target, &harw).map_err(ctx("harw link"))?;
         let harw_dir = PlanDir::new(harw.join("plans"));
@@ -852,8 +855,7 @@ mod tests {
             .ok_or(TestError::Missing("plan dir"))?;
 
         // Nach dem Öffnen wird das Verzeichnis gegen einen Symlink getauscht.
-        std::fs::rename(dir.root(), temp.path().join("verschoben"))
-            .map_err(ctx("move plans"))?;
+        std::fs::rename(dir.root(), temp.path().join("verschoben")).map_err(ctx("move plans"))?;
         let elsewhere = temp.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).map_err(ctx("elsewhere"))?;
         std::fs::write(elsewhere.join("auth.md"), "GEHEIM").map_err(ctx("secret"))?;

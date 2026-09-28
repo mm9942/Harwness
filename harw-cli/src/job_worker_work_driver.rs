@@ -4409,8 +4409,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_write_into_a_different_blocks_owned_path_is_caught_across_blocks()
-    -> TestResult {
+    async fn test_a_write_into_a_different_blocks_owned_path_is_caught_across_blocks() -> TestResult
+    {
         // Wellenbreite 1: w0 und w1 laufen in getrennten, nacheinander
         // ausgeführten Blöcken derselben Welle, nie gleichzeitig.
         let mut state = new_state(&work_id(), Timestamp::now());
@@ -4425,7 +4425,8 @@ mod tests {
             ..spec(10)
         };
         let mut memory = RunMemory::new(&spec, None, Timestamp::now());
-        let spawner = FakeSpawner::with_replies(vec![done_reply("a erledigt"), done_reply("b erledigt")]);
+        let spawner =
+            FakeSpawner::with_replies(vec![done_reply("a erledigt"), done_reply("b erledigt")]);
         // Block 1 (nur w0 läuft) verändert tatsächlich `b/x` — eine
         // Scope-Flucht in den Bereich von w1, der in diesem Block noch nicht
         // einmal gestartet ist. Die alte, wellenweite Vereinigung hätte das
@@ -4693,9 +4694,7 @@ mod tests {
         assert!(!parse_verdict("passed? no — FAILED").passed);
         // Verneinte Formulierung ohne das Wort "FAILED": hätte der alte
         // Klartext-Scan als `passed: true` gelesen.
-        assert!(
-            !parse_verdict("This has not passed review yet; more tests are needed.").passed
-        );
+        assert!(!parse_verdict("This has not passed review yet; more tests are needed.").passed);
         let nothing = parse_verdict("Ich kann das nicht beurteilen.");
         assert!(!nothing.passed);
         assert_eq!(nothing.comment, "Ich kann das nicht beurteilen.");

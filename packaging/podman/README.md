@@ -8,8 +8,8 @@ unit, with the container itself acting as the sandbox.
 
 | File | Purpose |
 | --- | --- |
-| `deploy/Containerfile` | Debian-slim image with the release `harw` binary, bubblewrap, dbus |
-| `deploy/quadlet/harw-control.container` | Quadlet user unit → `systemctl --user start harw-control` |
+| `packaging/podman/Containerfile` | Debian-slim image with the release `harw` binary, bubblewrap, dbus |
+| `packaging/podman/quadlet/harw-control.container` | Quadlet user unit → `systemctl --user start harw-control` |
 | `deploy/systemd/` (unchanged) | Host-side systemd units, still the reference for hardening |
 
 ## Build
@@ -17,14 +17,14 @@ unit, with the container itself acting as the sandbox.
 ```sh
 # from the repo root, after a release build exists
 cargo build --release -p harw
-podman build -t harw:local -f deploy/Containerfile .
+podman build -t harw:local -f packaging/podman/Containerfile .
 ```
 
 ## Install (per user, rootless)
 
 ```sh
 mkdir -p ~/.config/containers/systemd
-cp deploy/quadlet/harw-control.container ~/.config/containers/systemd/
+cp packaging/podman/quadlet/harw-control.container ~/.config/containers/systemd/
 
 # secrets are mounted, never copied
 podman secret create harw-telegram ~/.harw/secrets/telegram.env
