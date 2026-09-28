@@ -1403,14 +1403,18 @@ fn serve_mcp(
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // R18 P4: WorkDriver-Spur nach `[harness.jobs]` (höchstens so viele
+    // Läufe gleichzeitig wie Jobs laufen dürfen, mindestens einer).
+    let worker_options = job_worker::JobWorkerOptions::from_config(&config);
     let worker = spawn_job_worker_thread(worker_runtime, move || {
-        job_worker::run_job_worker(
+        job_worker::run_job_worker_with_options(
             store,
             executions,
             provider,
             plan_node_services,
             shutdown_rx,
             worker_context,
+            worker_options,
         )
     })?;
 

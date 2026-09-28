@@ -21,10 +21,16 @@
 //! - [`arbiter`]: per-session FIFO, compare-and-swap on the head, idempotency.
 //! - [`approvals`]: first-writer-wins approval resolution.
 //! - [`driver`]: the port to the agent runtime that actually runs turns.
-//! - [`host`]: the composition of all of the above.
+//! - [`agents`]: R18 agent principal registry (credential → principal,
+//!   delegation, grant/narrow cascade, revocation).
+//! - [`tool_host`]: R18 gateway tool host (tool registry, gateway sandbox,
+//!   admission steps 8-9, in-flight calls, tool approvals).
+//! - [`host`]: the composition of all of the above; `HostConnection` also
+//!   implements [`harw_protocol::ToolPort`] and [`harw_protocol::GatewayPort`].
 
 #![forbid(unsafe_code)]
 
+pub mod agents;
 pub mod approvals;
 pub mod arbiter;
 pub mod driver;
@@ -35,7 +41,16 @@ pub mod identity;
 pub mod live_ring;
 pub mod record;
 pub mod replay;
+pub mod tool_host;
 
+pub use agents::{AgentCredential, AgentRegistry, Delegation, ResolvedAgent};
 pub use error::HostError;
 pub use host::{HostConfig, HostConnection, SessionHost};
-pub use identity::{ClientIdentity, ConnectionId, caps_for_tier};
+pub use identity::{
+    AgentPrincipal, ClientIdentity, ConnectionId, ToolGrant, ToolGrantError, caps_for_tier,
+    gateway_caps_for_tier,
+};
+pub use tool_host::{
+    GatewaySandbox, NoGatewaySandbox, SessionScope, ToolApprovalIssuer, ToolHost, ToolHostBuilder,
+    ToolRegistration, WorkspaceGatewaySandbox, WorkspaceSandboxConfig,
+};

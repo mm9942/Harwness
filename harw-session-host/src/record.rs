@@ -43,6 +43,29 @@ pub struct HostedSessionRecord {
     /// Epoch of the host process that last owned this session.
     pub host_epoch: u64,
     pub generation: u32,
+    /// R18 §4: agent principal that created the session (`None`: created by
+    /// a human/device caller). Gateway tool calls into the session are
+    /// admitted only for this agent and its delegates, and for the agents
+    /// in [`Self::tool_agents`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent: Option<String>,
+    /// R18 §4: agent principals the host composition bound to the session
+    /// explicitly (`SessionHost::bind_tool_agent`), each with its delegates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_agents: Vec<String>,
+}
+
+impl HostedSessionRecord {
+    /// True when an agent whose delegation chain is `lineage` (the agent
+    /// first, then its parent, …, up to the UIA) may run gateway tools in
+    /// this session: some agent of the chain created the session or was
+    /// bound to it. Fail closed: an empty chain is never admitted.
+    #[must_use]
+    pub fn admits_tool_agent(&self, lineage: &[String]) -> bool {
+        lineage.iter().any(|agent| {
+            self.owner_agent.as_deref() == Some(agent.as_str()) || self.tool_agents.contains(agent)
+        })
+    }
 }
 
 /// File-backed store of [`HostedSessionRecord`]s.
@@ -272,7 +295,30 @@ mod tests {
             state,
             host_epoch: 0,
             generation: 1,
+            owner_agent: None,
+            tool_agents: Vec::new(),
         })
+    }
+
+    #[test]
+    fn records_without_tool_agents_keep_their_shape_and_admit_no_agent() -> TestResult {
+        let plain = record("s-9", HostedState::Idle, 100)?;
+        let json = serde_json::to_value(&plain)?;
+        assert!(json.get("owner_agent").is_none());
+        assert!(json.get("tool_agents").is_none());
+        assert!(!plain.admits_tool_agent(&["agent:uia".to_owned()]));
+        assert!(!plain.admits_tool_agent(&[]));
+
+        let mut owned = plain.clone();
+        owned.owner_agent = Some("agent:uia".into());
+        owned.tool_agents = vec!["agent:other".into()];
+        let chain = ["agent:w1".to_owned(), "agent:uia".to_owned()];
+        assert!(owned.admits_tool_agent(&chain));
+        assert!(owned.admits_tool_agent(&["agent:other".to_owned()]));
+        assert!(!owned.admits_tool_agent(&["agent:uia-b".to_owned()]));
+        let decoded: HostedSessionRecord = serde_json::from_value(serde_json::to_value(&owned)?)?;
+        assert_eq!(decoded, owned);
+        Ok(())
     }
 
     #[test]

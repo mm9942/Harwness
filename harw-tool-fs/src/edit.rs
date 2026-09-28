@@ -63,6 +63,15 @@ const DIFF_TRUNCATION_MARKER: &str = "… [Diff gekürzt]";
 /// Werkzeugname für Meldungen und Rechteprüfung.
 const TOOL: &str = "fs.edit";
 
+/// R18 F7: Lenkungssatz für die Modellbeschreibung von `fs.edit`.
+///
+/// Agenten haben Dateien über `shell.exec` mit `python3 - <<'EOF'` oder
+/// Heredocs bearbeitet; das umgeht Pfadprüfung, geschützte Bereiche und den
+/// Diff-Ausschnitt. Die Beschreibung in `provider.rs` hängt diesen Satz an.
+pub const FS_EDIT_STEERING: &str = "Use fs.edit for every change to an existing file. \
+    Never edit files through shell.exec heredocs (cat <<EOF), sed -i, perl -i or \
+    python3 -: those bypass the workspace path checks and produce no reviewable diff.";
+
 /// Deserialisierte Argumente für `fs.edit`.
 #[derive(Debug, Deserialize)]
 struct FsEditArgs {
@@ -648,5 +657,17 @@ mod tests {
             "{result:?}"
         );
         Ok(())
+    }
+
+    /// R18 EX-04: der Lenkungssatz nennt das Werkzeug und die Shell-Umwege,
+    /// die er ersetzt.
+    #[test]
+    fn fs_edit_steering_names_the_shell_detours() {
+        for needle in ["fs.edit", "heredoc", "python3 -", "sed -i", "shell.exec"] {
+            assert!(
+                FS_EDIT_STEERING.contains(needle),
+                "missing {needle:?} in {FS_EDIT_STEERING}"
+            );
+        }
     }
 }

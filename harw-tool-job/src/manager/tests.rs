@@ -88,6 +88,60 @@ async fn test_start_status_logs_stop() -> TestResult {
     Ok(())
 }
 
+/// R18 (P5/P6): die Herkunft eines Jobs landet in `meta.json` und im
+/// `Started`-Ereignis; der Start ohne Herkunft lässt alle Felder leer.
+#[tokio::test]
+async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
+    let env = Env::new()?;
+    let prepared = env.prepare("echo origin").await?;
+    let origin = JobOrigin {
+        call_id: Some("call-42".to_owned()),
+        tool: Some("job.start".to_owned()),
+        owner_agent: None,
+    };
+    let started = env
+        .manager
+        .start_with_origin(
+            request("origin", "agent-a", &[]),
+            prepared,
+            Vec::new(),
+            origin,
+        )
+        .map_err(ctx("start"))?;
+    let id = started.meta.job_id.clone();
+    assert_eq!(started.meta.origin_call_id.as_deref(), Some("call-42"));
+    assert_eq!(started.meta.origin_tool.as_deref(), Some("job.start"));
+    let on_disk = read_meta(&started.log_dir).ok_or(TestError::Missing("meta.json"))?;
+    assert_eq!(on_disk.origin_call_id.as_deref(), Some("call-42"));
+    let events = events_of(&env, &id);
+    match events.first() {
+        Some(JobEvent::Started {
+            origin_call_id,
+            origin_tool,
+            owner_agent,
+            ..
+        }) => {
+            assert_eq!(origin_call_id.as_deref(), Some("call-42"));
+            assert_eq!(origin_tool.as_deref(), Some("job.start"));
+            assert_eq!(owner_agent, &None);
+        }
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected Started first, got {other:?}"
+            )));
+        }
+    }
+
+    let prepared = env.prepare("echo plain").await?;
+    let plain = env
+        .manager
+        .start(request("plain", "agent-a", &[]), prepared)
+        .map_err(ctx("start plain"))?;
+    assert_eq!(plain.meta.origin_call_id, None);
+    assert_eq!(plain.meta.origin_tool, None);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_stop_kills_whole_process_group() -> TestResult {
     let env = Env::new()?;
@@ -409,6 +463,9 @@ fn previous_meta_with(
         stragglers_reaped: false,
         log_truncated: false,
         launch_warnings: Vec::new(),
+        origin_call_id: None,
+        origin_tool: None,
+        owner_agent: None,
     })
 }
 

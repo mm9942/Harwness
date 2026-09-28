@@ -5,33 +5,53 @@
 //! short, non-async sections (state changes, fan-out pushes, the attach
 //! replay read), never across an `.await`, so driver events are recorded
 //! without waiting on any client.
+//!
+//! R18 (contract `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md`):
+//! [`HostConnection`] also implements [`ToolPort`] (admission §4.2 steps
+//! 1-7 here, 8-9 in [`crate::tool_host`]) and [`GatewayPort`] (`gateway.*`,
+//! tenant-filtered, reads need `gateway_read`, mutations `gateway_admin`).
+//! Hello masks the R18 caps below wire minor 2
+//! ([`ClientCaps::for_wire_minor`]). Revoking a connection, device or agent
+//! principal cancels its in-flight tool calls; draining refuses new ones and
+//! lets in-flight calls finish.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, HelloAck, HelloParams,
-    HistoryParams, InterruptParams, RespondResult, SESSION_WIRE_MINOR, SessionSummary,
-    SetEffortParams, SetModeParams, SetModelParams, SubmitParams, SubmitResult, features,
+    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, GatewayConnectionInfo,
+    GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams,
+    GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult, GatewayStatus,
+    GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams,
+    HistoryParams, InterruptParams, PrincipalSummary, RespondResult, SESSION_WIRE_MINOR,
+    SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SubmitParams, SubmitResult,
+    TOOL_GATEWAY_WIRE_MINOR, ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams,
+    ToolListResult, features,
 };
 use harw_protocol::{
-    ClientCaps, Cursor, FrameEnvelope, FrameSource, HostedState, PortError, PortFuture,
-    PresenceEntry, SessionEvent, SessionFrame, SessionPort, TurnEvent,
+    ApprovalRequest, ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState,
+    PortError, PortFuture, PresenceEntry, SessionEvent, SessionFrame, SessionPort, ToolPort,
+    ToolRefusal, TurnEvent,
 };
-use harw_types::{DeviceId, SessionId};
+use harw_types::{DeviceId, SessionId, TenantId};
 use tokio::sync::watch;
 
+use crate::agents::{AgentRegistry, rights_of};
 use crate::approvals::{ApprovalBackend, ResolveOutcome};
 use crate::arbiter::{Arbiter, ArbiterLimits};
 use crate::driver::{DriverEvent, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome};
 use crate::error::HostError;
 use crate::fanout::{AttachmentQueue, QueueLimits, attachment};
-use crate::identity::{ClientIdentity, ConnectionId, Need, admit};
+use crate::identity::{
+    AgentPrincipal, ClientIdentity, ConnectionId, Need, ToolGrant, admit, admit_tool_call,
+    tenant_admits,
+};
 use crate::live_ring::LiveRing;
 use crate::record::{HostedSessionRecord, RecordStore};
 use crate::replay::{TranscriptSource, history_before, replay, tail_start};
+use crate::tool_host::{SessionScope, ToolEvents, ToolHost};
 
 /// Host configuration.
 #[derive(Clone, Debug)]
@@ -64,7 +84,27 @@ impl HostConfig {
 }
 
 /// Features this host implements.
-const HOST_FEATURES: &[&str] = &[features::COMPACT, features::HISTORY, features::CHILD_FRAMES];
+const HOST_FEATURES: &[&str] = &[
+    features::COMPACT,
+    features::HISTORY,
+    features::CHILD_FRAMES,
+    features::TOOLS,
+    features::GATEWAY,
+];
+
+/// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
+const R18_FEATURES: &[&str] = &[features::TOOLS, features::GATEWAY];
+
+/// One live connection as `gateway.connections.list` shows it.
+struct ConnEntry {
+    label: String,
+    principal: PrincipalSummary,
+    tenant: Option<TenantId>,
+    device: Option<DeviceId>,
+    agent: Option<String>,
+    granted: Option<ClientCaps>,
+    since: jiff::Timestamp,
+}
 
 struct AttachEntry {
     connection: ConnectionId,
@@ -110,6 +150,12 @@ struct HostInner {
     revoked_devices: Mutex<HashSet<DeviceId>>,
     revoked_connections: Mutex<HashSet<ConnectionId>>,
     draining: std::sync::atomic::AtomicBool,
+    /// R18 gateway tool host (tools, agent registry, in-flight calls).
+    tools: ToolHost,
+    /// R18 live connections (`gateway.connections.list`).
+    connections: Mutex<BTreeMap<ConnectionId, ConnEntry>>,
+    /// R18 configured listeners (`gateway.listeners.*`).
+    listeners: Mutex<Vec<GatewayListenerInfo>>,
 }
 
 /// The persistent session host. Cheap to clone.
@@ -137,6 +183,19 @@ impl SessionHost {
         transcripts: Arc<dyn TranscriptSource>,
         approvals: Arc<dyn ApprovalBackend>,
     ) -> Result<Self, HostError> {
+        Self::open_with_tools(config, driver, transcripts, approvals, ToolHost::disabled())
+    }
+
+    /// Like [`SessionHost::open`], with the R18 gateway tool host. Tool
+    /// approvals must be issued into the same store as `approvals`
+    /// ([`crate::tool_host::ToolHostBuilder::approvals`]).
+    pub fn open_with_tools(
+        config: HostConfig,
+        driver: Arc<dyn TurnDriver>,
+        transcripts: Arc<dyn TranscriptSource>,
+        approvals: Arc<dyn ApprovalBackend>,
+        tools: ToolHost,
+    ) -> Result<Self, HostError> {
         let records = RecordStore::new(&config.state_dir);
         let epoch = records.next_epoch()?;
         let interrupted = records.recover_after_restart(epoch)?;
@@ -159,6 +218,9 @@ impl SessionHost {
                 revoked_devices: Mutex::new(HashSet::new()),
                 revoked_connections: Mutex::new(HashSet::new()),
                 draining: std::sync::atomic::AtomicBool::new(false),
+                tools,
+                connections: Mutex::new(BTreeMap::new()),
+                listeners: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -176,13 +238,27 @@ impl SessionHost {
         if self.inner.is_revoked(&identity) {
             return Err(HostError::Revoked);
         }
-        if self
-            .inner
-            .draining
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.inner.is_draining() {
             return Err(HostError::Denied("host is draining".into()));
         }
+        if let Some(agent) = &identity.agent {
+            self.inner
+                .check_agent_registration(agent, identity.tenant.as_ref())?;
+        }
+        let entry = ConnEntry {
+            label: identity.label.clone(),
+            principal: identity.principal_summary(),
+            tenant: identity.tenant.clone(),
+            device: identity.device.clone(),
+            agent: identity.agent.as_ref().map(|agent| agent.id.clone()),
+            granted: None,
+            since: jiff::Timestamp::now(),
+        };
+        self.inner
+            .connections
+            .lock()
+            .map_err(|_| HostError::Storage("connection table poisoned".into()))?
+            .insert(identity.connection, entry);
         Ok(HostConnection {
             host: Arc::clone(&self.inner),
             identity,
@@ -191,42 +267,139 @@ impl SessionHost {
     }
 
     /// Revoke a device: refuse new calls, close its streams with `Revoked`,
-    /// drop its queued inputs (W00 §7, REV-01).
+    /// drop its queued inputs and cancel its in-flight tool calls (W00 §7,
+    /// REV-01, R18 §7).
     pub fn revoke_device(&self, device: &DeviceId) {
         if let Ok(mut revoked) = self.inner.revoked_devices.lock() {
             revoked.insert(device.clone());
+        }
+        for connection in self
+            .inner
+            .connections_where(|entry| entry.device.as_ref() == Some(device))
+        {
+            self.inner
+                .tools
+                .cancel_connection(connection, "device revoked");
         }
         self.inner
             .close_matching(|entry| entry.device.as_ref() == Some(device), revoked_frame);
     }
 
-    /// Revoke one connection (for example when its security context expired).
+    /// Revoke one connection (for example when its security context
+    /// expired). Also cancels its in-flight tool calls (R18 §7).
     pub fn revoke_connection(&self, connection: ConnectionId) {
-        if let Ok(mut revoked) = self.inner.revoked_connections.lock() {
-            revoked.insert(connection);
-        }
-        self.inner
-            .close_matching(|entry| entry.connection == connection, revoked_frame);
+        self.inner.revoke_connection(connection);
     }
 
-    /// Drain: refuse new connections, tell every client when to come back,
-    /// cancel running turns (they end `Interrupted` and resume after the
-    /// restart by policy).
-    pub fn drain(&self, retry_after_ms: u64) {
+    /// Revoke an agent principal and every agent it delegated to: refuse
+    /// their calls, close their streams with `Revoked` and cancel their
+    /// in-flight tool calls (R18 §7). Returns the ids revoked by this call.
+    pub fn revoke_agent(&self, agent: &str) -> Result<Vec<String>, HostError> {
+        let revoked = self.inner.tools.agents().revoke(agent)?;
         self.inner
-            .draining
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .tools
+            .cancel_agents(&revoked, "agent principal revoked");
+        let connections: HashSet<ConnectionId> = self
+            .inner
+            .connections_where(|entry| {
+                entry
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| revoked.contains(agent))
+            })
+            .into_iter()
+            .collect();
         self.inner.close_matching(
-            |_| true,
-            move |_| SessionFrame::HostDraining { retry_after_ms },
+            |entry| connections.contains(&entry.connection),
+            revoked_frame,
         );
-        for slot in self.inner.all_slots() {
-            if let Ok(state) = slot.lock()
-                && let Some(cancel) = &state.cancel
-            {
-                let _ = cancel.send(true);
-            }
+        Ok(revoked)
+    }
+
+    /// Drain: refuse new connections, turns and tool calls, tell every
+    /// client when to come back, cancel running turns (they end
+    /// `Interrupted` and resume after the restart by policy). In-flight
+    /// tool calls finish (R18 §7).
+    pub fn drain(&self, retry_after_ms: u64) {
+        self.inner.drain(retry_after_ms);
+    }
+
+    /// True once [`SessionHost::drain`] ran.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.inner.is_draining()
+    }
+
+    /// The R18 gateway tool host.
+    #[must_use]
+    pub fn tool_host(&self) -> &ToolHost {
+        &self.inner.tools
+    }
+
+    /// The R18 agent principal registry (listeners resolve agent
+    /// credentials here).
+    #[must_use]
+    pub fn agents(&self) -> &AgentRegistry {
+        self.inner.tools.agents()
+    }
+
+    /// Bind the active agent principal `agent` (and with it every agent it
+    /// delegates to) to `session` for gateway tool calls (R18 §4).
+    ///
+    /// A session admits `tool.list`/`tool.call`/`tool.cancel` only from the
+    /// agent that created it, its delegates, and agents bound here — never
+    /// from any other agent of the same tenant. This is a composition API
+    /// (for example: a human creates the session, the host launches the UIA
+    /// process for it), not a wire method; no payload can bind an agent.
+    ///
+    /// # Errors
+    /// - [`HostError::NotFound`]: unknown session or agent.
+    /// - [`HostError::Revoked`]: the agent is revoked.
+    /// - [`HostError::Denied`]: the agent's tenant differs from the
+    ///   session's tenant.
+    pub fn bind_tool_agent(&self, session: &SessionId, agent: &str) -> Result<(), HostError> {
+        let state = self.inner.tools.agents().state(agent)?;
+        if state.revoked {
+            return Err(HostError::Revoked);
         }
+        let slot = self.inner.slot(session)?;
+        let mut slot_state = slot.lock()?;
+        if slot_state.record.tenant != state.tenant {
+            return Err(HostError::Denied(
+                "agent principal and session belong to different tenants".into(),
+            ));
+        }
+        if !slot_state
+            .record
+            .tool_agents
+            .iter()
+            .any(|bound| bound == agent)
+        {
+            slot_state.record.tool_agents.push(agent.to_owned());
+            self.inner.save(&mut slot_state);
+        }
+        Ok(())
+    }
+
+    /// Announce a configured listener (`gateway.listeners.*`). A listener
+    /// with the same name is replaced.
+    pub fn register_listener(&self, listener: GatewayListenerInfo) {
+        if let Ok(mut listeners) = self.inner.listeners.lock() {
+            listeners.retain(|known| known.name != listener.name);
+            listeners.push(listener);
+        }
+    }
+
+    /// Whether the listener `name` is enabled (`None`: unknown listener).
+    /// Listener tasks poll this after `gateway.listeners.set`.
+    #[must_use]
+    pub fn listener_enabled(&self, name: &str) -> Option<bool> {
+        self.inner.listeners.lock().ok().and_then(|listeners| {
+            listeners
+                .iter()
+                .find(|listener| listener.name == name)
+                .map(|listener| listener.enabled)
+        })
     }
 
     /// Push a heartbeat frame to every attachment. Call from a timer task
@@ -279,7 +452,83 @@ impl HostInner {
             .lock()
             .map(|revoked| revoked.contains(&identity.connection))
             .unwrap_or(true);
-        device || connection
+        let agent = identity
+            .agent
+            .as_ref()
+            .is_some_and(|agent| self.tools.agents().is_revoked(&agent.id));
+        device || connection || agent
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// An agent identity must match its registration: known, not revoked,
+    /// same role, parent and tenant (the listener built it from a
+    /// credential; anything else is a listener bug, fail closed).
+    fn check_agent_registration(
+        &self,
+        agent: &AgentPrincipal,
+        tenant: Option<&TenantId>,
+    ) -> Result<(), HostError> {
+        let state = match self.tools.agents().state(&agent.id) {
+            Ok(state) => state,
+            Err(HostError::NotFound) => {
+                return Err(HostError::Denied("unknown agent principal".into()));
+            }
+            Err(error) => return Err(error),
+        };
+        if state.revoked {
+            return Err(HostError::Revoked);
+        }
+        if state.principal.role != agent.role
+            || state.principal.parent != agent.parent
+            || state.tenant.as_ref() != tenant
+        {
+            return Err(HostError::Denied(
+                "agent principal does not match its registration".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Connections whose table entry matches `pick`.
+    fn connections_where(&self, pick: impl Fn(&ConnEntry) -> bool) -> Vec<ConnectionId> {
+        self.connections
+            .lock()
+            .map(|connections| {
+                connections
+                    .iter()
+                    .filter(|(_, entry)| pick(entry))
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn revoke_connection(&self, connection: ConnectionId) {
+        if let Ok(mut revoked) = self.revoked_connections.lock() {
+            revoked.insert(connection);
+        }
+        self.tools
+            .cancel_connection(connection, "connection revoked");
+        self.close_matching(|entry| entry.connection == connection, revoked_frame);
+    }
+
+    fn drain(&self, retry_after_ms: u64) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.close_matching(
+            |_| true,
+            move |_| SessionFrame::HostDraining { retry_after_ms },
+        );
+        for slot in self.all_slots() {
+            if let Ok(state) = slot.lock() {
+                if let Some(cancel) = &state.cancel {
+                    let _ = cancel.send(true);
+                }
+            }
+        }
     }
 
     fn all_slots(&self) -> Vec<Arc<Slot>> {
@@ -447,6 +696,44 @@ impl SlotState {
 
     fn set_state(&mut self, state: HostedState) {
         self.record.state = state;
+    }
+
+    /// Fan out a frame that does not belong to a driver turn (gateway tool
+    /// events of an agent-run turn). Buffered in the live ring only while a
+    /// driver turn is active there, so it never outlives the ring's turn.
+    fn publish_side(&mut self, session_id: &SessionId, frame: SessionFrame) {
+        if self.ring.active_turn().is_some() {
+            self.publish(session_id, frame);
+            return;
+        }
+        let envelope = FrameEnvelope {
+            session_id: session_id.clone(),
+            cursor: self.head_cursor(),
+            frame,
+        };
+        self.attachments.retain(|entry| !entry.queue.is_closed());
+        for entry in &self.attachments {
+            entry.queue.push(envelope.clone());
+        }
+    }
+}
+
+/// Gateway tool events of one session.
+struct SlotEvents {
+    slot: Arc<Slot>,
+}
+
+impl ToolEvents for SlotEvents {
+    fn turn_event(&self, event: TurnEvent) {
+        if let Ok(mut state) = self.slot.lock() {
+            state.publish_side(&self.slot.id, SessionFrame::Turn(event));
+        }
+    }
+
+    fn approval_requested(&self, request: ApprovalRequest) {
+        if let Ok(mut state) = self.slot.lock() {
+            state.publish_side(&self.slot.id, SessionFrame::ApprovalRequested(request));
+        }
     }
 }
 
@@ -616,11 +903,28 @@ fn resume_parked(host: Arc<HostInner>, slot: Arc<Slot>) {
     });
 }
 
-/// One client's view of the host: a [`SessionPort`] bound to an identity.
+/// One client's view of the host: a [`SessionPort`] (and, R18, a
+/// [`ToolPort`] and [`GatewayPort`]) bound to an identity.
 pub struct HostConnection {
     host: Arc<HostInner>,
     identity: ClientIdentity,
     granted: Mutex<Option<ClientCaps>>,
+}
+
+impl Drop for HostConnection {
+    fn drop(&mut self) {
+        if let Ok(mut connections) = self.host.connections.lock() {
+            connections.remove(&self.identity.connection);
+        }
+    }
+}
+
+/// A `tool.*` call that passed admission steps 1-6.
+struct ToolAdmission {
+    slot: Arc<Slot>,
+    principal: AgentPrincipal,
+    tenant: Option<TenantId>,
+    workspace: Option<String>,
 }
 
 impl std::fmt::Debug for HostConnection {
@@ -673,18 +977,30 @@ impl HostConnection {
             ));
         }
         let ceiling = self.identity.caps;
+        let wire_minor = params.wire_minor.min(SESSION_WIRE_MINOR);
+        // Below minor 2 the R18 caps are masked: an older client never
+        // receives a caps field it cannot decode (R18 §2.3).
         let caps = params
             .requested_caps
-            .map_or(ceiling, |requested| requested.intersect(ceiling));
+            .map_or(ceiling, |requested| requested.intersect(ceiling))
+            .for_wire_minor(wire_minor);
         *granted = Some(caps);
+        if let Ok(mut connections) = self.host.connections.lock() {
+            if let Some(entry) = connections.get_mut(&self.identity.connection) {
+                entry.granted = Some(caps);
+            }
+        }
         let features = params
             .features
             .iter()
             .filter(|feature| HOST_FEATURES.contains(&feature.as_str()))
+            .filter(|feature| {
+                wire_minor >= TOOL_GATEWAY_WIRE_MINOR || !R18_FEATURES.contains(&feature.as_str())
+            })
             .cloned()
             .collect();
         Ok(HelloAck {
-            wire_minor: params.wire_minor.min(SESSION_WIRE_MINOR),
+            wire_minor,
             features,
             host_epoch: self.host.epoch,
             granted: caps,
@@ -696,6 +1012,11 @@ impl HostConnection {
         if !granted.observe {
             return Err(HostError::Denied("capability `observe` not granted".into()));
         }
+        self.summaries()
+    }
+
+    /// Summaries of every session visible to this caller's tenant.
+    fn summaries(&self) -> Result<Vec<SessionSummary>, HostError> {
         let mut out = Vec::new();
         for record in self.host.records.list()? {
             if !crate::identity::tenant_admits(
@@ -910,6 +1231,10 @@ impl HostConnection {
             state: HostedState::Idle,
             host_epoch: self.host.epoch,
             generation: 0,
+            // R18 §4: the creating agent (if any) owns the session's tool
+            // calls; its delegates inherit access, other agents do not.
+            owner_agent: self.identity.agent.as_ref().map(|agent| agent.id.clone()),
+            tool_agents: Vec::new(),
         })
     }
 
@@ -918,6 +1243,14 @@ impl HostConnection {
         params: SubmitParams,
     ) -> Result<(SubmitResult, Option<Arc<Slot>>), HostError> {
         let slot = self.admitted_slot(&params.session_id, Need::Steer)?;
+        if self.host.is_draining() {
+            return Ok((
+                SubmitResult::Denied {
+                    reason: "host draining".into(),
+                },
+                None,
+            ));
+        }
         let mut state = slot.lock()?;
         match state.record.state {
             HostedState::Closed => {
@@ -1022,6 +1355,14 @@ impl HostConnection {
         params: &ApprovalRespondParams,
     ) -> Result<(RespondResult, Option<Arc<Slot>>), HostError> {
         let granted = self.granted()?;
+        // R18: approvals ask a human. An agent principal never resolves
+        // one, not even with the `approve` cap (it could approve its own
+        // gateway tool call).
+        if self.identity.agent.is_some() {
+            return Err(HostError::Denied(
+                "agent principals cannot resolve approvals".into(),
+            ));
+        }
         let Some(session) = self.host.approvals.session_of(&params.request_id)? else {
             return Err(HostError::NotFound);
         };
@@ -1037,6 +1378,12 @@ impl HostConnection {
         )?;
         let result = match outcome {
             ResolveOutcome::Resolved => {
+                // A gateway tool approval wakes its waiting call, never a
+                // parked driver turn.
+                let tool_approval = self
+                    .host
+                    .tools
+                    .resolve_approval(&params.request_id, params.decision);
                 let mut state = slot.lock()?;
                 state.publish(
                     &slot.id,
@@ -1046,7 +1393,7 @@ impl HostConnection {
                         by: self.identity.actor_label(),
                     },
                 );
-                let resume = state.parked;
+                let resume = state.parked && !tool_approval;
                 drop(state);
                 return Ok((RespondResult::Resolved, resume.then_some(slot)));
             }
@@ -1090,6 +1437,338 @@ impl HostConnection {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// R18: `tool.*` and `gateway.*`
+// ---------------------------------------------------------------------------
+
+impl HostConnection {
+    /// Admission steps 1-6 of R18 §4.2 for a call in `session_id`
+    /// (`tool = None` for `tool.list`/`tool.cancel`). The agent principal is
+    /// re-read from the registry, so grant changes and revocations apply to
+    /// the next call.
+    fn tool_admission(
+        &self,
+        session_id: &SessionId,
+        tool: Option<&str>,
+    ) -> Result<ToolAdmission, HostError> {
+        let granted = self.granted()?;
+        let slot = self.host.slot(session_id)?;
+        let record = slot.lock()?.record.clone();
+        let tenant = record.tenant.clone();
+        let workspace = record.workspace.clone();
+        let live = match &self.identity.agent {
+            Some(agent) => match self.host.tools.agents().state(&agent.id) {
+                Ok(state) => Some(state),
+                Err(HostError::NotFound) => {
+                    return Err(HostError::Denied("unknown agent principal".into()));
+                }
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        // Session binding (R18 §4.2 step 1, same tenant is not enough): an
+        // agent reaches only sessions created by itself or an ancestor in
+        // its delegation chain, or bound to one of them
+        // (`SessionHost::bind_tool_agent`). Anything else answers exactly
+        // like an unknown session, so the refusal is no existence oracle
+        // for other sessions of the tenant (and their workspaces).
+        if let Some(state) = &live {
+            let lineage = self.host.tools.agents().lineage(&state.principal.id)?;
+            if !record.admits_tool_agent(&lineage) {
+                return Err(HostError::NotFound);
+            }
+        }
+        let mut effective = self.identity.clone();
+        effective.agent = live.as_ref().map(|state| state.principal.clone());
+        let known = tool.map(|name| (name, self.host.tools.serves(name)));
+        let principal = admit_tool_call(&effective, granted, tenant.as_ref(), known)?.clone();
+        // Step 6: revocation of the connection, device or agent principal.
+        if live.as_ref().is_some_and(|state| state.revoked) || self.host.is_revoked(&self.identity)
+        {
+            return Err(HostError::Revoked);
+        }
+        Ok(ToolAdmission {
+            slot,
+            principal,
+            tenant,
+            workspace,
+        })
+    }
+
+    fn list_tools_sync(&self, params: &ToolListParams) -> Result<ToolListResult, HostError> {
+        let admission = self.tool_admission(&params.session_id, None)?;
+        Ok(ToolListResult {
+            tools: self.host.tools.descriptors_for(&admission.principal.tools),
+        })
+    }
+
+    async fn call_tool_inner(
+        &self,
+        params: ToolCallParams,
+    ) -> Result<ToolCallResultFrame, HostError> {
+        let admission = self.tool_admission(&params.session_id, Some(&params.tool_name))?;
+        // Step 7.
+        if self.host.is_draining() {
+            return Err(HostError::ToolRefused {
+                refusal: ToolRefusal::Draining,
+                detail: "host draining".into(),
+            });
+        }
+        // Step 8.
+        let scope = SessionScope {
+            session_id: &params.session_id,
+            tenant: admission.tenant.as_ref(),
+            workspace: admission.workspace.as_deref(),
+        };
+        let sandbox = self
+            .host
+            .tools
+            .sandbox_for(&scope, &admission.principal.id)?;
+        // Step 9.
+        let call = self.host.tools.reserve(
+            params,
+            sandbox,
+            &admission.principal.id,
+            self.identity.connection,
+        )?;
+        // A revocation between step 6 and the reservation found nothing to
+        // cancel; re-check now that the call is visible to revocation.
+        if self.host.is_revoked(&self.identity) {
+            return Err(HostError::Revoked);
+        }
+        let events = SlotEvents {
+            slot: admission.slot,
+        };
+        Ok(self.host.tools.run(call, &events).await)
+    }
+
+    fn cancel_tool_sync(&self, params: &ToolCancelParams) -> Result<(), HostError> {
+        let admission = self.tool_admission(&params.session_id, None)?;
+        self.host
+            .tools
+            .cancel_call(&params.session_id, &params.call_id, &admission.principal.id);
+        Ok(())
+    }
+
+    /// Caps check for `gateway.*` (not bound to a session).
+    fn gateway_admit(&self, need: Need) -> Result<(), HostError> {
+        need.require(self.granted()?)
+    }
+
+    /// Host-wide mutations (`gateway.drain`, `gateway.listeners.set`) are
+    /// for unscoped (local operator) callers only.
+    fn require_unscoped(&self) -> Result<(), HostError> {
+        if self.identity.tenant.is_some() {
+            return Err(HostError::Denied(
+                "host-wide gateway operation needs an unscoped caller".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn caller_tenant(&self) -> Option<&TenantId> {
+        self.identity.tenant.as_ref()
+    }
+
+    fn status_view(&self) -> Result<GatewayStatus, HostError> {
+        let caller = self.caller_tenant();
+        let connections = self
+            .host
+            .connections_where(|entry| tenant_admits(caller, entry.tenant.as_ref()))
+            .len();
+        let sessions = self.summaries()?;
+        let running_turns = self
+            .host
+            .all_slots()
+            .iter()
+            .filter(|slot| {
+                slot.lock().is_ok_and(|state| {
+                    state.arbiter.is_running()
+                        && tenant_admits(caller, state.record.tenant.as_ref())
+                })
+            })
+            .count();
+        let listeners = self
+            .host
+            .listeners
+            .lock()
+            .map(|listeners| listeners.len())
+            .unwrap_or(0);
+        Ok(GatewayStatus {
+            host_epoch: self.host.epoch,
+            node: self.host.tools.node().map(str::to_owned),
+            draining: self.host.is_draining(),
+            connections: count(connections),
+            sessions: count(sessions.len()),
+            running_turns: count(running_turns),
+            listeners: count(listeners),
+            tools: count(self.host.tools.len()),
+            sandbox_available: self.host.tools.sandbox_available(),
+        })
+    }
+
+    fn status_sync(&self) -> Result<GatewayStatus, HostError> {
+        self.gateway_admit(Need::GatewayRead)?;
+        self.status_view()
+    }
+
+    fn connections_sync(&self) -> Result<GatewayConnectionsResult, HostError> {
+        self.gateway_admit(Need::GatewayRead)?;
+        let caller = self.caller_tenant();
+        let mut attached: HashMap<ConnectionId, u32> = HashMap::new();
+        for slot in self.host.all_slots() {
+            if let Ok(state) = slot.lock() {
+                for entry in &state.attachments {
+                    let slot_count = attached.entry(entry.connection).or_insert(0);
+                    *slot_count = slot_count.saturating_add(1);
+                }
+            }
+        }
+        let connections = self
+            .host
+            .connections
+            .lock()
+            .map_err(|_| HostError::Storage("connection table poisoned".into()))?
+            .iter()
+            .filter(|(_, entry)| tenant_admits(caller, entry.tenant.as_ref()))
+            .map(|(id, entry)| GatewayConnectionInfo {
+                connection: id.0,
+                label: entry.label.clone(),
+                principal: entry.principal.clone(),
+                tenant: entry.tenant.clone(),
+                granted: entry.granted,
+                attached: attached.get(id).copied().unwrap_or(0),
+                since: entry.since,
+            })
+            .collect();
+        Ok(GatewayConnectionsResult { connections })
+    }
+
+    fn sessions_sync(&self) -> Result<Vec<SessionSummary>, HostError> {
+        self.gateway_admit(Need::GatewayRead)?;
+        self.summaries()
+    }
+
+    fn listeners_sync(&self) -> Result<GatewayListenersResult, HostError> {
+        self.gateway_admit(Need::GatewayRead)?;
+        let listeners = self
+            .host
+            .listeners
+            .lock()
+            .map_err(|_| HostError::Storage("listener table poisoned".into()))?
+            .clone();
+        Ok(GatewayListenersResult { listeners })
+    }
+
+    fn tools_sync(&self) -> Result<GatewayToolsResult, HostError> {
+        self.gateway_admit(Need::GatewayRead)?;
+        Ok(GatewayToolsResult {
+            tools: self.host.tools.descriptors(),
+            grants: self.host.tools.agents().rights(self.caller_tenant()),
+        })
+    }
+
+    fn revoke_connection_sync(
+        &self,
+        params: &GatewayRevokeParams,
+    ) -> Result<GatewayRevokeResult, HostError> {
+        self.gateway_admit(Need::GatewayAdmin)?;
+        let target = ConnectionId(params.connection);
+        let visible = self
+            .host
+            .connections
+            .lock()
+            .map_err(|_| HostError::Storage("connection table poisoned".into()))?
+            .get(&target)
+            .is_some_and(|entry| tenant_admits(self.caller_tenant(), entry.tenant.as_ref()));
+        if !visible {
+            return Err(HostError::NotFound);
+        }
+        let already = self
+            .host
+            .revoked_connections
+            .lock()
+            .map(|revoked| revoked.contains(&target))
+            .unwrap_or(false);
+        if already {
+            return Ok(GatewayRevokeResult { revoked: false });
+        }
+        let reason: String = params.reason.chars().take(200).collect();
+        tracing::info!(
+            connection = target.0,
+            by = %self.identity.label,
+            %reason,
+            "session host: connection revoked through gateway.connections.revoke"
+        );
+        self.host.revoke_connection(target);
+        Ok(GatewayRevokeResult { revoked: true })
+    }
+
+    fn drain_sync(&self, params: &GatewayDrainParams) -> Result<GatewayStatus, HostError> {
+        self.gateway_admit(Need::GatewayAdmin)?;
+        self.require_unscoped()?;
+        tracing::info!(
+            by = %self.identity.label,
+            retry_after_ms = params.retry_after_ms,
+            "session host: drain through gateway.drain"
+        );
+        self.host.drain(params.retry_after_ms);
+        self.status_view()
+    }
+
+    fn set_listener_sync(
+        &self,
+        params: &GatewayListenerSetParams,
+    ) -> Result<GatewayListenerInfo, HostError> {
+        self.gateway_admit(Need::GatewayAdmin)?;
+        self.require_unscoped()?;
+        let mut listeners = self
+            .host
+            .listeners
+            .lock()
+            .map_err(|_| HostError::Storage("listener table poisoned".into()))?;
+        let listener = listeners
+            .iter_mut()
+            .find(|listener| listener.name == params.name)
+            .ok_or(HostError::NotFound)?;
+        listener.enabled = params.enabled;
+        Ok(listener.clone())
+    }
+
+    /// Admission of `gateway.tools.*`: admin cap and the agent visible to
+    /// the caller's tenant (a foreign agent reads as `NotFound`).
+    fn tool_rights_target(&self, params: &GatewayToolRightsParams) -> Result<ToolGrant, HostError> {
+        self.gateway_admit(Need::GatewayAdmin)?;
+        let tenant = self.host.tools.agents().tenant_of(&params.agent)?;
+        if !tenant_admits(self.caller_tenant(), tenant.as_ref()) {
+            return Err(HostError::NotFound);
+        }
+        Ok(ToolGrant::from_names(params.tools.iter()))
+    }
+
+    fn grant_tools_sync(
+        &self,
+        params: &GatewayToolRightsParams,
+    ) -> Result<GatewayToolRights, HostError> {
+        let tools = self.tool_rights_target(params)?;
+        let principal = self.host.tools.agents().grant(&params.agent, &tools)?;
+        Ok(rights_of(&principal))
+    }
+
+    fn narrow_tools_sync(
+        &self,
+        params: &GatewayToolRightsParams,
+    ) -> Result<GatewayToolRights, HostError> {
+        let tools = self.tool_rights_target(params)?;
+        let principal = self.host.tools.agents().narrow(&params.agent, &tools)?;
+        Ok(rights_of(&principal))
+    }
+}
+
+fn count(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn port<T: Send + 'static>(result: Result<T, HostError>) -> PortFuture<'static, T> {
@@ -1210,6 +1889,68 @@ impl SessionPort for HostConnection {
             self.set(params.session_id, Setting::Effort(params.effort))
                 .map_err_port(),
         )
+    }
+}
+
+impl ToolPort for HostConnection {
+    fn list_tools(&self, params: ToolListParams) -> PortFuture<'_, ToolListResult> {
+        port(self.list_tools_sync(&params))
+    }
+
+    fn call_tool(&self, params: ToolCallParams) -> PortFuture<'_, ToolCallResultFrame> {
+        Box::pin(self.call_tool_inner(params).map_err_port())
+    }
+
+    fn cancel_tool(&self, params: ToolCancelParams) -> PortFuture<'_, ()> {
+        port(self.cancel_tool_sync(&params))
+    }
+}
+
+impl GatewayPort for HostConnection {
+    fn status(&self) -> PortFuture<'_, GatewayStatus> {
+        port(self.status_sync())
+    }
+
+    fn connections(&self) -> PortFuture<'_, GatewayConnectionsResult> {
+        port(self.connections_sync())
+    }
+
+    fn sessions(&self) -> PortFuture<'_, Vec<SessionSummary>> {
+        port(self.sessions_sync())
+    }
+
+    fn listeners(&self) -> PortFuture<'_, GatewayListenersResult> {
+        port(self.listeners_sync())
+    }
+
+    fn tools(&self) -> PortFuture<'_, GatewayToolsResult> {
+        port(self.tools_sync())
+    }
+
+    fn revoke_connection(
+        &self,
+        params: GatewayRevokeParams,
+    ) -> PortFuture<'_, GatewayRevokeResult> {
+        port(self.revoke_connection_sync(&params))
+    }
+
+    fn drain(&self, params: GatewayDrainParams) -> PortFuture<'_, GatewayStatus> {
+        port(self.drain_sync(&params))
+    }
+
+    fn set_listener(
+        &self,
+        params: GatewayListenerSetParams,
+    ) -> PortFuture<'_, GatewayListenerInfo> {
+        port(self.set_listener_sync(&params))
+    }
+
+    fn grant_tools(&self, params: GatewayToolRightsParams) -> PortFuture<'_, GatewayToolRights> {
+        port(self.grant_tools_sync(&params))
+    }
+
+    fn narrow_tools(&self, params: GatewayToolRightsParams) -> PortFuture<'_, GatewayToolRights> {
+        port(self.narrow_tools_sync(&params))
     }
 }
 

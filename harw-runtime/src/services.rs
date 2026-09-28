@@ -62,6 +62,16 @@
 //! auch nicht über eine Operation, die versehentlich eine Modell-Fläche
 //! trüge. Job-Läufe ohne anwesende Person bleiben ebenfalls ohne.
 //!
+//! # Gateway-Port (R18 D-B)
+//! `Arc<dyn harw_protocol::GatewayPort>` — nur wenn die Laufzeit mit einem
+//! Gateway verbunden ist ([`RuntimeServicesParts::gateway`]) — liegt, sechste
+//! deklarierte Differenz, [`ServiceSurface::allows_gateway`], auf Slash,
+//! Modell-Werkzeug und Web, **nie** auf Job: die `gateway.*`-Operationen sind
+//! Bedien- und UIA-Flächen; ein durabler Job ohne anwesende Person verwaltet
+//! kein Gateway. Die Mutationen fragen auf Modell- und Web-Fläche immer
+//! (`approval = "always"`), und das Gateway prüft weiter die Caps des
+//! Aufrufers.
+//!
 //! # Was hier bewusst NICHT registriert wird
 //! - Web-eigene Dienste (`PeerCredentials`, `Arc<dyn ApprovalActorResolver>`,
 //!   `Arc<ApprovalStore>`): sie stammen pro Verbindung aus dem Kernel bzw. aus
@@ -101,6 +111,7 @@ use harw_operations::registry::OperationRegistry;
 use harw_operations::{ServiceMap, SharedSessionController};
 use harw_plan::{GoalStore, PlanStore, PlanToolConfig};
 use harw_plan_bridge::{FindingStore, register_plan_services};
+use harw_protocol::GatewayPort;
 use harw_provider_http::ProviderLoadRegistry;
 use harw_sandbox::ExtraRootsCell;
 use harw_session_store::JobStore;
@@ -300,6 +311,30 @@ impl ServiceSurface {
     pub const fn allows_infrastructure(self) -> bool {
         matches!(self, Self::Slash | Self::Web)
     }
+
+    /// Ob diese Fläche den Gateway-Port (`Arc<dyn GatewayPort>`) erhält.
+    ///
+    /// # Beschreibung
+    /// Sechste **deklarierte** Differenz (R18 D-B): die `gateway.*`-
+    /// Operationen erreichen den Port über getippte Slash-Eingabe, das
+    /// Modell-Werkzeug der UIA-Wurzel (lesend frei, mutierend mit
+    /// `approval = "always"`) und die lokale Web-Oberfläche. Ein durabler Job
+    /// ohne anwesende Person bekommt ihn nie.
+    ///
+    /// # Rückgabe
+    /// `true` für [`Self::Slash`], [`Self::ModelTool`] und [`Self::Web`],
+    /// `false` für [`Self::Job`].
+    ///
+    /// # Beispiel
+    /// ```rust
+    /// use harw_runtime::services::ServiceSurface;
+    /// assert!(ServiceSurface::ModelTool.allows_gateway());
+    /// assert!(!ServiceSurface::Job.allows_gateway());
+    /// ```
+    #[must_use]
+    pub const fn allows_gateway(self) -> bool {
+        matches!(self, Self::Slash | Self::ModelTool | Self::Web)
+    }
 }
 
 // ── PlanServices ──────────────────────────────────────────────────────────────
@@ -417,6 +452,11 @@ pub struct RuntimeServicesParts {
     /// Liegt nur auf den Flächen mit
     /// [`ServiceSurface::allows_infrastructure`] (Slash, Web).
     pub infrastructure: Option<Arc<InfrastructureAvailability>>,
+    /// Gateway-Port (R18 D-B), nur wenn die Laufzeit mit einem Gateway
+    /// verbunden ist ([`crate::assembly::RuntimeAssemblyBuilder::gateway_port`]).
+    /// Liegt nur auf den Flächen mit [`ServiceSurface::allows_gateway`]
+    /// (Slash, Modell-Werkzeug, Web — nie Job).
+    pub gateway: Option<Arc<dyn GatewayPort>>,
 }
 
 // ── RuntimeServices ───────────────────────────────────────────────────────────
@@ -799,6 +839,7 @@ impl RuntimeServices {
     /// | `Arc<LiveConfig>` (falls gebunden; `Arc<ResolvedConfig>` ist dann überall der Live-Stand) | ✓ | — | — | — |
     /// | `Arc<InfrastructureAvailability>` (falls vorhanden, `[infrastructure]`) | ✓ | — | ✓ | — |
     /// | `Arc<`[`harw_ops::work_driver::WorkDriverCaller`]`>` (falls gebunden, R14, `work_driver.enqueue`) | — | ✓ | — | — |
+    /// | `Arc<dyn GatewayPort>` (falls verbunden, R18 D-B, `gateway.*`) | ✓ | ✓ | ✓ | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -1011,6 +1052,15 @@ impl RuntimeServices {
         {
             insert_service(&mut map, &mut names, Arc::clone(infrastructure));
         }
+        // R18 D-B: Slash, Modell-Werkzeug und Web, nie Job.
+        if let Some(gateway) = self
+            .parts
+            .gateway
+            .as_ref()
+            .filter(|_| surface.allows_gateway())
+        {
+            insert_service(&mut map, &mut names, Arc::clone(gateway));
+        }
         if let Some(plan) = &self.parts.plan {
             // `register_plan_services` legt genau diese vier Typen ab
             // (harw-plan-bridge/src/context_ext.rs:202-205). Der Test
@@ -1187,6 +1237,7 @@ mod tests {
             provider_load_registry: ProviderLoadRegistry::new(),
             host_permit_handles: Some(test_host_permit_handles()),
             infrastructure: None,
+            gateway: None,
         }
     }
 
@@ -1208,6 +1259,7 @@ mod tests {
             provider_load_registry: ProviderLoadRegistry::new(),
             host_permit_handles: None,
             infrastructure: None,
+            gateway: None,
         }
     }
 
@@ -2285,6 +2337,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// R18 D-B, sechste deklarierte Differenz: der Gateway-Port liegt auf
+    /// Slash, Modell-Werkzeug und Web — nie auf Job — und nur, wenn die
+    /// Komposition einen hat.
+    #[test]
+    fn gateway_port_reaches_slash_model_tool_and_web_but_never_job() {
+        use harw_protocol::GatewayPort;
+
+        let port: Arc<dyn GatewayPort> = Arc::new(crate::test_support::NullGatewayPort);
+        let mut parts = full_parts();
+        parts.gateway = Some(Arc::clone(&port));
+        let services = RuntimeServices::new(parts);
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            let present = map.get::<Arc<dyn GatewayPort>>();
+            assert_eq!(
+                present.is_some(),
+                surface.allows_gateway(),
+                "{}",
+                surface.as_str()
+            );
+            if let Some(present) = present {
+                assert!(Arc::ptr_eq(present, &port), "{}", surface.as_str());
+            }
+            assert_eq!(
+                services
+                    .registered(surface)
+                    .contains(&type_name::<Arc<dyn GatewayPort>>()),
+                surface.allows_gateway(),
+                "{}",
+                surface.as_str()
+            );
+        }
+        for parts in [full_parts(), minimal_parts()] {
+            let services = RuntimeServices::new(parts);
+            for surface in ServiceSurface::ALL {
+                assert!(
+                    services
+                        .service_map(surface)
+                        .get::<Arc<dyn GatewayPort>>()
+                        .is_none(),
+                    "{}",
+                    surface.as_str()
+                );
+            }
+        }
+        assert!(!ServiceSurface::Job.allows_gateway());
     }
 
     #[test]

@@ -67,6 +67,14 @@ No application frame establishes identity.
 v1 has explicit session methods. It does not expose generic operation
 execution.
 
+**R18 amendment (wire minor 2):** generic operation execution remains
+forbidden. Tool invocation is allowed only as specified in
+[`R18-tool-gateway.md`](./R18-tool-gateway.md): through the closed `tool.*`
+methods (`tool.list`, `tool.call`, `tool.cancel`), for agent principals
+derived from the UIA, with the `tool_call` cap and a tool grant; and gateway
+inspection/administration only through the closed `gateway.*` table. Both
+tables are explicit method lists, not a generic dispatcher.
+
 ### D6 — one WS can multiplex many sessions
 
 The connection is an authenticated client channel. Session attachment is

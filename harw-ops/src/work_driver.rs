@@ -26,6 +26,20 @@
 //! caller therefore also needs the runtime to name the orchestrator on whose
 //! behalf the run is started.
 //!
+//! The one exception is the UIA (R18 F6, backlog C-04): the runtime puts
+//! [`WorkDriverCaller::for_uia`] into the UIA root's context — the UIA
+//! definition's own `[work_driver]` section if it has one, else
+//! [`WorkDriverCaller::uia_default_spec`]. Nothing else changes for it: the
+//! model surface asks a human on every call (`approval = "always"`) and the
+//! overrides only narrow.
+//!
+//! # Worker report tool
+//! [`WorkerReportToolProvider`] serves `work_driver.report`
+//! ([`harw_plan_bridge::WORK_DRIVER_REPORT_TOOL`]), the structured return of
+//! a WorkDriver worker (R18 D-E). It is not an operation: the job worker
+//! registers it for WorkDriver worker turns only and reads the result from
+//! the turn's [`WorkerReportSlot`].
+//!
 //! # Narrowing only
 //! The job payload carries the caller's [`WorkDriverSpec`] narrowed by the
 //! optional [`WorkDriverOverrides`]. Every override must be `>= 1` and not
@@ -124,7 +138,51 @@ pub struct WorkDriverCaller {
     pub spec: WorkDriverSpec,
 }
 
+/// Role name recorded as `orchestrator_role` for runs the UIA starts.
+pub const UIA_WORK_DRIVER_ROLE: &str = "user-interface";
+
 impl WorkDriverCaller {
+    /// The caller service for the UIA (R18 F6, backlog C-04).
+    ///
+    /// # Description
+    /// The UIA is not an orchestrator and usually has no `[work_driver]`
+    /// section, yet it may start a WorkDriver run on the user's behalf. The
+    /// runtime hook (`harw-runtime/src/assembly.rs`) puts this caller into the
+    /// UIA root's [`OpContext`]. `configured` is the UIA definition's own
+    /// `[work_driver]` section, if it has one; otherwise
+    /// [`Self::uia_default_spec`] applies. Admission is unchanged: the model
+    /// surface of `work_driver.enqueue` asks a human every time
+    /// (`approval = "always"`), and the overrides can only narrow this spec.
+    #[must_use]
+    pub fn for_uia(configured: Option<&WorkDriverSpec>) -> Self {
+        Self {
+            role: UIA_WORK_DRIVER_ROLE.to_owned(),
+            spec: configured.cloned().unwrap_or_else(Self::uia_default_spec),
+        }
+    }
+
+    /// Default WorkDriver settings of the UIA: the DSL defaults
+    /// (`WorkDriverSpec::DEFAULT_*`), the default worker role
+    /// ([`harw_plan_bridge::DEFAULT_WORKER_ROLE`]), no judge role, no own
+    /// `verify` commands (the goal's own `Command`/`Artifact` steps are
+    /// still verified centrally) and no own budgets (the driver's safety
+    /// defaults apply).
+    #[must_use]
+    pub fn uia_default_spec() -> WorkDriverSpec {
+        WorkDriverSpec {
+            max_iterations: WorkDriverSpec::DEFAULT_MAX_ITERATIONS,
+            max_parallel_workers: WorkDriverSpec::DEFAULT_MAX_PARALLEL_WORKERS,
+            max_attempts_per_worker: WorkDriverSpec::DEFAULT_MAX_ATTEMPTS_PER_WORKER,
+            stall_iterations: WorkDriverSpec::DEFAULT_STALL_ITERATIONS
+                .min(WorkDriverSpec::DEFAULT_MAX_ITERATIONS),
+            worker_role: harw_plan_bridge::DEFAULT_WORKER_ROLE.to_owned(),
+            judge_role: None,
+            verify: Vec::new(),
+            token_budget: None,
+            wall_budget_secs: None,
+        }
+    }
+
     /// Builds the service from a role's IR; `None` without `[work_driver]`.
     #[must_use]
     pub fn from_ir(role: impl Into<String>, ir: &AgentIr) -> Option<Self> {
@@ -467,6 +525,228 @@ pub fn write_state_sidecar(store: &JobStore, state: &WorkDriverState) -> io::Res
 #[must_use]
 pub fn is_work_driver_job(record: &StoredJob) -> bool {
     matches!(&record.job.kind, JobKind::Custom(kind) if kind == WORK_DRIVER_JOB_KIND)
+}
+
+// ── Worker report tool ───────────────────────────────────────────────────────
+
+/// Holds the last valid [`WorkerReport`] of one worker turn.
+///
+/// # Description
+/// The job worker creates one slot per WorkDriver worker turn, registers a
+/// [`WorkerReportToolProvider`] over it for exactly that turn and reads it
+/// with [`Self::take`] once the turn has ended. The last valid report of the
+/// turn wins; a rejected report never reaches the slot.
+///
+/// # Concurrency
+/// `Send + Sync`; a poisoned lock is recovered (the stored value is a plain
+/// report, it cannot be half-written).
+#[derive(Debug, Default)]
+pub struct WorkerReportSlot {
+    last: std::sync::Mutex<Option<harw_plan_bridge::WorkerReport>>,
+}
+
+impl WorkerReportSlot {
+    /// An empty slot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the last valid report, leaving the slot empty.
+    #[must_use]
+    pub fn take(&self) -> Option<harw_plan_bridge::WorkerReport> {
+        match self.last.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    fn store(&self, report: harw_plan_bridge::WorkerReport) {
+        match self.last.lock() {
+            Ok(mut guard) => *guard = Some(report),
+            Err(poisoned) => *poisoned.into_inner() = Some(report),
+        }
+    }
+}
+
+/// The tool `work_driver.report` ([`harw_plan_bridge::WORK_DRIVER_REPORT_TOOL`])
+/// for one WorkDriver worker turn (R18 D-E, contract §8).
+///
+/// # Description
+/// Registered by the job worker **only** for WorkDriver worker turns; no
+/// registry profile and no operation registry carries it. A call is checked
+/// with `WorkerReport` deserialization (`deny_unknown_fields`; a top-level
+/// `null` counts as absent) and [`harw_plan_bridge::WorkerReport::validate`]
+/// against the goal's criteria count. A rejected call returns a tool error
+/// naming the rule, so the worker can correct it, and is not recorded.
+/// The tool has no side effect beyond the slot.
+#[derive(Debug, Clone)]
+pub struct WorkerReportToolProvider {
+    slot: Arc<WorkerReportSlot>,
+    criteria_total: usize,
+}
+
+impl WorkerReportToolProvider {
+    /// The provider over `slot` for a goal with `criteria_total` acceptance
+    /// criteria.
+    #[must_use]
+    pub fn new(slot: Arc<WorkerReportSlot>, criteria_total: usize) -> Self {
+        Self {
+            slot,
+            criteria_total,
+        }
+    }
+}
+
+impl harw_extension_api::ToolProvider for WorkerReportToolProvider {
+    fn tools(&self) -> Vec<harw_tools::ToolSpec> {
+        vec![worker_report_tool_spec(self.criteria_total)]
+    }
+
+    fn executor(&self, name: &harw_tools::ToolName) -> Option<Arc<dyn harw_tools::ToolExecutor>> {
+        (name.as_str() == harw_plan_bridge::WORK_DRIVER_REPORT_TOOL).then(|| {
+            Arc::new(WorkerReportExecutor {
+                slot: Arc::clone(&self.slot),
+                criteria_total: self.criteria_total,
+            }) as Arc<dyn harw_tools::ToolExecutor>
+        })
+    }
+}
+
+struct WorkerReportExecutor {
+    slot: Arc<WorkerReportSlot>,
+    criteria_total: usize,
+}
+
+impl harw_tools::ToolExecutor for WorkerReportExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a harw_tools::ToolExecutionContext,
+        call: &'a harw_tools::ToolCall,
+    ) -> harw_tools::ToolExecutorFuture<'a> {
+        let arguments = call.arguments.clone();
+        Box::pin(async move {
+            Ok(record_worker_report(
+                &self.slot,
+                self.criteria_total,
+                arguments,
+            ))
+        })
+    }
+}
+
+/// Core of `work_driver.report` (testable without a sandbox context).
+fn record_worker_report(
+    slot: &WorkerReportSlot,
+    criteria_total: usize,
+    arguments: serde_json::Value,
+) -> harw_tools::ToolOutput {
+    let arguments = match arguments {
+        serde_json::Value::Object(mut map) => {
+            map.retain(|_, value| !value.is_null());
+            serde_json::Value::Object(map)
+        }
+        other => other,
+    };
+    let report: harw_plan_bridge::WorkerReport = match serde_json::from_value(arguments) {
+        Ok(report) => report,
+        Err(error) => {
+            return harw_tools::ToolOutput::error(format!(
+                "{}: invalid arguments ({error}); nothing was recorded",
+                harw_plan_bridge::WORK_DRIVER_REPORT_TOOL
+            ));
+        }
+    };
+    if let Err(error) = report.validate(criteria_total) {
+        return harw_tools::ToolOutput::error(format!("{error}; nothing was recorded"));
+    }
+    let status = report.status;
+    slot.store(report);
+    harw_tools::ToolOutput::text(format!(
+        "report recorded (status {}). End your turn now; a later valid report replaces this one.",
+        match status {
+            harw_plan_bridge::WorkerReportStatus::Done => "done",
+            harw_plan_bridge::WorkerReportStatus::Partial => "partial",
+            harw_plan_bridge::WorkerReportStatus::Blocked => "blocked",
+            harw_plan_bridge::WorkerReportStatus::Failed => "failed",
+        }
+    ))
+}
+
+/// Tool spec of `work_driver.report`; the shape of
+/// [`harw_plan_bridge::WorkerReport::input_schema`]. Not `strict`: optional
+/// fields stay optional instead of becoming nullable.
+fn worker_report_tool_spec(criteria_total: usize) -> harw_tools::ToolSpec {
+    use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType};
+    let typed = |schema_type: JsonSchemaType, description: &str| JsonSchema {
+        schema_type: Some(schema_type),
+        description: Some(description.to_owned()),
+        ..JsonSchema::default()
+    };
+    let array_of = |items: JsonSchema, description: &str| JsonSchema {
+        items: Some(Box::new(items)),
+        ..typed(JsonSchemaType::Array, description)
+    };
+    let mut status = typed(
+        JsonSchemaType::String,
+        "done: scope finished, waiting for the central verification; partial: can be \
+         continued; blocked: needs a human decision (name it in `blockers`); failed: hard \
+         failure.",
+    );
+    status.enum_values = Some(
+        ["done", "partial", "blocked", "failed"]
+            .into_iter()
+            .map(serde_json::Value::from)
+            .collect(),
+    );
+    let mut properties = std::collections::BTreeMap::new();
+    properties.insert("status".to_owned(), status);
+    properties.insert(
+        "criteria_addressed".to_owned(),
+        array_of(
+            typed(JsonSchemaType::Integer, "Criterion index."),
+            "Indices of the acceptance criteria you worked on (as listed in your task).",
+        ),
+    );
+    properties.insert(
+        "changed_paths".to_owned(),
+        array_of(
+            typed(JsonSchemaType::String, "Workspace-relative path."),
+            "Files you changed, workspace-relative with `/`; no absolute paths, no `..`.",
+        ),
+    );
+    properties.insert(
+        "summary".to_owned(),
+        typed(
+            JsonSchemaType::String,
+            "Short summary of what you did; must not be empty.",
+        ),
+    );
+    properties.insert(
+        "blockers".to_owned(),
+        array_of(
+            typed(JsonSchemaType::String, "One open question or obstacle."),
+            "Open decisions or obstacles; required (non-empty) for status `blocked`.",
+        ),
+    );
+    let parameters = JsonSchema {
+        schema_type: Some(JsonSchemaType::Object),
+        properties: Some(properties),
+        required: Some(vec!["status".to_owned(), "summary".to_owned()]),
+        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+        ..JsonSchema::default()
+    };
+    harw_tools::ToolSpec::Function(FunctionToolSpec {
+        name: harw_tools::ToolName::new(harw_plan_bridge::WORK_DRIVER_REPORT_TOOL),
+        description: format!(
+            "Report the outcome of your WorkDriver turn. Call it once at the end of every turn; \
+             the last valid call wins, a text status line is not read. The goal has \
+             {criteria_total} acceptance criteria (indices 0..{criteria_total}). An invalid \
+             report is rejected with the reason and not recorded."
+        ),
+        parameters,
+        strict: false,
+    })
 }
 
 // ── Narrowing ────────────────────────────────────────────────────────────────
@@ -1133,6 +1413,17 @@ mod tests {
     /// Context with job store, goal store (goal in `status`), enabled plan
     /// tooling, a model principal and — if `caller` — the WorkDriver caller.
     fn fixture(caller: bool, status: GoalStatus) -> TestResult<Fixture> {
+        fixture_with(
+            caller.then(|| WorkDriverCaller {
+                role: "work-orchestrator".to_owned(),
+                spec: spec(),
+            }),
+            status,
+        )
+    }
+
+    /// Like [`fixture`], with an explicit caller service (or none).
+    fn fixture_with(caller: Option<WorkDriverCaller>, status: GoalStatus) -> TestResult<Fixture> {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         std::fs::create_dir_all(dir.path().join("ws")).map_err(ctx("workspace"))?;
         let registry = WorkspaceRegistry::build(
@@ -1168,11 +1459,8 @@ mod tests {
             IngressSurface::Cli,
             PermissionTier::Operator,
         ));
-        if caller {
-            services.insert(Arc::new(WorkDriverCaller {
-                role: "work-orchestrator".to_owned(),
-                spec: spec(),
-            }));
+        if let Some(caller) = caller {
+            services.insert(Arc::new(caller));
         }
         Ok(Fixture {
             _dir: dir,
@@ -1646,6 +1934,7 @@ judge_role = "critic"
                     summary: "done".to_owned(),
                     artifacts: Vec::new(),
                     suggested_next: None,
+                    criteria_addressed: Vec::new(),
                 }),
                 context_tokens_used: 1000,
                 cache_hit_ratio: Some(0.5),
@@ -1977,6 +2266,258 @@ judge_role = "critic"
         assert!(
             matches!(result, Err(OpError::Execution(ref message)) if message.contains(existing_id)),
             "expected an active-run refusal naming the existing job, got {result:?}"
+        );
+        Ok(())
+    }
+
+    // ── work_driver.report (R18 D-E) ─────────────────────────────────────
+
+    use harw_plan_bridge::{WORK_DRIVER_REPORT_TOOL, WorkerReport, WorkerReportStatus};
+
+    fn recorded_text(output: &harw_tools::ToolOutput) -> TestResult<&str> {
+        match output {
+            harw_tools::ToolOutput::Text { content } => Ok(content.as_str()),
+            other => Err(TestError::Unexpected(format!(
+                "expected a recorded report, got {other:?}"
+            ))),
+        }
+    }
+
+    fn rejection(output: &harw_tools::ToolOutput) -> TestResult<&str> {
+        match output {
+            harw_tools::ToolOutput::Error { message } => Ok(message.as_str()),
+            other => Err(TestError::Unexpected(format!(
+                "expected a tool error, got {other:?}"
+            ))),
+        }
+    }
+
+    /// WD-01: a valid report call is recorded and becomes exactly
+    /// `WorkerReport::into_summary`.
+    #[test]
+    fn wd01_a_valid_report_is_recorded_and_summarised() -> TestResult {
+        let slot = WorkerReportSlot::new();
+        let arguments = serde_json::json!({
+            "status": "done",
+            "criteria_addressed": [1, 0],
+            "changed_paths": ["src/a.rs"],
+            "summary": "a fertig",
+        });
+        let output = record_worker_report(&slot, 2, arguments.clone());
+        assert!(recorded_text(&output)?.contains("status done"));
+        let report = slot.take().ok_or(TestError::Missing("recorded report"))?;
+        let expected: WorkerReport = serde_json::from_value(arguments).map_err(ctx("decode"))?;
+        assert_eq!(report, expected);
+        let summary = report.into_summary();
+        assert_eq!(summary.outcome, harw_plan_bridge::WorkerOutcome::Done);
+        assert_eq!(summary.artifacts, vec!["src/a.rs".to_owned()]);
+        assert_eq!(summary.criteria_addressed, vec![0, 1]);
+        assert!(slot.take().is_none(), "take empties the slot");
+        Ok(())
+    }
+
+    /// WD-03: an invalid report is a tool error to the worker and is not
+    /// recorded.
+    #[test]
+    fn wd03_an_invalid_report_is_a_tool_error_and_not_counted() -> TestResult {
+        let slot = WorkerReportSlot::new();
+        for (arguments, needle) in [
+            (
+                serde_json::json!({ "status": "blocked", "summary": "s" }),
+                "blocker",
+            ),
+            (
+                serde_json::json!({ "status": "done", "summary": "s", "criteria_addressed": [2] }),
+                "out of range",
+            ),
+            (
+                serde_json::json!({ "status": "done", "summary": "s", "changed_paths": ["../x"] }),
+                "../x",
+            ),
+            (
+                serde_json::json!({ "status": "done", "summary": " " }),
+                "summary is empty",
+            ),
+            (
+                serde_json::json!({ "status": "done", "summary": "s", "outcome": "done" }),
+                "invalid arguments",
+            ),
+            (
+                serde_json::json!({ "status": "finished", "summary": "s" }),
+                "invalid arguments",
+            ),
+            (serde_json::json!("done"), "invalid arguments"),
+        ] {
+            let output = record_worker_report(&slot, 2, arguments.clone());
+            let message = rejection(&output)?;
+            assert!(message.contains(needle), "{arguments}: {message}");
+            assert!(message.contains("nothing was recorded"), "{message}");
+            assert!(slot.take().is_none(), "{arguments} must not be recorded");
+        }
+        Ok(())
+    }
+
+    /// WD-04: the last valid report of the turn wins; a later invalid one
+    /// does not replace it. A top-level `null` counts as absent.
+    #[test]
+    fn wd04_the_last_valid_report_of_the_turn_wins() -> TestResult {
+        let slot = WorkerReportSlot::new();
+        recorded_text(&record_worker_report(
+            &slot,
+            1,
+            serde_json::json!({ "status": "partial", "summary": "erst halb" }),
+        ))?;
+        recorded_text(&record_worker_report(
+            &slot,
+            1,
+            serde_json::json!({ "status": "done", "summary": "fertig", "blockers": null }),
+        ))?;
+        rejection(&record_worker_report(
+            &slot,
+            1,
+            serde_json::json!({ "status": "failed", "summary": "" }),
+        ))?;
+        let report = slot.take().ok_or(TestError::Missing("recorded report"))?;
+        assert_eq!(report.status, WorkerReportStatus::Done);
+        assert_eq!(report.summary, "fertig");
+        Ok(())
+    }
+
+    #[test]
+    fn the_report_tool_serves_exactly_one_non_strict_tool() -> TestResult {
+        use harw_extension_api::ToolProvider as _;
+        let provider = WorkerReportToolProvider::new(Arc::new(WorkerReportSlot::new()), 3);
+        let tools = provider.tools();
+        let [harw_tools::ToolSpec::Function(spec)] = tools.as_slice() else {
+            return Err(TestError::Unexpected(format!("{tools:?}")));
+        };
+        assert_eq!(spec.name.as_str(), WORK_DRIVER_REPORT_TOOL);
+        assert!(!spec.strict);
+        assert!(spec.description.contains("3 acceptance criteria"));
+        assert_eq!(
+            spec.parameters.required,
+            Some(vec!["status".to_owned(), "summary".to_owned()])
+        );
+        let schema = serde_json::to_value(&spec.parameters).map_err(ctx("schema"))?;
+        let reference = WorkerReport::input_schema();
+        let keys = |value: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            value["properties"]
+                .as_object()
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(keys(&schema), keys(&reference));
+        assert_eq!(
+            schema["properties"]["status"]["enum"],
+            reference["properties"]["status"]["enum"]
+        );
+        assert!(
+            provider
+                .executor(&harw_tools::ToolName::new(WORK_DRIVER_REPORT_TOOL))
+                .is_some()
+        );
+        assert!(
+            provider
+                .executor(&harw_tools::ToolName::new("work_driver.enqueue"))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// WD-05: `work_driver.report` is offered by no registry profile and by no
+    /// operation — only the job worker registers it, for WorkDriver worker
+    /// turns.
+    #[test]
+    fn wd05_the_report_tool_is_not_offered_outside_work_driver_workers() {
+        use harw_registry_defaults::profile::RegistryProfile;
+        for profile in RegistryProfile::ALL {
+            assert!(
+                !profile
+                    .registered_tool_names()
+                    .contains(&WORK_DRIVER_REPORT_TOOL),
+                "{profile:?} must not carry {WORK_DRIVER_REPORT_TOOL}"
+            );
+        }
+        let mut registry = harw_operations::registry::OperationRegistry::new();
+        crate::register_all(&mut registry);
+        let _registered = crate::register_work_driver_tools(
+            &mut registry,
+            &harw_plan::PlanToolConfig::enabled_defaults(),
+        );
+        assert!(registry.find_by_name(WORK_DRIVER_REPORT_TOOL).is_none());
+    }
+
+    // ── UIA caller (R18 F6) ──────────────────────────────────────────────
+
+    #[test]
+    fn the_uia_caller_uses_its_own_section_or_the_default_spec() {
+        let default = WorkDriverCaller::for_uia(None);
+        assert_eq!(default.role, UIA_WORK_DRIVER_ROLE);
+        assert_eq!(default.spec, WorkDriverCaller::uia_default_spec());
+        assert_eq!(
+            default.spec.worker_role,
+            harw_plan_bridge::DEFAULT_WORKER_ROLE
+        );
+        assert!(default.spec.stall_iterations <= default.spec.max_iterations);
+        let configured = WorkDriverCaller::for_uia(Some(&spec()));
+        assert_eq!(configured.spec, spec());
+        assert_eq!(configured.role, UIA_WORK_DRIVER_ROLE);
+    }
+
+    /// WD-06: the UIA's `work_driver.enqueue` requires approval on every
+    /// surface and admits a job with the UIA caller spec.
+    #[tokio::test]
+    async fn wd06_uia_enqueue_requires_approval_and_uses_the_uia_spec() -> TestResult {
+        use harw_operations::{ApprovalPolicy, Surface};
+        let surfaces = &WorkDriverEnqueueOperation.meta().surfaces;
+        assert!(
+            surfaces.iter().any(|surface| matches!(
+                surface,
+                Surface::ModelTool {
+                    approval: ApprovalPolicy::Always,
+                    ..
+                }
+            )),
+            "model surface must always ask: {surfaces:?}"
+        );
+        assert!(
+            !surfaces.iter().any(|surface| matches!(
+                surface,
+                Surface::ModelTool {
+                    approval: ApprovalPolicy::None,
+                    ..
+                }
+            )),
+            "no model surface may skip the approval"
+        );
+
+        let fx = fixture_with(Some(WorkDriverCaller::for_uia(None)), GoalStatus::Active)?;
+        let output = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({ "goal_id": GOAL }),
+        )
+        .await
+        .map_err(ctx("enqueue as the UIA"))?;
+        let work_id = job_id_of(&output)?;
+        let record = fx.jobs.get(&work_id).map_err(ctx("get job"))?;
+        let input = WorkDriverJobInput::from_job(&record).map_err(ctx("decode input"))?;
+        assert_eq!(input.orchestrator_role, UIA_WORK_DRIVER_ROLE);
+        assert_eq!(input.spec, WorkDriverCaller::uia_default_spec());
+
+        // Overrides narrow the UIA spec like any other caller's.
+        let widened = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({
+                "goal_id": GOAL,
+                "overrides": { "max_iterations": WorkDriverSpec::DEFAULT_MAX_ITERATIONS + 1 }
+            }),
+        )
+        .await;
+        assert!(
+            matches!(widened, Err(OpError::InvalidArguments(_))),
+            "{widened:?}"
         );
         Ok(())
     }

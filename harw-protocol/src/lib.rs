@@ -18,12 +18,15 @@ pub use approvals::{ApprovalKind, ApprovalRequest, ApprovalResponse};
 pub use events::{SessionEvent, TurnEvent};
 pub use items::{
     AssistantMessageItem, ContentPart, ErrorItem, OpaqueReasoning, ReasoningItem, ResultTrust,
-    ToolCallItem, ToolCallResult, ToolResultItem, TurnItem, UserMessageItem,
+    ToolCallItem, ToolCallResult, ToolPlacement, ToolResultItem, TurnItem, UserMessageItem,
 };
 pub use orchestration::{AgentOrchestrationEvent, AgentOrchestrationStatus};
-pub use session_port::{FrameSource, PortError, PortFuture, SessionPort};
+pub use session_port::{
+    FrameSource, GatewayPort, PortError, PortFuture, SessionPort, ToolPort, ToolRefusal,
+};
 pub use session_wire::{
-    ClientCaps, Cursor, FrameEnvelope, HostedState, PresenceEntry, SessionFrame, StreamProfile,
+    AgentRole, ClientCaps, Cursor, FrameEnvelope, HostedState, PresenceEntry, SessionFrame,
+    StreamProfile, ToolApproval, ToolDescriptor,
 };
 pub use wire::{
     NotificationEnvelope, ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireError,

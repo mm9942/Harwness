@@ -571,6 +571,7 @@ mod tests {
                 call_id,
                 result: ToolCallResult::error("nope"),
                 duration_ms: 12,
+                placement: None,
             },
         );
         let Some(SdkEvent::ToolResult {

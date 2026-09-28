@@ -1,23 +1,46 @@
-//! Closed method table (W00 D5): one wire request → one typed
-//! [`SessionPort`] call.
+//! Closed method tables (W00 D5, R18 §2.1): one wire request → one typed
+//! port call.
 //!
 //! There is no generic operation execution here. Every method of
-//! [`harw_protocol::methods::SESSION_METHODS`] maps to exactly one port call
-//! with strictly decoded parameters; anything else is `METHOD_NOT_FOUND`.
-//! Parameters that fail to decode never reach the port.
+//! [`harw_protocol::methods::SESSION_METHODS`] maps to exactly one
+//! [`SessionPort`] call, every method of
+//! [`harw_protocol::methods::TOOL_METHODS`] to one [`ToolPort`] call and
+//! every method of [`harw_protocol::methods::GATEWAY_READ_METHODS`] /
+//! [`harw_protocol::methods::GATEWAY_ADMIN_METHODS`] to one [`GatewayPort`]
+//! call, with strictly decoded parameters; anything else is
+//! `METHOD_NOT_FOUND`. Parameters that fail to decode never reach a port.
+//!
+//! R18 methods pass a cap gate first ([`required_cap`]): the caps the host
+//! granted at hello must contain `tool_call`, `gateway_read` or
+//! `gateway_admin`, else `DENIED` without calling the port. The gate is
+//! defense in depth; the host admits every call again against the
+//! connection's identity. A connection without a tool or gateway port
+//! answers those methods `METHOD_NOT_FOUND`.
+
+use std::sync::Arc;
 
 use harw_protocol::methods::{
-    METHOD_APPROVAL_RESP, METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE,
-    METHOD_SESSION_DETACH, METHOD_SESSION_HELLO, METHOD_SESSION_HISTORY, METHOD_SESSION_LIST,
-    METHOD_SESSION_RESUME, METHOD_SESSION_SET_EFFORT, METHOD_SESSION_SET_MODE,
-    METHOD_SESSION_SET_MODEL, METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT,
+    GATEWAY_ADMIN_METHODS, GATEWAY_READ_METHODS, METHOD_APPROVAL_RESP,
+    METHOD_GATEWAY_CONNECTIONS_LIST, METHOD_GATEWAY_CONNECTIONS_REVOKE, METHOD_GATEWAY_DRAIN,
+    METHOD_GATEWAY_LISTENERS_LIST, METHOD_GATEWAY_LISTENERS_SET, METHOD_GATEWAY_SESSIONS_LIST,
+    METHOD_GATEWAY_STATUS, METHOD_GATEWAY_TOOLS_GRANT, METHOD_GATEWAY_TOOLS_LIST,
+    METHOD_GATEWAY_TOOLS_NARROW, METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE,
+    METHOD_SESSION_CREATE, METHOD_SESSION_DETACH, METHOD_SESSION_HELLO, METHOD_SESSION_HISTORY,
+    METHOD_SESSION_LIST, METHOD_SESSION_RESUME, METHOD_SESSION_SET_EFFORT, METHOD_SESSION_SET_MODE,
+    METHOD_SESSION_SET_MODEL, METHOD_TOOL_CALL, METHOD_TOOL_CANCEL, METHOD_TOOL_LIST,
+    METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT, TOOL_METHODS,
 };
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachParams, CreateParams, HelloParams, HistoryParams, HistoryResult,
-    InterruptParams, ListResult, SessionRef, SetEffortParams, SetModeParams, SetModelParams,
-    SubmitParams, error_codes,
+    ApprovalRespondParams, AttachParams, CreateParams, GatewayDrainParams,
+    GatewayListenerSetParams, GatewayRevokeParams, GatewayToolRightsParams, HelloParams,
+    HistoryParams, HistoryResult, InterruptParams, ListResult, SessionRef, SetEffortParams,
+    SetModeParams, SetModelParams, SubmitParams, ToolCallParams, ToolCancelParams, ToolListParams,
+    error_codes,
 };
-use harw_protocol::{FrameSource, PortError, RequestEnvelope, ResponseEnvelope, SessionPort};
+use harw_protocol::{
+    ClientCaps, FrameSource, GatewayPort, PortError, RequestEnvelope, ResponseEnvelope,
+    SessionPort, ToolPort,
+};
 use harw_types::SessionId;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -48,6 +71,221 @@ pub enum Dispatched {
 #[must_use]
 pub fn is_hello(method: &str) -> bool {
     method == METHOD_SESSION_HELLO
+}
+
+/// The ports one connection serves: the session port always, the R18 tool
+/// and gateway ports when the host offers them to this connection.
+#[derive(Clone)]
+pub struct Ports {
+    pub session: Arc<dyn SessionPort>,
+    pub tools: Option<Arc<dyn ToolPort>>,
+    pub gateway: Option<Arc<dyn GatewayPort>>,
+}
+
+impl std::fmt::Debug for Ports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ports")
+            .field("tools", &self.tools.is_some())
+            .field("gateway", &self.gateway.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Ports {
+    /// Session methods only (W00): `tool.*` and `gateway.*` answer
+    /// `METHOD_NOT_FOUND`.
+    #[must_use]
+    pub fn session_only(session: Arc<dyn SessionPort>) -> Self {
+        Self {
+            session,
+            tools: None,
+            gateway: None,
+        }
+    }
+
+    /// One port object serving all three tables (the host's connection).
+    #[must_use]
+    pub fn all<P>(port: Arc<P>) -> Self
+    where
+        P: SessionPort + ToolPort + GatewayPort + 'static,
+    {
+        Self {
+            session: Arc::clone(&port) as Arc<dyn SessionPort>,
+            tools: Some(Arc::clone(&port) as Arc<dyn ToolPort>),
+            gateway: Some(port as Arc<dyn GatewayPort>),
+        }
+    }
+}
+
+/// The R18 cap a method needs at the dispatcher, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequiredCap {
+    ToolCall,
+    GatewayRead,
+    GatewayAdmin,
+}
+
+impl RequiredCap {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ToolCall => "tool_call",
+            Self::GatewayRead => "gateway_read",
+            Self::GatewayAdmin => "gateway_admin",
+        }
+    }
+
+    const fn is_granted(self, caps: ClientCaps) -> bool {
+        match self {
+            Self::ToolCall => caps.tool_call,
+            Self::GatewayRead => caps.gateway_read,
+            Self::GatewayAdmin => caps.gateway_admin,
+        }
+    }
+}
+
+/// Cap gate of an R18 method; `None` for session methods and unknown names.
+#[must_use]
+pub fn required_cap(method: &str) -> Option<RequiredCap> {
+    if TOOL_METHODS.contains(&method) {
+        Some(RequiredCap::ToolCall)
+    } else if GATEWAY_READ_METHODS.contains(&method) {
+        Some(RequiredCap::GatewayRead)
+    } else if GATEWAY_ADMIN_METHODS.contains(&method) {
+        Some(RequiredCap::GatewayAdmin)
+    } else {
+        None
+    }
+}
+
+/// Route one request to the session, tool or gateway port. `granted` are
+/// the caps from the successful hello (`ClientCaps::NONE` before it).
+pub async fn dispatch_ports(
+    ports: &Ports,
+    granted: ClientCaps,
+    request: RequestEnvelope,
+) -> Dispatched {
+    let Some(cap) = required_cap(&request.method) else {
+        return dispatch(ports.session.as_ref(), request).await;
+    };
+    let RequestEnvelope {
+        id, method, params, ..
+    } = request;
+    let served = match cap {
+        RequiredCap::ToolCall => ports.tools.is_some(),
+        RequiredCap::GatewayRead | RequiredCap::GatewayAdmin => ports.gateway.is_some(),
+    };
+    if !served {
+        return Dispatched::Response(error_response(
+            id,
+            error_codes::METHOD_NOT_FOUND,
+            format!("unknown method {method:?}"),
+        ));
+    }
+    if !cap.is_granted(granted) {
+        return Dispatched::Response(error_response(
+            id,
+            error_codes::DENIED,
+            format!("capability `{}` not granted", cap.name()),
+        ));
+    }
+    let response = match (&ports.tools, &ports.gateway, cap) {
+        (Some(tools), _, RequiredCap::ToolCall) => {
+            dispatch_tool(tools.as_ref(), id, &method, params).await
+        }
+        (_, Some(gateway), RequiredCap::GatewayRead | RequiredCap::GatewayAdmin) => {
+            dispatch_gateway(gateway.as_ref(), id, &method, params).await
+        }
+        _ => error_response(
+            id,
+            error_codes::METHOD_NOT_FOUND,
+            format!("unknown method {method:?}"),
+        ),
+    };
+    Dispatched::Response(response)
+}
+
+/// `tool.*` (R18 D-A).
+async fn dispatch_tool(
+    port: &dyn ToolPort,
+    id: String,
+    method: &str,
+    params: Value,
+) -> ResponseEnvelope {
+    match method {
+        METHOD_TOOL_LIST => match decode::<ToolListParams>(&id, params) {
+            Ok(params) => encode(id, port.list_tools(params).await),
+            Err(response) => *response,
+        },
+        METHOD_TOOL_CALL => match decode::<ToolCallParams>(&id, params) {
+            Ok(params) => encode(id, port.call_tool(params).await),
+            Err(response) => *response,
+        },
+        METHOD_TOOL_CANCEL => match decode::<ToolCancelParams>(&id, params) {
+            Ok(params) => encode(id, port.cancel_tool(params).await),
+            Err(response) => *response,
+        },
+        _ => error_response(
+            id,
+            error_codes::METHOD_NOT_FOUND,
+            format!("unknown method {method:?}"),
+        ),
+    }
+}
+
+/// `gateway.*` (R18 D-B).
+async fn dispatch_gateway(
+    port: &dyn GatewayPort,
+    id: String,
+    method: &str,
+    params: Value,
+) -> ResponseEnvelope {
+    let parameterless = matches!(
+        method,
+        METHOD_GATEWAY_STATUS
+            | METHOD_GATEWAY_CONNECTIONS_LIST
+            | METHOD_GATEWAY_SESSIONS_LIST
+            | METHOD_GATEWAY_LISTENERS_LIST
+            | METHOD_GATEWAY_TOOLS_LIST
+    );
+    if parameterless && !is_empty_params(&params) {
+        return error_response(
+            id,
+            error_codes::INVALID_PARAMS,
+            format!("{method} takes no params"),
+        );
+    }
+    match method {
+        METHOD_GATEWAY_STATUS => encode(id, port.status().await),
+        METHOD_GATEWAY_CONNECTIONS_LIST => encode(id, port.connections().await),
+        METHOD_GATEWAY_SESSIONS_LIST => encode(id, port.sessions().await),
+        METHOD_GATEWAY_LISTENERS_LIST => encode(id, port.listeners().await),
+        METHOD_GATEWAY_TOOLS_LIST => encode(id, port.tools().await),
+        METHOD_GATEWAY_CONNECTIONS_REVOKE => match decode::<GatewayRevokeParams>(&id, params) {
+            Ok(params) => encode(id, port.revoke_connection(params).await),
+            Err(response) => *response,
+        },
+        METHOD_GATEWAY_DRAIN => match decode::<GatewayDrainParams>(&id, params) {
+            Ok(params) => encode(id, port.drain(params).await),
+            Err(response) => *response,
+        },
+        METHOD_GATEWAY_LISTENERS_SET => match decode::<GatewayListenerSetParams>(&id, params) {
+            Ok(params) => encode(id, port.set_listener(params).await),
+            Err(response) => *response,
+        },
+        METHOD_GATEWAY_TOOLS_GRANT => match decode::<GatewayToolRightsParams>(&id, params) {
+            Ok(params) => encode(id, port.grant_tools(params).await),
+            Err(response) => *response,
+        },
+        METHOD_GATEWAY_TOOLS_NARROW => match decode::<GatewayToolRightsParams>(&id, params) {
+            Ok(params) => encode(id, port.narrow_tools(params).await),
+            Err(response) => *response,
+        },
+        _ => error_response(
+            id,
+            error_codes::METHOD_NOT_FOUND,
+            format!("unknown method {method:?}"),
+        ),
+    }
 }
 
 /// Decode the params, call the port and encode the result.
@@ -203,8 +441,14 @@ fn encode<T: Serialize>(id: String, result: Result<T, PortError>) -> ResponseEnv
     }
 }
 
+/// Error response for a port error. A tool refusal carries its bare
+/// `detail` as the message, so `PortError::from_code` on the client restores
+/// the same value without double wrapping (R18 §10.3 P1).
 fn port_error(id: String, error: &PortError) -> ResponseEnvelope {
-    error_response(id, error.code(), error.to_string())
+    match error {
+        PortError::ToolRefused { detail, .. } => error_response(id, error.code(), detail.clone()),
+        _ => error_response(id, error.code(), error.to_string()),
+    }
 }
 
 fn internal(id: String, error: &serde_json::Error) -> ResponseEnvelope {
@@ -220,10 +464,14 @@ mod tests {
     use std::sync::Mutex;
 
     use harw_protocol::session_wire::{
-        AttachAck, ClientCaps, Cursor, FrameEnvelope, HelloAck, RespondResult, SessionSummary,
-        SubmitResult,
+        AgentRole, AttachAck, Cursor, FrameEnvelope, GatewayConnectionsResult, GatewayListenerInfo,
+        GatewayListenersResult, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
+        GatewayToolsResult, HelloAck, ListenerKind, RespondResult, SessionSummary, SubmitResult,
+        ToolCallResultFrame, ToolListResult,
     };
-    use harw_protocol::{PortFuture, ProtocolVersion};
+    use harw_protocol::{
+        PortFuture, ProtocolVersion, ResultTrust, ToolCallResult, ToolPlacement, ToolRefusal,
+    };
     use serde_json::json;
 
     use super::*;
@@ -267,10 +515,12 @@ mod tests {
         }
     }
 
-    /// Records every port call; `deny` makes every call fail with `Denied`.
+    /// Records every port call; `deny` makes every call fail with `Denied`,
+    /// `refusal` makes `tool.call` fail with that tool refusal.
     struct FakePort {
         calls: Mutex<Vec<&'static str>>,
         deny: bool,
+        refusal: Option<ToolRefusal>,
         summary: SessionSummary,
     }
 
@@ -279,6 +529,7 @@ mod tests {
             Ok(Self {
                 calls: Mutex::new(Vec::new()),
                 deny,
+                refusal: None,
                 summary: summary("s-1")?,
             })
         }
@@ -366,6 +617,120 @@ mod tests {
         }
         fn set_effort(&self, _params: SetEffortParams) -> PortFuture<'_, ()> {
             self.answer("set_effort", ())
+        }
+    }
+
+    fn status() -> GatewayStatus {
+        GatewayStatus {
+            host_epoch: 7,
+            node: None,
+            draining: false,
+            connections: 1,
+            sessions: 1,
+            running_turns: 0,
+            listeners: 0,
+            tools: 0,
+            sandbox_available: false,
+        }
+    }
+
+    fn rights() -> GatewayToolRights {
+        GatewayToolRights {
+            agent: "agent:uia".into(),
+            role: AgentRole::UserInterface,
+            tools: vec![],
+        }
+    }
+
+    impl ToolPort for FakePort {
+        fn list_tools(&self, _params: ToolListParams) -> PortFuture<'_, ToolListResult> {
+            self.answer("list_tools", ToolListResult { tools: vec![] })
+        }
+        fn call_tool(&self, params: ToolCallParams) -> PortFuture<'_, ToolCallResultFrame> {
+            if let Some(refusal) = self.refusal {
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.push("call_tool");
+                }
+                let detail = params.tool_name;
+                return Box::pin(async move { Err(PortError::ToolRefused { refusal, detail }) });
+            }
+            self.answer(
+                "call_tool",
+                ToolCallResultFrame {
+                    call_id: params.call_id,
+                    result: ToolCallResult::success(json!("ok")),
+                    placement: ToolPlacement::Gateway { node: None },
+                    duration_ms: 1,
+                    trust: ResultTrust::Untrusted,
+                },
+            )
+        }
+        fn cancel_tool(&self, _params: ToolCancelParams) -> PortFuture<'_, ()> {
+            self.answer("cancel_tool", ())
+        }
+    }
+
+    impl GatewayPort for FakePort {
+        fn status(&self) -> PortFuture<'_, GatewayStatus> {
+            self.answer("status", status())
+        }
+        fn connections(&self) -> PortFuture<'_, GatewayConnectionsResult> {
+            self.answer(
+                "connections",
+                GatewayConnectionsResult {
+                    connections: vec![],
+                },
+            )
+        }
+        fn sessions(&self) -> PortFuture<'_, Vec<SessionSummary>> {
+            self.answer("sessions", vec![self.summary.clone()])
+        }
+        fn listeners(&self) -> PortFuture<'_, GatewayListenersResult> {
+            self.answer("listeners", GatewayListenersResult { listeners: vec![] })
+        }
+        fn tools(&self) -> PortFuture<'_, GatewayToolsResult> {
+            self.answer(
+                "tools",
+                GatewayToolsResult {
+                    tools: vec![],
+                    grants: vec![],
+                },
+            )
+        }
+        fn revoke_connection(
+            &self,
+            _params: GatewayRevokeParams,
+        ) -> PortFuture<'_, GatewayRevokeResult> {
+            self.answer("revoke_connection", GatewayRevokeResult { revoked: true })
+        }
+        fn drain(&self, _params: GatewayDrainParams) -> PortFuture<'_, GatewayStatus> {
+            self.answer("drain", status())
+        }
+        fn set_listener(
+            &self,
+            params: GatewayListenerSetParams,
+        ) -> PortFuture<'_, GatewayListenerInfo> {
+            self.answer(
+                "set_listener",
+                GatewayListenerInfo {
+                    name: params.name,
+                    kind: ListenerKind::LocalUds,
+                    address: "/run/harw.sock".into(),
+                    enabled: params.enabled,
+                },
+            )
+        }
+        fn grant_tools(
+            &self,
+            _params: GatewayToolRightsParams,
+        ) -> PortFuture<'_, GatewayToolRights> {
+            self.answer("grant_tools", rights())
+        }
+        fn narrow_tools(
+            &self,
+            _params: GatewayToolRightsParams,
+        ) -> PortFuture<'_, GatewayToolRights> {
+            self.answer("narrow_tools", rights())
         }
     }
 
@@ -534,6 +899,222 @@ mod tests {
         assert!(response.error.is_none());
         assert_eq!(response.result, Some(Value::Null));
         assert_eq!(port.calls(), vec!["set_model"]);
+        Ok(())
+    }
+
+    fn call_params() -> Value {
+        json!({
+            "session_id": "s-1",
+            "turn_id": "t-1",
+            "call_id": "c-1",
+            "tool_name": "fs.read",
+            "arguments": {"path": "a"}
+        })
+    }
+
+    fn r18(port: FakePort) -> (Arc<FakePort>, Ports) {
+        let port = Arc::new(port);
+        let ports = Ports::all(Arc::clone(&port));
+        (port, ports)
+    }
+
+    #[test]
+    fn r18_methods_map_to_their_caps() {
+        assert_eq!(required_cap(METHOD_TOOL_CALL), Some(RequiredCap::ToolCall));
+        assert_eq!(
+            required_cap(METHOD_GATEWAY_STATUS),
+            Some(RequiredCap::GatewayRead)
+        );
+        assert_eq!(
+            required_cap(METHOD_GATEWAY_DRAIN),
+            Some(RequiredCap::GatewayAdmin)
+        );
+        assert_eq!(required_cap(METHOD_SESSION_LIST), None);
+        assert_eq!(required_cap("tool.exec"), None);
+    }
+
+    /// TG-11: an identity field in `tool.call` params is a decode error and
+    /// never reaches the port; an unknown `tool.*` name is `METHOD_NOT_FOUND`.
+    #[tokio::test]
+    async fn tool_call_with_identity_field_never_reaches_the_port() -> TestResult {
+        let (port, ports) = r18(FakePort::new(false)?);
+        let mut params = call_params();
+        params["principal"] = json!("agent:uia");
+        let response = plain(
+            dispatch_ports(
+                &ports,
+                ClientCaps::TOOL_CALL,
+                request(METHOD_TOOL_CALL, params),
+            )
+            .await,
+        )?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        let unknown = plain(
+            dispatch_ports(
+                &ports,
+                ClientCaps::TOOL_CALL,
+                request("tool.exec", json!({})),
+            )
+            .await,
+        )?;
+        assert_eq!(error_code(&unknown), Some(error_codes::METHOD_NOT_FOUND));
+        assert!(port.calls().is_empty());
+        let ok = plain(
+            dispatch_ports(
+                &ports,
+                ClientCaps::TOOL_CALL,
+                request(METHOD_TOOL_CALL, call_params()),
+            )
+            .await,
+        )?;
+        assert!(ok.error.is_none(), "{ok:?}");
+        let frame: ToolCallResultFrame = ctx(
+            serde_json::from_value(ok.result.ok_or("missing result")?),
+            "frame",
+        )?;
+        assert_eq!(frame.placement, ToolPlacement::Gateway { node: None });
+        assert_eq!(port.calls(), vec!["call_tool"]);
+        Ok(())
+    }
+
+    /// TG-12: `gateway.*` reads need `gateway_read`, mutations
+    /// `gateway_admin`, `tool.*` needs `tool_call`; the gate answers
+    /// `DENIED` without calling the port.
+    #[tokio::test]
+    async fn r18_caps_are_gated_before_the_port() -> TestResult {
+        let (port, ports) = r18(FakePort::new(false)?);
+        let operate = ClientCaps::OPERATE;
+        for (method, params) in [
+            (METHOD_GATEWAY_STATUS, Value::Null),
+            (METHOD_GATEWAY_DRAIN, json!({"retry_after_ms": 10})),
+            (METHOD_TOOL_LIST, json!({"session_id": "s-1"})),
+        ] {
+            let response = plain(dispatch_ports(&ports, operate, request(method, params)).await)?;
+            assert_eq!(error_code(&response), Some(error_codes::DENIED), "{method}");
+        }
+        let read_only = ClientCaps::GATEWAY_READ;
+        let drain = plain(
+            dispatch_ports(
+                &ports,
+                read_only,
+                request(METHOD_GATEWAY_DRAIN, json!({"retry_after_ms": 10})),
+            )
+            .await,
+        )?;
+        assert_eq!(error_code(&drain), Some(error_codes::DENIED));
+        assert!(port.calls().is_empty());
+
+        let status = plain(
+            dispatch_ports(&ports, read_only, request(METHOD_GATEWAY_STATUS, json!({}))).await,
+        )?;
+        assert!(status.error.is_none(), "{status:?}");
+        let admin = ClientCaps::GATEWAY_ADMIN;
+        let drained = plain(
+            dispatch_ports(
+                &ports,
+                admin,
+                request(METHOD_GATEWAY_DRAIN, json!({"retry_after_ms": 10})),
+            )
+            .await,
+        )?;
+        assert!(drained.error.is_none(), "{drained:?}");
+        let sessions = plain(
+            dispatch_ports(
+                &ports,
+                admin,
+                request(METHOD_GATEWAY_SESSIONS_LIST, Value::Null),
+            )
+            .await,
+        )?;
+        let listed: Vec<SessionSummary> = ctx(
+            serde_json::from_value(sessions.result.ok_or("missing result")?),
+            "sessions",
+        )?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(port.calls(), vec!["status", "drain", "sessions"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_params_are_strict() -> TestResult {
+        let (port, ports) = r18(FakePort::new(false)?);
+        let admin = ClientCaps::GATEWAY_ADMIN;
+        for (method, params) in [
+            (METHOD_GATEWAY_STATUS, json!({"tenant": "t"})),
+            (
+                METHOD_GATEWAY_TOOLS_GRANT,
+                json!({"agent": "a", "tools": [], "role": "user-interface"}),
+            ),
+            (
+                METHOD_GATEWAY_CONNECTIONS_REVOKE,
+                json!({"connection": 1, "reason": "r", "actor": "uid:0"}),
+            ),
+        ] {
+            let response = plain(dispatch_ports(&ports, admin, request(method, params)).await)?;
+            assert_eq!(
+                error_code(&response),
+                Some(error_codes::INVALID_PARAMS),
+                "{method}"
+            );
+        }
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_only_ports_do_not_serve_r18_methods() -> TestResult {
+        let port = Arc::new(FakePort::new(false)?);
+        let ports = Ports::session_only(Arc::clone(&port) as Arc<dyn SessionPort>);
+        let all = ClientCaps::ALL
+            .with(ClientCaps::TOOL_CALL)
+            .with(ClientCaps::GATEWAY_ADMIN);
+        for method in [
+            METHOD_TOOL_CALL,
+            METHOD_GATEWAY_STATUS,
+            METHOD_GATEWAY_DRAIN,
+        ] {
+            let response = plain(dispatch_ports(&ports, all, request(method, json!({}))).await)?;
+            assert_eq!(
+                error_code(&response),
+                Some(error_codes::METHOD_NOT_FOUND),
+                "{method}"
+            );
+        }
+        // Session methods still work through the same entry point.
+        let list =
+            plain(dispatch_ports(&ports, all, request(METHOD_SESSION_LIST, Value::Null)).await)?;
+        assert!(list.error.is_none());
+        assert_eq!(port.calls(), vec!["list"]);
+        Ok(())
+    }
+
+    /// A tool refusal travels as its own code with the bare detail, so the
+    /// client restores exactly the same `PortError`.
+    #[tokio::test]
+    async fn tool_refusal_message_is_the_bare_detail() -> TestResult {
+        for refusal in ToolRefusal::ALL {
+            let mut fake = FakePort::new(false)?;
+            fake.refusal = Some(refusal);
+            let (_, ports) = r18(fake);
+            let response = plain(
+                dispatch_ports(
+                    &ports,
+                    ClientCaps::TOOL_CALL,
+                    request(METHOD_TOOL_CALL, call_params()),
+                )
+                .await,
+            )?;
+            let error = response.error.ok_or("missing error")?;
+            assert_eq!(error.code, refusal.code());
+            assert_eq!(error.message, "fs.read");
+            assert_eq!(
+                PortError::from_code(error.code, error.message),
+                PortError::ToolRefused {
+                    refusal,
+                    detail: "fs.read".into()
+                }
+            );
+        }
         Ok(())
     }
 }

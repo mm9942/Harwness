@@ -33,7 +33,7 @@
 
 use crate::launcher::JobLauncher;
 use crate::logs::{LogQuery, LogSlice, read_log};
-use crate::manager::{Caller, JobError, JobManager, StartRequest, WaitOutcome};
+use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest, WaitOutcome};
 use crate::model::{JobEndReason, JobId, JobOwner, JobStatus, STDERR_LOG, STDOUT_LOG};
 use crate::procfs::JobSignal;
 use harw_authority::Permission;
@@ -139,7 +139,12 @@ pub fn job_start_command_text(arguments: &Value) -> Option<String> {
 }
 
 /// Höchste Wartezeit von `job.wait` in Sekunden.
-pub const MAX_WAIT_SECS: u64 = 600;
+///
+/// R18 F8: `job.wait` ist ein kurzes Abfragen, kein langes Blockieren —
+/// Agenten haben mit `timeout_secs: 600` über eine Stunde in
+/// `job.wait`-Schleifen gehangen. Das Ende eines Jobs kommt ohnehin als
+/// Notiz; ein größerer Wert wird abgewiesen (kein stilles Klemmen).
+pub const MAX_WAIT_SECS: u64 = 60;
 /// Vorgabe für `job.logs` ohne `tail`/`since_line`.
 const DEFAULT_LOG_TAIL: usize = 100;
 /// Höchstzahl Zeilen je Stream in `job.logs`.
@@ -345,6 +350,16 @@ fn spec(name: &str, description: &str, parameters: JsonSchema) -> ToolSpec {
     })
 }
 
+/// Modellbeschreibung von `job.wait` (R18 F8: kurzes Abfragen, das Ende
+/// kommt als Notiz, keine Warteschleifen).
+const JOB_WAIT_DESCRIPTION: &str = "Short poll: wait at most timeout_secs (1-60) until the job \
+     ends or reaches the next milestone (new error lines, progress crossing a 10% step, or a \
+     phase change such as cargo `Finished`). Returns the outcome (finished/milestone/timeout) \
+     and the job status. You do not need job.wait to learn that a job ended: its end (exit \
+     code, duration, last lines) is delivered to you automatically as a note. Do not call \
+     job.wait in a loop; after a timeout, continue other work or end your turn and react \
+     to the job's end note.";
+
 fn tool_specs() -> Vec<ToolSpec> {
     vec![
         spec(
@@ -359,7 +374,8 @@ fn tool_specs() -> Vec<ToolSpec> {
              system notes: job start, progress every notify_every_secs (default 60, only when \
              something changed; 0 = off), error lines as they appear, and the end with exit \
              code, duration and the last 20 lines. Do not poll in a loop: continue other work \
-             or call job.wait. On the host the job gets a filtered environment (PATH, HOME, \
+             or end your turn; the end note arrives on its own (job.wait is only a short poll, \
+             at most 60 s). On the host the job gets a filtered environment (PATH, HOME, \
              locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; \
              names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); \
              pass anything else explicitly via env.",
@@ -517,16 +533,17 @@ fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             JOB_WAIT_TOOL,
-            "Wait, bounded by timeout_secs (1-600), until the job ends or reaches the next \
-             milestone (new error lines, progress crossing a 10% step, or a phase change such \
-             as cargo `Finished`). Returns the outcome (finished/milestone/timeout) and the \
-             job status.",
+            JOB_WAIT_DESCRIPTION,
             object(
                 vec![
                     ("job_id", job_id_prop()),
                     (
                         "timeout_secs",
-                        prop(JsonSchemaType::Integer, "Maximum seconds to wait (1-600)."),
+                        prop(
+                            JsonSchemaType::Integer,
+                            "Maximum seconds to wait: a short poll, 1-60. Larger values are \
+                             rejected.",
+                        ),
                     ),
                 ],
                 &["job_id", "timeout_secs"],
@@ -625,6 +642,22 @@ struct WaitArgs {
     job_id: String,
     #[serde(deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
     timeout_secs: Option<u64>,
+}
+
+/// Prüft `timeout_secs` von `job.wait` (R18 F8, EX-05): `1..=MAX_WAIT_SECS`,
+/// alles andere — auch ein zu großer Wert — ist `InvalidArguments` mit dem
+/// Hinweis, dass das Ende als Notiz kommt (kein stilles Klemmen).
+fn parse_wait_secs(raw: Option<u64>) -> Result<u64, ToolsError> {
+    match raw {
+        Some(secs) if (1..=MAX_WAIT_SECS).contains(&secs) => Ok(secs),
+        _ => Err(invalid(
+            JOB_WAIT_TOOL,
+            format!(
+                "timeout_secs must be between 1 and {MAX_WAIT_SECS}: job.wait is a short poll. \
+                 The job's end is delivered to you as a note; do not wait in a loop."
+            ),
+        )),
+    }
 }
 
 fn invalid(tool: &str, reason: impl Into<String>) -> ToolsError {
@@ -967,15 +1000,21 @@ impl JobToolExecutor {
             notify_every,
             owner,
         };
-        match manager.start_with_warnings(request, launch.job, launch.warnings) {
+        // R18: Herkunft für die Verknüpfung Job ↔ Werkzeugzelle (TUI).
+        let origin = JobOrigin {
+            call_id: Some(call.id.as_str().to_owned()),
+            tool: Some(call.name.as_str().to_owned()),
+            owner_agent: None,
+        };
+        match manager.start_with_origin(request, launch.job, launch.warnings, origin) {
             Ok(status) => {
                 info!(job_id = %status.meta.job_id, "job.start");
                 let mut value = status_json(&status);
                 value["notify_every_secs"] = json!(notify_every.as_secs());
                 value["note"] = json!(
                     "Job runs in the background. You will receive progress/error/finish notes \
-                     automatically; use job.wait to block until the next milestone, job.logs \
-                     for output, job.stop to stop it."
+                     automatically, so do not loop on job.wait (a short poll of at most 60 s); \
+                     use job.logs for output, job.stop to stop it."
                 );
                 Ok(ToolOutput::json(value))
             }
@@ -1084,16 +1123,7 @@ impl JobToolExecutor {
     ) -> Result<ToolOutput, ToolsError> {
         let args: WaitArgs = parse_args(JOB_WAIT_TOOL, call)?;
         let id = parse_job_id(JOB_WAIT_TOOL, &args.job_id)?;
-        let secs = match args.timeout_secs {
-            Some(secs) if (1..=MAX_WAIT_SECS).contains(&secs) => secs,
-            Some(secs) if secs > MAX_WAIT_SECS => MAX_WAIT_SECS,
-            _ => {
-                return Err(invalid(
-                    JOB_WAIT_TOOL,
-                    format!("timeout_secs must be between 1 and {MAX_WAIT_SECS}"),
-                ));
-            }
-        };
+        let secs = parse_wait_secs(args.timeout_secs)?;
         let caller = Caller::Agent(context.session_id().as_str());
         match self
             .shared

@@ -14,13 +14,19 @@
 //! Hello gate: until a `session.hello` succeeds, every other method gets
 //! `HELLO_REQUIRED` without reaching the port, and the connection closes
 //! when hello does not succeed within [`WsLimits::hello_timeout`].
+//!
+//! R18: the caps granted in the hello acknowledgement are kept for the
+//! dispatcher's cap gate on `tool.*`/`gateway.*` ([`crate::dispatch::required_cap`]);
+//! an acknowledgement that does not decode grants nothing (fail closed).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use harw_protocol::session_wire::error_codes;
-use harw_protocol::{FrameEnvelope, FrameSource, RequestEnvelope, SessionFrame, SessionPort};
+use harw_protocol::session_wire::{HelloAck, error_codes};
+use harw_protocol::{
+    ClientCaps, FrameEnvelope, FrameSource, RequestEnvelope, SessionFrame, SessionPort,
+};
 use harw_types::SessionId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -30,7 +36,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::codec::{CloseReason, Inbound, decode, encode_frame, encode_response, error_response};
-use crate::dispatch::{Dispatched, dispatch, is_hello};
+use crate::dispatch::{Dispatched, Ports, dispatch_ports, is_hello};
 use crate::limits::WsLimits;
 
 /// How a connection ended.
@@ -68,10 +74,24 @@ struct Finished {
 ///
 /// `port` is already bound to the connection's authenticated identity; this
 /// function never looks at identity. `shutdown` flipping to `true` closes the
-/// connection with [`CloseReason::Draining`].
+/// connection with [`CloseReason::Draining`]. Session methods only; use
+/// [`serve_connection_with`] to also serve `tool.*` and `gateway.*`.
 pub async fn serve_connection<S>(
-    mut ws: WebSocketStream<S>,
+    ws: WebSocketStream<S>,
     port: Arc<dyn SessionPort>,
+    limits: WsLimits,
+    shutdown: watch::Receiver<bool>,
+) -> ConnectionEnd
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_connection_with(ws, Ports::session_only(port), limits, shutdown).await
+}
+
+/// Like [`serve_connection`], serving every table `ports` offers (R18).
+pub async fn serve_connection_with<S>(
+    mut ws: WebSocketStream<S>,
+    ports: Ports,
     limits: WsLimits,
     mut shutdown: watch::Receiver<bool>,
 ) -> ConnectionEnd
@@ -87,6 +107,7 @@ where
     let mut next_epoch: u64 = 0;
     let mut hello_done = false;
     let mut hello_pending: Option<String> = None;
+    let mut granted = ClientCaps::NONE;
 
     let hello_deadline = Instant::now() + limits.hello_timeout;
     let mut last_inbound = Instant::now();
@@ -124,7 +145,8 @@ where
                     Ok(Inbound::Request(request)) => {
                         let outcome = admit_request(
                             request,
-                            &port,
+                            &ports,
+                            granted,
                             &limits,
                             &in_flight,
                             &done_tx,
@@ -158,6 +180,7 @@ where
                     hello_pending = None;
                     if let Dispatched::Response(response) = &finished.dispatched {
                         hello_done = response.error.is_none();
+                        granted = granted_caps(response);
                     }
                 }
                 let result = match finished.dispatched {
@@ -221,9 +244,22 @@ where
     for (session, attachment) in attachments.drain() {
         attachment.pump.abort();
         // Best effort: the host also cleans up when the stream is dropped.
-        let _ = tokio::time::timeout(limits.hello_timeout, port.detach(session)).await;
+        let _ = tokio::time::timeout(limits.hello_timeout, ports.session.detach(session)).await;
     }
     end
+}
+
+/// Caps from a successful hello acknowledgement; anything else grants
+/// nothing.
+fn granted_caps(response: &harw_protocol::ResponseEnvelope) -> ClientCaps {
+    if response.error.is_some() {
+        return ClientCaps::NONE;
+    }
+    response
+        .result
+        .clone()
+        .and_then(|result| serde_json::from_value::<HelloAck>(result).ok())
+        .map_or(ClientCaps::NONE, |ack| ack.granted)
 }
 
 /// Check one request against the hello gate, duplicate ids and the
@@ -232,7 +268,8 @@ where
 #[allow(clippy::too_many_arguments)]
 fn admit_request(
     request: RequestEnvelope,
-    port: &Arc<dyn SessionPort>,
+    ports: &Ports,
+    granted: ClientCaps,
     limits: &WsLimits,
     in_flight: &Arc<Semaphore>,
     done_tx: &mpsc::Sender<Finished>,
@@ -284,10 +321,10 @@ fn admit_request(
     if hello {
         *hello_pending = Some(id.clone());
     }
-    let port = Arc::clone(port);
+    let ports = ports.clone();
     let done_tx = done_tx.clone();
     tokio::spawn(async move {
-        let dispatched = dispatch(port.as_ref(), request).await;
+        let dispatched = dispatch_ports(&ports, granted, request).await;
         // Detach of an unknown session still answers; the writer ignores it.
         let _ = done_tx
             .send(Finished {

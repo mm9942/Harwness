@@ -1,24 +1,31 @@
 //! End-to-end: HTTP/1 upgrade (hyper) → `harw.session.v1` WebSocket →
 //! connection driver → session host → scripted driver, and back as frames.
+//! R18: the same path serves `tool.*`/`gateway.*` for an agent principal.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use harw_protocol::methods::{
-    METHOD_SESSION_ATTACH, METHOD_SESSION_CREATE, METHOD_SESSION_HELLO, METHOD_TURN_SUBMIT,
+    METHOD_GATEWAY_STATUS, METHOD_SESSION_ATTACH, METHOD_SESSION_CREATE, METHOD_SESSION_HELLO,
+    METHOD_TOOL_CALL, METHOD_TOOL_LIST, METHOD_TURN_SUBMIT,
 };
-use harw_protocol::session_wire::SessionSummary;
+use harw_protocol::session_wire::{HelloAck, SessionSummary, ToolListResult, error_codes};
 use harw_protocol::{
-    FrameEnvelope, ProtocolVersion, RequestEnvelope, ResponseEnvelope, SessionFrame, TurnEvent,
-    WireMessage,
+    ClientCaps, FrameEnvelope, PortError, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
+    SessionFrame, ToolRefusal, TurnEvent, WireMessage,
 };
 use harw_session_host::approvals::MemoryApprovals;
 use harw_session_host::driver::{
     CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome,
 };
 use harw_session_host::replay::MemoryTranscripts;
-use harw_session_host::{ClientIdentity, ConnectionId, HostConfig, SessionHost, caps_for_tier};
+use harw_session_host::{
+    AgentCredential, ClientIdentity, ConnectionId, HostConfig, NoGatewaySandbox, SessionHost,
+    ToolGrant, ToolHost, caps_for_tier,
+};
+use harw_session_ws::conn::serve_connection_with;
+use harw_session_ws::dispatch::Ports;
 use harw_session_ws::{WsLimits, serve_connection, upgrade};
 use harw_types::{
     ApprovalActor, AuthStrength, IngressSurface, PermissionTier, Principal, PrincipalKind,
@@ -94,26 +101,44 @@ fn identity() -> ClientIdentity {
         zone: TrustZone::Local,
         strength: AuthStrength::PeerCredential,
         connection: ConnectionId::next(),
+        agent: None,
     }
 }
 
 /// Serve one HTTP/1 connection whose only route upgrades into the session
 /// control plane for a fixed, already-authenticated identity.
 fn spawn_server(io: tokio::io::DuplexStream, host: SessionHost) {
+    spawn_server_for(io, host, identity(), false);
+}
+
+/// Like [`spawn_server`] for any identity; `r18` also serves the tool and
+/// gateway tables of the host connection.
+fn spawn_server_for(
+    io: tokio::io::DuplexStream,
+    host: SessionHost,
+    identity: ClientIdentity,
+    r18: bool,
+) {
     tokio::spawn(async move {
         let service = service_fn(move |request: hyper::Request<Incoming>| {
             let host = host.clone();
+            let identity = identity.clone();
             async move {
                 let limits = WsLimits::default();
                 let upgraded = upgrade::upgrade_server(
                     request,
                     limits.tungstenite_config(),
                     move |ws| async move {
-                        let Ok(port) = host.connect(identity()) else {
+                        let Ok(port) = host.connect(identity) else {
                             return;
                         };
                         let (_tx, shutdown) = watch::channel(false);
-                        serve_connection(ws, Arc::new(port), limits, shutdown).await;
+                        if r18 {
+                            let ports = Ports::all(Arc::new(port));
+                            serve_connection_with(ws, ports, limits, shutdown).await;
+                        } else {
+                            serve_connection(ws, Arc::new(port), limits, shutdown).await;
+                        }
                     },
                 );
                 let response = match upgraded {
@@ -288,5 +313,97 @@ async fn browser_origin_is_refused() -> TestResult {
     );
     let response = client(client_io, request).await?;
     assert_eq!(response.status(), hyper::StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+/// R18 over the real transport: an agent principal negotiates minor 2 and
+/// receives `tool_call`; `tool.list` answers its grant; a refused
+/// `tool.call` carries the refusal code and the bare tool name, so the
+/// client restores the typed refusal; `gateway.*` without the cap is
+/// `DENIED`.
+#[tokio::test]
+async fn agent_tool_calls_over_the_websocket() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let host = SessionHost::open_with_tools(
+        HostConfig::new(dir.path().to_path_buf()),
+        Arc::new(EchoDriver),
+        Arc::new(MemoryTranscripts::new()),
+        Arc::new(MemoryApprovals::new()),
+        ToolHost::builder(Arc::new(NoGatewaySandbox)).build()?,
+    )?;
+    let credential = AgentCredential::new("cred-uia")?;
+    host.agents()
+        .enroll_uia(credential.clone(), "agent:uia", None, &ToolGrant::none())?;
+    let resolved = host
+        .agents()
+        .resolve(&credential)
+        .ok_or("agent not enrolled")?;
+    let agent = ClientIdentity {
+        caps: caps_for_tier(PermissionTier::Operator).with(ClientCaps::TOOL_CALL),
+        label: "uia".into(),
+        connection: ConnectionId::next(),
+        agent: Some(resolved.principal),
+        ..identity()
+    };
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    spawn_server_for(server_io, host, agent, true);
+    let (request, key) = upgrade::client_request("localhost")?;
+    let response = client(client_io, request).await?;
+    upgrade::verify_client_response(&response, &key)?;
+    let upgraded = hyper::upgrade::on(response).await?;
+    let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
+
+    let hello = call(
+        &mut ws,
+        "1",
+        METHOD_SESSION_HELLO,
+        serde_json::json!({"client_label": "uia", "wire_minor": 2, "features": ["tools"]}),
+    )
+    .await?;
+    let ack: HelloAck = serde_json::from_value(hello.result.ok_or("no hello result")?)?;
+    assert!(ack.granted.tool_call);
+    assert_eq!(ack.features, vec!["tools".to_owned()]);
+
+    let created = call(&mut ws, "2", METHOD_SESSION_CREATE, serde_json::json!({})).await?;
+    let summary: SessionSummary = serde_json::from_value(created.result.ok_or("no result")?)?;
+    let session = summary.session_id.as_str();
+
+    let listed = call(
+        &mut ws,
+        "3",
+        METHOD_TOOL_LIST,
+        serde_json::json!({"session_id": session}),
+    )
+    .await?;
+    let tools: ToolListResult = serde_json::from_value(listed.result.ok_or("no list")?)?;
+    assert!(tools.tools.is_empty());
+
+    let refused = call(
+        &mut ws,
+        "4",
+        METHOD_TOOL_CALL,
+        serde_json::json!({
+            "session_id": session,
+            "turn_id": "t-1",
+            "call_id": "c-1",
+            "tool_name": "fs.read",
+            "arguments": {}
+        }),
+    )
+    .await?;
+    let error = refused.error.ok_or("tool.call was not refused")?;
+    assert_eq!(
+        PortError::from_code(error.code, error.message),
+        PortError::ToolRefused {
+            refusal: ToolRefusal::UnknownTool,
+            detail: "fs.read".into()
+        }
+    );
+
+    let status = call(&mut ws, "5", METHOD_GATEWAY_STATUS, serde_json::Value::Null).await?;
+    assert_eq!(
+        status.error.map(|error| error.code),
+        Some(error_codes::DENIED)
+    );
     Ok(())
 }

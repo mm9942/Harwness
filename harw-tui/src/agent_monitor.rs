@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use harw_core::{AgentEvent, AgentEventKind};
-use harw_protocol::{AgentOrchestrationStatus, ContentPart, ToolCallResult, TurnEvent, TurnItem};
+use harw_extension_api::{ToolCall, ToolName};
+use harw_protocol::{
+    AgentOrchestrationStatus, ContentPart, ToolCallResult, ToolPlacement, TurnEvent, TurnItem,
+};
 use harw_types::{SessionId, TokenUsage};
 use ratatui::{
     buffer::Buffer,
@@ -29,6 +32,9 @@ use ratatui::{
 };
 
 use crate::chat_scroll::ChatScroll;
+use crate::child_stream::redact_result;
+use crate::export::redact_json_value;
+use crate::history_cell::{ToolCell, ToolState, tool_label};
 use crate::jobs_panel::JobRow;
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::status_line::{display_width, fit_width, model_segment};
@@ -40,7 +46,7 @@ const PREVIEW_CHARS: usize = 240;
 pub(crate) const MAX_TRACE_ENTRIES: usize = 400;
 /// Maximale Textmenge (Bytes) einer [`AgentTrace`].
 pub(crate) const MAX_TRACE_BYTES: usize = 64 * 1024;
-/// Maximale Länge der Argument-Vorschau eines Werkzeugaufrufs (Zeichen).
+/// Maximale Länge des Werkzeug-Labels in der Spur (Zeichen).
 const ARGS_PREVIEW_CHARS: usize = 160;
 /// Maximale Länge der Ergebnis-Vorschau eines Werkzeugaufrufs (Zeichen).
 const RESULT_PREVIEW_CHARS: usize = 240;
@@ -56,9 +62,14 @@ pub(crate) enum TraceEntry {
     Text(String),
     /// Reasoning-/Denktext, getrennt vom Antworttext.
     Reasoning(String),
-    /// Angeforderter Werkzeugaufruf mit kompakter Argument-Vorschau.
+    /// Angeforderter Werkzeugaufruf. `name` ist das Klartext-Label aus
+    /// [`crate::history_cell::tool_label`] (z. B. `Shell(ls)`), nie rohes
+    /// JSON; `args_preview` bleibt leer (R18 D-D: kein roher
+    /// Argument-Dump in der Detailansicht).
     ToolCall { name: String, args_preview: String },
-    /// Ergebnis eines Werkzeugaufrufs.
+    /// Ergebnis eines Werkzeugaufrufs. `name` ist das Label des Aufrufs,
+    /// `preview` der Ausgang aus [`ToolCell::compact_outcome`] (Dauer, Ort,
+    /// Zusammenfassung).
     ToolResult {
         name: String,
         ok: bool,
@@ -100,6 +111,8 @@ enum StreamKind {
 struct CallMark {
     id: String,
     name: String,
+    /// Klartext-Label des Aufrufs ([`crate::history_cell::tool_label`]).
+    label: String,
     call_logged: bool,
     result_logged: bool,
 }
@@ -236,10 +249,18 @@ impl AgentTrace {
     }
 
     /// Merkt sich einen Aufruf; ältere Marken fallen ab [`MAX_CALL_MARKS`] heraus.
-    fn remember(&mut self, call_id: &str, name: &str, call_logged: bool, result_logged: bool) {
+    fn remember(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        label: String,
+        call_logged: bool,
+        result_logged: bool,
+    ) {
         self.calls.push_back(CallMark {
             id: call_id.to_owned(),
             name: name.to_owned(),
+            label,
             call_logged,
             result_logged,
         });
@@ -249,40 +270,79 @@ impl AgentTrace {
     }
 
     /// Protokolliert einen Werkzeugaufruf (höchstens einmal je `call_id`).
-    fn record_call(&mut self, call_id: &str, name: &str, arguments: &serde_json::Value) {
+    ///
+    /// Das Label entsteht wie im Hauptverlauf über
+    /// [`crate::history_cell::tool_label`] (aus redigierten Argumenten), statt
+    /// rohes JSON zu zeigen.
+    fn record_call(
+        &mut self,
+        call_id: &harw_types::ToolCallId,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) {
         let already = self
-            .mark(call_id)
+            .mark(call_id.as_str())
             .map(|mark| std::mem::replace(&mut mark.call_logged, true));
-        match already {
-            Some(true) => return,
-            Some(false) => {}
-            None => self.remember(call_id, name, true, false),
+        if already == Some(true) {
+            return;
+        }
+        let call = ToolCall {
+            id: call_id.clone(),
+            name: ToolName::new(name),
+            arguments: redact_json_value(arguments),
+        };
+        let label = clip_chars(&sanitize_inline(&tool_label(&call)), ARGS_PREVIEW_CHARS);
+        match self.mark(call_id.as_str()) {
+            Some(mark) => mark.label = label.clone(),
+            None => self.remember(call_id.as_str(), name, label.clone(), true, false),
         }
         self.push(TraceEntry::ToolCall {
-            name: sanitize_inline(name),
-            args_preview: args_preview(arguments),
+            name: label,
+            args_preview: String::new(),
         });
     }
 
     /// Protokolliert ein Werkzeugergebnis (höchstens einmal je `call_id`).
-    fn record_result(&mut self, call_id: &str, result: &ToolCallResult) {
+    ///
+    /// Der Ausgang wird wie im Hauptverlauf über eine [`ToolCell`] bestimmt
+    /// (werkzeugspezifische Zusammenfassung, `exit N` als Fehlschlag), mit
+    /// Dauer und Ort ([`ToolCell::compact_outcome`]).
+    fn record_result(
+        &mut self,
+        call_id: &str,
+        result: &ToolCallResult,
+        duration_ms: u64,
+        placement: Option<&ToolPlacement>,
+    ) {
         let known = self.mark(call_id).map(|mark| {
             (
                 std::mem::replace(&mut mark.result_logged, true),
                 mark.name.clone(),
+                mark.label.clone(),
             )
         });
-        let name = match known {
-            Some((true, _)) => return,
-            Some((false, name)) => name,
+        let (name, label) = match known {
+            Some((true, _, _)) => return,
+            Some((false, name, label)) => (name, label),
             None => {
-                self.remember(call_id, "?", true, true);
-                "?".to_owned()
+                self.remember(call_id, "?", String::new(), true, true);
+                ("?".to_owned(), String::new())
             }
         };
-        let (ok, preview) = result_preview(result);
+        let label = if label.is_empty() {
+            sanitize_inline(&name)
+        } else {
+            label
+        };
+        let mut cell = ToolCell::labelled(&name, label.clone());
+        cell.complete_at(&redact_result(result), duration_ms, placement);
+        let ok = cell.state != ToolState::Failed;
+        let preview = clip_chars(
+            &sanitize_inline(&cell.compact_outcome()),
+            RESULT_PREVIEW_CHARS,
+        );
         self.push(TraceEntry::ToolResult {
-            name: sanitize_inline(&name),
+            name: label,
             ok,
             preview,
         });
@@ -324,31 +384,6 @@ fn clip_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-/// Kompakte, einzeilige Vorschau von Werkzeugargumenten.
-fn args_preview(arguments: &serde_json::Value) -> String {
-    let raw = match arguments {
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
-    };
-    clip_chars(&sanitize_inline(&raw), ARGS_PREVIEW_CHARS)
-}
-
-/// Erfolg und kompakte, einzeilige Vorschau eines Werkzeugergebnisses.
-fn result_preview(result: &ToolCallResult) -> (bool, String) {
-    let (ok, raw) = match result {
-        ToolCallResult::Success { value } => (
-            true,
-            match value {
-                serde_json::Value::String(text) => text.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            },
-        ),
-        ToolCallResult::Error { message } => (false, message.clone()),
-    };
-    (ok, clip_chars(&sanitize_inline(&raw), RESULT_PREVIEW_CHARS))
 }
 
 /// Verbindet die Textteile eines Nachrichteninhalts.
@@ -760,11 +795,15 @@ impl AgentMonitor {
                 }
                 TurnItem::ToolCall(call) => {
                     live.trace
-                        .record_call(call.call_id.as_str(), &call.tool_name, &call.arguments);
+                        .record_call(&call.call_id, &call.tool_name, &call.arguments);
                 }
                 TurnItem::ToolResult(result) => {
-                    live.trace
-                        .record_result(result.call_id.as_str(), &result.result);
+                    live.trace.record_result(
+                        result.call_id.as_str(),
+                        &result.result,
+                        result.duration_ms,
+                        None,
+                    );
                 }
                 TurnItem::Error(error) => {
                     live.trace
@@ -809,16 +848,25 @@ impl AgentMonitor {
             } => {
                 live.phase = AgentPhase::Tool;
                 live.current_tool = Some(tool_name.clone());
-                live.trace
-                    .record_call(call_id.as_str(), tool_name, arguments);
+                live.trace.record_call(call_id, tool_name, arguments);
             }
             TurnEvent::ToolCallCompleted {
-                call_id, result, ..
+                call_id,
+                result,
+                duration_ms,
+                placement,
+                ..
             } => {
                 live.tool_calls = live.tool_calls.saturating_add(1);
                 live.current_tool = None;
                 live.phase = AgentPhase::Thinking;
-                live.trace.record_result(call_id.as_str(), result);
+                // R18: Dauer und Ort bleiben in der Spur erhalten.
+                live.trace.record_result(
+                    call_id.as_str(),
+                    result,
+                    *duration_ms,
+                    placement.as_ref(),
+                );
             }
             TurnEvent::ChildSpawned { role, question, .. } => {
                 live.phase = AgentPhase::Waiting;
@@ -2661,6 +2709,7 @@ mod tests {
                     call_id: call_id.clone(),
                     result: ToolCallResult::error("nicht gefunden"),
                     duration_ms: 3,
+                    placement: None,
                 },
                 TurnEvent::ItemAdded {
                     turn_id: turn,
@@ -2678,17 +2727,61 @@ mod tests {
             trace_of(&monitor)?,
             vec![
                 TraceEntry::ToolCall {
-                    name: "fs.read".into(),
-                    args_preview: r#"{"path":"src/lib.rs"}"#.into(),
+                    name: "Read(src/lib.rs)".into(),
+                    args_preview: String::new(),
                 },
                 TraceEntry::ToolResult {
-                    name: "fs.read".into(),
+                    name: "Read(src/lib.rs)".into(),
                     ok: false,
-                    preview: "nicht gefunden".into(),
+                    preview: "3ms · nicht gefunden".into(),
                 },
             ]
         );
         assert_eq!(monitor.agent("a").ok_or("agent")?.tool_calls, 1);
+        Ok(())
+    }
+
+    /// R18 D-D: die Spur zeigt Label statt rohem JSON und behält Dauer, Ort
+    /// und den werkzeugspezifischen Ausgang (`exit 1` = Fehlschlag).
+    #[test]
+    fn tool_trace_uses_labels_duration_and_placement() -> TestResult {
+        let turn = t1()?;
+        let call_id = harw_types::ToolCallId::new();
+        let mut monitor = AgentMonitor::default();
+        apply_all(
+            &mut monitor,
+            vec![
+                TurnEvent::ToolCallRequested {
+                    turn_id: turn.clone(),
+                    call_id: call_id.clone(),
+                    tool_name: "shell.exec".into(),
+                    arguments: serde_json::json!({"command": "false"}),
+                },
+                TurnEvent::ToolCallCompleted {
+                    turn_id: turn,
+                    call_id,
+                    result: ToolCallResult::success(serde_json::json!({
+                        "exit_code": 1, "stdout": "", "stderr": "boom"
+                    })),
+                    duration_ms: 1500,
+                    placement: Some(ToolPlacement::Sandbox),
+                },
+            ],
+        )?;
+        assert_eq!(
+            trace_of(&monitor)?,
+            vec![
+                TraceEntry::ToolCall {
+                    name: "Shell(false)".into(),
+                    args_preview: String::new(),
+                },
+                TraceEntry::ToolResult {
+                    name: "Shell(false)".into(),
+                    ok: false,
+                    preview: "1.5s · sandbox · exit 1".into(),
+                },
+            ]
+        );
         Ok(())
     }
 
@@ -2894,13 +2987,14 @@ mod tests {
                     turn_id: turn.clone(),
                     call_id: call_id.clone(),
                     tool_name: "fs.grep".into(),
-                    arguments: serde_json::json!({"q": "cfg"}),
+                    arguments: serde_json::json!({"pattern": "cfg"}),
                 },
                 TurnEvent::ToolCallCompleted {
                     turn_id: turn.clone(),
                     call_id,
-                    result: ToolCallResult::success(serde_json::json!("3 Treffer")),
+                    result: ToolCallResult::success(serde_json::json!({"matches": [1, 2, 3]})),
                     duration_ms: 1,
+                    placement: None,
                 },
                 TurnEvent::AssistantDelta {
                     turn_id: turn,
@@ -2915,8 +3009,11 @@ mod tests {
         assert!(shown.contains("ctx"), "{shown}");
         assert!(shown.contains("25%"), "{shown}");
         assert!(shown.contains("∴ geheimer Gedanke"), "{shown}");
-        assert!(shown.contains("⚙ fs.grep"), "{shown}");
-        assert!(shown.contains("✓ fs.grep 3 Treffer"), "{shown}");
+        assert!(shown.contains("⚙ Search(\"cfg\" in .)"), "{shown}");
+        assert!(
+            shown.contains("✓ Search(\"cfg\" in .) 1ms · 3 Treffer"),
+            "{shown}"
+        );
         assert!(shown.contains("Gefunden in harw.toml"), "{shown}");
 
         let hidden = render_to_string(&monitor, 70, 20, 0, false)?;
@@ -3167,6 +3264,7 @@ mod tests {
             runtime: "4m10s".to_owned(),
             active,
             failed,
+            reason: None,
         }
     }
 

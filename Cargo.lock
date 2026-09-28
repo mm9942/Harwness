@@ -3416,6 +3416,7 @@ dependencies = [
  "harw-operations",
  "harw-plan",
  "harw-plan-bridge",
+ "harw-protocol",
  "harw-provider",
  "harw-provider-http",
  "harw-registry-defaults",
@@ -3680,7 +3681,9 @@ dependencies = [
  "harw-session-store",
  "harw-tool-job",
  "harw-tool-plan",
+ "harw-tool-remote",
  "harw-tool-shell",
+ "harw-tools",
  "harw-types",
  "jiff",
  "secrecy 0.10.3",
@@ -3788,9 +3791,12 @@ dependencies = [
 name = "harw-session-host"
 version = "0.8.0"
 dependencies = [
+ "harw-authority",
  "harw-fsutil",
  "harw-protocol",
+ "harw-sandbox",
  "harw-session-store",
+ "harw-tools",
  "harw-types",
  "jiff",
  "serde",
@@ -4016,6 +4022,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "harw-tool-remote"
+version = "0.8.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-protocol",
+ "harw-tools",
+ "harw-types",
+ "serde_json",
  "tokio",
  "tracing",
 ]

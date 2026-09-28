@@ -372,6 +372,8 @@ layer = "A"
 layer = "A"
 [packages."harw-session-host"]
 layer = "A"
+[packages."harw-tool-remote"]
+layer = "A"
 [packages."harw-session-ws"]
 layer = "A"
 [packages."harw-tailscale"]

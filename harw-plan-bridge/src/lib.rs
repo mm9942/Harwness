@@ -137,9 +137,11 @@ pub use crate::verify_exec::{
 };
 pub use crate::work_driver::{
     BudgetUsageSnapshot, DEFAULT_WORKER_ROLE, GiveUpReason, JUDGE_FOLLOWUP_SCOPE,
-    JUDGE_INSTRUCTION, JudgeVerdict, RespawnReason, VerificationState, WorkDriveInput,
-    WorkDriveLimits, WorkDrivePlan, WorkDriveStep, WorkDriver, WorkScope, WorkerOutcome,
-    WorkerResultSummary, WorkerState,
+    JUDGE_INSTRUCTION, JudgeVerdict, NO_REPORT_REASON, RespawnReason, TASK_RULES,
+    VerificationState, WORK_DRIVER_REPORT_TOOL, WORKSPACE_SCOPE, WorkDriveInput, WorkDriveLimits,
+    WorkDrivePlan, WorkDriveStep, WorkDriver, WorkScope, WorkerOutcome, WorkerReport,
+    WorkerReportError, WorkerReportStatus, WorkerResultSummary, WorkerState, is_workspace_scope,
+    scope_hints_from_plan,
 };
 
 /// Gemeinsame Test-Fixtures für alle Module dieser Crate.

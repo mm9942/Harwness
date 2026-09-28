@@ -85,6 +85,68 @@ fn test_tool_specs_and_parallel_safety() -> TestResult {
     Ok(())
 }
 
+/// R18 F8 (EX-05): `job.wait` is a short poll (cap 60 s); the description
+/// and the rejection tell the model not to loop and that the end arrives as
+/// a note.
+#[test]
+fn test_job_wait_is_a_documented_short_poll() -> TestResult {
+    assert_eq!(MAX_WAIT_SECS, 60);
+    assert!(JOB_WAIT_DESCRIPTION.contains("Short poll"));
+    assert!(JOB_WAIT_DESCRIPTION.contains("1-60"));
+    assert!(JOB_WAIT_DESCRIPTION.contains("Do not call job.wait in a loop"));
+    assert!(JOB_WAIT_DESCRIPTION.contains("delivered to you automatically"));
+    assert_eq!(parse_wait_secs(Some(60)).map_err(ctx("60 s"))?, 60);
+    assert_eq!(parse_wait_secs(Some(1)).map_err(ctx("1 s"))?, 1);
+    match parse_wait_secs(Some(61)) {
+        Err(ToolsError::InvalidArguments { reason, .. }) => {
+            assert!(reason.contains("short poll"), "{reason}");
+            assert!(reason.contains("note"), "{reason}");
+        }
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "61 s must be rejected, got {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// R18 (P5/P6): `job.start` records the originating call id and tool in
+/// the job's metadata.
+#[tokio::test]
+async fn test_job_start_records_its_origin() -> TestResult {
+    let env = Env::new()?;
+    let provider = provider(&env, Arc::new(NoLineage));
+    let worker = env.exec_context("worker")?;
+    let started = json_of(
+        run(
+            &provider,
+            &worker,
+            JOB_START_TOOL,
+            start_args("echo origin", "origin"),
+        )
+        .await
+        .map_err(ctx("start"))?,
+    )?;
+    let job_id = started["job_id"]
+        .as_str()
+        .and_then(JobId::parse)
+        .ok_or(TestError::Missing("job_id"))?;
+    let status = env
+        .manager
+        .status(&job_id, Caller::Agent("worker"))
+        .map_err(ctx("status"))?;
+    assert_eq!(status.meta.origin_tool.as_deref(), Some(JOB_START_TOOL));
+    assert!(
+        status
+            .meta
+            .origin_call_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+    );
+    Ok(())
+}
+
 /// Plan-Modus/lesendes Profil: kein `ExecuteProcess` → `job.start` lehnt ab,
 /// bevor irgendetwas startet — über den echten `shell.exec`-Weg.
 #[tokio::test]
@@ -398,6 +460,15 @@ async fn test_invalid_arguments_are_rejected() -> TestResult {
             json!({ "job_id": "job-1", "timeout_secs": 0 }),
         ),
         (JOB_WAIT_TOOL, json!({ "job_id": "job-1" })),
+        // R18 F8 (EX-05): above the short-poll cap → rejected, not clamped.
+        (
+            JOB_WAIT_TOOL,
+            json!({ "job_id": "job-1", "timeout_secs": MAX_WAIT_SECS + 1 }),
+        ),
+        (
+            JOB_WAIT_TOOL,
+            json!({ "job_id": "job-1", "timeout_secs": 600 }),
+        ),
     ];
     for (tool, arguments) in cases {
         let result = run(&provider, &worker, tool, arguments.clone()).await;
