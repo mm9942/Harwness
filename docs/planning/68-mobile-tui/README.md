@@ -162,13 +162,19 @@ Keep today's right-side agent/workbench layout unchanged.
 
 ### `PortraitDock`
 
-Initial tuning target:
+Tuned target (R19, portrait evidence 2026-09-28: a narrow, tall tmux pane
+on a portrait monitor showed only the one-line summary at ~50 columns):
 
 ```text
-60 <= cols < 100
+40 <= cols < 100
 rows >= 28
 agents_visible == true
 ```
+
+Below 68 columns the dock is one combined agents/jobs column. On terminals
+narrower than 80 columns the status line takes two rows whenever a goal, plan
+or host-mode mark is shown, so the marks never push mode, model and context out
+of the line.
 
 Render agents/jobs as a top dock.
 
@@ -183,7 +189,7 @@ keep today's one-line summary.
 Example target region:
 
 ```text
-60 <= cols < 100
+40 <= cols < 100
 20 <= rows < 28
 ```
 
@@ -192,7 +198,7 @@ Example target region:
 PL-65 remains authoritative for the future thin-client compact profile:
 
 ```text
-cols < 60 || rows < 20
+cols < 40 || rows < 20
 ```
 
 Until that profile lands, the existing small-terminal behavior stays
@@ -546,5 +552,49 @@ PLANNED:
   portrait pinned top dock + existing wide + existing tiny fallback
 
 IMPLEMENTED:
-  not in this PR
+  R17: PortraitDock (60 <= cols < 100, rows >= 28), combined dock < 68 cols
+  R19: PortraitDock from 40 columns, two-row status line below 80 columns,
+       background child counters, full redraw on resize and Ctrl+L
 ```
+
+## 10.1 R19: narrow portrait panes (evidence 2026-09-28)
+
+Evidence (photo, removed from the tree after adoption): harw in a narrow,
+tall tmux pane on a portrait monitor, roughly 45–55 columns × 60–80 rows.
+
+**Before:**
+
+- The width was below the old 60-column dock threshold, so the agents showed
+  only as the one-line summary `Agenten: ● 2 aktiv (assistant,
+  root-orchestrator) · br…`.
+- The status line was one row. The goal and host-mode marks consumed its
+  width first, and `fit_segments` then dropped mode, approval, model and
+  context without any sign.
+- A background root orchestrator stayed at `läuft · 0 Tools · 0 Tok`. Its cell
+  was only reachable from the turn that started it; later progress arrived
+  through the agent hub only.
+- Redraw leftovers (interleaved or doubled lines) in tmux on a phone: nothing
+  ever cleared the screen, so ratatui's cell diff could not repair a glyph a
+  terminal emulator measured differently.
+
+**After (render tests with measured sizes):**
+
+| Size | Result | Test |
+|---|---|---|
+| 45×60 | dock at the top, full width, running agent visible | `app::tests::narrow_tall_pane_shows_the_agent_dock` |
+| 40×28 … 59×80 | `PortraitDock { split: false }` | `placement::tests::classify_docks_narrow_tall_portrait_panes` |
+| 39×40 | fallback (summary line) | `classify_falls_back_to_summary_or_compact_exactly_like_app_rs_today` |
+| 50 wide, plan mark | marks on row 1, segments on row 2 | `app::tests::narrow_status_line_moves_marks_to_their_own_row` |
+| background child | cell follows hub counters, never backwards | `app::tests::background_child_cell_follows_hub_progress` |
+| Ctrl+L / resize | full redraw, also mid-turn | `app::tests::ctrl_l_requests_a_full_redraw` |
+
+**Remaining limits:**
+
+- Below 40 columns, or below 28 rows, the one-line summary stays.
+- On a two-row status line below 60 columns, the host warning reads
+  `HOST-MODUS AKTIV` without the key hint.
+- A terminal that measures a glyph differently still shows leftovers until
+  the next resize or `Ctrl+L`.
+- Tool calls of durable worker jobs (`agent.run`, WorkDriver) are still only
+  in their transcripts (tracked separately).
+
