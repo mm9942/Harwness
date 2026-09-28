@@ -9,6 +9,24 @@ Semantic Versioning within the 0.x pre-release range.
 ## [Unreleased]
 
 ### Added
+- Session control plane, W00 round 1 (PL-65, contract
+  `docs/planning/65-cloud-sessions/contracts/W00-websocket-control-plane.md`):
+  - `harw-protocol`: `session_wire` (cursor, caps, frames with an additive
+    `Unknown` fallback, typed params/results for the closed method table)
+    and `session_port` (`SessionPort`/`FrameSource`, std futures only).
+  - New crate `harw-session-host`: single writer of hosted sessions with
+    tenant/capability admission, durable records and restart recovery,
+    transcript replay by cursor, a live ring with snapshots, bounded
+    per-attachment queues with coalescing and `Lagged`, compare-and-swap
+    input arbitration with idempotent `client_msg_id`, first-writer-wins
+    approvals with host-derived actors, presence, revocation and drain.
+  - New crate `harw-session-ws`: `harw.session.v1` WebSocket transport
+    (upgrade validation incl. `Origin` refusal, codec and limits, hello
+    gate, request correlation, a fair frame multiplexer that keeps
+    responses ahead of delta floods).
+  - Arch gate: `[[forbidden_crates]]` rules (tungstenite only in ring A;
+    no transport crates in `harw-protocol`).
+  Not wired into `harw gateway`/TUI yet (W04–W06).
 - Tailscale access: `harw tailscale status` and `harw web --tailnet
   [--tailnet-port]`. The control plane listens on the node's tailnet
   address only, admits peers that `tailscaled` identifies via `whois`, and
