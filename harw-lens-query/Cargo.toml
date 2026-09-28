@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-lens-query"
+description = "Query interface for lens-based retrieval with index selection and visibility scoping"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

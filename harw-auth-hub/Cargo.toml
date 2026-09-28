@@ -1,0 +1,70 @@
+[package]
+publish.workspace = true
+name = "harw-auth-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local Auth/Crypto Hub (Masterplan v2 H3): CryptGuard KMS service over Hyper HTTP/1 on an AF_UNIX socket, authenticated via SO_PEERCRED."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "harw-auth-hub"
+path = "src/main.rs"
+
+[dependencies]
+# CryptGuard 3.1: typed Tower KMS service (`buffer` for the cloneable
+# `NetworkHandle`, `ml-dsa` for signing keys in `InMemoryProvider`) and the
+# reference Hyper adapter (routing, bounded bodies, CGK1 codec, error
+# mapping). Features are set once at the workspace root.
+crypt_guard_service = { workspace = true }
+crypt_guard_hyper = { workspace = true }
+# Same majors as `crypt_guard_hyper` (hyper 1, hyper-util 0.1.20+, http 1,
+# http-body-util 0.1), so the adapter's `TowerToHyperService` and our
+# connection service speak the same types.
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "service"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# Strict config (`deny_unknown_fields`) and the descriptive JSON bodies of
+# `/v1/version` and `/v1/capabilities`.
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+clap = { version = "4.6.1", features = ["derive"] }
+# systemd socket activation without `unsafe` in this crate: the same leaf
+# crate and the same approach as `dod/crates/harw-warden/src/systemd.rs`.
+sd-listen-fds = "0.2.0"
+# Sealed, persistent key provider (`src/sealed/`): the CryptGuard facade for
+# the ML-DSA `SignAlgorithm` impls and `OsRng` (same workspace dependency and
+# features as `harw-secrets`), XChaCha20-Poly1305 for the store file (same
+# version as `harw-secrets`), BLAKE3 for the KEK → file-key derivation,
+# `getrandom` for nonces/KEKs, `zeroize` for seeds, `harw-fsutil` for
+# symlink-safe opens, the 0600 check and atomic writes, `fs4` for the
+# single-writer store lock (as `harw-netsec`).
+crypt_guard = { workspace = true }
+chacha20poly1305 = "0.11.0"
+blake3 = { workspace = true }
+getrandom = { version = "0.4.2", features = ["std"] }
+zeroize = "1.8.1"
+harw-fsutil = { path = "../harw-fsutil" }
+fs4 = { workspace = true }
+# Purpose-bound signing (`HarwUsageAuthorizer`: sign/verify only over a
+# `SignTranscript`, no signing oracle) and `MAX_SIGNABLE_TRANSCRIPT_LEN`
+# for the sign body limit. Layer A → D, allowed by the arch policy.
+harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+
+[lints]
+workspace = true

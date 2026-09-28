@@ -1,6 +1,11 @@
 # Relative logical destinations installed by dod/scripts/install.sh.
 # The manifest deliberately excludes /etc/harw-dod/config.toml and all state,
 # telemetry, and runtime files so upgrades/uninstall never remove operator data.
+#
+# The systemd/, sysusers/ and tmpfiles/ entries are installed from the one
+# canonical deploy/ tree at the repository root (Crypto Masterplan v2 §22,
+# H10). The harw-install parity test checks this list against the embedded
+# deployment assets and dod/scripts/install.sh.
 libexec/harw-sentinel
 libexec/harw-probe-bpf
 libexec/harw-probe-fs
@@ -11,10 +16,11 @@ bpf/tcp_v4_connect.bpf.o
 bpf/tcp_v6_connect.bpf.o
 bpf/manifest.json
 systemd/harw-dod.target
-systemd/harw-dod-sentinel.service
-systemd/harw-dod-bpf.service
-systemd/harw-dod-warden.service
-systemd/harw-dod-warden.socket
-sysusers/harw-dod.conf
-tmpfiles/harw-dod.conf
+systemd/harw-sentinel.service
+systemd/harw-probe-bpf.service
+systemd/harw-probe-fs.service
+systemd/harw-warden.service
+systemd/harw-warden.socket
+sysusers/harw.conf
+tmpfiles/harw.conf
 config/config.toml.example

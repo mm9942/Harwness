@@ -4,7 +4,41 @@ All notable changes to this workspace are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project uses
 Semantic Versioning within the 0.x pre-release range.
 
+## [0.8.0] — Unreleased
+
 ## [Unreleased]
+
+### One systemd source of truth (Crypto Masterplan v2 H10)
+
+- `deploy/` is the only source of system units, `sysusers.d` and
+  `tmpfiles.d`. `dod/packaging/{systemd,sysusers.d,tmpfiles.d}` are gone;
+  `dod/scripts/install.sh` installs from `deploy/` and refuses unresolved
+  `@PLACEHOLDER@`s.
+- **Breaking for DoD hosts:** units are renamed (`harw-dod-sentinel` →
+  `harw-sentinel`, `harw-dod-bpf` → `harw-probe-bpf`, `harw-dod-warden` →
+  `harw-warden`; `harw-dod.target` stays), every binary has its own system
+  account (the Warden no longer runs as root: `CAP_DAC_OVERRIDE
+  CAP_NET_ADMIN`), and the sockets live in `/run/harw/` instead of
+  `/run/harw-dod/`. Re-run `sudo make dod-install` and `make dod-enable`;
+  the old unit files are removed, the old accounts are left for manual
+  cleanup.
+- New infrastructure units: `harw-infra.target`, socket-activated
+  `harw-auth-hub` and `harw-netsec` (`.socket` + `.service`, run with
+  `--systemd-socket`), and the self-binding `harw-control.service`
+  (`harw web`) and `harw-security-hub.service`; all sockets under
+  `/run/harw/infra/`.
+- `harw-install` embeds every `deploy/` file in production code;
+  `harw install --print-systemd [UNIT]` prints them.
+
+### One Cargo workspace (PL-60)
+
+- The DoD crates under `dod/crates/` are now members of the root Cargo
+  workspace. `dod/Cargo.toml` (the nested `[workspace]`) and `dod/Cargo.lock`
+  are gone; the root `Cargo.lock` is the single resolution record, and
+  `exclude = ["dod"]` was removed. `semver` moved into the root
+  `[workspace.dependencies]`. CI, `dod/Makefile`, `xtask gates` and the docs
+  build DoD from the root with `-p` selections. See
+  `docs/architecture/dod-workspace-merge-plan.md`.
 
 ### Publication cleanup
 

@@ -1,6 +1,7 @@
 [package]
-publish.workspace = true
 name = "harw-catalog"
+description = "Immutable capability catalog snapshots and safe skill authoring."
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

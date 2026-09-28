@@ -180,3 +180,36 @@ fn test_privileged_feature_activates_exactly_the_five_capability_crates() -> Tes
     }
     Ok(())
 }
+
+/// Crypto Masterplan v2 §3.3: die Fassade hat keine Kante auf
+/// `harw-dod-encrypt` und keine auf eine CryptGuard-Crate — weder unter
+/// `[dependencies]` (auch nicht `optional`) noch unter
+/// `[dev-dependencies]` oder als Feature-Eintrag. Geprüft gegen den
+/// tatsächlichen Manifest-Text; der `compile_fail`-Doctest in `src/lib.rs`
+/// belegt zusätzlich, dass kein Name der Crate über `harw_dod::…`
+/// erreichbar ist, und `xtask/src/gate_edges.rs` verbietet die Kante im
+/// Abhängigkeitsgraphen.
+#[test]
+fn test_facade_manifest_has_no_encrypt_or_crypt_guard_dependency() -> TestResult {
+    let manifest = include_str!("../Cargo.toml");
+
+    for forbidden in [
+        "harw-dod-encrypt",
+        "harw_dod_encrypt",
+        "crypt_guard",
+        "crypt-guard",
+    ] {
+        let offending: Vec<&str> = manifest
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| line.contains(forbidden))
+            .collect();
+        if !offending.is_empty() {
+            return Err(TestError::Unexpected(format!(
+                "harw-dod must not depend on `{forbidden}` (Masterplan v2 §3.3): {offending:?}"
+            )));
+        }
+    }
+    Ok(())
+}

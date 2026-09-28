@@ -1,6 +1,7 @@
 [package]
-publish = false
 name = "harw-dod-scanreport"
+description = "Reads and evaluates external scanner reports in SARIF and cargo audit formats."
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

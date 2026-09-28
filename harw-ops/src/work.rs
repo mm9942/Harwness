@@ -55,12 +55,14 @@ async fn work(ctx: &OpContext, _args: WorkArgs) -> Result<OpOutput, OpError> {
     let store = ctx
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
-    let counts = list_state_counts(store.as_ref())?;
+    let counts = list_state_counts(ctx, store.as_ref())?;
 
     Ok(OpOutput::from(render_work_panel(&counts)))
 }
 
-fn list_state_counts(store: &JobStore) -> Result<[usize; 7], OpError> {
+/// Zählt die für den Aufrufer sichtbaren Jobs je Zustand (H12: ein
+/// mandantengebundener Aufrufer zählt nur Jobs des eigenen Mandanten).
+fn list_state_counts(ctx: &OpContext, store: &JobStore) -> Result<[usize; 7], OpError> {
     let mut counts = [0; 7];
     let mut cursor = None;
 
@@ -73,7 +75,11 @@ fn list_state_counts(store: &JobStore) -> Result<[usize; 7], OpError> {
             })
             .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?;
 
-        for record in page.jobs {
+        for record in page
+            .jobs
+            .iter()
+            .filter(|record| crate::job_tenant::admits_job(ctx, record))
+        {
             counts[state_index(record.job.state)] += 1;
         }
 
@@ -276,6 +282,33 @@ mod tests {
         assert!(output.text.contains(
             "Approval and diff-preview data are unavailable in this local command context."
         ));
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter.
+    #[tokio::test]
+    async fn work_unscoped_caller_counts_all_tenants() -> TestResult {
+        use crate::job_tenant::fixtures::{context, two_tenants};
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = work(&op_ctx, WorkArgs::default())
+            .await
+            .map_err(ctx("work"))?;
+        assert!(output.text.contains("Durable jobs: 2"), "{}", output.text);
+        assert!(output.text.contains("Ready: 2"), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn work_scoped_caller_counts_only_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{TENANT_A, context, two_tenants};
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = work(&op_ctx, WorkArgs::default())
+            .await
+            .map_err(ctx("work"))?;
+        assert!(output.text.contains("Durable jobs: 1"), "{}", output.text);
+        assert!(output.text.contains("Ready: 1"), "{}", output.text);
         Ok(())
     }
 }

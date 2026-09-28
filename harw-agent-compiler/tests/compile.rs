@@ -45,9 +45,13 @@ impl RunnerProbe for FullRunner {
 }
 
 /// An isolated harw home with the given definitions under `agents/<name>/`.
+///
+/// Also installs the real built-in defaults (`harw-registry-defaults`), as
+/// the `harw` binary does at start.
 fn home_with(
     definitions: &[(&str, &str)],
 ) -> Result<(tempfile::TempDir, CompilerEnv), Box<dyn std::error::Error>> {
+    harw_registry_defaults::compiler_defaults::install();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
     for (name, text) in definitions {
@@ -359,6 +363,56 @@ fn test_child_closure_embeds_the_family_and_graphs_render() -> TestResult {
 }
 
 #[test]
+fn test_requirements_are_derived_and_unioned_over_the_family() -> TestResult {
+    use harw_agent_dsl::ir_v2::{RequirementLevel, TargetSpec};
+
+    let reader = worker(
+        "reader",
+        "[tools]\nadmitted = [\"fs.read\"]\n\n[spawn]\nmax_depth = 0\n",
+    );
+    let writer = worker(
+        "writer",
+        "[tools]\nadmitted = [\"fs.read\", \"fs.write\"]\n\n[spawn]\nmax_depth = 0\n",
+    );
+    let (_root, env) = home_with(&[("lead", LEAD), ("reader", &reader), ("writer", &writer)])?;
+    let host = TargetSpec::from_triple(&env.host_target).ok_or("host triple")?;
+
+    let reader = compile(&env, "reader")?;
+    let own = &reader.unit.ir.requirements;
+    assert!(!own.filesystem_write && !own.process_exec && !own.host_access);
+    assert_eq!(own.sandbox.filesystem, RequirementLevel::NotNeeded);
+    assert_eq!(own.targets, std::slice::from_ref(&host), "the build target");
+
+    let lead = compile(&env, "lead")?;
+    let family = &lead.unit.ir.requirements;
+    assert!(
+        family.filesystem_write,
+        "the writer child's write is unioned"
+    );
+    assert_eq!(family.sandbox.filesystem, RequirementLevel::BestEffort);
+    assert_eq!(family.targets, [host]);
+    assert!(lead.unit.ir.verify_snapshot(), "requirements are hashed");
+
+    // An explicit `--target` names that target.
+    let mut cross = Compiler::new(
+        env.clone(),
+        CompilerOptions {
+            target: Some("aarch64-apple-darwin".to_owned()),
+            ..CompilerOptions::default()
+        },
+    )?;
+    let cross = cross.compile_input(&AgentInput::Name("reader".to_owned()))?;
+    assert_eq!(
+        cross.unit.ir.requirements.targets,
+        [TargetSpec {
+            os: "macos".to_owned(),
+            arch: Some("aarch64".to_owned()),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
 fn test_child_cache_keeps_ancestry_and_depth_separate() -> TestResult {
     use harw_agent_compiler::passes::ChildResolver;
 
@@ -646,6 +700,9 @@ fn test_children_sharing_a_skill_store_it_once() -> TestResult {
     let report = harw_agent_compiler::inspect::inspect_path(&artifact_file, None)?;
     let text = report.text();
     assert!(text.contains("einzigartig"), "{text}");
+    assert!(text.contains("  requirements:\n"), "{text}");
+    assert!(text.contains("    targets:    "), "{text}");
+    assert!(text.contains("    sandbox:    filesystem="), "{text}");
     assert!(text.contains("gespart"), "{text}");
     assert!(
         text.contains("skill skills/evidence-quality-review/instructions.md"),

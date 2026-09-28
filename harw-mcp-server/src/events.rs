@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
-use harw_job_runtime::JobState;
+use harw_job_core::JobState;
 use harw_types::WorkId;
 use jiff::Timestamp;
 use serde::Serialize;

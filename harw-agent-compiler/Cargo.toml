@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-agent-compiler"
+description = "Compiler pipeline: agent definitions to compiled agents with discovery, validation, and multiple output backends."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,9 +22,6 @@ harw-catalog = { path = "../harw-catalog" }
 # `home_dir`, `config_layers_report_at` (discovery layers) and the bundled
 # agent definitions (`bundled_files`) as the lowest user-facing layer.
 harw-home = { path = "../harw-home" }
-# Built-in definitions and bases (rights ceilings), the context-program
-# library and the capability catalog.
-harw-registry-defaults = { path = "../harw-registry-defaults" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Same version line as `harw-agent-dsl` (resolution timestamps).
@@ -34,6 +32,11 @@ toml = { workspace = true }
 toml_edit = "0.25.13"
 
 [dev-dependencies]
+# The real `builtins::BuiltinDefaults` (built-in definitions and bases, the
+# context-program library, the capability catalog), installed by the tests
+# as the `harw` binary does. Only a dev-edge: the normal dependency points
+# from `harw-registry-defaults` to this crate (C must not depend on A).
+harw-registry-defaults = { path = "../harw-registry-defaults" }
 tempfile = { workspace = true }
 
 [lints]

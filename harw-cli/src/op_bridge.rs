@@ -37,6 +37,7 @@ use harw_core::InMemoryStateStore;
 use harw_operations::OpError;
 use harw_operations::OpOutput;
 use harw_operations::adapter::CommandAdapter;
+use harw_registry_defaults::ConfigAgents;
 use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores, ServiceSurface,
 };
@@ -94,12 +95,13 @@ pub(crate) fn run_operation(
         target.cwd,
         local_principal(IngressSurface::Cli),
     );
-    let (config, _trust) = harw_runtime::load_config(&spec).map_err(|error| error.to_string())?;
+    let (config, agents, _trust) =
+        harw_runtime::load_config_with_agents(&spec).map_err(|error| error.to_string())?;
 
     // Die Assembly braucht den Ereigniskanal für `SpawnerPolicy::BuiltinRoles`;
     // der Empfänger bleibt bis zum Ende dieser Funktion gebunden, damit keine
     // Sendung an einem geschlossenen Kanal endet.
-    let (assembly, _event_rx) = bridge_assembly(spec, &home, &config)?;
+    let (assembly, _event_rx) = bridge_assembly(spec, &home, &config, &agents)?;
 
     let adapter = find_command(&assembly, &command)?;
     let required = adapter.permission();
@@ -134,6 +136,7 @@ fn bridge_assembly(
     spec: RuntimeSpec,
     home: &Path,
     config: &ResolvedConfig,
+    agents: &ConfigAgents,
 ) -> Result<
     (
         RuntimeAssembly,
@@ -143,7 +146,7 @@ fn bridge_assembly(
 > {
     let job_store = Arc::new(JobStore::new(&profile_storage_root(home)?));
     let plan = open_plan_services(&spec.cwd, config)?;
-    let memory = open_memory(home, config);
+    let memory = open_memory(home, config, agents);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut builder = RuntimeAssembly::builder(spec)
@@ -248,8 +251,12 @@ fn open_plan_services(
 /// Öffnet das Gedächtnis wie der Chat: das der aktiven UIA, sonst das des
 /// aktiven Profils. Scheitert das Öffnen, bleibt es aus (die Operation meldet
 /// dann selbst, dass kein Gedächtnis verfügbar ist).
-fn open_memory(home: &Path, config: &ResolvedConfig) -> Option<Arc<dyn harw_memory::Memory>> {
-    let root = match uia_memory_root(config) {
+fn open_memory(
+    home: &Path,
+    config: &ResolvedConfig,
+    agents: &ConfigAgents,
+) -> Option<Arc<dyn harw_memory::Memory>> {
+    let root = match uia_memory_root(config, agents) {
         Some(root) => root,
         None => match profile_storage_root(home) {
             Ok(profile) => profile.join("memories"),
@@ -270,16 +277,16 @@ fn open_memory(home: &Path, config: &ResolvedConfig) -> Option<Arc<dyn harw_memo
 
 /// `<agent_dir>/memory`, wenn eine aktive UIA (Rolle `user-interface`)
 /// konfiguriert ist — dieselbe Regel wie beim Chat-Start.
-fn uia_memory_root(config: &ResolvedConfig) -> Option<PathBuf> {
+fn uia_memory_root(config: &ResolvedConfig, agents: &ConfigAgents) -> Option<PathBuf> {
     let definition_id = config.harness.active_uia_definition.as_deref()?;
-    let is_uia = config
+    let is_uia = agents
         .executable_agents
         .get(definition_id)
         .is_some_and(|ir| ir.role() == AgentRoleId::UserInterface);
     if !is_uia {
         return None;
     }
-    let agent_dir = config.agent_definition_dirs.get(definition_id)?;
+    let agent_dir = agents.agent_definition_dirs.get(definition_id)?;
     Some(agent_dir.join("memory"))
 }
 

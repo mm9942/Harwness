@@ -1,0 +1,62 @@
+# harw-netsec.service -- HARW NetSec daemon (network.sock).
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22.2, §23, H10).
+# Embedded into harw-install; `harw install --print-systemd harw-netsec.service`
+# prints it.
+#
+# Socket-activated only: harw-netsec.socket hands over exactly one listening
+# descriptor (LISTEN_FDS=1); `--systemd-socket` makes the daemon take it and
+# fail hard otherwise (no fallback to binding a path). No [Install]
+# section; enable the socket (or harw-infra.target), never this service
+# directly.
+#
+# AF_INET/AF_INET6 in addition to AF_UNIX: network.sock is only the local
+# control API; the daemon itself manages node transport over TCP/TLS (§6.2).
+# Binding privileged ports is not granted (empty capability set).
+
+[Unit]
+Description=HARW NetSec daemon (network.sock)
+Requires=harw-netsec.socket
+After=harw-netsec.socket
+PartOf=harw-infra.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=harw-netsec
+Group=harw-netsec
+ExecStart=/usr/bin/harw-netsec --systemd-socket
+Sockets=harw-netsec.socket
+StateDirectory=harw-netsec
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+# -- Hardening --
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=

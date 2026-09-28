@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-oauth"
+description = "PKCE-based OAuth setup, token exchange, and proactive refresh for Claude and ChatGPT"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

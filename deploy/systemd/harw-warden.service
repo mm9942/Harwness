@@ -1,102 +1,82 @@
-# harw-warden.service -- Knoten AW7-03, Klasse "systemd-Socket, kein Netz".
+# harw-warden.service -- DoD enforcement binary, socket-activated, no IP.
 #
-# Gehoert zwingend nach /etc/systemd/system/ -- eine Nutzerinstanz kann
-# weder Capabilities vergeben noch einen Systemsocket unter /run/harw/
-# fuer mehrere Systemnutzer (die drei Sonden) erreichbar machen.
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
+# by dod/scripts/install.sh (LIBEXECDIR, SYSCONFDIR).
 #
-# ANNAHME, ausdruecklich gemacht (die Klassentabelle des Auftrags nennt fuer
-# diese Zeile keine Capability, anders als bei den beiden Sonden): dieser
-# Prozess schreibt in `cgroup.freeze`/`cgroup.kill` unter dem konfigurierten
-# --cgroup-root (Standard /sys/fs/cgroup, siehe harw-warden::cli.rs) --
-# potenziell ausserhalb einer ihm selbst per systemd delegierten
-# Teil-Hierarchie. Laut cgroup-v2-Kernel-Dokumentation verlangt ein
-# schreibender Zugriff auf Kontrolldateien AUSSERHALB der eigenen
-# delegierten Hierarchie CAP_SYS_ADMIN im initialen User-Namespace. Diese
-# Unit gewaehrt deshalb CAP_SYS_ADMIN, obwohl die Tabelle des Auftrags die
-# Zelle fuer diese Zeile offen liess -- eine begruendete Entscheidung
-# dieses Knotens, kein stillschweigend uebernommener Wert, und im
-# Abschlussbericht als Annahme ausgewiesen.
+# Shipped DISABLED: no [Install] section, no edge from harw-dod.target, and
+# the ConditionPathExists= guard below. Opt in with
+# `make -C dod enable-warden` (creates SYSCONFDIR/warden.enable).
 #
-# Landlock: harter Startfehler, keine Degradation (Entscheidung Nr. 4) --
-# harw-warden/src/landlock.rs::enforce_cgroup_root() verlangt Lese- UND
-# Schreibzugriff auf --cgroup-root und laesst (anders als die beiden
-# Sonden, die mehrere Wurzeln haben) KEINE nicht-oeffenbare Wurzel als
-# stillen Teilerfolg zu -- es gibt nur diese eine Wurzel.
+# Identity (H10 reconciliation): a dedicated system user, never root. The
+# earlier DoD-installer variant ran as root with an unrestricted bounding
+# set; this unit keeps exactly the capabilities the code exercises:
+#   CAP_DAC_OVERRIDE -- write cgroup.freeze/cgroup.kill below --cgroup-root.
+#                       Those files are root-owned 0644 outside a delegated
+#                       subtree; cgroup v2 checks plain file permissions for
+#                       them, so DAC override (not CAP_SYS_ADMIN) is what a
+#                       non-root warden needs. Landlock
+#                       (harw-warden/src/landlock.rs) confines all file
+#                       access to --cgroup-root plus read/exec of nft.
+#   CAP_NET_ADMIN    -- network isolation runs /usr/sbin/nft as a child
+#                       (harw-warden/src/isolation.rs); nftables requires
+#                       CAP_NET_ADMIN, inherited through the ambient set.
+#
+# Landlock: hard start failure without full enforcement; there is exactly one
+# writable root (--cgroup-root).
 
 [Unit]
-Description=harw-warden -- Durchsetzer-Binary am systemd-Socket (AW5-04b)
+Description=HARW DoD Warden -- enforcement at the systemd socket (disabled by default)
 Documentation=man:harw-warden(1)
 Requires=harw-warden.socket
 After=harw-warden.socket
-# Requires=+After=, hier bewusst ANDERS als bei den Sonden gegenueber dem
-# Sentinel: dieser Dienst ist ohne "seinen" Socket bedeutungslos --
-# harw-warden::systemd::acquire_listen_socket() verlangt beim Start genau
-# einen von systemd uebergebenen Deskriptor und bricht sonst hart ab
-# (WardenBinError::ListenFds*/UnexpectedListenFdCount). Ein Start dieses
-# Dienstes ohne aktiven Socket ist kein sinnvoller Teilbetrieb -- anders als
-# bei den Sonden gegenueber dem Sentinel gibt es hier keine eigene,
-# feinere Recovery-Reaktion im Binary, die ein hartes Mitreissen ueberfluessig
-# machte.
+# Requires=+After=: harw-warden::systemd::acquire_listen_socket() requires
+# exactly one inherited descriptor and aborts otherwise.
+ConditionPathExists=@SYSCONFDIR@/warden.enable
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=harw-warden
 Group=harw-warden
-ExecStart=/usr/local/bin/harw-warden --log info --cgroup-root /sys/fs/cgroup
+ExecStart=@LIBEXECDIR@/harw-warden --log info --cgroup-root /sys/fs/cgroup
 Sockets=harw-warden.socket
-# Bindet diesen Dienst an genau die oben beschriebene Socket-Unit --
-# systemd uebergibt deren einen Deskriptor als LISTEN_FDS=1, LISTEN_PID=<eigene PID>.
 Restart=on-failure
 RestartSec=5
 
-# -- Haertung: jede Direktive einzeln begruendet --
+# -- Hardening --
 NoNewPrivileges=yes
-# Verhindert den Erwerb weiterer Faehigkeiten ueber exec() -- dieser
-# Prozess ruft nie ein fremdes Programm auf.
 ProtectSystem=strict
-# Dieser Prozess schreibt ausschliesslich unter --cgroup-root
-# (/sys/fs/cgroup) -- das liegt unter den API-Dateisystemen, die "strict"
-# laut systemd.exec(5) unangetastet laesst (siehe auch die explizite
-# Auslassung von ProtectControlGroups= unten). Der Rest des Dateisystems
-# wird schreibgeschuetzt, was dieser Prozess ohnehin nie braucht.
+ReadWritePaths=/sys/fs/cgroup
+# The one writable root (--cgroup-root). Explicit, although systemd keeps
+# /sys/fs/cgroup writable under ProtectKernelTunables= unless
+# ProtectControlGroups= is set.
 ProtectHome=yes
-# Dieser Prozess liest kein Nutzerverzeichnis.
 PrivateTmp=yes
+PrivateDevices=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
-# NICHT ProtectControlGroups=yes: diese Direktive wuerde /sys/fs/cgroup
-# durch eine leere, private cgroup-Namespace-Instanz ersetzen und damit
-# GENAU den Pfad wegnehmen, den dieser Prozess laut Auftrag lassen muss
-# (--cgroup-root, Standard /sys/fs/cgroup) -- der resultierende Fehlschlag
-# saehe wie ein Landlock-Fehler aus (enforce_cgroup_root scheiterte am
-# nicht mehr oeffenbaren PathFd), waere aber ein Konfigurationsfehler dieser
-# Unit. Das ist die im Auftrag ausdruecklich benannte Falle
-# ("Ein Binary, das hart scheitert, weil die Unit ihm den Pfad wegnimmt,
-# sieht aus wie ein Landlock-Fehler und ist einer der Konfiguration.") --
-# diese Zeile haelt die Begruendung fest, statt die Direktive stillschweigend
-# weg zulassen.
-RestrictAddressFamilies=AF_UNIX
-# Die Kernauflage dieser Klasse ("kein Netz im Warden") -- bewusst OHNE
-# AF_INET/AF_INET6/AF_NETLINK. Dieses Binary oeffnet laut seiner eigenen
-# Moduldoku ("Kein Netz") keinen TCP-Socket, macht keine DNS-Aufloesung und
-# bindet keine Netz-Crate ein; sein einziger Kommunikationsweg ist der oben
-# gebundene AF_UNIX-Socket. Diese Zeile ist die Unit-seitige Haelfte des
-# Gates "kein Netz im Warden" -- das Gate selbst prueft die
-# Abhaengigkeiten, diese Unit den laufenden Prozess.
+ProtectKernelLogs=yes
+# NOT ProtectControlGroups=yes: it would replace /sys/fs/cgroup with a
+# read-only view and take away exactly the path this binary must write. The
+# resulting failure would look like a Landlock error but be a unit error.
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# No AF_INET/AF_INET6 ("no network in the warden"). AF_UNIX is the activation
+# socket; AF_NETLINK is only for the nft child, which talks nftables over
+# netlink. RestrictAddressFamilies= is inherited by that child.
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=CAP_SYS_ADMIN
-AmbientCapabilities=CAP_SYS_ADMIN
-# Siehe Begruendung oben (Kommentarblock am Dateianfang) -- die einzige
-# Faehigkeit dieser Klasse, angenommen aus dem tatsaechlichen
-# cgroup-v2-Schreibzugriff dieses Binaries, nicht aus der (hier offenen)
-# Auftragstabelle.
+SystemCallFilter=@system-service
+SystemCallFilter=landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_NET_ADMIN
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_NET_ADMIN
 
-# Kein [Install]-Abschnitt: die Aktivierung laeuft ausschliesslich ueber
-# harw-warden.socket (dessen [Install] WantedBy=sockets.target traegt) --
-# diese Service-Unit selbst wird nie direkt mit `systemctl enable`
-# aktiviert, nur transitiv ueber Requires=/Sockets= beim ersten
-# eingehenden Verbindungsversuch bzw. beim Socket-Start.
+# No [Install] section: activation only through harw-warden.socket, and only
+# after the explicit opt-in above.

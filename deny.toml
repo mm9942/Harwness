@@ -25,13 +25,6 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste transitiv über ratatui (nur Compile-Zeit)" },
     # Nicht mehr gepflegt, Proc-Macro über `hax-lib-macros` (libcrux-Kette).
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 transitiv über hax-lib-macros (nur Compile-Zeit)" },
-    # libcrux-Meldungen: blockiert durch `crypt_guard = "=3.0.1"` (auch 3.0.2),
-    # das `libcrux-ml-kem = "=0.0.9"` exakt pinnt. Ein Upgrade braucht ein
-    # neues crypt_guard-Release und ein Neu-Blessing der KEM-KATs in
-    # `harw-secrets` (siehe dortige Cargo.toml). Offen, nicht erledigt.
-    { id = "RUSTSEC-2026-0207", reason = "libcrux-sha3 0.0.9 über crypt_guard =3.0.1; wartet auf crypt_guard-Upgrade" },
-    { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 0.0.9 über crypt_guard =3.0.1; wartet auf crypt_guard-Upgrade" },
-    { id = "RUSTSEC-2026-0212", reason = "libcrux-secrets 0.0.5 über crypt_guard =3.0.1; wartet auf crypt_guard-Upgrade" },
 ]
 
 [licenses]
@@ -62,6 +55,10 @@ ignore = true
 # Fehler: der Baum zieht sie über fremde Abhängigkeiten, nicht über eigene
 # Entscheidungen. Was wir selbst wählen, steht in [workspace.dependencies].
 multiple-versions = "warn"
+# Seit PL-60 (DoD im Wurzel-Workspace, ein Lockfile) erwartet und bewusst
+# getragen: `nix` 0.29 (transitiv über `zbus`, OS-Keyring in `harw-secrets`)
+# neben `nix` 0.31 (direkt, `harw-probe-fs`, Feature `fanotify`). Zwei
+# Major-Fassungen, keine gemeinsame Wahl möglich; `warn` genügt, kein `skip`.
 wildcards = "deny"
 # Pfad-Abhängigkeiten zwischen eigenen, unveröffentlichten Crates tragen
 # keine Versionsangabe.
@@ -69,6 +66,13 @@ allow-wildcard-paths = true
 # Die Zeitachse ist eine bewusste Festlegung: `jiff` für Neues. `time` liegt
 # noch in Bestandscrates und wird nicht im Rahmen dieses Programms migriert.
 skip = []
+# Tier C (docs/architecture/dependency-review.md): kein OpenSSL im Baum.
+# TLS läuft ausschließlich über rustls + aws-lc-rs (Ring A).
+deny = [
+    { crate = "openssl-sys" },
+    { crate = "openssl" },
+    { crate = "native-tls" },
+]
 
 [sources]
 unknown-registry = "deny"

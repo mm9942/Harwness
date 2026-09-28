@@ -15,7 +15,7 @@
 //! - [`artifact`]— `KnowledgeArtifact`, `ArtifactKind`, `Frontmatter`, `RecallQuery`
 //! - [`memory`]  — core / topic / palace / recall
 //! - [`diary`]   — append-only daily journal
-//! - [`dream`]   — dream job payload/output types (the `Job` lives in `harw-job-runtime`)
+//! - [`dream`]   — dream job payload/output types (the `Job` lives in `harw-job-core`)
 //! - [`workbench`]— per-session/per-project scratch surface
 //! - [`lock`]    — prozessübergreifende Dateisperre ([`lock::KnowledgeLock`])
 //!   für Read-Modify-Write-Zyklen (Diary, Kanban-Karten, Workbench)

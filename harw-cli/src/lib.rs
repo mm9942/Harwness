@@ -68,6 +68,7 @@ mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
 mod uia_bootstrap;
+mod verify_sandbox;
 mod web;
 mod worker_cancellation;
 
@@ -471,6 +472,10 @@ fn run_kill(_args: Vec<OsString>) -> ExitCode {
 /// gebaute, personalisierte harw ([`run_with_embedded_uia`]) denselben
 /// Einstieg nutzen kann; das Verhalten des `harw`-Binaries ist unverändert.
 pub fn main_entry() -> ExitCode {
+    // The agent compiler reads the built-in definitions and the capability
+    // catalog through an injected contract (`harw agent …`, `/agent …`, the
+    // automatic UIA build); this process provides them.
+    harw_registry_defaults::compiler_defaults::install();
     if let Some(args) = kill_passthrough_args(std::env::args_os()) {
         return run_kill(args);
     }
@@ -594,6 +599,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Onboard => "onboard",
             Command::Doctor { .. } => "doctor",
             Command::Update { .. } => "update",
+            Command::Install { .. } => "install",
             Command::Uninstall { .. } => "uninstall",
             Command::Completions(_) => "completions",
             Command::BugReport { .. } => "bug-report",
@@ -825,11 +831,24 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             serve_mcp(layers, storage_root, home)
         }
         Some(Command::Mcp { action }) => mcp::run(home_override, action),
-        Some(Command::Web { socket }) => {
+        Some(Command::Web {
+            socket,
+            system,
+            systemd_socket,
+            socket_group,
+        }) => {
             // `harw web` kennt kein `--config-dir` mehr: der Root-Space kommt
             // ausschließlich aus `--home` bzw. `HARW_HOME` (siehe `crate::web`).
             let home = web_home(home::resolve_home(home_override))?;
-            web::serve_web(Some(home), socket)
+            web::serve_web(
+                Some(home),
+                web::WebListenOptions {
+                    socket,
+                    system,
+                    systemd_socket,
+                    socket_group,
+                },
+            )
         }
         Some(Command::Project { action }) => project_trust::run(home_override, action),
         Some(Command::Config { action }) => settings::run(home_override, action),
@@ -855,6 +874,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
         Some(Command::Update { check }) => lifecycle::update(home_override, check),
+        Some(Command::Install { print_systemd }) => lifecycle::install(print_systemd),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
             legacy_hint("catalog", "model catalog");
@@ -980,6 +1000,7 @@ fn run_startup_migrations(
             | Command::Debug { .. }
             | Command::Completions(_)
             | Command::Update { .. }
+            | Command::Install { .. }
             | Command::Service { .. }
             | Command::Catalog { .. }
             | Command::Auth { .. }
@@ -1204,6 +1225,10 @@ fn serve_mcp(
 ) -> Result<(), String> {
     let config = discover_config(&layers).map_err(|error| error.to_string())?;
     config.validate().map_err(|error| error.to_string())?;
+    // `harw-config` reicht Agentendefinitionen ungeparst weiter; ihr Senken
+    // und die Prüfung der Auswahl gehören zur Validierung wie zuvor.
+    harw_registry_defaults::ConfigAgents::from_config_validated(&config)
+        .map_err(|error| error.to_string())?;
 
     if !config.harness.mcp_listener.enabled {
         return Err(
@@ -1293,6 +1318,12 @@ fn serve_mcp(
         }),
         None => None,
     };
+    // Verify-Befehle der Work-Driver-Wellen laufen gesandboxt unter demselben
+    // Home und Arbeitsverzeichnis wie `runtime_root`. Nicht fatal: ohne Home
+    // oder ohne baubaren Runner greift der bisherige Fallback-Verifier.
+    let verify_runner = runtime_root
+        .as_ref()
+        .and_then(|root| verify_sandbox::build(&root.home, &root.cwd));
     // Kanban-Karten (Plan D2) liegen im Wissensspeicher des Profils, dessen
     // Job-Speicher dieser Dienst bedient (`<storage_root>/knowledge`). Ohne
     // HARW-Home bleiben `kanban_card`-Jobs unberührt.
@@ -1306,6 +1337,7 @@ fn serve_mcp(
         configured_submitters,
         runtime_root,
         knowledge,
+        verify_runner,
     });
 
     // Zwei Runtimes (G-054): der Listener behält seine `current_thread`-Runtime
@@ -2026,7 +2058,8 @@ fn parse_plan_node_kind(name: &str) -> Result<PlanNodeKind, String> {
 ///
 /// Genau **eine** so gebaute Konfiguration geht anschließend sowohl in die
 /// Plan-, Goal- und Finding-Stores ([`build_plan_services`]) als auch in die
-/// `OperationRegistry` (über [`harw_ops::register_plan_tools`]). Beide aus
+/// `OperationRegistry` (über [`harw_ops::register_plan_tools`] und, hinter
+/// demselben Gate, [`harw_ops::register_work_driver_tools`]). Beide aus
 /// derselben Quelle zu speisen ist der Kern dieses Moduls: eine registrierte
 /// Operation ohne passenden Store — oder ein Store ohne Operationen — wäre der
 /// schwerste Fehler dieser Datei.
@@ -2244,30 +2277,35 @@ pub(crate) fn build_plan_services(
     })
 }
 
-/// Registriert Kern- und Planungs-Operationen in einer frischen Registry.
+/// Registriert Kern-, Planungs- und WorkDriver-Operationen in einer frischen
+/// Registry.
 ///
 /// # Description
 /// Nur noch Testhilfe: Produktionspfade finden Operationen über
 /// [`harw_runtime::RuntimeAssembly::operations`]. Dieselbe [`PlanToolConfig`],
-/// die [`build_plan_services`] bekommen hat, gated hier die sieben
-/// Planungs-Operationen. Ist sie abgeschaltet, erscheinen `plan`, `goal`,
-/// `explore`, `research`, `research_deps`, `research_web` und `analyze` gar
-/// nicht erst in der Werkzeugliste.
+/// die [`build_plan_services`] bekommen hat, gated hier sowohl die sieben
+/// Planungs-Operationen als auch die drei WorkDriver-Operationen — dasselbe
+/// Gate, zwei getrennt gezählte Flächen. Ist es abgeschaltet, erscheinen
+/// `plan`, `goal`, `explore`, `research`, `research_deps`, `research_web` und
+/// `analyze` ebenso wenig in der Werkzeugliste wie die WorkDriver-Ops.
 ///
 /// # Arguments
 /// - `config` (`&PlanToolConfig`): das Gate; geliehen.
 ///
 /// # Returns
-/// Die gefüllte `OperationRegistry` und die Anzahl registrierter
-/// Planungs-Operationen (`0` oder [`harw_ops::PLAN_TOOL_COUNT`]).
+/// Die gefüllte `OperationRegistry`, die Anzahl registrierter
+/// Planungs-Operationen (`0` oder [`harw_ops::PLAN_TOOL_COUNT`]) und die
+/// Anzahl registrierter WorkDriver-Operationen (`0` oder
+/// [`harw_ops::WORK_DRIVER_TOOL_COUNT`]).
 #[cfg(test)]
 pub(crate) fn build_operation_registry(
     config: &PlanToolConfig,
-) -> (harw_operations::registry::OperationRegistry, usize) {
+) -> (harw_operations::registry::OperationRegistry, usize, usize) {
     let mut registry = harw_operations::registry::OperationRegistry::new();
     harw_ops::register_all(&mut registry);
     let plan_tools = harw_ops::register_plan_tools(&mut registry, config);
-    (registry, plan_tools)
+    let work_driver_tools = harw_ops::register_work_driver_tools(&mut registry, config);
+    (registry, plan_tools, work_driver_tools)
 }
 
 /// Das Ergebnis der Startup-Komposition der Planungsfläche.
@@ -2366,6 +2404,7 @@ fn seed_startup_goal(
         evidence: Vec::new(),
         created_at: now,
         updated_at: now,
+        tenant: None,
     };
 
     let set_event = goal_store
@@ -2894,6 +2933,10 @@ fn doctor(
 ) -> Result<(), String> {
     let config = discover_config(&layers).map_err(|error| error.to_string())?;
     config.validate().map_err(|error| error.to_string())?;
+    // `harw-config` reicht Agentendefinitionen ungeparst weiter; ihr Senken
+    // und die Prüfung der Auswahl gehören zur Validierung wie zuvor.
+    harw_registry_defaults::ConfigAgents::from_config_validated(&config)
+        .map_err(|error| error.to_string())?;
     println!("Harwness configuration is valid.");
     println!(
         "layers={}",
@@ -3654,8 +3697,12 @@ mod tests {
             "ein abgeschaltetes Plan-Werkzeug darf kein goals/-Verzeichnis anlegen"
         );
 
-        let (registry, plan_tools) = build_operation_registry(&config);
+        let (registry, plan_tools, work_driver_tools) = build_operation_registry(&config);
         assert_eq!(plan_tools, 0, "geschlossenes Gate darf nichts registrieren");
+        assert_eq!(
+            work_driver_tools, 0,
+            "geschlossenes Gate darf auch die WorkDriver-Ops nicht registrieren"
+        );
         for path in [
             "/plan",
             "/goal",
@@ -3683,8 +3730,9 @@ mod tests {
         assert!(services.findings.is_some());
         assert!(services.to_runtime().is_some());
 
-        let (registry, plan_tools) = build_operation_registry(&config);
+        let (registry, plan_tools, work_driver_tools) = build_operation_registry(&config);
         assert_eq!(plan_tools, harw_ops::PLAN_TOOL_COUNT);
+        assert_eq!(work_driver_tools, harw_ops::WORK_DRIVER_TOOL_COUNT);
         for name in [
             "plan",
             "goal",
@@ -3951,8 +3999,9 @@ mod tests {
         );
 
         // Genau diese Konfiguration regiert auch die Operationen.
-        let (registry, plan_tools) = build_operation_registry(&config);
+        let (registry, plan_tools, work_driver_tools) = build_operation_registry(&config);
         assert_eq!(plan_tools, harw_ops::PLAN_TOOL_COUNT);
+        assert_eq!(work_driver_tools, harw_ops::WORK_DRIVER_TOOL_COUNT);
         assert!(registry.find_by_command("/analyze").is_some());
         Ok(())
     }

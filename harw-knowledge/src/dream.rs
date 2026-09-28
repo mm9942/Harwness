@@ -16,7 +16,7 @@
 //! [`read_report_data`], Review-Entscheid über [`set_suggestion_status`]
 //! (unter [`crate::lock::KnowledgeLock`]).
 
-use harw_job_runtime::WorkId;
+use harw_job_core::WorkId;
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};

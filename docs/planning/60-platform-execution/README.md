@@ -1,6 +1,6 @@
 # Platform Execution Strategy — Planning Compartment
 
-> Status: DRAFT / not implemented
+> Status: PARTIALLY LANDED (MIG-004, MIG-005)
 
 ## Current
 

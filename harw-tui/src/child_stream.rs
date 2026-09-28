@@ -270,7 +270,7 @@ impl OrchestratorRoles {
     /// Definitionen überschreiben gleichnamige eingebaute.
     ///
     /// # Argumente
-    /// - `definitions`: z. B. `ResolvedConfig::executable_agents`.
+    /// - `definitions`: z. B. `ConfigAgents::executable_agents`.
     pub(crate) fn from_definitions<'a, I>(definitions: I) -> Self
     where
         I: IntoIterator<Item = &'a ExecutableAgentIr>,

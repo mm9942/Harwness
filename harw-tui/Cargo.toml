@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-tui"
+description = "Command-shell primitives for Harwness TUI: input classification, parsing, command dispatch, and permission enforcement."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -52,7 +53,7 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 # Version bewusst identisch zu harw-cli/Cargo.toml.
 tracing = "0.1.44"
 serde_json = "1"
-harw-home = { version = "0.3.0", path = "../harw-home" }
+harw-home = { version = "0.8.0", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
 # `PendingApproval::requested_at`/`timeout_at` (harw-core) sind `jiff::Timestamp`;
 # der Freigabe-/Wiederaufnahme-Treiber (`src/approval.rs`) liest den

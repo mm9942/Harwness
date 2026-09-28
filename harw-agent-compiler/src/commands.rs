@@ -398,6 +398,7 @@ fn build_command(ctx: &mut CommandContext<'_>, args: &BuildArgs) -> CommandOutpu
     };
     let mut options = CompilerOptions {
         interfaces: args.interfaces.clone(),
+        target: args.target_triple.clone(),
         ..CompilerOptions::default()
     };
     let mut build_options = BuildOptions {

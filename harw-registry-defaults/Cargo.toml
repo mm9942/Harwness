@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-registry-defaults"
+description = "Shared coding-agent ExtensionRegistry assembly for consistent tool surface across CLI, TUI, and echo paths"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,9 +13,15 @@ tracing = "0.1"
 harw-authority = { path = "../harw-authority" }
 harw-home = { path = "../harw-home" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `compiler_defaults`: implements `harw_agent_compiler::builtins::BuiltinDefaults`
+# (built-in definitions, capability catalog, generic ceilings). A → C; the
+# compiler depends on this crate only as a dev-dependency (its tests).
+harw-agent-compiler = { path = "../harw-agent-compiler" }
 harw-catalog = { path = "../harw-catalog" }
 # `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
-# Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5).
+# Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5), dazu
+# die ungeparsten Agentendefinitionen (`ResolvedConfig::agent_sources`), die
+# `config_agents` parst und senkt (harw-config, Schicht I, kennt die DSL nicht).
 harw-config = { path = "../harw-config" }
 # `EgressPolicy` für die Web-Werkzeuge der Rolle `researcher-web` (W5 RD).
 harw-egress = { path = "../harw-egress" }
@@ -29,7 +36,7 @@ harw-tool-explorer = { path = "../harw-tool-explorer" }
 harw-tool-process = { path = "../harw-tool-process" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
-harw-tool-doc = { version = "0.3.0", path = "../harw-tool-doc" }
+harw-tool-doc = { version = "0.8.0", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 harw-tool-shell = { path = "../harw-tool-shell" }
@@ -65,7 +72,7 @@ time = "0.3.53"
 toml = "1.1.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-harw-tools = { version = "0.3.0", path = "../harw-tools" }
+harw-tools = { version = "0.8.0", path = "../harw-tools" }
 # `workbench.note`/`workbench.hypothesis` (`workbench_tools.rs`) schreiben über
 # `harw_knowledge::workbench` in den Sitzungs-Scope. Kein Zyklus:
 # `harw-knowledge` hängt (auch transitiv) nicht von `harw-registry-defaults` ab.

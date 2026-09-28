@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "xtask"
+description = "Toolkit for CI gates and control plane UI type generation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +13,13 @@ rust-version.workspace = true
 # Workspace-Graphen samt Ebenen. Grundlage von Gate 1 und Gate 2 — beide
 # müssten sonst `cargo metadata` aufrufen, also einen Subprozess starten.
 harw-code-graph = { path = "../harw-code-graph" }
+# Liest `xtask/arch-policy.toml` für das Gate `arch` (Schichtenregeln,
+# Ausnahmen, TCB-Allowlisten). Bereits über `harw-code-graph` im Baum —
+# keine neue Fassung, nur eine direkte Kante. Kein `serde`-Derive: die
+# Richtlinie wird als `toml::Table` gelesen und von Hand validiert, damit
+# jeder Formfehler eine lesbare Meldung statt eines Deserialisierungsfehlers
+# wird.
+toml = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,10 +1,21 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Vorübergehend nur per Hand: GitHub Actions ist auf diesem Konto gesperrt
+  # (Abrechnung), jeder Push und PR erzeugte nur rote, nie gestartete Läufe.
+  # Bis dahin ist der zentrale lokale Build aus CLAUDE.md das Gate. Ein Lauf
+  # wird gezielt per workflow_dispatch gestartet; bleibt er rot, bleiben die
+  # Trigger aus. Zum Reaktivieren die beiden Blöcke wieder einkommentieren;
+  # die Job-Bedingungen unten behandeln `push` und `pull_request` weiterhin.
+  #
+  # push:
+  #   # `dev` ist der Integrationsbranch, `main` die stabile Linie. Beide
+  #   # bekommen dieselbe volle CI, damit nichts ungeprüft auf `dev` liegt.
+  #   branches: [main, dev]
+  # # Alle PRs, auch gestapelte (Basis ist ein anderer Feature-Branch).
+  # pull_request:
+  #   types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 # Ein neuer Push auf denselben Branch/PR bricht den noch laufenden alten Lauf ab.
 concurrency:
@@ -32,8 +43,8 @@ env:
 # (Ökosystem `rust-toolchain`) aktualisiert – keine zweite Versionsangabe im
 # Workflow, die auseinanderlaufen könnte, und keine Dritt-Action.
 #
-# Pfadfilter: Die Filter greifen nur bei `pull_request`. Bei Push auf main
-# laufen immer alle Jobs. Scheitert der Filter-Job selbst, laufen ebenfalls
+# Pfadfilter: Die Filter greifen nur bei `pull_request`. Bei Push (solange
+# aktiviert) und bei workflow_dispatch laufen immer alle Jobs. Scheitert der Filter-Job selbst, laufen ebenfalls
 # alle Jobs (fail-open), damit nie ein Job ungeprüft „grün“ übersprungen wird.
 # Übersprungene Jobs zählen bei GitHub als erfolgreich und blockieren
 # erforderliche Checks nicht.
@@ -77,8 +88,9 @@ jobs:
   check:
     name: fmt, clippy, test (root workspace)
     needs: changes
-    # Auch bei `dod`-Änderungen: die Struktur-Gates (`xtask gates`) laden
-    # Produkt- und DoD-Workspace zusammen und prüfen die DoD-Binaries.
+    # Auch bei `dod`-Änderungen: seit PL-60 sind die DoD-Crates Members des
+    # Wurzel-Workspace, `--workspace` baut/testet sie mit, und die
+    # Struktur-Gates (`xtask gates`) prüfen die DoD-Binaries.
     if: >-
       ${{ !cancelled() && (github.event_name != 'pull_request'
       || needs.changes.result != 'success'
@@ -131,11 +143,6 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --tests -- -D warnings
 
-      # Die Warden-Gates lesen `dod/Cargo.lock` und die entpackten Quellen im
-      # Registry-Cache; der Root-Build holt nur die Pakete aus `Cargo.lock`.
-      - name: Fetch dod dependencies (for xtask gates)
-        run: cargo fetch --locked --manifest-path dod/Cargo.toml
-
       # Verbotene Kanten, Privilegienbudget je DoD-Binary, Warden-Hülle und
       # kein C-Build im Warden-Teilbaum. Ein Gate, das nichts geprüft hat,
       # ist rot (siehe xtask/src/gates.rs).
@@ -151,8 +158,16 @@ jobs:
         run: cargo test --workspace --doc
 
   dod:
-    name: test (dod workspace)
+    name: test (dod domain, package-scoped)
     needs: changes
+    # Seit PL-60 ist `dod/` kein eigener Workspace mehr; der `check`-Job baut
+    # und testet die DoD-Crates bereits mit `--workspace`. Dieser Job prüft
+    # die zweite, sicherheitsrelevante Konfiguration: DoD-Crates und die vier
+    # DoD-Binaries **nur mit `-p`-Auswahl** gebaut und getestet. Resolver 2
+    # vereinigt Features nur über die ausgewählten Pakete; so sieht der
+    # Job, was die Binaries ohne die Feature-Vereinigung mit Produkt-Crates
+    # (z. B. `serde_json/preserve_order`, weitere `rustix`-Features)
+    # tatsächlich tun — derselbe Zuschnitt wie `dod/Makefile` (`build`).
     # dod hängt per Pfad an Root-Crates (harw-types, harw-macros …), daher
     # auch bei `rust`-Änderungen.
     if: >-
@@ -166,17 +181,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # rustup findet `rust-toolchain.toml` im Elternordner auch für dod/.
       - name: Install pinned Rust (rust-toolchain.toml)
         run: |
           rustup toolchain install
           rustup show active-toolchain
           rustc --version
 
-      - name: Cache cargo (dod workspace)
+      # Eigener Cache-Schlüssel: andere Feature-Auflösung als der
+      # `--workspace`-Lauf im `check`-Job, also andere Artefakte.
+      - name: Cache cargo (dod domain)
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "dod -> target"
+          workspaces: "."
+          key: dod
 
       # bubblewrap for the sandbox tests; libdbus-1-dev + pkg-config for the
       # OS-keyring backend (`keyring` feature -> libdbus-sys) used by harw-secrets.
@@ -185,9 +202,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
-      - name: cargo test --workspace --locked
-        working-directory: dod
-        run: cargo test --workspace --locked
+      # Die vier DoD-Binaries gemeinsam, wie `dod/Makefile` (`build`) sie
+      # baut — ohne Produkt-Binaries im selben Feature-Graphen.
+      - name: Build DoD binaries (package-scoped)
+        run: cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden
+
+      # Warden-TCB fürs Log: die Laufzeit-Hülle, die `xtask gates`
+      # (warden-dependency-budget) gegen `MAX_WARDEN_RUNTIME_DEPS` zählt.
+      - name: Warden runtime dependency tree
+        run: cargo tree --locked -p harw-warden -e normal
+
+      # Jedes Verzeichnis unter dod/crates ist genau ein Paket gleichen
+      # Namens (geprüft von xtask: test_dod_crates_are_root_workspace_members).
+      - name: cargo test (dod crates, -p selection)
+        run: |
+          packages=()
+          for dir in dod/crates/*/; do
+            packages+=(-p "$(basename "$dir")")
+          done
+          cargo test --locked "${packages[@]}"
 
   cargo-deny:
     name: cargo deny check
@@ -228,3 +261,87 @@ jobs:
         uses: docker://rhysd/actionlint:1.7.7
         with:
           args: -color
+
+  macos:
+    name: test (macOS, Darwin job backend)
+    needs: changes
+    # Darwin-native job mechanics (harw-job-darwin) only run on macOS; the
+    # Linux jobs above compile its pure parts only. harw-job-linux must still
+    # compile (empty) on macOS.
+    # macOS-Minuten kosten das Zehnfache: nur auf main, per Hand
+    # (workflow_dispatch) oder auf PRs mit dem Label `macos`.
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'push'
+      || github.event_name == 'workflow_dispatch'
+      || contains(github.event.pull_request.labels.*.name, 'macos')) }}
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version
+
+      - name: Cache cargo (macOS)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: macos
+
+      - name: cargo test (job core + Darwin backend)
+        run: cargo test --locked -p harw-job-core -p harw-job-darwin
+
+      - name: cargo check (Linux backend compiles empty on macOS)
+        run: cargo check --locked -p harw-job-linux
+
+  native-agent:
+    name: native agent build (harw agent build --native)
+    needs: changes
+    # The native backend (harw-agent-compiler/src/backend/native.rs) is
+    # otherwise only covered by golden tests of the generated crate; this job
+    # runs a real `cargo build --release` of it and executes the result
+    # (scripts/native-e2e.sh). A release build of the runner crates takes
+    # minutes: only on main and per Hand (workflow_dispatch), never on PRs.
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'push'
+      || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version
+
+      - name: Cache cargo (native agent)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: native
+          # The native build's own target dir (NATIVE_E2E_HOME below), so
+          # harw's runner crates compile in release only when they change.
+          cache-directories: ${{ runner.temp }}/native-e2e-home/cache/agent-builds/target
+
+      # Debug harw plus a release runner build: reclaim disk like `check`.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # bubblewrap for the runner's sandbox admission; libdbus-1-dev +
+      # pkg-config for the OS-keyring backend harw-secrets builds with.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
+
+      - name: Native backend end to end
+        env:
+          NATIVE_E2E_HOME: ${{ runner.temp }}/native-e2e-home
+        run: sh scripts/native-e2e.sh

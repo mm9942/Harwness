@@ -1,93 +1,70 @@
-# harw-probe-bpf.service -- Knoten AW7-03, Klasse CAP_BPF.
+# harw-probe-bpf.service -- DoD eBPF probe, class CAP_BPF + CAP_PERFMON.
 #
-# Gehoert zwingend nach /etc/systemd/system/, NIE nach
-# ~/.config/systemd/user/ -- eine Nutzerinstanz kann keine Capabilities
-# vergeben (siehe harw-install::dod_units-Moduldoku).
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
+# by dod/scripts/install.sh (LIBEXECDIR, SYSCONFDIR, BPFDIR).
 #
-# Landlock-Asymmetrie (Entscheidung Nr. 4): dieses Binary bricht beim Start
-# HART ab, wenn Landlock den Dateisystem-Bereich nicht vollstaendig
-# durchsetzen kann (harw-probe-bpf/src/landlock.rs::enforce_fs_scope, nur
-# RulesetStatus::FullyEnforced zaehlt) -- ein Prozess mit CAP_BPF ohne
-# wirksame Selbstbeschraenkung darf nicht laufen.
+# Capability decision (H10): CAP_BPF alone is not enough. The real loader
+# (dod/crates/harw-dod-bpf/src/real.rs, has_attach_capabilities) refuses to
+# attach unless BOTH CAP_BPF and CAP_PERFMON are effective: the programs are
+# attached as sched tracepoints (perf_event_open) and FEntry/KProbe hooks,
+# which the kernel gates on CAP_PERFMON since 5.8. No CAP_SYS_ADMIN fallback,
+# no file capabilities.
 #
-# harw-probe-bpf/src/main.rs::run() verbindet sich ZUERST zum
-# Sentinel-Socket, ERST DANACH bindet es Landlock -- dieselbe Reihenfolge
-# wie harw-probe-fs, aus demselben Grund (ein neuer Socket-Pfad koennte
-# sonst nach der Selbstbeschraenkung nicht mehr geoeffnet werden).
+# Landlock: hard start failure without full enforcement
+# (harw-probe-bpf/src/landlock.rs). The binary connects to the sentinel
+# socket FIRST and only then restricts itself.
 
 [Unit]
-Description=harw-probe-bpf -- eBPF-Sonde, Push-Only (Prozessstart/Verbindung)
+Description=HARW DoD eBPF observation probe (push-only)
 Documentation=man:harw-probe-bpf(1)
+PartOf=harw-dod.target
 After=harw-sentinel.service
 Wants=harw-sentinel.service
-# Dieselbe Begruendung wie bei harw-probe-fs.service: Wants=+After=, nicht
-# Requires=/BindsTo=, damit ein Sentinel-Neustart diese Sonde nicht
-# mitreisst -- sie erholt sich selbst ueber Restart=on-failure, sobald der
-# naechste Sendeversuch nach einem verschwundenen Sentinel hart scheitert.
+# Wants=+After=, deliberately not Requires=/BindsTo=: a sentinel restart must
+# not take the probe down. The probe notices a vanished sentinel on its next
+# send, exits, and Restart=on-failure brings it back.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=harw-probe-bpf
 Group=harw-probe-bpf
-SupplementaryGroups=harw-ipc
-# Mitgliedschaft in harw-ipc: Zugriff auf /run/harw und den darin liegenden
-# Sentinel-Socket -- siehe harw-sentinel.service fuer die Modus-Begruendung.
-ExecStart=/usr/local/bin/harw-probe-bpf --log info --sentinel-socket /run/harw/sentinel.sock
-# Kein --procmon-program-path/--flow-program-path in dieser Grundunit: ohne
-# Angabe verwendet die Sonde einen eingebetteten Platzhalterrumpf (siehe
-# cli.rs-Moduldoku) -- ein Betreiber, der einen echten Programmrumpf
-# einsetzt, ergaenzt ihn ueber ein Drop-in und muss dafuer den unten
-# gesetzten Landlock-Dateisystembereich dieses Binaries selbst beachten
-# (der Pfad muss unter einer fuer diesen Prozess lesbaren Wurzel liegen --
-# ProtectSystem=strict macht den Rest des Baums nur schreibgeschuetzt,
-# nicht unlesbar, siehe unten).
+SupplementaryGroups=harw-ipc harw-dod-config
+ExecStart=@LIBEXECDIR@/harw-probe-bpf --log info --config @SYSCONFDIR@/config.toml --sentinel-socket /run/harw/sentinel.sock --exec-program-path @BPFDIR@/exec.bpf.o --exit-program-path @BPFDIR@/exit.bpf.o --tcp-v4-program-path @BPFDIR@/tcp_v4_connect.bpf.o --tcp-v6-program-path @BPFDIR@/tcp_v6_connect.bpf.o
 Restart=on-failure
 RestartSec=5
 
-# -- Haertung: jede Direktive einzeln begruendet --
+# -- Hardening --
 NoNewPrivileges=yes
 ProtectSystem=strict
-# Diese Sonde liest -- wenn ueberhaupt -- nur einen optionalen,
-# konfigurierten eBPF-Programmrumpf von der Platte
-# (harw-probe-bpf::landlock-Moduldoku, Abschnitt "Warum diese Sonde eigene
-# Wurzeln entgegennimmt"); ohne konfigurierten Pfad braucht sie ueberhaupt
-# kein Dateisystemziel. "strict" nimmt ihr nichts, was sie tatsaechlich
-# braucht -- ihre beiden Sensoren lesen ueber einen injizierten
-# harw_dod_bpf::BpfLoader, nicht ueber Dateisystempfade.
+# Reads only the config, the BPF objects, BTF and tracefs -- no writes. A
+# connect() to the sentinel socket needs no writable mount.
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
 ProtectKernelModules=yes
-# Bewusst trotz eBPF-Naehe gesetzt: das heutige harw_dod_bpf liefert keinen
-# echten Lader (real_loader.rs ist ein dokumentierter Platzhalter) und laedt
-# folglich kein Kernel-Modul. Sollte ein kuenftiger echter Lader
-# Modul-Introspektion brauchen, ist das eine bewusste, spaetere Lockerung
-# dieser einen Zeile -- keine Vermutung, die diese Unit heute vorwegnehmen
-# soll.
 ProtectKernelTunables=yes
+# /sys/kernel/tracing and /sys/kernel/btf stay readable (read-only).
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
-# Diese Sonde schreibt nie in cgroup-Kontrolldateien.
+# The profile resolves cgroup ids under /sys/fs/cgroup read-only.
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX
-# Push-only zum Sentinel ueber genau einen SOCK_SEQPACKET-Unix-Socket
-# (harw-probe-bpf::sink::SentinelSink) -- kein TCP/UDP. Bewusst KEIN
-# AF_NETLINK: der heutige Stand laedt kein echtes eBPF-Programm (siehe
-# harw-probe-bpf::real_loader-Moduldoku) und braucht deshalb auch keinen
-# Netlink-Socket fuer `bpf(2)`/Tracepoint-Anhaeftung. Ein kuenftiger echter
-# Lader, der Netlink braucht, muesste diese eine Zeile bewusst erweitern --
-# eine Lockerung, die dieser Knoten nicht vorwegnimmt, weil der heutige
-# Code sie nicht ausuebt.
+# Push-only over one SOCK_SEQPACKET socket. Tracepoint/FEntry attachment
+# uses bpf(2)/perf_event_open(2), not netlink.
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=CAP_BPF
-AmbientCapabilities=CAP_BPF
-# Genau die eine Faehigkeit dieser Klasse. NICHT CAP_SYS_ADMIN (das ist die
-# andere Sonde) -- auch wenn manche eBPF-Operationen aelterer Kernel
-# historisch CAP_SYS_ADMIN verlangten, ist CAP_BPF (seit Kernel 5.8) die
-# fuer diese Klasse vorgesehene, engere Faehigkeit; der heutige Code laedt
-# ohnehin kein echtes Programm (siehe oben) und braucht daher keine
-# zusaetzliche Faehigkeit, die diese engere Grenze aufweichen wuerde.
+SystemCallFilter=@system-service
+SystemCallFilter=bpf perf_event_open landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_BPF CAP_PERFMON
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=harw-dod.target

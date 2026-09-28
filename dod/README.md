@@ -9,13 +9,20 @@ This directory owns the system-wide DoD package. The default prefix is
 package never installs into a user's HARW home tree.
 
 The package contains root-owned service definitions and program/ELF files,
-`harw-dod`/`harw-dod-bpf` system identities, and FHS directories:
+one system identity per binary (`harw-sentinel`, `harw-probe-fs`,
+`harw-probe-bpf`, `harw-warden`), and FHS directories:
 
 * programs: `/usr/local/libexec/harw-dod`
 * eBPF objects and manifest: `/usr/local/lib/harw-dod/bpf`
 * configuration: `/etc/harw-dod`
-* state, telemetry, and runtime: `/var/lib/harw-dod`, `/var/log/harw-dod`,
-  `/run/harw-dod`
+* state and telemetry: `/var/lib/harw-dod`, `/var/log/harw-dod`
+* runtime sockets: `/run/harw/sentinel.sock`, `/run/harw/warden.sock`
+
+The systemd units, the `sysusers.d` accounts and the `tmpfiles.d`
+directories are **not** kept here: `install.sh` installs them from the one
+canonical tree `../deploy/` (Crypto Masterplan v2 §22, H10), the same files
+`harw install --print-systemd` prints. `packaging/` holds only the install
+manifest and the example configuration.
 
 `make -C dod install` installs files and performs no start or enable action.
 It preserves an existing `/etc/harw-dod/config.toml`; only
@@ -24,9 +31,10 @@ It preserves an existing `/etc/harw-dod/config.toml`; only
 accounts, call systemd, or touch host runtime state. A host install requires
 root and calls only the already-installed `systemd-sysusers`,
 `systemd-tmpfiles`, and `systemctl daemon-reload` helpers; it never invokes
-Cargo or installs prerequisites. The two service accounts receive read-only
-membership in the dedicated `harw-dod-config` group; the separate
-`harw-dod-ipc` group is reserved for the socket path.
+Cargo or installs prerequisites. The sentinel and the eBPF probe receive
+read-only membership in the dedicated `harw-dod-config` group; the separate
+`harw-ipc` group is reserved for the sentinel socket path, and
+`harw-warden-clients` (empty by default) for the Warden socket.
 
 Before enabling observation, copy the example to `/etc/harw-dod/config.toml`
 and add exactly one `active_profile`. `make -C dod enable` runs the explicit
@@ -41,13 +49,13 @@ either unit.
 
 ## Current binary integration boundary
 
-The service templates use the planned system CLI contract:
-`harw-sentinel --config --state-dir --telemetry-dir --runtime-dir` and
-`harw-probe-bpf --config`. The current binaries still expose the
-legacy `--home`/socket-only interface. The config owner must add these options
-and resolve/verify the immutable profile before program load; packaging does
-not silently substitute a personal home path. Until that integration lands,
-the units are an installable contract, not a claim of live service readiness.
+The units in `../deploy/systemd/` use the CLI the binaries have today:
+`harw-sentinel --home <STATEDIR> --socket /run/harw/sentinel.sock` (it reads
+`/etc/harw-dod/config.toml` by default) and `harw-probe-bpf --config`. The
+planned system contract (`harw-sentinel --config --state-dir --telemetry-dir
+--runtime-dir`) does not exist yet; packaging does not silently substitute a
+personal home path. Until that integration lands, the units are an
+installable contract, not a claim of live service readiness.
 
 The BPF artefacts are build outputs and are never checked in: `make build-bpf`
 compiles `bpf/src/*.bpf.c` with the pinned toolchain and writes

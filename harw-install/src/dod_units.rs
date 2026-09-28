@@ -1,99 +1,71 @@
-//! systemd-Unit-Beschreibung der vier DoD-Binaries (Knoten **AW7-03**).
+//! systemd-Unit-Beschreibung der vier DoD-Binaries (Knoten **AW7-03**,
+//! abgeglichen in **H10** des Crypto-Masterplans v2).
 //!
-//! Spezifikationsquelle: der AW7-03-Auftrag selbst (kein Contract-Master-
-//! Dokument existiert für diesen Knoten) sowie die vier gelandeten Binaries
-//! `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden` — dieses
-//! Modul liest keines ihrer Quelltexte zur Laufzeit, sondern beschreibt nur,
-//! was ihre jeweilige Moduldokumentation als Erwartung an den Betrieb
-//! festhält.
+//! Die Unit-Texte selbst liegen ausschließlich unter `deploy/systemd/` und
+//! werden über [`crate::deployment::DEPLOYMENT_ASSETS`] im Produktionscode
+//! eingebettet (`include_str!`, nicht nur unter `cfg(test)`). Dieses Modul
+//! trägt die Rechtematrix ([`UNIT_CLASSES`]) und einen minimalen Parser
+//! ([`parse_unit`]); seine Tests prüfen genau den eingebetteten Text, den
+//! `harw install --print-systemd` ausgibt und `dod/scripts/install.sh` aus
+//! `deploy/` installiert. Die frühere zweite Quelle
+//! `dod/packaging/systemd/*` ist mit H10 entfallen.
 //!
 //! # Die vier Klassen
-//! | Binary | Klasse | Faehigkeit dieser Unit |
+//! | Binary | Klasse | Fähigkeiten dieser Unit |
 //! |---|---|---|
 //! | `harw-sentinel` | unprivilegiert | keine (`CapabilityBoundingSet=` leer) |
-//! | `harw-probe-fs` | `CAP_SYS_ADMIN` | genau `CAP_SYS_ADMIN` |
-//! | `harw-probe-bpf` | `CAP_BPF` | genau `CAP_BPF` |
-//! | `harw-warden` | systemd-Socket, kein Netz | `CAP_SYS_ADMIN` (Annahme, siehe unten) |
+//! | `harw-probe-fs` | fanotify | genau `CAP_SYS_ADMIN` |
+//! | `harw-probe-bpf` | eBPF | genau `CAP_BPF CAP_PERFMON` |
+//! | `harw-warden` | systemd-Socket, kein IP | genau `CAP_DAC_OVERRIDE CAP_NET_ADMIN` |
 //!
-//! Für `harw-warden` nennt die Auftragstabelle keine Capability — dieser
-//! Knoten hat trotzdem eine gewählt (siehe die Begründung am Kopf von
-//! `deploy/systemd/harw-warden.service`): das Binary schreibt in
-//! `cgroup.freeze`/`cgroup.kill` unterhalb eines konfigurierbaren
-//! `--cgroup-root`, potenziell außerhalb einer ihm selbst delegierten
-//! cgroup-v2-Teilhierarchie — laut Kernel-Dokumentation verlangt das
-//! `CAP_SYS_ADMIN` im initialen User-Namespace. Das ist eine **Annahme
-//! dieses Knotens**, keine Vorgabe aus dem Auftrag.
+//! **H10-Entscheidungen** (jeweils die strengere Variante der beiden
+//! früheren Quellen, am Code begründet):
+//! - `harw-probe-bpf`: `CAP_PERFMON` ist nötig, nicht optional —
+//!   `harw-dod-bpf/src/real.rs::has_attach_capabilities` verweigert das
+//!   Anheften ohne `CAP_BPF` **und** `CAP_PERFMON` (Tracepoint-/FEntry-
+//!   Anheftung über `perf_event_open`).
+//! - `harw-warden`: eigener Systemnutzer statt `root`. Er schreibt
+//!   `cgroup.freeze`/`cgroup.kill` (root-eigen, 0644; cgroup v2 prüft dort
+//!   die Dateirechte → `CAP_DAC_OVERRIDE`, nicht `CAP_SYS_ADMIN`) und ruft
+//!   für die Netzisolation `/usr/sbin/nft` als Kindprozess auf
+//!   (`harw-warden/src/isolation.rs` → `CAP_NET_ADMIN`, über die
+//!   Ambient-Menge vererbt). Die frühere Annahme `CAP_SYS_ADMIN` entfällt.
 //!
 //! # Die Landlock-Asymmetrie (Entscheidung Nr. 4)
 //! `harw-sentinel` **degradiert** bei fehlender Landlock-Unterstützung
 //! (`SensorDegraded`-Ereignis, `harw-sentinel/src/sandbox.rs`) und läuft
-//! ohne die zusätzliche Schranke weiter — sein Berechtigungsumfang ist von
-//! vornherein leer, und ein Sammler, der gar nicht erst startet, verliert
-//! jede Beobachtung. Die drei privilegierten Binaries (`harw-probe-fs`,
-//! `harw-probe-bpf`, `harw-warden`) brechen dagegen **hart** ab, sobald
-//! `landlock::RulesetStatus::FullyEnforced` nicht erreicht wird — ein
-//! privilegierter Prozess ohne wirksame Selbstbeschränkung darf nicht
-//! laufen. Diese Units erzwingen dieselbe Landlock-Vorbedingung nicht noch
-//! einmal auf Unit-Ebene: das Binary selbst ist bereits der harte
-//! Torwächter (siehe die jeweilige `landlock.rs`-Moduldoku).
+//! ohne die zusätzliche Schranke weiter. Die drei privilegierten Binaries
+//! (`harw-probe-fs`, `harw-probe-bpf`, `harw-warden`) brechen dagegen
+//! **hart** ab, sobald `landlock::RulesetStatus::FullyEnforced` nicht
+//! erreicht wird. Die Units erzwingen diese Vorbedingung nicht noch einmal;
+//! das Binary selbst ist der harte Torwächter.
 //!
 //! # Wohin die Units gehören
-//! `/etc/systemd/system/` ist Systemverwaltung; `~/.config/systemd/user/`
-//! ist eine Nutzerinstanz. Eine Nutzerinstanz **kann keine Capabilities
-//! vergeben** — `AmbientCapabilities=`/`CapabilityBoundingSet=` existieren
-//! dort nicht in einer Form, die dem Prozess tatsächlich eine erhöhte
-//! Kernel-Fähigkeit gäbe. Die drei privilegierten Binaries brauchen daher
-//! zwingend Systemunits (`/etc/systemd/system/`); der unprivilegierte
-//! Sentinel bräuchte sie für sich genommen nicht, ist aber die Gegenstelle
-//! der drei privilegierten Sonden über ein gemeinsames
-//! `RuntimeDirectory=harw` unter `/run/` — ein Pfad, den nur eine
-//! Systeminstanz für mehrere unterschiedliche Systemnutzer gemeinsam
-//! bereitstellen kann. Alle vier Units dieses Knotens sind deshalb
-//! Systemunits, unter `deploy/systemd/` im Repository-Wurzelverzeichnis
-//! abgelegt.
-//!
-//! # Befund: `harw-install` arbeitet heute ausschließlich im Nutzerbereich
-//! [`crate::service_systemd::SystemdServiceManager`] legt seine Unit
-//! ausschließlich unter `~/.config/systemd/user/<name>.service` ab
-//! (`unit_path()`, `systemctl --user …`) — das reicht für einen generischen
-//! `ServiceSpec`-Dienst ohne Capability-Bedarf, aber **nicht** für die drei
-//! privilegierten Binaries dieses Knotens: eine Nutzerinstanz kann ihnen
-//! nie `CAP_SYS_ADMIN`/`CAP_BPF` verleihen. Dieser Knoten fügt deshalb
-//! **keine** fünfte, konkurrierende Installationslogik hinzu — er trägt nur
-//! die (statischen, geprüften) Unit-Texte unter `deploy/systemd/` und die
-//! hier festgehaltene Zuordnungstabelle ([`UNIT_CLASSES`]). Eine spätere
-//! Installationslogik für Systemunits (Schreiben nach
-//! `/etc/systemd/system/`, `systemctl daemon-reload`, `systemctl enable`)
-//! ist ein **eigener, hier nicht gebauter Knoten** — dieser Auftrag verbietet
-//! ausdrücklich, irgendetwas zu installieren, zu aktivieren oder zu
-//! starten.
+//! Ausschließlich Systemunits (`/etc/systemd/system/` bzw.
+//! `$prefix/lib/systemd/system/`): eine Nutzerinstanz kann keine
+//! Capabilities vergeben und keinen für mehrere Systemnutzer gemeinsamen
+//! `/run/harw`-Pfad bereitstellen. [`crate::service_systemd`] kennt nur
+//! Nutzerunits; die Systeminstallation übernimmt `dod/scripts/install.sh`
+//! (DoD) bzw. der Betreiber mit `harw install --print-systemd` (Infra).
 //!
 //! # Warum diese Units nicht über [`crate::service::ServiceSpec`] gerendert
 //! werden
-//! [`crate::service_systemd::render_systemd_unit`] kennt weder Capabilities
-//! noch Landlock-Wurzeln noch Socket-Aktivierung — es rendert eine
-//! einfache `Type=simple`-Unit aus Exec/WorkingDirectory/Env. Die vier
-//! Units dieses Knotens haben eine feste, je Binary unterschiedliche
-//! Rechtematrix, die keine Laufzeit-Eingabe eines Aufrufers verändern darf
-//! (Rule 1 des Auftrags: „genau die Fähigkeiten, die ihre Klasse nennt —
-//! und nicht mehr"). Sie sind deshalb als statische Textdateien unter
-//! `deploy/systemd/` abgelegt, nicht als von einer generischen Funktion zur
-//! Laufzeit zusammengesetzter Text — derselbe Grund, aus dem
-//! [`crate::service::ServiceSpec`] hier absichtlich nicht wiederverwendet
-//! wird.
+//! [`crate::service_systemd::render_systemd_unit`] kennt weder
+//! Capabilities noch Socket-Aktivierung. Die Rechtematrix ist fest und darf
+//! von keiner Laufzeit-Eingabe verändert werden; deshalb sind die Units
+//! statische, geprüfte Dateien unter `deploy/systemd/`.
 //!
 //! # Exportierte Typen
-//! [`UnitClass`], [`UNIT_CLASSES`], [`parse_unit`], [`ParsedUnit`].
+//! [`UnitClass`], [`UNIT_CLASSES`], [`parse_unit`], [`ParsedUnit`],
+//! [`capability_set`].
 //!
 //! # Concurrency
 //! Reine, zustandslose Funktionen und `'static`-Daten; `Send + Sync`.
 //!
 //! # Fehler
 //! Keine — [`parse_unit`] ist tolerant (fehlende Abschnitte/Schlüssel liefern
-//! `None`/leere Mengen statt eines `Err`), weil dieses Modul ausschließlich
-//! zur Prüfung bereits im Repository liegender, von Menschen geschriebener
-//! Unit-Texte dient (siehe `tests` unten), nicht zur Fehlerbehandlung einer
-//! Laufzeit-Eingabe.
+//! `None`/leere Mengen statt eines `Err`), weil es ausschließlich
+//! von Menschen geschriebene, im Repository liegende Unit-Texte prüft.
 
 use std::collections::BTreeSet;
 
@@ -120,9 +92,8 @@ pub struct UnitClass {
 /// Die vier Klassen dieses Knotens, in der Reihenfolge der Auftragstabelle.
 ///
 /// # Description
-/// `harw-warden`s `CAP_SYS_ADMIN`-Eintrag ist eine Annahme dieses Knotens,
-/// keine Vorgabe der Auftragstabelle (siehe Moduldoku, Abschnitt „Die vier
-/// Klassen").
+/// Die Fähigkeitsmengen von `harw-probe-bpf` und `harw-warden` sind die
+/// H10-Entscheidungen (siehe Moduldoku, Abschnitt „Die vier Klassen").
 pub const UNIT_CLASSES: &[UnitClass] = &[
     UnitClass {
         binary: "harw-sentinel",
@@ -137,12 +108,12 @@ pub const UNIT_CLASSES: &[UnitClass] = &[
     UnitClass {
         binary: "harw-probe-bpf",
         service_file: "harw-probe-bpf.service",
-        expected_capabilities: &["CAP_BPF"],
+        expected_capabilities: &["CAP_BPF", "CAP_PERFMON"],
     },
     UnitClass {
         binary: "harw-warden",
         service_file: "harw-warden.service",
-        expected_capabilities: &["CAP_SYS_ADMIN"],
+        expected_capabilities: &["CAP_DAC_OVERRIDE", "CAP_NET_ADMIN"],
     },
 ];
 
@@ -287,25 +258,17 @@ pub fn capability_set(value: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::{UNIT_CLASSES, capability_set, parse_unit};
+    use crate::deployment::systemd_unit;
     use crate::test_support::{TestError, TestResult};
 
-    const SENTINEL: &str = include_str!("../../deploy/systemd/harw-sentinel.service");
-    const PROBE_FS: &str = include_str!("../../deploy/systemd/harw-probe-fs.service");
-    const PROBE_BPF: &str = include_str!("../../deploy/systemd/harw-probe-bpf.service");
-    const WARDEN_SERVICE: &str = include_str!("../../deploy/systemd/harw-warden.service");
-    const WARDEN_SOCKET: &str = include_str!("../../deploy/systemd/harw-warden.socket");
-
-    /// Ordnet jeder [`UNIT_CLASSES`]-Klasse ihren eingebetteten Unit-Text zu.
+    /// Der eingebettete Produktionstext einer Unit aus `deploy/systemd/`
+    /// (dieselbe Quelle wie `harw install --print-systemd`).
     fn service_text(service_file: &str) -> TestResult<&'static str> {
-        match service_file {
-            "harw-sentinel.service" => Ok(SENTINEL),
-            "harw-probe-fs.service" => Ok(PROBE_FS),
-            "harw-probe-bpf.service" => Ok(PROBE_BPF),
-            "harw-warden.service" => Ok(WARDEN_SERVICE),
-            other => Err(TestError::Unexpected(format!(
-                "kein eingebetteter Unit-Text für {other}"
-            ))),
-        }
+        systemd_unit(service_file)
+            .map(|asset| asset.contents)
+            .ok_or_else(|| {
+                TestError::Unexpected(format!("kein eingebetteter Unit-Text für {service_file}"))
+            })
     }
 
     #[test]
@@ -332,10 +295,11 @@ mod tests {
     }
 
     #[test]
-    fn test_warden_socket_unit_is_syntactically_well_formed() {
-        let parsed = parse_unit(WARDEN_SOCKET);
+    fn test_warden_socket_unit_is_syntactically_well_formed() -> TestResult {
+        let parsed = parse_unit(service_text("harw-warden.socket")?);
         assert!(parsed.has_section("Unit"));
         assert!(parsed.has_section("Socket"));
+        Ok(())
     }
 
     #[test]
@@ -402,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_warden_restricts_address_families_without_inet() -> TestResult {
-        let parsed = parse_unit(WARDEN_SERVICE);
+        let parsed = parse_unit(service_text("harw-warden.service")?);
         let value = parsed
             .last_value("Service", "RestrictAddressFamilies")
             .ok_or(TestError::Missing(
@@ -414,6 +378,11 @@ mod tests {
             "harw-warden.service darf kein AF_INET/AF_INET6 zulassen (Gate: kein Netz im Warden)"
         );
         assert!(
+            families.iter().all(|f| f == "AF_UNIX" || f == "AF_NETLINK"),
+            "harw-warden.service: nur AF_UNIX (Aktivierungssocket) und AF_NETLINK \
+             (nft-Kindprozess) sind begründet, gefunden: {families:?}"
+        );
+        assert!(
             families.contains("AF_UNIX"),
             "harw-warden.service muss mindestens AF_UNIX zulassen (sein einziger Transport)"
         );
@@ -421,34 +390,33 @@ mod tests {
     }
 
     #[test]
-    fn test_warden_socket_unit_produces_exactly_one_descriptor() {
-        let parsed = parse_unit(WARDEN_SOCKET);
+    fn test_warden_socket_unit_produces_exactly_one_descriptor() -> TestResult {
+        let parsed = parse_unit(service_text("harw-warden.socket")?);
         let listen_directives = parsed.count_keys_with_prefix("Socket", "Listen");
         assert_eq!(
             listen_directives, 1,
             "harw-warden::systemd::acquire_listen_socket() verlangt hart genau einen \
              LISTEN_FDS-Eintrag — mehr als eine Listen*=-Zeile wäre ein Startfehler des Binaries"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_warden_socket_unit_uses_sequential_packet() {
-        let parsed = parse_unit(WARDEN_SOCKET);
+    fn test_warden_socket_unit_uses_sequential_packet() -> TestResult {
+        let parsed = parse_unit(service_text("harw-warden.socket")?);
         assert!(
             parsed
                 .last_value("Socket", "ListenSequentialPacket")
                 .is_some(),
             "harw-warden::ipc erwartet einen SOCK_SEQPACKET-Socket, keinen Stream-/Datagram-Socket"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_probes_order_after_the_sentinel_without_a_hard_requires() {
-        for (service_file, text) in [
-            ("harw-probe-fs.service", PROBE_FS),
-            ("harw-probe-bpf.service", PROBE_BPF),
-        ] {
-            let parsed = parse_unit(text);
+    fn test_probes_order_after_the_sentinel_without_a_hard_requires() -> TestResult {
+        for service_file in ["harw-probe-fs.service", "harw-probe-bpf.service"] {
+            let parsed = parse_unit(service_text(service_file)?);
             assert!(
                 parsed
                     .values("Unit", "After")
@@ -462,11 +430,12 @@ mod tests {
                  (ein Sentinel-Neustart soll die Sonde nicht mit stoppen — siehe Moduldoku)"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_warden_service_requires_its_own_socket() {
-        let parsed = parse_unit(WARDEN_SERVICE);
+    fn test_warden_service_requires_its_own_socket() -> TestResult {
+        let parsed = parse_unit(service_text("harw-warden.service")?);
         assert!(
             parsed
                 .values("Unit", "Requires")
@@ -475,15 +444,16 @@ mod tests {
             "harw-warden.service ist ohne seinen Socket bedeutungslos (acquire_listen_socket() \
              bricht sonst hart ab) und muss ihn deshalb über Requires= verlangen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_warden_service_does_not_protect_control_groups() {
+    fn test_warden_service_does_not_protect_control_groups() -> TestResult {
         // Die im Auftrag ausdrücklich benannte Falle: ProtectControlGroups=yes
         // würde /sys/fs/cgroup durch eine leere, private Instanz ersetzen und
         // damit genau den Pfad wegnehmen, den harw-warden laut
         // --cgroup-root braucht.
-        let parsed = parse_unit(WARDEN_SERVICE);
+        let parsed = parse_unit(service_text("harw-warden.service")?);
         let value = parsed.last_value("Service", "ProtectControlGroups");
         assert_ne!(
             value,
@@ -491,6 +461,7 @@ mod tests {
             "harw-warden.service darf ProtectControlGroups=yes nicht setzen — das nimmt dem \
              Binary seinen einzigen Schreibbereich (--cgroup-root) weg"
         );
+        Ok(())
     }
 
     #[test]

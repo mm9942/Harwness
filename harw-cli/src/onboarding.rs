@@ -470,7 +470,12 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
 
     let layers = harw_home::config_layers(home).map_err(|e| e.to_string())?;
     harw_config::discover_config(&layers)
-        .and_then(|c| c.validate())
+        .and_then(|c| {
+            c.validate()?;
+            // Agentendefinitionen reicht `harw-config` ungeparst weiter; ihr
+            // Senken und die Auswahlprüfung gehören zur Validierung.
+            harw_registry_defaults::ConfigAgents::from_config_validated(&c).map(|_| ())
+        })
         .map_err(|e| e.to_string())?;
     eprintln!(
         "Einrichtung gespeichert: {} / {} (Profil: {}).",

@@ -108,7 +108,7 @@
 //! # Eingebaute Rollen gewinnen (Plan R9, Teil B)
 //! Bis Plan R9 sollte eine lokale Definition eine eingebaute Rolle gleichen
 //! Namens ersetzen. Der Vergleich lief aber gegen die Schlüssel von
-//! `existing` — und die sind `DefinitionId`s (`ResolvedConfig::executable_agents`),
+//! `existing` — und die sind `DefinitionId`s (`ConfigAgents::executable_agents`),
 //! nie Rollennamen; er traf deshalb nie. Jetzt wird konsistent über
 //! Spezialisierung **und** volle ID verglichen, und die Richtung ist
 //! umgekehrt: eine eingebaute Rolle ist sicherheitsrelevant (Profil,
@@ -218,7 +218,7 @@ pub const BASE_DEFINITION_NAMES: &[&str] = &[WORKER_BASE_NAME, CHILD_ORCHESTRATO
 /// Zur Bauzeit über `include_dir!` eingebettet; zur Laufzeit findet kein
 /// Dateizugriff mehr statt. Siehe Modul-Dokumentation, Abschnitt
 /// „Verzeichniskonvention“.
-static AGENTS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/agents");
+pub(crate) static AGENTS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/agents");
 
 /// Cache für [`builtin_agent_toml`] — der Baum wird nur beim ersten Aufruf durchlaufen.
 static AGENT_TOML: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
@@ -242,7 +242,8 @@ static MEMBERSHIP_TOML: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::
 /// Ein Kontextprogramm ist keine Rolle: es beschreibt, *was ein Agent sieht*,
 /// nicht *wer er ist*. Als Rolle eingesammelt würde es beim Auflösen als
 /// startbarer Agent behandelt.
-const NON_ROLE_ROOT_DIRS: &[&str] = &["family", "families", "organization", "context-programs"];
+pub(crate) const NON_ROLE_ROOT_DIRS: &[&str] =
+    &["family", "families", "organization", "context-programs"];
 
 /// Root-Unterverzeichnisse, die als Families eingesammelt werden — `family`
 /// ist der heutige Name, `families` der für spätere Knoten vorgesehene
@@ -631,7 +632,7 @@ pub fn builtin_agent_toml() -> &'static [(&'static str, &'static str)] {
 ///
 /// # Argumente
 /// - `existing` (`&HashMap<String, ExecutableAgentIr>`): bereits geladene
-///   lokale Definitionen (`ResolvedConfig::executable_agents`, geschlüsselt
+///   lokale Definitionen (`ConfigAgents::executable_agents`, geschlüsselt
 ///   nach `DefinitionId`). Nur gelesen, nur für die Kollisionswarnung.
 ///
 /// # Rückgabe
@@ -3156,7 +3157,7 @@ mod tests {
     #[test]
     fn test_local_definition_never_replaces_a_builtin_role() -> TestResult {
         // Plan R9, Teil B: `existing` ist nach `DefinitionId` geschlüsselt
-        // (`ResolvedConfig::executable_agents`). Eine lokale Definition mit
+        // (`ConfigAgents::executable_agents`). Eine lokale Definition mit
         // derselben Spezialisierung wie eine eingebaute Rolle ersetzt sie
         // nicht — die eingebaute Rolle bleibt, die Kollision wird gemeldet.
         let local_explorer = builtin()?

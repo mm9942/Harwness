@@ -633,7 +633,7 @@ mod tests {
         let root = temporary_root("harw-knowledge-rebuild-dream")?;
         let store = KnowledgeStore::new(&root);
         let report = DreamReport {
-            work_id: harw_job_runtime::WorkId::from_str("dream-20260923T010203"),
+            work_id: harw_job_core::WorkId::from_str("dream-20260923T010203"),
             created_at: jiff::Timestamp::UNIX_EPOCH,
             summary: "Konsolidierte Reflexion".to_owned(),
             proposed_topic_updates: Vec::new(),

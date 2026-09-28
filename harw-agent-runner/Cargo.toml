@@ -135,7 +135,11 @@ harw-core = { path = "../harw-core" }
 # `NoopNotifier` — runs each compiled agent's child as a real job (#22 wave
 # 3C).
 harw-tool-job = { path = "../harw-tool-job" }
-rustix = { workspace = true, features = ["process"] }
+# `admission`: `HostReport::probe` (PL-90 runtime admission) and the
+# `SandboxReport`/`EnforcementState` it reports. Layer A → J is allowed
+# (`xtask/arch-policy.toml`); the crate is already in this binary's closure
+# through `harw-runtime`/`harw-core`.
+harw-job-runtime = { path = "../harw-job-runtime" }
 serde_json = { workspace = true }
 # `iface::mcp`'s event stream (optional: only pulled in by the `mcp`
 # feature); also a base dep of `iface::http`'s SSE stream via `http`'s own

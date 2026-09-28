@@ -416,7 +416,14 @@ fn confirm_and_track(
         .map_err(map_plan_error)?;
     let plan = store.switch_plan(plan_id, actor).map_err(map_plan_error)?;
     let goal_line = match ctx.goal_store() {
-        Some(goals) => bind_goal(goals.as_ref(), store, &plan, actor),
+        // H12: die Bindung sieht nur Ziele des eigenen Mandanten-Scopes und
+        // ersetzt nie ein fremdes (siehe `harw_plan::tenant_scope`).
+        Some(goals) => bind_goal(
+            &harw_plan::ScopedGoalStore::new(goals.as_ref(), ctx.tenant().cloned()),
+            store,
+            &plan,
+            actor,
+        ),
         None => "Goal-Bindung: keine (kein Goal-Store in diesem Einstieg).".to_owned(),
     };
     let plan = store.current().unwrap_or(plan);
@@ -552,6 +559,8 @@ fn new_goal(plan: &Plan) -> Goal {
         evidence: Vec::new(),
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
+        // H12: das Ziel eines Plans gehört demselben Mandanten wie der Plan.
+        tenant: plan.tenant.clone(),
     }
 }
 
@@ -1008,7 +1017,9 @@ pub(crate) fn step(
 /// # Returns
 /// `None` ohne Plan-Store oder ohne auffindbaren Plan.
 pub(crate) fn goal_progress_line(ctx: &OpContext, goal: &Goal) -> Option<String> {
-    let store = ctx.plan_store()?;
+    let handle = ctx.plan_store()?;
+    // H12: ein fremder Plan liefert keine Fortschrittszeile.
+    let store = harw_plan::ScopedPlanStore::new(handle.as_ref(), ctx.tenant().cloned());
     let plan = match &goal.plan_id {
         Some(id) => store.plan_by_id(id).ok()?,
         None => store.current().ok()?,

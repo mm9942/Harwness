@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-runtime"
+description = "Common runtime assembly for all harw entry points"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -38,6 +39,10 @@ harw-extension-api = { path = "../harw-extension-api" }
 # `harw-session-store/src/meta.rs`.
 harw-fsutil = { path = "../harw-fsutil" }
 harw-home = { path = "../harw-home" }
+# Crypto-Infrastruktur H4: `InfrastructureAvailability` aus `[infrastructure]`
+# (`src/infrastructure.rs`), als Dienst auf Slash/Web (`services.rs`). Kein
+# Zyklus: `harw-infra-client` (Schicht I) hängt von keiner harw-Crate ab.
+harw-infra-client = { path = "../harw-infra-client" }
 harw-job-runtime = { path = "../harw-job-runtime" }
 # L6: `Arc<KnowledgeStore>` für Slash/Modell-Werkzeug (`services.rs`). Kein
 # Zyklus: `harw-knowledge` hängt nicht von `harw-runtime` ab.

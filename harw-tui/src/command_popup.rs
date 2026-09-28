@@ -54,6 +54,10 @@ fn make_description(domain_str: &str, permission_str: &str) -> String {
         "CatalogConfig" => "Katalog",
         "Knowledge" => "Wissen",
         "Channels" => "Kanäle",
+        "Identity" => "Identität",
+        "Network" => "Netzwerk",
+        "Security" => "Sicherheit",
+        "Crypto" => "Kryptografie",
         "Misc" => "Allgemein",
         other => other,
     };

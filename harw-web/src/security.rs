@@ -654,6 +654,7 @@ mod tests {
             call_id: ToolCallId::from_str("call-1"),
             actor,
             issued_at: issued_at(),
+            tenant: None,
         };
         store
             .issue(&record)

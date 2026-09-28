@@ -180,24 +180,19 @@ fn cancel_reason_label(reason: Option<CancelReason>) -> String {
     .to_owned()
 }
 
-/// Kills the child's whole process group — best-effort, and via `rustix`
-/// like every other process signal in this codebase
-/// (`harw_tool_job::procfs::signal_group`), never raw `libc`/`unsafe`. A
-/// process that already exited is not an error.
-#[cfg(unix)]
+/// Terminates the child's whole process group — best-effort. Only the
+/// direct (test) path needs this; the job-managed path goes through
+/// [`JobManager::stop`]. The signal goes through
+/// [`harw_tool_job::procfs::signal_child_group`]: it opens a pidfd for the
+/// still-unreaped child and signals the group only while that pidfd proves
+/// the leader is our child (or, once it exited, only while its PID has not
+/// been reused) — never a raw `kill(-pid)` on a bare number. A process that
+/// already exited is not an error.
 fn kill_process_group(child: &Child) {
-    let Some(pid) = child.id().and_then(|pid| {
-        i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-    }) else {
-        return;
-    };
-    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::TERM);
+    if let Err(error) = harw_tool_job::procfs::signal_child_group(child, JobSignal::Term) {
+        tracing::debug!(%error, "child process group: SIGTERM not delivered");
+    }
 }
-
-#[cfg(not(unix))]
-fn kill_process_group(_child: &Child) {}
 
 /// Source of the child's stdout lines, unified so [`drive_protocol`] does
 /// not care whether it runs against a directly-spawned [`Child`] or a

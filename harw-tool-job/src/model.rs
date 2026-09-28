@@ -12,7 +12,16 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// Formatversion von `meta.json`.
-pub const META_VERSION: u32 = 1;
+///
+/// # Description
+/// - `1`: Prozessidentität nur als `pid` + `proc_start_ticks`.
+/// - `2`: zusätzlich [`JobMeta::identity`] (Startzeit, Programm, cgroup-v2-
+///   Pfad; Job-Runtime-Doc §15). `proc_start_ticks` wird weiter
+///   geschrieben, damit ältere harw-Versionen v2-Dateien lesen können.
+///
+/// Beide Versionen werden gelesen; [`JobMeta::process_identity`] liefert für
+/// v1 eine Identität ohne Programm und cgroup.
+pub const META_VERSION: u32 = 2;
 
 /// Höchstlänge einer [`JobId`].
 const MAX_JOB_ID_LEN: usize = 64;
@@ -210,6 +219,10 @@ pub struct JobMeta {
     /// Feld 22); erkennt PID-Wiederverwendung nach einem Neustart von harw.
     #[serde(default)]
     pub proc_start_ticks: Option<u64>,
+    /// Wiederherstellungsidentität des Gruppenführers (`meta.json` v2);
+    /// `None` in v1-Dateien und auf Plattformen ohne `/proc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<JobProcessIdentity>,
     /// `true`, wenn der Prozess direkt auf dem Host läuft (ohne `bwrap`).
     #[serde(default)]
     pub executed_on_host: bool,
@@ -253,6 +266,46 @@ pub struct JobMeta {
     pub launch_error: Option<String>,
 }
 
+impl JobMeta {
+    /// Die persistierte Identität des Gruppenführers: `identity` (v2), sonst
+    /// aus `proc_start_ticks` (v1, ohne Programm und cgroup). `None`, wenn
+    /// keine Startzeit bekannt ist — eine PID allein beweist nichts
+    /// (Job-Runtime-Doc §2.1, §25), ein solcher Job wird nie signalisiert.
+    #[must_use]
+    pub fn process_identity(&self) -> Option<JobProcessIdentity> {
+        self.identity.clone().or_else(|| {
+            self.proc_start_ticks.map(|start_ticks| JobProcessIdentity {
+                start_ticks,
+                executable: None,
+                cgroup_path: None,
+            })
+        })
+    }
+}
+
+/// Plattformneutrale, persistierbare Identität eines Job-Prozesses
+/// (`meta.json` v2, Job-Runtime-Doc §15).
+///
+/// # Description
+/// Unter Linux wird sie beim Neuladen in eine
+/// `harw_job_linux::LinuxRecoveryIdentity` übersetzt: ein früherer Job wird
+/// nur gesteuert, wenn die PID nach dem Öffnen eines pidfd noch dieselbe
+/// Startzeit (und, wo beide Seiten bekannt sind, dasselbe Programm und
+/// dieselbe cgroup) hat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProcessIdentity {
+    /// Startzeit in Clock-Ticks seit Boot (`/proc/<pid>/stat`, Feld 22).
+    pub start_ticks: u64,
+    /// `/proc/<pid>/exe`, zuletzt unter Aufsicht beobachtet (ein `exec` des
+    /// Gruppenführers ändert es; die Überwachung schreibt es nach).
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Pfad in der cgroup-v2-Hierarchie (`0::<pfad>` aus
+    /// `/proc/<pid>/cgroup`).
+    #[serde(default)]
+    pub cgroup_path: Option<String>,
+}
+
 /// Sicht auf einen Job für Werkzeuge und Oberfläche.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobStatus {
@@ -281,6 +334,7 @@ pub const META_FILE: &str = "meta.json";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_job_id_rejects_path_traversal_and_bad_chars() {
@@ -302,6 +356,56 @@ mod tests {
         assert!(!owner.may_control(""));
         let chain: Vec<&str> = owner.delivery_chain().collect();
         assert_eq!(chain, vec!["worker", "orchestrator", "uia"]);
+    }
+
+    fn v1_json(ticks: &str) -> String {
+        format!(
+            r#"{{"version":1,"job_id":"job-1","name":"n","command":"c","state":"running",
+               "pid":42,{ticks}"harw_instance":"harw-old",
+               "owner":{{"session":"s"}},"created_at":"2026-01-01T00:00:00Z",
+               "notify_every_secs":60}}"#
+        )
+    }
+
+    #[test]
+    fn test_v1_meta_converts_to_identity_without_exe() -> TestResult {
+        let meta: JobMeta = serde_json::from_str(&v1_json(r#""proc_start_ticks":777,"#))
+            .map_err(ctx("parse v1"))?;
+        assert_eq!(meta.version, 1);
+        assert_eq!(meta.identity, None);
+        assert_eq!(
+            meta.process_identity(),
+            Some(JobProcessIdentity {
+                start_ticks: 777,
+                executable: None,
+                cgroup_path: None,
+            })
+        );
+        let without: JobMeta =
+            serde_json::from_str(&v1_json("")).map_err(ctx("parse v1 without ticks"))?;
+        assert_eq!(without.process_identity(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_v2_identity_roundtrip_and_precedence() -> TestResult {
+        let mut meta: JobMeta =
+            serde_json::from_str(&v1_json(r#""proc_start_ticks":1,"#)).map_err(ctx("parse v1"))?;
+        let identity = JobProcessIdentity {
+            start_ticks: 2,
+            executable: Some("/usr/bin/sleep".to_owned()),
+            cgroup_path: Some("/user.slice".to_owned()),
+        };
+        meta.version = META_VERSION;
+        meta.identity = Some(identity.clone());
+        let json = serde_json::to_string(&meta).map_err(ctx("serialize v2"))?;
+        assert!(json.contains("\"identity\""));
+        assert!(json.contains("\"proc_start_ticks\":1"));
+        let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse v2"))?;
+        assert_eq!(back, meta);
+        // v2 `identity` wins over the v1 field.
+        assert_eq!(back.process_identity(), Some(identity));
+        Ok(())
     }
 
     #[test]

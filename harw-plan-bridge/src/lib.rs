@@ -27,6 +27,15 @@
 //! - Und ein Sicherheitsbefund hängt sich als Nachweis an, ohne den Plan
 //!   je zu kommandieren: ein Vertragsverstoß erzeugt einen Vorschlag,
 //!   niemals eine Invalidierung ([`security_bridge`], Knoten AW6-04).
+//! - Und ein Supervisor treibt Worker-Agenten auf das Ziel hin: kleine,
+//!   disjunkte Scopes parallel delegieren, denselben Worker mit knappem
+//!   Feedback fortsetzen (warmer Prompt-Cache), eine zentrale Verifikation je
+//!   Welle, Zielerreichung nur vorschlagen ([`work_driver`],
+//!   [`WorkDriver::decide`]).
+//! - Und deklarierte Verifikationsschritte werden tatsächlich ausgeführt —
+//!   Befehle nur in der Sandbox (Job-Coordinator), Artefakte unter der
+//!   Workspace-Wurzel — und liefern zitierfähige Evidenz; ohne Sandbox gilt
+//!   nichts als bestanden ([`verify_exec`]).
 //!
 //! # Verantwortungsbereich
 //! Diese Crate **besitzt keinen Zustand**. Plan und Goal gehören `harw-plan`,
@@ -45,8 +54,9 @@
 //! # Wer darf ein Ziel für erreicht erklären
 //! Niemand in dieser Crate. `reconcile` darf
 //! [`ReconcileStep::GoalStatus`] vorschlagen; `apply` wendet ihn ausdrücklich
-//! **nicht** an. Die Entscheidung bleibt bei einem menschlichen Akteur — so,
-//! wie `harw_plan::goal::validate_goal_action` es erzwingt.
+//! **nicht** an. Ebenso schlägt [`WorkDriver::decide`] nur
+//! [`WorkDriveStep::ProposeAchieved`] vor. Die Entscheidung bleibt bei einem
+//! menschlichen Akteur — so, wie `harw_plan::goal::validate_goal_action` es erzwingt.
 //!
 //! # Zwei Zeitachsen
 //! `harw-plan` datiert in `time::OffsetDateTime`, `harw-research` und
@@ -93,6 +103,8 @@ pub mod job_bridge;
 pub mod metrics;
 pub mod plan_context;
 pub mod security_bridge;
+pub mod verify_exec;
+pub mod work_driver;
 
 pub use crate::cells::{
     CellPlan, CellRun, CellSchedule, CellStage, MemberOutcome, ResolvedWave, SkipReason,
@@ -117,6 +129,17 @@ pub use crate::plan_context::{
 pub use crate::security_bridge::{
     dock_security_finding, evidence_for_security_finding,
     propose_invalidation_for_contract_violation,
+};
+pub use crate::verify_exec::{
+    CoordinatorVerifyRunner, NoSandboxRunner, RunVerdict, VerificationExecutor, VerifyConfig,
+    VerifyOutcome, VerifyRun, VerifyRunner, infer_evidence_kind, steps_from_commands,
+    steps_from_ir,
+};
+pub use crate::work_driver::{
+    BudgetUsageSnapshot, DEFAULT_WORKER_ROLE, GiveUpReason, JUDGE_FOLLOWUP_SCOPE,
+    JUDGE_INSTRUCTION, JudgeVerdict, RespawnReason, VerificationState, WorkDriveInput,
+    WorkDriveLimits, WorkDrivePlan, WorkDriveStep, WorkDriver, WorkScope, WorkerOutcome,
+    WorkerResultSummary, WorkerState,
 };
 
 /// Gemeinsame Test-Fixtures für alle Module dieser Crate.
@@ -304,6 +327,7 @@ pub(crate) mod testing {
             nodes,
             created_at: plan_time(),
             updated_at: plan_time(),
+            tenant: None,
         })
     }
 
@@ -621,6 +645,7 @@ pub(crate) mod testing {
             evidence: Vec::new(),
             created_at: plan_time(),
             updated_at: plan_time(),
+            tenant: None,
         }
     }
 

@@ -13,9 +13,9 @@ silent.
 
 The toolchain is pinned in **`rust-toolchain.toml`** at the repository
 root (`channel = "1.98.1"`, components `rustfmt` and `clippy`, profile
-`minimal`). rustup reads this file automatically — including in the
-standalone `dod/` workspace, which therefore has no file of its own — and
-installs the version on the first `cargo` invocation. CI
+`minimal`). rustup reads this file automatically — including under
+`dod/`, whose crates are members of the root workspace (PL-60) and
+therefore have no file of their own — and installs the version on the first `cargo` invocation. CI
 (`.github/workflows/ci.yml`, `release.yml`) installs exactly this file via
 `rustup toolchain install`; locally and in CI the same compiler, the same
 `rustfmt` and the same `clippy` are used.

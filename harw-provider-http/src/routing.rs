@@ -276,6 +276,25 @@ impl ModelProvider for RoutingModelProvider {
     fn pinned_model_id(&self) -> Option<String> {
         None
     }
+
+    /// Wartezeit des Vorgabe-Backends.
+    ///
+    /// # Description
+    /// Anders als die Pins wird die Drosselung durchgereicht: Requests ohne
+    /// `provider_id` landen beim Vorgabe-Backend, dessen Limits sind also die
+    /// für ungeroutete Arbeit maßgeblichen (konservativ). Wartezeiten anderer
+    /// Backends fließen bewusst nicht ein.
+    ///
+    /// # Returns
+    /// Die Wartezeit des Vorgabe-Backends; `None` bei vergifteter Sperre
+    /// (der Request selbst scheitert dann ohnehin bei der Auswahl).
+    fn pacing_wait(&self) -> Option<std::time::Duration> {
+        self.backends
+            .get(&self.default_provider_id)
+            .ok()
+            .flatten()
+            .and_then(|provider| provider.pacing_wait())
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +308,7 @@ mod tests {
     use harw_types::{ModelId, ProviderId};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     struct RecordingProvider {
         response: &'static str,
@@ -316,6 +336,19 @@ mod tests {
                     .push(request);
                 Ok(ModelResponse::text(response))
             })
+        }
+    }
+
+    /// Backend, das nur eine feste Drosselungs-Wartezeit meldet.
+    struct PacedProvider(Option<Duration>);
+
+    impl ModelProvider for PacedProvider {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async move { Ok(ModelResponse::text("paced")) })
+        }
+
+        fn pacing_wait(&self) -> Option<Duration> {
+            self.0
         }
     }
 
@@ -505,6 +538,46 @@ mod tests {
         )
         .map_err(ctx("router construction"))?;
         assert_eq!(router.provider_ids(), vec!["alpha", "zeta"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pacing_wait_reports_default_backend_only() -> TestResult {
+        let wait = Duration::from_secs(7);
+        let router = RoutingModelProvider::new(
+            registry([
+                (
+                    "default",
+                    Box::new(PacedProvider(Some(wait))) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "other",
+                    Box::new(PacedProvider(Some(Duration::from_secs(60))))
+                        as Box<dyn ModelProvider>,
+                ),
+            ]),
+            "default",
+        )
+        .map_err(ctx("router construction"))?;
+        assert_eq!(router.pacing_wait(), Some(wait));
+
+        // Die Wartezeit eines Nicht-Vorgabe-Backends sickert nicht durch.
+        let quiet = RoutingModelProvider::new(
+            registry([
+                (
+                    "default",
+                    Box::new(PacedProvider(None)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "other",
+                    Box::new(PacedProvider(Some(Duration::from_secs(60))))
+                        as Box<dyn ModelProvider>,
+                ),
+            ]),
+            "default",
+        )
+        .map_err(ctx("router construction"))?;
+        assert_eq!(quiet.pacing_wait(), None);
         Ok(())
     }
 

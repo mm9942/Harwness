@@ -34,6 +34,9 @@
 //! assert!(section.validate().is_ok());
 //! ```
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// `[web]` — Bind-Adresse, Port und Token-Lebensdauer der eingebetteten
@@ -56,6 +59,62 @@ pub struct WebSection {
     /// `[web.search]` — Backend des Agent-Werkzeugs `web.search`.
     #[serde(default)]
     pub search: WebSearchToml,
+    /// `[web.identity]` — Identitätsauflösung der Kontrollfläche `harw web`
+    /// (H12). Fehlt die Tabelle, gilt das Verhalten vor H12 (`tier_map` ohne
+    /// Mandanten).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<WebIdentityToml>,
+}
+
+/// `[web.identity] mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebIdentityModeToml {
+    /// Vorgabe: UID → Tier (+ optional Mandant aus `uid_tenants`).
+    #[default]
+    TierMap,
+    /// Zusätzlich Kontextbindung über den SecurityHub.
+    SecurityHub,
+}
+
+/// `[web.identity]` — rohe, deklarative Form der Identitätskonfiguration von
+/// `harw web` (H12).
+///
+/// # Description
+/// `harw-config` darf `harw-web` nicht kennen (Schichtung); dieser Typ spiegelt
+/// deshalb Feld für Feld `harw_web::identity::WebIdentityConfig`. Die
+/// Umwandlung und die semantische Prüfung (numerische UIDs, gültige Mandanten,
+/// `security_hub`-only-Schlüssel, Pflicht-Principals) übernimmt der Konsument
+/// (`harw-cli/src/web.rs` → `WebIdentityConfig::build_resolver`); hier gelten
+/// nur Form und `deny_unknown_fields`.
+///
+/// ```toml
+/// [web.identity]
+/// mode = "security_hub"                        # oder "tier_map" (Vorgabe)
+/// security_socket = "/run/harw/infra/security.sock"
+/// require_context = true
+/// uid_tenants = { "1000" = "tenant-a" }
+/// uid_principals = { "1000" = "alice" }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebIdentityToml {
+    /// Auflösungsmodus.
+    #[serde(default)]
+    pub mode: WebIdentityModeToml,
+    /// Socket des SecurityHub (nur `security_hub`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_socket: Option<PathBuf>,
+    /// Nur `security_hub`: ohne Kontext bzw. erreichbaren Hub ablehnen statt
+    /// auf die Tier-Tabelle zurückzufallen.
+    #[serde(default)]
+    pub require_context: bool,
+    /// UID (als Zeichenkette) → Mandant.
+    #[serde(default)]
+    pub uid_tenants: BTreeMap<String, String>,
+    /// Nur `security_hub`: UID (als Zeichenkette) → erwartete Principal-Id.
+    #[serde(default)]
+    pub uid_principals: BTreeMap<String, String>,
 }
 
 /// `[web.search]` — Such-Backend für `web.search`.
@@ -127,6 +186,7 @@ impl Default for WebSection {
             port: 0,
             token_ttl_secs: default_token_ttl_secs(),
             search: WebSearchToml::default(),
+            identity: None,
         }
     }
 }
@@ -206,6 +266,69 @@ mod tests {
         };
         assert!(error.to_string().contains("unknown field"));
         Ok(())
+    }
+
+    #[test]
+    fn test_web_identity_absent_by_default() -> TestResult {
+        let section: WebSection = toml::from_str("").map_err(ctx("parse toml"))?;
+        assert_eq!(section.identity, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_web_identity_parses_full_security_hub_table() -> TestResult {
+        let src = r#"
+            [identity]
+            mode = "security_hub"
+            security_socket = "/run/harw/infra/security.sock"
+            require_context = true
+            uid_tenants = { "1000" = "tenant-a", "1001" = "tenant-b" }
+            uid_principals = { "1000" = "alice" }
+        "#;
+        let section: WebSection = toml::from_str(src).map_err(ctx("parse toml"))?;
+        let identity = section
+            .identity
+            .clone()
+            .ok_or(TestError::Unexpected("[web.identity] missing".to_owned()))?;
+        assert_eq!(identity.mode, WebIdentityModeToml::SecurityHub);
+        assert_eq!(
+            identity.security_socket,
+            Some(PathBuf::from("/run/harw/infra/security.sock"))
+        );
+        assert!(identity.require_context);
+        assert_eq!(
+            identity.uid_tenants.get("1001").map(String::as_str),
+            Some("tenant-b")
+        );
+        assert_eq!(
+            identity.uid_principals.get("1000").map(String::as_str),
+            Some("alice")
+        );
+
+        let encoded = toml::to_string(&section).map_err(ctx("encode toml"))?;
+        let decoded: WebSection = toml::from_str(&encoded).map_err(ctx("parse encoded toml"))?;
+        assert_eq!(decoded, section);
+        Ok(())
+    }
+
+    #[test]
+    fn test_web_identity_empty_table_is_tier_map_default() -> TestResult {
+        let section: WebSection = toml::from_str("[identity]").map_err(ctx("parse toml"))?;
+        assert_eq!(section.identity, Some(WebIdentityToml::default()));
+        assert_eq!(
+            WebIdentityToml::default().mode,
+            WebIdentityModeToml::TierMap
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_web_identity_rejects_unknown_field_and_mode() {
+        let unknown =
+            toml::from_str::<WebSection>("[identity]\nuid_tiers = { \"1000\" = \"owner\" }");
+        assert!(unknown.is_err(), "unknown key must be rejected");
+        let bad_mode = toml::from_str::<WebSection>("[identity]\nmode = \"bearer\"");
+        assert!(bad_mode.is_err(), "unknown mode must be rejected");
     }
 
     #[test]

@@ -16,6 +16,7 @@
 //! - Implementierungen: [`memory_store`], [`file_store`], [`goal_store`]
 //! - Plan-Katalog (mehrere Pläne, ein aktiver, Archiv, Freigabestand):
 //!   [`catalog`]
+//! - Mandanten-Sicht (H12) auf beide Stores: [`tenant_scope`]
 //!
 //! # Architekturregel: eine Mutationsstelle
 //! Der Plan wird ausschließlich über `PlanStore::apply` verändert. Die
@@ -64,6 +65,8 @@ pub mod graph;
 pub mod ids;
 pub mod memory_store;
 pub mod store;
+// H12: Mandanten-Sicht auf Plan- und Goal-Stores.
+pub mod tenant_scope;
 // Test-Fixtures für dieses Crate **und** seine Konsumenten. Bewusst
 // unbedingt `pub` statt `#[cfg(test)]`: so gegattete Items sind für andere
 // Crates unsichtbar, und genau deshalb haben `harw-plan-bridge`, `harw-ops`
@@ -109,6 +112,7 @@ pub use crate::types::{
 // unter `harw_plan::graph::…`, damit der Crate-Root nur Typen führt.
 pub use crate::goal::{Goal, GoalAction, GoalEvent, GoalId, GoalPatch, GoalStatus, GoalStore};
 pub use crate::goal_store::{FileGoalStore, InMemoryGoalStore};
+pub use crate::tenant_scope::{ScopedGoalStore, ScopedPlanStore};
 
 #[cfg(test)]
 mod tests {
@@ -129,6 +133,7 @@ mod tests {
             nodes,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
         }
     }
 

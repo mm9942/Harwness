@@ -690,6 +690,10 @@ fn map_domain(d: harw_operations::operation::OperationDomain) -> CommandDomain {
         OperationDomain::Execution => CommandDomain::Execution,
         OperationDomain::CatalogConfig => CommandDomain::CatalogConfig,
         OperationDomain::Knowledge => CommandDomain::Knowledge,
+        OperationDomain::Identity => CommandDomain::Identity,
+        OperationDomain::Network => CommandDomain::Network,
+        OperationDomain::Security => CommandDomain::Security,
+        OperationDomain::Crypto => CommandDomain::Crypto,
         OperationDomain::Misc => CommandDomain::Misc,
     }
 }
@@ -1243,5 +1247,21 @@ mod tests {
             "the first of two same-named locals wins"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_map_domain_covers_infrastructure_domains() {
+        use harw_operations::operation::OperationDomain;
+        assert_eq!(
+            map_domain(OperationDomain::Identity),
+            CommandDomain::Identity
+        );
+        assert_eq!(map_domain(OperationDomain::Network), CommandDomain::Network);
+        assert_eq!(
+            map_domain(OperationDomain::Security),
+            CommandDomain::Security
+        );
+        assert_eq!(map_domain(OperationDomain::Crypto), CommandDomain::Crypto);
+        assert_eq!(map_domain(OperationDomain::Misc), CommandDomain::Misc);
     }
 }

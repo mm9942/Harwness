@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-ops"
+description = "Concrete operations (commands and model tools) for Harwness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -109,6 +110,12 @@ harw-tool-job = { path = "../harw-tool-job" }
 # #22 Welle 2B: `/agent check|build|inspect|graph|explain|…` (dieselben
 # Befehle wie `harw agent …`; `build` läuft als Job).
 harw-agent-compiler = { path = "../harw-agent-compiler" }
+# Crypto-Infrastruktur H5: `infra.*`-Operationen (`src/infra.rs`) lesen
+# `Arc<InfrastructureAvailability>` aus dem `OpContext` und rufen die typisierten
+# Clients (AuthHub/NetSec/SecurityHub); keine Operation öffnet selbst einen
+# Socket. Kein Zyklus: `harw-infra-client` (Schicht I) hängt von keiner
+# harw-Crate ab.
+harw-infra-client = { path = "../harw-infra-client" }
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`

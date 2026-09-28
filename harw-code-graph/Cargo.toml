@@ -1,10 +1,12 @@
 [package]
 publish.workspace = true
 name = "harw-code-graph"
+description = "Analyzes Cargo workspaces and registry sources without executing subprocesses."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

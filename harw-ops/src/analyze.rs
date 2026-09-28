@@ -1609,6 +1609,7 @@ fn wave_plan(root: &Path, units: &[&AnalysisUnit]) -> Plan {
             .collect(),
         created_at: now,
         updated_at: now,
+        tenant: None,
     }
 }
 
@@ -2655,6 +2656,7 @@ mod tests {
             nodes,
             created_at: now,
             updated_at: now,
+            tenant: None,
         }
     }
 

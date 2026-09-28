@@ -1,0 +1,51 @@
+# Quadlet user unit: harw control plane in a rootless podman container.
+# Install as: ~/.config/containers/systemd/harw-control.container
+# Result:     systemd --user unit "harw-control.service" managed by podman.
+#
+# Preconditions:
+#   - podman build -t harw:local -f deploy/Containerfile .   (from repo root)
+#   - bwrap works in this container: user/mount namespaces are the default in
+#     rootless podman; do NOT add userns=host or seccomp filters that block
+#     unshare(2).
+#
+# This mirrors deploy/systemd/harw-control.service hardening as far as a
+# container allows: systemd still supervises (Restart=always), the container
+# itself is the sandbox, secrets stay outside the image.
+
+[Unit]
+Description=HARW control plane (containerized harw web)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=harw:local
+ContainerName=harw-control
+
+# State: the whole HARW_HOME lives on a named volume so sessions/journals
+# survive container replacement (podman auto-update, image rebuild).
+Volume=harw-home.volume:/home/harw/.harw
+
+# Secrets: mounted read-only from the host's user secrets dir, never baked in.
+#   podman secret create harw-telegram ~/.harw/secrets/telegram.env
+Secret=harw-telegram,type=env,target=TELEGRAM_ENV_FILE
+
+# Ports: control plane only, loopback-only by default (matches the host unit).
+PublishPort=127.0.0.1:1337:1337
+
+# Resource and identity limits mirroring ProtectSystem/ProtectHome semantics.
+NoNewPrivileges=true
+DropCapability=all
+PidsLimit=256
+Memory=2g
+
+# Keep the container's own tmp private (PrivateTmp equivalent).
+Tmpfs=/tmp:rw,size=256m,mode=1777
+
+[Service]
+# Auto-start on login, auto-restart on failure — same behavior as the plain
+# systemd unit this replaces.
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

@@ -76,17 +76,21 @@ async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> 
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
 
-    let transition = store
-        .cancel(
-            &WorkId::from_str(work_id),
-            &CancelRequest {
-                cancelled_at: jiff::Timestamp::now(),
-                cancelled_by: ApprovalActor::Operator {
-                    id: "local-command".to_owned(),
+    let work_id_typed = WorkId::from_str(work_id);
+    // H12: ein fremder Job wird wie ein unbekannter behandelt.
+    let transition = crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
+        .and_then(|()| {
+            store.cancel(
+                &work_id_typed,
+                &CancelRequest {
+                    cancelled_at: jiff::Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "local-command".to_owned(),
+                    },
+                    reason: reason.to_owned(),
                 },
-                reason: reason.to_owned(),
-            },
-        )
+            )
+        })
         .map_err(|error| {
             OpError::Execution(format!("could not cancel durable job `{work_id}`: {error}"))
         })?;
@@ -308,6 +312,78 @@ mod tests {
                 .ok_or(TestError::Missing("cancellation recorded"))?
                 .reason,
             "superseded by newer job"
+        );
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter (unscoped sieht alles, scoped nur den eigenen
+    // Mandanten, fremde Jobs verhalten sich wie unbekannte).
+    #[tokio::test]
+    async fn cancel_unscoped_caller_reaches_every_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_B, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = cancel(
+            &op_ctx,
+            CancelArgs {
+                work_id: Some(JOB_B.to_owned()),
+                reason: None,
+            },
+        )
+        .await
+        .map_err(ctx("cancel foreign job without scope"))?;
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_B)?, JobState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_scoped_caller_reaches_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, TENANT_A, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = cancel(
+            &op_ctx,
+            CancelArgs {
+                work_id: Some(JOB_A.to_owned()),
+                reason: None,
+            },
+        )
+        .await
+        .map_err(ctx("cancel own job"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_A)?, JobState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_scoped_caller_foreign_job_is_hidden_like_missing() -> TestResult {
+        use crate::job_tenant::fixtures::{
+            JOB_B, MISSING, TENANT_A, assert_hidden_like_missing, context, state_of, two_tenants,
+        };
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let foreign = cancel(
+            &op_ctx,
+            CancelArgs {
+                work_id: Some(JOB_B.to_owned()),
+                reason: None,
+            },
+        )
+        .await;
+        let missing = cancel(
+            &op_ctx,
+            CancelArgs {
+                work_id: Some(MISSING.to_owned()),
+                reason: None,
+            },
+        )
+        .await;
+        assert_hidden_like_missing(foreign, missing)?;
+        assert_eq!(
+            state_of(&jobs, JOB_B)?,
+            JobState::Ready,
+            "foreign job untouched"
         );
         Ok(())
     }

@@ -99,14 +99,19 @@ async fn deny(ctx: &OpContext, args: DenyArgs) -> Result<OpOutput, OpError> {
         },
         reason: reason.to_owned(),
     };
-    let transition = if is_blocked {
-        store.deny_blocked(&work_id_typed, &request)
-    } else {
-        store.cancel(&work_id_typed, &request)
-    }
-    .map_err(|error| {
-        OpError::Execution(format!("could not deny durable job `{work_id}`: {error}"))
-    })?;
+    // H12: ein fremder Job wird wie ein unbekannter behandelt; die Wache
+    // läuft vor jeder Transition.
+    let transition = crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
+        .and_then(|()| {
+            if is_blocked {
+                store.deny_blocked(&work_id_typed, &request)
+            } else {
+                store.cancel(&work_id_typed, &request)
+            }
+        })
+        .map_err(|error| {
+            OpError::Execution(format!("could not deny durable job `{work_id}`: {error}"))
+        })?;
 
     Ok(OpOutput::from(format!(
         "Denied {} (was {:?}, revision {}).",
@@ -349,6 +354,78 @@ mod tests {
         ));
         assert!(output.text.contains(work_id.as_str()));
         assert!(output.text.contains("Blocked"));
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter (unscoped sieht alles, scoped nur den eigenen
+    // Mandanten, fremde Jobs verhalten sich wie unbekannte).
+    #[tokio::test]
+    async fn deny_unscoped_caller_reaches_every_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_B, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = deny(
+            &op_ctx,
+            DenyArgs {
+                work_id: Some(JOB_B.to_owned()),
+                reason: Some("nein".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("deny foreign job without scope"))?;
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_B)?, JobState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deny_scoped_caller_reaches_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, TENANT_A, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = deny(
+            &op_ctx,
+            DenyArgs {
+                work_id: Some(JOB_A.to_owned()),
+                reason: Some("nein".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("deny own job"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_A)?, JobState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deny_scoped_caller_foreign_job_is_hidden_like_missing() -> TestResult {
+        use crate::job_tenant::fixtures::{
+            JOB_B, MISSING, TENANT_A, assert_hidden_like_missing, context, state_of, two_tenants,
+        };
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let foreign = deny(
+            &op_ctx,
+            DenyArgs {
+                work_id: Some(JOB_B.to_owned()),
+                reason: Some("nein".to_owned()),
+            },
+        )
+        .await;
+        let missing = deny(
+            &op_ctx,
+            DenyArgs {
+                work_id: Some(MISSING.to_owned()),
+                reason: Some("nein".to_owned()),
+            },
+        )
+        .await;
+        assert_hidden_like_missing(foreign, missing)?;
+        assert_eq!(
+            state_of(&jobs, JOB_B)?,
+            JobState::Ready,
+            "foreign job untouched"
+        );
         Ok(())
     }
 }

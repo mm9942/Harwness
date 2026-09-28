@@ -5,10 +5,10 @@ use std::collections::BTreeSet;
 use harw_agent_dsl::Diagnostics;
 use harw_agent_dsl::classify::reclassify_permissions;
 use harw_agent_dsl::roles::AgentRoleId;
-use harw_registry_defaults::capability_catalog::{CapabilityCatalog, SPAWN_TOOLS, is_handoff_tool};
 
 use super::Pass;
 use super::reachable::collect_providers;
+use crate::builtins::builtin_defaults;
 use crate::codes;
 use crate::unit::CompileUnit;
 
@@ -33,6 +33,7 @@ impl Pass for PruneUnusedTools {
 
     fn run(&self, unit: &mut CompileUnit) -> Diagnostics {
         let mut diagnostics = Diagnostics::new();
+        let defaults = builtin_defaults();
         let children: BTreeSet<String> = unit
             .child_names()
             .into_iter()
@@ -48,10 +49,10 @@ impl Pass for PruneUnusedTools {
             if !seen.insert(tool.clone()) {
                 continue;
             }
-            let reason = if SPAWN_TOOLS.contains(&tool.as_str()) && !can_spawn {
+            let reason = if defaults.spawn_tools().contains(&tool.as_str()) && !can_spawn {
                 Some("the agent can start no child agent".to_owned())
             } else if !is_root
-                && is_handoff_tool(tool)
+                && defaults.is_handoff_tool(tool)
                 && tool
                     .strip_prefix("transfer_to_")
                     .is_some_and(|target| !children.contains(target))
@@ -78,7 +79,7 @@ impl Pass for PruneUnusedTools {
         }
         unit.ir.tools.admitted = kept;
         unit.pruned.extend(pruned);
-        let _unknown = reclassify_permissions(&mut unit.ir, &CapabilityCatalog);
+        let _unknown = reclassify_permissions(&mut unit.ir, defaults.tool_classifier());
         let _unknown = collect_providers(unit);
         diagnostics
     }

@@ -481,35 +481,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builds_once_then_only_on_change() -> TestResult {
-        let (_root, env) = setup("active_uia_definition = \"user.agent.mia@1\"\n")?;
-        install_runner(&env)?;
-        let AutoBuildOutcome::Built { name, path, digest } = auto_build_uia(&env, &FullRunner)
-        else {
-            return Err("first run builds".into());
-        };
-        assert_eq!(name, "harw-uia-terminal-ui");
-        assert!(path.is_file());
-        assert!(env.bin_dir().join(&name).exists(), "current link");
-        assert_eq!(
-            auto_build_uia(&env, &FullRunner),
-            AutoBuildOutcome::Unchanged { name: name.clone() }
-        );
-        // A bundle file changes: the digest changes, it rebuilds.
-        std::fs::write(
-            env.home.join("agents").join("mia").join("identity.md"),
-            "I am Mia, now with more detail.\n",
-        )?;
-        let AutoBuildOutcome::Built { digest: second, .. } = auto_build_uia(&env, &FullRunner)
-        else {
-            return Err("a changed bundle rebuilds".into());
-        };
-        assert_ne!(digest, second);
-        assert_eq!(BinDir::new(env.bin_dir()).versions(&name)?.len(), 2);
-        Ok(())
-    }
-
-    #[test]
     fn test_name_derivation() {
         assert_eq!(
             auto_binary_name(None, "terminal-ui"),

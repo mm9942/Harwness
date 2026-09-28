@@ -6,7 +6,8 @@
 
 version: 2
 updates:
-  # Rust-Hauptworkspace (Cargo.toml im Wurzelverzeichnis, inkl. aller Mitglieder).
+  # Rust-Workspace (Cargo.toml im Wurzelverzeichnis, inkl. aller Mitglieder;
+  # seit PL-60 auch die DoD-Crates unter dod/crates — ein Lockfile).
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -14,16 +15,6 @@ updates:
     open-pull-requests-limit: 3
     groups:
       cargo-minor-patch:
-        update-types: ["minor", "patch"]
-
-  # Eigenständiger DoD-Workspace.
-  - package-ecosystem: "cargo"
-    directory: "/dod"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    groups:
-      dod-minor-patch:
         update-types: ["minor", "patch"]
 
   # Web-UI (Node/Next.js).
@@ -48,7 +39,7 @@ updates:
         patterns: ["*"]
 
   # Gepinnte Rust-Toolchain (rust-toolchain.toml im Wurzelverzeichnis, gilt
-  # auch für dod/). Ein Update ändert lokal und in der CI zugleich die Version.
+  # für das ganze Repo einschließlich dod/). Ein Update ändert lokal und in der CI zugleich die Version.
   - package-ecosystem: "rust-toolchain"
     directory: "/"
     schedule:

@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-cli"
+description = "Harwness command-line entry point: chat, TUI, agent compiler commands, serve, and the durable job worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -80,6 +81,9 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 # production dependency, not test-only. It is already pulled in transitively via
 # harw-core / harw-mcp-server / harw-session-store.
 harw-job-runtime = { path = "../harw-job-runtime" }
+# Durable job records (`FsJobRecordStore`) for the sandboxed verify
+# coordinator of the work driver (`src/verify_sandbox.rs`).
+harw-job-store = { path = "../harw-job-store" }
 # Planungsfläche — von drei Stellen im Binary benutzt:
 #  * `src/job_worker.rs` (W4-08): parst den Mutationsvertrag eines Plan-Knotens
 #    und meldet den Job-Ausgang über `PlanJobBridge` zurück in den Plan.
@@ -143,6 +147,10 @@ harw-protocol = { path = "../harw-protocol" }
 # `harw kill` einen Fehler (Exit-Code 2).
 [target.'cfg(target_os = "linux")'.dependencies]
 harw-killer = { path = "../harw-killer" }
+# Sandboxed verify for the work driver (`src/verify_sandbox.rs`): bwrap as the
+# fallback backend when no Landlock trampoline is found. Linux-only.
+harw-job-runtime = { path = "../harw-job-runtime", features = ["bwrap"] }
+harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 
 [dev-dependencies]
 tempfile = "3"

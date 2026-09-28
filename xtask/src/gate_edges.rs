@@ -5,7 +5,7 @@
 //! Daten in [`FORBIDDEN`] und [`PURE_CRATES`], nicht verstreut im Code: eine
 //! neue verbotene Kante soll ein Listeneintrag sein, keine neue Funktion.
 //!
-//! # Die vier Regeln und warum es sie gibt
+//! # Die Regeln und warum es sie gibt
 //!
 //! **Keine Sensor-zu-Sensor-Kante.** Die Sensor-Crates sind Geschwister mit je
 //! genau einer Quelle und je genau einer Fähigkeit. Eine Kante zwischen zweien
@@ -27,6 +27,28 @@
 //! Zufall kann. Die Reinheit ist die Zusage, auf der seine Determinismus-Tests
 //! beruhen; eine transitive Kante auf `jiff` würde sie unbemerkt aufheben.
 //!
+//! **Keine Krypto- und HTTP-Stapel in Warden, Probes und Sensoren.**
+//! Crypto Masterplan v2 §20/§21: die TCBs von `harw-warden`,
+//! `harw-dod-warden*`, `harw-probe-fs`, `harw-probe-bpf` und jeder Crate aus
+//! [`SENSOR_CRATES`] dürfen in ihrer **normalen Abhängigkeitshülle** weder
+//! CryptGuard (`crypt_guard`, `crypt_guard_core`, `crypt_guard_service`,
+//! `crypt_guard_hyper`) noch `hyper` oder `tower` noch `harw-dod-encrypt`
+//! erreichen. Der kleine, geschlüsselte Beleg-Pfad des Warden bleibt klein;
+//! neue Kryptographie gehört an die Stelle, an der Sicherheitsinformation
+//! die lokale Grenze verlässt. Diese Regeln stehen in [`FORBIDDEN_REACH`]
+//! und nennen **externe** Paketnamen — [`FORBIDDEN`] kennt nur Kanten
+//! zwischen Workspace-Crates. Die Hülle folgt den internen `[dependencies]`
+//! aus dem Graphen und ab der ersten externen Crate den Kanten in
+//! `Cargo.lock` (wie `gate_arch.rs` für `*-sys`); damit fällt auch ein
+//! `hyper` auf, das über `reqwest` drei Ecken weiter hereinkommt.
+//! `Cargo.lock` kennt keine Feature- und Plattformfilter — die Hülle ist
+//! eine Überschätzung, die nichts übersieht. Ein erreichter externer Name
+//! ohne `Cargo.lock`-Eintrag ist ein Verstoß, kein stilles Blatt.
+//!
+//! **Die Fassade bleibt krypto-frei.** `harw-dod` darf `harw-dod-encrypt`
+//! weder direkt ([`FORBIDDEN`]) noch transitiv ([`FORBIDDEN_REACH`])
+//! erreichen (Masterplan v2 §3.3).
+//!
 //! # Warum die Hülle und nicht die direkte Kante
 //! Eine Fähigkeit wandert transitiv. Eine Crate, die nur einen harmlosen
 //! Nachbarn nennt, aber über drei Ecken einen Dateileser erreicht, hat den
@@ -39,12 +61,13 @@
 //! eine Testabhängigkeit auf einen Geschwistersensor ist erlaubt, weil sie
 //! nicht ins ausgelieferte Binary wandert.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use harw_code_graph::{CrateNode, WorkspaceGraph};
 
 use super::GateReport;
+use super::arch::LockIndex;
 
 /// Wie ein Crate-Name in einer Regel benannt wird.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +156,78 @@ pub const FORBIDDEN: &[ForbiddenEdge] = &[
         to: Pattern::Exact("harw-dod-escalate"),
         rule: "ein Telemetrie-Sink darf die Eskalationsleiter nicht erreichen (S1)",
     },
+    ForbiddenEdge {
+        from: Pattern::Exact("harw-dod"),
+        to: Pattern::Exact("harw-dod-encrypt"),
+        rule: "die DoD-Fassade darf harw-dod-encrypt nicht reexportieren \
+               (Crypto-Masterplan v2 §3.3)",
+    },
+];
+
+/// Namen, die eine Crate in ihrer normalen Abhängigkeitshülle nicht
+/// erreichen darf — intern **oder extern**.
+#[derive(Debug, Clone, Copy)]
+pub struct ForbiddenReach {
+    /// Wessen Hülle geprüft wird.
+    pub from: Pattern,
+    /// Paketnamen (wie in den `Cargo.toml`-Schlüsseln und in `Cargo.lock`),
+    /// die dort nicht vorkommen dürfen.
+    pub names: &'static [&'static str],
+    /// Warum — erscheint wörtlich in der Fehlermeldung.
+    pub rule: &'static str,
+}
+
+/// CryptGuard, der HTTP-/Tower-Stapel und die Harw-Kryptoschicht: nichts
+/// davon gehört in Warden, Probes oder Sensoren (Masterplan v2 §20/§21).
+/// Unterstrich-Namen, wie die Pakete tatsächlich heißen
+/// (`docs/architecture/crypto-drift-report.md` §1).
+pub const CRYPTO_AND_HTTP_STACK: &[&str] = &[
+    "crypt_guard",
+    "crypt_guard_core",
+    "crypt_guard_service",
+    "crypt_guard_hyper",
+    "hyper",
+    "tower",
+    "harw-dod-encrypt",
+];
+
+/// Begründung der TCB-Regeln in [`FORBIDDEN_REACH`].
+const TCB_NO_CRYPTO: &str = "Warden, Probes und Sensoren bleiben frei von CryptGuard, Hyper \
+                             und Tower (Crypto-Masterplan v2 §20/§21)";
+
+/// Die Hüllenregeln. Ein neuer Eintrag genügt.
+pub const FORBIDDEN_REACH: &[ForbiddenReach] = &[
+    ForbiddenReach {
+        from: Pattern::Exact("harw-warden"),
+        names: CRYPTO_AND_HTTP_STACK,
+        rule: TCB_NO_CRYPTO,
+    },
+    ForbiddenReach {
+        from: Pattern::Prefix("harw-dod-warden"),
+        names: CRYPTO_AND_HTTP_STACK,
+        rule: TCB_NO_CRYPTO,
+    },
+    ForbiddenReach {
+        from: Pattern::Exact("harw-probe-fs"),
+        names: CRYPTO_AND_HTTP_STACK,
+        rule: TCB_NO_CRYPTO,
+    },
+    ForbiddenReach {
+        from: Pattern::Exact("harw-probe-bpf"),
+        names: CRYPTO_AND_HTTP_STACK,
+        rule: TCB_NO_CRYPTO,
+    },
+    ForbiddenReach {
+        from: Pattern::Sensor,
+        names: CRYPTO_AND_HTTP_STACK,
+        rule: TCB_NO_CRYPTO,
+    },
+    ForbiddenReach {
+        from: Pattern::Exact("harw-dod"),
+        names: &["harw-dod-encrypt"],
+        rule: "die DoD-Fassade darf harw-dod-encrypt auch transitiv nicht erreichen \
+               (Crypto-Masterplan v2 §3.3)",
+    },
 ];
 
 /// Crates, deren **vollständige Hülle** frei von Nebenwirkungen sein muss,
@@ -164,8 +259,10 @@ pub const PURE_CRATES: &[(&str, &[&str])] = &[(
 /// kein `Err`, sondern erscheint im Bericht: das Gate hat dann erfolgreich
 /// geprüft und etwas gefunden.
 pub fn run() -> Result<GateReport, String> {
-    let graph = super::load_all_workspaces(Path::new("."))?;
-    Ok(evaluate(&graph))
+    let repo_root = Path::new(".");
+    let graph = super::load_all_workspaces(repo_root)?;
+    let lock = LockIndex::load(repo_root)?;
+    Ok(evaluate_with_lock(&graph, Some(&lock)))
 }
 
 /// Prüft einen bereits geladenen Graphen.
@@ -181,8 +278,31 @@ pub fn run() -> Result<GateReport, String> {
 ///
 /// # Returns
 /// Den Bericht mit geprüfter Anzahl und gefundenen Verstößen.
+#[cfg(test)]
 #[must_use]
 pub fn evaluate(graph: &WorkspaceGraph) -> GateReport {
+    evaluate_with_lock(graph, None)
+}
+
+/// Wie [`evaluate`], aber die [`FORBIDDEN_REACH`]-Hüllen folgen externen
+/// Crates über `lock` weiter.
+///
+/// # Description
+/// Ohne `lock` (`None`, nur für konstruierte Graphen in Tests) endet eine
+/// Hülle an der ersten externen Crate, und ein externer Name ohne Eintrag
+/// wird nicht gemeldet. Mit `lock` ist ein solcher Name ein Verstoß: eine
+/// Hülle mit Loch prüft nicht, was sie zu prüfen behauptet. [`run`] ruft
+/// immer mit `Some`.
+///
+/// # Arguments
+/// - `graph`: der zu prüfende Abhängigkeitsgraph.
+/// - `lock`: die Kanten aus `Cargo.lock`, oder `None`.
+///
+/// # Returns
+/// Den Bericht; `checked` zählt Kanten, Reinheits-Hüllen-Einträge und die
+/// Einträge jeder geprüften [`FORBIDDEN_REACH`]-Hülle.
+#[must_use]
+pub fn evaluate_with_lock(graph: &WorkspaceGraph, lock: Option<&LockIndex>) -> GateReport {
     let mut violations = Vec::new();
     let mut checked = 0usize;
 
@@ -216,11 +336,97 @@ pub fn evaluate(graph: &WorkspaceGraph) -> GateReport {
         }
     }
 
+    for node in &graph.crates {
+        for rule in FORBIDDEN_REACH {
+            if !rule.from.matches(&node.name) {
+                continue;
+            }
+            let hull = hull_with_paths(node, &by_name, lock);
+            checked += hull.paths.len();
+            for name in rule.names {
+                if let Some(path) = hull.paths.get(*name) {
+                    violations.push(format!(
+                        "{} erreicht '{}' über {} verletzt: {}",
+                        node.name,
+                        name,
+                        path.join(" → "),
+                        rule.rule
+                    ));
+                }
+            }
+            for missing in &hull.unresolved {
+                violations.push(format!(
+                    "{}: '{missing}' hat keinen Eintrag in Cargo.lock — die Hülle wäre \
+                     unvollständig ({})",
+                    node.name, rule.rule
+                ));
+            }
+        }
+    }
+
     GateReport {
         name: "edges",
         checked,
         violations,
     }
+}
+
+/// Eine Hülle samt kürzestem Pfad zu jedem erreichten Namen.
+#[derive(Debug, Default)]
+struct PathHull {
+    /// Erreichter Name → Pfad ab der Wurzel (Wurzel zuerst, Name zuletzt).
+    paths: HashMap<String, Vec<String>>,
+    /// Externe Namen ohne `Cargo.lock`-Eintrag (nur mit `lock`).
+    unresolved: BTreeSet<String>,
+}
+
+/// Breitensuche über normale Abhängigkeiten ab `root`.
+///
+/// # Description
+/// Interne Knoten folgen `deps` und `external_deps` aus dem Graphen,
+/// externe Knoten den Kanten in `lock` (falls vorhanden). Die Breitensuche
+/// liefert den kürzesten Pfad, damit die Meldung zeigt, **über wen** ein
+/// verbotener Name hereinkommt. `root` selbst gehört nicht zur Hülle.
+fn hull_with_paths(
+    root: &CrateNode,
+    by_name: &HashMap<&str, &CrateNode>,
+    lock: Option<&LockIndex>,
+) -> PathHull {
+    let mut hull = PathHull::default();
+    let mut seen: HashSet<String> = HashSet::from([root.name.clone()]);
+    let mut queue: VecDeque<Vec<String>> = VecDeque::from([vec![root.name.clone()]]);
+
+    while let Some(path) = queue.pop_front() {
+        let Some(current) = path.last() else {
+            continue;
+        };
+        let children: Vec<String> = if let Some(node) = by_name.get(current.as_str()) {
+            node.deps
+                .iter()
+                .chain(node.external_deps.iter())
+                .cloned()
+                .collect()
+        } else if let Some(lock) = lock {
+            if let Some(deps) = lock.deps_of(current) {
+                deps.iter().cloned().collect()
+            } else {
+                hull.unresolved.insert(current.clone());
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        for child in children {
+            if seen.insert(child.clone()) {
+                let mut next = path.clone();
+                next.push(child.clone());
+                hull.paths.insert(child, next.clone());
+                queue.push_back(next);
+            }
+        }
+    }
+
+    hull
 }
 
 /// Alle Namen, die `root` über normale Abhängigkeiten erreicht.
@@ -262,6 +468,7 @@ fn transitive_hull(root: &CrateNode, by_name: &HashMap<&str, &CrateNode>) -> BTr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::path::PathBuf;
 
     fn node(name: &str, deps: &[&str], external: &[&str]) -> CrateNode {
@@ -383,6 +590,241 @@ mod tests {
 
         assert!(!report.is_green(), "leerer Graph prüft nichts (G-102)");
         assert_eq!(report.checked, 0);
+    }
+
+    fn lock(text: &str) -> TestResult<LockIndex> {
+        LockIndex::parse(text).map_err(TestError::Unexpected)
+    }
+
+    /// `reqwest -> hyper`, `hyper -> tower-service`: der klassische Weg, auf
+    /// dem Hyper unbemerkt in eine Hülle wandert.
+    const LOCK_WITH_REQWEST: &str = r#"
+version = 4
+
+[[package]]
+name = "reqwest"
+version = "0.12.0"
+dependencies = ["hyper"]
+
+[[package]]
+name = "hyper"
+version = "1.0.0"
+dependencies = ["tower-service"]
+
+[[package]]
+name = "tower-service"
+version = "0.3.3"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+"#;
+
+    #[test]
+    fn test_evaluate_warden_reaching_crypt_guard_via_internal_crate_is_a_violation() {
+        let g = graph(vec![
+            node("harw-warden", &["harw-dod-warden-proto"], &[]),
+            node("harw-dod-warden-proto", &[], &["crypt_guard_service"]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(!report.is_green());
+        assert!(
+            report.violations.iter().any(|v| v.contains(
+                "harw-warden erreicht 'crypt_guard_service' über \
+                 harw-warden → harw-dod-warden-proto → crypt_guard_service"
+            )),
+            "die Meldung muss den ganzen Pfad nennen: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_sensor_reaching_hyper_through_lockfile_is_a_violation() -> TestResult {
+        let g = graph(vec![node("harw-dod-cpu", &[], &["reqwest"])]);
+
+        // Ohne Lockfile endet die Hülle an `reqwest` — genau die Lücke.
+        assert!(evaluate(&g).is_green());
+
+        let report = evaluate_with_lock(&g, Some(&lock(LOCK_WITH_REQWEST)?));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-dod-cpu → reqwest → hyper")),
+            "{:?}",
+            report.violations
+        );
+        // `tower-service` ist nicht `tower`: exakte Paketnamen.
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.contains("'tower-service'")),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_probes_and_warden_crates_reaching_encrypt_are_violations() {
+        for root in [
+            "harw-probe-bpf",
+            "harw-probe-fs",
+            "harw-dod-warden",
+            "harw-warden",
+            "harw-dod-thermal",
+        ] {
+            let g = graph(vec![
+                node(root, &["harw-dod-encrypt"], &[]),
+                node("harw-dod-encrypt", &[], &["crypt_guard_service"]),
+            ]);
+
+            let report = evaluate(&g);
+
+            for forbidden in ["'harw-dod-encrypt'", "'crypt_guard_service'"] {
+                assert!(
+                    report
+                        .violations
+                        .iter()
+                        .any(|v| v.starts_with(root) && v.contains(forbidden)),
+                    "{root} → {forbidden}: {:?}",
+                    report.violations
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_evaluate_facade_edge_to_encrypt_is_a_violation() {
+        let g = graph(vec![
+            node("harw-dod", &["harw-dod-encrypt"], &[]),
+            node("harw-dod-encrypt", &[], &["crypt_guard_service"]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-dod → harw-dod-encrypt verletzt")),
+            "direkte Kante: {:?}",
+            report.violations
+        );
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-dod erreicht 'harw-dod-encrypt'")),
+            "Hülle: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_facade_reaching_encrypt_transitively_is_a_violation() {
+        let g = graph(vec![
+            node("harw-dod", &["harw-dod-rules"], &[]),
+            node("harw-dod-rules", &["harw-dod-encrypt"], &[]),
+            node("harw-dod-encrypt", &[], &[]),
+        ]);
+
+        assert!(
+            evaluate(&g)
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-dod → harw-dod-rules → harw-dod-encrypt")),
+        );
+    }
+
+    #[test]
+    fn test_evaluate_encrypt_and_hub_may_use_crypt_guard() -> TestResult {
+        // Masterplan v2 §21 "Allowed": harw-dod-encrypt -> crypt_guard
+        // service; ein Nicht-TCB-Dienst darf Hyper nutzen.
+        let g = graph(vec![
+            node("harw-dod-encrypt", &[], &["crypt_guard_service"]),
+            node("harw-auth-hub", &["harw-dod-encrypt"], &["reqwest"]),
+        ]);
+        let lock_text = format!(
+            "{LOCK_WITH_REQWEST}\n[[package]]\nname = \"crypt_guard_service\"\nversion = \"3.1.0\"\n"
+        );
+
+        let report = evaluate_with_lock(&g, Some(&lock(&lock_text)?));
+
+        assert!(report.is_green(), "{:?}", report.violations);
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_unresolved_external_in_guarded_hull_is_a_violation() -> TestResult {
+        let g = graph(vec![node("harw-warden", &[], &["serde", "tokio"])]);
+
+        let report = evaluate_with_lock(&g, Some(&lock(LOCK_WITH_REQWEST)?));
+
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("'tokio' hat keinen Eintrag in Cargo.lock")),
+            "{:?}",
+            report.violations
+        );
+        assert!(
+            !report.violations.iter().any(|v| v.contains("'serde'")),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_reach_rules_count_hull_entries() -> TestResult {
+        let g = graph(vec![node("harw-probe-fs", &[], &["serde"])]);
+
+        let report = evaluate_with_lock(&g, Some(&lock(LOCK_WITH_REQWEST)?));
+
+        assert!(report.is_green(), "{:?}", report.violations);
+        assert_eq!(
+            report.checked, 1,
+            "die Hüllenregel muss ihre Einträge zählen, sonst ist 'grün' von \
+             'nichts geprüft' nicht zu unterscheiden"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_crypto_stack_names_every_crypt_guard_package_and_the_http_stack() {
+        for name in [
+            "crypt_guard",
+            "crypt_guard_core",
+            "crypt_guard_service",
+            "crypt_guard_hyper",
+            "hyper",
+            "tower",
+            "harw-dod-encrypt",
+        ] {
+            assert!(CRYPTO_AND_HTTP_STACK.contains(&name), "{name}");
+        }
+        for subject in [
+            "harw-warden",
+            "harw-dod-warden",
+            "harw-dod-warden-proto",
+            "harw-probe-fs",
+            "harw-probe-bpf",
+        ]
+        .into_iter()
+        .chain(SENSOR_CRATES.iter().copied())
+        {
+            assert!(
+                FORBIDDEN_REACH
+                    .iter()
+                    .any(|r| r.from.matches(subject) && r.names == CRYPTO_AND_HTTP_STACK),
+                "{subject} ohne Krypto-Hüllenregel"
+            );
+        }
     }
 
     #[test]

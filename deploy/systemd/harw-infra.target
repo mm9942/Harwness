@@ -1,0 +1,17 @@
+# harw-infra.target -- the local Harw infrastructure daemons.
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22.2, H10).
+# Embedded into harw-install; `harw install --print-systemd` prints it. Not
+# installed by the DoD installer, and independent of harw-dod.target.
+#
+# Starting this target opens the activation sockets under /run/harw/infra/
+# (control plane, auth hub, netsec, SecurityHub); every daemon is
+# socket-activated and starts on the first connection.
+
+[Unit]
+Description=HARW infrastructure daemons (control, auth hub, netsec, security hub)
+Wants=harw-auth-hub.socket harw-control.socket harw-netsec.socket harw-security-hub.socket
+After=harw-auth-hub.socket harw-control.socket harw-netsec.socket harw-security-hub.socket
+
+[Install]
+WantedBy=multi-user.target

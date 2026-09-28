@@ -143,10 +143,9 @@
 //! nie die Prüftiefe für die DoD-Capability-Domäne.
 //!
 //! # Fehlendes Binary
-//! Die vier DoD-Binaries liegen im eigenständigen DoD-Workspace unter
-//! `dod/`; `harw-agent-runner` liegt im Produkt-Workspace. [`run`] lädt
-//! deshalb Produkt- und DoD-Workspace zusammen
-//! ([`super::load_all_workspaces`]). Fehlt eines der vier trotzdem im
+//! Die vier DoD-Binaries liegen unter `dod/crates/`, `harw-agent-runner`
+//! an der Repo-Wurzel; seit PL-60 sind alle Members **eines** Workspace,
+//! den [`run`] über [`super::load_all_workspaces`] lädt. Fehlt eines der vier trotzdem im
 //! Graphen, ist das ein **Verstoß**, kein Hinweis: ein Binary, das das Gate
 //! nicht sieht, kann es nicht prüfen, und genau dieser Zustand hat das Gate
 //! früher rot-ohne-Befund bzw. mit „Gerüst"-Hinweisen stehen lassen, als nur
@@ -175,8 +174,8 @@
 //!
 //! # Stand
 //! Knoten **AW0-10b**: gelandet. [`evaluate`] prüft gegen konstruierte
-//! Graphen (siehe `tests`); [`run`] liest Produkt- und DoD-Workspace über
-//! `harw-code-graph`.
+//! Graphen (siehe `tests`); [`run`] liest den Wurzel-Workspace (inklusive
+//! DoD-Domäne) über `harw-code-graph`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -371,7 +370,8 @@ pub struct MonitoredBinary {
 }
 
 /// Die Binaries dieses Knotens samt ihrer Klasse aus dem Auftrag: die vier
-/// DoD-Binaries plus, seit R10 Wave 4, `harw-agent-runner`.
+/// DoD-Binaries plus, seit R10 Wave 4, `harw-agent-runner` und, seit R11,
+/// `harw-job-exec`.
 pub const MONITORED_BINARIES: &[MonitoredBinary] = &[
     MonitoredBinary {
         name: "harw-sentinel",
@@ -397,6 +397,17 @@ pub const MONITORED_BINARIES: &[MonitoredBinary] = &[
     // Binary außerhalb der DoD-Capability-Domäne — siehe Moduldoku.
     MonitoredBinary {
         name: "harw-agent-runner",
+        budget: BinaryBudget::Unprivileged,
+        unlisted_policy: UnlistedCratePolicy::DefaultUnprivileged,
+    },
+    // R11: Job-Trampolin (`harw-job-exec`), ersetzt `pre_exec`. Es *senkt*
+    // nur eigene Rechte (NO_NEW_PRIVS, Capability-Drop, Landlock, rlimits)
+    // und tritt einer delegierten cgroup bei — nichts davon braucht eine
+    // erhöhte Fähigkeit. Hülle: `harw-job-core`/`harw-job-linux` plus deren
+    // Produkt-Abhängigkeiten, keine `harw-dod-*`-Crate — deshalb wie
+    // `harw-agent-runner` behandelt.
+    MonitoredBinary {
+        name: "harw-job-exec",
         budget: BinaryBudget::Unprivileged,
         unlisted_policy: UnlistedCratePolicy::DefaultUnprivileged,
     },
@@ -631,7 +642,7 @@ fn reachable_with_chain(
 /// Führt Gate 2 aus.
 ///
 /// # Description
-/// Lädt Produkt- und DoD-Workspace zusammen über
+/// Lädt den Wurzel-Workspace (inklusive DoD-Domäne) über
 /// [`super::load_all_workspaces`] (kein `cargo`-Subprozess) und delegiert
 /// die eigentliche Prüfung an [`evaluate`].
 ///
@@ -640,7 +651,7 @@ fn reachable_with_chain(
 /// und den gefundenen Verstößen — ein fehlendes Binary ist einer davon.
 ///
 /// # Errors
-/// Wenn einer der beiden Workspace-Graphen nicht gelesen werden kann
+/// Wenn der Workspace-Graph nicht gelesen werden kann
 /// (kaputtes oder fehlendes `Cargo.toml`). Ein **Verstoß** ist dagegen kein
 /// `Err`, sondern erscheint im Bericht: das Gate hat dann erfolgreich
 /// geprüft und etwas gefunden.
@@ -701,7 +712,7 @@ pub fn evaluate(graph: &WorkspaceGraph) -> GateReport {
         if missing.contains(&spec.name) {
             violations.push(format!(
                 "{} ({}) ist nicht im Workspace-Graphen — das Binary kann nicht geprüft \
-                 werden (Produkt- und DoD-Workspace geladen?)",
+                 werden (steht es in den members der Wurzel-Cargo.toml?)",
                 spec.name,
                 spec.budget.label()
             ));
@@ -873,10 +884,11 @@ mod tests {
                 "harw-probe-fs",
                 "harw-probe-bpf",
                 "harw-warden",
-                "harw-agent-runner"
+                "harw-agent-runner",
+                "harw-job-exec"
             ]
         );
-        assert_eq!(report.violations.len(), 4, "{:?}", report.violations);
+        assert_eq!(report.violations.len(), 5, "{:?}", report.violations);
         assert!(
             report
                 .violations

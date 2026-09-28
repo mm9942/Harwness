@@ -1,38 +1,40 @@
-//! Test-Fehlertyp dieses Crates: ersetzt `panic!`/`unwrap`/`expect` in Tests
-//! (Rust Coding Bible R087/R165/R182). Tests geben [`TestResult`] zurück und
-//! melden Fehlschläge als `Err` statt zu paniken.
+//! Test error type of this crate: replaces `panic!`/`unwrap`/`expect` in
+//! tests (Rust Coding Bible R087/R165/R182). Tests return [`TestResult`].
+
+// The process scenarios that use every variant are Linux-only.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::fmt;
 
-/// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben.
+/// Failure of a test; every failure is an `Err`, never a panic.
 pub(crate) enum TestError {
-    /// Ein erwarteter Wert fehlte (`Option` war `None`).
+    /// An expected value was absent.
     Missing(&'static str),
-    /// Ein Ergebnis hatte eine unerwartete Form.
+    /// A result had an unexpected shape.
     Unexpected(String),
-    /// Ein Fremdfehler mit Kontext (ersetzt `expect("…")`).
+    /// A foreign error with context (replaces `expect("…")`).
     Context {
-        /// Was gerade versucht wurde.
+        /// What was being attempted.
         context: &'static str,
-        /// Gerenderter Quellfehler.
+        /// Rendered source error.
         source: String,
     },
 }
 
-/// Ergebnis einer Testfunktion bzw. eines Test-Helfers.
+/// Result of a test function or helper.
 pub(crate) type TestResult<T = ()> = Result<T, TestError>;
 
 impl fmt::Display for TestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing(what) => write!(f, "erwarteter Wert fehlt: {what}"),
-            Self::Unexpected(message) => write!(f, "unerwartetes Ergebnis: {message}"),
+            Self::Missing(what) => write!(f, "expected value missing: {what}"),
+            Self::Unexpected(message) => write!(f, "unexpected result: {message}"),
             Self::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
 
-// Debug delegiert an Display (Bible R081), damit fehlgeschlagene Tests lesbar bleiben.
+// Debug delegates to Display (Bible R081) so failing tests stay readable.
 impl fmt::Debug for TestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -41,12 +43,7 @@ impl fmt::Debug for TestError {
 
 impl std::error::Error for TestError {}
 
-/// Liefert einen `map_err`-Adapter, der einen Fremdfehler mit Kontext versieht.
-///
-/// # Examples
-/// ```rust,ignore
-/// let text = std::fs::read_to_string(path).map_err(ctx("Datei lesen"))?;
-/// ```
+/// Builds a `map_err` adapter that attaches context to a foreign error.
 pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
     move |error| TestError::Context {
         context,

@@ -26,11 +26,12 @@
 use std::path::PathBuf;
 
 use harw_agent_dsl::ExecutableAgentIr;
-use harw_config::{AgentDefinitionMeta, ResolvedConfig};
+use harw_config::ResolvedConfig;
 use harw_home::{
     HomeError, LayerReport, TrustStatus, active_profile_name, discover_project, project_key,
     project_settings_dir,
 };
+use harw_registry_defaults::{AgentDefinitionMeta, ConfigAgents};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::spec::RuntimeSpec;
@@ -95,6 +96,28 @@ impl ConfigTrustReport {
 /// (`harw-config/src/error.rs`: `PlaintextSecret` trägt nur `file`/`field`,
 /// `InvalidSecretRef`/`UnresolvedRef` nur die Referenz-Zeichenkette).
 pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigTrustReport)> {
+    load_config_with_agents(spec).map(|(config, _agents, trust)| (config, trust))
+}
+
+/// Wie [`load_config`], liefert aber zusätzlich die gesenkten
+/// Agentendefinitionen ([`ConfigAgents`]).
+///
+/// # Beschreibung
+/// `harw-config` reicht die DSL-Agentendefinitionen ungeparst weiter
+/// ([`ResolvedConfig::agent_sources`]); diese Funktion senkt sie genau
+/// einmal ([`ConfigAgents::from_config`]) und prüft die gewählten
+/// Definitionen ([`ConfigAgents::validate_selection`]) — fail-closed wie
+/// zuvor Discovery und `validate`. [`load_config`] ruft sie auf und
+/// verwirft nur das Ergebnis, damit jeder Einstieg dieselben Prüfungen
+/// durchläuft.
+///
+/// # Errors
+/// Wie [`load_config`]; eine nicht parsbare, nicht auflösbare oder nicht
+/// senkbare Definition sowie eine unbekannte oder falsch gerollte Auswahl
+/// sind [`RuntimeError::Config`].
+pub fn load_config_with_agents(
+    spec: &RuntimeSpec,
+) -> RuntimeResult<(ResolvedConfig, ConfigAgents, ConfigTrustReport)> {
     let report =
         harw_home::config_layers_report_at(&spec.home, &spec.cwd).map_err(map_home_error)?;
     let LayerReport {
@@ -142,9 +165,17 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
     .map_err(|error| RuntimeError::Config {
         detail: error.to_string(),
     })?;
+    let agents = ConfigAgents::from_config(&config).map_err(|error| RuntimeError::Config {
+        detail: error.to_string(),
+    })?;
     config.validate().map_err(|error| RuntimeError::Config {
         detail: error.to_string(),
     })?;
+    agents
+        .validate_selection(&config.harness)
+        .map_err(|error| RuntimeError::Config {
+            detail: error.to_string(),
+        })?;
     if let Some(requested) = spec.model_override.as_deref() {
         apply_model_override(&mut config, requested)?;
     }
@@ -155,7 +186,7 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
         untrusted_repo,
         trust_status: status,
     };
-    Ok((config, trust))
+    Ok((config, agents, trust))
 }
 
 /// Lädt die Konfiguration eines eingebetteten Laufs (#22 Welle 3A,
@@ -181,21 +212,34 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
 ///   Prozessumgebung noch (der ohnehin leeren) `env_layer` gesetzt ist — die
 ///   Meldung nennt jede fehlende Variable.
 pub fn load_config_embedded(spec: &RuntimeSpec) -> RuntimeResult<ResolvedConfig> {
+    load_config_embedded_with_agents(spec).map(|(config, _agents)| config)
+}
+
+/// Wie [`load_config_embedded`], liefert aber zusätzlich die Wurzel-IR und
+/// jede Kind-IR der Delegationshülle als [`ConfigAgents`] (ohne
+/// Agentenordner: ein eingebetteter Lauf hat keine).
+///
+/// # Errors
+/// Wie [`load_config_embedded`].
+pub fn load_config_embedded_with_agents(
+    spec: &RuntimeSpec,
+) -> RuntimeResult<(ResolvedConfig, ConfigAgents)> {
     let embedded = spec.embedded.as_ref().ok_or_else(|| RuntimeError::Config {
         detail: "load_config_embedded called without RuntimeSpec::embedded".to_owned(),
     })?;
 
     let mut config = ResolvedConfig::default();
+    let mut agents = ConfigAgents::default();
 
     for id in embedded.agent_ids() {
         let Some(ir) = embedded.agent_ir(id) else {
             continue;
         };
-        config
+        agents
             .executable_agents
             .insert(id.to_owned(), ExecutableAgentIr::from(ir));
-        config.agent_irs.insert(id.to_owned(), ir.clone());
-        config.agent_definition_meta.insert(
+        agents.agent_irs.insert(id.to_owned(), ir.clone());
+        agents.agent_definition_meta.insert(
             id.to_owned(),
             AgentDefinitionMeta {
                 name: ir.name.clone(),
@@ -234,7 +278,7 @@ pub fn load_config_embedded(spec: &RuntimeSpec) -> RuntimeResult<ResolvedConfig>
         }
     }
 
-    Ok(config)
+    Ok((config, agents))
 }
 
 /// Setzt ein explizit gewähltes Modell ([`RuntimeSpec::model_override`]) als
@@ -781,18 +825,19 @@ required_env = ["EMBEDDED_TEST_MISSING_VAR"]
         let root_id = agent.root_id().to_owned();
         let spec = spec_with_embedded(home.path(), cwd.path(), agent);
 
-        let config = load_config_embedded(&spec).map_err(TestError::Runtime)?;
+        let (config, agents) =
+            load_config_embedded_with_agents(&spec).map_err(TestError::Runtime)?;
 
         assert_eq!(
             config.harness.active_agent_definition.as_deref(),
             Some(root_id.as_str())
         );
-        let ir = config
+        let ir = agents
             .agent_irs
             .get(&root_id)
             .ok_or(TestError::Missing("agent_irs[root]"))?;
         assert_eq!(ir.specialization, "embedded-cfg");
-        assert!(config.executable_agents.contains_key(&root_id));
+        assert!(agents.executable_agents.contains_key(&root_id));
         Ok(())
     }
 
@@ -815,9 +860,10 @@ required_env = ["EMBEDDED_TEST_MISSING_VAR"]
         let root_id = agent.root_id().to_owned();
         let spec = spec_with_embedded(home.path(), cwd.path(), agent);
 
-        let config = load_config_embedded(&spec).map_err(TestError::Runtime)?;
+        let (_config, agents) =
+            load_config_embedded_with_agents(&spec).map_err(TestError::Runtime)?;
 
-        let ir = config
+        let ir = agents
             .agent_irs
             .get(&root_id)
             .ok_or(TestError::Missing("agent_irs[root]"))?;

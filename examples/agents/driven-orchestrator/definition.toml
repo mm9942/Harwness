@@ -1,0 +1,62 @@
+# driven-orchestrator: an orchestrator definition that may run a WorkDriver.
+#
+# A child orchestrator on `child-orchestrator-base@1`
+# (harw-registry-defaults/agents/child-orchestrator-base.toml) whose
+# `[work_driver]` table (docs/design/agent-definition-dsl.md §8.3) lets it
+# start a durable WorkDriver run through the `work_driver.enqueue` tool. See
+# docs/guides/work-driver.md for what the driver does with these settings.
+#
+# The base owns `[work]`, `[lifecycle]`, `[context]`, `[tools]`, `[spawn]`
+# and `[return]` (a same-named section here would be discarded), so this
+# definition only adds its delegation targets, its instructions, its model
+# and the driver settings. `[spawn] max_depth = 1` from the base is what
+# `[work_driver]` needs: a spawn depth above 0.
+#
+# `[work_driver]` grants no new right. Both roles it names must be listed as
+# spawn targets below, or lowering reports HARW-DRIVER-004. It also does not
+# admit the `work_driver.*` tools by itself: the tool list is the base's,
+# and the runtime clamps a custom agent under its base role. See the status
+# note at the top of docs/guides/work-driver.md for what is wired today.
+
+schema = "harwness.agent/v1"
+id = "harwness.example.driven-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "driven-orchestrator"
+
+name = "Driven Orchestrator"
+description = "Drives worker agents toward the active goal with a bounded WorkDriver run; the example for the WorkDriver guide."
+instructions_file = "system.md"
+
+# Spawn targets. `worker_role` and `judge_role` of `[work_driver]` must both
+# appear here (or in `[spawn] child_orchestrators`). A profile that defines
+# its own code-writing worker names that role here and in `worker_role`.
+[delegation]
+targets = [
+  "explorer",
+  "executor",
+  "analyst",
+]
+
+[work_driver]
+worker_role = "executor"
+judge_role = "analyst"
+max_iterations = 8
+max_parallel_workers = 3
+max_attempts_per_worker = 3
+stall_iterations = 2
+# One entry per command, run without a shell inside the sandbox: no pipes,
+# `&&`, redirections or `$` expansion (see the guide, "Verification").
+verify = [
+  "cargo test --workspace",
+  "cargo clippy --workspace -- -D warnings",
+]
+token_budget = 800000
+wall_budget_secs = 5400
+
+[models]
+provider = "anthropic"
+model = "claude-sonnet-5"
+effort = "high"
+required_env = ["ANTHROPIC_API_KEY"]

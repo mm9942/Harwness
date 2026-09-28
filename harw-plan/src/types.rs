@@ -448,6 +448,17 @@ pub struct Plan {
     /// Zeitpunkt der letzten Aktualisierung (wird vom Store gesetzt).
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Mandant, dem dieser Plan gehört (H12, Masterplan v2 §15).
+    ///
+    /// Setzt ausschließlich der Store beim Anlegen
+    /// ([`crate::store::PlanStore::create_for_tenant`]) aus dem serverseitigen
+    /// Mandanten-Scope des Aufrufers; keine [`crate::actions::PlanAction`]
+    /// ändert ihn danach. `None` ist Einzelnutzer-Betrieb bzw. Altbestand:
+    /// `#[serde(default)]` hält bestehende Snapshots lesbar,
+    /// `skip_serializing_if` hält ungescopte Pläne byte-identisch zum
+    /// bisherigen Format. Sichtbarkeit regelt [`crate::tenant_scope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<harw_types::TenantId>,
 }
 
 #[cfg(test)]
@@ -632,6 +643,63 @@ mod tests {
         assert_eq!(restored.digest, None);
         assert_eq!(restored.kind, EvidenceKind::CargoTest);
         assert_eq!(restored.locator, "cargo test");
+        Ok(())
+    }
+
+    /// Kanonischer Plan ohne Mandant — Ausgangspunkt der `tenant`-Tests.
+    fn make_plan() -> Plan {
+        Plan {
+            id: PlanId::new("p-tenant"),
+            revision: RevisionId::new(1),
+            parent_revision: None,
+            goal_statement: "Ziel".to_owned(),
+            goal_id: None,
+            nodes: vec![make_node("t-001")],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
+        }
+    }
+
+    /// Ein ungescopter Plan serialisiert kein `tenant`-Feld: bestehende
+    /// Snapshots bleiben byte-identisch.
+    #[test]
+    fn test_plan_without_tenant_omits_the_field_in_json() -> TestResult {
+        let json = serde_json::to_string(&make_plan())?;
+        assert!(
+            !json.contains("\"tenant\""),
+            "kein tenant-Feld erwartet: {json}"
+        );
+        Ok(())
+    }
+
+    /// Ein Plan-Snapshot von vor dem `tenant`-Feld lädt weiterhin und ist
+    /// ungescopt.
+    #[test]
+    fn test_plan_deserializes_legacy_json_without_tenant() -> TestResult {
+        let mut value = serde_json::to_value(make_plan())?;
+        let obj = value
+            .as_object_mut()
+            .ok_or(TestError::Missing("Plan serialisiert als JSON-Objekt"))?;
+        obj.remove("tenant");
+        assert!(!obj.contains_key("tenant"));
+        let restored: Plan = serde_json::from_value(value)?;
+        assert_eq!(restored.tenant, None);
+        assert_eq!(restored.id.as_str(), "p-tenant");
+        Ok(())
+    }
+
+    /// Ein gescopter Plan überlebt den Serde-Roundtrip mit seinem Mandanten.
+    #[test]
+    fn test_plan_with_tenant_roundtrips() -> TestResult {
+        let plan = Plan {
+            tenant: Some(harw_types::TenantId::from_str("tenant-a")),
+            ..make_plan()
+        };
+        let json = serde_json::to_string(&plan)?;
+        assert!(json.contains("\"tenant\":\"tenant-a\""), "{json}");
+        let back: Plan = serde_json::from_str(&json)?;
+        assert_eq!(back.tenant, plan.tenant);
         Ok(())
     }
 

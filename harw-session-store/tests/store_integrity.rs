@@ -11,9 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 
 use common::{TestError, TestResult, ctx};
-use harw_job_runtime::{
-    Budget, Job, JobKind, JobOutcome, JobScope, JobState, RetryPolicy, StoredJob,
-};
+use harw_job_core::{Budget, Job, JobKind, JobOutcome, JobScope, JobState, RetryPolicy, StoredJob};
 use harw_session_store::job_store::ReconcilePage;
 use harw_session_store::store::{MAX_RECORD_BYTES, TailRepair, persist_noclobber};
 use harw_session_store::{

@@ -11,9 +11,14 @@
 //! - `meta.json` bei Start, Fortschritt (höchstens alle
 //!   [`META_PERSIST_INTERVAL`]), Stop und Ende; beim Start einer neuen
 //!   Sitzung werden frühere Jobs geladen ([`JobState::Detached`], wenn der
-//!   Prozess — gleiche PID **und** Startzeit — noch lebt, sonst
-//!   [`JobState::Unknown`]).
+//!   Prozess noch lebt **und** seine Identität — Startzeit, Programm,
+//!   cgroup (`meta.json` v2) — passt, sonst [`JobState::Unknown`]; bei einer
+//!   wiederverwendeten PID zusätzlich eine Warnung).
 //! - Stop: Signal an die ganze Prozessgruppe, nach der Gnadenfrist SIGKILL.
+//!   Eigene Kinder werden über einen direkt nach dem Start geöffneten pidfd
+//!   gesteuert ([`crate::procfs`]); Jobs früherer Sitzungen nur nach
+//!   bewiesener Identität (Job-Runtime-Doc §15, §25) — eine PID allein
+//!   löst nie ein Signal aus.
 //! - Besitz: nur Erzeuger und Vorfahren ([`JobOwner::may_control`]); die
 //!   Oberfläche handelt als [`Caller::Operator`].
 //!
@@ -26,11 +31,10 @@ use crate::event::{JobEvent, JobNotification, JobNotifier};
 use crate::launcher::PreparedJob;
 use crate::logs::{LogFollower, clip_line, tail_of_file};
 use crate::model::{
-    JobId, JobMeta, JobOwner, JobState, JobStatus, META_FILE, META_VERSION, STDERR_LOG, STDOUT_LOG,
+    JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, META_FILE, META_VERSION,
+    STDERR_LOG, STDOUT_LOG,
 };
-use crate::procfs::{
-    JobSignal, group_exists, is_same_process_alive, process_start_ticks, signal_group,
-};
+use crate::procfs::{JobSignal, Liveness, OwnLeader, Recovered, SignalError};
 use crate::progress::{
     ProgressSnapshot, ProgressSource, ProgressTracker, Severity, detect_severity,
 };
@@ -65,6 +69,10 @@ const EVENT_LINE_CHARS: usize = 400;
 const KILL_WAIT: Duration = Duration::from_secs(3);
 /// Abfrageintervall für Prozesse ohne eigenen Überwachungs-Task.
 const FOREIGN_POLL: Duration = Duration::from_millis(200);
+/// Wie oft die Überwachung die Identität des Gruppenführers neu liest (ein
+/// `exec` ändert das Programm; `meta.json` soll die letzte Beobachtung
+/// tragen, damit ein Neustart den Job wiedererkennt).
+const IDENTITY_REFRESH: Duration = Duration::from_secs(2);
 /// Vorgabe-Höchstlänge einer stdout-Zeile eines [`JobManager::start_piped`]-Jobs
 /// in Bytes (ohne `\n`): 1 MiB, gleich `harw-agent-runner`s
 /// `child_protocol::MAX_FRAME_BYTES`.
@@ -339,12 +347,17 @@ struct JobEntry {
     state: Mutex<EntryState>,
     changes: watch::Sender<u64>,
     monitor: Mutex<Option<JoinHandle<()>>>,
+    /// Gruppenführer, falls diese Sitzung den Job selbst gestartet hat
+    /// (pidfd, bleibt auch nach `detach_all` gültig); `None` für Jobs
+    /// früherer Sitzungen — die werden nur nach Identitätsprüfung gesteuert.
+    leader: Option<OwnLeader>,
 }
 
 impl JobEntry {
-    fn new(dir: PathBuf, meta: JobMeta, monitored: bool) -> Self {
+    fn new(dir: PathBuf, meta: JobMeta, monitored: bool, leader: Option<OwnLeader>) -> Self {
         let (changes, _receiver) = watch::channel(0);
         Self {
+            leader,
             dir,
             state: Mutex::new(EntryState {
                 meta,
@@ -484,13 +497,19 @@ impl JobManager {
         &self.instance
     }
 
-    /// Lädt `meta.json` aller Job-Verzeichnisse; nicht beendete Jobs werden
-    /// [`JobState::Detached`] (Prozess lebt noch) oder [`JobState::Unknown`].
+    /// Lädt `meta.json` (v1 oder v2) aller Job-Verzeichnisse; nicht beendete
+    /// Jobs werden [`JobState::Detached`] (Prozess lebt noch, Identität
+    /// bewiesen) oder [`JobState::Unknown`]. Passt die Identität nicht (PID
+    /// wiederverwendet, keine Startzeit), geht zusätzlich eine
+    /// [`JobEvent::Warning`] an den Besitzer; der Prozess wird nie
+    /// signalisiert. Temporäre Dateien (`meta.json.tmp`) und Verzeichnisse
+    /// ohne lesbare `meta.json` werden übergangen.
     fn reload(&self, jobs_dir: &Path) {
         let Ok(entries) = fs::read_dir(jobs_dir) else {
             return;
         };
         let mut loaded = 0usize;
+        let mut warnings = Vec::new();
         for dir_entry in entries.flatten() {
             let dir = dir_entry.path();
             let Some(mut meta) = read_meta(&dir) else {
@@ -502,14 +521,34 @@ impl JobManager {
                 continue;
             }
             if !meta.state.is_terminal() {
-                let alive = meta
-                    .pid
-                    .is_some_and(|pid| is_same_process_alive(pid, meta.proc_start_ticks));
-                let next = if alive {
+                let liveness = recovered_liveness(&meta);
+                let next = if liveness == Liveness::Alive {
                     JobState::Detached
                 } else {
                     JobState::Unknown
                 };
+                match (&liveness, meta.pid) {
+                    (Liveness::Mismatch(reason), Some(pid)) => {
+                        let message = if meta.process_identity().is_some() {
+                            format!("PID {pid} reused, not controlled: {reason}")
+                        } else {
+                            format!("PID {pid} not controlled: {reason}")
+                        };
+                        warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity mismatch");
+                        warnings.push(JobNotification {
+                            owner: meta.owner.clone(),
+                            event: JobEvent::Warning {
+                                job_id: meta.job_id.clone(),
+                                name: meta.name.clone(),
+                                message,
+                            },
+                        });
+                    }
+                    (Liveness::Unverifiable(reason), Some(pid)) => {
+                        warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity not verifiable");
+                    }
+                    _ => {}
+                }
                 if next != meta.state {
                     meta.state = next;
                     if let Err(err) = write_meta(&dir, &meta) {
@@ -518,11 +557,14 @@ impl JobManager {
                 }
             }
             let id = meta.job_id.clone();
-            lock(&self.jobs).insert(id, Arc::new(JobEntry::new(dir, meta, false)));
+            lock(&self.jobs).insert(id, Arc::new(JobEntry::new(dir, meta, false, None)));
             loaded += 1;
         }
         if loaded > 0 {
             info!(loaded, "jobs from previous sessions loaded");
+        }
+        for notification in warnings {
+            self.notifier.notify(notification);
         }
     }
 
@@ -608,6 +650,7 @@ impl JobManager {
             state: JobState::Queued,
             pid: None,
             proc_start_ticks: None,
+            identity: None,
             executed_on_host: prepared.executed_on_host,
             harw_instance: self.instance.clone(),
             owner: request.owner,
@@ -637,7 +680,7 @@ impl JobManager {
                 meta.state = JobState::Failed;
                 meta.ended_at = Some(Timestamp::now());
                 meta.launch_error = Some(err.to_string());
-                let entry = Arc::new(JobEntry::new(dir, meta, false));
+                let entry = Arc::new(JobEntry::new(dir, meta, false, None));
                 entry.persist();
                 lock(&self.jobs).insert(id, entry);
                 return Err(JobError::Spawn(err.to_string()));
@@ -645,11 +688,10 @@ impl JobManager {
         };
 
         let pid = child.id();
-        meta.pid = pid;
-        meta.proc_start_ticks = pid.and_then(process_start_ticks);
+        let leader = adopt_child(&mut meta, pid);
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
-        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true));
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
         entry.persist();
         lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "job started");
@@ -730,6 +772,7 @@ impl JobManager {
             state: JobState::Queued,
             pid: None,
             proc_start_ticks: None,
+            identity: None,
             executed_on_host: prepared.executed_on_host,
             harw_instance: self.instance.clone(),
             owner: request.owner,
@@ -772,11 +815,10 @@ impl JobManager {
         };
 
         let pid = child.id();
-        meta.pid = pid;
-        meta.proc_start_ticks = pid.and_then(process_start_ticks);
+        let leader = adopt_child(&mut meta, pid);
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
-        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true));
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
         entry.persist();
         lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "piped job started");
@@ -824,7 +866,7 @@ impl JobManager {
         meta.state = JobState::Failed;
         meta.ended_at = Some(Timestamp::now());
         meta.launch_error = Some(error.clone());
-        let entry = Arc::new(JobEntry::new(dir, meta.clone(), false));
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), false, None));
         entry.persist();
         lock(&self.jobs).insert(meta.job_id, entry);
         JobError::Spawn(error)
@@ -866,6 +908,13 @@ impl JobManager {
     /// Gnadenfrist SIGKILL. Bei einem bereits beendeten Job werden nur noch
     /// verbliebene Gruppenmitglieder beendet.
     ///
+    /// # Description
+    /// Ein Job einer früheren Sitzung wird nur signalisiert, wenn seine
+    /// persistierte Identität nach dem Öffnen eines pidfd bewiesen ist. Passt
+    /// sie nicht (PID wiederverwendet), wird nichts gesendet: der Job wird
+    /// [`JobState::Unknown`] und der Besitzer erhält eine
+    /// [`JobEvent::Warning`].
+    ///
     /// # Errors
     /// [`JobError::NotFound`] für unbekannte oder fremde Jobs.
     pub async fn stop(
@@ -896,35 +945,48 @@ impl JobManager {
         if monitored && !meta.state.is_terminal() {
             lock(&entry.state).meta.stop_requested = true;
             entry.persist();
-            if let Err(err) = signal_group(pid, signal) {
+            if let Err(err) = signal_entry(entry, &meta, signal) {
                 debug!(job_id = %meta.job_id, error = %err, "job stop: signal failed");
             }
             if !wait_terminal(entry, grace).await {
-                self.escalate_kill(entry, &meta, pid, signal);
+                self.escalate_kill(entry, &meta, signal);
                 wait_terminal(entry, KILL_WAIT).await;
             }
-            kill_stragglers(pid);
+            if let Some(leader) = &entry.leader {
+                leader.kill_stragglers();
+            }
             return;
         }
 
         if !monitored && meta.state == JobState::Detached {
-            // Früherer bzw. abgelöster Job: nur signalisieren, wenn PID und
-            // Startzeit noch passen (PID-Wiederverwendung).
-            let mut stopped = false;
-            if is_same_process_alive(pid, meta.proc_start_ticks) {
-                if let Err(err) = signal_group(pid, signal) {
+            // Abgelöster Job dieser Sitzung (eigener pidfd) oder Job einer
+            // früheren Sitzung (nur nach bewiesener Identität).
+            let mut refusal = None;
+            let sent = match signal_entry(entry, &meta, signal) {
+                Ok(()) => true,
+                Err(SignalError::Io(err)) => {
                     debug!(job_id = %meta.job_id, error = %err, "job stop: signal failed");
+                    true
                 }
-                if !wait_foreign_exit(pid, meta.proc_start_ticks, grace).await {
-                    self.escalate_kill(entry, &meta, pid, signal);
-                    wait_foreign_exit(pid, meta.proc_start_ticks, KILL_WAIT).await;
+                Err(SignalError::Exited) => false,
+                Err(SignalError::Refused(reason)) => {
+                    refusal = Some(reason);
+                    false
                 }
-                stopped = true;
+            };
+            if sent {
+                if !wait_detached_exit(entry, &meta, grace).await {
+                    self.escalate_kill(entry, &meta, signal);
+                    wait_detached_exit(entry, &meta, KILL_WAIT).await;
+                }
+                if let Some(leader) = &entry.leader {
+                    leader.kill_stragglers();
+                }
             }
             {
                 let mut state = lock(&entry.state);
-                state.meta.stop_requested = stopped;
-                state.meta.state = if stopped {
+                state.meta.stop_requested = sent;
+                state.meta.state = if sent {
                     JobState::Stopped
                 } else {
                     JobState::Unknown
@@ -934,19 +996,30 @@ impl JobManager {
             }
             entry.persist();
             entry.bump();
+            if let Some(reason) = refusal {
+                warn!(job_id = %meta.job_id, pid, %reason, "job stop refused: process identity");
+                self.notifier.notify(JobNotification {
+                    owner: meta.owner.clone(),
+                    event: JobEvent::Warning {
+                        job_id: meta.job_id.clone(),
+                        name: meta.name.clone(),
+                        message: format!("job.stop sent no signal: {reason}"),
+                    },
+                });
+            }
             return;
         }
 
-        if meta.state.is_terminal() && meta.harw_instance == self.instance {
-            kill_stragglers(pid);
+        if let Some(leader) = entry.leader.as_ref().filter(|_| meta.state.is_terminal()) {
+            leader.kill_stragglers();
         }
     }
 
-    fn escalate_kill(&self, entry: &Arc<JobEntry>, meta: &JobMeta, pid: u32, signal: JobSignal) {
+    fn escalate_kill(&self, entry: &Arc<JobEntry>, meta: &JobMeta, signal: JobSignal) {
         if signal == JobSignal::Kill {
             return;
         }
-        if let Err(err) = signal_group(pid, JobSignal::Kill) {
+        if let Err(err) = signal_entry(entry, meta, JobSignal::Kill) {
             debug!(job_id = %meta.job_id, error = %err, "job stop: SIGKILL failed");
         }
         let message = format!(
@@ -1042,6 +1115,12 @@ impl JobManager {
                     state.monitored = false;
                     state.meta.detached = true;
                     state.meta.state = JobState::Detached;
+                    // Letzte Beobachtung für den nächsten Start festhalten.
+                    if let Some(fresh) = entry.leader.as_ref().and_then(OwnLeader::refresh_identity)
+                    {
+                        state.meta.proc_start_ticks = Some(fresh.start_ticks);
+                        state.meta.identity = Some(fresh);
+                    }
                     if !state.meta.executed_on_host {
                         summary.ends_with_harw += 1;
                     }
@@ -1089,10 +1168,10 @@ fn refresh_foreign(entry: &Arc<JobEntry>) {
         if state.monitored || state.meta.state != JobState::Detached {
             return;
         }
-        let alive = state
-            .meta
-            .pid
-            .is_some_and(|pid| is_same_process_alive(pid, state.meta.proc_start_ticks));
+        let alive = match &entry.leader {
+            Some(leader) => !leader.has_exited(),
+            None => recovered_liveness(&state.meta) == Liveness::Alive,
+        };
         if alive {
             false
         } else {
@@ -1122,26 +1201,76 @@ async fn wait_terminal(entry: &Arc<JobEntry>, limit: Duration) -> bool {
     }
 }
 
+/// Übernimmt das eben gestartete Kind `pid` (pidfd, Identität) und trägt
+/// PID und Identität in `meta` ein.
+fn adopt_child(meta: &mut JobMeta, pid: Option<u32>) -> Option<OwnLeader> {
+    meta.pid = pid;
+    let (leader, identity) = match pid {
+        Some(pid) => {
+            let (leader, identity) = OwnLeader::adopt(pid);
+            (Some(leader), identity)
+        }
+        None => (None, None),
+    };
+    meta.proc_start_ticks = identity.as_ref().map(|identity| identity.start_ticks);
+    meta.identity = identity;
+    leader
+}
+
+/// Identitätsprüfung eines Jobs ohne eigenen pidfd (frühere Sitzung).
+fn recovered_liveness(meta: &JobMeta) -> Liveness {
+    let Some(pid) = meta.pid else {
+        return Liveness::Exited;
+    };
+    let identity: Option<JobProcessIdentity> = meta.process_identity();
+    Recovered {
+        pid,
+        identity: identity.as_ref(),
+        instance: &meta.harw_instance,
+        job_id: &meta.job_id,
+    }
+    .liveness()
+}
+
+/// Signal an die Gruppe eines Jobs: über den eigenen pidfd, sonst nur nach
+/// bewiesener Identität.
+fn signal_entry(entry: &JobEntry, meta: &JobMeta, signal: JobSignal) -> Result<(), SignalError> {
+    if let Some(leader) = &entry.leader {
+        return leader.signal_group(signal);
+    }
+    let Some(pid) = meta.pid else {
+        return Err(SignalError::Exited);
+    };
+    let identity = meta.process_identity();
+    Recovered {
+        pid,
+        identity: identity.as_ref(),
+        instance: &meta.harw_instance,
+        job_id: &meta.job_id,
+    }
+    .signal_group(signal)
+}
+
+/// Ob der Gruppenführer eines nicht beaufsichtigten Jobs beendet ist (oder
+/// seine PID nicht mehr ihm gehört).
+fn detached_exited(entry: &JobEntry, meta: &JobMeta) -> bool {
+    match &entry.leader {
+        Some(leader) => leader.has_exited(),
+        None => recovered_liveness(meta) != Liveness::Alive,
+    }
+}
+
 /// Wartet höchstens `limit`, bis ein nicht beaufsichtigter Prozess weg ist.
-async fn wait_foreign_exit(pid: u32, ticks: Option<u64>, limit: Duration) -> bool {
+async fn wait_detached_exit(entry: &JobEntry, meta: &JobMeta, limit: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        if !is_same_process_alive(pid, ticks) {
+        if detached_exited(entry, meta) {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
         tokio::time::sleep(FOREIGN_POLL).await;
-    }
-}
-
-/// Beendet verbliebene Mitglieder der Prozessgruppe `pgid`.
-fn kill_stragglers(pgid: u32) {
-    if group_exists(pgid) {
-        if let Err(err) = signal_group(pgid, JobSignal::Kill) {
-            debug!(pgid, error = %err, "job stop: straggler SIGKILL failed");
-        }
     }
 }
 
@@ -1278,6 +1407,7 @@ struct MonitorState {
     tracker: ProgressTracker,
     throttle: NotifyThrottle,
     last_persist: Instant,
+    last_identity_check: Instant,
     dirty: bool,
     announced_milestones: u64,
 }
@@ -1311,6 +1441,7 @@ impl Monitor {
                 started,
             ),
             last_persist: started,
+            last_identity_check: started,
             dirty: false,
             announced_milestones: 0,
         };
@@ -1457,6 +1588,10 @@ impl Monitor {
                 event,
             });
         }
+        if now.saturating_duration_since(run.last_identity_check) >= IDENTITY_REFRESH {
+            run.last_identity_check = now;
+            self.refresh_identity();
+        }
         if run.dirty && now.saturating_duration_since(run.last_persist) >= META_PERSIST_INTERVAL {
             self.entry.persist();
             run.last_persist = now;
@@ -1466,6 +1601,32 @@ impl Monitor {
         if milestones != run.announced_milestones {
             run.announced_milestones = milestones;
             self.entry.bump();
+        }
+    }
+
+    /// Liest die Identität des Gruppenführers neu und schreibt `meta.json`
+    /// sofort, wenn sie sich geändert hat (z. B. nach `exec`).
+    fn refresh_identity(&self) {
+        let Some(fresh) = self
+            .entry
+            .leader
+            .as_ref()
+            .and_then(OwnLeader::refresh_identity)
+        else {
+            return;
+        };
+        let changed = {
+            let mut state = lock(&self.entry.state);
+            if state.meta.identity.as_ref() == Some(&fresh) {
+                false
+            } else {
+                state.meta.proc_start_ticks = Some(fresh.start_ticks);
+                state.meta.identity = Some(fresh);
+                true
+            }
+        };
+        if changed {
+            self.entry.persist();
         }
     }
 
@@ -1480,7 +1641,7 @@ impl Monitor {
         };
         let duration_secs = started.elapsed().as_secs();
         let mut events = Vec::new();
-        let (owner, pid) = {
+        let owner = {
             let mut state = lock(&self.entry.state);
             if let Some(batch) = run.throttle.flush_errors() {
                 events.push(JobEvent::ErrorLines {
@@ -1532,11 +1693,17 @@ impl Monitor {
                 duration_secs,
                 "job finished"
             );
-            (state.meta.owner.clone(), state.meta.pid)
+            state.meta.owner.clone()
         };
         self.entry.persist();
         let stop_requested = lock(&self.entry.state).meta.stop_requested;
-        if !stop_requested && pid.is_some_and(group_exists) {
+        if !stop_requested
+            && self
+                .entry
+                .leader
+                .as_ref()
+                .is_some_and(OwnLeader::stragglers_remain)
+        {
             let (job_id, name) = {
                 let state = lock(&self.entry.state);
                 (state.meta.job_id.clone(), state.meta.name.clone())

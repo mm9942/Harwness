@@ -116,9 +116,9 @@ pub enum KnowledgeError {
     #[from]
     TomlDecode(toml::de::Error),
 
-    /// A governed-work operation (claim/charge) failed in `harw-job-runtime`.
+    /// A governed-work operation (claim/charge) failed in `harw-job-core`.
     #[from]
-    Job(harw_job_runtime::JobError),
+    Job(harw_job_core::JobError),
 
     /// Zeitarithmetik hat den von `jiff` darstellbaren Bereich überschritten
     /// (z. B. beim Berechnen des Diary-Rollup-Cutoffs aus `retention_days`).

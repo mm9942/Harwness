@@ -96,17 +96,20 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     let store = ctx
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
-    let page = store
-        .list(&JobListQuery {
+    // H12: mandantengebundene Aufrufer sehen nur Jobs des eigenen Mandanten.
+    let jobs = crate::job_tenant::list_visible_jobs(
+        ctx,
+        store,
+        JobListQuery {
             states: states.map(|state| vec![state]),
             ..JobListQuery::default()
-        })
-        .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?;
-    if page.jobs.is_empty() {
+        },
+    )
+    .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?;
+    if jobs.is_empty() {
         return Ok(OpOutput::from("No jobs.".to_owned()));
     }
-    let text = page
-        .jobs
+    let text = jobs
         .iter()
         .map(|record| {
             format!(
@@ -312,6 +315,39 @@ mod tests {
         .await
         .map_err(crate::test_support::ctx("ps"))?;
         assert_eq!(output.text, "job-ready\tReady\trev 0");
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter.
+    #[tokio::test]
+    async fn ps_unscoped_caller_sees_all_tenants() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, JOB_B, context, two_tenants};
+        let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ps_scoped_caller_sees_only_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, JOB_B, TENANT_A, context, two_tenants};
+        let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        assert!(!output.text.contains(JOB_B), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ps_scoped_caller_without_own_jobs_sees_none() -> TestResult {
+        use crate::job_tenant::fixtures::{context, two_tenants};
+        let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
+        let op_ctx = context(&jobs, Some("tenant-other"))?;
+        let output = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
+        assert_eq!(output.text, "No jobs.");
         Ok(())
     }
 }

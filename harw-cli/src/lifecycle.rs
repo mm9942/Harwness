@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_install::{
-    Platform, ServiceKind, ServiceManager, ServiceSpec, UninstallScope, UpdateChecker,
+    Platform, RenderPaths, ServiceKind, ServiceManager, ServiceSpec, UninstallScope, UpdateChecker,
     detect_service_manager,
 };
 
@@ -191,6 +191,34 @@ pub(crate) const GATEWAY_SERVICE_NAME: &str = "harw-gateway";
 /// Wartezeit in Sekunden, bevor der Dienstmanager einen abgestürzten Dienst
 /// neu startet.
 const SERVICE_RESTART_SEC: u32 = 5;
+
+/// `harw install --print-systemd [UNIT]`: gibt eingebettete systemd-Systemunits aus.
+///
+/// # Description
+/// Die Units stammen aus `deploy/systemd/` und sind über
+/// [`harw_install::deployment`] byte-identisch eingebettet (Crypto-Masterplan
+/// v2 §22/§40, H10). Platzhalter werden mit den Vorgaben von
+/// `dod/scripts/install.sh` gerendert ([`RenderPaths::default`]). Ohne
+/// `UNIT` folgen alle Units nacheinander, jede mit einer Kopfzeile. Der
+/// Befehl schreibt, aktiviert und startet nichts.
+///
+/// # Errors
+/// Ohne `--print-systemd` (es gibt noch keine Installationsaktion) und bei
+/// einer unbekannten Unit; die Meldung nennt die eingebetteten Units.
+pub fn install(print_systemd: Option<Option<String>>) -> Result<(), String> {
+    let Some(unit) = print_systemd else {
+        return Err(
+            "harw install: derzeit nur `--print-systemd [UNIT]`. Die DoD-Systemunits \
+             installiert `sudo make -C dod install` aus deploy/; die Infrastruktur-Units \
+             gibt `harw install --print-systemd` zur Übernahme nach /etc/systemd/system aus."
+                .to_owned(),
+        );
+    };
+    let text = harw_install::print_systemd(unit.as_deref(), &RenderPaths::default())
+        .map_err(|error| error.to_string())?;
+    print!("{text}");
+    Ok(())
+}
 
 /// `harw service <install|status|uninstall>`: verwaltet die Hintergrunddienste.
 ///
@@ -2366,6 +2394,27 @@ mod tests {
             };
             assert!(error.contains("Autostart"), "{error}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_without_print_systemd_is_an_error() {
+        let error = install(None).err().unwrap_or_default();
+        assert!(error.contains("--print-systemd"), "{error}");
+    }
+
+    #[test]
+    fn test_install_print_systemd_unknown_unit_names_the_embedded_units() {
+        let error = install(Some(Some("harw-nope.service".to_owned())))
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("harw-nope.service"), "{error}");
+        assert!(error.contains("harw-sentinel.service"), "{error}");
+    }
+
+    #[test]
+    fn test_install_print_systemd_known_unit_succeeds() -> TestResult {
+        install(Some(Some("harw-warden.socket".to_owned()))).map_err(TestError::Unexpected)?;
         Ok(())
     }
 }

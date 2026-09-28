@@ -44,6 +44,23 @@
 //! über [`harw_session_store::approval::ApprovalStore::pending_all`] (höchstens
 //! [`PENDING_LIMIT`]) — kein eigener Verzeichnis-Scan in dieser Datei.
 //!
+//! # Mandanten-Sichtbarkeit
+//! Jeder [`ApprovalRecord`] trägt optional den Mandanten der auslösenden
+//! Sitzung (`ApprovalRecord::tenant`). Beide Operationen wenden die Regel
+//! aus [`OpContext::tenant_admits`] an:
+//! - Aufrufer ohne Mandanten-Scope sehen und entscheiden alles (bisheriges
+//!   Verhalten, unverändert).
+//! - Aufrufer mit Scope sehen in `approval.pending` nur Anfragen des eigenen
+//!   Mandanten; Anfragen ohne Mandant (Altdatensätze) sind für sie
+//!   unsichtbar (fail-closed). Gefiltert wird **vor** der Kappung auf
+//!   [`PENDING_LIMIT`], damit fremde Anfragen eigene nicht verdrängen.
+//! - `approval.resolve` auf eine fremde Anfrage liefert **denselben** Fehler
+//!   wie eine unbekannte Anfrage (`ApprovalNotFound` → byte-gleiches
+//!   [`OpError::InvalidArguments`]) — auch dann, wenn die fremde Anfrage
+//!   bereits aufgelöst oder abgelaufen ist. Der Mandant eines Datensatzes ist
+//!   nach `issue` unveränderlich (`create_new`, nie überschrieben); die
+//!   Vorabprüfung vor `resolve` kann ihn daher nicht veralten lassen.
+//!
 //! # Selbstgenehmigung — offen
 //! `ApprovalRecord::actor` ist der gebundene Beantworter, nicht der
 //! Anfragende; ohne persistierten Anfragenden ist „Anfragender ≠ Beantworter"
@@ -75,6 +92,13 @@ use harw_web::security::{
 
 /// Höchstzahl der von `approval.pending` gelieferten Anfragen.
 pub const PENDING_LIMIT: usize = 200;
+
+/// Obergrenze des ungekappten Scans vor dem Mandantenfilter.
+///
+/// `ApprovalStore::pending_all` liest ohnehin jede offene Anfrage, bevor es
+/// kappt; `usize::MAX` ändert den Aufwand nicht, verschiebt die Kappung aber
+/// hinter den Filter.
+const UNCAPPED_SCAN: usize = usize::MAX;
 
 /// Übersetzt [`SecurityError`] nach [`OpError`].
 ///
@@ -181,6 +205,45 @@ fn resolution_data(resolution: &ApprovalResolutionRecord) -> Result<serde_json::
     }))
 }
 
+/// Wache vor `approval.resolve` für mandantengebundene Aufrufer.
+///
+/// # Description
+/// Ohne Mandanten-Scope ist das ein No-op (bisheriges Verhalten). Mit Scope
+/// muss der ausstehende Datensatz lesbar sein und zum eigenen Mandanten
+/// gehören; jeder andere Fall — fehlend, fremd, ohne Mandant, unlesbar —
+/// liefert exakt den Fehler einer unbekannten Anfrage, damit ein fremder
+/// Mandant weder Existenz noch Zustand (aufgelöst, abgelaufen, anderer
+/// Genehmiger) einer Anfrage erfährt.
+///
+/// # Errors
+/// Die [`map_security_error`]-Abbildung von
+/// [`SessionStoreError::ApprovalNotFound`].
+fn ensure_request_visible(
+    ctx: &OpContext,
+    store: &ApprovalStore,
+    session: &SessionId,
+    request: &ItemId,
+) -> Result<(), OpError> {
+    if ctx.tenant().is_none() {
+        return Ok(());
+    }
+    let admitted = store
+        .pending(session, request)
+        .ok()
+        .filter(|record| record.session == *session && record.request == *request)
+        .is_some_and(|record| ctx.tenant_admits(record.tenant.as_ref()));
+    if admitted {
+        Ok(())
+    } else {
+        Err(map_security_error(SecurityError::Store(
+            SessionStoreError::ApprovalNotFound {
+                session: session.clone(),
+                request: request.clone(),
+            },
+        )))
+    }
+}
+
 /// Argument-Container für `approval.pending` — leer, weil die Fläche alle
 /// offenen Anfragen listet (siehe Moduldoku).
 #[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
@@ -223,9 +286,18 @@ async fn approval_pending(
 ) -> Result<OpOutput, OpError> {
     let store = approval_store(ctx)?;
     let clock = server_clock(ctx);
-    let records: Vec<ApprovalRecord> =
-        list_pending_approvals(&store, PENDING_LIMIT, clock.as_ref())
-            .map_err(map_security_error)?;
+    let records: Vec<ApprovalRecord> = if ctx.tenant().is_none() {
+        list_pending_approvals(&store, PENDING_LIMIT, clock.as_ref()).map_err(map_security_error)?
+    } else {
+        let mut visible: Vec<ApprovalRecord> =
+            list_pending_approvals(&store, UNCAPPED_SCAN, clock.as_ref())
+                .map_err(map_security_error)?
+                .into_iter()
+                .filter(|record| ctx.tenant_admits(record.tenant.as_ref()))
+                .collect();
+        visible.truncate(PENDING_LIMIT);
+        visible
+    };
     let data = serde_json::json!({
         "pending": serde_json::to_value(&records).map_err(|error| {
             OpError::Execution(format!("Anfragen nicht serialisierbar: {error}"))
@@ -338,6 +410,7 @@ impl harw_operations::FromRawArgs for ApprovalResolveArgs {
 )]
 async fn approval_resolve(ctx: &OpContext, args: ApprovalResolveArgs) -> Result<OpOutput, OpError> {
     let store = approval_store(ctx)?;
+    ensure_request_visible(ctx, &store, &args.session, &args.request)?;
     let principal = ctx.service::<Principal>().ok_or_else(|| {
         OpError::NotAvailable(
             "kein Principal im Kontext — Aufrufer nicht identifizierbar, Freigabe abgelehnt"
@@ -438,6 +511,7 @@ mod tests {
         resolver: Option<Arc<dyn ApprovalActorResolver>>,
         peer: Option<PeerCredentials>,
         clock: Option<Timestamp>,
+        tenant: Option<TenantId>,
     }
 
     fn test_context(services_in: Services) -> TestResult<(OpContext, PathBuf)> {
@@ -479,10 +553,12 @@ mod tests {
             let clock: Arc<dyn Clock> = Arc::new(FixedClock(now));
             services.insert(clock);
         }
-        Ok((
-            OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
-            root,
-        ))
+        let op_ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
+        let op_ctx = match services_in.tenant {
+            Some(tenant) => op_ctx.with_tenant(tenant),
+            None => op_ctx,
+        };
+        Ok((op_ctx, root))
     }
 
     fn web_principal() -> Principal {
@@ -506,6 +582,16 @@ mod tests {
         request: &str,
         issued: Timestamp,
     ) -> TestResult {
+        issue_pending_for(store, session, request, issued, None)
+    }
+
+    fn issue_pending_for(
+        store: &ApprovalStore,
+        session: &str,
+        request: &str,
+        issued: Timestamp,
+        tenant: Option<&str>,
+    ) -> TestResult {
         store
             .issue(&ApprovalRecord {
                 request: ItemId::from_str(request),
@@ -513,6 +599,7 @@ mod tests {
                 call_id: ToolCallId::from_str("call-1"),
                 actor: owner(),
                 issued_at: issued,
+                tenant: tenant.map(TenantId::from_str),
             })
             .map_err(ctx("issue pending approval"))
     }
@@ -541,6 +628,7 @@ mod tests {
             resolver: Some(resolver_owner()),
             peer: Some(PeerCredentials::new(1, 1000, 1000)),
             clock: Some(now),
+            tenant: None,
         }
     }
 
@@ -925,6 +1013,160 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Ein Aufrufer mit Mandanten-Scope sieht nur Anfragen seines Mandanten;
+    /// fremde und mandantenlose (Alt-)Anfragen fehlen. Ein Aufrufer ohne
+    /// Scope sieht weiterhin alles.
+    #[tokio::test]
+    async fn test_approval_pending_scoped_caller_sees_only_own_tenant() -> TestResult {
+        let store_root = unique_root("harw-ops-approval-tenant-list");
+        let store = Arc::new(ApprovalStore::new(&store_root));
+        let now = at_offset(SignedDuration::from_mins(5))?;
+        issue_pending_for(&store, "session-a", "own", issued_at(), Some("tenant-a"))?;
+        issue_pending_for(
+            &store,
+            "session-b",
+            "foreign",
+            issued_at(),
+            Some("tenant-b"),
+        )?;
+        issue_pending(&store, "session-c", "legacy", issued_at())?;
+
+        let (scoped_ctx, ws_scoped) = test_context(Services {
+            store: Some(Arc::clone(&store)),
+            clock: Some(now),
+            tenant: Some(TenantId::from_str("tenant-a")),
+            ..Services::default()
+        })?;
+        let scoped = approval_pending(&scoped_ctx, ApprovalPendingArgs::default())
+            .await
+            .map_err(crate::test_support::ctx("scoped list succeeds"))?;
+        let (open_ctx, ws_open) = test_context(Services {
+            store: Some(Arc::clone(&store)),
+            clock: Some(now),
+            ..Services::default()
+        })?;
+        let unscoped = approval_pending(&open_ctx, ApprovalPendingArgs::default())
+            .await
+            .map_err(crate::test_support::ctx("unscoped list succeeds"))?;
+        std::fs::remove_dir_all(ws_scoped).ok();
+        cleanup(&store_root, ws_open);
+
+        let requests = |output: &harw_operations::OpOutput| -> TestResult<Vec<String>> {
+            let data = output
+                .data
+                .as_ref()
+                .ok_or(TestError::Missing("structured payload"))?;
+            let pending = data["pending"]
+                .as_array()
+                .ok_or(TestError::Missing("pending array"))?;
+            let mut ids: Vec<String> = pending
+                .iter()
+                .filter_map(|record| record["request"].as_str().map(str::to_owned))
+                .collect();
+            ids.sort();
+            Ok(ids)
+        };
+        assert_eq!(requests(&scoped)?, vec!["own".to_owned()]);
+        assert!(!scoped.text.contains("foreign"));
+        assert!(!scoped.text.contains("legacy"));
+        let scoped_data = scoped
+            .data
+            .as_ref()
+            .ok_or(TestError::Missing("structured payload"))?;
+        assert_eq!(
+            scoped_data["pending"][0]["tenant"],
+            serde_json::json!("tenant-a")
+        );
+        assert_eq!(
+            requests(&unscoped)?,
+            vec!["foreign".to_owned(), "legacy".to_owned(), "own".to_owned()]
+        );
+        Ok(())
+    }
+
+    /// `approval.resolve` auf eine fremde Anfrage ist vom Fall „gibt es
+    /// nicht" nicht unterscheidbar — auch wenn die fremde Anfrage bereits
+    /// aufgelöst ist — und lässt den Speicher unberührt. Die eigene Anfrage
+    /// ist weiterhin auflösbar.
+    #[tokio::test]
+    async fn test_approval_resolve_foreign_tenant_is_indistinguishable_from_missing() -> TestResult
+    {
+        let store_root = unique_root("harw-ops-approval-tenant-resolve");
+        let store = Arc::new(ApprovalStore::new(&store_root));
+        let now = at_offset(SignedDuration::from_mins(1))?;
+        issue_pending_for(
+            &store,
+            "session-1",
+            "foreign",
+            issued_at(),
+            Some("tenant-b"),
+        )?;
+        issue_pending_for(
+            &store,
+            "session-1",
+            "foreign-done",
+            issued_at(),
+            Some("tenant-b"),
+        )?;
+        issue_pending_for(&store, "session-1", "own", issued_at(), Some("tenant-a"))?;
+
+        // Die zweite fremde Anfrage ist bereits (von ihrem Mandanten) entschieden.
+        let (b_ctx, ws_b) = test_context(Services {
+            tenant: Some(TenantId::from_str("tenant-b")),
+            ..web_services(&store, now)
+        })?;
+        approval_resolve(&b_ctx, approve_args("foreign-done"))
+            .await
+            .map_err(crate::test_support::ctx(
+                "tenant-b resolves its own request",
+            ))?;
+
+        let scoped = |store: &Arc<ApprovalStore>| Services {
+            tenant: Some(TenantId::from_str("tenant-a")),
+            ..web_services(store, now)
+        };
+        let (ctx_missing, ws_missing) = test_context(scoped(&store))?;
+        let missing = approval_resolve(&ctx_missing, approve_args("absent")).await;
+        let (ctx_foreign, ws_foreign) = test_context(scoped(&store))?;
+        let foreign = approval_resolve(&ctx_foreign, approve_args("foreign")).await;
+        let (ctx_done, ws_done) = test_context(scoped(&store))?;
+        let foreign_done = approval_resolve(&ctx_done, approve_args("foreign-done")).await;
+        let (ctx_own, ws_own) = test_context(scoped(&store))?;
+        let own = approval_resolve(&ctx_own, approve_args("own")).await;
+        let foreign_after = store
+            .resolution(
+                &SessionId::from_str("session-1"),
+                &ItemId::from_str("foreign"),
+            )
+            .map_err(crate::test_support::ctx("readable"))?;
+        for ws in [ws_b, ws_missing, ws_foreign, ws_done] {
+            std::fs::remove_dir_all(ws).ok();
+        }
+        cleanup(&store_root, ws_own);
+
+        let message = |result: Result<harw_operations::OpOutput, OpError>,
+                       label: &str|
+         -> TestResult<String> {
+            match result {
+                Err(OpError::InvalidArguments(message)) => Ok(message),
+                other => Err(TestError::Unexpected(format!(
+                    "{label}: expected InvalidArguments(not found), got: {other:?}"
+                ))),
+            }
+        };
+        let missing = message(missing, "missing")?;
+        assert!(missing.contains("keine offene Genehmigungsanfrage"));
+        let rename = |text: String, from: &str| text.replace(from, "absent");
+        assert_eq!(rename(message(foreign, "foreign")?, "foreign"), missing);
+        assert_eq!(
+            rename(message(foreign_done, "foreign-done")?, "foreign-done"),
+            missing
+        );
+        assert_eq!(foreign_after, None);
+        own.map_err(crate::test_support::ctx("own tenant request resolves"))?;
         Ok(())
     }
 }

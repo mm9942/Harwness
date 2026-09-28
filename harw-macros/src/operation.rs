@@ -467,6 +467,11 @@ pub(crate) fn expand_operation(
             "execution" => quote! { ::harw_operations::OperationCategory::System },
             "catalog_config" => quote! { ::harw_operations::OperationCategory::Model },
             "knowledge" => quote! { ::harw_operations::OperationCategory::Knowledge },
+            // Infrastruktur-Domänen (Masterplan v2 §31) gruppieren unter "System",
+            // analog zu `execution`; muss zu `OperationDomain::default_category` passen.
+            "identity" | "network" | "security" | "crypto" => {
+                quote! { ::harw_operations::OperationCategory::System }
+            }
             _ => quote! { ::harw_operations::OperationCategory::Misc },
         },
     };
@@ -770,12 +775,17 @@ fn map_domain(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
         "execution" => Ok(quote! { ::harw_operations::OperationDomain::Execution }),
         "catalog_config" => Ok(quote! { ::harw_operations::OperationDomain::CatalogConfig }),
         "knowledge" => Ok(quote! { ::harw_operations::OperationDomain::Knowledge }),
+        "identity" => Ok(quote! { ::harw_operations::OperationDomain::Identity }),
+        "network" => Ok(quote! { ::harw_operations::OperationDomain::Network }),
+        "security" => Ok(quote! { ::harw_operations::OperationDomain::Security }),
+        "crypto" => Ok(quote! { ::harw_operations::OperationDomain::Crypto }),
         "misc" => Ok(quote! { ::harw_operations::OperationDomain::Misc }),
         other => Err(syn::Error::new_spanned(
             lit,
             format!(
                 "unknown `domain` value `{other}`; \
-                 expected one of: session, agents, execution, catalog_config, knowledge, misc"
+                 expected one of: session, agents, execution, catalog_config, knowledge, \
+                 identity, network, security, crypto, misc"
             ),
         )),
     }
@@ -976,7 +986,7 @@ fn map_web_method(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
 
 #[cfg(test)]
 mod operation_tests {
-    use super::{expand_operation, parse_operation_args};
+    use super::{expand_operation, map_domain, parse_operation_args};
     use crate::test_support::{TestError, TestResult, ctx};
     use quote::quote;
     use syn::ItemFn;
@@ -1489,6 +1499,92 @@ mod operation_tests {
                 .to_string()
                 .contains("unsupported `operation` attribute key")
         );
+        Ok(())
+    }
+
+    /// Expandiert eine minimale Operation mit dem übergebenen `domain`-Literal.
+    fn expand_with_domain(domain: &str) -> TestResult<String> {
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = #domain,
+            permission = "maintainer", model_tool(readonly)
+        };
+        let args = parse_operation_args(attr)
+            .map_err(ctx("die Attribut-Schlüssel sind gültig und müssen parsen"))?;
+        let tokens =
+            expand_operation(func, args).map_err(ctx("eine gültige Operation muss expandieren"))?;
+        Ok(normalize(&tokens))
+    }
+
+    #[test]
+    fn map_domain_accepts_infrastructure_domains() -> TestResult {
+        for (slug, variant) in [
+            ("identity", "Identity"),
+            ("network", "Network"),
+            ("security", "Security"),
+            ("crypto", "Crypto"),
+        ] {
+            let lit = syn::LitStr::new(slug, proc_macro2::Span::call_site());
+            let tokens = map_domain(&lit).map_err(ctx("Infrastruktur-Domäne muss mappen"))?;
+            assert_eq!(
+                normalize(&tokens),
+                format!("::harw_operations::OperationDomain::{variant}")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn map_domain_rejects_unknown_and_lists_all_domains() -> TestResult {
+        let lit = syn::LitStr::new("infra", proc_macro2::Span::call_site());
+        let Err(error) = map_domain(&lit) else {
+            return Err(TestError::Unexpected(
+                "eine unbekannte Domäne muss abgewiesen werden".to_owned(),
+            ));
+        };
+        let message = error.to_string();
+        for slug in [
+            "session",
+            "agents",
+            "execution",
+            "catalog_config",
+            "knowledge",
+            "identity",
+            "network",
+            "security",
+            "crypto",
+            "misc",
+        ] {
+            assert!(message.contains(slug), "`{slug}` fehlt in: {message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expand_operation_maps_infrastructure_domains_and_system_category() -> TestResult {
+        for (slug, variant) in [
+            ("identity", "Identity"),
+            ("network", "Network"),
+            ("security", "Security"),
+            ("crypto", "Crypto"),
+        ] {
+            let flat = expand_with_domain(slug)?;
+            assert!(
+                flat.contains(&format!(
+                    "domain:::harw_operations::OperationDomain::{variant}"
+                )),
+                "Domäne `{slug}` muss auf `{variant}` expandieren: {flat}"
+            );
+            assert!(
+                flat.contains("category:::harw_operations::OperationCategory::System"),
+                "Domäne `{slug}` muss die Kategorie `System` ableiten"
+            );
+        }
         Ok(())
     }
 }

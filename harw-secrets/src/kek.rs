@@ -28,7 +28,7 @@ use crate::policy::{CryptoPolicy, KemAlgo};
 use crate::store::KekMaterial;
 
 /// Length of the root KEK seed and of every per-KEM hybrid recipient seed
-/// (`HYBRID_SEED_BYTES` in `crypt_guard-3.0.1/src/hpke_pq/mod.rs:1698`).
+/// (`HYBRID_SEED_BYTES` in `crypt_guard-3.0.2/src/hpke_pq/mod.rs:1698`).
 pub(crate) const KEK_SEED_LEN: usize = 32;
 
 /// Domain-separation prefix for per-KEM recipient seeds. The full context is
@@ -315,9 +315,10 @@ pub fn derive_secret_key(
 /// Derive the 32-byte hybrid recipient seed of `kem` from the root KEK seed.
 ///
 /// `SHA-256("harw-secrets kek seed v2 " ‖ kem.wire_name() ‖ 0x00 ‖ seed)`.
-/// Without this step crypt_guard 3.0.1 would expand the same root seed to the
-/// *same* ML-KEM-768 key for `MlKem768P256` and `MlKem768X25519`
-/// (`SHAKE256(seed)[..64]` in both, `hpke_pq/mod.rs:2238-2250`, `:2350-2360`).
+/// Without this step crypt_guard 3.0.2 (unchanged since 3.0.1) would expand
+/// the same root seed to the *same* ML-KEM-768 key for `MlKem768P256` and
+/// `MlKem768X25519` (`SHAKE256(seed)[..64]` in both, `hpke_pq/mod.rs:2238-2250`,
+/// `:2350-2360`).
 /// Every production path that calls `RecipientPrivateKey::from_seed_bytes`
 /// must go through this function.
 ///
@@ -698,7 +699,7 @@ mod tests {
         assert_eq!(p256, derive_public_key(&p256_policy, &seed)?);
         assert_eq!(x25519, derive_public_key(&x25519_policy, &seed)?);
 
-        // Control: without the domain separation crypt_guard 3.0.1 expands the
+        // Control: without the domain separation crypt_guard 3.0.2 expands the
         // root seed to the same ML-KEM-768 key for both variants.
         let raw_p256 = crypt_guard_raw_public_key(&p256_policy, &[0x5A; 32])?;
         let raw_x25519 = crypt_guard_raw_public_key(&x25519_policy, &[0x5A; 32])?;

@@ -1,6 +1,7 @@
 [package]
-publish = false
+publish.workspace = true
 name = "harw-dod-fsmon"
+description = "Fanotify filesystem monitor: decode events, resolve paths and login UIDs, shape into security events."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

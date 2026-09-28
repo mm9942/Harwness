@@ -10,7 +10,7 @@
 //! a different meaning; a retired code stays in the catalog and is marked as
 //! retired in its title. Areas follow `agent-definition-dsl.md` §20.1:
 //! `PARSE`, `SCHEMA`, `RESOLVE`, `PATCH`, `AUTH`, `ROLE`, `TOOL`, `CTX`,
-//! `RETURN`, `MODEL`, `SKILL`, `BINARY`, `ORG`, `BUILD`. `ORG` and `BUILD` are
+//! `RETURN`, `MODEL`, `SKILL`, `BINARY`, `DRIVER`, `ORG`, `BUILD`. `ORG` and `BUILD` are
 //! reserved here: organizations and compiler backends report their own codes
 //! from their own crates, this crate defines none of them yet.
 //!
@@ -96,6 +96,8 @@ pub enum Area {
     Skill,
     /// `[binary]` and interface selection.
     Binary,
+    /// `[work_driver]`: the WorkDriver settings of an orchestrator.
+    Driver,
     /// Families, clans, organizations (reserved, no codes in this crate).
     Org,
     /// Compiler backends (reserved, no codes in this crate).
@@ -119,6 +121,7 @@ impl Area {
             Area::Model => "MODEL",
             Area::Skill => "SKILL",
             Area::Binary => "BINARY",
+            Area::Driver => "DRIVER",
             Area::Org => "ORG",
             Area::Build => "BUILD",
         }
@@ -656,6 +659,61 @@ pub mod codes {
         "[binary]\nchild_execution = \"thread\"",
         "choose from job, in-process: `child_execution = \"job\"`"
     );
+
+    // ── DRIVER ─────────────────────────────────────────────────────────
+    code!(
+        DRIVER_UNKNOWN_KEY,
+        "HARW-DRIVER-001",
+        Driver,
+        Error,
+        "unknown key in `[work_driver]`",
+        "known keys: max_iterations, max_parallel_workers, max_attempts_per_worker, stall_iterations, \
+         worker_role, judge_role, verify, token_budget, wall_budget_secs",
+        "[work_driver]\nworker_role = \"executor\"\nmax_iteration = 8",
+        "fix the key name: `max_iterations = 8`"
+    );
+    code!(
+        DRIVER_OUT_OF_RANGE,
+        "HARW-DRIVER-002",
+        Driver,
+        Error,
+        "a `[work_driver]` value is outside its documented range",
+        "max_iterations 1..=1000, max_parallel_workers 1..=64, max_attempts_per_worker 1..=100, \
+         stall_iterations 1..=max_iterations, token_budget and wall_budget_secs at least 1",
+        "[work_driver]\nworker_role = \"executor\"\nmax_parallel_workers = 0",
+        "use a value inside the range: `max_parallel_workers = 4`"
+    );
+    code!(
+        DRIVER_INVALID_ROLE,
+        "HARW-DRIVER-003",
+        Driver,
+        Error,
+        "`[work_driver]` has a missing or malformed role reference",
+        "`worker_role` is required; `worker_role` and `judge_role` are role names matching `[a-z0-9][a-z0-9._-]{0,63}`",
+        "[work_driver]\nmax_iterations = 8",
+        "name the role the driver delegates to: `worker_role = \"executor\"`"
+    );
+    code!(
+        DRIVER_DELEGATION_RIGHTS,
+        "HARW-DRIVER-004",
+        Driver,
+        Error,
+        "the definition may not delegate to the roles its `[work_driver]` names",
+        "a work driver needs an orchestrator role, a spawn depth above 0, and `worker_role` (and `judge_role`) \
+         listed in `[delegation] targets` or `[spawn] child_orchestrators`",
+        "role = \"child-orchestrator\"\n\n[delegation]\ntargets = [\"explorer\"]\n\n[work_driver]\nworker_role = \"executor\"",
+        "grant the delegation: `targets = [\"explorer\", \"executor\"]`"
+    );
+    code!(
+        DRIVER_INVALID_VERIFY,
+        "HARW-DRIVER-005",
+        Driver,
+        Error,
+        "invalid `[work_driver] verify` command",
+        "verify commands are non-blank strings without control characters, one command per entry",
+        "[work_driver]\nworker_role = \"executor\"\nverify = [\"\"]",
+        "write the command or drop the entry: `verify = [\"cargo test\"]`"
+    );
 }
 
 /// Every code of [`codes`], in catalog order.
@@ -705,6 +763,11 @@ pub const CATALOG: &[DiagnosticCode] = &[
     codes::BINARY_INVALID_NAME,
     codes::BINARY_DUPLICATE_INTERFACE,
     codes::BINARY_UNKNOWN_CHILD_EXECUTION,
+    codes::DRIVER_UNKNOWN_KEY,
+    codes::DRIVER_OUT_OF_RANGE,
+    codes::DRIVER_INVALID_ROLE,
+    codes::DRIVER_DELEGATION_RIGHTS,
+    codes::DRIVER_INVALID_VERIFY,
 ];
 
 /// Looks up a code in [`CATALOG`].

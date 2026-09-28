@@ -394,6 +394,44 @@ If either the toolchain or the sources are missing, the build stops with
 a clear error. The artifact, and so the artifact hash, is identical to the
 default backend's.
 
+### Verifying the native backend
+
+The unit tests only compare the generated `Cargo.toml` and `src/main.rs`
+with golden files (`harw-agent-compiler/tests/golden/native/`). A real
+native build runs in two places, both against
+[`examples/agents/hello-analyst`](../../examples/agents/hello-analyst):
+
+```sh
+sh scripts/native-e2e.sh
+cargo test -p harw-agent-compiler --test native_e2e -- --ignored native
+```
+
+`scripts/native-e2e.sh` builds `harw` (`cargo build -p harw-cli --bin
+harw`), runs `harw agent build <example> --native --harw-src <checkout> -o
+<tmp>/agent` and then checks the binary: `--verify` (and `--verify --json`)
+report the digest the build printed, `--manifest` names the agent and
+`fs.read`, `--requirements --json` reports `"admitted": true`, and a
+one-shot with `--offline-echo` exits `0` with the `HARW_OFFLINE_ECHO` reply
+on stdout. The ignored test `native_e2e` does the same through the
+compiler API (`Compiler` plus `harw_agent_compiler::build` with `native:
+true`) and `std::process`. Both use a fresh temporary harw home unless
+`NATIVE_E2E_HOME` names one; a persistent home keeps the native build cache
+(`<home>/cache/agent-builds/target`), so later runs only rebuild what
+changed. The script also takes `HARW_BIN` to skip building `harw`.
+
+The one-shot needs `--offline-echo` because the native binary is a release
+build, which ignores `HARW_OFFLINE_ECHO` on its own; it sets a dummy
+`ANTHROPIC_API_KEY` because the example's `[models].required_env` names it
+and the runtime checks that it is set, although the echo never calls a
+provider.
+
+CI runs the script in the `native-agent` job on pushes to `main` and on
+manual runs (`workflow_dispatch`), not on pull requests: the first build
+compiles harw's runner crates in release mode. While the push trigger is
+commented out in `ci.yml` (see `CONTRIBUTING.md`), only manual runs execute
+it. The job caches the native
+build's target directory next to the usual cargo cache.
+
 ## 7. Secrets
 
 A built binary never contains secrets. The definition names the variables

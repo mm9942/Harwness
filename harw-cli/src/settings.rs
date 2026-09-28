@@ -292,7 +292,11 @@ fn print_validation_result(home: &Path) {
                 .map(|config| (layers, config))
         });
     match outcome {
-        Ok((layers, config)) => match config.validate() {
+        Ok((layers, config)) => match config.validate().and_then(|()| {
+            // Agentendefinitionen reicht `harw-config` ungeparst weiter; ihr
+            // Senken und die Auswahlprüfung gehören zur Validierung.
+            harw_registry_defaults::ConfigAgents::from_config_validated(&config).map(|_| ())
+        }) {
             Ok(()) => println!(
                 "config_valid=true layers={} providers={} models={}",
                 layers.len(),

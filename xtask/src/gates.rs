@@ -44,43 +44,37 @@ pub mod privileges;
 // Fragen stellen — Anzahl gegen Bauart.
 #[path = "gate_warden.rs"]
 pub mod warden;
+// Schichtenregeln aus `xtask/arch-policy.toml` (Architekturplan §47/§55/§56).
+#[path = "gate_arch.rs"]
+pub mod arch;
 
-/// Unterverzeichnis des eigenständigen DoD-Workspace, relativ zur Repo-Wurzel.
+/// Lädt den (einen) Wurzel-Workspace samt DoD-Domäne als Graphen.
 ///
 /// # Description
-/// `dod/` ist ein eigener Cargo-Workspace (eigenes `Cargo.lock`, eigene
-/// `[workspace.dependencies]`) und steht in der Wurzel-`Cargo.toml` unter
-/// `exclude`. Dort liegen alle vier Binaries, die `privileges` und die
-/// Warden-Gates prüfen, und alle Sensor-Crates, auf die sich die Regeln von
-/// `edges` beziehen.
-pub const DOD_WORKSPACE: &str = "dod";
-
-/// Lädt Produkt- und DoD-Workspace als **einen** Graphen.
+/// Bis PL-60 war `dod/` ein eigener Cargo-Workspace (eigenes `Cargo.lock`,
+/// eigene `[workspace.dependencies]`, in der Wurzel unter `exclude`), und
+/// diese Funktion führte beide Workspaces per
+/// [`WorkspaceGraph::load_many`] zusammen. Seit PL-60 stehen alle Crates
+/// unter `dod/crates/` explizit in den `members` der Wurzel-`Cargo.toml`
+/// (siehe `docs/architecture/dod-workspace-merge-plan.md`); ein einziger
+/// [`WorkspaceGraph::load`] enthält deshalb alle vier Binaries, alle
+/// Sensoren und die Pfad-Kanten DoD → Produkt als interne Kanten.
 ///
-/// # Description
-/// Vor dieser Funktion lud jedes Gate nur `.`. Seit DoD ein eigener
-/// Workspace ist, fehlten damit alle vier Binaries und alle Sensoren im
-/// Graphen: die Sensor- und Warden-Regeln von `edges` prüften still nichts,
-/// `privileges` meldete die Binaries als „Gerüst", und die Warden-Gates
-/// fanden ihre Wurzel nicht. Die DoD-Crates hängen per `path` an
-/// Produkt-Crates (`harw-types`, `harw-macros`, …); erst
-/// [`WorkspaceGraph::load_many`] macht diese Kanten zu internen Kanten, damit
-/// die Hüllen über die Workspace-Grenze hinweg weiterlaufen.
+/// Name und Signatur bleiben, damit alle Gates unverändert aufrufen. Dass
+/// die DoD-Crates tatsächlich im Graphen stehen, prüfen die Tests unten
+/// (und `privileges` meldet fehlende Binaries als Verstoß) — ein stilles
+/// Herausfallen der DoD-Domäne ist damit weiterhin rot.
 ///
 /// # Arguments
-/// - `repo_root` (`&Path`): Wurzel des Repositorys (die Produkt-`Cargo.toml`).
+/// - `repo_root` (`&Path`): Wurzel des Repositorys (die Wurzel-`Cargo.toml`).
 ///
 /// # Errors
-/// Wenn einer der beiden Workspaces nicht lesbar ist. Ein fehlendes `dod/`
-/// ist ein Fehler, kein leiser Rückfall auf den Produkt-Workspace allein —
-/// genau dieser Rückfall hat die Gates zuvor blind gemacht.
+/// Wenn der Workspace nicht lesbar ist.
 pub fn load_all_workspaces(repo_root: &Path) -> Result<WorkspaceGraph, String> {
-    let dod_root = repo_root.join(DOD_WORKSPACE);
-    WorkspaceGraph::load_many(&[repo_root, dod_root.as_path()]).map_err(|error| {
+    WorkspaceGraph::load(repo_root).map_err(|error| {
         format!(
-            "Workspace-Graph (Produkt '{}' + DoD '{}') nicht lesbar: {error}",
-            repo_root.display(),
-            dod_root.display()
+            "Workspace-Graph '{}' nicht lesbar: {error}",
+            repo_root.display()
         )
     })
 }
@@ -146,7 +140,7 @@ impl GateReport {
 ///
 /// # Arguments
 /// - `args` (`&[String]`): Namen einzelner Gates (`edges`, `privileges`,
-///   `warden-deps`, `warden-cbuild`); leer bedeutet alle.
+///   `warden-deps`, `warden-cbuild`, `arch`); leer bedeutet alle.
 ///
 /// # Returns
 /// `Ok(())`, wenn jedes ausgeführte Gate grün ist.
@@ -158,7 +152,13 @@ impl GateReport {
 /// Tippfehler rot werden, nicht still alles überspringen.
 pub fn run(args: &[String]) -> Result<(), String> {
     let selected: Vec<&str> = if args.is_empty() {
-        vec!["edges", "privileges", "warden-deps", "warden-cbuild"]
+        vec![
+            "edges",
+            "privileges",
+            "warden-deps",
+            "warden-cbuild",
+            "arch",
+        ]
     } else {
         args.iter().map(String::as_str).collect()
     };
@@ -170,6 +170,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "privileges" => privileges::run()?,
             "warden-deps" => warden::dependency_budget::run()?,
             "warden-cbuild" => warden::c_build::run()?,
+            "arch" => arch::run()?,
             other => return Err(format!("unbekanntes Gate '{other}'")),
         };
         println!("{}", report.summary());
@@ -246,6 +247,44 @@ mod tests {
         Ok(())
     }
 
+    /// PL-60: DoD ist kein verschachtelter Workspace mehr. Ein
+    /// wiederauftauchendes `dod/Cargo.toml` (oder `dod/Cargo.lock`) würde
+    /// wieder eine zweite Builddomäne mit eigenem Lockfile aufmachen, die
+    /// die Wurzel nicht sieht; ein DoD-Crate, das in den Wurzel-`members`
+    /// fehlt, fiele still aus jedem Gate.
+    #[test]
+    fn test_dod_crates_are_root_workspace_members() -> TestResult {
+        let root = repo_root()?;
+        assert!(
+            !root.join("dod").join("Cargo.toml").exists(),
+            "dod/Cargo.toml darf nicht wieder entstehen (PL-60: ein Workspace)"
+        );
+        assert!(
+            !root.join("dod").join("Cargo.lock").exists(),
+            "dod/Cargo.lock darf nicht wieder entstehen (PL-60: ein Lockfile)"
+        );
+
+        let graph = super::load_all_workspaces(root).map_err(TestError::Unexpected)?;
+        let crates_dir = root.join("dod").join("crates");
+        let entries =
+            std::fs::read_dir(&crates_dir).map_err(|_| TestError::Missing("dod/crates lesbar"))?;
+        let mut seen = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|_| TestError::Missing("dod/crates-Eintrag"))?;
+            if !entry.path().join("Cargo.toml").is_file() {
+                continue;
+            }
+            seen += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                graph.get(&name).is_some(),
+                "DoD-Crate '{name}' fehlt in den members der Wurzel-Cargo.toml"
+            );
+        }
+        assert!(seen > 0, "keine DoD-Crates unter dod/crates gefunden");
+        Ok(())
+    }
+
     #[test]
     fn test_edges_on_real_graph_sees_every_rule_subject() -> TestResult {
         let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
@@ -269,6 +308,13 @@ mod tests {
             "harw-warden",
             "harw-dod-sentinel",
             "harw-dod-escalate",
+            // Subjekte der Krypto-Hüllenregeln (`FORBIDDEN_REACH`).
+            "harw-dod",
+            "harw-dod-warden",
+            "harw-dod-warden-proto",
+            "harw-probe-fs",
+            "harw-probe-bpf",
+            "harw-dod-encrypt",
         ] {
             assert!(
                 graph.get(name).is_some(),

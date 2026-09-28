@@ -22,9 +22,9 @@ case "$action" in
         ;;
     disable)
         require_root
-        "$systemctl_bin" disable --now harw-dod.target harw-dod-sentinel.service harw-dod-bpf.service
+        "$systemctl_bin" disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service
         # Explicitly remove any accidental Warden activation without starting it.
-        "$systemctl_bin" disable --now harw-dod-warden.socket harw-dod-warden.service 2>/dev/null || true
+        "$systemctl_bin" disable --now harw-warden.socket harw-warden.service 2>/dev/null || true
         ;;
     restart)
         require_root
@@ -34,11 +34,11 @@ case "$action" in
         ;;
     status)
         "$(dirname "$0")/check-config.sh" --config "$config" || true
-        "$systemctl_bin" --no-pager status harw-dod.target harw-dod-sentinel.service harw-dod-bpf.service || true
-        "$systemctl_bin" --no-pager is-enabled harw-dod-warden.socket harw-dod-warden.service 2>&1 || true
+        "$systemctl_bin" --no-pager status harw-dod.target harw-sentinel.service harw-probe-bpf.service || true
+        "$systemctl_bin" --no-pager is-enabled harw-warden.socket harw-warden.service 2>&1 || true
         ;;
     logs)
-        exec journalctl --no-pager -u harw-dod-sentinel.service -u harw-dod-bpf.service -u harw-dod-warden.service
+        exec journalctl --no-pager -u harw-sentinel.service -u harw-probe-bpf.service -u harw-probe-fs.service -u harw-warden.service
         ;;
     smoke)
         if [ "${SMOKE_CONFIRM:-0}" != 1 ]; then

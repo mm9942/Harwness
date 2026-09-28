@@ -1,0 +1,30 @@
+[package]
+publish.workspace = true
+name = "harw-job-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Tokio adapter for Linux job processes without unsafe code: async pidfd exit readiness via AsyncFd, async layered termination, and one supervisor event loop fanning in exit, stdout/stderr, deadline and cancellation (Job-Runtime-Doc §3.2, §13, Phase 6)."
+
+# Everything is Linux-only (pidfd). On other targets the crate is an empty
+# library, so all dependencies are target-specific.
+[target.'cfg(target_os = "linux")'.dependencies]
+# ExitOutcome.
+harw-job-core = { path = "../harw-job-core" }
+# LinuxProcess / LinuxJobGroup (pidfd authority), SignalKind,
+# TerminationPolicy/-Report, ProcessError.
+harw-job-linux = { path = "../harw-job-linux" }
+# net:      tokio::io::unix::AsyncFd (pidfd readiness).
+# process:  tokio::process::ChildStdout/ChildStderr::from_std.
+# rt/macros: task spawn, select!. time: deadline/grace/drain timers.
+# sync:     bounded mpsc event channel, watch-based cancellation.
+# io-util:  AsyncReadExt::read.
+tokio = { version = "1", features = ["net", "rt", "time", "sync", "io-util", "macros", "process"] }
+# ProcessEvent::Stdout/Stderr payload (Job-Runtime-Doc §13).
+bytes = "1"
+tracing = { workspace = true }
+
+[lints]
+workspace = true

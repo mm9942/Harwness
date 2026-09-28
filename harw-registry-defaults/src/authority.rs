@@ -69,6 +69,9 @@
 
 use harw_authority::{Permission, PermissionSet};
 
+use crate::capability_catalog::{
+    WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
+};
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
 use crate::palace_tools::PalaceToolProvider;
@@ -579,6 +582,15 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 /// - `job.start` → `ExecuteProcess` (derselbe Startweg wie `shell.exec`);
 ///   `job.status/logs/stop/list/wait` → `ReadWorkspace` (Plan R9, Teil F:
 ///   kein Prozessstart, nur eigene Jobs bzw. die der Nachfahren).
+/// - `work_driver.enqueue` → `ExecuteProcess` (R14, derselbe Startweg wie
+///   `job.start`/`shell.exec`: startet einen dauerhaften Hintergrund-Job, der
+///   die `[work_driver] verify`-Kommandos ausführt und Worker-Agenten
+///   antreibt); `work_driver.status/stop` → `ReadWorkspace` (liest nur den
+///   Job bzw. beendet nur einen eigenen Job über den Job-Cancel-Pfad, wie
+///   `job.status`/`job.stop`). Die von `work_driver.enqueue` gestarteten
+///   Worker bekommen `WriteWorkspace` zusätzlich, aber nur auf ihre eigenen
+///   Scope-Pfade beschränkt — das regelt der Worker-Spawner, nicht dieser
+///   Rechtefilter, der pro Werkzeug nur ein Recht liefert.
 /// - `deps.graph`, `deps.locked` → `ReadWorkspace`, `deps.source_*` →
 ///   `ReadCargoRegistry` (`harw-tool-deps/src/{graph_tool.rs:195,
 ///   locked_tool.rs:209, source_tool.rs:803,855,918}`).
@@ -647,6 +659,14 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     } else if listed(SHELL_TOOLS)
         // Plan R9, Teil F: `job.start` startet einen Prozess wie `shell.exec`.
         || tool == harw_tool_job::JOB_START_TOOL
+        // R14: `work_driver.enqueue` startet einen dauerhaften Hintergrund-Job
+        // über denselben Startweg wie `job.start`/`shell.exec` (führt die
+        // `[work_driver] verify`-Kommandos aus und treibt Worker-Agenten an)
+        // und trägt daher dasselbe Prozessrecht. Die Worker, die es startet,
+        // bekommen `WriteWorkspace` zusätzlich, aber nur auf ihre eigenen
+        // Scope-Pfade beschränkt — das regelt der Worker-Spawner, nicht
+        // dieser Rechtefilter (der pro Werkzeug nur ein Recht liefert).
+        || tool == WORK_DRIVER_ENQUEUE_TOOL
         || listed(PROCESS_TOOLS)
         || listed(LATEX_TOOLS)
         || listed(crate::profile::SUDO_TOOLS)
@@ -674,6 +694,12 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // sie lesen bzw. beenden nur Jobs des Aufrufers und seiner
         // Nachfahren (Besitzprüfung in `harw-tool-job`).
         || listed(&harw_tool_job::JOB_CONTROL_TOOLS)
+        // R14: `work_driver.status` liest nur den Job und seine
+        // Zustands-Sidecar; `work_driver.stop` beendet nur einen eigenen Job
+        // über den Job-Cancel-Pfad — beide starten nichts, wie
+        // `job.status`/`job.stop`.
+        || tool == WORK_DRIVER_STATUS_TOOL
+        || tool == WORK_DRIVER_STOP_TOOL
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -891,6 +917,31 @@ mod tests {
         // eigene Hintergrund-Agenten; die Grenze zieht der Spawner.
         assert_eq!(tool_permission("agent.status"), None);
         assert_eq!(tool_permission("agent.cancel"), None);
+    }
+
+    /// R14: `work_driver.enqueue` startet einen dauerhaften Hintergrund-Job
+    /// über denselben Startweg wie `job.start` und trägt daher dasselbe
+    /// Recht (`ExecuteProcess`); `work_driver.status`/`work_driver.stop`
+    /// starten nichts — sie lesen bzw. beenden nur einen eigenen Job, wie
+    /// `job.status`/`job.stop`, und tragen daher `ReadWorkspace`.
+    #[test]
+    fn test_tool_permission_maps_work_driver_tools_like_job_tools() {
+        assert_eq!(
+            tool_permission(WORK_DRIVER_ENQUEUE_TOOL),
+            tool_permission(harw_tool_job::JOB_START_TOOL),
+            "work_driver.enqueue muss wie job.start abgebildet werden"
+        );
+        assert_eq!(
+            tool_permission(WORK_DRIVER_ENQUEUE_TOOL),
+            Some(Permission::ExecuteProcess)
+        );
+        for tool in [WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL] {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
     }
 
     #[test]

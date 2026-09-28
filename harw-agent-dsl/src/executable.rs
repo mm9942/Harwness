@@ -346,6 +346,14 @@ pub struct ExecutableAgentIr {
     /// ReturnPipeline — how return values are validated and reported upward.
     return_pipeline: ReturnPipeline,
 
+    /// WorkDriver settings (`[work_driver]`), carried through unchanged from
+    /// [`crate::ir_v2::AgentIr::work_driver`] when this IR is built from one.
+    /// `clamped_to`/`clamped_to_with` preserve it as-is — the section is the
+    /// agent's own configuration, not a right subject to clamping. `None`
+    /// wherever this IR is built without a v2 `AgentIr` (the [`lower`]
+    /// path from [`ResolvedAgentDefinition`], defaults, test builders).
+    pub work_driver: Option<crate::ir_v2::WorkDriverSpec>,
+
     /// Provenance from the resolved definition; carried through unchanged.
     /// NOTE: `trace` is excluded from the snapshot hash (contains timestamps).
     trace: ResolutionTrace,
@@ -1047,6 +1055,7 @@ impl ExecutableAgentIr {
                 ),
             },
             return_pipeline: self.return_pipeline.clone(),
+            work_driver: self.work_driver.clone(),
             trace: self.trace.clone(),
             snapshot_id: SnapshotId(String::new()),
         };
@@ -1626,6 +1635,9 @@ pub fn lower(resolved: &ResolvedAgentDefinition) -> Result<ExecutableAgentIr, Ds
         tool_surface,
         lifecycle_machine,
         return_pipeline,
+        // No `ir_v2::AgentIr` is available on this path — `lower` builds
+        // straight from `ResolvedAgentDefinition`, which has no work_driver.
+        work_driver: None,
         trace: resolved.trace.clone(),
         // Populated below after content fields are finalized.
         snapshot_id: SnapshotId(String::new()),
@@ -1696,6 +1708,7 @@ impl From<&crate::ir_v2::AgentIr> for ExecutableAgentIr {
                     .contract
                     .map(|contract| contract.as_str().to_owned()),
             },
+            work_driver: ir.work_driver.clone(),
             trace: ResolutionTrace {
                 steps: ir
                     .trace
@@ -1887,6 +1900,125 @@ mod tests {
         let resolved = base_resolved("focused-pure-coding")?;
         let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.specialization, "focused-pure-coding");
+        Ok(())
+    }
+
+    /// Builds a minimal, valid [`crate::ir_v2::AgentIr`] for tests of the
+    /// `From<&crate::ir_v2::AgentIr>` conversion. Every field is filled with
+    /// its most conservative value; only `id`, `specialization` and
+    /// `work_driver` vary between test cases.
+    fn base_agent_ir_v2(
+        id: &str,
+        work_driver: Option<crate::ir_v2::WorkDriverSpec>,
+    ) -> TestResult<crate::ir_v2::AgentIr> {
+        Ok(crate::ir_v2::AgentIr {
+            schema: crate::ir_v2::AGENT_IR_SCHEMA.to_owned(),
+            id: make_id(id)?,
+            version: make_version("1.0.0")?,
+            name: None,
+            description: None,
+            role: AgentRoleId::Worker,
+            specialization: "test-worker".to_owned(),
+            reasoning_effort: None,
+            authority: crate::ir_v2::Authority::default(),
+            instructions: crate::ir_v2::Instructions::none(),
+            tools: crate::ir_v2::ToolSurface::default(),
+            spawn: crate::ir_v2::SpawnContract::default(),
+            job: crate::ir_v2::Job::default(),
+            lifecycle: crate::ir_v2::Lifecycle::default(),
+            context: crate::ir_v2::ContextProgram::default(),
+            return_pipeline: crate::ir_v2::ReturnPipeline::default(),
+            models: None,
+            limits: None,
+            work: None,
+            research: None,
+            verification: None,
+            work_driver,
+            skills: crate::ir_v2::Skills::default(),
+            binary: crate::ir_v2::Binary {
+                name: "test-worker".to_owned(),
+                interfaces: vec![crate::ir_v2::Interface::Cli],
+                default_interface: crate::ir_v2::Interface::Cli,
+                child_execution: crate::ir_v2::ChildExecution::default(),
+            },
+            permissions: crate::ir_v2::Permissions {
+                tools: Vec::new(),
+                forbidden_tools: Vec::new(),
+                capabilities: Vec::new(),
+                filesystem: crate::ir_v2::FilesystemPermissions::default(),
+                network: crate::ir_v2::NetworkPermissions {
+                    mode: crate::ir_v2::NetworkMode::Off,
+                    tools: Vec::new(),
+                    hosts: Vec::new(),
+                },
+                shell: false,
+                host: false,
+                spawn: crate::ir_v2::SpawnPermissions::default(),
+                budget: None,
+                required_env: Vec::new(),
+            },
+            requirements: crate::ir_v2::ExecutionRequirements::default(),
+            trace: crate::ir_v2::Trace::default(),
+            snapshot: None,
+        })
+    }
+
+    /// Sample `[work_driver]` settings for tests, distinct from every
+    /// default so a missed carry-through is not masked by a coincidence.
+    fn sample_work_driver() -> crate::ir_v2::WorkDriverSpec {
+        crate::ir_v2::WorkDriverSpec {
+            max_iterations: 12,
+            max_parallel_workers: 3,
+            max_attempts_per_worker: 2,
+            stall_iterations: 4,
+            worker_role: "executor".to_owned(),
+            judge_role: Some("judge".to_owned()),
+            verify: vec!["cargo test".to_owned()],
+            token_budget: Some(1_000_000),
+            wall_budget_secs: Some(3_600),
+        }
+    }
+
+    #[test]
+    fn test_from_agent_ir_v2_carries_work_driver_through() -> TestResult {
+        let source = base_agent_ir_v2("harwness.agent.test-driver@1", Some(sample_work_driver()))?;
+        let ir = ExecutableAgentIr::from(&source);
+        assert_eq!(ir.work_driver, Some(sample_work_driver()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_agent_ir_v2_without_work_driver_section_is_none() -> TestResult {
+        let source = base_agent_ir_v2("harwness.agent.test-no-driver@1", None)?;
+        let ir = ExecutableAgentIr::from(&source);
+        assert_eq!(ir.work_driver, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_clamped_to_preserves_work_driver_of_self_unchanged() -> TestResult {
+        let self_source = base_agent_ir_v2(
+            "harwness.agent.test-driver-self@1",
+            Some(sample_work_driver()),
+        )?;
+        let ceiling_source = base_agent_ir_v2("harwness.agent.test-driver-ceiling@1", None)?;
+        let self_ir = ExecutableAgentIr::from(&self_source);
+        let ceiling_ir = ExecutableAgentIr::from(&ceiling_source);
+        let clamped = self_ir.clamped_to(&ceiling_ir);
+        // The work_driver section is the agent's own configuration, not a
+        // right granted by the ceiling — clamping must not touch it, even
+        // though the ceiling itself has none.
+        assert_eq!(clamped.work_driver, Some(sample_work_driver()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_from_resolved_definition_has_no_work_driver() -> TestResult {
+        // `lower` builds from `ResolvedAgentDefinition`, which carries no
+        // `ir_v2::AgentIr` and therefore no `[work_driver]` section.
+        let resolved = base_resolved("test-worker")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
+        assert_eq!(ir.work_driver, None);
         Ok(())
     }
 

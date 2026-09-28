@@ -39,6 +39,13 @@ fn full_registry() -> OperationRegistry {
         harw_ops::PLAN_TOOL_COUNT,
         "Planungsfläche muss registriert sein"
     );
+    let added =
+        harw_ops::register_work_driver_tools(&mut registry, &PlanToolConfig::enabled_defaults());
+    assert_eq!(
+        added,
+        harw_ops::WORK_DRIVER_TOOL_COUNT,
+        "WorkDriver-Fläche muss registriert sein"
+    );
     registry
 }
 

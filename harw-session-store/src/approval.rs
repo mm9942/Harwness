@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use fs4::FileExt;
 #[cfg(unix)]
 use harw_fsutil::OpenMode;
-use harw_types::{ApprovalActor, Clock, ItemId, ReviewDecision, SessionId, ToolCallId};
+use harw_types::{ApprovalActor, Clock, ItemId, ReviewDecision, SessionId, TenantId, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -71,6 +71,13 @@ const RESOLVED_SUFFIX: &str = ".resolved.json";
 
 /// Immutable authorization captured before an approval prompt reaches a
 /// channel. `actor` must match byte-for-byte when the response is consumed.
+///
+/// `tenant` ist der Mandant der auslösenden Sitzung (bzw. des durablen Jobs),
+/// falls bekannt. Mandantengebundene Leser filtern damit nach der Regel von
+/// `OpContext::tenant_admits` (ein Datensatz ohne Mandant ist für einen
+/// Aufrufer mit Scope unsichtbar). Das Feld fehlt in der JSON-Form, solange
+/// es `None` ist — Altdatensätze laden unverändert und ein neu geschriebener
+/// Datensatz ohne Mandant ist byte-gleich mit dem alten Format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRecord {
     pub request: ItemId,
@@ -78,6 +85,8 @@ pub struct ApprovalRecord {
     pub call_id: ToolCallId,
     pub actor: ApprovalActor,
     pub issued_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<TenantId>,
 }
 
 /// Terminal, audit-friendly result of consuming an approval request.
@@ -90,6 +99,9 @@ pub struct ApprovalResolutionRecord {
     pub decision: ReviewDecision,
     pub comment: Option<String>,
     pub resolved_at: Timestamp,
+    /// Mandant der aufgelösten Anfrage, übernommen aus [`ApprovalRecord::tenant`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<TenantId>,
 }
 
 /// Per-session file store for approval state.
@@ -279,6 +291,7 @@ impl ApprovalStore {
                 decision,
                 comment,
                 resolved_at: now,
+                tenant: record.tenant,
             };
             self.persist_resolution(&resolved_path, &resolution)?;
             Ok(resolution)
@@ -773,6 +786,7 @@ mod tests {
             call_id: ToolCallId::from_str("call-1"),
             actor: actor("alice"),
             issued_at,
+            tenant: None,
         }
     }
 
@@ -819,6 +833,84 @@ mod tests {
             ),
             Err(SessionStoreError::ApprovalAlreadyResolved { .. })
         ));
+        Ok(())
+    }
+
+    /// Altdatensätze ohne `tenant` laden als `tenant: None`, und ein Datensatz
+    /// ohne Mandant serialisiert byte-gleich zum alten Format.
+    #[test]
+    fn test_legacy_record_without_tenant_loads_and_reserializes_byte_identical() -> TestResult {
+        // Exakt die Feldfolge des Formats vor Einführung von `tenant`.
+        #[derive(Serialize)]
+        struct LegacyApprovalRecord {
+            request: ItemId,
+            session: SessionId,
+            call_id: ToolCallId,
+            actor: ApprovalActor,
+            issued_at: Timestamp,
+        }
+        let legacy = serde_json::to_vec(&LegacyApprovalRecord {
+            request: ItemId::from_str("approval-1"),
+            session: SessionId::from_str("session-1"),
+            call_id: ToolCallId::from_str("call-1"),
+            actor: actor("alice"),
+            issued_at: ISSUED,
+        })?;
+        let loaded: ApprovalRecord = serde_json::from_slice(&legacy)?;
+        assert_eq!(loaded, record());
+        assert_eq!(loaded.tenant, None);
+        assert_eq!(serde_json::to_vec(&loaded)?, legacy);
+
+        // Auch ein über den Speicher ausgestellter Altdatensatz ist lesbar.
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let session_dir = store.session_dir(&loaded.session)?;
+        std::fs::create_dir_all(&session_dir)?;
+        std::fs::write(session_dir.join("approval-1.pending.json"), &legacy)?;
+        assert_eq!(store.pending(&loaded.session, &loaded.request)?, loaded);
+        assert_eq!(
+            store.pending_all(10, &at_offset_mins(1)?)?,
+            vec![loaded.clone()]
+        );
+
+        let resolution = store.resolve(
+            &loaded.session,
+            &loaded.request,
+            ReviewDecision::Approved,
+            None,
+            &loaded.actor,
+            &at_offset_mins(1)?,
+        )?;
+        assert_eq!(resolution.tenant, None);
+        let resolution_json = serde_json::to_value(&resolution)?;
+        assert!(resolution_json.get("tenant").is_none());
+        Ok(())
+    }
+
+    /// Ein gesetzter Mandant wird persistiert und in die Auflösung übernommen.
+    #[test]
+    fn test_tenant_is_persisted_and_carried_into_resolution() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let mut request = record();
+        request.tenant = Some(TenantId::from_str("tenant-a"));
+        store.issue(&request)?;
+
+        let pending = store.pending(&request.session, &request.request)?;
+        assert_eq!(pending.tenant, Some(TenantId::from_str("tenant-a")));
+        let resolution = store.resolve(
+            &request.session,
+            &request.request,
+            ReviewDecision::Approved,
+            None,
+            &request.actor,
+            &at_offset_mins(1)?,
+        )?;
+        assert_eq!(resolution.tenant, Some(TenantId::from_str("tenant-a")));
+        let durable = store
+            .resolution(&request.session, &request.request)?
+            .ok_or(TestError::Missing("resolution"))?;
+        assert_eq!(durable.tenant, Some(TenantId::from_str("tenant-a")));
         Ok(())
     }
 
@@ -979,6 +1071,7 @@ mod tests {
             decision: ReviewDecision::Approved,
             comment: None,
             resolved_at: ISSUED,
+            tenant: None,
         };
         let path = store.resolved_path(&request.session, &request.request)?;
         std::fs::create_dir_all(path.parent().ok_or(TestError::Missing("path parent"))?)?;

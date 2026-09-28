@@ -14,7 +14,6 @@ bpfdir=${BPFDIR:-$libdir/bpf}
 sysconfdir=${SYSCONFDIR:-/etc/harw-dod}
 statedir=${STATEDIR:-${LOCALSTATEDIR:-/var}/lib/harw-dod}
 logdir=${LOGDIR:-${LOCALSTATEDIR:-/var}/log/harw-dod}
-runtimedir=${RUNTIMEDIR:-${RUNSTATEDIR:-/run}/harw-dod}
 unitdir=${SYSTEMD_UNITDIR:-$prefix/lib/systemd/system}
 sysusersdir=${SYSUSERSDIR:-$prefix/lib/sysusers.d}
 tmpfilesdir=${TMPFILESDIR:-$prefix/lib/tmpfiles.d}
@@ -22,6 +21,19 @@ binary_dir=${BINARY_DIR:-$(CDPATH= cd -- "$(dirname "$0")/../target/release" && 
 bpf_artifact_dir=${BPF_ARTIFACT_DIR:-$(CDPATH= cd -- "$(dirname "$0")/../bpf" && pwd)}
 manifest=$(CDPATH= cd -- "$(dirname "$0")/../packaging" && pwd)/manifest
 packaging_dir=$(CDPATH= cd -- "$(dirname "$0")/../packaging" && pwd)
+# The one canonical source of every unit, sysusers and tmpfiles snippet
+# (Crypto Masterplan v2 §22, H10): deploy/ at the repository root. The same
+# files are embedded byte-identically into harw-install
+# (`harw install --print-systemd`); there is no second copy under dod/.
+deploy_dir=${DEPLOY_DIR:-$(CDPATH= cd -- "$(dirname "$0")/../../deploy" && pwd)}
+
+# DoD units installed from $deploy_dir/systemd. The infrastructure units
+# (harw-infra.target, harw-auth-hub.*, ...) in the same directory are not
+# part of the DoD package.
+dod_units='harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service harw-warden.service harw-warden.socket'
+# Files of the pre-H10 layout (the old dod/packaging unit, sysusers and tmpfiles trees). Removed on
+# install and uninstall so an upgraded host never keeps two unit sets.
+legacy_files='systemd/harw-dod-sentinel.service systemd/harw-dod-bpf.service systemd/harw-dod-warden.service systemd/harw-dod-warden.socket sysusers/harw-dod.conf tmpfiles/harw-dod.conf'
 
 root_path() {
 	path=$1
@@ -65,8 +77,12 @@ render_unit() {
 		-e "s|@SYSCONFDIR@|$sysconfdir|g" \
 		-e "s|@STATEDIR@|$statedir|g" \
 		-e "s|@LOGDIR@|$logdir|g" \
-		-e "s|@RUNTIMEDIR@|$runtimedir|g" \
 		"$source" > "$tmp"
+	# Masterplan §40: no unresolved @PLACEHOLDER@ may reach the host.
+	if grep -n '@[A-Z][A-Z_]*@' "$tmp" >&2; then
+		rm -f "$tmp"
+		fail "unresolved placeholder in rendered $source"
+	fi
 	install -m 0644 "$tmp" "$destination"
 	rm -f "$tmp"
 }
@@ -77,6 +93,25 @@ install_file() {
 	destination=$3
 	[ -f "$source" ] || fail "packaging source missing: $source"
 	install -m "$mode" "$source" "$(root_path "$destination")"
+}
+
+legacy_destination() {
+	case "$1" in
+		systemd/*) printf '%s\n' "$unitdir/${1#systemd/}" ;;
+		sysusers/*) printf '%s\n' "$sysusersdir/${1#sysusers/}" ;;
+		tmpfiles/*) printf '%s\n' "$tmpfilesdir/${1#tmpfiles/}" ;;
+		*) fail "unknown legacy entry: $1" ;;
+	esac
+}
+
+remove_legacy_files() {
+	for entry in $legacy_files; do
+		destination=$(root_path "$(legacy_destination "$entry")")
+		if [ -e "$destination" ]; then
+			rm -f "$destination"
+			printf '%s\n' "Removed pre-H10 file: $destination"
+		fi
+	done
 }
 
 install_package() {
@@ -93,7 +128,6 @@ install_package() {
 	ensure_dir 0750 "$sysconfdir"
 	ensure_dir 0750 "$statedir"
 	ensure_dir 0750 "$logdir"
-	ensure_dir 0750 "$runtimedir"
 
 	for binary in harw-sentinel harw-probe-bpf harw-probe-fs harw-warden; do
 		install_file 0755 "$binary_dir/$binary" "$libexecdir/$binary"
@@ -102,18 +136,21 @@ install_package() {
 		install_file 0644 "$bpf_artifact_dir/$object" "$bpfdir/$object"
 	done
 
-	for unit in harw-dod.target harw-dod-sentinel.service harw-dod-bpf.service harw-dod-warden.service harw-dod-warden.socket; do
+	remove_legacy_files
+	for unit in $dod_units; do
+		[ -f "$deploy_dir/systemd/$unit" ] || fail "deployment source missing: $deploy_dir/systemd/$unit"
 		destination=$(root_path "$unitdir/$unit")
-		render_unit "$packaging_dir/systemd/$unit" "$destination"
+		render_unit "$deploy_dir/systemd/$unit" "$destination"
 	done
-	install_file 0644 "$packaging_dir/sysusers.d/harw-dod.conf" "$sysusersdir/harw-dod.conf"
-	render_unit "$packaging_dir/tmpfiles.d/harw-dod.conf" "$(root_path "$tmpfilesdir/harw-dod.conf")"
+	install_file 0644 "$deploy_dir/sysusers.d/harw.conf" "$sysusersdir/harw.conf"
+	[ -f "$deploy_dir/tmpfiles.d/harw.conf" ] || fail "deployment source missing: $deploy_dir/tmpfiles.d/harw.conf"
+	render_unit "$deploy_dir/tmpfiles.d/harw.conf" "$(root_path "$tmpfilesdir/harw.conf")"
 	install_file 0640 "$packaging_dir/config.example.toml" "$sysconfdir/config.toml.example"
 
 	if [ -z "$destdir" ]; then
 		command -v systemd-sysusers >/dev/null 2>&1 || fail 'systemd-sysusers is required for host installation'
 		command -v systemd-tmpfiles >/dev/null 2>&1 || fail 'systemd-tmpfiles is required for host installation'
-		systemd-sysusers "$(root_path "$sysusersdir/harw-dod.conf")"
+		systemd-sysusers "$(root_path "$sysusersdir/harw.conf")"
 		# The sentinel needs read access, while root retains ownership and
 		# write control.  Existing config contents are never replaced.
 		chown root:harw-dod-config "$(root_path "$sysconfdir")"
@@ -121,7 +158,7 @@ install_package() {
 		if [ -f "$(root_path "$sysconfdir/config.toml")" ]; then
 			chown root:harw-dod-config "$(root_path "$sysconfdir/config.toml")"
 		fi
-		systemd-tmpfiles --create "$(root_path "$tmpfilesdir/harw-dod.conf")"
+		systemd-tmpfiles --create "$(root_path "$tmpfilesdir/harw.conf")"
 		command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required for host installation'
 		systemctl daemon-reload
 	fi
@@ -153,6 +190,7 @@ uninstall_package() {
 		esac
 		rm -f "$(root_path "$destination")"
 	done < "$manifest"
+	remove_legacy_files
 
 	if [ -z "$destdir" ]; then
 		command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
