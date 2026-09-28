@@ -249,7 +249,7 @@ Update every doc/comment in this file that describes the changed behaviour. Code
     const missingCoders = toCode.filter((fp, i) => !codedAll[i]).map(fp => norm(fp.file))
     const review = await agent(`${CONTEXT}
 
-You review one contract wave cluster. Read \`${GIT} diff -- ${declared.join(' ')}\` and the contract below. Do not edit.
+You review one contract wave cluster. Read \`${GIT} diff -- ${declared.join(' ')}\` and the contract below. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
 Contract ${c.id}: ${contract.summary}
 ${contract.files.map(f => `- ${norm(f.file)}${f.change === false ? ' (no change)' : ''}: ${f.instructions}`).join('\n')}
 Coder reports: ${JSON.stringify(coded)}
@@ -292,7 +292,7 @@ Fix these minimally. If a problem needs another file, report it under deviations
     if (missingRepairs.length) { reports.push({ ...base, repairs, status: 'unresolved', reason: `no repair result for ${missingRepairs.join(', ')}` }); return null }
     const recheck = await agent(`${CONTEXT}
 
-You re-review one contract wave cluster after its repair pass. Read \`${GIT} diff -- ${declared.join(' ')}\`. Do not edit.
+You re-review one contract wave cluster after its repair pass. Read \`${GIT} diff -- ${declared.join(' ')}\`. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
 Contract ${c.id}: ${contract.summary}
 ${contract.files.map(f => `- ${norm(f.file)}${f.change === false ? ' (no change)' : ''}: ${f.instructions}`).join('\n')}
 The first review found:
@@ -316,7 +316,7 @@ if (waveFiles.length) {
   phase('Goal')
   goalCheck = await agent(`${CONTEXT}
 
-You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${waveFiles.join(' ')}\` and the tests in it. Do not edit.
+You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${waveFiles.join(' ')}\` and the tests in it. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
 For every acceptance criterion, answer met, not-met or unknown, using exactly these criterion ids and no others: ${GOAL.criteria.map(c => c.id).join(', ')}. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
     { label: `goal:${A.key}`, phase: 'Goal', schema: COVERAGE, model: 'sonnet', agentType: 'focused-explorer' })
 }

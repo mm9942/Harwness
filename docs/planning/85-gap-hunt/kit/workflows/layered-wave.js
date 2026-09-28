@@ -269,7 +269,7 @@ if (!stopped) {
   const answer = await agent(`Repository root: ${ROOT}. Do not edit. ${BUILD_RULE}
 
 You check wave ${KEY} against its goal. Goal ${GOAL.id}: ${GOAL.statement}
-Read \`${GIT} diff ${BASE} -- ${files.join(' ')}\` (new files included via \`${GIT} status\`) and the tests in it.
+Read \`${GIT} diff ${BASE} -- ${files.join(' ')}\` and the tests in it. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23).
 For every acceptance criterion answer met, not-met or unknown, using exactly these ids and no others: ${GOAL.criteria.map(c => c.id).join(', ')}; met needs evidence: a repo-relative file:line or a test name.
 ${GOAL.criteria.map(c => `- ${c.id}: ${c.text}`).join('\n')}
 List under deltas every contradiction between code/tests/gates and planning docs.`,

@@ -280,7 +280,7 @@ if (groups.length) {
   phase('Goal')
   goalCheck = await agent(`${CONTEXT}
 
-You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${groups.map(g => g[0]).join(' ')}\` and the tests in it. Do not edit.
+You check this wave against its goal. Read \`${GIT} diff ${BASE} -- ${groups.map(g => g[0]).join(' ')}\` and the tests in it. New files are untracked and do not appear in git diff: list them with \`${GIT} status --short --untracked-files=all\` and read them directly (catalog P23). Do not edit.
 For every acceptance criterion, answer met, not-met or unknown, using exactly these criterion ids and no others: ${GOAL.criteria.map(c => c.id).join(', ')}. met needs evidence: a repo-relative file:line or a test name in the diff that shows the criterion holds for this wave's files. A criterion this wave's files cannot satisfy on their own is unknown, never met. List under deltas every contradiction you saw between code/tests/gates and planning docs.`,
     { label: `goal:${A.key || 'batch'}`, phase: 'Goal', schema: COVERAGE, model: 'sonnet', agentType: 'focused-explorer' })
 }
