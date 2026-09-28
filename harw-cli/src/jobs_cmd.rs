@@ -4,6 +4,15 @@
 //! Jede Aktion ruft dieselbe Operation auf wie der entsprechende
 //! Chat-Befehl (`/ps`, `/review`, `/approve`, `/deny`, `/cancel`,
 //! `/retry`), damit Terminal und Chat identisch reagieren.
+//!
+//! `list` (`/ps`) zeigt Arbeitsaufträge (Art `work`) und die
+//! Hintergrundprozesse aus `job.start` (Art `process`, aus
+//! `<projekt>/.harw/state/jobs`) in einer Liste, jeweils mit Zustand,
+//! besitzendem Agenten, Sandbox-Profil und Endegrund. `show`, `approve`,
+//! `deny`, `cancel` und `retry` wirken nur auf Arbeitsaufträge (`/review`,
+//! `/approve`, `/deny`, `/cancel`, `/retry`); mit einer Prozess-ID scheitern
+//! sie, weil es keinen solchen Arbeitsauftrag gibt. Prozess-Jobs steuert man
+//! in der TUI über `/jobs`.
 
 use std::path::PathBuf;
 
@@ -106,6 +115,23 @@ mod tests {
         let (path, args) = operation_for(JobsAction::List { filter: None })?;
         assert_eq!(path, "/ps");
         assert!(args.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn work_item_actions_stay_on_work_operations() -> Result<(), String> {
+        let id = || "w1".to_owned();
+        let cases = [
+            (JobsAction::Show { id: id() }, "/review"),
+            (JobsAction::Cancel { id: id() }, "/cancel"),
+            (JobsAction::Retry { id: id() }, "/retry"),
+            (JobsAction::Approve { id: id(), note: None }, "/approve"),
+        ];
+        for (action, expected) in cases {
+            let (path, args) = operation_for(action)?;
+            assert_eq!(path, expected);
+            assert_eq!(args, vec![id()]);
+        }
         Ok(())
     }
 }
