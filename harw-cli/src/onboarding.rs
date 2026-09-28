@@ -11,11 +11,12 @@
 //! - `config.toml` ([`harw_config::HarnessConfig`]) mit `default_provider`,
 //!   `default_model` und den `onboarding.seen.*`-Flags.
 //!
-//! Secrets landen niemals als Klartext in einer TOML-Datei: Der Provider
-//! referenziert seinen Schlüssel entweder per `env:`- oder (bei interaktiver
-//! Key-Eingabe) per `file:`-[`harw_config::SecretRef`]. Die Schlüsseldatei
-//! liegt unter `<home>/secrets/<name>.key` und wird unter Unix auf `0o600`
-//! gesetzt.
+//! Secrets landen niemals als Klartext auf der Platte: Der Provider
+//! referenziert seinen Schlüssel entweder über eine fertige
+//! [`harw_config::SecretRef`] (`env:`, `file:`, …) oder — bei roh eingegebenem
+//! Key — über eine `secrets:<uuid>`-Referenz. Der rohe Key wandert dabei
+//! verschlüsselt in den SecretStore (`crate::secret_store::store_secret`);
+//! eine Klartext-Schlüsseldatei entsteht nicht.
 //!
 //! # Verantwortungsabgrenzung
 //! Der Wizard schreibt bewusst in den **Profil**-Layer (nicht den Home-Layer),
@@ -40,9 +41,10 @@ use harw_config::{HarnessConfig, ModelToml, ProviderToml, SecretRef};
 /// erzwingt: gesetzt (beliebiger Wert) → keine `stdin`-Reads.
 const NONINTERACTIVE_ENV: &str = "HARW_ONBOARD_NONINTERACTIVE";
 
-/// Monotonic suffix for sibling secret-file temporaries. `create_new` remains
-/// the authority for uniqueness; this only keeps retries in one process
-/// collision-free without introducing another dependency.
+/// Monotonic suffix for the sibling temporaries of setup writes
+/// (`write_file`). `create_new` remains the authority for uniqueness; this
+/// only keeps retries in one process collision-free without introducing
+/// another dependency.
 static SECRET_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Führt den Onboarding-Wizard aus (interaktiv, oder rein defaultbasiert, wenn
@@ -150,8 +152,9 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
 /// Überspringt still (ohne Ausgabe), wenn nicht-interaktiv, ohne TTY, oder
 /// wenn bereits ein `providers/openrouter.toml` im aktiven Profil existiert.
 /// Bei Zustimmung wird der Schlüssel wie beim ersten Provider entweder als
-/// bereits fertige [`SecretRef`] übernommen oder über [`write_secret_file`]
-/// als `file:`-Referenz abgelegt; danach wird `providers/openrouter.toml`
+/// bereits fertige [`SecretRef`] übernommen oder über [`store_provider_key`]
+/// verschlüsselt im SecretStore abgelegt (`secrets:<uuid>`-Referenz, keine
+/// Klartextdatei); danach wird `providers/openrouter.toml`
 /// geschrieben (`api = "openai-chat"`, `base_url =
 /// "https://openrouter.ai/api/v1"`, `enabled = true`, `models = []`).
 ///
@@ -204,7 +207,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
             .parse()
             .map_err(|e: harw_config::ConfigError| e.to_string())?
     } else {
-        write_secret_file(home, "openrouter", trimmed_key)?
+        store_provider_key(home, "openrouter", trimmed_key)?
     };
 
     let provider = ProviderToml {
@@ -310,6 +313,15 @@ fn merge_with_seeded_provider(path: &Path, fresh: ProviderToml) -> ProviderToml 
     existing
 }
 
+/// Liest die bisherige `auth`-Referenz aus `providers/<id>.toml`.
+///
+/// Eine fehlende, unlesbare oder unparsebare Datei liefert `None` — dann gibt
+/// es keinen Vorgänger, dessen Pool-Eintrag ersetzt werden müsste.
+fn previous_provider_auth(path: &Path) -> Option<SecretRef> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<ProviderToml>(&contents).ok()?.auth
+}
+
 fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), String> {
     validate_provider_name(&outcome.provider_id)?;
     harw_provider_http::validate_endpoint(&outcome.base_url).map_err(|e| e.to_string())?;
@@ -325,8 +337,10 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
     let profile_name = harw_home::active_profile_name(home);
     let profile = harw_home::profile_dir(home, &profile_name).map_err(|e| e.to_string())?;
 
-    // secret_ref kann eine fertige Referenz (env:/file:/file-json:) ODER ein
-    // roh eingegebener Schlüssel sein; letzterer wandert in eine 0600-Datei.
+    // secret_ref kann eine fertige Referenz (env:/file:/file-json:/secrets:)
+    // ODER ein roh eingegebener Schlüssel sein; letzterer wandert verschlüsselt
+    // in den SecretStore und wird als `secrets:<uuid>` referenziert.
+    let mut stored_raw_key = false;
     let auth_ref: Option<SecretRef> = match &outcome.secret_ref {
         None => None,
         Some(raw) if raw.is_empty() => None,
@@ -334,7 +348,10 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
             raw.parse()
                 .map_err(|e: harw_config::ConfigError| e.to_string())?,
         ),
-        Some(raw) => Some(write_secret_file(home, &outcome.provider_id, raw)?),
+        Some(raw) => {
+            stored_raw_key = true;
+            Some(store_provider_key(home, &outcome.provider_id, raw)?)
+        }
     };
 
     let model_id = if outcome.model.is_empty() {
@@ -378,6 +395,14 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
     let provider_path = providers_dir.join(format!("{}.toml", outcome.provider_id));
+    // Ein neu gespeicherter Rohschlüssel bekommt eine neue `secrets:`-ID. Die
+    // bisherige Provider-Referenz wird gemerkt, damit ihr Pool-Eintrag gleich
+    // mit ersetzt wird (siehe `replace_pool_entries`).
+    let previous_auth = if stored_raw_key {
+        previous_provider_auth(&provider_path)
+    } else {
+        None
+    };
     let provider = merge_with_seeded_provider(&provider_path, provider);
     write_file(
         &provider_path,
@@ -449,7 +474,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
             .credential_pool
             .entry(outcome.provider_id.clone())
             .or_default();
-        replace_pool_entries(pool, secret, &outcome.base_url);
+        replace_pool_entries(pool, secret, &outcome.base_url, previous_auth.as_ref());
         write_file(
             &auth_path.clone(),
             &toml::to_string_pretty(&auth).map_err(|e| format!("auth serialisieren: {e}"))?,
@@ -500,20 +525,31 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
 ///   Nicht-Codex-Routen (Erkennung über
 ///   [`harw_provider_http::is_codex_login_reference`] und
 ///   [`harw_provider_http::is_codex_base_url`]);
-/// - ein früherer Eintrag mit demselben Verweis entfällt (Duplikat).
+/// - ein früherer Eintrag mit demselben Verweis entfällt (Duplikat);
+/// - ersetzt ein neu gespeicherter Rohschlüssel eine frühere
+///   `secrets:`-Referenz des Providers (`replaced`), entfällt auch deren
+///   Eintrag. Jeder gespeicherte Schlüssel bekommt eine neue ID; ohne diese
+///   Regel sammelte der Pool bei jedem erneuten Onboarding einen weiteren
+///   Eintrag an, wo früher dieselbe Schlüsseldatei überschrieben wurde.
 ///
 /// # Arguments
 /// - `pool` (`&mut Vec<CredentialEntry>`): Pool-Einträge des Providers.
 /// - `secret` (`&SecretRef`): neuer Verweis aus dem Onboarding.
 /// - `base_url` (`&str`): Basis-URL der neuen Route.
+/// - `replaced` (`Option<&SecretRef>`): bisherige Provider-Referenz, nur
+///   gesetzt, wenn ein Rohschlüssel neu gespeichert wurde; wirkt nur, wenn sie
+///   eine `secrets:`-Referenz ungleich `secret` ist.
 fn replace_pool_entries(
     pool: &mut Vec<harw_config::CredentialEntry>,
     secret: &SecretRef,
     base_url: &str,
+    replaced: Option<&SecretRef>,
 ) {
     let codex_route = harw_provider_http::is_codex_login_reference(secret)
         || harw_provider_http::is_codex_base_url(base_url);
     let new_ref = secret.to_string();
+    let replaced =
+        replaced.filter(|previous| matches!(previous, SecretRef::Secrets(_)) && *previous != secret);
     let previous = std::mem::take(pool);
     pool.push(harw_config::CredentialEntry {
         secret: secret.clone(),
@@ -523,6 +559,7 @@ fn replace_pool_entries(
     });
     pool.extend(previous.into_iter().filter(|entry| {
         entry.secret.to_string() != new_ref
+            && replaced.is_none_or(|previous| &entry.secret != previous)
             && harw_provider_http::is_codex_login_reference(&entry.secret) == codex_route
     }));
 }
@@ -754,80 +791,32 @@ fn load_or_default_config(path: &Path) -> Result<HarnessConfig, String> {
     }
 }
 
-/// Schreibt den API-Key nach `<home>/secrets/<name>.key`, setzt unter Unix
-/// `0o600`, und gibt die zugehörige `file:`-[`SecretRef`] zurück. Der Schlüssel
-/// wird niemals geloggt.
+/// Legt einen roh eingegebenen API-Key verschlüsselt im SecretStore ab und
+/// gibt die zugehörige `secrets:<uuid>`-[`SecretRef`] zurück.
 ///
-/// The destination is never opened for writing. Instead, a same-directory
-/// temporary is created with `create_new`, written with restrictive Unix
-/// permissions from the beginning, synced, and atomically renamed over the
-/// destination. This both avoids following a destination symlink and avoids a
-/// window in which a newly-created secret has a permissive mode.
-fn write_secret_file(home: &Path, provider_name: &str, key: &str) -> Result<SecretRef, String> {
+/// # Description
+/// Der Provider-Name wird zuerst geprüft ([`validate_provider_name`]); danach
+/// entscheidet [`crate::secret_store::store_secret`] anhand der aktuell
+/// aufgelösten Konfiguration über die Versiegelung (AuthHub-V3 bei
+/// konfiguriertem `[infrastructure]`-Hub, sonst lokales V2 unter einem von
+/// harw selbst angelegten KEK). Es entsteht keine Klartextdatei; der Schlüssel
+/// wird niemals geloggt und erscheint in keiner Fehlermeldung.
+///
+/// # Errors
+/// Ein `String` bei ungültigem Provider-Namen, nicht ladbarer Konfiguration
+/// oder fehlgeschlagenem Speichern (auch bei unerreichbarem Hub — kein
+/// stiller Rückfall auf V2).
+fn store_provider_key(home: &Path, provider_name: &str, key: &str) -> Result<SecretRef, String> {
     validate_provider_name(provider_name)?;
-
-    let secrets_dir = home.join("secrets");
-    create_dir_all(&secrets_dir)?;
-    let secrets_metadata = std::fs::symlink_metadata(&secrets_dir).map_err(|e| {
-        format!(
-            "schlüsselverzeichnis prüfen ({}): {e}",
-            secrets_dir.display()
-        )
-    })?;
-    if secrets_metadata.file_type().is_symlink() || !secrets_metadata.is_dir() {
-        return Err(format!(
-            "schlüsselverzeichnis ist kein echtes Verzeichnis ({})",
-            secrets_dir.display()
-        ));
-    }
-    let key_path = secrets_dir.join(format!("{provider_name}.key"));
-    let temp_path = secrets_dir.join(format!(
-        ".{provider_name}.key.tmp-{}-{}",
-        std::process::id(),
-        SECRET_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    let mut temporary = secret_temp_file(&temp_path).map_err(|e| {
-        format!(
-            "schlüsseldatei temporär anlegen ({}): {e}",
-            temp_path.display()
-        )
-    })?;
-    let write_result = temporary
-        .write_all(key.as_bytes())
-        .and_then(|()| temporary.sync_all());
-    if let Err(error) = write_result {
-        drop(temporary);
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!(
-            "schlüsseldatei schreiben ({}): {error}",
-            key_path.display()
-        ));
-    }
-    drop(temporary);
-
-    if let Err(error) = std::fs::rename(&temp_path, &key_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!(
-            "schlüsseldatei ersetzen ({}): {error}",
-            key_path.display()
-        ));
-    }
-
-    #[cfg(unix)]
-    std::fs::File::open(&secrets_dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| {
-            format!(
-                "schlüsselverzeichnis synchronisieren ({}): {e}",
-                secrets_dir.display()
-            )
-        })?;
-
-    let absolute = key_path.canonicalize().unwrap_or_else(|_| key_path.clone());
-    format!("file:{}", absolute.display())
-        .parse()
-        .map_err(|e: harw_config::ConfigError| e.to_string())
+    let layers = harw_home::config_layers(home).map_err(|e| e.to_string())?;
+    let config = harw_config::discover_config(&layers).map_err(|e| e.to_string())?;
+    crate::secret_store::store_secret(
+        home,
+        &config,
+        &format!("{provider_name}-api-key"),
+        "provider authentication",
+        &secrecy::SecretString::from(key.to_owned()),
+    )
 }
 
 fn secret_temp_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -927,6 +916,179 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
 
+    /// Alle Dateien unterhalb von `dir` (rekursiv, Symlinks nicht verfolgt),
+    /// deren Bytes `needle` enthalten.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn files_containing(dir: &Path, needle: &[u8]) -> TestResult<Vec<PathBuf>> {
+        let mut hits = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).map_err(ctx("read_dir"))? {
+                let entry = entry.map_err(ctx("dir entry"))?;
+                let file_type = entry.file_type().map_err(ctx("file type"))?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    pending.push(path);
+                } else if file_type.is_file() {
+                    let bytes = std::fs::read(&path).map_err(ctx("read file"))?;
+                    if bytes.windows(needle.len()).any(|window| window == needle) {
+                        hits.push(path);
+                    }
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Onboardet `provider_id` mit einem roh eingegebenen Schlüssel.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn onboard_raw_key(home: &Path, provider_id: &str, raw_key: &str) -> TestResult {
+        let outcome = harw_tui::SetupOutcome {
+            provider_id: provider_id.into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api: "openai-responses".into(),
+            model: "gpt-5.4".into(),
+            secret_ref: Some(raw_key.into()),
+            auth_header: None,
+        };
+        persist_outcome(home, &outcome).map_err(ctx("persist_outcome"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn persist_outcome_stores_raw_key_encrypted() -> TestResult {
+        use secrecy::ExposeSecret as _;
+        use harw_provider_http::SecretResolver as _;
+
+        const RAW_KEY: &str = "sk-onboarding-raw-key-4f2a9c71d0e3b865";
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure_home"))?;
+        onboard_raw_key(home.path(), "openai", RAW_KEY)?;
+
+        let layers = harw_home::config_layers(home.path()).map_err(ctx("config_layers"))?;
+        let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
+        let auth_ref = config.providers["openai"]
+            .auth
+            .clone()
+            .ok_or(TestError::Missing("provider auth"))?;
+        let SecretRef::Secrets(id) = &auth_ref else {
+            return Err(TestError::Unexpected(format!(
+                "provider auth must be a secrets: reference, got {auth_ref}"
+            )));
+        };
+        assert!(
+            uuid_like(id),
+            "secrets: id must be a UUID, got {id}"
+        );
+        let pool: Vec<SecretRef> = config.auth.credential_pool["openai"]
+            .iter()
+            .map(|entry| entry.secret.clone())
+            .collect();
+        assert_eq!(pool, vec![auth_ref.clone()]);
+
+        let secrets_dir = home.path().join("secrets");
+        if secrets_dir.exists() {
+            for entry in std::fs::read_dir(&secrets_dir).map_err(ctx("read secrets dir"))? {
+                let path = entry.map_err(ctx("secrets entry"))?.path();
+                assert!(
+                    path.extension().is_none_or(|ext| ext != "key"),
+                    "no plaintext key file may be written: {}",
+                    path.display()
+                );
+            }
+        }
+        let leaks = files_containing(home.path(), RAW_KEY.as_bytes())?;
+        assert!(leaks.is_empty(), "raw key found in plaintext: {leaks:?}");
+
+        let resolver = crate::secret_store::open_configured_secret_resolver(home.path(), &config)
+            .map_err(ctx("open resolver"))?
+            .ok_or(TestError::Missing("sealed resolver"))?;
+        let resolved = resolver.resolve(id).map_err(ctx("resolve stored key"))?;
+        assert_eq!(resolved.expose_secret(), RAW_KEY);
+        Ok(())
+    }
+
+    /// `true`, wenn `id` die kanonische UUID-Form `8-4-4-4-12` (hex) hat.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn uuid_like(id: &str) -> bool {
+        let groups: Vec<&str> = id.split('-').collect();
+        groups.len() == 5
+            && groups
+                .iter()
+                .zip([8usize, 4, 4, 4, 12])
+                .all(|(group, len)| {
+                    group.len() == len && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn persist_outcome_second_raw_key_replaces_previous_secrets_pool_entry() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure_home"))?;
+        onboard_raw_key(home.path(), "openai", "sk-first-raw-key-91c3d7e0")?;
+        onboard_raw_key(home.path(), "openai", "sk-second-raw-key-5b8f2a64")?;
+
+        let layers = harw_home::config_layers(home.path()).map_err(ctx("config_layers"))?;
+        let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
+        let auth_ref = config.providers["openai"]
+            .auth
+            .clone()
+            .ok_or(TestError::Missing("provider auth"))?;
+        assert!(matches!(auth_ref, SecretRef::Secrets(_)));
+        let pool: Vec<SecretRef> = config.auth.credential_pool["openai"]
+            .iter()
+            .map(|entry| entry.secret.clone())
+            .collect();
+        assert_eq!(pool, vec![auth_ref]);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_pool_indices_treats_secrets_refs_as_non_codex() -> TestResult {
+        const STORED: &str = "secrets:0f8e2c4a-1b3d-4e5f-8a9b-0c1d2e3f4a5b";
+        let pool = vec![
+            pool_entry(STORED, Some("stored"))?,
+            pool_entry(STORED, Some("dup"))?,
+        ];
+        let api = provider("https://api.openai.com/v1", STORED)?;
+        assert_eq!(stale_pool_indices(&pool, Some(&api)), vec![1]);
+        let codex = provider("https://chatgpt.com/backend-api/codex", CODEX_REF)?;
+        assert_eq!(stale_pool_indices(&pool, Some(&codex)), vec![0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_pool_entries_drops_replaced_secrets_ref_only() -> TestResult {
+        let old_stored: SecretRef = "secrets:0f8e2c4a-1b3d-4e5f-8a9b-0c1d2e3f4a5b"
+            .parse()
+            .map_err(ctx("old stored ref"))?;
+        let new_stored: SecretRef = "secrets:7d6c5b4a-3928-4716-a5b4-c3d2e1f0a9b8"
+            .parse()
+            .map_err(ctx("new stored ref"))?;
+        let env_key: SecretRef = "env:OPENAI_OTHER".parse().map_err(ctx("env ref"))?;
+        let entry = |secret: &SecretRef| harw_config::CredentialEntry {
+            secret: secret.clone(),
+            label: None,
+            priority: 0,
+            base_url: None,
+        };
+        let base = "https://api.openai.com/v1";
+
+        let mut pool = vec![entry(&old_stored), entry(&env_key)];
+        replace_pool_entries(&mut pool, &new_stored, base, Some(&old_stored));
+        let refs: Vec<SecretRef> = pool.iter().map(|e| e.secret.clone()).collect();
+        assert_eq!(refs, vec![new_stored.clone(), env_key.clone()]);
+
+        // Eine Nicht-`secrets:`-Vorgängerreferenz wird nicht entfernt.
+        let mut pool = vec![entry(&env_key)];
+        replace_pool_entries(&mut pool, &new_stored, base, Some(&env_key));
+        let refs: Vec<SecretRef> = pool.iter().map(|e| e.secret.clone()).collect();
+        assert_eq!(refs, vec![new_stored, env_key]);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn persisted_foundry_setup_sends_correct_wire_request_after_reload() -> TestResult {
         use std::io::{Read, Write};
@@ -1026,8 +1188,23 @@ mod tests {
             persist_outcome(home.path(), &outcome).map_err(ctx("persist_outcome"))?;
             let layers = harw_home::config_layers(home.path()).map_err(ctx("config_layers"))?;
             let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
-            let provider = harw_provider_http::build_provider_with_home(&config, home.path(), None)
-                .map_err(ctx("build_provider_with_home"))?;
+            // Der roh eingegebene Schlüssel liegt verschlüsselt im SecretStore;
+            // der Provider löst ihn über den konfigurierten Resolver auf.
+            assert!(matches!(
+                config.providers["foundry"].auth,
+                Some(SecretRef::Secrets(_))
+            ));
+            let resolver =
+                crate::secret_store::open_configured_secret_resolver(home.path(), &config)
+                    .map_err(ctx("open resolver"))?;
+            let provider = harw_provider_http::build_provider_with_home(
+                &config,
+                home.path(),
+                resolver
+                    .as_ref()
+                    .map(|r| r as &dyn harw_provider_http::SecretResolver),
+            )
+            .map_err(ctx("build_provider_with_home"))?;
             let result = provider
                 .respond(harw_core::ModelRequest {
                     stream: None,
@@ -1261,7 +1438,7 @@ mod tests {
             base_url: None,
         };
         let mut pool = vec![entry(&old_key), entry(&new_key)];
-        replace_pool_entries(&mut pool, &new_key, "https://api.openai.com/v1");
+        replace_pool_entries(&mut pool, &new_key, "https://api.openai.com/v1", None);
         let refs: Vec<String> = pool.iter().map(|e| e.secret.to_string()).collect();
         assert_eq!(refs, vec!["env:OPENAI_NEW", "env:OPENAI_OLD"]);
         Ok(())
@@ -1307,35 +1484,8 @@ mod tests {
     }
 
     #[test]
-    fn write_secret_file_accepts_safe_provider_name() -> TestResult {
-        let home = std::env::temp_dir().join(format!(
-            "harw-onboarding-test-{}-safe-provider",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-
-        let secret_ref = write_secret_file(&home, "openai_compat-1", "test-key")
-            .map_err(ctx("safe provider name should be accepted"))?;
-        let key_path = home.join("secrets/openai_compat-1.key");
-
-        assert_eq!(
-            std::fs::read_to_string(&key_path).map_err(ctx("read key"))?,
-            "test-key"
-        );
-        assert!(secret_ref.to_string().starts_with("file:"));
-
-        let _ = std::fs::remove_dir_all(&home);
-        Ok(())
-    }
-
-    #[test]
-    fn write_secret_file_rejects_traversal_and_unsafe_provider_names() -> TestResult {
-        let home = std::env::temp_dir().join(format!(
-            "harw-onboarding-test-{}-unsafe-provider",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-
+    fn store_provider_key_rejects_traversal_and_unsafe_provider_names() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
         for provider_name in [
             "../outside",
             "nested/provider",
@@ -1345,7 +1495,7 @@ mod tests {
             "bad.name",
             "bad\nname",
         ] {
-            let result = write_secret_file(&home, provider_name, "must-not-write");
+            let result = store_provider_key(home.path(), provider_name, "must-not-store");
             let Err(error) = result else {
                 return Err(TestError::Unexpected(
                     "unsafe provider name should be rejected".into(),
@@ -1356,75 +1506,9 @@ mod tests {
                 "unexpected user-safe error: {error}"
             );
         }
-
-        assert!(
-            !home.exists(),
-            "rejection must happen before directory creation"
-        );
-
-        let _ = std::fs::remove_dir_all(&home);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_secret_file_creates_secret_with_mode_600_from_the_start() -> TestResult {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let home = std::env::temp_dir().join(format!(
-            "harw-onboarding-test-{}-secret-mode",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-
-        write_secret_file(&home, "mode-check", "secret").map_err(ctx("write secret"))?;
-        let mode = std::fs::metadata(home.join("secrets/mode-check.key"))
-            .map_err(ctx("secret metadata"))?
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-
-        let _ = std::fs::remove_dir_all(&home);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_secret_file_replaces_destination_symlink_without_following_it() -> TestResult {
-        use std::os::unix::fs::symlink;
-
-        let home = std::env::temp_dir().join(format!(
-            "harw-onboarding-test-{}-secret-symlink",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        let secrets_dir = home.join("secrets");
-        std::fs::create_dir_all(&secrets_dir).map_err(ctx("create secrets directory"))?;
-        let outside = home.join("outside.key");
-        std::fs::write(&outside, "must remain unchanged").map_err(ctx("write outside sentinel"))?;
-        symlink(&outside, secrets_dir.join("symlink-check.key"))
-            .map_err(ctx("create key symlink"))?;
-
-        write_secret_file(&home, "symlink-check", "new secret").map_err(ctx("replace symlink"))?;
-
-        assert_eq!(
-            std::fs::read_to_string(&outside).map_err(ctx("read outside sentinel"))?,
-            "must remain unchanged"
-        );
-        assert_eq!(
-            std::fs::read_to_string(secrets_dir.join("symlink-check.key"))
-                .map_err(ctx("read replacement secret"))?,
-            "new secret"
-        );
-        assert!(
-            !std::fs::symlink_metadata(secrets_dir.join("symlink-check.key"))
-                .map_err(ctx("replacement metadata"))?
-                .file_type()
-                .is_symlink()
-        );
-
-        let _ = std::fs::remove_dir_all(&home);
+        // Die Ablehnung passiert vor jedem Schreibzugriff: weder Store noch KEK.
+        assert!(!home.path().join("sealed-secrets").exists());
+        assert!(!home.path().join("keys").exists());
         Ok(())
     }
 
