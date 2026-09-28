@@ -13,7 +13,10 @@ use std::path::PathBuf;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HubError {
-    /// The config file could not be read.
+    /// The config file could not be opened or read, or failed a load-time
+    /// trust check (symlink, not a regular file, writable by group or
+    /// others, not root-owned at the default path, larger than the size
+    /// cap). `source` carries the reason.
     Read {
         /// The file.
         path: PathBuf,

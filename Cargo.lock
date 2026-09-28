@@ -3722,6 +3722,7 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "clap",
+ "harw-fsutil",
  "harw-types",
  "http-body-util",
  "hyper",

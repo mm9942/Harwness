@@ -60,8 +60,10 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 # `tests/identity_routes.rs` führt eine echte `Execute`-Route aus und braucht
 # dafür einen echten `OpContext` — also eine `SandboxSpec` über einer realen
-# `WorkspaceBinding` (`SandboxSpec::from_resolved`). Nur Testabhängigkeit;
-# `harw-authority` ist über `harw-operations` ohnehin im Graphen.
+# `WorkspaceBinding` (`SandboxSpec::from_resolved`); ebenso die Unit-Tests in
+# `src/server.rs` (Kontextfabrik und Identitätsprüfung vor `Execute`). Nur
+# Testabhängigkeit; `harw-authority` ist über `harw-operations` ohnehin im
+# Graphen.
 harw-authority = { path = "../harw-authority" }
 # `[web.identity]`-Beispiele in Tests exakt so parsen, wie sie in der
 # TOML-Konfiguration stehen (Schlüssel `"1000"` usw.).

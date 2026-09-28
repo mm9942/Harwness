@@ -83,8 +83,9 @@ pub enum WebIdentityModeToml {
 /// # Description
 /// `harw-config` darf `harw-web` nicht kennen (Schichtung); dieser Typ spiegelt
 /// deshalb Feld für Feld `harw_web::identity::WebIdentityConfig`. Die
-/// Umwandlung und die semantische Prüfung (numerische UIDs, gültige Mandanten,
-/// `security_hub`-only-Schlüssel, Pflicht-Principals) übernimmt der Konsument
+/// Umwandlung und die semantische Prüfung (numerische UIDs, eindeutige UIDs
+/// auch nach Normalisierung, gültige Mandanten, `security_hub`-only-Schlüssel,
+/// Pflicht-Principals) übernimmt der Konsument
 /// (`harw-cli/src/web.rs` → `WebIdentityConfig::build_resolver`); hier gelten
 /// nur Form und `deny_unknown_fields`.
 ///
@@ -106,13 +107,23 @@ pub struct WebIdentityToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_socket: Option<PathBuf>,
     /// Nur `security_hub`: ohne Kontext bzw. erreichbaren Hub ablehnen statt
-    /// auf die Tier-Tabelle zurückzufallen.
+    /// auf die Tier-Tabelle zurückzufallen. Bei `false` bleibt der Rückfall
+    /// für eine UID mit `uid_principals`-Eintrag aber trotzdem gesperrt,
+    /// solange `uid_tenants` für sie keinen Mandanten pinnt — sonst würde
+    /// der Rückfall den vom Hub zugewiesenen Mandanten stillschweigend
+    /// fallen lassen (siehe Moduldoku von `harw_web::identity`).
     #[serde(default)]
     pub require_context: bool,
-    /// UID (als Zeichenkette) → Mandant.
+    /// UID (als Zeichenkette) → Mandant. Der Konsument normalisiert die
+    /// Schlüssel (führende Nullen, `+`, umgebende Leerzeichen); zwei
+    /// Schlüssel, die auf dieselbe UID abbilden (z. B. `"1000"` und
+    /// `"01000"`), werden abgelehnt statt stillschweigend die Reihenfolge
+    /// der TOML-Tabelle entscheiden zu lassen.
     #[serde(default)]
     pub uid_tenants: BTreeMap<String, String>,
-    /// Nur `security_hub`: UID (als Zeichenkette) → erwartete Principal-Id.
+    /// Nur `security_hub`: UID (als Zeichenkette) → erwartete Principal-Id
+    /// des vorgelegten Kontexts (muss zur Hub-Richtlinie passen). Dieselbe
+    /// Normalisierungs-/Duplikatsprüfung wie bei `uid_tenants`.
     #[serde(default)]
     pub uid_principals: BTreeMap<String, String>,
 }

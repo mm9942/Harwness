@@ -1,6 +1,6 @@
 # Hardening Status
 
-> Status: partially implemented · Last reviewed: 2026-09-24
+> Status: partially implemented · Last reviewed: 2026-09-27
 
 This document tracks a set of structural-hardening gaps identified by a
 bottom-up review of the workspace, each checked against an external
@@ -270,8 +270,8 @@ shell effects.
 
 ### G11. `deny_unknown_fields` Coverage (§11, cross-cutting)
 
-**Status**: Implemented — now 363 occurrences across the tree (up from 4
-at the original review, 263 at the last check).
+**Status**: Implemented — now 480 occurrences in Rust sources across the
+tree (up from 4 at the original review, 363 at the previous check).
 
 **Status (original)**: Gap — only 4 uses
 
@@ -284,7 +284,12 @@ types and wire types do not.
 **Evidence**:
 - `harw-core/src/admission.rs` — `JobIntent` has `#[serde(deny_unknown_fields)]`
 - `harw-tool-shell/src/exec.rs` — `ShellExecArgs` has `#[serde(deny_unknown_fields)]`
-- `harw-config/src/harness_config.rs` — no `deny_unknown_fields` on most config structs
+- `harw-config/src/harness_config.rs` — Resolved: every config struct
+  (`HarnessConfig` and all 19 nested section structs, e.g. `LoggingSection`,
+  `SandboxSection`, `CargoSandboxToml`, `McpListenerSection`,
+  `McpPrincipalToml`) carries `#[serde(deny_unknown_fields)]`; covered by
+  the test `test_unknown_fields_are_rejected_at_each_runtime_config_boundary`
+  and the per-section `*_rejects_unknown_*field` tests
 - `harw-protocol/src/wire.rs` — Resolved: `RequestEnvelope`, `ResponseEnvelope`,
   `NotificationEnvelope`, `WireError`, and `ProtocolVersion` all carry
   `#[serde(deny_unknown_fields)]`; covered by the test

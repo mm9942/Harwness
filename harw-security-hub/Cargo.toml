@@ -18,8 +18,13 @@ path = "src/main.rs"
 [dependencies]
 # Identity vocabulary: SecurityContext / SecurityContextIssuer / TrustZone /
 # AuthStrength (H1), Principal, the id newtypes and ImpactSeverity for DoD
-# findings. The only internal edge of this crate.
+# findings.
 harw-types = { path = "../harw-types" }
+# Symlink-safe, non-blocking open of the config file (`open_nofollow`:
+# O_NOFOLLOW | O_NONBLOCK, FIFOs and devices refused on the open handle),
+# as in harw-auth-hub and harw-secrets. Ring I; A -> I is allowed
+# (xtask/arch-policy.toml).
+harw-fsutil = { path = "../harw-fsutil" }
 jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

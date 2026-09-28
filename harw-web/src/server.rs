@@ -3,12 +3,17 @@
 //!
 //! # Verantwortungsbereich
 //! Dieses Modul enthält den einzigen Ort dieser Crate, der `hyper` und
-//! einen echten Socket berührt. Es **entscheidet nichts selbst** — jede
-//! Zugriffsentscheidung kommt von [`crate::router::decide_resolved_route`], jede
-//! Berechtigungsstufe von [`crate::authz::PeerAuthorizer`], jede Identität
-//! von [`crate::peer::read_peer_credentials`]. Dieses Modul übersetzt nur
-//! zwischen HTTP-Semantik (Methode, Statuscode, JSON-Rumpf, SSE-Rahmen) und
-//! den bereits getroffenen Entscheidungen der übrigen Module.
+//! einen echten Socket berührt. Es **entscheidet nichts selbst** — über
+//! Operationsrouten entscheidet [`handle`] über
+//! [`crate::router::decide_resolved_route`]; die Metarouten und
+//! `GET /events` prüfen [`handle_meta`]/[`handle_events`] über denselben
+//! Resolver ([`handle_meta`] zusätzlich mit [`crate::authz::tier_permits`]).
+//! Stufe und Mandant kommen vom [`crate::identity::LocalPeerIdentityResolver`],
+//! dessen Tier-Deckel die Tabelle des [`crate::authz::PeerAuthorizer`] ist,
+//! die Peer-Identität von [`crate::peer::read_peer_credentials`]. Dieses
+//! Modul übersetzt nur zwischen HTTP-Semantik (Methode, Statuscode,
+//! JSON-Rumpf, SSE-Rahmen) und den bereits getroffenen Entscheidungen der
+//! übrigen Module.
 //!
 //! # HTTP-Stack
 //! `hyper` 1.x + `hyper-util` + `http-body-util`, exakt wie
@@ -58,15 +63,16 @@
 //! [`crate::identity::WebIdentityConfig::build_resolver`]). Die
 //! Routenentscheidung trifft [`crate::router::decide_resolved_route`];
 //! scheitert die Auflösung, trägt die `403` den Grund
-//! [`crate::identity::IdentityError::code`]. Bei `Execute` fädelt
-//! [`scoped_context`] über
+//! [`crate::identity::IdentityError::code`]. Bei `Execute` prüft zuerst
+//! [`admitted_identity`], dass eine aufgelöste Identität vorliegt — vor dem
+//! Lesen des Rumpfs und vor der [`WebContextFactory`]. Fehlt sie, lehnt
+//! [`admitted_identity`] mit `403` ab (R15/M1: Rückfallpfade lehnen ab),
+//! statt einen `OpContext` ungeschützt (mandantenübergreifend) zu bauen.
+//! Erst danach baut [`scoped_context`] den `OpContext` und fädelt über
 //! [`crate::identity::ResolvedPeer::scope_op_context`] Mandant und
-//! Kontextzusammenfassung in den `OpContext` — nie aus dem Rumpf. Fehlt die
-//! aufgelöste Identität, lehnt [`scoped_context`] mit `403` ab (R15/M1:
-//! Rückfallpfade lehnen ab), statt den `OpContext` ungeschützt
-//! (mandantenübergreifend) durchzureichen. Für unbekannte Pfade und falsche
-//! Methoden (`404`/`405`) wird keine Identität aufgelöst: dort gibt es
-//! nichts zu autorisieren, und ein Hub-Aufruf wäre reine Last.
+//! Kontextzusammenfassung ein — nie aus dem Rumpf. Für unbekannte Pfade und
+//! falsche Methoden (`404`/`405`) wird keine Identität aufgelöst: dort gibt
+//! es nichts zu autorisieren, und ein Hub-Aufruf wäre reine Last.
 //!
 //! # Zwei Wege zum Listener
 //! [`BoundWebServer::bind`] bindet einen Pfad selbst (siehe
@@ -78,10 +84,16 @@
 //! # Zwei CI-Gates
 //! „Keine Route ohne `OperationMeta`" und „Tier-Ablehnungsmatrix" (siehe
 //! `crate::router`-Moduldoku) werden von diesem Modul **konsumiert**, nicht
-//! implementiert: [`handle`] fragt ausschließlich
-//! [`crate::router::decide_resolved_route`] (derselbe Prüfpfad wie
-//! [`crate::router::decide_route`]) und führt nie eine Operation aus, die
-//! dieses nicht als [`crate::router::RouteDecision::Execute`] freigegeben hat.
+//! implementiert: [`handle`] fragt für Operationsrouten ausschließlich
+//! [`crate::router::decide_resolved_route`] — den Prüfpfad, den der Server
+//! tatsächlich läuft ([`crate::router::decide_route`] ist derselbe Kern, nur
+//! mit einem [`crate::authz::PeerAuthorizer`] statt einer bereits
+//! aufgelösten Identität) — und führt nie eine Operation aus, die dieses
+//! nicht als [`crate::router::RouteDecision::Execute`] freigegeben hat. Die
+//! Metarouten und `GET /events` sind keine Operationen und laufen nicht über
+//! diese Entscheidung: [`handle_meta`] prüft selbst über den Resolver und
+//! [`crate::authz::tier_permits`], [`handle_events`] verlangt eine über den
+//! Resolver aufgelöste Identität.
 //!
 //! # Nebenläufigkeit
 //! Jede angenommene Verbindung läuft in einer eigenen `tokio::task` (über
@@ -219,9 +231,16 @@ type WebResponse = Response<BoxBody<Bytes, Infallible>>;
 /// Baut den [`OpContext`] für eine freigegebene Ausführung.
 ///
 /// # Description
-/// Wird **einmal pro Aufruf** unmittelbar vor [`harw_operations::adapter::WebAdapter::invoke`]
-/// aufgerufen — nie vorher, damit kein `OpContext` für eine Route gebaut
-/// wird, die [`crate::router::decide_route`] gar nicht freigegeben hat. Die
+/// Wird **einmal pro Aufruf** unmittelbar vor
+/// [`harw_operations::adapter::WebAdapter::invoke`] aufgerufen — und erst,
+/// wenn alle drei Bedingungen erfüllt sind:
+/// [`crate::router::decide_resolved_route`] hat
+/// [`crate::router::RouteDecision::Execute`] geliefert, eine vom
+/// [`crate::identity::LocalPeerIdentityResolver`] des Servers aufgelöste
+/// Identität liegt vor, und der Rumpf ist gelesen. Nie vorher — so entsteht
+/// kein `OpContext` für eine Anfrage, die nicht freigegeben ist. Mandant und
+/// Kontextzusammenfassung fädelt der Server danach über
+/// [`crate::identity::ResolvedPeer::scope_op_context`] ein. Die
 /// Implementierung MUSS `sandbox`/`services` aus serverseitig vertrauter
 /// Konfiguration ableiten, niemals aus dem HTTP-Request.
 pub type WebContextFactory =
@@ -636,10 +655,15 @@ fn accept_backoff(failures: u32) -> Duration {
 /// # Description
 /// Trifft selbst keine Zugriffsentscheidung — löst die Identität über
 /// `identity` auf (siehe Moduldoku „Identitätsauflösung"), delegiert die
-/// Entscheidung vollständig an [`decide_resolved_route`] und übersetzt deren
-/// Ergebnis in eine HTTP-Antwort. `GET /events` und die Metarouten sind die
-/// einzigen Pfade, die diese Funktion ohne Umweg über die Routentabelle
-/// behandelt (sie sind keine Operationen).
+/// Entscheidung über Operationsrouten vollständig an
+/// [`decide_resolved_route`] und übersetzt deren Ergebnis in eine
+/// HTTP-Antwort. Bei `Execute` prüft zuerst [`admitted_identity`] die
+/// aufgelöste Identität — vor dem Rumpf und vor der [`WebContextFactory`];
+/// erst danach baut [`scoped_context`] den `OpContext`. `GET /events` und die
+/// Metarouten sind die einzigen Pfade, die diese Funktion ohne Umweg über die
+/// Routentabelle behandelt (sie sind keine Operationen): dort prüfen
+/// [`handle_meta`]/[`handle_events`] selbst über denselben Resolver
+/// ([`handle_meta`] zusätzlich mit [`tier_permits`]).
 async fn handle(
     request: Request<Incoming>,
     peer: PeerCredentials,
@@ -710,20 +734,20 @@ async fn handle(
             }),
         )),
         RouteDecision::Execute { route, caller_tier } => {
+            // Erst die aufgelöste Identität, dann Rumpf und `OpContext`: der
+            // `WebContextFactory`-Vertrag verbietet einen `OpContext` vor der
+            // Freigabe, R15/M1 ein ungeschütztes Weiterlaufen ohne Identität.
+            let resolved = match admitted_identity(resolved) {
+                Ok(resolved) => resolved,
+                Err(response) => return Ok(response),
+            };
             let args = match read_json_body(request, MAX_BODY_BYTES, BODY_READ_TIMEOUT).await {
                 Ok(value) => value,
                 Err(response) => return Ok(response),
             };
-            let ctx = (context_factory)(&peer, caller_tier);
             // Mandant und Kontextzusammenfassung kommen ausschließlich aus der
-            // aufgelösten Identität (H12), nie aus Rumpf oder Headern. Ohne
-            // aufgelöste Identität gibt es nichts, worauf sich die Sicht
-            // einschränken ließe — R15/M1 verlangt, dann abzulehnen statt
-            // ungeschützt (mandantenübergreifend) auszuführen.
-            let ctx = match scoped_context(resolved, ctx) {
-                Ok(ctx) => ctx,
-                Err(response) => return Ok(response),
-            };
+            // aufgelösten Identität (H12), nie aus Rumpf oder Headern.
+            let ctx = scoped_context(resolved, context_factory.as_ref(), &peer, caller_tier);
             let operation_name = route.operation_name().to_owned();
             let result = route.invoke(&ctx, args).await;
             let ok = result.is_ok();
@@ -761,12 +785,13 @@ async fn resolve_identity(
     identity.resolve(peer, presented).await
 }
 
-/// Schränkt den `OpContext` einer freigegebenen Ausführung auf die
-/// aufgelöste Identität ein — oder lehnt ab, wenn keine vorliegt.
+/// Lässt eine freigegebene Ausführung nur mit aufgelöster Identität weiter —
+/// oder lehnt ab, wenn keine vorliegt.
 ///
 /// # Description
-/// Mandant und Kontextzusammenfassung kommen ausschließlich aus
-/// [`ResolvedPeer::scope_op_context`] (H12), nie aus Rumpf oder Headern.
+/// [`handle`] ruft diese Funktion im `Execute`-Zweig **vor**
+/// [`read_json_body`] und vor der [`WebContextFactory`] auf: ohne Identität
+/// wird weder ein Rumpf gelesen noch ein `OpContext` gebaut.
 /// [`decide_resolved_route`] liefert `Execute` heute nur, wenn die Identität
 /// aufgelöst wurde — `resolved` ist hier also stets `Some`. Diese Funktion
 /// behandelt `None` trotzdem explizit als Ablehnung, damit eine künftige
@@ -776,17 +801,32 @@ async fn resolve_identity(
 /// auszuführen).
 ///
 /// # Errors
-/// `403` mit [`ForbiddenReason::UnknownPeer`], wenn `resolved` `None` ist.
+/// `403` mit Grund `unknown_peer` ([`ForbiddenReason::UnknownPeer`]), wenn
+/// `resolved` `None` ist.
+// Der Fehlerfall trägt bewusst eine fertige `WebResponse` (siehe
+// `read_json_body`).
+#[allow(clippy::result_large_err)]
+fn admitted_identity(resolved: Option<&ResolvedPeer>) -> Result<&ResolvedPeer, WebResponse> {
+    resolved.ok_or_else(|| forbidden_response(forbidden_reason_str(ForbiddenReason::UnknownPeer)))
+}
+
+/// Baut den `OpContext` einer freigegebenen Ausführung und schränkt ihn auf
+/// die aufgelöste Identität ein.
+///
+/// # Description
+/// Einzige Aufrufstelle der [`WebContextFactory`]. Weil diese Funktion ein
+/// `&ResolvedPeer` verlangt (in [`handle`] nur über [`admitted_identity`]
+/// erhältlich), lässt sich ohne aufgelöste Identität kein `OpContext` bauen —
+/// das schließt der Typ aus, nicht eine Laufzeitprüfung. Mandant und
+/// Kontextzusammenfassung kommen ausschließlich aus
+/// [`ResolvedPeer::scope_op_context`] (H12), nie aus Rumpf oder Headern.
 fn scoped_context(
-    resolved: Option<&ResolvedPeer>,
-    ctx: OpContext,
-) -> Result<OpContext, WebResponse> {
-    match resolved {
-        Some(resolved) => Ok(resolved.scope_op_context(ctx)),
-        None => Err(forbidden_response(forbidden_reason_str(
-            ForbiddenReason::UnknownPeer,
-        ))),
-    }
+    resolved: &ResolvedPeer,
+    context_factory: &WebContextFactory,
+    peer: &PeerCredentials,
+    caller_tier: PermissionTier,
+) -> OpContext {
+    resolved.scope_op_context((context_factory)(peer, caller_tier))
 }
 
 /// `403` mit stabilem Grund.
@@ -1066,13 +1106,14 @@ mod tests {
     use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::{
         ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX, BoundWebServer, HEADER_READ_TIMEOUT,
-        MAX_BODY_BYTES, WebContextFactory, WebServerConfig, accept_backoff, bind_unix_listener,
-        forbidden_reason_str, http_connection_builder, is_fatal_accept_error, json_response,
-        method_not_allowed_response, op_result_response, read_json_body, scoped_context,
+        MAX_BODY_BYTES, WebContextFactory, WebServerConfig, accept_backoff, admitted_identity,
+        bind_unix_listener, forbidden_reason_str, http_connection_builder, is_fatal_accept_error,
+        json_response, method_not_allowed_response, op_result_response, read_json_body,
         status_for_op_error,
     };
     use crate::authz::StaticUidTierMap;
@@ -1081,10 +1122,14 @@ mod tests {
     use crate::peer::PeerCredentials;
     use crate::router::{ForbiddenReason, WebMethod, WebRouteTable};
     use crate::test_support::{TestError, TestResult, ctx};
-    use harw_operations::context::OpContext;
+    use harw_operations::context::{OpContext, ServiceMap};
     use harw_operations::error::OpError;
-    use harw_operations::operation::PermissionTier;
+    use harw_operations::operation::{
+        ApprovalPolicy, BusyAvailability, OpFuture, OpInput, OpOutput, Operation,
+        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
+    };
     use harw_operations::registry::OperationRegistry;
+    use harw_types::{SessionId, TurnId};
     use hyper::StatusCode;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
@@ -1149,9 +1194,9 @@ mod tests {
     /// [`read_json_body`] mit [`MAX_BODY_BYTES`] und spiegelt das dekodierte
     /// JSON als `200`.
     ///
-    /// Eine vollständige `Execute`-Route über [`BoundWebServer`] ist in
-    /// dieser Crate nicht testbar: `OpContext` braucht eine `SandboxSpec`
-    /// aus `harw-sandbox`, das keine Abhängigkeit von `harw-web` ist.
+    /// Hier geht es nur um das Rumpflesen; vollständige `Execute`-Routen über
+    /// [`BoundWebServer`] prüfen `test_context_factory_runs_only_for_admitted_route`
+    /// und `harw-web/tests/identity_routes.rs`.
     fn spawn_body_reader(
         listener: UnixListener,
         header_read_timeout: Duration,
@@ -1230,20 +1275,18 @@ mod tests {
         );
     }
 
-    /// Baut einen echten `OpContext` über eine reale, kanonisierte
+    /// Baut eine echte `SandboxSpec` über eine reale, kanonisierte
     /// `WorkspaceBinding` in `dir` — derselbe Weg wie
     /// `harw-web/tests/identity_routes.rs`, da `OpContext::new` (siehe
     /// `harw-operations/src/context.rs`) eine echte `SandboxSpec` verlangt
     /// und `harw-authority` dafür bereits Testabhängigkeit dieser Crate ist
     /// (siehe `harw-web/Cargo.toml`). Der konkrete Mandant der Sandbox spielt
-    /// für [`scoped_context`] keine Rolle — er wird von dessen `None`-Zweig
-    /// nie gelesen.
-    fn dummy_op_context(dir: &Path) -> TestResult<OpContext> {
+    /// für die Tests dieses Moduls keine Rolle.
+    fn dummy_sandbox(dir: &Path) -> TestResult<harw_authority::SandboxSpec> {
         use harw_authority::{
             PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
         };
-        use harw_operations::context::ServiceMap;
-        use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+        use harw_types::{TenantId, WorkspaceId};
 
         std::fs::create_dir_all(dir.join("ws")).map_err(ctx("Workspace-Verzeichnis anlegbar"))?;
         let tenant = TenantId::try_from_str("t").map_err(ctx("Sandbox-Mandant"))?;
@@ -1260,30 +1303,42 @@ mod tests {
         let binding = registry
             .resolve(&tenant, &workspace)
             .map_err(ctx("Workspace auflösbar"))?;
-        let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        Ok(OpContext::new(
-            SessionId::new(),
-            TurnId::new(),
-            sandbox,
-            ServiceMap::new(),
-        ))
+        Ok(SandboxSpec::from_resolved(binding, PermissionSet::empty()))
     }
 
-    // R15/M1: ohne aufgelöste Identität lehnt `scoped_context` ab, statt den
-    // `OpContext` ungeschützt (mandantenübergreifend) durchzureichen — auch
-    // wenn `decide_resolved_route` diesen Zweig heute nie mit `Execute`
-    // erreicht (siehe `scoped_context`-Doku).
+    /// Kontext-Fabrik über `sandbox`, die jeden Aufruf in `calls` zählt —
+    /// so belegen die Tests, ob und wie oft `handle` sie erreicht
+    /// (dasselbe Muster wie `context_factory` in
+    /// `harw-web/tests/identity_routes.rs`).
+    fn counting_context_factory(
+        sandbox: harw_authority::SandboxSpec,
+        calls: Arc<AtomicUsize>,
+    ) -> Arc<WebContextFactory> {
+        Arc::new(
+            move |_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
+                calls.fetch_add(1, Ordering::SeqCst);
+                OpContext::new(
+                    SessionId::new(),
+                    TurnId::new(),
+                    sandbox.clone(),
+                    ServiceMap::new(),
+                )
+            },
+        )
+    }
+
+    // R15/M1: ohne aufgelöste Identität lehnt `admitted_identity` ab, bevor
+    // ein Rumpf gelesen oder ein `OpContext` gebaut wird — auch wenn
+    // `decide_resolved_route` diesen Zweig heute nie mit `Execute` erreicht
+    // (siehe `admitted_identity`-Doku).
     #[tokio::test]
-    async fn test_scoped_context_without_resolved_identity_is_forbidden() -> TestResult {
+    async fn test_admitted_identity_without_resolved_identity_is_forbidden() -> TestResult {
         use http_body_util::BodyExt;
 
-        let dir = socket_tempdir()?;
-        let op_ctx = dummy_op_context(dir.path())?;
-
-        let response = match scoped_context(None, op_ctx) {
+        let response = match admitted_identity(None) {
             Ok(_) => {
                 return Err(TestError::Unexpected(
-                    "scoped_context ohne aufgelöste Identität sollte ablehnen".to_owned(),
+                    "admitted_identity ohne aufgelöste Identität sollte ablehnen".to_owned(),
                 ));
             }
             Err(response) => response,
@@ -1741,34 +1796,110 @@ mod tests {
 
     // ── Echter Unix-Socket: Annahmeschleife Ende-zu-Ende ─────────────────────
 
+    /// Pfad der Testoperation [`ProbeOp`].
+    const PROBE_PATH: &str = "/api/probe";
+
+    /// Kleinste ausführbare `Surface::Web`-Operation (`Observer`, `GET`,
+    /// ohne Genehmigung): antwortet mit dem Text `"ok"`.
+    struct ProbeOp {
+        meta: OperationMeta,
+    }
+
+    impl Operation for ProbeOp {
+        fn meta(&self) -> &OperationMeta {
+            &self.meta
+        }
+
+        fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
+            Box::pin(async {
+                Ok(OpOutput {
+                    text: "ok".to_owned(),
+                    data: None,
+                })
+            })
+        }
+    }
+
+    /// Routentabelle mit genau einer Route: [`ProbeOp`] unter [`PROBE_PATH`].
+    fn probe_routes() -> TestResult<WebRouteTable> {
+        let mut registry = OperationRegistry::new();
+        registry
+            .try_register(Arc::new(ProbeOp {
+                meta: OperationMeta {
+                    name: "server.probe",
+                    summary: "Antwortet mit ok.",
+                    domain: OperationDomain::Misc,
+                    permission: PermissionTier::Observer,
+                    surfaces: vec![Surface::Web {
+                        path: PROBE_PATH,
+                        method: WebMethod::Get,
+                        approval: ApprovalPolicy::None,
+                    }],
+                    aliases: &[],
+                    category: OperationCategory::Misc,
+                    args_schema: None,
+                    output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
+                },
+            }))
+            .map_err(ctx("Testoperation registrierbar"))?;
+        WebRouteTable::from_registry(&registry).map_err(ctx("Routentabelle baubar"))
+    }
+
+    /// Bindet einen Server mit [`probe_routes`] an `socket`.
+    async fn bind_probe_server(
+        socket: &Path,
+        authorizer: StaticUidTierMap,
+        context_factory: Arc<WebContextFactory>,
+    ) -> TestResult<BoundWebServer> {
+        BoundWebServer::bind(
+            WebServerConfig {
+                socket_path: socket.to_path_buf(),
+            },
+            probe_routes()?,
+            Arc::new(authorizer),
+            context_factory,
+            Arc::new(WebEventBus::new(8).map_err(ctx("WebEventBus::new sollte gelingen"))?),
+        )
+        .await
+        .map_err(ctx("Tempdir-Socket bindbar"))
+    }
+
+    /// Bedient `server`, bis die eine Anfrage `raw` an `path` beantwortet ist,
+    /// fährt ihn dann über das Shutdown-Signal herunter und liefert die
+    /// Statuszeile der Antwort.
+    async fn serve_single_request(
+        server: BoundWebServer,
+        path: &Path,
+        raw: Vec<u8>,
+    ) -> TestResult<String> {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let client = async {
+            let status = send_and_read_status_line(path, raw).await?;
+            shutdown_tx
+                .send(true)
+                .map_err(ctx("Server hält den Empfänger"))?;
+            Ok::<String, TestError>(status)
+        };
+        let (served, status) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(server.serve_until(shutdown_rx), client)
+        })
+        .await
+        .map_err(ctx("Server endet nach Shutdown-Signal"))?;
+        let status = status?;
+        assert!(served.is_ok(), "serve_until muss sauber enden");
+        Ok(status)
+    }
+
     #[tokio::test]
     async fn test_serve_until_answers_over_real_socket_and_stops_on_shutdown() -> TestResult {
         let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
         let routes = WebRouteTable::from_registry(&OperationRegistry::new())
             .map_err(ctx("WebRouteTable::from_registry sollte gelingen"))?;
-        // Leere Routentabelle: `decide_route` liefert nie `Execute`, die
-        // Fabrik wird also nie aufgerufen — kein neutraler Dummy-Rückgabewert
-        // möglich, um das per Flag/Assert statt Panik zu belegen: der
-        // Rückgabetyp `WebContextFactory = dyn Fn(&PeerCredentials,
-        // PermissionTier) -> OpContext + Send + Sync + 'static` (Typalias
-        // oben) verlangt einen echten `OpContext`, der wiederum eine echte
-        // `harw_authority::SandboxSpec` braucht (`OpContext::new`,
-        // harw-operations/src/context.rs). Eine `SandboxSpec` lässt sich nur
-        // über eine reale, kanonisierte `WorkspaceBinding` bauen
-        // (`SandboxSpec::from_resolved`/`from_resolved_for_test`,
-        // harw-authority/src/lib.rs) — `harw-authority` ist keine
-        // Abhängigkeit dieser Crate (siehe Cargo.toml) und würde als neue
-        // Abhängigkeit gegen den Arbeitsauftrag verstoßen. `WebContextFactory`
-        // ist zudem Produktionscode ohne `Result`-Variante; eine
-        // Signaturänderung bräche alle Aufrufer außerhalb dieser Datei.
-        // `unreachable!` bleibt daher bewusst stehen; identisches, ebenso
-        // begründetes Muster in `harw-web/tests/method_admission.rs`.
-        let context_factory: Arc<WebContextFactory> = Arc::new(
-            |_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
-                unreachable!("leere Routentabelle: decide_route liefert nie Execute")
-            },
-        );
+        // Leere Routentabelle: `decide_resolved_route` liefert nie `Execute`
+        // — die zählende Fabrik belegt, dass sie nie aufgerufen wird.
+        let calls = Arc::new(AtomicUsize::new(0));
         let server = BoundWebServer::bind(
             WebServerConfig {
                 socket_path: path.clone(),
@@ -1778,32 +1909,83 @@ mod tests {
                 vec![],
                 PermissionTier::Observer,
             )),
-            context_factory,
+            counting_context_factory(dummy_sandbox(dir.path())?, Arc::clone(&calls)),
             Arc::new(WebEventBus::new(8).map_err(ctx("WebEventBus::new sollte gelingen"))?),
         )
         .await
         .map_err(ctx("Tempdir-Socket bindbar"))?;
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let client = async {
-            let raw = b"GET /api/gibt-es-nicht HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
-            let status = send_and_read_status_line(&path, raw).await?;
-            shutdown_tx
-                .send(true)
-                .map_err(ctx("Server hält den Empfänger"))?;
-            Ok(status)
-        };
-        let (served, status) = tokio::time::timeout(TEST_DEADLINE, async {
-            tokio::join!(server.serve_until(shutdown_rx), client)
-        })
-        .await
-        .map_err(ctx("Server endet nach Shutdown-Signal"))?;
-        let status = status?;
+        let raw = b"GET /api/gibt-es-nicht HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
+        let status = serve_single_request(server, &path, raw).await?;
         assert!(
             status.starts_with("HTTP/1.1 404"),
             "erwartet 404, erhalten: {status:?}"
         );
-        assert!(served.is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "ohne Execute keine Kontext-Fabrik"
+        );
+        Ok(())
+    }
+
+    // Die Kontext-Fabrik läuft nur für eine freigegebene Route mit
+    // aufgelöster Identität, und erst nach der Zugriffsentscheidung: ein
+    // unbekannter Peer mit übergroßem angekündigtem Rumpf bekommt `403`
+    // (nicht `413` — die Entscheidung fällt vor dem Rumpf), und die Fabrik
+    // wird nie aufgerufen. Jeder Fall hat seinen eigenen Socket.
+    #[tokio::test]
+    async fn test_context_factory_runs_only_for_admitted_route() -> TestResult {
+        let dir = socket_tempdir()?;
+        let sandbox = dummy_sandbox(dir.path())?;
+
+        // Fall 1: UID in keiner Tier-Tabelle → `403`, Fabrik nie aufgerufen.
+        let denied_path = dir.path().join("abgelehnt.sock");
+        let denied_calls = Arc::new(AtomicUsize::new(0));
+        let denied = bind_probe_server(
+            &denied_path,
+            StaticUidTierMap::new(vec![]),
+            counting_context_factory(sandbox.clone(), Arc::clone(&denied_calls)),
+        )
+        .await?;
+        let raw = format!(
+            "GET {PROBE_PATH} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        )
+        .into_bytes();
+        let status = serve_single_request(denied, &denied_path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 403"),
+            "erwartet 403 (nicht 413), erhalten: {status:?}"
+        );
+        assert_eq!(
+            denied_calls.load(Ordering::SeqCst),
+            0,
+            "abgelehnte Anfrage darf keinen OpContext bauen"
+        );
+
+        // Fall 2: jede UID ist `Observer` → `200`, Fabrik genau einmal.
+        let admitted_path = dir.path().join("frei.sock");
+        let admitted_calls = Arc::new(AtomicUsize::new(0));
+        let admitted = bind_probe_server(
+            &admitted_path,
+            StaticUidTierMap::with_default(vec![], PermissionTier::Observer),
+            counting_context_factory(sandbox, Arc::clone(&admitted_calls)),
+        )
+        .await?;
+        let raw =
+            format!("GET {PROBE_PATH} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+                .into_bytes();
+        let status = serve_single_request(admitted, &admitted_path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "erwartet 200, erhalten: {status:?}"
+        );
+        assert_eq!(
+            admitted_calls.load(Ordering::SeqCst),
+            1,
+            "freigegebene Anfrage baut genau einen OpContext"
+        );
         Ok(())
     }
 }

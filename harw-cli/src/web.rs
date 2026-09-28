@@ -408,9 +408,9 @@ pub(crate) fn serve_web(home: Option<PathBuf>, listen: WebListenOptions) -> Resu
 /// # Description
 /// `harw-config` kennt `harw-web` nicht (Schichtung) und spiegelt die Tabelle
 /// deshalb als [`WebIdentityToml`]; die Umwandlung ist Feld für Feld
-/// verlustfrei. Die semantische Prüfung (numerische UIDs, gültige Mandanten,
-/// `security_hub`-only-Schlüssel) bleibt bei
-/// [`WebIdentityConfig::build_resolver`].
+/// verlustfrei. Die semantische Prüfung (numerische UIDs, eindeutige UIDs
+/// auch nach Normalisierung, gültige Mandanten, `security_hub`-only-Schlüssel,
+/// Pflicht-Principals) bleibt bei [`WebIdentityConfig::build_resolver`].
 ///
 /// # Arguments
 /// - `raw` (`Option<&WebIdentityToml>`): `config.web.identity`.
@@ -1409,6 +1409,32 @@ mod tests {
                 field: "uid_principals"
             })
         );
+    }
+
+    /// Aliasierte UID-Schlüssel (`"1000"`/`"01000"`) passieren die rohe
+    /// Tabelle unverändert und werden erst beim Bau des Resolvers abgelehnt.
+    #[test]
+    fn test_web_identity_config_aliased_uid_keys_fail_to_build() -> TestResult {
+        let raw = WebIdentityToml {
+            uid_tenants: [
+                ("1000".to_owned(), "tenant-a".to_owned()),
+                ("01000".to_owned(), "tenant-b".to_owned()),
+            ]
+            .into(),
+            ..WebIdentityToml::default()
+        };
+        let authorizer: Arc<dyn harw_web::PeerAuthorizer> =
+            Arc::new(StaticUidTierMap::new(vec![(1000, PermissionTier::Owner)]));
+        assert_eq!(
+            web_identity_config(Some(&raw))
+                .build_resolver(authorizer)
+                .err(),
+            Some(harw_web::identity::IdentityConfigError::DuplicateUid {
+                field: "uid_tenants",
+                uid: 1000,
+            })
+        );
+        Ok(())
     }
 
     /// Nach dem Binden: Modus 0660, Gruppe unverändert bzw. gesetzt.

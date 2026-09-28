@@ -4,8 +4,13 @@
 //! Dieses Modul baut [`WebRouteTable`] ausschließlich aus einer
 //! [`harw_operations::registry::OperationRegistry`] und entscheidet für
 //! jeden eingehenden Aufruf (Pfad, Methode, Peer-Identität), ob er
-//! ausgeführt werden darf — [`decide_route`] ist die eine Funktion, die
-//! diese Entscheidung trifft und damit die Tier-Ablehnungsmatrix trägt.
+//! ausgeführt werden darf. Der Server ruft dafür [`decide_resolved_route`]:
+//! die Stufe kommt aus dem [`ResolvedPeer`] des
+//! [`crate::identity::LocalPeerIdentityResolver`], dessen Tier-Deckel
+//! weiterhin die [`crate::authz::PeerAuthorizer`]-Tabelle ist.
+//! [`decide_route`] ist derselbe Kern, nur mit der Stufe direkt aus einem
+//! [`PeerAuthorizer`] (die Tier-Map-Variante der Tests). Beide tragen die
+//! Tier-Ablehnungsmatrix über `decide_with_tier`/[`tier_permits`].
 //!
 //! # Warum eine Route ohne `OperationMeta` nicht konstruierbar ist
 //! [`WebRouteTable`] hat **einen** öffentlichen Konstruktor:
@@ -21,12 +26,17 @@
 //! `Surface::Web` deklariert: sie erzeugt nachweisbar keine Route.
 //!
 //! # Kein zweiter Autoritätspfad
-//! [`decide_route`] fragt für die Berechtigungsstufe ausschließlich
-//! [`crate::authz::PeerAuthorizer`] und für die Route ausschließlich
-//! [`WebRouteTable::find`] — beide sind ausschließlich von außen (Registry
-//! bzw. serverseitig vertraute Konfiguration) gespeist. Es gibt keinen
-//! Zweig, der eine Operation ausführt, die nicht über
-//! `WebRouteTable::from_registry` in die Tabelle gelangt ist.
+//! [`decide_resolved_route`] fragt für die Berechtigungsstufe ausschließlich
+//! die aufgelöste Identität ([`ResolvedPeer::tier`]), [`decide_route`]
+//! ausschließlich [`crate::authz::PeerAuthorizer`]; für die Route fragen
+//! beide ausschließlich [`WebRouteTable::find`] — alles ausschließlich von
+//! außen (Registry bzw. serverseitig vertraute Konfiguration) gespeist. Es
+//! gibt keinen Zweig, der eine Operation ausführt, die nicht über
+//! `WebRouteTable::from_registry` in die Tabelle gelangt ist. Die Metapfade
+//! und `GET /events` sind keine Operationen und laufen nicht durch diese
+//! Entscheidung; [`crate::server`] prüft sie selbst über denselben Resolver
+//! (`/v1/version`/`/v1/capabilities` zusätzlich über [`tier_permits`],
+//! `/v1/health` ohne Stufe; siehe [`crate::meta`]).
 
 use std::sync::Arc;
 
@@ -82,7 +92,8 @@ pub const fn method_name(method: WebMethod) -> &'static str {
 /// Nur exakt `"GET"` und `"POST"` werden abgebildet (HTTP-Methodennamen sind
 /// nach RFC 9110 §9.1 case-sensitiv). Insbesondere werden `HEAD` und
 /// `OPTIONS` **nicht** implizit auf `GET` abgebildet: sie liefern `None` und
-/// damit in [`decide_route`] immer [`RouteDecision::MethodNotAllowed`] — auch
+/// damit in [`decide_resolved_route`] bzw. [`decide_route`] immer
+/// [`RouteDecision::MethodNotAllowed`] — auch
 /// auf `GET`-Routen, sodass keine Methode außer der deklarierten je eine
 /// Operation erreicht (F-031).
 ///
@@ -111,18 +122,22 @@ pub fn parse_web_method(name: &str) -> Option<WebMethod> {
     }
 }
 
-/// Warum [`decide_route`] eine Route abgelehnt hat.
+/// Warum [`decide_resolved_route`] bzw. [`decide_route`] eine Route abgelehnt
+/// hat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForbiddenReason {
-    /// Der Peer ist keiner Berechtigungsstufe zugeordnet
-    /// ([`PeerAuthorizer::tier_for`] lieferte `None`).
+    /// Der Peer ist keiner Berechtigungsstufe zugeordnet:
+    /// [`PeerAuthorizer::tier_for`] lieferte `None` ([`decide_route`]), oder
+    /// die Identitätsauflösung scheiterte ([`decide_resolved_route`] mit
+    /// `identity == None`; der konkrete Grund steht im
+    /// [`crate::identity::IdentityError`] des Aufrufers).
     UnknownPeer,
     /// Der Peer ist bekannt, aber seine Stufe reicht für diese Route nicht.
     InsufficientTier,
 }
 
-/// Das Ergebnis von [`decide_route`] — genau ein Ausgang, nie mehrere
-/// gleichzeitig wahr.
+/// Das Ergebnis von [`decide_resolved_route`] bzw. [`decide_route`] — genau
+/// ein Ausgang, nie mehrere gleichzeitig wahr.
 #[derive(Debug)]
 pub enum RouteDecision<'a> {
     /// Kein registrierter `Surface::Web`-Pfad passt zu `path`.
@@ -163,6 +178,9 @@ pub enum RouteDecision<'a> {
 /// eine bekannte Stufe → Stufe reicht → keine Genehmigung nötig. Der erste
 /// nicht bestandene Schritt bestimmt das Ergebnis; besteht alles, liefert
 /// sie [`RouteDecision::Execute`].
+///
+/// Der Server ruft diese Funktion nicht; er nutzt [`decide_resolved_route`]
+/// (gleiche Reihenfolge, gleiche Matrix).
 ///
 /// # Arguments
 /// - `routes` (`&WebRouteTable`): die aus der Registry gebaute Routentabelle.
@@ -219,7 +237,8 @@ pub fn decide_route<'a>(
 }
 
 /// Wie [`decide_route`], aber mit einer bereits aufgelösten Identität
-/// ([`crate::identity::LocalPeerIdentityResolver`], H12).
+/// ([`crate::identity::LocalPeerIdentityResolver`], H12) — der Prüfpfad, den
+/// der Server tatsächlich läuft.
 ///
 /// # Description
 /// Derselbe Prüfpfad in derselben Reihenfolge (Route → Methode → Identität →
@@ -230,11 +249,13 @@ pub fn decide_route<'a>(
 /// steht im [`crate::identity::IdentityError`] des Aufrufers
 /// (`IdentityError::code`) und gehört in den `reason` der `403`-Antwort.
 ///
-/// Bei [`RouteDecision::Execute`] baut der Aufrufer den `OpContext` wie
-/// bisher über die `WebContextFactory` (mit `caller_tier`) und fädelt danach
-/// Mandant und Kontextzusammenfassung über
-/// [`ResolvedPeer::scope_op_context`] ein — der einzige Weg, auf dem ein
-/// Mandant in eine Operation gelangt; nie aus dem Rumpf.
+/// Bei [`RouteDecision::Execute`] verlangt der Aufrufer zuerst die
+/// aufgelöste Identität (ohne sie `403`, bevor Rumpf oder `OpContext`
+/// entstehen), liest erst dann den Rumpf, baut den `OpContext` über die
+/// `WebContextFactory` (mit `caller_tier`) und fädelt Mandant und
+/// Kontextzusammenfassung über [`ResolvedPeer::scope_op_context`] ein — der
+/// einzige Weg, auf dem ein Mandant in eine Operation gelangt; nie aus dem
+/// Rumpf.
 ///
 /// # Arguments
 /// - `routes` (`&WebRouteTable`): die aus der Registry gebaute Routentabelle.

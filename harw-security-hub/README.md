@@ -11,8 +11,9 @@ host:
 - **Should**: a short-lived `harw_types::SecurityContext`, minted with the
   hub's only `SecurityContextIssuer`, plus read-only DoD posture.
 
-The architecture layer is **A** (application/composition). The only internal
-dependency is `harw-types`. No DoD crate and no CryptGuard crate is linked.
+The architecture layer is **A** (application/composition). The internal
+dependencies are `harw-types` and `harw-fsutil` (symlink-safe opening of the
+config file). No DoD crate and no CryptGuard crate is linked.
 
 ## Socket
 
@@ -75,6 +76,19 @@ which is the safe direction.
 
 The config lives in `/etc/harw-security-hub/config.toml`. Every table uses
 `deny_unknown_fields`.
+
+The hub refuses to start unless the config file passes these checks at load
+time. The startup error names the check that failed.
+
+- It is a regular file, and the file itself is not a symlink. Parent
+  directories may be symlinks. A symlink, FIFO, socket, device or directory is
+  rejected, and a FIFO is rejected without blocking. Install the file itself,
+  not a link to it.
+- It is not writable by group or others. `0644`, `0640` and `0600` pass;
+  `0664` and `0666` do not.
+- It is at most 256 KiB (262144 bytes).
+- At the default path `/etc/harw-security-hub/config.toml` it is owned by
+  root.
 
 ```toml
 [server]
@@ -169,7 +183,8 @@ The tests cover:
 - The context table: expiry, revocation tombstones, capacity.
 - Finding parsing: filters, malformed and oversize lines, record limit,
   tail/partial lines, sanitizing.
-- Config validation.
+- Config validation and the load-time file checks: directory, `0666` file,
+  symlink, oversized file and FIFO (rejected without blocking).
 - End-to-end runs over a socket in a temp directory: issue → verify → revoke,
   expiry, denial for an unknown peer, posture with findings, socket mode
   `0660`, stale-socket handling and graceful shutdown.

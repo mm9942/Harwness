@@ -166,7 +166,7 @@ Vor B2b und B4 muss G3 geschlossen werden. Die heutige Disjunktheitsrelation erk
 ### B.8.2 G3: Lücke, Besitz, Reihenfolge
 
 **Herkunft.**
-- G3 steht in `docs/design/hardening-gap-analysis.md:79-95` (Priorität P3, `:393`).
+- G3 steht in `docs/design/hardening-gap-analysis.md:79-95` (Priorität P3, `:401`).
 - Die Idee zum „Borrow-Checker“ stammt aus `docs/design/agent-ir-v1.md:118-132`. Dort wird auch der Pass `PartitionWriteSets` vorgeschlagen (`:106`).
 - Der Beleg `ids.rs:163 PathOrSymbol(String)` in der Gap-Analyse ist veraltet. Heute ist es ein Enum mit `Path` und `Symbol` (`harw-plan/src/ids.rs:318-333`).
 

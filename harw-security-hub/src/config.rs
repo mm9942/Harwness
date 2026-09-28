@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use harw_fsutil::{OpenMode, is_symlink_loop, open_nofollow};
 use harw_types::{HostId, ImpactSeverity, NodeId};
 
 use crate::error::HubError;
@@ -188,41 +189,30 @@ impl HubConfig {
     /// Reads and validates the config at `path`.
     ///
     /// This file maps uids to principal, tenant, tier and trust zone, so it
-    /// is the root of every context the hub issues. Before ever opening it,
-    /// this checks the file's `lstat` metadata — which cannot block even if
-    /// `path` names a FIFO, unlike opening it would — to reject symlinks,
-    /// anything that is not a plain regular file, and group- or
-    /// world-writable permissions; for [`DEFAULT_CONFIG_PATH`] it also
-    /// rejects a non-root owner. `open` itself still follows a symlink in
-    /// the last path component, so between that `lstat` check and the
-    /// `open` call the path could be swapped out for one, or the file
-    /// `lstat` inspected could be chmod'ed or chown'ed in place without
-    /// changing which inode `open` returns; once the file is open, this
-    /// re-checks the now-open handle's `fstat` `(dev, ino)` against the
-    /// earlier `lstat` and rejects a mismatch, then re-runs the same
-    /// permission and ownership check against that `fstat` metadata,
-    /// closing both races before any byte is read. The read itself is
-    /// capped at `MAX_CONFIG_BYTES`.
+    /// is the root of every context the hub issues. The file is opened with
+    /// [`harw_fsutil::open_nofollow`]: a symlink in the last path component
+    /// is refused (`O_NOFOLLOW`), and a FIFO, socket or device is refused
+    /// without blocking (`O_NONBLOCK` plus a type check on the open
+    /// handle); parent directories resolve normally. Every further check
+    /// runs on that handle's `fstat` metadata, so the file that is checked
+    /// is the file that is read: it must be a regular file, not writable by
+    /// group or others, and owned by root for [`DEFAULT_CONFIG_PATH`]. The
+    /// read is capped at `MAX_CONFIG_BYTES`.
     ///
     /// # Errors
-    /// [`HubError::Read`] if the path cannot be statted, is not a
-    /// sufficiently trusted regular file (checked both before opening and
-    /// again against the open handle), was replaced between the trust
-    /// check and the open, or exceeds `MAX_CONFIG_BYTES`; plus everything
-    /// from [`Self::from_toml_str`].
+    /// [`HubError::Read`] if the path cannot be opened, is a symlink or not
+    /// a regular file, is writable by group or others, is not owned by root
+    /// at [`DEFAULT_CONFIG_PATH`], or exceeds `MAX_CONFIG_BYTES`; plus
+    /// everything from [`Self::from_toml_str`].
     pub fn load(path: &Path) -> Result<Self, HubError> {
         let read_error = |source: io::Error| HubError::Read {
             path: path.to_path_buf(),
             source,
         };
         let require_root = path == Path::new(DEFAULT_CONFIG_PATH);
-        let checked_metadata = std::fs::symlink_metadata(path).map_err(read_error)?;
-        check_trusted_metadata(&checked_metadata, require_root).map_err(read_error)?;
-
-        let file = std::fs::File::open(path).map_err(read_error)?;
-        let opened_metadata = file.metadata().map_err(read_error)?;
-        ensure_not_replaced_during_open(&checked_metadata, &opened_metadata).map_err(read_error)?;
-        check_trusted_metadata(&opened_metadata, require_root).map_err(read_error)?;
+        let file = open_config(path).map_err(read_error)?;
+        let metadata = file.metadata().map_err(read_error)?;
+        check_trusted_metadata(&metadata, require_root).map_err(read_error)?;
 
         let mut text = String::new();
         file.take(MAX_CONFIG_BYTES + 1)
@@ -269,20 +259,32 @@ impl HubConfig {
     }
 }
 
-/// Rejects anything but a plain, safely owned and permissioned regular
-/// file, purely from `metadata` (an `lstat` or an `fstat`, this function
-/// never opens or resolves a path itself): a symlink, a FIFO, a socket, a
-/// device or a directory, and (on Unix) group- or world-writable
-/// permissions. `require_root` additionally rejects a non-root owner, for
-/// the compiled-in system config path. `load` calls this twice: once on
-/// the pre-open `lstat` metadata, so a FIFO is rejected without ever
-/// blocking on `open`, and again on the post-open `fstat` metadata, to
-/// catch a same-inode permission or ownership change that happened in
-/// the window between the two.
+/// Opens the config with [`open_nofollow`] (read-only): `O_NOFOLLOW`
+/// refuses a symlink in the last path component, and `O_NONBLOCK` plus a
+/// type check on the open handle refuses a FIFO, socket or device without
+/// blocking; the returned handle blocks normally again. Those two refusals
+/// get the same operator-facing reasons as [`check_trusted_metadata`];
+/// every other error keeps its `errno`.
+fn open_config(path: &Path) -> io::Result<std::fs::File> {
+    open_nofollow(path, OpenMode::read_only()).map_err(|error| {
+        if is_symlink_loop(&error) {
+            io::Error::other("is a symlink; refusing to follow it")
+        } else if error.kind() == io::ErrorKind::InvalidInput {
+            // With `OpenMode::read_only()` the only `InvalidInput` is
+            // harw-fsutil's file-type check on the open handle.
+            io::Error::other("is not a regular file")
+        } else {
+            error
+        }
+    })
+}
+
+/// Rejects anything but a regular file that is not writable by group or
+/// others, from `metadata` alone (never opens or resolves a path). `load`
+/// passes the open handle's `fstat` metadata, which also catches the
+/// directories `open_nofollow` returns. `require_root` additionally
+/// rejects a non-root owner, for the compiled-in system config path.
 fn check_trusted_metadata(metadata: &std::fs::Metadata, require_root: bool) -> io::Result<()> {
-    if metadata.file_type().is_symlink() {
-        return Err(io::Error::other("is a symlink; refusing to follow it"));
-    }
     if !metadata.is_file() {
         return Err(io::Error::other("is not a regular file"));
     }
@@ -302,33 +304,13 @@ fn check_trusted_metadata(metadata: &std::fs::Metadata, require_root: bool) -> i
     Ok(())
 }
 
-/// Rejects an already-open file whose `(dev, ino)` does not match the
-/// `lstat` metadata `checked` before it was opened. `File::open` follows a
-/// symlink in the last path component, so between the `symlink_metadata`
-/// check and the `open` call the path could have been swapped for a
-/// symlink pointing elsewhere; `(dev, ino)` uniquely identifies the file
-/// that was actually opened, so a mismatch here can only mean the path no
-/// longer names the file `checked` inspected.
-fn ensure_not_replaced_during_open(
-    checked: &std::fs::Metadata,
-    opened: &std::fs::Metadata,
-) -> io::Result<()> {
-    if checked.dev() != opened.dev() || checked.ino() != opened.ino() {
-        return Err(io::Error::other(
-            "path was replaced between the trust check and opening it",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::time::Duration;
 
-    use super::{
-        DEFAULT_SOCKET_PATH, HubConfig, check_trusted_metadata, ensure_not_replaced_during_open,
-    };
+    use super::{DEFAULT_SOCKET_PATH, HubConfig, check_trusted_metadata};
+    use crate::error::HubError;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::ImpactSeverity;
 
@@ -412,7 +394,7 @@ mod tests {
         Ok(())
     }
 
-    /// Covers the brief's three cases in one table, matching
+    /// Covers four untrusted cases in one table, matching
     /// [`test_invalid_configs_are_rejected`]'s style: a directory (not a
     /// regular file), a chmod `0o666` config, a symlink and an oversized
     /// (> `MAX_CONFIG_BYTES`) config must all be rejected.
@@ -427,6 +409,8 @@ mod tests {
 
         let target = dir.path().join("real.toml");
         std::fs::write(&target, "[policy]\n").map_err(ctx("write"))?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .map_err(ctx("chmod"))?;
         let symlink = dir.path().join("link.toml");
         std::os::unix::fs::symlink(&target, &symlink).map_err(ctx("symlink"))?;
 
@@ -440,9 +424,10 @@ mod tests {
         Ok(())
     }
 
-    /// A FIFO must be rejected by `lstat` before `load` ever opens it, or
-    /// opening it would block this test (and a production startup) forever
-    /// waiting for a writer that never comes.
+    /// A FIFO must be rejected without blocking: `open_nofollow` opens with
+    /// `O_NONBLOCK` and refuses it on the open handle; a blocking open would
+    /// hang this test (and a production startup) waiting for a writer that
+    /// never comes.
     #[test]
     fn test_load_rejects_fifo_without_blocking() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -452,11 +437,15 @@ mod tests {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(HubConfig::load(&path).is_err());
+            let reason = match HubConfig::load(&path) {
+                Err(HubError::Read { source, .. }) => source.to_string(),
+                other => format!("unexpected: {other:?}"),
+            };
+            let _ = tx.send(reason);
         });
         match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(rejected) => {
-                assert!(rejected);
+            Ok(reason) => {
+                assert_eq!(reason, "is not a regular file");
                 Ok(())
             }
             Err(_) => Err(TestError::Unexpected(
@@ -484,12 +473,9 @@ mod tests {
         Ok(())
     }
 
-    /// `load`'s post-open re-check runs [`check_trusted_metadata`] on the
-    /// open handle's `fstat` metadata, not the pre-open `lstat` metadata;
-    /// confirm the same enforcement holds for that metadata source too,
-    /// matching harw-authority's `validate_policy_metadata`, which also
-    /// runs on the post-open `fstat` metadata rather than a pre-open
-    /// `lstat`.
+    /// `load` runs [`check_trusted_metadata`] on the open handle's `fstat`
+    /// metadata; confirm a `0o666` file is rejected from that metadata
+    /// source.
     #[test]
     fn test_check_trusted_metadata_also_rejects_fstat_metadata() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -505,31 +491,22 @@ mod tests {
         Ok(())
     }
 
-    /// Simulates the race `load` closes: the `lstat` metadata checked
-    /// before opening a path must match the `fstat` metadata of whatever
-    /// ends up open, or the path was swapped out in between (e.g. for a
-    /// symlink) and must be rejected, matching harw-authority's
-    /// `ensure_policy_not_replaced_detects_a_swapped_file`.
+    /// A symlink is refused by `O_NOFOLLOW` even when its target is a
+    /// trusted file, and the reason names the symlink.
     #[test]
-    fn test_ensure_not_replaced_during_open_detects_a_swapped_file() -> TestResult {
+    fn test_load_refuses_symlink_to_trusted_file() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let original = dir.path().join("config.toml");
-        let swapped = dir.path().join("other.toml");
-        std::fs::write(&original, "[policy]\n").map_err(ctx("write original"))?;
-        std::fs::write(&swapped, "[policy]\n[extra]\n").map_err(ctx("write swapped"))?;
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "[policy]\n").map_err(ctx("write"))?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .map_err(ctx("chmod"))?;
+        HubConfig::load(&target).map_err(ctx("load target"))?;
 
-        let checked = std::fs::symlink_metadata(&original).map_err(ctx("stat original"))?;
-        let opened_same = std::fs::File::open(&original)
-            .map_err(ctx("open original"))?
-            .metadata()
-            .map_err(ctx("fstat original"))?;
-        let opened_other = std::fs::File::open(&swapped)
-            .map_err(ctx("open swapped"))?
-            .metadata()
-            .map_err(ctx("fstat swapped"))?;
-
-        assert!(ensure_not_replaced_during_open(&checked, &opened_same).is_ok());
-        assert!(ensure_not_replaced_during_open(&checked, &opened_other).is_err());
-        Ok(())
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).map_err(ctx("symlink"))?;
+        match HubConfig::load(&link) {
+            Err(HubError::Read { source, .. }) if source.to_string().contains("symlink") => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
     }
 }

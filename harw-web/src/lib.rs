@@ -35,10 +35,12 @@
 //! **unausdrückbar** — siehe `router`-Moduldoku für die Belegtests. Genau
 //! dieselbe Disziplin gilt für die Ausführung selbst:
 //! [`server::handle`] (privat) trifft **keine eigene** Zugriffsentscheidung
-//! — jede kommt aus [`router::decide_route`], das ausschließlich
-//! [`authz::PeerAuthorizer`] (serverseitig vertraute, zur Komposition
-//! übergebene Konfiguration — nie aus dem Request abgeleitet) und
-//! [`router::WebRouteTable`] befragt.
+//! — für Operationsrouten kommt jede aus [`router::decide_resolved_route`],
+//! das ausschließlich die Identität aus dem
+//! [`identity::LocalPeerIdentityResolver`] des Servers (dessen
+//! Stufenobergrenze ist [`authz::PeerAuthorizer`]: serverseitig vertraute,
+//! zur Komposition übergebene Konfiguration — nie aus dem Request
+//! abgeleitet) und [`router::WebRouteTable`] befragt.
 //!
 //! # `SO_PEERCRED` statt Bearer-Token
 //! Die Bindung ist ein Unix-Socket, kein TCP-Port. [`peer::read_peer_credentials`]
@@ -69,8 +71,12 @@
 //! Ab diesem Knoten gelten zwei Gates: *keine Route ohne `OperationMeta`*
 //! (siehe oben — strukturell erzwungen, nicht nur geprüft) und *die
 //! Tier-Ablehnungsmatrix* (siehe `authz`- und `router`-Moduldoku:
-//! [`authz::tier_permits`] und [`router::decide_route`] sind die einzigen
-//! Stellen, die diese Entscheidung treffen).
+//! [`authz::tier_permits`] ist die einzige Matrix. Für Operationsrouten
+//! wendet [`router::decide_resolved_route`] sie an — derselbe Kern wie
+//! [`router::decide_route`] — mit der Stufe aus dem
+//! [`identity::LocalPeerIdentityResolver`]; die Metarouten wenden sie in
+//! `server` über denselben Resolver an, `GET /events` verlangt dort über
+//! ihn nur eine aufgelöste Identität, keine Mindeststufe).
 //!
 //! # Nebenläufigkeit
 //! [`server::BoundWebServer::serve_until`] bedient jede angenommene

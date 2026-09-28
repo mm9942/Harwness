@@ -209,7 +209,9 @@ impl ResolvedPeer {
 pub enum IdentityError {
     /// Die UID ist in der Tier-Tabelle unbekannt.
     UnknownPeer,
-    /// `require_context = true`, aber kein Kontext-Header vorgelegt.
+    /// Kein Kontext-Header vorgelegt, und entweder `require_context = true`
+    /// oder die UID hat einen `uid_principals`-Eintrag ohne `uid_tenants`-Pin
+    /// (Rückfall gesperrt, siehe Moduldoku).
     ContextRequired,
     /// Header mehrfach, leer, nicht ASCII oder keine gültige Kontext-Id.
     InvalidContextReference,
@@ -228,8 +230,10 @@ pub enum IdentityError {
     /// Authentisierungsstärke unter `peer_credential` oder Vertrauenszone
     /// jenseits von `host`.
     ContextNotPermitted,
-    /// Der Hub war nicht erreichbar (Socket fehlt, Zeitüberschreitung, `503`)
-    /// und `require_context = true`.
+    /// Der Hub war nicht erreichbar (Socket fehlt, Zeitüberschreitung, `503`),
+    /// und entweder `require_context = true` oder die UID hat einen
+    /// `uid_principals`-Eintrag ohne `uid_tenants`-Pin (Rückfall gesperrt,
+    /// siehe Moduldoku).
     HubUnavailable,
     /// Der Hub antwortete, aber nicht vertragsgemäß oder verweigerte die
     /// Prüfung (`harw-web` ist kein Verifier) — immer Ablehnung.
@@ -1312,6 +1316,26 @@ mod tests {
         assert_eq!(resolved.tier(), PermissionTier::Owner);
         assert_eq!(resolved.tenant().map(TenantId::as_str), Some("tenant-a"));
         assert_eq!(resolved.summary(), None);
+        Ok(())
+    }
+
+    /// Zweiter Auslöser von `HubUnavailable`: auch bei `require_context =
+    /// false` bleibt der Rückfall für eine an einen Principal gebundene UID
+    /// ohne `uid_tenants`-Pin gesperrt.
+    #[tokio::test]
+    async fn test_security_hub_unavailable_without_tenant_pin_is_denied() -> TestResult {
+        let hub = FakeHub::new(Err(VerifierError::Unavailable));
+        let unpinned = SecurityHubResolver::new(
+            TierMapResolver::new(tier_table()),
+            Arc::clone(&hub) as Arc<dyn ContextVerifier>,
+            vec![(ALICE, "alice".to_owned())],
+            false,
+        );
+        expect_err(
+            unpinned.resolve(&peer(ALICE), Some("ctx-1")).await,
+            IdentityError::HubUnavailable,
+        )?;
+        assert_eq!(hub.calls(), 1);
         Ok(())
     }
 
