@@ -73,8 +73,9 @@ systemd-socket activation already; the network isolator was not
 implemented, so successful observation was not proof of network
 enforcement.
 
-`PermissionSet::from_policy` was public, and `PermissionSet` was
-deserializable — many main-workspace call sites actually only produced
+`PermissionSet` was deserializable, and `PermissionSet::from_policy` was
+(and still is, see §6.1) a public, unrestricted constructor — many
+main-workspace call sites actually only produced
 requests or ceilings, others real root rights, and many test fixtures. The
 claim that a new crate or private constructors alone would make the whole
 system mathematically closed was rejected: a public policy compiler over
@@ -343,8 +344,9 @@ A new, ground-up crate, `harw-authority`, in the product workspace,
 consumable from DoD via a path dependency. **Confirmed present**
 (`harw-authority/src/lib.rs`), with `PermissionRequest`, `PermissionSet`,
 `AuthorityContext` and `AuthoritySnapshot` all defined there as planned.
-Dependencies limited to necessary base types/serialization, no runtime,
-core, tool, or registry edges.
+Dependencies limited to base types, serialization, and `rustix`
+(unix only, for `geteuid` in the operator-home policy owner check); no
+runtime, core, tool, or registry edges.
 
 The core owns `Permission`, `PermissionSet`, `SandboxSpec`, and the
 workspace/network-scope types needed for identical scope evaluation.
@@ -356,13 +358,19 @@ Central separation:
 
 - `PermissionRequest`: freely constructible, serializable
   requests/ceilings; conveys no execution right by itself.
-- `PermissionSet`: granted rights with private fields and private raw
-  construction; no public `Deserialize`, `FromIterator`, rights-bearing
-  `Default`, or unbounded builder.
+- `PermissionSet`: granted rights with private fields.
+  `PermissionSet::from_policy` is a public, unrestricted constructor for
+  code-defined grants and ceilings; the type implements no `Deserialize`,
+  `FromIterator`, or `Default`. The type itself is not the trust
+  boundary: that lies with `SandboxSpec::from_resolved*`, which turns a
+  set into a running sandbox, and with `PolicyBootstrap`, which issues
+  policy-derived grants.
 - `AuthorityContext`: granted context with workspace, network scope, and
   provenance; immutable once issued.
-- `AuthoritySnapshot`: serializable display/persistence data, explicitly
-  not a grant — resumption requires re-evaluating policy.
+- `AuthoritySnapshot`: serializable persistence data, explicitly not a
+  grant. It holds a path-free tenant/workspace reference used only for
+  matching, not for display; resumption requires re-evaluating policy via
+  `PolicyBootstrap::reissue` against a freshly resolved workspace binding.
 
 Public derivation `parent.restrict(request)` returns only a subset of the
 parent context. Mode/role/profile/contract ceilings become

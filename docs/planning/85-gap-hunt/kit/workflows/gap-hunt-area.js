@@ -94,6 +94,7 @@ const seen = new Set()
 const titles = []
 const confirmed = []
 const rejected = []
+const unverified = []
 
 const verifyOne = (f, l) => agent(`${CONTEXT}
 
@@ -120,8 +121,11 @@ const judge = async f => {
     const tie = await run(tieKey)
     votes = [...first, tie].filter(Boolean)
   }
-  if (votes.length === 0) {
-    rejected.push({ file: f.file, line: f.line, title: f.title, reasons: ['no verifier answered'] })
+  // Fixed quorum: as many answered lenses as were planned (the tie-breaker may
+  // stand in for a lens that died). Fewer answers never decide a finding in
+  // either direction; it stays unverified and can be retried.
+  if (votes.length < firstKeys.length) {
+    unverified.push({ ...f, votes: votes.map(v => ({ lens: v.lens, real: v.real })), reason: `${votes.length} of ${firstKeys.length} planned verdicts` })
     return
   }
   const need = Math.floor(votes.length / 2) + 1
@@ -166,5 +170,5 @@ Ask: which crates/files/modules were NOT examined, which risk classes were not c
   { label: `critic:${A.key}`, phase: 'Critic', schema: FINDINGS, model: 'opus', agentType: 'focused-explorer' })
 await parallel(freshOf(critic).map(f => () => judge(f)))
 
-log(`${A.key}: ${confirmed.length} confirmed (${confirmed.filter(c => c.oneFile).length} single-file), ${rejected.length} rejected`)
-return { area: A.key, confirmed, rejected }
+log(`${A.key}: ${confirmed.length} confirmed (${confirmed.filter(c => c.oneFile).length} single-file), ${rejected.length} rejected, ${unverified.length} unverified`)
+return { area: A.key, confirmed, rejected, unverified }

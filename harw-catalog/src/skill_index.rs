@@ -703,15 +703,34 @@ mod tests {
     }
 
     #[test]
-    fn search_finds_the_pyramid_skill_for_pyramide_and_minto() -> TestResult {
+    fn search_finds_the_pyramid_skill_for_pyramide_and_pyramidenprinzip() -> TestResult {
         let index = SkillIndex::build(&[]);
-        for query in ["Pyramide", "Minto", "pyramide Kernaussage"] {
+        for query in ["Pyramide", "Pyramidenprinzip", "pyramide Kernaussage"] {
             let hits = index.search(query);
             let first = hits
                 .first()
                 .ok_or(TestError::Unexpected(format!("{query}: kein Treffer")))?;
             assert_eq!(first.entry.name, "business-writing-pyramid", "{query}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn business_paper_section_of_latex_report_loads_under_the_new_heading() -> TestResult {
+        let index = SkillIndex::build(&[]);
+        let entry = index
+            .get("latex-report")
+            .ok_or(TestError::Missing("latex-report"))?;
+        // Teilzeichenkette: „business-paper“ trifft die ganze Überschrift.
+        let section = entry
+            .section_fragment("business-paper")
+            .ok_or(TestError::Missing("Abschnitt business-paper"))?;
+        assert!(
+            section.contains("### business-paper (Pyramidenprinzip)"),
+            "{section}"
+        );
+        assert!(section.contains("`business-writing-pyramid`"), "{section}");
+        assert!(!section.contains("### handbuch"), "{section}");
         Ok(())
     }
 

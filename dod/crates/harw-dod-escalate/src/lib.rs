@@ -60,12 +60,14 @@
 //! (F-001). Die Umstellung von [`action`]/[`freeze_ops`] vom fälschbaren
 //! v1-`AuthorizationProof` auf Proof v2 ist Folgearbeit W5 D-ESC.
 //!
-//! # Audit vor Fehlerpfad
-//! Was protokolliert werden soll, wird protokolliert, **bevor** eine Aktion
-//! versucht wird — [`freeze_ops::authorize_freeze`] und
-//! [`freeze_ops::authorize_release`] schreiben ihren `FreezeStore`-Datensatz
-//! vor jeder fehlschlagbaren Prüfung, damit auch eine scheiternde
-//! Autorisierung ihren Eintrag hinterlässt. Siehe [`freeze_ops`]-Moduldoku.
+//! # Autorisierung vor Zustand
+//! [`freeze_ops::authorize_freeze`] und [`freeze_ops::authorize_release`]
+//! werten zuerst die nebenwirkungsfreien Prüfungen aus (`Ladder::stage_for`,
+//! `Action::authorize`); erst danach, noch vor Übergabe der autorisierten
+//! Aktion, schreiben sie ihren `FreezeStore`-Datensatz. Eine abgelehnte
+//! Autorisierung lässt den Store unverändert — kein Phantom-`.active`, kein
+//! `Lifted` für eine noch eingefrorene Cgroup — und wird nur über den
+//! inhaltsfreien [`EscalateError`] gemeldet. Siehe [`freeze_ops`]-Moduldoku.
 //!
 //! # Rekonziliationsdisziplin beim Start
 //! [`freeze_ops::reconcile_expired_freezes`] muss vom Aufrufer einmal, vor

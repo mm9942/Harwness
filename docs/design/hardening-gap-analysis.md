@@ -285,7 +285,10 @@ types and wire types do not.
 - `harw-core/src/admission.rs` — `JobIntent` has `#[serde(deny_unknown_fields)]`
 - `harw-tool-shell/src/exec.rs` — `ShellExecArgs` has `#[serde(deny_unknown_fields)]`
 - `harw-config/src/harness_config.rs` — no `deny_unknown_fields` on most config structs
-- `harw-protocol/src/wire.rs` — `RequestEnvelope` etc. have no `deny_unknown_fields`
+- `harw-protocol/src/wire.rs` — Resolved: `RequestEnvelope`, `ResponseEnvelope`,
+  `NotificationEnvelope`, `WireError`, and `ProtocolVersion` all carry
+  `#[serde(deny_unknown_fields)]`; covered by the test
+  `inbound_envelopes_deny_unknown_fields`
 
 **Hardening delta**: Audit all structs that deserialize from untrusted
 input (config TOML, MCP JSON-RPC, channel wire, tool arguments). Add

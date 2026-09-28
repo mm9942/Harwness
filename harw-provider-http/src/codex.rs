@@ -4,12 +4,15 @@
 //! request. Unlike the original design, `harw` now also owns a *refresh*
 //! path for the short-lived access token: before a request, an
 //! about-to-expire token is refreshed proactively
-//! (see [`harw_oauth::jwt_needs_refresh`]); a genuine `401` triggers exactly
-//! one reactive refresh-and-retry (see [`CodexRoute::refresh`] and its call
-//! site in `lib.rs`). The actual token exchange, locking and atomic
-//! persistence into `auth.json` live in the `harw-oauth` crate
-//! ([`harw_oauth::refresh_codex_tokens`]) so this module stays a thin,
-//! endpoint-bound consumer.
+//! (see [`harw_oauth::jwt_needs_refresh`]); a genuine `401` triggers one
+//! reactive refresh-and-retry (see [`CodexRoute::refresh`] and its call site
+//! in `lib.rs`). Both paths call [`harw_oauth::refresh_codex_tokens`], which
+//! either exchanges the refresh token (at most one timeout-bounded HTTP
+//! request) or adopts a token that another holder rotated while it waited
+//! for the refresh lock. A server-rejected token is never skipped just
+//! because its `exp` is still far away. The token exchange, locking and
+//! atomic persistence into `auth.json` live in the `harw-oauth` crate, so
+//! this module stays a thin, endpoint-bound consumer.
 //! Wire reference: ../codex/codex-rs/{model-provider-info,codex-api,login}.
 
 use std::path::{Path, PathBuf};
@@ -29,6 +32,11 @@ const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 /// Proaktives Refresh-Fenster: läuft das Access-Token in weniger als dieser
 /// Restlaufzeit ab, wird vor dem Request erneuert (siehe Auftrag: "weniger
 /// als 5 Minuten Restlaufzeit").
+///
+/// Der Wert ist frei wählbar: `harw-oauth` überspringt den Netzwerk-Aufruf
+/// nur nach einer während des Wartens auf den Refresh-Lock beobachteten
+/// Rotation, nie wegen der Restlaufzeit. Es gibt daher keine Kopplung an
+/// eine Konstante in `harw-oauth`.
 const PROACTIVE_REFRESH_WINDOW_SECONDS: i64 = 5 * 60;
 
 /// Harw-eigener Default für den `originator`-Header, wenn
@@ -169,6 +177,12 @@ impl CodexRoute {
 
     /// Erneuert das Codex-/ChatGPT-Token-Set über [`harw_oauth::refresh_codex_tokens`]
     /// und schreibt es atomar zurück in `~/.codex/auth.json`.
+    ///
+    /// `harw-oauth` tauscht dabei entweder das Refresh-Token (höchstens ein
+    /// zeitlich begrenzter HTTP-Request) oder übernimmt ein Token, das ein
+    /// anderer Halter während des Wartens auf den Refresh-Lock rotiert hat.
+    /// Ein vom Server abgelehntes Token wird nie übersprungen, nur weil sein
+    /// `exp` noch weit entfernt liegt.
     ///
     /// Wird sowohl proaktiv (siehe [`Self::headers`]) als auch reaktiv nach
     /// einem tatsächlichen `401` genau einmal pro Request aufgerufen (siehe

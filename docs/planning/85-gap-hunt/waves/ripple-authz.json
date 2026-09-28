@@ -1,0 +1,133 @@
+{
+ "schema": 1,
+ "wave": "ripple-authz",
+ "branch": "claude/r16/ripple-authz",
+ "base_sha": "0bdd93b447bcfd944986c665144e2a714fb50aac",
+ "head_sha": "6b340b42200400ef6fb95fe62429939441a1ba07",
+ "files": [
+  "Cargo.lock",
+  "docs/architecture/dependency-review.md",
+  "docs/architecture/dod-workspace-merge-plan.md",
+  "docs/design/dod-system-operations-authority.md",
+  "harw-authority/Cargo.toml",
+  "harw-authority/src/lib.rs",
+  "harw-oauth/Cargo.toml",
+  "harw-oauth/src/codex_refresh.rs",
+  "harw-oauth/src/lib.rs",
+  "harw-oauth/src/store.rs",
+  "harw-provider-http/src/codex.rs"
+ ],
+ "findings": [
+  {
+   "id": "F-056a5480a5cd",
+   "cluster": "ra-authority",
+   "file": "harw-authority/src/lib.rs",
+   "line": 1405,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "The same problem is now solved three different ways. The new comment says harw-authority has no dependency that can call geteuid() safely, s"
+  },
+  {
+   "id": "F-547996011f7c",
+   "cluster": "ra-authority",
+   "file": "docs/design/dod-system-operations-authority.md",
+   "line": 359,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "The design doc now contradicts the rewritten PermissionSet docs. Section 6.1 (:359-361) says PermissionSet has \"private raw construction; no"
+  },
+  {
+   "id": "F-69772f4447ff",
+   "cluster": "ra-oauth",
+   "file": "harw-provider-http/src/lib.rs",
+   "line": 4219,
+   "severity": "high",
+   "pattern": "P1",
+   "title": "After-lock re-read skips the reactive refresh after a 401: the retry reuses the rejected token"
+  },
+  {
+   "id": "F-783dd3994185",
+   "cluster": "ra-oauth",
+   "file": "harw-oauth/src/codex_refresh.rs",
+   "line": 298,
+   "severity": "medium",
+   "pattern": "P1",
+   "title": "Noted for the verifier; this is in-file, not a cross-file ripple. The stale-lock takeover is still check-then-act. is_lock_stale (:314) and "
+  },
+  {
+   "id": "F-848660597ff7",
+   "cluster": "ra-authority",
+   "file": "harw-authority/src/lib.rs",
+   "line": 2170,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "Dangling cross-reference: \"siehe Bericht des Fixer-Agents\" points to an agent report that does not exist in the repo. harw-authority/Cargo.t"
+  },
+  {
+   "id": "F-ae9d10112266",
+   "cluster": "ra-oauth",
+   "file": "harw-oauth/src/lib.rs",
+   "line": 26,
+   "severity": "medium",
+   "pattern": "P1",
+   "title": "Docs elsewhere still describe the old behaviour. harw-oauth/src/lib.rs:26-27 says refresh_codex_tokens always drives one HTTP request (\"trei"
+  },
+  {
+   "id": "F-c8f262beee1a",
+   "cluster": "ra-oauth",
+   "file": "harw-oauth/src/codex_refresh.rs",
+   "line": 332,
+   "severity": "medium",
+   "pattern": "P1",
+   "title": "The same fix exists twice and the copies have already diverged. The new TEMP_FILE_COUNTER / temporary_credential_path / create_restricted_te"
+  },
+  {
+   "id": "F-cb3e55d4a074",
+   "cluster": "ra-authority",
+   "file": "harw-authority/src/lib.rs",
+   "line": 949,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "Public API ripple. AuthoritySnapshot::workspace() now returns &WorkspaceReference (:644-656), which has no accessors, only matches(). The sn"
+  },
+  {
+   "id": "F-f6a8e80ef4f6",
+   "cluster": "ra-oauth",
+   "file": "harw-oauth/src/codex_refresh.rs",
+   "line": 83,
+   "severity": "medium",
+   "pattern": "P1",
+   "title": "Hidden coupling between two crates. LOCK_HOLDER_REFRESH_WINDOW_SECONDS (5*60) has to be >= PROACTIVE_REFRESH_WINDOW_SECONDS in harw-provider"
+  }
+ ],
+ "workflow_runs": [
+  "wf_beb1ae15-ba9"
+ ],
+ "disposition": {
+  "complete": true,
+  "missing": [],
+  "clusters": [
+   {
+    "id": "ra-authority",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "ra-oauth",
+    "status": "ok",
+    "reason": null
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Out-of-cluster doc edits in dependency-review.md and dod-workspace-merge-plan.md were kept (they describe this wave's rustix edge); an unreviewed code repair in harw-project-discovery was dropped."
+}

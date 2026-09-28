@@ -22,10 +22,13 @@
 //! - [`OAuthError`] — handgeschriebener Fehlertyp (kein `anyhow`/`thiserror`).
 //!
 //! ## Nebenläufigkeit
-//! PKCE- und Store-Funktionen sind zustandslos. [`exchange_code`] und
-//! [`refresh_codex_tokens`] sind `async` und treiben jeweils eine einzelne
-//! HTTP-Anfrage; [`refresh_codex_tokens`] serialisiert parallele Refreshes
-//! zusätzlich über einen Datei-Lock (siehe [`codex_refresh`]-Moduldokumentation).
+//! PKCE- und Store-Funktionen sind zustandslos. [`exchange_code`] ist `async`
+//! und treibt genau eine HTTP-Anfrage. [`refresh_codex_tokens`] ist `async`
+//! und serialisiert parallele Refreshes über einen OS-Advisory-Lock neben der
+//! Credential-Datei (siehe [`codex_refresh`]-Moduldokumentation). Es treibt
+//! höchstens eine per Timeout begrenzte HTTP-Anfrage; keine nur dann, wenn ein
+//! anderer Lock-Halter das Access-Token rotiert hat, während dieser Aufruf auf
+//! den Lock wartete.
 //!
 //! ## Sicherheit
 //! Tokens tragen `secrecy::SecretString` und werden nur beim Schreiben in die

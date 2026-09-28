@@ -42,7 +42,11 @@
 //! [`scheduler_decision`] ist die reine Entscheidung des Schedulers
 //! (Leerlauf/Cooldown oder Cron über
 //! `harw_knowledge::context_steward::DreamSchedule`) und speist auch
-//! `/dream status`.
+//! `/dream status`. Aus `harw_knowledge::context_steward` nutzt dieser Kern
+//! nur den Zeitplan (`DreamSchedule`, `DreamDecision`); den Steward-Digest
+//! (`build_steward_digest`, `steward_digest_if_due`) baut er bewusst nicht —
+//! ein Traumbericht enthält keinen Abschnitt zu Kontextprogramm- oder
+//! Modellverhalten-Vorschlägen.
 //!
 //! # Nebenläufigkeit
 //! [`run_dream`] ist `async`; die Dateisperre wird über den Modellaufruf

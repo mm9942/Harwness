@@ -40,13 +40,18 @@
 //!   that module's doc for the heuristic, why it is a separate `ArtifactKind`
 //!   rather than a `ContextProposal` variant, and where its observed-data
 //!   input does (and does not) reach this crate.
-//! - [`context_steward`]— the Context Steward (AW6-08): curates, orders and
-//!   summarizes already-fetched [`context_proposal::ContextProposal`] and
+//! - [`context_steward`]— the Context Steward (AW6-08): pure functions that
+//!   curate, order and summarize already-fetched
+//!   [`context_proposal::ContextProposal`] and
 //!   [`model_behavior_proposal::ModelBehaviorProposal`] batches into a
-//!   [`context_steward::StewardDigest`] — never applies either. Also carries
-//!   this crate's three `steward_*` null counters (`harw-observe`, AW1-07's
-//!   deferred mechanic), each documented with the invariant it watches and
-//!   the production path it hangs on.
+//!   [`context_steward::StewardDigest`] — never applies either. **Not wired
+//!   yet:** no production path builds a digest today; the only external
+//!   consumer (the `harw-ops` dream run) uses just
+//!   [`context_steward::DreamSchedule`] (see that module's section
+//!   "Stand der Verdrahtung"). Also carries this crate's three `steward_*`
+//!   null counters (`harw-observe`, AW1-07's deferred mechanic), each
+//!   documented with the invariant it watches and the production path it
+//!   hangs on.
 //!
 //! # Errors
 //! Every fallible path returns [`error::KnowledgeError`] / [`error::KnowledgeResult`].

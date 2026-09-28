@@ -1,0 +1,162 @@
+{
+ "schema": 1,
+ "wave": "wa-authz",
+ "branch": "claude/r16/wa-authz",
+ "base_sha": "1ad90219d83aa305f5bfe2ca531a30b5ab41a829",
+ "head_sha": "e8eace412831c02c6e32e0c09aae9c723eb6ce7f",
+ "files": [
+  "harw-authority/src/lib.rs",
+  "harw-oauth/src/codex_refresh.rs",
+  "harw-oauth/src/error.rs"
+ ],
+ "findings": [
+  {
+   "id": "F-1025e939a793",
+   "file": "harw-oauth/src/codex_refresh.rs",
+   "line": 235,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "Refreshed Codex tokens go into a fixed temp path opened with create+truncate, so 0600 is not enforced and symlinks are followed"
+  },
+  {
+   "id": "F-460d97bb2b67",
+   "file": "harw-oauth/src/error.rs",
+   "line": 17,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "TokenExchange.body is documented as the raw response body but is always a redacted placeholder"
+  },
+  {
+   "id": "F-4d68bce5d9b0",
+   "file": "harw-oauth/src/codex_refresh.rs",
+   "line": 122,
+   "severity": "low",
+   "pattern": "NEW:integer-overflow",
+   "title": "jwt_needs_refresh computes `exp - now` unchecked on an untrusted i64 claim"
+  },
+  {
+   "id": "F-68ecaf66ce4a",
+   "file": "harw-authority/src/lib.rs",
+   "line": 228,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "is_public_dns_name doc says [a-z0-9-.] but the code also accepts '_'"
+  },
+  {
+   "id": "F-78c3e225e202",
+   "file": "harw-oauth/src/codex_refresh.rs",
+   "line": 192,
+   "severity": "medium",
+   "pattern": "NEW:stale-lock-takeover",
+   "title": "Codex refresh lock is not mutually exclusive: a live holder is treated as stale, and its guard deletes the next owner's lock"
+  },
+  {
+   "id": "F-9be8154b6fcb",
+   "file": "harw-authority/src/lib.rs",
+   "line": 522,
+   "severity": "medium",
+   "pattern": "NEW:deserialize-bypasses-constructor",
+   "title": "WorkspaceBinding derives Deserialize, bypassing the registry canonicalization its doc says is required"
+  },
+  {
+   "id": "F-9bf21cbc36db",
+   "file": "harw-authority/src/lib.rs",
+   "line": 1229,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "Trusted policy is checked by path and then opened following symlinks; the OperatorHome source has no owner or parent-directory check"
+  },
+  {
+   "id": "F-e21129cadc4a",
+   "file": "harw-authority/src/lib.rs",
+   "line": 105,
+   "severity": "medium",
+   "pattern": "M3",
+   "title": "PermissionSet docs claim there is no public policy or generic grant constructor, yet `from_policy` is exactly that (96 caller files)"
+  }
+ ],
+ "workflow_runs": [
+  "wf_1b390d71-f64",
+  "wf_0f5a1f1e-492"
+ ],
+ "disposition": {
+  "files": [
+   {
+    "file": "harw-authority/src/lib.rs",
+    "ok": false,
+    "repaired": true
+   },
+   {
+    "file": "harw-oauth/src/codex_refresh.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-oauth/src/error.rs",
+    "ok": true
+   }
+  ],
+  "ripple": [
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-provider-http/src/lib.rs",
+    "line": 4219
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-oauth/src/codex_refresh.rs",
+    "line": 83
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-oauth/src/lib.rs",
+    "line": 26
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-oauth/src/codex_refresh.rs",
+    "line": 332
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/docs/design/dod-system-operations-authority.md",
+    "line": 359
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-authority/src/lib.rs",
+    "line": 949
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-authority/src/lib.rs",
+    "line": 1405
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-authority/src/lib.rs",
+    "line": 2170
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-oauth/src/codex_refresh.rs",
+    "line": 298
+   },
+   {
+    "id": null,
+    "file": "(central build)",
+    "line": null
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Backfilled after the merge (kit-4); the wave predates the manifest. Merged before its ripple items were resolved; they are handled by wave ripple-authz. The lib.rs repair had no re-review (old kit logic); ripple-authz reviews that file again."
+}

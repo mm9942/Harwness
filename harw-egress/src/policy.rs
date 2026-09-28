@@ -96,10 +96,11 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let a = EgressPolicy::new(vec!["Docs.RS.".into(), "crates.io".into()], false).unwrap();
-    /// let b = EgressPolicy::new(vec!["crates.io".into(), "docs.rs".into()], false).unwrap();
+    /// let a = EgressPolicy::new(vec!["Docs.RS.".into(), "crates.io".into()], false)?;
+    /// let b = EgressPolicy::new(vec!["crates.io".into(), "docs.rs".into()], false)?;
     /// assert_eq!(a.digest(), b.digest());
     /// assert!(EgressPolicy::new(vec!["*.docs.rs".into()], false).is_err());
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     pub fn new(allow_hosts: Vec<String>, allow_private: bool) -> Result<Self, EgressError> {
         let mut normalized = allow_hosts
@@ -128,11 +129,12 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let open = EgressPolicy::new(Vec::new(), true).unwrap().with_open_public(true);
+    /// let open = EgressPolicy::new(Vec::new(), true)?.with_open_public(true);
     /// assert!(open.check_url("https://www.destatis.de/DE/Home/").is_ok());
     /// assert!(open.check_url("http://127.0.0.1/").is_err());
     /// assert!(open.check_url("http://printer.local/").is_err());
-    /// assert!(EgressPolicy::new(Vec::new(), false).unwrap().check_url("https://example.org/").is_err());
+    /// assert!(EgressPolicy::new(Vec::new(), false)?.check_url("https://example.org/").is_err());
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     #[must_use]
     pub fn with_open_public(mut self, open: bool) -> Self {
@@ -198,12 +200,13 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::{EgressError, EgressPolicy};
     ///
-    /// let policy = EgressPolicy::new(vec!["docs.rs".into()], false).unwrap();
+    /// let policy = EgressPolicy::new(vec!["docs.rs".into()], false)?;
     /// assert!(policy.check_url("https://static.docs.rs/x.css").is_ok());
     /// assert!(matches!(
     ///     policy.check_url("https://evil.com\\@docs.rs/"),
     ///     Err(EgressError::HostNotAllowed { .. })
     /// ));
+    /// # Ok::<(), EgressError>(())
     /// ```
     pub fn check_url(&self, url: &str) -> Result<EgressUrl, EgressError> {
         let parsed = EgressUrl::parse(url)?;
@@ -236,9 +239,10 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let open = EgressPolicy::new(Vec::new(), true).unwrap();
-    /// assert!(open.check_addr("10.0.0.1:443".parse().unwrap()).is_ok());
-    /// assert!(open.check_addr("169.254.169.254:80".parse().unwrap()).is_err());
+    /// let open = EgressPolicy::new(Vec::new(), true)?;
+    /// assert!(open.check_addr("10.0.0.1:443".parse()?).is_ok());
+    /// assert!(open.check_addr("169.254.169.254:80".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn check_addr(&self, addr: SocketAddr) -> Result<(), EgressError> {
         let ip = addr.ip();
@@ -257,7 +261,9 @@ impl EgressPolicy {
     /// `allow_private` (`0`/`1`), die Anzahl der Einträge als `u64`
     /// little-endian, dann je Eintrag seine Länge als `u64` little-endian und
     /// seine Bytes. Die Längenpräfixe verhindern, dass `["ab","c"]` und
-    /// `["a","bc"]` kollidieren.
+    /// `["a","bc"]` kollidieren. Danach, nur wenn `open_public` gesetzt ist,
+    /// folgen die Bytes `\0open-public` (bestehende Digests bleiben dadurch
+    /// unverändert).
     ///
     /// # Returns
     /// 32 Bytes BLAKE3.
@@ -269,9 +275,10 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let strict = EgressPolicy::new(vec!["docs.rs".into()], false).unwrap();
-    /// let open = EgressPolicy::new(vec!["docs.rs".into()], true).unwrap();
+    /// let strict = EgressPolicy::new(vec!["docs.rs".into()], false)?;
+    /// let open = EgressPolicy::new(vec!["docs.rs".into()], true)?;
     /// assert_ne!(strict.digest(), open.digest());
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
@@ -756,6 +763,21 @@ mod tests {
         expected.extend_from_slice(&1_u64.to_le_bytes());
         expected.extend_from_slice(&7_u64.to_le_bytes());
         expected.extend_from_slice(b"docs.rs");
+        assert_eq!(p.digest(), *blake3::hash(&expected).as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn test_digest_matches_documented_encoding_with_open_public() -> TestResult {
+        let p = policy(&["docs.rs"], true)?.with_open_public(true);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"harw:egress-policy:v1\0");
+        expected.push(1);
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(&7_u64.to_le_bytes());
+        expected.extend_from_slice(b"docs.rs");
+        // Dokumentierter Zusatz: nur bei gesetztem open_public angehängt.
+        expected.extend_from_slice(b"\0open-public");
         assert_eq!(p.digest(), *blake3::hash(&expected).as_bytes());
         Ok(())
     }

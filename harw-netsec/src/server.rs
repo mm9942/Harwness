@@ -54,7 +54,7 @@ use crate::config::NetsecConfig;
 use crate::error::{NetsecError, NetsecResult};
 use crate::ids::parse_node_id;
 use crate::model::NodeRegistration;
-use crate::store::NetsecStore;
+use crate::store::{DIR_FSYNC_CONTEXT, NetsecStore};
 
 /// Response type of every handler.
 pub type NetsecResponse = Response<Full<Bytes>>;
@@ -212,6 +212,30 @@ impl From<NetsecError> for ApiError {
                 "capacity_exhausted",
                 message,
             ),
+            // The mutation itself committed (the rename over `state.json`
+            // returned `Ok`); only the follow-up directory `fsync` failed,
+            // so a crash right now might still lose the new directory
+            // entry. Answer with a code of its own instead of the generic
+            // `internal` below: a caller that gets plain `internal` cannot
+            // tell "nothing happened, retry" from "it happened, do not
+            // retry blindly" apart, and a retry of the same mutation is a
+            // conflict, not a no-op (see `store.rs`'s module doc).
+            // The store sets that `context` from the single
+            // `crate::store::DIR_FSYNC_CONTEXT`, so the two cannot drift apart.
+            NetsecError::Io {
+                context: DIR_FSYNC_CONTEXT,
+                source,
+            } => {
+                tracing::error!(
+                    error = %source,
+                    "state mutation committed, but the directory fsync that makes it durable across a crash failed"
+                );
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "durability_unconfirmed",
+                    "the request was applied, but the server could not confirm the change will survive a crash; check the resource before retrying, a retry of the same mutation is answered as a conflict",
+                )
+            }
             // Store, I/O and configuration failures may carry paths: log
             // them, answer generically.
             other => {
@@ -661,5 +685,34 @@ mod tests {
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.code(), "internal");
         assert!(!error.message.contains("/var/lib"));
+    }
+
+    /// A mutation whose rename already committed, but whose directory
+    /// `fsync` then failed, must get a code of its own: a caller that only
+    /// ever sees `internal` cannot tell "nothing happened" apart from "it
+    /// happened, do not retry blindly" (the finding this test guards).
+    #[test]
+    fn test_dir_fsync_failure_maps_to_durability_unconfirmed() {
+        let error = ApiError::from(NetsecError::Io {
+            context: DIR_FSYNC_CONTEXT,
+            source: std::io::Error::other("injected for test"),
+        });
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code(), "durability_unconfirmed");
+        assert_ne!(error.code(), "internal");
+        assert!(!error.message.contains("injected for test"));
+    }
+
+    /// Every other [`NetsecError::Io`] context (unrelated to the
+    /// directory-fsync-after-commit case above) must keep falling into the
+    /// generic, path-free `internal` answer.
+    #[test]
+    fn test_other_io_contexts_still_map_to_generic_internal() {
+        let error = ApiError::from(NetsecError::Io {
+            context: "bind socket",
+            source: std::io::Error::other("injected for test"),
+        });
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code(), "internal");
     }
 }

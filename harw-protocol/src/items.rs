@@ -103,7 +103,8 @@ impl ToolCallResult {
 /// use harw_protocol::items::ResultTrust;
 ///
 /// assert_eq!(ResultTrust::default(), ResultTrust::Untrusted);
-/// assert_eq!(serde_json::to_string(&ResultTrust::Runtime).unwrap(), "\"runtime\"");
+/// assert_eq!(serde_json::to_string(&ResultTrust::Runtime)?, "\"runtime\"");
+/// # Ok::<(), serde_json::Error>(())
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,9 +152,10 @@ pub struct ToolResultItem {
 ///     model: "claude-opus-5".to_owned(),
 ///     blocks: vec![serde_json::json!({"type": "redacted_thinking", "data": "..."})],
 /// };
-/// let json = serde_json::to_value(&reasoning).unwrap();
-/// let back: OpaqueReasoning = serde_json::from_value(json).unwrap();
+/// let json = serde_json::to_value(&reasoning)?;
+/// let back: OpaqueReasoning = serde_json::from_value(json)?;
 /// assert_eq!(back, reasoning);
+/// # Ok::<(), serde_json::Error>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

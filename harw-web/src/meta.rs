@@ -15,17 +15,25 @@
 //! [`WebRouteTable`] mindestens eine `Surface::Web`-Route haben — sortiert und
 //! ohne Duplikate. Die Liste ist **beschreibend, keine Autorität**: sie sagt
 //! nichts darüber, ob der anfragende Peer eine Operation aufrufen darf; das
-//! entscheidet weiterhin allein [`crate::router::decide_route`].
+//! entscheidet weiterhin [`crate::router::decide_resolved_route`] — der
+//! Prüfpfad, den der Server tatsächlich läuft ([`crate::router::decide_route`]
+//! ist derselbe Kern, nur mit einem [`crate::authz::PeerAuthorizer`] statt
+//! einer bereits aufgelösten Identität).
 //!
 //! # Autorisierung
 //! - `/v1/health` braucht **keine** Berechtigungsstufe: jeder, der den Socket
 //!   per `connect(2)` erreicht (Dateimodus/Gruppe des Sockets), darf die
-//!   Lebendigkeit abfragen — wie bei `harw-auth-hub`/`harw-netsec`.
+//!   Lebendigkeit abfragen — wie bei `harw-auth-hub`. `harw-netsec` ist hier
+//!   *kein* Vorbild: dessen Server lehnt jede Anfrage eines nicht per Uid
+//!   erlaubten Peers ab, auch `/v1/health` (`403 peer_not_allowed`, noch vor
+//!   der Dispatch-Entscheidung).
 //! - `/v1/version` und `/v1/capabilities` verlangen die **niedrigste** Stufe,
 //!   die die Routentabelle kennt ([`MINIMUM_DESCRIPTIVE_TIER`] =
 //!   [`PermissionTier::Observer`]), aufgelöst über denselben
-//!   [`crate::authz::PeerAuthorizer`] wie jede Route. Ein unbekannter Peer
-//!   bekommt `403 unknown_peer` — dieselbe Regel wie für `GET /events`.
+//!   [`crate::identity::LocalPeerIdentityResolver`] wie jede Route (der
+//!   Server ruft ihn für die Metaflächen über denselben `resolve_identity`-
+//!   Pfad wie für den Router). Ein unbekannter Peer bekommt
+//!   `403 unknown_peer` — dieselbe Regel wie für `GET /events`.
 //!
 //! # Reservierte Pfade
 //! Die Metapfade und `/events` werden vom Server vor der Routentabelle

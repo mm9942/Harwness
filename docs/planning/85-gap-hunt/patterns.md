@@ -104,6 +104,46 @@ Jeder Eintrag hat die gleichen Teile:
 - **Regel:** fs4-Locks mit klarer Übernahme-Regel, atomares Schreiben
   (temp + rename).
 
+### M9 — Zustand ohne Endübergang
+- **Erkennen:** Ein Zustand hat einen Eingang, aber keinen sicheren Ausgang.
+  Ein Job bleibt für immer `Running`, ein fertiger Worker gibt seinen Slot nie
+  frei, eine Zielschleife dreht ohne Abbruch, ein abgelaufener Lease wird nie
+  bereinigt.
+- **Regel:** Jede Zustandsmaschine nennt ihre Endzustände. Jeder Pfad, auch
+  Fehler, Abbruch und Neustart, führt in einen davon. Beim Start werden
+  verwaiste Zustände abgeglichen (reconcile).
+- **Werkzeug:** Tests pro Endübergang, dazu ein Neustart-Test mit einem
+  Zustand, der mitten im Lauf liegen geblieben ist.
+
+### M10 — Erst sichtbar, dann persistiert
+- **Erkennen:** Ein Prozess macht einen Zustand sichtbar (Speicher, Event,
+  Antwort), bevor er dauerhaft geschrieben ist. Nach Absturz oder Neustart
+  fehlt, was Clients schon gesehen haben. Beispiele: Speicher vor dem fsync
+  des Verzeichnisses, eine Session-ID nur im Speicher, ein Event-Bus ohne
+  dauerhaften Replay.
+- **Abgrenzung:** M8 betrifft mehrere Prozesse an einer Datei, M10 die
+  Reihenfolge in einem Prozess.
+- **Regel:** Erst schreiben, dann sichtbar machen. Wo das nicht geht, ist
+  „bestätigt, aber nicht dauerhaft“ ein eigener Fehlerfall, den Aufrufer
+  unterscheiden können.
+
+### Zuordnen statt NEW
+Finder taggen viele Funde als `NEW:<name>`, die schon ein Muster haben:
+- `unbounded-read`, `unbounded-line-read`, `unbounded-connections`,
+  `unbounded-event-buffer`, `unbounded-cache-growth`, `unbounded-await`,
+  `no-timeout`: **M5**.
+- `detached-sse-pump`, `detached-per-event-spawn`, `cancel-not-propagated`,
+  `dropped-future-state`, `lock-across-sleep`, `unsupervised-…-death`:
+  **M6**.
+- `insecure-temp-exec`, `predictable-temp-exec`: **M7**.
+- `stale-lock-takeover`, `unlocked multi-process writer`: **M8**.
+- `expired-lease-never-reconciled`, `non-idempotent-recovery`: **M9**.
+- `unpersisted-history-mutation`: **M10**.
+- `let-chain`, `third-party-type-in-public-api`, `unused-dependency`,
+  `dead-feature-flag`: **P8**. `pub-without-caller`: **P1**.
+
+Der Finder-Prompt nennt deshalb alle Kürzel mit je einem Erkennungssatz.
+
 ## Muster im Prozess
 
 ### P1 — Fixes erzeugen Folgefunde
@@ -191,3 +231,117 @@ Anteil der Funde, die die Prüfung überstehen:
 - M3 lässt sich günstig per grep bestätigen statt mit drei Modell-Prüfern.
 - `critical`/`high` von Opus-Findern brauchen einen Prüfer für Umfang und
   Risiko (scope), aber keinen Existenzbeweis.
+
+### P11 — Ein Workflow, eine Branch
+Alle Fixer im selben Arbeitsbaum heißt: Niemand darf committen, solange
+irgendein Fixer schreibt, der Baum ist stundenlang schmutzig, und ein Abbruch
+am Session-Limit hinterlässt halbe Edits mitten zwischen fertigen.
+
+**Gegenmittel:**
+- Jede schreibende Welle bekommt einen eigenen git-Worktree auf eigener Branch
+  und committet sofort nach ihrem Review.
+- Eine Integrations-Branch sammelt die Wellen per Merge; nur dort läuft der
+  zentrale Build.
+- Wellen bleiben dateidisjunkt. Wer Dateien einer früheren Welle berührt,
+  startet erst nach deren Merge.
+- Nach einem Abbruch die Welle mit **unverändertem** Skript fortsetzen
+  (resume): Fertige Agenten kommen aus dem Journal, fehlgeschlagene laufen
+  neu. Mit geändertem Skript gilt P12.
+
+Dasselbe Prinzip steckt in DEC-045 für harw selbst: ein Klon je Zellhost mit
+Merge-Barriere statt vieler Schreiber auf einem Workspace.
+
+### P12 — Resume trifft nur den unveränderten Präfix
+Ein Resume liefert nur den **längsten unveränderten Präfix** der Agent-Aufrufe
+aus dem Cache. Ab dem ersten geänderten oder neuen Aufruf läuft alles live,
+auch Fixer und Coder, die schon fertig waren. Beispiel: Eine Welle bekommt
+nachträglich einen Re-Review-Schritt, dann laufen nach dem ersten neuen
+Re-Review alle späteren Fixer ein zweites Mal. Die Edits landen dann doppelt
+oder werden überschrieben, und die Tokens sind verloren.
+
+**Gegenmittel:**
+- Schreibende Wellen nie auf geänderte Logik fortsetzen.
+- Einen fehlenden Schritt (etwa den Re-Review einer Reparatur) als eigenen
+  Agenten nachholen, mit Vertrag, Befund und Reparaturbericht aus dem Journal.
+- Prüfen, ob schon doppelt geschrieben wurde: die mtimes der Dateien mit dem
+  Resume-Zeitpunkt vergleichen.
+
+### P13 — Gegen die Basis prüfen, nicht gegen den gefixten Baum
+Werden Funde nachträglich geprüft, während ihre Fixes schon im Arbeitsbaum
+liegen, lesen die Prüfer den gefixten Code. Dann verwerfen sie echte Funde
+mit „ist schon behoben“. In R16 traf das drei von sechs nachgeprüften Funden.
+Alle drei waren auf HEAD echt.
+
+**Gegenmittel:** `gap-verify` bekommt `base`, den Commit, gegen den gefunden
+wurde. Die Prüfer lesen `git show <base>:<datei>`. „Im Arbeitsbaum schon
+behoben“ zählt als echt und wird als `fixed_in_tree` gemeldet.
+
+### P14 — Das Arbeitsverzeichnis wandert mit
+Wechselt die Hauptsession per `cd` in einen Worktree, wandert ihr
+Arbeitsverzeichnis mit. Jeder Agent, der danach startet und nur „das aktuelle
+Verzeichnis“ kennt, arbeitet im falschen Checkout:
+- Fixer schreiben in den fremden Worktree.
+- Reviewer sehen dort einen leeren Diff und melden „Fix fehlt“.
+- Die Reparatur folgt dem Pfad aus dem Review-Text und schreibt den Fix ein
+  zweites Mal, wieder im falschen Baum, auch wenn sie selbst im richtigen
+  Verzeichnis startet.
+
+In R16 traf das zwei kurze `cd`-Fenster. Betroffen waren etwa 15 Dateien aus
+sieben Wellen, darunter ein doppelter, byte-gleicher Fix und zwei
+verschiedene Fixes für denselben Fund.
+
+**Gegenmittel:**
+- Die Hauptsession wechselt nie per `cd` in einen Worktree, sondern nutzt
+  `git -C <pfad>` und absolute Pfade.
+- Schreibende Workflows verlangen `root`, auch für den Hauptbaum. Ohne
+  `root` brechen `gap-fix` und `contract-wave` ab.
+- Ein Wellen-Commit nimmt nur die benannten Dateien der Welle. Fremde
+  Änderungen im Worktree werden gemeldet und nach dem Ende aller Wellen
+  abgeglichen: Hat der Hauptbaum keinen Fix, wird verschoben; ist er gleich,
+  wird verworfen; sind beide verschieden, entscheidet ein Review.
+
+### P15 — Agenten schreiben ihren Auftrag in den Code
+Fixer übernehmen Wörter aus ihrem Auftrag in Kommentare: „Covers the brief's
+three cases“ oder „siehe Bericht des Fixer-Agents“. Der Leser findet weder den
+Auftrag noch den Bericht, und die Zahl im Satz stimmt oft nicht einmal.
+
+**Gegenmittel:** Die Fixer-Regeln verbieten Verweise auf Auftrag, Vertrag,
+Bericht, Welle oder Agent in Code und Doku. Ein `xtask`-Gate sucht nach
+diesen Wörtern.
+
+### P16 — Ripple konvergiert, aber nicht auf null
+Jede Ripple-Runde findet weniger, fast nur Doku. Ab und zu steckt aber ein
+echter Fehler darin, den der Ripple-Fix selbst eingeführt hat. In R16 fand
+die erste Runde nach `wa-egress` 11 Punkte, die zweite 9 und darin einen
+neuen Verhaltensfehler (ein Leerlaufzähler zählte ab Verbindungsbeginn). Nach
+`r16-w4` waren es 14 Punkte, zwei davon HIGH.
+
+**Gegenmittel:**
+- Ein Ripple-Befund blockiert die Welle (`rippleStatus = findings`).
+- Die zweite Runde läuft als Vertragswelle, deren Opus-Nachprüfung die
+  Querprüfung übernimmt. Danach folgt kein weiterer Ripple-Lauf.
+- Reine Doku-Punkte werden gesammelt statt einzeln gejagt.
+
+### P17 — Dieselbe Lösung dreimal
+Sicheres Öffnen einer Datei (kein Symlink, kein FIFO, Größe, Besitzer) haben
+`harw-authority`, `harw-security-hub` und `harw-tool-plan` je selbst gebaut,
+obwohl `harw_fsutil` es anbietet. Denselben Fehler (die euid als Besitzer von
+`/proc/self` lesen) hatten drei Crates. Die Ursache ist die Ein-Datei-Regel:
+Der Fixer darf `Cargo.toml` nicht ändern und baut deshalb lokal nach.
+
+**Gegenmittel:**
+- Finder- und Fixer-Prompts nennen die Workspace-Helfer.
+- Braucht ein Fix eine neue Abhängigkeit, geht er in eine Vertragswelle.
+
+### P18 — Reparatur ohne blockierenden Befund
+`contract-wave` startete für jedes Problem, das der Reviewer nannte, einen
+Reparatur-Agenten. Das galt auch nach `ok=true` und auch für Dateien außerhalb
+des Clusters, die der Reviewer ausdrücklich als „nur zur Info“ markiert hatte.
+Diese Änderungen hat nie jemand nachgeprüft: In `ripple-authz` traf es drei
+fremde Dateien, darunter 69 Zeilen Code.
+
+**Gegenmittel:**
+- Reparaturen laufen nur nach `ok=false` und nur an deklarierten Dateien.
+- Hinweise gehören in ein eigenes Feld `notes`.
+- Ein blockierendes Problem außerhalb des Clusters beendet den Cluster als
+  `unresolved`.

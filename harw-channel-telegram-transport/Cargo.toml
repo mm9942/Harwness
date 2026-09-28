@@ -19,8 +19,6 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1.53.0", features = ["rt", "macros", "time", "net"] }
 secrecy = "0.10"
-secrecy_08 = { version = "0.8", package = "secrecy" }
-backon = "1.6.0"
 axum = "0.8.9"
 # Ohne Versionspin, wie alle anderen Workspace-internen Pfad-Deps: eine Version
 # neben `path` ist für den lokalen Build redundant und wird bei einem
