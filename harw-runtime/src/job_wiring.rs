@@ -256,11 +256,21 @@ impl SessionJobs {
     /// Die Verwaltung und die Empfangsseite ihrer Meldungen; der Aufrufer
     /// startet [`spawn_forwarder`], sobald eine Tokio-Laufzeit läuft.
     ///
+    /// `max_running` ist `[jobs] max_running` (siehe
+    /// `harw_config::harness_config::JobsToml::effective_max_running`) und
+    /// wird zu `JobManagerConfig::max_running_jobs`.
+    ///
     /// # Errors
     /// Wenn das Job-Verzeichnis nicht angelegt werden kann.
-    pub fn open(state_dir: &Path) -> io::Result<(Self, mpsc::UnboundedReceiver<JobNotification>)> {
+    pub fn open(
+        state_dir: &Path,
+        max_running: u32,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<JobNotification>)> {
         let (notifier, receiver) = ChannelNotifier::channel();
-        let manager = JobManager::new(JobManagerConfig::new(state_dir), Arc::new(notifier))?;
+        let mut config = JobManagerConfig::new(state_dir);
+        // `[jobs] max_running` (1–256, beim Parsen geprüft); defensiv geklemmt.
+        config.max_running_jobs = usize::try_from(max_running.clamp(1, 256)).unwrap_or(16);
+        let manager = JobManager::new(config, Arc::new(notifier))?;
         Ok((
             Self {
                 manager,
@@ -447,6 +457,30 @@ mod tests {
             JobDelivery::Root
         );
         assert_eq!(router.take_root_notes().len(), 1);
+        Ok(())
+    }
+
+    /// `[jobs] max_running` landet unverändert in
+    /// `JobManagerConfig::max_running_jobs`.
+    #[test]
+    fn session_jobs_open_applies_configured_max_running() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (jobs, _rx) = SessionJobs::open(dir.path(), 3)?;
+        assert_eq!(jobs.manager.config().max_running_jobs, 3);
+        Ok(())
+    }
+
+    /// Werte außerhalb von 1..=256 werden defensiv geklemmt (die eigentliche
+    /// Prüfung liegt beim Parsen von `[jobs] max_running`).
+    #[test]
+    fn session_jobs_open_clamps_out_of_range_max_running() -> TestResult {
+        let dir_low = tempfile::tempdir()?;
+        let (jobs_low, _rx_low) = SessionJobs::open(dir_low.path(), 0)?;
+        assert_eq!(jobs_low.manager.config().max_running_jobs, 1);
+
+        let dir_high = tempfile::tempdir()?;
+        let (jobs_high, _rx_high) = SessionJobs::open(dir_high.path(), 1000)?;
+        assert_eq!(jobs_high.manager.config().max_running_jobs, 256);
         Ok(())
     }
 }

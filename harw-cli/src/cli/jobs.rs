@@ -5,11 +5,16 @@ use clap::{Subcommand, ValueHint};
 /// Aktionen des `harw jobs`-Subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum JobsAction {
-    /// Listet Aufträge auf, optional nach Status gefiltert.
+    /// Listet Aufträge auf. Ohne `--kind` nur die Übersicht je Art mit Zählern
+    /// pro Zustand; mit `--kind work|process` die Zeilen dieser Art.
     List {
-        /// Optionaler Filter, z. B. ein Status wie `offen`.
+        /// Optionaler Statusfilter, z. B. `running` oder `failed`.
         #[arg(value_hint = ValueHint::Other)]
         filter: Option<String>,
+        /// Art der Zeilen: `work` (Arbeitsaufträge) oder `process`
+        /// (Hintergrundprozesse aus `job.start`).
+        #[arg(long, value_parser = ["work", "process"])]
+        kind: Option<String>,
     },
     /// Zeigt Details zu einem Auftrag.
     Show {

@@ -8,6 +8,27 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Added
+- Tailscale access: `harw tailscale status` and `harw web --tailnet
+  [--tailnet-port]`. The control plane listens on the node's tailnet
+  address only, admits peers that `tailscaled` identifies via `whois`, and
+  gives every tailnet device the tier Operator through a dedicated
+  `tailnet.sock` (new crate `harw-tailscale`, `ForwardedPeerResolver` in
+  `harw-web`). See `docs/setup/tailscale.md`.
+
+### `harw update` installs updates
+
+- `harw update` checks the latest GitHub release and installs it: tarball
+  plus `SHA256SUMS`, checksum-verified, binaries replaced by rename with the
+  previous ones kept as `<name>.old`. Without a published release it updates
+  from the recorded sources (`git pull --ff-only` + `make install`, or the
+  archive's `scripts/install.sh`).
+- `--check` only checks (exit code 10 = newer release), `--yes` skips the
+  question, `--dismiss` hides the start notice for the known version.
+- The chat start names a newer version from `~/.harw/version.json` and, at
+  most every 20 hours, checks in the background (`HARW_NO_UPDATE_CHECK=1`
+  turns this off).
+
 ### One systemd source of truth (Crypto Masterplan v2 H10)
 
 - `deploy/` is the only source of system units, `sysusers.d` and

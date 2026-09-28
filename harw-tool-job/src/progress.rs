@@ -6,7 +6,10 @@
 //!   vcpkg `Installing n/m`/Phasen, npm/pip-Phasen, generisch `NN%`).
 //! - [`detect_severity`]: erkennt Fehler- (`error:`, `error[E…]`,
 //!   `fatal error`, `FAILED`, `panicked`, `npm ERR!`) und Warnzeilen
-//!   (`warning:`, `npm WARN`).
+//!   (`warning:`, `npm WARN`). Bestandene libtest-/doctest-Zeilen
+//!   (`test <pfad> ... ok`) zählen dabei nie als Fehler, auch wenn der
+//!   Testpfad `error::` oder einen Testnamen mit `panicked` enthält; und
+//!   `error::`/`warning::`-Pfadsegmente lösen den Marker nicht aus.
 //! - [`ProgressTracker`]: fasst Zeilen zu einem [`ProgressSnapshot`]
 //!   zusammen (zählt z. B. cargo-Schritte ohne bekannte Gesamtzahl).
 //!
@@ -498,10 +501,21 @@ fn generic_percent(line: &str) -> Option<ProgressUpdate> {
 /// Erkennt Fehler- und Warnzeilen.
 ///
 /// # Description
-/// Fehler: `error:` (jede Schreibweise, z. B. gcc `a.c:1:2: error:`,
-/// vcpkg `error:`, Python `ERROR:`), rustc `error[E…]`, `fatal error`,
-/// ninja/Tests `FAILED`, Rust `panicked`, `npm ERR!`. Warnungen:
-/// `warning:` (jede Schreibweise), `npm WARN`. Fehler gewinnen.
+/// Erkennt zuerst libtest-/doctest-Ergebniszeilen (`test <pfad> ... <ergebnis>`)
+/// und wertet nur deren Ergebnis aus (`FAILED` → Fehler, sonst — `ok`,
+/// `ignored`, Bench-Zeiten — kein Fund); der Testpfad selbst wird dabei nie
+/// nach Fehler-/Warn-Mustern durchsucht. Das verhindert, dass bestandene
+/// Tests aus einem Modul `error` (Pfad `error::tests::…`) oder mit einem
+/// Namen wie `..._panicked_message_...` fälschlich als Fehler zählen.
+///
+/// Für alle anderen Zeilen gilt, ohne den Testpfad-Sonderfall: Fehler:
+/// `error:` (jede Schreibweise, z. B. gcc `a.c:1:2: error:`, vcpkg `error:`,
+/// Python `ERROR:` — aber nicht `error::` als Pfadtrenner), rustc
+/// `error[E…]`, `fatal error`, ninja/Tests `FAILED`, eine echte
+/// Rust-Panic-Meldung (`… panicked at …` bzw. eine mit `thread '`
+/// beginnende Zeile mit `panicked`, nicht bloß das Wort im Testnamen),
+/// `npm ERR!`. Warnungen: `warning:` (jede Schreibweise, aber nicht
+/// `warning::` als Pfadtrenner), `npm WARN`. Fehler gewinnen.
 ///
 /// # Examples
 /// ```rust
@@ -510,21 +524,74 @@ fn generic_percent(line: &str) -> Option<ProgressUpdate> {
 /// assert_eq!(detect_severity("src/a.c:3:1: error: expected ';'"), Some(Severity::Error));
 /// assert_eq!(detect_severity("warning: unused variable `x`"), Some(Severity::Warning));
 /// assert_eq!(detect_severity("-Werror=format is set"), None);
+/// assert_eq!(detect_severity("test error::tests::x ... ok"), None);
 /// ```
 #[must_use]
 pub fn detect_severity(line: &str) -> Option<Severity> {
+    if let Some(result) = libtest_result_severity(line) {
+        return result;
+    }
     let lower = line.to_ascii_lowercase();
-    let is_error = lower.contains("error:")
+    let is_error = contains_marker(&lower, "error:")
         || lower.contains("error[e")
         || lower.contains("fatal error")
         || line.contains("FAILED")
-        || lower.contains("panicked")
+        || is_panic_line(line, &lower)
         || line.contains("npm ERR!");
     if is_error {
         return Some(Severity::Error);
     }
-    let is_warning = lower.contains("warning:") || line.contains("npm WARN");
+    let is_warning = contains_marker(&lower, "warning:") || line.contains("npm WARN");
     is_warning.then_some(Severity::Warning)
+}
+
+/// Erkennt eine libtest-/doctest-Ergebniszeile (`test <pfad> ... <ergebnis>`).
+///
+/// # Returns
+/// `None`, wenn die Zeile keine solche Ergebniszeile ist — dann greift die
+/// allgemeine Mustererkennung in [`detect_severity`]. `Some(_)` beendet die
+/// Erkennung sofort, ohne den Testpfad selbst zu durchsuchen: `Some(Some(_))`
+/// bei `FAILED`, sonst `Some(None)` (`ok`, `ignored`, Bench-Zeiten, …).
+fn libtest_result_severity(line: &str) -> Option<Option<Severity>> {
+    let rest = line.trim_start().strip_prefix("test ")?;
+    let (_, outcome) = rest.rsplit_once(" ... ")?;
+    if outcome.starts_with("FAILED") {
+        Some(Some(Severity::Error))
+    } else {
+        Some(None)
+    }
+}
+
+/// Prüft, ob `text` (bereits klein geschrieben) `needle` (z. B. `"error:"`)
+/// als eigenständigen Marker enthält statt als Teil eines Pfades wie
+/// `error::` oder eines Bezeichners: das Zeichen direkt nach `needle` darf
+/// kein `:` sein (schließt `error::`/`warning::` aus), und das Zeichen
+/// davor darf weder alphanumerisch noch `_` sein — `a.c:1:2: error:` bleibt
+/// dabei ein Treffer, da davor ein Leerzeichen steht.
+fn contains_marker(text: &str, needle: &str) -> bool {
+    for (index, _) in text.match_indices(needle) {
+        let after_ok = text[index + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c != ':');
+        let before_ok = text[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if after_ok && before_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Erkennt eine echte Rust-Panic-Meldung (`… panicked at …`), nicht bloß
+/// das Wort „panicked" irgendwo in der Zeile — z. B. in einem Testnamen wie
+/// `test_extraction_panicked_message_names_page` (der über
+/// [`libtest_result_severity`] ohnehin nicht hier ankommt, aber auch sonst
+/// nicht fälschlich zünden soll).
+fn is_panic_line(line: &str, lower: &str) -> bool {
+    lower.contains(" panicked at") || (line.starts_with("thread '") && lower.contains("panicked"))
 }
 
 #[cfg(test)]
@@ -695,6 +762,31 @@ mod tests {
             ("test error_handling ... ok", None),
             ("0 errors, 0 failures", None),
             ("all good", None),
+            // libtest-/doctest-Ergebniszeilen: bestandene Zeilen mit
+            // `error::`/`panicked` im Pfad sind kein Fund.
+            ("test error::tests::test_gone_classification ... ok", None),
+            (
+                "test error::tests::test_extraction_panicked_message_names_page ... ok",
+                None,
+            ),
+            (
+                "test harw-core/src/error.rs - error::HarwError (line 12) ... ok",
+                None,
+            ),
+            ("test foo::warning::tests::x ... ignored", None),
+            ("   Doc-tests harw_error", None),
+            // aber ein tatsächlicher Fehlschlag zählt weiterhin.
+            ("test error::tests::x ... FAILED", Some(Severity::Error)),
+            (
+                "thread 'error::tests::x' panicked at src/error.rs:3:5:",
+                Some(Severity::Error),
+            ),
+            (
+                "error: test failed, to rerun pass `-p foo --lib`",
+                Some(Severity::Error),
+            ),
+            ("warning: unused import", Some(Severity::Warning)),
+            ("src/a.c:1:2: warning: x", Some(Severity::Warning)),
         ];
         for (line, expected) in cases {
             assert_eq!(detect_severity(line), *expected, "line: {line:?}");

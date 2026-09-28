@@ -36,7 +36,10 @@ use crate::tui_event::TuiEvent;
 /// Flächen des zuletzt gezeichneten Frames für das Maus-Routing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrameRegions {
-    /// Das sichtbare Agenten-Panel (Liste oder Detailansicht).
+    /// Das sichtbare Agenten-Panel: entweder die breite Seitenspalte
+    /// (bzw. deren Detailansicht) oder der oben angedockte Portrait-Dock
+    /// schmaler, hoher Terminals. Für das Rad- und Tasten-Routing macht das
+    /// keinen Unterschied — beide sind nur eine Fläche.
     pub(crate) agents: Option<Rect>,
     /// Ein offener Dialog anstelle des Composers.
     pub(crate) dialog: Option<Rect>,
@@ -455,6 +458,83 @@ mod tests {
         assert!(
             shown.iter().any(|row| row.contains("❯ 1. Ja")),
             "Scrollen ändert die Auswahl nicht: {shown:?}"
+        );
+        Ok(())
+    }
+
+    /// Mausrad über dem oben angedockten Portrait-Dock (schmales, hohes
+    /// Terminal) scrollt den Dock, nicht den Verlauf; darunter (über dem
+    /// Chat) scrollt weiterhin der Verlauf. Gleiche Zusicherung wie
+    /// `wheel_over_the_panel_scrolls_the_panel_not_the_chat`, nur mit dem
+    /// Dock statt der breiten Seitenspalte.
+    #[test]
+    fn wheel_over_the_top_dock_scrolls_the_dock_not_the_chat() -> TestResult {
+        let mut app = test_chat_app()?;
+        for index in 0..60 {
+            running(
+                &mut app,
+                &format!("a{index:02}"),
+                &format!("rolle-{index:02}"),
+            );
+        }
+        for index in 0..100 {
+            app.push_line(Role::System, format!("Zeile-{index:03}"));
+        }
+        let _ = screen(&app, 80, 40)?;
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        assert_eq!(dock.y, 0, "der Dock ist oben angedockt");
+        assert_eq!(dock.width, 80, "der Dock nimmt die volle Breite ein");
+        assert!(app.scroll.is_following());
+
+        let over_dock = wheel(MouseEventKind::ScrollDown, dock.x + 2, dock.y + 1);
+        assert_eq!(route_scroll_input(&mut app, &over_dock), Some(true));
+        assert_eq!(app.agent_monitor.panel_scroll_offset(), WHEEL_LINES);
+        assert!(app.scroll.is_following(), "der Verlauf bleibt unberührt");
+
+        let below_dock = dock.y + dock.height + 1;
+        let over_chat = wheel(MouseEventKind::ScrollUp, 2, below_dock);
+        assert_eq!(route_scroll_input(&mut app, &over_chat), Some(true));
+        assert!(!app.scroll.is_following(), "der Verlauf scrollt");
+        assert_eq!(app.agent_monitor.panel_scroll_offset(), WHEEL_LINES);
+        Ok(())
+    }
+
+    /// `scroll_panel_down`/`scroll_panel_up` wirken auch dann auf den
+    /// Agenten-Monitor, wenn nur der oben angedockte Portrait-Dock (statt
+    /// der Seitenspalte) sichtbar ist; F3 (`agents_visible = false`) blendet
+    /// beide gleich aus, die Taste geht dann normal an den Composer weiter.
+    #[test]
+    fn scroll_panel_keys_reach_the_dock_when_it_is_the_only_visible_agents_area() -> TestResult {
+        let mut app = test_chat_app()?;
+        for index in 0..3 {
+            running(&mut app, &format!("a{index}"), &format!("rolle-{index}"));
+        }
+        let ctrl_down = TuiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+
+        let _ = screen(&app, 80, 40)?;
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        assert_eq!(dock.y, 0, "der Dock ist oben angedockt");
+        assert_eq!(route_scroll_input(&mut app, &ctrl_down), Some(true));
+        assert_eq!(app.agent_monitor.panel_scroll_offset(), 1);
+
+        // F3 blendet den Dock genau wie die Seitenspalte aus — die Taste
+        // geht dann normal an den Composer weiter (`None`).
+        app.panels.agents_visible = false;
+        let _ = screen(&app, 80, 40)?;
+        assert!(app.last_regions.get().agents.is_none(), "der Dock ist aus");
+        assert_eq!(route_scroll_input(&mut app, &ctrl_down), None);
+        assert_eq!(
+            app.agent_monitor.panel_scroll_offset(),
+            1,
+            "ohne sichtbaren Dock ändert sich der Versatz nicht"
         );
         Ok(())
     }

@@ -12,10 +12,18 @@
 //! Blockierendes `std::fs`; [`read_log`] läuft im Aufrufer über
 //! `spawn_blocking`, [`LogFollower::read_new`] liest je Aufruf höchstens
 //! [`FOLLOW_CHUNK_BYTES`].
+//!
+//! # Byte-Budget
+//! [`enforce_log_budget`] hält eine Logdatei bei einem Byte-Budget plus
+//! genau einer Markerzeile. Die Überwachung ruft es je Abfrageintervall
+//! auf; dazwischen kann die Datei bis zu einem Intervall an Ausgabe über
+//! das Budget wachsen. Ein abgelöster Job, der harw überlebt, wird danach
+//! nicht mehr gekürzt.
 
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// Höchstens so viele Bytes liest [`LogFollower::read_new`] je Aufruf.
@@ -160,6 +168,55 @@ pub fn tail_of_file(path: &Path, count: usize) -> Vec<String> {
         .skip(skip)
         .map(|line| clip_line(line, MAX_LINE_CHARS))
         .collect()
+}
+
+/// Markerzeile am Ende einer gekürzten Logdatei.
+pub(crate) fn truncation_marker(budget: u64) -> String {
+    format!("\n[harw] log truncated: {budget}-byte budget reached; later output discarded\n")
+}
+
+/// Hält eine Logdatei (vom Job mit `O_APPEND` beschrieben) bei `budget`
+/// Bytes plus genau einer Markerzeile.
+///
+/// # Description
+/// Beim ersten Überschreiten überschreibt die Markerzeile die Ausgabe ab
+/// Offset `budget`, danach wird die Datei direkt hinter dem Marker
+/// abgeschnitten. Ausgabe, die der Job danach noch anhängt, schneidet der
+/// nächste Aufruf (mit `already_truncated`) wieder ab; der Marker steht so
+/// immer genau einmal bei Offset `budget`. Die Datei wird ohne `append`
+/// geöffnet, weil `pwrite` auf einem `O_APPEND`-Deskriptor unter Linux
+/// ans Ende schreibt.
+///
+/// # Returns
+/// Ob die Datei danach gekürzt ist.
+///
+/// # Errors
+/// I/O-Fehler; eine fehlende Datei ist keiner (liefert `already_truncated`).
+pub(crate) fn enforce_log_budget(
+    path: &Path,
+    budget: u64,
+    already_truncated: bool,
+) -> io::Result<bool> {
+    let len = match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(already_truncated),
+        Err(err) => return Err(err),
+    };
+    let marker = truncation_marker(budget);
+    let capped = budget.saturating_add(u64::try_from(marker.len()).unwrap_or(u64::MAX));
+    if already_truncated {
+        if len > capped {
+            OpenOptions::new().write(true).open(path)?.set_len(capped)?;
+        }
+        return Ok(true);
+    }
+    if len <= budget {
+        return Ok(false);
+    }
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.write_all_at(marker.as_bytes(), budget)?;
+    file.set_len(capped)?;
+    Ok(true)
 }
 
 /// Abfrage für [`read_log`].
@@ -391,6 +448,81 @@ mod tests {
         write_lines(&path, &["1", "2", "3"])?;
         assert_eq!(tail_of_file(&path, 2), vec!["2".to_owned(), "3".to_owned()]);
         assert!(tail_of_file(&dir.path().join("missing"), 2).is_empty());
+        Ok(())
+    }
+
+    fn marker_count(content: &[u8], marker: &str) -> usize {
+        String::from_utf8_lossy(content).matches(marker).count()
+    }
+
+    fn marker_len(budget: u64) -> u64 {
+        u64::try_from(truncation_marker(budget).len()).unwrap_or(u64::MAX)
+    }
+
+    #[test]
+    fn test_budget_leaves_small_file_alone() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("out.log");
+        fs::write(&path, b"0123456789").map_err(ctx("write"))?;
+        let truncated = enforce_log_budget(&path, 100, false).map_err(ctx("enforce"))?;
+        assert!(!truncated);
+        assert_eq!(fs::read(&path).map_err(ctx("read"))?, b"0123456789");
+        Ok(())
+    }
+
+    #[test]
+    fn test_budget_truncates_once_with_marker() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("out.log");
+        fs::write(&path, vec![b'x'; 5000]).map_err(ctx("write"))?;
+        let truncated = enforce_log_budget(&path, 1000, false).map_err(ctx("enforce"))?;
+        assert!(truncated);
+        let marker = truncation_marker(1000);
+        let content = fs::read(&path).map_err(ctx("read"))?;
+        assert_eq!(
+            u64::try_from(content.len()).map_err(ctx("len"))?,
+            1000 + marker_len(1000)
+        );
+        assert!(content.ends_with(marker.as_bytes()));
+        assert_eq!(marker_count(&content, &marker), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_budget_recuts_growth_after_truncation() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("out.log");
+        fs::write(&path, vec![b'x'; 5000]).map_err(ctx("write"))?;
+        assert!(enforce_log_budget(&path, 1000, false).map_err(ctx("first cut"))?);
+
+        let mut appender = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(ctx("open append"))?;
+        appender
+            .write_all(&[b'y'; 500])
+            .map_err(ctx("append growth"))?;
+        drop(appender);
+
+        let truncated = enforce_log_budget(&path, 1000, true).map_err(ctx("second cut"))?;
+        assert!(truncated);
+        let marker = truncation_marker(1000);
+        let content = fs::read(&path).map_err(ctx("read"))?;
+        assert_eq!(
+            u64::try_from(content.len()).map_err(ctx("len"))?,
+            1000 + marker_len(1000)
+        );
+        assert!(content.ends_with(marker.as_bytes()));
+        assert_eq!(marker_count(&content, &marker), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_budget_missing_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("missing.log");
+        assert!(!enforce_log_budget(&path, 10, false).map_err(ctx("missing, fresh"))?);
+        assert!(enforce_log_budget(&path, 10, true).map_err(ctx("missing, cut"))?);
         Ok(())
     }
 

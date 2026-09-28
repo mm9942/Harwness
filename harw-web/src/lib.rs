@@ -163,9 +163,10 @@ pub use authz::{PeerAuthorizer, StaticUidTierMap, tier_permits};
 pub use error::{WebError, WebResult};
 pub use events::{WebEvent, WebEventBus, WebEventKind, WebEventReceiveError, WebEventSubscription};
 pub use identity::{
-    ContextVerifier, HubVerdict, IdentityConfigError, IdentityError, IdentityMode, IdentitySource,
-    LocalPeerIdentityResolver, ResolvedPeer, SECURITY_CONTEXT_HEADER, SecurityHubResolver,
-    TierMapResolver, UidTenantMap, VerifierError, WebIdentityConfig, presented_context,
+    ContextVerifier, ForwardedPeerResolver, HubVerdict, IdentityConfigError, IdentityError,
+    IdentityMode, IdentitySource, LocalPeerIdentityResolver, ResolvedPeer, SECURITY_CONTEXT_HEADER,
+    SecurityHubResolver, TierMapResolver, UidTenantMap, VerifierError, WebIdentityConfig,
+    presented_context,
 };
 pub use peer::{PeerCredentials, read_peer_credentials};
 pub use router::{

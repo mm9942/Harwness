@@ -10,9 +10,13 @@
 //! `shell.exec` desselben Agenten baut; damit verhalten sich Plan-Modus,
 //! Sandbox, Host-Lease und Voll-Zugriff identisch.
 //!
+//! Hinweise des Startwegs (z. B. Start ohne rlimits) wandern über
+//! [`PreparedLaunch`] in `meta.json` und als `JobEvent::Warning` zum Besitzer.
+//!
 //! # Nebenläufigkeit
-//! `Send + Sync`; [`JobLauncher::prepare`] kann auf eine Nutzerfreigabe
-//! warten (Host-Permit-Frage).
+//! `Send + Sync`; [`JobLauncher::prepare`] und
+//! [`JobLauncher::prepare_launch`] können auf eine Nutzerfreigabe warten
+//! (Host-Permit-Frage).
 
 use harw_tool_shell::ShellToolProvider;
 use harw_tools::{ToolExecutionContext, ToolOutput};
@@ -34,6 +38,19 @@ pub struct PreparedJob {
 pub type LaunchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PreparedJob, ToolOutput>> + Send + 'a>>;
 
+/// Ergebnis von [`JobLauncher::prepare_launch`]: geprüfter Prozess und Hinweise des Startwegs.
+#[derive(Debug)]
+pub struct PreparedLaunch {
+    /// Der geprüfte, noch nicht gestartete Prozess.
+    pub job: PreparedJob,
+    /// Hinweise für den Besitzer (z. B. Start ohne rlimits); nie Werte von Umgebungsvariablen.
+    pub warnings: Vec<String>,
+}
+
+/// Future von [`JobLauncher::prepare_launch`].
+pub type PreparedLaunchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PreparedLaunch, ToolOutput>> + Send + 'a>>;
+
 /// Prüft Rechte/Freigabe eines Job-Starts und baut den Prozess.
 pub trait JobLauncher: Send + Sync {
     /// # Arguments
@@ -49,6 +66,27 @@ pub trait JobLauncher: Send + Sync {
         command: &'a str,
         cpu_budget_secs: u64,
     ) -> LaunchFuture<'a>;
+
+    /// Dieselben Prüfungen wie [`JobLauncher::prepare`], zusätzlich mit den
+    /// Hinweisen des Startwegs; `job.start` nutzt diese Methode. Die
+    /// Vorgabe liefert keine Hinweise.
+    ///
+    /// # Errors
+    /// Wie [`JobLauncher::prepare`].
+    fn prepare_launch<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        command: &'a str,
+        cpu_budget_secs: u64,
+    ) -> PreparedLaunchFuture<'a> {
+        Box::pin(async move {
+            let job = self.prepare(context, command, cpu_budget_secs).await?;
+            Ok(PreparedLaunch {
+                job,
+                warnings: Vec::new(),
+            })
+        })
+    }
 }
 
 /// Produktiver Startweg über `harw-tool-shell` (siehe Moduldoku).
@@ -74,14 +112,31 @@ impl JobLauncher for ShellJobLauncher {
         cpu_budget_secs: u64,
     ) -> LaunchFuture<'a> {
         Box::pin(async move {
+            self.prepare_launch(context, command, cpu_budget_secs)
+                .await
+                .map(|launch| launch.job)
+        })
+    }
+
+    fn prepare_launch<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        command: &'a str,
+        cpu_budget_secs: u64,
+    ) -> PreparedLaunchFuture<'a> {
+        Box::pin(async move {
             let launch = self
                 .shell
                 .prepare_background_launch(context, command, crate::JOB_START_TOOL, cpu_budget_secs)
                 .await?;
             let executed_on_host = launch.executed_on_host();
-            Ok(PreparedJob {
-                command: launch.into_command(),
-                executed_on_host,
+            let (command, warnings) = launch.into_parts();
+            Ok(PreparedLaunch {
+                job: PreparedJob {
+                    command,
+                    executed_on_host,
+                },
+                warnings,
             })
         })
     }

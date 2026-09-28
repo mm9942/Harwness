@@ -87,6 +87,8 @@ fn test_field_table_exhaustive_harness_config() {
         agents: _,
         // Runde 5, Teil N: `[shell]`, eigener Abschnittstest unten.
         shell: _,
+        // `[jobs]`, eigener Abschnittstest unten.
+        jobs: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -737,6 +739,18 @@ fn test_field_table_exhaustive_shell_toml() {
     let harw_config::ShellToml { max_timeout_secs } = harw_config::ShellToml::default();
     let _ = max_timeout_secs;
     assert_path_in_field_table_exactly_once("shell.max_timeout_secs");
+}
+
+// ---------------------------------------------------------------------
+// [jobs] (1 Feld) — Höchstzahl laufender Hintergrund-Jobs
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_jobs_toml() {
+    let harw_config::harness_config::JobsToml { max_running } =
+        harw_config::harness_config::JobsToml::default();
+    let _ = max_running;
+    assert_path_in_field_table_exactly_once("jobs.max_running");
 }
 
 // ---------------------------------------------------------------------

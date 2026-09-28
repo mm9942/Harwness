@@ -196,7 +196,10 @@ pub fn model_tool_schema_for(name: &str, fallback: Option<JsonSchema>) -> JsonSc
 
     let property_types: &[(&str, JsonSchemaType)] = match name {
         "status" => &[],
-        "ps" => &[("status", JsonSchemaType::String)],
+        "ps" => &[
+            ("status", JsonSchemaType::String),
+            ("kind", JsonSchemaType::String),
+        ],
         "diff" => &[
             ("path", JsonSchemaType::String),
             ("stat_only", JsonSchemaType::Boolean),
@@ -1434,7 +1437,13 @@ mod tests {
 
         let expected_properties = [
             ("status", &[][..]),
-            ("ps", &[("status", JsonSchemaType::String)][..]),
+            (
+                "ps",
+                &[
+                    ("status", JsonSchemaType::String),
+                    ("kind", JsonSchemaType::String),
+                ][..],
+            ),
             (
                 "diff",
                 &[

@@ -1,0 +1,21 @@
+[package]
+publish.workspace = true
+name = "harw-tailscale"
+description = "Tailscale integration for harw: LocalAPI client (status, whois), tailnet address checks, an admission gate and a TCP-to-Unix-socket proxy for tailnet access to the control plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "sync", "macros", "io-util", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -35,6 +35,7 @@ pub mod error;
 pub mod migration;
 pub mod pathscope;
 pub mod platform;
+pub mod release;
 pub mod service;
 pub mod service_launchd;
 pub mod service_schtasks;
@@ -56,6 +57,7 @@ pub use error::{DoctorError, InstallError, MigrationError, PathError, ServiceErr
 pub use migration::{ConfigMigration, MigrationRunner};
 pub use pathscope::PathScope;
 pub use platform::{Os, Platform};
+pub use release::{ReleaseAsset, ReleaseError, ReleaseInfo, validate_release_archive};
 pub use service::{
     ServiceKind, ServiceManager, ServiceSpec, ServiceStatus, detect_service_manager,
 };

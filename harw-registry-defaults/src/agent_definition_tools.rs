@@ -2901,6 +2901,9 @@ mod agents_build_tests {
                 warnings: 0,
                 errors: 0,
                 launch_error: None,
+                stragglers_reaped: false,
+                log_truncated: false,
+                launch_warnings: Vec::new(),
             };
             Ok(harw_tool_job::JobStatus {
                 meta,

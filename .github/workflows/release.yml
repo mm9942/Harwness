@@ -4,10 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  # Re-run the release for an existing tag by hand (Actions tab or API).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, e.g. v0.8.0"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: harw
+  # The tag being released: the pushed tag, or the dispatch input.
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -16,6 +25,9 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # An experimental target may fail without holding back the release of
+    # the others.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,9 +38,26 @@ jobs:
           # Cross-compiled for the maintainer's Raspberry Pi (64-bit).
           - target: aarch64-unknown-linux-gnu
             use_cross: true
+          # Termux on Android phones. No killer: harw-killer needs Linux
+          # procfs and pidfd and refuses other target OSes at compile time.
+          - target: aarch64-linux-android
+            use_cross: true
+            packages: -p harw-cli
+            experimental: true
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      # The OS-keyring backend of harw-secrets links libdbus (keyring
+      # `sync-secret-service` -> libdbus-sys), as in ci.yml. Cross targets
+      # get it through Cross.toml.
+      - name: Install build dependencies
+        if: ${{ !matrix.use_cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       # Gepinnte Toolchain aus rust-toolchain.toml (wie in ci.yml). Ein
       # `dtolnay/rust-toolchain@stable` würde hier ins Leere laufen: rustup
@@ -53,31 +82,26 @@ jobs:
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
         run: |
-          cargo build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
+          cargo build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer' }} --target ${{ matrix.target }}
           cargo build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
         run: |
-          cross build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
+          cross build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer' }} --target ${{ matrix.target }}
           cross build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
 
+      # Same layout as `make release` (scripts/package-release.sh): one
+      # directory harw-<tag>-<target>/ with harw, killer and the
+      # `release-runner` harw-agent-runner (fat LTO, `panic = "abort"`),
+      # which `harw agent build` needs next to `harw`.
       - name: Package
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          stage="harw-${tag}-${{ matrix.target }}"
-          mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
-          cp "target/${{ matrix.target }}/release/killer" "$stage/"
-          # `release-runner` (fat LTO, one codegen unit, `panic = "abort"`,
-          # see the root Cargo.toml) — shipped next to `harw` so `harw agent
-          # build` finds it without a further download (Makefile `install`
-          # does the same for a from-source install).
-          cp "target/${{ matrix.target }}/release-runner/harw-agent-runner" "$stage/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
-          tar -czf "${stage}.tar.gz" "$stage"
+          stage="harw-${TAG}-${{ matrix.target }}"
+          scripts/package-release.sh "${TAG}" "${{ matrix.target }}" .
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          rm -f SHA256SUMS
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -109,6 +133,8 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.TAG }}
+          name: harw ${{ env.TAG }}
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
@@ -132,6 +158,8 @@ jobs:
       - name: Checkout
         if: env.R2_ACCOUNT_ID != ''
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Download artifacts
         if: env.R2_ACCOUNT_ID != ''
@@ -144,7 +172,7 @@ jobs:
         if: env.R2_ACCOUNT_ID != ''
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${TAG}"
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           s3() { aws s3 cp --endpoint-url "$endpoint" --only-show-errors "$@"; }
           cd dist

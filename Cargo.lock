@@ -2167,6 +2167,7 @@ version = "0.8.0"
 dependencies = [
  "clap",
  "clap_complete",
+ "getrandom 0.4.3",
  "harw-agent-artifact",
  "harw-agent-compiler",
  "harw-agent-dsl",
@@ -2178,8 +2179,10 @@ dependencies = [
  "harw-config",
  "harw-context",
  "harw-core",
+ "harw-dod-encrypt",
  "harw-extension-api",
  "harw-home",
+ "harw-infra-client",
  "harw-install",
  "harw-job-executor-bwrap",
  "harw-job-runtime",
@@ -2208,6 +2211,7 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tailscale",
  "harw-tool-doc",
  "harw-tool-lens",
  "harw-tui",
@@ -2849,12 +2853,14 @@ dependencies = [
 name = "harw-install"
 version = "0.8.0"
 dependencies = [
+ "flate2",
  "getrandom 0.4.3",
  "harw-config",
  "harw-home",
  "jiff",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "toml_edit",
 ]
 
@@ -3797,6 +3803,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tailscale"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-tool-browser"
 version = "0.8.0"
 dependencies = [
@@ -4058,6 +4075,7 @@ dependencies = [
  "harw-tool-plan",
  "harw-tool-shell",
  "harw-tools",
+ "harw-tui-layout",
  "harw-types",
  "jiff",
  "ratatui",
@@ -4072,6 +4090,10 @@ dependencies = [
  "unicode-width 0.2.0",
  "zeroize",
 ]
+
+[[package]]
+name = "harw-tui-layout"
+version = "0.8.0"
 
 [[package]]
 name = "harw-types"

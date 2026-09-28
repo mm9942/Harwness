@@ -100,6 +100,8 @@ layer = "F"
 # von harw-context/harw-tools/harw-extension-api (I) gebraucht.
 [packages."harw-lens-types"]
 layer = "F"
+[packages."harw-tui-layout"]
+layer = "F"
 
 # --- C: compiler domain ----------------------------------------------------
 [packages."harw-agent-dsl"]
@@ -367,6 +369,8 @@ layer = "A"
 [packages."harw-tool-web"]
 layer = "A"
 [packages."harw-tui"]
+layer = "A"
+[packages."harw-tailscale"]
 layer = "A"
 [packages."harw-web"]
 layer = "A"

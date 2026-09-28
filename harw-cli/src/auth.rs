@@ -2,9 +2,9 @@
 //! den Credential-Status anzeigen.
 //!
 //! Dieses Modul koppelt die I/O-freie `harw-oauth`-Schicht (PKCE, Token-Store)
-//! an das Terminal: es zeigt die Authorize-URL, liest Codes/Token von `stdin`,
-//! speichert den Token als 0600-Datei. Secrets werden nie geloggt oder
-//! ausgegeben.
+//! an das Terminal: es zeigt die Authorize-URL, liest Codes/Token von `stdin`
+//! und speichert den Token verschlüsselt im SecretStore (`secrets:<id>`), nie
+//! als Klartextdatei. Secrets werden nie geloggt oder ausgegeben.
 
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ pub fn run(home_override: Option<PathBuf>, action: AuthAction) -> Result<(), Str
         AuthAction::Import { source } => import(source.as_str()),
         AuthAction::Status => status(&home),
         AuthAction::Prune { provider } => prune(&home, provider.as_deref()),
+        AuthAction::Migrate { dry_run } => crate::auth_migrate::run(&home, dry_run),
     }
 }
 
@@ -186,15 +187,19 @@ fn anthropic_token_file_note(path: &Path) -> &'static str {
     }
 }
 
-/// Speichert den Token (0600), ohne ihn in einer Shell-Zeile auszugeben.
+/// Speichert den Token verschlüsselt im SecretStore (`secrets:<id>`) und
+/// zeigt nur die Referenz an, nie den Token selbst.
+///
+/// # Errors
+/// Config-Lesefehler oder ein fehlgeschlagener Store-Schreibvorgang (z. B.
+/// ein konfigurierter, aber nicht erreichbarer AuthHub); es entsteht dann
+/// keine Klartextdatei als Ersatz.
 fn persist_and_hint(home: &Path, provider: &str, token: &SecretString) -> Result<(), String> {
-    let secret_ref = harw_oauth::save_token(home, provider, token)
-        .map_err(|error| format!("Token speichern fehlgeschlagen: {error}"))?;
+    let layers = harw_home::config_layers(home).map_err(|error| error.to_string())?;
+    let config = harw_config::discover_config(&layers).map_err(|error| error.to_string())?;
+    let secret_ref = persist_token(home, &config, provider, token)?;
 
-    eprintln!(
-        "\n✓ Token gespeichert (0600): {}",
-        secret_ref.as_ref_string()
-    );
+    eprintln!("\n✓ Token verschlüsselt gespeichert: {secret_ref}");
     eprintln!(
         "\nDer Token wurde nicht ausgegeben. Aktiviere ihn über eine sichere, \
             nicht protokollierte Shell-Eingabe."
@@ -204,6 +209,31 @@ fn persist_and_hint(home: &Path, provider: &str, token: &SecretString) -> Result
          damit Harw das Secret verwendet."
     );
     Ok(())
+}
+
+/// Legt den Token als `<provider>-oauth-token` im SecretStore ab und liefert
+/// die Referenz `secrets:<id>`.
+///
+/// Versiegelt wird über AuthHub (V3), wenn `[infrastructure].auth_socket`
+/// gesetzt ist, sonst lokal (V2) unter dem KEK des Homes. Es gibt keinen
+/// Klartext-Fallback.
+///
+/// # Errors
+/// Die Store-Fehlermeldung mit Präfix; sie nennt nie den Token-Wert.
+fn persist_token(
+    home: &Path,
+    config: &harw_config::ResolvedConfig,
+    provider: &str,
+    token: &SecretString,
+) -> Result<harw_config::SecretRef, String> {
+    crate::secret_store::store_secret(
+        home,
+        config,
+        &format!("{provider}-oauth-token"),
+        "provider authentication",
+        token,
+    )
+    .map_err(|error| format!("Token speichern fehlgeschlagen: {error}"))
 }
 
 /// Importiert lokale Credentials und zeigt die nutzbare Referenz an.
@@ -511,7 +541,11 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use super::persist_token;
     use super::{anthropic_token_file_note, check_anthropic_token_format, looks_like_jwt};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn jwt_like_values_are_rejected_for_openai_platform_auth() {
@@ -521,5 +555,133 @@ mod tests {
         assert!(!looks_like_jwt("sk-proj-example"));
         assert!(!looks_like_jwt("not.a.jwt.with.four.parts"));
         assert!(!looks_like_jwt("missing..segment"));
+    }
+
+    /// Sammelt rekursiv alle regulären Dateien unter `dir`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn files_below(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> TestResult {
+        for entry in std::fs::read_dir(dir).map_err(ctx("read directory"))? {
+            let path = entry.map_err(ctx("directory entry"))?.path();
+            if path.is_dir() {
+                files_below(&path, out)?;
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn persist_token_stores_encrypted_and_writes_no_token_file() -> TestResult {
+        use secrecy::ExposeSecret as _;
+
+        let home = tempfile::TempDir::new().map_err(ctx("temporary home"))?;
+        let config = harw_config::ResolvedConfig::default();
+        let raw = "sk-ant-oat01-persist-token-test-value";
+        let token = secrecy::SecretString::from(raw.to_owned());
+
+        let secret_ref = persist_token(home.path(), &config, "anthropic", &token)
+            .map_err(ctx("persist token"))?;
+        let harw_config::SecretRef::Secrets(id) = &secret_ref else {
+            return Err(TestError::Unexpected(format!(
+                "expected secrets: reference, got {secret_ref}"
+            )));
+        };
+        assert!(uuid_like(id), "secret id is not a UUID: {id}");
+        assert!(
+            !home
+                .path()
+                .join("secrets")
+                .join("anthropic-oauth.token")
+                .exists()
+        );
+
+        let mut files = Vec::new();
+        files_below(home.path(), &mut files)?;
+        for file in &files {
+            let bytes = std::fs::read(file).map_err(ctx("read home file"))?;
+            assert!(
+                !bytes
+                    .windows(raw.len())
+                    .any(|window| window == raw.as_bytes()),
+                "plaintext token found in {}",
+                file.display()
+            );
+        }
+
+        let auth_raw = std::fs::read_to_string(harw_home::auth_path(home.path()))
+            .map_err(ctx("read bootstrapped auth.toml"))?;
+        let auth: harw_config::AuthConfig =
+            toml::from_str(&auth_raw).map_err(ctx("parse bootstrapped auth.toml"))?;
+        let mut reloaded = harw_config::ResolvedConfig {
+            auth,
+            ..harw_config::ResolvedConfig::default()
+        };
+        reloaded.providers.insert(
+            "anthropic".to_owned(),
+            toml::from_str::<harw_config::ProviderToml>(&format!(
+                "name = \"anthropic\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"{secret_ref}\"\n"
+            ))
+            .map_err(ctx("valid test provider"))?,
+        );
+        let resolver = crate::secret_store::open_configured_secret_resolver(home.path(), &reloaded)
+            .map_err(ctx("open configured resolver"))?
+            .ok_or(TestError::Missing("sealed resolver"))?;
+        let resolved = harw_provider_http::SecretResolver::resolve(&resolver, id)
+            .map_err(ctx("resolve stored token"))?;
+        assert_eq!(resolved.expose_secret(), token.expose_secret());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn persist_token_fails_closed_when_hub_unreachable() -> TestResult {
+        let home = tempfile::TempDir::new().map_err(ctx("temporary home"))?;
+        let socket_dir = tempfile::TempDir::new().map_err(ctx("temporary socket dir"))?;
+        let config = harw_config::ResolvedConfig {
+            infrastructure: Some(harw_config::InfrastructureSection {
+                auth_socket: Some(socket_dir.path().join("missing.sock")),
+                ..harw_config::InfrastructureSection::default()
+            }),
+            ..harw_config::ResolvedConfig::default()
+        };
+        let token = secrecy::SecretString::from("sk-ant-oat01-unreachable-hub".to_owned());
+
+        let result = persist_token(home.path(), &config, "anthropic", &token);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "unreachable hub must fail the write".into(),
+            ));
+        };
+        assert!(!error.contains("unreachable-hub"), "{error}");
+        assert!(
+            !home
+                .path()
+                .join("secrets")
+                .join("anthropic-oauth.token")
+                .exists()
+        );
+        let records = home.path().join("sealed-secrets").join("secrets");
+        if records.is_dir() {
+            let count = std::fs::read_dir(&records)
+                .map_err(ctx("read sealed records"))?
+                .count();
+            assert_eq!(count, 0, "no record may be written without the hub");
+        }
+        Ok(())
+    }
+
+    /// `true` für die Textform einer UUID (8-4-4-4-12 Hex-Ziffern).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn uuid_like(value: &str) -> bool {
+        let groups: Vec<&str> = value.split('-').collect();
+        groups.len() == 5
+            && groups
+                .iter()
+                .zip([8_usize, 4, 4, 4, 12])
+                .all(|(group, len)| {
+                    group.len() == len && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
     }
 }

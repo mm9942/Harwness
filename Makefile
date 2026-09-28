@@ -31,7 +31,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
 .PHONY: help clippy-tests clippy tests fmt check build install uninstall service gates \
-	dod-build dod-install dod-enable dod-uninstall
+	dod-build dod-install dod-enable dod-uninstall release release-publish
 
 .DEFAULT_GOAL := help
 
@@ -62,8 +62,13 @@ fmt: ## Format check without changing anything
 check: ## Fast type check of the whole workspace
 	$(CARGO) check --workspace --all-features
 
-build: ## Release-build harw, killer and the agent runner
-	$(CARGO) build --release --bin harw --bin killer
+# killer needs Linux procfs and pidfd (compile_error! elsewhere). Termux on
+# Android reports `uname -o` = Android and builds harw + the runner only.
+HOST_IS_ANDROID := $(filter Android,$(shell uname -o 2>/dev/null))
+HOST_BINS = --bin harw $(if $(HOST_IS_ANDROID),,--bin killer)
+
+build: ## Release-build harw, killer (not on Android) and the agent runner
+	$(CARGO) build --release $(HOST_BINS)
 	$(CARGO) build --profile release-runner --bin harw-agent-runner
 
 # HARW_HOME follows the same default the Rust side uses (harw-home::paths,
@@ -86,11 +91,11 @@ HARW_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
 
 install: build ## Install harw, killer and the agent runner into BINDIR (default ~/.local/bin)
 	install -Dm755 target/release/harw $(BINDIR)/harw
-	install -Dm755 target/release/killer $(BINDIR)/killer
+	$(if $(HOST_IS_ANDROID),,install -Dm755 target/release/killer $(BINDIR)/killer)
 	install -Dm755 target/release-runner/harw-agent-runner $(BINDIR)/harw-agent-runner
 	install -Dm755 target/release-runner/harw-agent-runner \
 		"$(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
-	@echo "Installed $(BINDIR)/harw, $(BINDIR)/killer and $(BINDIR)/harw-agent-runner"
+	@echo "Installed $(BINDIR)/harw, $(if $(HOST_IS_ANDROID),,$(BINDIR)/killer and )$(BINDIR)/harw-agent-runner"
 	@echo "Runner copy: $(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
 	@case ":$$PATH:" in \
 		*":$(BINDIR):"*) ;; \
@@ -98,6 +103,27 @@ install: build ## Install harw, killer and the agent runner into BINDIR (default
 	esac
 	$(BINDIR)/harw agent install-record --source-dir $(CURDIR) --bindir $(BINDIR)
 	$(BINDIR)/harw agent auto-build-uia || true
+
+# Release tarballs in the layout `harw update` and `install.sh --binary` read
+# (scripts/package-release.sh). RELEASE_TARGET defaults to the host;
+# another target needs its Rust target and linker installed (or run the
+# same two builds under `cross`).
+RELEASE_TARGET ?= $(HARW_HOST_TARGET)
+RELEASE_TAG ?= v$(HARW_VERSION)
+DIST ?= dist
+
+# killer needs Linux procfs and pidfd; Android targets build harw only.
+RELEASE_PACKAGES = -p harw-cli $(if $(findstring android,$(RELEASE_TARGET)),,-p harw-killer)
+
+release: ## Build and package a release tarball + SHA256SUMS into $(DIST)/ (RELEASE_TARGET, RELEASE_TAG)
+	$(CARGO) build --release --locked $(RELEASE_PACKAGES) --target $(RELEASE_TARGET)
+	$(CARGO) build --profile release-runner --locked -p harw-agent-runner --target $(RELEASE_TARGET)
+	scripts/package-release.sh $(RELEASE_TAG) $(RELEASE_TARGET) $(DIST)
+
+release-publish: ## Create the GitHub release $(RELEASE_TAG) from $(DIST)/ (needs the gh CLI, logged in)
+	@ls $(DIST)/*.tar.gz $(DIST)/SHA256SUMS >/dev/null
+	gh release create $(RELEASE_TAG) $(DIST)/*.tar.gz $(DIST)/SHA256SUMS \
+		--title "harw $(RELEASE_TAG)" --notes "See CHANGELOG.md for $(RELEASE_TAG)."
 
 uninstall: ## Remove harw, killer and the agent runner from BINDIR, plus the regenerable agent-build cache
 	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-agent-runner

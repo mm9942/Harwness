@@ -10,14 +10,17 @@ pub enum AuthAction {
     /// Setup-Token per PKCE-Paste-Flow beschaffen und hinterlegen.
     ///
     /// Zeigt die Authorize-URL, nimmt den zurückgegebenen Code auf `stdin`
-    /// entgegen, tauscht ihn gegen den Token, speichert ihn (0600) und druckt
-    /// die `export CLAUDE_CODE_OAUTH_TOKEN=…`-Zeile.
+    /// entgegen, tauscht ihn gegen den Token, legt ihn verschlüsselt im
+    /// SecretStore ab und zeigt die `secrets:`-Referenz an (nie den Wert).
     Login {
         /// Provider (derzeit nur `anthropic`).
         #[arg(value_enum, default_value_t = LoginProvider::Anthropic)]
         provider: LoginProvider,
     },
     /// Setup-Token direkt setzen (Alternative zum API-Key). Liest von `stdin`.
+    ///
+    /// Legt den Token verschlüsselt im SecretStore ab und zeigt die
+    /// `secrets:`-Referenz an (nie den Wert).
     Token {
         /// Provider (derzeit nur `anthropic`).
         #[arg(value_enum, default_value_t = TokenProvider::Anthropic)]
@@ -43,4 +46,56 @@ pub enum AuthAction {
         /// Provider-Id (z. B. `openai`); ohne Angabe alle Pools.
         provider: Option<String>,
     },
+    /// Klartext-Secret-Referenzen in den verschlüsselten SecretStore überführen.
+    ///
+    /// Deckt `auth` in `<home>/providers/*.toml` und `<profile>/providers/*.toml`
+    /// sowie `credential_pool`-Einträge in `<home>/auth.toml` und
+    /// `<profile>/auth.toml` ab: `file:`/`file-json:`/`env:` werden kopiert und
+    /// auf `secrets:<id>` umgeschrieben; Codex-Login-Verweise bleiben. Nur von
+    /// Harw angelegte Dateien unter `<home>/secrets/` werden gelöscht. Gibt nie
+    /// einen Wert aus.
+    Migrate {
+        /// Nur den Plan anzeigen, nichts ändern.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use crate::cli::{AuthAction, Cli, Command};
+    use crate::test_support::{TestResult, ctx};
+
+    #[test]
+    fn auth_migrate_parses_with_and_without_dry_run() -> TestResult {
+        let plain =
+            Cli::try_parse_from(["harw", "auth", "migrate"]).map_err(ctx("auth migrate"))?;
+        assert!(
+            matches!(
+                plain.command,
+                Some(Command::Auth {
+                    action: AuthAction::Migrate { dry_run: false },
+                    ..
+                })
+            ),
+            "{:?}",
+            plain.command
+        );
+        let dry = Cli::try_parse_from(["harw", "auth", "migrate", "--dry-run"])
+            .map_err(ctx("auth migrate --dry-run"))?;
+        assert!(
+            matches!(
+                dry.command,
+                Some(Command::Auth {
+                    action: AuthAction::Migrate { dry_run: true },
+                    ..
+                })
+            ),
+            "{:?}",
+            dry.command
+        );
+        Ok(())
+    }
 }

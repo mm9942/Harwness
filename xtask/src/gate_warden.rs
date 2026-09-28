@@ -1395,6 +1395,21 @@ fn target_fact(key: &str) -> Option<&'static str> {
     }
 }
 
+/// Ob `target_has_atomic = "<breite>"` auf dem Zielsystem gilt.
+///
+/// # Description
+/// `target_has_atomic` ist ein mehrwertiger Schlüssel: auf
+/// `x86_64-unknown-linux-gnu` gelten `8`, `16`, `32`, `64` und `ptr`
+/// gleichzeitig, `128` nicht. Ohne diese Auswertung gälte etwa
+/// `cfg(not(target_has_atomic = "ptr"))` (jiffs Abhängigkeit auf
+/// `portable-atomic`) fälschlich als aktiv, und das Gate suchte Quellen von
+/// Crates, die auf diesem Ziel nie gebaut und deshalb auf frischen
+/// CI-Runnern auch nie entpackt werden.
+#[must_use]
+fn target_has_atomic(width: &str) -> bool {
+    matches!(width, "8" | "16" | "32" | "64" | "ptr")
+}
+
 /// Wertet einen geparsten `cfg(...)`-Ausdruck gegen das Zielsystem aus
 /// (siehe [`target_fact`]).
 ///
@@ -1408,6 +1423,7 @@ fn target_fact(key: &str) -> Option<&'static str> {
 fn eval_cfg(expr: &CfgExpr) -> bool {
     match expr {
         CfgExpr::Flag(name) => name == "unix",
+        CfgExpr::Eq(key, value) if key == "target_has_atomic" => target_has_atomic(value),
         CfgExpr::Eq(key, value) => target_fact(key) == Some(value.as_str()),
         CfgExpr::Any(items) => items.iter().any(eval_cfg),
         CfgExpr::All(items) => items.iter().all(eval_cfg),
@@ -2746,6 +2762,17 @@ mod tests {
             "cfg(all(unix, target_arch = \"wasm32\"))"
         ));
         assert!(cfg_predicate_matches_target("cfg(not(windows))"));
+        // Mehrwertiger Schlüssel: jiffs `portable-atomic`-Kante gilt auf
+        // x86_64 nicht.
+        assert!(!cfg_predicate_matches_target(
+            "cfg(not(target_has_atomic = \"ptr\"))"
+        ));
+        assert!(cfg_predicate_matches_target(
+            "cfg(target_has_atomic = \"64\")"
+        ));
+        assert!(!cfg_predicate_matches_target(
+            "cfg(target_has_atomic = \"128\")"
+        ));
     }
 
     #[test]
