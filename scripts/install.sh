@@ -15,16 +15,23 @@ case "${1:-}" in
   -h|--help)
     cat <<'EOF'
 Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
-       bash scripts/install.sh [--source]
+       curl -fsSL https://get.harw.dev/harw/install.sh | bash -s -- --binary
+       bash scripts/install.sh [--source | --binary]
 
 The piped installer downloads and extracts Harwness-main.zip, installs
 Rustup with the stable default toolchain when needed, installs missing
 Linux build dependencies including Bubblewrap, then runs make install.
 
-Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME.
+--binary installs harw, killer and harw-agent-runner from a GitHub release
+instead (no Rust toolchain): it downloads harw-<tag>-<target>.tar.gz and
+SHA256SUMS, refuses a tarball whose checksum does not match or that lacks a
+binary, and only then replaces an existing installation.
+
+Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME,
+HARW_RELEASE_TAG (default: the latest release), HARW_RELEASES_URL.
 EOF
     exit 0 ;;
-  ''|--source) ;;
+  ''|--source|--binary) ;;
   *) die "unknown argument: $1 (see --help)" ;;
 esac
 [ "$#" -le 1 ] || die "too many arguments (see --help)"
@@ -144,6 +151,84 @@ archive_hash() {
     die "sha256sum or shasum is required to identify the source archive"
   fi
 }
+
+# Release target of this machine: the Rust target triple the release
+# workflow builds for (Termux on Android reports "Android" as its OS).
+release_target() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    *) die "no release build for architecture $arch; use the source installer" ;;
+  esac
+  if [ "$(uname -o 2>/dev/null)" = Android ]; then
+    printf '%s-linux-android\n' "$arch"
+  else
+    printf '%s-unknown-linux-gnu\n' "$arch"
+  fi
+}
+
+# Tag of the latest release, read from the redirect of /releases/latest.
+latest_release_tag() {
+  local url
+  command -v curl >/dev/null 2>&1 || die "curl is required to find the latest release (or set HARW_RELEASE_TAG)"
+  url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$releases_url/latest")" \
+    || die "no release found at $releases_url (or set HARW_RELEASE_TAG)"
+  case "$url" in
+    */tag/v*) printf '%s\n' "${url##*/tag/}" ;;
+    *) die "no published release yet at $releases_url; use the source installer" ;;
+  esac
+}
+
+install_binary_release() {
+  local target tag name work_dir unpacked binary runner_dir
+  target="$(release_target)"
+  tag="${HARW_RELEASE_TAG:-$(latest_release_tag)}"
+  name="harw-$tag-$target"
+  work_dir="$(mktemp -d)"
+  trap 'rm -rf "$work_dir"' EXIT
+  log "Downloading $name.tar.gz"
+  fetch "$releases_url/download/$tag/$name.tar.gz" "$work_dir/$name.tar.gz"
+  fetch "$releases_url/download/$tag/SHA256SUMS" "$work_dir/SHA256SUMS"
+  (
+    cd "$work_dir"
+    grep -E "^[0-9a-fA-F]{64}[[:space:]]+\*?(\./)?$name\.tar\.gz\$" SHA256SUMS > "$name.sha256" \
+      || die "SHA256SUMS of $tag has no entry for $name.tar.gz"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum -c "$name.sha256" >/dev/null
+    else
+      shasum -a 256 -c "$name.sha256" >/dev/null
+    fi
+  ) || die "checksum of $name.tar.gz does not match SHA256SUMS; nothing installed"
+  tar -xzf "$work_dir/$name.tar.gz" -C "$work_dir"
+  unpacked="$work_dir/$name"
+  [ -d "$unpacked" ] || unpacked="$work_dir"
+  # killer is Linux-only (procfs, pidfd); Android releases ship without it.
+  binaries="harw harw-agent-runner"
+  case "$target" in *-android) ;; *) binaries="$binaries killer" ;; esac
+  for binary in $binaries; do
+    [ -f "$unpacked/$binary" ] || die "$name.tar.gz has no $binary; nothing installed"
+  done
+  mkdir -p "$install_dir"
+  for binary in $binaries; do
+    install -m 0755 "$unpacked/$binary" "$install_dir/$binary"
+  done
+  runner_dir="${HARW_HOME:-$HOME/.harw}/bin/.runners/$target/${tag#v}"
+  mkdir -p "$runner_dir"
+  install -m 0755 "$unpacked/harw-agent-runner" "$runner_dir/harw-agent-runner"
+  "$install_dir/harw" agent install-record --bindir "$install_dir" \
+    || log "could not record the installation; harw update falls back to the running binary's directory"
+  log "Harwness $tag installed into $install_dir"
+  "$install_dir/harw" --version
+  printf '%s\n' 'Next: harw doctor; then harw to start onboarding.'
+}
+
+releases_url="${HARW_RELEASES_URL:-https://github.com/mm9942/Harwness/releases}"
+if [ "${1:-}" = --binary ]; then
+  install_binary_release
+  exit 0
+fi
 
 checkout=""
 if [ "${1:-}" = --source ]; then

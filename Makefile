@@ -31,7 +31,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
 .PHONY: help clippy-tests clippy tests fmt check build install uninstall service gates \
-	dod-build dod-install dod-enable dod-uninstall
+	dod-build dod-install dod-enable dod-uninstall release release-publish
 
 .DEFAULT_GOAL := help
 
@@ -98,6 +98,27 @@ install: build ## Install harw, killer and the agent runner into BINDIR (default
 	esac
 	$(BINDIR)/harw agent install-record --source-dir $(CURDIR) --bindir $(BINDIR)
 	$(BINDIR)/harw agent auto-build-uia || true
+
+# Release tarballs in the layout `harw update` and `install.sh --binary` read
+# (scripts/package-release.sh). RELEASE_TARGET defaults to the host;
+# another target needs its Rust target and linker installed (or run the
+# same two builds under `cross`).
+RELEASE_TARGET ?= $(HARW_HOST_TARGET)
+RELEASE_TAG ?= v$(HARW_VERSION)
+DIST ?= dist
+
+# killer needs Linux procfs and pidfd; Android targets build harw only.
+RELEASE_PACKAGES = -p harw-cli $(if $(findstring android,$(RELEASE_TARGET)),,-p harw-killer)
+
+release: ## Build and package a release tarball + SHA256SUMS into $(DIST)/ (RELEASE_TARGET, RELEASE_TAG)
+	$(CARGO) build --release --locked $(RELEASE_PACKAGES) --target $(RELEASE_TARGET)
+	$(CARGO) build --profile release-runner --locked -p harw-agent-runner --target $(RELEASE_TARGET)
+	scripts/package-release.sh $(RELEASE_TAG) $(RELEASE_TARGET) $(DIST)
+
+release-publish: ## Create the GitHub release $(RELEASE_TAG) from $(DIST)/ (needs the gh CLI, logged in)
+	@ls $(DIST)/*.tar.gz $(DIST)/SHA256SUMS >/dev/null
+	gh release create $(RELEASE_TAG) $(DIST)/*.tar.gz $(DIST)/SHA256SUMS \
+		--title "harw $(RELEASE_TAG)" --notes "See CHANGELOG.md for $(RELEASE_TAG)."
 
 uninstall: ## Remove harw, killer and the agent runner from BINDIR, plus the regenerable agent-build cache
 	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-agent-runner

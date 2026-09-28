@@ -68,6 +68,7 @@ mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
 mod uia_bootstrap;
+mod update_cmd;
 mod verify_sandbox;
 mod web;
 mod worker_cancellation;
@@ -516,6 +517,9 @@ pub fn main_entry() -> ExitCode {
     // den Start nie; ein Fehlschlag erscheint einmal als Hinweis).
     if tui_active {
         auto_build::on_start(cli.global.home.clone());
+        // Hinweis auf eine neuere Version aus `version.json`; bei Bedarf
+        // prüft `harw update --check` losgelöst im Hintergrund.
+        update_cmd::on_start(cli.global.home.clone());
     }
     let code = match dispatch(cli) {
         Ok(()) => 0,
@@ -873,7 +877,18 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
-        Some(Command::Update { check }) => lifecycle::update(home_override, check),
+        Some(Command::Update {
+            check,
+            yes,
+            dismiss,
+        }) => update_cmd::run(
+            home_override,
+            update_cmd::UpdateArgs {
+                check,
+                yes,
+                dismiss,
+            },
+        ),
         Some(Command::Install { print_systemd }) => lifecycle::install(print_systemd),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
