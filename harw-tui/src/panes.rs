@@ -21,6 +21,15 @@
 //! [`WORKBENCH_MIN_ROWS`] Zeilen). In der Standard-Belegung wechselt `F4`
 //! den Fokus reihum; `Esc` gibt ihn an den Chat zurück. Die Tasten sind über `[tui].keybindings_file` umbelegbar
 //! (siehe [`crate::keybindings`]).
+//!
+//! Dieses Modul ist außerdem die einzige Stelle, an der `harw-tui` in die
+//! Geometrie-Crate `harw-tui-layout` hineinschaut: [`classify_screen`]
+//! wandelt deren Klassifikation (breite Seitenspalte, oben angedockter
+//! Portrait-Dock oder Zusammenfassungs-/Kompakt-Fallback) in
+//! `ratatui::layout::Rect` um, [`split_dock_areas`] entsprechend die interne
+//! Aufteilung des Docks. `PaneFocus`, `PanelState`, `PanelKey`, [`split`] und
+//! `split_right_column` bleiben unverändert und beschreiben weiterhin nur
+//! die breite Seitenspalten-Darstellung von oben.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -46,6 +55,82 @@ pub(crate) const EXPLORER_WIDTH: u16 = 36;
 pub(crate) const WORKBENCH_MIN_ROWS: u16 = 8;
 /// Mindesthöhe der Agenten über der Workbench.
 pub(crate) const AGENTS_MIN_ROWS: u16 = 3;
+
+/// Ratatui-Fassung von `harw_tui_layout::ScreenLayout`: dieselbe
+/// Platzierung, aber Rechtecke als `ratatui::layout::Rect` — dies ist die
+/// einzige Stelle, an der `harw-tui` den dritten Rect-Typ aus
+/// `harw-tui-layout` in einen eigenen umwandelt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScreenAreas {
+    pub placement: harw_tui_layout::Placement,
+    pub chat: Rect,
+    pub agents: Option<Rect>,
+    pub status: Rect,
+    pub composer: Rect,
+}
+
+/// Klassifiziert `area` (Terminalgröße) mithilfe von
+/// [`harw_tui_layout::classify`] und wandelt die zurückgegebenen Rechtecke
+/// in `ratatui::layout::Rect` um. `status_rows`/`composer_rows` sind exakt
+/// die Zeilen, die die aufrufende Seite heute für Statuszeile
+/// (`harw-tui/src/app.rs:9552`, immer 1) und Composer (die dort berechnete
+/// `input_height`) reserviert, damit die Fallback-Formel byte-identisch zu
+/// heute bleibt (siehe `harw-tui-layout/src/placement.rs`, Funktion
+/// `fallback`).
+pub(crate) fn classify_screen(area: Rect, status_rows: u16, composer_rows: u16) -> ScreenAreas {
+    let out = harw_tui_layout::classify(harw_tui_layout::LayoutInput {
+        cols: area.width,
+        rows: area.height,
+        status_rows,
+        composer_rows,
+    });
+    let to_rect = |r: harw_tui_layout::Rect| Rect {
+        x: area.x.saturating_add(r.x),
+        y: area.y.saturating_add(r.y),
+        width: r.width,
+        height: r.height,
+    };
+    ScreenAreas {
+        placement: out.placement,
+        chat: to_rect(out.chat),
+        agents: out.agents.map(to_rect),
+        status: to_rect(out.status),
+        composer: to_rect(out.composer),
+    }
+}
+
+/// Zielflächen des Portrait-Docks, bereits als `ratatui::layout::Rect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockAreas {
+    /// Eine kombinierte Liste (schmaler Dock).
+    Combined(Rect),
+    /// Agenten links, Jobs rechts (breiter Dock).
+    Split { agents: Rect, jobs: Rect },
+}
+
+/// Teilt den Dock-Bereich gemäß [`harw_tui_layout::split_dock`] und wandelt
+/// das Ergebnis in [`DockAreas`] um.
+pub(crate) fn split_dock_areas(dock: Rect) -> DockAreas {
+    let to_layout_rect = |r: Rect| harw_tui_layout::Rect {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+    };
+    let to_rect = |r: harw_tui_layout::Rect| Rect {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+    };
+    match harw_tui_layout::split_dock(to_layout_rect(dock)) {
+        harw_tui_layout::DockSplit::Combined(r) => DockAreas::Combined(to_rect(r)),
+        harw_tui_layout::DockSplit::Split { agents, jobs } => DockAreas::Split {
+            agents: to_rect(agents),
+            jobs: to_rect(jobs),
+        },
+    }
+}
 
 /// Welche Fläche Tastatureingaben bekommt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -299,6 +384,84 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    /// Cross-check gegen die heutige `split`-Geometrie: `classify_screen`
+    /// darf für breite Terminals keine andere Aufteilung liefern.
+    #[test]
+    fn classify_screen_reproduces_wide_side_geometry_at_160x40_120x30_100x30() -> TestResult {
+        for &(cols, rows) in &[(160u16, 40u16), (120, 30), (100, 30)] {
+            let out = classify_screen(Rect::new(0, 0, cols, rows), 1, 3);
+            assert_eq!(out.placement, harw_tui_layout::Placement::WideSide);
+            let body_rows = rows - (1 + 3);
+            let expected = split(Rect::new(0, 0, cols, body_rows), &PanelState::default());
+            assert_eq!(out.agents.map(|r| r.width), expected.agents.map(|r| r.width));
+            assert_eq!(out.chat.map(|r| r.width).unwrap_or(0), expected.chat.ok_or("expected chat")?.width);
+            let chat = out.chat;
+            assert_eq!(chat.width, cols - AGENTS_WIDTH);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn classify_screen_places_the_dock_for_80x40_and_wide_side_for_160x40() -> TestResult {
+        let dock = classify_screen(Rect::new(0, 0, 80, 40), 1, 3);
+        assert!(matches!(
+            dock.placement,
+            harw_tui_layout::Placement::PortraitDock { .. }
+        ));
+        let agents = dock.agents.ok_or("PortraitDock must have an agents rect")?;
+        assert!(agents.height > 0);
+
+        let wide = classify_screen(Rect::new(0, 0, 160, 40), 1, 3);
+        assert_eq!(wide.placement, harw_tui_layout::Placement::WideSide);
+        Ok(())
+    }
+
+    #[test]
+    fn classify_screen_offsets_rects_by_the_input_area_origin() -> TestResult {
+        let origin = classify_screen(Rect::new(0, 0, 80, 40), 1, 3);
+        let shifted = classify_screen(Rect::new(5, 2, 80, 40), 1, 3);
+        assert_eq!(shifted.chat.x, origin.chat.x + 5);
+        assert_eq!(shifted.chat.y, origin.chat.y + 2);
+        assert_eq!(shifted.chat.width, origin.chat.width);
+        assert_eq!(shifted.chat.height, origin.chat.height);
+        assert_eq!(shifted.status.x, origin.status.x + 5);
+        assert_eq!(shifted.status.y, origin.status.y + 2);
+        assert_eq!(shifted.composer.x, origin.composer.x + 5);
+        assert_eq!(shifted.composer.y, origin.composer.y + 2);
+        match (shifted.agents, origin.agents) {
+            (Some(s), Some(o)) => {
+                assert_eq!(s.x, o.x + 5);
+                assert_eq!(s.y, o.y + 2);
+                assert_eq!(s.width, o.width);
+                assert_eq!(s.height, o.height);
+            }
+            (None, None) => {}
+            _ => return Err("agents presence must not depend on the origin".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_dock_areas_splits_at_68_and_combines_below_it() -> TestResult {
+        let dock = Rect::new(0, 0, 68, 12);
+        match split_dock_areas(dock) {
+            DockAreas::Split { agents, jobs } => {
+                assert_eq!(agents.width + jobs.width, dock.width);
+                assert_eq!(jobs.x, dock.x + agents.width);
+            }
+            other => return Err(format!("expected Split, got {other:?}").into()),
+        }
+
+        let dock = Rect::new(0, 0, 67, 12);
+        match split_dock_areas(dock) {
+            DockAreas::Combined(r) => assert_eq!(r, dock),
+            other => return Err(format!("expected Combined, got {other:?}").into()),
+        }
+        Ok(())
     }
 
     #[test]

@@ -2132,6 +2132,249 @@ pub(crate) fn render_agents_panel(
     }
 }
 
+/// `true`, wenn der Eintrag zur Jobs-Spalte des geteilten Docks gehört
+/// (sonst zur Agenten-Spalte); Grundlage für [`dock_follow_column`].
+fn is_job_entry(entry: &PanelEntry<'_>) -> bool {
+    matches!(entry, PanelEntry::Job { .. } | PanelEntry::JobsFinished)
+}
+
+/// Ermittelt für den Split-Modus des Docks, in welcher Spalte die gewählte
+/// Zeile liegt und an welcher Position innerhalb der Zeilen dieser Spalte
+/// (dieselbe Reihenfolge, in der [`render_agents_only_panel`] bzw.
+/// [`render_jobs_only_panel`] ihre Zeilen aus `entries` aufbauen). Liefert
+/// `None`, wenn der Auswahlindex außerhalb von `entries` liegt.
+fn dock_follow_column(entries: &[PanelEntry<'_>], selected: usize) -> Option<(bool, usize)> {
+    let target = entries.get(selected)?;
+    let is_job = is_job_entry(target);
+    let position = entries[..=selected]
+        .iter()
+        .filter(|entry| is_job_entry(entry) == is_job)
+        .count()
+        .checked_sub(1)?;
+    Some((is_job, position))
+}
+
+/// Zeichnet das oben angepinnte Portrait-Dock (schmale/hohe Terminals).
+///
+/// Bei [`crate::panes::DockAreas::Combined`] entspricht das Ergebnis
+/// [`render_agents_panel`] eins zu eins (eine Liste, ein Rahmen). Bei
+/// [`crate::panes::DockAreas::Split`] werden Agenten und Jobs in zwei
+/// nebeneinanderliegende Spalten aus demselben Zustand projiziert; beide
+/// Spalten teilen sich weiterhin `panel_scroll` als einzigen Scroll-Offset
+/// (eine Liste, zwei sichtbare Spalten) und schreiben zusammen genau einmal
+/// je Bild in `panel_height` (das Maximum beider Spaltenhöhen). Ein per
+/// Tastatur gewählter Eintrag (`follow_selection`) wird dabei stets sofort
+/// sichtbar gehalten — unabhängig davon, ob er in der Agenten- oder der
+/// Jobs-Spalte liegt —, denn [`render_agents_only_panel`]/
+/// [`render_jobs_only_panel`] werten `follow_selection` selbst nicht mehr
+/// aus (siehe [`render_dock_rows`]).
+pub(crate) fn render_dock(
+    monitor: &AgentMonitor,
+    areas: crate::panes::DockAreas,
+    buf: &mut Buffer,
+    theme: Theme,
+    focused: bool,
+) {
+    match areas {
+        crate::panes::DockAreas::Combined(area) => {
+            render_agents_panel(monitor, area, buf, theme, focused);
+        }
+        crate::panes::DockAreas::Split { agents, jobs } => {
+            let agents = agents.intersection(buf.area);
+            let jobs = jobs.intersection(buf.area);
+            if monitor.follow_selection.get() {
+                let entries = monitor.panel_entries();
+                if let Some((is_job, position)) = dock_follow_column(&entries, monitor.selected) {
+                    let column = if is_job { jobs } else { agents };
+                    let height = usize::from(column.height.saturating_sub(2));
+                    if height > 0 {
+                        let mut offset = monitor.panel_scroll.get();
+                        if position < offset {
+                            offset = position;
+                        } else if position >= offset + height {
+                            offset = position + 1 - height;
+                        }
+                        monitor.panel_scroll.set(offset);
+                    }
+                }
+                monitor.follow_selection.set(false);
+            }
+            let agents_height = render_agents_only_panel(monitor, agents, buf, theme, focused);
+            let jobs_height = render_jobs_only_panel(monitor, jobs, buf, theme, focused);
+            monitor.panel_height.set(agents_height.max(jobs_height));
+        }
+    }
+}
+
+/// Zeichnet nur die Agenten-Spalte des geteilten Docks (ohne Jobs), mit
+/// eigenem Rahmen und Titel; nutzt dieselben Einzelzeilen-Renderer wie
+/// [`panel_rows`] (`agent_line`/`failure_line`/`finished_summary_line`), also
+/// kein Umbruch, sondern Kürzung mit Ellipse.
+fn render_agents_only_panel(
+    monitor: &AgentMonitor,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: Theme,
+    focused: bool,
+) -> usize {
+    if area.width < 3 || area.height < 3 {
+        return 0;
+    }
+    let (active, failed, finished) = monitor.panel_counts();
+    let mut title = format!(" Agenten · {active} aktiv ");
+    if failed > 0 {
+        title.push_str(&format!("· ✗ {failed} "));
+    }
+    if finished > 0 {
+        title.push_str(&format!("· {finished} fertig "));
+    }
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let title = fit_width(&title, inner_width);
+    let border = if focused {
+        Style::default().fg(style::accent_color(theme))
+    } else {
+        Style::default().fg(style::border_color(theme))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(title);
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let entries = monitor.panel_entries();
+    let selected = monitor.selected.min(entries.len().saturating_sub(1));
+    let finished_live: Vec<&AgentLive> = monitor
+        .rows()
+        .into_iter()
+        .filter(|(_, live)| live.is_finished_quietly())
+        .map(|(_, live)| live)
+        .collect();
+    let mut role_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in &entries {
+        if let PanelEntry::Agent { live, .. } = entry {
+            *role_counts.entry(live.role.as_str()).or_default() += 1;
+        }
+    }
+    let mut rows: Vec<PanelRow> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let is_selected = focused && index == selected;
+        match entry {
+            PanelEntry::Agent { depth, live } => {
+                let duplicate = role_counts.get(live.role.as_str()).copied().unwrap_or(0) > 1;
+                let label = row_label(live, duplicate);
+                let line = if live.is_unseen_failure() {
+                    failure_line(live, &label, *depth, is_selected, inner_width, theme)
+                } else {
+                    agent_line(live, &label, *depth, is_selected, inner_width, theme)
+                };
+                rows.push(PanelRow {
+                    line,
+                    entry: Some(index),
+                });
+            }
+            PanelEntry::Finished => rows.push(PanelRow {
+                line: finished_summary_line(
+                    &finished_live,
+                    monitor.finished_expanded,
+                    is_selected,
+                    inner_width,
+                    theme,
+                ),
+                entry: Some(index),
+            }),
+            PanelEntry::Job { .. } | PanelEntry::JobsFinished => {}
+        }
+    }
+    if rows.is_empty() {
+        rows.push(PanelRow {
+            line: Line::styled(
+                fit_width("Noch keine Agenten aktiv.", inner_width),
+                style::dim_style(theme),
+            ),
+            entry: None,
+        });
+    }
+    render_dock_rows(monitor, rows, inner, buf)
+}
+
+/// Zeichnet nur die Jobs-Spalte des geteilten Docks (ohne Agenten), mit
+/// eigenem Rahmen und Titel; nutzt dieselben Zeilen-Renderer aus
+/// [`crate::jobs_panel`] wie [`panel_rows`].
+fn render_jobs_only_panel(
+    monitor: &AgentMonitor,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: Theme,
+    focused: bool,
+) -> usize {
+    if area.width < 3 || area.height < 3 {
+        return 0;
+    }
+    let running = monitor.jobs.iter().filter(|row| row.active).count();
+    let title = fit_width(
+        &format!(" Jobs · {running} aktiv "),
+        usize::from(area.width.saturating_sub(2)),
+    );
+    let border = if focused {
+        Style::default().fg(style::accent_color(theme))
+    } else {
+        Style::default().fg(style::border_color(theme))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(title);
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let inner_width = usize::from(inner.width);
+    let entries = monitor.panel_entries();
+    let selected = monitor.selected.min(entries.len().saturating_sub(1));
+    let finished_jobs: Vec<&JobRow> = monitor.jobs.iter().filter(|row| !row.active).collect();
+    let mut rows: Vec<PanelRow> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let is_selected = focused && index == selected;
+        match entry {
+            PanelEntry::Job { row } => rows.push(PanelRow {
+                line: crate::jobs_panel::job_line(row, is_selected, inner_width, theme),
+                entry: Some(index),
+            }),
+            PanelEntry::JobsFinished => rows.push(PanelRow {
+                line: crate::jobs_panel::finished_jobs_line(
+                    &finished_jobs,
+                    monitor.finished_expanded,
+                    is_selected,
+                    inner_width,
+                    theme,
+                ),
+                entry: Some(index),
+            }),
+            PanelEntry::Agent { .. } | PanelEntry::Finished => {}
+        }
+    }
+    if rows.is_empty() {
+        rows.push(PanelRow {
+            line: Line::styled(fit_width("Keine Jobs.", inner_width), style::dim_style(theme)),
+            entry: None,
+        });
+    }
+    render_dock_rows(monitor, rows, inner, buf)
+}
+
+/// Gemeinsame Ausschnitts- und Zeichenlogik beider Dock-Spalten: schneidet
+/// `rows` auf den gemeinsamen `panel_scroll`-Offset zu und rendert sie ohne
+/// Umbruch in `inner`. Bewusst ohne den `follow_selection`-Abgleich aus
+/// [`render_agents_panel`]: der ist hier nicht nötig, weil [`render_dock`]
+/// `follow_selection` bereits vor dem Aufruf beider Spalten auswertet
+/// (siehe [`dock_follow_column`]) und `panel_scroll` entsprechend setzt.
+fn render_dock_rows(monitor: &AgentMonitor, rows: Vec<PanelRow>, inner: Rect, buf: &mut Buffer) -> usize {
+    let height = usize::from(inner.height);
+    let max_offset = rows.len().saturating_sub(height);
+    let offset = monitor.panel_scroll.get().min(max_offset);
+    let visible: Vec<Line<'static>> = rows.into_iter().skip(offset).take(height).map(|row| row.line).collect();
+    Paragraph::new(visible).render(inner, buf);
+    height
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3138,5 +3381,189 @@ mod tests {
         assert_eq!(compact_elapsed(185), "3m05s");
         assert_eq!(compact_elapsed(1404), "23m24s");
         assert_eq!(compact_elapsed(3720), "1h02m");
+    }
+
+    /// Wandelt einen gezeichneten Puffer in Textzeilen um (wie `panel_screen`,
+    /// aber für einen beliebigen `Buffer` statt eines Terminals).
+    fn buffer_rows(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_dock_combined_shows_agents_and_jobs_without_wrapping() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&context("a1", "uia-worker")?);
+        monitor.apply(&context("a2", "uia-explorer")?);
+        monitor.set_jobs(vec![
+            job_row("job-1", "build-frontend", true, false),
+            job_row("job-2", "build-backend", false, false),
+        ]);
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Combined(area),
+            &mut buf,
+            Theme::Dark,
+            false,
+        );
+        let rows = buffer_rows(&buf);
+        let shown = rows.join("\n");
+        assert!(shown.contains("uia-worker"), "{shown}");
+        assert!(shown.contains("build-frontend"), "{shown}");
+        for row in &rows {
+            assert!(row.chars().count() <= usize::from(area.width), "{shown}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn render_dock_split_puts_agents_left_and_jobs_right() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&context("a1", "uia-worker")?);
+        monitor.apply(&context("a2", "uia-explorer")?);
+        monitor.set_jobs(vec![
+            job_row("job-1", "build-frontend", true, false),
+            job_row("job-2", "build-backend", false, false),
+        ]);
+        let agents = Rect::new(0, 0, 34, 10);
+        let jobs = Rect::new(34, 0, 34, 10);
+        let area = Rect::new(0, 0, 68, 10);
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Split { agents, jobs },
+            &mut buf,
+            Theme::Dark,
+            false,
+        );
+        let rows = buffer_rows(&buf);
+        let left: String = rows
+            .iter()
+            .map(|row| row.chars().take(34).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let right: String = rows
+            .iter()
+            .map(|row| row.chars().skip(34).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(left.contains("uia-worker"), "{left}");
+        assert!(!right.contains("uia-worker"), "{right}");
+        assert!(right.contains("build-frontend"), "{right}");
+        assert!(!left.contains("build-frontend"), "{left}");
+        Ok(())
+    }
+
+    #[test]
+    fn render_dock_split_truncates_long_names_with_ellipsis_and_keeps_row_count_fixed() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&context(
+            "a1",
+            "ein-sehr-sehr-sehr-sehr-langer-rollenname-der-nicht-passt",
+        )?);
+        monitor.set_jobs(vec![job_row(
+            "job-1",
+            "ein-sehr-sehr-sehr-sehr-langer-job-name-der-nicht-passt",
+            true,
+            false,
+        )]);
+        let agents = Rect::new(0, 0, 20, 10);
+        let jobs = Rect::new(20, 0, 20, 10);
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Split { agents, jobs },
+            &mut buf,
+            Theme::Dark,
+            false,
+        );
+        // Kein Umbruch: die Zeilenkapazität beider Spalten bleibt exakt an
+        // die Innenhöhe (Rahmenhöhe - 2) gebunden, egal wie lang der Name ist.
+        assert_eq!(monitor.panel_height.get(), usize::from(10 - 2));
+        let shown = buffer_rows(&buf).join("\n");
+        assert!(shown.contains('…'), "{shown}");
+        Ok(())
+    }
+
+    /// Regression: `select_next` im geteilten Dock (68–99 Spalten, häufigster
+    /// Fall der Portrait-Breite) muss die Auswahl sofort sichtbar halten,
+    /// nicht erst ein Bild später — [`render_dock_rows`] wertet
+    /// `follow_selection` bewusst nicht mehr selbst aus, das übernimmt
+    /// [`render_dock`] vorab für beide Spalten.
+    #[test]
+    fn render_dock_split_follows_keyboard_selection_in_agents_column() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        for i in 0..8 {
+            monitor.apply(&context(&format!("a{i}"), "uia-worker")?);
+        }
+        let agents = Rect::new(0, 0, 24, 5);
+        let jobs = Rect::new(24, 0, 24, 5);
+        let area = Rect::new(0, 0, 48, 5);
+        for _ in 0..7 {
+            monitor.select_next();
+        }
+        assert!(monitor.follow_selection.get());
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Split { agents, jobs },
+            &mut buf,
+            Theme::Dark,
+            true,
+        );
+        let left: String = buffer_rows(&buf)
+            .iter()
+            .map(|row| row.chars().take(24).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(left.contains("a7"), "{left}");
+        assert!(!monitor.follow_selection.get());
+        Ok(())
+    }
+
+    /// Wie oben, aber die Auswahl wandert über die Agenten hinaus in die
+    /// Jobs-Spalte: der Ausgleich muss dann die Jobs- statt der
+    /// Agenten-Spaltenhöhe verwenden.
+    #[test]
+    fn render_dock_split_follows_keyboard_selection_in_jobs_column() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&context("a1", "uia-worker")?);
+        monitor.set_jobs(
+            (0..8)
+                .map(|i| job_row(&format!("job-{i}"), &format!("job{i}"), true, false))
+                .collect(),
+        );
+        let agents = Rect::new(0, 0, 24, 5);
+        let jobs = Rect::new(24, 0, 24, 5);
+        let area = Rect::new(0, 0, 48, 5);
+        // Erster Eintrag ist der eine Agent, danach folgen die acht Jobs.
+        for _ in 0..8 {
+            monitor.select_next();
+        }
+        assert!(monitor.follow_selection.get());
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Split { agents, jobs },
+            &mut buf,
+            Theme::Dark,
+            true,
+        );
+        let right: String = buffer_rows(&buf)
+            .iter()
+            .map(|row| row.chars().skip(24).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(right.contains("job7"), "{right}");
+        assert!(!monitor.follow_selection.get());
+        Ok(())
     }
 }

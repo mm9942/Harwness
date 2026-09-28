@@ -40,6 +40,10 @@ harw-tool-plan = { path = "../harw-tool-plan" }
 # Beenden-Dialog (stoppen oder ablösen).
 harw-tool-job = { path = "../harw-tool-job" }
 harw-tools = { path = "../harw-tools" }
+# Terminalgroessen-Klassifikation (wide/portrait-dock/summary/compact) und
+# Dock-Geometrie fuer den angehefteten Agenten-/Jobs-Bereich in schmalen,
+# hohen Terminals (src/panes.rs).
+harw-tui-layout = { path = "../harw-tui-layout" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
 # `unstable-rendered-line-info` schaltet `Paragraph::line_count` frei. Ohne sie
