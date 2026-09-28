@@ -299,6 +299,30 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/business-writing-pyramid/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/cli-command-surface-map/instructions.md",
+        contents: include_str!("../assets/skills/cli-command-surface-map/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/cli-command-surface-map/skill.toml",
+        contents: include_str!("../assets/skills/cli-command-surface-map/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/cli-doc-drift-review/instructions.md",
+        contents: include_str!("../assets/skills/cli-doc-drift-review/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/cli-doc-drift-review/skill.toml",
+        contents: include_str!("../assets/skills/cli-doc-drift-review/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/cli-live-review/instructions.md",
+        contents: include_str!("../assets/skills/cli-live-review/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/cli-live-review/skill.toml",
+        contents: include_str!("../assets/skills/cli-live-review/skill.toml"),
+    },
+    BundledFile {
         relative_path: "skills/contract-fanout-migration/instructions.md",
         contents: include_str!("../assets/skills/contract-fanout-migration/instructions.md"),
     },
@@ -1129,7 +1153,7 @@ mod tests {
         // Runde 7, Teil T6/T7: +`latex-report`.
         // Plan R9, Teil D: +10 Methoden-Skills der Analyse-Familie.
         // Plan R9, Web-Recherche: +`osint-web-research`.
-        assert_eq!(skills, 72, "das Bundle liefert 72 Skills");
+        assert_eq!(skills, 75, "das Bundle liefert 75 Skills");
         Ok(())
     }
 

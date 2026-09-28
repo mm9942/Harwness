@@ -1,0 +1,4 @@
+name = "cli-doc-drift-review"
+description = "Use when checking Harw CLI documentation, help text, examples, README command inventories, or migration notes against the live implementation. Compare docs to clap grammar, root dispatch, domain handlers, Operation bridges, aliases, output/exit behavior and tests; report omissions, phantom commands, grammar/behavior drift and authority-sensitive mismatches without treating documentation as implementation."
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "process.execute"]
