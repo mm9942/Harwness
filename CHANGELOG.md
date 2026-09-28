@@ -4,11 +4,37 @@ All notable changes to this workspace are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project uses
 Semantic Versioning within the 0.x pre-release range.
 
-## [0.8.0] — Unreleased
-
 ## [Unreleased]
 
+## [0.9.0] — Unreleased
+
 ### Added
+- Tool gateway, round R18a (contract
+  `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md`):
+  - Tools execute in the gateway inside the sandbox; only a UIA agent
+    principal is admitted to `tool.call`, sub-agents reach tools only
+    through delegation that can only narrow rights. Admission is
+    fail-closed in a fixed order and never falls back to host execution;
+    sessions belong to their owning agent.
+  - `harw-protocol`: `tool.*` / `gateway.*` wire (wire minor 2),
+    `ToolPlacement`, `ToolPort` / `GatewayPort`.
+  - `harw-session-host`: tool host, agent registry with cascading
+    narrowing and revocation; `harw-session-ws` routes the new methods
+    behind the caps granted at hello.
+  - New crate `harw-tool-remote`: remote tool proxy; runtime mode without
+    local tools.
+  - `gateway.*` operations for the UIA: nine reads without approval (incl.
+    `gateway.health` and `gateway.logs`), five mutations that always ask;
+    key operations keep no model surface.
+  - WorkDriver: `work_driver.report` replaces free-text parsing, writable
+    workspace scope for command-only criteria, central artifact
+    verification, role instructions, judge retry then escalate, lane size
+    from config, the UIA may enqueue (with approval).
+  - TUI: `Shell(...)` instead of `Bash(...)`, placement badge (host /
+    sandbox / gateway), `Job(name)` labels, plan cells show only the delta,
+    job failure reasons and originating tool call.
+  - Auto-mode classifier retries once on an empty reply, then falls back to
+    the main model, otherwise asks with a named cause.
 - Session control plane, W00 round 1 (PL-65, contract
   `docs/planning/65-cloud-sessions/contracts/W00-websocket-control-plane.md`):
   - `harw-protocol`: `session_wire` (cursor, caps, frames with an additive
@@ -34,6 +60,11 @@ Semantic Versioning within the 0.x pre-release range.
   `tailnet.sock` (new crate `harw-tailscale`, `ForwardedPeerResolver` in
   `harw-web`). See `docs/setup/tailscale.md`.
 
+### Changed
+- `job.wait` is a short poll: `timeout_secs` is limited to 1..=60 (larger
+  values are refused); job completion arrives as a notification.
+- `shell.exec` documents POSIX `/bin/sh` and steers file edits to `fs.*`.
+
 ### `harw update` installs updates
 
 - `harw update` checks the latest GitHub release and installs it: tarball
@@ -46,6 +77,8 @@ Semantic Versioning within the 0.x pre-release range.
 - The chat start names a newer version from `~/.harw/version.json` and, at
   most every 20 hours, checks in the background (`HARW_NO_UPDATE_CHECK=1`
   turns this off).
+
+## [0.8.0] — 2026-09-28
 
 ### One systemd source of truth (Crypto Masterplan v2 H10)
 
