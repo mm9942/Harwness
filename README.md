@@ -41,7 +41,7 @@ The workspace is organized around a few boundaries:
 - **Sandbox and job runtime** — long-running work, process execution, cancellation, resource policy, and platform-specific execution are separate runtime concerns.
 - **Durable state** — sessions, plans, jobs, pairing state, transcripts, and selected knowledge artifacts survive process restarts.
 - **Providers and interfaces** — provider adapters are separated from the agent runtime; the workspace exposes CLI/TUI, web, MCP, channel, and SDK integration points.
-- **Defense-on-Device (DoD)** — an optional peer security domain with separate sensors, escalation, privileged probes, and Warden enforcement.
+- **Detect · Orient · Defend (DoD)** — an optional peer security domain with separate sensors, escalation, privileged probes, and Warden enforcement.
 
 ## Security model
 
@@ -163,9 +163,9 @@ User and integration surfaces include:
 
 See [docs/setup/local-models.md](docs/setup/local-models.md) for local model configuration.
 
-## Defense-on-Device
+## Detect · Orient · Defend
 
-Defense-on-Device is an optional security subsystem and a peer domain in the workspace. It is not an implicit privilege extension for ordinary agents.
+Detect · Orient · Defend is an optional security subsystem and a peer domain in the workspace. It is not an implicit privilege extension for ordinary agents.
 
 Its crates cover host observation and security functions including eBPF integration, filesystem monitoring, process monitoring, cgroups, network policy, rules, findings, escalation, probes, Sentinel, and Warden components.
 
@@ -314,7 +314,7 @@ When changing Harwness, prefer this source-of-truth order:
 - [docs/guides/agent-compiler.md](docs/guides/agent-compiler.md) — standalone agent compiler
 - [docs/setup/install.md](docs/setup/install.md) — installation
 - [docs/setup/local-models.md](docs/setup/local-models.md) — local models
-- [docs/setup/dod.md](docs/setup/dod.md) — Defense-on-Device
+- [docs/setup/dod.md](docs/setup/dod.md) — Detect · Orient · Defend
 - [docs/philosophy/philosophy.md](docs/philosophy/philosophy.md) — project principles
 - [docs/philosophy/coding-philosophy.md](docs/philosophy/coding-philosophy.md) — coding principles
 
