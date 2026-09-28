@@ -31,6 +31,7 @@ mod knowledge;
 mod lens;
 mod mcp;
 mod models;
+mod pr_review;
 mod project;
 mod provider;
 mod sandbox;
@@ -56,6 +57,7 @@ pub use knowledge::*;
 pub use lens::*;
 pub use mcp::*;
 pub use models::*;
+pub use pr_review::*;
 pub use project::*;
 pub use provider::*;
 pub use sandbox::*;
@@ -202,6 +204,14 @@ pub enum Command {
         #[command(subcommand)]
         action: JobsAction,
     },
+    /// Holt einen GitHub-PR read-only, legt den Diff als Fixture ab und
+    /// reviewt ihn mit dem Agenten `github-pr-reviewer`.
+    ///
+    /// Der Diff ist nicht vertrauenswürdiger Input; Veröffentlichung auf
+    /// GitHub passiert nur mit `--post` plus interaktiver Bestätigung und
+    /// ist bis R5 nicht implementiert (bewusster Abbruch statt stiller
+    /// Veröffentlichung).
+    PrReview(PrReviewArgs),
 
     // ── Dienste ─────────────────────────────────────────────────────────
     /// Startet den Hintergrunddienst mit Agenten und Kanälen oder verwaltet seine Dienst-Einheit.
