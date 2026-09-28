@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_install::{
-    Platform, RenderPaths, ServiceKind, ServiceManager, ServiceSpec, UninstallScope, UpdateChecker,
+    Platform, RenderPaths, ServiceKind, ServiceManager, ServiceSpec, UninstallScope,
     detect_service_manager,
 };
 
@@ -157,29 +157,6 @@ fn evaluate_evidence(
     let has_trusted_spawn_context = sandbox_bound_to_project && approval_actor_present;
 
     (has_trusted_spawn_context, has_approval_boundary)
-}
-
-/// `harw update [--check]`: liest `version.json`.
-pub fn update(home_override: Option<PathBuf>, check: bool) -> Result<(), String> {
-    let home = resolve_home(home_override)?;
-    let checker = UpdateChecker::new(&home);
-
-    match checker.read().map_err(|error| error.to_string())? {
-        Some(info) => println!(
-            "letzte Prüfung: {} · neueste bekannte Version: {}",
-            info.last_checked_at, info.latest_version
-        ),
-        None => println!("noch keine Versionsdaten (version.json fehlt)"),
-    }
-
-    if check {
-        return Err(
-            "Versionsprüfung nicht verfügbar: kein Remote-Update-Checker ist konfiguriert; \
-             version.json bleibt unverändert."
-                .to_owned(),
-        );
-    }
-    Ok(())
 }
 
 /// Dienstname der Unit für `harw serve` (MCP-Listener + Job-Worker).
@@ -1701,51 +1678,6 @@ mod tests {
         );
         assert_eq!(evidence.has_trusted_spawn_context, Some(true));
         assert_eq!(evidence.has_approval_boundary, Some(true));
-        Ok(())
-    }
-
-    #[test]
-    fn update_check_reports_unavailable_without_creating_version_state() -> TestResult {
-        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
-
-        let result = update(Some(home.path().to_path_buf()), true);
-        let Err(error) = result else {
-            return Err(TestError::Unexpected(
-                "update check must fail without a remote checker".into(),
-            ));
-        };
-
-        assert!(error.contains("kein Remote-Update-Checker ist konfiguriert"));
-        assert!(!home.path().join("version.json").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn update_check_leaves_existing_version_state_unchanged() -> TestResult {
-        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
-        let checker = UpdateChecker::new(home.path());
-        checker
-            .write(&harw_install::VersionInfo {
-                latest_version: "1.2.3".to_owned(),
-                last_checked_at: jiff::Timestamp::now(),
-                dismissed_version: Some("1.2.2".to_owned()),
-            })
-            .map_err(ctx("write existing version state"))?;
-        let version_path = home.path().join("version.json");
-        let before = std::fs::read(&version_path).map_err(ctx("read existing version state"))?;
-
-        let result = update(Some(home.path().to_path_buf()), true);
-        let Err(error) = result else {
-            return Err(TestError::Unexpected(
-                "update check must fail without a remote checker".into(),
-            ));
-        };
-
-        assert!(error.contains("kein Remote-Update-Checker ist konfiguriert"));
-        assert_eq!(
-            std::fs::read(version_path).map_err(ctx("read version state after failed check"))?,
-            before
-        );
         Ok(())
     }
 

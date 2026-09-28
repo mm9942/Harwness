@@ -47,12 +47,26 @@ curl -fsSLO "https://github.com/mm9942/Harwness/releases/download/$tag/SHA256SUM
 sha256sum -c SHA256SUMS --ignore-missing
 
 tar -xzf "harw-$tag-$target.tar.gz"
-install -Dm755 harw ~/.local/bin/harw
-install -Dm755 killer ~/.local/bin/killer
+install -Dm755 "harw-$tag-$target/harw" ~/.local/bin/harw
+install -Dm755 "harw-$tag-$target/killer" ~/.local/bin/killer
+install -Dm755 "harw-$tag-$target/harw-agent-runner" ~/.local/bin/harw-agent-runner
 ```
 
-The tarball contains `harw`, `killer`, `LICENSE-MIT`, `LICENSE-APACHE` and
-`README.md`.
+The tarball holds one directory `harw-<tag>-<target>/` with `harw`,
+`killer` (not in Android builds), `harw-agent-runner`, `LICENSE-MIT`,
+`LICENSE-APACHE` and `README.md`. The same steps, checksum included, in one
+line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mm9942/Harwness/main/scripts/install.sh | bash -s -- --binary
+```
+
+`--binary` picks the latest release (`HARW_RELEASE_TAG=vX.Y.Z` pins one) and
+the target of this machine: `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, or `aarch64-linux-android` under Termux.
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is
+pushed (or by hand for an existing tag); `make release` builds the same
+tarball locally.
 
 ### (b) Source installer
 
@@ -156,8 +170,34 @@ accounts and the `tmpfiles.d` directories live in one canonical tree,
 
 ## Updating
 
-Re-running an install path overwrites `harw` and `killer` in place; it does
-not touch `~/.harw`.
+`harw update` checks for a newer version and installs it:
+
+```sh
+harw update            # check, ask, then install
+harw update --yes      # install without asking (scripts, no terminal)
+harw update --check    # only check; exit code 10 = a newer release exists
+harw update --dismiss  # hide the start notice for the known newest version
+```
+
+- **Release first.** It asks the GitHub API for the latest release
+  (`HARW_UPDATE_API` overrides the endpoint). If that release is newer, it
+  downloads `harw-<tag>-<target>.tar.gz` and `SHA256SUMS`, refuses the
+  tarball unless its checksum matches, and replaces `harw`, `killer` and
+  (if included) `harw-agent-runner` in the directory recorded in
+  `~/.harw/install.toml` (else next to the running `harw`). The previous
+  binaries stay as `<name>.old`.
+- **Otherwise from source.** With no published release it updates the
+  source directory `make install` recorded: a Git checkout with
+  `git pull --ff-only` and `make install`, a source archive by re-running
+  its `scripts/install.sh`.
+- **Start notice.** When the chat starts, `harw` reads `~/.harw/version.json`
+  and names a newer, not dismissed version. If the last check is older than
+  20 hours, it runs `harw update --check` detached in the background; the
+  chat start never waits for the network. `HARW_NO_UPDATE_CHECK=1` turns the
+  notice and the background check off.
+
+Re-running an install path by hand still works the same way: it overwrites
+`harw` and `killer` in place and does not touch `~/.harw`.
 
 `~/.harw`'s bundled assets (agent definitions, prompts, and similar shipped
 files under the root space) are updated according to the bundle manifest

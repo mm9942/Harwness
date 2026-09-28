@@ -74,3 +74,6 @@ __pycache__/
 
 # Gap-hunt kit: local verifier counter state
 .gap-hunt-verify-counter.state
+
+# Release tarballs from `make release`
+/dist/

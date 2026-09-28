@@ -273,11 +273,19 @@ pub enum Command {
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         config_dir: Option<PathBuf>,
     },
-    /// Sucht nach einer neuen Version.
+    /// Sucht nach einer neuen Version und installiert sie (Release, sonst aus den Quellen).
+    ///
+    /// Mit `--check` wird nur geprüft; Exit-Code 10 heißt „neuere Release verfügbar“.
     Update {
         /// Nur prüfen und Stand anzeigen, nichts installieren.
-        #[arg(long, hide = true)]
+        #[arg(long, conflicts_with_all = ["yes", "dismiss"])]
         check: bool,
+        /// Ohne Rückfrage installieren.
+        #[arg(long, short = 'y', conflicts_with = "dismiss")]
+        yes: bool,
+        /// Den Start-Hinweis auf die bekannte neueste Version ausblenden.
+        #[arg(long)]
+        dismiss: bool,
     },
     /// Zeigt die eingebetteten systemd-Systemunits aus `deploy/`.
     ///

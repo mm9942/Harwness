@@ -1,0 +1,17 @@
+# Cross images for `cross build` (release.yml, `make release` with cross).
+# The OS-keyring backend of harw-secrets links libdbus on Linux targets
+# (keyring `sync-secret-service` -> libdbus-sys); the image needs the
+# target's libdbus and a pkg-config that finds it. Android targets do not
+# link libdbus (keyring's Linux backends are target-gated), so they need
+# nothing extra.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libdbus-1-dev:$CROSS_DEB_ARCH pkg-config",
+]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = [
+    "PKG_CONFIG_ALLOW_CROSS=1",
+    "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig",
+]
