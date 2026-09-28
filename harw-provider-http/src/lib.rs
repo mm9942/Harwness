@@ -4752,12 +4752,13 @@ mod tests {
             .validate()
             .map_err(ctx("max_concurrency = 1 and header pacer are valid"))?;
 
-        let env_layer =
-            BTreeMap::from([("PACED_PROVIDER_KEY".to_owned(), "sk-secret".to_owned())]);
+        let env_layer = BTreeMap::from([("PACED_PROVIDER_KEY".to_owned(), "sk-secret".to_owned())]);
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("paced".to_owned());
         config.harness.default_model = Some("gpt-test".to_owned());
-        config.providers.insert("paced".to_owned(), provider.clone());
+        config
+            .providers
+            .insert("paced".to_owned(), provider.clone());
 
         let http_provider = std::sync::Arc::new(
             OpenAiResponsesProvider::from_named_config(
@@ -4767,7 +4768,9 @@ mod tests {
                 "gpt-test",
                 test_sources(&env_layer, None, None),
             )
-            .map_err(ctx("provider builds with header pacer and max_concurrency configured"))?,
+            .map_err(ctx(
+                "provider builds with header pacer and max_concurrency configured",
+            ))?,
         );
 
         // Header-Pacer direkt vorladen, ohne einen echten Antwort-Roundtrip:
@@ -4783,7 +4786,9 @@ mod tests {
                 reqwest::header::HeaderValue::from_str(value).map_err(ctx("header value"))?,
             );
         }
-        http_provider.rate_limiter_handle().observe_headers(&pacing_headers);
+        http_provider
+            .rate_limiter_handle()
+            .observe_headers(&pacing_headers);
 
         // Request A: groß genug (~500 geschätzte Tokens), um das knappe
         // Kontingent zu überschreiten -> muss auf den Reset warten, bevor es
@@ -4814,10 +4819,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let started_b = std::time::Instant::now();
-        let response_b = http_provider
-            .respond(request_b)
-            .await
-            .map_err(ctx("small request is admitted immediately by its own contingent"))?;
+        let response_b = http_provider.respond(request_b).await.map_err(ctx(
+            "small request is admitted immediately by its own contingent",
+        ))?;
         let elapsed_b = started_b.elapsed();
         let sequence_b = completion_order.fetch_add(1, Ordering::SeqCst);
         assert_eq!(response_b.message.as_deref(), Some("mock"));

@@ -345,3 +345,37 @@ fremde Dateien, darunter 69 Zeilen Code.
 - Hinweise gehören in ein eigenes Feld `notes`.
 - Ein blockierendes Problem außerhalb des Clusters beendet den Cluster als
   `unresolved`.
+
+### P19 — Das Session-Limit ist ein gemeinsamer Ausfallpunkt
+Ein einziger Fächer aus vielen parallelen Wellen (w1–w8, w4-2, w8-2,
+ripple-web, pr-baseline, Blocker-Karten, Feldbericht) lief gleichzeitig in das
+Session-Limit des Kontos. Die Fixer waren meist fertig, die späten Stufen
+(Review, Reparatur, Ripple) starben. Übrig blieben viele Änderungen im Baum,
+denen genau die Prüfung fehlte.
+
+**Gegenmittel:**
+- Die Parallelität richtet sich nach dem Token-Budget, nicht nach den CPUs:
+  `maxParallel` (Standard 3) begrenzt Dateien bzw. Cluster im Flug.
+- Eine Welle wird ganz abgeschlossen (Review, Commit, Manifest), bevor die
+  nächste startet.
+- Eine Stufe ohne Antwort zählt nie als bestanden.
+
+### P20 — Mehr Agenten sind nicht mehr Durchsatz
+Jeder Folge-Workflow (`-2`, Ripple, `contract-c-2`) entstand, weil sein
+Vorgänger unvollständig war. Die Koordinationskosten wuchsen schneller als
+der Fortschritt. Fast jeder Fehler aus P12–P19 sitzt an einer Übergabe
+zwischen Agenten, nicht in der Programmlogik.
+
+**Gegenmittel (Arbeitsweise aus Harws Goal-/Plan-Modell):**
+- Jede schreibende Welle dient **einem** Goal mit Acceptance Criteria und
+  Invarianten und läuft gegen **eine** gepinnte Basis.
+- Eine Welle ist erst `complete`, wenn eine Goal-Prüfung für jedes Kriterium
+  `met` mit Beleg (Datei:Zeile oder Testname) meldet. Widersprüche zwischen
+  Code und Planungsdokumenten werden als `deltas` gemeldet, nie still
+  aufgelöst.
+- Ein kritischer oder hoher Befund zählt erst mit einem Regressionstest, den
+  das (Re-)Review benennt.
+- Die Welle erklärt ihr Goal nie für erreicht; `achieve` bleibt beim Menschen.
+- Der zentrale Build läuft über einen eingefrorenen SHA und wird dafür
+  protokolliert (`kit/gate_record.py`). Jede Änderung danach macht den Lauf
+  ungültig.

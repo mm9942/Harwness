@@ -550,10 +550,10 @@ fn fsync_state_dir(dir: &Path) -> NetsecResult<()> {
         .map_err(NetsecError::io(DIR_FSYNC_CONTEXT))
 }
 
-/// Test-only fault injection for [`fsync_state_dir`]. Thread-local so
-/// concurrently running tests never see each other's setting.
 #[cfg(test)]
 thread_local! {
+    /// Test-only fault injection for [`fsync_state_dir`]. Thread-local so
+    /// concurrently running tests never see each other's setting.
     static FAIL_DIR_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -702,7 +702,10 @@ mod tests {
             "the rename already committed the write"
         );
         let on_disk = load(store.state_path())?;
-        assert_eq!(on_disk, snapshot, "disk and memory must agree on the new state");
+        assert_eq!(
+            on_disk, snapshot,
+            "disk and memory must agree on the new state"
+        );
 
         // The fault is scoped to the closure above; a later mutation must
         // succeed normally and must not be treated as a retry of the
@@ -731,7 +734,13 @@ mod tests {
             }
         };
         assert!(
-            matches!(&error, NetsecError::Io { context: DIR_FSYNC_CONTEXT, .. }),
+            matches!(
+                &error,
+                NetsecError::Io {
+                    context: DIR_FSYNC_CONTEXT,
+                    ..
+                }
+            ),
             "{error:?}"
         );
         assert_eq!(

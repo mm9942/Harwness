@@ -777,6 +777,9 @@ async fn resolve_identity(
 ///
 /// # Errors
 /// `403` mit [`ForbiddenReason::UnknownPeer`], wenn `resolved` `None` ist.
+// Wie bei `read_json_body`: der Fehlerfall ist die fertige `WebResponse`, die
+// der Aufrufer unverändert zurückgibt; sie lebt nur einen Request lang.
+#[allow(clippy::result_large_err)]
 fn scoped_context(
     resolved: Option<&ResolvedPeer>,
     ctx: OpContext,

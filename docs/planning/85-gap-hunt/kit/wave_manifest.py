@@ -14,8 +14,16 @@ about, so a resume, a re-cut or a later audit can check it against git:
     workflow_runs   run ids of every workflow that wrote or reviewed it
     disposition     complete flag, open files, ripple status and ripple item
                     ids, cluster statuses, as the workflow returned them
+    goal            (schema 2) goal id, statement and acceptance criteria the
+                    wave served, and the per-criterion coverage and deltas the
+                    goal check returned; `achieved` is always false: only a
+                    human declares a goal achieved
     central_build   the commands the central build must run over the final
                     integration head
+
+Schema 2 waves embed `goal` and `base` in their args. The manifest refuses a
+--base that does not resolve to the same commit as the wave's pinned base, so
+a wave cannot be recorded against another state than it was checked against.
 
 The file lands at docs/planning/85-gap-hunt/waves/<wave>.json in the given
 checkout and is never edited afterwards: a re-cut wave gets a new name.
@@ -79,9 +87,29 @@ def findings_of(args):
     return sorted(out, key=lambda x: x["id"])
 
 
-def disposition_of(path):
+def load_result(path):
     result = json.load(open(path, encoding="utf-8"))
-    result = result.get("result", result)
+    return result.get("result", result)
+
+
+def goal_of(args, result):
+    goal = args.get("goal")
+    if not goal:
+        return None
+    out = {
+        "id": goal.get("id"),
+        "statement": goal.get("statement"),
+        "criteria": [{"id": c.get("id"), "text": c.get("text")} for c in goal.get("criteria", [])],
+        "achieved": False,
+    }
+    if result is not None:
+        out["coverage"] = [{k: c.get(k) for k in ("id", "status", "evidence", "reason") if c.get(k) is not None}
+                           for c in result.get("coverage", [])]
+        out["deltas"] = list(result.get("deltas", []))
+    return out
+
+
+def disposition_of(result):
     d = {k: result[k] for k in ("complete", "rippleStatus", "missing") if k in result}
     if "open" in result:
         d["open"] = [{"file": x.get("file"), "status": x.get("status"), "reason": x.get("reason")}
@@ -110,21 +138,27 @@ def main():
     p.add_argument("--note")
     p.add_argument("files", nargs="+")
     a = p.parse_args()
+    args = wave_args(a.script)
+    base_sha = rev(a.repo, a.base)
+    if args.get("base") and rev(a.repo, args["base"]) != base_sha:
+        sys.exit(f"--base {a.base} is not the wave's pinned base {args['base']}")
+    result = load_result(a.result) if a.result else None
     if not re.fullmatch(r"[A-Za-z0-9._-]+", a.wave):
         sys.exit("wave name must be [A-Za-z0-9._-]+")
     out = os.path.join(a.repo, "docs/planning/85-gap-hunt/waves", a.wave + ".json")
     if os.path.exists(out):
         sys.exit(f"{out} exists: manifests are immutable, re-cut the wave under a new name")
     manifest = {
-        "schema": 1,
+        "schema": 2 if args.get("goal") else 1,
         "wave": a.wave,
         "branch": a.branch,
-        "base_sha": rev(a.repo, a.base),
+        "base_sha": base_sha,
         "head_sha": rev(a.repo, a.head),
         "files": sorted(set(a.files)),
-        "findings": findings_of(wave_args(a.script)),
+        "findings": findings_of(args),
         "workflow_runs": a.run,
-        "disposition": disposition_of(a.result) if a.result else None,
+        "disposition": disposition_of(result) if result is not None else None,
+        "goal": goal_of(args, result),
         "central_build": CENTRAL_BUILD,
     }
     if a.note:

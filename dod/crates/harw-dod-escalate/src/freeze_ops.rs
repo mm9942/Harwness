@@ -488,7 +488,9 @@ mod tests {
             Timestamp::UNIX_EPOCH,
             Timestamp::UNIX_EPOCH,
         )
-        .map_err(ctx("the still active freeze resolves on a confirmed release"))?;
+        .map_err(ctx(
+            "the still active freeze resolves on a confirmed release",
+        ))?;
         assert!(store.active().map_err(ctx("active"))?.is_empty());
         Ok(())
     }
@@ -500,11 +502,7 @@ mod tests {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
-        let refused = finding_with(
-            Severity::Critical,
-            Hardness::Observed,
-            Verdict::NeedsReview,
-        )?;
+        let refused = finding_with(Severity::Critical, Hardness::Observed, Verdict::NeedsReview)?;
         let record = Freeze {
             cgroup: cgroup.clone(),
             finding: refused.id().clone(),

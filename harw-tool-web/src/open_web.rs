@@ -487,7 +487,9 @@ mod tests {
         // Eine neue Domain bricht ab; die Meldung nennt nur die Domain.
         let target = "https://exfil.example.org/leak?q=geheim";
         let Err(refused) = access.admit_redirect(target) else {
-            return Err(TestError::Unexpected("Err erwartet: Redirect auf neue Domain".into()));
+            return Err(TestError::Unexpected(
+                "Err erwartet: Redirect auf neue Domain".into(),
+            ));
         };
         assert!(refused.starts_with(NOT_APPROVED_PREFIX), "{refused}");
         assert!(refused.contains("exfil.example.org"), "{refused}");
@@ -497,7 +499,11 @@ mod tests {
 
         // Ein Vermerk für genau diese URL gibt den Redirect nicht frei, wird
         // von ihm nicht verbraucht, und gemerkt wird nichts.
-        access.approve_call(OPEN_WEB_TOOL, &json!({ "url": target }), "exfil.example.org");
+        access.approve_call(
+            OPEN_WEB_TOOL,
+            &json!({ "url": target }),
+            "exfil.example.org",
+        );
         if access.admit_redirect(target).is_ok() {
             return Err(TestError::Unexpected(
                 "Err erwartet: ein Vermerk gibt keinen Redirect frei".into(),

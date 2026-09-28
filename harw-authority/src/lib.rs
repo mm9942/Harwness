@@ -1952,8 +1952,7 @@ network_targets = []
     }
 
     #[test]
-    fn snapshot_reference_matches_only_the_binding_it_was_taken_from() -> test_support::TestResult
-    {
+    fn snapshot_reference_matches_only_the_binding_it_was_taken_from() -> test_support::TestResult {
         // `view_workspace` teilt den Tenant und unterscheidet sich nur in der
         // Workspace-Id; den Tenant-Fall deckt der Test oben ab.
         let snapshot = test_context([Permission::ReadWorkspace], NetworkScope::empty()).snapshot();
@@ -2287,8 +2286,8 @@ network_targets = []
 
     #[cfg(unix)]
     #[test]
-    fn read_trusted_policy_rejects_group_writable_operator_home_parent()
-    -> test_support::TestResult {
+    fn read_trusted_policy_rejects_group_writable_operator_home_parent() -> test_support::TestResult
+    {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir("group-writable")?;
@@ -2309,8 +2308,7 @@ network_targets = []
 
     #[cfg(unix)]
     #[test]
-    fn read_trusted_policy_accepts_a_well_owned_operator_home_policy() -> test_support::TestResult
-    {
+    fn read_trusted_policy_accepts_a_well_owned_operator_home_policy() -> test_support::TestResult {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir("well-owned")?;
@@ -2322,8 +2320,9 @@ network_targets = []
         fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
             .map_err(test_support::ctx("policy mode must be settable"))?;
 
-        let bytes = read_trusted_policy(PolicySource::OperatorHome, &policy_path)
-            .map_err(test_support::ctx("well-owned operator-home policy must be accepted"))?;
+        let bytes = read_trusted_policy(PolicySource::OperatorHome, &policy_path).map_err(
+            test_support::ctx("well-owned operator-home policy must be accepted"),
+        )?;
         assert_eq!(bytes, b"schema_version = 1\n");
         Ok(())
     }

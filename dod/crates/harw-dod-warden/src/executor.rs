@@ -405,7 +405,10 @@ mod tests {
             "a/b\nc",
         ] {
             let cg = cgroup(id)?;
-            if !matches!(validate_path_segment(&cg), Err(WardenError::InvalidCgroupId)) {
+            if !matches!(
+                validate_path_segment(&cg),
+                Err(WardenError::InvalidCgroupId)
+            ) {
                 return Err(TestError::Unexpected(format!("{id:?} must be rejected")));
             }
         }

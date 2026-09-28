@@ -1,0 +1,399 @@
+[
+ {
+  "key": "web",
+  "map": {
+   "answer": "Short answer: harw-web is a hyper 1.11.1 / hyper-util 0.1.20 HTTP/1-only server on a Unix socket, and upgrades are off. It reads SO_PEERCRED once per connection and resolves identity again on every request (TierMapResolver, or SecurityHubResolver with tenant/principal binding). Each request goes through WebRouteTable (built only from the OperationRegistry) and decide_resolved_route. On Execute it builds an OpContext via WebContextFactory, scopes it with ResolvedPeer::scope_op_context, and calls WebAdapter::invoke. The web has no session/turn submit today. The only mutating approval-related operation is approval.resolve (POST /api/approval-resolve). Every route with approval != None is refused with 403 approval_required, so work_driver.enqueue, goal, stop, plan, permissions and key rotate cannot run over the web. GET /events is a single broadcast for the whole process. Its sequence is in-memory, it has no cursor or replay, and events are not filtered by tenant. Existing limits: 64 KiB body, 10 s header timeout, 30 s body timeout, an 8-frame channel per SSE client, and a 64-event bus. There is no connection cap, no limit on operation duration and no limit on SSE duration.\n\nWhere a WebSocket path plugs in so it reuses the same identity and authorization path:\n1. **Connection serving:** in `BoundWebServer::serve_until` (server.rs:497-513), replace `builder.serve_connection` with `serve_connection_with_upgrades`. This call already exists with harw-web's current features (hyper-util auto/mod.rs:256). Keep the per-connection `peer: PeerCredentials` from server.rs:488.\n2. **Reserved path:** in `handle` (server.rs:643), add a branch for a reserved path, modelled on the `EVENTS_PATH` branch (server.rs:654-658). Add that path to `meta::is_reserved_path` (meta.rs:121-123) so no operation can shadow it.\n3. **Identity at upgrade:** call `resolve_identity(identity, &peer, headers)` (server.rs:755-762), which calls `presented_context` and `LocalPeerIdentityResolver::resolve`, to get a `ResolvedPeer`. The actor always comes from that, never from a frame.\n4. **Authorization per frame:** use the private core `decide_with_tier` (router.rs:262-298) through a new sibling of `decide_resolved_route` (router.rs:251-258) that looks operations up by operation name (plus method) instead of HTTP path. It must still use `tier_permits` (authz.rs:175) and the `ApprovalPolicy` gate.\n5. **Execution:** build the context with `(context_factory)(&peer, caller_tier)` (`WebContextFactory`, server.rs:227-228), scope it with `scoped_context(Some(&resolved), ctx)` (server.rs:780-790), then call `WebAdapter::invoke` (harw-operations/src/adapter/web.rs:425-452).\n6. **Approvals:** keep going through the approval.resolve route. `ApprovalCaller::with_web_peer` gets its peer and resolver from the services that harw-cli `web_op_context` inserts (harw-cli/src/web.rs:683-688).\n7. **Live events:** use `WebEventBus::subscribe` and map `WebEventReceiveError::Lagged` to an explicit gap frame, as `sse_response` does (server.rs:881-910).\n\nSuggested placement (xtask/arch-policy.toml):\n- **Upgrade and frame loop:** a new private `ws` module inside harw-web (layer A, arch-policy.toml:364-365). It needs the private `handle`, `resolve_identity` and `scoped_context` functions, and it keeps a single authority path.\n- **Dependency:** declare tungstenite / tokio-tungstenite explicitly, without TLS or default features, in harw-web/Cargo.toml only. Do not rely on the copy that comes in through thirtyfour. No dod/Warden crate depends on harw-web, so the Warden stays free of Tungstenite.\n- **Frame and cursor types:** put them in harw-protocol (layer F, arch-policy.toml:90-91), as `session_wire.rs` as PL-65 §3.1 plans.\n- **Durable cursor and single writer:** these belong behind a session port in the session-store (I) and runtime (A) layers, not in harw-web.\n\nThis was a read-only mapping. I added no tests and ran no builds. When code lands, the central build must run cargo fmt --all, clippy -D warnings, workspace tests including doc tests (harw-web, harw-ops, harw-cli), xtask gates (arch) and cargo deny check (the new direct tungstenite dependency).",
+   "points": [
+    {
+     "topic": "Accept loop",
+     "finding": "serve_until runs a tokio::select! loop over shutdown, a 30 s heartbeat, JoinSet reaping, accept backoff and accept(). Each connection is spawned into an unbounded JoinSet. If reading SO_PEERCRED fails, the stream is dropped before any HTTP is served. Transient accept() errors trigger an exponential backoff from 10 ms up to 1 s; only EBADF, ENOTSOCK, EINVAL, EFAULT and EOPNOTSUPP are fatal. Bind never deletes a live socket or a non-socket file. The CLI runs everything on a current_thread runtime.",
+     "evidence": "harw-web/src/server.rs:423-521 (peer read :488-492, spawn :497-514), :208-211, :603-632, :546-584; harw-cli/src/web.rs:361-364"
+    },
+    {
+     "topic": "HTTP stack and upgrades",
+     "finding": "Locked versions are hyper 1.11.1, hyper-util 0.1.20 and http-body-util 0.1.5. Features are hyper [server,http1] and hyper-util [server,http1,tokio]. The builder is auto::Builder::new(TokioExecutor).http1_only() with TokioTimer and header_read_timeout. Connections use serve_connection, not serve_connection_with_upgrades, so upgrades are OFF. The upgrade API is available with the current features.",
+     "evidence": "Cargo.lock:4416,4453,4379; harw-web/Cargo.toml:32-33; server.rs:594-601, :499-513; hyper-util-0.1.20 src/server/conn/auto/mod.rs:256"
+    },
+    {
+     "topic": "Peer identity",
+     "finding": "PeerCredentials{pid,uid,gid} comes from rustix socket_peercred and is read once, right after accept(). No token is taken from a header or the body.",
+     "evidence": "harw-web/src/peer.rs:43-50, :109-117"
+    },
+    {
+     "topic": "Identity resolvers",
+     "finding": "The LocalPeerIdentityResolver trait resolves (peer, presented_context) to a ResolvedPeer with tier, tenant, principal_id, summary and source. TierMapResolver takes the tier from PeerAuthorizer plus a uid_tenants map, and sets principal 'uid:<uid>'. SecurityHubResolver verifies the x-harw-security-context id with the hub (2 s timeout). It binds the principal to the uid, requires a matching tenant, can only narrow the tier (min), and handles fallback and require_context. Identity is resolved again on EVERY request, so a hub revocation takes effect on the next request. The CLI builds the resolver from [web.identity]; its tier map grants Owner only to the process's own uid.",
+     "evidence": "identity.rs:309-319, :351-404 (:384), :473-623 (:582, :596-602, :606), :113, :116, :276-292, :194-203, :825-838; server.rs:678-683, :755-762; harw-cli/src/web.rs:324-332"
+    },
+    {
+     "topic": "Route table and dispatch",
+     "finding": "WebRouteTable::from_registry is the only constructor, and it builds entries only via WebAdapter::from_operation. Reserved paths (/events, /v1/*) are rejected. decide_with_tier checks in order: path, then declared method, then identity, then tier_permits, then ApprovalPolicy. On Execute, handle reads a JSON body of at most 64 KiB, calls context_factory, scoped_context and route.invoke, then publishes OperationCompleted. ApprovalRequired returns 403. WebAdapter::invoke wraps the args as OpInput::model_tool.",
+     "evidence": "router.rs:369-405, :251-258, :262-298 (:290-292), :127-157; meta.rs:121-123; server.rs:643-742 (:704-711, :713-739); authz.rs:175-177; harw-operations/src/adapter/web.rs:199-225, :425-452"
+    },
+    {
+     "topic": "OpContext per call",
+     "finding": "WebContextFactory runs once per Execute, not once per connection. The CLI version inserts web_principal(uid, tier), the PeerCredentials, the ApprovalActorResolver and the ApprovalStore. It also creates a fresh SessionId::new() and TurnId::new() on each call, so web operations are not bound to any session.",
+     "evidence": "server.rs:227-228, :717; harw-cli/src/web.rs:356-359, :675-695; harw-cli/src/runtime_web.rs:92-99"
+    },
+    {
+     "topic": "Approvals over the web",
+     "finding": "approval.pending is a GET at observer tier; approval.resolve is a POST at operator tier; both have approval=none. The actor comes from the Principal service plus the peer and resolver: ApprovalCaller::actor requires a SO_PEERCRED peer for Web principals. StaticUidApprovalActorMap maps only the process's own uid to 'owner'. ApprovalStore::resolve enforces single use, actor binding and TTL under a per-session file lock. A caller with a tenant who resolves another tenant's request gets the same error as for an unknown request.",
+     "evidence": "harw-ops/src/approval.rs:276-323, :404-453 (:414-427), :221-245; harw-web/src/security.rs:318-413, :534-575, :80; harw-cli/src/web.rs:337-341"
+    },
+    {
+     "topic": "Session/turn submit over the web",
+     "finding": "There is none. The routes with Surface::Web are help, work, explore, infra/*, analyze, work-driver/{enqueue,status,stop}, ps, goal, stop, permissions, diff, plan, status, attach (GET, read-only), research*, and approval-*. Every mutating one except analyze and approval.resolve has approval=always, so it returns 403. harw-protocol defines turn.submit and approval.respond names, but harw-web does not depend on harw-protocol.",
+     "evidence": "harw-ops/src/work_driver.rs:592; goal.rs:332; stop.rs:84; attach.rs:99; approval.rs:409; harw-protocol/src/methods.rs:3-10; harw-web/Cargo.toml (no harw-protocol)"
+    },
+    {
+     "topic": "SSE event bus",
+     "finding": "There is one broadcast channel for the whole process (capacity 64 in the CLI). A Mutex-held next_sequence starts at 1 and advances even with no subscribers. Only OperationCompleted{operation, ok, trust=Data} and Heartbeat are published. A slow subscriber gets Lagged{skipped}, which the SSE task sends as 'event: lagged'. Each client has an 8-frame Channel in its own spawned task. There is no Last-Event-ID, cursor or replay. GET /events checks only that identity resolves: there is no tier check and no tenant filter.",
+     "evidence": "events.rs:109-126, :136-141, :215-254, :271-275, :302-318, :349-356; server.rs:838-869, :881-910, :447-449, :201; harw-cli/src/web.rs:238"
+    },
+    {
+     "topic": "Existing limits",
+     "finding": "MAX_BODY_BYTES is 64 KiB, enforced through Limited even for chunked bodies. HEADER_READ_TIMEOUT is 10 s and also covers idle keep-alive connections. BODY_READ_TIMEOUT is 30 s (408). Operation run time and SSE streams are deliberately unbounded. There is NO connection cap; sibling crates do have Semaphore caps.",
+     "evidence": "server.rs:194, :204, :207, :92-103, :940-987; harw-node-transport/src/server.rs:42,53,96; harw-auth-hub/src/server.rs:84,200"
+    },
+    {
+     "topic": "WebSocket dependency and ring",
+     "finding": "tokio-tungstenite 0.30.0 is reached only through thirtyfour. harw-web is in layer A, harw-protocol in F and harw-operations in I. The only reverse dependencies of harw-web are harw-cli and harw-ops; no dod/Warden crate depends on it. Other agents are currently editing harw-web (R16 round), and line numbers reflect the working tree.",
+     "evidence": "Cargo.lock:6975, :7166-7179; xtask/arch-policy.toml:90-91, :122-123, :364-365; git status (harw-web/src/{events,identity,meta,router,server}.rs modified)"
+    }
+   ],
+   "gaps": [
+    "No WebSocket or upgrade path: serve_connection is used without upgrades, harw-web has no direct tungstenite dependency, and there is no reserved WS path.",
+    "No connection-count limit on the harw-web listener (unbounded JoinSet) and no per-connection time or idle limit for long-lived streams; operation run time is also unbounded.",
+    "No session/turn submit, interrupt or session.close operation on any surface reachable from the web. There is no /v1/rpc, and harw-protocol/src/session_wire.rs, which PL-65 §3.1 plans, does not exist.",
+    "No SessionPort type in code (it appears only in docs/planning/65-cloud-sessions/README.md and 75-harness-patterns/openclaw.md). There is also no single-writer session owner, no idempotency key or dedupe for submits, and no head/generation check on the web path.",
+    "No durable cursor, generation or replay: the WebEvent sequence is per process and in memory, it resets on restart, and Last-Event-ID is not read. Events are never persisted.",
+    "The event bus is not tenant- or session-scoped and has no tier check: any resolved peer sees every OperationCompleted. No turn, session or approval events are published to it.",
+    "The approval actor is derived from the peer uid via StaticUidApprovalActorMap (process uid mapped to 'owner'), not from ResolvedPeer.principal_id; in security_hub mode the hub principal is not used as the approver.",
+    "Routes with approval != None cannot run over the web at all (403). There is no web flow that parks an operation until an approval arrives, and none that resumes it afterwards.",
+    "No revocation during a connection: identity is resolved per HTTP request, so a long-lived WS connection would need periodic re-verification with the hub. Nothing like that exists today.",
+    "No NodeTransport-to-harw-web bridge: remote NodeTransport identities are never turned into a ResolvedPeer or OpContext.",
+    "No workbench view of run/agent scope or queue reasons (host capacity vs other limits) is exposed through harw-web routes or events.",
+    "No end-to-end test over the socket for SSE lagged/gap behaviour, and no tests for forged identity, cross-tenant replay, duplicate submit, concurrent approval over the socket, slow consumer, old cursor, or reconnect/restart."
+   ]
+  }
+ },
+ {
+  "key": "session",
+  "map": {
+   "answer": "Short answer: sessions are persisted in exactly one place, the append-only JSONL transcript (`harw-session-store`). It carries a per-session monotonic `sequence`, and that is the only durable cursor candidate. Nothing today exposes it as a reconnect cursor: there is no `generation`, and there is no `SessionPort`, `session_wire.rs`, `harw-session-host` or head/idempotency check for session submits. The single writer is the in-process owner of `&mut AgentSession` (TUI `app.rs`, or the Telegram per-chat FIFO worker). Two things back it up: a per-process sequence mutex, and an fs4 try-lock that is held for one append only. No cross-process session lease or writer epoch exists. Approvals reach a parked turn through in-memory channels (TUI, Telegram). Only children use the durable `ApprovalStore` path. Web `approval.resolve` consumes durable records, but nothing wakes a parked root turn from them. Detaching is not safe today: TUI exit cancels background agents and the in-process turn. Only durable jobs (fenced leases, coordinator reclaim) and host-executed process jobs survive a detach.\n\nThe DEC numbers in the brief do not match the repository. Only DEC-001 to DEC-008 exist (`docs/planning/70-decisions/README.md:19-26`). In PL-65, DEC-010 is the unwritten \"cloud home\" proposal. It covers single-writer storage (one block volume, one host). The session single writer is DEC-011, and input arbitration (`expect_head`, `client_msg_id`) is DEC-013. DEC-012 (NDJSON frames) and DEC-016 (split home) are plan text only, with no code. DEC-012 explicitly rejects WebSocket (`65:140-142`), so W00 has to supersede its transport clause while keeping its types and cursor rules.\n\nWhere new code should go (per `xtask/arch-policy.toml`):\n- **`harw-protocol` (F, line 90):** `session_wire.rs` (`Cursor`, `FrameEnvelope`, `SessionFrame` with an `Unknown` fallback, submit params without an actor field) and `session_port.rs` (std futures only). These are shared by the WS and NDJSON/SSE adapters, and no tokio or tungstenite goes here.\n- **`harw-session-store` (I, line 139):** transcript `generation` (bumped by `rewrite`), `read_from(sequence)`, and a session writer lease with an epoch, modelled on the job-store fencing.\n- **New `harw-session-host` (A):** it is not yet in `arch-policy.toml`, so it needs `[packages.\"harw-session-host\"] layer = \"A\"`. It holds the single-writer turn driver (generalised from `telegram_session.rs`), the arbiter (head check plus msg-id LRU), approval first-wins over `ApprovalStore`, fan-out with a bounded per-client queue, and the owned hyper and WS adapter. `tokio-tungstenite` should be a direct dependency of this A crate only; it must not go into `harw-protocol`, `harw-web`'s F/I dependencies or `dod/*` (the Warden).\n- **`harw-web` (A):** keep it for the peer and identity libraries and the migration SSE consumers.\n\nI only read code: I added no tests and changed no files, so the central build has nothing new to run for this mapping.",
+   "points": [
+    {
+     "topic": "Durable transcript (only persisted session state)",
+     "finding": "Each record is one append-only JSONL line with a monotonic 0-based `sequence`. `append` fsyncs the file and its directory under an fs4 try-lock that is held only for that one append and never blocks. `rewrite` replaces the whole file atomically (retention), with no generation bump. The store does not check that `sequence` actually increases; the caller assigns it.",
+     "evidence": "harw-session-store/src/record.rs:32-44 (\"Monotonic per-session ordering index (0-based append position)\"); harw-session-store/src/store.rs:164-185 (append), 267-303 (rewrite), 351-361 (lock_transcript with try_lock → LockContended)"
+    },
+    {
+     "topic": "Who assigns the sequence (the actual writer)",
+     "finding": "`TranscriptStateStore` keeps an in-memory `SequenceSlot` per session. On the first write it recovers the next number by reading max(sequence)+1 from the file, then caches it. This serialises writers within one process only. Two processes each hold their own cache, so they could reuse sequence numbers, and while they overlap they get `LockContended` (no retry in core/cli/tui).",
+     "evidence": "harw-core/src/state_store.rs:19-28, 661-666, 684-702, 713-777 (slot.next cached, store.append)"
+    },
+    {
+     "topic": "History replacement and generation",
+     "finding": "`save_history` appends every item again plus a `history_replaced` lifecycle marker; `load_history` keeps only the last N items. No transcript generation exists anywhere. The only 'generation' counters are the TUI settings controller (in-memory) and Telegram's `/new` session-id generation.",
+     "evidence": "harw-core/src/state_store.rs:844-868, 898-899; docs/architecture/session-controller.md:64-75 (generation/applied_generation); harw-tui/src/session_controller.rs:79,206,270,308; harw-cli/src/gateway/telegram_session.rs:11-12"
+    },
+    {
+     "topic": "Persisted session snapshot lacks run state",
+     "finding": "`core_session_state` persists only mode, usage and activation. It does not persist SessionState (Running/WaitingForApproval), current_turn, the pending approval or a head. `SessionMeta` has no tenant, owner or generation.",
+     "evidence": "harw-core/src/state_store.rs:263-275; harw-session-store/src/meta.rs:127-170 (fields version…drift_events)"
+    },
+    {
+     "topic": "Core single-writer model",
+     "finding": "Turns need `&mut AgentSession`; `try_start_turn` only succeeds from Idle (otherwise NotIdle). The `TurnControl`/`CancelToken` survives approval and child pauses on the session. `SessionManager` is a plain owned map, with no lease or epoch.",
+     "evidence": "harw-core/src/session.rs:144-151, 189, 1632-1646, 1650-1665; harw-core/src/turn_loop.rs:3344-3382; harw-core/src/session_manager.rs:13-144"
+    },
+    {
+     "topic": "Live events (not durable)",
+     "finding": "`AgentEventHub` is a process-wide `tokio::broadcast` with capacity 8192. A slow receiver gets `Lagged` and the turn loop never blocks. Events have no sequence, cursor or tenant. harw-web's `WebEventBus` has one process-wide stream with an in-memory `sequence` starting at 1, carries only OperationCompleted/Heartbeat, and cannot replay. The MCP server bus is per-session but likewise in-memory.",
+     "evidence": "harw-core/src/agent_events.rs:10-13, 20, 66-104; harw-web/src/events.rs:1-21, 109-138, 207-216, 302-316; harw-mcp-server/src/events.rs:1, 35-37"
+    },
+    {
+     "topic": "harw-protocol contract",
+     "finding": "There are versioned JSON-RPC envelopes (major must be 1). The method constants `turn.submit`, `approval.respond` and the rest are unused outside the crate. TurnEvent/SessionEvent are internally tagged with no Unknown fallback. There is no `session_wire.rs` or `session_port.rs`, and no SessionPort, Cursor or FrameEnvelope anywhere.",
+     "evidence": "harw-protocol/src/wire.rs:1-48, 60-147; harw-protocol/src/methods.rs:3-10; harw-protocol/src/events.rs:10-12, 50-52; `ls harw-protocol/src` = approvals, events, items, lib, methods, orchestration, test_support, wire"
+    },
+    {
+     "topic": "How approvals reach a running turn",
+     "finding": "TUI root: in-memory `ApprovalDriver` calls the non-durable `resume_after_approval` with the actor recorded in the session. Telegram: the parked map is in-memory, and the decision is enqueued at the front of the chat FIFO and uses the non-durable resume. Durable path (`run_turn_durable` issues an `ApprovalRecord` with tenant from the spawn context; `resume_after_approval_durable` consumes it first): only children use it. `ApprovalStore::resolve` is first-wins under a per-session fs4 try-lock and returns AlreadyResolved, ActorMismatch or Expired (30 min TTL). A concurrent caller gets LockContended with no retry. `ApprovalStore::resolution` (the reader meant for paused turns) has no production caller.",
+     "evidence": "harw-tui/src/approval.rs:1218-1262; harw-cli/src/gateway/telegram_session.rs:33-40, 592, 754, 856; harw-core/src/turn_loop.rs:3692-3731, 4806-4821; harw-core/src/child_controller.rs:5758; harw-core/src/child_approval.rs:368; harw-session-store/src/approval.rs:65, 226-300"
+    },
+    {
+     "topic": "Operator/web approval path",
+     "finding": "`approval.resolve` takes the actor only from the trusted Principal plus SO_PEERCRED plus a server-side resolver table, applies the tenant_admits filter, and fails closed. harw-web runs no model turns.",
+     "evidence": "harw-ops/src/approval.rs:22-33, 46-63, 411-448; harw-cli/src/runtime_web.rs:21-23"
+    },
+    {
+     "topic": "Idempotency / head checks",
+     "finding": "Durable jobs only: an `IdempotencyKey` gives a BLAKE3 work id over (tenant, workspace, submitter, key), returning Duplicate or IdempotencyConflict and surviving a lost race. Job records carry `revision` and `lease_epoch` fencing. For session submits there is nothing comparable: no client_msg_id and no expect_head. Telegram queues are bounded at 32 per chat.",
+     "evidence": "harw-core/src/admission.rs:15-19, 404-462; harw-job-core/src/stored.rs:115-117, 234; harw-session-store/src/job_store.rs:14-16; harw-cli/src/gateway/telegram_session.rs:92, 176-184"
+    },
+    {
+     "topic": "UI detach today",
+     "finding": "TUI exit calls `background_agents::cancel_all(\"tui exited\")`, and `/new` and `/resume` cancel as well. The quit dialog lets host process jobs keep running (detach), but sandboxed jobs end with harw. Durable jobs have their own leases, and the coordinator reattaches them after restart.",
+     "evidence": "harw-tui/src/runtime_root.rs:889-895; harw-tui/src/app/background_agents.rs:40-41; harw-tui/src/app/jobs_glue.rs:234-266, 438; harw-job-runtime/src/coordinator/tests.rs:646"
+    },
+    {
+     "topic": "PL-65 decision mapping",
+     "finding": "DEC-010 = cloud home (proposed, unwritten; 'one writer' is the storage volume). DEC-011 = host is the single turn loop. DEC-012 = JSON-RPC + NDJSON frames, Cursor{generation, durable = TranscriptRecord::sequence, live}, rejects WS. DEC-013 = FIFO (cap 8) + expect_head + client_msg_id LRU 256 + approvals first-wins, actor never taken from the wire. DEC-016 = split home (HARW_STATE_DIR/HARW_RUNTIME_DIR). All of these are plan only.",
+     "evidence": "docs/planning/65-cloud-sessions/README.md:39, 105-129, 134-142, 151-154, 232-248, 386-406, 440-463, 738, 758-766; docs/planning/80-copilot-backlog/README.md:232-252; `ls harw-home/src` has no storage.rs; no HARW_STATE_DIR in any .rs file"
+    },
+    {
+     "topic": "Ring placement",
+     "finding": "harw-protocol=F, harw-session-store=I, harw-core/harw-cli/harw-tui/harw-web/harw-node-transport=A. F may depend only on F, I on F/I, and A on anything. harw-session-host is not listed yet (PL-65 plans it as A). harw-protocol's dependencies are only harw-types, jiff, serde and serde_json.",
+     "evidence": "xtask/arch-policy.toml:42-53, 88-91, 139-140, 204-205, 280-283, 362-365; docs/planning/65-cloud-sessions/README.md:520; harw-protocol/Cargo.toml [dependencies]"
+    }
+   ],
+   "gaps": [
+    "No per-session transcript `generation`: `TranscriptStore::rewrite` silently invalidates sequence cursors (store.rs:267).",
+    "No seek or `read_from(sequence)` on `TranscriptReader`; replay means a full scan (reader.rs:25-120).",
+    "No cross-process single-writer lease or epoch for a session. The sequence cache is per process (state_store.rs:713-777), and fs4 covers only a single append. There is no HostedSessionRecord and no host_epoch.",
+    "No durable run state (Running/WaitingForApproval, current_turn, pending approval) in the session snapshot, so after a restart it is impossible to tell that a turn was interrupted (state_store.rs:263-275).",
+    "No SessionPort, session_wire.rs, Cursor, FrameEnvelope or SessionFrame::Unknown/Lagged/Resync, and no harw-session-host or harw-session-remote crate.",
+    "No idempotent session submit (client_msg_id) and no head/stale check (expect_head); telegram FIFO has no dedup.",
+    "No bridge from a durable `ApprovalStore` resolution to a parked root turn: `resolution()` has no production caller, the TUI and Telegram park in memory, and a restart loses their parked approvals.",
+    "Concurrent approval returns `LockContended` (no retry and no `AlreadyResolved` for the loser while the lock is held).",
+    "No per-client bounded outbound queue, connection-count limit or frame-size limit for session streams. AgentEvent and WebEvent carry no tenant or session scope.",
+    "Detach cancels work: TUI exit cancels background agents and the in-process turn. The model 'turn continues without clients' does not exist yet.",
+    "No WebSocket code of our own: tokio-tungstenite is only a transitive dependency via thirtyfour, and DEC-012 as planned rejects WS.",
+    "DEC-009 to DEC-019 are unwritten, and the brief's DEC-010 (single writer) is the cloud-home proposal. The session single writer is DEC-011 and arbitration is DEC-013.",
+    "The HARW_STATE_DIR/HARW_RUNTIME_DIR split home (DEC-016) is not implemented (no harw-home/src/storage.rs).",
+    "Tests added: none (read-only mapping). There are no new central-build commands for this mapping."
+   ]
+  }
+ },
+ {
+  "key": "plans",
+  "map": {
+   "answer": "Short answer: the only binding plan is PL-65, and it rejects WebSocket. Its status is \"planned\" (README.md:4). Its decision note DEC-012 was never written: 70-decisions/README.md lists only DEC-001 to DEC-008. So W00 needs a new decision note that explicitly amends PL-65 §3.1 (lines 136-142) and §7 (line 539, \"No new third-party crates\"). I found no \"older multi-node plan with multiplexed WebSockets\" anywhere in docs/ or in the markdown git history. The contract side of PL-65 already fits WS unchanged: SessionPort/FrameSource are transport-neutral (std futures, no tokio), `Cursor`/`SessionFrame` carry `Resync`/`Lagged`/`Revoked`, and the actor is never taken from the wire. Only the carrier changes: one WS text message is one envelope, in place of one NDJSON line.\n\nWhere the owned WS adapter should live:\n- **New ring-A crate** (working name `harw-control-ws`), with `[packages.\"harw-control-ws\"] layer = \"A\"` in xtask/arch-policy.toml.\n- **Direct dependencies:** `hyper`/`hyper-util` (already Tier A), `tokio`, `harw-protocol`, `harw-types`, and an explicit `tokio-tungstenite = { version = \"0.30\", default-features = false, features = [\"handshake\"] }`. The server side uses `WebSocketStream::from_raw_socket` over `hyper::upgrade::Upgraded`. The crate must not depend on `harw-core`, `harw-web` or `harw-node-transport`.\n- **What it owns:** upgrade accept, `WebSocketConfig` bounds (max_message/frame/write buffer), a bounded per-client outbound queue that overflows to `Lagged{resume_from}`, ping/idle timeouts and a maximum lifetime. It takes an already-authenticated, opaque identity from the listener and never reads identity from frames.\n- **Who mounts it:** `harw-session-host` (ring A, planned by PL-65 §7), on both listeners:\n  - the local UDS listener, where `harw-web` would need `serve_connection_with_upgrades`;\n  - `harw-node-transport`, where `server.rs:292-298` would need `.with_upgrades()`.\n- **What stays transport-free:** `harw-protocol` (ring F) keeps only the contract.\n- **Why the Warden cannot reach it:** ring D may not depend on A (arch-policy.toml:51), the TCB allowlist (376-383) blocks new internal edges, and the budget ratchet is 54 (gate_warden.rs:304).\n- **Guards to add:**\n  - `tungstenite` and `tokio-tungstenite` in `CRYPTO_AND_HTTP_STACK` (gate_edges.rs:184-192), so the rule is named instead of relying only on the budget;\n  - a deny.toml `wrappers` entry limiting `tokio-tungstenite` to `thirtyfour` plus the new crate (check the locked cargo-deny syntax first);\n  - a Tier B row in dependency-review.md.\n- **Decision number:** DEC-048. Docs already reserve up to DEC-047 (67-containers/cell.md:246).\n\nWhat stays on HTTP/NDJSON/SSE during migration:\n- `harw-web` `GET /events` SSE, consumed by webui/lib/sse.ts:155;\n- MCP streamable-HTTP SSE (harw-mcp-server/src/transport.rs:670);\n- the node-transport DoD NDJSON uplink (uplink.rs:36);\n- the PL-65 `POST /v1/rpc` route, which WS should mirror so both paths go through one dispatch.\n\nTests added: none (read-only mapping). Central build: nothing to run for this report. Once the adapter lands, run the full CLAUDE.md sequence, which includes `cargo run -q -p xtask -- gates` (arch, edges, warden-deps) and `cargo deny check`.",
+   "points": [
+    {
+     "topic": "PL-65 transport choice and reasons",
+     "finding": "PL-65 chose JSON-RPC envelopes over POST /v1/rpc plus NDJSON frames on GET /v1/sessions/{id}/frames?from=<cursor>. It rejected SSE and WS for two reasons: the same HTTP/1 route works over UDS (hyper) and over NodeTransportServer::serve (Tower), and WS would add tokio-tungstenite, which today comes in only through thirtyfour (Tier B). The plan is still 'planned', and its decision notes DEC-011 to DEC-019 were never written.",
+     "evidence": "docs/planning/65-cloud-sessions/README.md:4 'status: planned'; :136-142 (§3.1, incl. :141 'same HTTP/1 route works unchanged over UDS (hyper) and over NodeTransportServer::serve' and :142 'WebSockets would add tokio-tungstenite'); :757-766 DEC-011..019 still to be written; docs/planning/70-decisions/README.md index lists only DEC-001..008"
+    },
+    {
+     "topic": "PL-65 SessionPort, frames, replay, backpressure",
+     "finding": "The contract is transport-neutral. SessionPort/FrameSource live in harw-protocol with std futures only. Cursor is {generation, durable, live}. SessionFrame has Resync, Lagged, Revoked, HostDraining, Heartbeat and an Unknown fallback. Replay order is durable replay from the transcript sequence, then the live ring (or a Snapshot), then pending approvals from ApprovalStore. Each client gets a bounded queue (1024 frames / 4 MiB); on overflow the client gets Lagged and the turn loop never blocks. A breaking change needs /v2.",
+     "evidence": "README.md:209-230 (§3.3 SessionPort, LocalPort/RemotePort, 'TUI depends only on harw-protocol'); :149-200 (Cursor, SessionFrame); :232-242 (§3.4); :244-249 (§3.5); :251-255 (§3.6)"
+    },
+    {
+     "topic": "PL-65 auth, single writer, idempotency, limits",
+     "finding": "The host is the single writer. Submits are checked against expect_head (compare-and-swap) and made idempotent by a 256-entry client_msg_id LRU. Approvals are first-writer-wins. The actor is derived from the transport identity and never taken from the wire. Two listeners (UDS with SO_PEERCRED; node transport with AuthenticatedPeer, then DeviceRegistry) feed one hyper service. Remote clients must carry a tenant (Some). Revocation plus a 60 s maximum connection lifetime; HostLimits cover queue cap, attachments and submit rate.",
+     "evidence": "README.md:117-128 (§2.4); :261-279 (§4.1 'Both mount the same hyper/Tower service from harw-session-host/src/http.rs', ClientIdentity); :304-311 (§4.4); :322-333 (threat model, DoS); :550-561 (HostLimits)"
+    },
+    {
+     "topic": "PL-65 crate placement",
+     "finding": "PL-65 plans harw-session-host (A), harw-session-remote (A), harw-devices (I) and harw-protocol additions (F). It states 'No new third-party crates', so adding WS contradicts §7 and needs an explicit amendment.",
+     "evidence": "README.md:512-540, esp. :520 (session-host deps incl. harw-web, harw-node-transport), :539 'No new third-party crates'"
+    },
+    {
+     "topic": "Older multi-node / multiplexed-WebSocket plan",
+     "finding": "Not found in the repo. In current docs, the only WebSocket mentions are pattern research (OpenClaw 'one WebSocket', Claude Code transports) and the superseded 'one control.sock multiplexes' design, which is about sockets, not WS. A git log -G search of markdown history found no such plan. The closest multi-node plan, Masterplan v2 §19, uses Hyper/Tower plus Pingora and keeps one-shot management RPC.",
+     "evidence": "docs/planning/75-harness-patterns/openclaw.md:45; claude-code.md:39; Harwness_Crypto_Infrastructure_Masterplan_v2.md:19, :1249-1300 ('Initial management RPC may remain one-shot'); 66-placement/README.md:199,211 (HostFacts over harw-node-transport)"
+    },
+    {
+     "topic": "Masterplan constraints on the control transport",
+     "finding": "harw-web is the control transport substrate: 'Do not build a second local HTTP stack', evolve it instead. No second authority system. Pingora must not create principals from IP. OpenClaw's ClawJacked lesson: a browser can open a cross-origin WS to localhost, so the control socket must never become a loopback TCP port.",
+     "evidence": "Masterplan v2 :100-141 (§1.1), :974 (§14), :1842-1880 (§33); openclaw.md:157"
+    },
+    {
+     "topic": "harw-protocol wire.rs",
+     "finding": "The module doc names WebSocket as a target transport. ProtocolVersion rejects any major other than 1. The Request, Response and Notification envelopes and WireMessage exist, but nothing outside the crate uses them. Envelope params are a plain serde_json Value with no size bound, so transports must enforce size limits. Dependencies are harw-types, jiff, serde and serde_json only; the crate must stay transport-free (ring F).",
+     "evidence": "harw-protocol/src/wire.rs:1-2, :12-45, :60, :75, :123, :147; methods.rs:3-10; lib.rs:3-4 'Keine Runtime-Abhängigkeiten'; Cargo.toml deps; arch-policy.toml:90-91 (F); grep for RequestEnvelope outside the crate found nothing"
+    },
+    {
+     "topic": "harw-node-transport identity and WS feasibility",
+     "finding": "Identity is AuthenticatedPeer{node_id, protocol_version}. InjectPeer overwrites it on every request, so a client cannot influence it. Unknown nodes are refused by NodeVerifier::is_known before the server signs anything. ServerOptions has a handshake timeout, max_connections 256 and a header timeout, but no connection lifetime or idle limit. The connection is served with http1 serve_connection without .with_upgrades(), so a WebSocket upgrade over the node transport is impossible today.",
+     "evidence": "harw-node-transport/src/handshake.rs:321-326; server.rs:311-335; identity.rs:67-75; server.rs:34-56; server.rs:292-298; lib.rs:1-23; uplink.rs:36 NDJSON"
+    },
+    {
+     "topic": "harw-web today",
+     "finding": "Peer credentials are read per connection before any HTTP. The server uses hyper-util's auto Builder with http1_only and serve_connection, again without upgrades. I found no connection-count limit. GET /events is one process-wide broadcast with a sequence number and Lagged errors, but no replay. Consumers include the webui EventSource and the MCP SSE path.",
+     "evidence": "harw-web/src/server.rs:488-512, :500, :594-600, :199; events.rs:1-21, :207-216; webui/lib/sse.ts:155; harw-mcp-server/src/transport.rs:670; PL-65 README.md:28"
+    },
+    {
+     "topic": "Warden dependency fences",
+     "finding": "The Warden talks over SOCK_SEQPACKET. Its internal dependencies are limited to harw-dod-warden, harw-dod-warden-proto, harw-types, harw-macros and harw-completions. The transitive budget is 54 and already includes tokio via harw-types → tokio-util. FORBIDDEN_REACH names hyper and tower for the Warden, probes and sensors, but not tungstenite. The DoD rules crate has a precedent that forbids tokio-tungstenite in its own manifest. Ring D may depend only on F, I and D.",
+     "evidence": "dod/crates/harw-warden/src/ipc.rs:1; dod/crates/harw-warden/Cargo.toml [dependencies]; arch-policy.toml:376-383, :51; xtask/src/gate_warden.rs:274-281, :304; gate_edges.rs:184-192, :199-230; dod/crates/harw-dod-rules/src/advisory.rs:487-495; xtask/src/gates.rs:155-173"
+    },
+    {
+     "topic": "Cargo.lock tungstenite versions and chain",
+     "finding": "Locked: tokio-tungstenite 0.30.0 (with rustls, tokio-rustls and webpki-roots 0.26.11) and tungstenite 0.30.0 (with sha1 0.11.0, data-encoding, rand 0.10.3 and rustls). The only dependent is thirtyfour 0.37.5. Chain: harw-browser-thirtyfour (thirtyfour features reqwest, rustls, bidi, component) ← harw-registry-defaults feature 'browser' (optional) ← harw-runtime, whose default features include 'browser' ← harw-cli and harw-tui (default features). Both crates declare rust-version 1.85. tokio-tungstenite provides from_raw_socket, and WebSocketConfig has max_message_size, max_frame_size and max_write_buffer_size.",
+     "evidence": "Cargo.lock:7166-7179, :7469-7482, :6951-6977; harw-browser-thirtyfour/Cargo.toml:22; harw-registry-defaults/Cargo.toml:52,96; harw-runtime/Cargo.toml:12-13; harw-cli/Cargo.toml:142; harw-tui/Cargo.toml:57; ~/.cargo/registry tokio-tungstenite-0.30.0/src/lib.rs:218; tungstenite-0.30.0/src/protocol/mod.rs:57-92"
+    },
+    {
+     "topic": "Dependency policy",
+     "finding": "thirtyfour is Tier B, 'A only', and is the only source of tokio-tungstenite. There is no tungstenite row. Tier B requires a review entry for any new dependent. deny.toml bans only openssl, openssl-sys and native-tls, warns on multiple versions and runs with all-features=true. Nothing limits tungstenite to its current wrapper. The review doc warns that feature unification changes the effective graph.",
+     "evidence": "docs/architecture/dependency-review.md:75-78, :83, :68 (hyper Tier A), :138-140; deny.toml:14, :57, :71-75"
+    }
+   ],
+   "gaps": [
+    "No W00 or transport decision note exists. DEC-011 to DEC-019 from PL-65 are unwritten, including DEC-012 (Session-Wire). Docs reserve numbers up to DEC-047, so DEC-048 is the next free one (verify).",
+    "The 'older multi-node plan with multiplexed WebSockets' does not exist in the repo, neither in docs/ nor in the markdown git history.",
+    "harw-protocol has no session_wire.rs or session_port.rs: SessionPort, FrameSource, Cursor, SessionFrame and FrameEnvelope do not exist. methods.rs lacks the session.* constants.",
+    "The crates harw-session-host, harw-session-remote and harw-devices do not exist. There is no /v1/rpc route and no NDJSON frames route.",
+    "There is no first-party WebSocket code anywhere. No workspace crate depends directly on tungstenite or tokio-tungstenite.",
+    "harw-node-transport serve_connection has no .with_upgrades(), and ServerOptions has no max connection lifetime or idle timeout.",
+    "harw-web serve_connection has no upgrades, no connection-count limit, and no durable replay for the SSE bus.",
+    "gate_edges CRYPTO_AND_HTTP_STACK does not name tungstenite or tokio-tungstenite, and deny.toml has no wrappers restriction for them.",
+    "dependency-review.md has no Tier row for tungstenite or tokio-tungstenite, and PL-65 §7 says 'No new third-party crates'.",
+    "There is no enrollment path (RS2-05 enroll.rs), no DeviceVerifier, and no IngressSurface::RemoteClient.",
+    "The operator bundle items W11 and T18/T29-T31 are not in the repository."
+   ]
+  }
+ },
+ {
+  "key": "workbench",
+  "map": {
+   "answer": "Short answer: in this codebase \"Workbench\" means only the knowledge scratch surface: pinned files, notes, hypotheses and retention, per session or per project. It has no concept of agents, runs, queues or wait reasons. What the operator calls \"Workbench\" is closest to the TUI's right-hand column: the Agents panel (F3) on top and the Workbench pane (F5) below it. Waiting does happen in six places: the parent's child cap, the durable-admission rate limiter, provider pacing, provider concurrency/429 cooldown, the work-driver wave cap and scope overlap, and the job-worker lane. Almost all of these waits are silent. They show up in tracing logs, free-text rationale lines or counters, never as a typed event or operation field. The protocol has no `Queued` status and no wait-reason type. A child that is waiting for a slot has no session id yet, so no UI can see it. Nothing in the protocol carries run or tenant scope for agents beyond `root_session_id`.\n\nWhere new code should live, following xtask/arch-policy.toml:\n- **Wire contract, `harw-protocol` (layer F).** Add a `Queued` status and a typed `WaitReason` as additive serde fields. Suggested reasons: `ParentChildCap{limit}`, `AdmissionRateLimit{retry_after}`, `ProviderPacing{provider,until}`, `ProviderConcurrency{max,available}`, `HostLane{kind,limit}`, `ScopeOverlap{worker,path}`, `WaveCap{active,cap,source:Spec|Provider}`, `Approval`, `Dependency{ids}`. Also add a pending-spawn key (parent id plus tool-call id), because a queued child has no session id yet.\n- **Emitters (all layer A):**\n  - `harw-core/src/child_controller.rs`: `admit_or_wait_inner`, on the first `AdmitRejection::Capacity`, through the existing `OrchestrationObserver`.\n  - `harw-plan-bridge`: a structured `deferred` list next to `rationale` in `WorkDrivePlan`, recording whether the cap came from the spec or from the provider.\n  - `harw-ops/src/work_driver.rs` and `harw-cli/src/job_worker_work_driver.rs`: a `waiting` field in `WorkDriverState`, written before `pacer.pause`. The job worker should also publish a lane snapshot.\n- **One read-only observer operation in `harw-ops` (layer A)** for run/agent scope and the queue, served through the same operation registry to TUI, web GET and a future WS. This keeps one operation/authority path and matches DEC-008's rule that any third entry point must use the same caller.\n- **Rendering in `harw-tui`:** `agent_tree.rs` / `agent_monitor.rs` (the Agents panel), not `harw-knowledge/src/workbench.rs`.\n\nThis was a read-only mapping. I added no tests and ran no cargo or rustc. The central build has nothing new to verify for this report; once implementation lands it runs the standard order.",
+   "points": [
+    {
+     "topic": "What \"Workbench\" is",
+     "finding": "A knowledge scratch surface: pinned paths, NOTES.md, hypotheses.md and retention.json, per session or per project. Visibility is SelfOnly (a push surface). It has no agent, run or queue data.",
+     "evidence": "harw-knowledge/src/workbench.rs:1-13, 31-32; docs/design/knowledge-surfaces.md:386-404 (§5.1), 408-418 (§5.2); op `workbench` at harw-ops/src/workbench.rs:102; model tools workbench.note/hypothesis/show at harw-registry-defaults/src/workbench_tools.rs:60-66"
+    },
+    {
+     "topic": "TUI surfaces",
+     "finding": "The right-hand column holds Agents (F3, top 60%) and Workbench (F5, bottom 40%). The Workbench pane reloads through `/workbench show` when it receives an `AgentEventKind::Knowledge` invalidation. The Jobs panel shows only session background jobs from harw-tool-job.",
+     "evidence": "harw-tui/src/panes.rs:4-21; harw-tui/src/workbench_pane.rs:1-13; harw-core/src/agent_events.rs:47-61; harw-tui/src/jobs_panel.rs:1-11"
+    },
+    {
+     "topic": "TUI agent states",
+     "finding": "AgentPhase is Admitted/Thinking/Tool/Waiting/Done/Failed/Cancelled. `Waiting` only means \"a child was spawned\" or \"orchestration status Paused\" (approval or grandchild). AgentRow has role/status/task/budget fields but no wait reason, queue position or run/tenant field.",
+     "evidence": "harw-tui/src/agent_monitor.rs:367-375, 652-667, 823-825; harw-tui/src/agent_tree.rs:20-38"
+    },
+    {
+     "topic": "Protocol vocabulary",
+     "finding": "There is no Queued/Waiting status and no reason field. The event carries root/parent/child session, role and depth, but no tenant or run id. TurnEvent has ChildSpawned/Progress/Completed but no wait or backoff event. Only four RPC methods exist.",
+     "evidence": "harw-protocol/src/orchestration.rs:9-17 (Admitted..Cancelled), 24-50; harw-protocol/src/events.rs:92-116; harw-protocol/src/methods.rs:3-10"
+    },
+    {
+     "topic": "Child admission capacity (parent cap)",
+     "finding": "The only wait reason that is typed internally is `AdmitRejection::Capacity` (active children per parent, default 8). `admit_or_wait_inner` loops on Notify or sleep and emits nothing. The caller only logs `tracing::debug` after the wait. No child record exists while it waits, so the UI cannot see it.",
+     "evidence": "harw-core/src/child_controller.rs:674-691 (ChildLimits), 2419-2427, 7922-7926, 8718-8765; harw-core-bridge/src/agent_tool.rs:533-552"
+    },
+    {
+     "topic": "Durable-job admission queue",
+     "finding": "`submit_queued_async` returns `Queued{estimated_retry_after, result}` for rate-limit pressure only. The only callers are tests in admission.rs; there is no production caller and nothing is persisted.",
+     "evidence": "harw-core/src/admission.rs:25-35, 555-617, 621-640; tests 1376-1584; child_controller.rs:40-47 describes the intended caller"
+    },
+    {
+     "topic": "Provider limits (DEC-003)",
+     "finding": "The work driver pauses by `pacing_wait` before each wave chunk. The HTTP provider silently awaits the 429 cooldown and a concurrency permit. `ProviderLoadStatus` (max_concurrency, available_permits, rate_limit_wait, recent_rate_limited, budgets) is a pull snapshot, rendered only as text in /status and /provider.",
+     "evidence": "docs/planning/70-decisions/DEC-003-provider-limits.md:17-25, 63-72; harw-provider-http/src/lib.rs:1554-1569, 4187-4201; harw-core/src/model.rs:647-649; harw-ops/src/status.rs:219-240"
+    },
+    {
+     "topic": "Work driver waves",
+     "finding": "Deferral reasons exist only as free-text rationale lines (\"scope overlaps worker\", \"no free slot (x of cap)\"). `effective_cap` takes min(spec, provider), so which limit caused the deferral is lost. The sidecar stores `effective_parallel` and a `rate_limited` count, and is written only after a round, not during a pacing pause. `work_driver.status` (observer, GET /api/work-driver/status) does not return `last_rationale`.",
+     "evidence": "harw-plan-bridge/src/work_driver.rs:449-455, 1047-1052, 1093-1098, 1123-1130; harw-cli/src/job_worker_work_driver.rs:750-753, 1171-1180; harw-ops/src/work_driver.rs:353-386, 854-860, 957-972"
+    },
+    {
+     "topic": "Host capacity / job runtime",
+     "finding": "The job-worker lane allows at most 2 work_driver runs. A job without a permit is simply not claimed and stays Ready, with no reason recorded. JobState has no queued reason; StoredJob has only `not_before`. Blocked jobs carry no reason except the kanban convention `kanban:<BlockKind>`, and BlockKind has no capacity variant. harw-tool-job rejects with Capacity{max} instead of queueing.",
+     "evidence": "harw-cli/src/job_worker.rs:295, 407-410; harw-job-core/src/job.rs:31-46; harw-job-core/src/stored.rs:111-112; harw-runtime/src/job_ledger.rs:54-57; harw-knowledge/src/kanban/board.rs:125-134; harw-tool-job/src/manager.rs:113-114, 636-641"
+    },
+    {
+     "topic": "Plans: placement / PL-65",
+     "finding": "PL-66 plans a PlacementDecision with rejected-candidate reasons and a CapacityLedger. PL-65 plans HostLimits with `Queued{depth}`. None of this is implemented: there is no harw-placement or harw-session-host crate. Plan-graph `blocked_by` (dependency reasons) does exist.",
+     "evidence": "docs/planning/66-placement/README.md:59, 142-148, 172-175; docs/planning/65-cloud-sessions/README.md:550-561; harw-plan/src/graph.rs:170"
+    },
+    {
+     "topic": "Web transport",
+     "finding": "WebEventKind has only OperationCompleted and Heartbeat. harw-web does not subscribe to AgentEventHub, so no orchestration or wait data reaches web clients.",
+     "evidence": "harw-web/src/events.rs:109-126; no `AgentEventHub` match in harw-web/src"
+    },
+    {
+     "topic": "DEC-008 constraint",
+     "finding": "There is no TUI surface for the work driver. Observation goes through `work_driver.status` or the web API, and any future entry point must reuse the same caller. A read-only view is acceptable only if it goes through that same operation.",
+     "evidence": "docs/planning/70-decisions/DEC-008-no-tui.md:45-50"
+    }
+   ],
+   "gaps": [
+    "No Queued/Waiting status and no typed WaitReason in harw-protocol (AgentOrchestrationStatus, TurnEvent).",
+    "A child waiting in admit_or_wait emits no event and has no identity (no pending-spawn key), so it is invisible to every UI.",
+    "submit_queued_async has no production caller; queued durable submissions are not persisted or observable.",
+    "Provider waits (pacing, cooldown, concurrency permit, 429 backoff) emit no event, only tracing logs.",
+    "WorkDrivePlan deferrals are free-text only; effective_cap loses whether the spec or the provider limit applied; the sidecar is not updated during pacing pauses; work_driver.status omits last_rationale.",
+    "The job-worker lane (MAX_CONCURRENT_WORK_DRIVER_RUNS=2) records no reason when a Ready job is left unclaimed; JobState/StoredJob have no wait-reason field; kanban BlockKind has no capacity kind.",
+    "No run/tenant scope on orchestration events (only root_session_id); no RunId type.",
+    "No read-only operation or web route that lists agents per run together with queue state and wait reasons; harw-web does not forward AgentEventHub.",
+    "Placement engine (CapacityLedger, PlacementDecision) and harw-session-host HostLimits/Queued{depth} exist only as plans.",
+    "The operator's wiring bundle (W00/W11, T18, T29-T31) is not in this repository; there is no host-capacity concept separate from per-parent, lane and provider caps."
+   ]
+  }
+ },
+ {
+  "key": "wsapi",
+  "map": {
+   "answer": "Everything needed to serve WebSocket over the existing Hyper stack is already in the lockfile, but nothing in the workspace is wired for it yet. The locked versions are tokio-tungstenite 0.30.0 (Cargo.lock:7166-7178) and tungstenite 0.30.0 (Cargo.lock:7469-7484), next to hyper 1.11.1 and hyper-util 0.1.20. Today the only thing that pulls in tokio-tungstenite is thirtyfour (Cargo.lock:6975). It is compiled only when the `browser` feature is on (harw-registry-defaults/Cargo.toml:96).\n\n**Which features are on today.** thirtyfour's `bidi` feature enables `dep:tokio-tungstenite` with `default-features = false` and the features `connect` and `rustls-tls-webpki-roots` (thirtyfour-0.37.5/Cargo.toml:51-55, 344-351). Following the feature chain, tokio-tungstenite ends up with `connect`, `stream`, `handshake`, `__rustls-tls` and `rustls-tls-webpki-roots`. tungstenite ends up with `handshake` and `__rustls-tls`.\n\n**Direct dependency adds no new crate to Cargo.lock.** Adding `tokio-tungstenite = { version = \"0.30\", default-features = false, features = [\"handshake\"] }` resolves to crates that are already locked:\n- With no features: futures-util, log, tokio and tungstenite. tungstenite then needs bytes, log, `rand 0.10.3` and thiserror.\n- `handshake` adds data-encoding 2.11.0, http, httparse 1.10.1 and `sha1 0.11.0`, also all locked.\n\nOnly harw-web's own entry in Cargo.lock gains one dependency line. Two side effects remain:\n- data-encoding and sha1 0.11 are used only by tungstenite today. harw-web would now compile them in every build, including builds without the browser.\n- The arch gate reads lockfile edges without filtering by feature. So harw-web's closure (ring A) would count rustls, aws-lc-rs and ring through tokio-tungstenite (Cargo.lock:7172-7177, 6216-6219). Ring A allows that; only ring J and the TCB crates forbid sys crates.\n\n**Server-side API, confirmed from the registry sources.** These functions have no feature gate:\n- `pub async fn from_raw_socket(stream: S, role: Role, config: Option<WebSocketConfig>) -> Self where S: AsyncRead + AsyncWrite + Unpin` (tokio-tungstenite lib.rs:218-226).\n- `Role::Server` (tungstenite protocol/mod.rs:28-33).\n\nThis one needs `handshake`: `pub fn derive_accept_key(request_key: &[u8]) -> String` (handshake/mod.rs:117). It computes base64(SHA-1(key + the RFC 6455 GUID)).\n\n**Hyper upgrade API.**\n- `pub fn on<T: sealed::CanUpgrade>(msg: T) -> OnUpgrade` (hyper upgrade.rs:106). Awaiting it gives `Result<Upgraded, hyper::Error>` (upgrade.rs:227-228).\n- `Upgraded` implements hyper's own `rt::Read`/`Write`, not Tokio's. It must be wrapped as `TokioIo::new(upgraded)` (hyper-util rt/tokio.rs:130, 210-212, 242-244).\n\n**Upgrades are not enabled in harw-web today.** harw-web uses `hyper_util::server::conn::auto::Builder::new(..).http1_only()` and calls plain `serve_connection` (server.rs:168, 494-510, 591-598). Nothing in the workspace calls `with_upgrades()`, so hyper would fail any upgrade with a \"manual upgrade\" error (hyper server/conn/http1.rs:222-227).\n\nSwitching to the auto builder's `serve_connection_with_upgrades` is a trap. hyper-util documents that `http1_only` \"Does not do anything if used with serve_connection_with_upgrades\" (auto/mod.rs:127-131). That path always reads the first bytes to detect the protocol, with no timer (auto/mod.rs:256-274). That undoes the reason harw-web chose `http1_only`: its comment at server.rs:586-590 says it is there so the header-read timeout counts from connection start.\n\nThe safer route is the one harw-node-transport already uses (server.rs:292-297): hyper's own `http1::Builder` with `.timer(TokioTimer::new()).header_read_timeout(..)`, then `.serve_connection(TokioIo::new(stream), svc).with_upgrades()`. `with_upgrades` only requires `I: Send` (http1.rs:199-204), which `UnixStream` meets.\n\n**Where the new code should live.**\n- The adapter goes in harw-web (ring A, arch-policy.toml:364-365), for example `harw-web/src/ws.rs`, with German comments to match the crate. The peer credentials and `decide_resolved_route` are already available per connection there (server.rs:485-507), so there is no second authority path.\n- The versioned frame and envelope types belong in harw-protocol (ring F). Keep that crate transport-free: today it depends only on harw-types, jiff, serde and serde_json (Cargo.toml:11-18).\n- The Warden's TCB allowlist (arch-policy.toml:376-383) plus the sys-crate ban for TCB crates already stops tungstenite reaching the Warden.\n- A new row for tokio-tungstenite is needed in `docs/architecture/dependency-review.md`. Today it is listed only as a transitive dependency of thirtyfour (lines 71 and 83).\n\nI added no tests; this was a read-only mapping. Once the dependency is added, the central build must run, in this order: `cargo fmt --all`, clippy over the workspace with `-D warnings`, the tests including doc tests, `cargo run -q -p xtask -- gates` (the arch gate), `cargo deny check`, `make -C dod clippy test` (`--locked`, so the updated Cargo.lock must be committed first) and `actionlint`.",
+   "points": [
+    {
+     "topic": "Locked versions",
+     "finding": "Locked versions are tokio-tungstenite 0.30.0 and tungstenite 0.30.0, next to hyper 1.11.1 and hyper-util 0.1.20. The registry also holds stale 0.29.0 copies of both WebSocket crates, which are not in the lockfile.",
+     "evidence": "Cargo.lock:7166-7178 (tokio-tungstenite 0.30.0, deps futures-util, log, rustls, rustls-pki-types, tokio, tokio-rustls, tungstenite, webpki-roots 0.26.11); Cargo.lock:7469-7484 (tungstenite 0.30.0, deps bytes, data-encoding, http, httparse, log, rand 0.10.3, rustls, rustls-pki-types, sha1 0.11.0, thiserror); Cargo.lock:4415-4416 (hyper 1.11.1); Cargo.lock:4452-4453 (hyper-util 0.1.20)"
+    },
+    {
+     "topic": "Features enabled today",
+     "finding": "The only consumer is thirtyfour 0.37.5, through its bidi feature, which the harw browser adapter turns on. tokio-tungstenite gets connect, stream, handshake, __rustls-tls and rustls-tls-webpki-roots. tungstenite gets handshake and __rustls-tls. It is compiled only when the browser feature is on.",
+     "evidence": "Cargo.lock:6975 (thirtyfour depends on tokio-tungstenite); thirtyfour-0.37.5/Cargo.toml:51-55 `bidi = [\"dep:tokio-tungstenite\", ...]` and :344-351 `features = [\"connect\", \"rustls-tls-webpki-roots\"] ... default-features = false`; harw-browser-thirtyfour/Cargo.toml:22 `features = [\"reqwest\", \"rustls\", \"bidi\", \"component\"]`; harw-registry-defaults/Cargo.toml:96; tokio-tungstenite-0.30.0/Cargo.toml:55-95; tungstenite-0.30.0 [features] handshake = data-encoding, http, httparse, sha1"
+    },
+    {
+     "topic": "Direct dependency: effect on Cargo.lock",
+     "finding": "A direct dependency with default-features=false, with or without the handshake feature, pulls only crates that are already locked, so no new package appears in Cargo.lock. data-encoding and sha1 0.11.0 are used only by tungstenite, so harw-web would newly compile them in builds without the browser. The arch gate's closure is feature-blind, so harw-web would count rustls, aws-lc-rs and ring; ring A allows this, only ring J forbids sys crates.",
+     "evidence": "Cargo.lock:1346 data-encoding 2.11.0, :4392 httparse 1.10.1, :5924-5932 rand 0.10.3, :6589-6590 sha1 0.11.0 (only dependent: tungstenite), :6992 thiserror 2.0.18; tokio-tungstenite Cargo.toml:73 `handshake = [\"tungstenite/handshake\"]`, :184-186 tungstenite default-features=false; docs/architecture/dependency-review.md:43-46 (closure computed from Cargo.lock edges with no feature filter); xtask/arch-policy.toml:49 `J.forbid_sys_crates = true`"
+    },
+    {
+     "topic": "WebSocketStream API (not feature-gated)",
+     "finding": "from_raw_socket and from_partially_read carry no cfg attribute. The internal without_handshake helper is also ungated. WebSocketStream implements Stream with items of type Result<Message, WsError> and Sink<Message> with error type WsError. Reading is cancel-safe; the send side has no documented cancel-safety guarantee.",
+     "evidence": "tokio-tungstenite-0.30.0/src/lib.rs:218 `pub async fn from_raw_socket(stream: S, role: Role, config: Option<WebSocketConfig>) -> Self where S: AsyncRead + AsyncWrite + Unpin`; :230-235 `from_partially_read(stream: S, part: Vec<u8>, role: Role, config: Option<WebSocketConfig>)`; :289 `pub async fn close(&mut self, msg: Option<CloseFrame>) -> Result<(), WsError>`; :297-301, :339-343; :192-202 cancel-safety; src/handshake.rs:22 (ungated `without_handshake`); lib.rs:13 `pub use tungstenite;`"
+    },
+    {
+     "topic": "Role and WebSocketConfig",
+     "finding": "WebSocketConfig is #[non_exhaustive], so it must be built from Default plus the builder methods. Defaults: read_buffer_size 128 KiB, write_buffer_size 128 KiB, max_write_buffer_size usize::MAX (unbounded), max_message_size Some(64 MiB), max_frame_size Some(16 MiB), accept_unmasked_frames false. from_raw_socket PANICS if max_write_buffer_size <= write_buffer_size, so the config must be a validated constant. max_write_buffer_size only fills up when writes fail, so it cannot serve as the per-client outbound queue; an owned bounded channel is needed for that. Exceeding it returns Error::WriteBufferFull.",
+     "evidence": "tungstenite-0.30.0/src/protocol/mod.rs:28-33 `pub enum Role { Server, Client }`; :44-46 `#[non_exhaustive] pub struct WebSocketConfig`; :57,66,77,81,86,92 fields; :95-105 defaults; :110-143 builders e.g. `pub fn max_message_size(mut self, max_message_size: Option<usize>) -> Self`, `pub fn max_frame_size(mut self, max_frame_size: Option<usize>) -> Self`, `pub fn max_write_buffer_size(mut self, max_write_buffer_size: usize) -> Self`, `pub fn accept_unmasked_frames(mut self, accept_unmasked_frames: bool) -> Self`; :146-151 assert_valid; :176-178 `/// Panics if config is invalid`; :399-400; :67-76 write-buffer doc; src/error.rs:52 Capacity, :58 `WriteBufferFull(Box<Message>)`, :144 MessageTooLong"
+    },
+    {
+     "topic": "Sec-WebSocket-Accept",
+     "finding": "derive_accept_key is SHA-1 of the key plus the RFC 6455 GUID, base64-encoded. It needs the handshake feature, reachable as tokio_tungstenite::tungstenite::handshake::derive_accept_key. The upstream example shows the full hyper 1.x route: header checks, a 101 response, then upgrade::on, TokioIo and from_raw_socket with Role::Server, served with with_upgrades().",
+     "evidence": "tungstenite-0.30.0/src/handshake/mod.rs:117 `pub fn derive_accept_key(request_key: &[u8]) -> String`; src/lib.rs:25-26 `#[cfg(feature = \"handshake\")] pub mod handshake;`; tokio-tungstenite-0.30.0/examples/server-custom-accept.rs:109, 110-130, 133-138, 146-151, 176"
+    },
+    {
+     "topic": "hyper 1.x / hyper-util upgrade API",
+     "finding": "upgrade::on accepts a Request, &mut Request, Response or &mut Response and returns an OnUpgrade future that resolves to Result<Upgraded, hyper::Error>. Upgraded is Send and implements only hyper's rt::Read/Write, so it needs TokioIo. with_upgrades requires I: Send. A connection without with_upgrades fails any pending upgrade with a 'manual upgrade' error.",
+     "evidence": "hyper-1.11.1/src/upgrade.rs:106 `pub fn on<T: sealed::CanUpgrade>(msg: T) -> OnUpgrade`; :227-228 `impl Future for OnUpgrade { type Output = Result<Upgraded, crate::Error>;`; :66-68 `io: Rewind<Box<dyn Io + Send>>`; :339-364 CanUpgrade impls; src/server/conn/http1.rs:199 `pub fn with_upgrades(self) -> UpgradeableConnection<I, S> where I: Send`; :222-227 `pending.manual()`; :352 header_read_timeout; :411 timer; hyper-util-0.1.20/src/rt/tokio.rs:130 `pub fn new(inner: T) -> Self`, :210-212 `impl<T> tokio::io::AsyncRead for TokioIo<T> where T: hyper::rt::Read`"
+    },
+    {
+     "topic": "harw-web today: no upgrades, and a trap in the auto builder",
+     "finding": "harw-web builds an auto::Builder with http1_only, a TokioTimer and a header_read_timeout, and calls plain serve_connection. Nothing in the workspace calls with_upgrades or serve_connection_with_upgrades. hyper-util documents that http1_only has no effect on serve_connection_with_upgrades, which always sniffs the protocol without a timer. That would undo harw-web's reason for choosing http1_only. The safer path is hyper's own http1::Builder with with_upgrades(), as harw-node-transport already does.",
+     "evidence": "harw-web/src/server.rs:167-168 (`use hyper_util::server::conn::auto::Builder;`), :494-510 `.serve_connection(TokioIo::new(stream), service_fn(...))`, :586-598 http_connection_builder comment and code; hyper-util-0.1.20/src/server/conn/auto/mod.rs:127-131 `/// Does not do anything if used with [serve_connection_with_upgrades]`, :256-274 always `read_version(io)`, :666-670; harw-node-transport/src/server.rs:292-297 (hyper http1::Builder pattern); workspace search found no `with_upgrades`, `upgrade::on` or `SEC_WEBSOCKET` in any Rust file"
+    },
+    {
+     "topic": "Placement / ring",
+     "finding": "harw-web is ring A, where tungstenite's closure (rustls, aws-lc-sys, ring) is allowed. harw-protocol is ring F with transport-free dependencies; it should hold only the envelope and frame types. The Warden is a TCB crate with a fixed list of allowed internal dependencies and is covered by the sys-crate ban, so the gate would flag any path from it to tungstenite. harw-web does not depend on harw-protocol today. dependency-review.md lists tokio-tungstenite only as a transitive dependency of thirtyfour (Tier B), and PL-65 rejected WebSocket for that reason.",
+     "evidence": "xtask/arch-policy.toml:90-91 (harw-protocol layer F), :364-365 (harw-web layer A), :260-262 (harw-warden tcb = true), :376-383 (allowed_internal list); harw-protocol/Cargo.toml:11-18; harw-protocol/src/wire.rs:1-2 (mentions WebSocket only in a doc comment); docs/architecture/dependency-review.md:71, :83; docs/planning/65-cloud-sessions/README.md:141-143"
+    },
+    {
+     "topic": "Error-type caveat",
+     "finding": "tungstenite::Error is not #[non_exhaustive], but some of its variants exist only under certain features. Because Cargo unifies features across a build (for example with thirtyfour in the same build), the set of variants can change. Match with a wildcard arm and map to harw-web's own hand-written error type.",
+     "evidence": "tungstenite-0.30.0/src/error.rs:14-15 `#[derive(Error, Debug)] pub enum Error`, :70, :74 `#[cfg(feature = \"handshake\")]` variants"
+    }
+   ],
+   "gaps": [
+    "No WebSocket upgrade path exists: nothing in the workspace calls with_upgrades(), serve_connection_with_upgrades(), hyper::upgrade::on or sets SEC_WEBSOCKET_* headers or a 101 status (workspace grep).",
+    "No first-party dependency on tokio-tungstenite or tungstenite anywhere, and no entry in [workspace.dependencies] of the root Cargo.toml.",
+    "harw-web's connection builder (server.rs:591-598) cannot upgrade. Switching to the auto builder's serve_connection_with_upgrades would drop http1_only and allow protocol sniffing without a timeout; there is no helper yet that uses hyper's http1::Builder with with_upgrades().",
+    "harw-protocol/src/session_wire.rs, which PL-65 §3.1 plans, does not exist (harw-protocol/src has approvals, events, items, lib, methods, orchestration, test_support, wire).",
+    "DEC-012, cited by PL-65, and any W00 transport decision are absent from docs/planning/70-decisions (only DEC-001 to DEC-008 exist).",
+    "docs/architecture/dependency-review.md has no row approving direct use of tokio-tungstenite/tungstenite in ring A.",
+    "harw-web has no dependency on harw-protocol (harw-web/Cargo.toml:11-57), so the versioned envelope is not yet shared with the web transport.",
+    "No WebSocket test client or fixture exists; tests would need tokio-tungstenite's client_async (handshake feature) over a UnixStream as a dev-dependency.",
+    "No constant for a validated WebSocketConfig exists; since from_raw_socket panics on an invalid config, one is needed, together with a unit test that proves write_buffer_size < max_write_buffer_size.",
+    "Tests added: none (read-only mapping). Once a dependency is added, the central build must run, in order: cargo fmt --all; clippy over the workspace with -D warnings; tests including doc tests; cargo run -q -p xtask -- gates (arch gate); cargo deny check; make -C dod clippy test (--locked, so commit the updated Cargo.lock first); actionlint."
+   ]
+  }
+ }
+]
