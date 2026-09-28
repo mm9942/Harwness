@@ -16,8 +16,11 @@ Semantic Versioning within the 0.x pre-release range.
   releases. Missing files fail with a clear message.
 - `install.sh --binary` no longer aborts with `work_dir: unbound variable`
   at exit after a successful install.
-- The release `mirror` job also uploads `Harwness-main.zip`, which the
-  source path of the installer downloads.
+- The installer's source path builds from the release's versioned
+  `harwness-<version>-source.tar.gz` (checked against `SHA256SUMS`) and only
+  falls back to `Harwness-main.zip` when the mirror has none.
+- The release `mirror` job also uploads `harwness-<version>-source.tar.gz`
+  (listed in `SHA256SUMS`) and `Harwness-main.zip`.
 
 ## [0.9.0] — Unreleased
 

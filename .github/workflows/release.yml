@@ -176,6 +176,11 @@ jobs:
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           s3() { aws s3 cp --endpoint-url "$endpoint" --only-show-errors "$@"; }
           cd dist
+          # Versioned source tarball of the tag: the installer's source path
+          # prefers it (checked against SHA256SUMS) over Harwness-main.zip.
+          version="${tag#v}"
+          git -C .. archive --format=tar.gz --prefix="harwness-${version}/" \
+            -o "$PWD/harwness-${version}-source.tar.gz" HEAD
           sha256sum -- *.tar.gz > SHA256SUMS
           for file in *.tar.gz SHA256SUMS; do
             s3 "$file" "s3://${R2_BUCKET}/${R2_PREFIX}/${tag}/${file}"

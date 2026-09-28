@@ -158,6 +158,30 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertIn("Harwness-main.zip", urls)
             self.assertIn("no source archive published there", result.stderr)
 
+    def test_source_path_prefers_the_versioned_source_tarball(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"], source=True)
+            result, urls = self.run_installer(root, "aarch64")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"{self.TAG}/harwness-9.9.9-source.tar.gz", urls)
+            self.assertNotIn("Harwness-main.zip", urls)
+            source, args = (root / "make").read_text().strip().split("|")
+            self.assertEqual(args, f"install BINDIR={root / 'home/.local/bin'}")
+            self.assertTrue((Path(source) / "Cargo.toml").is_file())
+            self.assertIn("harw-test source", result.stdout)
+
+    def test_tampered_source_tarball_installs_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"], source=True)
+            tarball = root / "mirror" / self.TAG / "harwness-9.9.9-source.tar.gz"
+            tarball.write_bytes(tarball.read_bytes() + b"tampered")
+            result, _ = self.run_installer(root, "aarch64")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("checksum of harwness-9.9.9-source.tar.gz", result.stderr)
+            self.assertFalse((root / "make").exists())
+
     def test_binary_flag_without_latest_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -177,7 +201,7 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertIn("checksum", result.stderr)
             self.assertFalse((root / "home/.local/bin/harw").exists())
 
-    def publish(self, root, targets):
+    def publish(self, root, targets, source=False):
         """Writes the release.yml `mirror` layout for self.TAG below root/mirror."""
         release = root / "mirror" / self.TAG
         release.mkdir(parents=True)
@@ -201,6 +225,19 @@ class MirrorBinaryInstallTests(unittest.TestCase):
                     tar.addfile(info, io.BytesIO(body))
             (release / f"{name}.tar.gz").write_bytes(data.getvalue())
             sums.append(f"{hashlib.sha256(data.getvalue()).hexdigest()}  {name}.tar.gz\n")
+        if source:
+            name = "harwness-9.9.9"
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode="w:gz") as tar:
+                directory = tarfile.TarInfo(name)
+                directory.type, directory.mode = tarfile.DIRTYPE, 0o755
+                tar.addfile(directory)
+                for member, body in (("Cargo.toml", b"[workspace]\n"), ("Makefile", b"install:\n\t@true\n")):
+                    info = tarfile.TarInfo(f"{name}/{member}")
+                    info.size, info.mode = len(body), 0o644
+                    tar.addfile(info, io.BytesIO(body))
+            (release / f"{name}-source.tar.gz").write_bytes(data.getvalue())
+            sums.append(f"{hashlib.sha256(data.getvalue()).hexdigest()}  {name}-source.tar.gz\n")
         (release / "SHA256SUMS").write_text("".join(sums))
 
     def run_installer(self, root, machine, *args):
@@ -214,6 +251,20 @@ case "$1" in
   -o) echo GNU/Linux ;;
   *) echo Linux ;;
 esac
+""")
+        # Source path: a present Rust toolchain and build tools, and a `make`
+        # that records its call and installs a stub harw.
+        cargo_bin = home / ".cargo/bin"
+        cargo_bin.mkdir(parents=True, exist_ok=True)
+        for name in ("cargo", "rustc", "rustup"):
+            SourceInstallTests.executable(cargo_bin / name, "#!/bin/sh\nexit 0\n")
+        for name in ("pkg-config", "cmake", "git", "cc", "bwrap", "prlimit"):
+            SourceInstallTests.executable(mocks / name, "#!/bin/sh\nexit 0\n")
+        SourceInstallTests.executable(mocks / "make", f"""#!/bin/sh
+printf '%s|%s\\n' "$PWD" "$*" >> "{root / 'make'}"
+mkdir -p "$HARW_INSTALL_DIR"
+printf '#!/bin/sh\\necho harw-test source\\n' > "$HARW_INSTALL_DIR/harw"
+chmod +x "$HARW_INSTALL_DIR/harw"
 """)
         env = dict(
             os.environ,

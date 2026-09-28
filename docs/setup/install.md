@@ -89,7 +89,10 @@ release for this machine (`latest` names a tag whose `SHA256SUMS` lists
 toolchain is needed. Only when there is none it logs "building from source"
 and continues as below.
 
-The source path downloads `Harwness-main.zip`, extracts it under
+The source path takes the versioned source tarball of that release,
+`<tag>/harwness-<version>-source.tar.gz`, checked against the release's
+`SHA256SUMS` like a binary tarball. Only a mirror without one falls back to
+`Harwness-main.zip` (no checksum). It extracts the source under
 `$HARW_SOURCES_DIR` (default `~/.local/share/harw/sources`) and leaves the
 source in place for later agent builds. It installs Rustup from
 `https://sh.rustup.rs` if needed, then installs missing dependencies such as

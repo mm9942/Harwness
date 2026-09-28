@@ -26,7 +26,8 @@ Linux build dependencies including Bubblewrap, then runs make install.
 Without an argument the piped installer first looks for a prebuilt release
 on the mirror ($HARW_BASE_URL/latest, then $HARW_BASE_URL/<tag>/...) for this
 machine (x86_64 or aarch64 Linux, aarch64 Termux). Only when there is none it
-downloads Harwness-main.zip and builds from source.
+builds from source: from the release's harwness-<version>-source.tar.gz
+(checked against SHA256SUMS) when published, else from Harwness-main.zip.
 
 --binary installs harw, killer and harw-agent-runner from a release and
 fails instead of falling back to a source build (no Rust toolchain): it
@@ -283,6 +284,25 @@ mirror_has_binary_release() {
   return 1
 }
 
+# Tag whose source tarball the mirror publishes: `latest` (or
+# HARW_RELEASE_TAG) names a tag whose SHA256SUMS lists
+# harwness-<version>-source.tar.gz. Fails when there is none; the source path
+# then falls back to Harwness-main.zip.
+mirror_source_release() {
+  local tag sums
+  tag="${HARW_RELEASE_TAG:-$(mirror_latest_tag)}" || return 1
+  [ -n "$tag" ] || return 1
+  sums="$(mktemp)"
+  if fetch_quiet "$base_url/$tag/SHA256SUMS" "$sums" \
+    && grep -Eq "[[:space:]]\*?(\./)?harwness-${tag#v}-source\.tar\.gz\$" "$sums"; then
+    rm -f "$sums"
+    printf '%s\n' "$tag"
+    return 0
+  fi
+  rm -f "$sums"
+  return 1
+}
+
 # Tag of the latest release, read from the redirect of /releases/latest.
 latest_release_tag() {
   local url
@@ -396,20 +416,52 @@ else
   mkdir -p "$sources_dir"
   work_dir="$(mktemp -d "$sources_dir/.download-XXXXXX")"
   trap 'rm -rf "$work_dir"' EXIT
-  log "Downloading $base_url/$archive_name"
-  fetch "$base_url/$archive_name" "$work_dir/$archive_name" \
-    || die "could not download $base_url/$archive_name (no source archive published there); try: bash -s -- --binary"
-  ensure_unzip
-  hash="$(archive_hash "$work_dir/$archive_name")"
-  checkout="$sources_dir/$hash"
-  if [ ! -f "$checkout/Makefile" ]; then
-    mkdir -p "$work_dir/unpacked"
-    unzip -q "$work_dir/$archive_name" -d "$work_dir/unpacked"
-    extracted="$work_dir/unpacked/Harwness-main"
-    [ -f "$extracted/Cargo.toml" ] && [ -f "$extracted/Makefile" ] \
-      || die "$archive_name has no Harwness source root"
-    [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
-    mv "$extracted" "$checkout"
+  if source_tag="$(mirror_source_release)"; then
+    # The versioned source tarball of the release, checked against its
+    # SHA256SUMS like a binary release.
+    source_root="harwness-${source_tag#v}"
+    source_name="$source_root-source.tar.gz"
+    log "Downloading $base_url/$source_tag/$source_name"
+    fetch "$base_url/$source_tag/$source_name" "$work_dir/$source_name" \
+      || die "could not download $base_url/$source_tag/$source_name; nothing installed"
+    fetch "$base_url/$source_tag/SHA256SUMS" "$work_dir/SHA256SUMS" \
+      || die "could not download SHA256SUMS for $source_tag; nothing installed"
+    (
+      cd "$work_dir"
+      grep -E "^[0-9a-fA-F]{64}[[:space:]]+\*?(\./)?$source_name\$" SHA256SUMS > "$source_name.sha256" \
+        || die "SHA256SUMS of $source_tag has no entry for $source_name"
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$source_name.sha256" >/dev/null
+      else
+        shasum -a 256 -c "$source_name.sha256" >/dev/null
+      fi
+    ) || die "checksum of $source_name does not match SHA256SUMS; nothing installed"
+    check_release_archive "$work_dir/$source_name" "$source_root"
+    hash="$(archive_hash "$work_dir/$source_name")"
+    checkout="$sources_dir/$hash"
+    if [ ! -f "$checkout/Makefile" ]; then
+      tar -xzf "$work_dir/$source_name" -C "$work_dir"
+      [ -f "$work_dir/$source_root/Cargo.toml" ] && [ -f "$work_dir/$source_root/Makefile" ] \
+        || die "$source_name has no Harwness source root"
+      [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
+      mv "$work_dir/$source_root" "$checkout"
+    fi
+  else
+    log "Downloading $base_url/$archive_name"
+    fetch "$base_url/$archive_name" "$work_dir/$archive_name" \
+      || die "could not download $base_url/$archive_name (no source archive published there); try: bash -s -- --binary"
+    ensure_unzip
+    hash="$(archive_hash "$work_dir/$archive_name")"
+    checkout="$sources_dir/$hash"
+    if [ ! -f "$checkout/Makefile" ]; then
+      mkdir -p "$work_dir/unpacked"
+      unzip -q "$work_dir/$archive_name" -d "$work_dir/unpacked"
+      extracted="$work_dir/unpacked/Harwness-main"
+      [ -f "$extracted/Cargo.toml" ] && [ -f "$extracted/Makefile" ] \
+        || die "$archive_name has no Harwness source root"
+      [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
+      mv "$extracted" "$checkout"
+    fi
   fi
 fi
 
