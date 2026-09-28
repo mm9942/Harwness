@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Harwness">
+  <title>Harwness</title>
+  <defs><clipPath id="x"><rect x="0" y="150" width="512" height="238"/></clipPath></defs>
+  <rect width="512" height="512" rx="112" fill="#faf7f8"/>
+  <path clip-path="url(#x)" d="M78 110 L180 420 L256 200 L300 330 C 318 372, 376 376, 396 334 L446 110" fill="none" stroke="#9b5669" stroke-width="66" stroke-linejoin="miter" stroke-miterlimit="10"/>
+</svg>
