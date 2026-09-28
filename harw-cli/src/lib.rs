@@ -54,6 +54,7 @@ mod observe;
 mod onboarding;
 mod op_bridge;
 mod output;
+mod pr_review;
 mod project_trust;
 mod provider_cmd;
 mod resume;
@@ -595,6 +596,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
             Command::Serve { .. } => "serve",
             Command::Web { .. } => "web",
@@ -867,6 +869,13 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::PrReview(args)) => {
+            if let Err(message) = crate::pr_review::run(&args) {
+                eprintln!("{message}");
+                return Err(message);
+            }
+            Ok(())
+        }
         Some(Command::Debug {
             action: DebugAction::Classify { input },
         }) => run_debug_classify(&input),
@@ -993,6 +1002,7 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::PrReview(_)
             | Command::Uia { .. }
             | Command::Analyze(_),
         ) => {
