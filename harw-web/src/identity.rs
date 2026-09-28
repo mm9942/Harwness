@@ -403,6 +403,65 @@ impl LocalPeerIdentityResolver for TierMapResolver {
     }
 }
 
+/// Resolver für einen Socket, den nur ein vertrauter Vermittler desselben
+/// Nutzers erreicht, etwa der Tailnet-Proxy (`harw-tailscale`).
+///
+/// # Description
+/// Der Vermittler verbindet sich als harws eigene UID; jede andere UID wird
+/// abgelehnt ([`IdentityError::UnknownPeer`]). Der Aufrufer bekommt den
+/// festen `tier` (für das Tailnet `Operator`), nie den Owner-Tier des
+/// Haupt-Sockets. Ein lokaler Prozess derselben UID, der diesen Socket
+/// erreicht, kann damit nur Rechte verlieren, nie gewinnen: über den
+/// Haupt-Socket hätte er ohnehin den Owner-Tier. Ein vorgelegter
+/// Kontext-Header wird ignoriert.
+#[derive(Debug, Clone)]
+pub struct ForwardedPeerResolver {
+    uid: u32,
+    tier: PermissionTier,
+    principal_id: String,
+}
+
+impl ForwardedPeerResolver {
+    /// Resolver, der nur `uid` zulässt und ihr `tier` mit der Principal-Id
+    /// `principal_id` gibt.
+    #[must_use]
+    pub fn new(uid: u32, tier: PermissionTier, principal_id: impl Into<String>) -> Self {
+        Self {
+            uid,
+            tier,
+            principal_id: principal_id.into(),
+        }
+    }
+
+    /// Synchrone Auflösung.
+    ///
+    /// # Errors
+    /// [`IdentityError::UnknownPeer`] für jede fremde UID.
+    pub fn resolve_peer(&self, peer: &PeerCredentials) -> Result<ResolvedPeer, IdentityError> {
+        if peer.uid != self.uid {
+            return Err(IdentityError::UnknownPeer);
+        }
+        Ok(ResolvedPeer {
+            tier: self.tier,
+            tenant: None,
+            principal_id: self.principal_id.clone(),
+            summary: None,
+            source: IdentitySource::TierMap,
+        })
+    }
+}
+
+impl LocalPeerIdentityResolver for ForwardedPeerResolver {
+    fn resolve<'a>(
+        &'a self,
+        peer: &'a PeerCredentials,
+        _presented_context: Option<&'a str>,
+    ) -> IdentityFuture<'a> {
+        let result = self.resolve_peer(peer);
+        Box::pin(async move { result })
+    }
+}
+
 /// Antwort des Hubs auf eine Kontextprüfung.
 #[derive(Debug, Clone, PartialEq, Eq)]
 // Ein kurzlebiger Rückgabewert je Anfrage; Boxen brächte nur eine
@@ -897,10 +956,10 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        ContextVerifier, HubVerdict, IdentityConfigError, IdentityError, IdentityMode,
-        IdentitySource, LocalPeerIdentityResolver, ResolvedPeer, SECURITY_CONTEXT_HEADER,
-        SecurityHubResolver, TierMapResolver, UidTenantMap, VerifierError, VerifyFuture,
-        WebIdentityConfig, presented_context,
+        ContextVerifier, ForwardedPeerResolver, HubVerdict, IdentityConfigError, IdentityError,
+        IdentityMode, IdentitySource, LocalPeerIdentityResolver, ResolvedPeer,
+        SECURITY_CONTEXT_HEADER, SecurityHubResolver, TierMapResolver, UidTenantMap, VerifierError,
+        VerifyFuture, WebIdentityConfig, presented_context,
     };
     use crate::authz::{PeerAuthorizer, StaticUidTierMap};
     use crate::peer::PeerCredentials;
@@ -916,6 +975,22 @@ mod tests {
 
     fn at(second: i64) -> TestResult<Timestamp> {
         Timestamp::from_second(second).map_err(ctx("timestamp"))
+    }
+
+    #[test]
+    fn forwarded_peer_resolver_gives_the_fixed_tier_to_its_own_uid_only() -> TestResult {
+        let resolver = ForwardedPeerResolver::new(ALICE, PermissionTier::Operator, "tailnet");
+        let resolved = resolver
+            .resolve_peer(&peer(ALICE))
+            .map_err(ctx("own uid"))?;
+        assert_eq!(resolved.tier(), PermissionTier::Operator);
+        assert_eq!(resolved.principal_id(), "tailnet");
+        assert!(resolved.tenant().is_none());
+        assert_eq!(
+            resolver.resolve_peer(&peer(BOB)),
+            Err(IdentityError::UnknownPeer)
+        );
+        Ok(())
     }
 
     struct FixedClock(Timestamp);

@@ -13,6 +13,7 @@ members = [
     "harw-authority",
     "harw-code-graph",
     "harw-explorer",
+    "harw-tailscale",
     "harw-tool-explorer",
     "harw-killer",
     "harw-tool-process",

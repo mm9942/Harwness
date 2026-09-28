@@ -65,6 +65,7 @@ mod sandbox_cmd;
 mod secret_store;
 mod session_cmd;
 mod settings;
+mod tailscale_cmd;
 mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
@@ -604,6 +605,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Onboard => "onboard",
             Command::Doctor { .. } => "doctor",
             Command::Update { .. } => "update",
+            Command::Tailscale { .. } => "tailscale",
             Command::Install { .. } => "install",
             Command::Uninstall { .. } => "uninstall",
             Command::Completions(_) => "completions",
@@ -841,6 +843,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             system,
             systemd_socket,
             socket_group,
+            tailnet,
+            tailnet_port,
         }) => {
             // `harw web` kennt kein `--config-dir` mehr: der Root-Space kommt
             // ausschließlich aus `--home` bzw. `HARW_HOME` (siehe `crate::web`).
@@ -853,6 +857,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     systemd_socket,
                     socket_group,
                 },
+                tailnet.then_some(tailnet_port),
             )
         }
         Some(Command::Project { action }) => project_trust::run(home_override, action),
@@ -878,6 +883,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
+        Some(Command::Tailscale { action }) => tailscale_cmd::run(action),
         Some(Command::Update {
             check,
             yes,
@@ -1015,6 +1021,7 @@ fn run_startup_migrations(
             | Command::Run { .. }
             | Command::Debug { .. }
             | Command::Completions(_)
+            | Command::Tailscale { .. }
             | Command::Update { .. }
             | Command::Install { .. }
             | Command::Service { .. }

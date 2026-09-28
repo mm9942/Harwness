@@ -263,7 +263,11 @@ const EVENT_BUS_CAPACITY: usize = 64;
 ///
 /// # Concurrency
 /// Baut eine eigene einthreadige `tokio`-Runtime, siehe Moduldoc.
-pub(crate) fn serve_web(home: Option<PathBuf>, listen: WebListenOptions) -> Result<(), String> {
+pub(crate) fn serve_web(
+    home: Option<PathBuf>,
+    listen: WebListenOptions,
+    tailnet_port: Option<u16>,
+) -> Result<(), String> {
     let home = home.ok_or_else(|| {
         "harw web benötigt ein HARW-Home (--home); ohne Home gibt es weder Trust-Bericht noch Freigabespeicher"
             .to_owned()
@@ -352,6 +356,16 @@ pub(crate) fn serve_web(home: Option<PathBuf>, listen: WebListenOptions) -> Resu
     // unten kann je Anfrage ohnehin keinen Fehler melden.
     let root_sandbox = assembly.sandbox().clone();
 
+    // `--tailnet`: eine zweite Routentabelle für den Tailnet-Socket (die
+    // Tabelle wird vom Server übernommen, nicht geteilt).
+    let tailnet_routes = match tailnet_port {
+        Some(_) => Some(
+            WebRouteTable::from_registry(assembly.operations())
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+
     let factory_assembly = Arc::clone(&assembly);
     let context_factory: Arc<harw_web::server::WebContextFactory> =
         Arc::new(move |peer: &PeerCredentials, tier: PermissionTier| {
@@ -365,6 +379,11 @@ pub(crate) fn serve_web(home: Option<PathBuf>, listen: WebListenOptions) -> Resu
     runtime.block_on(async move {
         let events =
             Arc::new(WebEventBus::new(EVENT_BUS_CAPACITY).map_err(|error| error.to_string())?);
+        // Der Tailnet-Socket teilt Autorisierung, Kontext-Fabrik und
+        // Ereignisbus mit dem Haupt-Socket; nur der Resolver unterscheidet sich.
+        let tailnet_authorizer = Arc::clone(&authorizer);
+        let tailnet_context_factory = Arc::clone(&context_factory);
+        let tailnet_events = Arc::clone(&events);
         let server = match prepared {
             PreparedListener::Bind { path, system, gid } => {
                 let server = BoundWebServer::bind(
@@ -398,7 +417,127 @@ pub(crate) fn serve_web(home: Option<PathBuf>, listen: WebListenOptions) -> Resu
             "harw web listening on unix:{}",
             server.socket_path().display()
         );
-        server.serve().await.map_err(|error| error.to_string())
+        let (Some(port), Some(tailnet_routes)) = (tailnet_port, tailnet_routes) else {
+            return server.serve().await.map_err(|error| error.to_string());
+        };
+        let tailnet_socket = match server.socket_path().parent() {
+            Some(dir) if !server.socket_path().as_os_str().is_empty() => dir.join(TAILNET_SOCKET),
+            _ => home.join(TAILNET_SOCKET),
+        };
+        let tailnet = start_tailnet(
+            port,
+            tailnet_socket,
+            uid,
+            TailnetParts {
+                routes: tailnet_routes,
+                authorizer: tailnet_authorizer,
+                context_factory: tailnet_context_factory,
+                events: tailnet_events,
+            },
+        )
+        .await?;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::select! {
+            result = server.serve() => result.map_err(|error| error.to_string()),
+            result = tailnet.server.serve() => result.map_err(|error| format!("tailnet socket: {error}")),
+            result = harw_tailscale::serve_tailnet(
+                tailnet.listener,
+                tailnet.socket,
+                tailnet.gate,
+                shutdown_rx,
+            ) => result.map_err(|error| format!("tailnet proxy: {error}")),
+        }
+    })
+}
+
+/// Dateiname des Tailnet-Sockets neben dem Haupt-Socket.
+const TAILNET_SOCKET: &str = "tailnet.sock";
+
+/// Was der Tailnet-Socket vom Haupt-Server übernimmt.
+struct TailnetParts {
+    routes: WebRouteTable,
+    authorizer: Arc<dyn harw_web::PeerAuthorizer>,
+    context_factory: Arc<harw_web::server::WebContextFactory>,
+    events: Arc<WebEventBus>,
+}
+
+/// Der bereite Tailnet-Zugang: Socket-Server, Proxy-Listener, Gate.
+struct Tailnet {
+    server: BoundWebServer,
+    listener: tokio::net::TcpListener,
+    socket: PathBuf,
+    gate: Arc<dyn harw_tailscale::Admission>,
+}
+
+/// Richtet den Tailnet-Zugang ein (`harw web --tailnet`).
+///
+/// # Description
+/// Fragt `tailscaled` nach dem eigenen Knoten (muss `Running` sein), bindet
+/// einen zweiten Kontrollebenen-Socket `tailnet.sock` (Modus 0600), den nur
+/// der Proxy erreicht, und gibt ihm einen [`ForwardedPeerResolver`]: nur
+/// harws eigene UID, fester Tier `Operator` (Owner-Entscheidung), nie der
+/// Owner-Tier des Haupt-Sockets. Der Proxy lauscht auf der Tailnet-Adresse
+/// des Knotens (nie auf `0.0.0.0`) und lässt nur Peers durch, die
+/// `tailscaled` per `whois` identifiziert (siehe `harw_tailscale::gate`).
+///
+/// # Errors
+/// `tailscaled` nicht erreichbar oder nicht verbunden, keine
+/// Tailnet-Adresse, Socket oder Port nicht bindbar.
+async fn start_tailnet(
+    port: u16,
+    socket: PathBuf,
+    uid: u32,
+    parts: TailnetParts,
+) -> Result<Tailnet, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let api = harw_tailscale::LocalApi::discover().map_err(|error| error.to_string())?;
+    let status = api.status().await.map_err(|error| error.to_string())?;
+    if !status.is_running() {
+        return Err(format!(
+            "tailscale is not connected (state {}); run `tailscale up` first",
+            status.backend_state
+        ));
+    }
+    let ip = status
+        .ips
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or_else(|| status.ips.first())
+        .copied()
+        .ok_or("tailscale reports no tailnet address for this node")?;
+    let server = BoundWebServer::bind(
+        WebServerConfig {
+            socket_path: socket.clone(),
+        },
+        parts.routes,
+        parts.authorizer,
+        parts.context_factory,
+        parts.events,
+    )
+    .await
+    .map_err(|error| format!("tailnet socket: {error}"))?
+    .with_identity_resolver(Arc::new(harw_web::ForwardedPeerResolver::new(
+        uid,
+        PermissionTier::Operator,
+        "tailnet",
+    )));
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("{}: {error}", socket.display()))?;
+    let listener = tokio::net::TcpListener::bind((ip, port))
+        .await
+        .map_err(|error| format!("tailnet {ip}:{port}: {error}"))?;
+    let host = if status.dns_name.is_empty() {
+        ip.to_string()
+    } else {
+        status.dns_name.clone()
+    };
+    eprintln!("harw web tailnet access on http://{host}:{port} (tier Operator, via whois)");
+    Ok(Tailnet {
+        server,
+        listener,
+        socket,
+        gate: Arc::new(harw_tailscale::TailnetGate::new(api, status.ips)),
     })
 }
 

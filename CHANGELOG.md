@@ -8,6 +8,14 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Added
+- Tailscale access: `harw tailscale status` and `harw web --tailnet
+  [--tailnet-port]`. The control plane listens on the node's tailnet
+  address only, admits peers that `tailscaled` identifies via `whois`, and
+  gives every tailnet device the tier Operator through a dedicated
+  `tailnet.sock` (new crate `harw-tailscale`, `ForwardedPeerResolver` in
+  `harw-web`). See `docs/setup/tailscale.md`.
+
 ### `harw update` installs updates
 
 - `harw update` checks the latest GitHub release and installs it: tarball

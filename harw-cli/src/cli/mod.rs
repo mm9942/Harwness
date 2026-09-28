@@ -242,6 +242,15 @@ pub enum Command {
         /// Angabe bleibt die Gruppe unverändert.
         #[arg(long, value_name = "GROUP", requires = "system")]
         socket_group: Option<String>,
+        /// Zusätzlich im eigenen Tailnet erreichbar machen: lauscht auf der
+        /// Tailnet-Adresse dieses Knotens (nie öffentlich), lässt nur per
+        /// `tailscaled`-whois identifizierte Geräte durch und gibt ihnen den
+        /// Tier Operator.
+        #[arg(long)]
+        tailnet: bool,
+        /// TCP-Port auf der Tailnet-Adresse (mit `--tailnet`).
+        #[arg(long, value_name = "PORT", default_value_t = harw_tailscale::DEFAULT_TAILNET_PORT, requires = "tailnet")]
+        tailnet_port: u16,
     },
     /// Verwaltet den Hintergrunddienst (systemd/launchd).
     Service {
@@ -286,6 +295,12 @@ pub enum Command {
         /// Den Start-Hinweis auf die bekannte neueste Version ausblenden.
         #[arg(long)]
         dismiss: bool,
+    },
+    /// Tailscale: Zustand des eigenen Knotens (Zugang über `harw web --tailnet`).
+    Tailscale {
+        /// Auszuführende Tailscale-Aktion.
+        #[command(subcommand)]
+        action: TailscaleAction,
     },
     /// Zeigt die eingebetteten systemd-Systemunits aus `deploy/`.
     ///
@@ -416,4 +431,12 @@ pub enum Command {
         #[arg(required = true, num_args = 1.., value_hint = ValueHint::Other)]
         input: Vec<String>,
     },
+}
+
+/// Aktionen des `harw tailscale`-Subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand)]
+pub enum TailscaleAction {
+    /// Zeigt, ob `tailscaled` erreichbar und verbunden ist, samt Knotenname
+    /// und Tailnet-Adressen.
+    Status,
 }

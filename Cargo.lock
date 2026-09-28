@@ -2211,6 +2211,7 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tailscale",
  "harw-tool-doc",
  "harw-tool-lens",
  "harw-tui",
@@ -3798,6 +3799,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "harw-tailscale"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
