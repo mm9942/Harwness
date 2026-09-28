@@ -19,6 +19,17 @@
 //!   gesteuert ([`crate::procfs`]); Jobs früherer Sitzungen nur nach
 //!   bewiesener Identität (Job-Runtime-Doc §15, §25) — eine PID allein
 //!   löst nie ein Signal aus.
+//! - Ende ohne Stop: leben danach noch Prozesse der Job-Gruppe, werden sie
+//!   beendet (SIGTERM, nach der Gnadenfrist SIGKILL über denselben
+//!   pidfd-/PID-Wiederverwendungs-Schutz); `meta.json` vermerkt das
+//!   (`stragglers_reaped`), der Besitzer bekommt eine Warnung.
+//! - Log-Budget: `stdout.log`/`stderr.log` werden mit `O_APPEND` angelegt
+//!   und je Abfrageintervall sowie einmal nach dem Prozessende auf
+//!   [`JobManagerConfig::max_log_bytes`] plus eine Markerzeile gekürzt
+//!   (`log_truncated`, Warnung an den Besitzer); der Job läuft weiter.
+//! - Hinweise des Startwegs ([`JobManager::start_with_warnings`], z. B. Start
+//!   ohne rlimits) landen in `meta.json` (`launch_warnings`) und gehen als
+//!   Warnung an den Besitzer.
 //! - Besitz: nur Erzeuger und Vorfahren ([`JobOwner::may_control`]); die
 //!   Oberfläche handelt als [`Caller::Operator`].
 //!
@@ -43,7 +54,7 @@ use harw_types::cancel::CancelToken;
 use jiff::Timestamp;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -77,6 +88,8 @@ const IDENTITY_REFRESH: Duration = Duration::from_secs(2);
 /// in Bytes (ohne `\n`): 1 MiB, gleich `harw-agent-runner`s
 /// `child_protocol::MAX_FRAME_BYTES`.
 pub const DEFAULT_MAX_PIPED_LINE_BYTES: usize = 1024 * 1024;
+/// Vorgabe für [`JobManagerConfig::max_log_bytes`]: 64 MiB je Logdatei.
+pub const DEFAULT_MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Einstellungen der Job-Verwaltung.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,16 +114,21 @@ pub struct JobManagerConfig {
     pub max_error_lines: usize,
     /// Zeilen im Ende-Bericht ([`JobEvent::Finished`]).
     pub finish_tail_lines: usize,
-    /// Höchstzahl gleichzeitig laufender Jobs dieser Sitzung.
+    /// Höchstzahl gleichzeitig laufender Jobs dieser Sitzung. Die Montage
+    /// setzt ihn aus `[jobs] max_running` (1..=256, Vorgabe 16).
     pub max_running_jobs: usize,
     /// Wanduhr-Budget, aus dem die CPU-rlimit eines Jobs wächst.
     pub cpu_budget_secs: u64,
+    /// Byte-Budget je Logdatei (`stdout.log`, `stderr.log`); darüber kürzt
+    /// die Überwachung mit einer Markerzeile. Vorgabe 64 MiB.
+    pub max_log_bytes: u64,
 }
 
 impl JobManagerConfig {
     /// Vorgaben: Gnadenfrist 5 s, Abfrage 250 ms, Meldung alle 60 s
     /// (erlaubt 10 s – 1 h), Fehler nach 2 s gesammelt und höchstens alle
-    /// 20 s, 20 Zeilen im Ende-Bericht, 16 laufende Jobs, CPU-Budget 24 h.
+    /// 20 s, 20 Zeilen im Ende-Bericht, 16 laufende Jobs, CPU-Budget 24 h,
+    /// 64 MiB Log-Budget je Datei.
     #[must_use]
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -126,6 +144,7 @@ impl JobManagerConfig {
             finish_tail_lines: 20,
             max_running_jobs: 16,
             cpu_budget_secs: 24 * 3600,
+            max_log_bytes: DEFAULT_MAX_LOG_BYTES,
         }
     }
 
@@ -278,9 +297,10 @@ pub struct DetachSummary {
 pub enum JobError {
     /// Unbekannte Kennung **oder** fremder Job (bewusst nicht unterschieden).
     NotFound(String),
-    /// Zu viele laufende Jobs.
+    /// Zu viele laufende Jobs; die Meldung nennt den Schlüssel
+    /// `[jobs] max_running`, der die Obergrenze setzt.
     Capacity {
-        /// Obergrenze.
+        /// Obergrenze ([`JobManagerConfig::max_running_jobs`]).
         max: usize,
     },
     /// Der Prozess konnte nicht gestartet werden.
@@ -303,7 +323,8 @@ impl fmt::Display for JobError {
             ),
             Self::Capacity { max } => write!(
                 f,
-                "too many running jobs (max {max}); wait for one to finish or stop one"
+                "too many running jobs (max {max}, set by `[jobs] max_running`); \
+                 wait for one to finish or stop one"
             ),
             Self::Spawn(message) => write!(f, "failed to start the job: {message}"),
             Self::Io { context, source } => write!(f, "{context}: {source}"),
@@ -322,6 +343,13 @@ impl std::error::Error for JobError {
 
 fn io_err(context: &'static str) -> impl FnOnce(io::Error) -> JobError {
     move |source| JobError::Io { context, source }
+}
+
+/// Legt eine Logdatei im frisch angelegten Job-Verzeichnis an. `O_APPEND`
+/// ist Pflicht: kürzt die Überwachung die Datei (`set_len`), schreibt der
+/// Job danach am neuen Ende weiter statt hinter einem Loch.
+fn create_log(path: &Path) -> io::Result<File> {
+    OpenOptions::new().append(true).create_new(true).open(path)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -621,10 +649,14 @@ impl JobManager {
         }
     }
 
-    /// Startet einen geprüften Prozess als Job.
+    /// Startet einen geprüften Prozess als Job, ohne Hinweise des Startwegs
+    /// (siehe [`JobManager::start_with_warnings`]).
     ///
     /// # Description
     /// Muss innerhalb einer Tokio-Runtime laufen (Überwachungs-Task).
+    /// stdout/stderr gehen in `O_APPEND`-Logdateien, die die Überwachung am
+    /// Byte-Budget ([`JobManagerConfig::max_log_bytes`]) kürzt; Prozesse, die
+    /// nach einem Ende ohne Stop noch in der Gruppe leben, beendet sie.
     ///
     /// # Errors
     /// [`JobError::Capacity`], [`JobError::Io`] (Verzeichnis/Logdateien) oder
@@ -635,10 +667,26 @@ impl JobManager {
         request: StartRequest,
         prepared: PreparedJob,
     ) -> Result<JobStatus, JobError> {
+        self.start_with_warnings(request, prepared, Vec::new())
+    }
+
+    /// Wie [`JobManager::start`], zusätzlich mit Hinweisen des Startwegs
+    /// ([`crate::launcher::PreparedLaunch::warnings`]): sie landen in
+    /// `meta.json` (`launch_warnings`, auch bei gescheitertem Start) und
+    /// gehen nach `Started` je als [`JobEvent::Warning`] an den Besitzer.
+    ///
+    /// # Errors
+    /// Wie [`JobManager::start`].
+    pub fn start_with_warnings(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        warnings: Vec<String>,
+    ) -> Result<JobStatus, JobError> {
         self.check_capacity()?;
         let (id, dir) = self.allocate()?;
-        let stdout = File::create(dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?;
-        let stderr = File::create(dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
+        let stdout = create_log(&dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?;
+        let stderr = create_log(&dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
 
         let mut meta = JobMeta {
             version: META_VERSION,
@@ -666,6 +714,9 @@ impl JobManager {
             warnings: 0,
             errors: 0,
             launch_error: None,
+            stragglers_reaped: false,
+            log_truncated: false,
+            launch_warnings: warnings,
         };
 
         let mut command = prepared.command;
@@ -699,13 +750,24 @@ impl JobManager {
         self.notifier.notify(JobNotification {
             owner: meta.owner.clone(),
             event: JobEvent::Started {
-                job_id: id,
+                job_id: id.clone(),
                 name: meta.name.clone(),
                 command: meta.command.clone(),
                 pid,
                 executed_on_host: meta.executed_on_host,
             },
         });
+        for text in &meta.launch_warnings {
+            warn!(job_id = %id, warning = %text, "job started with launch warning");
+            self.notifier.notify(JobNotification {
+                owner: meta.owner.clone(),
+                event: JobEvent::Warning {
+                    job_id: id.clone(),
+                    name: meta.name.clone(),
+                    message: text.clone(),
+                },
+            });
+        }
 
         let monitor = Monitor {
             entry: Arc::clone(&entry),
@@ -759,8 +821,8 @@ impl JobManager {
         self.check_capacity()?;
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
-        let stdout_log = File::create(&stdout_log_path).map_err(io_err("create stdout.log"))?;
-        let stderr = File::create(dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
+        let stdout_log = create_log(&stdout_log_path).map_err(io_err("create stdout.log"))?;
+        let stderr = create_log(&dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
 
         let mut meta = JobMeta {
             version: META_VERSION,
@@ -788,6 +850,9 @@ impl JobManager {
             warnings: 0,
             errors: 0,
             launch_error: None,
+            stragglers_reaped: false,
+            log_truncated: false,
+            launch_warnings: Vec::new(),
         };
 
         let mut command = prepared.command;
@@ -1410,6 +1475,10 @@ struct MonitorState {
     last_identity_check: Instant,
     dirty: bool,
     announced_milestones: u64,
+    /// `stdout.log` ist schon am Byte-Budget gekürzt.
+    stdout_truncated: bool,
+    /// `stderr.log` ist schon am Byte-Budget gekürzt.
+    stderr_truncated: bool,
 }
 
 impl Monitor {
@@ -1444,6 +1513,8 @@ impl Monitor {
             last_identity_check: started,
             dirty: false,
             announced_milestones: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         let mut ticker = tokio::time::interval(self.config.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1451,19 +1522,110 @@ impl Monitor {
             tokio::select! {
                 status = child.wait() => break status,
                 _ = ticker.tick() => {
+                    self.enforce_log_budget(&mut run);
                     self.ingest(&mut run, false);
                     self.periodic(&mut run, started);
                 }
             }
         };
+        // Vor `tee.await`: ein verbliebener Prozess, der die stdout-Pipe
+        // offen hält, kann das Mitschreib-Task so nicht mehr aufhalten.
+        let reaped = self.reap_stragglers().await;
         if let Some(tee) = tee {
             // Der Prozess ist beendet; das Mitschreib-Task endet, sobald es
             // das Ende seiner stdout-Pipe sieht (kurz danach). Erst danach
             // steht die letzte Ausgabe vollständig in `STDOUT_LOG`.
             let _ = tee.await;
         }
+        self.enforce_log_budget(&mut run);
         self.ingest(&mut run, true);
-        self.finish(&mut run, status, started);
+        self.finish(&mut run, status, started, reaped);
+    }
+
+    /// Beendet nach einem Ende ohne Stop die Prozesse, die noch in der
+    /// Job-Gruppe leben: SIGTERM, Abfrage bis zur Gnadenfrist, dann SIGKILL
+    /// ([`OwnLeader::kill_stragglers`], mit Prüfung auf
+    /// PID-Wiederverwendung).
+    ///
+    /// # Returns
+    /// Ob verbliebene Prozesse gefunden und beendet wurden.
+    async fn reap_stragglers(&self) -> bool {
+        let Some(leader) = self.entry.leader.as_ref() else {
+            return false;
+        };
+        let (stop_requested, job_id) = {
+            let state = lock(&self.entry.state);
+            (state.meta.stop_requested, state.meta.job_id.clone())
+        };
+        if stop_requested || !leader.stragglers_remain() {
+            return false;
+        }
+        match leader.signal_group(JobSignal::Term) {
+            Ok(()) | Err(SignalError::Exited) => {}
+            Err(SignalError::Refused(reason)) => {
+                warn!(job_id = %job_id, reason = %reason, "job stragglers not signalled");
+                return false;
+            }
+            Err(SignalError::Io(err)) => {
+                debug!(job_id = %job_id, error = %err, "job stragglers: SIGTERM failed");
+            }
+        }
+        let deadline = tokio::time::Instant::now() + self.config.stop_grace;
+        while leader.stragglers_remain() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(self.config.poll_interval).await;
+        }
+        if leader.stragglers_remain() {
+            leader.kill_stragglers();
+        }
+        true
+    }
+
+    /// Hält `stdout.log` und `stderr.log` am Byte-Budget
+    /// ([`JobManagerConfig::max_log_bytes`]); beim ersten Kürzen einer Datei
+    /// vermerkt es `log_truncated` und warnt den Besitzer.
+    fn enforce_log_budget(&self, run: &mut MonitorState) {
+        let budget = self.config.max_log_bytes;
+        let mut events = Vec::new();
+        for is_stderr in [false, true] {
+            let (name, already) = if is_stderr {
+                (STDERR_LOG, run.stderr_truncated)
+            } else {
+                (STDOUT_LOG, run.stdout_truncated)
+            };
+            let path = self.entry.dir.join(name);
+            let truncated = match crate::logs::enforce_log_budget(&path, budget, already) {
+                Ok(truncated) => truncated,
+                Err(err) => {
+                    debug!(error = %err, log = name, "job log budget check failed");
+                    continue;
+                }
+            };
+            if !truncated || already {
+                continue;
+            }
+            if is_stderr {
+                run.stderr_truncated = true;
+            } else {
+                run.stdout_truncated = true;
+            }
+            run.dirty = true;
+            let mut state = lock(&self.entry.state);
+            state.meta.log_truncated = true;
+            events.push((
+                state.meta.owner.clone(),
+                JobEvent::Warning {
+                    job_id: state.meta.job_id.clone(),
+                    name: state.meta.name.clone(),
+                    message: format!(
+                        "{name} exceeded the log budget of {budget} bytes; later output is \
+                         discarded (the job keeps running)"
+                    ),
+                },
+            ));
+        }
+        for (owner, event) in events {
+            self.notifier.notify(JobNotification { owner, event });
+        }
     }
 
     /// Liest neue Zeilen aus beiden Logs und wertet sie aus.
@@ -1630,8 +1792,15 @@ impl Monitor {
         }
     }
 
-    /// Endzustand, letzte Meldungen, `meta.json`.
-    fn finish(&self, run: &mut MonitorState, status: io::Result<ExitStatus>, started: Instant) {
+    /// Endzustand, letzte Meldungen, `meta.json`; `stragglers_reaped`
+    /// meldet, ob [`Monitor::reap_stragglers`] Prozesse beendet hat.
+    fn finish(
+        &self,
+        run: &mut MonitorState,
+        status: io::Result<ExitStatus>,
+        started: Instant,
+        stragglers_reaped: bool,
+    ) {
         let (exit_code, signal) = match &status {
             Ok(status) => (status.code(), status.signal()),
             Err(err) => {
@@ -1664,7 +1833,20 @@ impl Monitor {
             state.meta.signal = signal;
             state.meta.ended_at = Some(Timestamp::now());
             state.meta.progress = run.tracker.snapshot().cloned();
+            state.meta.stragglers_reaped = stragglers_reaped;
             state.milestones += 1;
+            if stragglers_reaped {
+                info!(job_id = %state.meta.job_id, "job stragglers reaped");
+                events.push(JobEvent::Warning {
+                    job_id: state.meta.job_id.clone(),
+                    name: state.meta.name.clone(),
+                    message: format!(
+                        "processes the job left running in its process group were terminated \
+                         (SIGTERM, SIGKILL after {}s if still alive)",
+                        self.config.stop_grace.as_secs()
+                    ),
+                });
+            }
             let tail: Vec<String> = state
                 .tail
                 .iter()
@@ -1696,26 +1878,6 @@ impl Monitor {
             state.meta.owner.clone()
         };
         self.entry.persist();
-        let stop_requested = lock(&self.entry.state).meta.stop_requested;
-        if !stop_requested
-            && self
-                .entry
-                .leader
-                .as_ref()
-                .is_some_and(OwnLeader::stragglers_remain)
-        {
-            let (job_id, name) = {
-                let state = lock(&self.entry.state);
-                (state.meta.job_id.clone(), state.meta.name.clone())
-            };
-            events.push(JobEvent::Warning {
-                job_id,
-                name,
-                message: "processes started by the job are still running in its process group; \
-                          job.stop kills them"
-                    .to_owned(),
-            });
-        }
         for event in events {
             self.notifier.notify(JobNotification {
                 owner: owner.clone(),

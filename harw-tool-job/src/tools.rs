@@ -17,6 +17,15 @@
 //! - `cwd` muss im Workspace liegen (kanonisiert); Umgebungsvariablen werden
 //!   nur mit gültigem Namen und gequotetem Wert übernommen, ihre Werte nie
 //!   in `meta.json` gespeichert.
+//! - Auf dem Host läuft ein Job mit gefilterter Umgebung (`env_clear` plus
+//!   Allowlist: PATH, HOME, Locale, Build-Variablen wie `CARGO_*`/
+//!   `RUSTFLAGS`/`CC`, `SSH_AUTH_SOCK`, `XDG_*`; Namen mit TOKEN, SECRET,
+//!   PASSWORD, PASSWD, CREDENTIAL oder API_KEY fallen weg). Alles andere
+//!   muss der Aufrufer über `env` ausdrücklich übergeben; diese Variablen
+//!   stehen als `export …` im Befehlstext und überstehen den Filter.
+//! - `job.list` zeigt ohne `kind` nur eine Zusammenfassung je Kategorie;
+//!   Arbeitseinträge (`work`) sieht das Werkzeug nicht, nur `harw jobs list
+//!   --kind work` des Operators.
 //!
 //! # Nebenläufigkeit
 //! `job.status`, `job.logs`, `job.list` und `job.wait` sind `parallel_safe`
@@ -25,7 +34,7 @@
 use crate::launcher::JobLauncher;
 use crate::logs::{LogQuery, LogSlice, read_log};
 use crate::manager::{Caller, JobError, JobManager, StartRequest, WaitOutcome};
-use crate::model::{JobId, JobOwner, JobStatus, STDERR_LOG, STDOUT_LOG};
+use crate::model::{JobEndReason, JobId, JobOwner, JobStatus, STDERR_LOG, STDOUT_LOG};
 use crate::procfs::JobSignal;
 use harw_authority::Permission;
 use harw_extension_api::contributors::ToolProvider;
@@ -143,6 +152,8 @@ const MAX_NAME_CHARS: usize = 80;
 const MAX_ENV_VARS: usize = 64;
 /// Höchstzahl Jobs in `job.list`.
 const MAX_LIST_ENTRIES: usize = 100;
+/// Hinweis von `job.list` zur Kategorie `work`, die das Werkzeug nicht sieht.
+const WORK_NOT_VISIBLE: &str = "work items are not visible to job.list; the operator lists them with `harw jobs list --kind work`";
 
 /// Liefert die Elternkette einer Agenten-Sitzung (nächstliegend zuerst).
 ///
@@ -348,7 +359,10 @@ fn tool_specs() -> Vec<ToolSpec> {
              system notes: job start, progress every notify_every_secs (default 60, only when \
              something changed; 0 = off), error lines as they appear, and the end with exit \
              code, duration and the last 20 lines. Do not poll in a loop: continue other work \
-             or call job.wait.",
+             or call job.wait. On the host the job gets a filtered environment (PATH, HOME, \
+             locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; \
+             names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); \
+             pass anything else explicitly via env.",
             object(
                 vec![
                     (
@@ -400,7 +414,9 @@ fn tool_specs() -> Vec<ToolSpec> {
             JOB_STATUS_TOOL,
             "Status of one of your jobs: state (queued/running/succeeded/failed/stopped/\
              detached/unknown), pid, runtime, exit code, recognised progress, warning/error \
-             counts and the last output lines.",
+             counts, the last output lines, sandbox profile (host/bwrap), end reason \
+             (exited/signal/stopped/timeout/launch-error/unknown), whether leftover processes \
+             were reaped, whether a log hit its size budget, launch warnings.",
             object(vec![("job_id", job_id_prop())], &["job_id"]),
         ),
         spec(
@@ -480,8 +496,24 @@ fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             JOB_LIST_TOOL,
-            "List the jobs you (or your sub-agents) started, with state, runtime and progress.",
-            object(Vec::new(), &[]),
+            "Without kind: a summary per category (process = your background jobs from \
+             job.start, work = durable work items) with counts per state. With \
+             kind=\"process\": the rows (state, owner, sandbox profile, end reason, runtime, \
+             progress). Use job.status for one job.",
+            object(
+                vec![(
+                    "kind",
+                    JsonSchema {
+                        enum_values: Some(vec![json!("work"), json!("process")]),
+                        ..prop(
+                            JsonSchemaType::String,
+                            "Category whose rows to list: process or work. Omit for the \
+                             summary.",
+                        )
+                    },
+                )],
+                &[],
+            ),
         ),
         spec(
             JOB_WAIT_TOOL,
@@ -560,7 +592,32 @@ struct StopArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListArgs {}
+struct ListArgs {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Kategorie der Zeilenansicht von `job.list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    /// Durable Arbeitseinträge (für das Werkzeug unsichtbar).
+    Work,
+    /// Hintergrund-Jobs aus `job.start`.
+    Process,
+}
+
+/// `None`/leer ⇒ Zusammenfassung; sonst `work` oder `process`.
+fn parse_list_kind(raw: Option<&str>) -> Result<Option<ListKind>, ToolsError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("work") => Ok(Some(ListKind::Work)),
+        Some("process") => Ok(Some(ListKind::Process)),
+        Some(other) => Err(invalid(
+            JOB_LIST_TOOL,
+            format!("kind must be work or process, got `{other}`"),
+        )),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -748,6 +805,11 @@ fn status_json(status: &JobStatus) -> Value {
         "cwd": meta.cwd,
         "pid": meta.pid,
         "executed_on": if meta.executed_on_host { "host" } else { "sandbox" },
+        "sandbox_profile": meta.sandbox_profile(),
+        "end_reason": meta.end_reason().map(JobEndReason::as_str),
+        "stragglers_reaped": meta.stragglers_reaped,
+        "log_truncated": meta.log_truncated,
+        "launch_warnings": meta.launch_warnings,
         "started_at": meta.started_at.map(|ts| ts.to_string()),
         "ended_at": meta.ended_at.map(|ts| ts.to_string()),
         "runtime_secs": status.runtime_secs,
@@ -772,12 +834,60 @@ fn status_json(status: &JobStatus) -> Value {
     })
 }
 
+/// Standardansicht von `job.list`: Zahlen je Kategorie und Zustand, keine
+/// Zeilen. `count` oben bleibt die Zahl der sichtbaren Prozess-Jobs.
+fn list_summary_json(jobs: &[JobStatus]) -> Value {
+    let mut by_state: BTreeMap<&str, u64> = BTreeMap::new();
+    for status in jobs {
+        *by_state.entry(status.meta.state.as_str()).or_insert(0) += 1;
+    }
+    json!({
+        "view": "summary",
+        "count": jobs.len(),
+        "categories": {
+            "process": { "count": jobs.len(), "by_state": by_state },
+            "work": { "visible": false, "note": WORK_NOT_VISIBLE },
+        },
+        "note": "Pass kind=\"process\" for the rows; job.status shows one job.",
+    })
+}
+
+/// Zeilenansicht `kind=process`: die letzten [`MAX_LIST_ENTRIES`] Jobs.
+fn list_process_rows_json(jobs: &[JobStatus]) -> Value {
+    let count = jobs.len();
+    let skip = count.saturating_sub(MAX_LIST_ENTRIES);
+    let entries: Vec<Value> = jobs.iter().skip(skip).map(list_entry_json).collect();
+    json!({
+        "view": "rows",
+        "kind": "process",
+        "count": count,
+        "truncated": skip > 0,
+        "jobs": entries,
+    })
+}
+
+/// Zeilenansicht `kind=work`: leer, das Werkzeug sieht keine Arbeitseinträge.
+fn list_work_rows_json() -> Value {
+    json!({
+        "view": "rows",
+        "kind": "work",
+        "count": 0,
+        "truncated": false,
+        "jobs": [],
+        "note": WORK_NOT_VISIBLE,
+    })
+}
+
 fn list_entry_json(status: &JobStatus) -> Value {
     let meta = &status.meta;
     json!({
+        "kind": "process",
         "job_id": meta.job_id.as_str(),
         "name": meta.name,
         "state": meta.state.as_str(),
+        "owner": meta.owner.session,
+        "sandbox_profile": meta.sandbox_profile(),
+        "end_reason": meta.end_reason().map(JobEndReason::as_str),
         "runtime_secs": status.runtime_secs,
         "exit_code": meta.exit_code,
         "progress": meta.progress.as_ref().map(crate::ProgressSnapshot::render),
@@ -832,13 +942,15 @@ impl JobToolExecutor {
             return Ok(job_error(JOB_START_TOOL, &err));
         }
 
-        let prepared = match self
+        // Der Startweg filtert auf dem Host die Umgebung (Allowlist plus
+        // Namensfilter); Hinweise wie „ohne rlimits“ gehen mit in den Job.
+        let launch = match self
             .shared
             .launcher
-            .prepare(context, &composed.shell, manager.config().cpu_budget_secs)
+            .prepare_launch(context, &composed.shell, manager.config().cpu_budget_secs)
             .await
         {
-            Ok(prepared) => prepared,
+            Ok(launch) => launch,
             Err(denied) => return Ok(denied),
         };
 
@@ -855,7 +967,7 @@ impl JobToolExecutor {
             notify_every,
             owner,
         };
-        match manager.start(request, prepared) {
+        match manager.start_with_warnings(request, launch.job, launch.warnings) {
             Ok(status) => {
                 info!(job_id = %status.meta.job_id, "job.start");
                 let mut value = status_json(&status);
@@ -1018,17 +1130,14 @@ impl JobToolExecutor {
         context: &ToolExecutionContext,
         call: &ToolCall,
     ) -> Result<ToolOutput, ToolsError> {
-        let _args: ListArgs = parse_args(JOB_LIST_TOOL, call)?;
+        let args: ListArgs = parse_args(JOB_LIST_TOOL, call)?;
+        let kind = parse_list_kind(args.kind.as_deref())?;
         let caller = Caller::Agent(context.session_id().as_str());
-        let jobs = self.shared.manager.list(caller);
-        let count = jobs.len();
-        let skip = count.saturating_sub(MAX_LIST_ENTRIES);
-        let entries: Vec<Value> = jobs.iter().skip(skip).map(list_entry_json).collect();
-        Ok(ToolOutput::json(json!({
-            "count": count,
-            "truncated": skip > 0,
-            "jobs": entries,
-        })))
+        Ok(ToolOutput::json(match kind {
+            Some(ListKind::Work) => list_work_rows_json(),
+            Some(ListKind::Process) => list_process_rows_json(&self.shared.manager.list(caller)),
+            None => list_summary_json(&self.shared.manager.list(caller)),
+        }))
     }
 }
 
@@ -1072,3 +1181,171 @@ impl ToolProvider for JobToolProvider {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod list_view_tests {
+    //! Zusammenfassung/Zeilen von `job.list` und die neuen Statusfelder,
+    //! gebaut aus `meta.json`-Fixtures (ohne laufende Prozesse).
+
+    use super::*;
+    use crate::model::JobMeta;
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    /// v2-`meta.json` mit Pflichtfeldern; `extra` überschreibt Felder.
+    fn status_of(id: &str, state: &str, extra: Value) -> TestResult<JobStatus> {
+        let mut meta = json!({
+            "version": 2,
+            "job_id": id,
+            "name": "fixture",
+            "command": "true",
+            "state": state,
+            "harw_instance": "harw-test",
+            "owner": {"session": "agent-x"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "notify_every_secs": 60,
+        });
+        if let (Some(target), Value::Object(fields)) = (meta.as_object_mut(), extra) {
+            for (key, value) in fields {
+                target.insert(key, value);
+            }
+        }
+        let meta: JobMeta = serde_json::from_value(meta).map_err(ctx("parse meta fixture"))?;
+        Ok(JobStatus {
+            meta,
+            runtime_secs: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            last_lines: Vec::new(),
+            log_dir: PathBuf::new(),
+        })
+    }
+
+    #[test]
+    fn test_list_summary_counts_per_state() -> TestResult {
+        let jobs = vec![
+            status_of("job-a", "running", json!({}))?,
+            status_of("job-b", "running", json!({}))?,
+            status_of("job-c", "failed", json!({"exit_code": 1}))?,
+        ];
+        let value = list_summary_json(&jobs);
+        assert_eq!(value["view"], json!("summary"));
+        assert_eq!(value["count"], json!(3));
+        assert_eq!(value["categories"]["process"]["count"], json!(3));
+        assert_eq!(
+            value["categories"]["process"]["by_state"],
+            json!({"failed": 1, "running": 2})
+        );
+        assert!(value.get("jobs").is_none(), "{value}");
+        assert_eq!(value["categories"]["work"]["visible"], json!(false));
+        assert_eq!(
+            value["categories"]["work"]["note"],
+            json!(WORK_NOT_VISIBLE)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_rows_process_carry_owner_profile_end_reason() -> TestResult {
+        let jobs = vec![
+            status_of(
+                "job-host",
+                "succeeded",
+                json!({"executed_on_host": true, "exit_code": 0}),
+            )?,
+            status_of(
+                "job-bwrap",
+                "stopped",
+                json!({"signal": 15, "stop_requested": true}),
+            )?,
+        ];
+        let value = list_process_rows_json(&jobs);
+        assert_eq!(value["view"], json!("rows"));
+        assert_eq!(value["kind"], json!("process"));
+        assert_eq!(value["count"], json!(2));
+        assert_eq!(value["truncated"], json!(false));
+        let rows = value["jobs"]
+            .as_array()
+            .ok_or(TestError::Missing("jobs array"))?;
+        assert_eq!(rows.len(), 2);
+        let expected = [("job-host", "host", "exited"), ("job-bwrap", "bwrap", "stopped")];
+        for (row, (id, profile, reason)) in rows.iter().zip(expected) {
+            assert_eq!(row["job_id"], json!(id));
+            assert_eq!(row["kind"], json!("process"));
+            assert_eq!(row["owner"], json!("agent-x"));
+            assert_eq!(row["sandbox_profile"], json!(profile));
+            assert_eq!(row["end_reason"], json!(reason));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_kind_parsing() -> TestResult {
+        assert_eq!(parse_list_kind(None).map_err(ctx("none"))?, None);
+        assert_eq!(parse_list_kind(Some("")).map_err(ctx("empty"))?, None);
+        assert_eq!(parse_list_kind(Some("  ")).map_err(ctx("blank"))?, None);
+        assert_eq!(
+            parse_list_kind(Some("process")).map_err(ctx("process"))?,
+            Some(ListKind::Process)
+        );
+        assert_eq!(
+            parse_list_kind(Some(" work ")).map_err(ctx("work"))?,
+            Some(ListKind::Work)
+        );
+        match parse_list_kind(Some("all")) {
+            Err(ToolsError::InvalidArguments { name, reason }) => {
+                assert_eq!(name, JOB_LIST_TOOL);
+                assert!(reason.contains("`all`"), "{reason}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_work_rows_are_empty_with_note() -> TestResult {
+        let value = list_work_rows_json();
+        assert_eq!(value["view"], json!("rows"));
+        assert_eq!(value["kind"], json!("work"));
+        assert_eq!(value["count"], json!(0));
+        assert_eq!(value["truncated"], json!(false));
+        assert_eq!(value["jobs"], json!([]));
+        assert_eq!(value["note"], json!(WORK_NOT_VISIBLE));
+        Ok(())
+    }
+
+    #[test]
+    fn test_status_json_reports_profile_end_reason_reaped_truncated_warnings() -> TestResult {
+        let status = status_of(
+            "job-status",
+            "failed",
+            json!({
+                "executed_on_host": true,
+                "signal": 9,
+                "stragglers_reaped": true,
+                "log_truncated": true,
+                "launch_warnings": ["x"],
+            }),
+        )?;
+        let value = status_json(&status);
+        assert_eq!(value["executed_on"], json!("host"));
+        assert_eq!(value["sandbox_profile"], json!("host"));
+        assert_eq!(value["end_reason"], json!("signal"));
+        assert_eq!(value["stragglers_reaped"], json!(true));
+        assert_eq!(value["log_truncated"], json!(true));
+        assert_eq!(value["launch_warnings"], json!(["x"]));
+
+        // Altes `meta.json` ohne die neuen Felder: Vorgaben, laufender Job
+        // hat keinen Endgrund.
+        let old = status_json(&status_of("job-old", "running", json!({}))?);
+        assert_eq!(old["sandbox_profile"], json!("bwrap"));
+        assert_eq!(old["end_reason"], Value::Null);
+        assert_eq!(old["stragglers_reaped"], json!(false));
+        assert_eq!(old["log_truncated"], json!(false));
+        assert_eq!(old["launch_warnings"], json!([]));
+        Ok(())
+    }
+}

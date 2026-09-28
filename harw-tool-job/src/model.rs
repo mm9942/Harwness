@@ -1,6 +1,6 @@
 //! Datenmodell der Job-Verwaltung: [`JobId`], [`JobState`], [`JobOwner`],
-//! [`JobMeta`] (Inhalt von `meta.json`) und [`JobStatus`] (Sicht für
-//! Werkzeuge und Oberfläche).
+//! [`JobMeta`] (Inhalt von `meta.json`), [`JobEndReason`] (Endgrund) und
+//! [`JobStatus`] (Sicht für Werkzeuge und Oberfläche).
 //!
 //! # Nebenläufigkeit
 //! Reine Werttypen, `Send + Sync`.
@@ -18,6 +18,11 @@ use std::path::PathBuf;
 /// - `2`: zusätzlich [`JobMeta::identity`] (Startzeit, Programm, cgroup-v2-
 ///   Pfad; Job-Runtime-Doc §15). `proc_start_ticks` wird weiter
 ///   geschrieben, damit ältere harw-Versionen v2-Dateien lesen können.
+/// - Ohne Versionssprung (serde-Vorgabe) ergänzt:
+///   [`JobMeta::stragglers_reaped`], [`JobMeta::log_truncated`] und
+///   [`JobMeta::launch_warnings`]. Ältere Dateien laden mit `false` bzw.
+///   leer; ältere harw-Versionen ignorieren die Felder (`JobMeta` hat kein
+///   `deny_unknown_fields`).
 ///
 /// Beide Versionen werden gelesen; [`JobMeta::process_identity`] liefert für
 /// v1 eine Identität ohne Programm und cgroup.
@@ -264,9 +269,103 @@ pub struct JobMeta {
     /// Fehlermeldung, falls der Start selbst scheiterte.
     #[serde(default)]
     pub launch_error: Option<String>,
+    /// Nach dem normalen Ende lebten noch Prozesse der Gruppe; sie wurden
+    /// beendet (SIGTERM, nach der Gnadenfrist SIGKILL).
+    #[serde(default)]
+    pub stragglers_reaped: bool,
+    /// `stdout.log` oder `stderr.log` wurde am Byte-Budget gekürzt
+    /// (Markerzeile am Ende).
+    #[serde(default)]
+    pub log_truncated: bool,
+    /// Hinweise des Startwegs (z. B. „ohne rlimits“); nur Texte, nie Werte
+    /// von Umgebungsvariablen.
+    #[serde(default)]
+    pub launch_warnings: Vec<String>,
+}
+
+/// Signalnummer von SIGXCPU (CPU-Budget erschöpft) unter Linux.
+const SIGXCPU: i32 = 24;
+
+/// Warum ein Job endete (abgeleitet aus `meta.json`, siehe
+/// [`JobMeta::end_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobEndReason {
+    /// Der Prozess endete selbst mit einem Exit-Code.
+    Exited,
+    /// Der Prozess wurde durch ein Signal beendet (nicht durch `job.stop`).
+    Signal,
+    /// Durch `job.stop` (bzw. die Oberfläche) beendet.
+    Stopped,
+    /// Nur bei SIGXCPU gemeldet (CPU-Budget erschöpft); Jobs haben keine
+    /// Wanduhr-Grenze.
+    Timeout,
+    /// Der Start selbst scheiterte.
+    LaunchError,
+    /// Aus einer früheren harw-Sitzung; das Ergebnis ist unbekannt.
+    Unknown,
+}
+
+impl JobEndReason {
+    /// Kurzname (`exited`, `signal`, `stopped`, `timeout`, `launch-error`,
+    /// `unknown`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::Signal => "signal",
+            Self::Stopped => "stopped",
+            Self::Timeout => "timeout",
+            Self::LaunchError => "launch-error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for JobEndReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl JobMeta {
+    /// `"host"` ohne `bwrap`, sonst `"bwrap"` (gleiche Wörter wie
+    /// `harw jobs list`).
+    #[must_use]
+    pub fn sandbox_profile(&self) -> &'static str {
+        if self.executed_on_host {
+            "host"
+        } else {
+            "bwrap"
+        }
+    }
+
+    /// Warum der Job endete; `None` solange der Job nicht beendet ist.
+    ///
+    /// # Description
+    /// Reihenfolge: Startfehler, dann `job.stop`, dann SIGXCPU (`timeout`),
+    /// dann sonstiges Signal, dann Exit-Code, zuletzt `unknown` für Jobs
+    /// früherer Sitzungen ohne Ergebnis.
+    #[must_use]
+    pub fn end_reason(&self) -> Option<JobEndReason> {
+        if !self.state.is_terminal() {
+            return None;
+        }
+        if self.launch_error.is_some() {
+            return Some(JobEndReason::LaunchError);
+        }
+        if self.state == JobState::Stopped || self.stop_requested {
+            return Some(JobEndReason::Stopped);
+        }
+        match (self.signal, self.exit_code) {
+            (Some(SIGXCPU), _) => Some(JobEndReason::Timeout),
+            (Some(_), _) => Some(JobEndReason::Signal),
+            (None, Some(_)) => Some(JobEndReason::Exited),
+            (None, None) if self.state == JobState::Unknown => Some(JobEndReason::Unknown),
+            (None, None) => None,
+        }
+    }
+
     /// Die persistierte Identität des Gruppenführers: `identity` (v2), sonst
     /// aus `proc_start_ticks` (v1, ohne Programm und cgroup). `None`, wenn
     /// keine Startzeit bekannt ist — eine PID allein beweist nichts
@@ -417,5 +516,111 @@ mod tests {
         assert!(JobState::Failed.is_terminal());
         assert!(JobState::Stopped.is_terminal());
         assert!(JobState::Unknown.is_terminal());
+    }
+
+    #[test]
+    fn test_old_meta_defaults_new_fields() -> TestResult {
+        let v1: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        let v2: JobMeta = serde_json::from_str(&v1_json(r#""proc_start_ticks":5,"#).replace(
+            r#""version":1"#,
+            r#""version":2"#,
+        ))
+        .map_err(ctx("parse v2 without new keys"))?;
+        assert_eq!(v2.version, 2);
+        for meta in [&v1, &v2] {
+            assert!(!meta.stragglers_reaped);
+            assert!(!meta.log_truncated);
+            assert!(meta.launch_warnings.is_empty());
+            assert_eq!(meta.sandbox_profile(), "bwrap");
+            assert_eq!(meta.state, JobState::Running);
+            assert_eq!(meta.end_reason(), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_fields_roundtrip() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        meta.version = META_VERSION;
+        meta.stragglers_reaped = true;
+        meta.log_truncated = true;
+        meta.launch_warnings = vec!["started without rlimits".to_owned()];
+        let json = serde_json::to_string(&meta).map_err(ctx("serialize"))?;
+        assert!(json.contains("\"stragglers_reaped\":true"));
+        assert!(json.contains("\"log_truncated\":true"));
+        assert!(json.contains("\"launch_warnings\":[\"started without rlimits\"]"));
+        let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse back"))?;
+        assert_eq!(back, meta);
+        Ok(())
+    }
+
+    #[test]
+    fn test_end_reason_derivation() -> TestResult {
+        let base: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        type Row = (
+            JobState,
+            Option<i32>,
+            Option<i32>,
+            bool,
+            Option<&'static str>,
+            Option<JobEndReason>,
+        );
+        let table: [Row; 12] = [
+            (JobState::Succeeded, Some(0), None, false, None, Some(JobEndReason::Exited)),
+            (JobState::Failed, Some(2), None, false, None, Some(JobEndReason::Exited)),
+            (JobState::Failed, None, Some(9), false, None, Some(JobEndReason::Signal)),
+            (JobState::Failed, None, Some(24), false, None, Some(JobEndReason::Timeout)),
+            (JobState::Stopped, None, Some(15), false, None, Some(JobEndReason::Stopped)),
+            (JobState::Failed, None, Some(9), true, None, Some(JobEndReason::Stopped)),
+            (
+                JobState::Failed,
+                None,
+                None,
+                false,
+                Some("spawn failed"),
+                Some(JobEndReason::LaunchError),
+            ),
+            (JobState::Unknown, None, None, false, None, Some(JobEndReason::Unknown)),
+            (JobState::Failed, None, None, false, None, None),
+            (JobState::Running, None, None, false, None, None),
+            (JobState::Detached, None, None, false, None, None),
+            (JobState::Queued, Some(0), None, false, None, None),
+        ];
+        for (state, exit_code, signal, stop_requested, launch_error, expected) in table {
+            let mut meta = base.clone();
+            meta.state = state;
+            meta.exit_code = exit_code;
+            meta.signal = signal;
+            meta.stop_requested = stop_requested;
+            meta.launch_error = launch_error.map(str::to_owned);
+            assert_eq!(meta.end_reason(), expected, "state {state}");
+        }
+        let names: Vec<&str> = [
+            JobEndReason::Exited,
+            JobEndReason::Signal,
+            JobEndReason::Stopped,
+            JobEndReason::Timeout,
+            JobEndReason::LaunchError,
+            JobEndReason::Unknown,
+        ]
+        .into_iter()
+        .map(JobEndReason::as_str)
+        .collect();
+        assert_eq!(
+            names,
+            ["exited", "signal", "stopped", "timeout", "launch-error", "unknown"]
+        );
+        let json = serde_json::to_string(&JobEndReason::LaunchError).map_err(ctx("serialize"))?;
+        assert_eq!(json, "\"launch-error\"");
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_profile_host_and_bwrap() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        assert_eq!(meta.sandbox_profile(), "bwrap");
+        meta.executed_on_host = true;
+        assert_eq!(meta.sandbox_profile(), "host");
+        Ok(())
     }
 }
