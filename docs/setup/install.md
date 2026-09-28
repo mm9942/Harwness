@@ -60,12 +60,17 @@ The tarball holds one directory `harw-<tag>-<target>/` with `harw`,
 line:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mm9942/Harwness/main/scripts/install.sh | bash -s -- --binary
+curl -fsSL https://get.harw.dev/harw/install.sh | bash -s -- --binary
 ```
 
 `--binary` picks the latest release (`HARW_RELEASE_TAG=vX.Y.Z` pins one) and
 the target of this machine: `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu`, or `aarch64-linux-android` under Termux.
+`aarch64-unknown-linux-gnu`, or `aarch64-linux-android` under Termux. It
+reads the mirror at `get.harw.dev/harw` (`latest`, then
+`<tag>/harw-<tag>-<target>.tar.gz` and `<tag>/SHA256SUMS`); with
+`HARW_RELEASES_URL` set it reads a GitHub-style release layout instead. It
+never falls back to a source build: without a release for this machine it
+stops with an error and installs nothing.
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is
 pushed (or by hand for an existing tag); `make release` builds the same
 tarball locally.
@@ -78,7 +83,13 @@ curl -fsSL https://get.harw.dev/harw/install.sh | bash
 bash scripts/install.sh --source
 ```
 
-The piped script downloads `Harwness-main.zip`, extracts it under
+Without an argument the piped script first asks the mirror for a prebuilt
+release for this machine (`latest` names a tag whose `SHA256SUMS` lists
+`harw-<tag>-<target>.tar.gz`) and installs it like `--binary`, so no Rust
+toolchain is needed. Only when there is none it logs "building from source"
+and continues as below.
+
+The source path downloads `Harwness-main.zip`, extracts it under
 `$HARW_SOURCES_DIR` (default `~/.local/share/harw/sources`) and leaves the
 source in place for later agent builds. It installs Rustup from
 `https://sh.rustup.rs` if needed, then installs missing dependencies such as

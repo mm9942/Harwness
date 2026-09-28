@@ -180,6 +180,11 @@ jobs:
           for file in *.tar.gz SHA256SUMS; do
             s3 "$file" "s3://${R2_BUCKET}/${R2_PREFIX}/${tag}/${file}"
           done
+          # Source archive of the tag for the installer's source path
+          # (install.sh without a release for this machine).
+          git -C .. archive --format=zip --prefix=Harwness-main/ -o "$PWD/Harwness-main.zip" HEAD
+          s3 Harwness-main.zip "s3://${R2_BUCKET}/${R2_PREFIX}/Harwness-main.zip" \
+            --content-type "application/zip" --cache-control "no-cache"
           s3 ../scripts/install.sh "s3://${R2_BUCKET}/${R2_PREFIX}/install.sh" \
             --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
           # `latest` last, so it never points at a half-uploaded tag.

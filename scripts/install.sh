@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install Harwness from the source archive published at get.harw.dev.
+# Install Harwness from get.harw.dev: a prebuilt release when the mirror has
+# one for this machine, else the source archive built with make install.
 # Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
 set -euo pipefail
 
@@ -22,10 +23,18 @@ The piped installer downloads and extracts Harwness-main.zip, installs
 Rustup with the stable default toolchain when needed, installs missing
 Linux build dependencies including Bubblewrap, then runs make install.
 
---binary installs harw, killer and harw-agent-runner from a GitHub release
-instead (no Rust toolchain): it downloads harw-<tag>-<target>.tar.gz and
-SHA256SUMS, refuses a tarball whose checksum does not match or that lacks a
-binary, and only then replaces an existing installation.
+Without an argument the piped installer first looks for a prebuilt release
+on the mirror ($HARW_BASE_URL/latest, then $HARW_BASE_URL/<tag>/...) for this
+machine (x86_64 or aarch64 Linux, aarch64 Termux). Only when there is none it
+downloads Harwness-main.zip and builds from source.
+
+--binary installs harw, killer and harw-agent-runner from a release and
+fails instead of falling back to a source build (no Rust toolchain): it
+downloads harw-<tag>-<target>.tar.gz and SHA256SUMS, refuses a tarball whose
+checksum does not match or that lacks a binary, and only then replaces an
+existing installation. The mirror is the default source; with
+HARW_RELEASES_URL set it reads a GitHub-style release layout
+(<url>/download/<tag>/...) instead.
 
 Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME,
 HARW_RELEASE_TAG (default: the latest release), HARW_RELEASES_URL.
@@ -159,6 +168,18 @@ fetch() {
   fi
 }
 
+# Like `fetch`, but silent and without dying: for probing optional files.
+fetch_quiet() {
+  local url="$1" output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 2 "$url" -o "$output" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O "$output" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 ensure_rustup() {
   if ! command -v rustup >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/rustup" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
@@ -186,19 +207,80 @@ archive_hash() {
 
 # Release target of this machine: the Rust target triple the release
 # workflow builds for (Termux on Android reports "Android" as its OS).
-release_target() {
+# Fails (without dying) on an architecture without release builds.
+release_target_or_none() {
   local arch
   arch="$(uname -m)"
   case "$arch" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
-    *) die "no release build for architecture $arch; use the source installer" ;;
+    *) return 1 ;;
   esac
   if [ "$(uname -o 2>/dev/null)" = Android ]; then
     printf '%s-linux-android\n' "$arch"
   else
     printf '%s-unknown-linux-gnu\n' "$arch"
   fi
+}
+
+release_target() {
+  release_target_or_none \
+    || die "no release build for architecture $(uname -m); use the source installer"
+}
+
+# URL of one release file: the mirror layout (<base>/<tag>/<file>, written by
+# release.yml `mirror`) by default, the GitHub layout with HARW_RELEASES_URL.
+release_file_url() {
+  local tag="$1" file="$2"
+  if [ -n "${HARW_RELEASES_URL:-}" ]; then
+    printf '%s/download/%s/%s\n' "$releases_url" "$tag" "$file"
+  else
+    printf '%s/%s/%s\n' "$base_url" "$tag" "$file"
+  fi
+}
+
+# Tag the mirror names as latest (<base>/latest, one line `vX.Y.Z`).
+mirror_latest_tag() {
+  local out tag
+  out="$(mktemp)"
+  if fetch_quiet "$base_url/latest" "$out"; then
+    tag="$(head -n 1 "$out" | tr -d '[:space:]')"
+    rm -f "$out"
+    case "$tag" in v[0-9]*) printf '%s\n' "$tag"; return 0 ;; esac
+    return 1
+  fi
+  rm -f "$out"
+  return 1
+}
+
+# Tag to install: HARW_RELEASE_TAG, else the latest release of the chosen
+# layout (mirror by default, GitHub with HARW_RELEASES_URL).
+release_tag() {
+  if [ -n "${HARW_RELEASE_TAG:-}" ]; then
+    printf '%s\n' "$HARW_RELEASE_TAG"
+  elif [ -n "${HARW_RELEASES_URL:-}" ]; then
+    latest_release_tag
+  else
+    mirror_latest_tag || die "no release published at $base_url (missing $base_url/latest)"
+  fi
+}
+
+# True when the mirror has a prebuilt release for this machine: `latest`
+# names a tag and its SHA256SUMS lists harw-<tag>-<target>.tar.gz.
+mirror_has_binary_release() {
+  local target tag sums
+  [ -z "${HARW_RELEASES_URL:-}" ] || return 1
+  target="$(release_target_or_none)" || return 1
+  tag="${HARW_RELEASE_TAG:-$(mirror_latest_tag)}" || return 1
+  [ -n "$tag" ] || return 1
+  sums="$(mktemp)"
+  if fetch_quiet "$base_url/$tag/SHA256SUMS" "$sums" \
+    && grep -Eq "[[:space:]]\*?(\./)?harw-$tag-$target\.tar\.gz\$" "$sums"; then
+    rm -f "$sums"
+    return 0
+  fi
+  rm -f "$sums"
+  return 1
 }
 
 # Tag of the latest release, read from the redirect of /releases/latest.
@@ -240,15 +322,18 @@ LISTING
 }
 
 install_binary_release() {
-  local target tag name work_dir unpacked binary runner_dir
+  # work_dir stays global: the EXIT trap runs after this function returned.
+  local target tag name unpacked binary runner_dir
   target="$(release_target)"
-  tag="${HARW_RELEASE_TAG:-$(latest_release_tag)}"
+  tag="$(release_tag)"
   name="harw-$tag-$target"
   work_dir="$(mktemp -d)"
   trap 'rm -rf "$work_dir"' EXIT
   log "Downloading $name.tar.gz"
-  fetch "$releases_url/download/$tag/$name.tar.gz" "$work_dir/$name.tar.gz"
-  fetch "$releases_url/download/$tag/SHA256SUMS" "$work_dir/SHA256SUMS"
+  fetch "$(release_file_url "$tag" "$name.tar.gz")" "$work_dir/$name.tar.gz" \
+    || die "could not download $name.tar.gz for $tag; nothing installed"
+  fetch "$(release_file_url "$tag" SHA256SUMS)" "$work_dir/SHA256SUMS" \
+    || die "could not download SHA256SUMS for $tag; nothing installed"
   (
     cd "$work_dir"
     grep -E "^[0-9a-fA-F]{64}[[:space:]]+\*?(\./)?$name\.tar\.gz\$" SHA256SUMS > "$name.sha256" \
@@ -288,6 +373,15 @@ if [ "${1:-}" = --binary ]; then
   install_binary_release
   exit 0
 fi
+# Piped without an argument: a prebuilt release when the mirror has one for
+# this machine, so no Rust toolchain is needed; otherwise build from source.
+if [ -z "${1:-}" ]; then
+  if mirror_has_binary_release; then
+    install_binary_release
+    exit 0
+  fi
+  log "No prebuilt release for this machine on $base_url; building from source"
+fi
 
 checkout=""
 if [ "${1:-}" = --source ]; then
@@ -303,7 +397,8 @@ else
   work_dir="$(mktemp -d "$sources_dir/.download-XXXXXX")"
   trap 'rm -rf "$work_dir"' EXIT
   log "Downloading $base_url/$archive_name"
-  fetch "$base_url/$archive_name" "$work_dir/$archive_name"
+  fetch "$base_url/$archive_name" "$work_dir/$archive_name" \
+    || die "could not download $base_url/$archive_name (no source archive published there); try: bash -s -- --binary"
   ensure_unzip
   hash="$(archive_hash "$work_dir/$archive_name")"
   checkout="$sources_dir/$hash"

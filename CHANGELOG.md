@@ -6,6 +6,19 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Fixed
+
+- `curl -fsSL https://get.harw.dev/harw/install.sh | bash` no longer fails
+  with a bare 404 on `Harwness-main.zip`. Without an argument it now installs
+  the prebuilt release from the mirror (`latest` + `<tag>/SHA256SUMS`) when
+  one exists for this machine (x86_64 or aarch64), and only otherwise builds
+  from source. `--binary` reads the mirror instead of the private GitHub
+  releases. Missing files fail with a clear message.
+- `install.sh --binary` no longer aborts with `work_dir: unbound variable`
+  at exit after a successful install.
+- The release `mirror` job also uploads `Harwness-main.zip`, which the
+  source path of the installer downloads.
+
 ## [0.9.0] — Unreleased
 
 ### Added
