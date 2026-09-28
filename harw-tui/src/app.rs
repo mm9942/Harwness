@@ -9541,8 +9541,8 @@ fn render_explorer_panel(
 /// und Kontext still verdrängen.
 const STATUS_TWO_ROWS_MAX_COLS: u16 = 80;
 
-/// Ab dieser Breite trägt die Host-Warnung auf zwei Zeilen noch ihren
-/// Tastenhinweis „(Strg+H beendet)"; darunter nur „HOST-MODUS AKTIV".
+/// Ab dieser Breite trägt die Host-Warnung noch ihren Tastenhinweis
+/// „(Strg+H beendet)"; darunter nur „HOST-MODUS AKTIV".
 const STATUS_HOST_HINT_MIN_COLS: u16 = 60;
 
 /// Zeilen der Statuszeile: zwei, wenn das Terminal schmal ist und eine
@@ -9556,6 +9556,63 @@ fn status_rows_for(app: &ChatApp, theme: style::Theme, width: u16) -> u16 {
     } else {
         1
     }
+}
+
+/// Host-Warnung der Statuszeile (vorne, Warnfarbe, fett).
+const HOST_MODE_MARK: &str = " HOST-MODUS AKTIV (Strg+H beendet) ·";
+
+/// Host-Warnung unter [`STATUS_HOST_HINT_MIN_COLS`]: ohne Tastenhinweis,
+/// „HOST-MODUS AKTIV" steht immer vollständig da.
+const HOST_MODE_MARK_SHORT: &str = " HOST-MODUS AKTIV ·";
+
+/// Plan-Marke, wenn die volle Marke neben der Host-Warnung nicht passt.
+const PLAN_MARK_SHORT: &str = " ⏸ plan ";
+
+/// Setzt die Marken der Statuszeile zusammen: Host-Warnung zuerst mit fest
+/// reserviertem Platz, dann die Plan-Marke (voll, sonst kurz, sonst weg) und
+/// die Goal-Marke, gekürzt auf den Rest.
+///
+/// # Rückgabe
+/// Die Spans und ihre Gesamtbreite in Spalten (nie über `width`, außer die
+/// Host-Warnung allein ist breiter — sie wird nie gekürzt).
+fn status_mark_spans(
+    host: Option<Span<'static>>,
+    plan: Option<(Span<'static>, Span<'static>)>,
+    goal: Vec<Span<'static>>,
+    width: usize,
+) -> (Vec<Span<'static>>, usize) {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    if let Some(host) = host {
+        used += host.width();
+        spans.push(host);
+    }
+    let mut remaining = width.saturating_sub(used);
+    if let Some((full, short)) = plan {
+        let pick = if full.width() <= remaining {
+            Some(full)
+        } else if short.width() <= remaining {
+            Some(short)
+        } else {
+            None
+        };
+        if let Some(span) = pick {
+            remaining -= span.width();
+            used += span.width();
+            spans.push(span);
+        }
+    }
+    for span in goal {
+        if remaining == 0 {
+            break;
+        }
+        let text = status_line::fit_width(span.content.as_ref(), remaining);
+        let width = status_line::display_width(&text);
+        remaining -= width.min(remaining);
+        used += width;
+        spans.push(Span::styled(text, span.style));
+    }
+    (spans, used)
 }
 
 /// Zeichnet die Fullscreen-Viewport: scrollbare History oben und Eingabebox unten.
@@ -10133,77 +10190,61 @@ fn render_viewport(
         Seg::new(15, vec![agents_hint, agents_hint_short, String::new()]),
         Seg::optional(220, pending_permission_suffix),
     ];
-    // Breite der Marken vor/nach dem Text (Plan, Goal, Host-Modus) abziehen.
-    const HOST_MODE_SUFFIX: &str = " · HOST-MODUS AKTIV (Strg+H beendet)";
-    // Schmale Zwei-Zeilen-Statuszeile: die Warnung bleibt vollständig lesbar
-    // („HOST-MODUS AKTIV" steht immer da), nur der Tastenhinweis entfällt.
-    const HOST_MODE_SUFFIX_SHORT: &str = " · HOST-MODUS AKTIV";
-    let two_rows = status_area.height >= 2;
-    let host_suffix = if two_rows && status_area.width < STATUS_HOST_HINT_MIN_COLS {
-        HOST_MODE_SUFFIX_SHORT
-    } else {
-        HOST_MODE_SUFFIX
-    };
-    let plan_width = if app.current_permission_stage() == PermissionCycleStage::Plan {
-        crate::plan_dialog::plan_status_span(theme).width()
-    } else {
-        0
-    };
-    let host_width = if app.host_mode_active() {
-        status_line::display_width(host_suffix)
-    } else {
-        0
-    };
-    // Auf zwei Zeilen darf die Goal-Marke die ganze erste Zeile neben Plan-
-    // und Host-Marke nutzen (`status_spans` teilt ihre Breite durch drei).
-    let goal_budget = if two_rows {
-        status_area
-            .width
-            .saturating_sub(u16::try_from(plan_width + host_width).unwrap_or(u16::MAX))
-            .saturating_mul(3)
-    } else {
-        status_area.width
-    };
-    let mut goal_spans = app.goal_status_spans(theme, goal_budget);
-    let goal_width: usize = goal_spans.iter().map(Span::width).sum();
-    let status_width = if two_rows {
-        usize::from(status_area.width)
-    } else {
-        usize::from(status_area.width).saturating_sub(goal_width + plan_width + host_width)
-    };
-    let status = status_line::fit_segments(&segments, status_width);
-    let status_style = Style::default().fg(style::border_color(theme));
     // Solange eine Host-Arbeitsphase läuft, muss die Statuszeile das gemäß
     // `docs/design/mediated-process-execution.md` („permanent und
     // unübersehbar `HOST-MODUS AKTIV`") in einer eigenen, hervorgehobenen
-    // Warnfarbe zeigen — ein einfacher String-Suffix in derselben Farbe wie
-    // der Rest der Zeile wäre zu leicht zu übersehen.
-    // Runde 5, Teil P: feste Goal-Marke vorne, solange ein Goal aktiv ist;
-    // Runde 5, Teil F: deutliche Plan-Marke in eigener Farbe davor.
-    let mut marks: Vec<Span<'static>> = Vec::new();
-    if app.current_permission_stage() == PermissionCycleStage::Plan {
-        marks.push(crate::plan_dialog::plan_status_span(theme));
-    }
-    marks.append(&mut goal_spans);
+    // Warnfarbe zeigen. Die Warnung steht deshalb **vorne** und ihr Platz ist
+    // fest reserviert; Plan- und Goal-Marke (Runde 5, Teile F/P) teilen sich
+    // nur den Rest (Review #60: dahinter fiel sie im Hochformat heraus).
+    let two_rows = status_area.height >= 2;
+    let host_text = if status_area.width < STATUS_HOST_HINT_MIN_COLS {
+        HOST_MODE_MARK_SHORT
+    } else {
+        HOST_MODE_MARK
+    };
     let host_span = app.host_mode_active().then(|| {
         Span::styled(
-            host_suffix,
+            host_text,
             Style::default()
                 .fg(style::warning_color(theme))
                 .add_modifier(Modifier::BOLD),
         )
     });
+    let plan_spans = (app.current_permission_stage() == PermissionCycleStage::Plan).then(|| {
+        let full = crate::plan_dialog::plan_status_span(theme);
+        let short = Span::styled(PLAN_MARK_SHORT, full.style);
+        (full, short)
+    });
+    // `status_spans` teilt ihre Breite durch drei: auf zwei Zeilen darf die
+    // Goal-Marke die ganze erste Zeile nutzen, einzeilig wie bisher.
+    let goal_budget = if two_rows {
+        status_area.width.saturating_mul(3)
+    } else {
+        status_area.width
+    };
+    let goal_spans = app.goal_status_spans(theme, goal_budget);
+    let (mut marks, marks_width) = status_mark_spans(
+        host_span,
+        plan_spans,
+        goal_spans,
+        usize::from(status_area.width),
+    );
+    let status_width = if two_rows {
+        usize::from(status_area.width)
+    } else {
+        usize::from(status_area.width).saturating_sub(marks_width)
+    };
+    let status = status_line::fit_segments(&segments, status_width);
+    let status_style = Style::default().fg(style::border_color(theme));
     if two_rows {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(status_area);
-        marks.extend(host_span);
         frame.render_widget(Paragraph::new(Line::from(marks)), rows[0]);
         frame.render_widget(Paragraph::new(status).style(status_style), rows[1]);
     } else {
         marks.push(Span::styled(status, status_style));
-        marks.extend(host_span);
         frame.render_widget(Paragraph::new(Line::from(marks)), status_area);
     }
 
@@ -14490,6 +14531,68 @@ forbidden = [{forbidden}]
             BusyKeyOutcome::Redraw
         ));
         assert!(app.full_redraw.get(), "busy Ctrl+L marks a full redraw too");
+        Ok(())
+    }
+
+    /// Review #60 (P1): die Host-Warnung steht vorne mit fest reserviertem
+    /// Platz und bleibt neben Plan- oder Goal-Marke bei 40, 45 und 55 Spalten
+    /// vollständig im gerenderten Buffer; Plan/Goal werden gekürzt.
+    #[test]
+    fn host_warning_stays_complete_next_to_plan_and_goal_marks() -> TestResult {
+        let theme = crate::style::Theme::Dark;
+        let host_text = |width: u16| {
+            if width < STATUS_HOST_HINT_MIN_COLS {
+                HOST_MODE_MARK_SHORT
+            } else {
+                HOST_MODE_MARK
+            }
+        };
+        let plan = || {
+            let full = crate::plan_dialog::plan_status_span(theme);
+            let short = Span::styled(PLAN_MARK_SHORT, full.style);
+            (full, short)
+        };
+        let goal = || {
+            vec![Span::raw(
+                " ◎ Goal: Auf aktueller dev-Basis einen sicheren Reviewer bauen · 1/5 ",
+            )]
+        };
+        for width in [40u16, 45, 55] {
+            for (label, with_plan, with_goal) in [
+                ("host+plan", true, false),
+                ("host+goal", false, true),
+                ("host+plan+goal", true, true),
+            ] {
+                let (spans, used) = status_mark_spans(
+                    Some(Span::raw(host_text(width))),
+                    with_plan.then(plan),
+                    if with_goal { goal() } else { Vec::new() },
+                    usize::from(width),
+                );
+                assert!(used <= usize::from(width), "{label} at {width}: {used}");
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
+                        .map_err(ctx("test terminal"))?;
+                terminal
+                    .draw(|frame| {
+                        frame
+                            .render_widget(Paragraph::new(Line::from(spans.clone())), frame.area());
+                    })
+                    .map_err(ctx("draw"))?;
+                let buffer = terminal.backend().buffer();
+                let row: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+                assert!(
+                    row.contains("HOST-MODUS AKTIV"),
+                    "{label} at {width} columns lost the host warning: {row:?}"
+                );
+                if with_plan {
+                    assert!(
+                        row.contains('⏸'),
+                        "{label} at {width}: plan mark gone: {row:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

@@ -591,8 +591,12 @@ tall tmux pane on a portrait monitor, roughly 45–55 columns × 60–80 rows.
 **Remaining limits:**
 
 - Below 40 columns, or below 28 rows, the one-line summary stays.
-- On a two-row status line below 60 columns, the host warning reads
-  `HOST-MODUS AKTIV` without the key hint.
+- The host warning always comes first on the status line, and its width is
+  reserved. Plan and goal marks share the rest: the plan mark shrinks to
+  `⏸ plan` and the goal title is shortened. Below 60 columns the warning
+  reads `HOST-MODUS AKTIV` without the key hint. Test:
+  `host_warning_stays_complete_next_to_plan_and_goal_marks` (40/45/55
+  columns, host+plan, host+goal, host+plan+goal).
 - A terminal that measures a glyph differently still shows leftovers until
   the next resize or `Ctrl+L`.
 - Tool calls of durable worker jobs (`agent.run`, WorkDriver) are still only
