@@ -66,8 +66,8 @@ curl -fsSL https://get.harw.dev/harw/install.sh | bash -s -- --binary
 `--binary` picks the latest release (`HARW_RELEASE_TAG=vX.Y.Z` pins one) and
 the target of this machine: `x86_64-unknown-linux-gnu`,
 `aarch64-unknown-linux-gnu`, or `aarch64-linux-android` under Termux. It
-reads the mirror at `get.harw.dev/harw` (`latest`, then
-`<tag>/harw-<tag>-<target>.tar.gz` and `<tag>/SHA256SUMS`); with
+reads the mirror at `get.harw.dev/harw` (the tag from `version.json`, else
+`latest`, then `<tag>/harw-<tag>-<target>.tar.gz` and `<tag>/SHA256SUMS`); with
 `HARW_RELEASES_URL` set it reads a GitHub-style release layout instead. It
 never falls back to a source build: without a release for this machine it
 stops with an error and installs nothing.
@@ -88,6 +88,14 @@ release for this machine (`latest` names a tag whose `SHA256SUMS` lists
 `harw-<tag>-<target>.tar.gz`) and installs it like `--binary`, so no Rust
 toolchain is needed. Only when there is none it logs "building from source"
 and continues as below.
+
+`version.json` is the release manifest of the mirror, written by
+`scripts/release-manifest.sh` from the release's `SHA256SUMS`: `version`,
+`tag`, `published_at`, the `source` tarball and one entry per target, each
+with its `file` (relative to the mirror base) and `sha256`. After a
+successful install the script seeds `~/.harw/version.json` (the update
+notice's state, see below) with the installed version, unless that file
+already exists.
 
 The source path takes the versioned source tarball of that release,
 `<tag>/harwness-<version>-source.tar.gz`, checked against the release's

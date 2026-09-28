@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,7 @@ import zipfile
 
 
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
+MANIFEST = Path(__file__).resolve().parents[1] / "release-manifest.sh"
 
 
 class SourceInstallTests(unittest.TestCase):
@@ -182,6 +184,41 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertIn("checksum of harwness-9.9.9-source.tar.gz", result.stderr)
             self.assertFalse((root / "make").exists())
 
+    def test_mirror_version_json_names_the_tag_without_latest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"], source=True, manifest=True)
+            manifest = json.loads((root / "mirror/version.json").read_text())
+            self.assertEqual(manifest["tag"], self.TAG)
+            self.assertEqual(manifest["version"], "9.9.9")
+            self.assertEqual(
+                manifest["targets"]["x86_64-unknown-linux-gnu"]["file"],
+                f"{self.TAG}/harw-{self.TAG}-x86_64-unknown-linux-gnu.tar.gz",
+            )
+            self.assertEqual(manifest["source"]["file"], f"{self.TAG}/harwness-9.9.9-source.tar.gz")
+            result, urls = self.run_installer(root, "x86_64")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mirror.example/harw/version.json", urls)
+            self.assertNotIn("mirror.example/harw/latest", urls)
+            self.assertIn("harw-test x86_64-unknown-linux-gnu", result.stdout)
+
+    def test_install_seeds_local_version_json_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"])
+            result, _ = self.run_installer(root, "x86_64")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = root / "home/.harw/version.json"
+            info = json.loads(record.read_text())
+            self.assertEqual(info["latest_version"], "9.9.9")
+            self.assertIsNone(info["dismissed_version"])
+            self.assertRegex(info["last_checked_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            # A later install keeps an existing record (it may hold a dismissal).
+            record.write_text('{"latest_version":"9.9.9","last_checked_at":"2026-01-01T00:00:00Z","dismissed_version":"9.9.9"}\n')
+            result, _ = self.run_installer(root, "x86_64")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(record.read_text())["dismissed_version"], "9.9.9")
+
     def test_binary_flag_without_latest_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -201,11 +238,16 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertIn("checksum", result.stderr)
             self.assertFalse((root / "home/.local/bin/harw").exists())
 
-    def publish(self, root, targets, source=False):
-        """Writes the release.yml `mirror` layout for self.TAG below root/mirror."""
+    def publish(self, root, targets, source=False, manifest=False):
+        """Writes the release.yml `mirror` layout for self.TAG below root/mirror.
+
+        With manifest, the mirror names the tag only in version.json (written by
+        scripts/release-manifest.sh), not in `latest`.
+        """
         release = root / "mirror" / self.TAG
         release.mkdir(parents=True)
-        (root / "mirror" / "latest").write_text(self.TAG + "\n")
+        if not manifest:
+            (root / "mirror" / "latest").write_text(self.TAG + "\n")
         sums = []
         for target in targets:
             name = f"harw-{self.TAG}-{target}"
@@ -239,6 +281,12 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             (release / f"{name}-source.tar.gz").write_bytes(data.getvalue())
             sums.append(f"{hashlib.sha256(data.getvalue()).hexdigest()}  {name}-source.tar.gz\n")
         (release / "SHA256SUMS").write_text("".join(sums))
+        if manifest:
+            written = subprocess.run(
+                ["bash", str(MANIFEST), self.TAG, str(release)],
+                capture_output=True, text=True, check=True,
+            )
+            (root / "mirror" / "version.json").write_text(written.stdout)
 
     def run_installer(self, root, machine, *args):
         home, mocks = root / "home", root / "mocks"

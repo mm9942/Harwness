@@ -24,7 +24,8 @@ Rustup with the stable default toolchain when needed, installs missing
 Linux build dependencies including Bubblewrap, then runs make install.
 
 Without an argument the piped installer first looks for a prebuilt release
-on the mirror ($HARW_BASE_URL/latest, then $HARW_BASE_URL/<tag>/...) for this
+on the mirror ($HARW_BASE_URL/version.json or /latest, then
+$HARW_BASE_URL/<tag>/...) for this
 machine (x86_64 or aarch64 Linux, aarch64 Termux). Only when there is none it
 builds from source: from the release's harwness-<version>-source.tar.gz
 (checked against SHA256SUMS) when published, else from Harwness-main.zip.
@@ -240,10 +241,19 @@ release_file_url() {
   fi
 }
 
-# Tag the mirror names as latest (<base>/latest, one line `vX.Y.Z`).
+# Tag the mirror names as latest: the "tag" of <base>/version.json (the
+# release manifest), else <base>/latest (one line `vX.Y.Z`).
 mirror_latest_tag() {
   local out tag
   out="$(mktemp)"
+  if fetch_quiet "$base_url/version.json" "$out"; then
+    tag="$(sed -n 's/.*"tag"[[:space:]]*:[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p' "$out" | head -n 1)"
+    if [ -n "$tag" ]; then
+      rm -f "$out"
+      printf '%s\n' "$tag"
+      return 0
+    fi
+  fi
   if fetch_quiet "$base_url/latest" "$out"; then
     tag="$(head -n 1 "$out" | tr -d '[:space:]')"
     rm -f "$out"
@@ -341,6 +351,19 @@ LISTING
   esac
 }
 
+# Seeds ~/.harw/version.json (harw_install::VersionInfo) with the installed
+# release, so the start notice and `harw update` know it without a network
+# check. An existing file is left alone: it may hold a dismissed version.
+record_installed_version() {
+  local version="${1#v}" file
+  file="${HARW_HOME:-$HOME/.harw}/version.json"
+  [ -n "$version" ] && [ ! -e "$file" ] || return 0
+  mkdir -p "$(dirname "$file")"
+  printf '{"latest_version":"%s","last_checked_at":"%s","dismissed_version":null}\n' \
+    "$version" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$file" \
+    || log "could not write $file; harw checks for updates on its next start"
+}
+
 install_binary_release() {
   # work_dir stays global: the EXIT trap runs after this function returned.
   local target tag name unpacked binary runner_dir
@@ -383,6 +406,7 @@ install_binary_release() {
   install -m 0755 "$unpacked/harw-agent-runner" "$runner_dir/harw-agent-runner"
   "$install_dir/harw" agent install-record --bindir "$install_dir" \
     || log "could not record the installation; harw update falls back to the running binary's directory"
+  record_installed_version "$tag"
   log "Harwness $tag installed into $install_dir"
   "$install_dir/harw" --version
   printf '%s\n' 'Next: harw doctor; then harw to start onboarding.'
@@ -404,6 +428,7 @@ if [ -z "${1:-}" ]; then
 fi
 
 checkout=""
+source_tag=""
 if [ "${1:-}" = --source ]; then
   [ -f scripts/install.sh ] && [ -f Cargo.toml ] && [ -f Makefile ] \
     || die "--source must be run from the Harwness repository root"
@@ -488,6 +513,7 @@ if [ "$install_dir" = "$HOME/.local/bin" ]; then
   done
 fi
 
+record_installed_version "${source_tag:-}"
 log "Harwness installed from $checkout"
 "$install_dir/harw" --version
 printf '%s\n' 'Next: harw doctor; then harw to start onboarding.'

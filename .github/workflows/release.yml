@@ -192,7 +192,11 @@ jobs:
             --content-type "application/zip" --cache-control "no-cache"
           s3 ../scripts/install.sh "s3://${R2_BUCKET}/${R2_PREFIX}/install.sh" \
             --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
-          # `latest` last, so it never points at a half-uploaded tag.
+          # version.json (release manifest) and `latest` last, so neither
+          # points at a half-uploaded tag.
+          ../scripts/release-manifest.sh "$tag" . > version.json
+          s3 version.json "s3://${R2_BUCKET}/${R2_PREFIX}/version.json" \
+            --content-type "application/json; charset=utf-8" --cache-control "no-cache"
           printf '%s\n' "$tag" > latest
           s3 latest "s3://${R2_BUCKET}/${R2_PREFIX}/latest" \
             --content-type "text/plain; charset=utf-8" --cache-control "no-cache"

@@ -19,6 +19,11 @@ Semantic Versioning within the 0.x pre-release range.
 - The installer's source path builds from the release's versioned
   `harwness-<version>-source.tar.gz` (checked against `SHA256SUMS`) and only
   falls back to `Harwness-main.zip` when the mirror has none.
+- The mirror publishes `version.json`, a release manifest (version, tag,
+  source and per-target tarballs with sha256) written by
+  `scripts/release-manifest.sh`; the installer takes the tag from it before
+  falling back to `latest`, and seeds `~/.harw/version.json` with the
+  installed version.
 - The release `mirror` job also uploads `harwness-<version>-source.tar.gz`
   (listed in `SHA256SUMS`) and `Harwness-main.zip`.
 
