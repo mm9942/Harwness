@@ -14,6 +14,16 @@ related:
 
 Planning only. No files were changed and no build was run. Every statement below is based on code I read at the current HEAD; where I was not sure, the item is marked **(verify)**.
 
+> **Transport-Profil W00:** Der ergänzende Entwurf
+> [Local / Own-Cloud Session Control Plane — WebSocket transport profile](local-own-cloud-websocket.md)
+> optimiert dieses Programm für die neuere WebSocket-Control-Plane-Richtung.
+> Er ändert keine bereits gelandete Transportfläche: `harw-web /events` bleibt
+> SSE und der DoD-Uplink bleibt NDJSON. Für die **noch nicht implementierte**
+> Session-Control-Plane ersetzt der Entwurf lediglich den hier geplanten
+> Zwischenweg `POST /v1/rpc` + NDJSON durch einen direkt versionierten,
+> multiplexen WebSocket-Transport. Der feste W00-Umsetzungsvertrag liegt unter
+> [`contracts/W00-websocket-control-plane.md`](contracts/W00-websocket-control-plane.md).
+
 Build rule (binding, verbatim, for every agent prompt): Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.
 
 ---
