@@ -1005,6 +1005,11 @@ docs/
     ├── 67-containers/
     │   └── README.md            (optional OCI/K8s executors + DoD container sensor)
     │
+    ├── 68-mobile-tui/
+    │   ├── README.md            (portrait phone layout: pinned top agent/jobs dock)
+    │   └── contracts/
+    │       └── W00-phone-top-dock.md
+    │
     ├── 70-decisions/
     │   └── README.md            (DEC-001 …)
     │

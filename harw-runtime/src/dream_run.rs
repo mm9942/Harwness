@@ -7,7 +7,7 @@
 //!
 //! - [`build_recent_dream_context`]: gedeckelte, deterministische Sicht auf
 //!   die jüngsten dauerhaften Gespräche des Profils (fail-closed bei
-//!   Symlinks, Provenienz-Brüchen oder Überschreitung der Grenzen; eigene
+//!   Symlinks, Provenienz-Brüchen oder Fehlern; Größenlimits beenden den Scan
 //!   Traum-Transkripte sind ausgeschlossen, damit kein Bericht rekursiv
 //!   Input wird).
 //! - [`ProviderDreamReasoner`]: ein werkzeugloser Reflexions-Turn über
@@ -38,8 +38,8 @@ use harw_session_store::{JobStore, RecordKind, TranscriptStore};
 use harw_types::{AgentRole, SessionId, ThreadRef};
 use jiff::Timestamp;
 
-/// Maximale Zahl dauerhafter Datensätze, die ein Traum-Kontext prüft; eine
-/// Überschreitung ist eine Sicherheitsverletzung (fail closed).
+/// Maximale Zahl dauerhafter Datensätze, die ein Traum-Kontext prüft; bei
+/// Überschreitung wird der Scan kontrolliert abgebrochen.
 pub const DREAM_CONTEXT_MAX_RECORDS: usize = 256;
 /// Maximale UTF-8-Bytes des gerenderten Transkript-Kontexts.
 pub const DREAM_CONTEXT_MAX_BYTES: usize = 16 * 1024;
@@ -100,9 +100,13 @@ pub fn transcript_root_for_profile(profile_dir: &Path, config: &ResolvedConfig) 
 /// werden als ganze Session ausgeschlossen.
 ///
 /// # Fehler
-/// [`DREAM_CONTEXT_SAFETY_VIOLATION`] bei Symlinks, Provenienz-Brüchen,
-/// unlesbarem Verzeichnis oder Überschreitung von
-/// [`DREAM_CONTEXT_MAX_RECORDS`]/[`DREAM_CONTEXT_MAX_BYTES`].
+/// Gibt [`DREAM_CONTEXT_SAFETY_VIOLATION`] zurück, wenn ein Transkript ein
+/// Symlink ist, das Transkriptverzeichnis oder Dateimetadaten nicht gelesen
+/// werden können, ein Eintrag während der Verzeichnisauflistung fehlschlägt
+/// oder die Provenienz eines Datensatzes nicht zur Session passt.
+/// Überschreitungen von [`DREAM_CONTEXT_MAX_RECORDS`] oder
+/// [`DREAM_CONTEXT_MAX_BYTES`] beenden den Scan dagegen kontrolliert und geben
+/// den bis dahin gesammelten Kontext zurück.
 pub fn build_recent_dream_context(transcript_root: &Path) -> Result<String, String> {
     let entries = match fs::read_dir(transcript_root) {
         Ok(entries) => entries,
@@ -150,7 +154,7 @@ pub fn build_recent_dream_context(transcript_root: &Path) -> Result<String, Stri
     let transcripts = TranscriptStore::new(transcript_root);
     let mut examined_records = 0_usize;
     let mut context = String::new();
-    for (session_id, _) in sessions {
+    'sessions: for (session_id, _) in sessions {
         let reader = match transcripts.reader(&session_id) {
             Ok(reader) => reader,
             // Eine Datei kann während des Scans verschwinden oder defekt
@@ -163,7 +167,7 @@ pub fn build_recent_dream_context(transcript_root: &Path) -> Result<String, Stri
         for record in reader {
             examined_records = examined_records.saturating_add(1);
             if examined_records > DREAM_CONTEXT_MAX_RECORDS {
-                return Err(DREAM_CONTEXT_SAFETY_VIOLATION.to_owned());
+                break 'sessions;
             }
 
             let record = match record {
@@ -207,7 +211,7 @@ pub fn build_recent_dream_context(transcript_root: &Path) -> Result<String, Stri
             };
             let rendered = format!("[{role} | {}]\n{text}\n\n", session_id.as_str());
             if context.len().saturating_add(rendered.len()) > DREAM_CONTEXT_MAX_BYTES {
-                return Err(DREAM_CONTEXT_SAFETY_VIOLATION.to_owned());
+                break 'sessions;
             }
             context.push_str(&rendered);
         }
@@ -531,10 +535,8 @@ mod tests {
                 "bounded",
             )?;
         }
-        assert_eq!(
-            build_recent_dream_context(records.path()),
-            Err(DREAM_CONTEXT_SAFETY_VIOLATION.to_owned())
-        );
+        let oversized = build_recent_dream_context(records.path()).map_err(ctx("dream context"))?;
+        assert!(!oversized.contains("bounded"));
 
         let bytes = tempfile::tempdir().map_err(ctx("temp dir"))?;
         append_user_transcript_item(
@@ -544,10 +546,9 @@ mod tests {
             0,
             &"x".repeat(DREAM_CONTEXT_MAX_BYTES),
         )?;
-        assert_eq!(
-            build_recent_dream_context(bytes.path()),
-            Err(DREAM_CONTEXT_SAFETY_VIOLATION.to_owned())
-        );
+        assert!(build_recent_dream_context(bytes.path())
+            .map_err(ctx("dream context"))?
+            .is_empty());
 
         let provenance = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let expected = SessionId::from_str("expected-session");
