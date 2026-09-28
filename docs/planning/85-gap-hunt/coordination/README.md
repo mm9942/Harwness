@@ -17,3 +17,8 @@ this folder are the record.
 | Note | Content |
 |---|---|
 | `claude-handoff.md` | Claude's open state at `a856dea`, mapped onto the plan nodes |
+| `claude-inventory.md` | Every Claude branch and preserved state, and the index of this folder |
+| `claude-patterns-pending.md` | Pattern catalog entries P15–P20 |
+| `claude-field-report.md` | Live harw session failures mapped to code |
+| `w11/` | W00/W11 WebSocket control-plane design draft and critic |
+| `tools/` | Wave scripts used for R16 |
