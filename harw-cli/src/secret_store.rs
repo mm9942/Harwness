@@ -22,8 +22,8 @@ use harw_config::{
     KekProvenance as ConfigKekProvenance, ProviderToml, ResolvedConfig, SecretRef,
 };
 use harw_infra_client::{
-    AuthHubClient, AuthHubDekWrapper, InfraClientError, InfrastructureAvailability, KeyProfile,
-    KeyRef, KeyState, RemoteErrorKind,
+    AuthHubClient, AuthHubDekWrapper, CreatedKey, InfraClientError, InfrastructureAvailability,
+    KeyDescription, KeyProfile, KeyRef, KeyState, RemoteErrorKind,
 };
 use harw_provider_http::SecretResolver;
 use harw_secrets::audit::chain::PersistedChainStatus;
@@ -354,9 +354,38 @@ fn ensure_hub_key_generation(client: &AuthHubClient, key: &KeyRef) -> Result<u32
     })
 }
 
+/// The two hub key calls [`hub_key_generation`] needs. A seam so the
+/// describe/generate decision is testable without a hub; production uses
+/// [`AuthHubClient`].
+trait HubKeys {
+    /// See [`AuthHubClient::describe`].
+    async fn describe(&self, key: &KeyRef) -> Result<KeyDescription, InfraClientError>;
+
+    /// See [`AuthHubClient::generate_key`].
+    async fn generate_key(
+        &self,
+        key: &KeyRef,
+        profile: KeyProfile,
+    ) -> Result<CreatedKey, InfraClientError>;
+}
+
+impl HubKeys for AuthHubClient {
+    async fn describe(&self, key: &KeyRef) -> Result<KeyDescription, InfraClientError> {
+        AuthHubClient::describe(self, key).await
+    }
+
+    async fn generate_key(
+        &self,
+        key: &KeyRef,
+        profile: KeyProfile,
+    ) -> Result<CreatedKey, InfraClientError> {
+        AuthHubClient::generate_key(self, key, profile).await
+    }
+}
+
 /// Describe, and on not-found generate exactly once (a `409` from generate
 /// means a concurrent creation: describe once more).
-async fn hub_key_generation(client: &AuthHubClient, key: &KeyRef) -> Result<u32, String> {
+async fn hub_key_generation<C: HubKeys>(client: &C, key: &KeyRef) -> Result<u32, String> {
     match client.describe(key).await {
         Ok(description) => described_generation(&description),
         Err(InfraClientError::NotFound) => {
@@ -379,7 +408,7 @@ async fn hub_key_generation(client: &AuthHubClient, key: &KeyRef) -> Result<u32,
 
 /// Checks a described hub key (enabled, `pq-hpke-default`) and returns its
 /// 0-based generation.
-fn described_generation(description: &harw_infra_client::KeyDescription) -> Result<u32, String> {
+fn described_generation(description: &KeyDescription) -> Result<u32, String> {
     if description.state != KeyState::Enabled {
         return Err(format!(
             "AuthHub key {SECRETS_KEK_NAMESPACE}/{SECRETS_KEK_KEY_ID} is not enabled"
@@ -800,6 +829,8 @@ fn expand_leading_home(path: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -815,12 +846,157 @@ mod tests {
     use secrecy_08::SecretBox;
     use tempfile::TempDir;
 
+    use harw_infra_client::{
+        CreatedKey, InfraClientError, KeyDescription, KeyProfile, KeyRef, KeyState,
+        RemoteErrorKind,
+    };
+
     use super::{
-        ConfiguredSecretResolver, SECRETS_KEK_NAMESPACE, SecretResolver, SecretSealing,
-        configured_secret_store_persisted_audit_chain_status, open_configured_secret_resolver,
-        open_configured_secret_resolver_for_active_provider, select_secret_sealing, store_secret,
+        ConfiguredSecretResolver, HubKeys, SECRETS_KEK_KEY_ID, SECRETS_KEK_NAMESPACE,
+        SecretResolver, SecretSealing, configured_secret_store_persisted_audit_chain_status,
+        hub_key_generation, open_configured_secret_resolver,
+        open_configured_secret_resolver_for_active_provider, secrets_kek_ref,
+        select_secret_sealing, store_secret,
     };
     use crate::test_support::{TestError, TestResult, ctx};
+
+    /// Scripted hub: answers `describe` from a queue and `generate_key` once,
+    /// and records every call.
+    struct FakeHub {
+        describes: RefCell<VecDeque<Result<KeyDescription, InfraClientError>>>,
+        generated: RefCell<Option<Result<CreatedKey, InfraClientError>>>,
+        describe_calls: Cell<usize>,
+        generate_calls: RefCell<Vec<KeyProfile>>,
+    }
+
+    impl FakeHub {
+        fn new(
+            describes: Vec<Result<KeyDescription, InfraClientError>>,
+            generated: Option<Result<CreatedKey, InfraClientError>>,
+        ) -> Self {
+            Self {
+                describes: RefCell::new(describes.into()),
+                generated: RefCell::new(generated),
+                describe_calls: Cell::new(0),
+                generate_calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HubKeys for FakeHub {
+        async fn describe(&self, _key: &KeyRef) -> Result<KeyDescription, InfraClientError> {
+            self.describe_calls.set(self.describe_calls.get() + 1);
+            self.describes
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Err(InfraClientError::Protocol("unexpected describe")))
+        }
+
+        async fn generate_key(
+            &self,
+            _key: &KeyRef,
+            profile: KeyProfile,
+        ) -> Result<CreatedKey, InfraClientError> {
+            self.generate_calls.borrow_mut().push(profile);
+            self.generated
+                .borrow_mut()
+                .take()
+                .unwrap_or(Err(InfraClientError::Protocol("unexpected generate")))
+        }
+    }
+
+    fn hub_key_version(version: u32) -> TestResult<KeyRef> {
+        KeyRef::versioned(SECRETS_KEK_NAMESPACE, SECRETS_KEK_KEY_ID, version)
+            .map_err(ctx("versioned hub key"))
+    }
+
+    fn hub_description(state: KeyState, version: u32) -> TestResult<KeyDescription> {
+        Ok(KeyDescription {
+            key: hub_key_version(version)?,
+            state,
+            profile_name: Some(KeyProfile::PqHpkeDefault.wire_name().to_owned()),
+        })
+    }
+
+    #[tokio::test]
+    async fn hub_key_generation_creates_a_missing_key_once() -> TestResult {
+        let hub = FakeHub::new(
+            vec![Err(InfraClientError::NotFound)],
+            Some(Ok(CreatedKey {
+                key: hub_key_version(1)?,
+                public: None,
+            })),
+        );
+        let key = secrets_kek_ref().map_err(ctx("hub key reference"))?;
+
+        let generation = hub_key_generation(&hub, &key)
+            .await
+            .map_err(ctx("a missing key is created"))?;
+
+        assert_eq!(generation, 0);
+        assert_eq!(hub.describe_calls.get(), 1);
+        assert_eq!(*hub.generate_calls.borrow(), vec![KeyProfile::PqHpkeDefault]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hub_key_generation_redescribes_after_a_generate_conflict() -> TestResult {
+        let hub = FakeHub::new(
+            vec![
+                Err(InfraClientError::NotFound),
+                Ok(hub_description(KeyState::Enabled, 4)?),
+            ],
+            Some(Err(InfraClientError::Remote(RemoteErrorKind::Conflict))),
+        );
+        let key = secrets_kek_ref().map_err(ctx("hub key reference"))?;
+
+        let generation = hub_key_generation(&hub, &key)
+            .await
+            .map_err(ctx("a concurrent creation is described again"))?;
+
+        assert_eq!(generation, 3);
+        assert_eq!(hub.describe_calls.get(), 2);
+        assert_eq!(*hub.generate_calls.borrow(), vec![KeyProfile::PqHpkeDefault]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hub_key_generation_reports_a_failed_creation() -> TestResult {
+        let hub = FakeHub::new(
+            vec![Err(InfraClientError::NotFound)],
+            Some(Err(InfraClientError::Unavailable)),
+        );
+        let key = secrets_kek_ref().map_err(ctx("hub key reference"))?;
+
+        let Err(error) = hub_key_generation(&hub, &key).await else {
+            return Err(TestError::Unexpected(
+                "a failed generate must fail the key lookup".into(),
+            ));
+        };
+
+        assert!(error.contains("could not be created"));
+        assert!(error.contains("harw.secrets-kek/dek-kek"));
+        assert_eq!(hub.describe_calls.get(), 1);
+        assert_eq!(hub.generate_calls.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hub_key_generation_rejects_a_disabled_key_without_generating() -> TestResult {
+        let hub = FakeHub::new(vec![Ok(hub_description(KeyState::Disabled, 1)?)], None);
+        let key = secrets_kek_ref().map_err(ctx("hub key reference"))?;
+
+        let Err(error) = hub_key_generation(&hub, &key).await else {
+            return Err(TestError::Unexpected(
+                "a disabled hub key must not be used".into(),
+            ));
+        };
+
+        assert!(error.contains("is not enabled"));
+        assert!(error.contains("harw.secrets-kek/dek-kek"));
+        assert!(hub.generate_calls.borrow().is_empty());
+        Ok(())
+    }
 
     #[test]
     fn no_secrets_provider_reference_returns_none_without_a_kek() -> TestResult {
