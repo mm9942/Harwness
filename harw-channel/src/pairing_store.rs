@@ -16,9 +16,15 @@
 //! Each table (`codes`, `bindings`, `claims`) keeps a `records/` tree of atomic
 //! JSON files plus a `locks/` tree of advisory `fs4` exclusive locks. Mutations
 //! take the per-key lock, read-modify-write via a synced sibling temp file, then
-//! release the lock. An append-only journal under `journal/` records every
-//! transition through `harw-session-store`'s [`TranscriptStore`] so history is
-//! preserved even when the mutable projection is flipped or revoked.
+//! release the lock. Every `records/`/`locks/` directory this store creates is
+//! mode `0700` on Unix, and the `codes` table keys its files by the SHA-256
+//! digest of `channel|code` rather than a reversible encoding, so a local
+//! reader who can list the store's directories cannot recover a still-valid
+//! pairing code from a filename. An append-only journal under `journal/`
+//! records every transition through `harw-session-store`'s [`TranscriptStore`]
+//! so history is preserved even when the mutable projection is flipped or
+//! revoked; the `pairing.code.issued` event carries that same digest instead
+//! of the plaintext code.
 //!
 //! # Concurrency
 //! [`PairingStore`] is `Clone` and cheap to share (`Send + Sync`, it holds only a
@@ -70,7 +76,9 @@ use crate::pairing::{PairingCode, PairingRecord};
 const KEY_SEP: char = '\u{1f}';
 
 // Durable, mutable projection of one issued pairing code. Append-only history
-// lives in the journal; this file is flipped to consumed on redemption.
+// lives in the journal; this file is flipped to consumed on redemption. The
+// plaintext `code` only ever lives here, under a hashed filename (see
+// `code_key_digest`) in a mode-0700 directory — never in the journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct IssuedCodeRecord {
     channel: ChannelId,
@@ -80,6 +88,19 @@ struct IssuedCodeRecord {
     expires_at: Timestamp,
     consumed_at: Option<Timestamp>,
     consumed_by: Option<PeerId>,
+}
+
+// Redacted projection of an issued code for the append-only journal: the
+// plaintext code never leaves the `codes` table (spec forbids pairing codes
+// in audit/journal records), only its digest, so history stays auditable
+// without letting a journal reader recover a still-valid code.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct IssuedCodeJournalEntry {
+    channel: ChannelId,
+    code_digest: String,
+    tenant: TenantId,
+    issued_at: Timestamp,
+    expires_at: Timestamp,
 }
 
 // Durable, mutable projection of one PeerId -> TenantId binding.
@@ -175,7 +196,9 @@ impl PairingStore {
     /// Renders a code from `entropy`, computes the expiry from
     /// [`PairingCode::default_ttl`], and atomically persists the issued-code
     /// record under the per-key lock, then journals a `pairing.code.issued`
-    /// lifecycle event. Returns the rendered code string to present to the peer.
+    /// lifecycle event. The record and lock filenames, and the journaled
+    /// event, carry the SHA-256 digest of `channel|code`, never the code
+    /// itself. Returns the rendered code string to present to the peer.
     ///
     /// # Arguments
     /// - `channel` (`&ChannelId`): the channel scope the code is valid against.
@@ -235,7 +258,7 @@ impl PairingStore {
             consumed_at: None,
             consumed_by: None,
         };
-        let paths = self.paths("codes", &[channel.as_str(), &code]);
+        let paths = self.code_paths(channel, &code);
         let lock = self.lock(&paths.lock, channel, "code")?;
         let result = (|| {
             if paths.record.exists() {
@@ -248,7 +271,15 @@ impl PairingStore {
             persist_json(&paths.record, &record)
         })();
         unlock(lock, result)?;
-        self.journal_append(channel, now, "pairing.code.issued", &record)?;
+        // Journal only the digest (finding: never the plaintext code).
+        let journal_entry = IssuedCodeJournalEntry {
+            channel: channel.clone(),
+            code_digest: code_key_digest(channel, &code),
+            tenant: tenant.clone(),
+            issued_at: now,
+            expires_at,
+        };
+        self.journal_append(channel, now, "pairing.code.issued", &journal_entry)?;
         Ok(code)
     }
 
@@ -256,10 +287,16 @@ impl PairingStore {
     /// code's tenant (§3.2). Single-winner under concurrency.
     ///
     /// # Description
-    /// Under the per-code lock, validates scope, redemption state, and expiry,
-    /// then flips the code to consumed and writes the authoritative binding
-    /// record under its own lock. Journals a `pairing.redeemed` event and
-    /// returns the resulting [`PairingRecord`].
+    /// A well-formed but never-issued code is rejected before any lock file is
+    /// created on disk. Otherwise, under the per-code lock, validates scope,
+    /// redemption state, and expiry; then — still holding the code lock —
+    /// takes the per-binding lock and writes the authoritative binding record
+    /// *before* flipping the code to consumed, so a contended or failed
+    /// binding write never burns a code without pairing the peer. Marking the
+    /// code consumed and journaling `pairing.redeemed` happen after the
+    /// binding is durable and are best-effort: once the binding record is
+    /// written, this call no longer returns `Err`. Returns the resulting
+    /// [`PairingRecord`].
     ///
     /// # Arguments
     /// - `channel` (`&ChannelId`): the channel the code must be scoped to.
@@ -274,14 +311,21 @@ impl PairingStore {
     /// - [`ChannelError::PairingInvalid`]: unknown code or wrong channel scope.
     /// - [`ChannelError::PairingAlreadyRedeemed`]: the code was already consumed.
     /// - [`ChannelError::PairingExpired`]: the code's TTL elapsed before `now`.
-    /// - [`ChannelError::PairingContended`]: a lock was already held.
-    /// - [`ChannelError::Io`] / [`ChannelError::Serde`] / [`ChannelError::SessionStore`]:
-    ///   persistence or journalling failure.
+    /// - [`ChannelError::PairingContended`]: the code lock, or the binding lock
+    ///   taken while still holding it, was already held; the code is left
+    ///   unconsumed so a retry can still win.
+    /// - [`ChannelError::Io`] / [`ChannelError::Serde`]: reading the code record
+    ///   or persisting the binding record failed. Once the binding record is
+    ///   durably persisted, later bookkeeping (marking the code consumed, the
+    ///   journal append) is best-effort and cannot turn a successful pairing
+    ///   into an `Err`.
     ///
     /// # Concurrency
     /// Serializes redeemers of the same code on the per-code advisory lock;
     /// exactly one caller wins a race, the rest observe a contention or
-    /// already-redeemed error.
+    /// already-redeemed error. Concurrent redemption/revocation of the same
+    /// `(channel, actor)` binding is serialized on the per-binding lock, taken
+    /// while the code lock is still held.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -305,10 +349,19 @@ impl PairingStore {
         actor: &PeerId,
         now: Timestamp,
     ) -> ChannelResult<PairingRecord> {
-        let paths = self.paths("codes", &[channel.as_str(), code]);
+        let paths = self.code_paths(channel, code);
+        // A well-formed but never-issued code must not create a permanent
+        // lock file (finding: unbounded lock-file growth from unknown
+        // codes) — fail closed before the per-code lock exists on disk.
+        if !paths.record.exists() {
+            return Err(ChannelError::PairingInvalid {
+                channel: channel.clone(),
+                code: code.to_owned(),
+            });
+        }
         let lock = self.lock(&paths.lock, channel, "code")?;
-        let consume = (|| {
-            let mut record: IssuedCodeRecord =
+        let outcome = (|| -> ChannelResult<PairingRecord> {
+            let record: IssuedCodeRecord =
                 read_json(&paths.record)?.ok_or_else(|| ChannelError::PairingInvalid {
                     channel: channel.clone(),
                     code: code.to_owned(),
@@ -330,32 +383,61 @@ impl PairingStore {
                     code: code.to_owned(),
                 });
             }
-            record.consumed_at = Some(now);
-            record.consumed_by = Some(actor.clone());
-            persist_json(&paths.record, &record)?;
-            Ok(record.tenant)
-        })();
-        let tenant = unlock(lock, consume)?;
 
+            // Bind before burning the code: the binding lock is taken while
+            // the code lock is still held, and the binding record is made
+            // durable first. A contended or failed binding write therefore
+            // leaves the code unconsumed on disk, so a retry can still win
+            // instead of reporting a false `PairingAlreadyRedeemed` for a
+            // peer that was never actually paired.
+            let bpaths = self.paths("bindings", &[channel.as_str(), actor.as_str()]);
+            let block = self.lock(&bpaths.lock, channel, "binding")?;
+            let binding = BindingRecord {
+                channel: channel.clone(),
+                peer: actor.clone(),
+                tenant: record.tenant.clone(),
+                bound_at: now,
+                revoked_at: None,
+            };
+            let bresult = persist_json(&bpaths.record, &binding);
+            unlock(block, bresult)?;
+
+            // The binding is durable from here: the peer is paired even if
+            // the remaining bookkeeping fails, so nothing past this point may
+            // become an `Err` for the caller. Marking the code consumed is
+            // best-effort: `persist_json`'s write-temp-then-rename means a
+            // failed attempt leaves the on-disk record exactly as unconsumed
+            // as before, so a retry with the same code simply re-derives the
+            // same binding rather than a spurious `PairingAlreadyRedeemed`.
+            // This crate has no logging dependency to report the failure
+            // with, so it is deliberately swallowed rather than propagated.
+            let mut consumed = record;
+            consumed.consumed_at = Some(now);
+            consumed.consumed_by = Some(actor.clone());
+            let _ = persist_json(&paths.record, &consumed);
+
+            Ok(PairingRecord {
+                channel: channel.clone(),
+                peer: actor.clone(),
+                tenant: consumed.tenant,
+                bound_at: now,
+            })
+        })();
+        let pairing = unlock(lock, outcome)?;
+
+        // Best-effort: the binding is already durable, so a journal failure
+        // is swallowed rather than turned into an error for an
+        // already-successful pairing.
         let binding = BindingRecord {
-            channel: channel.clone(),
-            peer: actor.clone(),
-            tenant: tenant.clone(),
-            bound_at: now,
+            channel: pairing.channel.clone(),
+            peer: pairing.peer.clone(),
+            tenant: pairing.tenant.clone(),
+            bound_at: pairing.bound_at,
             revoked_at: None,
         };
-        let bpaths = self.paths("bindings", &[channel.as_str(), actor.as_str()]);
-        let block = self.lock(&bpaths.lock, channel, "binding")?;
-        let bresult = persist_json(&bpaths.record, &binding);
-        unlock(block, bresult)?;
+        let _ = self.journal_append(channel, now, "pairing.redeemed", &binding);
 
-        self.journal_append(channel, now, "pairing.redeemed", &binding)?;
-        Ok(PairingRecord {
-            channel: channel.clone(),
-            peer: actor.clone(),
-            tenant,
-            bound_at: now,
-        })
+        Ok(pairing)
     }
 
     /// Durable, restart-correct read of a peer's active tenant binding (§3.2).
@@ -545,6 +627,21 @@ impl PairingStore {
         }
     }
 
+    // Filesystem paths (record + lock) for one pairing code, keyed by the
+    // SHA-256 digest of `channel|code` rather than the reversible hex
+    // encoding `paths` uses for the other tables: a local reader who lists
+    // `codes/records/` or `codes/locks/` must not be able to recover a
+    // still-valid code from a filename.
+    fn code_paths(&self, channel: &ChannelId, code: &str) -> RecordPaths {
+        let name = code_key_digest(channel, code);
+        let records = self.root.join("codes").join("records");
+        let locks = self.root.join("codes").join("locks");
+        RecordPaths {
+            record: records.join(&name).with_extension("json"),
+            lock: locks.join(&name).with_extension("lock"),
+        }
+    }
+
     // On-demand append-only journal (never held open across calls).
     fn journal_append<T: Serialize>(
         &self,
@@ -573,7 +670,7 @@ impl PairingStore {
     // Acquires the per-key advisory exclusive lock (JobStore idiom).
     fn lock(&self, lock_path: &Path, channel: &ChannelId, resource: &str) -> ChannelResult<File> {
         if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_dir(parent)?;
         }
         let file = OpenOptions::new()
             .create(true)
@@ -598,16 +695,49 @@ struct RecordPaths {
     lock: PathBuf,
 }
 
-// Hex-encodes the composite key so any id (colons, dashes, unicode) is a safe,
-// injective, collision-free filename.
-fn key_filename(parts: &[&str]) -> String {
-    let joined = parts.join(&KEY_SEP.to_string());
-    let mut out = String::with_capacity(joined.len() * 2);
-    for byte in joined.as_bytes() {
+// Lowercase-hex-encodes raw bytes.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
         out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
     }
     out
+}
+
+// Hex-encodes the composite key so any id (colons, dashes, unicode) is a safe,
+// injective, collision-free filename. This encoding is reversible by design
+// (any local reader can decode the parts back out) and is used for keys that
+// are not secrets: peer ids, update ids, channel ids.
+fn key_filename(parts: &[&str]) -> String {
+    let joined = parts.join(&KEY_SEP.to_string());
+    hex_encode(joined.as_bytes())
+}
+
+// Hex-encodes the SHA-256 digest of `channel|code` as a pairing-code table
+// key. Unlike `key_filename`, this is intentionally one-way: a pairing code
+// is a bearer secret redeemable for up to 15 minutes, so its record/lock
+// filename must not let a local reader who can merely list a directory
+// recover the code. Reuses `harw-secrets`'s `sha256` (already a dependency
+// of this crate) rather than adding a new one.
+fn code_key_digest(channel: &ChannelId, code: &str) -> String {
+    let joined = [channel.as_str(), code].join(&KEY_SEP.to_string());
+    hex_encode(&harw_secrets::audit::chain::sha256(joined.as_bytes()))
+}
+
+// Creates `dir` (recursively) with mode 0700 on Unix, so only this store's
+// owner can list a table's `records/`/`locks/` filenames — defense in depth
+// alongside `code_key_digest`. Mirrors
+// `harw-channel-telegram/src/attachment_cache.rs::create_private_dir`.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 // Pairing journal session identifiers are persisted through TranscriptStore,
@@ -630,7 +760,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> ChannelResult<Option<T>> {
 // Atomically writes a JSON record via a synced sibling temp file + rename.
 fn persist_json<T: Serialize>(path: &Path, value: &T) -> ChannelResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let parent = path.parent().ok_or_else(|| {
         ChannelError::Io(std::io::Error::other("pairing record path has no parent"))
@@ -680,6 +810,27 @@ mod tests {
 
     fn peer(id: &str) -> PeerId {
         PeerId::from_str(id)
+    }
+
+    // Recursively collects every regular file under `dir` (a missing `dir`
+    // yields an empty list rather than an error, so callers can walk trees a
+    // store has not created yet).
+    fn walk_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path)?);
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(out)
     }
 
     #[test]
@@ -932,6 +1083,112 @@ mod tests {
                 .claim_once(&ch, "99", now)
                 .map_err(ctx("claim_once"))?
         );
+        Ok(())
+    }
+
+    // Finding: a still-valid pairing code must never appear, plaintext or
+    // hex-encoded, in the journal or in a listable filename under `codes/`;
+    // and the directory housing those filenames must be private (mode 0700
+    // on Unix), so a local reader who can list the store cannot recover it.
+    #[test]
+    fn test_issued_code_is_redacted_from_journal_and_filenames() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = PairingStore::new(dir.path());
+        let ch = channel_a();
+        let now = ts();
+        let code = store
+            .issue_code(&ch, &tenant_ops(), b"seed12345", now)
+            .map_err(ctx("issue_code"))?;
+        let code_hex = hex_encode(code.as_bytes());
+
+        for path in walk_files(&dir.path().join("journal")).map_err(ctx("walk journal"))? {
+            let text = std::fs::read_to_string(&path).map_err(ctx("read journal file"))?;
+            assert!(!text.contains(&code));
+            assert!(!text.contains(&code_hex));
+        }
+
+        for path in walk_files(&dir.path().join("codes")).map_err(ctx("walk codes"))? {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(TestError::Missing("dateiname unter codes/"))?;
+            assert!(!name.contains(&code_hex));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("codes").join("records"))
+                .map_err(ctx("stat codes/records"))?
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        Ok(())
+    }
+
+    // Finding: a well-formed but never-issued code must not create a
+    // permanent lock file — that would let an unauthenticated caller grow the
+    // `codes/locks/` tree without bound by presenting codes it made up.
+    #[test]
+    fn test_redeem_unknown_code_leaves_no_lock_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = PairingStore::new(dir.path());
+        let ch = channel_a();
+        let now = ts();
+
+        let result = store.redeem_once(&ch, "0000-0000", &peer("100"), now);
+        assert!(matches!(result, Err(ChannelError::PairingInvalid { .. })));
+
+        let locks_dir = dir.path().join("codes").join("locks");
+        let locks = walk_files(&locks_dir).map_err(ctx("walk codes/locks"))?;
+        assert!(locks.is_empty());
+        Ok(())
+    }
+
+    // Finding: contention on the binding lock must be observed *before* the
+    // code is burned. A losing `redeem_once` must leave the code redeemable,
+    // not report a false `PairingAlreadyRedeemed` on the next attempt.
+    #[test]
+    fn test_redeem_once_binding_contention_leaves_code_redeemable() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = PairingStore::new(dir.path());
+        let ch = channel_a();
+        let target = peer("100");
+        let now = ts();
+        let code = store
+            .issue_code(&ch, &tenant_ops(), b"seed12345", now)
+            .map_err(ctx("issue_code"))?;
+
+        // Hold the exact binding lock file `redeem_once` will contend on.
+        let bpaths = store.paths("bindings", &[ch.as_str(), target.as_str()]);
+        if let Some(parent) = bpaths.lock.parent() {
+            std::fs::create_dir_all(parent).map_err(ctx("create_dir_all bindings/locks"))?;
+        }
+        let guard = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&bpaths.lock)
+            .map_err(ctx("open binding lock"))?;
+        FileExt::try_lock(&guard)
+            .map_err(|_| TestError::Unexpected("Sperre bereits gehalten".to_owned()))?;
+
+        let contended = store.redeem_once(&ch, &code, &target, now);
+        assert!(matches!(
+            contended,
+            Err(ChannelError::PairingContended { .. })
+        ));
+
+        FileExt::unlock(&guard).map_err(ctx("unlock binding lock"))?;
+        drop(guard);
+
+        let paired = store
+            .redeem_once(&ch, &code, &target, now)
+            .map_err(ctx("redeem_once after release"))?;
+        assert_eq!(paired.tenant, tenant_ops());
+        assert_eq!(paired.peer, target);
         Ok(())
     }
 }

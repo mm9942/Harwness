@@ -95,7 +95,9 @@ use harw_plan_bridge::{
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
 use harw_runtime::{RuntimeAssembly, RuntimeNarrowing};
-use harw_session_store::{ClaimRequest, JobListQuery, JobStore, TranscriptStore};
+use harw_session_store::{
+    ClaimRequest, JobListQuery, JobStore, SessionStoreResult, TranscriptStore,
+};
 use harw_types::{SessionId, ThreadRef, WorkId};
 
 use crate::runtime_jobs::{JobAssemblyInputs, JobEntry, job_assembly, job_principal};
@@ -111,6 +113,15 @@ mod work_driver_job;
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
 const MAX_REASON_BYTES: usize = 160;
+
+/// Page size of the Ready poll and of the expired-lease sweep (the store
+/// clamps every page to at most 100 records).
+const STORE_PAGE_LIMIT: usize = 100;
+
+/// Interval of the expired-lease sweep in the worker loop. Well below
+/// [`LEASE_TTL_SECONDS`], so a lapsed lease is reclaimed soon after it lapses
+/// without a full store scan on every 250 ms poll.
+const EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The [`JobKind::Custom`] discriminator carried by every job that was created
 /// from a plan node.
@@ -400,9 +411,10 @@ impl WorkerServices {
 ///
 /// Dropping the lane (or [`WorkDriverLane::shutdown`]) aborts every in-flight
 /// run: the dropped runner future releases its execution binding, cancels
-/// the job token and stops renewing, so the lease lapses and the store's
-/// expiry reconciliation takes over — the same path as a worker process that
-/// stops mid-run. No outcome is invented for an interrupted run.
+/// the job token and stops renewing, so the lease lapses and the expiry sweep
+/// of the next worker loop (`reconcile_expired_leases`) takes over — the same
+/// path as a worker process that stops mid-run. No outcome is invented for an
+/// interrupted run.
 ///
 /// # Concurrency
 /// Owned by one worker loop; not shared.
@@ -513,15 +525,20 @@ impl WorkDriverLane {
     }
 }
 
-/// Runs one deterministic poll of Ready durable jobs.
+/// Runs one expired-lease sweep and one deterministic poll of Ready durable
+/// jobs.
 ///
 /// # Description
-/// The list is ordered by work ID by [`JobStore`].  Each candidate is still
-/// claimed atomically, so another process claiming it between list and claim
-/// cannot execute it here.  Unsupported job kinds are skipped; a `plan-node`
-/// job is *never* skipped, even when `plan_services` is `None` — it then
-/// terminates as [`JobOutcome::Blocked`] with a visible reason, because a
-/// silently skipped plan job leaves its node `InProgress` forever.
+/// The sweep (`reconcile_expired_leases`) first moves every Running job whose
+/// lease has lapsed back to Ready under its retry policy, or to Failed once
+/// its retries are exhausted.  The poll then reads the first page of at most
+/// `STORE_PAGE_LIMIT` Ready jobs, ordered by work ID by [`JobStore`].  Each
+/// candidate is still claimed atomically, so another process claiming it
+/// between list and claim cannot execute it here.  Unsupported job kinds are
+/// skipped; a `plan-node` job is *never* skipped, even when `plan_services`
+/// is `None` — it then terminates as [`JobOutcome::Blocked`] with a visible
+/// reason, because a silently skipped plan job leaves its node `InProgress`
+/// forever.
 ///
 /// `work_driver` jobs run in their own lane (see `WorkDriverLane`) and do
 /// not hold up the other kinds; this one-shot poll waits for the driver runs
@@ -538,7 +555,8 @@ impl WorkDriverLane {
 ///   submitters and runtime root; only the pointer is cloned per job.
 ///
 /// # Returns
-/// The number of jobs that reached a terminal state in this poll.
+/// The number of jobs that reached a terminal state in this poll; jobs the
+/// sweep failed are not counted.
 ///
 /// # Concurrency
 /// Non-driver jobs are executed sequentially inside one poll; up to
@@ -555,18 +573,67 @@ pub async fn run_job_worker_once(
     context: Arc<JobWorkerContext>,
 ) -> usize {
     let services = WorkerServices::new(store, executions, provider, plan_services, context);
+    reconcile_expired_leases(&services.store).await;
     let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
-    let completed = poll_ready_jobs(&services, &mut lane).await;
+    let completed = poll_ready_jobs(&services, &mut lane, &mut None).await;
     completed + lane.drain().await
 }
 
-// One poll: finished driver runs are collected, `work_driver` jobs are handed
-// to the lane (or left Ready when it is full), every other job is driven to
-// its commit in list order. Returns the jobs that reached a terminal state.
-async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -> usize {
+// Expired-lease sweep: pages through `JobStore::reconcile_expired` until the
+// store reports no further page. Every Running job whose lease has lapsed (a
+// run interrupted by shutdown, a timed-out stop, a crash) goes back to Ready
+// under its retry policy, or ends Failed once its retries are exhausted;
+// nothing else ever moves such a job out of Running. The store does blocking
+// file I/O, so the pages run in `spawn_blocking`. A failed sweep is logged and
+// repeated by the next one.
+async fn reconcile_expired_leases(store: &Arc<JobStore>) {
+    let store = Arc::clone(store);
+    let swept = tokio::task::spawn_blocking(move || -> SessionStoreResult<()> {
+        let now = Timestamp::now();
+        let mut cursor: Option<WorkId> = None;
+        loop {
+            let page = store.reconcile_expired(now, STORE_PAGE_LIMIT, cursor.as_ref())?;
+            for expired in &page.expired {
+                tracing::info!(
+                    work_id = %expired.work_id.as_str(),
+                    holder = %expired.expired_lease.holder,
+                    retry_scheduled_for = ?expired.retry_scheduled_for,
+                    "lapsed job lease reclaimed"
+                );
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(()),
+            }
+        }
+    })
+    .await;
+    match swept {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(error = %error, "expired-lease sweep failed"),
+        Err(error) => tracing::warn!(error = %error, "expired-lease sweep task failed"),
+    }
+}
+
+// One poll: finished driver runs are collected, then one page of at most
+// `STORE_PAGE_LIMIT` Ready jobs is read, starting behind `ready_cursor`.
+// `work_driver` jobs are handed to the lane (or left Ready when it is full),
+// every other job is driven to its commit in list order. `ready_cursor` then
+// moves to the end of the page, or back to the start after the last page, so
+// skipped Ready jobs (lane full, retry backoff, no knowledge store, another
+// consumer's kind) never hide the jobs behind them for longer than one pass,
+// while every poll still reads exactly one page. Returns the jobs that
+// reached a terminal state.
+async fn poll_ready_jobs(
+    services: &WorkerServices,
+    lane: &mut WorkDriverLane,
+    ready_cursor: &mut Option<WorkId>,
+) -> usize {
     let mut completed = lane.reap();
     let page = match services.store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
+        limit: STORE_PAGE_LIMIT,
+        cursor: ready_cursor.clone(),
         ..JobListQuery::default()
     }) {
         Ok(page) => page,
@@ -575,6 +642,7 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
             return completed;
         }
     };
+    *ready_cursor = page.next_cursor;
 
     for record in page.jobs {
         if record.not_before > Timestamp::now() || !is_supported_kind(&record.job.kind) {
@@ -621,6 +689,13 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
 /// observed, in-flight driver runs are interrupted before the loop returns
 /// (their leases lapse; nothing is committed for them).
 ///
+/// Before its first poll and then every `EXPIRY_SWEEP_INTERVAL` the loop
+/// sweeps lapsed leases (`reconcile_expired_leases`): a job left Running by
+/// an interrupted run, a timed-out stop or a crash goes back to Ready under
+/// its retry policy, or ends Failed once its retries are exhausted. Each poll
+/// reads one page of Ready jobs and resumes behind the previous page, so
+/// skipped jobs cannot starve the ones listed after them.
+///
 /// # Arguments
 /// - `store` (`Arc<JobStore>`): the durable job store.
 /// - `executions` (`Arc<JobExecutionRegistry>`): fenced cancellation registry.
@@ -651,15 +726,22 @@ pub async fn run_job_worker(
     drive_worker_loop(&services, shutdown).await;
 }
 
-// The loop behind `run_job_worker`; the driver lane lives exactly as long as
-// the loop.
+// The loop behind `run_job_worker`; the driver lane and the Ready cursor live
+// exactly as long as the loop. The expiry sweep always runs ahead of a poll,
+// so a rescheduled job is claimed once its `not_before` has passed.
 async fn drive_worker_loop(services: &WorkerServices, mut shutdown: watch::Receiver<bool>) {
     let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+    let mut ready_cursor = None;
+    let mut last_sweep: Option<tokio::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             break;
         }
-        let _ = poll_ready_jobs(services, &mut lane).await;
+        if last_sweep.is_none_or(|at| at.elapsed() >= EXPIRY_SWEEP_INTERVAL) {
+            reconcile_expired_leases(&services.store).await;
+            last_sweep = Some(tokio::time::Instant::now());
+        }
+        let _ = poll_ready_jobs(services, &mut lane, &mut ready_cursor).await;
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1190,7 +1272,8 @@ struct PromptWallAllowance {
 // Verbleibendes Wanduhr-Budget, zusätzlich begrenzt durch die verbleibende
 // Lease-Gültigkeit abzüglich `PROMPT_LEASE_COMMIT_MARGIN_SECONDS`: ohne
 // Lease-Erneuerung (W4a) könnte ein längerer Turn seinen Ausgang ohnehin nicht
-// mehr festschreiben und bliebe als `Running` liegen.
+// mehr festschreiben; die Ablauf-Bereinigung (`reconcile_expired_leases`)
+// plante den Job danach neu ein oder ließe ihn scheitern.
 fn prompt_wall_allowance(
     budget: &harw_job_runtime::Budget,
     usage: &harw_job_runtime::BudgetUsage,
@@ -3975,6 +4058,98 @@ mod tests {
         Ok(())
     }
 
+    // ── Expired leases ────────────────────────────────────────────────────
+
+    // Admits a prompt job in the past and claims it there with a one-second
+    // lease nobody renews: what a crash, a timed-out stop or an interrupted
+    // driver run leaves behind. Retries carry no backoff.
+    fn admit_with_lapsed_lease(store: &JobStore, id: &str, max_attempts: u32) -> TestResult {
+        let past = Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(600))
+            .map_err(ctx("past timestamp"))?;
+        let mut record = ready_record(id, serde_json::json!({"prompt": "hello"}))?;
+        record.job.retry = RetryPolicy {
+            max_attempts,
+            base_delay: SignedDuration::ZERO,
+            factor: 1.0,
+            max_delay: SignedDuration::ZERO,
+        };
+        record.submitted_at = past;
+        record.not_before = past;
+        admit(store, &record)?;
+        store
+            .claim(
+                &record.job.id,
+                &ClaimRequest {
+                    worker_id: "crashed-worker".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(1),
+                    now: past,
+                },
+            )
+            .map_err(ctx("claim with a short lease"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_job_worker_once_retries_a_job_whose_lease_lapsed() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit_with_lapsed_lease(&store, "lapsed-job", 2)?;
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::new(EchoModelProvider::new("done")),
+            None,
+            job_context(temp.path())?,
+        )
+        .await;
+
+        // The sweep put the job back to Ready ahead of the poll, which then
+        // ran it to its commit.
+        assert_eq!(completed, 1);
+        let stored = store
+            .get(&WorkId::from_str("lapsed-job"))
+            .map_err(ctx("get job"))?;
+        assert_eq!(stored.job.state, JobState::Completed);
+        assert_eq!(stored.job.attempts, 1, "the lapsed attempt is counted");
+        assert!(matches!(
+            completion_of(&store, "lapsed-job")?,
+            JobOutcome::Succeeded { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_job_worker_once_fails_a_lapsed_job_without_retries_left() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit_with_lapsed_lease(&store, "exhausted-job", 1)?;
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            None,
+            job_context(temp.path())?,
+        )
+        .await;
+
+        assert_eq!(completed, 0, "the sweep fails the job; the poll runs nothing");
+        assert!(provider.recorded().is_empty());
+        let stored = store
+            .get(&WorkId::from_str("exhausted-job"))
+            .map_err(ctx("get job"))?;
+        assert_eq!(stored.job.state, JobState::Failed);
+        assert!(stored.lease.is_none());
+        assert!(matches!(
+            completion_of(&store, "exhausted-job")?,
+            JobOutcome::Failed { .. }
+        ));
+        Ok(())
+    }
+
     // ── Work-driver lane ──────────────────────────────────────────────────
 
     mod work_driver_lane {
@@ -4107,10 +4282,14 @@ mod tests {
             let (services, drivers) =
                 gated_services(&store, &executions, job_context(temp.path())?);
             let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+            let mut ready_cursor = None;
 
-            let completed = tokio::time::timeout(WAIT, poll_ready_jobs(&services, &mut lane))
-                .await
-                .map_err(ctx("the poll waited for the driver run"))?;
+            let completed = tokio::time::timeout(
+                WAIT,
+                poll_ready_jobs(&services, &mut lane, &mut ready_cursor),
+            )
+            .await
+            .map_err(ctx("the poll waited for the driver run"))?;
             assert_eq!(completed, 1, "only the prompt job finishes in this poll");
             let JobOutcome::Succeeded { result } = completion_of(&store, "b-prompt")? else {
                 return Err(TestError::Unexpected("prompt job should succeed".into()));
@@ -4145,14 +4324,15 @@ mod tests {
             let (services, drivers) =
                 gated_services(&store, &executions, job_context(temp.path())?);
             let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+            let mut ready_cursor = None;
 
-            let completed = poll_ready_jobs(&services, &mut lane).await;
+            let completed = poll_ready_jobs(&services, &mut lane, &mut ready_cursor).await;
             assert_eq!(completed, 0);
             drivers
                 .wait_started(MAX_CONCURRENT_WORK_DRIVER_RUNS)
                 .await?;
             // A second poll while the lane is full claims nothing more.
-            let completed = poll_ready_jobs(&services, &mut lane).await;
+            let completed = poll_ready_jobs(&services, &mut lane, &mut ready_cursor).await;
             assert_eq!(completed, 0);
             for _ in 0..20 {
                 tokio::task::yield_now().await;
@@ -4173,7 +4353,7 @@ mod tests {
                 .map_err(ctx("driver runs did not finish"))?;
             assert_eq!(drained, 2);
             // The freed lane now takes the remaining job.
-            let completed = poll_ready_jobs(&services, &mut lane).await;
+            let completed = poll_ready_jobs(&services, &mut lane, &mut ready_cursor).await;
             let drained = tokio::time::timeout(WAIT, lane.drain())
                 .await
                 .map_err(ctx("third driver run did not finish"))?;
@@ -4196,8 +4376,9 @@ mod tests {
             let (services, drivers) =
                 gated_services(&store, &executions, job_context(temp.path())?);
             let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+            let mut ready_cursor = None;
 
-            let _ = poll_ready_jobs(&services, &mut lane).await;
+            let _ = poll_ready_jobs(&services, &mut lane, &mut ready_cursor).await;
             drivers.wait_started(1).await?;
             let token = drivers
                 .tokens
@@ -4248,6 +4429,79 @@ mod tests {
                 .get(&WorkId::from_str("driver"))
                 .map_err(ctx("get job"))?;
             assert!(stored.completion.is_none());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_worker_loop_sweeps_a_lapsed_lease_and_reruns_the_job() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let executions = Arc::new(JobExecutionRegistry::new());
+            admit_with_lapsed_lease(&store, "lapsed", 2)?;
+            let (services, _drivers) =
+                gated_services(&store, &executions, job_context(temp.path())?);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let worker = tokio::spawn(async move {
+                drive_worker_loop(&services, shutdown_rx).await;
+            });
+            let committed = tokio::time::timeout(WAIT, async {
+                while !matches!(state_of(&store, "lapsed"), Ok(JobState::Completed)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            shutdown_tx.send_replace(true);
+            tokio::time::timeout(WAIT, worker)
+                .await
+                .map_err(ctx("worker loop did not stop"))?
+                .map_err(ctx("worker loop task"))?;
+            committed.map_err(ctx("the lapsed job was never rerun"))?;
+            let stored = store
+                .get(&WorkId::from_str("lapsed"))
+                .map_err(ctx("get job"))?;
+            assert_eq!(stored.job.attempts, 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_skipped_ready_jobs_do_not_starve_the_jobs_behind_them() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let executions = Arc::new(JobExecutionRegistry::new());
+            // A full page of Ready jobs this worker skips (another consumer's
+            // kind), all listed before the prompt job.
+            for index in 0..STORE_PAGE_LIMIT {
+                admit(
+                    &store,
+                    &ready_record_of_kind(
+                        &format!("a-foreign-{index:03}"),
+                        JobKind::Custom("another-consumer".to_owned()),
+                        serde_json::json!({}),
+                    )?,
+                )?;
+            }
+            admit(
+                &store,
+                &ready_record("zzz-prompt", serde_json::json!({"prompt": "hello"}))?,
+            )?;
+            let (services, _drivers) =
+                gated_services(&store, &executions, job_context(temp.path())?);
+            let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+            let mut ready_cursor = None;
+
+            // The first poll reads the page of skipped jobs; the next one
+            // resumes behind it instead of rereading the same page.
+            let first = poll_ready_jobs(&services, &mut lane, &mut ready_cursor).await;
+            assert_eq!(first, 0);
+            assert_eq!(state_of(&store, "zzz-prompt")?, JobState::Ready);
+            let second = poll_ready_jobs(&services, &mut lane, &mut ready_cursor).await;
+            assert_eq!(second, 1);
+            assert!(matches!(
+                completion_of(&store, "zzz-prompt")?,
+                JobOutcome::Succeeded { .. }
+            ));
+            assert!(ready_cursor.is_none(), "after the last page the walk starts over");
             Ok(())
         }
     }

@@ -36,10 +36,9 @@ Urteil lesen lässt, gilt als `passed: false` (fail closed) — nie als `true`.
   das Bewerter-Kriterium auswertet; `comment`/`missing` sind nur erklärender
   Zusatz und fließen als Feedback in die nächste Runde, nicht in die Entscheidung.
 - Das tolerante Parsen (`parse_verdict`) probiert zuerst ein JSON-Objekt mit
-  `passed`/`met`/`verified`, dann einen Klartext-Marker `PASSED`/`FAILED`
-  (`FAILED` gewinnt bei beiden), und fällt sonst auf `passed: false` mit dem
-  Rohtext als Kommentar zurück — es gibt keinen Pfad, auf dem unlesbarer Text
-  zu `true` wird.
+  `passed`/`met`/`verified`, und fällt sonst auf `passed: false` mit dem
+  Rohtext als Kommentar zurück — es gibt keinen Klartext-Marker-Scan
+  (`PASSED`/`FAILED`) und keinen Pfad, auf dem unlesbarer Text zu `true` wird.
 - Trade-off: ein Bewerter, der z. B. nur "sieht gut aus" ohne JSON schreibt,
   wird als nicht bestanden gewertet, auch wenn er inhaltlich zustimmen wollte.
   Das ist bewusst so gewählt, damit im Zweifel nie falsch positiv gewertet wird.

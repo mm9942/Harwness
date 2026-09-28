@@ -32,7 +32,12 @@
 //! - geöffnet mit `O_APPEND | O_CREAT`, neu angelegt mit Modus
 //!   [`EXPORT_FILE_MODE`] (`0640`); ein bestehender, breiter lesbarer
 //!   Modus wird auf höchstens `0640` verengt,
-//! - kein Symlink, keine Nicht-Datei am Zielpfad (sonst Schreibfehler),
+//! - kein Symlink, keine Nicht-Datei am Zielpfad: einmal vor dem Öffnen per
+//!   `symlink_metadata` auf dem Pfad und erneut per `fstat` auf dem bereits
+//!   offenen Deskriptor geprüft (schließt die Lücke, in der der Pfad
+//!   zwischen beiden Aufrufen zu einer Nicht-Datei wurde) — siehe
+//!   [`open_export_file`] für die dort verbleibende Restlücke ohne
+//!   `O_NOFOLLOW`,
 //! - jede Zeile geht in einem einzigen `write_all` hinaus,
 //! - Rotation: würde eine Zeile die Datei über [`MAX_EXPORT_BYTES`]
 //!   (16 MiB) wachsen lassen, wird sie nach `<pfad>.1` umbenannt (ein
@@ -198,6 +203,28 @@ fn rotated_path(path: &Path) -> PathBuf {
 }
 
 /// Öffnet die Exportdatei append-only; legt sie mit [`EXPORT_FILE_MODE`] an.
+///
+/// # Symlink-/Dateityp-Prüfung, zweistufig
+/// Vor dem Öffnen lehnt [`fs::symlink_metadata`] jeden bestehenden Symlink
+/// und jede bestehende Nicht-Datei am Pfad ab (check-then-open, per Pfad).
+/// Nach dem Öffnen prüft ein `fstat` auf dem bereits offenen Deskriptor
+/// (`File::metadata`) erneut, dass das Ergebnis eine reguläre Datei ist —
+/// das fängt ab, was zwischen den beiden Aufrufen unter dem Pfad zu einer
+/// Nicht-Datei (FIFO, Gerätedatei, Verzeichnis) wurde, bevor
+/// [`restrict_mode`] den Modus dieses Deskriptors angleicht.
+///
+/// # Restlücke ohne `O_NOFOLLOW`
+/// Ein Symlink, der genau in diesem Fenster (nach der Vorabprüfung, vor
+/// `open()`) auf eine andere **reguläre** Datei umgehängt wird, bliebe
+/// unentdeckt: `open()` folgt ihm ohne Weiteres, und die zweite Prüfung
+/// sieht danach eine reguläre Datei, wie erwartet. Ein vollständiger
+/// Schluss bräuchte `O_NOFOLLOW` am `open()`-Aufruf selbst (z. B. über
+/// `rustix::fs` mit aktiviertem `fs`-Feature oder `harw_fsutil::open_nofollow`
+/// auf dem Elternverzeichnis) — keine der beiden ist heute eine Abhängigkeit
+/// dieser Kiste. Ein hier hartkodierter `O_NOFOLLOW`-Zahlenwert wäre
+/// architekturabhängig (x86_64 und aarch64 unterscheiden sich, siehe
+/// `harw-fsutil`s Moduldoku und den historischen Fehler F-006) und wird
+/// deshalb bewusst nicht nachgebaut.
 fn open_export_file(path: &Path) -> io::Result<File> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.file_type().is_file() => {
@@ -218,6 +245,15 @@ fn open_export_file(path: &Path) -> io::Result<File> {
         options.mode(EXPORT_FILE_MODE);
     }
     let file = options.open(path)?;
+    // Zweite, fd-gebundene Prüfung: `fstat` auf dem Deskriptor statt einem
+    // erneuten Pfadzugriff, siehe Funktionsdoku „Symlink-/Dateityp-Prüfung,
+    // zweistufig" oben.
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "findings export path resolved to a non-regular file after opening",
+        ));
+    }
     restrict_mode(&file)?;
     Ok(file)
 }
@@ -692,6 +728,32 @@ mod tests {
         assert_eq!(exporter.failures(), 1);
         let untouched = fs::read(&target).map_err(ctx("read target"))?;
         assert!(untouched.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_export_file_accepts_a_freshly_created_regular_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        // Deckt den fd-gebundenen `fstat`-Nachcheck (nach dem Öffnen, vor
+        // `restrict_mode`) ab: eine ganz neu angelegte Datei muss ihn
+        // widerspruchsfrei passieren.
+        let file = open_export_file(&path).map_err(ctx("open"))?;
+        assert!(file.metadata().map_err(ctx("metadata"))?.file_type().is_file());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_export_file_accepts_a_pre_existing_regular_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        fs::write(&path, b"existing\n").map_err(ctx("seed"))?;
+        // Wie beim Wiederöffnen nach `rotate()`: der fd-gebundene Nachcheck
+        // darf eine bereits bestehende reguläre Datei nicht ablehnen.
+        let file = open_export_file(&path).map_err(ctx("open"))?;
+        assert!(file.metadata().map_err(ctx("metadata"))?.file_type().is_file());
         Ok(())
     }
 

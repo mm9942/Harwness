@@ -16,14 +16,20 @@
 //! - **Kleine, isolierte Scopes parallel delegieren.** Jedes offene
 //!   Kriterium, das kein Worker abdeckt, bekommt einen
 //!   [`WorkDriveStep::Delegate`] — höchstens so viele, wie
-//!   [`WorkDriveLimits::max_parallel_workers`] freie Plätze lässt. Scopes
-//!   besitzen disjunkte Pfade: überschneidet ein neuer Scope einen laufenden
-//!   Worker, wird er zurückgestellt; überschneiden sich zwei neue Scopes
-//!   derselben Runde, werden sie zu einem verschmolzen.
+//!   [`WorkDriveLimits::max_parallel_workers`] freie Plätze lässt. Einen
+//!   Platz belegen nur aktive Worker: ein `Done`-Worker, dessen
+//!   Scope-Kriterien alle belegt sind, ist ausgeschieden und gibt Platz und
+//!   Pfade frei — außer in einer Runde, die ihn fortsetzt. Scopes besitzen
+//!   disjunkte Pfade: überschneidet ein neuer Scope einen aktiven Worker,
+//!   wird er zurückgestellt; überschneiden sich zwei neue Scopes derselben
+//!   Runde, werden sie zu einem verschmolzen.
 //! - **Denselben Worker weiterführen statt neu starten.**
 //!   [`WorkDriveStep::Continue`] schickt knappes Feedback (nur die offenen
 //!   Kriterien seines Scopes und die fehlschlagende Evidenz) an *denselben*
 //!   Worker — sein Prompt-Cache bleibt warm, das Feedback wird nur angehängt.
+//!   Überschneiden sich zwei fertige Worker (ein ausgeschiedener, dessen
+//!   Pfade inzwischen ein neuerer besitzt), läuft pro Runde nur einer davon
+//!   weiter, der mit offenen Kriterien zuerst.
 //!   [`WorkDriveStep::Respawn`] ist die Ausnahme: nach ausgeschöpften
 //!   Versuchen, bei zu großem Kontext oder nach einem harten Fehlschlag; der
 //!   frische Worker bekommt eine kompakte Übergabe statt des alten Verlaufs.
@@ -65,6 +71,9 @@
 //! - `usage.iterations_without_progress` zählt Runden ohne neu erfülltes
 //!   Kriterium; der Treiber vergleicht nur mit
 //!   [`WorkDriveLimits::stall_iterations`].
+//! - Ausgeschiedene Worker darf der Aufrufer in `workers` behalten: sie
+//!   belegen weder Platz noch Pfade, bekommen aber weiter Feedback, wenn die
+//!   Verifikation ihre Pfade nennt.
 //!
 //! # Reihenfolge der Schritte
 //! `ProposeAchieved` oder `GiveUp` stehen jeweils allein. Sonst:
@@ -82,9 +91,9 @@
 //! TPM-Taktung, Halbierung nach HTTP 429) und meldet sie über
 //! [`WorkDriveInput::effective_parallel`]. `decide` bildet stets das Minimum
 //! aus beiden und weitet die Provider-Grenze nie auf: sowohl ein neuer
-//! `Delegate` als auch eine Bewerter-Nachfolge-Delegation zählen laufende
-//! Worker mit; Scopes über der Grenze bleiben wie am Spec-Limit für spätere
-//! Runden zurückgestellt.
+//! `Delegate` als auch eine Bewerter-Nachfolge-Delegation zählen aktive
+//! (nicht ausgeschiedene) Worker mit; Scopes über der Grenze bleiben wie am
+//! Spec-Limit für spätere Runden zurückgestellt.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -130,7 +139,8 @@ pub struct WorkDriveLimits {
     pub max_iterations: u32,
     /// Länge einer Fortsetzungskette je Worker, bevor er neu gestartet wird.
     pub max_attempts_per_worker: u32,
-    /// Höchstzahl gleichzeitig existierender Worker.
+    /// Höchstzahl gleichzeitig aktiver Worker (ausgeschiedene `Done`-Worker,
+    /// deren Scope-Kriterien alle belegt sind, zählen nicht).
     pub max_parallel_workers: usize,
     /// Token-Budget des gesamten Laufs.
     pub token_budget: u64,
@@ -378,7 +388,7 @@ pub enum GiveUpReason {
 pub enum WorkDriveStep {
     /// Neuen parallelen Worker für einen noch nicht abgedeckten Scope starten.
     Delegate {
-        /// Der Scope (disjunkt zu allen laufenden Scopes).
+        /// Der Scope (disjunkt zu allen aktiven Scopes).
         scope: WorkScope,
         /// Rolle des Workers.
         role: String,
@@ -590,6 +600,40 @@ fn is_done(worker: &WorkerState) -> bool {
     matches!(outcome(worker), Some(WorkerOutcome::Done))
 }
 
+/// `Done`, und kein Kriterium des Scopes ist mehr offen: der Worker ist
+/// ausgeschieden. Wird eines seiner Kriterien wieder offen, ist er wieder
+/// aktiv.
+fn is_retired(worker: &WorkerState, view: &GoalView) -> bool {
+    is_done(worker)
+        && !worker
+            .scope
+            .criteria
+            .iter()
+            .any(|idx| view.open.contains(idx))
+}
+
+/// Die Worker, die einen Platz unter [`effective_cap`] und ihre Pfade
+/// belegen: alle nicht ausgeschiedenen plus die ausgeschiedenen, die `out`
+/// bereits fortsetzt oder neu startet.
+fn active_workers<'w>(
+    workers: &[&'w WorkerState],
+    view: &GoalView,
+    out: &WorkDrivePlan,
+) -> Vec<&'w WorkerState> {
+    let driven = |id: &str| {
+        out.steps.iter().any(|step| match step {
+            WorkDriveStep::Continue { worker_id, .. }
+            | WorkDriveStep::Respawn { worker_id, .. } => worker_id.as_str() == id,
+            _ => false,
+        })
+    };
+    workers
+        .iter()
+        .copied()
+        .filter(|worker| !is_retired(worker, view) || driven(worker.worker_id.as_str()))
+        .collect()
+}
+
 /// Die erste gegriffene Grenze in fester Reihenfolge.
 fn limit_hit(input: &WorkDriveInput<'_>) -> Option<(GiveUpReason, String)> {
     let limits = &input.limits;
@@ -674,7 +718,7 @@ fn drive_settled_wave(
             delegate_uncovered(input, workers, view, out);
         }
         VerificationState::Failed { failing } => {
-            let continued = drive_done_workers(input, workers, out, |worker| {
+            let continued = drive_done_workers(input, workers, view, out, |worker| {
                 let mut lines = scope_open_lines(input.goal, &worker.scope, &view.open);
                 lines.extend(failing_lines_for(worker, workers, failing));
                 lines
@@ -696,7 +740,7 @@ fn drive_settled_wave(
             if view.evidence_open.is_empty() && invariants_ok {
                 drive_judge(input, workers, view, out);
             } else {
-                let continued = drive_done_workers(input, workers, out, |worker| {
+                let continued = drive_done_workers(input, workers, view, out, |worker| {
                     let mut lines = scope_open_lines(input.goal, &worker.scope, &view.open);
                     if !lines.is_empty() || !invariants_ok {
                         lines.extend(invariant_lines(input.report));
@@ -756,7 +800,7 @@ fn drive_judge(
         None => delegate_uncovered(input, workers, view, out),
         Some(verdict) => {
             let judge_set: BTreeSet<usize> = view.judge_open.iter().copied().collect();
-            let continued = drive_done_workers(input, workers, out, |worker| {
+            let continued = drive_done_workers(input, workers, view, out, |worker| {
                 let mut lines: Vec<String> = verdict
                     .missing
                     .iter()
@@ -823,26 +867,49 @@ fn drive_running_wave(
 }
 
 /// Setzt jeden `Done`-Worker fort, für den `feedback_for` Zeilen liefert.
+/// Überschneidet sein Scope einen schon gewählten, bleibt er bis zur nächsten
+/// Welle zurückgestellt (die Pfade eines ausgeschiedenen Workers kann
+/// inzwischen ein neuerer besitzen). Worker mit offenen Kriterien haben dabei
+/// Vorrang; die Schritte folgen trotzdem der `worker_id`.
 /// Gibt die Zahl der fortgesetzten (oder neu gestarteten) Worker zurück.
 fn drive_done_workers<F>(
     input: &WorkDriveInput<'_>,
     workers: &[&WorkerState],
+    view: &GoalView,
     out: &mut WorkDrivePlan,
     feedback_for: F,
 ) -> usize
 where
     F: Fn(&WorkerState) -> Vec<String>,
 {
-    let mut driven = 0;
-    for worker in workers.iter().filter(|worker| is_done(worker)) {
-        let lines = feedback_for(worker);
-        if lines.is_empty() {
+    let mut wanted: Vec<(&WorkerState, Vec<String>)> = workers
+        .iter()
+        .copied()
+        .filter(|worker| is_done(worker))
+        .map(|worker| (worker, feedback_for(worker)))
+        .filter(|(_, lines)| !lines.is_empty())
+        .collect();
+    // Stabil: innerhalb beider Gruppen bleibt die `worker_id`-Ordnung.
+    wanted.sort_by_key(|(worker, _)| is_retired(worker, view));
+    let mut chosen: Vec<(&WorkerState, Vec<String>)> = Vec::new();
+    for (worker, lines) in wanted {
+        if let Some((other, _)) = chosen
+            .iter()
+            .find(|(other, _)| scopes_overlap(&other.scope, &worker.scope))
+        {
+            out.rationale.push(format!(
+                "{}: Scope überschneidet {} — bis zur nächsten Welle zurückgestellt.",
+                worker.worker_id, other.worker_id
+            ));
             continue;
         }
-        continue_or_respawn(input, worker, &lines, out);
-        driven += 1;
+        chosen.push((worker, lines));
     }
-    driven
+    chosen.sort_by(|a, b| a.0.worker_id.cmp(&b.0.worker_id));
+    for (worker, lines) in &chosen {
+        continue_or_respawn(input, worker, lines, out);
+    }
+    chosen.len()
 }
 
 /// `Continue` ist der Normalfall; `Respawn` nur bei zu großem Kontext oder
@@ -974,9 +1041,9 @@ fn failing_lines_for(
 /// Der wirksame Höchstwert gleichzeitig aktiver Worker: das Minimum aus der
 /// Spec-Grenze ([`WorkDriveLimits::max_parallel_workers`]) und dem vom
 /// Aufrufer gemeldeten Provider-Limit ([`WorkDriveInput::effective_parallel`]).
-/// `None` heißt: nur die Spec-Grenze gilt. Laufende Worker zählen wie heute
-/// gegen diesen Wert; Scopes über der Grenze bleiben für spätere Runden
-/// zurückgestellt.
+/// `None` heißt: nur die Spec-Grenze gilt. Aktive Worker
+/// ([`active_workers`]) zählen gegen diesen Wert, ausgeschiedene nicht;
+/// Scopes über der Grenze bleiben für spätere Runden zurückgestellt.
 fn effective_cap(input: &WorkDriveInput<'_>) -> usize {
     match input.effective_parallel {
         Some(cap) => input.limits.max_parallel_workers.min(cap.get()),
@@ -1010,7 +1077,8 @@ fn delegate_uncovered(
     let mut hints: Vec<&WorkScope> = input.scope_hints.iter().collect();
     hints.sort_by(|a, b| a.id.cmp(&b.id));
     let cap = effective_cap(input);
-    let free = cap.saturating_sub(workers.len());
+    let active = active_workers(workers, view, out);
+    let free = cap.saturating_sub(active.len());
     let uncovered_set: BTreeSet<usize> = uncovered.iter().copied().collect();
     let mut assigned: BTreeSet<usize> = BTreeSet::new();
     let mut pending: Vec<WorkScope> = Vec::new();
@@ -1022,7 +1090,7 @@ fn delegate_uncovered(
         let candidate = scope_for(input.goal, idx, &hints, &uncovered_set, &assigned);
         assigned.extend(candidate.criteria.iter().copied());
 
-        if let Some((worker, path)) = conflicting_worker(&candidate, workers) {
+        if let Some((worker, path)) = conflicting_worker(&candidate, &active) {
             out.rationale.push(format!(
                 "Scope {} überschneidet Worker {worker} (Pfad {path}) — zurückgestellt.",
                 candidate.id
@@ -1056,7 +1124,7 @@ fn delegate_uncovered(
             out.rationale.push(format!(
                 "Kein freier Platz für Scope {} ({} von {} Workern belegt).",
                 candidate.id,
-                workers.len().saturating_add(pending.len()),
+                active.len().saturating_add(pending.len()),
                 cap
             ));
             continue;
@@ -1086,7 +1154,7 @@ fn delegate_judge_followup(
     verdict: &JudgeVerdict,
     out: &mut WorkDrivePlan,
 ) {
-    if workers.len() >= effective_cap(input) {
+    if active_workers(workers, view, out).len() >= effective_cap(input) {
         out.rationale.push(format!(
             "Bewerter: nicht erfüllt ({}), aber kein freier Platz.",
             verdict.comment
@@ -1615,6 +1683,116 @@ mod tests {
             .rationale
             .iter()
             .any(|line| line.contains("zurückgestellt"))
+        {
+            return Err(TestError::Unexpected(format!("{:?}", plan.rationale)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_done_workers_with_met_criteria_free_their_slots() -> TestResult {
+        let mut fx = Fixture::new(goal_n(4), report(4, &[2, 3]));
+        fx.limits.max_parallel_workers = 2;
+        fx.workers = vec![
+            worker("w0", &[0], &["src/a"], Some(WorkerOutcome::Done)),
+            worker("w1", &[1], &["src/b"], Some(WorkerOutcome::Done)),
+        ];
+        fx.verification = VerificationState::Passed;
+
+        let plan = fx.decide();
+
+        let criteria: Vec<Vec<usize>> = delegates(&plan)
+            .iter()
+            .map(|s| s.criteria.clone())
+            .collect();
+        assert_eq!(criteria, vec![vec![2], vec![3]], "{plan:?}");
+        assert_eq!(plan.steps.len(), 2, "{plan:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_retired_worker_no_longer_blocks_its_paths() -> TestResult {
+        let mut fx = Fixture::new(goal_n(2), report(2, &[1]));
+        fx.limits.max_parallel_workers = 1;
+        fx.workers = vec![worker("w0", &[0], &["src/a"], Some(WorkerOutcome::Done))];
+        fx.hints = vec![scope("h-1", &[1], &["src/a/b.rs"])];
+        fx.verification = VerificationState::Passed;
+
+        let plan = fx.decide();
+
+        match only_step(&plan)? {
+            WorkDriveStep::Delegate { scope, .. } => {
+                assert_eq!(scope.id, "h-1");
+                assert_eq!(scope.criteria, vec![1]);
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_retired_worker_continued_in_the_same_plan_keeps_its_paths() -> TestResult {
+        let mut fx = Fixture::new(goal_n(3), report(3, &[2]));
+        fx.limits.max_parallel_workers = 2;
+        fx.workers = vec![
+            worker("w0", &[0], &["src/a"], Some(WorkerOutcome::Done)),
+            worker("w1", &[1], &["src/b"], Some(WorkerOutcome::Done)),
+        ];
+        fx.hints = vec![scope("h-2", &[2], &["src/a/c.rs"])];
+        fx.verification = VerificationState::Failed {
+            failing: vec!["lint src/a/x.rs schlägt fehl".to_owned()],
+        };
+
+        let plan = fx.decide();
+
+        match only_step(&plan)? {
+            WorkDriveStep::Continue {
+                worker_id,
+                feedback,
+            } => {
+                assert_eq!(worker_id, "w0");
+                assert_eq!(feedback, "Fehlschlag: lint src/a/x.rs schlägt fehl");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        if !plan
+            .rationale
+            .iter()
+            .any(|line| line.contains("überschneidet Worker w0"))
+        {
+            return Err(TestError::Unexpected(format!("{:?}", plan.rationale)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_overlapping_done_workers_are_never_continued_together() -> TestResult {
+        let mut fx = Fixture::new(goal_n(2), report(2, &[1]));
+        // w0 ist ausgeschieden; w1 hat danach einen Pfad in dessen Bereich übernommen.
+        fx.workers = vec![
+            worker("w0", &[0], &["src/a"], Some(WorkerOutcome::Done)),
+            worker("w1", &[1], &["src/a/b.rs"], Some(WorkerOutcome::Done)),
+        ];
+        fx.verification = VerificationState::Failed {
+            failing: vec!["gate schlägt fehl".to_owned()],
+        };
+
+        let plan = fx.decide();
+
+        match only_step(&plan)? {
+            WorkDriveStep::Continue {
+                worker_id,
+                feedback,
+            } => {
+                assert_eq!(worker_id, "w1");
+                assert_eq!(feedback, "Offen: [1] k1\nFehlschlag: gate schlägt fehl");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        if !plan
+            .rationale
+            .iter()
+            .any(|line| line.contains("w0: Scope überschneidet w1"))
         {
             return Err(TestError::Unexpected(format!("{:?}", plan.rationale)));
         }

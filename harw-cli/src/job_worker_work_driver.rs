@@ -19,7 +19,9 @@
 //! - `Delegate`/`Continue`/`Respawn` bilden **eine Welle** und laufen
 //!   gleichzeitig, höchstens [`RunMemory::parallel_now`] auf einmal
 //!   ([`execute_wave`]); vor jedem Block wartet die Welle, solange der
-//!   Provider eine Wartezeit meldet ([`ProviderPacing`]). `Continue` schickt
+//!   Provider eine Wartezeit meldet ([`ProviderPacing`]), höchstens bis zum
+//!   Laufende: ist die Wandzeit des Laufs abgelaufen, startet kein Worker
+//!   mehr und der Job endet `Failed`. `Continue` schickt
 //!   nur das knappe Feedback an **dieselbe** durable Session (Cache-Regel);
 //!   `Respawn` bekommt eine rein textuelle Übergabe.
 //! - `Verify`: genau ein zentraler Lauf über `spec.verify` plus die
@@ -31,7 +33,13 @@
 //!   nur der variable Teil); die Antwort wird tolerant geparst, im Zweifel
 //!   „nicht bestanden".
 //! - `Verify` an der Workspace-Sperre (`VerifyRunOutcome::Busy`): kein
-//!   Fehlschlag; dieselbe Runde läuft nach einer Pause erneut.
+//!   Fehlschlag; dieselbe Runde läuft nach einer Pause erneut. Ebenso nach
+//!   einem 429 des Bewerters (exponentieller Backoff über die
+//!   aufeinanderfolgenden 429) und nach einer Welle, in der kein Worker
+//!   arbeiten konnte, weil jeder bis zum Wiederholungsdeckel am 429 hing.
+//! - Goal inzwischen terminal (`Achieved`/`Abandoned`/`Superseded`): Job
+//!   endet `Cancelled`; ein leerer Plan (`decide` ohne Schritt) endet
+//!   `Failed`, statt Runde um Runde ohne Wartepunkt wiederholt zu werden.
 //! - `Escalate`: Job endet `Blocked { work_driver:NeedsInput: … }`; nach
 //!   `unblock` fließt die Freigabe-Notiz an die blockierten Worker.
 //! - `ProposeAchieved`: Job endet `Succeeded` mit dem Vorschlag und dem
@@ -67,7 +75,9 @@
 //! (`None`, solange sie nicht unter `spec.max_parallel_workers` liegt),
 //! die Zahl der 429-Ereignisse (kumulativ) in `WorkDriverState::rate_limited`. Ein 429 ist kein Worker-Fehlschlag: Backoff (Retry-After,
 //! exponentiell, gedeckelt), dann Fortsetzung derselben Session ohne
-//! Versuchsverbrauch.
+//! Versuchs- und ohne Rundenverbrauch. Als 429 zählen beide Formen des
+//! Providers: `ModelError::RateLimited` und `Transient { status: Some(429) }`
+//! (OpenAI-kompatibler Pfad).
 //!
 //! # Modellunabhängig
 //! Fortschritt misst der Treiber nur an generischen Artefakten: letzter
@@ -168,13 +178,13 @@ const MAX_RATE_LIMIT_RETRIES: u32 = 4;
 
 /// Höchstzahl erneuter Abfragen von [`ProviderPacing::pacing_wait`] vor
 /// einem Block. Deckelt **nicht** die gemeldete Wartezeit selbst (die wird
-/// ungekappt abgewartet), sondern nur die Zahl der Wiederholungen: bricht
-/// `Pacer::pause` durch einen Abbruch vorzeitig ab (`CancellablePacer`),
-/// meldet der Provider ohne echten Zeitablauf oft weiter eine Wartezeit,
-/// sonst würde die Welle spinnen, statt den Abbruch beim nächsten
-/// Worker-Start als `WorkerReply::Cancelled` bemerken zu lassen. Bei
-/// normalem Zeitablauf (Sekunden bis Stunden pro Wartezeit) ist dieser
-/// Deckel praktisch unerreichbar.
+/// bis zum Laufende ungekappt abgewartet), sondern nur die Zahl der
+/// Wiederholungen: bricht `Pacer::pause` durch einen Abbruch vorzeitig ab
+/// (`CancellablePacer`), meldet der Provider ohne echten Zeitablauf oft
+/// weiter eine Wartezeit, sonst würde die Welle spinnen, statt den Abbruch
+/// beim nächsten Worker-Start als `WorkerReply::Cancelled` bemerken zu
+/// lassen. Bei normalem Zeitablauf (Sekunden bis Stunden pro Wartezeit) ist
+/// dieser Deckel praktisch unerreichbar.
 const MAX_PACING_POLLS: u32 = 1_000;
 
 /// Basis des exponentiellen Backoffs nach HTTP 429.
@@ -182,7 +192,8 @@ const RATE_LIMIT_BASE_BACKOFF_SECS: u64 = 5;
 
 /// Obergrenze eines einzelnen Backoffs nach HTTP 429 (`rate_limit_backoff`).
 /// Gilt **nicht** für die proaktive Provider-Taktung ([`ProviderPacing`]):
-/// deren gemeldete Wartezeit wird in `execute_wave` ungekappt abgewartet.
+/// deren gemeldete Wartezeit wird in `execute_wave` abgewartet, gekappt nur
+/// durch das Laufende (Wandzeit-Budget, [`Pacer::deadline_passed`]).
 const RATE_LIMIT_MAX_BACKOFF_SECS: u64 = 300;
 
 /// Wandzeit eines Laufs ohne eigenes Budget (wie `WorkDriveLimits::default`).
@@ -305,6 +316,9 @@ pub(super) struct RunMemory {
     operator_notes: BTreeMap<String, String>,
     /// Worker, deren letzter Turn am Rate-Limit endete (kein Versuchsverbrauch).
     rate_limit_pending: BTreeSet<String>,
+    /// Aufeinanderfolgende 429 des Bewerters (Exponent seines Backoffs;
+    /// zurück auf 0 nach einer Antwort).
+    judge_rate_limits: u32,
     /// Prompt-/Cache-Tokens je Worker seit Claim-Beginn.
     worker_tokens: BTreeMap<String, (u64, u64)>,
     /// Nächste Worker-Nummer (`None`: aus dem Zustand ableiten).
@@ -333,6 +347,7 @@ impl RunMemory {
             progress_pending: false,
             operator_notes: BTreeMap::new(),
             rate_limit_pending: BTreeSet::new(),
+            judge_rate_limits: 0,
             worker_tokens: BTreeMap::new(),
             next_worker: None,
         }
@@ -403,7 +418,8 @@ pub(super) trait GoalAccess: Send + Sync {
     fn goal(&self, goal_id: &str) -> Result<Goal, String>;
     /// Der Plan (`plan_id` wird geprüft, falls gesetzt); `None` ohne Plan.
     fn plan(&self, plan_id: Option<&str>) -> Result<Option<Plan>, String>;
-    /// Hängt Nachweise an das Goal (`GoalAction::AttachEvidence`).
+    /// Hängt Nachweise an das Goal `goal_id` (`GoalAction::AttachEvidence`);
+    /// scheitert, wenn inzwischen ein anderes Goal das aktuelle ist.
     fn attach_evidence(&self, goal_id: &str, evidence: &[EvidenceRef]) -> Result<(), String>;
 }
 
@@ -571,10 +587,14 @@ pub(super) trait WriteScopeGuard: Send + Sync {
     fn after_wave(&self, owners: &[(String, Vec<String>)]) -> WaveChanges;
 }
 
-/// Wartet (Backoff nach Rate-Limit); injiziert, damit Tests nicht schlafen.
+/// Wartet (Backoff nach Rate-Limit, Provider-Taktung); injiziert, damit Tests
+/// nicht schlafen. Keine Pause reicht über das Laufende (Wandzeit-Budget).
 pub(super) trait Pacer: Send + Sync {
-    /// Wartet `wait`.
+    /// Wartet `wait`, höchstens bis zum Laufende.
     fn pause<'a>(&'a self, wait: Duration) -> BoxFuture<'a, ()>;
+    /// `true`, sobald die Wandzeit des Laufs abgelaufen ist: dann startet
+    /// keine Welle mehr einen Worker.
+    fn deadline_passed(&self) -> bool;
 }
 
 /// Fragt den Provider, wie lange vor der nächsten Anfrage zu warten ist
@@ -608,8 +628,9 @@ pub(super) struct DrivePorts<'a> {
 pub(super) enum RoundEnd {
     /// Weiter mit der nächsten Runde.
     Next,
-    /// Dieselbe Runde erneut (Verifikation an der Workspace-Sperre); zählt
-    /// weder als Runde noch als Runde ohne Fortschritt.
+    /// Dieselbe Runde erneut (Verifikation an der Workspace-Sperre, 429 des
+    /// Bewerters, Welle ohne Arbeit wegen 429); zählt weder als Runde noch
+    /// als Runde ohne Fortschritt.
     Repeat,
     /// Der Job endet mit diesem Ausgang.
     Finish(JobOutcome),
@@ -779,7 +800,9 @@ fn apply_operator_answer(
 /// # Description
 /// Siehe Moduldoku. Bei [`RoundEnd::Next`] ist `state.iteration` bereits
 /// weitergezählt; bei [`RoundEnd::Finish`] nicht (ein freigegebener
-/// `Blocked`-Job führt dieselbe Runde erneut aus).
+/// `Blocked`-Job führt dieselbe Runde erneut aus). Ein terminal gewordenes
+/// Goal endet `Cancelled`, ein leerer Plan `Failed`: beide änderten sich
+/// von Runde zu Runde nicht, und keine Grenze von `decide` griffe.
 pub(super) async fn drive_round(
     input: &WorkDriverJobInput,
     state: &mut WorkDriverState,
@@ -791,6 +814,22 @@ pub(super) async fn drive_round(
         Ok(goal) => goal,
         Err(reason) => return RoundEnd::Finish(JobOutcome::Failed { reason }),
     };
+    // `decide` liefert für ein terminales Goal einen leeren Plan noch vor
+    // jeder Grenze (Runden, Wandzeit): ohne diese Prüfung liefe der Lauf
+    // ohne Wartepunkt endlos weiter.
+    if matches!(
+        goal.status,
+        harw_plan::GoalStatus::Achieved
+            | harw_plan::GoalStatus::Abandoned
+            | harw_plan::GoalStatus::Superseded
+    ) {
+        return RoundEnd::Finish(JobOutcome::Cancelled {
+            reason: format!(
+                "goal '{}' is {:?}; nothing left to drive",
+                goal.id, goal.status
+            ),
+        });
+    }
     let plan = match ports.goals.plan(input.plan_id.as_deref()) {
         Ok(plan) => plan,
         Err(reason) => return RoundEnd::Finish(JobOutcome::Failed { reason }),
@@ -843,6 +882,20 @@ pub(super) async fn drive_round(
         "work-driver decided"
     );
     state.last_rationale = decided.rationale;
+    if decided.steps.is_empty() {
+        // Jeder Worker-Turn endet innerhalb seiner Runde; ohne äußere
+        // Änderung liefert `decide` in der nächsten Runde denselben leeren
+        // Plan, der Lauf käme nur über die Rundengrenze zum Ende.
+        return RoundEnd::Finish(JobOutcome::Failed {
+            reason: clip(
+                &format!(
+                    "work-driver has nothing to do: {}",
+                    state.last_rationale.join(" ")
+                ),
+                MAX_OUTCOME_REASON_CHARS,
+            ),
+        });
+    }
 
     let end = execute_steps(input, &goal, state, memory, ports, decided.steps).await;
     // AIMD-Stand nach der Runde; `rate_limited` zählt `execute_wave`/`run_judge`
@@ -1060,6 +1113,12 @@ fn worker_role_of(input: &WorkDriverJobInput) -> String {
 /// Führt die Worker-Turns einer Welle aus: gleichzeitig in Blöcken der
 /// aktuellen Wellenbreite, 429 mit Backoff und Fortsetzung, danach die
 /// Schreibbereichsprüfung.
+///
+/// # Returns
+/// `None`: weiter mit den übrigen Schritten. `Finish(Failed)`, wenn die
+/// Wandzeit vor einem Block abgelaufen ist (kein Worker startet mehr);
+/// `Repeat`, wenn die 429-Wiederholungen erschöpft sind und kein Worker der
+/// Welle arbeiten konnte.
 async fn execute_wave(
     state: &mut WorkDriverState,
     memory: &mut RunMemory,
@@ -1088,6 +1147,10 @@ async fn execute_wave(
     let mut pending = requests;
     let mut retries = 0_u32;
     let mut wave_rate_limited = false;
+    let mut rate_limit_exhausted = false;
+    let mut deadline_hit = false;
+    // Mindestens ein Worker lieferte etwas anderes als ein 429.
+    let mut worked = false;
     loop {
         let width = memory.parallel_now();
         let mut limited: Vec<WorkerRequest> = Vec::new();
@@ -1098,16 +1161,26 @@ async fn execute_wave(
             // jeder Wartezeit erneut abfragen (das Kontingent füllt sich mit
             // der Zeit weiter), statt die Wartezeit auf den Deckel des
             // reaktiven 429-Backoffs zu kappen — TPM-/RPM-Kontingente sind
-            // vertraglich vereinbarte Grenzen (DEC-003), keine Näherung. Der
-            // Iterationsdeckel greift nur, wenn `pause` durch einen Abbruch
-            // ohne echten Zeitablauf immer wieder vorzeitig endet.
+            // vertraglich vereinbarte Grenzen (DEC-003), keine Näherung. Die
+            // Wandzeit des Laufs ist ebenso eine Grenze: `pause` endet
+            // spätestens an ihr, danach startet kein Worker mehr (er
+            // scheiterte sofort an der Frist). Der Iterationsdeckel greift
+            // nur, wenn `pause` durch einen Abbruch ohne echten Zeitablauf
+            // immer wieder vorzeitig endet.
             let mut pacing_polls = 0_u32;
             while let Some(wait) = ports.pacing.pacing_wait().filter(|wait| !wait.is_zero()) {
+                if ports.pacer.deadline_passed() {
+                    break;
+                }
                 ports.pacer.pause(wait).await;
                 pacing_polls = pacing_polls.saturating_add(1);
                 if pacing_polls >= MAX_PACING_POLLS {
                     break;
                 }
+            }
+            if ports.pacer.deadline_passed() {
+                deadline_hit = true;
+                break;
             }
             let end = index.saturating_add(width).min(pending.len());
             let chunk = &pending[index..end];
@@ -1124,6 +1197,9 @@ async fn execute_wave(
             let mut chunk_limited = false;
             for (request, run) in chunk.iter().zip(runs) {
                 account_usage(state, memory, &request.worker_id, run.usage);
+                if !matches!(run.reply, WorkerReply::RateLimited { .. }) {
+                    worked = true;
+                }
                 match run.reply {
                     WorkerReply::Cancelled => {
                         return Some(RoundEnd::Finish(JobOutcome::Cancelled {
@@ -1175,7 +1251,7 @@ async fn execute_wave(
                     .await;
             }
         }
-        if limited.is_empty() {
+        if deadline_hit || limited.is_empty() {
             break;
         }
         wave_rate_limited = true;
@@ -1189,13 +1265,19 @@ async fn execute_wave(
                     &request.worker_id,
                     WorkerResultSummary {
                         outcome: WorkerOutcome::Partial,
-                        summary: "Provider-Rate-Limit; wird in der nächsten Runde fortgesetzt."
+                        summary: "Provider-Rate-Limit; wird nach einer Pause fortgesetzt."
                             .to_owned(),
                         artifacts: Vec::new(),
                         suggested_next: None,
                     },
                 );
             }
+            rate_limit_exhausted = true;
+            // Auch nach dem letzten Versuch nicht sofort erneut hineinstarten.
+            ports
+                .pacer
+                .pause(rate_limit_backoff(retry_after, retries))
+                .await;
             break;
         }
         ports
@@ -1263,7 +1345,28 @@ async fn execute_wave(
     if !wave_rate_limited {
         memory.on_clean_wave();
     }
+    if deadline_hit {
+        return Some(RoundEnd::Finish(wall_budget_exhausted()));
+    }
+    if rate_limit_exhausted && !worked {
+        // Ein 429 ist ein Warte-Signal, kein Fortschritt zum Aufgeben
+        // (DEC-003): ohne Arbeit in dieser Welle verbraucht sie keine Runde;
+        // die Wandzeit begrenzt den Lauf weiter.
+        return Some(RoundEnd::Repeat);
+    }
     None
+}
+
+/// `Failed`-Ausgang, wenn die Wandzeit des Laufs vor dem nächsten
+/// Worker-Start abgelaufen ist — derselbe Grund wie `GiveUp { WallBudget }`
+/// aus `decide`, ohne Worker zu starten, die sofort an der Frist scheiterten.
+fn wall_budget_exhausted() -> JobOutcome {
+    JobOutcome::Failed {
+        reason: format!(
+            "work-driver gave up ({}): the run's wall-clock limit passed before the next worker start",
+            give_up_label(GiveUpReason::WallBudget)
+        ),
+    }
 }
 
 /// Bucht Verbrauch und Cache-Quote eines Worker-Turns.
@@ -1405,7 +1508,9 @@ async fn run_verification(
     None
 }
 
-/// Ein Bewerteraufruf; 429 → Backoff und später erneut, Ausfall → Eskalation.
+/// Ein Bewerteraufruf; 429 → exponentieller Backoff über die
+/// aufeinanderfolgenden 429 und dieselbe Runde erneut (kein Rundenverbrauch,
+/// DEC-003), Ausfall → Eskalation.
 async fn run_judge(
     input: &WorkDriverJobInput,
     goal: &Goal,
@@ -1418,6 +1523,7 @@ async fn run_judge(
     let request = judge_request(&input.spec, goal, criteria, question, state);
     match ports.judge.judge(&request).await {
         Ok(reply) => {
+            memory.judge_rate_limits = 0;
             state.usage.tokens_used = state.usage.tokens_used.saturating_add(reply.tokens);
             state.last_judge = Some(parse_verdict(&reply.text));
             None
@@ -1425,12 +1531,15 @@ async fn run_judge(
         Err(JudgeError::RateLimited { retry_after_secs }) => {
             state.rate_limited = state.rate_limited.saturating_add(1);
             memory.on_rate_limited();
+            memory.judge_rate_limits = memory.judge_rate_limits.saturating_add(1);
             state.last_judge = None;
             ports
                 .pacer
-                .pause(rate_limit_backoff(retry_after_secs, 1))
+                .pause(rate_limit_backoff(retry_after_secs, memory.judge_rate_limits))
                 .await;
-            None
+            // Warte-Signal, kein Fortschritt zum Aufgeben: `max_iterations`
+            // bleibt unberührt, die Wandzeit begrenzt den Lauf weiter.
+            Some(RoundEnd::Repeat)
         }
         Err(JudgeError::Failed(reason)) => Some(RoundEnd::Finish(needs_input(&format!(
             "Der Bewerter ist nicht verfügbar: {reason}"
@@ -1815,14 +1924,23 @@ fn json_objects(text: &str) -> Vec<&str> {
     objects
 }
 
-/// Deutet ein JSON-Objekt als Urteil: `passed`, `met` oder `verified`
-/// (bool), dazu `comment`/`rationale` und optional `missing`.
+/// Deutet ein JSON-Objekt als Urteil, sobald es `passed`, `met` oder
+/// `verified` trägt, dazu `comment`/`rationale` und optional `missing`.
+/// Bestanden nur, wenn **jeder** dieser vorhandenen Schlüssel `true` ist
+/// (`{"passed": true, "met": false}` ist nicht bestanden, ein Nicht-Bool
+/// ebenso).
 fn verdict_from_object(object: &str) -> Option<JudgeVerdict> {
     let value: serde_json::Value = serde_json::from_str(object).ok()?;
     let map = value.as_object()?;
-    let passed = ["passed", "met", "verified"]
+    let flags: Vec<bool> = ["passed", "met", "verified"]
         .iter()
-        .find_map(|key| map.get(*key).and_then(serde_json::Value::as_bool))?;
+        .filter_map(|key| map.get(*key))
+        .map(|flag| flag.as_bool() == Some(true))
+        .collect();
+    if flags.is_empty() {
+        return None;
+    }
+    let passed = flags.iter().all(|flag| *flag);
     let comment = ["comment", "rationale", "reason"]
         .iter()
         .find_map(|key| map.get(*key).and_then(serde_json::Value::as_str))
@@ -1847,21 +1965,41 @@ fn verdict_from_object(object: &str) -> Option<JudgeVerdict> {
 /// Parst das Urteil tolerant und modellunabhängig, fail closed.
 ///
 /// # Description
-/// 1. Das erste JSON-Objekt mit `passed`/`met`/`verified` gewinnt.
-/// 2. Sonst `passed: false` mit dem Rohtext als Kommentar: `JUDGE_INSTRUCTION`
-///    verlangt vom Bewerter ausschließlich JSON, ein Klartext-Fallback ist
-///    daher nur die letzte Absicherung. Ein früherer Klartext-Marker-Scan auf
-///    bloße Wörter wie „PASSED"/„FAILED" träfe auch verneinte Formulierungen
-///    ohne das Wort „FAILED" (z. B. „hat … noch nicht PASSED") als
-///    `passed: true` — das widerspricht „im Zweifel nicht bestanden".
+/// 1. Alle JSON-Objekte mit `passed`/`met`/`verified` zählen. Stimmen sie
+///    überein, gilt das erste (Kommentar, `missing`); `passed: true` also nur,
+///    wenn jedes dieser Objekte bestanden sagt.
+/// 2. Widersprechen sie sich (etwa ein laut denkender Bewerter mit
+///    `{"passed": true} … {"passed": false}`): `passed: false` mit dem
+///    Rohtext als Kommentar und allen `missing` — DEC-001: jede Antwort, die
+///    sich nicht eindeutig als Urteil lesen lässt, gilt als nicht bestanden.
+/// 3. Ohne solches Objekt ebenso `passed: false` mit dem Rohtext:
+///    `JUDGE_INSTRUCTION` verlangt vom Bewerter ausschließlich JSON, ein
+///    Klartext-Fallback ist daher nur die letzte Absicherung. Ein früherer
+///    Klartext-Marker-Scan auf bloße Wörter wie „PASSED"/„FAILED" träfe auch
+///    verneinte Formulierungen ohne das Wort „FAILED" (z. B. „hat … noch
+///    nicht PASSED") als `passed: true` — das widerspricht „im Zweifel nicht
+///    bestanden".
 pub(super) fn parse_verdict(text: &str) -> JudgeVerdict {
-    if let Some(verdict) = json_objects(text).into_iter().find_map(verdict_from_object) {
-        return verdict;
+    let verdicts: Vec<JudgeVerdict> = json_objects(text)
+        .into_iter()
+        .filter_map(verdict_from_object)
+        .collect();
+    let unanimous = verdicts
+        .first()
+        .filter(|first| verdicts.iter().all(|other| other.passed == first.passed));
+    if let Some(verdict) = unanimous {
+        return verdict.clone();
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for item in verdicts.into_iter().flat_map(|verdict| verdict.missing) {
+        if !missing.contains(&item) {
+            missing.push(item);
+        }
     }
     JudgeVerdict {
         passed: false,
         comment: clip(text.trim(), MAX_OUTCOME_REASON_CHARS),
-        missing: Vec::new(),
+        missing,
     }
 }
 
@@ -2087,7 +2225,7 @@ pub(super) async fn execute_work_driver_claim(
 
     // Budgets: Token-Ledger des Jobs (von `work_driver.enqueue` aus der Spec
     // gespiegelt) für alle Modellrunden des Laufs; die Wandzeit bindet jeden
-    // Worker-Turn an das Laufende.
+    // Worker-Turn, den Bewerter und jede Pause an das Laufende.
     let ledger = PromptTokenLedger::new(claim.job.budget.clone(), claim.job.usage.clone());
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: Arc::clone(&provider),
@@ -2178,6 +2316,7 @@ pub(super) async fn execute_work_driver_claim(
     };
     let pacer = CancellablePacer {
         control: Arc::clone(&control),
+        deadline,
     };
     // Derselbe Provider wie die Worker (die Budget-Hülle reicht durch).
     let pacing = ModelPacing(Arc::clone(&budgeted));
@@ -2368,24 +2507,36 @@ impl GoalAccess for StoreGoalAccess {
         }
     }
 
-    fn attach_evidence(&self, _goal_id: &str, evidence: &[EvidenceRef]) -> Result<(), String> {
+    fn attach_evidence(&self, goal_id: &str, evidence: &[EvidenceRef]) -> Result<(), String> {
         let scoped = ScopedGoalStore::new(self.goals.as_ref(), self.tenant.clone());
         for item in evidence {
+            // Eine Verifikation läuft Minuten; ersetzt ein `Set` das Goal
+            // inzwischen, gehören die Nachweise nicht zum neuen Goal (ein
+            // gleichlautendes `Command`-Kriterium gälte dort sonst als
+            // erfüllt). Die Prüfung sieht dasselbe Goal wie die Mutation.
             scoped
-                .apply(
+                .apply_guarded(
                     GoalAction::AttachEvidence {
                         evidence: item.clone(),
                     },
                     DRIVER_ACTOR,
+                    &|current: Option<&Goal>| match current {
+                        Some(goal) if goal.id.as_str() == goal_id => Ok(()),
+                        _ => Err(harw_plan::PlanError::GoalNotFound),
+                    },
                 )
-                .map_err(|error| format!("evidence not attached: {error}"))?;
+                .map_err(|error| format!("evidence not attached to goal '{goal_id}': {error}"))?;
         }
         Ok(())
     }
 }
 
 /// Zählt Token-Nutzung je Modellrunde mit (inkl. Cache-Tokens) und merkt sich
-/// ein Provider-Rate-Limit (HTTP 429).
+/// ein Provider-Rate-Limit (HTTP 429) in beiden Formen des Providers:
+/// `ModelError::RateLimited` und `Transient { status: Some(429) }`
+/// (OpenAI-kompatibler Pfad), wie `harw_provider_http::retry::rate_limit_hint`.
+/// `QuotaExceeded` bleibt ein Fehlschlag: ein erschöpftes Kontingent ist kein
+/// Warte-Signal.
 #[derive(Debug, Default, Clone, Copy)]
 struct UsageMeter {
     tokens: u64,
@@ -2439,13 +2590,12 @@ impl ModelProvider for MeteredModelProvider {
                         .saturating_add(usage.cached_tokens.unwrap_or(0));
                     guard.last_prompt_tokens = usage.prompt_tokens();
                 }
-                Err(harw_core::ModelError::RateLimited {
-                    retry_after_secs, ..
-                }) => {
-                    guard.rate_limited =
-                        Some(guard.rate_limited.unwrap_or(0).max(*retry_after_secs));
+                Err(error) => {
+                    if let Some(hint) = harw_provider_http::retry::rate_limit_hint(error) {
+                        guard.rate_limited =
+                            Some(guard.rate_limited.unwrap_or(0).max(hint.as_secs()));
+                    }
                 }
-                Err(_) => {}
             }
             drop(guard);
             result
@@ -2876,19 +3026,29 @@ impl ProviderPacing for ModelPacing {
     }
 }
 
-/// [`Pacer`] mit `tokio::time::sleep`, vorzeitig beendet durch einen Abbruch.
+/// [`Pacer`] mit `tokio::time::sleep_until`: jede Pause endet spätestens am
+/// Laufende (`deadline`, dieselbe Frist wie die der Worker-Turns und des
+/// Bewerters) und vorzeitig durch einen Abbruch.
 struct CancellablePacer {
     control: Arc<WorkerExecutionControl>,
+    deadline: tokio::time::Instant,
 }
 
 impl Pacer for CancellablePacer {
     fn pause<'a>(&'a self, wait: Duration) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let until = tokio::time::Instant::now()
+                .checked_add(wait)
+                .map_or(self.deadline, |end| end.min(self.deadline));
             tokio::select! {
-                () = tokio::time::sleep(wait) => {}
+                () = tokio::time::sleep_until(until) => {}
                 () = cancellation_requested(self.control.cancellation()) => {}
             }
         })
+    }
+
+    fn deadline_passed(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
     }
 }
 
@@ -3046,7 +3206,7 @@ mod tests {
             Ok(None)
         }
 
-        fn attach_evidence(&self, _goal_id: &str, evidence: &[EvidenceRef]) -> Result<(), String> {
+        fn attach_evidence(&self, goal_id: &str, evidence: &[EvidenceRef]) -> Result<(), String> {
             if let Some(reason) = self
                 .fail_attach
                 .lock()
@@ -3056,6 +3216,9 @@ mod tests {
                 return Err(reason);
             }
             let mut goal = self.goal.lock().map_err(|_| "poisoned".to_owned())?;
+            if goal.id.as_str() != goal_id {
+                return Err("unknown goal".to_owned());
+            }
             goal.evidence.extend(evidence.iter().cloned());
             Ok(())
         }
@@ -3146,13 +3309,20 @@ mod tests {
 
     struct FakeJudge {
         reply: String,
+        /// Fehler vor der ersten Antwort (FIFO), etwa HTTP 429.
+        failures: Mutex<VecDeque<JudgeError>>,
         requests: Mutex<Vec<JudgeRequest>>,
     }
 
     impl FakeJudge {
         fn replying(reply: &str) -> Self {
+            Self::failing_first(Vec::new(), reply)
+        }
+
+        fn failing_first(failures: Vec<JudgeError>, reply: &str) -> Self {
             Self {
                 reply: reply.to_owned(),
+                failures: Mutex::new(failures.into()),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -3173,6 +3343,14 @@ mod tests {
             Box::pin(async move {
                 if let Ok(mut requests) = self.requests.lock() {
                     requests.push(request.clone());
+                }
+                let failure = self
+                    .failures
+                    .lock()
+                    .ok()
+                    .and_then(|mut failures| failures.pop_front());
+                if let Some(error) = failure {
+                    return Err(error);
                 }
                 Ok(JudgeReply {
                     text: self.reply.clone(),
@@ -3254,27 +3432,52 @@ mod tests {
         }
     }
 
+    /// Pacer mit Scheinuhr: die Zeit ist die Summe der Pausen.
     #[derive(Default)]
     struct FakePacer {
         pauses: Mutex<Vec<Duration>>,
+        /// Gesetzt: das Laufende nach so viel Scheinzeit; jede Pause wird wie
+        /// bei `CancellablePacer` daran gekappt.
+        deadline: Option<Duration>,
     }
 
     impl FakePacer {
+        fn with_deadline(deadline: Duration) -> Self {
+            Self {
+                pauses: Mutex::new(Vec::new()),
+                deadline: Some(deadline),
+            }
+        }
+
         fn pauses(&self) -> Vec<Duration> {
             self.pauses
                 .lock()
                 .map(|pauses| pauses.clone())
                 .unwrap_or_default()
         }
+
+        fn elapsed(&self) -> Duration {
+            self.pauses()
+                .iter()
+                .fold(Duration::ZERO, |sum, wait| sum.saturating_add(*wait))
+        }
     }
 
     impl Pacer for FakePacer {
         fn pause<'a>(&'a self, wait: Duration) -> BoxFuture<'a, ()> {
             Box::pin(async move {
+                let wait = match self.deadline {
+                    Some(deadline) => wait.min(deadline.saturating_sub(self.elapsed())),
+                    None => wait,
+                };
                 if let Ok(mut pauses) = self.pauses.lock() {
                     pauses.push(wait);
                 }
             })
+        }
+
+        fn deadline_passed(&self) -> bool {
+            self.deadline.is_some_and(|deadline| self.elapsed() >= deadline)
         }
     }
 
@@ -3875,14 +4078,14 @@ mod tests {
         Ok(())
     }
 
-    /// Meldet immer eine Wartezeit; bildet nach, dass `Pacer::pause` (etwa
-    /// nach einem Abbruch) ohne echten Zeitablauf vorzeitig endet und der
-    /// Provider deshalb nie „aufgefüllt" erscheint.
-    struct AlwaysWaitingPacing;
+    /// Meldet immer dieselbe Wartezeit; bildet nach, dass `Pacer::pause`
+    /// (etwa nach einem Abbruch) ohne echten Zeitablauf vorzeitig endet und
+    /// der Provider deshalb nie „aufgefüllt" erscheint.
+    struct AlwaysWaitingPacing(Duration);
 
     impl ProviderPacing for AlwaysWaitingPacing {
         fn pacing_wait(&self) -> Option<Duration> {
-            Some(Duration::from_millis(1))
+            Some(self.0)
         }
     }
 
@@ -3900,7 +4103,7 @@ mod tests {
         let mut memory = memory_for(&input, None);
         let spawner = FakeSpawner::with_replies(vec![done_reply("fertig")]);
         let pacer = FakePacer::default();
-        let pacing = AlwaysWaitingPacing;
+        let pacing = AlwaysWaitingPacing(Duration::from_millis(1));
         let guard = FakeGuard::default();
         let judge = FakeJudge::replying("{}");
         let goals = FakeGoals::new(goal(Vec::new()));
@@ -3918,6 +4121,66 @@ mod tests {
         assert_eq!(end, None);
         assert_eq!(pacer.pauses().len(), MAX_PACING_POLLS as usize);
         assert_eq!(spawner.calls()?.len(), 1, "dispatches despite the cap");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pacing_stops_at_the_run_deadline_and_starts_no_worker() -> TestResult {
+        // Der Provider meldet ein volles Stundenfenster, die Wandzeit des
+        // Laufs endet aber in 10 s: eine Pause bis zum Laufende, danach
+        // startet kein Worker mehr (er scheiterte sofort an der Frist).
+        let mut state = new_state(&work_id(), Timestamp::now());
+        state.workers.push(worker_state("w0", Vec::new()));
+        let requests = vec![worker_request("w0", Vec::new())];
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        let spawner = FakeSpawner::default();
+        let pacer = FakePacer::with_deadline(Duration::from_secs(10));
+        let pacing = AlwaysWaitingPacing(Duration::from_secs(3_600));
+        let guard = FakeGuard::default();
+        let judge = FakeJudge::replying("{}");
+        let goals = FakeGoals::new(goal(Vec::new()));
+        let verifier = FakeVerifier::with_reports(Vec::new());
+        let ports = DrivePorts {
+            goals: &goals,
+            workers: &spawner,
+            verifier: &verifier,
+            judge: &judge,
+            scope_guard: &guard,
+            pacer: &pacer,
+            pacing: &pacing,
+        };
+        let end = execute_wave(&mut state, &mut memory, &ports, requests).await;
+        let reason = match end {
+            Some(RoundEnd::Finish(JobOutcome::Failed { reason })) => reason,
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a wall-clock failure, got {other:?}"
+                )));
+            }
+        };
+        assert!(reason.contains("wall-clock budget"), "{reason}");
+        assert_eq!(pacer.pauses(), vec![Duration::from_secs(10)]);
+        assert!(spawner.calls()?.is_empty(), "no worker starts after the deadline");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancellable_pacer_ends_a_long_pause_at_the_run_deadline() -> TestResult {
+        let deadline = some_or(
+            tokio::time::Instant::now().checked_add(Duration::from_millis(50)),
+            "deadline",
+        )?;
+        let pacer = CancellablePacer {
+            control: WorkerExecutionControl::new(),
+            deadline,
+        };
+        // Ohne Deckel schliefe die Pause eine Stunde; der äußere Timeout lässt
+        // den Test scheitern statt hängen.
+        tokio::time::timeout(Duration::from_secs(30), pacer.pause(Duration::from_secs(3_600)))
+            .await
+            .map_err(|_| TestError::Unexpected("the pause outlived the run deadline".to_owned()))?;
+        assert!(pacer.deadline_passed());
         Ok(())
     }
 
@@ -4234,6 +4497,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_judge_rate_limits_repeat_the_round_with_growing_backoff() -> TestResult {
+        let harness = harness()?;
+        let mut fakes = Fakes::new(goal(vec![manual_criterion("Doku erklärt BOM-Verhalten")]));
+        let limited = || JudgeError::RateLimited {
+            retry_after_secs: 0,
+        };
+        fakes.judge = FakeJudge::failing_first(
+            vec![limited(), limited(), limited()],
+            r#"{"passed": false, "comment": "Doku fehlt"}"#,
+        );
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        // Runde 1: Welle; Runde 2: zentrale Verifikation.
+        step(&harness, &input, &fakes.ports(), &mut memory, 2).await;
+        let before = state_of(&harness)?.iteration;
+
+        // Drei 429 des Bewerters: je dieselbe Runde erneut, kein Rundenverbrauch.
+        step(&harness, &input, &fakes.ports(), &mut memory, 3).await;
+        let state = state_of(&harness)?;
+        assert_eq!(state.iteration, before, "a judge 429 is not a round");
+        assert_eq!(state.rate_limited, 3);
+        assert_eq!(
+            fakes.pacer.pauses(),
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20)
+            ]
+        );
+
+        // Die vierte Frage wird beantwortet: erst jetzt zählt die Runde.
+        step(&harness, &input, &fakes.ports(), &mut memory, 1).await;
+        let state = state_of(&harness)?;
+        assert_eq!(state.iteration, before.saturating_add(1));
+        assert_eq!(fakes.judge.requests()?.len(), 4);
+        assert_eq!(state.last_judge.map(|verdict| verdict.passed), Some(false));
+        assert_eq!(memory.judge_rate_limits, 0, "an answer resets the backoff");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_wave_that_only_hit_rate_limits_repeats_the_round() -> TestResult {
+        let mut state = new_state(&work_id(), Timestamp::now());
+        state.workers.push(worker_state("w0", Vec::new()));
+        let requests = vec![worker_request("w0", Vec::new())];
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        // Erster Versuch plus `MAX_RATE_LIMIT_RETRIES` Wiederholungen, alle 429.
+        let spawner = FakeSpawner::with_replies(
+            (0..=MAX_RATE_LIMIT_RETRIES)
+                .map(|_| WorkerReply::RateLimited {
+                    retry_after_secs: 0,
+                })
+                .collect(),
+        );
+        let pacer = FakePacer::default();
+        let pacing = FakePacing::default();
+        let guard = FakeGuard::default();
+        let judge = FakeJudge::replying("{}");
+        let goals = FakeGoals::new(goal(Vec::new()));
+        let verifier = FakeVerifier::with_reports(Vec::new());
+        let ports = DrivePorts {
+            goals: &goals,
+            workers: &spawner,
+            verifier: &verifier,
+            judge: &judge,
+            scope_guard: &guard,
+            pacer: &pacer,
+            pacing: &pacing,
+        };
+        let end = execute_wave(&mut state, &mut memory, &ports, requests).await;
+        assert_eq!(end, Some(RoundEnd::Repeat), "no work, no round used");
+        assert_eq!(spawner.calls()?.len(), 5);
+        // Backoff auch nach dem letzten Versuch, bevor die Runde erneut läuft.
+        assert_eq!(
+            pacer.pauses(),
+            [5, 10, 20, 40, 80]
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect::<Vec<_>>()
+        );
+        assert!(memory.rate_limit_pending.contains("w0"));
+        assert_eq!(state.rate_limited, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_busy_verification_repeats_the_round_without_counting_it() -> TestResult {
         let harness = harness()?;
         let mut fakes = Fakes::new(goal(vec![command_criterion("a", "cargo test a")]));
@@ -4523,6 +4873,78 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_a_goal_that_turned_terminal_ends_the_run() -> TestResult {
+        for status in [
+            GoalStatus::Achieved,
+            GoalStatus::Abandoned,
+            GoalStatus::Superseded,
+        ] {
+            let harness = harness()?;
+            let mut terminal = goal(vec![command_criterion("a", "cargo test a")]);
+            terminal.status = status;
+            let fakes = Fakes::new(terminal);
+            let input = input(10);
+            let mut memory = memory_for(&input, None);
+            // Ohne Rundenbegrenzung: `decide` plant für ein terminales Goal
+            // nichts, der Lauf muss trotzdem enden.
+            let outcome = outcome_of(
+                run_rounds(
+                    &harness.store,
+                    &work_id(),
+                    &input,
+                    &fakes.ports(),
+                    &mut memory,
+                    None,
+                    &not_cancelled,
+                )
+                .await,
+            )?;
+            let JobOutcome::Cancelled { reason } = outcome else {
+                return Err(TestError::Unexpected(format!(
+                    "expected cancelled for {status:?}, got {outcome:?}"
+                )));
+            };
+            assert!(reason.contains(&format!("{status:?}")), "{reason}");
+            assert!(fakes.spawner.calls()?.is_empty());
+            assert_eq!(state_of(&harness)?.iteration, 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_empty_decision_finishes_instead_of_spinning() -> TestResult {
+        let fakes = Fakes::new(goal(vec![command_criterion("a", "cargo test a")]));
+        let input = input(10);
+        let mut memory = memory_for(&input, None);
+        let mut state = new_state(&work_id(), Timestamp::now());
+        // Ein Worker ohne Ergebnis deckt das einzige Kriterium ab: `decide`
+        // wartet auf ihn und plant nichts — im Job läuft er aber nie weiter.
+        let mut waiting = worker_state("wd-run-w0", Vec::new());
+        waiting.scope.criteria = vec![0];
+        state.workers.push(waiting);
+        let end = drive_round(
+            &input,
+            &mut state,
+            &mut memory,
+            &fakes.ports(),
+            Timestamp::now(),
+        )
+        .await;
+        let reason = match end {
+            RoundEnd::Finish(JobOutcome::Failed { reason }) => reason,
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a failure, got {other:?}"
+                )));
+            }
+        };
+        assert!(reason.contains("nothing to do"), "{reason}");
+        assert!(fakes.spawner.calls()?.is_empty());
+        assert_eq!(state.iteration, 0);
+        Ok(())
+    }
+
     #[test]
     fn test_attribute_changes_maps_paths_to_owners_and_reports_the_rest() {
         let diff = UnifiedDiff {
@@ -4667,6 +5089,42 @@ mod tests {
     }
 
     #[test]
+    fn test_attach_evidence_refuses_a_goal_that_replaced_the_run_goal() -> TestResult {
+        let store = Arc::new(InMemoryGoalStore::new());
+        let cmd = "cargo test -p parser";
+        store
+            .apply(
+                GoalAction::Set {
+                    goal: goal(vec![command_criterion("a", cmd)]),
+                },
+                "human:alice",
+            )
+            .map_err(ctx("set goal"))?;
+        let access = StoreGoalAccess::for_input(
+            Arc::clone(&store) as Arc<dyn GoalStore>,
+            None,
+            &input_for_tenant(None),
+        );
+        // Während die Verifikation läuft, ersetzt ein `Set` das Goal des
+        // Laufs durch eines mit demselben `Command`-Kriterium.
+        let mut replacement = goal(vec![command_criterion("a", cmd)]);
+        replacement.id = GoalId::new("g-other");
+        store
+            .apply(GoalAction::Set { goal: replacement }, "human:alice")
+            .map_err(ctx("replace goal"))?;
+        let Err(error) = access.attach_evidence("g-utf8", &[evidence(cmd)]) else {
+            return Err(TestError::Unexpected(
+                "evidence of the run goal landed on its replacement".to_owned(),
+            ));
+        };
+        assert!(error.contains("g-utf8"), "{error}");
+        let current = store.current().map_err(ctx("current goal"))?;
+        assert_eq!(current.id.as_str(), "g-other");
+        assert!(current.evidence.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_parse_verdict_is_tolerant_and_fails_closed() {
         let passed = parse_verdict(r#"{"passed": true, "comment": "belegt"}"#);
         assert!(passed.passed);
@@ -4684,9 +5142,10 @@ mod tests {
             parse_verdict("Hier mein Urteil: {\"verified\": true, \"comment\": \"ok {x}\"} Ende.");
         assert!(prose.passed);
         assert_eq!(prose.comment, "ok {x}");
-        let first_bool_wins =
+        let skips_non_verdicts =
             parse_verdict(r#"{"note": "x"} und dann {"passed": false, "comment": "c"}"#);
-        assert!(!first_bool_wins.passed);
+        assert!(!skips_non_verdicts.passed);
+        assert_eq!(skips_non_verdicts.comment, "c");
         // Kein JSON-Objekt: fail closed, auch wenn das bloße Wort "PASSED"
         // vorkommt (kein Klartext-Marker-Scan mehr).
         assert!(!parse_verdict("Ergebnis: PASSED").passed);
@@ -4699,6 +5158,24 @@ mod tests {
         let nothing = parse_verdict("Ich kann das nicht beurteilen.");
         assert!(!nothing.passed);
         assert_eq!(nothing.comment, "Ich kann das nicht beurteilen.");
+    }
+
+    #[test]
+    fn test_parse_verdict_fails_closed_on_an_ambiguous_verdict() {
+        // Laut denkender Bewerter: erst bestanden, dann doch nicht.
+        let thinking = r#"Vorläufig {"passed": true} — nein, doch {"passed": false, "missing": ["BOM-Test"]}"#;
+        let second_thoughts = parse_verdict(thinking);
+        assert!(!second_thoughts.passed);
+        assert_eq!(second_thoughts.comment, thinking);
+        assert_eq!(second_thoughts.missing, vec!["BOM-Test".to_owned()]);
+        // Widersprüchliche Schlüssel in einem Objekt.
+        assert!(!parse_verdict(r#"{"passed": true, "met": false}"#).passed);
+        // Ein Nicht-Bool ist kein „bestanden".
+        assert!(!parse_verdict(r#"{"passed": true, "verified": "yes"}"#).passed);
+        // Übereinstimmende Objekte bleiben eindeutig: das erste gilt.
+        let agreeing = parse_verdict(r#"{"passed": true, "comment": "a"} {"met": true}"#);
+        assert!(agreeing.passed);
+        assert_eq!(agreeing.comment, "a");
     }
 
     #[test]
@@ -4817,6 +5294,87 @@ mod tests {
         assert_eq!(limits.token_budget, 5_000);
         assert_eq!(limits.wall_budget.whole_seconds(), 90);
         assert_eq!(limits.max_parallel_workers, 4);
+    }
+
+    /// Antwortet einmal mit dem hinterlegten Fehler (danach `EmptyResponse`).
+    struct FailingProvider(Mutex<Option<harw_core::ModelError>>);
+
+    impl ModelProvider for FailingProvider {
+        fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+            let error = self
+                .0
+                .lock()
+                .ok()
+                .and_then(|mut error| error.take())
+                .unwrap_or(harw_core::ModelError::EmptyResponse);
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    fn empty_model_request() -> harw_core::ModelRequest {
+        harw_core::ModelRequest::new(
+            harw_extension_api::LoadedInstructions {
+                system_prompt: String::new(),
+                fragments: Vec::new(),
+            },
+            Vec::new(),
+            harw_core::ConversationHistory::new(),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_meter_counts_both_forms_of_http_429_as_a_rate_limit() -> TestResult {
+        let cases = vec![
+            // OpenAI-kompatibler Pfad: 429 als `Transient`, auch ohne Hinweis.
+            (
+                harw_core::ModelError::Transient {
+                    status: Some(429),
+                    retry_after_secs: None,
+                    message: "too many requests".to_owned(),
+                },
+                Some(0),
+            ),
+            (
+                harw_core::ModelError::Transient {
+                    status: Some(429),
+                    retry_after_secs: Some(12),
+                    message: "too many requests".to_owned(),
+                },
+                Some(12),
+            ),
+            (
+                harw_core::ModelError::RateLimited {
+                    retry_after_secs: 7,
+                    message: "slow down".to_owned(),
+                },
+                Some(7),
+            ),
+            // Kein Warte-Signal: bleibt ein Fehlschlag.
+            (
+                harw_core::ModelError::QuotaExceeded {
+                    message: "quota exhausted".to_owned(),
+                },
+                None,
+            ),
+            (
+                harw_core::ModelError::Transient {
+                    status: Some(503),
+                    retry_after_secs: None,
+                    message: "unavailable".to_owned(),
+                },
+                None,
+            ),
+        ];
+        for (error, expected) in cases {
+            let label = error.to_string();
+            let inner: Arc<dyn ModelProvider> = Arc::new(FailingProvider(Mutex::new(Some(error))));
+            let (metered, meter) = MeteredModelProvider::new(inner);
+            let result = metered.respond(empty_model_request()).await;
+            assert!(result.is_err(), "{label}");
+            assert_eq!(meter_snapshot(&meter).rate_limited, expected, "{label}");
+        }
+        Ok(())
     }
 
     #[tokio::test]

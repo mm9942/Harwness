@@ -10,13 +10,19 @@
 //! Mit dieser Fassade kennt er einen Namen (`harw-lens`) und zwei
 //! Funktionen: [`build`] und [`ask`].
 //!
-//! `harw-lens-federation` ist zum Zeitpunkt dieses Knotens noch Gerüst
-//! (Inhalt entsteht erst in Knoten AW6-07, nach diesem Knoten) und taucht
-//! deshalb in der Fassadenfläche unten nicht auf: es gibt noch keinen
-//! gelandeten Namen, den diese Crate auswählen oder verschweigen könnte.
-//! Sobald AW6-07 landet, ist zu prüfen, ob ein föderiertes Abfragen über
-//! mehrere Indizes eine dritte Fassadenfunktion (etwa `ask_federated`)
-//! rechtfertigt — das ist bewusst nicht Teil dieses Knotens.
+//! `harw-lens-federation` ist seit Knoten AW6-07 gelandet und implementiert
+//! föderierte Abfragen über mehrere Indizes; sie verschmilzt die Treffer
+//! dabei über `harw_lens_rank::rrf_fuse` (siehe deren `//!`-Block). Sie
+//! taucht in der Fassadenfläche unten trotzdem nicht auf: diese Crate führt
+//! `harw-lens-federation` nicht als Abhängigkeit (siehe `Cargo.toml`), und
+//! `harw-tool-lens` (Knoten AW6-10) ruft
+//! `harw_lens_federation::federated_query` bereits direkt auf, ohne über
+//! diese Fassade zu gehen (siehe dessen `//!`-Block, Abschnitt „Wie
+//! übersprungene Indizes sichtbar bleiben"). Ob eine dritte
+//! Fassadenfunktion (etwa `ask_federated`) das rechtfertigen würde, bleibt
+//! deshalb offen: sie bräuchte eine neue Abhängigkeit in `Cargo.toml`, nicht
+//! nur einen weiteren Re-Export in dieser Datei, und ist damit kein Teil
+//! dieses reinen Dokumentationsknotens.
 //!
 //! # Das Auswahlkriterium
 //! **Eine Fassade wählt aus, sie reicht nicht alles weiter.** Das Kriterium
@@ -96,25 +102,33 @@
 //!
 //! ## `harw-lens-rank` — vier reine Funktionen
 //! - **Nein**, alle vier (`rrf_fuse`, `mmr`, `collapse`, `pack`):
-//!   `collapse` ruft [`ask`] bereits intern auf (über
-//!   `harw_lens_query::query`); ein zusätzlicher Export erlaubte einem
-//!   Aufrufer, bereits entdoppelte Treffer ein zweites Mal zu entdoppeln
-//!   oder die Abfrage-Pipeline von Hand nachzubauen. `rrf_fuse`/`mmr` sind
-//!   an dieser Ausbaustufe in keiner Lens-Pipeline verdrahtet (keine
-//!   Mehrfach-Retriever-Fusion, keine Diversitäts-Nachsortierung) — sie
-//!   jetzt freizugeben wäre, Fähigkeit zu zeigen, die diese Fassade noch
-//!   nicht orchestriert. `pack` siehe oben (eingefrorener Lens/Kontext-
-//!   Vertrag, direkt von `harw-context` genutzt).
+//!   [`ask`] ruft `collapse` bereits intern auf (über
+//!   `harw_lens_query::query_scoped`, das seinerseits `query` aufruft); ein
+//!   zusätzlicher Export erlaubte einem Aufrufer, bereits entdoppelte
+//!   Treffer ein zweites Mal zu entdoppeln oder die Abfrage-Pipeline von
+//!   Hand nachzubauen. `rrf_fuse` ist seit Knoten AW6-07 in
+//!   `harw-lens-federation`s `federated_query`-Pipeline verdrahtet
+//!   (Mehrfach-Retriever-Fusion über mehrere Indizes) — aber eben in jener
+//!   Crate, nicht in dieser Fassade (siehe die Erläuterung zu
+//!   `harw-lens-federation` weiter oben); ein separater Export hier gäbe
+//!   denselben Namen ein zweites Mal frei, ohne die Fusionslogik von
+//!   `harw-lens-federation` mitzubringen. `mmr` bleibt an dieser
+//!   Ausbaustufe weiterhin in keiner Lens-Pipeline verdrahtet (keine
+//!   Diversitäts-Nachsortierung) — es jetzt freizugeben wäre, Fähigkeit zu
+//!   zeigen, die keine Pipeline dieses Workspaces nutzt. `pack` siehe oben
+//!   (eingefrorener Lens/Kontext-Vertrag, direkt von `harw-context`
+//!   genutzt).
 //!
 //! ## `harw-lens-chunk` — drei Zerlegungsstrategien
 //! - **Nein**, alle (`chunk_markdown`, `chunk_rust`, `chunk_plain`,
 //!   `suggest_relations`, `DEFAULT_TARGET_BYTES`, `DEFAULT_OVERLAP_BYTES`):
 //!   [`build`] nimmt bereits vollständigen, noch nicht zerlegten Text
 //!   entgegen ([`RawDocument::text`]) und zerlegt ihn ausschließlich intern
-//!   (`harw-lens-source` ruft `chunk_markdown` auf, versioniert über
-//!   [`CHUNKER_VERSION`]). Ein Aufrufer, der selbst zerlegen könnte, könnte
-//!   auch doppelt zerlegen oder die inkrementelle Digest-Cache-Zusage von
-//!   `harw-lens-source` unterlaufen.
+//!   (`harw-lens-source` ruft je nach Indexname `chunk_rust` oder
+//!   `chunk_markdown` auf, versioniert über [`CHUNKER_VERSION`]). Ein
+//!   Aufrufer, der selbst zerlegen könnte, könnte auch doppelt zerlegen oder
+//!   die inkrementelle Digest-Cache-Zusage von `harw-lens-source`
+//!   unterlaufen.
 //!
 //! ## `harw-lens-store` — Speichermechanik
 //! - **Nein**, `LensStore` vollständig (auch nicht einzelne Methoden): der

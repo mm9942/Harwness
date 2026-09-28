@@ -26,6 +26,11 @@
 //! **vollständigen Hülle** nichts enthalten, das Dateien, Netz, Zeit oder
 //! Zufall kann. Die Reinheit ist die Zusage, auf der seine Determinismus-Tests
 //! beruhen; eine transitive Kante auf `jiff` würde sie unbemerkt aufheben.
+//! [`PURE_CRATES`] nutzt dieselbe Hülle wie [`FORBIDDEN_REACH`]: ab der
+//! ersten externen Crate folgt sie `Cargo.lock`, damit auch ein `uuid` mit
+//! `v4`-Feature auffällt, das `getrandom` erst zwei Ecken weiter zieht. Fehlt
+//! die Wurzel-Crate selbst im Graphen (umbenannt, entfernt), ist das ein
+//! Verstoß, kein stilles Überspringen.
 //!
 //! **Keine Krypto- und HTTP-Stapel in Warden, Probes und Sensoren.**
 //! Crypto Masterplan v2 §20/§21: die TCBs von `harw-warden`,
@@ -39,11 +44,13 @@
 //! und nennen **externe** Paketnamen — [`FORBIDDEN`] kennt nur Kanten
 //! zwischen Workspace-Crates. Die Hülle folgt den internen `[dependencies]`
 //! aus dem Graphen und ab der ersten externen Crate den Kanten in
-//! `Cargo.lock` (wie `gate_arch.rs` für `*-sys`); damit fällt auch ein
-//! `hyper` auf, das über `reqwest` drei Ecken weiter hereinkommt.
-//! `Cargo.lock` kennt keine Feature- und Plattformfilter — die Hülle ist
-//! eine Überschätzung, die nichts übersieht. Ein erreichter externer Name
-//! ohne `Cargo.lock`-Eintrag ist ein Verstoß, kein stilles Blatt.
+//! `Cargo.lock`; damit fällt auch ein `hyper` auf, das über `reqwest` drei
+//! Ecken weiter hereinkommt. `Cargo.lock` kennt keine Feature- und
+//! Plattformfilter — ab der ersten externen Crate ist die Hülle eine
+//! Überschätzung. Innerhalb des Workspace sieht der Graph keine
+//! `[target.'cfg(..)'.dependencies]`; dort deklarierte Kanten fehlen der
+//! Hülle (dieselbe Grenze wie in `gate_arch.rs`). Ein erreichter externer
+//! Name ohne `Cargo.lock`-Eintrag ist ein Verstoß, kein stilles Blatt.
 //!
 //! **Die Fassade bleibt krypto-frei.** `harw-dod` darf `harw-dod-encrypt`
 //! weder direkt ([`FORBIDDEN`]) noch transitiv ([`FORBIDDEN_REACH`])
@@ -231,7 +238,9 @@ pub const FORBIDDEN_REACH: &[ForbiddenReach] = &[
 ];
 
 /// Crates, deren **vollständige Hülle** frei von Nebenwirkungen sein muss,
-/// mit der Liste dessen, was dort nicht vorkommen darf.
+/// mit der Liste dessen, was dort nicht vorkommen darf. Die Hülle wird wie
+/// bei [`FORBIDDEN_REACH`] mit [`hull_with_paths`] gebildet und folgt daher
+/// auch über externe Crates hinweg `Cargo.lock`.
 pub const PURE_CRATES: &[(&str, &[&str])] = &[(
     "harw-lens-rank",
     &[
@@ -322,17 +331,31 @@ pub fn evaluate_with_lock(graph: &WorkspaceGraph, lock: Option<&LockIndex>) -> G
 
     for (pure, forbidden_names) in PURE_CRATES {
         let Some(root) = by_name.get(pure) else {
+            // Eine umbenannte oder entfernte Wurzel-Crate ist kein Grund,
+            // die Regel klanglos zu überspringen — genau dann ist nicht
+            // geprüft, was die Regel behauptet zu prüfen.
+            violations.push(format!(
+                "{pure} fehlt im Workspace-Graphen — die Reinheits-Hülle (L7) kann nicht \
+                 geprüft werden"
+            ));
             continue;
         };
-        let hull = transitive_hull(root, &by_name);
-        checked += hull.len();
-        for name in &hull {
-            if forbidden_names.contains(&name.as_str()) {
+        let hull = hull_with_paths(root, &by_name, lock);
+        checked += hull.paths.len();
+        for name in *forbidden_names {
+            if let Some(path) = hull.paths.get(*name) {
                 violations.push(format!(
-                    "{pure} erreicht '{name}' in seiner Hülle — die Crate muss frei von \
-                     I/O, Zeit und Zufall bleiben (L7)"
+                    "{pure} erreicht '{name}' über {} — die Crate muss frei von I/O, Zeit \
+                     und Zufall bleiben (L7)",
+                    path.join(" → ")
                 ));
             }
+        }
+        for missing in &hull.unresolved {
+            violations.push(format!(
+                "{pure}: '{missing}' hat keinen Eintrag in Cargo.lock — die Reinheits-Hülle \
+                 wäre unvollständig (L7)"
+            ));
         }
     }
 
@@ -427,42 +450,6 @@ fn hull_with_paths(
     }
 
     hull
-}
-
-/// Alle Namen, die `root` über normale Abhängigkeiten erreicht.
-///
-/// # Description
-/// Schließt sowohl interne (`deps`) als auch externe (`external_deps`)
-/// Abhängigkeiten ein — die Reinheitsprüfung interessiert sich gerade für die
-/// externen. Zyklen können in einem Cargo-Workspace nicht auftreten; der
-/// `HashSet` schützt trotzdem gegen eine Endlosschleife, falls der Graph
-/// jemals anders geladen wird.
-///
-/// # Returns
-/// Die erreichten Namen ohne `root` selbst, in stabiler Ordnung.
-#[must_use]
-fn transitive_hull(root: &CrateNode, by_name: &HashMap<&str, &CrateNode>) -> BTreeSet<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out = BTreeSet::new();
-    let mut stack: Vec<String> = root
-        .deps
-        .iter()
-        .chain(root.external_deps.iter())
-        .cloned()
-        .collect();
-
-    while let Some(name) = stack.pop() {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        out.insert(name.clone());
-        if let Some(node) = by_name.get(name.as_str()) {
-            stack.extend(node.deps.iter().cloned());
-            stack.extend(node.external_deps.iter().cloned());
-        }
-    }
-
-    out
 }
 
 #[cfg(test)]
@@ -582,6 +569,60 @@ mod tests {
         ]);
 
         assert!(evaluate(&g).is_green());
+    }
+
+    #[test]
+    fn test_evaluate_missing_pure_crate_root_is_a_violation() {
+        // Eine umbenannte oder entfernte `harw-lens-rank`: kein stilles
+        // Überspringen (vormals `continue`), sondern ein benannter Verstoß.
+        let g = graph(vec![node("harw-unrelated", &[], &[])]);
+
+        let report = evaluate(&g);
+
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-lens-rank fehlt im Workspace-Graphen")),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_pure_crate_reaching_getrandom_through_lockfile_is_a_violation() -> TestResult
+    {
+        // `transitive_hull` folgte Cargo.lock nicht und hätte diese Kante
+        // nicht gesehen: lens-rank → ext-a → getrandom, wobei `ext-a` selbst
+        // kein Workspace-Crate ist.
+        let g = graph(vec![node("harw-lens-rank", &[], &["ext-a"])]);
+
+        // Ohne Lockfile endet die Hülle an `ext-a` — genau die Lücke aus dem
+        // Befund.
+        assert!(evaluate(&g).is_green());
+
+        let lock_text = r#"
+version = 4
+
+[[package]]
+name = "ext-a"
+version = "1.0.0"
+dependencies = ["getrandom"]
+
+[[package]]
+name = "getrandom"
+version = "0.2.0"
+"#;
+        let report = evaluate_with_lock(&g, Some(&lock(lock_text)?));
+
+        assert!(
+            report.violations.iter().any(|v| v.contains(
+                "harw-lens-rank erreicht 'getrandom' über harw-lens-rank → ext-a → getrandom"
+            )),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
     }
 
     #[test]
@@ -791,6 +832,26 @@ version = "1.0.0"
             report.checked, 1,
             "die Hüllenregel muss ihre Einträge zählen, sonst ist 'grün' von \
              'nichts geprüft' nicht zu unterscheiden"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_pure_crate_unresolved_external_in_lockfile_is_a_violation() -> TestResult {
+        // `ext-a` hat keinen Eintrag in `LOCK_WITH_REQWEST` — die Hülle wäre
+        // an dieser Stelle unvollständig, also ein benannter Verstoß statt
+        // eines stillen Endes.
+        let g = graph(vec![node("harw-lens-rank", &[], &["ext-a"])]);
+
+        let report = evaluate_with_lock(&g, Some(&lock(LOCK_WITH_REQWEST)?));
+
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-lens-rank: 'ext-a' hat keinen Eintrag in Cargo.lock")),
+            "{:?}",
+            report.violations
         );
         Ok(())
     }

@@ -74,13 +74,13 @@
 //! `Send + Sync`) und ausschließlich `&'static str`-Felder ohne inneren Zustand.
 //!
 //! # Fehlertypen
-//! - [`crate::error::OpError::InvalidArguments`]: Argumente sind kein JSON-Objekt,
-//!   tragen ein Effort-Feld (`effort`/`reasoning_effort`), oder ein Budget-Label
-//!   ist syntaktisch ungültig.
-//! - [`crate::error::OpError::NotAvailable`]: Kein `ManagedAgentSpawner`/`StateStore`
-//!   im Kontext registriert, die Deklaration trägt ein unlesbares `budget_hint`,
-//!   der Spawn/Lauf/Effort-Clamp schlug fehl, oder das Kind pausierte ohne
-//!   Pause-Erlaubnis.
+//! - [`harw_operations::error::OpError::InvalidArguments`]: Argumente sind kein
+//!   JSON-Objekt, tragen ein Effort-Feld (`effort`/`reasoning_effort`), oder ein
+//!   Budget-Label ist syntaktisch ungültig.
+//! - [`harw_operations::error::OpError::NotAvailable`]: Kein
+//!   `ManagedAgentSpawner`/`StateStore` im Kontext registriert, die Deklaration
+//!   trägt ein unlesbares `budget_hint`, der Spawn/Lauf/Effort-Clamp schlug fehl,
+//!   oder das Kind pausierte ohne Pause-Erlaubnis.
 //!
 //! # Spec-Quelle
 //! `docs/design/agents-as-tools.md`, `agent-definition-dsl.md` §13,
@@ -213,9 +213,9 @@ impl AgentToolAdapter {
     /// Erstellt einen `AgentToolAdapter`, falls die Operation eine `Surface::AgentTool`-Fläche deklariert.
     ///
     /// # Beschreibung
-    /// Durchsucht [`crate::operation::OperationMeta::surfaces`] nach dem ersten
-    /// `Surface::AgentTool`-Eintrag. Sind defensiv mehrere vorhanden, wird die
-    /// **erste** verwendet — analog zu [`crate::adapter::ModelToolAdapter`].
+    /// Durchsucht [`harw_operations::operation::OperationMeta::surfaces`] nach dem
+    /// ersten `Surface::AgentTool`-Eintrag. Sind defensiv mehrere vorhanden, wird die
+    /// **erste** verwendet — analog zu [`harw_operations::adapter::ModelToolAdapter`].
     ///
     /// # Argumente
     /// - `op` (`Arc<dyn Operation>`): Die zu adapterisierende Operation. Der `Arc`

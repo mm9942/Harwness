@@ -28,11 +28,6 @@ pub enum McpLifecycleEventKind {
         work_id: WorkId,
         revision: u64,
     },
-    JobReconciled {
-        work_id: WorkId,
-        state: JobState,
-        revision: u64,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -323,6 +318,23 @@ mod tests {
             bus.publish("session-a", Timestamp::now(), updated_event(1)),
             Err(McpEventBusError::SessionNotSubscribed)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn event_kind_wire_tags_match_contract() -> TestResult {
+        // Locks the SSE wire contract: renaming or removing a variant here
+        // must be a deliberate, visible change to the serialized `type` tag.
+        let updated = serde_json::to_value(&updated_event(1)).map_err(ctx("serialize update"))?;
+        assert_eq!(updated["type"], "job_updated");
+
+        let cancellation = McpLifecycleEventKind::JobCancellationRequested {
+            work_id: WorkId::new(),
+            revision: 1,
+        };
+        let cancellation =
+            serde_json::to_value(&cancellation).map_err(ctx("serialize cancellation"))?;
+        assert_eq!(cancellation["type"], "job_cancellation_requested");
         Ok(())
     }
 

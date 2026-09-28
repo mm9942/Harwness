@@ -3,10 +3,21 @@
 //! # Overview
 //! Exposes the embedded agent over a small HTTP/JSON API:
 //! - `POST /run` — run a prompt; synchronous by default, or `{"background":
-//!   true}` to get a `run_id` back immediately (`202`).
+//!   true}` to get a `run_id` back immediately (`202`). An optional
+//!   `context` string is prepended to the prompt using the same rule as
+//!   the MCP interface's `tools/call run`. The two interfaces diverge on a
+//!   non-string `context`, though: this one rejects it with `400`, while
+//!   MCP silently drops it (see `tool_run` in `iface::mcp`).
+//!   The turn itself always runs in a detached task, so a synchronous
+//!   caller that disconnects mid-turn never leaves the run stuck
+//!   `"running"`; it still reaches a terminal status.
 //! - `GET /runs/{id}` — status/result of a run.
 //! - `GET /runs/{id}/events` — an SSE stream of the SDK events for a run,
 //!   one JSON object per `data:` line, `event:` set to the event's kind.
+//!   The replay buffer for a late subscriber is capped at
+//!   [`MAX_BUFFERED_EVENTS`]; once a run has dropped older events to stay
+//!   under the cap, a new subscriber's stream opens with a `lagged` marker
+//!   before the buffered replay.
 //! - `POST /runs/{id}/cancel` — cancel a running (or not-yet-finished) run.
 //! - `GET /manifest` — the root IR's permissions, declared interfaces and
 //!   artifact digest.
@@ -32,7 +43,8 @@
 //! [`RunnerContext::harwness`] builds (denied unless the manifest grants
 //! `--full-access`) is used as-is; the outcome shows up in the run's
 //! `status` (`"cancelled"`/`"failed"` when a held-back tool call could not
-//! be approved) exactly as `harwness_sdk::TurnReport` reports it.
+//! be approved, `"truncated"` when the model's output was cut off) exactly
+//! as `harwness_sdk::TurnReport` reports it.
 //!
 //! # HTTP stack
 //! `hyper` 1.x + `hyper-util` + `http-body-util`, the same stack (and the
@@ -92,6 +104,14 @@ const MAX_RUNS: usize = 64;
 /// Backlog of a run's live event broadcast channel; a slow SSE reader sees
 /// `Lagged` and simply keeps going rather than blocking the run.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+/// Upper bound on how many events one run buffers for replay to a new SSE
+/// subscriber. A long or chatty turn (one `text_delta`/`reasoning_delta`
+/// per token) must not grow this buffer without bound, so once a run has
+/// pushed more than this many events, the oldest are dropped; a subscriber
+/// that attaches afterwards gets a `lagged` marker first so it knows the
+/// replay is incomplete. Events already broadcast to a subscriber that was
+/// attached at the time are unaffected — only the replay buffer is capped.
+const MAX_BUFFERED_EVENTS: usize = 2048;
 /// Small grace window after a turn settles to catch any event that was
 /// published but not yet observed by the event pump.
 const EVENT_DRAIN_GRACE: Duration = Duration::from_millis(20);
@@ -283,6 +303,19 @@ struct RunRequest {
     background: bool,
 }
 
+/// Builds the text actually sent to the model: `context`, if present and a
+/// non-empty string, is prepended to `prompt` — the same rule the MCP
+/// interface's `tools/call run` applies
+/// (`HarwnessPromptRunner::run_prompt` in `iface::mcp`) — so the two
+/// interfaces treat the same request the same way instead of one of them
+/// silently dropping `context`.
+fn prompt_with_context(context: Option<&str>, prompt: &str) -> String {
+    match context.filter(|value| !value.is_empty()) {
+        Some(context) => format!("{context}\n\n{prompt}"),
+        None => prompt.to_owned(),
+    }
+}
+
 async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
     let request: RunRequest = match serde_json::from_value(body) {
         Ok(request) => request,
@@ -299,6 +332,17 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
             &json!({"error": "invalid_request", "detail": "prompt must not be empty"}),
         );
     }
+    let context = match &request.context {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "invalid_request", "detail": "context must be a string"}),
+            );
+        }
+    };
+    let prompt = prompt_with_context(context.as_deref(), &request.prompt);
 
     let session = match state.backend.open() {
         Ok(session) => session,
@@ -313,21 +357,23 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .alloc_id();
-    let record = Arc::new(Mutex::new(RunRecord::new(request.context, cancel)));
+    let record = Arc::new(Mutex::new(RunRecord::new(cancel)));
     state
         .runs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(run_id.clone(), Arc::clone(&record));
 
+    // The turn always runs in its own detached task, in both modes. A
+    // synchronous caller only *awaits* `handle`'s `JoinHandle` below; if
+    // that outer future is ever dropped (the client disconnected), the
+    // task keeps running and still reaches a terminal status — dropping a
+    // `JoinHandle` does not abort the task it names.
+    let handle = tokio::spawn(drive_run(Arc::clone(&record), session, prompt));
     if request.background {
-        let background_record = Arc::clone(&record);
-        tokio::spawn(async move {
-            drive_run(background_record, session, request.prompt).await;
-        });
         json_response(StatusCode::ACCEPTED, &json!({"run_id": run_id}))
     } else {
-        drive_run(Arc::clone(&record), session, request.prompt).await;
+        let _ = handle.await;
         let snapshot = record
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -385,12 +431,13 @@ fn handle_events(state: &AppState, id: &str) -> HttpResponse {
     else {
         return json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"}));
     };
-    let (buffered, mut receiver, already_finished) = {
+    let (buffered, dropped, mut receiver, already_finished) = {
         let guard = record
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
-            guard.events.clone(),
+            guard.events.iter().cloned().collect::<Vec<_>>(),
+            guard.dropped_events,
             guard.event_tx.subscribe(),
             guard.status.is_finished(),
         )
@@ -398,6 +445,15 @@ fn handle_events(state: &AppState, id: &str) -> HttpResponse {
 
     let (mut sender, body) = Channel::<Bytes, Infallible>::new(8);
     tokio::spawn(async move {
+        if dropped > 0 {
+            // Older events were evicted from the replay buffer (see
+            // `MAX_BUFFERED_EVENTS`); tell this subscriber before replaying
+            // what is left, rather than silently starting mid-stream.
+            let lagged = json!({"event": "lagged", "skipped": dropped});
+            if sender.send_data(sse_frame(&lagged)).await.is_err() {
+                return;
+            }
+        }
         for envelope in buffered {
             if sender.send_data(sse_frame(&envelope)).await.is_err() {
                 return;
@@ -493,7 +549,7 @@ async fn drive_run(
         }
     }
     let finished = json!({"event": "run.finished", "status": guard.status.as_str()});
-    guard.events.push(finished.clone());
+    guard.push_event(finished.clone());
     let _ = guard.event_tx.send(finished);
 }
 
@@ -501,7 +557,7 @@ fn record_event(record: &Arc<Mutex<RunRecord>>, envelope: Value) {
     let mut guard = record
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.events.push(envelope.clone());
+    guard.push_event(envelope.clone());
     let _ = guard.event_tx.send(envelope);
 }
 
@@ -523,6 +579,11 @@ enum RunStatus {
     Pending,
     Running,
     Completed,
+    /// The model's output was cut off (e.g. at a length limit). Reported
+    /// distinctly from `Completed` — an interrupted turn is not a
+    /// successful one — matching the MCP interface's `"truncated"` and the
+    /// child protocol's decision to treat it as unsuccessful.
+    Truncated,
     Failed,
     Cancelled,
 }
@@ -533,13 +594,17 @@ impl RunStatus {
             Self::Pending => "pending",
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Truncated => "truncated",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
     }
 
     fn is_finished(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Truncated | Self::Failed | Self::Cancelled
+        )
     }
 }
 
@@ -548,30 +613,43 @@ struct RunRecord {
     text: Option<String>,
     usage: Option<Value>,
     error: Option<String>,
-    /// `POST /run`'s optional `context` field, kept for callers that poll a
-    /// run back. `harwness_sdk::Session::send` has no separate "context"
-    /// input today, so it is not fed to the model; stored here so a future
-    /// SDK hook (or a caller reading it back) has it without an API change.
-    #[allow(dead_code)]
-    context: Option<Value>,
-    events: Vec<Value>,
+    /// Replay buffer for a new SSE subscriber, capped at
+    /// [`MAX_BUFFERED_EVENTS`] (oldest first out); see `push_event`.
+    events: VecDeque<Value>,
+    /// How many events have been evicted from `events` to stay under the
+    /// cap. A new SSE subscriber that sees this above zero gets a `lagged`
+    /// marker before the replay (see `handle_events`).
+    dropped_events: u64,
     event_tx: broadcast::Sender<Value>,
     cancel: Arc<dyn Cancellable>,
 }
 
 impl RunRecord {
-    fn new(context: Option<Value>, cancel: Arc<dyn Cancellable>) -> Self {
+    fn new(cancel: Arc<dyn Cancellable>) -> Self {
         let (event_tx, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             status: RunStatus::Pending,
             text: None,
             usage: None,
             error: None,
-            context,
-            events: Vec::new(),
+            events: VecDeque::new(),
+            dropped_events: 0,
             event_tx,
             cancel,
         }
+    }
+
+    /// Appends one event to the replay buffer, dropping the oldest once
+    /// [`MAX_BUFFERED_EVENTS`] is reached so a long or chatty run cannot
+    /// grow this buffer without bound. Events already delivered to a
+    /// subscriber attached at the time are unaffected — only the replay
+    /// buffer for future subscribers shrinks.
+    fn push_event(&mut self, envelope: Value) {
+        if self.events.len() >= MAX_BUFFERED_EVENTS {
+            self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+        self.events.push_back(envelope);
     }
 
     fn snapshot(&self, run_id: &str) -> Value {
@@ -748,7 +826,8 @@ impl AgentBackend for Harwness {
 fn status_from_turn(status: &harwness_sdk::TurnStatus) -> RunStatus {
     use harwness_sdk::TurnStatus;
     match status {
-        TurnStatus::Completed | TurnStatus::Truncated => RunStatus::Completed,
+        TurnStatus::Completed => RunStatus::Completed,
+        TurnStatus::Truncated => RunStatus::Truncated,
         TurnStatus::Cancelled { .. } => RunStatus::Cancelled,
         TurnStatus::Refused { .. } | TurnStatus::Failed { .. } => RunStatus::Failed,
         // `TurnStatus` is `#[non_exhaustive]`; treat anything future as a
@@ -1225,6 +1304,41 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    // ── `context` (prepended like MCP's `tools/call run`) ────────────────
+
+    #[tokio::test]
+    async fn a_string_context_is_prepended_to_the_prompt() -> TestResult {
+        let state = test_state(None);
+        let response = dispatch(
+            &state,
+            &Method::POST,
+            "/run",
+            &HeaderMap::new(),
+            json!({"prompt": "p", "context": "c"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await?;
+        let text = value["text"].as_str().ok_or("text must be a string")?;
+        assert_eq!(text, "echo: c\n\np", "got: {text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_string_context_is_400() -> TestResult {
+        let state = test_state(None);
+        let response = dispatch(
+            &state,
+            &Method::POST,
+            "/run",
+            &HeaderMap::new(),
+            json!({"prompt": "p", "context": 5}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
     // ── Background run + status ──────────────────────────────────────────
 
     #[tokio::test]
@@ -1281,6 +1395,64 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Disconnect safety (synchronous `/run`) ────────────────────────────
+
+    #[tokio::test]
+    async fn a_dropped_synchronous_run_still_reaches_a_terminal_status() -> TestResult {
+        let state = test_state(None);
+
+        // Simulate a client that disconnects mid-turn: the request future
+        // is dropped well before a "block" turn would settle on its own.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(10),
+            handle_run(&state, json!({"prompt": "block"})),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the request future should still have been in flight at 10ms"
+        );
+
+        let run_id = {
+            let guard = state.runs.lock().map_err(|_| "poisoned lock")?;
+            guard
+                .order
+                .front()
+                .cloned()
+                .ok_or("no run was recorded before the request future was dropped")?
+        };
+
+        // Unblock the detached turn instead of waiting out its own
+        // timeout, then give it a moment to observe the cancellation.
+        let cancel = {
+            let guard = state.runs.lock().map_err(|_| "poisoned lock")?;
+            let record = guard.get(&run_id).ok_or("run vanished from the map")?;
+            Arc::clone(&record.lock().map_err(|_| "poisoned lock")?.cancel)
+        };
+        cancel.cancel();
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            {
+                let guard = state.runs.lock().map_err(|_| "poisoned lock")?;
+                let record = guard.get(&run_id).ok_or("run vanished from the map")?;
+                status = record
+                    .lock()
+                    .map_err(|_| "poisoned lock")?
+                    .status
+                    .as_str()
+                    .to_owned();
+            }
+            if status != "pending" && status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_ne!(status, "running", "the run must not stay running forever");
+        assert_ne!(status, "pending");
+        Ok(())
     }
 
     // ── SSE events ───────────────────────────────────────────────────────
@@ -1341,6 +1513,44 @@ mod tests {
         }
         assert!(collected.contains("event: message"), "got: {collected}");
         assert!(collected.contains("run.finished"), "got: {collected}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_buffer_is_capped_and_a_late_subscriber_sees_a_lagged_marker() -> TestResult {
+        let state = test_state(None);
+        let cancel: Arc<dyn Cancellable> = Arc::new(FlagCancel(Arc::new(AtomicBool::new(false))));
+        let record = Arc::new(Mutex::new(RunRecord::new(cancel)));
+        for index in 0..(MAX_BUFFERED_EVENTS + 100) {
+            record_event(&record, json!({"event": "text_delta", "text": index}));
+        }
+        {
+            let mut guard = record.lock().map_err(|_| "poisoned lock")?;
+            guard.status = RunStatus::Completed;
+            assert!(
+                guard.events.len() <= MAX_BUFFERED_EVENTS,
+                "buffer grew to {}",
+                guard.events.len()
+            );
+            assert_eq!(guard.dropped_events, 100);
+        }
+        state
+            .runs
+            .lock()
+            .map_err(|_| "poisoned lock")?
+            .insert("run-cap-test".to_owned(), record);
+
+        let events_response = handle_events(&state, "run-cap-test");
+        let mut body = events_response.into_body();
+        let frame = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .map_err(|_| "timed out waiting for the first SSE frame")?
+            .ok_or("stream ended before any frame was sent")?
+            .map_err(|_| "frame carried an error")?;
+        let data = frame.data_ref().ok_or("frame carried no data")?;
+        let text = String::from_utf8_lossy(data);
+        assert!(text.starts_with("event: lagged"), "got: {text}");
+        assert!(text.contains("\"skipped\":100"), "got: {text}");
         Ok(())
     }
 
@@ -1406,10 +1616,9 @@ mod tests {
     fn run_cap_evicts_oldest_finished_runs_first() -> TestResult {
         let mut runs = Runs::default();
         for index in 0..(MAX_RUNS + 10) {
-            let record = Arc::new(Mutex::new(RunRecord::new(
-                None,
-                Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
-            )));
+            let record = Arc::new(Mutex::new(RunRecord::new(Arc::new(FlagCancel(Arc::new(
+                AtomicBool::new(false),
+            ))))));
             record.lock().map_err(|_| "poisoned lock")?.status = RunStatus::Completed;
             runs.insert(format!("run-{index}"), record);
         }
@@ -1422,20 +1631,30 @@ mod tests {
         let mut runs = Runs::default();
         // One run that never finishes, then enough finished runs to push
         // well past the cap.
-        let in_flight = Arc::new(Mutex::new(RunRecord::new(
-            None,
-            Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
-        )));
+        let in_flight = Arc::new(Mutex::new(RunRecord::new(Arc::new(FlagCancel(Arc::new(
+            AtomicBool::new(false),
+        ))))));
         runs.insert("in-flight".to_owned(), in_flight);
         for index in 0..(MAX_RUNS + 10) {
-            let record = Arc::new(Mutex::new(RunRecord::new(
-                None,
-                Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
-            )));
+            let record = Arc::new(Mutex::new(RunRecord::new(Arc::new(FlagCancel(Arc::new(
+                AtomicBool::new(false),
+            ))))));
             record.lock().map_err(|_| "poisoned lock")?.status = RunStatus::Completed;
             runs.insert(format!("run-{index}"), record);
         }
         assert!(runs.map.contains_key("in-flight"));
+        Ok(())
+    }
+
+    // ── Turn status mapping ──────────────────────────────────────────────
+
+    #[test]
+    fn a_truncated_turn_is_not_reported_as_completed() -> TestResult {
+        let status = status_from_turn(&harwness_sdk::TurnStatus::Truncated);
+        assert_ne!(status, RunStatus::Completed);
+        assert_eq!(status, RunStatus::Truncated);
+        assert!(status.is_finished());
+        assert_eq!(status.as_str(), "truncated");
         Ok(())
     }
 }

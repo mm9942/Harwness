@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn fail_chit_rerolls_exactly_once() {
+    fn fail_chit_rerolls_exactly_once() -> TestResult {
         // Suche einen Seed mit Misserfolg im ersten Wurf.
         for i in 0..500u64 {
             let m = master(1_000 + i);
@@ -748,9 +748,9 @@ mod tests {
             assert!(with.used_fail_chit);
             assert_eq!(with.rolls.get(1).map(|r| r.attempt), Some(1));
             assert_eq!(with.success, with.rolls.get(1).is_some_and(|r| r.success));
-            return;
+            return Ok(());
         }
-        panic!("kein Misserfolg in 500 Seeds gefunden");
+        Err("kein Misserfolg in 500 Seeds gefunden".into())
     }
 
     #[test]

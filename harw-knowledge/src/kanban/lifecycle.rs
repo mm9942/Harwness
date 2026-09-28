@@ -329,12 +329,25 @@ pub fn block(
 
 /// `Blocked -> Ready` (§6.3 unblock).
 ///
+/// # Beschreibung
+/// `Blocked { AwaitingApproval }` ist ausgenommen: dieser Übergang hätte
+/// dieselbe Wirkung wie [`approve`], aber ohne Freigeber-Identität und ohne
+/// Freigabe-Marker im Ledger ([`JobTransitions::approve`] fällt sonst
+/// stillschweigend auf [`JobTransitions::unblock`] zurück). Diese Prüfung
+/// ergänzt, nicht ersetzt, die Sperre in `harw-ops` (`kanban.rs`), die den
+/// Aufruf schon davor abfängt — `unblock` bleibt hier die zweite,
+/// crate-interne Grenze für Aufrufer ohne `harw-ops`.
+///
 /// # Errors
-/// [`KnowledgeError::IllegalTransition`] unless `card.state` is `Blocked { .. }`;
+/// [`KnowledgeError::IllegalTransition`] unless `card.state` is
+/// `Blocked { .. }` and not `AwaitingApproval` (use [`approve`] for that);
 /// Fehler aus [`JobTransitions::unblock`].
 pub fn unblock(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Blocked { .. }) {
         return Err(illegal_transition(card, "ready"));
+    }
+    if awaits_approval(card) {
+        return Err(illegal_transition(card, "ready (use approve)"));
     }
     jobs.unblock(&bound_work_id(card)?)?;
     refresh(jobs, card)
@@ -793,6 +806,33 @@ mod tests {
             ));
         };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
+    }
+
+    /// unblock darf eine auf Freigabe wartende Karte nicht befreien — das ist
+    /// allein Sache von `approve` (Audit-Identität, Freigabe-Marker).
+    #[test]
+    fn test_unblock_refuses_a_card_awaiting_approval() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Blocked)?;
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
+        let mut waiting = JobSnapshot::new(JobState::Blocked);
+        waiting.block_reason = Some(BlockKind::AwaitingApproval);
+        jobs.insert(work_id.clone(), waiting);
+        let mut card = card.record().view_with(&jobs)?;
+        assert!(awaits_approval(&card));
+
+        let Err(error) = unblock(&jobs, &mut card) else {
+            return Err(TestError::Unexpected(
+                "unblock must not free a card awaiting approval".to_owned(),
+            ));
+        };
+        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        assert!(awaits_approval(&card));
+        assert_eq!(
+            jobs.snapshot(&work_id)?.map(|job| job.state),
+            Some(JobState::Blocked)
+        );
         Ok(())
     }
 

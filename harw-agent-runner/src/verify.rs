@@ -13,7 +13,7 @@
 
 use std::process::ExitCode;
 
-use harw_agent_artifact::{Artifact, Bundle, EmbeddedArtifact};
+use harw_agent_artifact::{Artifact, ArtifactDigest, Bundle, EmbeddedArtifact};
 use harw_agent_dsl::ir_v2::AgentIr;
 
 use crate::error::RunnerError;
@@ -56,6 +56,23 @@ pub fn root_ir(bundle: &Bundle) -> Result<AgentIr, RunnerError> {
     Ok(serde_json::from_value(bundle.header.ir.clone())?)
 }
 
+/// Renders the `--verify --json` success line: `{"ok":true,"digest":".."}`,
+/// built through `serde_json` so the digest's hex form is escaped like any
+/// other JSON string (it never needs escaping in practice, but this keeps
+/// the success and failure lines on the same safe path).
+fn verify_ok_json(digest: &ArtifactDigest) -> String {
+    serde_json::json!({"ok": true, "digest": digest}).to_string()
+}
+
+/// Renders the `--verify --json` failure line: `{"ok":false,"error":".."}`,
+/// built through `serde_json` so a `message` containing `"`, `\`, a newline
+/// or any other control character (a Windows path in an I/O error, a
+/// chained error's multi-line `Display`) still comes out as one valid JSON
+/// value instead of a line a machine reader would reject or misparse.
+fn verify_err_json(message: &str) -> String {
+    serde_json::json!({"ok": false, "error": message}).to_string()
+}
+
 /// Runs `--verify`: loads and verifies via `load`, prints the digest (or,
 /// with `json`, a `{"ok":.., "digest":..}` line), and maps success/failure
 /// straight to exit `0`/`1` — the sysexits-style codes of
@@ -69,7 +86,7 @@ pub fn run_verify(
         Ok((artifact, _bundle)) => {
             let digest = artifact.digest();
             if json {
-                println!(r#"{{"ok":true,"digest":"{digest}"}}"#);
+                println!("{}", verify_ok_json(&digest));
             } else {
                 println!("ok: {digest}");
             }
@@ -77,8 +94,7 @@ pub fn run_verify(
         }
         Err(error) => {
             if json {
-                let message = error.to_string().replace('"', "'");
-                println!(r#"{{"ok":false,"error":"{message}"}}"#);
+                println!("{}", verify_err_json(&error.to_string()));
             } else {
                 eprintln!("verify failed: {error}");
             }
@@ -234,6 +250,30 @@ mod tests {
             run_verify(|| Err(RunnerError::Usage("no artifact".to_owned())), false),
             ExitCode::from(1)
         );
+        Ok(())
+    }
+
+    /// A message with a backslash, a quote and a newline (a Windows path
+    /// inside a chained I/O error) must still round-trip as one JSON
+    /// string, not corrupt the line for a machine reader.
+    #[test]
+    fn test_verify_err_json_escapes_backslashes_and_newlines() -> TestResult {
+        let message = r#"C:\agents\demo.json: "bad header"
+caused by: unexpected end of file"#;
+        let line = verify_err_json(message);
+        let parsed: serde_json::Value = serde_json::from_str(&line)?;
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], message);
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_ok_json_round_trips_the_digest() -> TestResult {
+        let digest = ArtifactDigest::of(b"demo");
+        let line = verify_ok_json(&digest);
+        let parsed: serde_json::Value = serde_json::from_str(&line)?;
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["digest"], digest.to_string());
         Ok(())
     }
 }

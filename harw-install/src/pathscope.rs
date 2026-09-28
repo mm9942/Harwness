@@ -6,7 +6,11 @@
 //! auf und verhindert Directory-Traversal. Die Prüfung erfolgt **rein
 //! lexikalisch** über [`std::path::Path::components`] — es wird bewusst **kein**
 //! [`std::fs::canonicalize`] aufgerufen, um Symlinks nicht zu folgen und keinen
-//! Dateisystem-Zugriff zu erfordern.
+//! Dateisystem-Zugriff zu erfordern. Dadurch bleibt aber auch ungeprüft, ob
+//! eine `Normal`-Komponente innerhalb von `root` selbst ein Symlink ist, der
+//! auf dem Dateisystem aus `root` hinausführt — die lexikalische Ablehnung
+//! jeder `..`-Komponente schützt nur gegen Traversal im Eingabetext, nicht
+//! gegen Symlinks, die bereits unterhalb `root` liegen.
 //!
 //! ## Verantwortung
 //! Dieses Modul besitzt ausschließlich die Traversal-Validierung und den
@@ -17,7 +21,8 @@
 //!
 //! ## Fehler
 //! - [`crate::error::PathError`] (Variante `Traversal`), wenn ein Eingabepfad
-//!   den `root` verlassen würde.
+//!   absolut ist oder eine `..`-Komponente enthält — auch dann, wenn diese
+//!   lexikalisch innerhalb von `root` bliebe.
 //!
 //! ## Nebenläufigkeit
 //! [`PathScope`] hält nur einen [`std::path::PathBuf`] und ist damit `Send +
@@ -42,9 +47,12 @@ use crate::error::PathError;
 ///
 /// # Description
 /// Kapselt ein Wurzelverzeichnis und löst relative Eingaben zu absoluten (bzw.
-/// root-präfixierten) Pfaden auf. Eingaben, die den `root` lexikalisch
-/// verlassen, absolut sind oder eine `..`-Komponente enthalten, werden mit
-/// [`PathError::Traversal`] abgelehnt.
+/// root-präfixierten) Pfaden auf. Eingaben, die absolut sind oder auch nur
+/// eine einzige `..`-Komponente enthalten, werden mit
+/// [`PathError::Traversal`] abgelehnt — unabhängig davon, ob diese
+/// `..`-Komponente lexikalisch innerhalb von `root` bliebe. Symlinks
+/// unterhalb von `root` werden nicht aufgelöst und können auf Dateisystem-
+/// Ebene weiterhin aus `root` hinausführen; das prüft dieser Typ nicht.
 ///
 /// # Concurrency
 /// `Send + Sync`; enthält nur einen [`PathBuf`]. Keine interne Mutabilität.
@@ -85,12 +93,15 @@ impl PathScope {
     ///
     /// # Description
     /// Der Eingabepfad wird an `root` angehängt und über
-    /// [`Path::components`] normalisiert. Dabei werden `.`-Komponenten
-    /// verworfen und `..`-Komponenten so weit möglich gegen zuvor akkumulierte
-    /// Namenskomponenten aufgerechnet. Verlässt die Normalisierung den `root`
-    /// (oder ist `rel` absolut / enthält eine Wurzel-/Präfix-Komponente), wird
-    /// abgelehnt. Es findet **kein** Dateisystem-Zugriff statt; Symlinks werden
-    /// nicht aufgelöst.
+    /// [`Path::components`] durchlaufen. Dabei werden `.`-Komponenten
+    /// verworfen; jede `..`-Komponente führt sofort zur Ablehnung, auch wenn
+    /// sie lexikalisch innerhalb von `root` bliebe (z. B. `a/../b.toml`). Das
+    /// ist strenger als eine reine Root-Grenzprüfung, gibt Aufrufenden aber
+    /// eine feste Garantie: das Ergebnis enthält niemals eine `..`-Komponente
+    /// aus der Eingabe. Ist `rel` absolut oder enthält eine
+    /// Wurzel-/Präfix-Komponente, wird ebenfalls abgelehnt. Es findet **kein**
+    /// Dateisystem-Zugriff statt; Symlinks unterhalb von `root` werden nicht
+    /// aufgelöst und daher auch nicht auf ein Verlassen von `root` geprüft.
     ///
     /// # Arguments
     /// - `rel` (`&str`): der aufzulösende relative Pfad, geliehen.
@@ -99,9 +110,9 @@ impl PathScope {
     /// Den vollständigen, root-präfixierten [`PathBuf`] bei Erfolg.
     ///
     /// # Errors
-    /// - [`PathError::Traversal`]: wenn `rel` absolut ist, eine `..`-Komponente
-    ///   enthält, oder die lexikalische Normalisierung den `root` verlassen
-    ///   würde.
+    /// - [`PathError::Traversal`]: wenn `rel` absolut ist, eine
+    ///   `..`-Komponente enthält (unabhängig von deren Tiefe), oder eine
+    ///   Wurzel-/Präfix-Komponente enthält.
     ///
     /// # Concurrency
     /// Seiteneffektfrei und thread-sicher (kein I/O, keine Locks).
@@ -124,11 +135,11 @@ impl PathScope {
             });
         }
 
-        // Lexikalische Normalisierung relativ zum root. `depth` zählt die
-        // Namenskomponenten OBERHALB des root; ein negativer Stand bedeutet
-        // einen Ausbruch aus dem root.
+        // Lexikalischer Durchlauf relativ zum root. Jede ".."-Komponente wird
+        // sofort abgelehnt, unabhängig davon, ob sie lexikalisch innerhalb
+        // des root bliebe (siehe Doc-Kommentar oben) — es gibt daher keinen
+        // Auf-/Abstiegszähler mehr.
         let mut normalized = self.root.clone();
-        let mut depth: usize = 0;
 
         for component in candidate.components() {
             match component {
@@ -141,18 +152,13 @@ impl PathScope {
                 }
                 // "." ändert die Position nicht.
                 Component::CurDir => {}
-                // ".." darf niemals über den root hinaus aufsteigen.
+                // ".." wird immer abgelehnt, auch innerhalb von root.
                 Component::ParentDir => {
-                    if depth == 0 {
-                        return Err(PathError::Traversal {
-                            input: rel.to_owned(),
-                        });
-                    }
-                    depth -= 1;
-                    normalized.pop();
+                    return Err(PathError::Traversal {
+                        input: rel.to_owned(),
+                    });
                 }
                 Component::Normal(part) => {
-                    depth += 1;
                     normalized.push(part);
                 }
             }
@@ -190,13 +196,11 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_parent_dir_within_root_ok() -> TestResult {
-        // Steigt einmal auf, bleibt aber im root.
-        let got = scope()
-            .resolve("a/../b.toml")
-            .map_err(ctx("bleibt in root"))?;
-        assert_eq!(got, PathBuf::from("/srv/harw/b.toml"));
-        Ok(())
+    fn test_resolve_inner_parent_dir_rejected() {
+        // ".." wird auch abgelehnt, wenn sie lexikalisch innerhalb von root
+        // bliebe — siehe Doc-Kommentar der Methode.
+        let err = scope().resolve("a/../b.toml");
+        assert!(matches!(err, Err(PathError::Traversal { .. })));
     }
 
     #[test]

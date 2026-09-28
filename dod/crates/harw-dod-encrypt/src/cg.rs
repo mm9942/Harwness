@@ -22,7 +22,9 @@
 //! - [`HarwUsageAuthorizer`]: a CryptGuard `Authorizer` that applies
 //!   [`KeyUsagePolicy`] to every operation on a `harw.*` namespace before an
 //!   inner authorizer (for example [`namespace_policy_for`]) runs. An
-//!   unknown `harw.*` namespace or unknown operation kind is rejected.
+//!   unknown `harw.*` namespace or unknown operation kind is rejected, and
+//!   so is a `Generate` whose algorithm no [`HarwCryptoProfile`] of the
+//!   key's purpose maps to (independent of how the request was built).
 //!
 //! # Transcript binding on every route
 //! CryptGuard hands the authorizer the whole `CryptoOperation`, including
@@ -259,6 +261,10 @@ pub fn verify_operation(
 
 /// Build a key generation for `key` with `profile`.
 ///
+/// [`HarwUsageAuthorizer`] runs the same purpose-to-profile check on every
+/// `Generate` it sees, however built, so this early check is a precise
+/// error for this crate's own callers, not the security boundary.
+///
 /// # Errors
 /// - [`EncryptError::UnexpectedKeyVersion`] if `key` names a version
 ///   (generation creates version 1).
@@ -291,6 +297,13 @@ pub fn generate_operation(
 /// On a `harw.*` namespace it rejects (`Forbidden`), before `inner` runs:
 /// - an unknown `harw.*` namespace or an operation kind the key purpose
 ///   does not permit;
+/// - a `Generate` whose algorithm is not the [`key_algorithm`] of some
+///   [`HarwCryptoProfile`] that [`HarwCryptoProfile::supports`] the key's
+///   purpose. This is what actually pins the algorithm: the purpose-to-
+///   profile rule also lives in [`generate_operation`], but that helper is
+///   only one caller, and every `Generate` — however built — passes through
+///   this authorizer. It also means a purpose with no profile at all
+///   (pseudonymization) can never be generated through the crypto service;
 /// - a `Sign` or `Verify` whose message is not a well-formed transcript
 ///   within [`MAX_SIGNABLE_TRANSCRIPT_LEN`](crate::MAX_SIGNABLE_TRANSCRIPT_LEN)
 ///   ([`SignTranscript::validate_for_kms`]) of exactly the key purpose's
@@ -332,6 +345,16 @@ impl<A: Authorizer> Authorizer for HarwUsageAuthorizer<A> {
             if !allows(purpose, kind) {
                 return Err(CryptoServiceError::Forbidden);
             }
+            // Algorithm binding: a `Generate` may only use the algorithm of
+            // a profile that actually fits the purpose. Without this, any
+            // caller that authorizes `Generate` on a `harw.*` namespace
+            // could create, say, an ML-DSA-44 key (no Harw profile at all)
+            // or an HPKE key in a signing namespace.
+            if let CryptoOperation::Generate(generate) = op {
+                if !is_own_algorithm(purpose, generate.algorithm) {
+                    return Err(CryptoServiceError::Forbidden);
+                }
+            }
             // Transcript binding: the payload itself, not only the kind.
             let message: Option<&[u8]> = match op {
                 CryptoOperation::Sign(sign) => Some(sign.message.as_ref()),
@@ -346,6 +369,17 @@ impl<A: Authorizer> Authorizer for HarwUsageAuthorizer<A> {
     }
 }
 
+/// Whether `algorithm` is [`key_algorithm`] of some [`HarwCryptoProfile`]
+/// that [`HarwCryptoProfile::supports`] `purpose`. `false` for a purpose no
+/// profile supports (pseudonymization) and for any algorithm — including
+/// ones CryptGuard itself supports, such as `SignatureAlgorithm::MlDsa44`
+/// — that no Harw profile maps to.
+fn is_own_algorithm(purpose: HarwKeyPurpose, algorithm: KeyAlgorithm) -> bool {
+    HarwCryptoProfile::ALL
+        .into_iter()
+        .any(|profile| profile.supports(purpose) && key_algorithm(profile) == algorithm)
+}
+
 /// Whether `message` is a KMS-sized, well-formed transcript of exactly
 /// `purpose`'s own sign purpose. `false` for purposes that do not sign.
 fn is_own_transcript(purpose: HarwKeyPurpose, message: &[u8]) -> bool {
@@ -353,4 +387,134 @@ fn is_own_transcript(purpose: HarwKeyPurpose, message: &[u8]) -> bool {
         return false;
     };
     SignTranscript::validate_for_kms(message).is_ok_and(|found| found == own)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// The broader boundary tests for this module live in `tests/cg_mapping.rs`
+// and use the crate's `TestResult`/`ctx` helpers from `tests/common`, which
+// unit tests in `src/` cannot reach (a different compilation unit). This
+// module therefore defines its own minimal, local, non-`unwrap`/`expect`/
+// `panic!` result type for the same purpose.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crypt_guard_service::{AllowAll, RequestId, pq_hpke::DEFAULT_SUITE};
+
+    #[derive(Debug)]
+    enum TestError {
+        Unexpected(String),
+    }
+
+    type TestResult<T = ()> = Result<T, TestError>;
+
+    fn anon() -> RequestContext {
+        RequestContext::anonymous(RequestId(1))
+    }
+
+    /// A `Generate` built directly, as a hostile or careless caller could,
+    /// bypassing [`generate_operation`] entirely.
+    fn raw_generate(namespace: &str, algorithm: KeyAlgorithm) -> TestResult<CryptoOperation> {
+        let namespace = KeyNamespace::new(namespace)
+            .map_err(|e| TestError::Unexpected(format!("namespace: {e}")))?;
+        let id = KeyId::new("k").map_err(|e| TestError::Unexpected(format!("key id: {e}")))?;
+        Ok(CryptoOperation::Generate(GenerateKey {
+            namespace,
+            id,
+            algorithm,
+        }))
+    }
+
+    #[test]
+    fn test_is_own_algorithm_matches_profile_supports_for_every_pair() {
+        for purpose in HarwKeyPurpose::ALL {
+            for profile in HarwCryptoProfile::ALL {
+                assert_eq!(
+                    is_own_algorithm(purpose, key_algorithm(profile)),
+                    profile.supports(purpose),
+                    "{purpose:?} {profile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_own_algorithm_rejects_an_algorithm_no_profile_maps_to() {
+        // ML-DSA-44 is a CryptGuard algorithm, but no Harw profile uses it.
+        for purpose in HarwKeyPurpose::ALL {
+            assert!(!is_own_algorithm(
+                purpose,
+                KeyAlgorithm::Signature(SignatureAlgorithm::MlDsa44)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_authorizer_binds_generate_to_a_supporting_profiles_algorithm() -> TestResult {
+        let auth = HarwUsageAuthorizer::new(AllowAll);
+
+        // An HPKE algorithm has no place in a signing namespace: it would
+        // create a key CryptGuard can never sign with.
+        let hpke_in_signing_ns = raw_generate(
+            "harw.node-identity",
+            KeyAlgorithm::Hpke { suite: DEFAULT_SUITE },
+        )?;
+        assert_eq!(
+            auth.authorize(&anon(), &hpke_in_signing_ns),
+            Err(CryptoServiceError::Forbidden)
+        );
+
+        // ML-DSA-44 is not a Harw profile at all, even in a signing
+        // namespace that otherwise allows `Generate`.
+        let ml_dsa_44 = raw_generate(
+            "harw.artifact-signing",
+            KeyAlgorithm::Signature(SignatureAlgorithm::MlDsa44),
+        )?;
+        assert_eq!(
+            auth.authorize(&anon(), &ml_dsa_44),
+            Err(CryptoServiceError::Forbidden)
+        );
+
+        // Pseudonymization has no profile at all: every algorithm is
+        // refused, not just a mismatched one.
+        let pseudonymization = raw_generate(
+            "harw.pseudonymization",
+            KeyAlgorithm::Signature(SignatureAlgorithm::MlDsa65),
+        )?;
+        assert_eq!(
+            auth.authorize(&anon(), &pseudonymization),
+            Err(CryptoServiceError::Forbidden)
+        );
+
+        // ML-DSA-87 fits a signing namespace and reaches the (permissive)
+        // inner authorizer.
+        let ml_dsa_87 = raw_generate(
+            "harw.artifact-signing",
+            KeyAlgorithm::Signature(SignatureAlgorithm::MlDsa87),
+        )?;
+        assert_eq!(auth.authorize(&anon(), &ml_dsa_87), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_authorizer_accepts_every_generate_operation_builds() -> TestResult {
+        // What `generate_operation` itself builds for its documented default
+        // profile always passes the authorizer's own algorithm check, for
+        // every purpose that has a profile at all.
+        let auth = HarwUsageAuthorizer::new(AllowAll);
+        for purpose in HarwKeyPurpose::ALL {
+            let Some(profile) = HarwCryptoProfile::default_for(purpose) else {
+                continue; // Pseudonymization: no profile, covered above.
+            };
+            let owner =
+                NodeId::new("n").map_err(|e| TestError::Unexpected(format!("node id: {e}")))?;
+            let key = HarwKeyRef::latest(purpose, owner);
+            let op = generate_operation(&key, profile)
+                .map_err(|e| TestError::Unexpected(format!("generate_operation: {e}")))?;
+            assert_eq!(auth.authorize(&anon(), &op), Ok(()), "{purpose:?}");
+        }
+        Ok(())
+    }
 }

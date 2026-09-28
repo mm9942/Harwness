@@ -73,6 +73,15 @@ const FOREIGN_POLL: Duration = Duration::from_millis(200);
 /// `exec` ändert das Programm; `meta.json` soll die letzte Beobachtung
 /// tragen, damit ein Neustart den Job wiedererkennt).
 const IDENTITY_REFRESH: Duration = Duration::from_secs(2);
+/// Höchstwartezeit auf das Mitschreib-Task (`tee_stdout`) nach Prozessende
+/// eines [`JobManager::start_piped`]-Jobs. `tee_stdout` endet nur auf EOF
+/// seiner stdout-Pipe; erbt ein Nachfahre des Prozesses (z. B. ein
+/// hintergrundgestellter Enkel) dieselbe Pipe, bleibt sie offen, obwohl der
+/// Job selbst längst beendet ist. Nach dieser Frist bricht die Überwachung
+/// das Mitschreiben ab, statt für immer zu warten; der Job endet wie beim
+/// nicht gepipten Weg, und `finish` warnt wie gewohnt über verbliebene
+/// Gruppenmitglieder.
+const TEE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Vorgabe-Höchstlänge einer stdout-Zeile eines [`JobManager::start_piped`]-Jobs
 /// in Bytes (ohne `\n`): 1 MiB, gleich `harw-agent-runner`s
 /// `child_protocol::MAX_FRAME_BYTES`.
@@ -204,10 +213,13 @@ pub struct PipedJob {
     pub stdin: ChildStdin,
     /// Zeilen der stdout, in Ankunftsreihenfolge (dieselben Zeilen landen
     /// auch in `STDOUT_LOG`). Endet (liefert `None`), wenn der Prozess seine
-    /// stdout schließt. Eine zu lange oder nicht-UTF-8-Zeile liefert genau
-    /// ein `Err` ([`PipedLineError`]); danach endet der Strom, und die
-    /// stdout-Pipe ist geschlossen (der Prozess sieht beim nächsten
-    /// Schreiben `EPIPE`/`SIGPIPE`).
+    /// stdout schließt — oder wenn ein Nachfahre sie länger als
+    /// `TEE_DRAIN_GRACE` über das Ende des Jobs hinaus offen hält (die
+    /// Überwachung bricht das Mitschreiben dann ab, ohne `PipedLineError`).
+    /// Eine zu lange oder nicht-UTF-8-Zeile liefert genau ein `Err`
+    /// ([`PipedLineError`]); danach endet der Strom, und die stdout-Pipe ist
+    /// geschlossen (der Prozess sieht beim nächsten Schreiben
+    /// `EPIPE`/`SIGPIPE`).
     pub stdout_lines: mpsc::UnboundedReceiver<Result<String, PipedLineError>>,
 }
 
@@ -450,6 +462,11 @@ pub struct JobManager {
     notifier: Arc<dyn JobNotifier>,
     jobs: Mutex<BTreeMap<JobId, Arc<JobEntry>>>,
     counter: AtomicU64,
+    /// Plätze, die zwischen Kapazitätsprüfung und Eintrag in `jobs` reserviert
+    /// sind (siehe [`JobManager::reserve_slot`]): verhindert, dass zwei
+    /// gleichzeitige `start`/`start_piped_with_line_limit`-Aufrufe beide die
+    /// Prüfung bestehen, bevor einer von beiden in `jobs` sichtbar wird.
+    reserved: Mutex<usize>,
 }
 
 impl fmt::Debug for JobManager {
@@ -458,6 +475,19 @@ impl fmt::Debug for JobManager {
             .field("instance", &self.instance)
             .field("jobs_dir", &self.config.jobs_dir())
             .finish_non_exhaustive()
+    }
+}
+
+/// Von [`JobManager::reserve_slot`] zurückgegebener Kapazitätsplatz; gibt ihn
+/// beim Fallenlassen wieder frei (siehe dort).
+struct ReservedSlot<'a> {
+    manager: &'a JobManager,
+}
+
+impl Drop for ReservedSlot<'_> {
+    fn drop(&mut self) {
+        let mut reserved = lock(&self.manager.reserved);
+        *reserved = reserved.saturating_sub(1);
     }
 }
 
@@ -480,6 +510,7 @@ impl JobManager {
             notifier,
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
+            reserved: Mutex::new(0),
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -590,6 +621,15 @@ impl JobManager {
 
     /// Prüft vorab, ob noch ein Job starten darf (vor einer Host-Freigabe).
     ///
+    /// # Description
+    /// Nur ein Vorabblick ohne Wirkung auf spätere Aufrufe: anders als die
+    /// interne Reservierung, die `start`/`start_piped_with_line_limit`
+    /// nutzen, hält es keine Sperre über Prüfung und einen späteren Start
+    /// hinweg. Zwischen diesem Aufruf und dem eigentlichen Start kann sich
+    /// die Zahl laufender Jobs also ändern; für die tatsächliche
+    /// Durchsetzung der Obergrenze zählt allein die interne Reservierung in
+    /// `start`.
+    ///
     /// # Errors
     /// [`JobError::Capacity`].
     pub fn check_capacity(&self) -> Result<(), JobError> {
@@ -598,6 +638,32 @@ impl JobManager {
             return Err(JobError::Capacity { max });
         }
         Ok(())
+    }
+
+    /// Reserviert atomar einen Platz unter der Obergrenze, oder lehnt ab.
+    ///
+    /// # Description
+    /// Hält dafür kurz die interne Sperre `reserved` und zählt deren
+    /// aktuellen Wert zur laufenden Zahl hinzu: zwei gleichzeitige Aufrufe
+    /// (z. B. von zwei Agenten über denselben `Arc<JobManager>`) können so
+    /// nicht beide die Prüfung bestehen, bevor einer von ihnen seinen Job in
+    /// `jobs` einträgt — anders als der reine Vorabblick
+    /// [`JobManager::check_capacity`]. Der zurückgegebene [`ReservedSlot`]
+    /// gibt den Platz beim Fallenlassen wieder frei (jeder Rückweg aus
+    /// `start`/`start_piped_with_line_limit`, erfolgreich oder nicht): ist
+    /// der Start erfolgreich, zählt der neue, beaufsichtigte Eintrag ab dann
+    /// selbst über [`JobManager::running_count`].
+    ///
+    /// # Errors
+    /// [`JobError::Capacity`].
+    fn reserve_slot(&self) -> Result<ReservedSlot<'_>, JobError> {
+        let max = self.config.max_running_jobs;
+        let mut reserved = lock(&self.reserved);
+        if self.running_count() + *reserved >= max {
+            return Err(JobError::Capacity { max });
+        }
+        *reserved += 1;
+        Ok(ReservedSlot { manager: self })
     }
 
     fn allocate(&self) -> Result<(JobId, PathBuf), JobError> {
@@ -624,7 +690,11 @@ impl JobManager {
     /// Startet einen geprüften Prozess als Job.
     ///
     /// # Description
-    /// Muss innerhalb einer Tokio-Runtime laufen (Überwachungs-Task).
+    /// Muss innerhalb einer Tokio-Runtime laufen (Überwachungs-Task). Die
+    /// Obergrenze [`JobManagerConfig::max_running_jobs`] wird atomar
+    /// durchgesetzt ([`JobManager::reserve_slot`]): gleichzeitige Aufrufe
+    /// über denselben `Arc<JobManager>` können sie nicht gemeinsam
+    /// überschreiten.
     ///
     /// # Errors
     /// [`JobError::Capacity`], [`JobError::Io`] (Verzeichnis/Logdateien) oder
@@ -635,7 +705,7 @@ impl JobManager {
         request: StartRequest,
         prepared: PreparedJob,
     ) -> Result<JobStatus, JobError> {
-        self.check_capacity()?;
+        let _slot = self.reserve_slot()?;
         let (id, dir) = self.allocate()?;
         let stdout = File::create(dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?;
         let stderr = File::create(dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
@@ -727,7 +797,9 @@ impl JobManager {
     ///
     /// # Description
     /// Muss innerhalb einer Tokio-Runtime laufen (Überwachungs- und
-    /// Mitschreib-Task).
+    /// Mitschreib-Task). Die Obergrenze
+    /// [`JobManagerConfig::max_running_jobs`] wird atomar durchgesetzt wie
+    /// bei [`JobManager::start`].
     ///
     /// # Errors
     /// [`JobError::Capacity`], [`JobError::Io`] (Verzeichnis/Logdateien) oder
@@ -756,7 +828,7 @@ impl JobManager {
         prepared: PreparedJob,
         max_line_bytes: usize,
     ) -> Result<PipedJob, JobError> {
-        self.check_capacity()?;
+        let _slot = self.reserve_slot()?;
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
         let stdout_log = File::create(&stdout_log_path).map_err(io_err("create stdout.log"))?;
@@ -1285,7 +1357,10 @@ async fn cancelled(cancel: Option<&CancelToken>) {
 /// vollständig (mit Zeilenende) in `stdout_log` und schickt sie zusätzlich an
 /// `sender` — bis die Pipe schließt (Prozessende) oder ein Lesefehler
 /// auftritt. Ist der Empfänger bereits verworfen, wird trotzdem bis zum Ende
-/// weiter mitgeschrieben (nur `STDOUT_LOG` zählt dann noch).
+/// weiter mitgeschrieben (nur `STDOUT_LOG` zählt dann noch). Hält ein
+/// Nachfahre des Prozesses dieselbe Pipe offen, sieht dieses Task nie ein
+/// EOF; `Monitor::run_inner` wartet darauf deshalb nur bis [`TEE_DRAIN_GRACE`]
+/// und bricht es danach ab.
 ///
 /// # Description
 /// Anders als `AsyncBufReadExt::lines` puffert es eine Zeile höchstens bis
@@ -1417,10 +1492,12 @@ impl Monitor {
         self.run_inner(child, None).await;
     }
 
-    /// Wie [`Monitor::run`], aber wartet nach dem Prozessende zusätzlich auf
-    /// `tee` (das Mitschreib-Task von [`JobManager::start_piped`]), damit die
-    /// letzte Ausgabe sicher in `STDOUT_LOG` steht, bevor der Ende-Bericht
-    /// den Tail liest.
+    /// Wie [`Monitor::run`], aber wartet nach dem Prozessende zusätzlich
+    /// höchstens [`TEE_DRAIN_GRACE`] auf `tee` (das Mitschreib-Task von
+    /// [`JobManager::start_piped`]), damit die letzte Ausgabe sicher in
+    /// `STDOUT_LOG` steht, bevor der Ende-Bericht den Tail liest. Läuft `tee`
+    /// nach Ablauf der Frist noch (ein Nachfahre hält die stdout-Pipe offen),
+    /// wird es abgebrochen; der Job endet trotzdem.
     async fn run_piped(self, child: Child, tee: JoinHandle<()>) {
         self.run_inner(child, Some(tee)).await;
     }
@@ -1456,11 +1533,27 @@ impl Monitor {
                 }
             }
         };
-        if let Some(tee) = tee {
-            // Der Prozess ist beendet; das Mitschreib-Task endet, sobald es
-            // das Ende seiner stdout-Pipe sieht (kurz danach). Erst danach
-            // steht die letzte Ausgabe vollständig in `STDOUT_LOG`.
-            let _ = tee.await;
+        if let Some(mut tee) = tee {
+            // Der Prozess ist beendet; das Mitschreib-Task endet normalerweise,
+            // sobald es das Ende seiner stdout-Pipe sieht (kurz danach), und
+            // erst dann steht die letzte Ausgabe vollständig in `STDOUT_LOG`.
+            // Hält aber ein Nachfahre dieselbe Pipe offen (z. B. ein
+            // hintergrundgestellter Enkelprozess), sieht `tee` nie ein EOF:
+            // ohne Frist bliebe der Job für immer `Running` (eigener
+            // Kapazitätsplatz belegt, `job.wait` liefert nur noch `Timeout`).
+            // Nach `TEE_DRAIN_GRACE` wird stattdessen abgebrochen; `finish`
+            // unten warnt wie beim nicht gepipten Weg über verbliebene
+            // Gruppenmitglieder, falls es welche gibt.
+            if tokio::time::timeout(TEE_DRAIN_GRACE, &mut tee)
+                .await
+                .is_err()
+            {
+                tee.abort();
+                debug!(
+                    job_id = %self.entry.meta().job_id,
+                    "job stdout tee: aborted after grace period; a descendant kept stdout open"
+                );
+            }
         }
         self.ingest(&mut run, true);
         self.finish(&mut run, status, started);
@@ -1728,3 +1821,124 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests;
+
+/// Tests der beiden hier behobenen Befunde (Kapazitätsrennen,
+/// Mitschreib-Frist eines gepipten Jobs); die übrige Testsuite dieses Moduls
+/// liegt unverändert in `manager::tests`.
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+    use crate::event::JobEvent;
+    use crate::test_support::{Env, TestError, TestResult, ctx, request};
+    use std::time::Duration;
+
+    /// Großzügige Wartezeit für diese Tests (echte, kurze Prozesse).
+    const WAIT_LIMIT: Duration = Duration::from_secs(10);
+
+    /// Ein hintergrundgestellter Enkelprozess erbt dieselbe stdout-Pipe wie
+    /// der `start_piped`-Job und hält sie offen, obwohl der Job-Prozess
+    /// selbst (die Shell) längst beendet ist. Ohne die Frist
+    /// `TEE_DRAIN_GRACE` bliebe der Job für immer `Running`.
+    #[tokio::test]
+    async fn test_piped_job_finishes_despite_descendant_holding_stdout_open() -> TestResult {
+        let env = Env::new()?;
+        let prepared = env
+            .prepare_piped(&["/bin/sh", "-c", "sleep 30 & echo hi"])
+            .await?;
+        let mut piped = env
+            .manager
+            .start_piped(request("straggler", "agent-a", &[]), prepared)
+            .map_err(ctx("start_piped"))?;
+        let id = piped.job_id.clone();
+
+        let line = tokio::time::timeout(WAIT_LIMIT, piped.stdout_lines.recv())
+            .await
+            .map_err(ctx("recv timeout"))?
+            .ok_or(TestError::Missing("stdout line"))?
+            .map_err(ctx("stdout line"))?;
+        assert_eq!(line, "hi");
+
+        // Ohne die Frist würde dieser Aufruf bis `WAIT_LIMIT` hängen bleiben
+        // und `Timeout` liefern, weil `sleep 30` die stdout-Pipe offen hält.
+        let caller = Caller::Agent("agent-a");
+        let (outcome, status) = env
+            .manager
+            .wait(&id, caller, WAIT_LIMIT, None)
+            .await
+            .map_err(ctx("wait"))?;
+        assert_eq!(outcome, WaitOutcome::Finished);
+        assert_eq!(status.meta.state, JobState::Succeeded);
+
+        let events: Vec<JobEvent> = env
+            .recorder
+            .notifications()
+            .into_iter()
+            .map(|notification| notification.event)
+            .filter(|event| event.job_id() == &id)
+            .collect();
+        let warned = events.iter().any(|event| {
+            matches!(
+                event,
+                JobEvent::Warning { message, .. }
+                    if message.contains("still running in its process group")
+            )
+        });
+        assert!(
+            warned,
+            "expected a straggler warning for the backgrounded descendant; got {events:?}"
+        );
+
+        // Aufräumen: `sleep 30` läuft real weiter, bis es signalisiert wird.
+        env.manager
+            .stop(&id, caller, JobSignal::Kill)
+            .await
+            .map_err(ctx("cleanup: stop straggler"))?;
+        Ok(())
+    }
+
+    /// `max_running_jobs` muss zwei gleichzeitige `start`-Aufrufe atomar
+    /// zählen: genau einer bekommt den einzigen Platz, der andere
+    /// `JobError::Capacity`. `start` selbst ist synchron; zwei
+    /// `spawn_blocking`-Aufgaben laufen deshalb auf echten, verschiedenen
+    /// Threads des Blocking-Pools, statt sich innerhalb einer Aufgabe zu
+    /// verschachteln.
+    #[tokio::test]
+    async fn test_concurrent_start_enforces_capacity_exactly_once() -> TestResult {
+        let env = Env::with_config(|config| JobManagerConfig {
+            max_running_jobs: 1,
+            ..config
+        })?;
+        let first = env.prepare("sleep 5").await?;
+        let second = env.prepare("sleep 5").await?;
+        let manager_a = Arc::clone(&env.manager);
+        let manager_b = Arc::clone(&env.manager);
+        let (a, b) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                manager_a.start(request("one", "agent-a", &[]), first)
+            }),
+            tokio::task::spawn_blocking(move || {
+                manager_b.start(request("two", "agent-a", &[]), second)
+            }),
+        );
+        let a = a.map_err(ctx("join first start"))?;
+        let b = b.map_err(ctx("join second start"))?;
+
+        let mut successes = 0usize;
+        let mut capacity_errors = 0usize;
+        for result in [a, b] {
+            match result {
+                Ok(_) => successes += 1,
+                Err(JobError::Capacity { max: 1 }) => capacity_errors += 1,
+                Err(other) => return Err(TestError::Unexpected(other.to_string())),
+            }
+        }
+        assert_eq!(successes, 1, "expected exactly one job to start");
+        assert_eq!(
+            capacity_errors, 1,
+            "expected exactly one JobError::Capacity"
+        );
+
+        assert_eq!(env.manager.stop_all().await, 1);
+        Ok(())
+    }
+}

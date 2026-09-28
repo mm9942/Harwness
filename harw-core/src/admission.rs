@@ -34,6 +34,14 @@
 //! non-capacity error occurs, or a caller-supplied `max_wait` elapses. See
 //! [`QueuedAdmission`].
 //!
+//! # Status
+//! Unwired extension point: outside this file's own tests, no crate in this
+//! workspace calls [`JobAdmissionService::submit_queued_async`] today. It is
+//! kept for a future `UserInterface`-role delegation caller (an approval or
+//! UI-facing session that wants "queued, will start once capacity frees"
+//! instead of a hard rejection); nothing should depend on the queueing
+//! behaviour until such a caller wires it in.
+//!
 //! # Concurrency
 //! The service is `Send + Sync` when `P` is. The rate limiter uses one
 //! `std::sync::Mutex` held only for window bookkeeping. [`JobAdmissionService::submit`]
@@ -41,8 +49,9 @@
 //! [`JobAdmissionService::submit_async`], which runs it on `spawn_blocking`.
 //! [`JobAdmissionService::submit_queued_async`] additionally spawns at most
 //! one background `tokio::task` per call, holding only an `Arc` clone of the
-//! service; the caller-side `oneshot::Receiver` may be dropped without
-//! cancelling that task.
+//! service. If the caller-side `oneshot::Receiver` is dropped, the task
+//! stops retrying at the next check (before any further submission attempt)
+//! instead of eventually admitting a job nobody can claim.
 //!
 //! # Errors
 //! [`JobAdmissionError`].
@@ -523,7 +532,11 @@ impl<P: JobAdmissionPolicy + 'static> JobAdmissionService<P> {
     /// task is spawned that keeps retrying [`Self::submit_async`] (with a
     /// fresh timestamp on every attempt) until it succeeds, a different
     /// error occurs, or `max_wait` elapses; the caller gets the estimated
-    /// wait immediately and a receiver for the eventual outcome.
+    /// wait immediately and a receiver for the eventual outcome. Before each
+    /// retry attempt the loop checks whether the caller dropped the
+    /// receiver (racing the retry sleep against it as well) and stops
+    /// without submitting if so, so a job is never admitted for a requester
+    /// that already gave up.
     ///
     /// # Arguments
     /// - `intent` (`JobIntent`): see [`Self::submit`].
@@ -544,6 +557,13 @@ impl<P: JobAdmissionPolicy + 'static> JobAdmissionService<P> {
     /// Any [`JobAdmissionError`] other than `RateLimited` from the first
     /// attempt is returned immediately without queueing.
     ///
+    /// # Status
+    /// Unwired extension point: no crate in this workspace calls this method
+    /// outside its own tests today. It is kept for a future caller with a
+    /// `UserInterface`-role delegation that wants a queued outcome instead
+    /// of a hard [`JobAdmissionError::RateLimited`]; nothing should depend
+    /// on it running until such a caller wires it in.
+    ///
     /// # Concurrency
     /// Requires a Tokio runtime. Spawns at most one background task per
     /// call; that task holds only an `Arc` clone of `self`.
@@ -561,13 +581,28 @@ impl<P: JobAdmissionPolicy + 'static> JobAdmissionService<P> {
         {
             Ok(outcome) => Ok(QueuedAdmission::Admitted(Box::new(outcome))),
             Err(JobAdmissionError::RateLimited { retry_after }) => {
-                let (tx, rx) = oneshot::channel();
+                let (mut tx, rx) = oneshot::channel();
                 let service = Arc::clone(self);
                 tokio::spawn(async move {
                     let deadline = tokio::time::Instant::now() + max_wait;
                     let mut last_retry_after = retry_after;
                     let outcome = loop {
-                        service.limiter.wait_before_retry(last_retry_after).await;
+                        // Race the retry sleep against the receiver being
+                        // dropped so a gone-away caller (its owning task
+                        // exited or was cancelled) wakes the loop immediately
+                        // instead of waiting out the full delay before
+                        // noticing.
+                        tokio::select! {
+                            () = service.limiter.wait_before_retry(last_retry_after) => {},
+                            () = tx.closed() => return,
+                        }
+                        // Re-check right before the attempt: admitting a job
+                        // after the receiver is gone would leave it with no
+                        // owner, so a dropped receiver must stop the loop
+                        // rather than submit.
+                        if tx.is_closed() {
+                            return;
+                        }
                         let attempt = service
                             .submit_async(
                                 intent.clone(),
@@ -586,8 +621,6 @@ impl<P: JobAdmissionPolicy + 'static> JobAdmissionService<P> {
                             other => break other,
                         }
                     };
-                    // Best-effort: nothing to do if the caller dropped `rx`
-                    // (e.g. the UIA session ended before capacity freed).
                     let _ = tx.send(outcome);
                 });
                 Ok(QueuedAdmission::Queued {
@@ -614,7 +647,10 @@ pub enum QueuedAdmission {
         /// window stayed contended).
         estimated_retry_after: SignedDuration,
         /// Resolves to the eventual [`Self::Admitted`]-equivalent outcome or
-        /// the terminal error. Dropping it does not cancel the retry.
+        /// the terminal error. Dropping it before the retry loop admits a
+        /// job stops that loop at its next check instead of admitting a job
+        /// with no owner; an attempt already in flight still runs to
+        /// completion, but no further attempt is made.
         result: oneshot::Receiver<Result<AdmissionOutcome, JobAdmissionError>>,
     },
 }
@@ -1529,6 +1565,65 @@ mod tests {
             outcome,
             Err(JobAdmissionError::RateLimited { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_submit_queued_async_stops_retry_when_receiver_dropped() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = Arc::new(
+            service(root.path())?.with_limits(
+                AdmissionLimits::new(1, SignedDuration::from_millis(150))
+                    .ok_or(TestError::Missing("limits"))?,
+            ),
+        );
+        let alice = operator_context("queue-dropped-receiver");
+        svc.submit(
+            intent(Value::Null),
+            &SubmitOptions::default(),
+            &alice,
+            Timestamp::now(),
+        )
+        .map_err(ctx("fills the single-slot window"))?;
+
+        let queued = svc
+            .submit_queued_async(
+                intent(Value::Null),
+                SubmitOptions::default(),
+                alice,
+                Timestamp::now(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .map_err(ctx("second attempt is rejected only by rate limiting"))?;
+
+        let QueuedAdmission::Queued { result, .. } = queued else {
+            return Err(TestError::Unexpected(
+                "an exhausted window must be queued, not rejected outright".to_owned(),
+            ));
+        };
+
+        // The requester goes away before capacity frees (its owning task
+        // exited or was cancelled). No `.await` happened since `result` was
+        // produced, so on the single-threaded test runtime the background
+        // task cannot have polled yet; it will see the receiver already
+        // closed.
+        drop(result);
+
+        // Let the 150ms window elapse well past its length: if the
+        // background loop did not notice the dropped receiver, it would
+        // retry here and admit a second, unowned job.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let page = svc
+            .store()
+            .list(&harw_session_store::JobListQuery::default())
+            .map_err(ctx("list stored jobs"))?;
+        assert_eq!(
+            page.jobs.len(),
+            1,
+            "a dropped receiver must stop the retry loop before it admits a second job"
+        );
         Ok(())
     }
 }

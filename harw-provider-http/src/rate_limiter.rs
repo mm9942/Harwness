@@ -20,7 +20,13 @@
 //!   Warte-Hinweis, unabhängig von einer bestimmten Dimension.
 //!
 //! Unparsbare Werte werden ignoriert (nur `tracing::debug!`), niemals als
-//! Fehler nach außen gemeldet.
+//! Fehler nach außen gemeldet. Alle aus Headern abgeleiteten Dauern werden
+//! zusätzlich auf [`MAX_HEADER_DURATION`] gedeckelt und nur mit
+//! `checked_add` auf ein [`std::time::Instant`] addiert — ein (auch
+//! feindlicher) Provider kann beliebig große Werte melden (z. B.
+//! `retry-after: 18446744073709551615` oder
+//! `x-ratelimit-reset-tokens: 99999999999999999999s`); das darf nie zu einem
+//! Overflow-Panic in der `Instant`/`Duration`-Arithmetik führen.
 //!
 //! ## Nebenläufigkeit
 //! Der interne Zustand liegt in einem `std::sync::Mutex<State>`. Der Lock
@@ -76,6 +82,17 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Angenommene Fensterlänge, wenn nach einem abgelaufenen Reset kein
 /// beobachtetes Fenster bekannt ist (typische Limits sind "pro Minute").
 const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Obergrenze für jede aus einem Rate-Limit-Header abgeleitete Dauer
+/// (`retry-after`, Go-artige Dauern, RFC3339-Reset-Zeitstempel), bevor sie
+/// in ein [`Instant`] umgerechnet wird. Verhindert, dass ein beliebiger
+/// (auch feindlicher) Provider mit absurden Werten wie
+/// `retry-after: 18446744073709551615` oder
+/// `x-ratelimit-reset-tokens: 99999999999999999999s` einen Überlauf in der
+/// `Instant`/`Duration`-Arithmetik auslöst (siehe
+/// `harw_provider_http::error::MAX_RETRY_AFTER_HINT_SECS` für dasselbe
+/// Muster bei Retry-Hinweisen).
+const MAX_HEADER_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Fehler der schätzungsbewussten Zulassung
 /// ([`ProviderRateLimiter::wait_for_slot_with_estimate`]).
@@ -387,7 +404,22 @@ impl ProviderRateLimiter {
 
         if let Some(value) = header_str(headers, "retry-after") {
             match value.trim().parse::<u64>() {
-                Ok(secs) => state.retry_after_until = Some(now + Duration::from_secs(secs)),
+                // Vor der Umrechnung in ein `Instant` gedeckelt
+                // (`MAX_HEADER_DURATION`) und mit `checked_add` addiert: ein
+                // Provider kann `secs` bis `u64::MAX` melden, das würde
+                // `now + Duration::from_secs(secs)` sonst in der
+                // `Instant`-Arithmetik überlaufen lassen (Panic).
+                Ok(secs) => {
+                    let capped = Duration::from_secs(secs).min(MAX_HEADER_DURATION);
+                    match now.checked_add(capped) {
+                        Some(until) => state.retry_after_until = Some(until),
+                        None => tracing::debug!(
+                            header = "retry-after",
+                            value,
+                            "provider.rate_limit.header_overflow"
+                        ),
+                    }
+                }
                 Err(_) => {
                     tracing::debug!(
                         header = "retry-after",
@@ -844,9 +876,24 @@ fn apply_openai_family(dim: &mut DimensionState, headers: &HeaderMap, kind: &str
     if let Some(value) = header_str(headers, &reset_header) {
         match parse_go_like_duration(value) {
             Some(duration) => {
-                dim.reset_at = Some(now + duration);
-                if !duration.is_zero() {
-                    dim.window = Some(duration);
+                // Vor `now + duration` gedeckelt (`MAX_HEADER_DURATION`) und
+                // mit `checked_add` addiert: `parse_go_like_duration` kann
+                // (durch Summation vieler Segmente) sehr große Dauern
+                // liefern, die sonst die `Instant`-Arithmetik überlaufen
+                // ließen (Panic).
+                let capped = duration.min(MAX_HEADER_DURATION);
+                match now.checked_add(capped) {
+                    Some(reset_at) => {
+                        dim.reset_at = Some(reset_at);
+                        if !capped.is_zero() {
+                            dim.window = Some(capped);
+                        }
+                    }
+                    None => tracing::debug!(
+                        header = %reset_header,
+                        value,
+                        "provider.rate_limit.header_overflow"
+                    ),
                 }
             }
             None => {
@@ -861,7 +908,11 @@ fn apply_openai_family(dim: &mut DimensionState, headers: &HeaderMap, kind: &str
 ///
 /// Unterstützte Einheiten: `ms`, `s`, `m`, `h`. Mehrere Segmente werden
 /// aufsummiert. Gibt `None` bei leerem oder syntaktisch ungültigem Input
-/// zurück.
+/// zurück. Jedes Segment wird vor der Umrechnung auf
+/// [`MAX_HEADER_DURATION`] gedeckelt (via [`duration_from_secs_f64_capped`])
+/// und sättigend aufsummiert — ein Provider kann Zahlenwerte melden, die
+/// `Duration::from_secs_f64` sonst zum Paniken brächten (z. B.
+/// `"99999999999999999999s"`).
 fn parse_go_like_duration(input: &str) -> Option<Duration> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -885,16 +936,16 @@ fn parse_go_like_duration(input: &str) -> Option<Duration> {
 
         if idx < chars.len() && chars[idx] == 'm' && chars.get(idx + 1) == Some(&'s') {
             idx += 2;
-            total += Duration::from_secs_f64((value / 1000.0).max(0.0));
+            total = total.saturating_add(duration_from_secs_f64_capped(value / 1000.0));
         } else if idx < chars.len() && chars[idx] == 's' {
             idx += 1;
-            total += Duration::from_secs_f64(value.max(0.0));
+            total = total.saturating_add(duration_from_secs_f64_capped(value));
         } else if idx < chars.len() && chars[idx] == 'm' {
             idx += 1;
-            total += Duration::from_secs_f64((value * 60.0).max(0.0));
+            total = total.saturating_add(duration_from_secs_f64_capped(value * 60.0));
         } else if idx < chars.len() && chars[idx] == 'h' {
             idx += 1;
-            total += Duration::from_secs_f64((value * 3600.0).max(0.0));
+            total = total.saturating_add(duration_from_secs_f64_capped(value * 3600.0));
         } else {
             return None;
         }
@@ -902,6 +953,33 @@ fn parse_go_like_duration(input: &str) -> Option<Duration> {
     }
 
     parsed_any.then_some(total)
+}
+
+/// Wandelt Sekunden (als `f64`, z. B. aus einem Header-Wert) in eine
+/// [`Duration`] um, ohne bei nicht endlichen oder extrem großen Werten zu
+/// paniken (Analogon zu `harw_provider_http::budget`s `duration_from_secs`).
+///
+/// # Description
+/// `Duration::from_secs_f64` panikt bei `NaN`, `Infinity` oder Werten, die
+/// den von `Duration` darstellbaren Bereich übersteigen. Diese Funktion
+/// fängt das ab: nicht endliche oder nicht positive Werte werden zu
+/// [`Duration::ZERO`]; alles andere wird vor der Umrechnung auf
+/// [`MAX_HEADER_DURATION`] gedeckelt und über das panikfreie
+/// `Duration::try_from_secs_f64` erzeugt (Fallback auf
+/// [`MAX_HEADER_DURATION`], falls die Umrechnung selbst nach dem Deckeln
+/// scheitert).
+///
+/// # Arguments
+/// - `secs` (`f64`): Sekundenwert, z. B. aus einem geparsten Header.
+///
+/// # Returns
+/// Eine gültige, auf [`MAX_HEADER_DURATION`] gedeckelte [`Duration`].
+fn duration_from_secs_f64_capped(secs: f64) -> Duration {
+    if !secs.is_finite() || secs <= 0.0 {
+        return Duration::ZERO;
+    }
+    let capped_secs = secs.min(MAX_HEADER_DURATION.as_secs_f64());
+    Duration::try_from_secs_f64(capped_secs).unwrap_or(MAX_HEADER_DURATION)
 }
 
 /// Parst einen RFC3339-Zeitstempel (`YYYY-MM-DDTHH:MM:SS(.fff)?(Z|±HH:MM)`)
@@ -999,7 +1077,11 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 /// (Monotonic-Clock-Referenzpunkt) verankert ist.
 ///
 /// Liegt der Zeitpunkt in der Vergangenheit, wird `now` selbst
-/// zurückgegeben (keine Wartezeit).
+/// zurückgegeben (keine Wartezeit). `epoch` stammt aus einem geparsten
+/// RFC3339-Header und kann beliebig groß sein (z. B. ein absurd langes
+/// Sekunden-Feld); `delta` wird deshalb vor der Umrechnung auf
+/// [`MAX_HEADER_DURATION`] gedeckelt (via [`duration_from_secs_f64_capped`])
+/// und mit `checked_add` auf `now` addiert, statt mit `+` zu überlaufen.
 fn instant_from_epoch_seconds(epoch: f64, now: Instant) -> Option<Instant> {
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1007,7 +1089,7 @@ fn instant_from_epoch_seconds(epoch: f64, now: Instant) -> Option<Instant> {
         .as_secs_f64();
     let delta = epoch - now_epoch;
     if delta > 0.0 {
-        Some(now + Duration::from_secs_f64(delta))
+        now.checked_add(duration_from_secs_f64_capped(delta))
     } else {
         Some(now)
     }
@@ -1048,6 +1130,30 @@ mod tests {
         );
         assert_eq!(parse_go_like_duration(""), None);
         assert_eq!(parse_go_like_duration("abc"), None);
+    }
+
+    /// Ohne Deckelung würde `Duration::from_secs_f64` hier paniken (der Wert
+    /// übersteigt den von `Duration` darstellbaren Bereich).
+    #[test]
+    fn test_parse_go_like_duration_caps_absurd_values() {
+        assert_eq!(
+            parse_go_like_duration("99999999999999999999s"),
+            Some(MAX_HEADER_DURATION)
+        );
+        assert_eq!(
+            parse_go_like_duration("99999999999999999999h"),
+            Some(MAX_HEADER_DURATION)
+        );
+    }
+
+    #[test]
+    fn test_duration_from_secs_f64_capped_handles_extreme_values() {
+        assert_eq!(duration_from_secs_f64_capped(f64::NAN), Duration::ZERO);
+        assert_eq!(duration_from_secs_f64_capped(f64::INFINITY), Duration::ZERO);
+        assert_eq!(duration_from_secs_f64_capped(-5.0), Duration::ZERO);
+        assert_eq!(duration_from_secs_f64_capped(0.0), Duration::ZERO);
+        assert_eq!(duration_from_secs_f64_capped(1e20), MAX_HEADER_DURATION);
+        assert_eq!(duration_from_secs_f64_capped(10.0), Duration::from_secs(10));
     }
 
     #[test]
@@ -1174,6 +1280,42 @@ mod tests {
         Ok(())
     }
 
+    /// Regressionstest für die drei in der Praxis beobachteten Panics:
+    /// `retry-after` als `u64::MAX`, eine `x-ratelimit-reset-*`-Dauer weit
+    /// jenseits von `Duration`s darstellbarem Bereich und ein RFC3339-Reset
+    /// mit einem absurd langen Sekunden-Feld. Ein beliebiger (auch
+    /// feindlicher) Provider kann all das in echten Antwort-Headern senden;
+    /// `observe_headers` darf dabei nie paniken und muss die daraus
+    /// abgeleitete Wartezeit auf `MAX_WAIT` deckeln.
+    #[test]
+    fn test_observe_headers_with_oversized_headers_does_not_panic() -> TestResult {
+        let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
+            enabled: true,
+            safety_margin_pct: 10,
+            ..harw_config::RateLimitToml::default()
+        }));
+        let headers = header_map(&[
+            ("retry-after", "18446744073709551615"),
+            ("x-ratelimit-limit-tokens", "1000"),
+            ("x-ratelimit-remaining-tokens", "1"),
+            ("x-ratelimit-reset-tokens", "99999999999999999999s"),
+            ("anthropic-ratelimit-input-tokens-limit", "1000"),
+            ("anthropic-ratelimit-input-tokens-remaining", "1"),
+            (
+                "anthropic-ratelimit-input-tokens-reset",
+                "1970-01-01T00:00:99999999999999999999999999Z",
+            ),
+        ])?;
+        // Darf nicht paniken; ohne Deckelung würden mehrere dieser Werte die
+        // `Instant`/`Duration`-Arithmetik überlaufen lassen.
+        limiter.observe_headers(&headers);
+        let wait = limiter
+            .pending_wait()
+            .ok_or(TestError::Missing("wait erwartet"))?;
+        assert!(wait <= MAX_WAIT);
+        Ok(())
+    }
+
     #[test]
     fn test_parse_rfc3339_epoch_seconds_basic() -> TestResult {
         // 1970-01-01T00:00:01Z == 1 Sekunde seit Epoche.
@@ -1186,6 +1328,31 @@ mod tests {
     #[test]
     fn test_parse_rfc3339_epoch_seconds_rejects_garbage() {
         assert_eq!(parse_rfc3339_epoch_seconds("not-a-timestamp"), None);
+    }
+
+    /// Das Sekunden-Feld ist im Parser nicht auf zwei Ziffern begrenzt; ein
+    /// Provider kann hier eine absurd große Zahl liefern. Der Parser selbst
+    /// darf dabei nicht paniken — die Begrenzung erfolgt downstream in
+    /// [`instant_from_epoch_seconds`]/[`duration_from_secs_f64_capped`].
+    #[test]
+    fn test_parse_rfc3339_epoch_seconds_accepts_huge_seconds_field_without_panicking()
+    -> TestResult {
+        let epoch = parse_rfc3339_epoch_seconds("1970-01-01T00:00:99999999999999999999999999Z")
+            .ok_or(TestError::Missing("parsebar"))?;
+        assert!(epoch > 0.0);
+        Ok(())
+    }
+
+    /// Ohne Deckelung würde `now + Duration::from_secs_f64(delta)` hier
+    /// paniken (delta liegt weit jenseits des von `Duration` darstellbaren
+    /// Bereichs).
+    #[test]
+    fn test_instant_from_epoch_seconds_caps_huge_delta_without_panicking() -> TestResult {
+        let now = Instant::now();
+        let instant = instant_from_epoch_seconds(f64::MAX, now)
+            .ok_or(TestError::Missing("Instant erwartet"))?;
+        assert_eq!(instant.saturating_duration_since(now), MAX_HEADER_DURATION);
+        Ok(())
     }
 
     #[tokio::test]

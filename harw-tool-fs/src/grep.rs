@@ -26,28 +26,42 @@
 //! Wurzel — unabhängig vom Suchmotor.
 //!
 //! # ripgrep-Integration
-//! Ist ein `rg`-Binary in `PATH` auffindbar (einmal je Prozess ermittelt,
-//! siehe [`rg_binary`]; keine `which`-Crate — reine `PATH`-Suche über
-//! `std::env::split_paths`) und wurden keine Kontextzeilen angefordert, läuft
-//! `rg --json` synchron im bereits blockierenden Kontext (siehe
-//! [`crate::blocking::run_blocking`]) mit `current_dir` = Workspace-Wurzel
-//! und entferntem `RIPGREP_CONFIG_PATH`. Die `match`-Ereignisse der
-//! `--json`-Ausgabe werden zeilenweise geparst (siehe
+//! `rg` wird nie über `PATH` gesucht, sondern nur an festen, absoluten Pfaden
+//! (`RG_CANDIDATES`), und nur verwendet, wenn es dieselbe Vertrauensregel
+//! erfüllt wie `bwrap` und `prlimit`
+//! (`harw_sandbox::BwrapLauncher::find_pinned_executable`: reguläre
+//! ausführbare Datei, Eigentümer root, nicht group-/world-beschreibbar). Ein
+//! `rg`, das eine Sandbox-Shell in ein Workspace- oder relatives
+//! `PATH`-Verzeichnis legt, startet `fs.grep` so nie auf dem Host. Der Pfad
+//! wird einmal je Prozess ermittelt (siehe [`rg_binary`]). Wurden keine
+//! Kontextzeilen angefordert, läuft `rg --json` synchron im bereits
+//! blockierenden Kontext (siehe [`crate::blocking::run_blocking`]) mit
+//! `current_dir` = Workspace-Wurzel und geleerter Umgebung (nur minimales
+//! `PATH`/`LANG`, also weder `RIPGREP_CONFIG_PATH` noch globale Ignore-Dateien
+//! aus `HOME`). `rg` erhält dieselbe Dateigrößengrenze (`--max-filesize`,
+//! [`MAX_FILE_SIZE_BYTES`]) und dieselben harten Ausschlüsse (`target`,
+//! `.git`) wie die interne Suche; ein Watchdog-Thread beendet `rg` nach
+//! demselben Zeitbudget (10 s, `# stopped: deadline`). `rg` ignoriert
+//! `--max-columns` unter `--json`, daher liest ein begrenzter Zeilenleser die
+//! Ausgabe: Ereignisse über `MAX_RG_EVENT_BYTES` werden verworfen und im
+//! Hinweis gezählt. Die übrigen `match`-Ereignisse werden geparst (siehe
 //! [`parse_rg_match_line`]) und in dieselbe Trefferstruktur überführt wie die
 //! interne Suche — identisches Ausgabeformat, identische Zeilenkürzung,
-//! identische Treffer-/Ausgabegrenzen. Der Kindprozess wird beim Erreichen
-//! einer Grenze vorzeitig beendet. Ein Regex-Fehler von `rg` (Exit-Code 2)
-//! ohne bereits gesammelte Treffer sowie jeder Spawn-Fehler fallen auf die
-//! interne Suche zurück; Exit-Code 1 (keine Treffer) liefert ein leeres
-//! Ergebnis. `rg` überspringt standardmäßig `.gitignore`-Einträge und
-//! versteckte Dateien — das deckt sich mit dem internen Fallback (der
-//! ebenfalls `.gitignore` beachtet) und ist akzeptiertes Verhalten.
+//! identische Treffer-/Ausgabegrenzen. Von `--max-filesize` übersprungene
+//! Dateien meldet `rg` nicht; der Hinweis darauf entfällt im rg-Pfad. Der
+//! Kindprozess wird beim Erreichen einer Grenze vorzeitig beendet. Ein
+//! Regex-Fehler von `rg` (Exit-Code 2) ohne bereits gesammelte Treffer sowie
+//! jeder Spawn-Fehler fallen auf die interne Suche zurück; Exit-Code 1 (keine
+//! Treffer) liefert ein leeres Ergebnis. `rg` überspringt standardmäßig
+//! `.gitignore`-Einträge und versteckte Dateien — das deckt sich mit dem
+//! internen Fallback (der ebenfalls `.gitignore` beachtet) und ist
+//! akzeptiertes Verhalten.
 //! Kontextzeilen (`context_lines > 0`) werden ausschließlich intern bedient,
 //! da die verwendete `rg`-Argumentliste keine `-A`/`-B`/`-C`-Flags enthält.
 //! In Testbuilds liefert [`rg_binary`] stets `None`, damit Tests unabhängig
 //! vom Testrechner deterministisch bleiben; die ripgrep-Anbindung wird
-//! stattdessen gezielt über [`grep_with_engine`] mit einem injizierten Pfad
-//! getestet.
+//! stattdessen gezielt über [`grep_with_engine`] bzw. `run_rg` mit einem
+//! injizierten Pfad getestet.
 //!
 //! # Traversierung und Grenzen (W1-02, interne Suche)
 //! Im Verzeichnis-Modus wird über [`crate::tree::walk_tree`] gewalkt (Basis
@@ -68,7 +82,8 @@
 //!
 //! # Nebenläufigkeit
 //! [`FsGrepTool`] ist `Send + Sync` (Unit-Struct). `fs.grep` ist `parallel_safe`.
-//! Walk bzw. rg-Subprozess laufen über `spawn_blocking`.
+//! Walk bzw. rg-Subprozess laufen über `spawn_blocking`; der rg-Pfad startet
+//! zusätzlich einen kurzlebigen, gescopten Watchdog-Thread für das Zeitbudget.
 //!
 //! # Fehler
 //! Permission-Fehler (erzwungen durch den Makro-Prolog vor der
@@ -78,23 +93,27 @@
 use crate::blocking::run_blocking;
 use crate::symlink::open_start;
 use crate::tree::{
-    HARD_MAX_RESULTS, MAX_LINE_BYTES, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason,
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason, WALK_DEADLINE,
     WalkOptions, Workspace, normalize_relative, open_file_in, read_bounded, truncate_line,
     walk_tree,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use harw_fsutil::EntryType;
 use harw_macros::Tool;
+use harw_sandbox::BwrapLauncher;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(not(test))]
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Standard-Obergrenze für `fs.grep`-Treffer.
 pub const DEFAULT_MAX_MATCHES: usize = 100;
@@ -121,6 +140,20 @@ const LINE_OVERHEAD_BYTES: usize = 16;
 /// Verzeichnis- bzw. Dateinamen, die unabhängig von `.gitignore` immer
 /// übersprungen werden.
 const HARD_EXCLUDED_NAMES: &[&str] = &["target", ".git"];
+
+/// Feste, absolute Kandidaten für `rg` in Suchreihenfolge; `PATH` wird nie
+/// durchsucht (Modul-Doku "ripgrep-Integration").
+const RG_CANDIDATES: [&str; 3] = ["/usr/bin/rg", "/bin/rg", "/usr/local/bin/rg"];
+
+/// Einzige Umgebung des `rg`-Kindprozesses (nach `env_clear`).
+const RG_ENV: [(&str, &str); 2] = [("PATH", "/usr/bin:/bin"), ("LANG", "C.UTF-8")];
+
+/// Obergrenze eines `rg --json`-Ereignisses (eine Zeile). `rg` ignoriert
+/// `--max-columns` unter `--json` und liefert die Trefferzeile vollständig;
+/// längere Ereignisse werden verworfen und im Hinweis gezählt. So groß wie die
+/// Gesamtausgabe, damit lange Quelltextzeilen samt JSON-Escaping und
+/// `submatches` noch durchkommen und ohnehin per `truncate_line` gekürzt werden.
+const MAX_RG_EVENT_BYTES: usize = MAX_OUTPUT_BYTES;
 
 /// Deserialisierte Argumente für `fs.grep`.
 #[derive(Debug, Tool, Deserialize)]
@@ -361,8 +394,15 @@ fn resolve_target(
 }
 
 /// Formatiert die gesammelten Treffer und hängt Hinweis-/Abbruchzeilen an
-/// (gemeinsame Ausgabeformatierung für beide Suchmotoren).
-fn finalize(hits: &[GrepHit], stop: Option<StopReason>, cap: usize, skipped: usize) -> ToolOutput {
+/// (gemeinsame Ausgabeformatierung für beide Suchmotoren). `dropped` zählt
+/// verworfene, überlange `rg`-Ereignisse (siehe `MAX_RG_EVENT_BYTES`).
+fn finalize(
+    hits: &[GrepHit],
+    stop: Option<StopReason>,
+    cap: usize,
+    skipped: usize,
+    dropped: usize,
+) -> ToolOutput {
     let mut out_lines = format_hits(hits);
     let mut note_parts = Vec::new();
     if stop == Some(StopReason::ResultLimit) {
@@ -371,6 +411,11 @@ fn finalize(hits: &[GrepHit], stop: Option<StopReason>, cap: usize, skipped: usi
     if skipped > 0 {
         note_parts.push(format!(
             "{skipped} Datei(en) übersprungen (Binärdatei oder Größenlimit überschritten)"
+        ));
+    }
+    if dropped > 0 {
+        note_parts.push(format!(
+            "{dropped} überlange rg-Zeile(n) ausgelassen (über {MAX_RG_EVENT_BYTES} Bytes)"
         ));
     }
     if !note_parts.is_empty() {
@@ -387,14 +432,16 @@ fn finalize(hits: &[GrepHit], stop: Option<StopReason>, cap: usize, skipped: usi
 #[cfg(not(test))]
 static RG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// Sucht `rg` in `PATH` (manuelle Suche über [`std::env::split_paths`], keine
-/// `which`-Crate — siehe Workspace-Regel gegen neue Abhängigkeiten).
+/// Sucht `rg` ausschließlich an [`RG_CANDIDATES`], nie über `PATH`.
 fn find_rg() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var).find_map(|dir| {
-        let candidate = dir.join("rg");
-        candidate.is_file().then_some(candidate)
-    })
+    find_rg_in(&RG_CANDIDATES.map(Path::new))
+}
+
+/// Erster vertrauenswürdiger Kandidat nach derselben Regel wie für `bwrap`
+/// und `prlimit` ([`BwrapLauncher::find_pinned_executable`]): absolut,
+/// reguläre ausführbare Datei, Eigentümer root, nicht group-/world-beschreibbar.
+fn find_rg_in(candidates: &[&Path]) -> Option<PathBuf> {
+    BwrapLauncher::find_pinned_executable(candidates)
 }
 
 /// Liefert den gecachten `rg`-Pfad, falls vorhanden (einmal je Prozess
@@ -413,10 +460,20 @@ fn rg_binary() -> Option<&'static Path> {
     None
 }
 
+/// Gesammelte Treffer eines `rg`-Laufs.
+struct RgHits {
+    /// Treffer in Ausgabereihenfolge.
+    hits: Vec<GrepHit>,
+    /// Abbruchgrund, falls eine Grenze oder das Zeitbudget griff.
+    stop: Option<StopReason>,
+    /// Anzahl verworfener Ereignisse über `MAX_RG_EVENT_BYTES`.
+    dropped: usize,
+}
+
 /// Ergebnis eines `rg`-Laufs.
 enum RgOutcome {
     /// Fertige Trefferliste inklusive Abbruchgrund.
-    Hits(Vec<GrepHit>, Option<StopReason>),
+    Hits(RgHits),
     /// `rg` konnte nicht sinnvoll verwendet werden — die interne Suche
     /// übernimmt (Spawn-Fehler oder Regex-Fehler ohne bereits gesammelte
     /// Treffer).
@@ -481,67 +538,67 @@ fn parse_rg_match_line(line: &str) -> Option<RgMatchLine> {
     })
 }
 
-/// Führt `rg --json` im Verzeichnis `root` aus und übersetzt die
-/// `match`-Ereignisse in [`GrepHit`]s (Abschnitt "ripgrep-Integration").
-///
-/// Bricht beim Erreichen von `cap` Treffern oder [`MAX_OUTPUT_BYTES`] ab und
-/// beendet den Kindprozess vorzeitig (`StopReason::ResultLimit` /
-/// `OutputLimit`). Exit-Code 2 (z. B. Regex-Fehler) ohne bereits gesammelte
-/// Treffer sowie jeder Spawn-Fehler liefern [`RgOutcome::Fallback`];
-/// Exit-Code 1 (keine Treffer) liefert eine leere Trefferliste.
-fn run_rg(rg: &Path, root: &Path, args: &GrepArgs, start_rel: &Path, cap: usize) -> RgOutcome {
-    let target_arg = if start_rel.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        start_rel
-    };
-
-    let mut cmd = Command::new(rg);
-    cmd.current_dir(root)
-        .env_remove("RIPGREP_CONFIG_PATH")
-        .arg("--json")
-        .arg("--no-config")
-        .arg("--no-follow")
-        .arg("--no-messages")
-        .arg("--color")
-        .arg("never")
-        .arg("--max-columns")
-        .arg(MAX_LINE_BYTES.to_string());
-    if args.case_insensitive.unwrap_or(false) {
-        cmd.arg("--ignore-case");
+/// Liest eine Zeile (ohne `\n`) nach `buf`, hält aber höchstens `limit` Bytes
+/// im Speicher; der Rest einer längeren Zeile wird ungepuffert übersprungen.
+/// `Ok(None)` am Datenende, sonst `Ok(Some(passt))`.
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let budget = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    if reader.by_ref().take(budget).read_until(b'\n', buf)? == 0 {
+        return Ok(None);
     }
-    if let Some(glob) = args.glob.as_deref().filter(|glob| !glob.is_empty()) {
-        cmd.arg("--glob").arg(glob);
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        return Ok(Some(true));
     }
-    cmd.arg("-e")
-        .arg(&args.pattern)
-        .arg("--")
-        .arg(target_arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    if buf.len() <= limit {
+        return Ok(Some(true));
+    }
+    buf.clear();
+    reader.skip_until(b'\n')?;
+    Ok(Some(false))
+}
 
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(_) => return RgOutcome::Fallback,
+/// Sammelt die `match`-Ereignisse aus `rg --json`, bis `cap` Treffer,
+/// [`MAX_OUTPUT_BYTES`] oder `deadline` (ab `started`) erreicht sind.
+fn collect_rg_hits<R: BufRead>(
+    mut reader: R,
+    cap: usize,
+    started: Instant,
+    deadline: Duration,
+) -> RgHits {
+    let mut found = RgHits {
+        hits: Vec::new(),
+        stop: None,
+        dropped: 0,
     };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return RgOutcome::Fallback;
-    };
-
-    let mut hits: Vec<GrepHit> = Vec::new();
     let mut output_bytes = 0usize;
-    let mut stop: Option<StopReason> = None;
-
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        let Some(matched) = parse_rg_match_line(&line) else {
+    let mut buf = Vec::new();
+    loop {
+        if started.elapsed() >= deadline {
+            found.stop = Some(StopReason::Deadline);
+            break;
+        }
+        match read_capped_line(&mut reader, &mut buf, MAX_RG_EVENT_BYTES) {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => {
+                found.dropped += 1;
+                continue;
+            }
+            Ok(None) | Err(_) => break,
+        }
+        let Some(matched) = std::str::from_utf8(&buf)
+            .ok()
+            .and_then(parse_rg_match_line)
+        else {
             continue;
         };
-        if hits.len() >= cap {
-            stop = Some(StopReason::ResultLimit);
+        if found.hits.len() >= cap {
+            found.stop = Some(StopReason::ResultLimit);
             break;
         }
         let hit = GrepHit {
@@ -553,14 +610,116 @@ fn run_rg(rg: &Path, root: &Path, args: &GrepArgs, start_rel: &Path, cap: usize)
         };
         let cost = hit.output_cost();
         if output_bytes + cost > MAX_OUTPUT_BYTES {
-            stop = Some(StopReason::OutputLimit);
+            found.stop = Some(StopReason::OutputLimit);
             break;
         }
         output_bytes += cost;
-        hits.push(hit);
+        found.hits.push(hit);
+    }
+    found
+}
+
+/// Führt `rg --json` im Verzeichnis `root` aus und übersetzt die
+/// `match`-Ereignisse in [`GrepHit`]s (Abschnitt "ripgrep-Integration").
+///
+/// `rg` läuft mit geleerter Umgebung (nur [`RG_ENV`]), derselben
+/// Dateigrößengrenze und denselben harten Ausschlüssen wie die interne Suche.
+/// Bricht beim Erreichen von `cap` Treffern, [`MAX_OUTPUT_BYTES`] oder
+/// `deadline` ab und beendet den Kindprozess vorzeitig
+/// (`StopReason::ResultLimit` / `OutputLimit` / `Deadline`); ein
+/// Watchdog-Thread beendet `rg` auch dann, wenn das Lesen blockiert.
+/// Exit-Code 2 (z. B. Regex-Fehler) ohne bereits gesammelte Treffer sowie
+/// jeder Spawn-Fehler liefern [`RgOutcome::Fallback`]; Exit-Code 1 (keine
+/// Treffer) liefert eine leere Trefferliste.
+fn run_rg(
+    rg: &Path,
+    root: &Path,
+    args: &GrepArgs,
+    start_rel: &Path,
+    cap: usize,
+    deadline: Duration,
+) -> RgOutcome {
+    let target_arg = if start_rel.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        start_rel
+    };
+
+    let mut cmd = Command::new(rg);
+    cmd.current_dir(root)
+        .env_clear()
+        .envs(RG_ENV)
+        .arg("--json")
+        .arg("--no-config")
+        .arg("--no-follow")
+        .arg("--no-messages")
+        .arg("--color")
+        .arg("never")
+        .arg("--max-filesize")
+        .arg(MAX_FILE_SIZE_BYTES.to_string());
+    if args.case_insensitive.unwrap_or(false) {
+        cmd.arg("--ignore-case");
+    }
+    if let Some(glob) = args.glob.as_deref().filter(|glob| !glob.is_empty()) {
+        cmd.arg("--glob").arg(glob);
+    }
+    // Nach dem Nutzer-Glob: bei `rg` hat der spätere Glob Vorrang.
+    for name in HARD_EXCLUDED_NAMES {
+        cmd.arg("--glob").arg(format!("!{name}"));
+    }
+    cmd.arg("-e")
+        .arg(&args.pattern)
+        .arg("--")
+        .arg(target_arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let started = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return RgOutcome::Fallback,
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return RgOutcome::Fallback;
+    };
+
+    // Der Watchdog beendet `rg` nach `deadline`, auch wenn `rg` weder Ereignisse
+    // noch EOF liefert; das Lesen selbst hält die Sperre nie.
+    let shared = Mutex::new(child);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let collected: Option<(RgHits, bool)> = std::thread::scope(|scope| {
+        let child = &shared;
+        let watchdog = std::thread::Builder::new()
+            .name("fs.grep-rg-watchdog".to_owned())
+            .spawn_scoped(scope, move || {
+                let expired = matches!(
+                    done_rx.recv_timeout(deadline),
+                    Err(RecvTimeoutError::Timeout)
+                );
+                if expired {
+                    let _ = child.lock().unwrap_or_else(PoisonError::into_inner).kill();
+                }
+                expired
+            })
+            .ok()?;
+        let found = collect_rg_hits(BufReader::new(stdout), cap, started, deadline);
+        drop(done_tx);
+        Some((found, watchdog.join().unwrap_or(true)))
+    });
+    let mut child = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let Some((mut found, expired)) = collected else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return RgOutcome::Fallback;
+    };
+    if expired && found.stop.is_none() {
+        found.stop = Some(StopReason::Deadline);
     }
 
-    let exit_code = if stop.is_some() {
+    let exit_code = if found.stop.is_some() {
         let _ = child.kill();
         let _ = child.wait();
         None
@@ -568,10 +727,10 @@ fn run_rg(rg: &Path, root: &Path, args: &GrepArgs, start_rel: &Path, cap: usize)
         child.wait().ok().and_then(|status| status.code())
     };
 
-    if hits.is_empty() && exit_code == Some(2) {
+    if found.hits.is_empty() && exit_code == Some(2) {
         return RgOutcome::Fallback;
     }
-    RgOutcome::Hits(hits, stop)
+    RgOutcome::Hits(found)
 }
 
 /// Kern von [`grep_blocking`] mit injizierbarem `rg`-Pfad (siehe Modul-Doku
@@ -657,8 +816,10 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
     // -A/-B/-C-Flags, mit Kontextzeilen läuft ausschließlich die interne Suche.
     if context_lines == 0 {
         if let Some(rg) = rg {
-            match run_rg(rg, root, args, &start_rel, cap) {
-                RgOutcome::Hits(hits, stop) => return finalize(&hits, stop, cap, 0),
+            match run_rg(rg, root, args, &start_rel, cap, WALK_DEADLINE) {
+                RgOutcome::Hits(found) => {
+                    return finalize(&found.hits, found.stop, cap, 0, found.dropped);
+                }
                 RgOutcome::Fallback => {}
             }
         }
@@ -714,7 +875,7 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
         }
     };
 
-    finalize(&run.hits, stop, cap, run.skipped)
+    finalize(&run.hits, stop, cap, run.skipped, 0)
 }
 
 #[cfg(test)]
@@ -1135,7 +1296,110 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "erfordert ein installiertes rg-Binary auf PATH; nicht Teil der Standard-Testsuite"]
+    fn test_find_rg_in_rejects_relative_and_untrusted_candidates() -> TestResult {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TempDir::new()?;
+        let fake = dir.path().join("rg");
+        fs::write(&fake, "#!/bin/sh\nexit 0\n")?;
+
+        // Relative Kandidaten (`.`, `node_modules/.bin`, direnv `bin`) nie.
+        let relative = [StdPath::new("rg"), StdPath::new("./rg"), StdPath::new("bin/rg")];
+        assert_eq!(find_rg_in(&relative), None);
+        // Group-/world-beschreibbar: nie, auch nicht root-eigen.
+        for mode in [0o775, 0o757] {
+            fs::set_permissions(&fake, fs::Permissions::from_mode(mode))?;
+            assert_eq!(find_rg_in(&[fake.as_path()]), None, "Modus {mode:o}");
+        }
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))?;
+        let accepted = find_rg_in(&[fake.as_path()]);
+        if fs::metadata(&fake)?.uid() == 0 {
+            // Test läuft als root: Eigentümerprüfung hier nicht beobachtbar.
+            assert_eq!(accepted.as_deref(), Some(fake.as_path()));
+        } else {
+            assert_eq!(accepted, None, "nutzereigenes rg darf nie gewählt werden");
+        }
+
+        // Keine PATH-Suche mehr: gefunden wird höchstens ein fester Kandidat.
+        let found = find_rg();
+        assert!(
+            found
+                .as_deref()
+                .is_none_or(|path| RG_CANDIDATES.iter().any(|c| StdPath::new(c) == path)),
+            "{found:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_capped_line_skips_overlong_lines_without_buffering() -> TestResult {
+        let mut reader = std::io::Cursor::new(b"abcd\nabcde\nxy".to_vec());
+        let mut buf = Vec::new();
+        assert_eq!(read_capped_line(&mut reader, &mut buf, 4)?, Some(true));
+        assert_eq!(buf, b"abcd");
+        assert_eq!(read_capped_line(&mut reader, &mut buf, 4)?, Some(false));
+        assert!(buf.is_empty(), "überlange Zeile darf nicht gepuffert bleiben");
+        assert_eq!(read_capped_line(&mut reader, &mut buf, 4)?, Some(true));
+        assert_eq!(buf, b"xy");
+        assert_eq!(read_capped_line(&mut reader, &mut buf, 4)?, None);
+        Ok(())
+    }
+
+    /// Legt ein ausführbares Skript an, das `rg` spielt (nur als injizierter
+    /// Pfad; `find_rg` würde es nie wählen).
+    fn fake_rg(dir: &StdPath, name: &str, body: &str) -> TestResult<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        fs::write(&script, format!("#!/bin/sh\n{body}\n"))?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+        Ok(script)
+    }
+
+    /// 20 MiB lange Trefferzeile, danach eine normale.
+    const HUGE_RG_BODY: &str = r#"printf '{"type":"match","data":{"path":{"text":"big.txt"},"lines":{"text":"'
+head -c 20971520 /dev/zero | tr '\000' x
+printf '"},"line_number":1}}\n'
+printf '{"type":"match","data":{"path":{"text":"small.txt"},"lines":{"text":"MATCHME\\n"},"line_number":2}}\n'"#;
+
+    #[test]
+    fn test_rg_engine_bounds_event_size_and_runtime() -> TestResult {
+        let dir = TempDir::new()?;
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws)?;
+        // Beide Skripte vor dem ersten Start schreiben und nacheinander
+        // starten: ein paralleler `fork` mit offenem Schreib-Deskriptor ließe
+        // `exec` sonst mit ETXTBSY scheitern (Fallback statt rg-Pfad).
+        let huge = fake_rg(dir.path(), "rg-huge", HUGE_RG_BODY)?;
+        let slow = fake_rg(dir.path(), "rg-slow", "exec sleep 60")?;
+
+        let text = text_of(grep_with_engine(&ws, &grep_args("MATCHME"), Some(&huge)))?;
+        assert!(text.starts_with("small.txt:2: MATCHME\n"), "{text}");
+        assert!(!text.contains("big.txt"), "{text}");
+        assert!(text.contains("1 überlange rg-Zeile(n)"), "{text}");
+        assert!(text.len() < 1024, "Ausgabe zu groß: {}", text.len());
+
+        let started = Instant::now();
+        let outcome = run_rg(
+            &slow,
+            &ws,
+            &grep_args("MATCHME"),
+            StdPath::new(""),
+            10,
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        let RgOutcome::Hits(found) = outcome else {
+            return Err(TestError::Unexpected(
+                "hängendes rg fiel auf die interne Suche zurück".to_owned(),
+            ));
+        };
+        assert_eq!(found.stop, Some(StopReason::Deadline));
+        assert!(found.hits.is_empty());
+        assert!(elapsed < Duration::from_secs(10), "Watchdog griff nicht: {elapsed:?}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "erfordert ein vertrauenswürdiges rg an einem festen Pfad (RG_CANDIDATES); nicht Teil der Standard-Testsuite"]
     fn test_grep_with_engine_spawns_real_ripgrep_when_present() -> TestResult {
         let Some(rg) = find_rg() else {
             return Ok(());

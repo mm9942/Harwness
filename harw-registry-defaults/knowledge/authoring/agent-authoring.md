@@ -64,11 +64,14 @@ Jeder eingebaute Agent braucht einen Rückgabevertrag — keine Rohausgaben an
 den Aufraggeber, sondern eine strukturierte Zusammenfassung.
 
 ## Ablageorte
-- **Projekt-Scope**: `<projekt>/.harw/agents/<name>.toml` — für dieses
-  Repository sichtbar, gehört ins Projekt.
-- **Profil-Scope**: `~/.harw/profiles/<profil>/agents/<name>/agent.toml`
+- **Projekt-Scope**: `<projekt>/.harw/agents/<name>/definition.toml` — für
+  dieses Repository sichtbar, gehört ins Projekt.
+- **Profil-Scope**: `~/.harw/profiles/<profil>/agents/<name>/definition.toml`
   (siehe `harw-home/src/scaffold.rs`) — persönlich, profilweit, nie im
   Projekt-Repository.
+- **Legacy**: die flache Form `<dir>/<name>.toml` wird nur noch gelesen (mit
+  Warnung, siehe `config_agents.rs`), nie mehr geschrieben — neue
+  Definitionen landen immer im Verzeichnisformat oben.
 
 ## Häufige Fehler
 - `admitted` weicht vom Registry-Profil der Rolle ab (zu viel oder zu
@@ -138,15 +141,18 @@ nie in ein Projekt-Repository:
   `version`, `name`, `description`, `specialization`) — wie oben, nur mit
   dieser Rolle statt `worker`.
 - `agent.toml`: dieselben Kernfelder (`name`, `role`, `description`) als
-  Agentenmetadaten neben der Definition (siehe
-  `harw-cli/src/uia_bootstrap.rs::write_generated_uia`).
+  Agentenmetadaten neben der Definition (legacy, siehe
+  `agent_definition_tools.rs::build_agent_toml`/`commit_uia_bundle`) — trägt
+  seit Plan R9 **kein** `identity`-Feld mehr.
 - `Personality.md`: Ton, Persönlichkeit, Antwortverhalten — wie die UIA
   klingen und reagieren soll.
 - `USER.md` (freiwillig): Nutzerkontext, üblicherweise mit einer
   `Name: …`-Zeile, die `harw-config::loader::load_uia_user_name` liest.
-- `Identity.md`: **weglassen** — der aktuelle Loader
-  (`harw-config/src/loader.rs::load_uia_personalization`) liest nur
-  `Personality.md` und `USER.md`; eine zusätzliche Datei bliebe wirkungslos.
+- `identity.md` (freiwillig, über `identity_md` von `agents.write_uia`): wer
+  der Agent selbst ist (Name, Herkunft, Abgrenzung zu anderen UIAs) — der
+  Loader (`harw-config/src/loader.rs::load_uia_identity`, aufgerufen aus
+  `load_uia_personalization`) liest sie tatsächlich; ohne `identity_md`
+  entfällt die Datei ersatzlos, kein Fehler.
 
 ### Aktivierung nur durch den Nutzer
 `agents.write_uia` schreibt das Bündel atomar je Datei mit `0600`

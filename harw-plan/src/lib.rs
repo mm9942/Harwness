@@ -24,9 +24,10 @@
 //! beide Stores gemeinsam nutzen — es gibt keine zweite Kopie der
 //! Mutationslogik und keinen `&mut PlanNode` in der öffentlichen API.
 //!
-//! # Nicht im Slice
-//! Adapter (Command / Model-Tool / Channel), MCP-Bridge, TUI-Projektion —
-//! kommen in Folge-Waves.
+//! # Adapter
+//! Command-Adapter (`harw-ops`), MCP-Bridge (`harw-plan-bridge`) und
+//! TUI-Projektion (`harw-tui`) sind eigene Crates, die gegen diese API
+//! bauen — nicht Teil dieses Crates.
 //!
 //! # Concurrency
 //! Alle Store-Implementierungen sind `Send + Sync`.
@@ -91,6 +92,10 @@ mod test_support;
 
 pub use crate::actions::{NodePatch, PlanAction, PlanEvent};
 pub use crate::admission::ScopeMatcher;
+// Die vier Funktionen stehen bewusst zusätzlich zu den Typen am Root:
+// `harw-ops` (Plan-Commands) importiert alle vier, `harw-tui`
+// (Plan-Projektion) einen Teil davon (`has_blocked_step`, `plan_progress`) —
+// beide einzeln neben `Plan`/`PlanNode` statt über `harw_plan::catalog::…`.
 pub use crate::catalog::{
     PlanApproval, PlanMeta, PlanSummary, current_step, has_blocked_step, plan_progress,
     progress_bar,
@@ -108,8 +113,15 @@ pub use crate::types::{
 
 // Ziel-Verwaltung. `Invariant`, `Constraint`, `ConstraintKind` und `GoalReport`
 // bleiben bewusst unter `harw_plan::goal::…` — ihre Namen sind ohne den
-// Modulkontext zu allgemein. Die Graph-Funktionen bleiben aus demselben Grund
-// unter `harw_plan::graph::…`, damit der Crate-Root nur Typen führt.
+// Modulkontext zu allgemein. Die Graph-Funktionen (`ready_nodes`,
+// `topological_waves`, `blocked_by`, `partition_write_sets`,
+// `missing_explorations`, `condense_candidates`, `children_of`) bleiben aus
+// einem anderen Grund unter `harw_plan::graph::…`: Aufrufer (`harw-ops`,
+// `harw-plan-bridge`) importieren das Modul als Ganzes und rufen mehrere
+// dieser Funktionen nebeneinander auf — anders als die vier Katalog-
+// Funktionen oben, die einzeln neben den Kerntypen gebraucht werden und
+// deshalb am Root stehen. Der Crate-Root führt also nicht nur Typen,
+// sondern auch diese schmale, stabile Katalog-Fassade.
 pub use crate::goal::{Goal, GoalAction, GoalEvent, GoalId, GoalPatch, GoalStatus, GoalStore};
 pub use crate::goal_store::{FileGoalStore, InMemoryGoalStore};
 pub use crate::tenant_scope::{ScopedGoalStore, ScopedPlanStore};
@@ -176,6 +188,28 @@ mod tests {
             id: crate::PlanId::new("p-1"),
         };
         assert!(error.to_string().contains("p-1"));
+    }
+
+    /// Die vier Katalog-Funktionen müssen über den Crate-Root erreichbar
+    /// sein — sonst weicht die im Modulkopf beschriebene Fassade von der
+    /// tatsächlichen API ab (siehe Re-Export-Kommentar oben in dieser
+    /// Datei).
+    #[test]
+    fn catalog_functions_are_reachable_from_the_crate_root() {
+        let plan = plan_with_nodes(vec![
+            node("done", PlanNodeStatus::Completed),
+            node("blocked", PlanNodeStatus::Blocked),
+        ]);
+
+        assert!(crate::has_blocked_step(&plan));
+        assert_eq!(
+            crate::current_step(&plan).map(|found| found.id.clone()),
+            Some(TaskId::new("blocked"))
+        );
+
+        let (done, total) = crate::plan_progress(&plan);
+        assert_eq!((done, total), (1, 2));
+        assert_eq!(crate::progress_bar(done, total, 4), "[██░░] 1/2");
     }
 
     #[test]

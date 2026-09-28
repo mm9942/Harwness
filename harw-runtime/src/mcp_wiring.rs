@@ -45,27 +45,76 @@ fn mcp_runtime() -> Option<&'static tokio::runtime::Runtime> {
         .as_ref()
 }
 
+/// Grund, warum eine [`SecretRef`] hier nicht zu einem Token aufgelöst
+/// werden konnte (nur für die Warnung in [`spec_for`], kein `harw-config`-Typ).
+#[derive(Debug)]
+enum TokenResolveError {
+    /// Umgebungsvariable fehlt oder ist nicht in gültigem UTF-8 gesetzt.
+    EnvUnavailable,
+    /// Datei fehlt oder ist nicht lesbar.
+    FileUnreadable,
+    /// Dateiinhalt ist kein gültiges JSON.
+    InvalidJson,
+    /// JSON-Pointer verweist auf kein vorhandenes String-Feld.
+    PointerMissing,
+    /// Aufgelöster Wert ist leer (nur Leerraum).
+    Empty,
+    /// `keyring:`/`secrets:` sind hier (ohne Secret-Store) nie auflösbar.
+    BackendUnsupported,
+}
+
+impl TokenResolveError {
+    /// Kurzform für `tracing`-Felder (kein `Display`, damit niemand versucht
+    /// ist, den Grund als Nutzertext auszugeben statt ihn zu loggen).
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::EnvUnavailable => "env_unavailable",
+            Self::FileUnreadable => "file_unreadable",
+            Self::InvalidJson => "invalid_json",
+            Self::PointerMissing => "pointer_missing",
+            Self::Empty => "empty",
+            Self::BackendUnsupported => "backend_unsupported",
+        }
+    }
+}
+
 /// Löst eine [`SecretRef`] für ein MCP-Bearer-Token auf. `keyring:`/`secrets:`
-/// sind hier (ohne Secret-Store) nicht auflösbar und liefern `None`.
-fn resolve_token(reference: &SecretRef) -> Option<Vec<u8>> {
+/// sind hier (ohne Secret-Store) nicht auflösbar und liefern `Err`.
+///
+/// Ein `Err` heißt: der Aufrufer darf sich **nicht** mit diesem Server
+/// verbinden, ohne das konfigurierte Token — [`spec_for`] lässt den Server
+/// deshalb ganz aus, statt ihn unauthentifiziert zu verbinden.
+fn resolve_token(reference: &SecretRef) -> Result<Vec<u8>, TokenResolveError> {
     let value = match reference {
-        SecretRef::Env(name) => std::env::var(name).ok()?,
-        SecretRef::File(path) => std::fs::read_to_string(path).ok()?,
+        SecretRef::Env(name) => {
+            std::env::var(name).map_err(|_| TokenResolveError::EnvUnavailable)?
+        }
+        SecretRef::File(path) => {
+            std::fs::read_to_string(path).map_err(|_| TokenResolveError::FileUnreadable)?
+        }
         SecretRef::FileJson { path, pointer } => {
-            let raw = std::fs::read_to_string(path).ok()?;
-            let doc: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            doc.pointer(pointer)?.as_str()?.to_owned()
+            let raw =
+                std::fs::read_to_string(path).map_err(|_| TokenResolveError::FileUnreadable)?;
+            let doc: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|_| TokenResolveError::InvalidJson)?;
+            doc.pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TokenResolveError::PointerMissing)?
+                .to_owned()
         }
         SecretRef::Keyring(_) | SecretRef::Secrets(_) => {
             tracing::warn!(
                 reference = %reference.as_ref_string(),
                 "mcp.credential_backend_unsupported_here"
             );
-            return None;
+            return Err(TokenResolveError::BackendUnsupported);
         }
     };
     let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.as_bytes().to_vec())
+    if trimmed.is_empty() {
+        return Err(TokenResolveError::Empty);
+    }
+    Ok(trimmed.as_bytes().to_vec())
 }
 
 /// Übersetzt die konfigurierten, aktiven Server in Verbindungs-Specs.
@@ -93,10 +142,28 @@ fn spec_for(key: &str, server: &McpServerToml) -> Option<McpServerSpec> {
                 tracing::warn!(server = %name, "mcp.http_server_without_url");
                 return None;
             };
-            McpEndpoint::Http {
-                url,
-                token: server.auth.as_ref().and_then(resolve_token),
-            }
+            // Ein konfiguriertes Auth, das sich nicht auflösen lässt, darf
+            // den Server nie unauthentifiziert verbinden (er würde entweder
+            // mit einem unklaren 401 scheitern oder, schlimmer, anonym eine
+            // andere Werkzeugmenge zeigen als konfiguriert) — der Server
+            // fehlt dann schlicht in der Werkzeugliste, wie jeder andere
+            // Fehlkonfigurations-Fall in dieser Funktion.
+            let token = match &server.auth {
+                Some(reference) => match resolve_token(reference) {
+                    Ok(token) => Some(token),
+                    Err(error) => {
+                        tracing::warn!(
+                            server = %name,
+                            reference = %reference.as_ref_string(),
+                            reason = error.as_str(),
+                            "mcp.auth_unresolved_server_skipped"
+                        );
+                        return None;
+                    }
+                },
+                None => None,
+            };
+            McpEndpoint::Http { url, token }
         }
         McpTransportToml::Stdio => {
             let Some(command) = server.command.clone() else {
@@ -176,7 +243,11 @@ impl AssemblyContributor for McpContributor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
+    /// Baut einen Testserver ohne Auth (die meisten Tests hier prüfen nichts
+    /// Auth-Bezogenes); [`http_server_with_unresolvable_auth_is_skipped`]
+    /// setzt `auth` selbst.
     fn server(transport: McpTransportToml, enabled: bool) -> McpServerToml {
         McpServerToml {
             name: String::new(),
@@ -185,7 +256,7 @@ mod tests {
             command: Some("mcp-server".to_owned()),
             args: vec!["--stdio".to_owned()],
             url: Some("https://mcp.example.test/mcp".to_owned()),
-            auth: Some(SecretRef::Env("HARW_TEST_MCP_TOKEN_UNSET".to_owned())),
+            auth: None,
             tools: vec!["search".to_owned()],
             enabled,
         }
@@ -226,6 +297,58 @@ mod tests {
 
     #[test]
     fn keyring_references_are_not_resolved_here() {
-        assert!(resolve_token(&SecretRef::Keyring("x".to_owned())).is_none());
+        assert!(resolve_token(&SecretRef::Keyring("x".to_owned())).is_err());
+    }
+
+    /// Finding: ein HTTP-Server mit konfiguriertem `auth`, dessen Geheimnis
+    /// sich nicht auflösen lässt, darf nicht ohne Token verbunden werden —
+    /// er fehlt ganz in der Spec-Liste statt anonym zu verbinden.
+    #[test]
+    fn http_server_with_unresolvable_auth_is_skipped() {
+        let mut config = ResolvedConfig::default();
+        let mut docs = server(McpTransportToml::StreamableHttp, true);
+        docs.auth = Some(SecretRef::Env("HARW_TEST_MCP_TOKEN_UNSET".to_owned()));
+        config.mcps.insert("docs".to_owned(), docs);
+        let specs = server_specs(&config);
+        assert!(
+            specs.is_empty(),
+            "ein nicht auflösbares Auth darf den Server nicht unauthentifiziert verbinden"
+        );
+    }
+
+    /// Auflösbares Auth landet als Token in der Spec (nicht `None`, nicht
+    /// übersprungen) — die Gegenprobe zu
+    /// [`http_server_with_unresolvable_auth_is_skipped`].
+    #[test]
+    fn http_server_with_resolvable_auth_carries_the_token() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let token_path = dir.path().join("token.txt");
+        std::fs::write(&token_path, "s3cr3t\n")?;
+        let token_path = token_path
+            .to_str()
+            .ok_or_else(|| TestError::Unexpected("Token-Pfad ist kein UTF-8".to_owned()))?
+            .to_owned();
+        let mut config = ResolvedConfig::default();
+        let mut docs = server(McpTransportToml::StreamableHttp, true);
+        docs.auth = Some(SecretRef::File(token_path));
+        config.mcps.insert("docs".to_owned(), docs);
+        let specs = server_specs(&config);
+        let [spec] = specs.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "erwartete genau eine Spec, bekam {}",
+                specs.len()
+            )));
+        };
+        match &spec.endpoint {
+            McpEndpoint::Http {
+                token: Some(token), ..
+            } => {
+                assert_eq!(token, b"s3cr3t");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartete ein aufgelöstes Token, bekam {other:?}"
+            ))),
+        }
     }
 }

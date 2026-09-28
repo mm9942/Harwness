@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 /// ```rust,no_run
 /// use harw_research::QuestionId;
-/// let id: QuestionId = "q-crate-versions".parse().unwrap();
+/// let id = QuestionId::new("q-crate-versions");
 /// assert_eq!(id.as_str(), "q-crate-versions");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

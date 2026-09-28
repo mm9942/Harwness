@@ -15,7 +15,8 @@ use harw_agent_compiler::CompilerEnv;
 use harw_agent_compiler::backend::runner::locate_runner;
 use harw_agent_compiler::cache::AgentCompilerSettings;
 
-/// Lock file that keeps two starts from building at the same time.
+/// Lock file that keeps two starts from building at the same time. Acquired
+/// atomically by [`try_acquire_lock`], never by a plain check-then-write.
 const LOCK_FILE: &str = ".auto-build-uia.lock";
 
 /// A lock older than this is considered stale (a crashed build).
@@ -39,6 +40,39 @@ fn lock_is_fresh(path: &std::path::Path) -> bool {
         .is_some_and(|age| age.as_secs() < LOCK_STALE_SECS)
 }
 
+/// Atomically acquires the auto-build lock (`create_new`, not check-then-write):
+/// two starts racing for the lock cannot both succeed. If the existing lock
+/// is stale (a crashed build), it is removed and creation is retried once.
+///
+/// Returns `true` if the lock is now held by the caller, who must then
+/// either spawn the build or remove the lock again on failure. Returns
+/// `false` if another build already holds a fresh lock, or if the retry
+/// after removing a stale lock lost a race to a third starter.
+fn try_acquire_lock(path: &std::path::Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if lock_is_fresh(path) {
+                return false;
+            }
+            // Stale lock: remove it and retry exactly once. If the removal
+            // fails (e.g. a third starter already replaced it), give up
+            // instead of looping.
+            std::fs::remove_file(path).is_ok()
+                && std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Shows a failed auto-build once and starts a new one in the background
 /// if needed. Never fails, never blocks.
 pub fn on_start(home_override: Option<PathBuf>) {
@@ -59,7 +93,10 @@ pub fn on_start(home_override: Option<PathBuf>) {
         return;
     };
     let lock = env.bin_dir().join(LOCK_FILE);
-    if std::fs::create_dir_all(env.bin_dir()).is_err() || std::fs::write(&lock, b"").is_err() {
+    if std::fs::create_dir_all(env.bin_dir()).is_err() || !try_acquire_lock(&lock) {
+        // Either the directory could not be created, or another start
+        // already holds a fresh lock (or won the race to replace a stale
+        // one): do not spawn a second build.
         return;
     }
     let mut command = Command::new(exe);
@@ -95,18 +132,81 @@ pub fn release_lock(env: &CompilerEnv) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx, some_or};
 
     #[test]
-    fn test_no_spawn_without_uia_or_runner() -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
+    fn test_no_spawn_without_uia_or_runner() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("create temp dir"))?;
         let env = CompilerEnv::isolated(root.path().join("home"), root.path().to_path_buf());
         assert!(!should_spawn(&env), "no UIA, no runner");
-        std::fs::create_dir_all(&env.home)?;
+        std::fs::create_dir_all(&env.home).map_err(ctx("create home dir"))?;
         std::fs::write(
             env.home.join("config.toml"),
             "active_uia_definition = \"user.agent.mia@1\"\n",
-        )?;
+        )
+        .map_err(ctx("write config.toml"))?;
         assert!(!should_spawn(&env), "a UIA but no runner: skipped silently");
+        Ok(())
+    }
+
+    /// A fresh lock (just written by another start) must block a second
+    /// acquire: this is the race the check-then-write bug allowed through.
+    #[test]
+    fn test_try_acquire_lock_blocks_on_fresh_lock() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("create temp dir"))?;
+        let lock = root.path().join(LOCK_FILE);
+        std::fs::write(&lock, b"").map_err(ctx("write lock file"))?;
+        assert!(
+            !try_acquire_lock(&lock),
+            "a fresh lock must not be acquired a second time"
+        );
+        Ok(())
+    }
+
+    /// The first acquire on an absent lock succeeds; an immediate second
+    /// acquire (simulating a racing start) must fail; after releasing the
+    /// lock, acquiring it again must succeed.
+    #[test]
+    fn test_try_acquire_lock_first_wins_second_fails_then_released() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("create temp dir"))?;
+        let lock = root.path().join(LOCK_FILE);
+        assert!(
+            try_acquire_lock(&lock),
+            "no lock file yet: the first acquire must succeed"
+        );
+        assert!(
+            !try_acquire_lock(&lock),
+            "a lock just acquired must block an immediate second acquire"
+        );
+        std::fs::remove_file(&lock).map_err(ctx("remove lock file"))?;
+        assert!(
+            try_acquire_lock(&lock),
+            "after releasing the lock, acquiring it again must succeed"
+        );
+        Ok(())
+    }
+
+    /// A stale lock (older than the crash threshold) is replaced, not
+    /// left in place: `try_acquire_lock` must still succeed.
+    #[test]
+    fn test_try_acquire_lock_replaces_stale_lock() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("create temp dir"))?;
+        let lock = root.path().join(LOCK_FILE);
+        std::fs::write(&lock, b"").map_err(ctx("write lock file"))?;
+        let stale = some_or(
+            std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(LOCK_STALE_SECS + 60)),
+            "stale timestamp underflows SystemTime",
+        )?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .map_err(ctx("reopen lock file for mtime update"))?;
+        file.set_modified(stale).map_err(ctx("set stale mtime"))?;
+        assert!(
+            try_acquire_lock(&lock),
+            "a stale lock must be replaced, not block the acquire"
+        );
         Ok(())
     }
 }

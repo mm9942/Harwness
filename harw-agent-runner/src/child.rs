@@ -682,11 +682,19 @@ impl ApprovalHandler for RelayApprovals {
 
 /// A short, human-readable summary of a tool call's arguments — never the
 /// raw JSON verbatim, to keep the frame small.
+///
+/// Cuts at a UTF-8 char boundary at or before `MAX_LEN` bytes: serde_json
+/// emits non-ASCII characters unescaped, and a naive `truncate(MAX_LEN)`
+/// panics when the cut falls inside a multi-byte character.
 fn summarize_arguments(arguments: &serde_json::Value) -> String {
     const MAX_LEN: usize = 200;
     let mut text = arguments.to_string();
     if text.len() > MAX_LEN {
-        text.truncate(MAX_LEN);
+        let mut cut = MAX_LEN;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
         text.push('…');
     }
     text
@@ -968,5 +976,29 @@ mod tests {
         let long = serde_json::json!({"data": "x".repeat(500)});
         let summary = summarize_arguments(&long);
         assert!(summary.chars().count() <= 201);
+    }
+
+    #[test]
+    fn summarize_arguments_truncates_non_ascii_at_a_char_boundary() -> TestResult {
+        // serde_json emits non-ASCII characters unescaped; a byte-oriented
+        // cut at MAX_LEN must not land inside a multi-byte character. `€` is
+        // 3 bytes wide and the `{"t":"` prefix is 6 bytes, so byte offset
+        // 200 falls inside a character rather than on a boundary — unlike a
+        // 2-byte character, whose boundaries always land on the even offset
+        // that MAX_LEN happens to be. This forces the walk-back loop to
+        // actually decrement `cut` at least once, which is what this test
+        // guards against regressing.
+        let long = serde_json::json!({"t": "€".repeat(150)});
+        let raw = long.to_string();
+        assert!(
+            !raw.is_char_boundary(200),
+            "input no longer exercises the walk-back loop; pick a character or \
+             prefix whose byte width does not evenly divide MAX_LEN"
+        );
+
+        let summary = summarize_arguments(&long);
+        assert!(summary.len() <= 203);
+        assert!(summary.ends_with('…'));
+        Ok(())
     }
 }

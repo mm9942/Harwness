@@ -98,7 +98,7 @@ case.
 | --- | --- |
 | 0 | Preview succeeded, or every selected process is confirmed terminated |
 | 1 | An error occurred, or at least one target was not observed as terminated |
-| 2 | No valid selector (clap also uses 2 for invalid arguments) |
+| 2 | No matching process (a report is still printed), or invalid/missing selector (clap usage error) |
 | 3 | Interactively aborted |
 
 ## Behavior and limits

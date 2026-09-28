@@ -730,6 +730,12 @@ fn write_last_consolidation_marker(memories_root: &Path, now: OffsetDateTime) ->
 
 /// Hängt `conflicts` an `<memories>/facts/_conflicts.json` an (liest die
 /// bestehende JSON-Liste, ergänzt, schreibt atomar zurück).
+///
+/// # Errors
+/// [`MemoryError::Serde`], wenn die bestehende Datei kein JSON-Array ist
+/// (z. B. teilweise handbearbeitet oder beschädigt) — die Datei wird in
+/// diesem Fall **nicht** überschrieben, damit bereits gesammelte, nicht
+/// automatisch aufgelöste Widersprüche nicht verloren gehen.
 fn write_conflicts(
     memories_root: &Path,
     conflicts: &[Conflict],
@@ -737,7 +743,10 @@ fn write_conflicts(
 ) -> MemoryResult<()> {
     let path = conflicts_path(memories_root);
     let mut existing: Vec<serde_json::Value> = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| MemoryError::Serde {
+            context: "_conflicts.json lesen",
+            source,
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(MemoryError::Io { path, source: e }),
     };
@@ -778,7 +787,11 @@ fn write_conflicts(
 /// Anwendung ([`apply_plan`])/[`FactStore::decay`]/[`FactStore::write_index`];
 /// [`MemoryError::Io`] bei Fehlern der Marker-Datei. Ein Fehler beim
 /// Schreiben der Widersprüche wird nicht propagiert (nur `tracing::warn!`),
-/// da er die eigentliche Konsolidierung nicht ungültig macht.
+/// da er die eigentliche Konsolidierung nicht ungültig macht; ist
+/// `_conflicts.json` bereits vorhanden, aber kein gültiges JSON-Array
+/// (siehe [`write_conflicts`]), bleibt die Datei dabei unverändert erhalten
+/// statt überschrieben zu werden — nur die neuen Widersprüche aus diesem
+/// Lauf gehen dann verloren, nicht die bereits gesammelten.
 pub fn consolidate_project_memories(memories_root: &Path) -> MemoryResult<ConsolidationReport> {
     let lock = match ConsolidationLock::try_acquire(memories_root) {
         Ok(lock) => lock,
@@ -836,7 +849,7 @@ fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> 
 mod tests {
     use super::*;
     use crate::facts::FactStore;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn tmp_root(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1023,6 +1036,66 @@ mod tests {
         let facts = store.list().map_err(ctx("Facts auflisten"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].fact_type, crate::facts::FactType::Fact);
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // -- write_conflicts -------------------------------------------------
+
+    #[test]
+    fn write_conflicts_appends_to_existing_valid_array() -> TestResult {
+        let root = tmp_root("conflicts-append");
+        let facts_dir = root.join("facts");
+        std::fs::create_dir_all(&facts_dir).map_err(ctx("facts-Verzeichnis anlegen"))?;
+        let path = conflicts_path(&root);
+        std::fs::write(&path, b"[{\"left\":\"alt\",\"right\":\"neu\",\"note\":\"vorher\"}]")
+            .map_err(ctx("_conflicts.json vorbelegen"))?;
+
+        let conflict = Conflict {
+            left: "a".to_owned(),
+            right: "b".to_owned(),
+            note: "test".to_owned(),
+        };
+        let now = OffsetDateTime::now_utc();
+        write_conflicts(&root, &[conflict], now).map_err(ctx("write_conflicts"))?;
+
+        let bytes = std::fs::read(&path).map_err(ctx("_conflicts.json lesen"))?;
+        let stored: Vec<serde_json::Value> =
+            serde_json::from_slice(&bytes).map_err(ctx("_conflicts.json parsen"))?;
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0]["note"], "vorher");
+        assert_eq!(stored[1]["left"], "a");
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn write_conflicts_preserves_unparsable_existing_file() -> TestResult {
+        // Regression: ein bereits vorhandener, aber kein JSON-Array
+        // enthaltender `_conflicts.json` (z. B. teilweise handbearbeitet
+        // oder beschädigt) darf nicht kommentarlos mit den neuen
+        // Widersprüchen überschrieben werden — sonst gehen die bereits
+        // gesammelten, nicht automatisch aufgelösten Widersprüche verloren.
+        let root = tmp_root("conflicts-corrupt");
+        let facts_dir = root.join("facts");
+        std::fs::create_dir_all(&facts_dir).map_err(ctx("facts-Verzeichnis anlegen"))?;
+        let path = conflicts_path(&root);
+        let original: &[u8] = b"{not json";
+        std::fs::write(&path, original).map_err(ctx("_conflicts.json vorbelegen"))?;
+
+        let conflict = Conflict {
+            left: "a".to_owned(),
+            right: "b".to_owned(),
+            note: "test".to_owned(),
+        };
+        let now = OffsetDateTime::now_utc();
+        let Err(err) = write_conflicts(&root, &[conflict], now) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(err, MemoryError::Serde { .. }));
+
+        let bytes = std::fs::read(&path).map_err(ctx("_conflicts.json erneut lesen"))?;
+        assert_eq!(bytes, original);
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

@@ -40,6 +40,8 @@
 //! [`PlanBridgeError::NodeNotFound`], [`PlanBridgeError::NoReadyNodes`],
 //! [`PlanBridgeError::Json`].
 
+use std::cell::Cell;
+
 use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
 use harw_observe::TelemetrySink;
 use harw_plan::actions::{NodePatch, PlanAction};
@@ -233,6 +235,13 @@ impl PlanJobBridge {
     /// Reihenfolge ist zwingend: `harw-plan` verweigert `Completed` ohne
     /// vorhandene Evidenz (Regel 11).
     ///
+    /// Abgeschlossen wird **nur**, wenn `work_id` exakt der `Assignment.job`
+    /// des Knotens entspricht (`assigned_to`) — derselbe Abgleich, den der
+    /// Reconcile-Pfad bereits macht (`controller::job_state_steps`). Ohne
+    /// diese Prüfung könnte ein verwaister Job (`admit_node` lässt Waisen
+    /// bewusst zu) oder ein inzwischen umgehängter Job den falschen Knoten
+    /// abschließen.
+    ///
     /// # Arguments
     /// - `plan` (`&dyn PlanStore`): der Plan-Store der Session.
     /// - `task` (`&TaskId`): der abzuschließende Knoten.
@@ -248,16 +257,21 @@ impl PlanJobBridge {
     /// # Errors
     /// - [`PlanBridgeError::NodeNotFound`]: wenn `task` im aktuellen Plan
     ///   fehlt.
+    /// - [`PlanBridgeError::JobStore`]: wenn `work_id` nicht (mehr) der
+    ///   `Assignment.job` des Knotens entspricht — der Rückkanal wird
+    ///   verweigert, statt den falschen Knoten abzuschließen.
     /// - [`PlanBridgeError::Plan`]: wenn eine der beiden Mutationen abgelehnt
     ///   wird (z.B. weil der Knoten nicht `InProgress` war).
     ///
     /// Ist der Knoten bereits `Completed`, ist der Rückkanal schon wirksam
-    /// und die Methode kehrt ohne Mutation mit `Ok(())` zurück.
+    /// und die Methode kehrt ohne Mutation mit `Ok(())` zurück — unabhängig
+    /// davon, welcher Job ihn seinerzeit abgeschlossen hat.
     ///
     /// # Concurrency
     /// Beide Aktionen laufen als **ein** `apply_batch` (G-038, K1): lehnt
     /// `harw-plan` den Abschluss ab, wird auch die Evidenz nicht angehängt.
-    /// Bei Revisionskonflikt wird einmal neu gelesen.
+    /// Bei Revisionskonflikt wird einmal neu gelesen; der Zuordnungsabgleich
+    /// läuft dabei jedes Mal gegen den frisch gelesenen Snapshot.
     pub fn on_job_completed(
         plan: &dyn PlanStore,
         task: &TaskId,
@@ -268,10 +282,21 @@ impl PlanJobBridge {
     ) -> Result<(), PlanBridgeError> {
         ensure_node_exists(plan, task)?;
 
+        let foreign_job = Cell::new(false);
         let events = apply_atomically(plan, actor, |snapshot| {
-            if find_node(snapshot, task)
-                .is_some_and(|node| node.status == PlanNodeStatus::Completed)
-            {
+            let Some(node) = find_node(snapshot, task) else {
+                return Vec::new();
+            };
+            if node.status == PlanNodeStatus::Completed {
+                return Vec::new();
+            }
+            if !assigned_to(node, work_id) {
+                // Der Knoten gehört diesem Job (nicht mehr): ein Waise
+                // (`admit_node` lässt sie bewusst zu), ein umgehängter Job
+                // oder ein gleichnamiger Knoten in einem anderen Plan. Diesen
+                // Rückkanal zu übernehmen würde den falschen Knoten
+                // abschließen.
+                foreign_job.set(true);
                 return Vec::new();
             }
             vec![
@@ -294,6 +319,12 @@ impl PlanJobBridge {
                 },
             ]
         })?;
+        if foreign_job.get() {
+            return Err(PlanBridgeError::JobStore(format!(
+                "Job '{work_id}' ist Knoten '{task}' nicht (mehr) zugewiesen — \
+                 Abschluss verweigert"
+            )));
+        }
         if events.is_empty() {
             tracing::debug!(task = %task, work_id = work_id, "Knoten war bereits completed");
             return Ok(());
@@ -360,10 +391,16 @@ impl PlanJobBridge {
     /// [`InvalidationCondition`] hat kein Freitextfeld, und den Grund in einen
     /// `locator` zu schreiben wäre Missbrauch dieses Feldes.
     ///
+    /// Invalidiert wird **nur**, wenn `work_id` exakt der `Assignment.job`
+    /// des Knotens entspricht (`assigned_to`) — wie bei
+    /// [`Self::on_job_completed`], aus demselben Grund: ein verwaister oder
+    /// umgehängter Job darf nicht den falschen Knoten treffen.
+    ///
     /// # Arguments
     /// - `plan` (`&dyn PlanStore`): der Plan-Store der Session.
     /// - `task` (`&TaskId`): der zu invalidierende Knoten.
-    /// - `work_id` (`&str`): die `WorkId` des gescheiterten Jobs (nur Trace).
+    /// - `work_id` (`&str`): die `WorkId` des gescheiterten Jobs (Trace und
+    ///   Zuordnungsprüfung).
     /// - `reason` (`&str`): der Fehlergrund (nur Trace).
     /// - `actor` (`&str`): Akteur der Mutation.
     ///
@@ -373,6 +410,9 @@ impl PlanJobBridge {
     /// # Errors
     /// - [`PlanBridgeError::NodeNotFound`]: wenn `task` im aktuellen Plan
     ///   fehlt.
+    /// - [`PlanBridgeError::JobStore`]: wenn `work_id` nicht (mehr) der
+    ///   `Assignment.job` des Knotens entspricht — die Invalidierung wird
+    ///   verweigert, statt den falschen Knoten zu treffen.
     /// - [`PlanBridgeError::Plan`]: wenn der Knoten nicht invalidierbar ist
     ///   (etwa weil er bereits `Completed` ist — dafür gibt es `Supersede`).
     ///
@@ -380,7 +420,9 @@ impl PlanJobBridge {
     /// mit `Ok(())` zurück (ein doppelt gemeldeter Fehlschlag ist kein Fehler).
     ///
     /// # Concurrency
-    /// Ein einzelner atomarer Batch; thread-sicher.
+    /// Ein einzelner atomarer Batch; thread-sicher. Bei Revisionskonflikt
+    /// wird einmal neu gelesen; der Zuordnungsabgleich läuft dabei jedes Mal
+    /// gegen den frisch gelesenen Snapshot.
     pub fn on_job_failed(
         plan: &dyn PlanStore,
         task: &TaskId,
@@ -396,10 +438,16 @@ impl PlanJobBridge {
             reason = reason,
             "Job gescheitert — Knoten wird invalidiert"
         );
+        let foreign_job = Cell::new(false);
         apply_atomically(plan, actor, |snapshot| {
-            if find_node(snapshot, task)
-                .is_some_and(|node| node.status == PlanNodeStatus::Invalidated)
-            {
+            let Some(node) = find_node(snapshot, task) else {
+                return Vec::new();
+            };
+            if node.status == PlanNodeStatus::Invalidated {
+                return Vec::new();
+            }
+            if !assigned_to(node, work_id) {
+                foreign_job.set(true);
                 return Vec::new();
             }
             vec![PlanAction::Invalidate {
@@ -407,6 +455,12 @@ impl PlanJobBridge {
                 condition: InvalidationCondition::ManualInvalidate,
             }]
         })?;
+        if foreign_job.get() {
+            return Err(PlanBridgeError::JobStore(format!(
+                "Job '{work_id}' ist Knoten '{task}' nicht (mehr) zugewiesen — \
+                 Invalidierung verweigert"
+            )));
+        }
         Ok(())
     }
 
@@ -659,6 +713,28 @@ fn ensure_job_admitted(
         }
         Err(error) => Err(PlanBridgeError::JobStore(error.to_string())),
     }
+}
+
+/// Prüft, ob ein Knoten aktuell exakt diesem Job zugewiesen ist.
+///
+/// # Description
+/// Vergleicht `node.assignment.job` (falls überhaupt eine Zuweisung besteht)
+/// mit `work_id`. Ohne diesen Abgleich könnte ein verwaister Job
+/// (`admit_node` lässt Waisen bewusst zu, siehe dort), ein inzwischen
+/// umgehängter Job oder ein gleichnamiger Knoten in einem gewechselten Plan
+/// den falschen Knoten abschließen bzw. invalidieren — genau die Prüfung,
+/// die der Reconcile-Pfad bereits macht
+/// (`crate::controller::job_state_steps`), dieser Rückkanal aber bislang
+/// nicht.
+///
+/// # Returns
+/// `true`, wenn `node.assignment.job` exakt `work_id` ist; sonst `false`
+/// (keine Zuweisung oder eine fremde `WorkId`).
+fn assigned_to(node: &PlanNode, work_id: &str) -> bool {
+    node.assignment
+        .as_ref()
+        .and_then(|assignment| assignment.job.as_deref())
+        == Some(work_id)
 }
 
 /// Stellt sicher, dass ein Knoten im aktuellen Plan existiert.
@@ -1199,6 +1275,10 @@ mod tests {
 
     #[test]
     fn test_on_job_completed_on_a_ready_node_attaches_nothing() -> TestResult {
+        // Der Knoten ist nie admittiert worden — er hat keine `Assignment`
+        // und "work-x" ist damit eine fremde `WorkId` (dieselbe Prüfung
+        // greift also schon, bevor `harw-plan` den Statuswechsel selbst
+        // ablehnen könnte).
         let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
 
         match PlanJobBridge::on_job_completed(
@@ -1209,12 +1289,15 @@ mod tests {
             "runtime",
             OffsetDateTime::UNIX_EPOCH,
         ) {
-            Err(PlanBridgeError::Plan(PlanError::BatchActionRejected { index, .. })) => {
-                assert_eq!(index, 1, "der Statuswechsel muss scheitern");
+            Err(PlanBridgeError::JobStore(message)) => {
+                assert!(
+                    message.contains("work-x"),
+                    "Fehlermeldung nennt die fremde WorkId nicht: {message}"
+                );
             }
             other => {
                 return Err(TestError::Unexpected(format!(
-                    "erwartet BatchActionRejected, bekommen: {other:?}"
+                    "erwartet JobStore-Fehler wegen fremder WorkId, bekommen: {other:?}"
                 )));
             }
         }
@@ -1228,17 +1311,130 @@ mod tests {
     }
 
     #[test]
+    fn test_on_job_completed_rejects_a_reassigned_jobs_stale_report() -> TestResult {
+        // Findet den unter [low] gemeldeten Fehler: ein Knoten wird von Job A
+        // auf Job B umgehängt (z. B. ein Retry); ein verspäteter Abschluss-
+        // Rückkanal für das alte Job A darf den Knoten dann nicht mehr
+        // schließen.
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
+        let (task, work_id_a) = &admitted[0];
+
+        plan.apply(
+            PlanAction::UpdateNode {
+                id: task.clone(),
+                patch: NodePatch {
+                    assignment: Some(Some(Assignment {
+                        worker: "runtime".to_owned(),
+                        attempt: 1,
+                        job: Some("work-b".to_owned()),
+                    })),
+                    ..Default::default()
+                },
+            },
+            "test",
+        )
+        .map_err(ctx("Knoten auf Job B umhängen"))?;
+
+        match PlanJobBridge::on_job_completed(
+            &plan,
+            task,
+            work_id_a,
+            "cargo test grün",
+            "runtime",
+            OffsetDateTime::UNIX_EPOCH,
+        ) {
+            Err(PlanBridgeError::JobStore(message)) => {
+                assert!(
+                    message.contains(work_id_a.as_str()),
+                    "Fehlermeldung nennt die alte WorkId nicht: {message}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet JobStore-Fehler wegen umgehängtem Job, bekommen: {other:?}"
+                )));
+            }
+        }
+
+        let snapshot = snapshot_of(&plan)?;
+        let node = &snapshot.nodes[0];
+        assert_eq!(
+            node.status,
+            PlanNodeStatus::InProgress,
+            "der falsche Job hat den Knoten abgeschlossen"
+        );
+        assert!(
+            node.evidence.is_empty(),
+            "Evidenz des fremden Jobs A wurde angehängt"
+        );
+        assert_eq!(
+            node.assignment.as_ref().and_then(|a| a.job.as_deref()),
+            Some("work-b"),
+            "die Zuweisung auf Job B wurde überschrieben"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_on_job_failed_twice_is_a_noop() -> TestResult {
         let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
+        let (task, work_id) = &admitted[0];
         for round in 0..2 {
-            PlanJobBridge::on_job_failed(&plan, &TaskId::new("t-1"), "work-x", "rot", "runtime")
-                .map_err(|error| {
-                    TestError::Unexpected(format!("on_job_failed Runde {round}: {error}"))
-                })?;
+            PlanJobBridge::on_job_failed(&plan, task, work_id, "rot", "runtime").map_err(
+                |error| TestError::Unexpected(format!("on_job_failed Runde {round}: {error}")),
+            )?;
         }
         assert_eq!(
             snapshot_of(&plan)?.nodes[0].status,
             PlanNodeStatus::Invalidated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_on_job_failed_rejects_a_reassigned_jobs_stale_report() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
+        let (task, work_id_a) = &admitted[0];
+
+        plan.apply(
+            PlanAction::UpdateNode {
+                id: task.clone(),
+                patch: NodePatch {
+                    assignment: Some(Some(Assignment {
+                        worker: "runtime".to_owned(),
+                        attempt: 1,
+                        job: Some("work-b".to_owned()),
+                    })),
+                    ..Default::default()
+                },
+            },
+            "test",
+        )
+        .map_err(ctx("Knoten auf Job B umhängen"))?;
+
+        match PlanJobBridge::on_job_failed(&plan, task, work_id_a, "clippy rot", "runtime") {
+            Err(PlanBridgeError::JobStore(message)) => {
+                assert!(message.contains(work_id_a.as_str()));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet JobStore-Fehler wegen umgehängtem Job, bekommen: {other:?}"
+                )));
+            }
+        }
+        assert_eq!(
+            snapshot_of(&plan)?.nodes[0].status,
+            PlanNodeStatus::InProgress,
+            "der falsche Job hat den Knoten invalidiert"
         );
         Ok(())
     }

@@ -16,6 +16,25 @@ const MAX_SERVER_ATTEMPTS: u32 = 5;
 const INITIAL_SERVER_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_SERVER_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Maximum number of consecutive HTTP 429 ("Too Many Requests") responses
+/// this client retries automatically before giving up and returning
+/// `ApiRejected` to the caller.
+///
+/// Combined with `MAX_RETRY_AFTER`, this bounds the worst-case time a
+/// single `TelegramClient::call` blocks on Telegram flood control to
+/// `MAX_RETRY_AFTER_ATTEMPTS * MAX_RETRY_AFTER` (currently 3 * 60s = 180s),
+/// mirroring the 5xx cap above (`MAX_SERVER_ATTEMPTS` / `MAX_SERVER_BACKOFF`).
+/// This matters for every caller that awaits `call` directly, including the
+/// long-poll loop in `ingress_long_poll.rs`: its own `POLL_BACKOFF_MAX`
+/// (30s, capped by `sleep_unless_shutdown`) only covers the delay *between*
+/// `get_updates` attempts and does not see this in-call sleep, so shutdown
+/// cannot interrupt it either.
+const MAX_RETRY_AFTER_ATTEMPTS: u32 = 3;
+/// Upper bound on a single Telegram-supplied `retry_after` delay this client
+/// honours. A flood-wait longer than this is rejected instead of slept on, so
+/// the caller's own backoff or supervision decides how to proceed.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// Telegram Bot API client which owns its bot token.
 pub struct TelegramClient {
     http: reqwest::Client,
@@ -317,6 +336,7 @@ impl TelegramClient {
         body: B,
     ) -> TransportResult<T> {
         let mut server_attempt = 0;
+        let mut retry_after_attempt = 0;
         loop {
             let response = self
                 .http
@@ -361,16 +381,22 @@ impl TelegramClient {
                 .error_code
                 .unwrap_or_else(|| status.as_u16().into());
             let retry_after = envelope.parameters.and_then(|value| value.retry_after);
-            match retry_decision(code, retry_after, server_attempt) {
+            match retry_decision(code, retry_after, server_attempt, retry_after_attempt) {
                 RetryDecision::RetryAfter(delay) => {
                     tokio::time::sleep(delay).await;
                     if (500..600).contains(&code) {
                         server_attempt += 1;
+                    } else if code == 429 {
+                        retry_after_attempt += 1;
                     }
                     continue;
                 }
-                RetryDecision::Reject => {
-                    return Err(api_rejected(method, code, envelope.description));
+                RetryDecision::Reject(override_description) => {
+                    return Err(api_rejected(
+                        method,
+                        code,
+                        override_description.or(envelope.description),
+                    ));
                 }
             }
         }
@@ -634,26 +660,47 @@ fn should_retry_server_error(code: i64, prior_retries: u32) -> bool {
     (500..600).contains(&code) && prior_retries < MAX_SERVER_ATTEMPTS - 1
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Outcome of `retry_decision`. `Reject` carries an optional override for
+/// the rejection's description: `None` keeps Telegram's own `description`
+/// field (the ordinary case), `Some(_)` replaces it when the client itself
+/// gave up (attempt or delay cap exceeded) rather than Telegram rejecting
+/// the request outright.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RetryDecision {
     RetryAfter(Duration),
-    Reject,
+    Reject(Option<String>),
 }
 
 fn retry_decision(
     code: i64,
     retry_after_secs: Option<u64>,
     prior_server_retries: u32,
+    prior_retry_after_retries: u32,
 ) -> RetryDecision {
     if code == 429 {
-        return retry_after_secs
-            .map(|seconds| RetryDecision::RetryAfter(Duration::from_secs(seconds)))
-            .unwrap_or(RetryDecision::Reject);
+        let Some(seconds) = retry_after_secs else {
+            return RetryDecision::Reject(None);
+        };
+        if prior_retry_after_retries >= MAX_RETRY_AFTER_ATTEMPTS {
+            return RetryDecision::Reject(Some(format!(
+                "Telegram flood control requested retry_after={seconds}s after \
+                 {MAX_RETRY_AFTER_ATTEMPTS} retries; giving up"
+            )));
+        }
+        let delay = Duration::from_secs(seconds);
+        if delay > MAX_RETRY_AFTER {
+            return RetryDecision::Reject(Some(format!(
+                "Telegram flood control requested retry_after={seconds}s, exceeding the \
+                 {}s cap",
+                MAX_RETRY_AFTER.as_secs()
+            )));
+        }
+        return RetryDecision::RetryAfter(delay);
     }
     if should_retry_server_error(code, prior_server_retries) {
         return RetryDecision::RetryAfter(server_backoff(prior_server_retries));
     }
-    RetryDecision::Reject
+    RetryDecision::Reject(None)
 }
 
 fn server_backoff(prior_retries: u32) -> Duration {
@@ -673,7 +720,7 @@ fn is_valid_webhook_secret(secret_token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn api_urls_follow_telegram_bot_api_shape() {
@@ -691,23 +738,64 @@ mod tests {
     #[test]
     fn retry_decision_uses_telegram_rate_limit_and_bounded_server_backoff() {
         assert_eq!(
-            retry_decision(429, Some(17), 0),
+            retry_decision(429, Some(17), 0, 0),
             RetryDecision::RetryAfter(Duration::from_secs(17))
         );
-        assert_eq!(retry_decision(429, None, 0), RetryDecision::Reject);
+        assert_eq!(retry_decision(429, None, 0, 0), RetryDecision::Reject(None));
         assert_eq!(
-            retry_decision(500, None, 0),
+            retry_decision(500, None, 0, 0),
             RetryDecision::RetryAfter(Duration::from_secs(1))
         );
         assert_eq!(
-            retry_decision(599, None, MAX_SERVER_ATTEMPTS - 2),
+            retry_decision(599, None, MAX_SERVER_ATTEMPTS - 2, 0),
             RetryDecision::RetryAfter(Duration::from_secs(8))
         );
         assert_eq!(
-            retry_decision(500, None, MAX_SERVER_ATTEMPTS - 1),
-            RetryDecision::Reject
+            retry_decision(500, None, MAX_SERVER_ATTEMPTS - 1, 0),
+            RetryDecision::Reject(None)
         );
         assert_eq!(server_backoff(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_decision_caps_telegram_flood_wait_attempts_and_delay() -> TestResult {
+        // A flood-wait far beyond the configured ceiling is rejected instead
+        // of slept on, no matter how few attempts already happened.
+        match retry_decision(429, Some(3600), 0, 0) {
+            RetryDecision::Reject(Some(description)) => {
+                assert!(description.contains("3600"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "retry_after above the cap must reject with a description, got {other:?}"
+                )));
+            }
+        }
+
+        // A small delay is still retried up to the attempt cap...
+        assert_eq!(
+            retry_decision(429, Some(1), 0, MAX_RETRY_AFTER_ATTEMPTS - 1),
+            RetryDecision::RetryAfter(Duration::from_secs(1))
+        );
+        // ...but once the cap is reached the client gives up instead of
+        // retrying forever against a steady stream of 429s.
+        match retry_decision(429, Some(1), 0, MAX_RETRY_AFTER_ATTEMPTS) {
+            RetryDecision::Reject(Some(description)) => {
+                assert!(description.contains("retries"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "retry_after attempts at the cap must reject with a description, got {other:?}"
+                )));
+            }
+        }
+
+        // A delay exactly at the cap is still honoured.
+        assert_eq!(
+            retry_decision(429, Some(MAX_RETRY_AFTER.as_secs()), 0, 0),
+            RetryDecision::RetryAfter(MAX_RETRY_AFTER)
+        );
+        Ok(())
     }
 
     #[test]

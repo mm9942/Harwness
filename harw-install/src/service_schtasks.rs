@@ -54,7 +54,12 @@ use crate::service::{ServiceKind, ServiceManager, ServiceSpec, ServiceStatus};
 ///
 /// # Description
 /// Implementiert [`ServiceManager`] für Windows über `schtasks`. Der Task wird
-/// per `schtasks /Create` mit dem in `spec.exec` gerenderten Kommando angelegt.
+/// per `schtasks /Create` mit dem in `spec.exec` gerenderten, gequoteten
+/// Kommando (siehe `command_line_for`) und `/RL LIMITED` angelegt — der Task
+/// läuft mit dem normalen, nicht erhöhten Token des angemeldeten Nutzers, auch
+/// wenn dieser zur Administratorgruppe gehört. Ein `HARW_HOME` aus `spec.env`
+/// wird als `--home <pfad>`-Argument übergeben, da Task-Scheduler-Aufgaben
+/// keine Umgebungsvariablen kennen.
 ///
 /// # Concurrency
 /// Zustandslos, `Send + Sync`.
@@ -68,6 +73,37 @@ impl SchtasksServiceManager {
     /// Eine zustandslose Instanz.
     pub fn new() -> Self {
         SchtasksServiceManager
+    }
+
+    /// Baut die Argumente für `schtasks /Create …` aus `spec` (rein, ohne
+    /// Programmnamen).
+    ///
+    /// # Description
+    /// `/RL LIMITED` statt `HIGHEST`: der Task läuft mit dem normalen,
+    /// nicht erhöhten Token des angemeldeten Nutzers; weder das Anlegen noch
+    /// der Start des Tasks verlangen damit eine Elevation. `/TR` erhält den
+    /// über [`command_line_for`] gequoteten Kommandozeilentext, sodass ein
+    /// `exec[0]` mit Leerzeichen (z. B. unter „C:\Program Files\…") nicht am
+    /// ersten Leerzeichen abgeschnitten wird.
+    ///
+    /// # Arguments
+    /// - `spec` (`&ServiceSpec`): Dienstbeschreibung.
+    ///
+    /// # Returns
+    /// Die Argumentliste ohne führenden Programmnamen `schtasks`.
+    fn create_args(spec: &ServiceSpec) -> Vec<String> {
+        vec![
+            "/Create".to_owned(),
+            "/TN".to_owned(),
+            spec.name.clone(),
+            "/TR".to_owned(),
+            command_line_for(spec),
+            "/SC".to_owned(),
+            "ONLOGON".to_owned(),
+            "/RL".to_owned(),
+            "LIMITED".to_owned(),
+            "/F".to_owned(),
+        ]
     }
 
     /// Führt `schtasks <args…>` aus und liefert die rohe Ausgabe.
@@ -126,19 +162,9 @@ impl ServiceManager for SchtasksServiceManager {
     }
 
     fn install(&self, spec: &ServiceSpec) -> Result<(), ServiceError> {
-        let command_line = spec.exec.join(" ");
-        let out = Self::schtasks(&[
-            "/Create",
-            "/TN",
-            &spec.name,
-            "/TR",
-            &command_line,
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ])?;
+        let args = Self::create_args(spec);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = Self::schtasks(&arg_refs)?;
         if !out.status.success() {
             return Err(ServiceError::Command {
                 command: format!("schtasks /Create /TN {}", spec.name),
@@ -269,12 +295,89 @@ fn remove_files_if_present(paths: &[PathBuf]) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// Liest `HARW_HOME` aus `spec.env`, falls vorhanden (rein).
+///
+/// # Description
+/// Task-Scheduler-Aufgaben kennen im Gegensatz zu systemd-Units und
+/// launchd-Plists keine Umgebungsvariablen; [`command_line_for`] übersetzt
+/// ein hier gefundenes `HARW_HOME` deshalb in ein zusätzliches
+/// `--home <pfad>`-Argument. Andere Einträge aus `spec.env` haben unter
+/// diesem Backend keine Entsprechung und werden ignoriert.
+///
+/// # Arguments
+/// - `env` (`&[(String, String)]`): `spec.env`.
+fn home_from_env(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .find(|(key, _)| key.as_str() == "HARW_HOME")
+        .map(|(_, value)| value.as_str())
+}
+
+/// Quotet ein einzelnes Kommandozeilenargument nach Windows-Konvention (rein).
+///
+/// # Description
+/// Enthält `arg` ein Leerzeichen, einen Tabulator, ein doppeltes
+/// Anführungszeichen oder ist es leer, wird es in doppelte Anführungszeichen
+/// gefasst und darin enthaltene Anführungszeichen mit `\` maskiert; sonst
+/// bleibt es unverändert. Damit schneidet `schtasks` einen Programmpfad wie
+/// `C:\Program Files\harw\harw.exe` nicht am ersten Leerzeichen ab.
+///
+/// # Arguments
+/// - `arg` (`&str`): rohes Argument.
+fn quote_windows_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| c == ' ' || c == '\t' || c == '"');
+    if !needs_quotes {
+        return arg.to_owned();
+    }
+    let mut escaped = String::with_capacity(arg.len() + 2);
+    escaped.push('"');
+    for c in arg.chars() {
+        if c == '"' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// Baut den vollständigen `/TR`-Kommandozeilentext aus `spec` (rein).
+///
+/// # Description
+/// Jeder Token aus `spec.exec` wird einzeln über [`quote_windows_arg`]
+/// gequotet und mit Leerzeichen aneinandergereiht; ein per [`home_from_env`]
+/// gefundenes `HARW_HOME` wird als zusätzliches, ebenfalls gequotetes
+/// `--home <pfad>`-Argument angehängt. `spec.working_dir` fließt hier nicht
+/// ein: klassisches `schtasks /Create` kennt keinen Schalter für ein
+/// „Start in"-Verzeichnis (das könnte nur `/Create /XML` mit einem
+/// `<WorkingDirectory>`-Element setzen); der über `--home` übergebene Pfad
+/// deckt die Home-Auflösung des Dienstes ab (`--home` gewinnt vor
+/// `HARW_HOME`/`$HOME`, siehe `harw-cli/src/home.rs`).
+///
+/// # Arguments
+/// - `spec` (`&ServiceSpec`): Dienstbeschreibung.
+///
+/// # Returns
+/// Den vollständigen, gequoteten Kommandozeilentext.
+fn command_line_for(spec: &ServiceSpec) -> String {
+    let mut tokens: Vec<String> = spec.exec.iter().map(|s| quote_windows_arg(s)).collect();
+    if let Some(home) = home_from_env(&spec.env) {
+        tokens.push("--home".to_owned());
+        tokens.push(quote_windows_arg(home));
+    }
+    tokens.join(" ")
+}
+
 /// Rendert eine einfache Task-Scheduler-Beschreibung (XML) rein (ohne I/O).
 ///
 /// # Description
 /// Erzeugt ein kompaktes Task-XML mit `Command` (= `spec.exec[0]`),
 /// `Arguments` (Rest von `spec.exec`), `WorkingDirectory` und einer
-/// `RestartOnFailure`-Angabe basierend auf `spec.restart_sec`.
+/// `RestartOnFailure`-Angabe basierend auf `spec.restart_sec`. Dient nur der
+/// Vorschau (z. B. `harw service render`); die tatsächliche Installation über
+/// [`SchtasksServiceManager::install`] legt keine XML-Datei an, quotet die
+/// Kommandozeile über [`command_line_for`] und kann — anders als hier gezeigt
+/// — weder `WorkingDirectory` noch `RestartOnFailure` setzen, da klassisches
+/// `schtasks /Create` dafür keine Schalter kennt.
 ///
 /// # Arguments
 /// - `spec` (`&ServiceSpec`): Dienstbeschreibung.
@@ -339,7 +442,7 @@ fn xml_escape(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn spec() -> ServiceSpec {
         ServiceSpec {
@@ -378,6 +481,96 @@ mod tests {
     #[test]
     fn test_kind_is_schtasks() {
         assert_eq!(SchtasksServiceManager::new().kind(), ServiceKind::Schtasks);
+    }
+
+    #[test]
+    fn test_quote_windows_arg_leaves_simple_token_unquoted() {
+        assert_eq!(quote_windows_arg("serve"), "serve");
+    }
+
+    #[test]
+    fn test_quote_windows_arg_wraps_path_with_space() {
+        assert_eq!(
+            quote_windows_arg("C:/Program Files/harw/harw.exe"),
+            "\"C:/Program Files/harw/harw.exe\""
+        );
+    }
+
+    #[test]
+    fn test_quote_windows_arg_escapes_embedded_quotes() {
+        assert_eq!(quote_windows_arg("has \"quote\""), "\"has \\\"quote\\\"\"");
+    }
+
+    #[test]
+    fn test_home_from_env_finds_harw_home() {
+        let env = vec![("HARW_HOME".to_owned(), "C:/harw-home".to_owned())];
+        assert_eq!(home_from_env(&env), Some("C:/harw-home"));
+    }
+
+    #[test]
+    fn test_home_from_env_ignores_other_keys() {
+        let env = vec![("RUST_LOG".to_owned(), "info".to_owned())];
+        assert_eq!(home_from_env(&env), None);
+    }
+
+    #[test]
+    fn test_command_line_for_quotes_program_path_with_space() {
+        let mut s = spec();
+        s.exec = vec![
+            "C:/Program Files/harw/harw.exe".to_owned(),
+            "serve".to_owned(),
+        ];
+        assert_eq!(
+            command_line_for(&s),
+            "\"C:/Program Files/harw/harw.exe\" serve"
+        );
+    }
+
+    #[test]
+    fn test_command_line_for_appends_home_from_env() {
+        let mut s = spec();
+        s.env = vec![(
+            "HARW_HOME".to_owned(),
+            "C:/Users/John Doe/.harw".to_owned(),
+        )];
+        assert_eq!(
+            command_line_for(&s),
+            "C:/harw/harw.exe serve --home \"C:/Users/John Doe/.harw\""
+        );
+    }
+
+    #[test]
+    fn test_command_line_for_omits_home_argument_without_env() {
+        let s = spec();
+        assert_eq!(command_line_for(&s), "C:/harw/harw.exe serve");
+    }
+
+    #[test]
+    fn test_create_args_uses_limited_run_level_not_highest() {
+        let args = SchtasksServiceManager::create_args(&spec());
+        assert!(args.iter().any(|a| a == "LIMITED"));
+        assert!(!args.iter().any(|a| a == "HIGHEST"));
+    }
+
+    #[test]
+    fn test_create_args_quotes_exec_and_carries_home() -> TestResult {
+        let mut s = spec();
+        s.exec = vec![
+            "C:/Program Files/harw/harw.exe".to_owned(),
+            "serve".to_owned(),
+        ];
+        s.env = vec![("HARW_HOME".to_owned(), "C:/harw-home".to_owned())];
+        let args = SchtasksServiceManager::create_args(&s);
+        let tr_index = args
+            .iter()
+            .position(|a| a == "/TR")
+            .ok_or(TestError::Missing("/TR"))?;
+        let command_line = args
+            .get(tr_index + 1)
+            .ok_or(TestError::Missing("/TR-Wert"))?;
+        assert!(command_line.contains("\"C:/Program Files/harw/harw.exe\""));
+        assert!(command_line.contains("--home C:/harw-home"));
+        Ok(())
     }
 
     /// Legt ein eindeutiges temporäres Verzeichnis an.

@@ -18,23 +18,22 @@
 //!
 //! # Two [`CaseRunner`]s
 //! [`EchoStub`] never runs the agent (every answer check reports `pending`,
-//! never `passed`); harw-cli and the `/agent` op used it as their only
-//! option before wave 3B, and both still default to it, so it stays here
-//! unchanged for them to keep building against.
+//! never `passed`); it is kept for tests and offline callers that have no
+//! runner to locate.
 //!
-//! [`SubprocessCaseRunner`] is the real one wave 3B adds. It does **not**
-//! link `harw-agent-runner` in-process — this crate has no dependency on it
-//! at all, on purpose (see this crate's `Cargo.toml` and
-//! `crate::commands::run_agent`'s doc comment, which makes the same call for
-//! `harw agent run`): it locates a runner exactly as `harw agent build`'s
-//! artifact backend does ([`crate::backend::runner::locate_runner`]),
-//! appends the case's already-built [`Artifact`] to it in memory
+//! [`SubprocessCaseRunner`] is the real one wave 3B added, and the one
+//! `harw-cli` (`harw agent test`) and `harw-ops` (the `/agent` op) wire their
+//! `CommandContext`s with. It does **not** link `harw-agent-runner`
+//! in-process — this crate has no dependency on it at all, on purpose (see
+//! this crate's `Cargo.toml` and `crate::commands::run_agent`'s doc comment,
+//! which makes the same call for `harw agent run`): it locates a runner
+//! exactly as `harw agent build`'s artifact backend does
+//! ([`crate::backend::runner::locate_runner`]), appends the case's
+//! already-built [`Artifact`] to it in memory
 //! ([`harw_agent_artifact::append_to_executable`]), execs the combined
 //! bytes as a throwaway one-shot process with `--json`, and reads the
 //! agent's final answer back out of the emitted `harwness_sdk::SdkEvent`
-//! JSON lines. Whoever wires up a `CommandContext` (currently `harw-cli`'s
-//! and `harw-ops`'s `EchoStub` call sites) switches to this once a runner is
-//! actually being shipped; that wiring is outside this file's scope.
+//! JSON lines.
 
 use std::path::{Path, PathBuf};
 
@@ -59,7 +58,7 @@ pub trait CaseRunner {
     fn is_real(&self) -> bool;
 }
 
-/// The pre-wave-3B stand-in: runs nothing. See the module docs for why this
+/// The stand-in that never runs the agent. See the module docs for why this
 /// stays alongside [`SubprocessCaseRunner`] rather than being replaced.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EchoStub;
@@ -98,15 +97,16 @@ impl CaseRunner for SubprocessCaseRunner<'_> {
         let runner_bytes = std::fs::read(&runner.path)
             .map_err(|error| format!("read {}: {error}", runner.path.display()))?;
         let binary = harw_agent_artifact::append_to_executable(&runner_bytes, artifact);
-        let temp = std::env::temp_dir().join(format!(
-            "harw-agent-test-{}-{}",
-            std::process::id(),
-            artifact.digest()
-        ));
-        harw_agent_artifact::write_executable(&temp, &binary)
-            .map_err(|error| format!("write {}: {error}", temp.display()))?;
-        let result = self.run_temp(&temp, prompt);
-        let _ = std::fs::remove_file(&temp);
+        // A fresh private directory, not a predictable name in the shared
+        // temp dir that another local user could pre-plant as a symlink.
+        let written = harw_agent_artifact::embed::TempExecutable::create(
+            &std::env::temp_dir(),
+            "harw-agent-test",
+            &binary,
+        )
+        .map_err(|error| format!("write temp executable: {error}"))?;
+        let result = self.run_temp(written.path(), prompt);
+        drop(written);
         result
     }
 
@@ -363,7 +363,7 @@ pub fn render_cases(results: &[CaseResult], runner_is_real: bool) -> String {
                 .any(|c| c.status == CheckStatus::Pending)
         })
     {
-        out.push_str("note: answer checks are pending: running the agent needs harw-agent-runner (#22 wave 3); only static checks ran\n");
+        out.push_str("note: answer checks are pending: running the agent needs harw-agent-runner; only static checks ran\n");
     }
     for result in results {
         let mark = if result.ok() { "ok" } else { "FAILED" };
@@ -416,7 +416,7 @@ mod tests {
         };
         assert!(result.ok(), "pending is not a failure");
         let text = render_cases(&[result], false);
-        assert!(text.contains("wave 3"), "{text}");
+        assert!(text.contains("harw-agent-runner"), "{text}");
         assert!(text.contains("pending"), "{text}");
     }
 
@@ -501,6 +501,57 @@ mod tests {
                 .build()?;
         let answer = runner.run(&artifact, "hi there")?;
         assert_eq!(answer, "echo: hi there");
+        Ok(())
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_subprocess_runner_ignores_a_symlink_planted_at_the_old_shared_path() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("home");
+        let env = CompilerEnv::isolated(home.clone(), dir.path().to_path_buf());
+        let runner_path = env
+            .home_runner_dir(&env.host_target)
+            .join("harw-agent-runner");
+        std::fs::create_dir_all(runner_path.parent().ok_or("parent")?)?;
+        let script = "#!/bin/sh\n\
+            printf '{\"type\":\"message\",\"source\":{\"parent\":null},\"text\":\"ok\",\"final_answer\":true}\\n'\n\
+            exit 0\n";
+        harw_agent_artifact::write_executable(&runner_path, script.as_bytes())?;
+        let artifact =
+            harw_agent_artifact::ArtifactBuilder::new(&serde_json::json!({"name": "demo"}))
+                .build()?;
+        // Before the fix, `run()` wrote and executed a binary at exactly
+        // this path: shared across the whole machine and predictable from
+        // the artifact's digest alone. Plant a symlink there, pointing at a
+        // file with known contents, and make sure `run()` no longer goes
+        // anywhere near it.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"do not touch")?;
+        let old_shared_path = std::env::temp_dir().join(format!(
+            "harw-agent-test-{}-{}",
+            std::process::id(),
+            artifact.digest()
+        ));
+        if old_shared_path.exists() {
+            return Err(format!(
+                "{} already exists; cannot verify symlink safety",
+                old_shared_path.display()
+            )
+            .into());
+        }
+        std::os::unix::fs::symlink(&victim, &old_shared_path)?;
+        let runner = SubprocessCaseRunner::new(&env);
+        let answer = runner.run(&artifact, "hi");
+        let _ = std::fs::remove_file(&old_shared_path);
+        assert_eq!(answer?, "ok");
+        let victim_contents = std::fs::read_to_string(&victim)?;
+        assert_eq!(
+            victim_contents, "do not touch",
+            "the planted symlink's target must stay untouched"
+        );
         Ok(())
     }
 }

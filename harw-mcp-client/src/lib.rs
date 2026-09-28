@@ -1,13 +1,16 @@
 //! Minimaler MCP-Client für entfernte Streamable-HTTP-Server.
 //!
 //! Die Cloudflare-Server sprechen MCP über `POST /mcp`. Dieses Crate hält die
-//! Transportdetails bewusst klein: JSON-RPC-Requests, optionale Session-ID,
-//! Bearer-Authentifizierung sowie JSON- und endliche SSE-Antworten.
+//! Transportdetails bewusst klein: JSON-RPC-Requests, die beim `initialize`
+//! vergebene Session-ID, Bearer-Authentifizierung, Zeitlimits sowie JSON- und
+//! endliche SSE-Antworten.
 
 pub mod stdio;
 pub mod tool_bridge;
 
+use std::borrow::Cow;
 use std::fmt;
+use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -23,13 +26,26 @@ const MCP_PROTOCOL_HEADER: HeaderName = HeaderName::from_static("mcp-protocol-ve
 /// Ressourcen-Inhalte in `tools/call`-Ergebnissen.
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Zeitlimit für einen einzelnen HTTP-Request vom Verbindungsaufbau bis zum
+/// Ende des Antwortkörpers (wie beim stdio-Transport).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Zeitlimit nur für den Verbindungsaufbau.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Obergrenze für die Anzahl der `tools/list`-Seiten, schützt vor Servern,
+/// die endlos neue Cursor liefern.
+const MAX_TOOL_PAGES: usize = 50;
+
 pub type McpResult<T> = Result<T, McpError>;
 
 #[derive(Debug)]
 pub enum McpError {
     InvalidEndpoint(String),
     InvalidHeader(&'static str),
-    Http(reqwest::Error),
+    /// Der HTTP-Request ist gescheitert (Verbindung, TLS, Antwortkörper).
+    /// Enthält die Ursachenkette als Text, ohne URL.
+    Http(String),
     UnexpectedStatus {
         status: u16,
         body: String,
@@ -51,7 +67,8 @@ pub enum McpError {
     /// fachlicher Fehler des Tools, kein Transport- oder Protokollfehler.
     ToolCallFailed(Vec<McpContent>),
     /// Transportfehler abseits von HTTP (z. B. stdio-Prozess beendet,
-    /// Lese-/Schreibfehler auf der Pipe, Zeitüberschreitung).
+    /// Lese-/Schreibfehler auf der Pipe) sowie Zeitüberschreitungen beider
+    /// Transporte.
     Transport(String),
 }
 
@@ -61,7 +78,7 @@ impl fmt::Display for McpError {
             Self::InvalidEndpoint(reason) => write!(f, "invalid MCP endpoint: {reason}"),
             Self::Transport(reason) => write!(f, "MCP transport failed: {reason}"),
             Self::InvalidHeader(name) => write!(f, "invalid MCP header: {name}"),
-            Self::Http(error) => write!(f, "MCP HTTP request failed: {error}"),
+            Self::Http(reason) => write!(f, "MCP HTTP request failed: {reason}"),
             Self::UnexpectedStatus { status, body } => {
                 write!(f, "MCP server returned HTTP {status}: {body}")
             }
@@ -95,12 +112,26 @@ impl fmt::Display for McpError {
     }
 }
 
-impl std::error::Error for McpError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Http(error) => Some(error),
-            _ => None,
-        }
+impl std::error::Error for McpError {}
+
+/// Übersetzt einen `reqwest`-Fehler in [`McpError`], damit kein Fremdtyp in
+/// der öffentlichen API erscheint. Die URL entfällt, die Ursachenkette bleibt
+/// als Text erhalten; Zeitüberschreitungen werden wie beim stdio-Transport zu
+/// [`McpError::Transport`].
+fn http_error(error: reqwest::Error) -> McpError {
+    let timed_out = error.is_timeout();
+    let error = error.without_url();
+    let mut reason = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        reason.push_str(": ");
+        reason.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    if timed_out {
+        McpError::Transport(format!("HTTP request timed out: {reason}"))
+    } else {
+        McpError::Http(reason)
     }
 }
 
@@ -174,6 +205,8 @@ pub struct McpResourceContents {
 }
 
 /// Session-bound Streamable-HTTP client.
+///
+/// Jeder Request ist auf 60 s begrenzt, `tools/list` auf 50 Seiten.
 pub struct McpClient {
     endpoint: Url,
     token: Option<Vec<u8>>,
@@ -188,6 +221,15 @@ impl McpClient {
     /// Creates a client. The token is held only in memory and is never part of
     /// `Debug`, error messages, or catalog metadata.
     pub fn new(endpoint: &str, token: Option<Vec<u8>>) -> McpResult<Self> {
+        Self::with_request_timeout(endpoint, token, REQUEST_TIMEOUT)
+    }
+
+    /// Wie [`McpClient::new`], aber mit frei gewähltem Zeitlimit pro Request.
+    fn with_request_timeout(
+        endpoint: &str,
+        token: Option<Vec<u8>>,
+        request_timeout: Duration,
+    ) -> McpResult<Self> {
         let endpoint =
             Url::parse(endpoint).map_err(|error| McpError::InvalidEndpoint(error.to_string()))?;
         match endpoint.scheme() {
@@ -201,10 +243,15 @@ impl McpClient {
                 )));
             }
         }
+        let http = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(request_timeout.min(HTTP_CONNECT_TIMEOUT))
+            .build()
+            .map_err(http_error)?;
         Ok(Self {
             endpoint,
             token,
-            http: reqwest::Client::new(),
+            http,
             session_id: None,
             protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
             next_id: 1,
@@ -223,6 +270,9 @@ impl McpClient {
     }
 
     /// Performs MCP initialize and the required initialized notification.
+    ///
+    /// Vergibt der Server dabei eine `Mcp-Session-Id`, wird sie gespeichert
+    /// und an alle folgenden Requests sowie an [`McpClient::close`] gehängt.
     pub async fn initialize(&mut self, client_name: &str, client_version: &str) -> McpResult<()> {
         self.session_id = None;
         self.initialized = false;
@@ -235,7 +285,7 @@ impl McpClient {
                     "capabilities": {},
                     "clientInfo": {"name": client_name, "version": client_version}
                 }),
-                false,
+                true,
             )
             .await?;
         self.protocol_version = result
@@ -270,11 +320,15 @@ impl McpClient {
         })
     }
 
-    /// Fetches all pages from `tools/list`.
+    /// Fetches all pages from `tools/list` (höchstens 50 Seiten).
+    ///
+    /// # Errors
+    /// [`McpError::InvalidJsonRpc`] bei mehr als 50 Seiten, sonst wie
+    /// [`McpClient::list_tools`].
     pub async fn list_all_tools(&mut self) -> McpResult<Vec<McpTool>> {
         let mut all = Vec::new();
         let mut cursor = None;
-        loop {
+        for _ in 0..MAX_TOOL_PAGES {
             let page = self.list_tools(cursor.as_deref()).await?;
             all.extend(page.tools);
             cursor = page.next_cursor;
@@ -282,6 +336,9 @@ impl McpClient {
                 return Ok(all);
             }
         }
+        Err(McpError::InvalidJsonRpc(format!(
+            "tools/list exceeded {MAX_TOOL_PAGES} pages"
+        )))
     }
 
     /// Ruft ein MCP-Tool per `tools/call` auf und liefert dessen Inhalt.
@@ -295,6 +352,7 @@ impl McpClient {
     /// - [`McpError::ToolCallFailed`], wenn der Server `isError: true` meldet;
     ///   dies ist ein fachlicher Fehler des Tools, kein Transport-/Protokollfehler.
     /// - [`McpError::ResponseTooLarge`], wenn die Antwort [`MAX_RESPONSE_BYTES`] überschreitet.
+    /// - [`McpError::Transport`], wenn der Request länger als 60 s dauert.
     /// - Übrige Varianten bei Transport- oder Protokollfehlern, wie bei anderen Requests.
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> McpResult<Vec<McpContent>> {
         if !self.initialized {
@@ -321,12 +379,12 @@ impl McpClient {
             .headers(self.headers(true, Some(session))?)
             .send()
             .await
-            .map_err(McpError::Http)?;
+            .map_err(http_error)?;
         let status = response.status().as_u16();
         if !(response.status().is_success() || status == 404 || status == 405) {
             return Err(McpError::UnexpectedStatus {
                 status,
-                body: safe_body(response.text().await.map_err(McpError::Http)?),
+                body: safe_body(response.text().await.map_err(http_error)?),
             });
         }
         self.session_id = None;
@@ -342,12 +400,12 @@ impl McpClient {
             .json(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .send()
             .await
-            .map_err(McpError::Http)?;
+            .map_err(http_error)?;
         if !(response.status().is_success() || response.status().as_u16() == 202) {
             let status = response.status().as_u16();
             return Err(McpError::UnexpectedStatus {
                 status,
-                body: safe_body(response.text().await.map_err(McpError::Http)?),
+                body: safe_body(response.text().await.map_err(http_error)?),
             });
         }
         Ok(())
@@ -371,12 +429,12 @@ impl McpClient {
             .json(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .send()
             .await
-            .map_err(McpError::Http)?;
+            .map_err(http_error)?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(McpError::UnexpectedStatus {
                 status,
-                body: safe_body(response.text().await.map_err(McpError::Http)?),
+                body: safe_body(response.text().await.map_err(http_error)?),
             });
         }
         if initializing {
@@ -492,7 +550,7 @@ async fn read_body_capped(mut response: reqwest::Response, limit: usize) -> McpR
         ensure_within_limit(usize::try_from(len).unwrap_or(usize::MAX), limit)?;
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(McpError::Http)? {
+    while let Some(chunk) = response.chunk().await.map_err(http_error)? {
         bytes.extend_from_slice(&chunk);
         ensure_within_limit(bytes.len(), limit)?;
     }
@@ -518,8 +576,18 @@ fn parse_tool_call_result(result: Value) -> McpResult<Vec<McpContent>> {
     Ok(content)
 }
 
+/// Sucht in einer endlichen SSE-Antwort die Antwort mit `expected_id`.
+///
+/// Server dürfen vorher Benachrichtigungen oder eigene Requests senden (z. B.
+/// Fortschritt, Logging); diese und Antworten mit fremder `id` werden wie beim
+/// stdio-Transport übersprungen. Zeilenenden `\r\n` und `\r` gelten wie `\n`.
 fn parse_sse_bytes(bytes: &[u8], expected_id: u64) -> McpResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|error| McpError::Sse(error.to_string()))?;
+    let text: Cow<'_, str> = if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(text)
+    };
     for event in text.split("\n\n") {
         let data = event
             .lines()
@@ -529,8 +597,16 @@ fn parse_sse_bytes(bytes: &[u8], expected_id: u64) -> McpResult<Value> {
         if data.is_empty() {
             continue;
         }
-        let value =
+        let value: Value =
             serde_json::from_str(&data).map_err(|error| McpError::Sse(error.to_string()))?;
+        if let Some(method) = value.get("method").and_then(Value::as_str) {
+            tracing::debug!(method, "ignoring MCP server message on SSE stream");
+            continue;
+        }
+        if value.get("id").and_then(Value::as_u64) != Some(expected_id) {
+            tracing::debug!("ignoring MCP SSE response with unexpected id");
+            continue;
+        }
         return parse_json_rpc_response(value, expected_id);
     }
     Err(McpError::SseResponseMissing)
@@ -541,8 +617,12 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn parses_tool_page_and_json_rpc_result() -> TestResult {
@@ -654,6 +734,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_bytes_skips_server_messages_and_foreign_ids() -> TestResult {
+        let sse = b"\
+            data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n\
+            data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n\
+            data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":false}}\n\n\
+            data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let value = parse_sse_bytes(sse, 1)?;
+        assert_eq!(value["ok"], true);
+        let only_notification =
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n";
+        assert!(matches!(
+            parse_sse_bytes(only_notification, 1),
+            Err(McpError::SseResponseMissing)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_sse_bytes_accepts_crlf_and_cr_framing() -> TestResult {
+        let crlf = b"event: message\r\n\
+            data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\n\
+            data: {\"jsonrpc\":\"2.0\",\"id\":1,\r\n\
+            data: \"result\":{\"ok\":true}}\r\n\r\n";
+        assert_eq!(parse_sse_bytes(crlf, 1)?["ok"], true);
+        let cr = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\r\
+            data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\r";
+        assert_eq!(parse_sse_bytes(cr, 1)?["ok"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn http_error_is_crate_owned_text() {
+        let error = McpError::Http("error sending request: connection refused".to_owned());
+        assert_eq!(
+            error.to_string(),
+            "MCP HTTP request failed: error sending request: connection refused"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
     fn tool_call_failed_display_includes_text_content() {
         let error = McpError::ToolCallFailed(vec![McpContent::Text {
             text: "division by zero".to_owned(),
@@ -662,5 +783,205 @@ mod tests {
             error.to_string(),
             "MCP tool call reported an error: division by zero"
         );
+    }
+
+    /// Mitschnitt aller Requests, die der Stub-Server gesehen hat.
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    fn runtime() -> TestResult<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ctx("tokio runtime"))
+    }
+
+    /// Wert eines HTTP-Headers; der Name wird ohne Groß-/Kleinschreibung verglichen.
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if key.trim().eq_ignore_ascii_case(name) {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Liest einen HTTP/1.1-Request: Kopf bis `\r\n\r\n`, dann
+    /// `Content-Length` Bytes Körper.
+    fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut data = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            data.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&data);
+            let complete = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                let length = header(head, "content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                body.len() >= length
+            });
+            if complete || read == 0 {
+                return Ok(text.into_owned());
+            }
+        }
+    }
+
+    /// Startet einen HTTP/1.1-Stub auf Loopback, der jeden Request mit
+    /// `reply` beantwortet und mitschreibt. Jede Verbindung trägt genau einen
+    /// Request (`Connection: close`).
+    fn spawn_stub(reply: fn(&str) -> String) -> TestResult<(String, Seen)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind stub"))?;
+        let port = listener.local_addr().map_err(ctx("stub address"))?.port();
+        let seen = Seen::default();
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let request = match read_request(&mut stream) {
+                    Ok(request) if !request.is_empty() => request,
+                    _ => continue,
+                };
+                let response = reply(&request);
+                if let Ok(mut log) = log.lock() {
+                    log.push(request);
+                }
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        Ok((format!("http://127.0.0.1:{port}/mcp"), seen))
+    }
+
+    fn http_response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Zustandsbehafteter Streamable-HTTP-Server: `initialize` vergibt die
+    /// Session `s-1`, jeder weitere Request ohne sie scheitert mit 400, und
+    /// `tools/list` liefert immer einen weiteren Cursor.
+    fn stateful_reply(request: &str) -> String {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap_or((request, ""));
+        let message: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let id = message.get("id").cloned();
+        if message.get("method").and_then(Value::as_str) == Some("initialize") {
+            let result = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"protocolVersion": MCP_PROTOCOL_VERSION}
+            });
+            return http_response(
+                "200 OK",
+                "Mcp-Session-Id: s-1\r\nContent-Type: application/json\r\n",
+                &result.to_string(),
+            );
+        }
+        if header(head, "mcp-session-id") != Some("s-1") {
+            return http_response("400 Bad Request", "", "missing session");
+        }
+        if head.starts_with("DELETE ") {
+            return http_response("200 OK", "", "");
+        }
+        match id {
+            None => http_response("202 Accepted", "", ""),
+            Some(id) => {
+                let result = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"tools": [{"name": "t"}], "nextCursor": "more"}
+                });
+                http_response(
+                    "200 OK",
+                    "Content-Type: application/json\r\n",
+                    &result.to_string(),
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn initialize_keeps_session_id_until_close_deletes_it() -> TestResult {
+        let (endpoint, seen) = spawn_stub(stateful_reply)?;
+        let mut client = McpClient::new(&endpoint, None)?;
+        runtime()?.block_on(async {
+            client.initialize("harw-test", "0.0.0").await?;
+            assert_eq!(client.session_id.as_deref(), Some("s-1"));
+            client.close().await?;
+            assert_eq!(client.session_id, None);
+            let requests = seen.lock().map_err(ctx("stub log"))?.clone();
+            let [initialize, initialized, delete] = requests.as_slice() else {
+                return Err(TestError::Unexpected(format!(
+                    "expected 3 requests, got {requests:?}"
+                )));
+            };
+            // Vor der Aushandlung weder Session noch Protokollversion senden.
+            assert_eq!(header(initialize, "mcp-session-id"), None);
+            assert_eq!(header(initialize, "mcp-protocol-version"), None);
+            assert_eq!(header(initialized, "mcp-session-id"), Some("s-1"));
+            assert_eq!(
+                header(initialized, "mcp-protocol-version"),
+                Some(MCP_PROTOCOL_VERSION)
+            );
+            assert!(delete.starts_with("DELETE "));
+            assert_eq!(header(delete, "mcp-session-id"), Some("s-1"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn list_all_tools_stops_after_max_pages() -> TestResult {
+        let (endpoint, seen) = spawn_stub(stateful_reply)?;
+        let mut client = McpClient::new(&endpoint, None)?;
+        runtime()?.block_on(async {
+            client.initialize("harw-test", "0.0.0").await?;
+            match client.list_all_tools().await {
+                Err(McpError::InvalidJsonRpc(reason)) => {
+                    assert_eq!(reason, format!("tools/list exceeded {MAX_TOOL_PAGES} pages"));
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected page cap, got {other:?}"
+                    )));
+                }
+            }
+            let pages = seen
+                .lock()
+                .map_err(ctx("stub log"))?
+                .iter()
+                .filter(|request| request.contains("\"tools/list\""))
+                .count();
+            assert_eq!(pages, MAX_TOOL_PAGES);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn call_tool_times_out_when_server_never_answers() -> TestResult {
+        // Der Kernel nimmt die Verbindung im Backlog an; geantwortet wird nie.
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind stub"))?;
+        let port = listener.local_addr().map_err(ctx("stub address"))?.port();
+        let mut client = McpClient::with_request_timeout(
+            &format!("http://127.0.0.1:{port}/mcp"),
+            None,
+            Duration::from_millis(200),
+        )?;
+        client.initialized = true;
+        runtime()?.block_on(async {
+            match client.call_tool("slow", json!({})).await {
+                Err(McpError::Transport(reason)) => {
+                    assert!(reason.contains("timed out"), "{reason}");
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected timeout, got {other:?}"
+                    )));
+                }
+            }
+            Ok(())
+        })
     }
 }

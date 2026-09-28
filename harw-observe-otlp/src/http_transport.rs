@@ -60,16 +60,41 @@
 //!
 //! # Fehlschlag
 //! Jeder Fehlschlag — eine ungültige `endpoint`-Konfiguration, ein ungültiger
-//! Headername/-wert, ein Verbindungsfehler, ein Zeitüberschreitungsfehler des
-//! zugrunde liegenden Connectors oder ein nicht-erfolgreicher HTTP-Status
-//! (alles außerhalb `2xx`) — wird als [`crate::OtlpError::Send`] gemeldet.
-//! [`HttpTransport`] versucht **nie**, einen fehlgeschlagenen Stapel erneut
-//! zuzustellen; das ist bereits [`crate::OtlpSink::flush`]s Vertrag (siehe
-//! Crate-Doc, Abschnitt „Puffern und Zustellen"): der Aufrufer zählt den
-//! Fehlschlag über [`crate::OtlpSink::send_failure_count`], statt ihn zu
-//! propagieren. [`HttpTransport::send_batch`] pausiert nie auf eine erneute
-//! Verbindung — ein Verbindungsfehler kommt vom zugrunde liegenden Connector
-//! zurück und wird sofort als [`crate::OtlpError::Send`] gemeldet.
+//! Headername/-wert, ein Verbindungsfehler, eine eigene Zeitüberschreitung
+//! (siehe Abschnitt „Zeitüberschreitung und Antwortrumpf-Obergrenze") oder
+//! ein nicht-erfolgreicher HTTP-Status (alles außerhalb `2xx`) — wird als
+//! [`crate::OtlpError::Send`] gemeldet. [`HttpTransport`] versucht **nie**,
+//! einen fehlgeschlagenen Stapel erneut zuzustellen; das ist bereits
+//! [`crate::OtlpSink::flush`]s Vertrag (siehe Crate-Doc, Abschnitt „Puffern
+//! und Zustellen"): der Aufrufer zählt den Fehlschlag über
+//! [`crate::OtlpSink::send_failure_count`], statt ihn zu propagieren.
+//! [`HttpTransport::send_batch`] pausiert nie auf eine erneute Verbindung —
+//! ein Verbindungsfehler kommt vom zugrunde liegenden Connector zurück und
+//! wird sofort als [`crate::OtlpError::Send`] gemeldet.
+//!
+//! # Zeitüberschreitung und Antwortrumpf-Obergrenze
+//! Ohne eigenes Zeitlimit könnte ein Collector, der die TCP-Verbindung
+//! zwar annimmt, aber nie antwortet oder einen endlos langen Rumpf
+//! ausliefert, [`HttpTransport::send_batch`] (und über
+//! `Runtime::block_on`, siehe Abschnitt „Blockierender Aufruf, eigene
+//! Laufzeit", auch [`crate::OtlpSink::flush`]) auf unbestimmte Zeit
+//! blockieren; der Aufrufer ruft `flush()` beim Herunterfahren synchron
+//! auf, ein hängender Collector würde also das Herunterfahren blockieren.
+//! [`HttpTransport::new`] setzt deshalb auf dem `HttpConnector` ein
+//! Verbindungsaufbau-Zeitlimit (`DEFAULT_CONNECT_TIMEOUT`), und
+//! [`HttpTransport::send_batch`] umschließt den gesamten `deliver`-Aufruf
+//! (Anfrage senden, Statuszeile und Antwortrumpf lesen) zusätzlich mit
+//! `tokio::time::timeout` über `request_timeout` (Standardwert
+//! `DEFAULT_REQUEST_TIMEOUT`) — läuft dieses Zeitlimit ab, meldet
+//! `send_batch` [`crate::OtlpError::Send`], statt weiter zu warten. Der
+//! Antwortrumpf selbst wird nicht mehr unbegrenzt eingelesen, sondern über
+//! `http_body_util::Limited` auf `RESPONSE_BODY_LIMIT` begrenzt: ein
+//! Collector, der endlos streamt, lässt den Speicher dieses Transports
+//! damit nicht unbegrenzt wachsen, sondern das Einlesen bricht spätestens
+//! bei `RESPONSE_BODY_LIMIT` mit einem (hier absichtlich verworfenen)
+//! Fehler ab — die zugrunde liegende Verbindung wird dann nicht mehr
+//! sauber an den Pool zurückgegeben, sondern geschlossen, ein hinnehmbarer
+//! Kompromiss gegenüber unbegrenztem Speicherwachstum.
 //!
 //! # Die OTel-Adapter-Isolation gilt auch hier
 //! [`HttpTransport::new`] und [`HttpTransport::send_batch`] tragen nach außen
@@ -142,9 +167,10 @@
 //! ```
 
 use std::fmt;
+use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::{Method, Request, Uri};
 use hyper_util::client::legacy::Client;
@@ -155,6 +181,26 @@ use tokio::runtime::Runtime;
 use crate::config::OtlpConfig;
 use crate::error::OtlpError;
 use crate::transport::OtlpTransport;
+
+/// Verbindungsaufbau-Zeitlimit des internen `HttpConnector` (siehe Moduldoc,
+/// Abschnitt „Zeitüberschreitung und Antwortrumpf-Obergrenze"). Fest, nicht
+/// pro Instanz überschreibbar: dieser Wert fließt bereits beim Bau des
+/// `hyper_util`-Clients in [`HttpTransport::new`] ein, danach lässt sich der
+/// Connector nicht mehr verändern.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Gesamt-Zeitlimit für einen einzelnen `POST` (Anfrage senden, Statuszeile
+/// und Antwortrumpf lesen zusammen); Standardwert für das private Feld
+/// `HttpTransport::request_timeout` (siehe Moduldoc, Abschnitt
+/// „Zeitüberschreitung und Antwortrumpf-Obergrenze").
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Obergrenze für den eingelesenen Antwortrumpf in Bytes (siehe Moduldoc,
+/// Abschnitt „Zeitüberschreitung und Antwortrumpf-Obergrenze"): der Inhalt
+/// trägt für diesen Transport ohnehin keine Information, ein endlos
+/// streamender Rumpf soll den Speicher trotzdem nicht unbegrenzt wachsen
+/// lassen.
+const RESPONSE_BODY_LIMIT: usize = 64 * 1024;
 
 /// Ein netzwerkfähiger [`crate::OtlpTransport`], der einen OTLP/JSON-Stapel
 /// per HTTP `POST` an [`crate::OtlpConfig::endpoint`] ausliefert.
@@ -168,6 +214,14 @@ pub struct HttpTransport {
     uri: Uri,
     header_count: usize,
     headers: Vec<(HeaderName, HeaderValue)>,
+    // Gesamt-Zeitlimit für `deliver` (siehe Moduldoc, Abschnitt
+    // „Zeitüberschreitung und Antwortrumpf-Obergrenze"). Kein öffentlicher
+    // Setter -- außerhalb dieser Crate bleibt der Wert fest auf
+    // `DEFAULT_REQUEST_TIMEOUT`; die Tests dieses Moduls überschreiben ihn
+    // direkt (privates Feld, in Rust auch von Kind-Modulen sichtbar), um
+    // eine Zeitüberschreitung ohne einen mehrere Sekunden langen Testlauf
+    // zu erzwingen.
+    request_timeout: Duration,
 }
 
 impl fmt::Debug for HttpTransport {
@@ -235,7 +289,15 @@ impl HttpTransport {
                     "failed to start the HTTP transport's internal tokio runtime: {error}"
                 ),
             })?;
-        let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+        // Verbindungsaufbau-Zeitlimit setzen, bevor der Client den
+        // Connector übernimmt (siehe Moduldoc, Abschnitt
+        // „Zeitüberschreitung und Antwortrumpf-Obergrenze"): ohne dieses
+        // Limit gäbe es keine Obergrenze für den TCP-Verbindungsaufbau,
+        // sondern nur das (viel großzügigere und plattformabhängige)
+        // Betriebssystem-Zeitlimit.
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         let header_count = headers.len();
         Ok(Self {
             runtime,
@@ -243,6 +305,7 @@ impl HttpTransport {
             uri,
             header_count,
             headers,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -273,8 +336,17 @@ impl HttpTransport {
         let status = response.status();
         // Den Rumpf noch abholen, damit die zugrunde liegende Verbindung dem
         // Pool sauber zurückgegeben wird -- der Inhalt selbst trägt für
-        // diesen Transport keine Information.
-        let _ = response.into_body().collect().await;
+        // diesen Transport keine Information. `Limited` begrenzt die
+        // eingelesene Menge auf `RESPONSE_BODY_LIMIT` (siehe Moduldoc,
+        // Abschnitt „Zeitüberschreitung und Antwortrumpf-Obergrenze"): ohne
+        // diese Grenze könnte ein Collector, der endlos streamt, den
+        // Speicher dieses Transports unbegrenzt wachsen lassen. Der Fehler
+        // bei Überschreitung wird -- wie schon zuvor bei einem
+        // regelkonformen Rumpf -- verworfen; die Verbindung wandert in
+        // diesem Fall statt in den Pool in die Schließung.
+        let _ = Limited::new(response.into_body(), RESPONSE_BODY_LIMIT)
+            .collect()
+            .await;
 
         if status.is_success() {
             Ok(())
@@ -288,7 +360,23 @@ impl HttpTransport {
 
 impl OtlpTransport for HttpTransport {
     fn send_batch(&self, payload: &[u8]) -> Result<(), OtlpError> {
-        self.runtime.block_on(self.deliver(payload))
+        // `deliver` allein hätte kein Gesamt-Zeitlimit -- ein Collector, der
+        // die Verbindung annimmt, aber nie antwortet oder endlos streamt,
+        // würde `block_on` (und damit `flush()`, siehe Moduldoc, Abschnitt
+        // „Zeitüberschreitung und Antwortrumpf-Obergrenze") auf unbestimmte
+        // Zeit blockieren. `tokio::time::timeout` umschließt deshalb den
+        // gesamten `deliver`-Aufruf, nicht nur einen Teilschritt davon.
+        self.runtime.block_on(async {
+            match tokio::time::timeout(self.request_timeout, self.deliver(payload)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(OtlpError::Send {
+                    reason: format!(
+                        "HTTP request to {} did not complete within {:?}",
+                        self.uri, self.request_timeout
+                    ),
+                }),
+            }
+        })
     }
 }
 
@@ -547,6 +635,72 @@ mod tests {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(error, OtlpError::Send { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_send_batch_times_out_when_collector_never_responds() -> TestResult {
+        // Nimmt die Verbindung an, schreibt aber nie eine Antwort -- genau
+        // das im Fund beschriebene Szenario: ein Collector, der TCP annimmt,
+        // aber nie antwortet, darf `send_batch` nicht unbegrenzt blockieren
+        // (siehe Moduldoc, Abschnitt „Zeitüberschreitung und
+        // Antwortrumpf-Obergrenze").
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("test listener binds"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(ctx("bound listener has an address"))?;
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Hält die Verbindung offen und schreibt absichtlich nichts
+                // zurück; der Test muss längst vor Ablauf dieser Schlafzeit
+                // fertig sein. Der Thread wird beim Prozessende einfach
+                // verworfen, kein Join nötig (wie bei den übrigen
+                // Testservern dieses Moduls).
+                thread::sleep(std::time::Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let config = test_config(&format!("http://{addr}/v1/metrics"));
+        let mut transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
+        // Kurzes Zeitlimit statt `DEFAULT_REQUEST_TIMEOUT` (10 s), damit der
+        // Test nicht selbst mehrere Sekunden wartet -- das Feld ist privat,
+        // aber dieses Testmodul liegt innerhalb desselben Moduls und sieht
+        // es deshalb direkt (siehe Feldkommentar an `request_timeout`).
+        transport.request_timeout = std::time::Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let Err(error) = transport.send_batch(b"{}") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(error, OtlpError::Send { .. }));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "send_batch must return promptly once the request timeout elapses, took {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_send_batch_ignores_oversized_response_body() -> TestResult {
+        // Ein Rumpf, der `RESPONSE_BODY_LIMIT` überschreitet, darf einen
+        // sonst erfolgreichen Status nicht in einen Fehlschlag verwandeln
+        // -- `deliver` verwirft den Lesefehler von `Limited` absichtlich
+        // (siehe Moduldoc, Abschnitt „Zeitüberschreitung und
+        // Antwortrumpf-Obergrenze").
+        let body_len = RESPONSE_BODY_LIMIT + 4096;
+        let body = "a".repeat(body_len);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{body}"
+        );
+        let status_line: &'static str = Box::leak(response.into_boxed_str());
+        let (endpoint, _received) = spawn_single_request_server(status_line)?;
+        let config = test_config(&endpoint);
+        let transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
+
+        let result = transport.send_batch(b"{}");
+        assert!(result.is_ok(), "{result:?}");
         Ok(())
     }
 

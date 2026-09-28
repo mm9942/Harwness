@@ -5,12 +5,17 @@
 //!
 //! # Verantwortung
 //! Diese Operation validiert einen Verzeichnis-Kandidaten über
-//! [`harw_sandbox::validate_extra_root`] (via [`ExtraRootsCell::add`]) und
-//! registriert ihn in der geteilten [`ExtraRootsCell`] der Sitzung. Sie
-//! erweitert **nie** implizit eine Sandbox: die Zelle wird nur dann wirksam,
-//! wenn eine `SandboxSpec` sie ausdrücklich über `with_extra_roots` gebunden
-//! hat — das ist Sache der Kompositionswurzel (`harw-runtime`), nicht dieser
-//! Operation.
+//! [`harw_sandbox::validate_extra_root`] und registriert ihn danach über
+//! [`ExtraRootsCell::add`] (das dieselbe Validierung intern erneut
+//! durchläuft) in der geteilten [`ExtraRootsCell`] der Sitzung. Sie erweitert
+//! **nie** implizit eine Sandbox: die Zelle wird nur dann wirksam, wenn eine
+//! `SandboxSpec` sie ausdrücklich über `with_extra_roots` gebunden hat — das
+//! ist Sache der Kompositionswurzel (`harw-runtime`), nicht dieser Operation.
+//! Bei `--save` läuft die Validierung zusätzlich **vor** jedem
+//! Persistenz-Versuch, und die Persistenz selbst läuft **vor** der
+//! Registrierung in der Zelle: schlägt eine der beiden fehl, bleibt die
+//! Zelle unverändert, statt eine Wurzel zu zeigen, die nie geschrieben wurde
+//! (siehe `add_one_workdir`).
 //!
 //! # Unterkommandos
 //! - `/add-workdir` (kein Argument) — listet die aktuell registrierten
@@ -40,7 +45,7 @@ use std::path::PathBuf;
 use harw_config::{ConfigWriter, SettingScope};
 use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
-use harw_sandbox::{ExtraRootError, ExtraRootsCell};
+use harw_sandbox::{ExtraRootError, ExtraRootsCell, validate_extra_root};
 
 /// Meldung für den Fall, dass keine [`ExtraRootsCell`] registriert ist.
 pub(crate) const NO_EXTRA_ROOTS_CELL: &str = crate::permissions::NO_EXTRA_ROOTS_CELL;
@@ -122,11 +127,32 @@ fn list_workdirs(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// Validiert und registriert `path_str` für diese Sitzung, optional mit
 /// dauerhaftem Projekt-Merken (`--save`).
 ///
+/// # Beschreibung
+/// Bei `--save` läuft die Reihenfolge bewusst **validieren, dann
+/// persistieren, dann in die Zelle aufnehmen** — nicht umgekehrt. Vorher
+/// registrierte [`ExtraRootsCell::add`] die Wurzel bereits mit
+/// `persisted = true` in der Zelle, bevor überhaupt versucht wurde, sie zu
+/// schreiben; schlug das Schreiben danach fehl, blieb die Wurzel trotzdem in
+/// der Zelle und `/permissions` listete sie als „(gemerkt)“, obwohl in der
+/// Config-Datei nichts stand. Jetzt bricht ein ungültiger Kandidat oder ein
+/// Persistenzfehler ab, bevor [`ExtraRootsCell::add`] je aufgerufen wird —
+/// die Zelle bleibt in beiden Fällen unverändert.
+///
+/// Eine Ausnahme bleibt das Sitzungslimit ([`ExtraRootError::TooMany`]): das
+/// prüft ausschließlich [`ExtraRootsCell::add`] selbst, weil nur die Zelle
+/// ihren aktuellen Füllstand kennt. Scheitert ein sonst gültiger Kandidat
+/// erst daran, wurde er für `--save` bereits geschrieben, obwohl die
+/// Sitzungs-Zelle ihn ablehnt. Das ist kein neues Risiko: eine künftige
+/// Sitzung überspringt einen solchen Eintrag beim Neuladen genauso wie jeden
+/// anderen veralteten (`harw-runtime::assembly::seed_extra_roots` protokolliert
+/// das nur als Warnung, ohne die Montage zu gefährden) — anders als bei einer
+/// tatsächlich ungültigen Wurzel (Home, `/`, Vorfahre) wird so nie eine
+/// Wurzel in der laufenden Sitzung wirksam, die nicht auch validiert wurde.
+///
 /// # Errors
 /// - [`OpError::NotAvailable`]: keine `ExtraRootsCell` registriert.
 /// - [`OpError::InvalidArguments`]: Validierung schlug fehl (siehe
-///   [`harw_sandbox::ExtraRootError`]), oder `path_str` konnte für `--save`
-///   nicht kanonisiert werden.
+///   [`harw_sandbox::ExtraRootError`]).
 /// - [`OpError::Execution`]: Projekt-Config-Pfad, -Öffnen, -Schreiben oder
 ///   -Speichern schlug bei `--save` fehl.
 fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutput, OpError> {
@@ -137,18 +163,14 @@ fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutp
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
     let candidate = PathBuf::from(path_str);
 
-    let added = cell
-        .add(&candidate, save, primary_root, user_home.as_deref())
-        .map_err(|error| OpError::InvalidArguments(format_extra_root_error(&error)))?;
-
     let mut note = String::new();
     if save {
-        let canonical = candidate.canonicalize().map_err(|error| {
-            OpError::InvalidArguments(format!(
-                "/add-workdir: '{}' konnte für --save nicht kanonisiert werden: {error}",
-                candidate.display()
-            ))
-        })?;
+        // Validieren und persistieren, BEVOR die Zelle überhaupt berührt
+        // wird (siehe Funktionsdoku oben) — bei einem Fehler hier ist
+        // `cell.add` unten noch nicht gelaufen, die Zelle bleibt also exakt
+        // im Zustand von vor diesem Aufruf.
+        let canonical = validate_extra_root(&candidate, primary_root, user_home.as_deref())
+            .map_err(|error| OpError::InvalidArguments(format_extra_root_error(&error)))?;
         let path = crate::permissions::scope_path(ctx, SettingScope::Project)?;
         let mut writer = ConfigWriter::open(&path).map_err(|error| {
             OpError::Execution(format!("Config öffnen fehlgeschlagen: {error}"))
@@ -169,6 +191,13 @@ fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutp
             }
         );
     }
+
+    // Erst jetzt, nach erfolgreicher Persistenz (falls `--save`), wird die
+    // Zelle erweitert bzw. das `persisted`-Flag einer bereits registrierten
+    // Wurzel gesetzt.
+    let added = cell
+        .add(&candidate, save, primary_root, user_home.as_deref())
+        .map_err(|error| OpError::InvalidArguments(format_extra_root_error(&error)))?;
 
     let verb = if added {
         "hinzugefügt"
@@ -192,8 +221,9 @@ fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutp
 /// durch (siehe Moduldoku „Fehlermeldungen").
 ///
 /// # Arguments
-/// - `error` (`&ExtraRootError`): der von [`ExtraRootsCell::add`]
-///   zurückgegebene Validierungsfehler.
+/// - `error` (`&ExtraRootError`): der von [`harw_sandbox::validate_extra_root`]
+///   oder [`ExtraRootsCell::add`] zurückgegebene Validierungsfehler — beide
+///   verwenden intern dieselbe Prüfung und liefern denselben Fehlertyp.
 ///
 /// # Returns
 /// Der `/add-workdir: …`-präfigierte Meldungstext für
@@ -257,10 +287,12 @@ mod tests {
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
+    use harw_home::{ProjectKind, ProjectRoot, ResolvedHomeContext};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_sandbox::ExtraRootsCell;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Baut einen [`OpContext`] dessen Sandbox-Root ein frisches temporäres
@@ -300,6 +332,49 @@ mod tests {
             services,
         );
         Ok((ctx, root))
+    }
+
+    /// Baut einen [`ResolvedHomeContext`] für `home` mit einem simplen
+    /// Fake-Projekt (`ProjectKind::Directory` — kein `.git` nötig, die
+    /// Tests unten prüfen nur die Persistenz unter `<home>`, nicht die
+    /// Projekt-Erkennung selbst). Analog zu
+    /// `crate::permissions::tests::resolved_home_context`.
+    fn resolved_home_context(home: &std::path::Path) -> TestResult<Arc<ResolvedHomeContext>> {
+        let project_dir = home.join("project");
+        std::fs::create_dir_all(&project_dir).map_err(ctx("create project dir"))?;
+        let project = ProjectRoot {
+            root: project_dir.clone(),
+            trust_key: project_dir,
+            kind: ProjectKind::Directory,
+        };
+        Ok(Arc::new(
+            ResolvedHomeContext::new(home, "default".to_owned(), project)
+                .map_err(ctx("build resolved home context"))?,
+        ))
+    }
+
+    /// Wie [`test_context`] (immer mit einer eigenen [`ExtraRootsCell`]),
+    /// zusätzlich mit einem echten [`ResolvedHomeContext`] für `home` in der
+    /// `ServiceMap` — für Tests, die `--save` gegen einen echten
+    /// Persistenz-Pfad fahren, statt gegen `HARW_HOME`/`$HOME` der
+    /// Testumgebung (Contract §2, siehe `crate::permissions::scope_path`).
+    /// Analog zu `crate::permissions::tests::test_context_with_resolved_home`.
+    fn test_context_with_resolved_home(
+        home: &std::path::Path,
+    ) -> TestResult<(OpContext, PathBuf, ExtraRootsCell)> {
+        let (base, root) = test_context(false)?;
+        let home_context = resolved_home_context(home)?;
+        let cell = ExtraRootsCell::new();
+        let mut services = ServiceMap::new();
+        services.insert(cell.clone());
+        services.insert(home_context);
+        let op_ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+        Ok((op_ctx, root, cell))
     }
 
     #[test]
@@ -392,6 +467,161 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Deckt ab, dass `--save` auf einen bereits von `validate_extra_root`
+    /// abgelehnten Kandidaten (`/`) die Zelle nicht füllt — ohne dass dafür
+    /// je `crate::permissions::scope_path` (und damit `HARW_HOME`) berührt
+    /// werden muss, weil `validate_extra_root` hier schon beim
+    /// `RootDirectory`-Check abbricht, bevor der Persistenz-Zweig überhaupt
+    /// erreicht wird.
+    ///
+    /// Dieser Test allein prüft die in der Moduldoku beschriebene
+    /// Reihenfolge (validieren → persistieren → `cell.add`) NICHT: bei
+    /// einem bereits ungültigen Kandidaten liefert auch der alte Code (der
+    /// `cell.add` vor der Persistenz aufrief) denselben Fehler ohne die
+    /// Zelle je zu berühren, weil [`ExtraRootsCell::add`] intern selbst
+    /// zuerst validiert. Die eigentliche Reihenfolge — ein *gültiger*
+    /// Kandidat, dessen Persistenz erst nach erfolgreicher Validierung läuft
+    /// und dessen `cell.add` erst nach erfolgreicher Persistenz — decken
+    /// `add_workdir_save_of_a_valid_directory_persists_and_registers` und
+    /// `add_workdir_save_of_a_valid_directory_leaves_the_cell_untouched_when_persistence_fails`
+    /// unten ab.
+    #[tokio::test]
+    async fn add_workdir_save_of_root_directory_leaves_the_cell_untouched() -> TestResult {
+        let (ctx, root) = test_context(true)?;
+        let Some(cell) = ctx.service::<ExtraRootsCell>() else {
+            std::fs::remove_dir_all(&root).ok();
+            return Err(TestError::Unexpected(
+                "test_context(true) sollte eine ExtraRootsCell registrieren".to_owned(),
+            ));
+        };
+        let result = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec!["/".to_owned(), "--save".to_owned()],
+            },
+        )
+        .await;
+        let remaining = cell.snapshot().len();
+        std::fs::remove_dir_all(&root).ok();
+        match result {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(
+                    message.contains('/'),
+                    "message should mention '/': {message}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
+        }
+        assert_eq!(
+            remaining, 0,
+            "--save auf einen ungültigen Kandidaten darf die Zelle nicht füllen"
+        );
+        Ok(())
+    }
+
+    /// Regressionstest für die eigentliche Ordering-Reihenfolge: `--save` auf
+    /// einen *gültigen* Kandidaten muss den Persistenz-Zweig
+    /// (`ConfigWriter::open`/`append_extra_root`/`save`) tatsächlich
+    /// durchlaufen — die Datei unter dem projektbezogenen Pfad des
+    /// gebundenen `ResolvedHomeContext` enthält danach den kanonischen
+    /// Kandidaten — und danach `ExtraRootsCell::add` erreichen, statt eine
+    /// der beiden Wirkungen bloß zu behaupten.
+    #[tokio::test]
+    async fn add_workdir_save_of_a_valid_directory_persists_and_registers() -> TestResult {
+        let home_dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = home_dir.path().join("home");
+        let (op_ctx, root, cell) = test_context_with_resolved_home(&home)?;
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&extra).map_err(ctx("create extra dir"))?;
+        let canonical_extra = extra.canonicalize().map_err(ctx("canonicalize extra dir"))?;
+
+        let output = add_workdir(
+            &op_ctx,
+            AddWorkdirArgs {
+                tokens: vec![extra.to_string_lossy().into_owned(), "--save".to_owned()],
+            },
+        )
+        .await
+        .map_err(crate::test_support::ctx("add --save"))?;
+        assert!(output.text.contains("gemerkt"), "{}", output.text);
+
+        let project_settings_path =
+            crate::permissions::scope_path(&op_ctx, harw_config::SettingScope::Project)
+                .map_err(crate::test_support::ctx("scope_path"))?;
+        let persisted =
+            std::fs::read_to_string(&project_settings_path).map_err(ctx("read persisted config"))?;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            persisted.contains(&canonical_extra.to_string_lossy().into_owned()),
+            "{persisted}"
+        );
+
+        let roots = cell.snapshot();
+        assert_eq!(
+            roots.len(),
+            1,
+            "cell.add sollte nach erfolgreicher Persistenz erreicht werden"
+        );
+        assert!(
+            roots[0].persisted,
+            "die registrierte Wurzel sollte persisted=true tragen"
+        );
+        Ok(())
+    }
+
+    /// Regressionstest (Ordering-Fix): schlägt die Persistenz bei `--save`
+    /// fehl, obwohl der Kandidat `validate_extra_root` bestanden hat, darf
+    /// `ExtraRootsCell::add` nie aufgerufen werden — die Zelle bleibt exakt
+    /// im Zustand von vor diesem Aufruf. Erzwingt den Fehler wie
+    /// `crate::permissions::tests::permissions_allow_global_does_not_activate_the_rule_when_persistence_fails`:
+    /// der Projekt-Config-Pfad ist bereits ein Verzeichnis, `ConfigWriter::open`
+    /// scheitert beim Lesen.
+    #[tokio::test]
+    async fn add_workdir_save_of_a_valid_directory_leaves_the_cell_untouched_when_persistence_fails()
+    -> TestResult {
+        let home_dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = home_dir.path().join("home");
+        let (op_ctx, root, cell) = test_context_with_resolved_home(&home)?;
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&extra).map_err(ctx("create extra dir"))?;
+
+        let project_settings_path =
+            crate::permissions::scope_path(&op_ctx, harw_config::SettingScope::Project)
+                .map_err(crate::test_support::ctx("scope_path"))?;
+        std::fs::create_dir_all(&project_settings_path)
+            .map_err(ctx("block config path with a directory"))?;
+
+        let result = add_workdir(
+            &op_ctx,
+            AddWorkdirArgs {
+                tokens: vec![extra.to_string_lossy().into_owned(), "--save".to_owned()],
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(&root).ok();
+
+        match result {
+            Err(OpError::Execution(message)) => {
+                assert!(message.contains("Config"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Execution error, got {other:?}"
+                )));
+            }
+        }
+        assert_eq!(
+            cell.snapshot().len(),
+            0,
+            "fehlgeschlagene Persistenz darf die Zelle nicht füllen"
+        );
         Ok(())
     }
 

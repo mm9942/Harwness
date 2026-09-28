@@ -37,7 +37,7 @@ use std::convert::Infallible;
 use std::io::{BufRead, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +99,9 @@ fn run_stdio(ctx: RunnerContext) -> ExitCode {
 enum RunState {
     Running,
     Completed,
+    /// The model's output was cut off. A terminal state of its own, not
+    /// `Completed` — same as `iface::http`'s `RunStatus::Truncated`.
+    Truncated,
     Cancelled,
     Failed,
 }
@@ -108,8 +111,22 @@ impl RunState {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Truncated => "truncated",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
+        }
+    }
+
+    /// Terminal state of a background run whose `run_prompt` returned an
+    /// outcome, from [`PromptOutcome::status`]. Mirrors `iface::http`'s
+    /// `status_from_turn`: `refused`, `failed` and any status a later SDK
+    /// version adds count as [`Self::Failed`], never as `Completed`.
+    fn from_outcome_status(status: &str) -> Self {
+        match status {
+            "completed" => Self::Completed,
+            "truncated" => Self::Truncated,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Failed,
         }
     }
 }
@@ -119,6 +136,10 @@ struct TrackedRun {
     state: RunState,
     result: Option<Value>,
     cancel: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Set by [`RunRegistry::cancel`] while the run is `Running`. A cancel
+    /// that arrives before the worker installed its closure is thereby
+    /// remembered, and [`RunRegistry::set_cancel`] replays it on install.
+    cancel_requested: bool,
 }
 
 /// Upper bound on the number of background runs [`RunRegistry`] keeps before
@@ -166,7 +187,14 @@ impl RunRegistry {
         }
     }
 
-    fn insert_running(&self, id: String, cancel: Box<dyn Fn() + Send + Sync>) {
+    /// Records a new run as [`RunState::Running`] with no cancel closure
+    /// yet — this happens *before* the worker thread is spawned, so
+    /// [`Self::complete`] always finds an entry to update, even if the run
+    /// fails before it ever calls `register_cancel`, or finishes so fast
+    /// that `complete` would otherwise race this insert. The worker later
+    /// installs the real closure via [`Self::set_cancel`], if it gets that
+    /// far; a `cancel` that arrives before then is remembered and replayed.
+    fn insert_running(&self, id: String) {
         self.order
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -176,10 +204,39 @@ impl RunRegistry {
             TrackedRun {
                 state: RunState::Running,
                 result: None,
-                cancel: Some(cancel),
+                cancel: None,
+                cancel_requested: false,
             },
         );
         self.evict_finished_over_cap();
+    }
+
+    /// Installs `cancel` on a run that is still [`RunState::Running`].
+    /// Called from the worker thread once `run_prompt` reaches its
+    /// `register_cancel` callback. If [`Self::cancel`] was already called
+    /// for this run (typically right after `run` with `background: true`
+    /// returned), the closure is not stored but invoked right away, after
+    /// the lock is released, so that early cancel request is not lost. If
+    /// the run is no longer `Running`, `complete` has already cleared
+    /// `cancel` and this call is a silent no-op: there is nothing left to
+    /// cancel.
+    fn set_cancel(&self, id: &str, cancel: Box<dyn Fn() + Send + Sync>) {
+        let replay = {
+            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            match runs.get_mut(id) {
+                Some(run) if run.state == RunState::Running && run.cancel_requested => {
+                    Some(cancel)
+                }
+                Some(run) if run.state == RunState::Running => {
+                    run.cancel = Some(cancel);
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(cancel) = replay {
+            cancel();
+        }
     }
 
     fn complete(&self, id: &str, state: RunState, result: Value) {
@@ -204,15 +261,23 @@ impl RunRegistry {
             .map(|run| (run.state.clone(), run.result.clone()))
     }
 
-    /// Requests cancellation. Returns `true` if a running entry was found
-    /// (regardless of whether cancellation lands before the run already
-    /// finished on its own — that race is inherent to cooperative
-    /// cancellation and is reported truthfully by a subsequent `status`).
+    /// Requests cancellation. Returns `true` if an entry for `id` exists at
+    /// all (running or already finished); `false` only for an unknown id.
+    /// For a `Running` run the request is recorded first: if the worker has
+    /// not reached `register_cancel` yet (right after `run` with
+    /// `background: true` returns), [`Self::set_cancel`] invokes the
+    /// closure as soon as it arrives instead of dropping the request. The
+    /// one race left is the run finishing on its own before the
+    /// cooperative cancel takes effect; a subsequent `status` reports that
+    /// truthfully.
     fn cancel(&self, id: &str) -> bool {
         let cancel = {
             let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
             match runs.get_mut(id) {
-                Some(run) if run.state == RunState::Running => run.cancel.take(),
+                Some(run) if run.state == RunState::Running => {
+                    run.cancel_requested = true;
+                    run.cancel.take()
+                }
                 Some(_) => return true,
                 None => return false,
             }
@@ -266,7 +331,10 @@ trait PromptRunner: Send + Sync {
     ///
     /// `register_cancel` is invoked once, synchronously, before the prompt
     /// starts running, with a closure the caller can invoke from another
-    /// thread to request cancellation.
+    /// thread to request cancellation. The closure must take effect even
+    /// when invoked before the turn has actually started — including from
+    /// inside `register_cancel` itself (`RunRegistry::set_cancel` replays
+    /// an early cancel request that way).
     fn run_prompt(
         &self,
         prompt: &str,
@@ -311,8 +379,16 @@ impl PromptRunner for HarwnessPromptRunner {
         runtime.block_on(async move {
             let mut session = harwness.session().map_err(|error| error.to_string())?;
             let cancel_handle = session.cancel_handle();
+            // `CancelHandle::cancel` only reaches a turn `send` has already
+            // armed, so a request made before that (e.g. replayed from
+            // inside `register_cancel`) is also remembered here and
+            // re-issued once the turn is armed, below.
+            let cancel_requested = Arc::new(AtomicBool::new(false));
+            let requested = Arc::clone(&cancel_requested);
+            let handle = cancel_handle.clone();
             register_cancel(Box::new(move || {
-                cancel_handle.cancel();
+                requested.store(true, Ordering::SeqCst);
+                handle.cancel();
             }));
 
             let mut events = session.events();
@@ -333,10 +409,24 @@ impl PromptRunner for HarwnessPromptRunner {
                 chunks
             });
 
-            let report = session
-                .send(full_prompt)
-                .await
-                .map_err(|error| error.to_string())?;
+            // `Session::send` arms the turn's cancel token before its first
+            // await point, so after one poll a cancel requested earlier can
+            // be re-issued and actually reach the turn.
+            let mut turn = std::pin::pin!(session.send(full_prompt));
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(turn.as_mut(), cx))
+            })
+            .await;
+            let report = match first_poll {
+                std::task::Poll::Ready(report) => report,
+                std::task::Poll::Pending => {
+                    if cancel_requested.load(Ordering::SeqCst) {
+                        cancel_handle.cancel();
+                    }
+                    turn.await
+                }
+            }
+            .map_err(|error| error.to_string())?;
 
             // The progress task owns the only remaining event receiver end
             // once `send` has returned (the turn is over), so this always
@@ -623,14 +713,21 @@ impl McpServer {
         let context = context.map(str::to_owned);
         let run_id_for_thread = run_id.clone();
 
-        // `register_cancel` is called synchronously before `run_prompt`
-        // starts driving the turn, so the registry always has a cancel
-        // closure installed before this call returns.
-        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<CancelFn>();
+        // The entry is recorded as `Running` *before* the worker thread
+        // starts, so `complete` below always finds it — including when
+        // `run_prompt` fails before it ever calls `register_cancel` (e.g.
+        // `ctx.harwness()`/`session()` errors), and including a turn that
+        // finishes (or fails) so fast that `complete` would otherwise run
+        // before this insert. The worker installs the real cancel closure
+        // via `RunRegistry::set_cancel` once (if) `run_prompt` calls
+        // `register_cancel`; a `cancel` that arrives before then is
+        // recorded on the entry and replayed by `set_cancel`.
+        self.runs.insert_running(run_id.clone());
+
         std::thread::spawn(move || {
             let mut on_progress = |_: &str| {};
             let mut register_cancel = |cancel: CancelFn| {
-                let _ = cancel_tx.send(cancel);
+                runs.set_cancel(&run_id_for_thread, cancel);
             };
             let outcome = runner.run_prompt(
                 &prompt,
@@ -640,11 +737,7 @@ impl McpServer {
             );
             match outcome {
                 Ok(outcome) => {
-                    let state = if outcome.status == "cancelled" {
-                        RunState::Cancelled
-                    } else {
-                        RunState::Completed
-                    };
+                    let state = RunState::from_outcome_status(outcome.status);
                     runs.complete(&run_id_for_thread, state, outcome.to_json());
                 }
                 Err(message) => {
@@ -656,14 +749,6 @@ impl McpServer {
                 }
             }
         });
-
-        // Block briefly for the cancel closure so `cancel` works immediately
-        // after `run` returns; a run that never registers one (e.g. it
-        // failed before starting a session) simply has no way to be
-        // cancelled, which `cancel` reports as "not found".
-        if let Ok(cancel) = cancel_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            self.runs.insert_running(run_id.clone(), cancel);
-        }
 
         result_response(
             id,
@@ -1182,7 +1267,6 @@ fn empty_response(status: StatusCode) -> HttpResponse {
 mod tests {
     use super::*;
     use hyper::header::{AUTHORIZATION, ORIGIN};
-    use std::sync::atomic::AtomicBool;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1240,6 +1324,51 @@ mod tests {
                 .take()
                 .unwrap_or_else(|| Err("outcome already taken".to_owned()))
         }
+    }
+
+    /// A [`PromptRunner`] double that fails before ever calling
+    /// `register_cancel` — simulates `HarwnessPromptRunner::run_prompt`
+    /// erroring out of `ctx.harwness()`/`session()` before it gets to
+    /// install a cancel closure.
+    struct FailFastRunner;
+
+    impl PromptRunner for FailFastRunner {
+        fn run_prompt(
+            &self,
+            _prompt: &str,
+            _context: Option<&str>,
+            _on_progress: &mut dyn FnMut(&str),
+            _register_cancel: &mut dyn FnMut(CancelFn),
+        ) -> Result<PromptOutcome, String> {
+            Err("boom".to_owned())
+        }
+    }
+
+    /// Polls `status` for `run_id` until it reports `want_state`, up to a
+    /// short bound, returning the matching response. Background runs
+    /// finish on a separate OS thread, so tests that start one need to poll
+    /// rather than assume it is done as soon as `run` returns.
+    fn poll_status(
+        server: &McpServer,
+        run_id: &str,
+        want_state: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 999,
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {"run_id": run_id}}
+        });
+        for _ in 0..200 {
+            let response = server
+                .handle_message(&request, &mut no_emit)
+                .ok_or("a response")?;
+            if response["result"]["status"] == json!(want_state) {
+                return Ok(response);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(format!("run {run_id} never reached status '{want_state}'").into())
     }
 
     fn test_config() -> McpConfig {
@@ -1446,6 +1575,158 @@ mod tests {
             .handle_message(&request, &mut no_emit)
             .ok_or("a response")?;
         assert_eq!(response["error"]["code"], json!(-32602));
+        Ok(())
+    }
+
+    #[test]
+    fn background_run_that_fails_before_registering_cancel_is_reported_as_failed() -> TestResult {
+        // Regression test: `run_prompt` erroring out before it ever calls
+        // `register_cancel` used to leave no registry entry at all, so the
+        // "running" answer `run` already sent back was never corrected and
+        // the error message was lost. It must now show up as "failed".
+        let server = server_with(Arc::new(FailFastRunner));
+        let start = json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {"name": "run", "arguments": {"prompt": "doomed", "background": true}}
+        });
+        let started = server
+            .handle_message(&start, &mut no_emit)
+            .ok_or("a response")?;
+        let run_id = started["result"]["run_id"]
+            .as_str()
+            .ok_or("run_id in background start response")?
+            .to_owned();
+        assert_eq!(started["result"]["status"], json!("running"));
+
+        let status_response = poll_status(&server, &run_id, "failed")?;
+        assert_eq!(
+            status_response["result"]["result"]["error"],
+            json!("boom")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn background_run_that_finishes_immediately_never_stays_running() -> TestResult {
+        // Regression test: a run that registers its cancel closure and then
+        // finishes right away used to race the registry insert that only
+        // happened after the worker thread's first message, sometimes
+        // leaving a stale "running" entry that could never complete or be
+        // evicted.
+        let server = server_with(FakeRunner::echoing("done"));
+        let start = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {"name": "run", "arguments": {"prompt": "quick", "background": true}}
+        });
+        let started = server
+            .handle_message(&start, &mut no_emit)
+            .ok_or("a response")?;
+        let run_id = started["result"]["run_id"]
+            .as_str()
+            .ok_or("run_id in background start response")?
+            .to_owned();
+
+        let status_response = poll_status(&server, &run_id, "completed")?;
+        assert_eq!(
+            status_response["result"]["result"]["status"],
+            json!("completed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancel_before_the_closure_is_installed_is_replayed_on_install() -> TestResult {
+        // Regression test: `cancel` right after a background `run` (before
+        // the worker reached `register_cancel`) used to find no closure,
+        // report success and drop the request.
+        let runs = RunRegistry::default();
+        let id = runs.new_id();
+        runs.insert_running(id.clone());
+        assert!(runs.cancel(&id));
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        runs.set_cancel(&id, Box::new(move || flag.store(true, Ordering::SeqCst)));
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the early cancel request should fire once the closure arrives"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_closure_installed_without_a_cancel_request_is_not_invoked() -> TestResult {
+        let runs = RunRegistry::default();
+        let id = runs.new_id();
+        runs.insert_running(id.clone());
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        runs.set_cancel(&id, Box::new(move || flag.store(true, Ordering::SeqCst)));
+        assert!(!fired.load(Ordering::SeqCst));
+        assert!(runs.cancel(&id));
+        assert!(fired.load(Ordering::SeqCst), "cancel should invoke the closure");
+        Ok(())
+    }
+
+    #[test]
+    fn background_run_reports_a_truncated_turn_as_truncated() -> TestResult {
+        // Regression test: every outcome but "cancelled" used to be recorded
+        // as `completed`, so `status` hid truncated (and failed) turns.
+        let runner = FakeRunner::echoing("cut off");
+        *runner.outcome.lock().map_err(|_| "poisoned lock")? = Some(Ok(PromptOutcome {
+            status: "truncated",
+            text: Some("cut off".to_owned()),
+            ..PromptOutcome::default()
+        }));
+        let server = server_with(runner);
+        let start = json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {"name": "run", "arguments": {"prompt": "long", "background": true}}
+        });
+        let started = server
+            .handle_message(&start, &mut no_emit)
+            .ok_or("a response")?;
+        let run_id = started["result"]["run_id"]
+            .as_str()
+            .ok_or("run_id in background start response")?
+            .to_owned();
+
+        let status_response = poll_status(&server, &run_id, "truncated")?;
+        assert_eq!(
+            status_response["result"]["result"]["status"],
+            json!("truncated")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn background_outcome_statuses_map_like_the_http_interface() -> TestResult {
+        assert_eq!(
+            RunState::from_outcome_status("completed"),
+            RunState::Completed
+        );
+        assert_eq!(
+            RunState::from_outcome_status("truncated"),
+            RunState::Truncated
+        );
+        assert_eq!(
+            RunState::from_outcome_status("cancelled"),
+            RunState::Cancelled
+        );
+        for status in ["refused", "failed", "something-new"] {
+            assert_eq!(
+                RunState::from_outcome_status(status),
+                RunState::Failed,
+                "{status}"
+            );
+        }
         Ok(())
     }
 

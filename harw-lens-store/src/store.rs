@@ -125,7 +125,16 @@ impl LensStore {
     /// Legt einen Chunk unter seinem Digest ab.
     ///
     /// # Description
-    /// Idempotent: existiert am Zielpfad bereits eine reguläre Datei, kehrt
+    /// Prüft zuerst den Digest nach: berechnet
+    /// `ContentDigest::of(chunk.text.as_bytes())` über den mitgegebenen Text
+    /// und vergleicht ihn mit `chunk.digest`. Stimmen beide nicht überein,
+    /// bricht diese Methode ab, bevor irgendetwas geschrieben wird — ein
+    /// content-adressierter Slot wird nie unter einem falschen Digest
+    /// belegt, denn das würde jeden späteren korrekten Schreibversuch
+    /// desselben Inhalts zu einem stillen No-op machen (der fehlerhafte
+    /// Eintrag existiert unter diesem Digest ja schon) und jeden Lesezugriff
+    /// mit [`LensStoreError::ChunkDigestMismatch`] scheitern lassen. Danach
+    /// idempotent: existiert am Zielpfad bereits eine reguläre Datei, kehrt
     /// diese Methode ohne erneutes Schreiben zurück — derselbe Chunk
     /// zweimal abgelegt erzeugt genau eine Datei, kein Fehler. Andernfalls
     /// schreibt sie über `tempfile::NamedTempFile` im selben
@@ -142,17 +151,21 @@ impl LensStore {
     ///
     /// # Arguments
     /// - `chunk` (`&Chunk`): der abzulegende Chunk. Der Zielpfad entsteht
-    ///   aus `chunk.digest`, nicht aus einer hier neu berechneten
-    ///   Prüfsumme — die Korrektheit von `chunk.digest` relativ zu
-    ///   `chunk.text` ist Sache des Aufrufers (`harw-lens-chunk`); dieser
-    ///   Store prüft sie beim Schreiben nicht, sondern erst beim Lesen
-    ///   (siehe [`LensStore::get_chunk`]).
+    ///   aus `chunk.digest`; diese Methode verlangt aber, dass
+    ///   `chunk.digest` tatsächlich zu `chunk.text` passt, und verweigert
+    ///   sich sonst (siehe oben). [`LensStore::get_chunk`] prüft den Digest
+    ///   zusätzlich beim Lesen erneut nach — das bleibt die zweite
+    ///   Verteidigungslinie gegen nachträglich auf der Platte verfälschte
+    ///   Dateien.
     ///
     /// # Returns
     /// `chunk.digest`, unverändert zurückgegeben als Bequemlichkeit für den
     /// Aufrufer.
     ///
     /// # Errors
+    /// - [`LensStoreError::ChunkDigestMismatch`]: `chunk.digest` passt nicht
+    ///   zu `ContentDigest::of(chunk.text.as_bytes())`. Es wird nichts
+    ///   geschrieben.
     /// - [`LensStoreError::UnexpectedPathType`]: der Zielpfad ist bereits
     ///   von einer Nicht-Datei belegt (Symlink-Abwehr).
     /// - [`LensStoreError::Io`] / [`LensStoreError::Serde`]: I/O- bzw.
@@ -185,6 +198,13 @@ impl LensStore {
     /// assert!(store.put_chunk(&chunk).is_ok());
     /// ```
     pub fn put_chunk(&self, chunk: &Chunk) -> LensStoreResult<ChunkDigest> {
+        let actual = ContentDigest::of(chunk.text.as_bytes());
+        if actual != chunk.digest.0 {
+            return Err(LensStoreError::ChunkDigestMismatch {
+                requested: chunk.digest.0,
+                actual,
+            });
+        }
         let (dir, path) = self.chunk_paths(&chunk.digest);
         std::fs::create_dir_all(&dir)?;
         let lock = self.lock()?;
@@ -743,6 +763,27 @@ mod tests {
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(ctx("valid entries"))?;
         assert_eq!(entries.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_put_chunk_rejects_digest_that_does_not_match_text() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+        let mut chunk = sample_chunk("a")?;
+        // Digest passt zu "a", aber der Text wird danach auf "b" geändert —
+        // simuliert einen Aufrufer, der einen falschen Digest mitgibt.
+        chunk.text = "b".to_owned();
+
+        let result = store.put_chunk(&chunk);
+        assert!(matches!(
+            result,
+            Err(LensStoreError::ChunkDigestMismatch { .. })
+        ));
+
+        let (dir, path) = store.chunk_paths(&chunk.digest);
+        assert!(!path_exists(&path).map_err(ctx("checks target path"))?);
+        assert!(!path_exists(&dir).map_err(ctx("checks fanout dir"))?);
         Ok(())
     }
 

@@ -22,7 +22,11 @@
 //! `plan_id` und `question_id` stammen aus Modell-Ausgaben. Beide werden über
 //! [`sanitize_component`] auf ein einzelnes, harmloses Pfadsegment reduziert
 //! (kein `/`, kein `..`, kein Nullbyte, keine Leerzeichen, Länge gedeckelt).
-//! Ein Pfad kann den Store-Root damit nicht verlassen.
+//! Ein Pfad kann den Store-Root damit nicht verlassen. Verändert die
+//! Sanitisierung die Eingabe (Zeichen ersetzt, Dotfile-Präfix, Kürzung),
+//! hängt sie einen BLAKE3-Hash-Suffix an, damit verschiedene Roh-IDs (z. B.
+//! `a/b` und `a:b`) nicht auf dasselbe Artefakt fallen und sich gegenseitig
+//! überschreiben.
 //!
 //! # Exportierte Typen
 //! [`FindingStore`], [`finding_locator`], [`offset_from_timestamp`].
@@ -56,11 +60,16 @@ use time::OffsetDateTime;
 
 use crate::error::{PlanBridgeError, map_knowledge_error};
 
-/// Obergrenze für ein einzelnes Pfadsegment nach der Sanitisierung.
+/// Obergrenze für ein einzelnes Pfadsegment nach der Sanitisierung
+/// (schließt ein eventuelles Hash-Suffix, siehe [`hash_suffix`], mit ein).
 const MAX_COMPONENT_LEN: usize = 128;
 
 /// Ersatzname, wenn eine ID nach dem Trimmen leer ist.
 const BLANK_COMPONENT: &str = "_";
+
+/// Länge des Hash-Suffixes `-<16 Hex-Zeichen>`, das [`sanitize_component`]
+/// bei verlustbehafteter Sanitisierung anhängt.
+const HASH_SUFFIX_LEN: usize = 17;
 
 /// Unterverzeichnis je Plan, in dem die Findings liegen.
 const RESEARCH_DIR: &str = "research";
@@ -74,7 +83,7 @@ const JSON_END: &str = "<!-- harw-plan-bridge:finding-json:end -->";
 /// Reduziert eine Modell-gelieferte ID auf ein einzelnes, harmloses Pfadsegment.
 ///
 /// # Description
-/// Genau zwei Regeln, damit das Ergebnis prüfbar bleibt:
+/// Drei Regeln, damit das Ergebnis prüfbar bleibt:
 ///
 /// 1. Jedes Zeichen außerhalb von `[A-Za-z0-9._-]` — insbesondere `/`, `\`,
 ///    `:` und Nullbytes — wird durch `-` ersetzt. Damit kann das Ergebnis
@@ -83,25 +92,41 @@ const JSON_END: &str = "<!-- harw-plan-bridge:finding-json:end -->";
 ///    weder `.` noch `..` (Traversal) noch ein verstecktes Dotfile
 ///    darstellbar; ein `..` *innerhalb* eines längeren Namens ist harmlos,
 ///    weil nur ein vollständiges `..`-Segment traversiert.
+/// 3. Regel 1 und 2 sind für sich verlustbehaftet: `a/b`, `a:b` und `a b`
+///    würden ohne Gegenmaßnahme alle zu `a-b`, ebenso würde die gekappte
+///    Version einer langen ID mit der gekappten Version einer anderen langen
+///    ID zusammenfallen, sobald beide in den ersten [`MAX_COMPONENT_LEN`]
+///    Zeichen übereinstimmen. Verändert eine der ersten beiden Regeln die
+///    Eingabe tatsächlich (Zeichen ersetzt, Dotfile-Präfix eingefügt) oder
+///    würde die Eingabe ungekappt die Länge überschreiten, wird das Ergebnis
+///    auf Platz für ein Suffix gekürzt und um `-<16 Hex-Zeichen aus
+///    BLAKE3(trimmed)>` ([`hash_suffix`]) ergänzt. Nicht verlustbehaftete
+///    Eingaben (bereits ein gültiges, kurzes Segment) bleiben unverändert und
+///    bekommen kein Suffix — sie sind schon injektiv.
 ///
-/// Die Länge wird auf [`MAX_COMPONENT_LEN`] gekappt (zuzüglich des
-/// eventuellen `_`-Präfixes). Die Funktion ist total: eine leere oder nur aus
-/// Leerzeichen bestehende Eingabe ergibt [`BLANK_COMPONENT`].
+/// Damit ist die gesamte Funktion injektiv genug für den Anwendungsfall:
+/// zwei verschiedene Eingaben, die dieselbe Zeichen-Ersetzung und Kürzung
+/// durchlaufen, unterscheiden sich im BLAKE3-Digest (praktisch kollisionsfrei)
+/// und damit im Suffix. Die Gesamtlänge bleibt in jedem Fall auf
+/// [`MAX_COMPONENT_LEN`] gedeckelt — auch mit Suffix, das Präfix wird also
+/// vor dem Kürzen und nicht danach angehängt. Die Funktion ist total: eine
+/// leere oder nur aus Leerzeichen bestehende Eingabe ergibt
+/// [`BLANK_COMPONENT`].
 ///
 /// # Arguments
 /// - `raw` (`&str`): die ungeprüfte ID aus einer Modell-Ausgabe.
 ///
 /// # Returns
-/// Ein nicht-leeres Pfadsegment ohne Separatoren, das weder `.` noch `..` ist.
+/// Ein nicht-leeres Pfadsegment ohne Separatoren, das weder `.` noch `..` ist
+/// und höchstens [`MAX_COMPONENT_LEN`] Zeichen lang ist.
 fn sanitize_component(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return BLANK_COMPONENT.to_owned();
     }
 
-    let mut out: String = trimmed
+    let mapped: String = trimmed
         .chars()
-        .take(MAX_COMPONENT_LEN)
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
                 ch
@@ -111,16 +136,62 @@ fn sanitize_component(raw: &str) -> String {
         })
         .collect();
 
-    if out.starts_with('.') {
-        out.insert(0, '_');
+    let prefixed = if mapped.starts_with('.') {
+        format!("_{mapped}")
+    } else {
+        mapped
+    };
+
+    // Verlustbehaftet, wenn Zeichen ersetzt oder ein Dotfile-Präfix eingefügt
+    // wurden, oder wenn die Länge ungekappt über der Obergrenze liegt.
+    let is_lossy = prefixed != trimmed || prefixed.chars().count() > MAX_COMPONENT_LEN;
+
+    if !is_lossy {
+        // `prefixed == trimmed` und innerhalb der Obergrenze: schon ein
+        // gültiges, eindeutiges Segment, kein Suffix nötig.
+        return prefixed;
     }
 
-    // Invariante: `trimmed` war nicht leer, also enthält `out` mindestens ein
-    // Zeichen. Der Zweig ist reine Absicherung gegen künftige Änderungen.
+    let suffix = hash_suffix(trimmed);
+    let budget = MAX_COMPONENT_LEN.saturating_sub(suffix.len());
+    let mut out: String = prefixed.chars().take(budget).collect();
+    out.push_str(&suffix);
+
+    // Invariante: `budget >= 0` und `suffix` nicht leer, also enthält `out`
+    // mindestens `suffix`. Der Zweig ist reine Absicherung gegen künftige
+    // Änderungen an `HASH_SUFFIX_LEN`/`MAX_COMPONENT_LEN`.
     if out.is_empty() {
         return BLANK_COMPONENT.to_owned();
     }
     out
+}
+
+/// Bildet das Hash-Suffix `-<16 Hex-Zeichen>` für eine verlustbehaftet
+/// sanitisierte Komponente.
+///
+/// # Description
+/// Nutzt [`harw_types::ContentDigest`] (BLAKE3) über die *getrimmte*
+/// Rohkomponente — nicht über das schon zeichen-ersetzte Ergebnis —, damit
+/// zwei Eingaben, die auf dieselbe Ersetzung abbilden (`a/b`, `a:b`, `a b`),
+/// unterschiedliche Suffixe erhalten. Die ersten 8 der 32 Digest-Bytes
+/// (2^64 Möglichkeiten) reichen aus, um Kollisionen im Alltag praktisch
+/// auszuschließen; alle 32 Bytes wären reiner Platzverbrauch im Dateinamen.
+///
+/// # Arguments
+/// - `trimmed` (`&str`): die getrimmte (aber noch nicht zeichen-ersetzte)
+///   Roheingabe.
+///
+/// # Returns
+/// Einen 17 Zeichen langen String der Form `-0123456789abcdef`
+/// ([`HASH_SUFFIX_LEN`] Zeichen).
+fn hash_suffix(trimmed: &str) -> String {
+    let digest = harw_types::ContentDigest::of(trimmed.as_bytes());
+    let bytes = digest.as_bytes();
+    let mut head = [0_u8; 8];
+    head.copy_from_slice(&bytes[..8]);
+    let suffix = format!("-{:016x}", u64::from_be_bytes(head));
+    debug_assert_eq!(suffix.len(), HASH_SUFFIX_LEN);
+    suffix
 }
 
 /// Baut den relativen Lokator eines Finding-Artefakts.
@@ -136,15 +207,19 @@ fn sanitize_component(raw: &str) -> String {
 /// - `question_id` (`&str`): Frage-Bezeichner (wird sanitisiert).
 ///
 /// # Returns
-/// `"<plan_id>/research/<question_id>.md"` mit sanitisierten Segmenten.
+/// `"<plan_id>/research/<question_id>.md"` mit sanitisierten Segmenten. War
+/// die Sanitisierung eines Segments verlustbehaftet, trägt das jeweilige
+/// Segment zusätzlich einen Hash-Suffix (siehe [`sanitize_component`]); der
+/// genaue Wert ist nicht Teil der öffentlichen Schnittstelle, nur seine Form
+/// (`-` gefolgt von 16 Hex-Zeichen, direkt vor dem nächsten Trenner bzw. vor
+/// der `.md`-Endung).
 ///
 /// # Examples
 /// ```rust
 /// use harw_plan_bridge::finding_locator;
-/// assert_eq!(
-///     finding_locator("p-1", "../../etc/passwd"),
-///     "p-1/research/_..-..-etc-passwd.md"
-/// );
+/// let locator = finding_locator("p-1", "../../etc/passwd");
+/// assert!(locator.starts_with("p-1/research/_..-..-etc-passwd-"));
+/// assert!(locator.ends_with(".md"));
 /// ```
 #[must_use]
 pub fn finding_locator(plan_id: &str, question_id: &str) -> String {
@@ -440,15 +515,23 @@ impl FindingStore {
 /// Den [`EvidenceRef`] mit `kind = Finding`.
 #[must_use]
 pub fn evidence_for_finding(plan_id: &str, finding: &ResearchFinding, actor: &str) -> EvidenceRef {
+    // `render_document` liefert dieselben Bytes, die `FindingStore::write`
+    // unter `locator` ablegt (deterministisch aus `finding`, kein
+    // Wanduhr-/Zufallsanteil). Der Digest macht den Lokator prüfbar: ein
+    // Verifizierer kann später erkennen, ob die Datei unter dem Lokator noch
+    // zu diesem Finding gehört, statt sich blind auf den Pfad zu verlassen.
+    // Schlägt die Serialisierung ausnahmsweise fehl, bleibt der Nachweis
+    // trotzdem gültig, nur ohne Digest — fail closed statt eines falschen.
+    let digest = render_document(finding)
+        .ok()
+        .map(|document| harw_types::ContentDigest::of(document.as_bytes()));
+
     EvidenceRef {
         kind: EvidenceKind::Finding,
         locator: finding_locator(plan_id, finding.question_id.as_str()),
         attached_at: offset_from_timestamp(finding.produced_at),
         actor: actor.to_owned(),
-        // Der Lokator zeigt auf die von `FindingStore::write` gerenderte
-        // Markdown-Datei (Frontmatter + Prosa + JSON-Block); diese Bytes
-        // liegen hier nicht vor, nur die strukturierten Rohdaten des Findings.
-        digest: None,
+        digest,
     }
 }
 
@@ -637,20 +720,80 @@ mod tests {
         Ok((FindingStore::new(dir.path().join("plans")), dir))
     }
 
+    /// Prüft, dass `sanitized` aus `expected_prefix` (der zeichen-ersetzten,
+    /// noch nicht gekürzten Komponente) gefolgt von einem Hash-Suffix
+    /// `-<16 Hex-Zeichen>` besteht — dem Format aus [`hash_suffix`], das
+    /// [`sanitize_component`] bei verlustbehafteter Sanitisierung anhängt.
+    /// Der genaue Hash-Wert ist bewusst nicht Teil der Prüfung: er hängt vom
+    /// BLAKE3-Digest der Eingabe ab und ist kein von diesem Modul
+    /// garantierter Vertrag, nur seine Form.
+    fn assert_lossy_result(sanitized: &str, expected_prefix: &str) -> TestResult {
+        let rest = sanitized.strip_prefix(expected_prefix).ok_or_else(|| {
+            TestError::Unexpected(format!(
+                "'{sanitized}' beginnt nicht mit erwartetem Präfix '{expected_prefix}'"
+            ))
+        })?;
+        let suffix = rest.strip_prefix('-').ok_or_else(|| {
+            TestError::Unexpected(format!(
+                "'{sanitized}' hat nach '{expected_prefix}' kein '-'-Hash-Suffix"
+            ))
+        })?;
+        if suffix.len() != 16 || !suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(TestError::Unexpected(format!(
+                "Suffix '{suffix}' in '{sanitized}' ist kein 16-stelliger Hex-Wert"
+            )));
+        }
+        Ok(())
+    }
+
     #[test]
-    fn test_sanitize_component_strips_separators_and_traversal() {
-        assert_eq!(sanitize_component("../../etc/passwd"), "_..-..-etc-passwd");
-        assert_eq!(sanitize_component("a/b"), "a-b");
-        assert_eq!(sanitize_component("a\\b"), "a-b");
-        // Führendes `_`, weil die Dotfile-Regel auch hier greift: `%` wird zu
-        // `-`, der Rest beginnt mit `..` — und ein Ergebnis, das mit `.` anfängt,
-        // wäre ein Dotfile. Diese Erwartung war zuvor veraltet und widersprach
-        // `test_sanitize_component_never_yields_dot_or_dotdot_or_dotfile`.
-        assert_eq!(sanitize_component("..%2f..%2fetc"), "_..-2f..-2fetc");
+    fn test_sanitize_component_strips_separators_and_traversal() -> TestResult {
+        // Unveränderte, bereits gültige Segmente bleiben identisch — nichts
+        // war verlustbehaftet, also gibt es kein Hash-Suffix.
         assert_eq!(sanitize_component("   "), BLANK_COMPONENT);
         assert_eq!(sanitize_component(""), BLANK_COMPONENT);
         assert_eq!(sanitize_component("q-1"), "q-1");
         assert_eq!(sanitize_component("q_1.v2"), "q_1.v2");
+
+        // Zeichen-Ersetzung und/oder eingefügtes Dotfile-Präfix sind
+        // verlustbehaftet: das Ergebnis trägt zusätzlich den Hash-Suffix aus
+        // `hash_suffix`, damit unterschiedliche Rohwerte, die auf dieselbe
+        // Zeichen-Ersetzung abbilden (siehe
+        // `test_sanitize_component_disambiguates_same_character_mapping`),
+        // trotzdem unterscheidbar bleiben.
+        assert_lossy_result(&sanitize_component("../../etc/passwd"), "_..-..-etc-passwd")?;
+        assert_lossy_result(&sanitize_component("a/b"), "a-b")?;
+        assert_lossy_result(&sanitize_component("a\\b"), "a-b")?;
+        // Führendes `_`, weil die Dotfile-Regel auch hier greift: `%` wird zu
+        // `-`, der Rest beginnt mit `..` — und ein Ergebnis, das mit `.` anfängt,
+        // wäre ein Dotfile.
+        assert_lossy_result(&sanitize_component("..%2f..%2fetc"), "_..-2f..-2fetc")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sanitize_component_disambiguates_same_character_mapping() -> TestResult {
+        // Vor dem Befund landeten `a/b`, `a:b` und `a b` alle bei `a-b` und
+        // teilten sich damit eine Datei (letzter `write` gewinnt, ohne dass
+        // die ältere Frage das merkt). Das Hash-Suffix macht sie wieder
+        // unterscheidbar.
+        let slash = sanitize_component("a/b");
+        let colon = sanitize_component("a:b");
+        let space = sanitize_component("a b");
+
+        assert_ne!(slash, colon, "'a/b' und 'a:b' kollidieren weiterhin");
+        assert_ne!(slash, space, "'a/b' und 'a b' kollidieren weiterhin");
+        assert_ne!(colon, space, "'a:b' und 'a b' kollidieren weiterhin");
+
+        // Alle drei ersetzen ihr Trennzeichen durch `-` und tragen deshalb
+        // denselben (nicht gekürzten) Präfix `a-b`.
+        assert_lossy_result(&slash, "a-b")?;
+        assert_lossy_result(&colon, "a-b")?;
+        assert_lossy_result(&space, "a-b")?;
+
+        // Deterministisch: dieselbe Eingabe liefert immer dasselbe Ergebnis.
+        assert_eq!(slash, sanitize_component("a/b"));
+        Ok(())
     }
 
     #[test]
@@ -683,12 +826,16 @@ mod tests {
     #[test]
     fn test_sanitize_component_caps_length() {
         let long = "x".repeat(MAX_COMPONENT_LEN * 3);
+        // Der Cap gilt für das *Gesamtergebnis*, Hash-Suffix eingeschlossen —
+        // sonst könnte `list()` Stems liefern, die länger als
+        // `MAX_COMPONENT_LEN` sind (der ursprüngliche Befund).
         assert_eq!(sanitize_component(&long).len(), MAX_COMPONENT_LEN);
     }
 
     #[test]
-    fn test_sanitize_component_removes_nul_and_control_bytes() {
-        assert_eq!(sanitize_component("a\0b\nc"), "a-b-c");
+    fn test_sanitize_component_removes_nul_and_control_bytes() -> TestResult {
+        assert_lossy_result(&sanitize_component("a\0b\nc"), "a-b-c")?;
+        Ok(())
     }
 
     #[test]
@@ -755,6 +902,78 @@ mod tests {
             .read("../../outside", "../../../etc/passwd")
             .map_err(ctx("read schlug fehl"))?;
         assert_eq!(restored.question_id, hostile.question_id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_keeps_distinct_question_ids_apart_after_sanitization() -> TestResult {
+        // Befund: `a/b` und `a:b` sanitisierten beide zu `a-b` und teilten
+        // sich eine Datei — der zweite `write` überschrieb den ersten, ohne
+        // dass jemand es merkte. Mit dem Hash-Suffix landen sie in
+        // verschiedenen Dateien.
+        let (store, _dir) = temp_store("distinct-ids")?;
+        let mut slash = finding("a/b");
+        slash.conclusion = "Antwort für a/b".to_owned();
+        let mut colon = finding("a:b");
+        colon.conclusion = "Antwort für a:b".to_owned();
+
+        let path_slash = store
+            .write("p-1", &slash)
+            .map_err(ctx("write 'a/b' schlug fehl"))?;
+        let path_colon = store
+            .write("p-1", &colon)
+            .map_err(ctx("write 'a:b' schlug fehl"))?;
+        assert_ne!(
+            path_slash, path_colon,
+            "'a/b' und 'a:b' landen in derselben Datei"
+        );
+
+        let restored_slash = store
+            .read("p-1", "a/b")
+            .map_err(ctx("read 'a/b' schlug fehl"))?;
+        let restored_colon = store
+            .read("p-1", "a:b")
+            .map_err(ctx("read 'a:b' schlug fehl"))?;
+        assert_eq!(restored_slash.conclusion, "Antwort für a/b");
+        assert_eq!(restored_colon.conclusion, "Antwort für a:b");
+        Ok(())
+    }
+
+    #[test]
+    fn test_long_dotfile_question_id_roundtrips_through_list_and_read() -> TestResult {
+        // Befund: eine lange, mit `.` beginnende ID wurde zu einem 129
+        // Zeichen langen Dateinamen (Kürzung auf 128 vor dem `_`-Präfix statt
+        // danach). `list()` liefert diesen Stem unverändert zurück; `read()`
+        // sanitisierte ihn ein zweites Mal und landete wegen der erneuten
+        // Kürzung bei einem anderen (kürzeren) Namen — `NotFound`.
+        let (store, _dir) = temp_store("long-dotfile")?;
+        let question_id = format!(".{}", "x".repeat(200));
+        let mut source = finding(&question_id);
+        source.conclusion = "Antwort für die lange Dotfile-ID".to_owned();
+        store.write("p-1", &source).map_err(ctx("write schlug fehl"))?;
+
+        let ids = store.list("p-1").map_err(ctx("list schlug fehl"))?;
+        assert_eq!(ids.len(), 1, "erwartet genau einen Stem, bekommen: {ids:?}");
+        let stem = ids.first().ok_or(TestError::Missing("Stem aus list()"))?;
+        assert!(
+            stem.len() <= MAX_COMPONENT_LEN,
+            "Stem '{stem}' überschreitet die Obergrenze"
+        );
+
+        // `sanitize_component` ist idempotent: der von `list()` gelieferte
+        // Stem sanitisiert sich selbst zu sich selbst und ist deshalb über
+        // `read()` wieder auflösbar, ohne dass er zuvor ein weiteres Mal
+        // gekürzt oder umbenannt würde.
+        let restored_via_stem = store
+            .read("p-1", stem.as_str())
+            .map_err(ctx("read über list()-Stem schlug fehl"))?;
+        assert_eq!(restored_via_stem.conclusion, "Antwort für die lange Dotfile-ID");
+
+        // Und natürlich auch über die ursprüngliche, unsanitisierte ID.
+        let restored_via_original_id = store
+            .read("p-1", &question_id)
+            .map_err(ctx("read über Original-ID schlug fehl"))?;
+        assert_eq!(restored_via_original_id, restored_via_stem);
         Ok(())
     }
 
@@ -839,6 +1058,16 @@ mod tests {
         assert_eq!(evidence.locator, "p-1/research/q-1.md");
         assert_eq!(evidence.actor, "runtime");
         assert_eq!(evidence.attached_at, offset_from_timestamp(timestamp()));
+
+        // Der Digest deckt den Inhalt ab, auf den `locator` zeigt — nicht
+        // nur den Pfad. `render_document` ist deterministisch in `finding`,
+        // also identisch zu den Bytes, die `FindingStore::write` ablegen
+        // würde.
+        let document = render_document(&source).map_err(ctx("render schlug fehl"))?;
+        assert_eq!(
+            evidence.digest,
+            Some(harw_types::ContentDigest::of(document.as_bytes()))
+        );
         Ok(())
     }
 

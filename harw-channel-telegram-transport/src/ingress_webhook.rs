@@ -255,10 +255,10 @@ fn dispatch_callback(config: &WebhookConfig, update: &RawUpdate) {
             }
         }
         None => {
-            if let Some(callback_id) = callback_query_id(update)
-                && config.dedup.claim_update(update.update_id)
-            {
-                consumer.handle_unroutable_callback(callback_id);
+            if let Some(callback_id) = callback_query_id(update) {
+                if config.dedup.claim_update(update.update_id) {
+                    consumer.handle_unroutable_callback(callback_id);
+                }
             }
         }
     }

@@ -16,6 +16,7 @@
 //! The state of the last attempt is `~/.harw/bin/.auto-build-uia.json`;
 //! [`take_auto_build_notice`] returns a failure once, for a one-time notice.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use harw_agent_dsl::diagnostics::SourceFile;
@@ -143,6 +144,12 @@ pub fn native_home_name(explicit_name: Option<&str>, specialization: &str) -> St
 /// (`identity.md`, `Personality.md`, `USER.md`, …) as knowledge payloads
 /// (`knowledge/<file>`), except the instruction file itself. A change to
 /// any of them changes the artifact digest.
+///
+/// The directory scan below is only a cheap pre-filter (no symlink, size
+/// within [`MAX_BUNDLE_FILE_BYTES`]); it is itself race-prone, since a file
+/// can be swapped for a symlink between this filter and the read. The
+/// authoritative check is the crate-private `read_bundle_file`, which
+/// re-verifies the opened handle before any bytes are embedded.
 pub fn embed_uia_bundle(unit: &mut CompileUnit) {
     if unit.ir.role != AgentRoleId::UserInterface {
         return;
@@ -171,10 +178,53 @@ pub fn embed_uia_bundle(unit: &mut CompileUnit) {
         if instructions.as_deref() == Some(name) {
             continue;
         }
-        if let Ok(bytes) = std::fs::read(&path) {
+        if let Some(bytes) = read_bundle_file(&path) {
             unit.put_file("knowledge", format!("knowledge/{name}"), bytes);
         }
     }
+}
+
+/// Reads one bundle file, closing the gap between the directory scan above
+/// and the read: a plain `std::fs::read(path)` would follow a symlink
+/// swapped in after the scan and read without a bound.
+///
+/// - The size cap and the "regular file" check are re-applied to the
+///   metadata of the **opened handle** (`file.metadata()`, an `fstat`), not
+///   to a path lookup that a swap could have raced.
+/// - On unix, the path is also re-checked right after the open
+///   (`symlink_metadata`) and must still name a non-symlink with the same
+///   identity (`st_dev`/`st_ino`) as the opened handle. `File::open` itself
+///   still follows a symlink (there is no portable, dependency-free way to
+///   pass `O_NOFOLLOW` here: the flag's numeric value differs by
+///   architecture, and `harw-fsutil::open_nofollow` — the crate that
+///   already carries that architecture table — is not a dependency of this
+///   crate); this recheck instead detects the swap after the fact and
+///   refuses to hand back the bytes, so nothing swapped in during the race
+///   ever reaches [`embed_uia_bundle`]'s caller.
+/// - The read itself is bounded (`Read::take`) regardless of what the
+///   metadata says, so a size lie cannot force an unbounded read.
+fn read_bundle_file(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.len() > MAX_BUNDLE_FILE_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let on_disk = std::fs::symlink_metadata(path).ok()?;
+        if !on_disk.is_file() || on_disk.dev() != opened.dev() || on_disk.ino() != opened.ino() {
+            return None;
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BUNDLE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_BUNDLE_FILE_BYTES {
+        return None;
+    }
+    Some(bytes)
 }
 
 /// The recorded state of the last automatic build.
@@ -456,6 +506,25 @@ mod tests {
         Ok(())
     }
 
+    /// Lowers [`UIA`] on its own (front end only, no built-in ceilings
+    /// needed) into a real `role = user-interface` IR for
+    /// [`embed_uia_bundle`] tests.
+    fn lowered_uia_ir() -> Result<harw_agent_dsl::ir_v2::AgentIr, Box<dyn std::error::Error>> {
+        let file = SourceFile::new(
+            harw_agent_dsl::layers::DefinitionLayer::UserGlobal,
+            "mia/definition.toml",
+            UIA,
+        );
+        let target = harw_agent_dsl::ids::DefinitionId::parse("user.agent.mia@1")?;
+        let sources = harw_agent_dsl::lower_v2::LowerSources::new(std::slice::from_ref(&file));
+        let ir = harw_agent_dsl::lower_v2::compile_agent(
+            &target,
+            &sources,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        Ok(ir)
+    }
+
     #[test]
     fn test_disabled_and_missing_uia_and_missing_runner() -> TestResult {
         let (_root, env) = setup(
@@ -510,5 +579,82 @@ mod tests {
         );
         assert_eq!(explicit.default_interface, None);
         assert_eq!(explicit_binary(None), ExplicitBinary::default());
+    }
+
+    #[test]
+    fn test_read_bundle_file_reads_a_regular_file() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("identity.md");
+        std::fs::write(&path, b"I am Mia.\n")?;
+        assert_eq!(read_bundle_file(&path), Some(b"I am Mia.\n".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_bundle_file_refuses_an_oversized_file() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("big.md");
+        let oversized = vec![b'a'; usize::try_from(MAX_BUNDLE_FILE_BYTES + 1)?];
+        std::fs::write(&path, &oversized)?;
+        assert_eq!(read_bundle_file(&path), None);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_read_bundle_file_refuses_a_symlink_even_to_a_regular_file() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, b"top secret")?;
+        let link = dir.path().join("evil.md");
+        std::os::unix::fs::symlink(&target, &link)?;
+        // `File::open` follows the symlink; the opened handle's own
+        // `fstat` looks like an ordinary small regular file (the target
+        // is one). Only the identity recheck against `symlink_metadata`
+        // (this finding's fix) sees that `link` itself is still a
+        // symlink and refuses it — this is the check a bare
+        // `std::fs::read(path)` (the previous code) had none of.
+        assert_eq!(read_bundle_file(&link), None);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_embed_uia_bundle_skips_symlink_and_oversized_bundle_files() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("identity.md"), "I am Mia.\n")?;
+        let outside = tempfile::tempdir()?;
+        std::fs::write(outside.path().join("secret.txt"), b"top secret")?;
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("evil.md"))?;
+        let oversized = vec![b'a'; usize::try_from(MAX_BUNDLE_FILE_BYTES + 1)?];
+        std::fs::write(dir.path().join("oversized.md"), &oversized)?;
+
+        let ir = lowered_uia_ir()?;
+        let mut unit = CompileUnit::new(
+            "mia".to_owned(),
+            ir,
+            Some(dir.path().to_path_buf()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        embed_uia_bundle(&mut unit);
+
+        assert!(
+            unit.files
+                .iter()
+                .any(|file| file.path == "knowledge/identity.md"),
+            "an ordinary bundle file is still embedded"
+        );
+        assert!(
+            !unit.files.iter().any(|file| file.path == "knowledge/evil.md"),
+            "a symlink must never be embedded"
+        );
+        assert!(
+            !unit
+                .files
+                .iter()
+                .any(|file| file.path == "knowledge/oversized.md"),
+            "an oversized file must never be embedded"
+        );
+        Ok(())
     }
 }

@@ -60,10 +60,17 @@
 //! durchsucht" zu unterscheiden. Diese Datei trifft deshalb dieselbe
 //! Entscheidung wie `resolve_index` selbst: der erste unsichtbare Selektor
 //! bricht `federated_query` mit einem Fehler ab, **bevor** irgendein anderer
-//! Index befragt wird. Das ist die einzige Wahl, die mit `resolve_index`s
-//! eigener Logik konsistent ist -- ein Aufrufer, der Teilergebnisse über
-//! sichtbare Indizes will, muss `federated_query` selbst pro Sichtbarkeit
-//! aufrufen und die Fehler seiner Selektoren einzeln behandeln.
+//! Index befragt wird. Dafür prüft [`federated_query`] die Sichtbarkeit
+//! aller sortierten Selektoren in einem eigenen Vorlauf, bevor auch nur ein
+//! einziger Index aufgelöst oder abgefragt wird: sonst würde ein sichtbarer,
+//! früher sortierter Selektor bereits vollständig aufgelöst und über
+//! [`query`] (samt Einbettung, möglicherweise über ein entferntes
+//! Embedding-Backend) abgefragt, bevor der später sortierte, unsichtbare
+//! Selektor überhaupt an die Reihe käme. Das ist die einzige Wahl, die mit
+//! `resolve_index`s eigener Logik konsistent ist -- ein Aufrufer, der
+//! Teilergebnisse über sichtbare Indizes will, muss `federated_query` selbst
+//! pro Sichtbarkeit aufrufen und die Fehler seiner Selektoren einzeln
+//! behandeln.
 //!
 //! # Die Provenienzfrage über mehrere Indizes
 //! `harw_lens_query::query` prüft eine übergebene [`QueryProvenance`] gegen
@@ -110,7 +117,7 @@ use std::path::Path;
 
 use harw_lens_embed::{Embedder, EmbeddingDescriptor};
 use harw_lens_index::VectorIndex;
-use harw_lens_query::{IndexSelector, QueryProvenance, ReadScope, query, resolve_index};
+use harw_lens_query::{IndexSelector, QueryError, QueryProvenance, ReadScope, query, resolve_index};
 use harw_lens_rank::{pack, rrf_fuse};
 use harw_lens_types::{
     BudgetSpec, CollapsePolicy, CostEstimator, EdgeIndex, IndexManifest, LensTypesError, Packed,
@@ -218,11 +225,15 @@ fn skip_reason_from_manifest_check(err: LensTypesError) -> SkipReason {
 ///
 /// # Description
 /// Sortiert `selectors` zuerst ausdrücklich (siehe Moduldokumentation,
-/// Abschnitt „Determinismus"). Löst dann jeden Selektor über
-/// [`resolve_index`] auf: ein Selektor außerhalb von `scope` bricht die
-/// **gesamte** Anfrage sofort mit
+/// Abschnitt „Determinismus"). Prüft danach die Sichtbarkeit **aller**
+/// sortierten Selektoren gegen `scope` in einem eigenen Vorlauf, ohne dafür
+/// auch nur einen Index zu laden oder abzufragen: ein Selektor außerhalb von
+/// `scope` bricht die **gesamte** Anfrage sofort mit
 /// [`harw_lens_query::QueryError::IndexNotVisible`] ab (Abschnitt „Die
-/// Sichtbarkeitsfrage" oben). Für jeden aufgelösten Index wird `provenance`
+/// Sichtbarkeitsfrage" oben), bevor irgendein Index aufgelöst oder ein
+/// weiterer, später sortierter Selektor überhaupt betrachtet wird. Erst
+/// danach löst diese Funktion jeden verbleibenden Selektor über
+/// [`resolve_index`] auf. Für jeden aufgelösten Index wird `provenance`
 /// gegen dessen Manifest geprüft ([`IndexManifest::compatible_with`]); ein
 /// abweichender Index wird nicht abgefragt, sondern in `skipped` vermerkt
 /// (Abschnitt „Die Provenienzfrage" oben). Jeder verbleibende Index wird über
@@ -309,13 +320,32 @@ pub fn federated_query(
     let mut sorted: Vec<IndexSelector> = selectors.to_vec();
     sorted.sort_by(|a, b| selector_sort_key(a).cmp(&selector_sort_key(b)));
 
+    // Sichtbarkeit aller sortierten Selektoren vorab prüfen, bevor auch nur
+    // ein einziger Index aufgelöst oder abgefragt wird. Ohne diesen Vorlauf
+    // würde ein sichtbarer, früher sortierter Selektor bereits vollständig
+    // aufgelöst und über `query` (samt Einbettung, möglicherweise über ein
+    // entferntes Embedding-Backend) abgefragt, bevor ein später sortierter,
+    // unsichtbarer Selektor den Fehler auslöst -- verschwendete Arbeit und
+    // verschwendete entfernte Aufrufe, entgegen der Zusage in der
+    // Moduldokumentation (siehe Abschnitt „Die Sichtbarkeitsfrage").
+    for selector in &sorted {
+        if !scope.allows(&selector.visibility) {
+            return Err(QueryError::IndexNotVisible {
+                index_name: selector.index_name.clone(),
+                visibility: selector.visibility.clone(),
+            }
+            .into());
+        }
+    }
+
     let mut queried = Vec::new();
     let mut skipped = Vec::new();
     let mut lists: Vec<Vec<Ranked>> = Vec::new();
 
     for selector in &sorted {
-        // Sichtbarkeitsverstoss bricht sofort ab -- niemals ein
-        // stillschweigend gekuerztes Ergebnis (siehe Moduldokumentation).
+        // Sichtbarkeit wurde bereits im Vorlauf oben geprüft; `resolve_index`
+        // prüft sie hier defensiv erneut (billig, kein zusätzlicher I/O) und
+        // lädt anschließend den Index.
         let index = resolve_index(home, selector, scope)?;
 
         let expected = provenance_manifest(index.manifest(), provenance);
@@ -392,6 +422,8 @@ pub fn federated_pack(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use harw_lens_types::{ByteSpan, BytesOverFour, Chunk, ChunkDigest, SourceRef};
     use harw_types::ContentDigest;
@@ -443,5 +475,130 @@ mod tests {
         let inner = LensTypesError::ManifestMismatch { field: "model" };
         let reason = skip_reason_from_manifest_check(inner);
         assert_eq!(reason, SkipReason::IncompatibleManifest { field: "model" });
+    }
+
+    /// Zählt Aufrufe von [`Embedder::embed`], ohne das Einbettungsverhalten
+    /// selbst zu verändern -- Testdoppel für
+    /// `test_federated_query_checks_visibility_of_all_selectors_before_querying_any`
+    /// unten (Muster: `LyingEmbedder`/`UnlabeledEmbedder` in
+    /// `harw-lens-embed/src/embedder.rs`).
+    struct CountingEmbedder<E> {
+        inner: E,
+        calls: AtomicUsize,
+    }
+
+    impl<E> CountingEmbedder<E> {
+        fn new(inner: E) -> Self {
+            Self {
+                inner,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<E: Embedder> Embedder for CountingEmbedder<E> {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, harw_lens_embed::EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.embed(texts)
+        }
+
+        fn dimensions(&self) -> usize {
+            self.inner.dimensions()
+        }
+
+        fn locality(&self) -> harw_lens_types::Locality {
+            self.inner.locality()
+        }
+    }
+
+    /// Regressionstest für den Befund, dass ein unsichtbarer Selektor zwar
+    /// letztlich abbricht, aber erst *nachdem* frühere, sichtbare Selektoren
+    /// bereits vollständig aufgelöst und eingebettet wurden -- entgegen der
+    /// Zusage der Moduldokumentation (Abschnitt „Die Sichtbarkeitsfrage").
+    /// `docs.design` ("workspace") existiert tatsächlich, ist sichtbar und
+    /// sortiert vor dem unsichtbaren Selektor ("operator-only"); ohne den
+    /// Sichtbarkeits-Vorlauf würde `docs.design` bereits über [`query`] (und
+    /// damit über den Embedder) abgefragt, bevor der unsichtbare Selektor
+    /// überhaupt an die Reihe käme.
+    #[test]
+    fn test_federated_query_checks_visibility_of_all_selectors_before_querying_any()
+    -> crate::test_support::TestResult {
+        use crate::test_support::{TestError, ctx};
+        use harw_lens_embed::DeterministicEmbedder;
+        use harw_lens_source::{CHUNKER_VERSION, DOCS_DESIGN_INDEX, RawDocument, build_index};
+        use harw_lens_types::{Locality, Metric};
+
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let documents = vec![RawDocument {
+            source: SourceRef::File {
+                path: "architecture.md".to_owned(),
+            },
+            text: "Some design text.".to_owned(),
+            visibility: "workspace".to_owned(),
+        }];
+
+        let descriptor = EmbeddingDescriptor {
+            document_prefix: "passage: ".to_owned(),
+            query_prefix: "query: ".to_owned(),
+            normalize: false,
+        };
+        let embedder = CountingEmbedder::new(DeterministicEmbedder::new(8));
+
+        build_index(
+            home.path(),
+            DOCS_DESIGN_INDEX,
+            &documents,
+            "test-model",
+            Locality::Local,
+            Metric::Cosine,
+            &embedder,
+            &descriptor,
+        )
+        .map_err(ctx("builds docs.design"))?;
+        let calls_after_build = embedder.call_count();
+
+        let selectors = [
+            IndexSelector::new(DOCS_DESIGN_INDEX, "workspace"),
+            IndexSelector::new("knowledge.palace", "operator-only"),
+        ];
+        let scope = ReadScope::single("workspace");
+        let provenance = QueryProvenance {
+            model: "test-model".to_owned(),
+            chunker_version: CHUNKER_VERSION,
+        };
+
+        let result = federated_query(
+            home.path(),
+            &selectors,
+            &scope,
+            "does it matter",
+            &embedder,
+            &descriptor,
+            &provenance,
+            &EdgeIndex::default(),
+            CollapsePolicy::ByDigest,
+            10,
+            60.0,
+        );
+
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "an invisible selector must abort the whole federation".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            err,
+            FederationError::Query(QueryError::IndexNotVisible { .. })
+        ));
+        assert_eq!(
+            embedder.call_count(),
+            calls_after_build,
+            "the visible docs.design selector, sorted before the invisible one, must not be queried"
+        );
+        Ok(())
     }
 }

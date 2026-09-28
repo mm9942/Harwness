@@ -343,8 +343,8 @@ fn run_uia_setup_dialog(home: &Path, context: DialogContext) -> Result<String, S
 }
 
 /// Schreibt eine neue UIA-Definition (`definition.toml`, `agent.toml`,
-/// `identity.md`, `Personality.md`, `USER.md`) in `dir` und setzt unter Unix
-/// `0o600`.
+/// `identity.md`, `Personality.md`, `USER.md`) in `dir`; unter Unix tragen
+/// `dir` und alle fünf Dateien von Anfang an `0o700` bzw. `0o600`.
 ///
 /// # Description
 /// Legt `dir` rekursiv an, escaped `name` für den TOML-Basic-String-Kontext
@@ -353,10 +353,19 @@ fn run_uia_setup_dialog(home: &Path, context: DialogContext) -> Result<String, S
 /// `agents.write_uia` — **immer** geschrieben (mit neutralem Standardtext,
 /// falls der Dialog leer beantwortet wurde), damit jede über den
 /// Einrichtungsdialog angelegte UIA von Anfang an eine eigene Identität
-/// besitzt (siehe `harw_config::loader::load_uia_identity`). Nur unter
-/// `#[cfg(unix)]` werden die Zugriffsrechte aller fünf Dateien auf `0o600`
-/// gesetzt, damit Identität, Persönlichkeit und Nutzerkontext nicht für
-/// andere lokale Benutzer lesbar sind.
+/// besitzt (siehe `harw_config::loader::load_uia_identity`).
+///
+/// Unter `#[cfg(unix)]` erhält `dir` `0o700` bereits beim Anlegen
+/// ([`create_uia_directory`], `DirBuilderExt::mode`) und jede der fünf
+/// Dateien `0o600` bereits beim Öffnen ([`create_uia_file`],
+/// `OpenOptionsExt::mode` zusammen mit `create_new`) — nicht erst nachträglich
+/// per `chmod`, nachdem alle Schreibvorgänge abgeschlossen sind. Damit gibt es
+/// kein Zeitfenster, in dem eine frisch angelegte Datei nur über den
+/// Prozess-`umask` (typischerweise `0o644`/`0o755`) geschützt und somit für
+/// andere lokale Benutzer lesbar ist; scheitert ein späterer Schreibvorgang,
+/// bleiben bereits angelegte Dateien trotzdem `0o600`. `create_new` verweigert
+/// außerdem das Anlegen, falls am Zielpfad bereits ein Symlink liegt, statt
+/// ihm wie `fs::write` stillschweigend zu folgen.
 ///
 /// # Arguments
 /// - `dir` (`&Path`): geliehener Zielpfad des neuen Agentenverzeichnisses;
@@ -369,13 +378,12 @@ fn run_uia_setup_dialog(home: &Path, context: DialogContext) -> Result<String, S
 /// - `user_md` (`&str`): vollständiger Inhalt für `USER.md`.
 ///
 /// # Returns
-/// `Ok(())`, sobald alle fünf Dateien geschrieben (und unter Unix mit
-/// `0o600` versehen) wurden.
+/// `Ok(())`, sobald alle fünf Dateien angelegt und geschrieben wurden.
 ///
 /// # Errors
 /// - Verzeichnis kann nicht angelegt werden.
-/// - Eine der fünf Dateien kann nicht geschrieben werden.
-/// - Unter Unix: die Zugriffsrechte einer Datei können nicht gesetzt werden.
+/// - Eine der fünf Dateien existiert am Zielpfad bereits (z. B. Symlink oder
+///   Race) oder kann nicht angelegt/beschrieben werden.
 ///
 /// # Concurrency
 /// Einzelthreadig, rein synchrone Dateisystemoperationen ohne Locking; nicht
@@ -388,44 +396,84 @@ fn write_uia_files(
     personality_md: &str,
     user_md: &str,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir)
-        .map_err(|error| format!("UIA-Verzeichnis {}: {error}", dir.display()))?;
+    create_uia_directory(dir)?;
 
     let escaped_name = escape_toml_basic_string(name);
     let definition = dir.join("definition.toml");
     let source = format!(
         "schema = \"harwness.agent/v1\"\nid = \"{id}\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\nname = \"{escaped_name}\"\ndescription = \"Lokale Benutzeroberflächen-Agentin, interaktiv eingerichtet.\"\n"
     );
-    std::fs::write(&definition, source)
-        .map_err(|error| format!("UIA-Definition {}: {error}", definition.display()))?;
+    write_new_uia_file(&definition, source.as_bytes(), "UIA-Definition")?;
 
     let agent = dir.join("agent.toml");
-    std::fs::write(
-        &agent,
-        format!(
-            "name = \"{escaped_name}\"\nrole = \"user-interface\"\ndescription = \"Lokale Benutzeroberflächen-Agentin, interaktiv eingerichtet.\"\n"
-        ),
-    )
-    .map_err(|error| format!("UIA-Agentenmetadaten {}: {error}", agent.display()))?;
+    let agent_source = format!(
+        "name = \"{escaped_name}\"\nrole = \"user-interface\"\ndescription = \"Lokale Benutzeroberflächen-Agentin, interaktiv eingerichtet.\"\n"
+    );
+    write_new_uia_file(&agent, agent_source.as_bytes(), "UIA-Agentenmetadaten")?;
 
     let identity = dir.join("identity.md");
-    std::fs::write(&identity, identity_md)
-        .map_err(|error| format!("UIA-Identität {}: {error}", identity.display()))?;
+    write_new_uia_file(&identity, identity_md.as_bytes(), "UIA-Identität")?;
 
     let personality = dir.join("Personality.md");
-    std::fs::write(&personality, personality_md)
-        .map_err(|error| format!("UIA-Persönlichkeit {}: {error}", personality.display()))?;
+    write_new_uia_file(&personality, personality_md.as_bytes(), "UIA-Persönlichkeit")?;
 
     let user = dir.join("USER.md");
-    std::fs::write(&user, user_md)
-        .map_err(|error| format!("UIA-Nutzerkontext {}: {error}", user.display()))?;
+    write_new_uia_file(&user, user_md.as_bytes(), "UIA-Nutzerkontext")?;
 
-    #[cfg(unix)]
-    for path in [&definition, &agent, &identity, &personality, &user] {
-        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .map_err(|error| format!("Rechte für UIA-Datei {}: {error}", path.display()))?;
-    }
     Ok(())
+}
+
+// INTERNAL: Legt `dir` (und fehlende Elternverzeichnisse) rekursiv an. Unter
+// `#[cfg(unix)]` erhalten dabei alle neu angelegten Verzeichnisse `0o700`
+// über `DirBuilderExt::mode`; bereits existierende Verzeichnisse (z. B. das
+// gemeinsame `agents/`-Elternverzeichnis) bleiben unverändert — `create` mit
+// `recursive(true)` ist idempotent und rührt an vorhandenen Verzeichnissen
+// nichts an.
+fn create_uia_directory(dir: &Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .map_err(|error| format!("UIA-Verzeichnis {}: {error}", dir.display()))
+}
+
+// INTERNAL: Öffnet `path` exklusiv zum Schreiben einer brandneuen UIA-Datei.
+// `create_new(true)` schlägt fehl, falls am Zielpfad bereits etwas liegt
+// (Datei oder Symlink), statt es wie `fs::write` stillschweigend zu
+// überschreiben bzw. einem Symlink zu folgen. Unter `#[cfg(unix)]` trägt die
+// Datei bereits beim `open`-Aufruf `0o600` (`OpenOptionsExt::mode`), sodass
+// kein Zeitfenster mit nur `umask`-geschützten Rechten entsteht.
+#[cfg(unix)]
+fn create_uia_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_uia_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+// INTERNAL: Legt `path` über [`create_uia_file`] exklusiv an und schreibt
+// `content` vollständig; `label` liefert den menschenlesbaren Kontext für
+// beide möglichen Fehlerquellen (Anlegen, Schreiben) in einer Fehlermeldung.
+fn write_new_uia_file(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
+    let mut file =
+        create_uia_file(path).map_err(|error| format!("{label} {}: {error}", path.display()))?;
+    file.write_all(content)
+        .map_err(|error| format!("{label} {}: {error}", path.display()))
 }
 
 /// Erzeugt einen ASCII-Kleinbuchstaben-Bindestrich-Slug aus einer freien
@@ -746,6 +794,10 @@ mod tests {
         );
         assert!(result.is_ok());
 
+        let dir_metadata = std::fs::metadata(&target).map_err(ctx("read dir metadata"))?;
+        let dir_mode = dir_metadata.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "unexpected permissions for the agent dir");
+
         for file_name in [
             "definition.toml",
             "agent.toml",
@@ -757,6 +809,52 @@ mod tests {
             let metadata = std::fs::metadata(&path).map_err(ctx("read metadata"))?;
             let mode = metadata.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "unexpected permissions for {file_name}");
+        }
+        Ok(())
+    }
+
+    // Belegt den in Finding R15 beschriebenen Fix: die Rechte der fünf
+    // Dateien entstehen beim Anlegen (`create_new` + `mode`) statt erst nach
+    // dem letzten erfolgreichen Schreibvorgang per `chmod`. Ein erzwungener
+    // Fehler beim letzten Schreibvorgang (`USER.md` existiert bereits als
+    // Verzeichnis) darf die bereits angelegten, vorherigen Dateien nicht in
+    // einem nur über den Prozess-`umask` geschützten Zustand zurücklassen.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_uia_files_keeps_0600_on_earlier_files_after_later_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
+        let target = dir.path().join("ada");
+        // USER.md existiert bereits als Verzeichnis, bevor write_uia_files
+        // läuft; das erzwingt einen Fehler beim letzten der fünf Schreib-
+        // vorgänge, weil `create_new` keinen bereits vorhandenen Pfad
+        // überschreibt.
+        std::fs::create_dir_all(target.join("USER.md")).map_err(ctx("pre-create USER.md dir"))?;
+
+        let result = write_uia_files(
+            &target,
+            "harwness.agent.ada@1",
+            "Ada",
+            "identity\n",
+            "personality\n",
+            "user\n",
+        );
+        assert!(result.is_err());
+
+        for file_name in [
+            "definition.toml",
+            "agent.toml",
+            "identity.md",
+            "Personality.md",
+        ] {
+            let path = target.join(file_name);
+            let metadata = std::fs::metadata(&path).map_err(ctx("read metadata"))?;
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "earlier file {file_name} lost 0600 after a later write failed"
+            );
         }
         Ok(())
     }

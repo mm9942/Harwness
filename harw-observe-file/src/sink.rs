@@ -7,9 +7,39 @@
 //! `docs/design/build-history.md`). Schreibt jeden `record()`-Aufruf als
 //! eine JSON-Zeile in eine anhängende Datei unter dem übergebenen
 //! Verzeichnis; sobald die aktive Datei `max_bytes` erreicht oder
-//! überschreitet, wird sie geschlossen, umbenannt und bekommt eine
-//! `.blake3`-Beidatei mit ihrem Digest, bevor eine neue leere aktive
-//! Datei entsteht.
+//! überschreitet, wird sie geschlossen und kollisionssicher zu einer
+//! rotierten Datei gemacht (hart verlinkt, dann entlinkt, statt per
+//! `rename` einen gleichnamigen Zielpfad kommentarlos zu überschreiben).
+//! Sie bekommt eine `.blake3`-Beidatei mit ihrem Digest, bevor eine neue
+//! leere aktive Datei entsteht.
+//!
+//! # Mehrere Schreiber im selben Verzeichnis
+//! `harw gateway` (`harw-cli/src/observe.rs`) und `harw-sentinel`
+//! (`dod/crates/harw-sentinel/src/main.rs`) öffnen beide unabhängig einen
+//! `FileSink` auf demselben `harw_home::paths::telemetry_dir(home)` —
+//! keine Fehlkonfiguration, sondern der vorgesehene Betrieb. Deshalb
+//! bekommt jeder `open()`-Aufruf seine eigene, instanzeindeutig benannte
+//! aktive Datei (`active-<pid>-<n>.jsonl`, `n` ein prozessweiter Zähler)
+//! statt einer festen `active.jsonl`: kein zweiter Prozess schreibt über
+//! sein eigenes Dateihandle je in die Inode weiter, die ein anderer
+//! Prozess bereits umbenannt und gehasht hat. Die Rotationsnummer
+//! (`rotated-*`) bleibt ein über das ganze Verzeichnis geteilter Zähler;
+//! kollidieren zwei Schreiber dabei (etwa weil beide bei `open()` denselben
+//! leeren Verzeichnis-Stand sahen), rückt `rotate_locked` einfach zur
+//! nächsten freien Nummer vor, statt ein schon gehashtes Segment eines
+//! anderen Schreibers zu überschreiben. Kompromiss: eine liegen gebliebene
+//! aktive Datei eines abgestürzten Vorgängers wird wegen der
+//! instanzeindeutigen Namen bei einem Neustart nicht mehr automatisch zum
+//! Weiterschreiben aufgenommen (das stünde wieder gegen das stille
+//! Überschreiben bzw. einen falsch werdenden `.blake3`-Digest im
+//! Mehrschreiber-Betrieb — das schwerere Problem). Damit solche liegen
+//! gebliebenen Dateien nicht unbegrenzt im Verzeichnis bleiben, räumt jeder
+//! `open()`-Aufruf sie stattdessen auf: eine `active-*.jsonl`, deren
+//! eingebettete PID laut [`pid_is_alive`] nicht mehr existiert, wird —
+//! falls nichtleer — kollisionssicher rotiert und gehasht wie eine normale
+//! Rotation, sonst gelöscht (siehe [`sweep_orphaned_active_files`]). Eine
+//! aktive Datei, deren Prozess laut dieser Prüfung noch läuft, fasst der
+//! Sweep nie an — auch nicht die eigene, gerade erst angelegte.
 //!
 //! # Nebenläufigkeit
 //! [`FileSink`] ist `Send + Sync + Debug` (Vertrag A.3). Weil
@@ -17,7 +47,10 @@
 //! gesamten veränderlichen Zustand (offene Datei, aktuelle Größe,
 //! Rotationszähler) hinter einem `std::sync::Mutex`. Jeder Aufruf aus
 //! jedem Thread nimmt diese eine Sperre für die Dauer des Schreibens bzw.
-//! Rotierens.
+//! Rotierens. Das schützt nur innerhalb eines Prozesses; über
+//! Prozessgrenzen hinweg gibt es keine Sperre — siehe „Mehrere Schreiber
+//! im selben Verzeichnis" oben für den Ersatz (getrennte aktive Dateien,
+//! kollisionssichere Rotation).
 //!
 //! # Fehler
 //! [`crate::error::ObserveFileError`] aus `open()`.
@@ -60,16 +93,44 @@ use serde::Serialize;
 
 use crate::error::ObserveFileError;
 
-const ACTIVE_FILE_NAME: &str = "active.jsonl";
+const ACTIVE_FILE_PREFIX: &str = "active";
+const ACTIVE_FILE_SUFFIX: &str = ".jsonl";
 const ROTATED_PREFIX: &str = "rotated-";
 const ROTATED_SUFFIX: &str = ".jsonl";
 const DIGEST_SUFFIX: &str = ".blake3";
+
+/// Prozessweiter Zähler für instanzeindeutige aktive Dateinamen (siehe
+/// [`unique_active_file_name`]). `AtomicU64` statt `Mutex`, weil er nie
+/// mit anderem Zustand zusammen gelesen werden muss.
+static ACTIVE_FILE_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// Baut einen Dateinamen für die aktive Datei, der für diesen `open()`-Aufruf
+/// eindeutig ist — kombiniert aus Prozess-ID und einem prozessweiten Zähler.
+///
+/// # Description
+/// Zwei `FileSink`s, die dasselbe Verzeichnis öffnen (zwei Prozesse wie
+/// `harw gateway`/`harw-sentinel`, oder zwei Instanzen in einem Testprozess
+/// mit derselben PID), bekommen dadurch garantiert unterschiedliche aktive
+/// Dateien — keine Inode wird je von zwei `FileSink`s gleichzeitig
+/// beschrieben (siehe Moduldoc, „Mehrere Schreiber im selben Verzeichnis").
+fn unique_active_file_name() -> String {
+    let instance = ACTIVE_FILE_INSTANCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{ACTIVE_FILE_PREFIX}-{}-{instance}{ACTIVE_FILE_SUFFIX}",
+        std::process::id()
+    )
+}
 
 /// Ein anhängender JSONL-Sink unter dem harw-Home, mit Größenrotation.
 #[derive(Debug)]
 pub struct FileSink {
     dir: PathBuf,
     max_bytes: u64,
+    /// Pfad der aktiven Datei dieser Instanz (`active-<pid>-<n>.jsonl`),
+    /// einmal bei `open()` bestimmt und über die Lebensdauer der Instanz
+    /// unverändert — auch nach einer Rotation entsteht die neue leere
+    /// aktive Datei wieder unter genau diesem Pfad.
+    active_path: PathBuf,
     state: Mutex<FileSinkState>,
     write_errors: AtomicU64,
 }
@@ -116,11 +177,26 @@ impl FileSink {
     /// Öffnet oder legt den Sink unter `dir` an.
     ///
     /// # Description
-    /// Legt `dir` an, falls es fehlt, und öffnet die aktive Datei
-    /// (`active.jsonl`) anhängend — vorhandener Inhalt aus einem früheren
-    /// Prozess bleibt erhalten. Vorhandene rotierte Dateien im Verzeichnis
-    /// bestimmen die nächste Rotationsnummer, damit ein Neustart keine
-    /// Dateien überschreibt.
+    /// Legt `dir` an, falls es fehlt, und öffnet eine für diesen Aufruf
+    /// eindeutig benannte aktive Datei (`active-<pid>-<n>.jsonl`, siehe
+    /// [`unique_active_file_name`]) anhängend. Die Eindeutigkeit ist
+    /// beabsichtigt (Moduldoc, „Mehrere Schreiber im selben Verzeichnis"):
+    /// zwei gleichzeitige `FileSink`s auf demselben Verzeichnis — zwei
+    /// Prozesse oder zwei Instanzen — schreiben dadurch nie in dieselbe
+    /// Inode. Kompromiss: eine liegen gebliebene aktive Datei eines
+    /// abgestürzten Vorgängers wird bei einem Neustart nicht mehr
+    /// automatisch zum Weiterschreiben aufgenommen, da der neue Aufruf
+    /// einen anderen Dateinamen bekommt. Bevor die eigene aktive Datei
+    /// entsteht, räumt `open()` deshalb zuerst liegen gebliebene
+    /// `active-*.jsonl` anderer, laut [`pid_is_alive`] bereits beendeter
+    /// Schreiber auf: nichtleere werden kollisionssicher rotiert und
+    /// gehasht, leere gelöscht ([`sweep_orphaned_active_files`]); eine
+    /// Datei, deren Prozess noch läuft, bleibt unberührt. Vorhandene
+    /// rotierte Dateien im Verzeichnis bestimmen den Startwert der
+    /// nächsten Rotationsnummer, den dieser Sweep bei Bedarf fortschreibt;
+    /// `rotate_locked` rückt bei einer späteren Kollision mit einem
+    /// anderen Schreiber zusätzlich vor, statt eine bestehende rotierte
+    /// Datei zu überschreiben.
     ///
     /// # Arguments
     /// - `dir` (`&Path`): Zielverzeichnis für aktive und rotierte Dateien.
@@ -135,7 +211,11 @@ impl FileSink {
     /// # Errors
     /// [`ObserveFileError::Open`], wenn das Verzeichnis nicht angelegt
     /// oder die aktive Datei nicht geöffnet bzw. ihre Metadaten nicht
-    /// gelesen werden können.
+    /// gelesen werden können. Der Sweep liegen gebliebener aktiver Dateien
+    /// anderer Schreiber ist reine Aufräumarbeit: schlägt er für eine
+    /// einzelne Datei fehl, lässt er `open()` nicht scheitern und die
+    /// betroffene Datei bleibt einfach liegen, statt den eigenen Sink am
+    /// Starten zu hindern.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -149,9 +229,10 @@ impl FileSink {
             source,
         })?;
 
-        let next_sequence = next_rotation_sequence(dir);
+        let mut next_sequence = next_rotation_sequence(dir);
+        sweep_orphaned_active_files(dir, &mut next_sequence);
 
-        let active_path = dir.join(ACTIVE_FILE_NAME);
+        let active_path = dir.join(unique_active_file_name());
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -171,6 +252,7 @@ impl FileSink {
         Ok(Self {
             dir: dir.to_path_buf(),
             max_bytes: max_bytes.max(1),
+            active_path,
             state: Mutex::new(FileSinkState {
                 file,
                 size,
@@ -206,7 +288,7 @@ impl FileSink {
             .file
             .write_all(line)
             .map_err(|source| ObserveFileError::Open {
-                path: self.dir.join(ACTIVE_FILE_NAME).display().to_string(),
+                path: self.active_path.display().to_string(),
                 source,
             })?;
         state.size += line.len() as u64;
@@ -216,10 +298,11 @@ impl FileSink {
         Ok(())
     }
 
-    /// Schließt die aktive Datei, benennt sie um, schreibt Digest und
-    /// `.blake3`-Beidatei, und öffnet eine neue leere aktive Datei.
+    /// Schließt die aktive Datei, macht sie kollisionssicher zu einer
+    /// rotierten Datei, schreibt Digest und `.blake3`-Beidatei, und öffnet
+    /// eine neue leere aktive Datei unter demselben Pfad.
     fn rotate_locked(&self, state: &mut FileSinkState) -> Result<(), ObserveFileError> {
-        let active_path = self.dir.join(ACTIVE_FILE_NAME);
+        let active_path = &self.active_path;
         state
             .file
             .flush()
@@ -228,12 +311,39 @@ impl FileSink {
                 source,
             })?;
 
-        let sequence = state.next_sequence;
-        state.next_sequence += 1;
-        let rotated_name = format!("{ROTATED_PREFIX}{sequence:010}{ROTATED_SUFFIX}");
-        let rotated_path = self.dir.join(&rotated_name);
+        // Nicht per `fs::rename`: unter POSIX ersetzt das kommentarlos einen
+        // gleichnamigen Zielpfad. Zwei `FileSink`s auf demselben Verzeichnis
+        // (siehe Moduldoc, „Mehrere Schreiber im selben Verzeichnis") können
+        // bei `open()` denselben leeren Verzeichnis-Stand gesehen und deshalb
+        // dieselbe `next_sequence` errechnet haben; ein `rename` würde dann
+        // das schon rotierte und gehashte Segment des anderen Schreibers
+        // überschreiben. Stattdessen: hart verlinken (schlägt mit
+        // `AlreadyExists` fehl statt zu ersetzen) und erst danach die aktive
+        // Datei entlinken; bei einer Kollision zur nächsten Nummer vorrücken
+        // und erneut versuchen. Endet garantiert, weil im Verzeichnis nur
+        // endlich viele rotierte Dateien liegen können.
+        let rotated_path = loop {
+            let sequence = state.next_sequence;
+            let rotated_name = format!("{ROTATED_PREFIX}{sequence:010}{ROTATED_SUFFIX}");
+            let candidate = self.dir.join(&rotated_name);
+            match fs::hard_link(active_path, &candidate) {
+                Ok(()) => {
+                    state.next_sequence = sequence + 1;
+                    break candidate;
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    state.next_sequence = sequence + 1;
+                }
+                Err(source) => {
+                    return Err(ObserveFileError::Rotate {
+                        path: active_path.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        };
 
-        fs::rename(&active_path, &rotated_path).map_err(|source| ObserveFileError::Rotate {
+        fs::remove_file(active_path).map_err(|source| ObserveFileError::Rotate {
             path: active_path.display().to_string(),
             source,
         })?;
@@ -254,7 +364,7 @@ impl FileSink {
         let new_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&active_path)
+            .open(active_path)
             .map_err(|source| ObserveFileError::Rotate {
                 path: active_path.display().to_string(),
                 source,
@@ -374,9 +484,12 @@ fn field_value_to_jsonl(value: &FieldValue) -> JsonlValue {
     }
 }
 
-/// Bestimmt die nächste freie Rotationsnummer, indem das Verzeichnis nach
-/// vorhandenen `rotated-*.jsonl`-Dateien durchsucht wird — ein Neustart
-/// über demselben Verzeichnis darf keine bestehende Datei überschreiben.
+/// Bestimmt den Startwert der nächsten Rotationsnummer, indem das
+/// Verzeichnis nach vorhandenen `rotated-*.jsonl`-Dateien durchsucht wird —
+/// nur der Startwert: dieser Scan allein schließt eine Kollision mit einem
+/// zweiten, gleichzeitig auf demselben Verzeichnis geöffneten `FileSink`
+/// nicht aus (beide können hier denselben Stand sehen). Das eigentliche
+/// Nicht-Überschreiben leistet `rotate_locked` beim tatsächlichen Rotieren.
 fn next_rotation_sequence(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -400,6 +513,110 @@ fn next_rotation_sequence(dir: &Path) -> u64 {
     max_seen.map_or(0, |m| m + 1)
 }
 
+/// Räumt beim Öffnen liegen gebliebene aktive Dateien anderer Schreiber im
+/// selben Verzeichnis auf (Moduldoc, „Mehrere Schreiber im selben
+/// Verzeichnis"): jede `active-*.jsonl`, deren eingebettete PID laut
+/// [`pid_is_alive`] nicht mehr existiert, wird — falls nichtleer —
+/// kollisionssicher rotiert und gehasht wie eine normale Rotation, sonst
+/// gelöscht. `next_sequence` wird dabei fortgeschrieben, damit `open()`
+/// mit dem Ergebnis weiterrechnet und keine Rotationsnummer doppelt
+/// vergibt. Reine Aufräumarbeit: einzelne Fehler brechen den Sweep nicht
+/// ab, sie werden stillschweigend übersprungen (keine Korrektheitsfrage
+/// für diese Instanz, siehe `open()`s `# Errors`).
+fn sweep_orphaned_active_files(dir: &Path, next_sequence: &mut u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid) = parse_active_file_pid(name) else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        let _ = rotate_or_remove_orphan(dir, &entry.path(), next_sequence);
+    }
+}
+
+/// Liest die eingebettete PID aus einem Dateinamen im Schema
+/// `active-<pid>-<n>.jsonl` (siehe [`unique_active_file_name`]); `None`,
+/// wenn der Name nicht diesem Schema folgt (z. B. eine `rotated-*`-Datei
+/// oder eine fremde Datei im selben Verzeichnis).
+fn parse_active_file_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix(ACTIVE_FILE_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.strip_suffix(ACTIVE_FILE_SUFFIX))?;
+    let (pid_part, _instance_part) = rest.split_once('-')?;
+    pid_part.parse::<u32>().ok()
+}
+
+/// Prüft grob, ob ein Prozess mit dieser PID noch läuft — nur als
+/// Heuristik für [`sweep_orphaned_active_files`], nie für Korrektheit
+/// innerhalb dieses Prozesses (dafür sorgt die instanzeindeutige aktive
+/// Datei, siehe Moduldoc). Über `kill -0 <pid>`, denselben Mechanismus wie
+/// `pid_alive` in `harw-cli/src/lifecycle.rs`, ohne einen weiteren
+/// Abhängigkeitsbaum für eine reine Aufräum-Heuristik. Zwei Unschärfen,
+/// beide zur sicheren Seite hin (keine Datei eines noch laufenden
+/// Prozesses wird angefasst): fehlt der `kill`-Befehl, gilt die PID als
+/// lebend; gehört sie einem Prozess eines anderen Nutzers (`EPERM`), gilt
+/// sie ebenfalls als lebend — Gateway, Sentinel und dieser Sink laufen im
+/// vorgesehenen Betrieb aber stets unter demselben Nutzer wie das
+/// Telemetrieverzeichnis, daher in der Praxis kein Konflikt.
+fn pid_is_alive(pid: u32) -> bool {
+    match std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(_) => true,
+    }
+}
+
+/// Macht eine einzelne liegen gebliebene aktive Datei eines beendeten
+/// Schreibers zu einer abgeschlossenen Datei: nichtleer wie eine normale
+/// Rotation (kollisionssicher hart verlinkt, gehasht, `.blake3`-Beidatei
+/// geschrieben, dann die aktive Datei entlinkt), leer einfach gelöscht.
+/// `next_sequence` teilt sich den Zähler mit `open()`s eigenem
+/// Rotationsstart, damit ein hier vergebenes `rotated-*` nie mit einem
+/// späteren dieser Instanz kollidiert.
+fn rotate_or_remove_orphan(
+    dir: &Path,
+    orphan_path: &Path,
+    next_sequence: &mut u64,
+) -> std::io::Result<()> {
+    if fs::metadata(orphan_path)?.len() == 0 {
+        return fs::remove_file(orphan_path);
+    }
+
+    let rotated_path = loop {
+        let sequence = *next_sequence;
+        let candidate = dir.join(format!("{ROTATED_PREFIX}{sequence:010}{ROTATED_SUFFIX}"));
+        match fs::hard_link(orphan_path, &candidate) {
+            Ok(()) => {
+                *next_sequence = sequence + 1;
+                break candidate;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                *next_sequence = sequence + 1;
+            }
+            Err(source) => return Err(source),
+        }
+    };
+
+    fs::remove_file(orphan_path)?;
+
+    let contents = fs::read(&rotated_path)?;
+    let digest = blake3::hash(&contents);
+    let digest_path = PathBuf::from(format!("{}{DIGEST_SUFFIX}", rotated_path.display()));
+    fs::write(&digest_path, digest.to_hex().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,7 +638,8 @@ mod tests {
         let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
         let target = dir.path().join("nested");
         let sink = FileSink::open(&target, 1_048_576).map_err(ctx("FileSink öffnen"))?;
-        assert!(target.join(ACTIVE_FILE_NAME).exists());
+        assert!(sink.active_path.exists());
+        assert_eq!(sink.active_path.parent(), Some(target.as_path()));
         assert_eq!(sink.name(), "file");
         Ok(())
     }
@@ -437,8 +655,8 @@ mod tests {
         );
         sink.flush();
 
-        let contents = fs::read_to_string(dir.path().join(ACTIVE_FILE_NAME))
-            .map_err(ctx("aktive Datei lesen"))?;
+        let contents =
+            fs::read_to_string(&sink.active_path).map_err(ctx("aktive Datei lesen"))?;
         let line = contents
             .lines()
             .next()
@@ -481,7 +699,7 @@ mod tests {
         let stored_digest = fs::read_to_string(&digest_path).map_err(ctx("Digest-Datei lesen"))?;
         assert_eq!(stored_digest, expected_digest);
 
-        let active_len = fs::metadata(dir.path().join(ACTIVE_FILE_NAME))
+        let active_len = fs::metadata(&sink.active_path)
             .map_err(ctx("aktive Datei-Metadaten lesen"))?
             .len();
         assert_eq!(
@@ -517,6 +735,66 @@ mod tests {
             vec![0, 1],
             "sequence numbers must not collide across restarts"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_two_sinks_on_same_dir_get_distinct_active_files() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink_a = FileSink::open(dir.path(), 1_048_576).map_err(ctx("ersten FileSink öffnen"))?;
+        let sink_b = FileSink::open(dir.path(), 1_048_576).map_err(ctx("zweiten FileSink öffnen"))?;
+        assert_ne!(
+            sink_a.active_path, sink_b.active_path,
+            "zwei FileSinks auf demselben Verzeichnis dürfen nie dieselbe aktive Datei teilen"
+        );
+        Ok(())
+    }
+
+    // Deckt den Fund „FileSink hat keine Prozess-übergreifende Exklusion,
+    // Rotation überschreibt Segmente still" ab: zwei `FileSink`s wie
+    // `harw gateway` und `harw-sentinel` auf demselben Verzeichnis rotieren
+    // ohne einander zu überschreiben, und keiner schreibt in die Inode
+    // weiter, die der andere schon rotiert und gehasht hat.
+    #[test]
+    fn test_two_sinks_on_same_dir_both_rotate_without_overwriting() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink_a = FileSink::open(dir.path(), 1).map_err(ctx("ersten FileSink öffnen"))?;
+        let sink_b = FileSink::open(dir.path(), 1).map_err(ctx("zweiten FileSink öffnen"))?;
+
+        sink_a.record(&key("a"), MetricValue::Count(1), &[]);
+        sink_b.record(&key("b"), MetricValue::Count(2), &[]);
+
+        let rotated: Vec<PathBuf> = fs::read_dir(dir.path())
+            .map_err(ctx("Verzeichnis lesen"))?
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(ROTATED_PREFIX) && name.ends_with(ROTATED_SUFFIX) {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            rotated.len(),
+            2,
+            "beide Rotationen müssen erhalten bleiben, gefunden: {rotated:?}"
+        );
+
+        for rotated_path in &rotated {
+            let digest_path = PathBuf::from(format!("{}{DIGEST_SUFFIX}", rotated_path.display()));
+            let contents = fs::read(rotated_path).map_err(ctx("rotierte Datei lesen"))?;
+            let expected_digest = blake3::hash(&contents).to_hex().to_string();
+            let stored_digest =
+                fs::read_to_string(&digest_path).map_err(ctx("Digest-Datei lesen"))?;
+            assert_eq!(
+                stored_digest,
+                expected_digest,
+                "Digest von {} muss zu seinem eigenen Inhalt passen",
+                rotated_path.display()
+            );
+        }
         Ok(())
     }
 

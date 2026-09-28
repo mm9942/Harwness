@@ -186,11 +186,25 @@ impl AskResolutionPolicy {
     /// Ohne diesen Abgleich würde die Vorhersage eine Allow-Regel als
     /// Rückfrage missdeuten (und einen an sich freigegebenen Aufruf hier
     /// fälschlich ablehnen) oder eine Deny-Regel übersehen.
+    ///
+    /// Ebenso zuerst geprüft wird `ALWAYS_ASK_TOOLS` (Nachtrag K3,
+    /// „Freigabe-Härtung"): `review` liefert dafür immer `AskUser`, noch vor
+    /// jeder Regel (`harw-registry-defaults/src/lib.rs:844`).
+    /// Ohne diesen Schritt sagte die Vorhersage für ein solches Werkzeug mit
+    /// passender Allow-Regel `Allow` voraus, während die Kette tatsächlich
+    /// `AskUser` aggregiert — ein Einstieg ohne anwesende Person blieb dann in
+    /// `AwaitingApproval` stehen, genau die Lage, die dieser Handler
+    /// verhindern soll.
     fn would_ask(&self, call: &ToolCall) -> bool {
         // Wie in `DefaultApprovalPolicy::review`: `FullAccess` fragt nie
         // (eine Deny-Regel lehnt dort die Standardpolitik selbst hart ab).
         if self.mode.get() == ApprovalMode::FullAccess {
             return false;
+        }
+        // Wie in `DefaultApprovalPolicy::review`: `ALWAYS_ASK_TOOLS` fragt
+        // immer, noch vor jeder Regel — auch vor einer passenden Allow-Regel.
+        if harw_registry_defaults::ALWAYS_ASK_TOOLS.contains(&call.name.as_str()) {
+            return true;
         }
         // Wie in `DefaultApprovalPolicy::review`: Remote-OCR unter
         // `[tools.doc].remote_ocr = "ask"` fragt unter `ask`/`auto`
@@ -1584,6 +1598,41 @@ mod tests {
         assert!(matches!(
             block_on(chain.handlers()[1].review(&shell_call("git status --short")))?,
             ApprovalDecision::Allow
+        ));
+        Ok(())
+    }
+
+    /// Nachtrag K3/Z2c-02: `ALWAYS_ASK_TOOLS` gewinnt in der Vorhersage über
+    /// eine passende Allow-Regel, genau wie in `DefaultApprovalPolicy::review`
+    /// (`harw-registry-defaults/src/lib.rs:844`). Ohne diesen Schritt sagte
+    /// `would_ask` für `process.kill` mit einer solchen Regel `Allow` voraus,
+    /// während die Kette tatsächlich `AskUser` aggregiert — ein Einstieg ohne
+    /// anwesende Person blieb dann in `AwaitingApproval` stehen, genau die
+    /// Lage, die dieser Handler verhindern soll.
+    #[test]
+    fn ask_resolution_prediction_denies_an_always_ask_tool_despite_an_allow_rule() -> TestResult {
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "process.kill".to_owned(),
+            pattern: None,
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Global,
+        });
+        let chain = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::RejectTurn,
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            None,
+            rules,
+        );
+        // Reihenfolge ohne Config-Politik: Default, Ask.
+        assert!(matches!(
+            block_on(chain.handlers()[0].review(&call("process.kill")))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        assert!(matches!(
+            block_on(chain.handlers()[1].review(&call("process.kill")))?,
+            ApprovalDecision::Deny(_)
         ));
         Ok(())
     }

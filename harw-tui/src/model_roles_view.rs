@@ -3,13 +3,13 @@
 //! Spec-Quelle: `tui_contract.md` (T10, `ModelRolesView::from_config`).
 //!
 //! # Verantwortung
-//! Zeigt in einer Tabelle das live aktive Sitzungsmodell sowie für jede der
-//! zwölf [`ModelRole`]s Provider, Modell, Herkunft (Quelle), Reasoning-
-//! Effort und ab wann eine Änderung wirkt. Die Ansicht schreibt nichts
-//! selbst: `Enter` öffnet über `/models pick <rolle>` den Modell-Picker
-//! (bzw. `/model` für die Live-Zeile, bei einer UIA-Wurzel `/uia-model`),
-//! `r` setzt über `/models reset <rolle>` zurück. Frische Daten kommen über
-//! [`OverlayView::refresh_command`] (`/models show`) und
+//! Zeigt in einer Tabelle das live aktive Sitzungsmodell sowie für jede
+//! [`ModelRole`] (siehe `ModelRole::ALL`) Provider, Modell, Herkunft (Quelle),
+//! Reasoning-Effort und ab wann eine Änderung wirkt. Die Ansicht schreibt
+//! nichts selbst: `Enter` öffnet über `/models pick <rolle>` den
+//! Modell-Picker (bzw. `/model` für die Live-Zeile, bei einer UIA-Wurzel
+//! `/uia-model`), `r` setzt über `/models reset <rolle>` zurück. Frische
+//! Daten kommen über [`OverlayView::refresh_command`] (`/models show`) und
 //! [`OverlayView::apply_data`]; die TUI baut die Ansicht zudem bei jedem
 //! Öffnen aus dem Live-Stand der Montage (`ChatApp::model_roles_view`).
 //!

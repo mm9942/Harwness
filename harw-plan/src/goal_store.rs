@@ -74,7 +74,11 @@
 //! beim Öffnen ([`PlanError::SealMismatch`]). Ein Verzeichnis ohne jedes
 //! Siegel gilt als Legacy-Stand (einmal `warn!`, der nächste Write
 //! versiegelt). Ungeschlüsselt: erkennt Beschädigung und naive Manipulation,
-//! nicht einen Angreifer mit Schreibrecht auf `HARW_HOME`.
+//! nicht einen Angreifer mit Schreibrecht auf `HARW_HOME`. Ein History-Event,
+//! das [`FileGoalStore::load`] über den zuletzt veröffentlichten Snapshot
+//! hinaus nachspielt (siehe dort), bleibt außerhalb der Siegelkette, bis der
+//! nächste Write wieder erfolgreich siegelt — die Kette darf nichts
+//! referenzieren, das nicht auf Platte liegt.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -98,7 +102,7 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use time::OffsetDateTime;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{PlanError, PlanResult};
 use crate::file_store::seal;
@@ -407,9 +411,15 @@ impl GoalStore for InMemoryGoalStore {
 /// `<root>/history.jsonl` an. `<root>` ist das Verzeichnis *dieses einen* Ziels
 /// (siehe [`FileGoalStore::new`]). Der Snapshot wird über eine synchronisierte
 /// Temp-Datei plus `std::fs::rename` veröffentlicht — und zwar erst, nachdem das
-/// History-Event dauerhaft geschrieben ist. Ein abgebrochener Schreibvorgang
-/// hinterlässt deshalb nie einen sichtbaren Halb-Zustand: entweder Event *und*
-/// Snapshot existieren, oder keiner von beiden.
+/// History-Event dauerhaft geschrieben ist. Scheitert der Append selbst,
+/// erreicht das Event `history.jsonl` nie — dann existieren weder Event noch
+/// Snapshot. Scheitert dagegen erst die Veröffentlichung von Siegel oder
+/// Snapshot *nach* einem erfolgreichen Append (oder stürzt der Prozess genau
+/// in diesem Fenster ab), bleibt `history.jsonl` das maßgebliche Protokoll:
+/// [`FileGoalStore::load`] spielt ein solches Nachzügler-Event beim nächsten
+/// Öffnen nach, und `apply_guarded` rückt Revision und RAM-Cache im selben
+/// Prozess ebenfalls vor (siehe dort). Ein sichtbarer Zustand geht dadurch nie
+/// verloren.
 ///
 /// # Concurrency
 /// `Send + Sync` durch `RwLock<FileInner>`. Lesezugriffe halten einen Lese-Lock,
@@ -485,17 +495,41 @@ impl FileGoalStore {
         })
     }
 
-    /// Lädt beim Öffnen den neuesten vollständigen Zielstand aus `root`.
+    /// Lädt beim Öffnen den neuesten vollständigen Zielstand aus `root` und
+    /// spielt anschließend jedes History-Event nach, dessen Revision über der
+    /// des geladenen Ziels liegt.
     ///
-    /// Die Dateinamen sind die durable Sequenzquelle: gewählt wird die höchste
-    /// `rev-<n>.json`. Anders als `FilePlanStore::load` braucht es keinen
-    /// Tie-Break über die ID — ein Verzeichnis gehört genau einem Ziel, und je
-    /// Revision existiert genau eine Datei. Die nächste Revision ist das Maximum
-    /// aus Dateiname, `goal.revision` und der höchsten History-Revision plus
-    /// eins, damit ein halb geschriebener Stand keine Nummer doppelt vergibt.
+    /// Die Dateinamen sind die durable Sequenzquelle für den Snapshot:
+    /// gewählt wird die höchste `rev-<n>.json`. Anders als
+    /// `FilePlanStore::load` braucht es keinen Tie-Break über die ID — ein
+    /// Verzeichnis gehört genau einem Ziel, und je Revision existiert genau
+    /// eine Datei. Die nächste Revision ist das Maximum aus Dateiname,
+    /// `goal.revision` (nach dem Nachspielen) und der höchsten
+    /// History-Revision plus eins, damit ein halb geschriebener Stand keine
+    /// Nummer doppelt vergibt.
     ///
-    /// Nur der neueste Snapshot wird gelesen; sein Siegel wird vor der
-    /// Deserialisierung geprüft.
+    /// Der Snapshot ist nur der zuletzt *veröffentlichte* Stand, nicht
+    /// notwendig der zuletzt *geschriebene*: [`FileGoalStore::apply_guarded`]
+    /// hängt das Event vor Siegel und Snapshot an (Commit-Punkt laut dortigem
+    /// Doc-Kommentar); ein Absturz oder ein Veröffentlichungsfehler
+    /// dazwischen hinterlässt ein `history.jsonl`, das dem Snapshot einen oder
+    /// mehrere Schritte voraus ist. Jedes solche Nachzügler-Event wird hier
+    /// über [`apply_goal_action`] erneut angewendet (`Set` ersetzt, behält
+    /// aber `created_at`, wie in `apply_guarded`) — ohne einen weiteren
+    /// History-Eintrag zu erzeugen, denn die Zeile steht schon da. Ohne
+    /// vorhandenen Snapshot beginnt das Nachspielen bei `goal = None`; das
+    /// erste Event ist dann immer `Set` ([`validate_goal_action`] lässt keine
+    /// andere Aktion ohne bestehendes Ziel zu). Das Siegel des gelesenen
+    /// Snapshots wird vor der Deserialisierung geprüft; die Siegelkette
+    /// (`link`) bleibt beim zuletzt veröffentlichten Stand stehen, auch wenn
+    /// danach noch nachgespielt wird.
+    ///
+    /// # Errors
+    /// - [`PlanError::Io`] wenn eine History-Zeile eine Nicht-`Set`-Aktion
+    ///   trägt, ohne dass ein vorheriges Ziel geladen oder nachgespielt wurde
+    ///   — laut [`validate_goal_action`] kann das beim Schreiben nie
+    ///   entstehen, eine derart beschädigte `history.jsonl` wird trotzdem
+    ///   abgewiesen statt fail-open übersprungen.
     fn load(root: &Path) -> PlanResult<LoadedGoalState> {
         if !root.exists() {
             return Ok((None, Vec::new(), 1, None));
@@ -522,13 +556,18 @@ impl FileGoalStore {
             }
         }
 
-        let Some((file_revision, snapshot_path)) = newest else {
-            return Ok((None, Vec::new(), 1, None));
+        // Snapshot laden, falls einer existiert; ohne Snapshot beginnt das
+        // Nachspielen unten bei `goal = None`.
+        let (mut goal, link, file_revision) = match &newest {
+            Some((revision, snapshot_path)) => {
+                let bytes = std::fs::read(snapshot_path)?;
+                let dir_sealed = seal::directory_is_sealed(root)?;
+                let link = seal::verify(snapshot_path, *revision, &bytes, dir_sealed)?;
+                let goal: Goal = serde_json::from_slice(&bytes)?;
+                (Some(goal), link, *revision)
+            }
+            None => (None, None, 0),
         };
-        let bytes = std::fs::read(&snapshot_path)?;
-        let dir_sealed = seal::directory_is_sealed(root)?;
-        let link = seal::verify(&snapshot_path, file_revision, &bytes, dir_sealed)?;
-        let goal: Goal = serde_json::from_slice(&bytes)?;
 
         let history_path = Self::history_path(root);
         let history = if history_path.exists() {
@@ -547,16 +586,47 @@ impl FileGoalStore {
             Vec::new()
         };
 
+        // Nachzügler-Events (Revision über dem geladenen Ziel) erneut
+        // anwenden — siehe Doc-Kommentar oben.
+        let base_revision = goal.as_ref().map_or(0, |existing| existing.revision);
+        for event in history.iter().filter(|event| event.revision > base_revision) {
+            match &event.action {
+                GoalAction::Set { goal: new_goal } => {
+                    let mut replayed = new_goal.clone();
+                    replayed.created_at = goal
+                        .as_ref()
+                        .map_or(event.applied_at, |existing| existing.created_at);
+                    replayed.revision = event.revision;
+                    replayed.updated_at = event.applied_at;
+                    goal = Some(replayed);
+                }
+                other => {
+                    let Some(current) = goal.as_mut() else {
+                        // Laut `validate_goal_action` kann ein Nicht-`Set`-
+                        // Event beim Schreiben nie ohne ein vorheriges Ziel
+                        // entstanden sein (siehe # Errors oben).
+                        return Err(PlanError::Io(std::io::Error::other(format!(
+                            "history.jsonl: Revision {} ohne vorheriges Set",
+                            event.revision
+                        ))));
+                    };
+                    apply_goal_action(current, other, event.applied_at);
+                    current.revision = event.revision;
+                    current.updated_at = event.applied_at;
+                }
+            }
+        }
+
         let history_revision = history
             .iter()
             .map(|event| event.revision)
             .max()
             .unwrap_or(0);
         let next = file_revision
-            .max(goal.revision)
+            .max(goal.as_ref().map_or(0, |existing| existing.revision))
             .max(history_revision)
             .saturating_add(1);
-        Ok((Some(goal), history, next, link))
+        Ok((goal, history, next, link))
     }
 
     /// Gibt den Snapshot-Pfad einer Revision zurück.
@@ -693,11 +763,21 @@ impl GoalStore for FileGoalStore {
     ///
     /// # Description
     /// Reihenfolge: Lock → [`validate_goal_action`] → Kandidat mutieren →
-    /// Snapshot als Temp-Datei stagen → History-Event anhängen → Snapshot per
-    /// `rename` veröffentlichen → RAM-Cache aktualisieren. Der Kandidat wird
-    /// erst sichtbar, wenn das Event dauerhaft geschrieben ist; scheitert der
-    /// Append, wird die Temp-Datei verworfen und weder Revision noch Cache
-    /// rücken vor. Eine von der Validierung abgewiesene Aktion erreicht das
+    /// Snapshot und Siegel als Temp-Dateien stagen → History-Event anhängen →
+    /// Siegel und Snapshot per `rename` veröffentlichen → RAM-Cache
+    /// aktualisieren. Scheitert der Append selbst, werden beide Temp-Dateien
+    /// verworfen und weder Revision noch Cache rücken vor — das Event
+    /// erreicht `history.jsonl` nie. Scheitert dagegen erst die
+    /// Veröffentlichung von Siegel oder Snapshot *nach* einem erfolgreichen
+    /// Append, ist das Event bereits die dauerhafte Wahrheit: Revision,
+    /// RAM-Cache und History-Liste rücken trotzdem vor, sonst würde der
+    /// nächste Versuch dieselbe Revision ein zweites Mal in `history.jsonl`
+    /// schreiben; nur die Siegelkette (`inner.seal`) bleibt auf dem zuletzt
+    /// tatsächlich veröffentlichten Stand stehen. [`FileGoalStore::load`]
+    /// spielt exakt dasselbe Event beim nächsten Öffnen nach, falls der
+    /// Prozess in diesem Fenster abstürzt (siehe dort). Der Fehler wird trotz
+    /// des fortgeschrittenen internen Zustands unverändert an den Aufrufer
+    /// zurückgegeben. Eine von der Validierung abgewiesene Aktion erreicht das
     /// Dateisystem gar nicht erst — sie erzeugt weder Snapshot noch
     /// History-Zeile.
     ///
@@ -799,13 +879,30 @@ impl GoalStore for FileGoalStore {
             staged_snapshot.discard();
             return Err(error);
         }
-        // Siegel vor dem Snapshot (siehe `FilePlanStore`): ein Absturz
-        // dazwischen hinterlässt nie einen unversiegelten neuesten Snapshot.
-        if let Err(error) = staged_seal.commit() {
-            staged_snapshot.discard();
-            return Err(error);
+
+        // Ab hier ist das Event dauerhaft in `history.jsonl` — der
+        // Commit-Punkt. Siegel vor dem Snapshot (siehe `FilePlanStore`): ein
+        // Absturz dazwischen hinterlässt nie einen unversiegelten neuesten
+        // Snapshot. Scheitert eine der beiden Veröffentlichungen jetzt noch,
+        // bleibt das Event trotzdem die Wahrheit (siehe Doc-Kommentar oben);
+        // `publish_error` merkt sich den Fehler nur, um ihn nach dem
+        // Vorrücken von Revision und Cache an den Aufrufer zurückzugeben.
+        let publish_error = match staged_seal.commit() {
+            Ok(()) => staged_snapshot.commit().err(),
+            Err(error) => {
+                staged_snapshot.discard();
+                Some(error)
+            }
+        };
+        if let Some(error) = &publish_error {
+            warn!(
+                revision = revision,
+                actor = actor,
+                error = %error,
+                "Siegel- oder Snapshot-Veröffentlichung fehlgeschlagen; Event bleibt \
+                 in history.jsonl, Revision und Cache rücken trotzdem vor"
+            );
         }
-        staged_snapshot.commit()?;
 
         debug!(
             revision = revision,
@@ -814,8 +911,14 @@ impl GoalStore for FileGoalStore {
         );
         inner.next_revision = revision.saturating_add(1);
         inner.goal = Some(candidate);
-        inner.seal = Some(link);
+        if publish_error.is_none() {
+            inner.seal = Some(link);
+        }
         inner.history.push(event.clone());
+
+        if let Some(error) = publish_error {
+            return Err(error);
+        }
         Ok(event)
     }
 
@@ -1402,6 +1505,161 @@ mod tests {
         assert!(
             !dir.path().join("rev-1.json").exists(),
             "ein fehlgeschlagener History-Append darf keinen Snapshot veröffentlichen"
+        );
+        Ok(())
+    }
+
+    /// Regressionstest für den Fund „`load` spielt keine History nach, ein
+    /// Post-Append-Fehler vergibt eine Revision doppelt“: Das Siegel für
+    /// Revision 2 kann nicht veröffentlicht werden, weil an seiner Stelle ein
+    /// Verzeichnis liegt (derselbe Trick wie im Test oben, nur für
+    /// `rev-2.seal` statt `history.jsonl`). Das Event steht danach trotzdem
+    /// dauerhaft in `history.jsonl` — sowohl der laufende Prozess als auch ein
+    /// Neustart müssen es zeigen, und keiner von beiden darf die Revision 2
+    /// noch einmal vergeben.
+    #[test]
+    fn test_apply_advances_and_load_replays_after_a_publish_failure_mid_write() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
+        apply_ok(
+            &store,
+            GoalAction::Set {
+                goal: make_goal(GoalStatus::Active),
+            },
+            "human:alice",
+        )?;
+
+        std::fs::create_dir(dir.path().join("rev-2.seal"))?;
+
+        let result = store.apply(
+            GoalAction::Refine {
+                patch: GoalPatch {
+                    statement: Some("verdichtet trotz Absturz".to_owned()),
+                    ..GoalPatch::default()
+                },
+            },
+            "human:alice",
+        );
+        assert!(
+            result.is_err(),
+            "die Siegel-Veröffentlichung muss scheitern, war: {result:?}"
+        );
+
+        // Das Event steht schon dauerhaft in history.jsonl — Revision und
+        // RAM-Cache müssen trotz des Fehlers vorgerückt sein, sonst würde der
+        // nächste Versuch dieselbe Revision noch einmal in die History
+        // schreiben.
+        assert_eq!(
+            store.revision(),
+            2,
+            "die Revision darf nach dem dauerhaften Append nicht stehen bleiben"
+        );
+        assert_eq!(current_ok(&store)?.statement, "verdichtet trotz Absturz");
+        assert_eq!(
+            history_ok(&store, None)?.len(),
+            2,
+            "das Event steht schon in history.jsonl"
+        );
+        assert!(
+            !dir.path().join("rev-2.json").exists(),
+            "der Snapshot darf ohne veröffentlichtes Siegel nicht sichtbar sein"
+        );
+
+        drop(store);
+        std::fs::remove_dir(dir.path().join("rev-2.seal"))?;
+
+        // Neustart: `load` muss das nachgezügerte Event aus history.jsonl
+        // nachspielen, obwohl der neueste lesbare Snapshot noch rev-1.json ist.
+        let reloaded = file_store(&dir)?;
+        let goal = current_ok(&reloaded)?;
+        assert_eq!(
+            goal.revision, 2,
+            "das nachgespielte Event muss die Revision auf 2 heben"
+        );
+        assert_eq!(goal.statement, "verdichtet trotz Absturz");
+        assert_eq!(reloaded.revision(), 2);
+        assert_eq!(history_ok(&reloaded, None)?.len(), 2);
+
+        let third = apply_ok(&reloaded, GoalAction::Inspect, "human:alice")?;
+        assert_eq!(
+            third.revision, 3,
+            "die nächste Revision darf nicht mit der zweiten kollidieren"
+        );
+        Ok(())
+    }
+
+    /// `load` spielt auch ein nachgezügertes `Set` nach — und behält dabei
+    /// `created_at`, genau wie `apply_guarded` es beim ursprünglichen Schreiben
+    /// getan hätte.
+    #[test]
+    fn test_load_replays_a_lost_set_event_and_keeps_created_at() -> TestResult {
+        let dir = temp_dir()?;
+        let created_at;
+        {
+            let store = file_store(&dir)?;
+            apply_ok(
+                &store,
+                GoalAction::Set {
+                    goal: make_goal(GoalStatus::Draft),
+                },
+                "human:alice",
+            )?;
+            created_at = current_ok(&store)?.created_at;
+
+            let mut replacement = make_goal(GoalStatus::Active);
+            replacement.statement = "nach Absturz ersetzt".to_owned();
+            apply_ok(&store, GoalAction::Set { goal: replacement }, "human:alice")?;
+        }
+        // Simuliert, dass der Snapshot von Revision 2 nie veröffentlicht
+        // wurde, obwohl das Event schon in history.jsonl steht.
+        std::fs::remove_file(dir.path().join("rev-2.json"))?;
+        std::fs::remove_file(dir.path().join("rev-2.seal"))?;
+
+        let reloaded = file_store(&dir)?;
+        let goal = current_ok(&reloaded)?;
+        assert_eq!(
+            goal.revision, 2,
+            "das nachgespielte Set muss die Revision auf 2 heben"
+        );
+        assert_eq!(goal.statement, "nach Absturz ersetzt");
+        assert_eq!(
+            goal.created_at, created_at,
+            "Set ersetzt, behält aber created_at (siehe apply_guarded)"
+        );
+        assert_eq!(reloaded.revision(), 2);
+
+        let next_event = apply_ok(&reloaded, GoalAction::Inspect, "human:alice")?;
+        assert_eq!(
+            next_event.revision, 3,
+            "die nächste Revision darf nicht mit der zweiten kollidieren"
+        );
+        Ok(())
+    }
+
+    /// Fail-closed-Test für den neuen Verteidigungszweig in `load`: eine
+    /// `history.jsonl`, deren erstes Event kein `Set` ist, kann laut
+    /// `validate_goal_action` beim Schreiben nie entstanden sein — eine derart
+    /// beschädigte Datei wird beim Öffnen abgewiesen statt fail-open
+    /// übersprungen.
+    #[test]
+    fn test_load_rejects_a_non_set_history_event_without_a_prior_goal() -> TestResult {
+        let dir = temp_dir()?;
+        let event = GoalEvent {
+            revision: 1,
+            action: GoalAction::Inspect,
+            actor: "human:alice".to_owned(),
+            applied_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        std::fs::write(
+            dir.path().join("history.jsonl"),
+            format!("{}\n", serde_json::to_string(&event)?),
+        )?;
+
+        let result = FileGoalStore::new(dir.path());
+
+        assert!(
+            matches!(result, Err(PlanError::Io(_))),
+            "eine History ohne vorheriges Set muss beim Öffnen abgewiesen werden, war: {result:?}"
         );
         Ok(())
     }

@@ -1748,12 +1748,15 @@ impl RuntimeAssemblyBuilder {
         // `[web.search]` einrichten — ohne das scheitert jeder Abruf mit
         // `NotConfigured`. Ein ungültiger Host-Eintrag deaktiviert nur das
         // Netz (Warnung), nicht die ganze Sitzung.
-        if let Ok(home) = harw_home::home_dir()
-            && let Err(error) = harw_registry_defaults::install_web_tools(
-                &config,
-                &harw_home::paths::cache_dir(&home),
-            )
-        {
+        // Kein let-Ketten-Kurzschluss (MSRV 1.85) und keine verschachtelten
+        // `if let` (die `clippy::collapsible_if` seit Clippy 1.88 ebenfalls
+        // zur let-Kette zusammenzöge, siehe Befund Z2c-09 weiter unten in
+        // dieser Datei): `home_dir()` wird über den `Err`-Fall von
+        // `install_web_tools` gemappt, sodass nur noch ein flaches `if let`
+        // übrig bleibt.
+        if let Ok(Err(error)) = harw_home::home_dir().map(|home| {
+            harw_registry_defaults::install_web_tools(&config, &harw_home::paths::cache_dir(&home))
+        }) {
             tracing::warn!(%error, "runtime.web_tools_not_configured");
         }
 
@@ -1974,12 +1977,19 @@ impl RuntimeAssemblyBuilder {
         // Rolle diese Funktion deshalb nicht abfragen darf.
         let uia_ir = if agent_ir.is_some() {
             None
-        } else if matches!(spec.entry, EntryKind::Tui | EntryKind::OneShot)
-            && let Some(embedded) = spec.embedded.as_deref()
-        {
-            Some(resolve_embedded_uia(embedded.root_ir())?)
         } else {
-            resolve_active_uia(spec.entry, &config, &config_agents, &agent_definitions)?
+            // Kein let-Ketten-Kurzschluss (MSRV 1.85): `spec.embedded` zählt
+            // nur für `Tui`/`OneShot`, sonst gilt derselbe `None`-Zweig wie
+            // bei fehlendem `spec.embedded`.
+            let embedded_for_entry = if matches!(spec.entry, EntryKind::Tui | EntryKind::OneShot) {
+                spec.embedded.as_deref()
+            } else {
+                None
+            };
+            match embedded_for_entry {
+                Some(embedded) => Some(resolve_embedded_uia(embedded.root_ir())?),
+                None => resolve_active_uia(spec.entry, &config, &config_agents, &agent_definitions)?,
+            }
         };
         // Die Kind-Decke ist die *tatsächliche* Aktivierung der Root-Session:
         // `new_root_session` wendet ausschließlich `agent_ir` an (bei aktiver
@@ -4199,15 +4209,24 @@ fn effective_root_model_id(config: &ResolvedConfig, uia_root: bool) -> Option<St
 /// `uia_provider` bei nutzbarer UIA-Auswahl einer UIA-Wurzel, sonst
 /// `default_provider`.
 fn effective_root_provider_id(config: &ResolvedConfig, uia_root: bool) -> Option<String> {
-    if uia_root
+    // Kein let-Ketten-Kurzschluss (MSRV 1.85) und keine verschachtelten
+    // `if let` (siehe Befund Z2c-09 weiter unten in dieser Datei): die
+    // gesamte Bedingung wird als ein Bool vorab bestimmt, danach steht nur
+    // noch ein flaches `if`.
+    let uia_provider_usable = uia_root
         && config.harness.uia_model.is_some()
-        && let Some(provider) = config.harness.uia_provider.as_deref()
         && config
-            .providers
-            .get(provider)
-            .is_some_and(|provider| provider.enabled)
-    {
-        return Some(provider.to_owned());
+            .harness
+            .uia_provider
+            .as_deref()
+            .is_some_and(|provider_id| {
+                config
+                    .providers
+                    .get(provider_id)
+                    .is_some_and(|provider| provider.enabled)
+            });
+    if uia_provider_usable {
+        return config.harness.uia_provider.clone();
     }
     config.harness.default_provider.clone()
 }
@@ -6831,6 +6850,49 @@ mod tests {
             effective_root_model_id(&config, true).as_deref(),
             Some("local-a-model"),
             "deaktivierter UIA-Provider fällt auf das Vorgabemodell zurück"
+        );
+        Ok(())
+    }
+
+    /// Regressionstest zum let-Ketten-Fix in [`effective_root_provider_id`]:
+    /// dieselbe Rangfolge wie [`effective_root_model_id`], zusätzlich mit dem
+    /// Fall „`uia_provider` gesetzt, aber `uia_model` fehlt“ — genau die
+    /// dritte, zuvor per let-Kette geprüfte Bedingung.
+    #[test]
+    fn effective_root_provider_follows_the_uia_pair_only_for_uia_roots() -> TestResult {
+        let mut config = two_provider_config();
+        assert_eq!(
+            effective_root_provider_id(&config, true).as_deref(),
+            Some("local-a"),
+            "ohne UIA-Paar gilt der Vorgabe-Provider"
+        );
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
+        assert_eq!(
+            effective_root_provider_id(&config, true).as_deref(),
+            Some("local-b")
+        );
+        assert_eq!(
+            effective_root_provider_id(&config, false).as_deref(),
+            Some("local-a"),
+            "eine Nicht-UIA-Wurzel ignoriert das UIA-Paar"
+        );
+        config.harness.uia_model = None;
+        assert_eq!(
+            effective_root_provider_id(&config, true).as_deref(),
+            Some("local-a"),
+            "uia_provider ohne uia_model fällt auf den Vorgabe-Provider zurück"
+        );
+        config.harness.uia_model = Some("local-b-model".to_owned());
+        config
+            .providers
+            .get_mut("local-b")
+            .ok_or(TestError::Missing("local-b"))?
+            .enabled = false;
+        assert_eq!(
+            effective_root_provider_id(&config, true).as_deref(),
+            Some("local-a"),
+            "deaktivierter UIA-Provider fällt auf den Vorgabe-Provider zurück"
         );
         Ok(())
     }

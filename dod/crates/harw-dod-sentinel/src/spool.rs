@@ -2,14 +2,29 @@
 //! (W3/C-FIND, Befunde F-074, G-037; Design „Warden-Proof v2“).
 //!
 //! # Verantwortungsbereich
-//! Der Sammelprozess (`harw-sentinel`) schreibt jeden
-//! [`harw_dod_rules::finding::FindingRecord`] hierher; der Triage-Dienst liest
-//! ihn über einen Cursor ([`FindingSpool::page`]), und der Escalator liest
-//! denselben Record **selbst** über [`FindingSpool::get`], bevor er
-//! `harw_dod_rules::finding::triage_record` aufruft. Dieses Modul besitzt nur
-//! Ablage, Benennung, Größen- und Symlinkschutz — keine Deutung einer Quelle
-//! (siehe `lib.rs`, „keine Parselogik“: gelesen werden ausschließlich
-//! Records, die diese Crate selbst geschrieben hat).
+//! `FindingSpool` ist als dateibasierter Übergabepunkt entworfen: ein
+//! Sammelprozess legt jeden [`harw_dod_rules::finding::FindingRecord`] hier ab
+//! ([`FindingSpool::put`]), ein Triage-Dienst liest ihn über einen Cursor
+//! ([`FindingSpool::page`]), und ein Escalator liest denselben Record
+//! **selbst** über [`FindingSpool::get`], bevor er
+//! `harw_dod_rules::finding::triage_record` aufruft.
+//!
+//! **Verdrahtet ist das noch nicht** (Stand dieses Knotens). `harw-sentinel`
+//! (`src/main.rs`, Aufruf von `findings::report_findings`) meldet zertifizierte
+//! Befunde heute nur über `tracing` und, wenn `--findings-export` gesetzt
+//! ist, als JSON-Lines-Zeile für `harw-security-hub`
+//! (`harw-sentinel/src/export.rs`) — keinen `FindingRecord` in diesen Spool.
+//! Außerhalb dieser Crate ruft nichts [`FindingSpool::put`],
+//! [`FindingSpool::get`] oder [`FindingSpool::page`] auf; dieses Modul ist
+//! bislang unbenutzte Infrastruktur. Der offene Verdrahtungspunkt (der Aufruf
+//! von `findings::report_findings` in `harw-sentinel/src/main.rs`) gehört
+//! in `docs/planning/90-migration-ledger/MIGRATION_LEDGER.md`, nicht in
+//! dieses Modul.
+//!
+//! Dieses Modul selbst besitzt nur Ablage, Benennung, Größen- und
+//! Symlinkschutz — keine Deutung einer Quelle (siehe `lib.rs`, „keine
+//! Parselogik“: gelesen werden ausschließlich Records, die diese Crate
+//! selbst geschrieben hat).
 //!
 //! # Ablage
 //! - Ein Record je Datei `<seq:020>-<record-digest-hex>.json`, Rechte

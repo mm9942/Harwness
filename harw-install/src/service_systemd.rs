@@ -301,13 +301,27 @@ fn remove_files_if_present(paths: &[PathBuf]) -> Result<(), ServiceError> {
 /// pro Variable, `Restart=always`, `RestartSec=<restart_sec>` und
 /// `WantedBy=default.target`.
 ///
+/// `ExecStart` und `Environment` werden nach `systemd.syntax(7)` zitiert:
+/// jedes `ExecStart`-Wort und jede `Environment=`-Zuweisung wird einzeln über
+/// [`quote_systemd_value`] in doppelte Anführungszeichen gesetzt. Damit
+/// spaltet ein Leerzeichen im Programmpfad `ExecStart` nicht in ein anderes
+/// Kommando auf, `%` (Spezifizierer) und `$` (Variablenexpansion) werden
+/// verdoppelt statt expandiert, und ein Zeilenumbruch im Wert erzeugt keine
+/// zusätzliche physische Zeile (und damit keine zusätzliche Direktive) in
+/// der Unit-Datei.
+///
 /// # Arguments
 /// - `spec` (`&ServiceSpec`): Dienstbeschreibung.
 ///
 /// # Returns
 /// Den vollständigen Unit-Text als `String`.
 fn render_systemd_unit(spec: &ServiceSpec) -> String {
-    let exec_start = spec.exec.join(" ");
+    let exec_start = spec
+        .exec
+        .iter()
+        .map(|word| quote_systemd_value(word))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut out = String::new();
     out.push_str("[Unit]\n");
     out.push_str(&format!("Description=harw service {}\n", spec.name));
@@ -320,13 +334,76 @@ fn render_systemd_unit(spec: &ServiceSpec) -> String {
         spec.working_dir.display()
     ));
     for (key, value) in &spec.env {
-        out.push_str(&format!("Environment={key}={value}\n"));
+        let assignment = format!("{key}={value}");
+        out.push_str(&format!(
+            "Environment={}\n",
+            quote_systemd_value(&assignment)
+        ));
     }
     out.push_str("Restart=always\n");
     out.push_str(&format!("RestartSec={}\n\n", spec.restart_sec));
     out.push_str("[Install]\n");
     out.push_str("WantedBy=default.target\n");
     out
+}
+
+/// Escaped einen Rohwert für die Verwendung innerhalb einer doppelt
+/// zitierten systemd-Zuweisung (rein, ohne umschließende Anführungszeichen).
+///
+/// # Description
+/// systemd expandiert `%`-Spezifizierer und, in `ExecStart=`/`Environment=`,
+/// `$`-Variablen unabhängig von Anführungszeichen; ein unzitiertes
+/// Leerzeichen trennt Wörter in `ExecStart=`. Diese Funktion verdoppelt `%`
+/// und `$`, escaped `\` und `"` C-artig (wie von `systemd.syntax(7)`
+/// erwartet) und ersetzt Steuerzeichen — inklusive `\n`, `\r`, `\t` — durch
+/// die passende Escape-Sequenz (benannt bzw. `\xHH`). So kann ein Rohwert
+/// niemals eine neue physische Zeile oder eine zusätzliche Direktive im
+/// Unit-File erzeugen; C-artige Escape-Sequenzen bewahren aber den
+/// ursprünglichen Zeicheninhalt beim Parsen durch systemd.
+///
+/// # Arguments
+/// - `raw` (`&str`): unverarbeiteter Wert, z. B. ein Pfadsegment oder eine
+///   `KEY=value`-Zuweisung.
+///
+/// # Returns
+/// Den escapten Wert ohne umschließende Anführungszeichen.
+fn escape_systemd_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Zitiert einen Rohwert für eine systemd-Unit-Zeile (rein).
+///
+/// # Description
+/// Wendet [`escape_systemd_value`] an und umschließt das Ergebnis mit
+/// doppelten Anführungszeichen (`"..."`), wie es `ExecStart=`- und
+/// `Environment=`-Zeilen nach `systemd.syntax(7)` erwarten.
+///
+/// # Arguments
+/// - `raw` (`&str`): unverarbeiteter Wert.
+///
+/// # Returns
+/// Den Wert in doppelten Anführungszeichen.
+fn quote_systemd_value(raw: &str) -> String {
+    format!("\"{}\"", escape_systemd_value(raw))
 }
 
 /// Bestimmt das Home-Verzeichnis aus den Umgebungsvariablen.
@@ -356,7 +433,7 @@ mod tests {
     #[test]
     fn test_render_unit_contains_exec_start_command() {
         let unit = render_systemd_unit(&spec());
-        assert!(unit.contains("ExecStart=/usr/bin/harw serve"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/harw\" \"serve\""));
     }
 
     #[test]
@@ -368,7 +445,76 @@ mod tests {
     #[test]
     fn test_render_unit_contains_environment_line() {
         let unit = render_systemd_unit(&spec());
-        assert!(unit.contains("Environment=RUST_LOG=info"));
+        assert!(unit.contains("Environment=\"RUST_LOG=info\""));
+    }
+
+    #[test]
+    fn test_render_unit_quotes_exec_words_with_spaces() {
+        let mut s = spec();
+        s.exec = vec!["/opt/My Apps/harw".to_owned(), "serve".to_owned()];
+        let unit = render_systemd_unit(&s);
+        assert!(unit.contains("ExecStart=\"/opt/My Apps/harw\" \"serve\"\n"));
+    }
+
+    #[test]
+    fn test_render_unit_quotes_environment_assignment_with_spaces() {
+        let mut s = spec();
+        s.env = vec![("HARW_HOME".to_owned(), "/home/a b/.harw".to_owned())];
+        let unit = render_systemd_unit(&s);
+        assert!(unit.contains("Environment=\"HARW_HOME=/home/a b/.harw\"\n"));
+    }
+
+    #[test]
+    fn test_render_unit_doubles_percent_specifier_in_exec_and_env() {
+        let mut s = spec();
+        s.exec = vec!["/opt/100%done/harw".to_owned()];
+        s.env = vec![("KEY".to_owned(), "50%off".to_owned())];
+        let unit = render_systemd_unit(&s);
+        assert!(unit.contains("ExecStart=\"/opt/100%%done/harw\"\n"));
+        assert!(unit.contains("Environment=\"KEY=50%%off\"\n"));
+    }
+
+    #[test]
+    fn test_render_unit_doubles_dollar_variable_in_env() {
+        let mut s = spec();
+        s.env = vec![("PATH".to_owned(), "$HOME/bin".to_owned())];
+        let unit = render_systemd_unit(&s);
+        assert!(unit.contains("Environment=\"PATH=$$HOME/bin\"\n"));
+    }
+
+    #[test]
+    fn test_render_unit_prevents_line_injection_via_newline_in_env_value() -> TestResult {
+        let mut s = spec();
+        s.env = vec![(
+            "EVIL".to_owned(),
+            "x\n[Service]\nExecStart=/bin/evil".to_owned(),
+        )];
+        let unit = render_systemd_unit(&s);
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("Environment=\"EVIL="))
+            .ok_or(TestError::Missing("Environment=EVIL-Zeile"))?;
+        assert!(line.contains("x\\n[Service]\\nExecStart=/bin/evil"));
+        // Der eingebettete Zeilenumbruch darf keine zusätzliche
+        // `ExecStart=`-Zeile im Unit-Text erzeugen.
+        assert_eq!(unit.matches("ExecStart=").count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_escape_systemd_value_escapes_backslash_and_quote() {
+        assert_eq!(escape_systemd_value("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    #[test]
+    fn test_escape_systemd_value_escapes_control_chars() {
+        assert_eq!(escape_systemd_value("a\nb\tc\rd"), "a\\nb\\tc\\rd");
+        assert_eq!(escape_systemd_value("a\u{7}b"), "a\\x07b");
+    }
+
+    #[test]
+    fn test_quote_systemd_value_wraps_in_double_quotes() {
+        assert_eq!(quote_systemd_value("plain"), "\"plain\"");
     }
 
     #[test]

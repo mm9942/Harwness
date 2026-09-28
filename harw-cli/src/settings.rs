@@ -19,7 +19,12 @@
 //! `get`/`set`/`permissions` respektieren `--global` (Vorgabe,
 //! `~/.harw/profiles/<p>/config.toml`) und `--project`
 //! (`~/.harw/profiles/<p>/projects/<key>/settings.toml`, Projekt-Erkennung
-//! über [`harw_home::discover_project`] ab dem aktuellen Arbeitsverzeichnis).
+//! über [`harw_home::discover_project`] ab dem aktuellen Arbeitsverzeichnis,
+//! mit den Markern aus `[harness].project_root_markers` der bereits
+//! geladenen Basis-Konfiguration statt der harten Vorgabe `&[]` — wie
+//! `harw-runtime/src/config.rs` und die `/permissions`-Op
+//! (`harw-ops/src/permissions.rs`), sonst erkennen CLI, Runtime und TUI bei
+//! benutzerdefinierten Markern unterschiedliche Projekt-Schlüssel).
 //! `provider`/`model default` wirken immer auf die globale Ebene (Profil),
 //! wie der Onboarding-Wizard.
 //!
@@ -37,11 +42,18 @@
 //! verweist auf `harw auth`.
 //!
 //! # Validierung
-//! Nach jedem Schreiben lädt [`print_validation_result`] die betroffene
-//! Config-Kette neu (`harw_home::config_layers` +
-//! `harw_config::discover_config` + `ResolvedConfig::validate`) und druckt ein knappes Ergebnis — im Stil
+//! Nach jedem Schreiben lädt [`print_validation_result`] dieselbe Kette neu,
+//! die auch ein regulärer Lauf lädt: Root-Space, aktives Profil, ggf.
+//! vertrautes Repo (`harw_home::config_layers`) **und** den
+//! Projekt-Settings-Layer `projects/<key>/settings.toml`, den sonst nur
+//! `harw-runtime/src/config.rs` anhängt
+//! (`harw_config::discover_config_with_restricted_and_project_settings` +
+//! `ResolvedConfig::validate`) — und druckt ein knappes Ergebnis, im Stil
 //! von `harw doctor` (`crate::doctor`), aber nicht fehlschlagend: die Datei
-//! ist zu diesem Zeitpunkt bereits geschrieben.
+//! ist zu diesem Zeitpunkt bereits geschrieben. [`validate_config_chain`]
+//! trägt die eigentliche Ladekette und liefert sie als `Result` zurück,
+//! damit Tests das Ergebnis prüfen können, statt den gedruckten Text zu
+//! parsen.
 //!
 //! # Concurrency
 //! Zustandslos; ein `harw settings`-Prozess pro Root-Space ist die
@@ -227,20 +239,29 @@ fn global_config_path(home: &Path) -> Result<PathBuf, SettingsError> {
     Ok(active_profile_dir(home)?.join("config.toml"))
 }
 
-/// `~/.harw/profiles/<p>/projects/<key>/settings.toml` (Projekt-Ebene),
-/// Projekt-Erkennung ab dem aktuellen Arbeitsverzeichnis.
+/// `~/.harw/profiles/<p>/projects/<key>/settings.toml` (Projekt-Ebene).
+/// Projekt-Erkennung ab dem aktuellen Arbeitsverzeichnis, mit den Markern
+/// aus `[harness].project_root_markers` der Basis-Konfiguration
+/// ([`base_config_layers`]) statt der harten Vorgabe `&[]` (nur `.git`):
+/// sonst erkennt `harw settings … --project` bei benutzerdefinierten Markern
+/// (z. B. ein Monorepo-Teilpaket) ein anderes Projekt als `harw-runtime`
+/// bzw. die `/permissions --project`-Op, und die Einstellung landet in einer
+/// Datei, die die Runtime nie liest.
 ///
 /// # Errors
 /// [`SettingsError::Io`], wenn das Arbeitsverzeichnis nicht ermittelbar ist;
-/// [`SettingsError::Home`], wenn Projekt-Erkennung oder Pfadauflösung
-/// scheitern (siehe [`harw_home::discover_project`],
+/// [`SettingsError::Config`], wenn die Basis-Konfiguration nicht geladen
+/// werden kann; [`SettingsError::Home`], wenn Projekt-Erkennung oder
+/// Pfadauflösung scheitern (siehe [`harw_home::discover_project`],
 /// [`harw_home::project_settings_dir`]).
 fn project_settings_path(home: &Path) -> Result<PathBuf, SettingsError> {
     let cwd = std::env::current_dir().map_err(|source| SettingsError::Io {
         path: PathBuf::from("."),
         source,
     })?;
-    let project = harw_home::discover_project(&cwd, &[])?;
+    let (_, base_config) = base_config_layers(home)?;
+    let markers = project_root_markers(&base_config);
+    let project = harw_home::discover_project(&cwd, &markers)?;
     let profile_name = harw_home::active_profile_name(home);
     let key = harw_home::project_key(&project.root);
     let dir = harw_home::project_settings_dir(home, &profile_name, &key)?;
@@ -278,34 +299,128 @@ fn provider_path(home: &Path, name: &str) -> Result<PathBuf, SettingsError> {
 // Validierung im Stil von `harw doctor`
 // ---------------------------------------------------------------------
 
+/// Basis-Konfiguration ohne Projekt-Layer: Root-Space, aktives Profil und —
+/// nur wenn freigegeben — ein vertrautes repo-lokales `.harw`
+/// (`harw_home::config_layers` + `harw_config::discover_config`). Dient
+/// ausschließlich dazu, `[harness].project_root_markers` zu kennen, **bevor**
+/// das Projekt selbst erkannt wird — dieselbe Reihenfolge wie
+/// `harw-runtime/src/config.rs::load_config_with_agents`, damit CLI, Runtime
+/// und die `/permissions`-Op auf demselben Projekt-Schlüssel landen.
+///
+/// # Errors
+/// [`SettingsError::Home`] bzw. [`SettingsError::Config`], wie
+/// [`harw_home::config_layers`]/[`harw_config::discover_config`].
+fn base_config_layers(
+    home: &Path,
+) -> Result<(Vec<PathBuf>, harw_config::ResolvedConfig), SettingsError> {
+    let layers = harw_home::config_layers(home)?;
+    let config = harw_config::discover_config(&layers)?;
+    Ok((layers, config))
+}
+
+/// Projekt-Root-Marker aus einer bereits geladenen Basis-Konfiguration;
+/// `[]` (nur `.git`, siehe [`harw_home::discover_project`]), wenn kein
+/// Profil eigene Marker setzt.
+fn project_root_markers(config: &harw_config::ResolvedConfig) -> Vec<String> {
+    config
+        .harness
+        .project_root_markers
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Ergebnis von [`validate_config_chain`]/[`print_validation_result`] —
+/// eigenständiger Typ statt nur eines gedruckten Textes, damit Tests das
+/// Ergebnis direkt prüfen können.
+#[derive(Debug, PartialEq, Eq)]
+enum ValidationOutcome {
+    /// Die vollständige Kette ließ sich laden und validieren.
+    Valid {
+        layers: usize,
+        providers: usize,
+        models: usize,
+    },
+    /// Laden oder Validieren scheiterte; `reason` ist `Display` des Fehlers.
+    Invalid { reason: String },
+}
+
+/// Lädt exakt die Kette, die auch ein regulärer Lauf lädt, und validiert
+/// sie: Root-Space, aktives Profil, ggf. vertrautes Repo
+/// ([`base_config_layers`]) **und** der Projekt-Settings-Layer
+/// `projects/<key>/settings.toml`, den sonst nur `harw-runtime/src/config.rs`
+/// anhängt. Ohne diesen letzten Layer meldete `harw settings set --project`
+/// `config_valid=true`, obwohl die frisch geschriebene Datei beim nächsten
+/// Start einen Typfehler auslöst — die alte Kette (`config_layers` +
+/// `discover_config`) kennt `projects/<key>/settings.toml` gar nicht.
+///
+/// # Errors
+/// [`SettingsError::Io`], wenn das Arbeitsverzeichnis nicht ermittelbar ist;
+/// [`SettingsError::Home`]/[`SettingsError::Config`], wie
+/// [`base_config_layers`], [`harw_home::discover_project`],
+/// [`harw_home::project_settings_dir`] und
+/// [`harw_config::discover_config_with_restricted_and_project_settings`];
+/// zusätzlich, wenn `ResolvedConfig::validate` oder
+/// `harw_registry_defaults::ConfigAgents::from_config_validated` die
+/// geladene Konfiguration ablehnen.
+fn validate_config_chain(
+    home: &Path,
+) -> Result<(Vec<PathBuf>, harw_config::ResolvedConfig), SettingsError> {
+    let (mut layers, base_config) = base_config_layers(home)?;
+    let markers = project_root_markers(&base_config);
+    let cwd = std::env::current_dir().map_err(|source| SettingsError::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let project = harw_home::discover_project(&cwd, &markers)?;
+    let profile_name = harw_home::active_profile_name(home);
+    let key = harw_home::project_key(&project.root);
+    let settings_dir = harw_home::project_settings_dir(home, &profile_name, &key)?;
+    let settings_path = settings_dir.join("settings.toml");
+    if settings_path.is_file() || settings_dir.join("config.toml").is_file() {
+        layers.push(settings_dir);
+    }
+    let config = harw_config::discover_config_with_restricted_and_project_settings(
+        &layers,
+        None,
+        settings_path.is_file().then_some(settings_path.as_path()),
+    )?;
+    config.validate().and_then(|()| {
+        // Agentendefinitionen reicht `harw-config` ungeparst weiter; ihr
+        // Senken und die Auswahlprüfung gehören zur Validierung.
+        harw_registry_defaults::ConfigAgents::from_config_validated(&config).map(|_| ())
+    })?;
+    Ok((layers, config))
+}
+
+/// Testbarer Kern von [`print_validation_result`]: lädt und validiert die
+/// Kette über [`validate_config_chain`] und liefert das Ergebnis zurück,
+/// statt es zu drucken.
+fn compute_validation_result(home: &Path) -> ValidationOutcome {
+    match validate_config_chain(home) {
+        Ok((layers, config)) => ValidationOutcome::Valid {
+            layers: layers.len(),
+            providers: config.providers.len(),
+            models: config.models.len(),
+        },
+        Err(error) => ValidationOutcome::Invalid {
+            reason: error.to_string(),
+        },
+    }
+}
+
 /// Lädt die Config-Kette neu und validiert sie, druckt ein knappes Ergebnis.
 ///
 /// Schlägt die Validierung fehl, wird das nur gemeldet, nicht propagiert:
 /// die betroffene Datei ist zu diesem Zeitpunkt bereits geschrieben (analog
 /// zu einem separaten `harw doctor`-Aufruf danach).
 fn print_validation_result(home: &Path) {
-    let outcome = harw_home::config_layers(home)
-        .map_err(SettingsError::from)
-        .and_then(|layers| {
-            harw_config::discover_config(&layers)
-                .map_err(SettingsError::from)
-                .map(|config| (layers, config))
-        });
-    match outcome {
-        Ok((layers, config)) => match config.validate().and_then(|()| {
-            // Agentendefinitionen reicht `harw-config` ungeparst weiter; ihr
-            // Senken und die Auswahlprüfung gehören zur Validierung.
-            harw_registry_defaults::ConfigAgents::from_config_validated(&config).map(|_| ())
-        }) {
-            Ok(()) => println!(
-                "config_valid=true layers={} providers={} models={}",
-                layers.len(),
-                config.providers.len(),
-                config.models.len()
-            ),
-            Err(error) => println!("config_valid=false reason={error}"),
-        },
-        Err(error) => println!("config_valid=false reason={error}"),
+    match compute_validation_result(home) {
+        ValidationOutcome::Valid {
+            layers,
+            providers,
+            models,
+        } => println!("config_valid=true layers={layers} providers={providers} models={models}"),
+        ValidationOutcome::Invalid { reason } => println!("config_valid=false reason={reason}"),
     }
 }
 
@@ -1724,6 +1839,56 @@ mod tests {
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
             Some("settings.toml")
+        );
+        Ok(())
+    }
+
+    /// Finding #1: `harw settings set --project` muss den Projekt-Layer
+    /// mitvalidieren, nicht nur Root-Space/Profil/vertrautes Repo.
+    /// `run_set` schreibt jeden Wert als TOML-String (siehe dessen Doku);
+    /// `config_version` erwartet aber eine Zahl. Vor dem Fix prüfte
+    /// `print_validation_result` ausschließlich `harw_home::config_layers` +
+    /// `discover_config` — eine Kette, die `projects/<key>/settings.toml`
+    /// gar nicht kennt — und hätte hier fälschlich `config_valid=true`
+    /// gemeldet, obwohl der nächste reguläre Lauf an genau dieser Datei mit
+    /// einem Typfehler scheitert.
+    #[test]
+    fn test_project_scope_set_reports_config_invalid_on_type_mismatch() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        run_set(
+            &home,
+            "config_version",
+            Some("5".to_owned()),
+            SettingScope::Project,
+        )
+        .map_err(ctx("set project key"))?;
+
+        let outcome = compute_validation_result(&home);
+        assert!(
+            matches!(outcome, ValidationOutcome::Invalid { .. }),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Finding #2: `project_settings_path` (und damit auch
+    /// [`validate_config_chain`]) müssen `[harness].project_root_markers`
+    /// aus der bereits geladenen Basis-Konfiguration übernehmen statt einer
+    /// harten Vorgabe — sonst erkennt die CLI bei benutzerdefinierten
+    /// Markern ein anderes Projekt als `harw-runtime`/die
+    /// `/permissions --project`-Op. Prüft direkt die dafür genutzte
+    /// Verdrahtung ([`base_config_layers`] + [`project_root_markers`]),
+    /// ohne den Arbeitsordner des Testprozesses zu ändern (Tests laufen
+    /// parallel, siehe [`temp_home`]).
+    #[test]
+    fn test_project_root_markers_reads_from_base_config() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        write_global_config(&home, "project_root_markers = [\"pkg.marker\"]\n")?;
+
+        let (_, base_config) = base_config_layers(&home).map_err(ctx("load base config"))?;
+        assert_eq!(
+            project_root_markers(&base_config),
+            vec!["pkg.marker".to_owned()]
         );
         Ok(())
     }

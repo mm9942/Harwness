@@ -234,6 +234,7 @@ pub trait ChildBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn completed_has_no_end_cause() {
@@ -251,19 +252,22 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_maps_reason_through() {
+    fn cancelled_maps_reason_through() -> TestResult {
         let status = ChildRunStatus::Cancelled {
             reason: "user".to_owned(),
         };
         assert!(!status.is_success());
         match status.to_child_end_cause() {
             Some(ChildEndCause::Cancelled { reason }) => assert_eq!(reason, "user"),
-            other => panic!("unexpected: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!("unexpected: {other:?}")));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn crashed_reports_exit_code_and_stderr_tail() {
+    fn crashed_reports_exit_code_and_stderr_tail() -> TestResult {
         let status = ChildRunStatus::Crashed {
             exit_code: Some(137),
             stderr_tail: "panicked at ...".to_owned(),
@@ -274,30 +278,39 @@ mod tests {
                 assert!(message.contains("137"));
                 assert!(message.contains("panicked at"));
             }
-            other => panic!("unexpected: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!("unexpected: {other:?}")));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn crashed_without_exit_code_says_unknown() {
+    fn crashed_without_exit_code_says_unknown() -> TestResult {
         let status = ChildRunStatus::Crashed {
             exit_code: None,
             stderr_tail: String::new(),
         };
         match status.to_child_end_cause() {
             Some(ChildEndCause::TurnError(message)) => assert!(message.contains("unknown")),
-            other => panic!("unexpected: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!("unexpected: {other:?}")));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn failed_maps_reason_through() {
+    fn failed_maps_reason_through() -> TestResult {
         let status = ChildRunStatus::Failed {
             reason: "provider timeout".to_owned(),
         };
         match status.to_child_end_cause() {
             Some(ChildEndCause::TurnError(reason)) => assert_eq!(reason, "provider timeout"),
-            other => panic!("unexpected: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!("unexpected: {other:?}")));
+            }
         }
+        Ok(())
     }
 }

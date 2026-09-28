@@ -11,6 +11,9 @@
 //! - Basis muss in den Schichten auffindbar sein, sonst `DslError::MissingBase`.
 //! - Mixins müssen auffindbar sein, sonst `DslError::MissingMixin`.
 //! - Authority-Patches dürfen nur reduzieren, sonst `DslError::AuthorityElevation`.
+//! - Eine höhere Schicht (Overlay) darf die Authority-Obergrenze der niedrigeren
+//!   Schichten nicht erweitern — auch nicht über ein eigenes `extends`, das die
+//!   Basiskette erneut anwendet. Sonst `DslError::AuthorityElevation`.
 //! - Mixins dürfen die Rolle nicht ändern.
 //!
 //! # Nebenläufigkeit
@@ -70,7 +73,9 @@ fn check_schema(
 /// 4. Wendet Mixins in der deklarierten Reihenfolge an.
 ///    Fehlt eines: `DslError::MissingMixin`.
 /// 5. Wendet Patches der Ziel-Definition an.
-/// 6. Prüft Authority-Monotonie (child.authority ⊆ parent.authority).
+/// 6. Prüft Authority-Monotonie (child.authority ⊆ parent.authority) und je
+///    Overlay-Schicht (Ergebnis der Schicht ⊆ Obergrenze der niedrigeren
+///    Schichten, auch wenn die Schicht ein eigenes `extends` trägt).
 ///    Verletzung: `DslError::AuthorityElevation`.
 /// 7. Erzeugt den [`ResolutionTrace`].
 ///
@@ -85,7 +90,9 @@ fn check_schema(
 /// # Fehler
 /// - [`DslError::MissingBase`]: wenn `extends` auf eine nicht vorhandene Definition zeigt.
 /// - [`DslError::MissingMixin`]: wenn ein `mixin` nicht in den Schichten gefunden wird.
-/// - [`DslError::AuthorityElevation`]: wenn ein Patch Authority unzulässig erhöht.
+/// - [`DslError::AuthorityElevation`]: wenn ein Patch Authority unzulässig erhöht
+///   oder eine höhere Schicht (auch über ihr `extends`) die Obergrenze der
+///   niedrigeren Schichten erweitert.
 /// - [`DslError::SchemaMismatch`]: wenn eine Ziel- oder Basisdefinition nicht
 ///   `harwness.agent/v1` bzw. ein Mixin weder `harwness.mixin/v1` noch
 ///   `harwness.agent/v1` deklariert.
@@ -170,7 +177,11 @@ pub fn resolve_definition(
         skills: Vec::new(),
     };
     // 4–5. Ziel-Layer aufsteigend komponieren. Höhere Layer sind Overlays.
+    // Ein Overlay mit eigenem `extends` wendet seine Basiskette erneut an,
+    // deren Wurzel die Obergrenze ungeprüft ersetzt. Darum wird das Ergebnis
+    // jeder Overlay-Schicht gegen die Obergrenze davor geprüft (6.).
     for (layer_index, definition) in target_layers.iter().enumerate() {
+        let ceiling_below = (layer_index > 0).then(|| ctx.authority.clone());
         let mut active_extends = vec![(definition.id.clone(), definition.version.clone())];
         resolve_extends(definition, &mut ctx, &mut active_extends)?;
         apply_mixins(definition, authoritative_role, &mut ctx)?;
@@ -180,6 +191,9 @@ pub fn resolve_definition(
             layer_index > 0 || base_target.extends.is_some(),
             layer_index > 0,
         )?;
+        if let Some(ceiling_below) = ceiling_below {
+            check_overlay_ceiling(definition, &ctx.authority, &ceiling_below)?;
+        }
     }
 
     // Skills liegen unter einem reservierten Config-Schlüssel (siehe
@@ -253,7 +267,48 @@ fn apply_reasoning_effort_override(ctx: &mut ResolveCtx<'_>, definition: &RawAge
     }
 }
 
+/// Prüft, dass eine Overlay-Schicht die Obergrenze der niedrigeren Schichten
+/// nicht erweitert.
+///
+/// # Beschreibung
+/// Ohne `extends` fängt schon [`apply_definition_content`] jede Erweiterung
+/// ab. Mit `extends` wendet [`resolve_extends`] die Basiskette erneut an, und
+/// deren Wurzel ersetzt die Obergrenze ungeprüft — eine Verengung aus einer
+/// niedrigeren Schicht ginge verloren, und das eigene `[authority]` des
+/// Overlays würde nur gegen die zurückgesetzte Obergrenze geprüft. Darum wird
+/// hier das Ergebnis der ganzen Schicht mit `ceiling_below` verglichen.
+///
+/// # Errors
+/// [`DslError::AuthorityElevation`], wenn `resolved` Capabilities trägt, die
+/// `ceiling_below` nicht hat. Feldpfad ist `authority.capabilities`, wenn das
+/// Overlay selbst `[authority]` setzt, sonst `extends`.
+fn check_overlay_ceiling(
+    definition: &RawAgentDefinition,
+    resolved: &AuthorityCeiling,
+    ceiling_below: &AuthorityCeiling,
+) -> DslResult<()> {
+    let added = resolved.added_relative_to(ceiling_below);
+    if added.is_empty() {
+        return Ok(());
+    }
+    let field = if definition.extends.is_some()
+        && extract_authority_from_table(&definition.tables).is_none()
+    {
+        "extends"
+    } else {
+        "authority.capabilities"
+    };
+    Err(DslError::AuthorityElevation {
+        of: Box::new(definition.id.clone()),
+        added_capabilities: added,
+        location: DiagLocation::field(field),
+    })
+}
+
 /// Resolves every ancestor of `definition`, from its root base to its direct base.
+///
+/// Die Wurzel der Kette setzt die Obergrenze ungeprüft; für Overlay-Schichten
+/// prüft [`check_overlay_ceiling`] das Ergebnis gegen die Obergrenze davor.
 ///
 /// Nimmt den geteilten Pipeline-Zustand gebündelt über `ctx` entgegen
 /// (siehe [`ResolveCtx`]), um `clippy::too_many_arguments` zu vermeiden.
@@ -1629,6 +1684,119 @@ capabilities = ["filesystem.read", "filesystem.write"]
             location.field_path.as_deref(),
             Some("authority.capabilities")
         );
+        Ok(())
+    }
+
+    /// Basis `[read, write]`; eine niedrigere Zielschicht verengt per `extends`
+    /// auf `[read]`; darüber ein Project-Overlay, das dieselbe Basis erneut
+    /// per `extends` einbindet und `overlay_extra` anhängt.
+    fn overlay_extends_layers(
+        overlay_extra: &str,
+    ) -> TestResult<Vec<(DefinitionLayer, RawAgentDefinition)>> {
+        let base = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.ceiling-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base"
+
+[authority]
+capabilities = ["filesystem.read", "filesystem.write"]
+"#,
+        )?;
+        let lower = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.ceiling-target@1"
+version = "1.0.0"
+role = "worker"
+specialization = "lower"
+extends = { id = "harwness.agent.ceiling-base@1" }
+
+[authority]
+capabilities = ["filesystem.read"]
+"#,
+        )?;
+        let overlay = parse_toml(&format!(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.ceiling-target@1"
+version = "1.1.0"
+role = "worker"
+specialization = "overlay"
+extends = {{ id = "harwness.agent.ceiling-base@1" }}
+{overlay_extra}
+"#
+        ))?;
+        Ok(vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::UserGlobal, lower),
+            (DefinitionLayer::Project, overlay),
+        ])
+    }
+
+    #[test]
+    fn test_resolve_rejects_overlay_extends_that_resets_lower_ceiling() -> TestResult {
+        let id = DefinitionId::parse("harwness.agent.ceiling-target@1")?;
+        match resolve_definition(&id, &overlay_extends_layers("")?, now()) {
+            Err(DslError::AuthorityElevation {
+                of,
+                added_capabilities,
+                location,
+            }) => {
+                assert_eq!(*of, id);
+                assert_eq!(added_capabilities, vec!["filesystem.write"]);
+                assert_eq!(location.field_path.as_deref(), Some("extends"));
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "AuthorityElevation expected, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_resolve_rejects_overlay_extends_authority_above_lower_ceiling() -> TestResult {
+        // Innerhalb der Basis, aber über der Verengung der niedrigeren Schicht.
+        let id = DefinitionId::parse("harwness.agent.ceiling-target@1")?;
+        let layers = overlay_extends_layers(
+            r#"
+[authority]
+capabilities = ["filesystem.read", "filesystem.write"]
+"#,
+        )?;
+        match resolve_definition(&id, &layers, now()) {
+            Err(DslError::AuthorityElevation {
+                added_capabilities,
+                location,
+                ..
+            }) => {
+                assert_eq!(added_capabilities, vec!["filesystem.write"]);
+                assert_eq!(
+                    location.field_path.as_deref(),
+                    Some("authority.capabilities")
+                );
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "AuthorityElevation expected, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_resolve_accepts_overlay_extends_that_keeps_lower_ceiling() -> TestResult {
+        let id = DefinitionId::parse("harwness.agent.ceiling-target@1")?;
+        let layers = overlay_extends_layers(
+            r#"
+[authority]
+capabilities = ["filesystem.read"]
+"#,
+        )?;
+        let resolved = resolve_definition(&id, &layers, now())?;
+        assert_eq!(resolved.authority.capabilities, vec!["filesystem.read"]);
+        assert_eq!(resolved.specialization, "overlay");
         Ok(())
     }
 

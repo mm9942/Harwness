@@ -57,7 +57,10 @@
 //! den neuen Stand neu aufgebaut und erneut versucht; ein zweiter Konflikt
 //! wird als Fehler gemeldet. Die Schritte einer Runde bilden zusammen
 //! **keine** Transaktion: bricht Schritt `n` ab, bleiben die Schritte
-//! `0..n` wirksam.
+//! `0..n` wirksam. Ausnahme: [`ReconcileStep::MarkReady`] bündelt seine
+//! Knoten nicht in einen gemeinsamen Batch, sondern läuft je Knoten als
+//! eigener `apply_batch` — eine abgelehnte Aktion bricht nur diesen einen
+//! Knoten ab, nicht die übrigen Knoten der Liste (siehe unten, „Fehler“).
 //!
 //! # Exportierte Typen
 //! [`ReconcileInput`], [`ReconcileStep`], [`PlanController`].
@@ -72,7 +75,12 @@
 //! `apply` gibt [`PlanBridgeError::Plan`] weiter, wenn `harw-plan` eine
 //! Mutation ablehnt (darunter `BatchActionRejected` und ein wiederholter
 //! `RevisionConflict`), und [`PlanBridgeError::GoalUnbound`], wenn ein
-//! `GoalStatus`-Vorschlag ohne gebundenen Goal-Store ankommt.
+//! `GoalStatus`-Vorschlag ohne gebundenen Goal-Store ankommt. Ausnahme:
+//! eine abgelehnte Aktion innerhalb eines [`ReconcileStep::MarkReady`] wird
+//! **nicht** weitergegeben — sie wird je Knoten abgefangen und als
+//! [`ReconcileStep::AskModel`] verzögert, damit ein einzelner abgelehnter
+//! Knoten (z. B. Scope-Konflikt) nicht die übrigen Knoten derselben Liste
+//! oder spätere Schritte der Runde mit sich reißt.
 
 use std::collections::HashSet;
 
@@ -609,6 +617,20 @@ impl PlanController {
     /// Aufrufer reagiert darauf mit einer neuen `reconcile`-Runde. Der
     /// fehlgeschlagene Schritt selbst hinterlässt nichts.
     ///
+    /// Ausnahme: [`ReconcileStep::MarkReady`] verarbeitet seine Knoten
+    /// einzeln (je Knoten ein eigener `apply_batch`). Lehnt `harw-plan` die
+    /// Aktion für einen Knoten ab (`BatchActionRejected`, z. B.
+    /// `ScopeConflict` oder `ExplorationRequired`), bricht **nur dieser
+    /// Knoten** ab: er wird nicht gesetzt, sondern als
+    /// [`ReconcileStep::AskModel`] mit dem Ablehnungsgrund in die
+    /// zurückgegebenen Vorschläge aufgenommen. Die übrigen Knoten der Liste
+    /// und alle folgenden Schritte der Runde laufen unverändert weiter —
+    /// sonst hinge `reconcile → apply` an jedem betroffenen Knoten in jeder
+    /// Runde erneut fest, weil `reconcile` deterministisch denselben
+    /// Zustand wieder vorfindet. Nur ein Store-/I/O-Fehler oder ein
+    /// wiederholter Revisionskonflikt bricht auch die `MarkReady`-Liste als
+    /// Ganzes ab.
+    ///
     /// # Arguments
     /// - `steps` (`&[ReconcileStep]`): die anzuwendende Schrittfolge.
     /// - `plan` (`&dyn PlanStore`): der zu mutierende Plan-Store.
@@ -623,7 +645,11 @@ impl PlanController {
     /// # Errors
     /// - [`PlanBridgeError::Plan`]: wenn `harw-plan` eine Mutation ablehnt
     ///   (`BatchActionRejected` mit Index und Ursache) oder die Revision auch
-    ///   nach einmaligem Neulesen nicht passt (`RevisionConflict`).
+    ///   nach einmaligem Neulesen nicht passt (`RevisionConflict`). Für
+    ///   [`ReconcileStep::MarkReady`] gilt das nur für den wiederholten
+    ///   Revisionskonflikt — eine abgelehnte Aktion an einem einzelnen
+    ///   Knoten wird stattdessen abgefangen und als `AskModel` verzögert
+    ///   (siehe oben).
     /// - [`PlanBridgeError::GoalUnbound`]: wenn ein `GoalStatus`-Vorschlag
     ///   ankommt, obwohl kein Goal-Store gebunden ist — der Vorschlag hätte
     ///   dann keinen Adressaten.
@@ -750,15 +776,43 @@ fn apply_steps(
 
             ReconcileStep::MarkReady { ids } => {
                 // Je Knoten ein eigener Batch: ein einzelner abgelehnter
-                // Knoten (z. B. Scope-Konflikt) darf die übrigen nicht
-                // dauerhaft mit blockieren.
+                // Knoten (z. B. Scope-Konflikt oder fehlende frische
+                // Exploration) darf die übrigen nicht dauerhaft mit
+                // blockieren. Deshalb hier **kein** `?`: eine abgelehnte
+                // Aktion wird abgefangen und als `AskModel` verzögert, statt
+                // die restlichen Knoten dieser Liste und jeden späteren
+                // Schritt der Runde abzureißen — sonst schlüge `reconcile`
+                // in jeder folgenden Runde am selben Knoten wieder fehl, weil
+                // es deterministisch denselben Zustand wieder vorfindet.
                 let mut marked: Vec<TaskId> = Vec::new();
                 for id in ids {
-                    let events =
-                        apply_atomically(plan, actor, |snapshot| mark_ready_actions(snapshot, id))?;
-                    if !events.is_empty() {
-                        marked.push(id.clone());
-                        outcome.events.extend(events);
+                    match apply_atomically(plan, actor, |snapshot| mark_ready_actions(snapshot, id))
+                    {
+                        Ok(events) => {
+                            if !events.is_empty() {
+                                marked.push(id.clone());
+                                outcome.events.extend(events);
+                            }
+                        }
+                        Err(PlanBridgeError::Plan(PlanError::BatchActionRejected {
+                            source,
+                            ..
+                        })) => {
+                            tracing::warn!(
+                                task = %id,
+                                reason = %source,
+                                "MarkReady abgelehnt — Knoten wird verzögert, die übrigen \
+                                 Knoten dieser Liste bleiben unberührt"
+                            );
+                            outcome.deferred.push(ReconcileStep::AskModel {
+                                prompt: mark_ready_rejected_prompt(id, &source),
+                            });
+                        }
+                        // Store-/I/O-Fehler und ein wiederholter
+                        // Revisionskonflikt sind keine Ablehnung eines
+                        // einzelnen Knotens, sondern ein Problem der ganzen
+                        // Runde — die gibt `apply` unverändert weiter.
+                        Err(error) => return Err(error),
                     }
                 }
                 if !marked.is_empty() {
@@ -938,6 +992,24 @@ fn mark_ready_actions(snapshot: &Plan, id: &TaskId) -> Vec<PlanAction> {
         status: PlanNodeStatus::Ready,
         reason: Some("alle Abhängigkeiten abgeschlossen".to_owned()),
     }]
+}
+
+/// Baut den Prompt für einen von `apply` abgelehnten `MarkReady`-Knoten.
+///
+/// # Description
+/// Der Knoten bleibt im bisherigen Status; nur er wird verzögert — die
+/// übrigen Knoten derselben `MarkReady`-Liste sind davon nicht betroffen
+/// (siehe `apply_steps`, Zweig `MarkReady`). `source` ist die Ursache, die
+/// `harw-plan` in `BatchActionRejected` mitgegeben hat (z. B.
+/// `ScopeConflict`, `ExplorationRequired`).
+fn mark_ready_rejected_prompt(id: &TaskId, source: &PlanError) -> String {
+    format!(
+        "Knoten '{id}' konnte nicht auf Ready gesetzt werden: {source}. Der Knoten bleibt im \
+         bisherigen Status; die übrigen zuvor vorgeschlagenen Knoten wurden davon nicht \
+         berührt. Kläre den Konflikt (z. B. einen anderen aktiven Knoten mit überlappendem \
+         write_scope oder eine fehlende frische Exploration) und stoße danach eine neue \
+         Reconcile-Runde an."
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1141,10 +1213,11 @@ mod tests {
         EVIDENCE_ATTACHED_TOTAL, EXPLORE_INSERTED_TOTAL, GOAL_AGE_DAYS, GOAL_COVERAGE,
         INVALIDATIONS_TOTAL, PROPOSALS_PENDING, RECONCILE_STEPS_TOTAL,
     };
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testing::{
-        InMemoryGoalStore, RecordingSink, coding_node, covered_goal_fixture, exploration_config,
-        node_with, plan_with, research_node, sample_finding,
+        InMemoryGoalStore, RecordingSink, ScriptedPlanStore, coding_node, covered_goal_fixture,
+        exploration_config, node_with, plan_with, research_node, sample_finding,
+        seeded_plan_store,
     };
     use harw_observe::MetricValue;
     use harw_plan::goal::Invariant;
@@ -1849,6 +1922,114 @@ mod tests {
             None => return Err(TestError::Unexpected("Zielknoten verschwunden".into())),
         };
         assert_eq!(target_node.dependencies, vec![TaskId::new("t-1-explore")]);
+        Ok(())
+    }
+
+    /// Regressionstest für die per-Knoten-Isolation von `MarkReady`: ein
+    /// Scope-Konflikt an einem Knoten darf die übrigen Knoten derselben
+    /// Liste nicht blockieren (siehe `apply_steps`, Zweig `MarkReady`).
+    #[test]
+    fn test_mark_ready_defers_a_rejected_node_and_still_marks_the_others() -> TestResult {
+        let dep = node_with("dep", PlanNodeKind::Contract, PlanNodeStatus::Completed);
+
+        let mut node_a = node_with("a", PlanNodeKind::Contract, PlanNodeStatus::Draft);
+        node_a.dependencies = vec![TaskId::new("dep")];
+        node_a.write_scope = vec![PathOrSymbol::new("docs/c.md")];
+
+        let mut node_b = node_with("b", PlanNodeKind::Contract, PlanNodeStatus::Draft);
+        node_b.dependencies = vec![TaskId::new("dep")];
+        node_b.write_scope = vec![PathOrSymbol::new("docs/c.md")];
+
+        let mut node_c = node_with("c", PlanNodeKind::Contract, PlanNodeStatus::Draft);
+        node_c.dependencies = vec![TaskId::new("dep")];
+        node_c.write_scope = vec![PathOrSymbol::new("docs/d.md")];
+
+        let store = seeded_plan_store(vec![dep, node_a, node_b, node_c])?;
+        let plan = store.current().map_err(ctx("Plan lesen"))?;
+        let config = permissive_config();
+
+        let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
+        match steps.iter().find(|step| matches!(step, ReconcileStep::MarkReady { .. })) {
+            Some(ReconcileStep::MarkReady { ids }) => {
+                assert_eq!(
+                    ids,
+                    &vec![TaskId::new("a"), TaskId::new("b"), TaskId::new("c")],
+                    "unerwartete MarkReady-Kandidaten: {ids:?}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet MarkReady für a, b, c: {other:?}"
+                )));
+            }
+        }
+
+        let (events, deferred) = match PlanController::apply(&steps, &store, None, "test") {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("apply schlug fehl: {error}")));
+            }
+        };
+        assert_eq!(events.len(), 2, "erwartet zwei SetStatus(Ready): {events:?}");
+
+        match deferred.iter().find_map(|step| match step {
+            ReconcileStep::AskModel { prompt } => Some(prompt.as_str()),
+            _ => None,
+        }) {
+            Some(prompt) => assert!(
+                prompt.contains("'b'"),
+                "verzögerter Prompt erwähnt Knoten 'b' nicht: {prompt}"
+            ),
+            None => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet einen verzögerten AskModel für 'b': {deferred:?}"
+                )));
+            }
+        }
+
+        let plan_after = store.current().map_err(ctx("Plan erneut lesen"))?;
+        for (id, expected) in [
+            ("a", PlanNodeStatus::Ready),
+            ("b", PlanNodeStatus::Draft),
+            ("c", PlanNodeStatus::Ready),
+        ] {
+            match plan_after.nodes.iter().find(|node| node.id == TaskId::new(id)) {
+                Some(node) => assert_eq!(
+                    node.status, expected,
+                    "Knoten '{}' hat unerwarteten Status: {:?}",
+                    id, node.status
+                ),
+                None => {
+                    return Err(TestError::Unexpected(format!("Knoten '{id}' verschwunden")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ein Store-/I/O-Fehler ist keine Ablehnung eines einzelnen Knotens und
+    /// darf deshalb nicht wie ein `BatchActionRejected` abgefangen werden —
+    /// `apply` gibt ihn wie jeden anderen mutierenden Schritt weiter.
+    #[test]
+    fn test_mark_ready_still_propagates_a_store_error() -> TestResult {
+        let store = ScriptedPlanStore::new(seeded_plan_store(vec![node_with(
+            "t-1",
+            PlanNodeKind::Contract,
+            PlanNodeStatus::Draft,
+        )])?);
+        store.inject_failures(1);
+        let steps = vec![ReconcileStep::MarkReady {
+            ids: vec![TaskId::new("t-1")],
+        }];
+
+        match PlanController::apply(&steps, &store, None, "test") {
+            Err(PlanBridgeError::Plan(PlanError::Io(_))) => {}
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet weitergereichten Io-Fehler, bekommen: {other:?}"
+                )));
+            }
+        }
         Ok(())
     }
 

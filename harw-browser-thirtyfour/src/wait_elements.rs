@@ -13,6 +13,15 @@ use crate::runtime::FirefoxRuntime;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Waits for one of the four element-state conditions supported by this module.
+///
+/// The driver mutex is taken fresh for every poll (switch window, evaluate the
+/// predicate, drop) and released before each `sleep`, matching
+/// [`crate::wait_navigation`]'s `wait_navigation_condition`. A wait can run
+/// for up to the maximum wait timeout, so holding the mutex across the whole
+/// loop would block `close_runtime` and every other session operation for
+/// that long; each iteration also re-checks `ensure_open` so a session that
+/// closes mid-wait ends the wait immediately instead of polling a dead
+/// driver.
 pub(crate) async fn wait_for_element(
     runtime: &FirefoxRuntime,
     context_id: &BrowserContextId,
@@ -21,17 +30,22 @@ pub(crate) async fn wait_for_element(
 ) -> Result<WaitOutcome> {
     let predicate = ElementPredicate::from_condition(&condition)?;
     let window = resolve_window(runtime, context_id).await?;
-    let driver = runtime.driver().await;
-    let webdriver = driver.webdriver();
-    webdriver
-        .switch_to_window(window)
-        .await
-        .map_err(|error| map_driver_error("switch browsing context", error))?;
 
     let started = Instant::now();
     let deadline = started + timeout.duration();
     loop {
-        if predicate.is_satisfied(webdriver).await? {
+        runtime.ensure_open()?;
+
+        let driver = runtime.driver().await;
+        driver
+            .webdriver()
+            .switch_to_window(window.clone())
+            .await
+            .map_err(|error| map_driver_error("switch browsing context", error))?;
+        let satisfied = predicate.is_satisfied(driver.webdriver()).await?;
+        drop(driver);
+
+        if satisfied {
             return Ok(WaitOutcome::new(true, elapsed_millis(started), condition));
         }
 
@@ -143,5 +157,125 @@ fn map_driver_error(operation: &str, error: WebDriverError) -> Error {
         _ => Error::CapabilityUnavailable {
             detail: format!("Firefox WebDriver could not {operation}: {error}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestError, TestResult};
+    use harw_browser::selector::Selector;
+    use thirtyfour::error::WebDriverErrorInfo;
+
+    // `wait_for_element` itself needs a live driver session (a real
+    // `FirefoxRuntime` cannot be constructed without one) and is exercised by
+    // the crate's integration tests instead; the cases below cover the pure
+    // logic that runs without a driver: condition routing and error mapping.
+
+    fn target() -> Target {
+        Target::new(Selector::Css("#login".to_owned()))
+    }
+
+    #[test]
+    fn test_from_condition_accepts_all_four_element_conditions() -> TestResult {
+        let present = WaitCondition::ElementPresent(target());
+        assert!(matches!(
+            ElementPredicate::from_condition(&present),
+            Ok(ElementPredicate::Present(_))
+        ));
+
+        let visible = WaitCondition::ElementVisible(target());
+        assert!(matches!(
+            ElementPredicate::from_condition(&visible),
+            Ok(ElementPredicate::Visible(_))
+        ));
+
+        let clickable = WaitCondition::ElementClickable(target());
+        assert!(matches!(
+            ElementPredicate::from_condition(&clickable),
+            Ok(ElementPredicate::Clickable(_))
+        ));
+
+        let gone = WaitCondition::ElementGone(target());
+        assert!(matches!(
+            ElementPredicate::from_condition(&gone),
+            Ok(ElementPredicate::Gone(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_condition_rejects_non_element_conditions() -> TestResult {
+        let condition = WaitCondition::NavigationComplete;
+        match ElementPredicate::from_condition(&condition) {
+            Err(Error::InvalidArgument { .. }) => Ok(()),
+            Ok(_) => Err(TestError::Unexpected(
+                "expected InvalidArgument, got Ok".to_owned(),
+            )),
+            Err(other) => Err(TestError::Unexpected(format!(
+                "expected InvalidArgument, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_map_driver_error_invalid_argument_and_selector_stay_invalid_argument() -> TestResult {
+        for error in [
+            WebDriverError::InvalidArgument(WebDriverErrorInfo::new("bad arg".to_owned())),
+            WebDriverError::InvalidSelector(WebDriverErrorInfo::new("bad selector".to_owned())),
+        ] {
+            match map_driver_error("query element wait target", error) {
+                Error::InvalidArgument { .. } => {}
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected InvalidArgument, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_driver_error_timeouts_become_timeout() -> TestResult {
+        for error in [
+            WebDriverError::Timeout("slow".to_owned()),
+            WebDriverError::WebDriverTimeout(WebDriverErrorInfo::new("slow".to_owned())),
+            WebDriverError::ScriptTimeout(WebDriverErrorInfo::new("slow".to_owned())),
+        ] {
+            match map_driver_error("evaluate predicate", error) {
+                Error::Timeout { .. } => {}
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected Timeout, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_driver_error_stale_element_becomes_selector_not_found() -> TestResult {
+        let error = WebDriverError::StaleElementReference(WebDriverErrorInfo::new(
+            "element vanished".to_owned(),
+        ));
+        match map_driver_error("read element visibility", error) {
+            Error::SelectorNotFound { .. } => Ok(()),
+            other => Err(TestError::Unexpected(format!(
+                "expected SelectorNotFound, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_map_driver_error_falls_back_to_capability_unavailable() -> TestResult {
+        let error = WebDriverError::NoSuchWindow(WebDriverErrorInfo::new("gone".to_owned()));
+        match map_driver_error("switch browsing context", error) {
+            Error::CapabilityUnavailable { .. } => Ok(()),
+            other => Err(TestError::Unexpected(format!(
+                "expected CapabilityUnavailable, got {other:?}"
+            ))),
+        }
     }
 }

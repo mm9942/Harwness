@@ -8,8 +8,12 @@
 //! [`GoalPatch`] (für [`GoalAction::Refine`]) und [`GoalAction::Condense`] können
 //! `statement` und `open_questions` verdichten, erreichen `acceptance_criteria` und
 //! `invariants` aber gar nicht — diese können nur über [`GoalAction::AddCriterion`] /
-//! [`GoalAction::AddInvariant`] wachsen, niemals schrumpfen. Das ist keine Konvention,
-//! sondern durch die Typen selbst erzwungen.
+//! [`GoalAction::AddInvariant`] wachsen, niemals schrumpfen. Für `Refine`/`Condense`
+//! ist das durch die Typen selbst erzwungen. [`GoalAction::Set`] ersetzt dagegen das
+//! ganze Goal und könnte seinem Typ nach schrumpfen — für ein bereits existierendes,
+//! nicht-terminales Goal verhindert das [`validate_goal_action`] zur Laufzeit (dieselbe
+//! Status-Matrix- und Nie-schrumpfen-Prüfung wie bei jeder anderen Aktion). Ein bereits
+//! terminales oder noch nicht existierendes Goal gilt für `Set` als frischer Neuanfang.
 //!
 //! # Runtime besitzt Status, Modell schlägt vor
 //! Ein Modell darf ein Goal per [`GoalAction::SetStatus`] vorschlagen, aber nur ein
@@ -17,7 +21,9 @@
 //! oder `Abandoned` erklären. [`validate_goal_action`] weist den Versuch eines
 //! Modell-Akteurs mit [`PlanError::ActorNotAuthorized`] zurück — die Runtime (bzw.
 //! der Mensch, der sie bedient) entscheidet über Zielerreichung, das Modell schlägt nur
-//! vor.
+//! vor. Dieselbe Prüfung greift, wenn [`GoalAction::Set`] den Status eines bereits
+//! existierenden, nicht-terminalen Goals ändert — `Set` ist kein zweiter Weg an dieser
+//! Grenze vorbei.
 //!
 //! # Verantwortungsbereich
 //! - Typisierte Kennung [`GoalId`] und Lebenszyklus-Status [`GoalStatus`].
@@ -242,6 +248,13 @@ pub struct GoalPatch {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum GoalAction {
     /// Legt ein neues Goal an bzw. ersetzt es vollständig.
+    ///
+    /// Für ein bereits existierendes, nicht-terminales Goal prüft
+    /// [`validate_goal_action`] dabei dieselbe Status-Matrix und dieselbe
+    /// Nie-schrumpfen-Regel wie [`GoalAction::SetStatus`] /
+    /// [`GoalAction::AddCriterion`] / [`GoalAction::AddInvariant`]. Ein bereits
+    /// terminales oder noch nicht existierendes Goal gilt als frischer
+    /// Neuanfang (virtueller Ausgangsstatus `Draft`).
     Set {
         /// Das anzulegende Goal.
         goal: Goal,
@@ -464,6 +477,58 @@ fn validate_status_transition(
     Ok(())
 }
 
+/// Prüft eine `Set`-Aktion, die als frischer Neuanfang gilt (kein
+/// existierendes Goal oder ein bereits terminales, siehe [`validate_goal_action`]).
+///
+/// Der virtuelle "Von"-Status ist `Draft`; bleibt `new_status` auf `Draft`, gibt
+/// es keinen Übergang zu prüfen. Kriterien-/Invarianten-Prüfung entfällt hier
+/// bewusst — ein frischer Neuanfang hat nichts zu verlieren.
+fn validate_fresh_set(
+    new_status: GoalStatus,
+    criteria_count: usize,
+    actor: &str,
+) -> PlanResult<()> {
+    if new_status == GoalStatus::Draft {
+        return Ok(());
+    }
+    validate_status_transition(GoalStatus::Draft, new_status, criteria_count, actor)
+}
+
+/// Prüft, ob jedes Element aus `old` (mit Mehrfachvorkommen) strukturell in `new`
+/// vorkommt — die Kernprüfung der Nie-schrumpfen-Regel für [`GoalAction::Set`] auf
+/// ein bereits existierendes, nicht-terminales Goal.
+///
+/// # Description
+/// [`Criterion`] und [`Invariant`] haben kein `PartialEq` (`Criterion` liegt in
+/// `crate::types` und trägt zudem `Vec<VerificationStep>`, das ebenfalls keins hat).
+/// Der Vergleich geht deshalb über die vorhandene `Serialize`-Ableitung auf
+/// `serde_json::Value`, das `PartialEq` mitbringt — Reihenfolge ist egal, nur
+/// Vorhandensein (mit Multiplizität) zählt. Ein Serialisierungsfehler zählt
+/// konservativ als "nicht enthalten" (fail closed) statt zu `panic!`en; für die
+/// hier verwendeten reinen Werttypen tritt das praktisch nie auf.
+fn is_superset_by_value<T: Serialize>(new: &[T], old: &[T]) -> bool {
+    let mut remaining = Vec::with_capacity(new.len());
+    for item in new {
+        match serde_json::to_value(item) {
+            Ok(value) => remaining.push(value),
+            Err(_) => return false,
+        }
+    }
+    for item in old {
+        let value = match serde_json::to_value(item) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        match remaining.iter().position(|candidate| candidate == &value) {
+            Some(idx) => {
+                remaining.remove(idx);
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Validiert eine Goal-Aktion (rein).
 ///
 /// # Description
@@ -481,6 +546,14 @@ fn validate_status_transition(
 ///   garantiert).
 /// - Eine leere `statement` bei `Set` → [`PlanError::InvalidId`] mit
 ///   `field = "statement"`.
+/// - `Set` auf ein bereits existierendes, nicht-terminales Goal läuft durch
+///   dieselbe Matrix-/Kriterien-/Actor-Prüfung wie `SetStatus` (der aktuelle
+///   Status ist der "Von"-Status), und die neuen `acceptance_criteria`/
+///   `invariants` müssen die alten strukturell enthalten (Multiset-Vergleich,
+///   siehe [`is_superset_by_value`]) — sonst
+///   [`PlanError::GoalTransitionReserved`]. Ein terminales oder noch nicht
+///   existierendes Goal gilt für `Set` als frischer Neuanfang (virtueller
+///   "Von"-Status `Draft`), ohne Kriterien-/Invarianten-Prüfung.
 /// - Jede Aktion außer `Set` verlangt ein bereits existierendes Goal, sonst
 ///   [`PlanError::GoalNotFound`].
 ///
@@ -508,7 +581,63 @@ pub fn validate_goal_action(
                     value: new_goal.statement.to_owned(),
                 });
             }
-            Ok(())
+
+            match goal {
+                None => validate_fresh_set(
+                    new_goal.status,
+                    new_goal.acceptance_criteria.len(),
+                    actor,
+                ),
+                Some(existing)
+                    if matches!(
+                        existing.status,
+                        GoalStatus::Achieved | GoalStatus::Abandoned | GoalStatus::Superseded
+                    ) =>
+                {
+                    // Ein terminales Goal hat nichts mehr zu verlieren — `Set` ist
+                    // hier ein frischer Neuanfang, keine Fortsetzung desselben
+                    // Goals (siehe `harw-ops::goal::guard_replacement`, das genau
+                    // diesen Fall vor jedem `Set` durchlässt).
+                    validate_fresh_set(new_goal.status, new_goal.acceptance_criteria.len(), actor)
+                }
+                Some(existing) => {
+                    // Ein nicht-terminales Goal existiert bereits: `Set` ersetzt es
+                    // vollständig, muss dabei aber dieselbe Status- und
+                    // Nie-schrumpfen-Disziplin einhalten wie jede andere Aktion —
+                    // sonst wäre die Store-Grenze für `Set` wirkungslos (siehe
+                    // Modulkopf).
+                    if new_goal.status != existing.status {
+                        validate_status_transition(
+                            existing.status,
+                            new_goal.status,
+                            new_goal.acceptance_criteria.len(),
+                            actor,
+                        )?;
+                    }
+                    if !is_superset_by_value(
+                        &new_goal.acceptance_criteria,
+                        &existing.acceptance_criteria,
+                    ) {
+                        return Err(PlanError::GoalTransitionReserved {
+                            status: format!(
+                                "{:?} (Set würde Akzeptanzkriterien des laufenden Goals '{}' \
+                                 verwerfen — verboten durch die Nie-schrumpfen-Regel)",
+                                new_goal.status, existing.id
+                            ),
+                        });
+                    }
+                    if !is_superset_by_value(&new_goal.invariants, &existing.invariants) {
+                        return Err(PlanError::GoalTransitionReserved {
+                            status: format!(
+                                "{:?} (Set würde Invarianten des laufenden Goals '{}' verwerfen \
+                                 — verboten durch die Nie-schrumpfen-Regel)",
+                                new_goal.status, existing.id
+                            ),
+                        });
+                    }
+                    Ok(())
+                }
+            }
         }
 
         GoalAction::SetStatus { status, .. } => {
@@ -911,6 +1040,136 @@ mod tests {
             Err(PlanError::ActorNotAuthorized { .. })
         ));
         assert!(validate_goal_action(Some(&goal), &action, "human:alice").is_ok());
+    }
+
+    /// `Set` darf die Actor-Policy nicht umgehen: ein Modell-Akteur, der ein laufendes
+    /// Goal per `Set` direkt auf `Achieved` setzt (statt über `SetStatus`), muss
+    /// genauso an [`PlanError::ActorNotAuthorized`] scheitern wie über `SetStatus`.
+    #[test]
+    fn test_validate_goal_action_set_cannot_bypass_actor_policy() {
+        let existing = make_goal(GoalStatus::Active);
+        let mut achieved_goal = existing.clone();
+        achieved_goal.status = GoalStatus::Achieved;
+        let action = GoalAction::Set {
+            goal: achieved_goal.clone(),
+        };
+
+        assert!(
+            matches!(
+                validate_goal_action(Some(&existing), &action, "model:gpt"),
+                Err(PlanError::ActorNotAuthorized { .. })
+            ),
+            "ein Modell-Akteur darf ein laufendes Goal per Set nicht auf Achieved heben"
+        );
+        assert!(
+            validate_goal_action(Some(&existing), &action, "human:alice").is_ok(),
+            "ein menschlicher Akteur darf denselben Übergang per Set auslösen"
+        );
+    }
+
+    /// `Set` darf die Goal-Status-Matrix nicht umgehen: ein Übergang, den
+    /// `SetStatus` ablehnen würde, muss auch über `Set` an
+    /// [`PlanError::GoalTransitionReserved`] scheitern — unabhängig vom Akteur.
+    #[test]
+    fn test_validate_goal_action_set_cannot_bypass_status_matrix() {
+        let existing = make_goal(GoalStatus::Blocked);
+        let mut illegal_goal = existing.clone();
+        illegal_goal.status = GoalStatus::Achieved; // Blocked -> Achieved ist nicht in der Matrix.
+        let action = GoalAction::Set { goal: illegal_goal };
+
+        assert!(matches!(
+            validate_goal_action(Some(&existing), &action, "human:alice"),
+            Err(PlanError::GoalTransitionReserved { .. })
+        ));
+    }
+
+    /// `Set` darf ein Akzeptanzkriterium eines laufenden, nicht-terminalen Goals
+    /// nicht stillschweigend verwerfen — auch nicht durch einen menschlichen
+    /// Akteur (philosophy.md §5, siehe Modulkopf).
+    #[test]
+    fn test_validate_goal_action_set_cannot_drop_criterion_on_active_goal() {
+        let mut existing = make_goal(GoalStatus::Active);
+        existing.acceptance_criteria.push(Criterion {
+            description: "zweites Kriterium".to_owned(),
+            verification: vec![],
+        });
+        assert_eq!(existing.acceptance_criteria.len(), 2);
+
+        let mut shrunk_goal = existing.clone();
+        shrunk_goal.acceptance_criteria.truncate(1);
+        let action = GoalAction::Set { goal: shrunk_goal };
+
+        assert!(matches!(
+            validate_goal_action(Some(&existing), &action, "human:alice"),
+            Err(PlanError::GoalTransitionReserved { .. })
+        ));
+    }
+
+    /// Dieselbe Nie-schrumpfen-Regel gilt für Invarianten.
+    #[test]
+    fn test_validate_goal_action_set_cannot_drop_invariant_on_active_goal() {
+        let mut existing = make_goal(GoalStatus::Active);
+        existing.invariants.push(Invariant {
+            id: "inv-1".to_owned(),
+            statement: "keine Downtime".to_owned(),
+            verification: vec![],
+        });
+
+        let mut dropped_goal = existing.clone();
+        dropped_goal.invariants.clear();
+        let action = GoalAction::Set { goal: dropped_goal };
+
+        assert!(matches!(
+            validate_goal_action(Some(&existing), &action, "human:alice"),
+            Err(PlanError::GoalTransitionReserved { .. })
+        ));
+    }
+
+    /// Wachsen bleibt erlaubt: ein `Set`, das alle alten Kriterien behält und
+    /// weitere ergänzt, ist kein Schrumpfen.
+    #[test]
+    fn test_validate_goal_action_set_may_grow_criteria_on_active_goal() {
+        let existing = make_goal(GoalStatus::Active);
+        let mut grown_goal = existing.clone();
+        grown_goal.acceptance_criteria.push(Criterion {
+            description: "zusätzliches Kriterium".to_owned(),
+            verification: vec![],
+        });
+        let action = GoalAction::Set { goal: grown_goal };
+
+        assert!(validate_goal_action(Some(&existing), &action, "human:alice").is_ok());
+    }
+
+    /// Ein bereits terminales Goal hat nichts mehr zu verlieren: `Set` darf es durch
+    /// ein komplett neues, kriterienloses Goal ersetzen (siehe
+    /// `harw-ops::goal::guard_replacement`, das genau diesen Fall vor jedem `Set`
+    /// durchlässt).
+    #[test]
+    fn test_validate_goal_action_set_replaces_terminal_goal_freely() -> TestResult {
+        let existing = make_goal(GoalStatus::Achieved);
+
+        let mut fresh_goal = existing.clone();
+        fresh_goal.id = "g-fresh".parse()?;
+        fresh_goal.status = GoalStatus::Active;
+        fresh_goal.acceptance_criteria.clear();
+        fresh_goal.invariants.clear();
+        let action = GoalAction::Set { goal: fresh_goal };
+
+        assert!(validate_goal_action(Some(&existing), &action, "human:alice").is_ok());
+        Ok(())
+    }
+
+    /// Ohne existierendes Goal darf `Set` kein Goal anlegen, das direkt in einen
+    /// reservierten Status springt (virtueller Ausgangsstatus `Draft`).
+    #[test]
+    fn test_validate_goal_action_set_without_existing_goal_rejects_direct_achieved() {
+        let fresh_goal = make_goal(GoalStatus::Achieved);
+        let action = GoalAction::Set { goal: fresh_goal };
+
+        assert!(matches!(
+            validate_goal_action(None, &action, "human:alice"),
+            Err(PlanError::GoalTransitionReserved { .. })
+        ));
     }
 
     #[test]

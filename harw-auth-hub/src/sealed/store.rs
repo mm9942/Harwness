@@ -38,7 +38,11 @@ pub(super) const SEED_LEN: usize = 32;
 // `RECIPIENT_SEED_LEN` is CryptGuard's constant; the store format fixes 32.
 const _: () = assert!(RECIPIENT_SEED_LEN == SEED_LEN);
 
-/// Upper bound for a store file (fail closed on anything larger).
+/// Upper bound for a store file (fail closed on anything larger). Enforced
+/// symmetrically: `open()`'s `read_store_file` refuses to *read* a file past
+/// this size, and `save()` refuses to *write* a sealed body past it (see
+/// [`ensure_store_len`]) so it can never produce a file the next `open()`
+/// would reject.
 const MAX_STORE_FILE_LEN: u64 = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -616,6 +620,12 @@ impl StoreFile {
     }
 
     /// Seal and atomically write `table` as the next generation.
+    ///
+    /// Errors: a sealed length over [`MAX_STORE_FILE_LEN`] (the same ceiling
+    /// `open()`'s `read_store_file` enforces) → `TooLarge`, checked *before*
+    /// `write_atomic` runs, so the file on disk and `self.generation` are
+    /// left untouched and the previous generation stays loadable; encoding
+    /// or write failures as before.
     pub(super) fn save(&mut self, table: &KeyTable) -> Result<(), SealedStoreError> {
         let generation = self
             .generation
@@ -624,6 +634,8 @@ impl StoreFile {
         let body = format::encode_body(table, generation)?;
         let sealed = format::seal_file(&self.file_key, &body)?;
         drop(body);
+        let sealed_len = u64::try_from(sealed.len()).unwrap_or(u64::MAX);
+        ensure_store_len(sealed_len, &self.path)?;
         harw_fsutil::write_atomic(
             &self.path,
             &sealed,
@@ -631,6 +643,22 @@ impl StoreFile {
         )
         .map_err(SealedStoreError::io("write store", &self.path))?;
         self.generation = generation;
+        Ok(())
+    }
+}
+
+/// Reject a length past [`MAX_STORE_FILE_LEN`]. Shared by [`StoreFile::save`]
+/// (checked on the sealed length, before it is written) and
+/// [`read_store_file`] (checked on the on-disk length, before it is read),
+/// so both directions enforce the exact same ceiling, and the boundary
+/// needs only one, direct unit test.
+fn ensure_store_len(len: u64, path: &Path) -> Result<(), SealedStoreError> {
+    if len > MAX_STORE_FILE_LEN {
+        Err(SealedStoreError::TooLarge {
+            path: path.to_path_buf(),
+            len,
+        })
+    } else {
         Ok(())
     }
 }
@@ -646,22 +674,65 @@ fn read_store_file(path: &Path) -> Result<Vec<u8>, SealedStoreError> {
         .metadata()
         .map_err(SealedStoreError::io("stat store", path))?
         .len();
-    if len > MAX_STORE_FILE_LEN {
-        return Err(SealedStoreError::TooLarge {
-            path: path.to_path_buf(),
-            len,
-        });
-    }
+    ensure_store_len(len, path)?;
     let mut bytes = Vec::new();
     file.take(MAX_STORE_FILE_LEN.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(SealedStoreError::io("read store", path))?;
     let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if read > MAX_STORE_FILE_LEN {
-        return Err(SealedStoreError::TooLarge {
-            path: path.to_path_buf(),
-            len: read,
-        });
-    }
+    ensure_store_len(read, path)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::test_support::{TestError, TestResult};
+
+    use super::{MAX_STORE_FILE_LEN, SealedStoreError, ensure_store_len};
+
+    fn dummy_path() -> &'static Path {
+        Path::new("store.sealed")
+    }
+
+    /// The limit itself must still be accepted: `open()`'s `read_store_file`
+    /// only rejects lengths *over* [`MAX_STORE_FILE_LEN`], so `save()` must
+    /// agree at the boundary or a store exactly at the limit would become
+    /// unwritable while still being readable.
+    #[test]
+    fn ensure_store_len_accepts_exactly_the_limit() -> TestResult {
+        match ensure_store_len(MAX_STORE_FILE_LEN, dummy_path()) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(TestError::Unexpected(format!(
+                "the limit itself must be accepted: {error}"
+            ))),
+        }
+    }
+
+    /// One byte over the limit is refused, and the reported path/length are
+    /// exactly the ones passed in (no silent truncation).
+    #[test]
+    fn ensure_store_len_rejects_one_byte_over_the_limit() -> TestResult {
+        let over = MAX_STORE_FILE_LEN.saturating_add(1);
+        match ensure_store_len(over, dummy_path()) {
+            Err(SealedStoreError::TooLarge { path, len }) => {
+                if path.as_path() != dummy_path() {
+                    return Err(TestError::Unexpected(format!(
+                        "TooLarge carried the wrong path: {}",
+                        path.display()
+                    )));
+                }
+                if len != over {
+                    return Err(TestError::Unexpected(format!(
+                        "TooLarge carried the wrong length: {len}"
+                    )));
+                }
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "expected TooLarge one byte over the limit, got {other:?}"
+            ))),
+        }
+    }
 }

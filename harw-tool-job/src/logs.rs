@@ -8,6 +8,14 @@
 //! bei 1. Für die Fortschrittserkennung zerlegt der Aufrufer eine Zeile
 //! zusätzlich an `\r` (Fortschrittsbalken schreiben mit `\r` über).
 //!
+//! Jobs laufen ohne `RLIMIT_FSIZE`; eine Zeile ohne `\n` kann daher beliebig
+//! lang werden (binäre Ausgabe, ein Fortschrittsbalken nur mit `\r`). Damit
+//! [`read_log`] dabei nicht die ganze Zeile in einem Vec puffert, begrenzt
+//! es Rohbytes je Zeile schon beim Lesen (nicht erst bei der Ausgabe) auf
+//! wenige Kilobyte (`MAX_RAW_LINE_BYTES`); der Rest bis zum nächsten `\n`
+//! wird verworfen, ohne gepuffert zu werden. Ein `grep`-Treffer hinter
+//! dieser Grenze wird dadurch auf einer solchen Zeile nicht gefunden.
+//!
 //! # Nebenläufigkeit
 //! Blockierendes `std::fs`; [`read_log`] läuft im Aufrufer über
 //! `spawn_blocking`, [`LogFollower::read_new`] liest je Aufruf höchstens
@@ -25,6 +33,11 @@ pub const FOLLOW_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_BYTES: usize = 64 * 1024;
 /// Höchstlänge einer einzelnen zurückgegebenen Zeile (Zeichen).
 pub const MAX_LINE_CHARS: usize = 1000;
+/// Höchstzahl Rohbytes, die [`read_log`] je Zeile puffert (4 Byte je
+/// UTF-8-Zeichen reichen für [`MAX_LINE_CHARS`] auch im ungünstigsten Fall).
+/// Begrenzt das Lesen selbst, nicht erst die Ausgabe, damit eine Zeile ohne
+/// `\n` keine unbeschränkte Allokation auslöst.
+const MAX_RAW_LINE_BYTES: usize = MAX_LINE_CHARS * 4;
 
 /// Kürzt eine Zeile auf `max` Zeichen (mit `…`).
 #[must_use]
@@ -169,7 +182,9 @@ pub struct LogQuery {
     pub tail: Option<usize>,
     /// Nur Zeilen ab dieser Nummer (1-basiert).
     pub since_line: Option<u64>,
-    /// Nur Zeilen, die diesen Text enthalten (einfacher Teilstring).
+    /// Nur Zeilen, die diesen Text enthalten (einfacher Teilstring). Bei
+    /// einer sehr langen Zeile ohne `\n` wird nur ihr Anfang durchsucht
+    /// (siehe Modul-Doku).
     pub grep: Option<String>,
     /// Höchstzahl zurückgegebener Zeilen.
     pub max_lines: usize,
@@ -188,6 +203,34 @@ pub struct LogSlice {
     pub matched_lines: u64,
     /// Es gab mehr passende Zeilen als zurückgegeben.
     pub truncated: bool,
+}
+
+/// Liest eine Zeile in `raw` (ohne Zeilenende), begrenzt auf höchstens
+/// [`MAX_RAW_LINE_BYTES`]. Eine überlange Zeile wird bis zum nächsten `\n`
+/// verworfen, statt sie zu puffern; `raw` wächst dadurch nie über die
+/// Grenze hinaus. Liefert `false` bei EOF ohne gelesene Bytes (wie
+/// `BufRead::read_until() == 0`), sonst `true` (auch für eine unvollständige
+/// letzte Zeile ohne `\n`).
+fn read_bounded_line(reader: &mut impl BufRead, raw: &mut Vec<u8>) -> io::Result<bool> {
+    raw.clear();
+    let mut saw_byte = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        saw_byte = true;
+        let newline_at = buf.iter().position(|&byte| byte == b'\n');
+        let scan_len = newline_at.unwrap_or(buf.len());
+        let take = scan_len.min(MAX_RAW_LINE_BYTES.saturating_sub(raw.len()));
+        raw.extend_from_slice(&buf[..take]);
+        let consumed = newline_at.map_or(buf.len(), |pos| pos + 1);
+        reader.consume(consumed);
+        if newline_at.is_some() {
+            break;
+        }
+    }
+    Ok(saw_byte)
 }
 
 /// Liest eine Logdatei gemäß `query`.
@@ -215,16 +258,12 @@ pub fn read_log(path: &Path, query: &LogQuery) -> io::Result<LogSlice> {
     let mut raw = Vec::new();
     let mut number = 0u64;
     loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
+        if !read_bounded_line(&mut reader, &mut raw)? {
             break;
         }
         number += 1;
         if number < since {
             continue;
-        }
-        if raw.last() == Some(&b'\n') {
-            raw.pop();
         }
         let text = String::from_utf8_lossy(&raw);
         if let Some(needle) = &query.grep {
@@ -278,7 +317,7 @@ pub fn read_log(path: &Path, query: &LogQuery) -> io::Result<LogSlice> {
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     fn write_lines(path: &Path, lines: &[&str]) -> TestResult {
         let mut file = File::create(path).map_err(ctx("create log"))?;
@@ -356,6 +395,102 @@ mod tests {
 
         let missing = read_log(&dir.path().join("nope.log"), &query()).map_err(ctx("missing"))?;
         assert_eq!(missing, LogSlice::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_bounded_line_caps_overlong_lines() -> TestResult {
+        // Baut eine überlange Zeile MIT `\n`, die weit über
+        // `MAX_RAW_LINE_BYTES` hinausgeht, gefolgt von einer kurzen Zeile
+        // MIT `\n` und einer ebenso überlangen letzten Zeile OHNE
+        // Zeilenende (wie ein Job ohne FSIZE-Limit sie am Ende ohne `\n`
+        // hinterlassen könnte).
+        let mut data = vec![b'a'; MAX_RAW_LINE_BYTES * 5];
+        data.push(b'\n');
+        data.extend_from_slice(b"short\n");
+        data.resize(data.len() + MAX_RAW_LINE_BYTES * 3, b'b');
+
+        // Kleine Puffergröße erzwingt mehrere fill_buf/consume-Runden wie
+        // bei einer echten Datei mit Default-Puffer.
+        let mut reader = BufReader::with_capacity(4096, Cursor::new(data));
+        let mut raw = Vec::new();
+
+        assert!(read_bounded_line(&mut reader, &mut raw).map_err(ctx("line 1"))?);
+        assert_eq!(raw.len(), MAX_RAW_LINE_BYTES);
+        assert!(raw.iter().all(|&byte| byte == b'a'));
+        assert!(
+            raw.capacity() < 1024 * 1024,
+            "Puffer darf nicht auf Dateigröße wachsen: {}",
+            raw.capacity()
+        );
+
+        assert!(read_bounded_line(&mut reader, &mut raw).map_err(ctx("line 2"))?);
+        assert_eq!(raw, b"short");
+
+        // Letzte Zeile: läuft bis EOF ohne `\n`, gilt trotzdem als Zeile.
+        assert!(read_bounded_line(&mut reader, &mut raw).map_err(ctx("line 3"))?);
+        assert_eq!(raw.len(), MAX_RAW_LINE_BYTES);
+        assert!(raw.iter().all(|&byte| byte == b'b'));
+
+        assert!(!read_bounded_line(&mut reader, &mut raw).map_err(ctx("eof"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_log_bounds_overlong_line_without_newline() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("stdout.log");
+        // Simuliert Job-Ausgabe ohne Zeilenende (binäre Daten, ein
+        // Fortschrittsbalken nur mit `\r`); Jobs laufen ohne FSIZE-Limit, die
+        // Zeile kann also beliebig lang werden. 20 KiB liegen weit über
+        // `MAX_RAW_LINE_BYTES` und reichen, um die Grenze zu prüfen, ohne die
+        // Testsuite mit einer echten mehrstelligen-MiB-Datei zu belasten.
+        let mut body = String::from("near-start-needle");
+        body.push_str(&"x".repeat(20_000));
+        body.push_str("late-needle");
+        let mut file = File::create(&path).map_err(ctx("create"))?;
+        file.write_all(body.as_bytes()).map_err(ctx("write"))?;
+
+        let tail = read_log(
+            &path,
+            &LogQuery {
+                tail: Some(5),
+                ..query()
+            },
+        )
+        .map_err(ctx("tail"))?;
+        assert_eq!(tail.total_lines, 1);
+        assert_eq!(tail.lines.len(), 1);
+        let (number, text) = &tail.lines[0];
+        assert_eq!(*number, 1);
+        // Geklemmt auf MAX_LINE_CHARS Zeichen plus die angehängte Ellipse.
+        assert_eq!(text.chars().count(), MAX_LINE_CHARS + 1);
+        assert!(text.starts_with("near-start-needle"));
+
+        // Ein Treffer am Zeilenanfang bleibt auffindbar …
+        let grep_near = read_log(
+            &path,
+            &LogQuery {
+                grep: Some("near-start-needle".into()),
+                tail: Some(5),
+                ..query()
+            },
+        )
+        .map_err(ctx("grep near"))?;
+        assert_eq!(grep_near.matched_lines, 1);
+
+        // … ein Treffer weit hinter der Lesegrenze nicht mehr (dokumentierte
+        // Nebenwirkung der Speicherbegrenzung, siehe Modul-Doku).
+        let grep_late = read_log(
+            &path,
+            &LogQuery {
+                grep: Some("late-needle".into()),
+                tail: Some(5),
+                ..query()
+            },
+        )
+        .map_err(ctx("grep late"))?;
+        assert_eq!(grep_late.matched_lines, 0);
         Ok(())
     }
 

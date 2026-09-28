@@ -1059,7 +1059,33 @@ fn migrate_config_paths(config_paths: &[PathBuf]) -> Result<(), String> {
 }
 
 /// Legt den Root-Space an (idempotent) und meldet, was neu erstellt wurde.
+///
+/// Legt außerdem ein Git-Repository im erkannten Projekt-Root an, sofern dort
+/// noch keines existiert — aber niemals in einem der drei Sonderpfade, an
+/// denen [`harw_home::project::discover_project_with_home_stop`] die
+/// Aufwärtssuche stoppt bzw. keinen Marker binden lässt: dem Home-Verzeichnis
+/// des Benutzers, dem System-Temp-Verzeichnis oder dem Dateisystem-Root `/`.
+/// Ohne diese Schranke würde ein `harw init` direkt in `$HOME` das gesamte
+/// Home-Verzeichnis zu einem Git-Repository machen, und eines in `/tmp`
+/// legte ein `/tmp/.git` an, bevor [`harw_home::project::ProjectHome::ensure`]
+/// den Temp-Root im nächsten Schritt ohnehin ablehnt — der Seiteneffekt wäre
+/// dann schon passiert. Betrifft der Sonderpfad das Home-Verzeichnis, bleibt
+/// `ensure` weiterhin erfolgreich (dort dient `~/.harw` als Projekt-Home,
+/// siehe dessen Doku); nur das unaufgeforderte `git init` wird übersprungen.
 fn cmd_init(home_override: Option<PathBuf>) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
+    let home_stop = user_home_canonical_for_init();
+    cmd_init_at(home_override, &cwd, home_stop.as_deref())
+}
+
+/// Testbarer Kern von [`cmd_init`] mit injiziertem Arbeitsverzeichnis und
+/// injizierter Home-Grenze; siehe dort für die Beweggründe der
+/// `git init`-Schranke.
+fn cmd_init_at(
+    home_override: Option<PathBuf>,
+    cwd: &Path,
+    home_stop: Option<&Path>,
+) -> Result<(), String> {
     let home = home::resolve_home(home_override)?;
     let report = home::ensure_home(&home).map_err(|error| error.to_string())?;
     if report.created_home {
@@ -1070,10 +1096,15 @@ fn cmd_init(home_override: Option<PathBuf>) -> Result<(), String> {
     println!("aktives Profil: {}", report.profile_dir.display());
     println!("neu geschriebene Dateien: {}", report.written_files.len());
 
-    let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
     let project =
-        harw_home::project::discover_project(&cwd, &[]).map_err(|error| error.to_string())?;
-    if !project.root.join(".git").exists() {
+        harw_home::project::discover_project_with_home_stop(cwd, &[], home_stop)
+            .map_err(|error| error.to_string())?;
+    if project_root_forbids_unattended_git_init(&project, home_stop) {
+        println!(
+            "kein Git-Repository angelegt: {} ist das Home-, Temp- oder Dateisystem-Root",
+            project.root.display()
+        );
+    } else if !project.root.join(".git").exists() {
         let status = ProcessCommand::new("git")
             .arg("init")
             .current_dir(&project.root)
@@ -1099,6 +1130,43 @@ fn cmd_init(home_override: Option<PathBuf>) -> Result<(), String> {
         project_home.dir.display()
     );
     Ok(())
+}
+
+/// Kanonisches Home-Verzeichnis des Benutzers für die `git init`-Schranke in
+/// [`cmd_init`] — dieselbe Grenze, die
+/// [`harw_home::project::discover_project_with_home_stop`] intern verwendet
+/// (dort privat), hier für die Prozessumgebung neu aufgelöst, weil dieses
+/// Crate keinen Zugriff auf das private Gegenstück hat. `None`, wenn `$HOME`
+/// fehlt oder nicht kanonisierbar ist — dann greift nur noch die Temp- und
+/// die `/`-Schranke.
+fn user_home_canonical_for_init() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home_path = PathBuf::from(home);
+    Some(std::fs::canonicalize(&home_path).unwrap_or(home_path))
+}
+
+/// Entscheidet, ob `project` einer der drei Sonderpfade ist, in denen `harw
+/// init` kein unaufgefordertes `git init` ausführen darf (siehe [`cmd_init`]).
+///
+/// Nur relevant für [`harw_home::project::ProjectKind::Directory`]: einen
+/// echten Marker-Treffer (`.git`, Worktree oder ein konfigurierter Marker)
+/// überspringt der Aufrufer ohnehin schon über das vorhandene
+/// `.git`-Existenz-Prüfung.
+fn project_root_forbids_unattended_git_init(
+    project: &harw_home::project::ProjectRoot,
+    home_stop: Option<&Path>,
+) -> bool {
+    if project.kind != harw_home::project::ProjectKind::Directory {
+        return false;
+    }
+    let root = project.root.as_path();
+    if root == Path::new("/") {
+        return true;
+    }
+    if home_stop == Some(root) {
+        return true;
+    }
+    std::fs::canonicalize(std::env::temp_dir()).is_ok_and(|temp| temp.as_path() == root)
 }
 
 /// Fragt eine Pflichtangabe für `harw bug-report` interaktiv ab, falls sie
@@ -5362,6 +5430,103 @@ mod tests {
         assert!(!run_doctor_checks(&home, &config));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
+    }
+
+    // ── `harw init`: keine unaufgeforderte `git init` in Sonderpfaden ─────────
+
+    #[test]
+    fn forbids_unattended_git_init_rejects_the_injected_home() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create fake home"))?;
+        let project = harw_home::project::ProjectRoot {
+            root: home.path().to_path_buf(),
+            trust_key: home.path().to_path_buf(),
+            kind: harw_home::project::ProjectKind::Directory,
+        };
+        assert!(project_root_forbids_unattended_git_init(
+            &project,
+            Some(home.path())
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn forbids_unattended_git_init_rejects_the_filesystem_root() {
+        let project = harw_home::project::ProjectRoot {
+            root: PathBuf::from("/"),
+            trust_key: PathBuf::from("/"),
+            kind: harw_home::project::ProjectKind::Directory,
+        };
+        assert!(project_root_forbids_unattended_git_init(&project, None));
+    }
+
+    #[test]
+    fn forbids_unattended_git_init_allows_an_ordinary_directory() -> TestResult {
+        let project_dir = tempfile::tempdir().map_err(ctx("create ordinary project dir"))?;
+        let unrelated_home = tempfile::tempdir().map_err(ctx("create unrelated home"))?;
+        let project = harw_home::project::ProjectRoot {
+            root: project_dir.path().to_path_buf(),
+            trust_key: project_dir.path().to_path_buf(),
+            kind: harw_home::project::ProjectKind::Directory,
+        };
+        assert!(!project_root_forbids_unattended_git_init(
+            &project,
+            Some(unrelated_home.path())
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn forbids_unattended_git_init_ignores_a_real_marker_hit() -> TestResult {
+        // Die Schranke greift nur bei `ProjectKind::Directory`; ein echter
+        // Marker-Treffer (`.git`, Worktree, konfigurierter Marker) bindet die
+        // Sitzung laut `discover_project_with_home_stop` ohnehin nie an
+        // Home/Temp/`/`, aber der Test hält die Guard-Klausel selbst fest.
+        let home = tempfile::tempdir().map_err(ctx("create fake home"))?;
+        let project = harw_home::project::ProjectRoot {
+            root: home.path().to_path_buf(),
+            trust_key: home.path().to_path_buf(),
+            kind: harw_home::project::ProjectKind::Git,
+        };
+        assert!(!project_root_forbids_unattended_git_init(
+            &project,
+            Some(home.path())
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_init_at_skips_git_init_for_the_injected_home() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(ctx("create fake home"))?;
+        let harw_root_space = tempfile::tempdir().map_err(ctx("create root space"))?;
+        let canonical_fake_home =
+            std::fs::canonicalize(fake_home.path()).map_err(ctx("canonicalize fake home"))?;
+
+        cmd_init_at(
+            Some(harw_root_space.path().to_path_buf()),
+            canonical_fake_home.as_path(),
+            Some(canonical_fake_home.as_path()),
+        )
+        .map_err(|error| TestError::Unexpected(format!("cmd_init_at failed: {error}")))?;
+
+        assert!(!canonical_fake_home.join(".git").exists());
+        assert!(canonical_fake_home.join(".harw").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_init_at_never_creates_a_dot_git_in_the_system_temp_dir() -> TestResult {
+        let harw_root_space = tempfile::tempdir().map_err(ctx("create root space"))?;
+        let temp_dir = std::env::temp_dir();
+        let git_marker = temp_dir.join(".git");
+        let existed_before = git_marker.exists();
+
+        // Das System-Temp-Verzeichnis ist nie ein zulässiges Projekt-Home
+        // (`ProjectHome::ensure` lehnt es ab); der Aufruf bleibt fail-closed,
+        // aber ohne vorher ein `.git` anzulegen.
+        let result = cmd_init_at(Some(harw_root_space.path().to_path_buf()), &temp_dir, None);
+        assert!(result.is_err());
+        assert_eq!(git_marker.exists(), existed_before);
         Ok(())
     }
 }

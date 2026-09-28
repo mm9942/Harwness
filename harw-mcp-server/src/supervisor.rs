@@ -12,7 +12,7 @@
 //! Dienst braucht eine `Arc<harw_authority::WorkspaceRegistry>` und eine
 //! `JobAdmissionPolicy`-Implementierung, die an dieser MCP-Einreiseseite nicht
 //! existieren, und ihre Beschaffung würde die Composition Root in
-//! `harw-cli/src/main.rs` verändern — außerhalb des für diesen Fix erlaubten
+//! `harw-cli/src/lib.rs` verändern — außerhalb des für diesen Fix erlaubten
 //! Änderungsbereichs (`harw-mcp-server/`). Die Budget-Obergrenze gab es hier
 //! bereits ([`McpJobBudgetLimits`]); Idempotenz und Ratenbegrenzung sind daher
 //! als **eigenständige Zweitimplementierung** direkt in diesem Modul
@@ -876,7 +876,14 @@ impl McpSupervisor for DurableMcpSupervisor {
                 .get(&work_id)
                 .map_err(McpSupervisorError::JobStore)?;
             if !can_read(&context.principal, &record.scope) {
-                return Err(McpSupervisorError::NotAuthorized);
+                // Fremder Mandant/Scope verrät die Existenz des Jobs nicht:
+                // derselbe Fehler wie eine unbekannte Work-ID (siehe Test
+                // `job_status_hides_a_foreign_tenant_job_as_not_found` unten
+                // und `harw_ops::job_tenant::get_visible_job`, das dieselbe
+                // Regel für die übrigen Job-Operationen umsetzt).
+                return Err(McpSupervisorError::JobStore(SessionStoreError::JobNotFound {
+                    work_id,
+                }));
             }
             Ok(status(&record))
         })
@@ -894,7 +901,14 @@ impl McpSupervisor for DurableMcpSupervisor {
                 .get(&work_id)
                 .map_err(McpSupervisorError::JobStore)?;
             if !can_cancel(&context.principal, &record.scope) {
-                return Err(McpSupervisorError::NotAuthorized);
+                // Wie `job_status`: fremder Mandant/Scope liefert denselben
+                // Fehler wie eine unbekannte Work-ID, sonst könnte ein
+                // Principal über die Fehlerunterscheidung erraten, ob eine
+                // deterministische Idempotenz-Work-ID (`mcp_idempotent_work_id`)
+                // in einem fremden Mandanten bereits vergeben ist.
+                return Err(McpSupervisorError::JobStore(SessionStoreError::JobNotFound {
+                    work_id,
+                }));
             }
             let cancelled_at = Timestamp::now();
             let transition = self
@@ -1234,6 +1248,117 @@ mod tests {
             vec![McpJobCapability::ReadWorkspace],
         );
         assert!(!can_read(&foreign_tenant, &job_scope));
+    }
+
+    // Sonde einer Tenant-B-Principal mit vollen Workspace-Rechten — aber
+    // eben in `tenant-b`, nicht im Mandanten des Jobs (`tenant-a`,
+    // `scope()`/`record(..)`). `same_scope` schlägt daher trotz der
+    // Workspace-Capabilities fehl.
+    fn foreign_tenant_context() -> McpRequestContext {
+        McpRequestContext::from_trusted_ingress(
+            "mcp-foreign-session-test".to_owned(),
+            principal(
+                "mallory",
+                "tenant-b",
+                "workspace-b",
+                vec![
+                    McpJobCapability::ReadWorkspace,
+                    McpJobCapability::CancelWorkspace,
+                ],
+            ),
+        )
+    }
+
+    // Ein Job in einer anderen Mandantschaft darf seine Existenz nicht
+    // gegenüber einer nicht berechtigten Sonde preisgeben: dieselbe
+    // `JobNotFound`-Antwort wie für eine tatsächlich unbekannte Work-ID.
+    // Work-IDs unter `mcp_idempotent_work_id` sind aus (Tenant, Workspace,
+    // Submitter, Schlüssel) deterministisch ableitbar; ein Principal, der
+    // `NotAuthorized` von `JobNotFound` unterscheiden könnte, könnte damit
+    // erraten, ob ein fremder Mandant einen bestimmten Idempotenzschlüssel
+    // schon verwendet hat.
+    #[tokio::test]
+    async fn job_status_hides_a_foreign_tenant_job_as_not_found() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        store
+            .admit(&record("foreign-tenant-job")?)
+            .map_err(ctx("admit"))?;
+        let supervisor = DurableMcpSupervisor::new(store);
+
+        let foreign = supervisor
+            .job_status(
+                &foreign_tenant_context(),
+                WorkId::from_str("foreign-tenant-job"),
+            )
+            .await;
+        let unknown = supervisor
+            .job_status(&foreign_tenant_context(), WorkId::from_str("no-such-job"))
+            .await;
+
+        assert_hides_as_job_not_found("job_status(foreign tenant)", foreign)?;
+        assert_hides_as_job_not_found("job_status(unknown work id)", unknown)?;
+        Ok(())
+    }
+
+    // Wie oben, für `cancel_job`; zusätzlich bleibt der fremde Job dabei
+    // unverändert (kein stiller Seiteneffekt trotz abgelehnter Anfrage).
+    #[tokio::test]
+    async fn cancel_job_hides_a_foreign_tenant_job_as_not_found() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        store
+            .admit(&record("foreign-tenant-cancel")?)
+            .map_err(ctx("admit"))?;
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
+
+        let foreign = supervisor
+            .cancel_job(
+                &foreign_tenant_context(),
+                WorkId::from_str("foreign-tenant-cancel"),
+                "probe".to_owned(),
+            )
+            .await;
+        let unknown = supervisor
+            .cancel_job(
+                &foreign_tenant_context(),
+                WorkId::from_str("no-such-cancel-job"),
+                "probe".to_owned(),
+            )
+            .await;
+
+        assert_hides_as_job_not_found("cancel_job(foreign tenant)", foreign)?;
+        assert_hides_as_job_not_found("cancel_job(unknown work id)", unknown)?;
+
+        let untouched = store
+            .get(&WorkId::from_str("foreign-tenant-cancel"))
+            .map_err(ctx("get"))?;
+        assert_eq!(
+            untouched.job.state,
+            JobState::Ready,
+            "a rejected cross-tenant cancel attempt must not mutate the job"
+        );
+        Ok(())
+    }
+
+    // Beide Sonden aus den beiden Tests oben müssen exakt denselben
+    // Fehler-Zweig treffen (`McpSupervisorError::JobStore(JobNotFound)`),
+    // nie `NotAuthorized`: nur so bildet `transport.rs`s
+    // `redacted_store_error_message` beide auf dieselbe verdrahtete
+    // JSON-RPC-Antwort ab (Code -32000, "job was not found").
+    fn assert_hides_as_job_not_found<T>(
+        label: &str,
+        result: Result<T, McpSupervisorError>,
+    ) -> TestResult {
+        match result {
+            Err(McpSupervisorError::JobStore(SessionStoreError::JobNotFound { .. })) => Ok(()),
+            Err(other) => Err(TestError::Unexpected(format!(
+                "{label} must fail as JobStore(JobNotFound), got {other:?}"
+            ))),
+            Ok(_) => Err(TestError::Unexpected(format!(
+                "{label} must fail for an unauthorized or unknown work id"
+            ))),
+        }
     }
 
     #[tokio::test]

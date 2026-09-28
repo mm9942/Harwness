@@ -4,10 +4,17 @@
 //! die drei Aktionen aus [`crate::cli::ProjectAction`]: `trust`, `untrust`,
 //! `status`. Der Root-Space wird wie überall in `harw-cli` über
 //! [`crate::home::resolve_home`] aufgelöst (`--home` vor `HARW_HOME`); das
-//! Projekt-Verzeichnis ist das gegebene `DIR` oder, ohne Angabe, das
-//! aktuelle Arbeitsverzeichnis. Kanonisierung und Digest-Vergleich
-//! übernimmt vollständig `harw_home::trust` — dieses Modul formatiert nur
-//! die Nutzerausgabe.
+//! Startverzeichnis ist das gegebene `DIR` oder, ohne Angabe, das aktuelle
+//! Arbeitsverzeichnis. Von dort aus wird der tatsächliche Projekt-Root über
+//! [`harw_home::discover_project`] ermittelt (Aufstieg zum nächsten `.git`
+//! bzw. konfigurierten Marker) — exakt der Root, den auch die Config-Schicht
+//! (`harw_home::paths::config_layers_report_at`) für ihre Trust-Prüfung
+//! verwendet. So arbeiten `trust`/`untrust`/`status` aus einem
+//! Unterverzeichnis eines Repos auf demselben Root wie die Config-Ladung,
+//! statt versehentlich einen leeren `.harw`-Stand im Unterverzeichnis
+//! anzulegen bzw. abzufragen. Kanonisierung und Digest-Vergleich übernimmt
+//! vollständig `harw_home::trust` — dieses Modul formatiert nur die
+//! Nutzerausgabe.
 //!
 //! # Nebenläufigkeit
 //! Zustandslos; jeder Aufruf lädt/schreibt den Trust-Store einmal über
@@ -63,8 +70,9 @@ pub(crate) fn run(home_override: Option<PathBuf>, action: ProjectAction) -> Resu
 /// - Status: `Trusted: <root>` / `Untrusted: <root>` / `Changed: <root>`
 ///
 /// # Errors
-/// - Kanonisierungsfehler des Projekt-Roots (z. B. Verzeichnis existiert
-///   nicht) als `String`.
+/// - Fehler bei der Root-Auflösung (`std::env::current_dir` bzw.
+///   [`harw_home::discover_project`], z. B. wenn `DIR` aus einem anderen
+///   Grund als "existiert nicht" nicht auflösbar ist) als `String`.
 /// - Jeder [`harw_home::HomeError`] aus `trust_project`/`untrust_project`/
 ///   `project_trust_status`, in Kontext gesetzt.
 fn execute(home: &Path, action: ProjectAction) -> Result<String, String> {
@@ -107,16 +115,45 @@ fn execute(home: &Path, action: ProjectAction) -> Result<String, String> {
     }
 }
 
-/// Löst das Ziel-Verzeichnis auf: `path` oder das aktuelle Arbeitsverzeichnis.
+/// Löst den Projekt-Root auf: Aufstieg von `path` (oder, ohne Angabe, dem
+/// aktuellen Arbeitsverzeichnis) über [`harw_home::discover_project`] zum
+/// nächsten Marker (Default `.git`).
+///
+/// Das ist bewusst derselbe Aufruf wie in der Config-Schicht
+/// (`config_layers_report_in` in `harw_home::paths`, dort mit `&[]` = den
+/// Default-Markern): ohne geladene Config kennt auch dieses Modul keine
+/// konfigurierten `project_root_markers` — beide Stellen weichen also
+/// identisch vom Profil ab, statt hier eine andere Root-Definition als die
+/// Config-Ladung zu verwenden. Ein Aufruf aus einem Unterverzeichnis eines
+/// Repos liefert damit den Repo-Root, nicht das Unterverzeichnis.
+///
+/// Existiert `path`/das Arbeitsverzeichnis nicht mehr (etwa ein bereits
+/// gelöschtes Projekt, das per früherem absoluten Pfad ausgetragen werden
+/// soll), wird der gegebene Pfad unverändert zurückgegeben: `untrust_project`
+/// behandelt diesen Fall selbst (siehe dort); `trust`/`status` scheitern für
+/// einen solchen Pfad ohnehin unabhängig von dieser Funktion.
 ///
 /// # Errors
-/// `String`, wenn `std::env::current_dir` scheitert (z. B. Verzeichnis
-/// gelöscht, keine Zugriffsrechte).
+/// `String`, wenn `std::env::current_dir` scheitert, oder wenn die
+/// Root-Suche aus einem anderen Grund als "Pfad existiert nicht" scheitert
+/// (z. B. keine Zugriffsrechte auf einen Vorfahren).
 fn project_root(path: Option<PathBuf>) -> Result<PathBuf, String> {
-    match path {
-        Some(path) => Ok(path),
+    let cwd = match path {
+        Some(path) => path,
         None => std::env::current_dir()
-            .map_err(|error| format!("aktuelles Arbeitsverzeichnis nicht auflösbar: {error}")),
+            .map_err(|error| format!("aktuelles Arbeitsverzeichnis nicht auflösbar: {error}"))?,
+    };
+    match harw_home::discover_project(&cwd, &[]) {
+        Ok(project) => Ok(project.root),
+        Err(harw_home::HomeError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(cwd)
+        }
+        Err(error) => Err(format!(
+            "Projekt-Root nicht auflösbar für {}: {error}",
+            cwd.display()
+        )),
     }
 }
 
@@ -142,6 +179,16 @@ mod tests {
         let project = tempfile::tempdir().map_err(ctx("create temporary project directory"))?;
         std::fs::create_dir(project.path().join(".harw")).map_err(ctx("create .harw"))?;
         Ok(project)
+    }
+
+    /// Wie [`temp_project`], aber mit `.git`-Marker (echter Repo-Root) und
+    /// einer `src`-Unterverzeichnis-Ebene für die Subdir-Regressionstests.
+    fn temp_repo() -> TestResult<tempfile::TempDir> {
+        let repo = tempfile::tempdir().map_err(ctx("create temporary repo directory"))?;
+        std::fs::create_dir(repo.path().join(".git")).map_err(ctx("create .git"))?;
+        std::fs::create_dir(repo.path().join(".harw")).map_err(ctx("create .harw"))?;
+        std::fs::create_dir(repo.path().join("src")).map_err(ctx("create src subdirectory"))?;
+        Ok(repo)
     }
 
     #[test]
@@ -188,6 +235,115 @@ mod tests {
         let canonical =
             std::fs::canonicalize(project.path()).map_err(ctx("canonicalize project"))?;
         assert_eq!(output, format!("not trusted: {}", canonical.display()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_status_from_subdirectory_reports_trusted_at_repo_root() -> TestResult {
+        let home = temp_home()?;
+        let repo = temp_repo()?;
+
+        execute(
+            home.path(),
+            ProjectAction::Trust {
+                path: Some(repo.path().to_path_buf()),
+            },
+        )
+        .map_err(ctx("trust at repo root succeeds"))?;
+
+        // `status` aus dem Unterverzeichnis `src/` heraus muss denselben Root
+        // wie die Config-Schicht prüfen — nicht das (untrustete) `src/`.
+        let status_output = execute(
+            home.path(),
+            ProjectAction::Status {
+                path: Some(repo.path().join("src")),
+            },
+        )
+        .map_err(ctx("status from subdirectory succeeds"))?;
+
+        let canonical_repo = std::fs::canonicalize(repo.path()).map_err(ctx("canonicalize repo"))?;
+        assert_eq!(
+            status_output,
+            format!("Trusted: {}", canonical_repo.display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_untrust_from_subdirectory_removes_repo_root_trust() -> TestResult {
+        let home = temp_home()?;
+        let repo = temp_repo()?;
+
+        execute(
+            home.path(),
+            ProjectAction::Trust {
+                path: Some(repo.path().to_path_buf()),
+            },
+        )
+        .map_err(ctx("trust at repo root succeeds"))?;
+
+        // `untrust` aus `src/` heraus muss den Repo-Root-Eintrag entfernen,
+        // nicht fälschlich "not trusted" für `src/` melden.
+        let untrust_output = execute(
+            home.path(),
+            ProjectAction::Untrust {
+                path: Some(repo.path().join("src")),
+            },
+        )
+        .map_err(ctx("untrust from subdirectory succeeds"))?;
+
+        let canonical_repo = std::fs::canonicalize(repo.path()).map_err(ctx("canonicalize repo"))?;
+        assert_eq!(
+            untrust_output,
+            format!("removed: {}", canonical_repo.display())
+        );
+
+        let status_output = execute(
+            home.path(),
+            ProjectAction::Status {
+                path: Some(repo.path().to_path_buf()),
+            },
+        )
+        .map_err(ctx("status after untrust succeeds"))?;
+        assert_eq!(
+            status_output,
+            format!("Untrusted: {}", canonical_repo.display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_untrust_of_deleted_project_still_removes_by_former_path() -> TestResult {
+        let home = temp_home()?;
+        let project = temp_project()?;
+        let canonical_project =
+            std::fs::canonicalize(project.path()).map_err(ctx("canonicalize project"))?;
+
+        execute(
+            home.path(),
+            ProjectAction::Trust {
+                path: Some(project.path().to_path_buf()),
+            },
+        )
+        .map_err(ctx("trust succeeds"))?;
+
+        // Das Projekt wird gelöscht, bevor es ausgetragen wird: `project_root`
+        // darf die Root-Suche in diesem Fall nicht hart scheitern lassen,
+        // sondern muss (wie zuvor) den früheren kanonischen Pfad an
+        // `untrust_project` weitergeben, das den NotFound-Fall selbst
+        // behandelt.
+        drop(project);
+
+        let output = execute(
+            home.path(),
+            ProjectAction::Untrust {
+                path: Some(canonical_project.clone()),
+            },
+        )
+        .map_err(ctx(
+            "untrust of a deleted project by its former path still succeeds",
+        ))?;
+        assert_eq!(output, format!("removed: {}", canonical_project.display()));
         Ok(())
     }
 }

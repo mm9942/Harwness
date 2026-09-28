@@ -33,8 +33,9 @@
 //! Entwurf hier.
 //!
 //! # Ohne `unsafe`
-//! `rustix::net` deckt `accept`, `sockopt::socket_peercred`, `recv` und
-//! `send` bereits sicher ab. Jeder hier verwendete Aufruf ist gegen die
+//! `rustix::net` deckt `accept`, `sockopt::socket_peercred`,
+//! `sockopt::set_socket_timeout`, `recv` und `send` bereits sicher ab. Jeder
+//! hier verwendete Aufruf ist gegen die
 //! tatsächlich im Workspace gepinnte Quelle geprüft
 //! (`~/.cargo/registry/src/…/rustix-1.1.4/src/net/`), nicht gegen docs.rs
 //! oder aus dem Gedächtnis — dieselbe Prüfung, die `harw-sentinel::ipc`
@@ -65,10 +66,17 @@
 //!
 //! # Nebenläufigkeit
 //! [`serve_forever`] startet `std::thread::spawn` je angenommener
-//! Verbindung (Muster: `harw-sentinel::ipc::spawn_receive_loop`). `warden`
-//! wird als `Arc<Warden>` geteilt; `Warden` selbst trägt keinen
-//! veränderlichen inneren Zustand außerhalb seiner Ausführer/seines
-//! Audit-Ziels (siehe `harw_dod_warden::warden`-Moduldoku), die ihrerseits
+//! Verbindung (Muster: `harw-sentinel::ipc::spawn_receive_loop`), aber
+//! **nicht unbegrenzt**: [`accept_connection`] setzt ein Empfangs-Timeout
+//! (`SO_RCVTIMEO`, [`RECV_TIMEOUT`]), und [`serve_forever`] reserviert vor
+//! jedem Thread-Start einen Platz in einem geteilten Zähler
+//! ([`try_acquire_slot`], Obergrenze [`MAX_CONCURRENT_CONNECTIONS`]) — ist
+//! keiner mehr frei, schließt es die neu angenommene Verbindung sofort
+//! wieder. Beides zusammen begrenzt, was ein Peer anrichten kann, der
+//! verbindet und nie sendet. `warden` wird als `Arc<Warden>` geteilt;
+//! `Warden` selbst trägt keinen veränderlichen inneren Zustand außerhalb
+//! seiner Ausführer/seines Audit-Ziels (siehe
+//! `harw_dod_warden::warden`-Moduldoku), die ihrerseits
 //! entweder zustandslos sind (`CgroupV2Executor`,
 //! `crate::isolation::NftNetworkIsolator`,
 //! `crate::audit::TracingAuditSink`) oder — in Produktion nicht verwendet —
@@ -77,7 +85,9 @@
 //! Anfragen sind deshalb ohne zusätzliches Locking sicher.
 
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use harw_dod_warden::Warden;
 use harw_macros::HarwError;
@@ -89,6 +99,18 @@ use crate::protocol::WardenRequestEnvelope;
 /// `harw-sentinel::ipc::RECV_BUFFER_LEN`, dort `16_384` für ein einzelnes
 /// `SecurityEvent`).
 const RECV_BUFFER_LEN: usize = 16_384;
+
+/// Empfangs-Timeout je angenommener Verbindung (`SO_RCVTIMEO`, gesetzt in
+/// [`accept_connection`]). Verhindert, dass ein Peer, der verbindet und nie
+/// sendet, seinen Bedienungs-Thread für immer in `recv()` blockiert (siehe
+/// Moduldoku, Abschnitt „Nebenläufigkeit").
+const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Obergrenze gleichzeitig bedienter Verbindungen (siehe
+/// [`try_acquire_slot`]). Über dieser Grenze schließt [`serve_forever`]
+/// eine neu angenommene Verbindung sofort wieder, statt einen weiteren
+/// Thread zu starten.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 
 /// Fehler des IPC-Empfangspfads — je Verbindung, nicht prozessfatal (siehe
 /// `crate::error`-Moduldoku für die Abgrenzung zu [`crate::error::WardenBinError`]).
@@ -106,7 +128,13 @@ pub enum IpcError {
     /// konnte nicht gelesen werden.
     #[msg("failed to read peer credentials of an ipc connection")]
     PeerCredentialsUnavailable,
-    /// Ein Lesevorgang auf einer angenommenen Verbindung ist fehlgeschlagen.
+    /// Für eine angenommene Verbindung ließ sich kein Empfangs-Timeout
+    /// (`SO_RCVTIMEO`) setzen.
+    #[msg("failed to set a receive timeout on an ipc connection")]
+    Timeout,
+    /// Ein Lesevorgang auf einer angenommenen Verbindung ist fehlgeschlagen
+    /// — eingeschlossen das Ablaufen des in [`accept_connection`] gesetzten
+    /// Empfangs-Timeouts ([`RECV_TIMEOUT`]).
     #[msg("failed to receive a message from an ipc peer")]
     Recv,
     /// Eine empfangene Nachricht war größer als [`RECV_BUFFER_LEN`] und
@@ -149,6 +177,56 @@ pub struct PeerCredentials {
     pub gid: u32,
 }
 
+/// RAII-Platzhalter im Verbindungszähler von [`serve_forever`]: reserviert
+/// beim Erzeugen (über [`try_acquire_slot`]) einen Platz, gibt ihn beim
+/// `Drop` wieder frei.
+///
+/// # Description
+/// Trägt einen eigenen [`Arc`]-Klon des Zählers statt einer Referenz: Der
+/// Verbindungs-Thread, in den dieser Platzhalter hineinbewegt wird, braucht
+/// wegen `std::thread::spawn`s `'static`-Grenze eine vom Aufrufer-Stack
+/// unabhängige Kopie — eine Referenz auf eine in [`serve_forever`] lokale
+/// Variable wäre das nicht mehr, sobald diese Funktion nach einem
+/// endgültigen `accept()`-Fehler zurückkehrt, während bediente Threads noch
+/// liefen.
+struct ConnectionSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Versucht, im Zähler `active` einen Platz unterhalb von `max` zu
+/// reservieren.
+///
+/// # Description
+/// Reines Zählen, keine E/A, kein Warten: `fetch_update` erhöht `active`
+/// genau dann um 1, wenn der zuvor gelesene Wert kleiner als `max` war —
+/// atomar, keine Race zwischen zwei Threads, die beide denselben alten Wert
+/// unterhalb von `max` sehen und beide gleichzeitig erhöhen wollen.
+///
+/// # Arguments
+/// - `active`: der geteilte Verbindungszähler.
+/// - `max`: die Obergrenze, ab der kein weiterer Platz vergeben wird.
+///
+/// # Returns
+/// - `Some(slot)`: ein Platz war frei; `active` wurde um 1 erhöht. Der
+///   Platz wird wieder frei, sobald `slot` fällt (`Drop`).
+/// - `None`: `active` war bereits `>= max`; unverändert, nichts reserviert.
+fn try_acquire_slot(active: &Arc<AtomicUsize>, max: usize) -> Option<ConnectionSlot> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current < max { Some(current + 1) } else { None }
+        })
+        .ok()
+        .map(|_| ConnectionSlot {
+            active: Arc::clone(active),
+        })
+}
+
 /// Nimmt Verbindungen auf dem von systemd übergebenen, bereits lauschenden
 /// Socket entgegen und bedient jede in einem eigenen Thread.
 ///
@@ -168,14 +246,35 @@ pub struct PeerCredentials {
 ///   geteilt über jeden Verbindungs-Thread.
 ///
 /// # Concurrency
-/// Startet `std::thread::spawn` je angenommener Verbindung, siehe
-/// Moduldoku.
+/// Startet `std::thread::spawn` je angenommener Verbindung, aber höchstens
+/// [`MAX_CONCURRENT_CONNECTIONS`] gleichzeitig ([`try_acquire_slot`]); über
+/// dieser Grenze wird eine neu angenommene Verbindung sofort wieder
+/// geschlossen, ohne einen weiteren Thread zu starten. Siehe Moduldoku,
+/// Abschnitt „Nebenläufigkeit".
 pub fn serve_forever(listener: OwnedFd, warden: Arc<Warden>) {
+    let active_connections = Arc::new(AtomicUsize::new(0));
     loop {
         match accept_connection(&listener) {
             Ok((connection, peer)) => {
-                let warden = Arc::clone(&warden);
-                std::thread::spawn(move || handle_connection(connection, peer, &warden));
+                match try_acquire_slot(&active_connections, MAX_CONCURRENT_CONNECTIONS) {
+                    Some(slot) => {
+                        let warden = Arc::clone(&warden);
+                        std::thread::spawn(move || {
+                            let _slot = slot;
+                            handle_connection(connection, peer, &warden);
+                        });
+                    }
+                    None => {
+                        tracing::warn!(
+                            ?peer,
+                            max = MAX_CONCURRENT_CONNECTIONS,
+                            "rejecting ipc connection: already at the concurrent connection limit"
+                        );
+                        // `connection` fällt hier ohne Antwort aus dem
+                        // Gültigkeitsbereich — schließt den angenommenen
+                        // Socket, ohne einen weiteren Thread zu starten.
+                    }
+                }
             }
             Err(error) => {
                 tracing::error!(error = %error, "ipc accept failed; ceasing to serve");
@@ -185,11 +284,21 @@ pub fn serve_forever(listener: OwnedFd, warden: Arc<Warden>) {
     }
 }
 
-/// Nimmt genau eine Verbindung an und liest sofort ihre `SO_PEERCRED`-Identität.
+/// Nimmt genau eine Verbindung an, setzt sofort ihr Empfangs-Timeout
+/// (`SO_RCVTIMEO`, [`RECV_TIMEOUT`], siehe Moduldoku „Nebenläufigkeit") und
+/// liest ihre `SO_PEERCRED`-Identität.
+///
+/// # Errors
+/// - [`IpcError::Accept`]: `accept()` selbst ist fehlgeschlagen.
+/// - [`IpcError::Timeout`]: das Empfangs-Timeout ließ sich nicht setzen.
+/// - [`IpcError::PeerCredentialsUnavailable`]: `SO_PEERCRED` ließ sich nicht
+///   lesen.
 fn accept_connection(listener: &OwnedFd) -> Result<(OwnedFd, PeerCredentials), IpcError> {
     use rustix::net::sockopt;
 
     let accepted = rustix::net::accept(listener).map_err(|_| IpcError::Accept)?;
+    sockopt::set_socket_timeout(&accepted, sockopt::Timeout::Recv, Some(RECV_TIMEOUT))
+        .map_err(|_| IpcError::Timeout)?;
     let creds =
         sockopt::socket_peercred(&accepted).map_err(|_| IpcError::PeerCredentialsUnavailable)?;
     let peer = PeerCredentials {
@@ -255,7 +364,10 @@ fn handle_connection(connection: OwnedFd, peer: PeerCredentials, warden: &Warden
 /// - `None`: der Peer hat die Verbindung geordnet geschlossen.
 ///
 /// # Errors
-/// - [`IpcError::Recv`]: der zugrunde liegende `recv()`-Aufruf schlägt fehl.
+/// - [`IpcError::Recv`]: der zugrunde liegende `recv()`-Aufruf schlägt fehl
+///   — eingeschlossen das Ablaufen des in [`accept_connection`] gesetzten
+///   Empfangs-Timeouts ([`RECV_TIMEOUT`]): der Peer hat verbunden, aber
+///   innerhalb der Frist nichts gesendet.
 /// - [`IpcError::Oversized`]: das Datagramm war größer als
 ///   [`RECV_BUFFER_LEN`].
 /// - [`IpcError::Malformed`]: die empfangenen Bytes sind kein wohlgeformtes
@@ -303,7 +415,10 @@ fn send_response(
 
 #[cfg(test)]
 mod tests {
-    use super::IpcError;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    use super::{IpcError, try_acquire_slot};
     use crate::test_support::{TestError, TestResult};
 
     #[test]
@@ -311,6 +426,14 @@ mod tests {
         assert_eq!(
             IpcError::Oversized.to_string(),
             "received an ipc message larger than the receive buffer; it was discarded"
+        );
+    }
+
+    #[test]
+    fn test_timeout_error_is_content_free() {
+        assert_eq!(
+            IpcError::Timeout.to_string(),
+            "failed to set a receive timeout on an ipc connection"
         );
     }
 
@@ -329,11 +452,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_try_acquire_slot_refuses_at_the_cap_and_releases_on_drop() -> TestResult {
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let Some(first) = try_acquire_slot(&active, 2) else {
+            return Err(TestError::Missing("first of two slots"));
+        };
+        let Some(second) = try_acquire_slot(&active, 2) else {
+            return Err(TestError::Missing("second of two slots"));
+        };
+        assert!(
+            try_acquire_slot(&active, 2).is_none(),
+            "a third slot must be refused once the cap of 2 is reached"
+        );
+
+        drop(first);
+        let Some(third) = try_acquire_slot(&active, 2) else {
+            return Err(TestError::Unexpected(
+                "dropping a reserved slot must free it for reuse".into(),
+            ));
+        };
+
+        drop(second);
+        drop(third);
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "every reserved slot must have released its count after being dropped"
+        );
+        Ok(())
+    }
+
     // `serve_forever`/`accept_connection`/`handle_connection` werden hier
     // bewusst nicht getestet: jede würde einen echten Socket annehmen oder
     // öffnen — nach Aufgabenstellung ausdrücklich untersagt. Die Anfrage-
     // Verarbeitung selbst (`Warden::handle` unverändert erreicht, inhalts-
     // freie Antwort) ist in `crate::warden_factory`s Tests direkt gegen den
     // produktiven Warden geprüft, ohne einen Socket zu benötigen. Das
-    // Umschlag-Format ist in `crate::protocol`s Tests geprüft.
+    // Umschlag-Format ist in `crate::protocol`s Tests geprüft. Der
+    // Verbindungszähler, den `serve_forever` zur Begrenzung gleichzeitiger
+    // Threads nutzt (`try_acquire_slot`/`ConnectionSlot`), braucht dagegen
+    // keinen Socket — reines Zählen auf einem `AtomicUsize` — und wird
+    // deshalb oben direkt getestet.
 }

@@ -230,10 +230,12 @@ impl AllowRuleSet {
     /// - `tool == "shell.exec"`: `pattern` ist ein Befehls-Präfix, das auf
     ///   ganzen Whitespace-Tokens verglichen wird (`"git status"` passt auf
     ///   `"git status --short"`, nicht auf `"git statusx"`). Enthält der
-    ///   Befehl eines der Metazeichen `; && || | `$( > < \n` oder ein
-    ///   token-endständiges `&`, passt er **niemals** auf eine `Allow`-Regel;
-    ///   eine `Deny`-Regel prüft in diesem Fall nur das erste, ungefährliche
-    ///   Teilstück des Befehls.
+    ///   Befehl eines der Metazeichen `` ; & | ` $( > < \n \r `` — `&` an jeder
+    ///   Stelle, auch mitten im Wort (`git status&rm x`) —, passt er
+    ///   **niemals** auf eine `Allow`-Regel. Eine `Deny`-Regel wird gegen
+    ///   jedes Teilstück zwischen diesen Trennzeichen (zusätzlich `(`/`)`)
+    ///   geprüft und trifft, sobald eines davon passt (`true; rm -rf ~`
+    ///   trifft `Deny`-Regel `rm`).
     /// - `tool == "job.start"` (Plan R9, Teil F): wie `shell.exec`, über
     ///   `command` bzw. das gequotete `argv`; mit gesetztem `env` trifft
     ///   keine `Allow`-Regel.
@@ -409,35 +411,27 @@ fn quote_word(word: &str) -> String {
 }
 
 /// Zeichen bzw. Zeichenfolgen, die einen Shell-Befehl als potenziell
-/// zusammengesetzt (mehrere Kommandos) markieren.
-const DANGEROUS_SHELL_MARKERS: [&str; 9] = [";", "&&", "||", "|", "`", "$(", ">", "<", "\n"];
+/// zusammengesetzt (mehrere Kommandos, Umleitung, Kommando-Ersetzung)
+/// markieren. Jedes `&` zählt: in POSIX-sh ist ein einzelnes `&` auch mitten
+/// in einem Wort ein Steueroperator (`git status&rm x`); `&&` und `||` sind
+/// über `&` und `|` mit abgedeckt. `\r` trennt in sh nicht, dient aber nur
+/// der Verschleierung und wird deshalb ebenfalls abgelehnt.
+const DANGEROUS_SHELL_MARKERS: [&str; 9] = [";", "&", "|", "`", "$(", ">", "<", "\n", "\r"];
 
-/// Prüft, ob ein Befehl eines der gefährlichen Shell-Metazeichen enthält,
-/// oder ein Token token-endständig mit `&` abschließt (Hintergrundjob).
+/// Prüft, ob ein Befehl eines der gefährlichen Shell-Metazeichen enthält.
 fn has_dangerous_shell_chars(command: &str) -> bool {
-    if DANGEROUS_SHELL_MARKERS
+    DANGEROUS_SHELL_MARKERS
         .iter()
         .any(|marker| command.contains(marker))
-    {
-        return true;
-    }
-    command.split_whitespace().any(|token| token.ends_with('&'))
 }
 
-/// Liefert das erste, ungefährliche Teilstück eines Befehls (vor dem ersten
-/// gefährlichen Metazeichen), rechts getrimmt.
-fn first_safe_segment(command: &str) -> &str {
-    let mut cut = command.len();
-    let bytes = command.as_bytes();
-    for (i, c) in command.char_indices() {
-        let hits_marker = matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n')
-            || (c == '$' && bytes.get(i + 1) == Some(&b'('));
-        if hits_marker {
-            cut = i;
-            break;
-        }
-    }
-    command[..cut].trim_end()
+/// Zerlegt einen Befehl für die `Deny`-Prüfung in Teilstücke — an jedem
+/// Zeichen aus [`DANGEROUS_SHELL_MARKERS`] sowie an `(`/`)`, damit auch
+/// `$(…)`, `<(…)` und Subshells `(…)` als eigenes Teilstück geprüft werden.
+fn shell_segments(command: &str) -> impl Iterator<Item = &str> {
+    command.split(|c: char| {
+        matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '(' | ')' | '\n' | '\r')
+    })
 }
 
 /// Prüft ein `shell.exec`-Muster gegen einen tatsächlichen Befehl.
@@ -447,48 +441,40 @@ fn first_safe_segment(command: &str) -> &str {
 /// eigenes Token wird verworfen — Präfix-Vergleich erlaubt ohnehin beliebig
 /// viele weitere Tokens). Ist der Befehl gefährlich (siehe
 /// [`has_dangerous_shell_chars`]), trifft eine `Allow`-Regel nie zu; eine
-/// `Deny`-Regel prüft nur das erste ungefährliche Teilstück.
+/// `Deny`-Regel trifft, sobald eines der [`shell_segments`] passt — im
+/// Zweifel verweigern, nicht nur den Anfang des Befehls prüfen.
 fn shell_pattern_matches(pattern: &str, command: &str, decision: RuleDecision) -> bool {
-    let command = command.trim_start();
-    let dangerous = has_dangerous_shell_chars(command);
-
-    if dangerous && decision == RuleDecision::Allow {
-        return false;
-    }
-
-    let segment = if dangerous {
-        first_safe_segment(command)
-    } else {
-        command
-    };
-
     let mut pattern_tokens: Vec<&str> = pattern.split_whitespace().collect();
     if pattern_tokens.last() == Some(&"*") {
         pattern_tokens.pop();
     }
-    if pattern_tokens.is_empty() {
-        return true;
-    }
 
-    let segment_tokens: Vec<&str> = segment.split_whitespace().collect();
-    if segment_tokens.len() < pattern_tokens.len() {
-        return false;
+    match decision {
+        RuleDecision::Allow => {
+            !has_dangerous_shell_chars(command) && tokens_match_prefix(&pattern_tokens, command)
+        }
+        RuleDecision::Deny => shell_segments(command)
+            .any(|segment| tokens_match_prefix(&pattern_tokens, segment)),
     }
+}
 
+/// Prüft, ob die Whitespace-Tokens von `segment` mit `pattern_tokens`
+/// beginnen; leere `pattern_tokens` passen auf alles.
+fn tokens_match_prefix(pattern_tokens: &[&str], segment: &str) -> bool {
     // Runde 5, Teil E: ein an das letzte Muster-Token angehängtes `*`
     // (`"cargo test*"`) ist ein Präfix-Glob nur für dieses Token — die
     // Tokens davor müssen weiterhin exakt passen.
-    let last = pattern_tokens.len() - 1;
-    pattern_tokens
-        .iter()
-        .zip(segment_tokens.iter())
-        .enumerate()
-        .all(
-            |(index, (pattern_token, token))| match pattern_token.strip_suffix('*') {
-                Some(prefix) if index == last && !prefix.is_empty() => token.starts_with(prefix),
-                _ => pattern_token == token,
-            },
-        )
+    let last = pattern_tokens.len().saturating_sub(1);
+    let mut tokens = segment.split_whitespace();
+    pattern_tokens.iter().enumerate().all(|(index, pattern_token)| {
+        let Some(token) = tokens.next() else {
+            return false;
+        };
+        match pattern_token.strip_suffix('*') {
+            Some(prefix) if index == last && !prefix.is_empty() => token.starts_with(prefix),
+            _ => *pattern_token == token,
+        }
+    })
 }
 
 /// Prüft, ob ein Pfad eine `..`-Komponente enthält.
@@ -500,52 +486,66 @@ fn has_dotdot_component(path: &str) -> bool {
 /// hinweg, `?` für ein einzelnes Zeichen) gegen einen Pfad.
 ///
 /// Beide Seiten werden an `/` in Segmente zerlegt und segmentweise
-/// verglichen; `**` konsumiert null oder mehr ganze Segmente.
+/// verglichen; `**` konsumiert null oder mehr ganze Segmente. Der Pfad
+/// stammt vom Modell: der Abgleich läuft deshalb iterativ (siehe
+/// [`wildcard_match_by`]), ohne Rekursion pro Zeichen oder Segment.
 fn glob_match_path(pattern: &str, path: &str) -> bool {
     let pattern_segments: Vec<&str> = pattern.split('/').collect();
     let path_segments: Vec<&str> = path.split('/').collect();
-    match_segments(&pattern_segments, &path_segments)
-}
-
-/// Vergleicht Pfadsegmente rekursiv gegen Musterssegmente, mit `**` als
-/// Platzhalter für null oder mehr ganze Segmente.
-fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    match pattern.first() {
-        None => path.is_empty(),
-        Some(&"**") => {
-            let rest = &pattern[1..];
-            if rest.is_empty() {
-                return true;
-            }
-            (0..=path.len()).any(|skip| match_segments(rest, &path[skip..]))
-        }
-        Some(&segment_pattern) => match path.first() {
-            Some(&segment) if segment_match(segment_pattern, segment) => {
-                match_segments(&pattern[1..], &path[1..])
-            }
-            _ => false,
-        },
-    }
+    wildcard_match_by(
+        &pattern_segments,
+        &path_segments,
+        |segment_pattern| *segment_pattern == "**",
+        |segment_pattern, segment| segment_match(segment_pattern, segment),
+    )
 }
 
 /// Vergleicht ein einzelnes Pfadsegment gegen ein Muster mit `*` (null oder
 /// mehr Zeichen) und `?` (genau ein Zeichen).
 fn segment_match(pattern: &str, segment: &str) -> bool {
-    wildcard_match(pattern.as_bytes(), segment.as_bytes())
+    wildcard_match_by(
+        pattern.as_bytes(),
+        segment.as_bytes(),
+        |&byte| byte == b'*',
+        |&expected, &actual| expected == b'?' || expected == actual,
+    )
 }
 
-/// Klassischer rekursiver Wildcard-Abgleich (`*`, `?`) auf Byte-Ebene.
-fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
-    match (pattern.first(), text.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => {
-            wildcard_match(&pattern[1..], text)
-                || (!text.is_empty() && wildcard_match(pattern, &text[1..]))
+/// Iterativer Wildcard-Abgleich mit Rücksprung zum zuletzt gesehenen Stern:
+/// O(Muster·Text) Schritte, konstante Stacktiefe. `is_star` markiert ein
+/// Musterelement, das null oder mehr Textelemente konsumiert; `matches_one`
+/// vergleicht jedes andere Musterelement mit genau einem Textelement.
+fn wildcard_match_by<P, T>(
+    pattern: &[P],
+    text: &[T],
+    is_star: impl Fn(&P) -> bool,
+    matches_one: impl Fn(&P, &T) -> bool,
+) -> bool {
+    let (mut p, mut t) = (0, 0);
+    // Musterposition hinter dem letzten Stern und die Textposition, ab der
+    // dieser Stern beim nächsten Rücksprung ein Element mehr konsumiert.
+    let mut backtrack: Option<(usize, usize)> = None;
+    while let Some(actual) = text.get(t) {
+        match pattern.get(p) {
+            Some(expected) if is_star(expected) => {
+                p += 1;
+                backtrack = Some((p, t));
+            }
+            Some(expected) if matches_one(expected, actual) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match backtrack {
+                Some((star_p, star_t)) => {
+                    p = star_p;
+                    t = star_t + 1;
+                    backtrack = Some((star_p, t));
+                }
+                None => return false,
+            },
         }
-        (Some(b'?'), Some(_)) => wildcard_match(&pattern[1..], &text[1..]),
-        (Some(p), Some(t)) if p == t => wildcard_match(&pattern[1..], &text[1..]),
-        _ => false,
     }
+    pattern.iter().skip(p).all(is_star)
 }
 
 /// Denylist breiter Interpreter/Wrapper, für die `derive_shell_rule` keinen
@@ -602,6 +602,7 @@ mod tests {
     use super::{
         AllowRuleSet, ApprovalRule, RuleDecision, RuleScope, derive_shell_rule, glob_match_path,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
 
     fn rule(
@@ -725,6 +726,120 @@ mod tests {
             None,
             "ein zusammengesetzter Befehl trifft nie eine Allow-Regel"
         );
+    }
+
+    /// Ein einzelnes `&` ist in sh auch mitten im Wort ein Steueroperator:
+    /// `git status &rm -rf ~` darf die Regel `git status` nicht treffen —
+    /// weder für `shell.exec` noch für `job.start`.
+    #[test]
+    fn test_evaluate_bare_ampersand_never_allowed() {
+        let rules = AllowRuleSet::new();
+        for tool in ["shell.exec", "job.start"] {
+            rules.add(rule(
+                tool,
+                Some("git status"),
+                RuleDecision::Allow,
+                RuleScope::Session,
+            ));
+            rules.add(rule(
+                tool,
+                Some("cargo test*"),
+                RuleDecision::Allow,
+                RuleScope::Session,
+            ));
+        }
+
+        for tool in ["shell.exec", "job.start"] {
+            for command in [
+                "git status &rm -rf ~",
+                "git status&touch x",
+                "git status --short &curl -o f http://x",
+                "git status\rrm -rf ~",
+                "cargo test&x",
+            ] {
+                assert_eq!(
+                    rules.evaluate(tool, &json!({"command": command})),
+                    None,
+                    "{tool}: {command:?} darf keine Allow-Regel treffen"
+                );
+            }
+            assert_eq!(
+                rules.evaluate(tool, &json!({"command": "git status --short"})),
+                Some(RuleDecision::Allow)
+            );
+        }
+        assert_eq!(derive_shell_rule("git status&touch x"), None);
+    }
+
+    /// Eine Deny-Regel prüft jedes Teilstück eines zusammengesetzten
+    /// Befehls, nicht nur das erste — sonst hebelt ein harmloser Anfang sie
+    /// unter FullAccess aus.
+    #[test]
+    fn test_evaluate_deny_matches_any_segment() {
+        let rules = AllowRuleSet::new();
+        for tool in ["shell.exec", "job.start"] {
+            rules.add(rule(tool, Some("rm"), RuleDecision::Deny, RuleScope::Session));
+        }
+
+        for tool in ["shell.exec", "job.start"] {
+            for command in [
+                "true; rm -rf ~",
+                "echo a|rm x",
+                "git status &rm -rf ~",
+                "echo $(rm x)",
+                "(rm x)",
+                "true\nrm x",
+            ] {
+                assert_eq!(
+                    rules.evaluate(tool, &json!({"command": command})),
+                    Some(RuleDecision::Deny),
+                    "{tool}: {command:?} muss die Deny-Regel treffen"
+                );
+            }
+            for command in ["rmdir x", "echo rm; ls"] {
+                assert_eq!(
+                    rules.evaluate(tool, &json!({"command": command})),
+                    None,
+                    "{tool}: {command:?} trifft `rm` nur als ganzes erstes Token"
+                );
+            }
+        }
+    }
+
+    /// Ein vom Modell geliefertes, sehr langes Pfadsegment darf den Abgleich
+    /// nicht in eine Rekursion pro Byte treiben, viele Segmente mit mehreren
+    /// `**` nicht in polynomielle Laufzeit: ein Thread mit 256 KiB Stack muss
+    /// beides zügig überstehen.
+    #[test]
+    fn test_glob_long_path_runs_iteratively() -> TestResult {
+        let rules = AllowRuleSet::new();
+        rules.add(rule(
+            "fs.*",
+            Some("src/*"),
+            RuleDecision::Allow,
+            RuleScope::Project,
+        ));
+
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let long_segment = format!("src/{}", "a".repeat(1_000_000));
+                let many_segments = format!("{}q", "a/".repeat(100_000));
+                (
+                    glob_match_path("src/*", &long_segment),
+                    rules.evaluate("fs.read", &json!({"path": long_segment})),
+                    glob_match_path("**/a/**/a/**/b", &many_segments),
+                )
+            })
+            .map_err(ctx("Thread mit kleinem Stack starten"))?;
+        let (long_match, long_decision, many_match) = worker.join().map_err(|_| {
+            TestError::Unexpected("Glob-Abgleich im kleinen Stack abgebrochen".to_owned())
+        })?;
+
+        assert!(long_match);
+        assert_eq!(long_decision, Some(RuleDecision::Allow));
+        assert!(!many_match);
+        Ok(())
     }
 
     #[test]

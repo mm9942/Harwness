@@ -125,11 +125,17 @@
 //! [`RemoteEmbedBackend`] mit dem ersten echten Transport
 //! ([`http_backend::HttpEmbedBackend`]) und aktualisierte die eingebettete
 //! `embeddings.toml`, damit ihr entferntes Modell einen echten Modellnamen
-//! (`text-embedding-3-large`) statt eines generischen Platzhalters trägt --
-//! siehe den Abschlussbericht dieses Knotens dafür, warum
-//! `harw-tool-lens/src/provenance.rs` trotzdem weiterhin
-//! [`DeterministicEmbedder`] verwendet (die kuratierte Fassade `harw-lens`
-//! reicht [`HttpEmbedBackend`]/[`RemoteEmbedder`] noch nicht durch).
+//! (`text-embedding-3-large`) statt eines generischen Platzhalters trägt.
+//! Ein späterer Knoten reichte [`HttpEmbedBackend`]/[`RemoteEmbedder`]/
+//! [`DimensionCheckedEmbedder`] durch die kuratierte Fassade `harw-lens`
+//! durch; `harw-tool-lens/src/provenance.rs` wählt seither für
+//! [`EmbeddingRole::Query`] zwischen beiden Pfaden -- den entfernten nur,
+//! wenn ein Betreiber bewusst einen Endpunkt konfiguriert, sonst
+//! [`DeterministicEmbedder`]. Für [`EmbeddingRole::Confidential`] gilt das
+//! nicht: dieses Werkzeug fragt diese Rolle nie ab (siehe `provenance.rs`,
+//! Abschnitt „Was `Confidential` weiterhin nicht hat") und wählt für sie
+//! folglich auch nie automatisch einen Embedder -- `Confidential` hat wie
+//! oben festgehalten weiterhin keinen produktionsreifen Einbetter im Baum.
 
 pub mod catalog;
 pub mod descriptor;

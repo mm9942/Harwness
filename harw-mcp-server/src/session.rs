@@ -3,7 +3,7 @@ use std::fmt;
 
 use jiff::{SignedDuration, Timestamp};
 
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+use crate::MCP_PROTOCOL_VERSION;
 
 pub type McpServerResult<T> = Result<T, McpServerError>;
 
@@ -212,6 +212,25 @@ mod tests {
             sessions.require(&session.id, MCP_PROTOCOL_VERSION, later),
             Err(McpServerError::SessionUnknown)
         ));
+        Ok(())
+    }
+
+    /// `session.rs` must not redefine `MCP_PROTOCOL_VERSION` on its own; it has
+    /// to reuse the crate-root constant so a version bump there also moves
+    /// every session (Z1-R3-04).
+    #[test]
+    fn initialized_session_uses_crate_root_protocol_version() -> TestResult {
+        let now = Timestamp::now();
+        let mut sessions = McpSessionRegistry::new(1, SignedDuration::from_secs(60));
+        let session = sessions
+            .initialize(
+                "session-b".to_owned(),
+                "test".to_owned(),
+                "principal-b".to_owned(),
+                now,
+            )
+            .map_err(ctx("Session initialisieren"))?;
+        assert_eq!(session.protocol_version, crate::MCP_PROTOCOL_VERSION);
         Ok(())
     }
 }

@@ -22,6 +22,16 @@
 //! - **Byte-Modus** (Rückfall, `offset`/`max_bytes` gesetzt): unverändertes
 //!   Verhalten von vor W1-03 — Kürzung statt Ablehnung (siehe unten).
 //!
+//! Zeilen- und Tail-Modus lesen jede Rohzeile über `read_bounded_line`
+//! begrenzt: höchstens `MAX_LINE_BYTES` + 4 Bytes bleiben im Speicher, der
+//! Rest einer zu langen oder zeilenumbruchfreien Zeile wird bis zum
+//! nächsten `\n` verworfen statt gesammelt. Das Scan-Budget
+//! ([`crate::tree::MAX_SCAN_FILE_BYTES`]) wird deshalb auch innerhalb einer
+//! einzelnen Zeile geprüft, nicht nur zwischen vollständigen Zeilen — eine
+//! Datei ohne Zeilenumbruch (z. B. ein Minified-Bundle oder eine über
+//! `truncate -s 50G x` erzeugte sparse-Datei) sprengt den Speicher damit
+//! nicht.
+//!
 //! `null` gilt überall als „nicht gesetzt“, ebenso `0` bei
 //! `tail`/`limit`/`max_bytes`. Harmlose Kombinationen werden toleriert
 //! (Standardwerte `line` = 1 bzw. `offset` = 0 neben einem anderen Modus;
@@ -77,6 +87,15 @@ const MAX_LINE_LIMIT: u64 = 2000;
 
 // Anhängsel an eine über `MAX_LINE_BYTES` gekürzte Ausgabezeile.
 const LINE_TRUNCATION_MARKER: &str = " … [Zeile gekürzt]";
+
+// Höchstens so viele Rohbytes einer einzelnen Zeile hält `read_bounded_line`
+// im Speicher; der Rest einer zu langen oder zeilenumbruchfreien Zeile wird
+// beim Scannen verworfen, ohne `raw_line` weiter wachsen zu lassen. 4 Byte
+// Spielraum über `MAX_LINE_BYTES` hinaus, damit ein abschließendes `\r\n`
+// noch mitgenommen wird und `truncate_display_line` eine zu lange Zeile
+// zuverlässig als „gekürzt“ markiert (statt sie unmarkiert exakt an der
+// Grenze abzuschneiden).
+const MAX_KEPT_LINE_BYTES: usize = MAX_LINE_BYTES + 4;
 
 /// Deserialisierte Argumente für `fs.read`.
 #[derive(Debug, Deserialize)]
@@ -405,10 +424,11 @@ impl FsReadExecutor {
     }
 
     // Zeilenmodus (Standard): `line`/`limit`, `cat -n`-Ausgabe. Liest
-    // zeilenweise über `BufRead` nur bis zur letzten benötigten Zeile; zählt
-    // darüber hinaus bis Dateiende (begrenzt durch `MAX_SCAN_FILE_BYTES`)
-    // weiter, um die Gesamtzeilenzahl zu melden, ohne den Zeileninhalt danach
-    // noch zu speichern.
+    // zeilenweise über `read_bounded_line` nur bis zur letzten benötigten
+    // Zeile; zählt darüber hinaus bis Dateiende (begrenzt durch
+    // `MAX_SCAN_FILE_BYTES`, auch innerhalb einer einzelnen Zeile) weiter, um
+    // die Gesamtzeilenzahl zu melden, ohne den Zeileninhalt danach noch zu
+    // speichern.
     fn read_line_mode(file: &File, args: &FsReadArgs) -> ToolOutput {
         let path = args.path.as_str();
         let start_line = args.line.unwrap_or(1).max(1);
@@ -419,7 +439,7 @@ impl FsReadExecutor {
         let last_wanted = start_line.saturating_add(limit).saturating_sub(1);
 
         let mut reader = BufReader::new(file);
-        let mut raw_line: Vec<u8> = Vec::new();
+        let mut raw_line: Vec<u8> = Vec::with_capacity(MAX_KEPT_LINE_BYTES);
         let mut current_line: u64 = 0;
         let mut bytes_scanned: u64 = 0;
         let mut candidates: Vec<(u64, String)> = Vec::new();
@@ -429,19 +449,35 @@ impl FsReadExecutor {
             if bytes_scanned >= MAX_SCAN_FILE_BYTES {
                 break;
             }
-            raw_line.clear();
-            let read = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(n) => n,
+            let scan_budget = MAX_SCAN_FILE_BYTES - bytes_scanned;
+            let outcome = match read_bounded_line(
+                &mut reader,
+                &mut raw_line,
+                MAX_KEPT_LINE_BYTES,
+                scan_budget,
+            ) {
+                Ok(outcome) => outcome,
                 Err(err) => return ToolOutput::error(FsToolError::Io(err).to_string()),
             };
-            if read == 0 {
-                reached_eof = true;
-                break;
-            }
+            let (consumed, budget_exhausted) = match outcome {
+                BoundedLine::Eof => {
+                    reached_eof = true;
+                    break;
+                }
+                BoundedLine::Line { consumed } => (consumed, false),
+                BoundedLine::BudgetExhausted { consumed } => (consumed, true),
+            };
             current_line += 1;
-            bytes_scanned = bytes_scanned.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            bytes_scanned = bytes_scanned.saturating_add(consumed);
             if current_line >= start_line && current_line <= last_wanted {
                 candidates.push((current_line, decode_line(&raw_line)));
+            }
+            if budget_exhausted {
+                // Eine einzelne (zu lange oder zeilenumbruchfreie) Zeile hat
+                // das Scan-Budget aufgebraucht; der Rest bleibt ungelesen —
+                // `reached_eof` bleibt `false`, `format_total` meldet also
+                // eine Untergrenze.
+                break;
             }
         }
 
@@ -498,15 +534,15 @@ impl FsReadExecutor {
     // Tail-Modus: letzte `tail` Zeilen mit echten Zeilennummern, gleiches
     // Ausgabeformat wie der Zeilenmodus. Ein Durchlauf mit Ringpuffer
     // (`VecDeque`) hält nur die letzten `tail` Zeilen im Speicher, während
-    // bis Dateiende (begrenzt durch `MAX_SCAN_FILE_BYTES`) weitergezählt
-    // wird.
+    // bis Dateiende (begrenzt durch `MAX_SCAN_FILE_BYTES`, auch innerhalb
+    // einer einzelnen Zeile über `read_bounded_line`) weitergezählt wird.
     fn read_tail_mode(file: &File, args: &FsReadArgs) -> ToolOutput {
         let path = args.path.as_str();
         let tail_count = args.tail.unwrap_or(1).clamp(1, MAX_LINE_LIMIT);
         let tail_capacity = usize::try_from(tail_count).unwrap_or(usize::MAX);
 
         let mut reader = BufReader::new(file);
-        let mut raw_line: Vec<u8> = Vec::new();
+        let mut raw_line: Vec<u8> = Vec::with_capacity(MAX_KEPT_LINE_BYTES);
         let mut current_line: u64 = 0;
         let mut bytes_scanned: u64 = 0;
         let mut ring: VecDeque<(u64, String)> = VecDeque::with_capacity(tail_capacity);
@@ -516,21 +552,35 @@ impl FsReadExecutor {
             if bytes_scanned >= MAX_SCAN_FILE_BYTES {
                 break;
             }
-            raw_line.clear();
-            let read = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(n) => n,
+            let scan_budget = MAX_SCAN_FILE_BYTES - bytes_scanned;
+            let outcome = match read_bounded_line(
+                &mut reader,
+                &mut raw_line,
+                MAX_KEPT_LINE_BYTES,
+                scan_budget,
+            ) {
+                Ok(outcome) => outcome,
                 Err(err) => return ToolOutput::error(FsToolError::Io(err).to_string()),
             };
-            if read == 0 {
-                reached_eof = true;
-                break;
-            }
+            let (consumed, budget_exhausted) = match outcome {
+                BoundedLine::Eof => {
+                    reached_eof = true;
+                    break;
+                }
+                BoundedLine::Line { consumed } => (consumed, false),
+                BoundedLine::BudgetExhausted { consumed } => (consumed, true),
+            };
             current_line += 1;
-            bytes_scanned = bytes_scanned.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            bytes_scanned = bytes_scanned.saturating_add(consumed);
             if ring.len() == tail_capacity {
                 ring.pop_front();
             }
             ring.push_back((current_line, decode_line(&raw_line)));
+            if budget_exhausted {
+                // Wie im Zeilenmodus: eine einzelne zu lange Zeile hat das
+                // Scan-Budget aufgebraucht; `reached_eof` bleibt `false`.
+                break;
+            }
         }
 
         let lines_counted = current_line;
@@ -574,6 +624,68 @@ impl FsReadExecutor {
     }
 }
 
+/// Ergebnis eines einzelnen [`read_bounded_line`]-Aufrufs.
+enum BoundedLine {
+    /// Eine vollständige Zeile (endet mit `\n` oder direkt vor Dateiende).
+    /// `consumed` ist die Anzahl der dafür aus der Datei entnommenen Bytes.
+    Line { consumed: u64 },
+    /// Dateiende erreicht, ohne dass noch eine weitere Zeile begann.
+    Eof,
+    /// Das übergebene Scan-Budget wurde mitten in der Zeile erschöpft, bevor
+    /// ein `\n` oder das Dateiende erreicht wurde; `consumed` Bytes wurden
+    /// bis dahin verbraucht, der Rest der Zeile bleibt ungelesen.
+    BudgetExhausted { consumed: u64 },
+}
+
+/// Liest eine Zeile über [`BufRead::fill_buf`]/[`BufRead::consume`], hält
+/// aber höchstens `max_keep` Rohbytes in `raw_line` — der Rest einer zu
+/// langen Zeile wird bytenweise bis zum nächsten `\n` verworfen, statt den
+/// Puffer unbegrenzt wachsen zu lassen. Bricht zusätzlich ab, sobald
+/// `scan_budget` Bytes für diese eine Zeile verbraucht sind, auch ohne
+/// gefundenes `\n` (endlose Zeile — z. B. eine Datei ohne Zeilenumbruch oder
+/// eine sparse-Datei): so bleibt der Speicherverbrauch beschränkt, selbst
+/// wenn eine einzelne Zeile größer als [`crate::tree::MAX_SCAN_FILE_BYTES`]
+/// ist.
+///
+/// # Errors
+/// Gibt `Err` nur bei einem zugrunde liegenden I/O-Fehler zurück.
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    raw_line: &mut Vec<u8>,
+    max_keep: usize,
+    scan_budget: u64,
+) -> std::io::Result<BoundedLine> {
+    raw_line.clear();
+    let mut consumed: u64 = 0;
+    loop {
+        if consumed >= scan_budget {
+            return Ok(BoundedLine::BudgetExhausted { consumed });
+        }
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if consumed == 0 {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line { consumed }
+            });
+        }
+        let remaining = usize::try_from(scan_budget - consumed).unwrap_or(usize::MAX);
+        let take = available.len().min(remaining);
+        let chunk = &available[..take];
+        let newline_at = chunk.iter().position(|&byte| byte == b'\n');
+        let used = newline_at.map_or(chunk.len(), |pos| pos + 1);
+        if raw_line.len() < max_keep {
+            let keep = (max_keep - raw_line.len()).min(used);
+            raw_line.extend_from_slice(&chunk[..keep]);
+        }
+        consumed = consumed.saturating_add(u64::try_from(used).unwrap_or(u64::MAX));
+        reader.consume(used);
+        if newline_at.is_some() {
+            return Ok(BoundedLine::Line { consumed });
+        }
+    }
+}
+
 /// Entfernt ein am Ende abgeschnittenes, unvollständiges UTF-8-Zeichen.
 ///
 /// Nur wenn davor gültiger Text steht; sonst bleibt der Puffer unverändert
@@ -587,9 +699,9 @@ fn trim_partial_utf8(raw: &mut Vec<u8>) {
 }
 
 // Entfernt den Zeilenumbruch (`\n`, optional vorangehendes `\r`) einer über
-// `BufRead::read_until` gelesenen Rohzeile und kürzt sie danach für die
-// Anzeige. Das Trennen auf Byte-Ebene ist UTF-8-sicher, da `\n`/`\r` nie als
-// Fortsetzungsbyte einer Mehrbyte-Sequenz vorkommen.
+// `read_bounded_line` gelesenen (ggf. bereits gekürzten) Rohzeile und kürzt
+// sie danach für die Anzeige. Das Trennen auf Byte-Ebene ist UTF-8-sicher,
+// da `\n`/`\r` nie als Fortsetzungsbyte einer Mehrbyte-Sequenz vorkommen.
 fn decode_line(raw: &[u8]) -> String {
     let mut bytes = raw;
     if bytes.last() == Some(&b'\n') {
@@ -1251,6 +1363,46 @@ mod tests {
     }
 
     #[test]
+    fn test_fs_read_line_mode_bounds_memory_for_lineless_file() -> TestResult {
+        // Fund: eine Datei ohne Zeilenumbruch (z. B. ein Minified-Bundle oder
+        // eine sparse-Datei aus `truncate -s 50G x`) darf den Speicher nicht
+        // sprengen. Eine 32-MiB-sparse-Datei ohne `\n` muss trotzdem sofort
+        // mit einer einzigen gekürzten Zeile und einer Untergrenze
+        // („≥ N“) zurückkommen — begrenzt durch `MAX_SCAN_FILE_BYTES` (8 MiB)
+        // *innerhalb* der einen Zeile, nicht nur dazwischen.
+        let fixture = Fixture::new()?;
+        let path = fixture.ws.join("lineless.bin");
+        let file = fs::File::create(&path)?;
+        file.set_len(32 * 1024 * 1024)?;
+        drop(file);
+
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call("fs.read", serde_json::json!({ "path": "lineless.bin" }));
+
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => {
+                assert!(content.contains("[Zeile gekürzt]"), "{content}");
+                assert!(content.contains("von ≥ 1"), "{content}");
+                // Die Ausgabe bleibt in der Größenordnung der Ausgabegrenze,
+                // weit unter den 32 MiB der Datei — der Fix hält also
+                // tatsächlich den Speicher (und die Ausgabe) beschränkt.
+                assert!(
+                    content.len() < MAX_OUTPUT_BYTES + 4096,
+                    "Ausgabe nicht begrenzt: {} Bytes",
+                    content.len()
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_fs_read_rejects_mixed_byte_and_line_params() -> TestResult {
         let fixture = Fixture::new()?;
         fs::write(fixture.ws.join("mix.txt"), "a\nb\n")?;
@@ -1330,6 +1482,44 @@ mod tests {
                 assert!(content.contains("1\ta"), "{content}");
                 assert!(content.contains("2\tb"), "{content}");
                 assert!(content.contains("3\tc"), "{content}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_tail_mode_bounds_memory_for_lineless_file() -> TestResult {
+        // Wie im Zeilenmodus (siehe
+        // `test_fs_read_line_mode_bounds_memory_for_lineless_file`): dieselbe
+        // `read_bounded_line`-Grenze gilt auch hier, derselbe Codepfad war
+        // vor dem Fix betroffen (unbegrenztes `read_until` je Zeile).
+        let fixture = Fixture::new()?;
+        let path = fixture.ws.join("lineless_tail.bin");
+        let file = fs::File::create(&path)?;
+        file.set_len(32 * 1024 * 1024)?;
+        drop(file);
+
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call(
+            "fs.read",
+            serde_json::json!({ "path": "lineless_tail.bin", "tail": 5 }),
+        );
+
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => {
+                assert!(content.contains("[Zeile gekürzt]"), "{content}");
+                assert!(content.contains("von ≥ 1"), "{content}");
+                assert!(
+                    content.len() < MAX_OUTPUT_BYTES + 4096,
+                    "Ausgabe nicht begrenzt: {} Bytes",
+                    content.len()
+                );
             }
             other => {
                 return Err(TestError::Unexpected(format!(

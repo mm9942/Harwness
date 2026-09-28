@@ -32,15 +32,26 @@
 //! # Scopes und Speicherorte (Contract §2)
 //! - `Session`: nur die geteilten Zellen ([`ApprovalModeCell`],
 //!   [`AllowRuleSet`]) — endet mit der Sitzung.
-//! - `Global`: `~/.harw/config.toml` ([`global_config_path`]).
+//! - `Global`: `<home>/config.toml` ([`global_config_path`]).
 //! - `Project`: **autoritätsgewährend** außerhalb des Repos —
-//!   `~/.harw/profiles/<profil>/projects/<projekt-schlüssel>/settings.toml`
-//!   ([`project_config_path`]), niemals `<repo>/.harw/…`, damit ein
-//!   geklontes Repo sich keine Rechte selbst geben kann.
+//!   `<home>/profiles/<profil>/projects/<projekt-schlüssel>/settings.toml`,
+//!   niemals `<repo>/.harw/…`, damit ein geklontes Repo sich keine Rechte
+//!   selbst geben kann.
 //!
-//! Jede Mutation aktualisiert zusätzlich sofort die passende geteilte Zelle
-//! ([`ApprovalModeCell`]/[`AllowRuleSet`]), damit ein persistenter Schreib-
-//! vorgang nicht erst nach einem Neustart wirkt.
+//! Beide Pfade kommen ausschließlich aus dem einmal gebundenen
+//! [`harw_home::ResolvedHomeContext`] in der `ServiceMap` ([`scope_path`]) —
+//! **nicht** erneut aus `harw_home::home_dir()`/der Prozessumgebung. Sonst
+//! würde `harw --home /x` ignoriert: `/permissions … --global` schriebe
+//! heimlich nach `$HARW_HOME`/`~/.harw` statt nach `/x`, und eine spätere
+//! Sitzung ohne `--home` bekäme die fremde Konfiguration zu Gesicht. Fehlt
+//! der Kontext, meldet [`scope_path`] das ehrlich über
+//! [`OpError::NotAvailable`] statt einen falschen Pfad zu erraten.
+//!
+//! Jede Mutation aktualisiert die passende geteilte Zelle
+//! ([`ApprovalModeCell`]/[`AllowRuleSet`]) erst **nach** erfolgreicher
+//! Persistenz (`--project`/`--global`), damit ein fehlgeschlagener
+//! Schreibvorgang nie eine Regel oder einen Modus aktiv aussehen lässt, die
+//! nach einem Neustart wieder verschwunden wäre.
 //!
 //! # Woher der Zustand kommt
 //! Die Operation besitzt keinen eigenen Zustand. Sie liest und schreibt
@@ -57,6 +68,7 @@
 mod auto;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use harw_config::{ConfigWriter, PermissionsSection, RuleKind, RuleToml, SettingScope};
 use harw_extension_api::ApprovalMode;
@@ -86,6 +98,17 @@ pub(crate) const NO_ALLOW_RULE_SET: &str = "In dieser Laufzeit ist kein AllowRul
 pub(crate) const NO_EXTRA_ROOTS_CELL: &str = "In dieser Laufzeit ist keine ExtraRootsCell registriert — zusätzliche \
      Arbeitsverzeichnisse können nicht angezeigt werden. Die Oberfläche muss \
      eine `ExtraRootsCell` in die ServiceMap legen.";
+
+/// Meldung für den Fall, dass kein `Arc<harw_home::ResolvedHomeContext>`
+/// registriert ist.
+///
+/// Ohne diesen Kontext hat [`scope_path`] keine autoritative Quelle für
+/// `<home>` — sie darf dann nicht klammheimlich die Prozessumgebung
+/// (`harw_home::home_dir()`) befragen, denn genau das würde `--home` der
+/// Sitzung ignorieren (siehe Moduldoku).
+pub(crate) const NO_RESOLVED_HOME_CONTEXT: &str = "In dieser Laufzeit ist kein ResolvedHomeContext registriert — Global- und \
+     Projekt-Scope haben keinen Konfigurationspfad. Die Oberfläche muss einen \
+     `Arc<ResolvedHomeContext>` in die ServiceMap legen.";
 
 // ── Argumente ────────────────────────────────────────────────────────────────
 
@@ -183,69 +206,43 @@ fn set_scope_flag(slot: &mut Option<SettingScope>, value: SettingScope) -> Resul
 /// Baut den globalen, autoritätsgewährenden Config-Pfad: `<home>/config.toml`.
 ///
 /// # Arguments
-/// - `home` (`&Path`): Root-Space (siehe [`harw_home::home_dir`]).
+/// - `home` (`&Path`): Root-Space, wie ihn [`scope_path`] über den einmal
+///   gebundenen [`harw_home::ResolvedHomeContext`] liefert.
 #[must_use]
 pub(crate) fn global_config_path(home: &Path) -> PathBuf {
     home.join("config.toml")
 }
 
-/// Baut den projekt-autoritätsgewährenden Config-Pfad (Contract §2/§3):
-/// `<home>/profiles/<profil>/projects/<projekt-schlüssel>/settings.toml` —
-/// bewusst außerhalb des Repos.
-///
-/// # Arguments
-/// - `home` (`&Path`): Root-Space.
-/// - `profile` (`&str`): aktives Profil.
-/// - `markers` (`&[String]`): `project_root_markers`, leer bedeutet `[".git"]`.
-/// - `cwd` (`&Path`): Startpunkt der Projekt-Erkennung (üblicherweise der
-///   kanonische Sandbox-Root der Sitzung).
-///
-/// # Errors
-/// [`OpError::Execution`], wenn Projekt-Erkennung oder Pfadauflösung
-/// fehlschlagen (siehe [`harw_home::discover_project`],
-/// [`harw_home::project_settings_dir`]).
-pub(crate) fn project_config_path(
-    home: &Path,
-    profile: &str,
-    markers: &[String],
-    cwd: &Path,
-) -> Result<PathBuf, OpError> {
-    let project = harw_home::discover_project(cwd, markers).map_err(|error| {
-        OpError::Execution(format!("Projekt-Erkennung fehlgeschlagen: {error}"))
-    })?;
-    let key = harw_home::project_key(&project.root);
-    let dir = harw_home::project_settings_dir(home, profile, &key).map_err(|error| {
-        OpError::Execution(format!("Projekt-Settings-Pfad fehlgeschlagen: {error}"))
-    })?;
-    Ok(dir.join("settings.toml"))
-}
-
 /// Löst den Konfigurationspfad für einen [`SettingScope`] auf.
+///
+/// Liest ausschließlich den einmal gebundenen
+/// [`harw_home::ResolvedHomeContext`] aus der `ServiceMap` — **nie** erneut
+/// `harw_home::home_dir()`/die Prozessumgebung. Der Kontext trägt `<home>`
+/// und den fertig aufgelösten Projekt-Settings-Pfad bereits, weil die
+/// Kompositionswurzel (`harw-runtime`) sie einmal beim Sitzungsstart bindet
+/// (inklusive eines etwaigen `--home`); ein erneutes Auflösen hier würde
+/// diese Bindung umgehen und z. B. `--home` ignorieren (siehe Moduldoku).
 ///
 /// # Errors
 /// - [`OpError::Execution`]: `scope` ist [`SettingScope::Session`] (hat
-///   keinen Pfad — Aufrufer müssen das vorher ausschließen), oder Home-/
-///   Projekt-Auflösung schlug fehl.
+///   keinen Pfad — Aufrufer müssen das vorher ausschließen).
+/// - [`OpError::NotAvailable`]: kein `Arc<harw_home::ResolvedHomeContext>`
+///   in der `ServiceMap` registriert — fail closed statt eines geratenen
+///   Pfads.
 pub(crate) fn scope_path(ctx: &OpContext, scope: SettingScope) -> Result<PathBuf, OpError> {
     match scope {
         SettingScope::Session => Err(OpError::Execution(
             "Sitzungs-Scope hat keinen Konfigurationspfad".to_owned(),
         )),
-        SettingScope::Global => {
-            let home = harw_home::home_dir()
-                .map_err(|error| OpError::Execution(format!("Home nicht auflösbar: {error}")))?;
-            Ok(global_config_path(&home))
-        }
-        SettingScope::Project => {
-            let home = harw_home::home_dir()
-                .map_err(|error| OpError::Execution(format!("Home nicht auflösbar: {error}")))?;
-            let profile = harw_home::active_profile_name(&home);
-            let markers = crate::config_util::load_default_config("")
-                .ok()
-                .and_then(|config| config.harness.project_root_markers)
-                .unwrap_or_default();
-            let cwd = ctx.sandbox().workspace().canonical_root();
-            project_config_path(&home, &profile, &markers, cwd)
+        SettingScope::Global | SettingScope::Project => {
+            let Some(home_context) = ctx.service::<Arc<harw_home::ResolvedHomeContext>>() else {
+                return Err(OpError::NotAvailable(NO_RESOLVED_HOME_CONTEXT.to_owned()));
+            };
+            if scope == SettingScope::Global {
+                Ok(global_config_path(&home_context.home))
+            } else {
+                Ok(home_context.project_settings_path.clone())
+            }
         }
     }
 }
@@ -565,6 +562,14 @@ fn set_mode(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
 /// `/permissions allow|deny <tool> [muster] [--project|--global]`. Default
 /// `--project`.
 ///
+/// Bei `--project`/`--global` wird zuerst dauerhaft geschrieben; die
+/// geteilte Regel im [`AllowRuleSet`] wird erst nach erfolgreichem
+/// Speichern aktiviert (wie [`set_mode`]). Schlägt die Persistenz fehl,
+/// bleibt der bisherige Zustand unverändert — die Regel wirkt sonst schon
+/// für den Rest der Sitzung, obwohl der Fehler das Gegenteil nahelegt. Bei
+/// `--session` gibt es nichts zu persistieren, die Regel wird direkt
+/// aktiviert.
+///
 /// # Errors
 /// - [`OpError::InvalidArguments`]: kein `tool`, widersprüchliche Scope-Flags.
 /// - [`OpError::NotAvailable`]: kein `AllowRuleSet` registriert.
@@ -591,14 +596,9 @@ fn set_rule(ctx: &OpContext, decision: RuleDecision, tail: &[String]) -> Result<
         return Err(OpError::NotAvailable(NO_ALLOW_RULE_SET.to_owned()));
     };
 
-    let approval_rule = ApprovalRule {
-        tool: tool.clone(),
-        pattern: pattern.clone(),
-        decision,
-        scope: to_rule_scope(flags.scope),
-    };
-    rule_set.add(approval_rule);
-
+    // Erst persistieren, dann aktivieren: schlägt das Schreiben fehl, darf
+    // die Regel nicht trotzdem schon für die Sitzung wirken (siehe Doku
+    // oben und `set_mode`, das dieselbe Reihenfolge verwendet).
     let mut note = String::new();
     if flags.scope != SettingScope::Session {
         let path = scope_path(ctx, flags.scope)?;
@@ -625,6 +625,14 @@ fn set_rule(ctx: &OpContext, decision: RuleDecision, tail: &[String]) -> Result<
             }
         );
     }
+
+    let approval_rule = ApprovalRule {
+        tool: tool.clone(),
+        pattern: pattern.clone(),
+        decision,
+        scope: to_rule_scope(flags.scope),
+    };
+    rule_set.add(approval_rule);
 
     Ok(OpOutput::from(format!(
         "Regel: {tool} {} → {} ({}).{note}",
@@ -741,7 +749,7 @@ fn remove_persisted_rule(
 mod tests {
     use super::{
         ApprovalMode, PermissionsArgs, compute_mode_origin, global_config_path, parse_scope_flags,
-        permissions, project_config_path,
+        permissions,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
@@ -751,11 +759,13 @@ mod tests {
     use harw_config::{ConfigWriter, PermissionsSection, RuleKind, RuleToml, SettingScope};
     use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
     use harw_extension_api::approval_mode::ApprovalModeCell;
+    use harw_home::{ProjectKind, ProjectRoot, ResolvedHomeContext};
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError};
     use harw_sandbox::ExtraRootsCell;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Baut einen [`OpContext`] mit leerer [`ServiceMap`] — keine Zellen
@@ -940,19 +950,146 @@ mod tests {
         assert_eq!(global_config_path(&home), home.join("config.toml"));
     }
 
-    #[test]
-    fn test_project_config_path_builds_settings_toml_under_profile_projects() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).map_err(ctx("create fake git dir"))?;
-        let home = dir.path().join("home");
+    /// Baut einen [`ResolvedHomeContext`] für `home` mit einem simplen
+    /// Fake-Projekt (`ProjectKind::Directory` — kein `.git` nötig, der Test
+    /// prüft nur die Pfadauflösung, nicht die Projekt-Erkennung selbst).
+    fn resolved_home_context(home: &std::path::Path) -> TestResult<Arc<ResolvedHomeContext>> {
+        let project_dir = home.join("project");
+        std::fs::create_dir_all(&project_dir).map_err(ctx("create project dir"))?;
+        let project = ProjectRoot {
+            root: project_dir.clone(),
+            trust_key: project_dir,
+            kind: ProjectKind::Directory,
+        };
+        Ok(Arc::new(
+            ResolvedHomeContext::new(home, "default".to_owned(), project)
+                .map_err(ctx("build resolved home context"))?,
+        ))
+    }
 
-        let path =
-            project_config_path(&home, "default", &[], &repo).map_err(ctx("resolve path"))?;
-        assert!(path.starts_with(home.join("profiles/default/projects")));
-        assert_eq!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some("settings.toml")
+    /// Wie [`test_context`], zusätzlich mit einem echten
+    /// [`ResolvedHomeContext`] für `home` und einem leeren [`AllowRuleSet`]
+    /// in der `ServiceMap` — für Tests, die `/permissions allow|deny
+    /// --project|--global` gegen ein temporäres `home` fahren, statt gegen
+    /// die Prozessumgebung (Contract §2, siehe Moduldoku zu `scope_path`).
+    fn test_context_with_resolved_home(
+        home: &std::path::Path,
+    ) -> TestResult<(OpContext, AllowRuleSet)> {
+        let base = test_context()?;
+        let home_context = resolved_home_context(home)?;
+        let rule_set = AllowRuleSet::new();
+        let mut services = ServiceMap::new();
+        services.insert(home_context);
+        services.insert(rule_set.clone());
+        let op_ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+        Ok((op_ctx, rule_set))
+    }
+
+    /// Regressionstest: `scope_path` muss `<home>` aus dem gebundenen
+    /// [`ResolvedHomeContext`] nehmen, nicht aus `harw_home::home_dir()`
+    /// (das würde `--home` der Sitzung ignorieren, siehe Moduldoku).
+    #[test]
+    fn test_scope_path_global_and_project_use_the_bound_home_context() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = dir.path().join("home");
+        let home_context = resolved_home_context(&home)?;
+
+        let base = test_context()?;
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&home_context));
+        let op_ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let global_path =
+            super::scope_path(&op_ctx, SettingScope::Global).map_err(ctx("global scope_path"))?;
+        assert_eq!(global_path, home.join("config.toml"));
+
+        let project_path = super::scope_path(&op_ctx, SettingScope::Project)
+            .map_err(ctx("project scope_path"))?;
+        assert_eq!(project_path, home_context.project_settings_path);
+        assert!(project_path.starts_with(home.join("profiles/default/projects")));
+        Ok(())
+    }
+
+    /// Fail-closed: ohne gebundenen `ResolvedHomeContext` gibt es keinen
+    /// geratenen Pfad über die Prozessumgebung, sondern `NotAvailable`.
+    #[test]
+    fn test_scope_path_without_resolved_home_context_is_not_available() -> TestResult {
+        let op_ctx = test_context()?;
+        match super::scope_path(&op_ctx, SettingScope::Global) {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("ResolvedHomeContext"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable for Global, got {other:?}"
+                )));
+            }
+        }
+        match super::scope_path(&op_ctx, SettingScope::Project) {
+            Err(OpError::NotAvailable(_)) => {}
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable for Project, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Regressionstest (Finding: `/permissions … --global` schrieb an
+    /// `harw_home::home_dir()` statt an das gebundene `--home`): die
+    /// Persistenz muss im Root des `ResolvedHomeContext` landen.
+    #[tokio::test]
+    async fn permissions_allow_global_persists_to_the_bound_home_context() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = dir.path().join("home");
+        let (op_ctx, rules) = test_context_with_resolved_home(&home)?;
+
+        let output = permissions(&op_ctx, args("allow", &["fs.write", "--global"]))
+            .await
+            .map_err(crate::test_support::ctx("allow --global"))?;
+        assert!(output.text.contains("erlaubt"), "{}", output.text);
+
+        let content = std::fs::read_to_string(global_config_path(&home))
+            .map_err(ctx("read persisted config"))?;
+        assert!(content.contains("fs.write"), "{content}");
+        assert!(
+            rules
+                .snapshot()
+                .iter()
+                .any(|rule| rule.tool == "fs.write" && rule.scope == RuleScope::Global)
+        );
+        Ok(())
+    }
+
+    /// Regressionstest (set_rule-Ordering-Fix): schlägt die Persistenz fehl
+    /// (hier: der Config-Pfad ist bereits ein Verzeichnis, `ConfigWriter::open`
+    /// scheitert am Lesen), darf die Regel nicht trotzdem im geteilten
+    /// `AllowRuleSet` aktiv werden.
+    #[tokio::test]
+    async fn permissions_allow_global_does_not_activate_the_rule_when_persistence_fails()
+    -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = dir.path().join("home");
+        let (op_ctx, rules) = test_context_with_resolved_home(&home)?;
+        std::fs::create_dir_all(global_config_path(&home))
+            .map_err(ctx("block config path with a directory"))?;
+
+        let result = permissions(&op_ctx, args("allow", &["shell.exec", "--global"])).await;
+        assert!(matches!(result, Err(OpError::Execution(_))), "{result:?}");
+        assert!(
+            rules.snapshot().is_empty(),
+            "fehlgeschlagene Persistenz darf die Regel nicht aktivieren"
         );
         Ok(())
     }
@@ -1219,9 +1356,43 @@ mod tests {
         Ok(())
     }
 
+    /// Mit einem gebundenen `ResolvedHomeContext` ist der Default-Scope
+    /// `--project` deterministisch: er persistiert unter dessen
+    /// `project_settings_path`, statt (wie vor dem Fix) unter einem über
+    /// `harw_home::home_dir()`/die Prozessumgebung geratenen Pfad.
     #[tokio::test]
-    async fn permissions_allow_defaults_to_project_scope_and_updates_cell_immediately() -> TestResult
-    {
+    async fn permissions_allow_defaults_to_project_scope_and_persists_to_the_bound_home_context()
+    -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = dir.path().join("home");
+        let (op_ctx, rules) = test_context_with_resolved_home(&home)?;
+
+        let output = permissions(
+            &op_ctx,
+            PermissionsArgs {
+                cmd: Some("allow".to_owned()),
+                tail: vec!["shell.exec".to_owned(), "git status".to_owned()],
+            },
+        )
+        .await
+        .map_err(crate::test_support::ctx("allow default project scope"))?;
+        assert!(output.text.contains("erlaubt"));
+
+        let snapshot = rules.snapshot();
+        assert!(snapshot.iter().any(|r| r.tool == "shell.exec"
+            && r.pattern.as_deref() == Some("git status")
+            && r.scope == RuleScope::Project));
+        Ok(())
+    }
+
+    /// Regressionstest: ohne gebundenen `ResolvedHomeContext` darf
+    /// `/permissions allow` im Default-Scope (`--project`) nicht
+    /// klammheimlich `harw_home::home_dir()`/die Prozessumgebung befragen
+    /// und dort schreiben — sie muss fail-closed `NotAvailable` liefern,
+    /// und die Regel darf nicht trotzdem im geteilten `AllowRuleSet` landen.
+    #[tokio::test]
+    async fn permissions_allow_default_project_scope_without_home_context_is_not_available()
+    -> TestResult {
         let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
@@ -1231,17 +1402,17 @@ mod tests {
             },
         )
         .await;
-        // Project scope tries to touch a real config path; accept either a
-        // successful persist or an execution error from path resolution in
-        // this sandboxed test environment, but the in-memory rule set must
-        // reflect the mutation either way is only guaranteed on success.
-        if let Ok(output) = result {
-            assert!(output.text.contains("erlaubt"));
-            let snapshot = rules.snapshot();
-            assert!(snapshot.iter().any(|r| r.tool == "shell.exec"
-                && r.pattern.as_deref() == Some("git status")
-                && r.scope == RuleScope::Project));
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("ResolvedHomeContext"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        assert!(rules.snapshot().is_empty());
         Ok(())
     }
 
@@ -1447,11 +1618,13 @@ mod tests {
     }
 
     // ── Persistenz-Rundlauf (Contract §2), ohne echte HARW_HOME-Env-Mutation ──
-    // `global_config_path`/`project_config_path` sind reine Funktionen über
-    // einem übergebenen `home`; der Rundlauf testet sie zusammen mit
-    // `ConfigWriter` direkt gegen ein temporäres Verzeichnis, statt den
-    // Prozess-weiten `HARW_HOME`/`HOME` zu mutieren (nicht thread-sicher,
-    // würde parallel laufende Tests gefährden).
+    // `global_config_path` ist eine reine Funktion über einem übergebenen
+    // `home`; der Rundlauf testet sie zusammen mit `ConfigWriter` direkt
+    // gegen ein temporäres Verzeichnis, statt den Prozess-weiten
+    // `HARW_HOME`/`HOME` zu mutieren (nicht thread-sicher, würde parallel
+    // laufende Tests gefährden). Denselben Grund hat
+    // `resolved_home_context`/`test_context_with_resolved_home` oben: ein
+    // gebundener `ResolvedHomeContext` statt einer Env-Mutation.
 
     #[test]
     fn test_permissions_persistence_round_trip_default_mode_and_rules() -> TestResult {

@@ -9,16 +9,21 @@
 //! - Definiert [`operation::OperationMeta`], [`operation::OpInput`],
 //!   [`operation::OpOutput`] sowie Hilfstypen (Domäne, Berechtigung, Flächen).
 //! - Definiert [`error::OpError`], den Fehler-Enum dieser Crate.
-//! - Delegiert konkrete Implementierungen an eigenständige Crates
-//!   (z. B. `harw-ops-session`, `harw-ops-agents`).
-//! - Delegiert Adapter-Logik an `harw-tui`, `harw-channel` etc.
+//! - Delegiert konkrete Implementierungen an die Operations-Crate `harw-ops`
+//!   (Session-, Agent- und weitere Fach-Operationen implementieren dort
+//!   [`operation::Operation`]).
+//! - Enthält die Adapter-Logik selbst im Modul [`adapter`] (`CommandAdapter`,
+//!   `ModelToolAdapter`, `WebAdapter`); nur `AgentToolAdapter` ist wegen der
+//!   `harw-core`-Kopplung nach `harw-core-bridge` ausgelagert (siehe die
+//!   Moduldoku von [`adapter`]).
 //!
 //! # Schlüsseltypen
 //! - [`Operation`] — Kern-Trait
 //! - [`OperationMeta`] — statische Metadaten
 //! - [`OperationDomain`] — thematische Gruppierung
 //! - [`PermissionTier`] — Berechtigungsstufen (Observer → Operator → Maintainer → Owner)
-//! - [`Surface`] — deklarierte Expositionsfläche (Command oder ModelTool)
+//! - [`Surface`] — deklarierte Expositionsfläche (`Command`, `ModelTool`,
+//!   `AgentTool` oder `Web`)
 //! - [`OpInput`] / [`OpOutput`] — fläche-neutrale Ein-/Ausgabe
 //! - [`OpContext`] — unveränderlicher Ausführungs-Kontext (Session, Turn, Sandbox, Services)
 //! - [`ServiceMap`] — getypter Service-Container
@@ -39,7 +44,11 @@
 //! # Abhängigkeiten
 //! - `harw-types`: ID-Newtypes und Basisvokabular
 //! - `harw-tools`: Tool-Vokabular (ToolSpec, ToolExecutor …)
-//! - `harw-sandbox`: `SandboxSpec` (Authority-Boundary)
+//! - `harw-authority`: `SandboxSpec` (Authority-Boundary)
+//! - `harw-extension-api`: Contributor-Traits (u. a. `ToolProvider`) für
+//!   [`adapter::model_tool`]
+//! - `inventory`: Sammel-Mechanismus für statisch registrierte Built-in-Operationen
+//!   ([`registry::InventoryOp`])
 //! - `serde` / `serde_json`: Serialisierung von JSON-Argumenten in [`OpInput`]
 //!
 //! # Nebenläufigkeit

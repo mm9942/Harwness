@@ -70,9 +70,16 @@
 //! Deklariert ist `model_tool(approval = "always")`. Weil `plan` nicht in
 //! `harw_registry_defaults::AUTO_APPROVED_TOOLS` steht (W1-05), liefert die
 //! `DefaultApprovalPolicy` für jeden Modell-Aufruf im Modus `Delegated`
-//! `ApprovalDecision::AskUser` — geprüft in
-//! `harw-ops/tests/plan_authority.rs`. **Gewollt** wäre
-//! [`harw_operations::ApprovalPolicy::RequireForScope`]: die Lesezugriffe
+//! **ohne angehängtes Auto-Modus-Gate** `ApprovalDecision::AskUser` — geprüft
+//! in `harw-ops/tests/approval_declaration_gate.rs`
+//! (`no_model_tool_with_a_declared_approval_is_auto_approved`,
+//! `no_mutating_model_tool_is_auto_approved`). Dieser Test prüft aber nur die
+//! reine Namensvorhersage (`DefaultApprovalPolicy::requires_explicit_approval`),
+//! nicht `ApprovalHandler::review` selbst: hängt die Laufzeit ein
+//! Auto-Modus-Gate an (`DefaultApprovalPolicy::with_auto_gate`, Runde 5, Teil
+//! E), entscheidet dessen Urteil statt der Rückfrage — es kann `plan` unter
+//! `Delegated` auch ohne Rückfrage an die Nutzerin freigeben. **Gewollt**
+//! wäre [`harw_operations::ApprovalPolicy::RequireForScope`]: die Lesezugriffe
 //! `inspect`, `ready`, `waves` und `reconcile` verändern den Plan nicht (auch
 //! `reconcile` wendet nur Runtime-Schritte an und gibt jede Entscheidung als
 //! Vorschlag zurück) und bräuchten keine Freigabe, während jede Mutation

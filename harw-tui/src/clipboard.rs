@@ -22,7 +22,11 @@
 //! # Nebenläufigkeit
 //! Jeder Aufruf spawnt höchstens einen Kindprozess synchron über
 //! `std::process::Command` (kein Tokio) und wartet mit einem 5-Sekunden-
-//! Zeitlimit per Polling. Kein Shared State zwischen Aufrufen.
+//! Zeitlimit per Polling. Das Schreiben auf `stdin` läuft in einem
+//! entkoppelten Hilfsthread, damit ein Werkzeug, das `stdin` nicht liest
+//! (z. B. `xclip` mit unerreichbarem `DISPLAY`), den aufrufenden Thread
+//! nicht über das Zeitlimit hinaus blockiert. Kein Shared State zwischen
+//! Aufrufen.
 //!
 //! # Fehlertypen
 //! [`crate::export::ExportError::NoClipboard`] bei fehlgeschlagenem Kopieren
@@ -80,6 +84,18 @@ pub enum ClipboardTarget {
 /// Kandidaten versucht. Nach [`CLIPBOARD_TIMEOUT`] ohne Prozessende wird der
 /// Kindprozess beendet und `false` zurückgegeben.
 ///
+/// Das Zeitlimit läuft ab dem Spawn, nicht erst ab Schreibende: Das
+/// Schreiben von `text` auf `stdin` geschieht in einem entkoppelten
+/// Hilfsthread. Liest das Werkzeug `stdin` nicht (z. B. weil `XOpenDisplay`
+/// bei nicht erreichbarem `DISPLAY` hängt) und übersteigt `text` den
+/// Pipe-Puffer (üblicherweise ~64 KiB), würde `write_all` sonst unbegrenzt
+/// blockieren; im Hilfsthread blockiert es höchstens den Hilfsthread selbst.
+/// Läuft das Zeitlimit ab, wird der Kindprozess getötet — das schließt
+/// dessen Lese-Ende der Pipe, wodurch der blockierende `write_all` im
+/// Hilfsthread mit einem Fehler (`EPIPE`) zurückkehrt und der Hilfsthread
+/// endet. Der Hilfsthread wird bewusst nicht eingesammelt (`detach`), da er
+/// nach Prozessende bzw. -abbruch selbst terminiert.
+///
 /// # Argumente
 /// - `program` (`&str`): Name des Binärprogramms.
 /// - `args` (`&[&str]`): Kommandozeilenargumente.
@@ -89,7 +105,9 @@ pub enum ClipboardTarget {
 /// `true` bei erfolgreichem Exit-Code `0`, sonst `false`.
 ///
 /// # Nebenläufigkeit
-/// Synchron; blockiert den aufrufenden Thread höchstens [`CLIPBOARD_TIMEOUT`].
+/// Der aufrufende Thread blockiert höchstens [`CLIPBOARD_TIMEOUT`] beim
+/// Warten auf das Prozessende; das Schreiben auf `stdin` läuft parallel in
+/// einem eigenen, kurzlebigen Hilfsthread.
 fn spawn_and_write(program: &str, args: &[&str], text: &str) -> bool {
     let mut child = match Command::new(program)
         .args(args)
@@ -102,17 +120,23 @@ fn spawn_and_write(program: &str, args: &[&str], text: &str) -> bool {
         Err(_) => return false,
     };
 
+    // Das Zeitlimit beginnt hier, unmittelbar nach dem Spawn — nicht erst
+    // nachdem `text` vollständig geschrieben wurde.
+    let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
+
     if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        }
-        // `stdin` wird hier gedroppt und schließt damit die Pipe, sodass das
-        // Zwischenablage-Werkzeug EOF sieht und beendet.
+        let owned_text = text.to_owned();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(owned_text.as_bytes());
+            // `stdin` wird hier gedroppt und schließt damit die Pipe, sodass
+            // das Zwischenablage-Werkzeug EOF sieht und beendet. Schlägt der
+            // Schreibvorgang fehl (z. B. weil der Aufrufer nach Ablauf des
+            // Zeitlimits den Kindprozess getötet hat), ist das unschädlich —
+            // der Aufrufer hat den Fall bereits als „nicht verfügbar“
+            // gewertet.
+        });
     }
 
-    let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
@@ -429,6 +453,41 @@ mod tests {
         let seq = osc52_sequence("").map_err(ctx("leerer Text passt"))?;
         let wrapped = wrap_osc52_for_tmux(&seq);
         assert_eq!(wrapped, "\x1bPtmux;\x1b\x1b]52;c;\x07\x1b\\");
+        Ok(())
+    }
+
+    /// Regressionstest: Ein „Werkzeug“, das `stdin` nie liest (hier über
+    /// `sleep`, das seine Pipe niemals leert), darf den aufrufenden Thread
+    /// nicht über [`CLIPBOARD_TIMEOUT`] hinaus blockieren — selbst wenn die
+    /// Nutzlast den Pipe-Puffer (~64 KiB) übersteigt und `write_all` daher
+    /// ohne Hilfsthread unbegrenzt blockieren würde.
+    ///
+    /// Nur unter Unix: `sleep` liest garantiert nicht von `stdin` und
+    /// existiert dort verlässlich. Unter Windows gäbe es kein `sleep`-
+    /// Binärprogramm, `spawn` schlüge sofort fehl und der Test prüfte gar
+    /// nichts vom eigentlichen Verhalten.
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_and_write_does_not_block_past_timeout_on_unread_stdin() -> TestResult {
+        // Deutlich größer als der typische Pipe-Puffer, damit ein
+        // synchrones `write_all` vor Beginn des Zeitlimits blockieren würde.
+        let large_text = "x".repeat(1024 * 1024);
+
+        let start = Instant::now();
+        let ok = spawn_and_write("sleep", &["30"], &large_text);
+        let elapsed = start.elapsed();
+
+        if ok {
+            return Err(TestError::Unexpected(
+                "sleep(30) darf sich nicht erfolgreich innerhalb des Zeitlimits beenden"
+                    .to_owned(),
+            ));
+        }
+        if elapsed >= CLIPBOARD_TIMEOUT + Duration::from_secs(2) {
+            return Err(TestError::Unexpected(format!(
+                "spawn_and_write hat zu lange blockiert: {elapsed:?}"
+            )));
+        }
         Ok(())
     }
 }

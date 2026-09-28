@@ -9,6 +9,10 @@
 //! `apply`/`apply_batch`: Snapshot und Siegel stagen → alle History-Zeilen in
 //! **einem** Append schreiben (bei Fehler auf die alte Länge kürzen) → Siegel
 //! veröffentlichen → Snapshot veröffentlichen → RAM-Cache aktualisieren.
+//! Der History-Append ist der Commit-Punkt: scheitern danach Siegel, Snapshot
+//! oder Kompaktierung, meldet das nur ein `warn!`. RAM-Cache und
+//! Revisionsfolge rücken trotzdem vor (sonst vergäbe die nächste Aktion
+//! dieselbe Revision); beim Laden gelten der vorige Checkpoint plus History.
 //!
 //! # Pfad-Sicherheit (F-013, G-032)
 //! Jede `PlanId` wird vor dem `join` unter `<root>/plans/` gegen die Grammatik
@@ -19,10 +23,17 @@
 //!
 //! # Integritätssiegel
 //! Siehe [`seal`]: BLAKE3-Digest des Snapshots plus Kettenwert über die
-//! Vorgänger-Revision. Das Siegel ist **ungeschlüsselt** — es erkennt
-//! Beschädigung und naive Manipulation (Snapshot editiert, Siegel gelöscht
-//! oder vertauscht), nicht aber einen Angreifer mit Schreibrecht auf
-//! `HARW_HOME`, der Snapshot und Siegel konsistent neu berechnet.
+//! Vorgänger-Revision. Mit dem ersten veröffentlichten Checkpoint entsteht die
+//! Marke `<plan_id>/sealed`, die die Kompaktierung stehen lässt: ein einmal
+//! versiegelter Plan lädt nie wieder als Legacy-Stand. Die History-Zeilen nach
+//! dem Checkpoint trägt kein Siegel; beim Laden müssen ihre Revisionen streng
+//! steigen und jede Zeile muss `validate_with` (gegen die aktuelle
+//! Konfiguration) bestehen, sonst wird der Plan abgewiesen. Das Siegel ist
+//! **ungeschlüsselt** — es erkennt Beschädigung und naive Manipulation
+//! (Snapshot editiert, Siegel gelöscht oder vertauscht, regelwidrige
+//! History-Zeile), nicht aber einen Angreifer mit Schreibrecht auf
+//! `HARW_HOME`, der Snapshot und Siegel konsistent neu berechnet, Siegel samt
+//! Marke löscht oder regelkonforme History-Zeilen anhängt.
 //!
 //! Die Mutationslogik selbst liegt **nicht** hier, sondern in
 //! `crate::mutation` (über `crate::store::stage_actions`) — dieselbe Funktion,
@@ -66,9 +77,15 @@ use crate::ids::{PlanId, RevisionId};
 use crate::mutation::apply_mutation;
 use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
 use crate::types::{Plan, PlanNodeStatus};
+use crate::validate::validate_with;
 
-/// Höchstens neun History-Ereignisse müssen nach einem Checkpoint nachgespielt werden.
+/// Höchstens neun History-Ereignisse müssen nach einem Checkpoint nachgespielt
+/// werden (mehr nur, wenn ein Checkpoint nach dem Append nicht erschien).
 const CHECKPOINT_INTERVAL: u64 = 10;
+
+/// Marke im Plan-Verzeichnis: entsteht mit dem ersten veröffentlichten
+/// Checkpoint (Siegel plus Snapshot) und bleibt bei der Kompaktierung stehen.
+const SEALED_MARKER: &str = "sealed";
 
 /// Integritätssiegel für Snapshot-Dateien (crate-privat, geteilt mit
 /// `goal_store::FileGoalStore`).
@@ -84,9 +101,9 @@ const CHECKPOINT_INTERVAL: u64 = 10;
 /// # Prüfung beim Laden
 /// Digest, Revision, Kettenwert und — falls vorhanden — der Kettenwert des
 /// Vorgängersiegels müssen stimmen. Fehlt das Siegel in einem Verzeichnis, das
-/// bereits Siegel enthält, ist das eine Manipulation. Ein Verzeichnis ganz ohne
-/// Siegel gilt als Legacy-Stand: einmal `warn!`, der nächste Schreibvorgang
-/// versiegelt.
+/// als versiegelt gilt (es enthält Siegel oder — beim Plan-Store — die Marke
+/// `sealed`), ist das eine Manipulation. Ein Verzeichnis ohne beides gilt als
+/// Legacy-Stand: einmal `warn!`, der nächste Schreibvorgang versiegelt.
 ///
 /// # Grenzen
 /// Ungeschlüsselt: erkennt Beschädigung und naive Manipulation, nicht einen
@@ -227,11 +244,11 @@ pub(crate) mod seal {
     /// - `snapshot_path` (`&Path`): Pfad des `rev-<n>.json`.
     /// - `revision` (`u64`): Revision laut Dateiname.
     /// - `bytes` (`&[u8]`): exakt die gelesenen Snapshot-Bytes.
-    /// - `dir_sealed` (`bool`): enthält das Verzeichnis bereits Siegel?
+    /// - `dir_sealed` (`bool`): gilt das Verzeichnis bereits als versiegelt?
     ///
     /// # Returns
     /// `Some(SealLink)` bei gültigem Siegel, `None` bei einem Legacy-Stand
-    /// (Verzeichnis ohne jedes Siegel; es wird einmal gewarnt).
+    /// (unversiegeltes Verzeichnis; es wird einmal gewarnt).
     ///
     /// # Errors
     /// - [`PlanError::SealMismatch`]: Siegel fehlt (in versiegeltem
@@ -468,11 +485,14 @@ impl StagedWrite {
 /// use harw_plan::actions::PlanAction;
 /// use harw_plan::ids::PlanId;
 ///
-/// let store = FilePlanStore::new("/tmp/myplans").unwrap();
+/// # fn main() -> harw_plan::error::PlanResult<()> {
+/// let store = FilePlanStore::new("/tmp/myplans")?;
 /// store.apply(PlanAction::Create {
-///     plan_id: PlanId::parse("p-1").unwrap(),
+///     plan_id: PlanId::parse("p-1")?,
 ///     goal: "Ziel".to_owned(),
-/// }, "orchestrator").unwrap();
+/// }, "orchestrator")?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct FilePlanStore {
     inner: RwLock<Inner>,
@@ -515,7 +535,8 @@ impl FilePlanStore {
     ///
     /// Die Konfiguration wird vor dem Anlegen des Wurzelverzeichnisses geprüft.
     /// Ein bereits vorhandener Plan wird vor dem Exponieren des Stores gegen
-    /// sein Integritätssiegel und das Knotenlimit validiert.
+    /// sein Integritätssiegel und das Knotenlimit validiert; seine
+    /// History-Zeilen nach dem Checkpoint gegen die Planregeln.
     ///
     /// # Errors
     /// - [`PlanError::Config`] wenn die Konfiguration deaktiviert oder ungültig ist.
@@ -524,11 +545,14 @@ impl FilePlanStore {
     ///   nicht passt.
     /// - [`PlanError::InvalidId`] wenn der Snapshot eine andere ID trägt als
     ///   sein Verzeichnis.
+    /// - [`PlanError::RevisionRegressed`] bzw. der Validierungsfehler, wenn die
+    ///   History des aktiven Plans doppelte Revisionen oder eine regelwidrige
+    ///   Zeile nach dem Checkpoint enthält.
     pub fn with_config(root: impl AsRef<Path>, config: PlanToolConfig) -> PlanResult<Self> {
         config.require_enabled().map_err(PlanError::Config)?;
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let loaded = Self::load(&root)?;
+        let loaded = Self::load(&root, &config)?;
         // Wie bisher wird der aktive Plan gegen die Konfiguration geprüft;
         // inaktive Pläne erst, wenn sie per Mutation wieder angefasst werden.
         if let Some(active) = &loaded.active
@@ -559,10 +583,10 @@ impl FilePlanStore {
     /// früheren Einzelplan-Stores.
     ///
     /// # Errors
-    /// Lese-, Siegel- und ID-Fehler des **aktiven** Plans sowie ein
-    /// unlesbarer Index. Fehler inaktiver Pläne werden mit `warn!`
-    /// übersprungen.
-    fn load(root: &Path) -> PlanResult<LoadedCatalog> {
+    /// Lese-, Siegel-, ID- und History-Fehler (siehe `load_plan`) des
+    /// **aktiven** Plans sowie ein unlesbarer Index. Fehler inaktiver Pläne
+    /// werden mit `warn!` übersprungen.
+    fn load(root: &Path, config: &PlanToolConfig) -> PlanResult<LoadedCatalog> {
         let plans_root = root.join("plans");
         let index = Self::read_index(root)?;
         if !plans_root.exists() {
@@ -633,7 +657,7 @@ impl FilePlanStore {
         let mut plans = Vec::with_capacity(candidates.len());
         for (plan_id, file_revision, snapshot_path) in candidates {
             let is_active = active.as_ref() == Some(&plan_id);
-            match Self::load_plan(root, &plan_id, file_revision, &snapshot_path) {
+            match Self::load_plan(root, config, &plan_id, file_revision, &snapshot_path) {
                 Ok(loaded) => {
                     let meta = index
                         .as_ref()
@@ -668,16 +692,23 @@ impl FilePlanStore {
 
     /// Lädt einen Plan aus seinem Verzeichnis: neuester Snapshot (gegen sein
     /// Siegel geprüft, muss die ID seines Verzeichnisses tragen) plus alle
-    /// späteren History-Ereignisse.
+    /// späteren History-Ereignisse, jedes über `validate_with` geprüft.
+    ///
+    /// # Errors
+    /// Zusätzlich zu Lese- und Siegelfehlern: [`PlanError::RevisionRegressed`]
+    /// bei nicht streng steigenden History-Revisionen, [`PlanError::PlanExists`]
+    /// für ein `Create` nach dem Checkpoint und jeder Validierungsfehler einer
+    /// nachgespielten Zeile.
     fn load_plan(
         root: &Path,
+        config: &PlanToolConfig,
         plan_id: &PlanId,
         file_revision: RevisionId,
         snapshot_path: &Path,
     ) -> PlanResult<LoadedPlan> {
         let bytes = std::fs::read(snapshot_path)?;
         let plan_dir = Self::plan_dir(root, plan_id)?;
-        let dir_sealed = seal::directory_is_sealed(&plan_dir)?;
+        let dir_sealed = Self::dir_is_sealed(&plan_dir)?;
         let seal_link = seal::verify(snapshot_path, file_revision.value(), &bytes, dir_sealed)?;
         let plan: Plan = serde_json::from_slice(&bytes)?;
         if &plan.id != plan_id {
@@ -705,21 +736,41 @@ impl FilePlanStore {
         };
         // Der Snapshot ist nur ein Checkpoint. Alle späteren Events sind die
         // maßgebliche Fortsetzung und werden ohne neue History-Einträge erneut
-        // auf den geladenen Zustand angewendet.
+        // auf den geladenen Zustand angewendet — über dieselbe Validierung wie
+        // `stage_actions`, denn diese Zeilen trägt kein Siegel. Eine doppelte
+        // Revision hieße, dass eine der beiden Aktionen still verloren ginge.
         let mut plan = plan;
+        let mut last: Option<RevisionId> = None;
         for event in &history {
+            if let Some(previous) = last.filter(|previous| event.revision <= *previous) {
+                return Err(PlanError::RevisionRegressed {
+                    current: previous,
+                    attempted: event.revision,
+                });
+            }
+            last = Some(event.revision);
             if event.revision <= plan.revision {
                 continue;
+            }
+            if matches!(event.action, PlanAction::Create { .. }) {
+                return Err(PlanError::PlanExists {
+                    id: plan_id.clone(),
+                });
+            }
+            if let Err(error) = validate_with(&plan, &event.action, config, event.applied_at) {
+                warn!(
+                    plan_id = %plan_id,
+                    revision = %event.revision,
+                    error = %error,
+                    "History-Zeile verletzt die Planregeln; Plan wird abgewiesen"
+                );
+                return Err(error);
             }
             apply_mutation(&mut plan, &event.action, &event.actor, event.applied_at);
             plan.updated_at = event.applied_at;
             plan.revision = event.revision;
         }
-        let history_revision = history
-            .iter()
-            .map(|event| event.revision)
-            .max()
-            .unwrap_or(RevisionId::new(0));
+        let history_revision = last.unwrap_or(RevisionId::new(0));
         let next_revision = file_revision
             .max(plan.revision)
             .max(history_revision)
@@ -732,27 +783,60 @@ impl FilePlanStore {
         })
     }
 
-    /// `true`, wenn `dir` mindestens einen Snapshot `rev-<n>.json` enthält.
+    /// `true`, wenn `dir` bereits einen Plan trägt: mindestens einen Snapshot
+    /// `rev-<n>.json` oder eine nicht leere `history.jsonl`.
     ///
-    /// Ein Verzeichnis ohne Snapshot (etwa Reste eines fehlgeschlagenen
-    /// ersten `Create`) blockiert ein neues `Create` derselben ID nicht.
-    fn dir_holds_snapshot(dir: &Path) -> PlanResult<bool> {
+    /// Reste eines vor dem History-Append gescheiterten ersten `Create` (kein
+    /// Snapshot, leere History) blockieren ein neues `Create` derselben ID
+    /// nicht. Eine nicht leere History schon: sie vergibt Revision 1 bereits,
+    /// auch wenn ihr Checkpoint nach dem Append nicht erschienen ist.
+    fn dir_holds_plan(dir: &Path) -> PlanResult<bool> {
         if !dir.is_dir() {
             return Ok(false);
         }
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            let is_snapshot = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix("rev-"))
-                .and_then(|rest| rest.strip_suffix(".json"))
-                .is_some_and(|number| number.parse::<u64>().is_ok());
-            if is_snapshot {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let occupied = if name == "history.jsonl" {
+                let meta = entry.metadata()?;
+                meta.is_file() && meta.len() > 0
+            } else {
+                name.strip_prefix("rev-")
+                    .and_then(|rest| rest.strip_suffix(".json"))
+                    .is_some_and(|number| number.parse::<u64>().is_ok())
+            };
+            if occupied {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// `true`, wenn `dir` je versiegelt wurde: Marke [`SEALED_MARKER`] oder
+    /// mindestens ein Siegel.
+    ///
+    /// # Errors
+    /// - [`PlanError::Io`] bei Lesefehler.
+    fn dir_is_sealed(dir: &Path) -> PlanResult<bool> {
+        if dir.join(SEALED_MARKER).try_exists()? {
+            return Ok(true);
+        }
+        seal::directory_is_sealed(dir)
+    }
+
+    /// Legt die Marke [`SEALED_MARKER`] atomar an, falls sie fehlt.
+    ///
+    /// # Errors
+    /// - [`PlanError::Io`] bei Schreibfehler.
+    fn mark_sealed(dir: &Path) -> PlanResult<()> {
+        let marker = dir.join(SEALED_MARKER);
+        if marker.try_exists()? {
+            return Ok(());
+        }
+        Self::stage_atomic_write(&marker, b"harw-plan-seal:v1\n")?.commit()
     }
 
     /// Pfad des Katalog-Index.
@@ -916,7 +1000,8 @@ impl FilePlanStore {
 
     /// Entfernt nach einem erfolgreich veröffentlichten Checkpoint alle älteren
     /// Snapshots und Siegel. `history.jsonl` bleibt unverändert die vollständige
-    /// Audit-Historie. Der Checkpoint beginnt bewusst eine neue Siegelkette;
+    /// Audit-Historie, die Marke [`SEALED_MARKER`] bleibt stehen. Der
+    /// Checkpoint beginnt bewusst eine neue Siegelkette;
     /// dadurch ist seine Integrität ohne bereits gelöschte Vorgänger prüfbar.
     fn compact_checkpoints(root: &Path, plan_id: &PlanId, keep: RevisionId) -> PlanResult<()> {
         let dir = Self::plan_dir(root, plan_id)?;
@@ -943,6 +1028,20 @@ impl FilePlanStore {
         Self::sync_parent_directory(&dir.join("history.jsonl"))
     }
 
+    /// Hängt `events` an und veröffentlicht bei einem Checkpoint Siegel,
+    /// Snapshot und Marke.
+    ///
+    /// Der History-Append ist der Commit-Punkt. Danach beschleunigen Siegel,
+    /// Snapshot und Kompaktierung nur das Laden: ihr Scheitern meldet `warn!`
+    /// und liefert `Ok(None)` (bzw. das neue Kettenglied, wenn nur Marke oder
+    /// Kompaktierung scheitern), damit der Aufrufer RAM-Cache und
+    /// Revisionsfolge nach jedem dauerhaften Append vorrückt. Ohne sichtbares
+    /// Siegel wird der Snapshot verworfen; der vorige Checkpoint plus History
+    /// bleiben maßgeblich, der nächste Checkpoint holt beides nach.
+    ///
+    /// # Errors
+    /// Serialisierungs-, Staging- und Append-Fehler — alle vor dem
+    /// Commit-Punkt, es ist dann nichts sichtbar.
     fn publish(
         root: &Path,
         candidate: &Plan,
@@ -953,6 +1052,7 @@ impl FilePlanStore {
             return Ok(None);
         }
         let bytes = serde_json::to_vec_pretty(candidate)?;
+        let plan_dir = Self::plan_dir(root, &candidate.id)?;
         let plan_path = Self::plan_path(root, &candidate.id, candidate.revision)?;
         // Checkpoints are self-contained because compaction deletes their
         // predecessor snapshots and seals.
@@ -970,12 +1070,40 @@ impl FilePlanStore {
             staged_snapshot.discard();
             return Err(error);
         }
+        // Ab hier ist die Revision dauerhaft vergeben.
         if let Err(error) = staged_seal.commit() {
+            // Ein Snapshot ohne Siegel wäre in einem versiegelten Verzeichnis
+            // beim Laden eine Manipulation.
             staged_snapshot.discard();
-            return Err(error);
+            warn!(
+                plan_id = %candidate.id,
+                revision = %candidate.revision,
+                error = %error,
+                "Checkpoint-Siegel nach dem History-Append nicht veröffentlicht"
+            );
+            return Ok(None);
         }
-        staged_snapshot.commit()?;
-        Self::compact_checkpoints(root, &candidate.id, candidate.revision)?;
+        if let Err(error) = staged_snapshot.commit() {
+            warn!(
+                plan_id = %candidate.id,
+                revision = %candidate.revision,
+                error = %error,
+                "Checkpoint-Snapshot nach dem History-Append nicht veröffentlicht"
+            );
+            return Ok(None);
+        }
+        // Die Marke muss vor der Kompaktierung liegen: danach bleibt nur ein
+        // Siegel, dessen Löschen sonst wie ein Legacy-Stand aussähe. Ohne Marke
+        // bleiben die älteren Siegel bis zum nächsten Checkpoint liegen.
+        let finished = Self::mark_sealed(&plan_dir)
+            .and_then(|()| Self::compact_checkpoints(root, &candidate.id, candidate.revision));
+        if let Err(error) = finished {
+            warn!(
+                plan_id = %candidate.id,
+                error = %error,
+                "Siegel-Marke oder Kompaktierung nach dem Checkpoint unvollständig"
+            );
+        }
         Ok(Some(link))
     }
 }
@@ -1045,7 +1173,7 @@ impl FilePlanStore {
             }
             // Auch ein nicht ladbares Verzeichnis derselben ID (etwa ein
             // übersprungener, beschädigter Plan) wird nicht überschrieben.
-            if Self::dir_holds_snapshot(&Self::plan_dir(&inner.root, &plan_id)?)? {
+            if Self::dir_holds_plan(&Self::plan_dir(&inner.root, &plan_id)?)? {
                 return Err(PlanError::PlanExists { id: plan_id });
             }
 
@@ -1796,6 +1924,7 @@ mod tests {
         let plan_dir = dir.path().join("plans").join("p-seal");
         assert!(plan_dir.join("rev-1.seal").exists());
         assert!(!plan_dir.join("rev-2.seal").exists());
+        assert!(plan_dir.join(SEALED_MARKER).is_file(), "Siegel-Marke fehlt");
 
         let reloaded = make_store(&dir)?;
         assert_eq!(reloaded.current()?.nodes.len(), 1);
@@ -1839,19 +1968,21 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_without_seal_loads_as_legacy() -> TestResult {
+    fn test_deleted_checkpoint_seal_is_rejected_on_load() -> TestResult {
         let dir = TempDir::new()?;
-        drop(seeded_store(&dir, "p-legacy-seal")?);
-        // A single retained checkpoint has no predecessor seal that could mark
-        // the directory as sealed. This intentionally remains compatible with
-        // pre-seal stores; the next checkpoint writes a fresh seal.
+        drop(seeded_store(&dir, "p-seal-gone")?);
+        // Nach der Kompaktierung liegt nur ein Siegel; die Marke verhindert,
+        // dass sein Löschen den Plan zum Legacy-Stand macht.
         std::fs::remove_file(
             dir.path()
                 .join("plans")
-                .join("p-legacy-seal")
+                .join("p-seal-gone")
                 .join("rev-1.seal"),
         )?;
-        assert!(FilePlanStore::new(dir.path()).is_ok());
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::SealMismatch { .. })
+        ));
         Ok(())
     }
 
@@ -1860,7 +1991,9 @@ mod tests {
         let dir = TempDir::new()?;
         drop(seeded_store(&dir, "p-legacy")?);
         let plan_dir = dir.path().join("plans").join("p-legacy");
+        // Altbestand vor den Siegeln: weder Siegel noch Marke.
         std::fs::remove_file(plan_dir.join("rev-1.seal"))?;
+        std::fs::remove_file(plan_dir.join(SEALED_MARKER))?;
 
         let legacy = make_store(&dir)?;
         assert_eq!(legacy.current()?.nodes.len(), 1, "Legacy lädt");
@@ -1878,6 +2011,7 @@ mod tests {
                     plan_dir.join("rev-10.seal").exists(),
                     "Checkpoint versiegelt"
                 );
+                assert!(plan_dir.join(SEALED_MARKER).is_file(), "Marke erneuert");
             }
         }
 
@@ -1912,6 +2046,133 @@ mod tests {
         let reloaded = make_store(&dir)?;
         assert_eq!(reloaded.revision(), RevisionId::new(11));
         assert_eq!(reloaded.history(None)?.len(), 11);
+        Ok(())
+    }
+
+    // ── History-Replay und Commit-Punkt ────────────────────────────────────
+
+    #[test]
+    fn test_history_line_violating_rules_is_rejected_on_load() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = seeded_store(&dir, "p-forged")?;
+        for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
+            store.apply(
+                PlanAction::SetStatus {
+                    id: TaskId::new("t1"),
+                    status,
+                    reason: None,
+                },
+                "a",
+            )?;
+        }
+        drop(store);
+        // Handangehängt: Completed ohne Evidenz verletzt Regel 4.
+        let forged = PlanEvent {
+            revision: RevisionId::new(5),
+            action: PlanAction::SetStatus {
+                id: TaskId::new("t1"),
+                status: PlanNodeStatus::Completed,
+                reason: None,
+            },
+            actor: "hand".to_owned(),
+            applied_at: OffsetDateTime::now_utc(),
+        };
+        let history = dir.path().join("plans").join("p-forged").join("history.jsonl");
+        let mut file = std::fs::OpenOptions::new().append(true).open(&history)?;
+        writeln!(file, "{}", serde_json::to_string(&forged)?)?;
+        drop(file);
+
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::EvidenceMissing { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_history_revision_is_rejected_on_load() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-dup")?);
+        let history = dir.path().join("plans").join("p-dup").join("history.jsonl");
+        let content = std::fs::read_to_string(&history)?;
+        let last = content
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or(TestError::Missing("letzte History-Zeile"))?;
+        std::fs::write(&history, format!("{content}{last}\n"))?;
+
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::RevisionRegressed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_failed_seal_after_history_append_still_advances_revision() -> TestResult {
+        let dir = TempDir::new()?;
+        let plan_dir = dir.path().join("plans").join("p-commit");
+        {
+            let store = seeded_store(&dir, "p-commit")?;
+            // Ein Verzeichnis an der Siegelposition lässt den Rename scheitern.
+            std::fs::create_dir(plan_dir.join("rev-3.seal"))?;
+            let terminal = store.apply(
+                PlanAction::SetStatus {
+                    id: TaskId::new("t1"),
+                    status: PlanNodeStatus::Superseded,
+                    reason: None,
+                },
+                "a",
+            )?;
+            assert_eq!(terminal.revision, RevisionId::new(3));
+            assert!(!plan_dir.join("rev-3.json").exists(), "kein Snapshot ohne Siegel");
+            std::fs::remove_dir(plan_dir.join("rev-3.seal"))?;
+            let next = store.apply(
+                PlanAction::AddNode {
+                    node: make_node("t2"),
+                },
+                "a",
+            )?;
+            assert_eq!(next.revision, RevisionId::new(4), "keine Revision doppelt");
+        }
+
+        let reloaded = make_store(&dir)?;
+        let plan = reloaded.current()?;
+        assert_eq!(plan.revision, RevisionId::new(4));
+        assert!(plan.nodes.iter().any(|node| node.id == TaskId::new("t2")));
+        assert!(plan.nodes.iter().any(|node| {
+            node.id == TaskId::new("t1") && node.status == PlanNodeStatus::Superseded
+        }));
+        let revisions: Vec<u64> = reloaded
+            .history(None)?
+            .iter()
+            .map(|event| event.revision.value())
+            .collect();
+        assert_eq!(revisions, vec![1, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_is_rejected_when_history_exists_without_snapshot() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-orphan")?);
+        // Stand nach einem Create, dessen Checkpoint nach dem Append nicht
+        // erschienen ist: History ja, Snapshot nein.
+        let plan_dir = dir.path().join("plans").join("p-orphan");
+        std::fs::remove_file(plan_dir.join("rev-1.json"))?;
+        std::fs::remove_file(plan_dir.join("rev-1.seal"))?;
+
+        let store = make_store(&dir)?;
+        let result = store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-orphan"),
+                goal: "würde Revision 1 doppelt vergeben".to_owned(),
+            },
+            "orchestrator",
+        );
+        assert!(matches!(result, Err(PlanError::PlanExists { .. })));
+        assert_eq!(history_lines(&dir, "p-orphan")?, 2, "History unberührt");
         Ok(())
     }
 

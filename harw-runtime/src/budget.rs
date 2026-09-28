@@ -72,8 +72,8 @@ const GATEWAY_MAX_ROUNDS: u32 = 16;
 /// Maximale Tokens eines Gateway-Turns.
 ///
 /// # Beschreibung
-/// Wörtlich `DREAM_MAX_TOKENS` aus `harw-cli/src/gateway.rs:279`, die
-/// bestehende Obergrenze des einzigen heute montierten Gateways.
+/// Früher `DREAM_MAX_TOKENS` in `harw-cli/src/gateway.rs`, dort mit
+/// fce85fc entfernt; seitdem ist diese Konstante die Quelle.
 const GATEWAY_MAX_TOKENS: u64 = 16_384;
 /// Maximale Wanduhrzeit eines Gateway-Turns (5 min).
 const GATEWAY_MAX_WALL_SECS: u64 = 300;
@@ -126,10 +126,12 @@ impl RootBudget {
     /// leistet das Tier ([`crate::sandbox::permissions_for_tier`]), nicht das
     /// Budget.
     ///
-    /// Die Job- und Gateway-Zahlen sind keine Erfindung dieser Datei, sondern
-    /// die bereits geltenden Obergrenzen des Workspace (siehe
-    /// die Konstanten `JOB_MAX_TOKENS`, `JOB_MAX_WALL_SECS` und
-    /// `GATEWAY_MAX_TOKENS` in dieser Datei).
+    /// Die Job-Zahlen sind keine Erfindung dieser Datei, sondern die bereits
+    /// geltenden Obergrenzen des Workspace (siehe die Konstanten
+    /// `JOB_MAX_TOKENS` und `JOB_MAX_WALL_SECS` in dieser Datei). Die
+    /// Gateway-Zahl war das früher ebenso; seit `DREAM_MAX_TOKENS` mit
+    /// fce85fc aus `harw-cli/src/gateway.rs` entfernt wurde, ist
+    /// `GATEWAY_MAX_TOKENS` (ebenfalls in dieser Datei) selbst die Quelle.
     ///
     /// # Argumente
     /// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration. Trägt

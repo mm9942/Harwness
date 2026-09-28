@@ -40,7 +40,16 @@
 //!   [`DefinitionWriteMode::Commit`] und nur mit gesetzter Decke**: validiert
 //!   den Vorschlag erneut, rechnet beide Deltas erneut — **gegen die Decke
 //!   des committenden Aufrufers**, die von der Decke des ursprünglichen
-//!   Autors abweichen kann — und schreibt danach ans Ziel.
+//!   Autors abweichen kann — und schreibt danach ans Ziel. Nur `definition.toml`
+//!   selbst gilt dabei als vertrauenswürdig genug, um erneut geparst zu
+//!   werden; jedes andere Feld aus `proposal.json` (`kind`, `scope`, `name`,
+//!   `dir_name`, `expires_at`) wird ebenfalls erneut geprüft, nicht
+//!   ungeprüft in einen Schreibpfad übernommen — ein fehlendes oder
+//!   unparsbares `expires_at` gilt als abgelaufen, `scope` muss exakt
+//!   `"project"` oder `"profile"` sein, `name`/`dir_name` müssen
+//!   [`is_valid_slug`] erfüllen, und `kind` muss zur `role` aus der
+//!   (erneut validierten) `definition.toml` passen (siehe
+//!   [`commit_definition_proposal`]/[`commit_uia_proposal`]).
 //! - `agents.reject_proposal {proposal_id, reason}` **nur im
 //!   [`DefinitionWriteMode::Commit`] und nur mit gesetzter Decke**.
 //!
@@ -153,16 +162,17 @@ fn now_rfc3339() -> String {
 }
 
 /// Parst einen RFC-3339-Zeitstempel und prüft, ob er in der Vergangenheit
-/// liegt. Ein nicht parsbarer Zeitstempel gilt als **nicht** abgelaufen
-/// (lenient: eine defekte Altdatei blockiert die Listen-/Commit-Ansicht
-/// nicht zusätzlich zu ihrem eigentlichen Defekt).
+/// liegt. Ein nicht parsbarer Zeitstempel gilt als abgelaufen (fail-closed:
+/// ein Vorschlag mit manipuliertem oder defektem Ablaufdatum lässt sich
+/// nicht mehr committen — dieselbe Regel wie
+/// `skill_proposal_tools.rs::is_expired`).
 fn is_expired(rfc3339_timestamp: &str) -> bool {
     match time::OffsetDateTime::parse(
         rfc3339_timestamp,
         &time::format_description::well_known::Rfc3339,
     ) {
         Ok(expires_at) => expires_at < now(),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -1637,11 +1647,14 @@ impl AgentsListProposalsExecutor {
             }
             match read_proposal_json(&entry.path()) {
                 Ok(mut value) => {
+                    // Ein fehlendes `expires_at` gilt ebenfalls als abgelaufen
+                    // (fail-closed, wie `is_expired` selbst bei einem
+                    // unparsbaren Wert — siehe dessen Dokumentation).
                     let expired = value
                         .get("expires_at")
                         .and_then(|v| v.as_str())
                         .map(is_expired)
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     if let Some(object) = value.as_object_mut() {
                         object.insert("expired".to_owned(), serde_json::Value::Bool(expired));
                     }
@@ -1741,6 +1754,126 @@ fn agents_commit_proposal_spec() -> ToolSpec {
     })
 }
 
+/// Liest eine Nebendatei eines Vorschlags (`agent.toml`, `Personality.md`,
+/// `USER.md`) für `agents.commit_proposal`. Ein Lesefehler wird
+/// durchgereicht statt — wie vor der K3-Härtung — stillschweigend durch
+/// einen leeren Ersatzinhalt maskiert zu werden: sonst würde ein
+/// unvollständiger oder manipulierter Vorschlag die vorhandenen
+/// persönlichen Dateien der UIA (z. B. `USER.md`) beim Commit mit leerem
+/// Inhalt überschreiben.
+fn read_proposal_sidecar_file(dir: &Path, file_name: &str) -> Result<String, String> {
+    std::fs::read_to_string(dir.join(file_name))
+        .map_err(|error| format!("{} nicht lesbar: {error}", dir.join(file_name).display()))
+}
+
+/// Committet einen `kind = "definition"`-Vorschlag (Nachtrag K3-Härtung):
+/// `scope` und `name` kommen ungeprüft aus proposal.json und werden hier —
+/// genau wie bei `agents.write_definition` selbst — erneut auf einen
+/// gültigen Slug bzw. einen von genau zwei zulässigen Werten geprüft, bevor
+/// sie in einen Schreibpfad einfließen. Ohne diese Prüfung würde ein
+/// editiertes `scope` heimlich auf `profile_agents_dir` zurückfallen (`_ =>`)
+/// und ein leerer `name` direkt in dessen Wurzelverzeichnis schreiben.
+fn commit_definition_proposal(
+    proposal: &serde_json::Value,
+    project_agents_dir: &Option<PathBuf>,
+    profile_agents_dir: &Option<PathBuf>,
+    definition_toml: &str,
+    new_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let scope = proposal
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !matches!(scope, "project" | "profile") {
+        return Err(format!(
+            "Vorschlag hat einen ungültigen scope '{scope}' in proposal.json — Vorschlag wurde \
+             verändert"
+        ));
+    }
+    let name = proposal
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !is_valid_slug(name) {
+        return Err(format!(
+            "Vorschlag hat einen ungültigen name '{name}' in proposal.json — Vorschlag wurde \
+             verändert"
+        ));
+    }
+    let target_dir = match scope {
+        "project" => project_agents_dir,
+        _ => profile_agents_dir,
+    };
+    match target_dir {
+        Some(target_dir) => commit_definition(target_dir, name, definition_toml, new_id)
+            .map(|path| (path.display().to_string(), None)),
+        None => Err(format!("kein Verzeichnis für scope '{scope}' konfiguriert")),
+    }
+}
+
+/// Committet einen `kind = "uia"`-Vorschlag (Nachtrag K3-Härtung): `dir_name`
+/// kommt ungeprüft aus proposal.json und wird hier — genau wie bei
+/// `agents.write_uia` selbst — erneut auf einen gültigen Slug geprüft, bevor
+/// er in `profile_agents_dir.join(dir_name)` einfließt (ein absoluter oder
+/// `..`-Wert würde sonst das Profil-Agentenverzeichnis verlassen, ein leerer
+/// Wert direkt hineinschreiben). `agent.toml`/`Personality.md`/`USER.md`
+/// müssen lesbar sein — ein Lesefehler bricht ab, statt die vorhandene
+/// persönliche Datei mit leerem Inhalt zu überschreiben (siehe
+/// [`read_proposal_sidecar_file`]) — und alle Bundle-Felder werden erneut auf
+/// offensichtliche Geheimnisse geprüft, nicht mehr nur `definition_toml`.
+fn commit_uia_proposal(
+    dir: &Path,
+    profile_agents_dir: &Path,
+    proposal: &serde_json::Value,
+    definition_toml: &str,
+    new_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let dir_name = proposal
+        .get("dir_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !is_valid_slug(dir_name) {
+        return Err(format!(
+            "Vorschlag hat einen ungültigen dir_name '{dir_name}' in proposal.json — Vorschlag \
+             wurde verändert"
+        ));
+    }
+    let agent_toml = read_proposal_sidecar_file(dir, "agent.toml")?;
+    let personality_md = read_proposal_sidecar_file(dir, "Personality.md")?;
+    let user_md = read_proposal_sidecar_file(dir, "USER.md")?;
+    // `identity.md` ist im Vorschlag nur vorhanden, wenn `identity_md` beim
+    // Ablegen angegeben wurde (`propose_uia` lässt die Datei sonst weg) —
+    // anders als die drei Pflichtdateien oben bleibt ihr Fehlen also ohne
+    // Befund.
+    let identity_md = std::fs::read_to_string(dir.join("identity.md")).ok();
+
+    let mut secret_fields: Vec<(&str, &str)> = vec![
+        ("definition_toml", definition_toml),
+        ("agent.toml", agent_toml.as_str()),
+        ("Personality.md", personality_md.as_str()),
+        ("USER.md", user_md.as_str()),
+    ];
+    if let Some(identity_md) = &identity_md {
+        secret_fields.push(("identity_md", identity_md.as_str()));
+    }
+    let secret_errors = scan_for_secrets(&secret_fields);
+    if !secret_errors.is_empty() {
+        return Err(secret_errors.join("; "));
+    }
+
+    let bundle_dir = profile_agents_dir.join(dir_name);
+    commit_uia_bundle(
+        &bundle_dir,
+        new_id,
+        definition_toml,
+        &agent_toml,
+        identity_md.as_deref(),
+        &personality_md,
+        &user_md,
+    )
+    .map(|()| (bundle_dir.display().to_string(), Some(activation_hint(new_id))))
+}
+
 struct AgentsCommitProposalExecutor {
     project_agents_dir: Option<PathBuf>,
     profile_agents_dir: Option<PathBuf>,
@@ -1785,11 +1918,14 @@ impl AgentsCommitProposalExecutor {
                 args.proposal_id
             ));
         }
+        // Ein fehlendes `expires_at` gilt als abgelaufen (fail-closed —
+        // siehe [`is_expired`]): eine manipulierte proposal.json ohne dieses
+        // Feld darf nie committen.
         let expired = proposal
             .get("expires_at")
             .and_then(|v| v.as_str())
             .map(is_expired)
-            .unwrap_or(false);
+            .unwrap_or(true);
         if expired {
             return ToolOutput::json(serde_json::json!({
                 "ok": false,
@@ -1835,6 +1971,24 @@ impl AgentsCommitProposalExecutor {
                 )],
             }));
         }
+        // Umkehrung derselben Prüfung: `kind` kommt ungeprüft aus
+        // proposal.json (Nachtrag K3-Härtung). Ein `kind = "uia"`-Vorschlag,
+        // dessen `kind`-Feld nachträglich auf `"definition"` geändert wurde,
+        // trägt in seiner (unveränderten) definition.toml weiterhin
+        // `role = "user-interface"` — genau das fängt diese Prüfung ab, bevor
+        // `review_level_for` mit dem falschen `kind` einen niedrigeren
+        // Freigabelevel berechnet.
+        if kind == "definition" && evaluated.ir.role() == AgentRoleId::UserInterface {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [format!(
+                    "agents.commit_proposal: Vorschlag '{}' hat kind 'definition', aber \
+                     definition.toml hat role 'user-interface' — Vorschlag wurde verändert",
+                    args.proposal_id
+                )],
+            }));
+        }
         if !evaluated.rights_delta_author.is_empty() {
             return author_elevation_rejection(&evaluated.rights_delta_author);
         }
@@ -1851,67 +2005,17 @@ impl AgentsCommitProposalExecutor {
             }));
         }
 
+        let new_id = evaluated.ir.id().to_string();
         let commit_result: Result<(String, Option<String>), String> = match kind {
-            "definition" => {
-                let scope = proposal
-                    .get("scope")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let name = proposal
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let target_dir = match scope {
-                    "project" => &self.project_agents_dir,
-                    _ => &self.profile_agents_dir,
-                };
-                match target_dir {
-                    Some(target_dir) => commit_definition(
-                        target_dir,
-                        name,
-                        &definition_toml,
-                        &evaluated.ir.id().to_string(),
-                    )
-                    .map(|path| (path.display().to_string(), None)),
-                    None => Err(format!("kein Verzeichnis für scope '{scope}' konfiguriert")),
-                }
-            }
+            "definition" => commit_definition_proposal(
+                &proposal,
+                &self.project_agents_dir,
+                &self.profile_agents_dir,
+                &definition_toml,
+                &new_id,
+            ),
             "uia" => {
-                let secret_errors = scan_for_secrets(&[("definition_toml", &definition_toml)]);
-                if !secret_errors.is_empty() {
-                    Err(secret_errors.join("; "))
-                } else {
-                    let dir_name = proposal
-                        .get("dir_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let agent_toml =
-                        std::fs::read_to_string(dir.join("agent.toml")).unwrap_or_default();
-                    // `identity.md` ist im Vorschlag nur vorhanden, wenn
-                    // `identity_md` beim Ablegen angegeben wurde
-                    // (`propose_uia` lässt die Datei sonst weg).
-                    let identity_md = std::fs::read_to_string(dir.join("identity.md")).ok();
-                    let personality_md =
-                        std::fs::read_to_string(dir.join("Personality.md")).unwrap_or_default();
-                    let user_md = std::fs::read_to_string(dir.join("USER.md")).unwrap_or_default();
-                    let bundle_dir = profile_agents_dir.join(dir_name);
-                    let new_id = evaluated.ir.id().to_string();
-                    commit_uia_bundle(
-                        &bundle_dir,
-                        &new_id,
-                        &definition_toml,
-                        &agent_toml,
-                        identity_md.as_deref(),
-                        &personality_md,
-                        &user_md,
-                    )
-                    .map(|()| {
-                        (
-                            bundle_dir.display().to_string(),
-                            Some(activation_hint(&new_id)),
-                        )
-                    })
-                }
+                commit_uia_proposal(&dir, profile_agents_dir, &proposal, &definition_toml, &new_id)
             }
             other => Err(format!("unbekannte Vorschlagsart '{other}'")),
         };
@@ -3860,5 +3964,272 @@ contract = "harwness.return.research-finding@1"
                 .executor(&ToolName::new("agents.reject_proposal"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_is_expired_treats_missing_or_unparsable_timestamp_as_expired() {
+        // Fail-closed (Nachtrag K3-Härtung): eine manipulierte proposal.json
+        // ohne oder mit defektem `expires_at` darf nie committen.
+        assert!(is_expired(""));
+        assert!(is_expired("not-a-timestamp"));
+    }
+
+    /// Minimale, gültige UIA-Definition — dasselbe Format wie das
+    /// produktiv erzeugte Bundle in `harw-cli/src/uia_bootstrap.rs::write_generated_uia`
+    /// (kein `extends`, kein `[tools]`, kein `[return]` nötig).
+    const MINIMAL_UIA_DEFINITION: &str = "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.test-commit-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n";
+
+    /// Legt über `agents.write_uia` einen frischen, gültigen UIA-Vorschlag ab
+    /// und gibt seine `proposal_id` sowie sein Vorschlagsverzeichnis zurück —
+    /// gemeinsamer Aufbau für die `agents.commit_proposal`-Härtungstests
+    /// unten.
+    fn write_fresh_uia_proposal(
+        profile_agents_dir: &Path,
+        ceiling: &DefinitionAuthorCeiling,
+        dir_name: &str,
+    ) -> TestResult<(String, PathBuf)> {
+        let write_executor = AgentsWriteUiaExecutor {
+            profile_agents_dir: Some(profile_agents_dir.to_path_buf()),
+            ceiling: ceiling.clone(),
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.write_uia"),
+            arguments: serde_json::json!({
+                "dir_name": dir_name,
+                "definition_toml": MINIMAL_UIA_DEFINITION,
+                "personality_md": "Ruhig und knapp.",
+            }),
+        };
+        match write_executor.write(&call) {
+            ToolOutput::Json { content } => {
+                if content["ok"] != serde_json::json!(true) {
+                    return Err(TestError::Unexpected(format!(
+                        "agents.write_uia must succeed: {content}"
+                    )));
+                }
+                let proposal_id = content["proposal_id"]
+                    .as_str()
+                    .ok_or(TestError::Missing("proposal_id ist ein String"))?
+                    .to_owned();
+                let dir = proposal_dir(profile_agents_dir, &proposal_id);
+                Ok((proposal_id, dir))
+            }
+            other => Err(TestError::Unexpected(format!(
+                "expected a json output, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_happy_path_writes_uia_bundle() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let profile_agents_dir = home.path().join("agents");
+        let ceiling = empty_ceiling(AgentRoleId::UserInterface);
+        let (proposal_id, _dir) =
+            write_fresh_uia_proposal(&profile_agents_dir, &ceiling, "test-commit-uia")?;
+
+        let commit_executor = AgentsCommitProposalExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: Some(profile_agents_dir.clone()),
+            ceiling,
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.commit_proposal"),
+            arguments: serde_json::json!({ "proposal_id": proposal_id, "user_confirmed": true }),
+        };
+        match commit_executor.commit(&call) {
+            ToolOutput::Json { content } => {
+                assert_eq!(
+                    content["ok"],
+                    serde_json::json!(true),
+                    "commit must succeed: {content}"
+                );
+                assert_eq!(content["written"], serde_json::json!(true));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json output, got {other:?}"
+                )));
+            }
+        }
+        let bundle_dir = profile_agents_dir.join("test-commit-uia");
+        assert!(bundle_dir.join("definition.toml").exists());
+        assert!(bundle_dir.join("agent.toml").exists());
+        assert!(bundle_dir.join("Personality.md").exists());
+        assert!(bundle_dir.join("USER.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_happy_path_writes_definition_proposal() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let profile_agents_dir = home.path().join("agents");
+        let ceiling = DefinitionAuthorCeiling {
+            role: AgentRoleId::RootOrchestrator,
+            tools: BTreeSet::from(["fs.read".to_owned()]),
+            permissions: PermissionSet::from_policy([Permission::ReadWorkspace]),
+            max_depth: 0,
+            budget_tokens: 0,
+            effort_cap: None,
+        };
+        let write_executor = AgentsWriteDefinitionExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: Some(profile_agents_dir.clone()),
+            ceiling: ceiling.clone(),
+        };
+        let write_call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.write_definition"),
+            arguments: serde_json::json!({
+                "scope": "profile",
+                "name": "note-taker",
+                "toml": COMMITTED_WORKER,
+            }),
+        };
+        let proposal_id = match write_executor.write(&write_call) {
+            ToolOutput::Json { content } => {
+                if content["ok"] != serde_json::json!(true) {
+                    return Err(TestError::Unexpected(format!(
+                        "agents.write_definition must succeed: {content}"
+                    )));
+                }
+                content["proposal_id"]
+                    .as_str()
+                    .ok_or(TestError::Missing("proposal_id ist ein String"))?
+                    .to_owned()
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json output, got {other:?}"
+                )));
+            }
+        };
+
+        let commit_executor = AgentsCommitProposalExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: Some(profile_agents_dir.clone()),
+            ceiling,
+        };
+        let commit_call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.commit_proposal"),
+            arguments: serde_json::json!({ "proposal_id": proposal_id, "user_confirmed": true }),
+        };
+        match commit_executor.commit(&commit_call) {
+            ToolOutput::Json { content } => {
+                assert_eq!(
+                    content["ok"],
+                    serde_json::json!(true),
+                    "commit must succeed: {content}"
+                );
+                assert_eq!(content["written"], serde_json::json!(true));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json output, got {other:?}"
+                )));
+            }
+        }
+        assert!(
+            profile_agents_dir
+                .join("note-taker")
+                .join("definition.toml")
+                .exists()
+        );
+        Ok(())
+    }
+
+    /// Legt einen frischen UIA-Vorschlag ab, manipuliert `proposal.json`
+    /// über `mutate` und erwartet, dass `agents.commit_proposal` danach
+    /// `ok: false` meldet, ohne irgendetwas außerhalb von
+    /// `profile_agents_dir` zu schreiben (Nachtrag K3-Härtung: `commit`
+    /// vertraut keinem Feld aus `proposal.json` mehr ungeprüft).
+    fn assert_tampered_uia_proposal_is_rejected(
+        dir_name: &str,
+        mutate: impl FnOnce(&Path, &mut serde_json::Value),
+    ) -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let profile_agents_dir = home.path().join("agents");
+        let ceiling = empty_ceiling(AgentRoleId::UserInterface);
+        let (proposal_id, dir) =
+            write_fresh_uia_proposal(&profile_agents_dir, &ceiling, dir_name)?;
+
+        let mut proposal = read_proposal_json(&dir).map_err(TestError::Unexpected)?;
+        mutate(&dir, &mut proposal);
+        write_proposal_json(&dir, &proposal).map_err(TestError::Unexpected)?;
+
+        let commit_executor = AgentsCommitProposalExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: Some(profile_agents_dir.clone()),
+            ceiling,
+        };
+        let commit_call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.commit_proposal"),
+            arguments: serde_json::json!({ "proposal_id": proposal_id, "user_confirmed": true }),
+        };
+        match commit_executor.commit(&commit_call) {
+            ToolOutput::Json { content } => {
+                assert_eq!(
+                    content["ok"],
+                    serde_json::json!(false),
+                    "tampered proposal must not commit: {content}"
+                );
+                assert_eq!(content["written"], serde_json::json!(false));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json output, got {other:?}"
+                )));
+            }
+        }
+        // Nichts darf außerhalb von `profile_agents_dir` gelandet sein.
+        assert!(!home.path().join("escape").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_rejects_tampered_dir_name_path_escape() -> TestResult {
+        assert_tampered_uia_proposal_is_rejected("tampered-escape", |_dir, proposal| {
+            if let Some(object) = proposal.as_object_mut() {
+                object.insert("dir_name".to_owned(), serde_json::json!("../escape"));
+            }
+        })
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_rejects_missing_dir_name() -> TestResult {
+        assert_tampered_uia_proposal_is_rejected("tampered-missing-dir", |_dir, proposal| {
+            if let Some(object) = proposal.as_object_mut() {
+                object.remove("dir_name");
+            }
+        })
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_rejects_missing_expires_at() -> TestResult {
+        assert_tampered_uia_proposal_is_rejected("tampered-no-expiry", |_dir, proposal| {
+            if let Some(object) = proposal.as_object_mut() {
+                object.remove("expires_at");
+            }
+        })
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_rejects_kind_flipped_from_uia_to_definition() -> TestResult {
+        assert_tampered_uia_proposal_is_rejected("tampered-kind-flip", |_dir, proposal| {
+            if let Some(object) = proposal.as_object_mut() {
+                object.insert("kind".to_owned(), serde_json::json!("definition"));
+            }
+        })
+    }
+
+    #[test]
+    fn test_agents_commit_proposal_rejects_missing_user_md() -> TestResult {
+        assert_tampered_uia_proposal_is_rejected("tampered-missing-user-md", |dir, _proposal| {
+            let _ = std::fs::remove_file(dir.join("USER.md"));
+        })
     }
 }

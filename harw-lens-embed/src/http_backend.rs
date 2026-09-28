@@ -103,8 +103,10 @@
 //! außerhalb des Schreibbereichs dieses Knotens (`harw-lens-embed/**` und
 //! `harw-tool-lens/src/provenance.rs`), deshalb bleibt [`HttpEmbedBackend`]
 //! ein eigenständiger, minimaler Transport statt eines Aufrufs durch
-//! `harw-provider-http` hindurch. Siehe den Abschlussbericht dieses Knotens
-//! für die vollständige Einordnung.
+//! `harw-provider-http` hindurch. Siehe die Moduldokumentation von
+//! `harw-tool-lens/src/provenance.rs` für die vollständige Einordnung, wie
+//! dieser Transport beim ersten echten Konsumenten tatsächlich verdrahtet
+//! wird.
 //!
 //! # Nebenläufigkeit
 //! [`HttpEmbedBackend`] ist `Send + Sync` (der `reqwest::blocking::Client`
@@ -113,9 +115,14 @@
 //!
 //! # Fehler
 //! [`crate::error::EmbedError::RemoteBackendFailed`] für jede Störung:
-//! Transportfehler, Nicht-2xx-Status, unlesbarer oder unvollständiger
-//! JSON-Antwortkörper. Die Fehlermeldung enthält nie den API-Key (er wird
-//! nur über [`secrecy::ExposeSecret`] beim Setzen des Headers offengelegt).
+//! Transportfehler, Nicht-2xx-Status, ein Antwortkörper über der
+//! `MAX_EMBED_RESPONSE_BYTES`-Grenze (64 MiB -- ein `base_url` ist
+//! Betreiber-Konfiguration und damit kein vollständig vertrauter Endpunkt;
+//! ohne diese Grenze könnte ein übergroßer Körper den Speicher des
+//! aufrufenden Prozesses erschöpfen), oder ein unlesbarer, nicht-UTF-8
+//! oder unvollständiger JSON-Antwortkörper. Die Fehlermeldung enthält nie
+//! den API-Key (er wird nur über [`secrecy::ExposeSecret`] beim Setzen des
+//! Headers offengelegt).
 //!
 //! # Examples
 //! ```rust,no_run
@@ -132,6 +139,8 @@
 //! assert!(vectors.is_ok() || vectors.is_err());
 //! ```
 
+use std::io::Read as _;
+
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -143,6 +152,18 @@ use crate::remote::RemoteEmbedBackend;
 /// Fehlerantwort eines entfernten Dienstes unbegrenzt in einer
 /// [`EmbedError`]-Meldung landet.
 const ERROR_BODY_SNIPPET_LEN: usize = 200;
+
+/// Obergrenze für die Größe des gesamten Antwortkörpers einer
+/// Einbettungs-Antwort -- schützt gegen einen fehlkonfigurierten oder
+/// kompromittierten Endpunkt (`base_url` ist Betreiber-Konfiguration), der
+/// einen beliebig großen Körper schickt und damit den Speicher des
+/// aufrufenden Prozesses erschöpft. `harw-provider-http` begrenzt einzelne
+/// SSE-Events analog über `MAX_EVENT_BYTES` (siehe dessen `sse.rs`); diese
+/// Grenze ist bewusst großzügiger gewählt (64 MiB statt 16 MiB), weil eine
+/// Einbettungs-Antwort für einen großen Batch aus vielen hochdimensionalen
+/// Vektoren legitim deutlich größer ausfallen kann als ein einzelnes
+/// SSE-Event.
+const MAX_EMBED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Ein [`RemoteEmbedBackend`], das Texte über eine OpenAI-kompatible
 /// HTTP-Einbettungs-API verschickt.
@@ -248,9 +269,10 @@ impl RemoteEmbedBackend for HttpEmbedBackend {
     ///
     /// # Errors
     /// - [`EmbedError::RemoteBackendFailed`]: bei Transportfehler,
-    ///   Nicht-2xx-Status, unlesbarem/ungültigem JSON-Antwortkörper, einem
-    ///   `index`-Wert außerhalb von `texts`, oder einer Antwort, die für
-    ///   einen Eingabetext keinen Eintrag liefert.
+    ///   Nicht-2xx-Status, einem Antwortkörper über
+    ///   `MAX_EMBED_RESPONSE_BYTES`, unlesbarem/nicht-UTF-8/ungültigem
+    ///   JSON-Antwortkörper, einem `index`-Wert außerhalb von `texts`, oder
+    ///   einer Antwort, die für einen Eingabetext keinen Eintrag liefert.
     fn embed_remote(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let body = serde_json::json!({
             "model": self.model,
@@ -268,10 +290,30 @@ impl RemoteEmbedBackend for HttpEmbedBackend {
             })?;
 
         let status = response.status();
-        let response_text = response
-            .text()
+
+        // Liest höchstens `MAX_EMBED_RESPONSE_BYTES + 1` Bytes -- die "+ 1"
+        // erlaubt, das Überschreiten der Grenze zu erkennen, ohne den
+        // Endpunkt zu zwingen, exakt an der Grenze aufzuhören. Ein Körper,
+        // der die Grenze überschreitet, wird verworfen statt vollständig
+        // gepuffert: `response.text()` hätte hier unbegrenzt gepuffert (die
+        // gefixte Schwachstelle dieses Knotens).
+        let mut response_bytes = Vec::new();
+        response
+            .take(MAX_EMBED_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut response_bytes)
             .map_err(|error| EmbedError::RemoteBackendFailed {
                 reason: format!("failed to read response body: {error}"),
+            })?;
+        if response_bytes.len() > MAX_EMBED_RESPONSE_BYTES {
+            return Err(EmbedError::RemoteBackendFailed {
+                reason: format!(
+                    "response body exceeded the {MAX_EMBED_RESPONSE_BYTES}-byte limit"
+                ),
+            });
+        }
+        let response_text =
+            String::from_utf8(response_bytes).map_err(|error| EmbedError::RemoteBackendFailed {
+                reason: format!("response body was not valid UTF-8: {error}"),
             })?;
 
         if !status.is_success() {
@@ -474,6 +516,33 @@ mod tests {
         };
 
         assert!(matches!(error, EmbedError::RemoteBackendFailed { .. }));
+        join_mock_server(server)
+    }
+
+    #[test]
+    fn test_http_embed_backend_rejects_oversized_response_body() -> TestResult {
+        // Der Server liefert absichtlich einen Körper, der die
+        // `MAX_EMBED_RESPONSE_BYTES`-Grenze um ein Byte überschreitet -- ohne
+        // die Grenze hätte `response.text()` diesen Körper vollständig
+        // gepuffert (die gefixte Schwachstelle dieses Knotens).
+        let oversized_body = "x".repeat(MAX_EMBED_RESPONSE_BYTES + 1);
+        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &oversized_body)?;
+
+        let backend = HttpEmbedBackend::new(base_url, "test-model", SecretString::new("k".into()));
+        let result = backend.embed_remote(&["x".to_owned()]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "oversized response body must fail closed".to_owned(),
+            ));
+        };
+
+        let error_repr = format!("{error:?}");
+        let EmbedError::RemoteBackendFailed { reason } = error else {
+            return Err(TestError::Unexpected(format!(
+                "expected RemoteBackendFailed, got {error_repr}"
+            )));
+        };
+        assert!(reason.contains("byte limit"));
         join_mock_server(server)
     }
 

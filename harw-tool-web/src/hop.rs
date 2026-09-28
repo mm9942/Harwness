@@ -13,7 +13,7 @@
 //! 3. **Sandbox-Scope:** [`harw_authority::NetworkScope::allows`] des aktiven
 //!    Tool-Aufrufs.
 //!
-//! [`map_send_error`] findet Ablehnungen des Scoped-Resolvers aus
+//! `map_send_error` (crate-intern) findet Ablehnungen des Scoped-Resolvers aus
 //! [`harw_egress::build_client`] in der `source()`-Kette eines
 //! `reqwest::Error` wieder, damit sie als Ablehnung (nicht als
 //! Transportfehler mit Cache-Fail-open) gemeldet werden.
@@ -287,6 +287,14 @@ fn denial_in_chain(error: &reqwest::Error, hop: usize) -> Option<WebToolError> {
 /// veralteter Cache-Eintrag darf sie nicht überdecken. Alles andere wird zu
 /// [`WebToolError::Http`] ohne URL im `Display`.
 ///
+/// Crate-intern: `reqwest::Error` ist ein Fremdtyp und darf nicht in einer
+/// öffentlichen Signatur dieses Moduls stehen; Aufrufer außerhalb der Crate
+/// gibt es nicht (nur `search.rs` und `fetch.rs`). Das behebt nur die
+/// Signatur dieser Funktion: [`WebToolError::Http`] selbst trägt den
+/// `reqwest::Error` weiterhin öffentlich (`#[from]` in `error.rs`) — das
+/// Kapseln in einen eigenen, opaken Fehlertyp ist ein offener Folgeschritt
+/// außerhalb dieser Datei.
+///
 /// # Arguments
 /// - `error` (`reqwest::Error`): der Sendefehler (Eigentum geht über).
 /// - `hop` (`usize`): Nummer des Hops (nur für Meldungen).
@@ -297,7 +305,7 @@ fn denial_in_chain(error: &reqwest::Error, hop: usize) -> Option<WebToolError> {
 /// # Concurrency
 /// Rein; von jedem Thread aufrufbar.
 #[must_use]
-pub fn map_send_error(error: reqwest::Error, hop: usize) -> WebToolError {
+pub(crate) fn map_send_error(error: reqwest::Error, hop: usize) -> WebToolError {
     let denial = denial_in_chain(&error, hop);
     denial.unwrap_or_else(|| WebToolError::Http(error.without_url()))
 }

@@ -29,10 +29,13 @@
 //!     if let Some(err) = require_permission(ctx, Permission::ReadWorkspace, "fs.read") {
 //!         return Ok(err);
 //!     }
-//!     if let Some(host) = host_from_url(url) {
-//!         if let Some(err) = require_host_access(ctx, &host, "http.fetch") {
-//!             return Ok(err);
-//!         }
+//!     // Fail closed: without an extractable host the allow-list check below
+//!     // cannot run, so an unparseable URL must not fall through to success.
+//!     let Some(host) = host_from_url(url) else {
+//!         return Ok(ToolOutput::error("dispatch: aus der URL ließ sich kein Hostname lesen"));
+//!     };
+//!     if let Some(err) = require_host_access(ctx, &host, "http.fetch") {
+//!         return Ok(err);
 //!     }
 //!     Ok(ToolOutput::text("ok"))
 //! }

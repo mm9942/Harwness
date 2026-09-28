@@ -58,7 +58,7 @@
 //! | `mixins` | `Vec<`[`DefinitionRef`]`>` | nein | Wiederverwendbare Sektions-Bündel, in Deklarationsreihenfolge angewandt. |
 //! | `sections` | `Vec<`[`RawContextSectionSpec`]`>` | nein | `[[sections]]`-Array; **Reihenfolge ist bedeutungstragend** (§ unten). |
 //! | `exclude` | `Vec<String>` | nein | Selektor-Muster, die nie in den Kontext gelangen dürfen. |
-//! | `patch` | `toml::Table` | nein | Merge-Patches für Vererbung (§7): `patch.sections.*`, `patch.exclude.*`. |
+//! | `patch` | `toml::Table` | nein | Merge-Patches für Vererbung (§7): ausschließlich `patch.sections.*`, `patch.exclude.*` — jeder andere Top-Level-Schlüssel ist ein Fehler. |
 //!
 //! Jede `[[sections]]`-Tabelle ([`RawContextSectionSpec`]) trägt:
 //!
@@ -129,9 +129,16 @@
 //! `name` wie eine bereits vorhandene Sektion, **überschreibt** er sie an
 //! derselben Position (gezielte Überschreibung, keine Duplizierung — siehe
 //! [`resolve_context_program`]). `patch.sections.remove` entfernt Sektionen nach
-//! Name; `patch.sections.replace` ersetzt die gesamte Liste. `patch.exclude.*`
-//! nutzt die vorhandene [`crate::merge::MergeOp`]-Maschinerie unverändert
-//! (`append`/`prepend`/`remove`/`replace`/`intersect`).
+//! Name; `patch.sections.replace` ersetzt die gesamte Liste. Ein Schlüssel
+//! außerhalb dieser drei (z. B. ein Tippfehler wie `appnd`) ist ein Fehler
+//! ([`DslError::UnknownMergeOp`]), keine stille Auslassung. `patch.exclude.*`
+//! nutzt die vorhandene [`crate::merge::MergeOp`]-Maschinerie streng: jeder
+//! anwesende Operator aus [`PATCH_OPERATOR_KEYS`] läuft (nicht nur der erste
+//! gefundene), ein Nicht-Array-Operand auf einem Array-Operator ist
+//! [`DslError::PatchTypeMismatch`] statt „keine Elemente“, und ein Schlüssel
+//! außerhalb [`PATCH_OPERATOR_KEYS`] ist ebenfalls ein Fehler. Ein Top-Level-
+//! Schlüssel unter `[patch]` außerhalb von `sections`/`exclude` (z. B.
+//! `patch.exclud`) ist genauso ein Fehler, bevor irgendein Operator läuft.
 //!
 //! ## Welche Achsen `extends` schneidet, und welche additiv bleiben
 //! Eine Sektion trägt mindestens vier Achsen: `name`, `strength`, `detail`,
@@ -237,6 +244,15 @@
 //!       Zyklus.
 //!     - [`crate::error::DslError::Toml`]: eine `patch.sections.*`-Tabelle
 //!       lässt sich nicht in [`RawContextSectionSpec`] deserialisieren.
+//!     - [`crate::error::DslError::UnknownMergeOp`]: ein Top-Level-Schlüssel
+//!       unter `[patch]` ist weder `sections` noch `exclude`, ein Schlüssel
+//!       unter `[patch.sections]` ist weder `append`, `remove` noch `replace`,
+//!       oder ein Schlüssel unter `[patch.exclude]` liegt außerhalb
+//!       [`PATCH_OPERATOR_KEYS`] — jeweils vor jeder Operator-Anwendung
+//!       geprüft, keine stille Auslassung.
+//!     - [`crate::error::DslError::PatchTypeMismatch`]: ein Array-Operator
+//!       unter `[patch.exclude]` (`append`/`prepend`/`remove`/`intersect`)
+//!       bekommt einen Nicht-Array-Operanden.
 //! - [`ContextProgramError::TrustEscalation`]: ein Kind deklariert für eine
 //!   geerbte Sektion eine höhere [`harw_context::TrustClass`], als die
 //!   `extends`-Basis dafür vorsah (§ „Welche Achsen `extends` schneidet" oben).
@@ -273,7 +289,7 @@ use time::OffsetDateTime;
 use crate::error::{DiagLocation, DslError, DslResult};
 use crate::ids::{DefinitionId, DefinitionRef, Version};
 use crate::layers::DefinitionLayer;
-use crate::merge::{MergeOp, apply_merge_op};
+use crate::merge::{MergeOp, PATCH_OPERATOR_KEYS, apply_merge_op};
 use crate::resolved::{ResolutionStep, ResolutionTrace};
 
 // ---------------------------------------------------------------------------
@@ -546,11 +562,54 @@ fn apply_mixins(
     Ok(())
 }
 
+/// Die einzigen zulässigen Schlüssel unter `[patch.sections]` (§7), in keiner
+/// bestimmten Reihenfolge angewandt (jeder wirkt auf einen anderen Aspekt der
+/// Liste — anders als [`PATCH_OPERATOR_KEYS`], deren Reihenfolge mehrere
+/// Operatoren auf demselben Wert anwendbar macht).
+const SECTIONS_PATCH_OPERATOR_KEYS: &[&str] = &["append", "remove", "replace"];
+
+/// Die einzigen zulässigen Top-Level-Schlüssel unter `[patch]` eines
+/// Kontextprogramms (§7). Ein Kontextprogramm ist — wie seine eigene
+/// TOML-Grammatik (§ Grammatik, `deny_unknown_fields`) — eine abgeschlossene
+/// Definition, kein offenes Erweiterungsformat: anders als die Agenten-
+/// Grammatik in `crate::resolve` (die zusätzlich `patch.skills`/
+/// `patch.authority` sowie beliebige Config-Pfade kennt) gibt es hier
+/// ausschließlich diese zwei Pfade.
+const PATCH_TOP_LEVEL_KEYS: &[&str] = &["sections", "exclude"];
+
+/// Weist ein `[patch]` zurück, dessen Top-Level-Schlüssel etwas anderes als
+/// `sections`/`exclude` enthalten (§7) — ein Tippfehler wie `patch.exclud`
+/// wurde vor diesem Knoten stillschweigend ignoriert (§ Befund); jetzt ist er
+/// [`DslError::UnknownMergeOp`], geprüft bevor [`apply_sections_patch`] oder
+/// [`apply_exclude_patch`] überhaupt läuft.
+///
+/// # Errors
+/// [`DslError::UnknownMergeOp`], wenn ein Top-Level-Schlüssel unter `[patch]`
+/// weder `sections` noch `exclude` ist.
+fn validate_patch_top_level_keys(patch: &toml::Table) -> DslResult<()> {
+    if let Some(unknown) = patch
+        .keys()
+        .find(|key| !PATCH_TOP_LEVEL_KEYS.contains(&key.as_str()))
+    {
+        return Err(DslError::UnknownMergeOp {
+            name: format!("patch.{unknown}"),
+        });
+    }
+    Ok(())
+}
+
 /// Applies `patch.sections.{append,remove,replace}` to the accumulated section list.
 ///
 /// `append` uses [`merge_section`] per entry, so an appended section with a
 /// `name` already present overwrites that entry in place (targeted override) —
 /// this is the mechanism behind "a patch overwrites a specific section".
+///
+/// # Errors
+/// - [`DslError::UnknownMergeOp`]: `[patch.sections]` contains a key outside
+///   [`SECTIONS_PATCH_OPERATOR_KEYS`] (e.g. a typo like `appnd`) — rejected
+///   before any operator runs, instead of being silently ignored.
+/// - [`DslError::Toml`]: `append`/`replace` does not deserialize into
+///   [`RawContextSectionSpec`].
 fn apply_sections_patch(
     patch: &toml::Table,
     sections: &mut Vec<RawContextSectionSpec>,
@@ -558,6 +617,15 @@ fn apply_sections_patch(
     let Some(sections_patch) = patch.get("sections").and_then(toml::Value::as_table) else {
         return Ok(());
     };
+
+    if let Some(unknown) = sections_patch
+        .keys()
+        .find(|key| !SECTIONS_PATCH_OPERATOR_KEYS.contains(&key.as_str()))
+    {
+        return Err(DslError::UnknownMergeOp {
+            name: format!("patch.sections.{unknown}"),
+        });
+    }
 
     if let Some(append_val) = sections_patch.get("append") {
         let appended: Vec<RawContextSectionSpec> = append_val
@@ -588,31 +656,92 @@ fn apply_sections_patch(
     Ok(())
 }
 
+/// Der Array-Wert eines Array-Operators unter `[patch.exclude]`.
+///
+/// Spiegelt die strenge Prüfung, die `crate::resolve::operator_values` für den
+/// Agenten-Pfad bereits durchsetzt (dort modul-privat, deshalb hier eine
+/// eigene kleine Kopie statt eines Cross-Modul-Zugriffs — siehe Bericht dieses
+/// Knotens). Vor diesem Knoten ersetzte `vals.as_array().cloned().unwrap_or_default()`
+/// einen Nicht-Array-Operanden stillschweigend durch „keine Elemente" — genau
+/// die Falle, die der Kommentar in `crate::resolve` als bereits behobenen
+/// Fehler des Agenten-Pfads benennt.
+///
+/// # Errors
+/// [`DslError::PatchTypeMismatch`], wenn `val` kein Array ist.
+fn exclude_operator_values(op: &str, val: &toml::Value) -> DslResult<Vec<toml::Value>> {
+    val.as_array()
+        .cloned()
+        .ok_or_else(|| DslError::PatchTypeMismatch {
+            op: op.to_owned(),
+            expected: "array",
+            found: val.type_str(),
+            location: DiagLocation::field("patch.exclude"),
+        })
+}
+
 /// Applies `patch.exclude.*` to the accumulated exclude list, using the shared
-/// [`crate::merge::apply_merge_op`] machinery unchanged (§7) — this field does
-/// not need a dedicated patch mechanic, unlike `sections`.
+/// [`crate::merge::apply_merge_op`] machinery (§7) — this field does not need
+/// a dedicated patch mechanic, unlike `sections`.
+///
+/// Anders als vor diesem Knoten (§ Befund) ist dieser Pfad streng, genau wie
+/// `crate::resolve`s Gegenstück für die Agenten-Grammatik: ein Schlüssel
+/// außerhalb [`PATCH_OPERATOR_KEYS`] ist ein Fehler, bevor irgendein Operator
+/// läuft; jeder anwesende Operator läuft — in [`PATCH_OPERATOR_KEYS`]-Reihenfolge,
+/// nicht nur der erste, den eine `if`/`else if`-Kette findet; und ein
+/// Nicht-Array-Operand auf einem Array-Operator ist ein Fehler statt eines
+/// stillen „keine Elemente".
+///
+/// # Errors
+/// - [`DslError::UnknownMergeOp`]: `[patch.exclude]` enthält einen Schlüssel
+///   außerhalb [`PATCH_OPERATOR_KEYS`] (z. B. einen Tippfehler wie `appnd`).
+/// - [`DslError::PatchTypeMismatch`]: ein Array-Operator
+///   (`append`/`prepend`/`remove`/`intersect`) bekommt einen Nicht-Array-Wert.
 fn apply_exclude_patch(patch: &toml::Table, exclude: &mut Vec<String>) -> DslResult<()> {
     let Some(exclude_patch) = patch.get("exclude").and_then(toml::Value::as_table) else {
         return Ok(());
     };
 
+    if let Some(unknown) = exclude_patch
+        .keys()
+        .find(|key| !PATCH_OPERATOR_KEYS.contains(&key.as_str()))
+    {
+        return Err(DslError::UnknownMergeOp {
+            name: format!("patch.exclude.{unknown}"),
+        });
+    }
+
     let mut current =
         toml::Value::Array(exclude.iter().cloned().map(toml::Value::String).collect());
 
-    if let Some(val) = exclude_patch.get("replace") {
-        apply_merge_op(&mut current, MergeOp::Replace { value: val.clone() })?;
-    } else if let Some(vals) = exclude_patch.get("append") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(&mut current, MergeOp::Append { values })?;
-    } else if let Some(vals) = exclude_patch.get("prepend") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(&mut current, MergeOp::Prepend { values })?;
-    } else if let Some(vals) = exclude_patch.get("remove") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(&mut current, MergeOp::Remove { values })?;
-    } else if let Some(vals) = exclude_patch.get("intersect") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(&mut current, MergeOp::Intersect { values })?;
+    // Jeder anwesende Operator läuft — in PATCH_OPERATOR_KEYS-Reihenfolge —
+    // statt nur der erste, den eine `if`/`else if`-Kette findet (§ Befund):
+    // `remove` UND `append` im selben Patch wirken jetzt beide.
+    for key in PATCH_OPERATOR_KEYS {
+        let Some(val) = exclude_patch.get(*key) else {
+            continue;
+        };
+        let op = match *key {
+            "replace" => MergeOp::Replace { value: val.clone() },
+            "prepend" => MergeOp::Prepend {
+                values: exclude_operator_values(key, val)?,
+            },
+            "append" => MergeOp::Append {
+                values: exclude_operator_values(key, val)?,
+            },
+            "remove" => MergeOp::Remove {
+                values: exclude_operator_values(key, val)?,
+            },
+            "intersect" => MergeOp::Intersect {
+                values: exclude_operator_values(key, val)?,
+            },
+            "min" => MergeOp::Min { value: val.clone() },
+            // "max-within-parent" / "max_within_parent": `exclude` ist eine
+            // Liste, keine Zahl — `apply_merge_op` weist das fail-closed als
+            // `PatchTypeMismatch` ab, statt es (wie vor diesem Knoten) stumm
+            // zu ignorieren.
+            _ => MergeOp::MaxWithinParent { value: val.clone() },
+        };
+        apply_merge_op(&mut current, op)?;
     }
 
     *exclude = current
@@ -677,6 +806,13 @@ fn apply_exclude_patch(patch: &toml::Table, exclude: &mut Vec<String>) -> DslRes
 ///     - [`DslError::InheritanceCycle`]: `extends` bildet einen Zyklus.
 ///     - [`DslError::Toml`]: `patch.sections.append`/`replace` lässt sich
 ///       nicht in [`RawContextSectionSpec`] deserialisieren.
+///     - [`DslError::UnknownMergeOp`]: ein Top-Level-Schlüssel unter `[patch]`
+///       ist weder `sections` noch `exclude`, ein Schlüssel unter
+///       `[patch.sections]` ist weder `append`, `remove` noch `replace`, oder
+///       ein Schlüssel unter `[patch.exclude]` liegt außerhalb
+///       [`crate::merge::PATCH_OPERATOR_KEYS`].
+///     - [`DslError::PatchTypeMismatch`]: ein Array-Operator unter
+///       `[patch.exclude]` bekommt einen Nicht-Array-Operanden.
 /// - [`ContextProgramError::TrustEscalation`]: ein Kind (direkt oder über ein
 ///   Mixin) deklariert für eine geerbte Sektion eine höhere
 ///   [`harw_context::TrustClass`], als die `extends`-Basis dafür vorsah.
@@ -846,6 +982,7 @@ fn resolve_inner(
             continue;
         }
 
+        validate_patch_top_level_keys(patch)?;
         apply_sections_patch(patch, &mut sections)?;
         apply_exclude_patch(patch, &mut exclude)?;
         resolved_version = def.version.clone();
@@ -1938,6 +2075,207 @@ append = ["secrets/**"]
             resolve_context_program(&id("harwness.context.exclude-base@1")?, &layers, now())?;
 
         assert_eq!(resolved.exclude, vec!["memory.*", "secrets/**"]);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Regressionsschutz für den Befund: `patch.exclude` mit einem
+    // Nicht-Array-Operanden wurde stillschweigend zu „keine Elemente" statt
+    // eines Fehlers, und nur der erste in einer `if`/`else if`-Kette
+    // gefundene Operator lief. Alle fünf Tests hier reproduzieren jeweils
+    // eine konkrete Zeile aus dem Befund.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exclude_patch_with_non_array_operand_errors_instead_of_no_op() -> TestResult {
+        let base = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.exclude-bad-operand@1"
+version = "1.0.0"
+exclude = ["memory.*"]
+"#,
+        )?;
+        // `append` bekommt einen String statt eines Arrays — vor diesem
+        // Knoten hätte `unwrap_or_default()` das zu "append nichts" gemacht.
+        let patch_layer = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.exclude-bad-operand@1"
+version = "1.1.0"
+
+[patch.exclude]
+append = "secrets"
+"#,
+        )?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::Project, patch_layer),
+        ];
+        let result = resolve_context_program(
+            &id("harwness.context.exclude-bad-operand@1")?,
+            &layers,
+            now(),
+        );
+        match result {
+            Err(ContextProgramError::Resolution(DslError::PatchTypeMismatch { op, .. })) => {
+                assert_eq!(op, "append");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected PatchTypeMismatch, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exclude_patch_applies_every_present_operator_not_only_the_first() -> TestResult {
+        let base = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.exclude-both-ops@1"
+version = "1.0.0"
+exclude = ["a"]
+"#,
+        )?;
+        // `remove` UND `append` im selben Patch — die alte `if`/`else if`-Kette
+        // hätte nur `remove` (erster Treffer in Prüfreihenfolge) angewandt und
+        // `append` stillschweigend verloren.
+        let patch_layer = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.exclude-both-ops@1"
+version = "1.1.0"
+
+[patch.exclude]
+remove = ["a"]
+append = ["b"]
+"#,
+        )?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::Project, patch_layer),
+        ];
+        let resolved = resolve_context_program(
+            &id("harwness.context.exclude-both-ops@1")?,
+            &layers,
+            now(),
+        )
+        .map_err(ctx("both operators in one patch.exclude must apply"))?;
+
+        assert_eq!(resolved.exclude, vec!["b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn exclude_patch_rejects_unknown_operator_key() -> TestResult {
+        let base = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.exclude-typo@1"
+version = "1.0.0"
+exclude = ["a"]
+"#,
+        )?;
+        // `appnd` statt `append` — vor diesem Knoten stillschweigend ignoriert.
+        let patch_layer = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.exclude-typo@1"
+version = "1.1.0"
+
+[patch.exclude]
+appnd = ["b"]
+"#,
+        )?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::Project, patch_layer),
+        ];
+        let result =
+            resolve_context_program(&id("harwness.context.exclude-typo@1")?, &layers, now());
+        assert!(matches!(
+            result,
+            Err(ContextProgramError::Resolution(
+                DslError::UnknownMergeOp { .. }
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn patch_rejects_unknown_top_level_key() -> TestResult {
+        let base = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.patch-typo@1"
+version = "1.0.0"
+exclude = ["a"]
+"#,
+        )?;
+        // `exclud` statt `exclude` als Top-Level-Schlüssel unter `[patch]`.
+        let patch_layer = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.patch-typo@1"
+version = "1.1.0"
+
+[patch.exclud]
+append = ["b"]
+"#,
+        )?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::Project, patch_layer),
+        ];
+        let result =
+            resolve_context_program(&id("harwness.context.patch-typo@1")?, &layers, now());
+        assert!(matches!(
+            result,
+            Err(ContextProgramError::Resolution(
+                DslError::UnknownMergeOp { .. }
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn sections_patch_rejects_unknown_operator_key() -> TestResult {
+        let base = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.sections-typo@1"
+version = "1.0.0"
+
+[[sections]]
+name = "history.tail"
+"#,
+        )?;
+        // `appnd` statt `append` unter `[patch.sections]`.
+        let patch_layer = parse(
+            r#"
+schema = "harwness.context/v1"
+id = "harwness.context.sections-typo@1"
+version = "1.1.0"
+
+[patch.sections]
+appnd = [{ name = "goal.invariants" }]
+"#,
+        )?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::Project, patch_layer),
+        ];
+        let result =
+            resolve_context_program(&id("harwness.context.sections-typo@1")?, &layers, now());
+        assert!(matches!(
+            result,
+            Err(ContextProgramError::Resolution(
+                DslError::UnknownMergeOp { .. }
+            ))
+        ));
         Ok(())
     }
 

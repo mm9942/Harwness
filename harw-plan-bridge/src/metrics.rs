@@ -1,4 +1,4 @@
-//! Telemetrie der Planschleife: acht Fragen zu einem bisher unbeobachteten
+//! Telemetrie der Planschleife: sieben Fragen zu einem bisher unbeobachteten
 //! Regelkreis (Knoten AW1-05).
 //!
 //! # Verantwortungsbereich
@@ -32,56 +32,37 @@
 //! # Was hier bewusst fehlt: `scope_violation_rate`
 //! `harw_plan::admission::validate_patch` ist die Funktion, die einen
 //! Schreibversuch außerhalb des Reviers ablehnt — genau das, was diese Metrik
-//! zählen sollte. Sie hat aber, Stand dieses Knotens, **keinen einzigen
-//! Aufrufer** außerhalb ihres eigenen Testmoduls (`harw-plan/src/admission.rs`)
-//! — weder in dieser Crate noch anderswo im Workspace. `harw-plan-bridge`
-//! baut zwar über [`crate::job_bridge`] den [`harw_plan::admission::MutationContract`]
-//! und legt ihn in den Job-Payload (siehe `job_bridge::node_payload`), ruft
-//! `validate_patch` selbst aber nirgends auf — die Prüfung eines
-//! eingereichten Patches gegen diesen Vertrag ist (noch) nicht implementiert.
-//! Eine Metrik an eine Funktion zu hängen, die nie aufgerufen wird, würde
-//! dauerhaft `0` anzeigen und das fälschlich als "keine Scope-Verletzungen"
-//! lesen lassen — das wäre eine Metrik, die lügt, schlimmer als keine. Diese
-//! Crate deklariert `scope_violation_rate` deshalb **nicht**. Sobald ein
-//! Aufrufer von `validate_patch` innerhalb dieser Crate entsteht, gehört die
-//! Metrik dorthin.
+//! zählen sollte. `harw-plan-bridge` baut zwar über [`crate::job_bridge`] den
+//! [`harw_plan::admission::MutationContract`] und legt ihn in den Job-Payload
+//! (siehe `job_bridge::node_payload`), ruft `validate_patch` selbst aber
+//! nirgends auf: der Job-Payload, den diese Crate baut, trägt nie eine Liste
+//! geänderter Dateien, nur den Kontrakt selbst. Eine Metrik in diesem Modul an
+//! eine Funktion zu hängen, die diese Crate nie aufruft, würde dauerhaft `0`
+//! anzeigen und das fälschlich als "keine Scope-Verletzungen" lesen lassen —
+//! das wäre eine Metrik, die lügt, schlimmer als keine.
 //!
-//! ## Nachtrag: der Kontrakt hat einen Konsumenten — aber keinen, der prüft
-//! Eine nachträgliche Suche über den gesamten Workspace zeigt: der
-//! [`harw_plan::admission::MutationContract`] selbst hat sehr wohl einen
-//! Konsumenten außerhalb von `harw-plan` und `harw-plan-bridge` —
-//! `harw-cli/src/job_worker.rs`, Funktion `derive_plan_node_sandbox` (mit
-//! Helfer `contract_permission_ceiling`). Sie liest den Kontrakt, der über
-//! `job_bridge::node_payload` in den Job-Payload gewandert ist, und leitet
-//! daraus die `SandboxSpec` ab, unter der der Worker-Turn läuft. Das ist ein
-//! echter Produktionspfad: `execute_plan_node_claim` → `PlanNodePayload::parse`
-//! → `derive_plan_node_sandbox` → Turn-Ausführung.
+//! ## Nachtrag: `validate_patch` hat inzwischen Aufrufer — beide in `harw-cli`
+//! Seit Commit `ff9c499` (2026-09-21) ist `validate_patch` nicht mehr
+//! unerreicht. `harw-cli/src/job_worker.rs`, Funktion `enforce_patch_admission`,
+//! baut aus dem Vorher-/Nachher-Schnappschuss des Sandbox-Verzeichnisses ein
+//! [`harw_plan::admission::UnifiedDiff`] und prüft es nach jedem Turn eines
+//! Plan-Knotens per `validate_patch` gegen den mitgeführten
+//! `MutationContract`, bevor das Ergebnis als `JobOutcome::Succeeded` bzw.
+//! `Failed` an den Plan zurückgemeldet wird — genau der Schritt zwischen
+//! Turn-Ende und `report_plan_node_outcome`, den eine frühere Fassung dieses
+//! Abschnitts noch als fehlend beschrieb. Daneben ruft
+//! `harw-cli/src/job_worker_work_driver.rs`, Funktion `attribute_changes`,
+//! `validate_patch` ebenfalls auf, dort um geänderte Dateien innerhalb einer
+//! Welle den einzelnen Workern zuzuordnen und Pfade außerhalb aller
+//! `owned_paths` zu melden. Beide Aufrufer sind echte Produktionspfade.
 //!
-//! Trotzdem bleibt `validate_patch` unerreicht, denn `derive_plan_node_sandbox`
-//! prüft etwas anderes: Es bildet `contract.allowed_paths` auf eine einzige
-//! binäre Berechtigung ab (`Permission::WriteWorkspace` an/aus, je nachdem, ob
-//! überhaupt erlaubte Pfade existieren — siehe `contract_permission_ceiling`)
-//! und schränkt damit den gesamten Workspace-Zugriff des Turns ein. Es gibt an
-//! dieser Stelle keine Liste einzeln geänderter Dateien (kein `UnifiedDiff`,
-//! kein `PatchFile`) — der Agent schreibt frei innerhalb des restringierten
-//! Sandbox-Verzeichnisses, und niemand vergleicht die tatsächlich berührten
-//! Pfade Datei für Datei gegen `allowed_paths`/`forbidden_paths`. Das ist genau
-//! die Granularität, die `validate_patch` bietet und die hier fehlt.
-//!
-//! **Wo die Prüfung stattdessen stehen müsste:** `harw-cli/src/job_worker.rs`,
-//! entweder (a) in `derive_plan_node_sandbox` selbst, wenn dort künftig ein
-//! dateigenaues Sandbox-Modell entsteht, oder (b) als neuer Schritt zwischen
-//! Turn-Ende und `report_plan_node_outcome`/`PlanJobBridge::on_job_completed`,
-//! der die tatsächlich geänderten Dateien des Sandbox-Verzeichnisses (z. B.
-//! über einen Filesystem- oder Git-Diff) in ein `UnifiedDiff` fasst und gegen
-//! den mitgeführten `MutationContract` per `validate_patch` prüft, bevor der
-//! Job als erfolgreich an den Plan zurückgemeldet wird. Beide Stellen liegen
-//! in `harw-cli`, außerhalb des Schreibbereichs dieses Auftrags — deshalb
-//! bleibt `scope_violation_rate` hier weiterhin unideklariert, und diese Crate
-//! erhält keine neue Aufrufstelle von `validate_patch`: eine Aufrufstelle
-//! innerhalb von `harw-plan-bridge` einzubauen wäre eine Prüfung an einer
-//! Stelle, die kein echter Patch durchläuft — der Job-Payload, den diese Crate
-//! baut, trägt nie eine Liste geänderter Dateien, nur den Kontrakt selbst.
+//! Beide Stellen liegen aber weiterhin in `harw-cli`, außerhalb des
+//! Schreibbereichs dieser Crate. `scope_violation_rate` bliebe hier ebenfalls
+//! eine Metrik, die nie feuert, denn `harw-plan-bridge` selbst ruft
+//! `validate_patch` nach wie vor nirgends auf. Die Metrik gehört deshalb nach
+//! `harw-cli`, direkt neben `enforce_patch_admission` (und ggf.
+//! `attribute_changes`) — diese Crate deklariert `scope_violation_rate`
+//! weiterhin **nicht**.
 //!
 //! # Kardinalität von `reconcile_steps_total`
 //! [`crate::controller::ReconcileStep`] hat genau neun Varianten

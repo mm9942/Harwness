@@ -36,16 +36,25 @@
 use serde::Deserialize;
 use serde::de::Error as _;
 
-/// Interne Hilfsdarstellung: entweder eine JSON-Zahl oder ein JSON-String.
+/// Interne Hilfsdarstellung: JSON-Zahl (in allen Vorzeichen-/Kommavarianten)
+/// oder JSON-String.
 ///
-/// `untagged` lässt `serde_json` beide Formen für dasselbe Feld akzeptieren;
+/// `untagged` lässt `serde_json` alle Formen für dasselbe Feld akzeptieren;
 /// die eigentliche Validierung (Ziffern, kein Vorzeichen, kein Dezimalpunkt)
-/// passiert danach manuell in [`parse_digits`].
+/// passiert danach manuell in [`parse_digits`] bzw. direkt beim Matchen der
+/// Varianten. `Neg` und `Float` existieren nur, damit negative Zahlen und
+/// Fließkommazahlen mit der festen [`ERR_MSG`]-Meldung abgelehnt werden,
+/// statt in serdes generische Fehlermeldung des untagged Enums zu fallen
+/// (die entstünde, wenn keine Variante passt).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum NumOrString {
-    /// Bereits eine JSON-Zahl.
+    /// Eine nicht-negative JSON-Ganzzahl.
     Num(u64),
+    /// Eine negative JSON-Ganzzahl — wird stets abgelehnt.
+    Neg(i64),
+    /// Eine JSON-Fließkommazahl — wird stets abgelehnt.
+    Float(f64),
     /// Ein JSON-String, der (getrimmt) nur ASCII-Ziffern enthalten darf.
     Str(String),
 }
@@ -91,6 +100,7 @@ pub fn lenient_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<
     match opt {
         None => Ok(None),
         Some(NumOrString::Num(n)) => Ok(Some(n)),
+        Some(NumOrString::Neg(_)) | Some(NumOrString::Float(_)) => Err(D::Error::custom(ERR_MSG)),
         Some(NumOrString::Str(s)) => parse_digits(&s).map(Some),
     }
 }
@@ -218,14 +228,30 @@ mod tests {
 
     #[test]
     fn test_lenient_opt_u64_rejects_negative_number() -> TestResult {
-        // JSON `-1` is not representable as u64 via the untagged Num(u64) variant,
-        // so it falls through to string matching and fails deserialization.
+        // JSON `-1` is not representable as u64 via the untagged `Num(u64)`
+        // variant, but matches the `Neg(i64)` fallback variant, which is
+        // rejected explicitly with `ERR_MSG` rather than serde's generic
+        // "did not match any variant" message.
         let Err(err) = serde_json::from_str::<U64Args>(r#"{"value": -1}"#) else {
             return Err(TestError::Unexpected(
                 "negative number must be rejected".into(),
             ));
         };
-        assert!(!err.to_string().is_empty());
+        assert!(err.to_string().contains(ERR_MSG));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lenient_opt_u64_rejects_float_number() -> TestResult {
+        // JSON `8000.5` matches neither `Num(u64)` nor `Neg(i64)`, but the
+        // `Float(f64)` fallback variant, which is rejected explicitly with
+        // `ERR_MSG`.
+        let Err(err) = serde_json::from_str::<U64Args>(r#"{"value": 8000.5}"#) else {
+            return Err(TestError::Unexpected(
+                "float number must be rejected".into(),
+            ));
+        };
+        assert!(err.to_string().contains(ERR_MSG));
         Ok(())
     }
 

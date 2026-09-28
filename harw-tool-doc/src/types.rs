@@ -30,9 +30,10 @@
 //! ```rust
 //! use harw_tool_doc::types::PageRange;
 //!
-//! let range = PageRange::parse("2-5").unwrap();
+//! let range = PageRange::parse("2-5")?;
 //! assert!(range.contains(3));
 //! assert!(!range.contains(6));
+//! # Ok::<(), harw_tool_doc::DocToolError>(())
 //! ```
 
 use crate::error::{DocToolError, DocToolResult};
@@ -73,10 +74,11 @@ impl PageRange {
     /// ```rust
     /// use harw_tool_doc::types::PageRange;
     ///
-    /// assert_eq!(PageRange::parse("3").unwrap(), PageRange { first: 3, last: Some(3) });
-    /// assert_eq!(PageRange::parse("4-").unwrap(), PageRange { first: 4, last: None });
+    /// assert_eq!(PageRange::parse("3")?, PageRange { first: 3, last: Some(3) });
+    /// assert_eq!(PageRange::parse("4-")?, PageRange { first: 4, last: None });
     /// assert!(PageRange::parse("0").is_err());
     /// assert!(PageRange::parse("5-2").is_err());
+    /// # Ok::<(), harw_tool_doc::DocToolError>(())
     /// ```
     pub fn parse(raw: &str) -> DocToolResult<Self> {
         let invalid = |reason: &str| DocToolError::InvalidPageRange {
@@ -117,10 +119,10 @@ impl PageRange {
             }
         };
 
-        if let Some(last_page) = last
-            && last_page < first
-        {
-            return Err(invalid("erste Seite liegt hinter der letzten"));
+        if let Some(last_page) = last {
+            if last_page < first {
+                return Err(invalid("erste Seite liegt hinter der letzten"));
+            }
         }
 
         Ok(Self { first, last })

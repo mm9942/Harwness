@@ -56,8 +56,9 @@ use crate::error::InstallError;
 pub enum UninstallScope {
     /// Registrierte Systemdienst-Einheiten (systemd-Unit, launchd-Plist).
     Service,
-    /// Zustands-/Laufzeitdaten im Home-Baum (Cache, Logs, State) — ohne
-    /// `profiles`/`workspace`.
+    /// Zustands-/Laufzeitdaten aus einer festen Liste bekannter harw-Verzeichnisse
+    /// (`KNOWN_STATE_DIRS`) — ohne `profiles`/`workspace`. Setzt voraus, dass
+    /// `home` als harw-Home erkennbar ist (siehe [`plan`]).
     State,
     /// Arbeitsverzeichnisse je Profil (`profiles/*/workspace`).
     Workspace,
@@ -84,9 +85,30 @@ pub struct CleanupPlan {
 
 /// Bekannte Zustands-Unterverzeichnisse des Home-Baums (Reihenfolge stabil).
 ///
-/// Diese Namen bilden den State-Scope, falls kein Verzeichnislisting verfügbar
-/// ist. Sie schließen `profiles`/`workspace` bewusst aus.
-const KNOWN_STATE_DIRS: &[&str] = &["cache", "logs", "state", "run", "tmp"];
+/// Diese Namen bilden abschließend den State-Scope (Allowlist statt eines
+/// Verzeichnislistings von `home`, siehe [`collect_state`]): nur Pfade, die
+/// zu einem dieser Namen passen **und** tatsächlich existieren, landen in
+/// `removals`. Ergänzt um die AW0–AW7-Root-Verzeichnisse aus
+/// `harw_home::paths` (`telemetry_dir`, `freeze_dir`, `ring_snapshot_dir`,
+/// `scan_reports_dir`, `bug_report_dir`, `lens_store_dir`,
+/// `visibility_index_dir`s `index`-Wurzel, `plans_dir`, `goals_dir`). Sie
+/// schließen `profiles`/`workspace` bewusst aus.
+const KNOWN_STATE_DIRS: &[&str] = &[
+    "cache",
+    "logs",
+    "state",
+    "run",
+    "tmp",
+    "telemetry",
+    "freeze",
+    "ring_snapshots",
+    "scan_reports",
+    "bug-report",
+    "lens_store",
+    "index",
+    "plans",
+    "goals",
+];
 
 /// Top-Level-Namen, die der State-Scope niemals entfernt (Nutzerdaten).
 const STATE_EXCLUDED: &[&str] = &["profiles", "workspace"];
@@ -95,15 +117,20 @@ const STATE_EXCLUDED: &[&str] = &["profiles", "workspace"];
 ///
 /// # Description
 /// Reine Berechnung: es wird nichts gelöscht. Zur Auflösung dynamischer Pfade
-/// (Home-Unterverzeichnisse, `profiles/*/workspace`) darf read-only auf den
-/// Verzeichnisbaum zugegriffen werden; fehlende Verzeichnisse führen zu einem
-/// stabilen Fallback (bekannte Namen) statt zu einem Fehler.
+/// (`profiles/*/workspace`) darf read-only auf den Verzeichnisbaum
+/// zugegriffen werden; fehlende Verzeichnisse führen zu einem stabilen
+/// Fallback (leere Liste) statt zu einem Fehler.
 ///
 /// Scope-Zuordnung:
-/// - [`UninstallScope::State`]: alle Home-Unterverzeichnisse außer `profiles`
-///   und `workspace`. Ist [`UninstallScope::Workspace`] **nicht** gewählt,
-///   werden die ausgenommenen `profiles`/`workspace`-Pfade in `preserved`
-///   vermerkt.
+/// - [`UninstallScope::State`]: die vorhandenen Verzeichnisse aus
+///   `KNOWN_STATE_DIRS` (Allowlist, **kein** Verzeichnislisting von `home`)
+///   — und nur, wenn `home` anhand seiner Marker (`active_profile`-Datei
+///   **und** `profiles/`-Verzeichnis) als harw-Home erkennbar ist; fehlt ein
+///   Marker, bleibt der Scope leer, statt ein falsch gesetztes
+///   `--home`/`HARW_HOME` leerzuräumen. Ist
+///   [`UninstallScope::Workspace`] **nicht** gewählt, werden die
+///   ausgenommenen, tatsächlich vorhandenen `profiles`/`workspace`-Pfade in
+///   `preserved` vermerkt.
 /// - [`UninstallScope::Workspace`]: `profiles/*/workspace` je Profil.
 /// - [`UninstallScope::Service`]: bekannte Service-Unit-Pfade (systemd/launchd),
 ///   abgeleitet aus dem OS-Home (`home.parent()`).
@@ -167,46 +194,57 @@ pub fn plan(home: &Path, scopes: &[UninstallScope]) -> CleanupPlan {
     }
 }
 
-/// Sammelt State-Scope-Pfade (Home-Unterverzeichnisse außer `profiles`/`workspace`).
+/// Sammelt State-Scope-Pfade aus der Allowlist [`KNOWN_STATE_DIRS`].
 ///
-/// Liest read-only das Home-Verzeichnis; fällt auf [`KNOWN_STATE_DIRS`] zurück,
-/// wenn das Listing nicht verfügbar ist.
+/// # Description
+/// Listet `home` bewusst **nicht** per Verzeichnislisting: `home` kommt aus
+/// `--home`/`HARW_HOME` und wird von diesem Modul nie darauf geprüft, ob es
+/// tatsächlich ein harw-Home ist. Ein Verzeichnislisting würde deshalb bei
+/// falsch gesetztem `--home` (z. B. versehentlich `$HOME`) *jedes*
+/// Unterverzeichnis außer `profiles`/`workspace` zum Löschen vormerken.
+/// Stattdessen wird für jeden Namen aus [`KNOWN_STATE_DIRS`] nur geprüft, ob
+/// `home/<name>` existiert und ein Verzeichnis ist.
+///
+/// Zusätzlich verlangt diese Funktion ein erkennbares harw-Home
+/// ([`looks_like_harw_home`]): fehlt der Marker, bleiben `removals` und
+/// `preserved` leer — ein fremdes oder falsch benanntes Verzeichnis wird so
+/// nie angerührt, selbst wenn es zufällig gleichnamige Unterordner enthält.
 fn collect_state(
     home: &Path,
     workspace_selected: bool,
     removals: &mut Vec<PathBuf>,
     preserved: &mut Vec<PathBuf>,
 ) {
-    match fs::read_dir(home) {
-        Ok(entries) => {
-            let mut names: Vec<String> = entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().is_dir())
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect();
-            names.sort();
-            for name in &names {
-                if STATE_EXCLUDED.contains(&name.as_str()) {
-                    if !workspace_selected {
-                        push_unique(preserved, home.join(name));
-                    }
-                } else {
-                    push_unique(removals, home.join(name));
-                }
-            }
+    if !looks_like_harw_home(home) {
+        return;
+    }
+    for name in KNOWN_STATE_DIRS {
+        let candidate = home.join(name);
+        if candidate.is_dir() {
+            push_unique(removals, candidate);
         }
-        Err(_) => {
-            // Fallback: bekannte Zustandsverzeichnisse und ausgenommene Pfade.
-            for name in KNOWN_STATE_DIRS {
-                push_unique(removals, home.join(name));
-            }
-            if !workspace_selected {
-                for name in STATE_EXCLUDED {
-                    push_unique(preserved, home.join(name));
-                }
+    }
+    if !workspace_selected {
+        for name in STATE_EXCLUDED {
+            let candidate = home.join(name);
+            if candidate.is_dir() {
+                push_unique(preserved, candidate);
             }
         }
     }
+}
+
+/// Prüft, ob `home` anhand seiner Marker als harw-Home erkennbar ist.
+///
+/// # Description
+/// [`harw_home::scaffold::ensure_home`] legt bei jeder Einrichtung sowohl die
+/// `active_profile`-Zeigerdatei als auch `profiles/` an (siehe
+/// `harw-home/src/scaffold.rs`). Beide Marker müssen vorhanden sein, damit der
+/// State-Scope ([`collect_state`]) irgendetwas entfernt — ein einzelner davon
+/// (etwa ein zufällig gleichnamiges `profiles`-Verzeichnis) reicht bewusst
+/// nicht.
+fn looks_like_harw_home(home: &Path) -> bool {
+    harw_home::active_profile_path(home).is_file() && home.join("profiles").is_dir()
 }
 
 /// Sammelt Workspace-Scope-Pfade (`profiles/*/workspace`).
@@ -345,12 +383,23 @@ mod tests {
         Ok(base)
     }
 
+    /// Legt die Marker an, die [`looks_like_harw_home`] als harw-Home
+    /// erkennt (`profiles/` plus `active_profile`-Datei). Ruft der Test
+    /// vorher schon `profiles` an, ist der erneute `create_dir_all` ein No-op.
+    fn mark_as_harw_home(home: &Path) -> TestResult<()> {
+        stdfs::create_dir_all(home.join("profiles")).map_err(ctx("profiles-Marker"))?;
+        stdfs::write(home.join("active_profile"), "default")
+            .map_err(ctx("active_profile-Marker"))?;
+        Ok(())
+    }
+
     #[test]
     fn test_plan_state_removes_non_profile_dirs_and_preserves_data() -> TestResult {
         let home = temp_home("state")?;
         for d in ["cache", "logs", "profiles", "workspace"] {
             stdfs::create_dir_all(home.join(d)).map_err(ctx("dir"))?;
         }
+        mark_as_harw_home(&home)?;
 
         let p = plan(&home, &[UninstallScope::State]);
 
@@ -371,10 +420,95 @@ mod tests {
         for d in ["cache", "profiles", "workspace"] {
             stdfs::create_dir_all(home.join(d)).map_err(ctx("dir"))?;
         }
+        mark_as_harw_home(&home)?;
 
         let p = plan(&home, &[UninstallScope::State, UninstallScope::Workspace]);
 
         assert!(p.preserved.is_empty());
+        stdfs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_state_without_marker_yields_no_removals() -> TestResult {
+        // Unvalidiertes `--home`/`HARW_HOME` (kein `active_profile`, kein
+        // `profiles/`): der State-Scope darf ein fremdes `Documents/` niemals
+        // anfassen, selbst wenn zufällig bekannte Namen daneben liegen.
+        let home = temp_home("no-marker")?;
+        stdfs::create_dir_all(home.join("Documents")).map_err(ctx("dir"))?;
+        stdfs::create_dir_all(home.join("cache")).map_err(ctx("dir"))?;
+
+        let p = plan(&home, &[UninstallScope::State]);
+
+        assert!(
+            p.removals.is_empty(),
+            "ohne Marker darf nichts entfernt werden"
+        );
+        assert!(p.preserved.is_empty());
+        stdfs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_state_with_only_one_marker_yields_no_removals() -> TestResult {
+        // Nur `profiles/` ohne `active_profile`-Datei: reicht bewusst nicht,
+        // da `profiles` allein ein zufälliger Verzeichnisname sein kann.
+        let home = temp_home("half-marker")?;
+        stdfs::create_dir_all(home.join("profiles")).map_err(ctx("dir"))?;
+        stdfs::create_dir_all(home.join("cache")).map_err(ctx("dir"))?;
+
+        let p = plan(&home, &[UninstallScope::State]);
+
+        assert!(p.removals.is_empty());
+        stdfs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_state_with_marker_ignores_foreign_dirs() -> TestResult {
+        let home = temp_home("marker-foreign")?;
+        mark_as_harw_home(&home)?;
+        stdfs::create_dir_all(home.join("Documents")).map_err(ctx("dir"))?;
+        stdfs::create_dir_all(home.join("cache")).map_err(ctx("dir"))?;
+
+        let p = plan(&home, &[UninstallScope::State]);
+
+        assert!(p.removals.contains(&home.join("cache")));
+        assert!(
+            !p.removals.contains(&home.join("Documents")),
+            "fremdes Verzeichnis darf nicht im Plan stehen"
+        );
+        stdfs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_state_includes_known_program_dirs() -> TestResult {
+        let home = temp_home("program-dirs")?;
+        mark_as_harw_home(&home)?;
+        let program_dirs = [
+            "telemetry",
+            "freeze",
+            "ring_snapshots",
+            "scan_reports",
+            "bug-report",
+            "lens_store",
+            "index",
+            "plans",
+            "goals",
+        ];
+        for d in program_dirs {
+            stdfs::create_dir_all(home.join(d)).map_err(ctx("dir"))?;
+        }
+
+        let p = plan(&home, &[UninstallScope::State]);
+
+        for d in program_dirs {
+            assert!(
+                p.removals.contains(&home.join(d)),
+                "{d} muss im State-Scope enthalten sein"
+            );
+        }
         stdfs::remove_dir_all(&home).ok();
         Ok(())
     }
@@ -451,8 +585,10 @@ mod tests {
         let home = temp_home("dry")?;
         let victim = home.join("cache");
         stdfs::create_dir_all(&victim).map_err(ctx("dir"))?;
+        mark_as_harw_home(&home)?;
 
         let p = plan(&home, &[UninstallScope::State]);
+        assert!(p.removals.contains(&victim), "cache muss geplant sein");
         let result = execute(&p, true);
 
         assert!(result.is_ok());
@@ -466,7 +602,7 @@ mod tests {
         let home = temp_home("real")?;
         let victim = home.join("cache");
         stdfs::create_dir_all(&victim).map_err(ctx("dir"))?;
-        stdfs::create_dir_all(home.join("profiles")).map_err(ctx("dir"))?;
+        mark_as_harw_home(&home)?;
 
         let p = plan(&home, &[UninstallScope::State]);
         let result = execute(&p, false);

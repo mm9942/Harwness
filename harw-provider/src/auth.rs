@@ -5,7 +5,10 @@
 //! OAuth/Login-Drumherum, das hier bewusst rausoperiert ist.
 //!
 //! Tokens tragen `secrecy::SecretString` (Note 11: SecretString-Pflicht), sodass
-//! ein versehentliches `Debug` auf die Registry keine Keys leakt.
+//! ein versehentliches `Debug` auf die Registry keine Keys leakt. Sobald ein
+//! Token in [`HeaderMap`] als fertiger `Bearer …`-Header landet, redigiert
+//! `HeaderMap`s handgeschriebenes `Debug` die Werte sicherheitsrelevanter
+//! Header (siehe [`SENSITIVE_HEADER_NAMES`]) ebenfalls.
 
 use std::sync::Arc;
 
@@ -13,15 +16,43 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::error::{ProviderError, ProviderResult};
 
+/// Header-Namen, deren Werte in `Debug`-Ausgaben nie im Klartext auftauchen
+/// dürfen (Note 08 §4.5, Note 11 SecretString-Pflicht).
+const SENSITIVE_HEADER_NAMES: [&str; 4] = [
+    "authorization",
+    "x-api-key",
+    "chatgpt-account-id",
+    "cookie",
+];
+
 /// Minimaler, dependency-freier Header-Container.
 ///
 /// Note 08 §4.2 skizziert `http::HeaderMap`; um `harw-provider` frei von
 /// `http`/`reqwest` zu halten (höchste Stabilität, kein Runtime-SDK in der
 /// Identitäts-Schicht), benutzen wir hier eine schlanke eigene Form. Der echte
 /// HTTP-Client (eigenes Crate) übersetzt das in `http::HeaderMap`.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` ist bewusst handgeschrieben statt abgeleitet: die Werte
+/// sicherheitsrelevanter Header (siehe [`SENSITIVE_HEADER_NAMES`]) werden
+/// dabei redigiert, damit ein `?headers`-Log oder ein Debug-Print keinen
+/// Bearer-Token oder API-Key im Klartext ausgibt.
+#[derive(Clone, Default)]
 pub struct HeaderMap {
     entries: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for HeaderMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for (name, value) in &self.entries {
+            if SENSITIVE_HEADER_NAMES.contains(&name.as_str()) {
+                map.entry(name, &"[REDACTED]");
+            } else {
+                map.entry(name, value);
+            }
+        }
+        map.finish()
+    }
 }
 
 impl HeaderMap {
@@ -74,8 +105,9 @@ pub enum ProviderAuth {
 
 impl ProviderAuth {
     /// Hängt die passenden Auth-Header an. Das Token wird lokal in den
-    /// `Bearer …`-String gegossen und landet nie als `String`-Feld irgendwo,
-    /// das später auseinandergeloggt wird (Note 08 §4.5).
+    /// `Bearer …`-String gegossen und landet zwar als `String`-Wert in
+    /// [`HeaderMap`], deren handgeschriebenes `Debug` diesen Wert aber
+    /// redigiert, sodass er nicht auseinandergeloggt wird (Note 08 §4.5).
     pub fn add_auth_headers(&self, headers: &mut HeaderMap) {
         match self {
             Self::ApiKey(cfg) => {
@@ -160,5 +192,68 @@ impl AuthProvider for BearerAuth {
             "authorization",
             format!("Bearer {}", self.token.expose_secret()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::{
+        ApiKeyConfig, AuthProvider, BearerAuth, HeaderMap, ProviderAuth, StaticBearerConfig,
+    };
+    use crate::test_support::TestResult;
+
+    #[test]
+    fn debug_redacts_bearer_token_from_authorization_header() -> TestResult {
+        let mut headers = HeaderMap::new();
+        BearerAuth::from_static("tok-secret-123").add_auth_headers(&mut headers);
+        let rendered = format!("{headers:?}");
+        assert!(!rendered.contains("tok-secret-123"));
+        assert!(rendered.contains("REDACTED"));
+        Ok(())
+    }
+
+    #[test]
+    fn debug_redacts_api_key_via_provider_auth() -> TestResult {
+        let auth = ProviderAuth::ApiKey(ApiKeyConfig {
+            api_key: SecretString::new("sk-test-123".to_owned()),
+        });
+        let mut headers = HeaderMap::new();
+        auth.add_auth_headers(&mut headers);
+        let rendered = format!("{headers:?}");
+        assert!(!rendered.contains("sk-test-123"));
+        Ok(())
+    }
+
+    #[test]
+    fn debug_redacts_bearer_token_and_account_id_from_static_bearer() -> TestResult {
+        let auth = ProviderAuth::StaticBearer(StaticBearerConfig {
+            access_token: SecretString::new("tok-abc".to_owned()),
+            account_id: Some(std::sync::Arc::from("acct-42")),
+        });
+        let mut headers = HeaderMap::new();
+        auth.add_auth_headers(&mut headers);
+        let rendered = format!("{headers:?}");
+        assert!(!rendered.contains("tok-abc"));
+        assert!(!rendered.contains("acct-42"));
+        Ok(())
+    }
+
+    #[test]
+    fn debug_keeps_non_sensitive_header_values_readable() -> TestResult {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req-99");
+        let rendered = format!("{headers:?}");
+        assert!(rendered.contains("req-99"));
+        Ok(())
+    }
+
+    #[test]
+    fn get_still_returns_full_value_despite_redacted_debug() -> TestResult {
+        let mut headers = HeaderMap::new();
+        BearerAuth::from_static("tok-full-value").add_auth_headers(&mut headers);
+        assert_eq!(headers.get("authorization"), Some("Bearer tok-full-value"));
+        Ok(())
     }
 }

@@ -5,7 +5,8 @@
 //! Responsibilities:
 //! - sweep legacy completion files for a binary, removing only files that are provably
 //!   harw/clap generated ([`crate::shell::is_ours`]); foreign files are reported and left alone,
-//! - write the canonical completion script atomically (temp file + rename, permissions preserved),
+//! - write the canonical completion script atomically (temp file created at the target's own
+//!   mode from the moment it exists, fsynced, then renamed; never briefly wider than intended),
 //! - maintain a managed rc block (`# >>> harw completions (<bin>) >>>` ... `# <<< ... <<<`) and remove
 //!   legacy `source <(<bin> completion ...)` one-liners, backing rc files up to `<rc>.harw-bak`,
 //! - drop stale zsh `.zcompdump*` caches that reference `_<bin>`.
@@ -644,7 +645,9 @@ fn resolve_symlink(path: &Path) -> PathBuf {
     }
 }
 
-// Writes `bytes` to `path` via `.{name}.harw-tmp-{pid}` + rename, preserving existing permissions.
+// Writes `bytes` to `path` via `.{name}.harw-tmp-{pid}` + rename. The temp file's mode always
+// matches the target's own mode (or `0o600` for a target that does not exist yet), so it is
+// never briefly wider than intended.
 fn write_atomic(path: &Path, bytes: &[u8]) -> CompletionResult<()> {
     let target = resolve_symlink(path);
     let parent = match target.parent() {
@@ -678,17 +681,62 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> CompletionResult<()> {
     result
 }
 
+// Creates the temp file backing `write_and_swap` via `O_CREAT | O_EXCL` (`create_new`), narrowed
+// to `target_permissions` (or `0o600` when the target does not exist yet) *at creation time* on
+// Unix. This closes the window a plain `fs::write` (mode `0o666 & ~umask`, typically `0o644`)
+// followed by a later `chmod` used to leave open: another local user could read the temp copy of
+// a secret-bearing rc file before it was narrowed, and a crash between the write and the `chmod`
+// left a widely readable copy behind. Requesting the eventual mode directly at open time means
+// the kernel never grants more than that (a stricter umask can only narrow it further, never
+// widen it). `create_new` also means the temp name is never taken over if it already refers to
+// an existing file or symlink; an `AlreadyExists` error means the name is a leftover from a
+// crashed earlier run under our own naming scheme, which is ours to clean up.
+fn create_temp_file(
+    temp: &Path,
+    target_permissions: Option<&fs::Permissions>,
+) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mode = target_permissions.map_or(0o600, |permissions| permissions.mode());
+        options.mode(mode);
+    }
+
+    match options.open(temp) {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(temp)?;
+            options.open(temp)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 // Temp write, permission copy and rename for `write_atomic`.
 fn write_and_swap(temp: &Path, target: &Path, bytes: &[u8]) -> CompletionResult<()> {
-    fs::write(temp, bytes).map_err(io_err("write", temp))?;
-    match fs::metadata(target) {
-        Ok(meta) => {
-            fs::set_permissions(temp, meta.permissions())
-                .map_err(io_err("set permissions on", temp))?;
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+    let target_permissions = match fs::metadata(target) {
+        Ok(meta) => Some(meta.permissions()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
         Err(err) => return Err(io_err("inspect", target)(err)),
+    };
+
+    let mut file =
+        create_temp_file(temp, target_permissions.as_ref()).map_err(io_err("create", temp))?;
+
+    use std::io::Write as _;
+    file.write_all(bytes).map_err(io_err("write", temp))?;
+    // Fsync before the rename so the content survives a crash right after.
+    file.sync_all().map_err(io_err("sync", temp))?;
+    if let Some(permissions) = target_permissions {
+        // Re-applies the exact target mode on the open file descriptor: `fchmod` ignores the
+        // umask, so this corrects for a umask that narrowed the mode further at creation.
+        file.set_permissions(permissions)
+            .map_err(io_err("set permissions on", temp))?;
     }
+    drop(file);
+
     fs::rename(temp, target).map_err(io_err("rename", target))
 }
 
@@ -706,4 +754,108 @@ fn log_summary(report: &InstallReport) {
         hints = report.hints.len(),
         "shell completions finished"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // No crate-wide test support module exists here; kept local like the other single-file test
+    // modules in this workspace (e.g. `harw-runtime/src/embedded.rs`).
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> TestResult<u32> {
+        Ok(fs::symlink_metadata(path)?.permissions().mode() & 0o777)
+    }
+
+    // Finding: the temp file must be narrow from the moment it exists, not narrowed afterwards.
+    // No byte has been written yet when this asserts, so there is no window in between.
+    #[test]
+    #[cfg(unix)]
+    fn test_create_temp_file_matches_target_mode_before_any_write() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("target.rc");
+        fs::write(&target, b"old")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        let target_permissions = fs::metadata(&target)?.permissions();
+
+        let temp = dir.path().join(".target.rc.harw-tmp-test");
+        let file = create_temp_file(&temp, Some(&target_permissions))?;
+        assert_eq!(mode_of(&temp)?, 0o600);
+        drop(file);
+        fs::remove_file(&temp)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_temp_file_defaults_to_0600_for_a_new_target() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let temp = dir.path().join(".new-target.harw-tmp-test");
+        let file = create_temp_file(&temp, None)?;
+        assert_eq!(mode_of(&temp)?, 0o600);
+        drop(file);
+        fs::remove_file(&temp)?;
+        Ok(())
+    }
+
+    // A leftover temp file from a crashed earlier run must not be reused as-is (wrong content,
+    // possibly wide-open mode); it is removed and recreated narrow.
+    #[test]
+    #[cfg(unix)]
+    fn test_create_temp_file_replaces_a_stale_leftover() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let temp = dir.path().join(".target.rc.harw-tmp-test");
+        fs::write(&temp, b"stale")?;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644))?;
+
+        let permissions = fs::Permissions::from_mode(0o600);
+        let file = create_temp_file(&temp, Some(&permissions))?;
+        assert_eq!(mode_of(&temp)?, 0o600);
+        drop(file);
+        assert_eq!(fs::read(&temp)?, Vec::<u8>::new());
+        fs::remove_file(&temp)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_atomic_preserves_target_mode_and_leaves_no_temp_behind() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join(".bashrc");
+        fs::write(&target, b"export TOKEN=old\n")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+
+        write_atomic(&target, b"export TOKEN=new\n")?;
+
+        assert_eq!(fs::read(&target)?, b"export TOKEN=new\n");
+        assert_eq!(mode_of(&target)?, 0o600);
+        let names: Vec<_> = fs::read_dir(dir.path())?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(names, vec![std::ffi::OsString::from(".bashrc")]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_atomic_defaults_new_files_to_0600() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("new.rc");
+        write_atomic(&target, b"content")?;
+        assert_eq!(mode_of(&target)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_atomic_creates_a_new_file() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("completions.bash");
+        write_atomic(&target, b"complete -F _bin bin\n")?;
+        assert_eq!(fs::read(&target)?, b"complete -F _bin bin\n");
+        Ok(())
+    }
 }

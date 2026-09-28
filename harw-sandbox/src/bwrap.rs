@@ -4,7 +4,15 @@
 //! the syscall-adjacent consumer that turns it into a minimal `bwrap` command.
 //! By default it never mounts a host home, parent workspace, or arbitrary
 //! environment; [`BwrapLauncher::with_host_path`] is the sole, explicit
-//! opt-in that binds Host-`PATH` directories (Plan Teil C1).
+//! opt-in that binds Host-`PATH` directories (Plan Teil C1), and even then
+//! never one that equals or contains the workspace or the host `HOME`.
+//!
+//! Ein beschreibbarer Workspace bekommt `<workspace>/.git` direkt nach der
+//! Workspace-Bindung erneut nur lesend (`--ro-bind-try`): Hooks und
+//! `.git/config` (`core.fsmonitor`, `core.hooksPath`) führten sonst von der
+//! Sandbox geschriebenen Code auf dem Host aus, sobald Nutzer oder IDE dort
+//! `git` aufrufen — dieselbe Regel wie bei `fs.write`. Ein `.git`-Symlink
+//! wird nie gebunden; der Plan scheitert dann (siehe [`BwrapLauncher::plan`]).
 //!
 //! Jeder Plan bindet unabhängig von einem Profil `/etc/passwd`, `/etc/group`
 //! und `/etc/nsswitch.conf` (`--ro-bind-try`) und setzt, wenn ermittelbar,
@@ -182,16 +190,10 @@ pub struct BwrapLauncher {
     read_only_paths: Vec<PathBuf>,
 }
 
-impl Default for BwrapLauncher {
-    /// Sucht `bwrap` an den festen Pfaden ([`BWRAP_CANDIDATES`]). Ist dort
-    /// keines vertrauenswürdig vorhanden, wird trotzdem der erste feste Pfad
-    /// eingetragen: Der Start scheitert dann laut mit „not found“, statt über
-    /// `PATH` ein beliebiges Programm zu finden.
-    fn default() -> Self {
-        Self::discover().unwrap_or_else(|_| Self::new(PathBuf::from(BWRAP_CANDIDATES[0])))
-    }
-}
-
+// Bewusst kein `Default`: Ein Rückfall auf den ersten festen Pfad liefe auch
+// dann, wenn [`BwrapLauncher::discover`] das Binary dort als nicht
+// vertrauenswürdig verworfen hat (nicht root-eigen, beschreibbar). Aufrufer
+// nehmen `discover()?` oder geben den Pfad mit [`BwrapLauncher::new`] vor.
 impl BwrapLauncher {
     /// Verwendet genau `executable`. Der Aufrufer ist für die Vertrauenswürdigkeit
     /// des Pfads verantwortlich; [`spawn`](Self::spawn) lehnt relative Pfade ab.
@@ -426,6 +428,10 @@ impl BwrapLauncher {
     /// execution. The host network namespace is never shared: every plan
     /// carries `--unshare-net`; [`NetworkMode::ProxyOnly`] additionally binds
     /// the relay and proxy socket and wraps `command` in the relay's exec mode.
+    /// With `WriteWorkspace`, an existing `<workspace>/.git` (directory or
+    /// worktree/submodule `gitdir:` file) is re-bound read-only right after
+    /// the workspace, so sandboxed code cannot plant hooks or `.git/config`
+    /// entries that later run on the host.
     ///
     /// # Errors
     /// - [`SandboxError::ProcessExecutionDenied`]: `ExecuteProcess` fehlt.
@@ -434,6 +440,8 @@ impl BwrapLauncher {
     /// - [`SandboxError::InvalidRelaySpec`]: Relay-Pfad/-Socket nicht absolut
     ///   bzw. nicht normal, oder Port `0`.
     /// - [`SandboxError::InvalidSandboxWorkspaceDestination`]: Workspace-Pfad ungültig.
+    /// - [`SandboxError::Io`]: bei beschreibbarem Workspace ist `.git` ein
+    ///   Symlink bzw. weder Verzeichnis noch Datei, oder nicht prüfbar.
     pub fn plan(
         &self,
         sandbox: &SandboxSpec,
@@ -697,10 +705,13 @@ impl BwrapLauncher {
                 Path::new("/lib64"),
             ];
             // Für jeden PATH-Eintrag (in Reihenfolge, Duplikate raus): leer/
-            // relativ überspringen; `/` und exakt `home` überspringen;
+            // relativ überspringen; `/` sowie Einträge, die den Workspace
+            // oder `home` enthalten bzw. ihnen gleichen, überspringen (sie
+            // blendeten Geschwisterprojekte bzw. den Home-Baum ein);
             // Einträge unter /usr,/bin,/lib,/lib64 (oben bereits gebunden)
-            // nicht erneut binden; Einträge gleich/unter dem Workspace nicht
+            // nicht erneut binden; Einträge unter dem Workspace nicht
             // binden (der folgt gleich selbst); sonst `--ro-bind-try`.
+            let home = binding.home.as_deref();
             for entry in binding.path.split(':') {
                 if entry.is_empty() {
                     continue;
@@ -715,7 +726,7 @@ impl BwrapLauncher {
                 if dir == Path::new("/") {
                     continue;
                 }
-                if binding.home.as_deref().is_some_and(|home| dir == home) {
+                if contains_workspace_or_home(dir, workspace, home) {
                     continue;
                 }
                 if stdlib_prefixes.iter().any(|prefix| dir.starts_with(prefix)) {
@@ -738,7 +749,9 @@ impl BwrapLauncher {
             // Schleife oben. Ist ein `cargo_profile` aktiv, hat dessen
             // eigene, oben bereits gesetzte Bindung/Umgebung Vorrang: kein
             // doppeltes/konkurrierendes `--setenv CARGO_HOME`/`RUSTUP_HOME`
-            // bzw. `--ro-bind-try` auf denselben Sandbox-Zielpfad.
+            // bzw. `--ro-bind-try` auf denselben Sandbox-Zielpfad. Ein Baum,
+            // der den Workspace oder `home` enthält bzw. ihnen gleicht, wird
+            // wie ein solcher PATH-Eintrag weder gebunden noch gesetzt.
             let cargo_home = binding
                 .cargo_home
                 .clone()
@@ -753,7 +766,8 @@ impl BwrapLauncher {
                     let rustup_home = binding
                         .rustup_home
                         .clone()
-                        .or_else(|| binding.home.as_ref().map(|home| home.join(".rustup")));
+                        .or_else(|| binding.home.as_ref().map(|home| home.join(".rustup")))
+                        .filter(|tree| !contains_workspace_or_home(tree, workspace, home));
                     if let Some(rustup_home) = rustup_home {
                         append_destination_dirs_dedup(&mut args, &rustup_home, &mut created_dirs)?;
                         args.extend([
@@ -765,15 +779,17 @@ impl BwrapLauncher {
                             rustup_home.as_os_str().to_owned(),
                         ]);
                     }
-                    append_destination_dirs_dedup(&mut args, &cargo_home, &mut created_dirs)?;
-                    args.extend([
-                        OsString::from("--ro-bind-try"),
-                        cargo_home.as_os_str().to_owned(),
-                        cargo_home.as_os_str().to_owned(),
-                        OsString::from("--setenv"),
-                        OsString::from("CARGO_HOME"),
-                        cargo_home.as_os_str().to_owned(),
-                    ]);
+                    if !contains_workspace_or_home(&cargo_home, workspace, home) {
+                        append_destination_dirs_dedup(&mut args, &cargo_home, &mut created_dirs)?;
+                        args.extend([
+                            OsString::from("--ro-bind-try"),
+                            cargo_home.as_os_str().to_owned(),
+                            cargo_home.as_os_str().to_owned(),
+                            OsString::from("--setenv"),
+                            OsString::from("CARGO_HOME"),
+                            cargo_home.as_os_str().to_owned(),
+                        ]);
+                    }
                 }
             }
         }
@@ -786,6 +802,42 @@ impl BwrapLauncher {
         });
         args.push(workspace.as_os_str().to_owned());
         args.push(workspace.as_os_str().to_owned());
+        // `.git` bleibt auch im beschreibbaren Workspace nur lesend (siehe
+        // Moduldoku); die Bindung muss nach dem Workspace stehen, sonst
+        // überdeckt dieser sie. Nur ein echtes Verzeichnis bzw. eine echte
+        // `gitdir:`-Datei wird gebunden: bwrap folgt Symlinks in Quelle und
+        // Ziel, ein von der Sandbox gelegtes `.git -> ..` blendete sonst beim
+        // nächsten Start einen Host-Pfad außerhalb des Workspace ein. Fehlt
+        // `.git`, entfällt die Bindung: ein Platzhalter hinterließe ein leeres
+        // `.git` auf dem Host, das `harw init` und die Projekterkennung als
+        // Repository werten. `-try` deckt ein Verschwinden bis zum Start ab.
+        if write_allowed {
+            let git = workspace.join(".git");
+            match std::fs::symlink_metadata(&git) {
+                Ok(metadata) if metadata.is_dir() || metadata.is_file() => {
+                    args.extend([
+                        OsString::from("--ro-bind-try"),
+                        git.as_os_str().to_owned(),
+                        git.as_os_str().to_owned(),
+                    ]);
+                }
+                Ok(_) => {
+                    return Err(SandboxError::Io {
+                        path: git,
+                        reason: "workspace .git is a symlink or special file and cannot be \
+                                 bound read-only safely"
+                            .to_owned(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SandboxError::Io {
+                        path: git,
+                        reason: format!("cannot inspect workspace .git: {error}"),
+                    });
+                }
+            }
+        }
         // Relay-Bindungen nach dem Workspace, damit eine Workspace-Bindung sie
         // nicht überdecken kann. Ziele liegen auf dem tmpfs-Root der Sandbox.
         if let Some(spec) = relay {
@@ -1234,6 +1286,14 @@ fn append_destination_dirs(args: &mut Vec<OsString>, destination: &Path) -> Sand
     Ok(())
 }
 
+/// `true`, wenn der Host-Pfad `dir` den Workspace oder das Host-`HOME`
+/// enthält oder ihnen gleicht (damit immer auch `/`). So ein Pfad blendete
+/// Geschwisterprojekte, fremde Workspaces oder den ganzen Home-Baum ein; die
+/// Host-`PATH`-Bindung (Teil C1) überspringt ihn wie `read_only_paths`.
+fn contains_workspace_or_home(dir: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+    workspace.starts_with(dir) || home.is_some_and(|home| home.starts_with(dir))
+}
+
 /// Wie [`append_destination_dirs`], überspringt aber bereits erzeugte
 /// Zielverzeichnisse: verhindert doppelte `--dir`-Einträge, wenn mehrere
 /// Host-Pfade (Teil C1) denselben Elternpfad teilen, z. B. `~/.cargo/bin`
@@ -1324,7 +1384,13 @@ mod tests {
     use harw_types::{TenantId, WorkspaceId};
 
     fn sandbox(permissions: PermissionSet) -> TestResult<SandboxSpec> {
-        let root = std::env::temp_dir().join(format!("harwness-bwrap-{}", std::process::id()));
+        sandbox_in("harwness-bwrap", permissions)
+    }
+
+    // Wie `sandbox`, aber unter eigenem Wurzelnamen: Tests, die im Workspace
+    // etwas anlegen (etwa `.git`), stören so die übrigen Plan-Tests nicht.
+    fn sandbox_in(tag: &str, permissions: PermissionSet) -> TestResult<SandboxSpec> {
+        let root = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
         std::fs::create_dir_all(root.join("workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
@@ -1343,6 +1409,11 @@ mod tests {
         ))
     }
 
+    // Launcher mit festem Pfad für reine Plan-Tests (es gibt kein `Default`).
+    fn test_launcher() -> BwrapLauncher {
+        BwrapLauncher::new(PathBuf::from(BWRAP_CANDIDATES[0]))
+    }
+
     fn strings(plan: &BwrapCommandPlan) -> Vec<String> {
         plan.args()
             .iter()
@@ -1356,7 +1427,7 @@ mod tests {
             Permission::ReadWorkspace,
             Permission::ExecuteProcess,
         ]))?;
-        let plan = BwrapLauncher::default()
+        let plan = test_launcher()
             .plan(&spec, &[OsString::from("/bin/true")])
             .map_err(TestError::Sandbox)?;
         let args = strings(&plan);
@@ -1380,7 +1451,7 @@ mod tests {
         ] {
             let spec = sandbox(PermissionSet::from_policy(permissions))?;
             let workspace = spec.workspace().canonical_root().display().to_string();
-            let plan = BwrapLauncher::default()
+            let plan = test_launcher()
                 .plan_read_only(
                     &spec,
                     &[("GIT_OPTIONAL_LOCKS", "0")],
@@ -1404,7 +1475,7 @@ mod tests {
         }
         let denied = sandbox(PermissionSet::from_policy([Permission::ExecuteProcess]))?;
         assert!(matches!(
-            BwrapLauncher::default().plan_read_only(&denied, &[], &[OsString::from("/bin/true")]),
+            test_launcher().plan_read_only(&denied, &[], &[OsString::from("/bin/true")]),
             Err(SandboxError::ProcessExecutionDenied)
         ));
         Ok(())
@@ -1419,7 +1490,7 @@ mod tests {
             Permission::ExecuteProcess,
             Permission::NetworkAccess,
         ]))?;
-        let plan = BwrapLauncher::default()
+        let plan = test_launcher()
             .plan(&spec, &[OsString::from("/bin/true")])
             .map_err(TestError::Sandbox)?;
         let args = strings(&plan);
@@ -1488,7 +1559,7 @@ mod tests {
     //     assert!(!extra_roots.add(&extra_a, false, &primary, None).unwrap());
     //
     //     let spec = base.with_extra_roots(extra_roots);
-    //     let plan = BwrapLauncher::default()
+    //     let plan = test_launcher()
     //         .plan(&spec, &[OsString::from("/bin/true")])
     //         .unwrap();
     //     let args = strings(&plan);
@@ -1516,7 +1587,7 @@ mod tests {
         ]))?;
         let primary = base.workspace().canonical_root().to_path_buf();
 
-        let plan = BwrapLauncher::default()
+        let plan = test_launcher()
             .plan(&base, &[OsString::from("/bin/true")])
             .map_err(TestError::Sandbox)?;
         let args = strings(&plan);
@@ -1528,6 +1599,140 @@ mod tests {
             count_window(&args, &["--ro-bind", primary_str, primary_str]),
             1
         );
+        Ok(())
+    }
+
+    fn writable_execute_permissions() -> PermissionSet {
+        PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ])
+    }
+
+    /// `.git` bleibt im beschreibbaren Workspace nur lesend: direkt nach
+    /// `--bind ws ws` folgt `--ro-bind-try ws/.git ws/.git`. Ein nur lesender
+    /// Workspace braucht die Zusatzbindung nicht.
+    #[test]
+    fn writable_plan_rebinds_git_read_only_right_after_workspace() -> TestResult {
+        let spec = sandbox_in("harwness-bwrap-git", writable_execute_permissions())?;
+        let workspace = spec.workspace().canonical_root().to_path_buf();
+        let git_path = workspace.join(".git");
+        std::fs::create_dir_all(git_path.join("hooks"))?;
+        let ws = workspace
+            .to_str()
+            .ok_or(TestError::Missing("workspace path as UTF-8"))?;
+        let git = git_path
+            .to_str()
+            .ok_or(TestError::Missing(".git path as UTF-8"))?;
+        let command = [OsString::from("/bin/true")];
+        let args = strings(
+            &test_launcher()
+                .plan(&spec, &command)
+                .map_err(TestError::Sandbox)?,
+        );
+        assert_eq!(
+            count_window(&args, &["--bind", ws, ws, "--ro-bind-try", git, git]),
+            1,
+            "{args:?}"
+        );
+        let read_only = sandbox_in(
+            "harwness-bwrap-git",
+            PermissionSet::from_policy([Permission::ReadWorkspace, Permission::ExecuteProcess]),
+        )?;
+        let args = strings(
+            &test_launcher()
+                .plan(&read_only, &command)
+                .map_err(TestError::Sandbox)?,
+        );
+        assert!(!args.iter().any(|a| a == git), "{args:?}");
+        Ok(())
+    }
+
+    /// Ohne `.git` keine Zusatzbindung; eine `gitdir:`-Datei (Worktree,
+    /// Submodul) wird wie ein Verzeichnis gebunden; einem `.git`-Symlink folgt
+    /// der Plan nie, er scheitert geschlossen.
+    #[test]
+    fn writable_plan_binds_git_file_and_refuses_git_symlink() -> TestResult {
+        let spec = sandbox_in("harwness-bwrap-gitlink", writable_execute_permissions())?;
+        let workspace = spec.workspace().canonical_root().to_path_buf();
+        let git_path = workspace.join(".git");
+        // Reste eines früheren Laufs mit derselben PID entfernen.
+        if std::fs::symlink_metadata(&git_path).is_ok() {
+            std::fs::remove_file(&git_path)?;
+        }
+        let git = git_path
+            .to_str()
+            .ok_or(TestError::Missing(".git path as UTF-8"))?;
+        let command = [OsString::from("/bin/true")];
+
+        let args = strings(
+            &test_launcher()
+                .plan(&spec, &command)
+                .map_err(TestError::Sandbox)?,
+        );
+        assert!(!args.iter().any(|a| a == git), "{args:?}");
+
+        std::fs::write(&git_path, b"gitdir: /srv/main/.git/worktrees/wt\n")?;
+        let planned = test_launcher().plan(&spec, &command);
+        std::fs::remove_file(&git_path)?;
+        let args = strings(&planned.map_err(TestError::Sandbox)?);
+        assert_eq!(
+            count_window(&args, &["--ro-bind-try", git, git]),
+            1,
+            "{args:?}"
+        );
+
+        std::os::unix::fs::symlink("..", &git_path)?;
+        let result = test_launcher().plan(&spec, &command);
+        std::fs::remove_file(&git_path)?;
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(
+            matches!(error, SandboxError::Io { ref path, .. } if path == &git_path),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    /// Ende-zu-Ende: Die beschreibbare Sandbox darf den Workspace beschreiben,
+    /// aber keinen Hook unter `.git/hooks` anlegen (EROFS).
+    #[test]
+    #[ignore = "startet bwrap auf dem Host; braucht User-Namespaces"]
+    fn sandbox_cannot_plant_git_hook_in_writable_workspace() -> TestResult {
+        let Ok(launcher) = BwrapLauncher::discover() else {
+            eprintln!("übersprungen: kein vertrauenswürdiges bwrap an den festen Pfaden");
+            return Ok(());
+        };
+        let spec = sandbox_in("harwness-bwrap-git-e2e", writable_execute_permissions())?;
+        let workspace = spec.workspace().canonical_root().to_path_buf();
+        let hooks = workspace.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks)?;
+        let marker = workspace.join("written.txt");
+        let hook = hooks.join("pre-commit");
+        for leftover in [&marker, &hook] {
+            if leftover.exists() {
+                std::fs::remove_file(leftover)?;
+            }
+        }
+        let plan = launcher
+            .plan(
+                &spec,
+                &[
+                    OsString::from("/bin/sh"),
+                    OsString::from("-c"),
+                    OsString::from("echo x > written.txt; echo x > .git/hooks/pre-commit"),
+                ],
+            )
+            .map_err(TestError::Sandbox)?;
+        let status = launcher.spawn(&plan)?.wait()?;
+        if !marker.exists() {
+            eprintln!("übersprungen: Sandbox ist hier nicht gestartet ({status})");
+            return Ok(());
+        }
+        assert!(!status.success(), "{status}");
+        assert!(!hook.exists(), "hook written through the sandbox");
         Ok(())
     }
 
@@ -1912,7 +2117,7 @@ mod tests {
     #[test]
     fn process_start_is_denied_without_execute_permission() -> TestResult {
         let spec = sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
-        let result = BwrapLauncher::default().plan(&spec, &[OsString::from("/bin/true")]);
+        let result = test_launcher().plan(&spec, &[OsString::from("/bin/true")]);
         let Err(error) = result else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
@@ -1965,19 +2170,6 @@ mod tests {
         );
         assert!(!args.contains(&"--size".to_owned()));
         Ok(())
-    }
-
-    #[test]
-    fn default_executable_is_always_a_fixed_absolute_path() {
-        let launcher = BwrapLauncher::default();
-        assert!(launcher.executable().is_absolute());
-        assert!(
-            BWRAP_CANDIDATES
-                .iter()
-                .any(|candidate| Path::new(candidate) == launcher.executable()),
-            "default must never fall back to a PATH lookup: {:?}",
-            launcher.executable()
-        );
     }
 
     #[test]
@@ -2073,7 +2265,7 @@ mod tests {
     #[test]
     fn spawn_rejects_relative_executable() -> TestResult {
         let spec = execute_sandbox()?;
-        let plan = BwrapLauncher::default()
+        let plan = test_launcher()
             .plan(&spec, &[OsString::from("/bin/true")])
             .map_err(TestError::Sandbox)?;
         let result = BwrapLauncher::new(PathBuf::from("bwrap")).spawn(&plan);
@@ -2268,6 +2460,52 @@ mod tests {
             1,
             "{args:?}"
         );
+        Ok(())
+    }
+
+    /// PATH-Einträge und Cargo-/Rustup-Bäume, die den Workspace oder `HOME`
+    /// enthalten, werden nie gebunden: sie blendeten Geschwisterprojekte bzw.
+    /// den ganzen Home-Baum ein.
+    #[test]
+    fn plan_with_host_path_skips_ancestors_of_workspace_and_home() -> TestResult {
+        let spec = execute_sandbox()?;
+        let parent = spec
+            .workspace()
+            .canonical_root()
+            .parent()
+            .ok_or(TestError::Missing("workspace parent"))?
+            .to_path_buf();
+        let parent_str = parent
+            .to_str()
+            .ok_or(TestError::Missing("workspace parent as UTF-8"))?;
+        let binding = HostPathBinding {
+            path: format!("{parent_str}:/home:{parent_str}/bin:/opt/tool/bin"),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: Some(PathBuf::from("/home")),
+            cargo_home: Some(parent.clone()),
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
+        );
+        for skipped in [parent_str, "/home"] {
+            assert_eq!(
+                count_window(&args, &["--ro-bind-try", skipped, skipped]),
+                0,
+                "{skipped}: {args:?}"
+            );
+        }
+        assert_eq!(
+            count_window(&args, &["--ro-bind-try", "/opt/tool/bin", "/opt/tool/bin"]),
+            1,
+            "{args:?}"
+        );
+        // `cargo_home/bin` steht im PATH, aber beide Bäume enthalten den
+        // Workspace bzw. `HOME`: weder Bindung noch Umgebung.
+        assert!(!args.iter().any(|a| a == "CARGO_HOME"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "RUSTUP_HOME"), "{args:?}");
         Ok(())
     }
 
@@ -2573,7 +2811,7 @@ mod tests {
     fn plan_uses_resolved_process_identity_by_default() -> TestResult {
         let spec = execute_sandbox()?;
         let args = strings(
-            &BwrapLauncher::default()
+            &test_launcher()
                 .plan(&spec, &[OsString::from("/bin/true")])
                 .map_err(TestError::Sandbox)?,
         );
@@ -2604,7 +2842,7 @@ mod tests {
     fn plan_binds_etc_nss_files_for_every_profile() -> TestResult {
         let spec = execute_sandbox()?;
         let args = strings(
-            &BwrapLauncher::default()
+            &test_launcher()
                 .plan(&spec, &[OsString::from("/bin/true")])
                 .map_err(TestError::Sandbox)?,
         );
@@ -2623,7 +2861,7 @@ mod tests {
     fn plan_user_and_logname_match_host_username_resolution() -> TestResult {
         let spec = execute_sandbox()?;
         let args = strings(
-            &BwrapLauncher::default()
+            &test_launcher()
                 .plan(&spec, &[OsString::from("/bin/true")])
                 .map_err(TestError::Sandbox)?,
         );

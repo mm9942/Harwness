@@ -4262,11 +4262,15 @@ impl OpenAiResponsesProvider {
                     self.budgets.penalize(model, hint.map(Duration::from_secs));
                     // Gemeinsame Abkühlphase für alle Requests dieses
                     // Providers (UIA und Kinder), siehe
-                    // `ProviderRateLimiter::note_rate_limit_cooldown`.
-                    if let Some(secs) = hint {
-                        self.rate_limiter
-                            .note_rate_limit_cooldown(Duration::from_secs(secs));
-                    }
+                    // `ProviderRateLimiter::note_rate_limit_cooldown`. Ohne
+                    // `Retry-After`-Hinweis greift derselbe Default wie
+                    // `budgets.penalize` oben ([`budget::DEFAULT_PENALTY`]):
+                    // sonst bliebe `pacing_wait` nach einem unbeschrifteten
+                    // 429 `None`, und andere im Flug befindliche Worker
+                    // würden ungebremst weitersenden.
+                    self.rate_limiter.note_rate_limit_cooldown(
+                        hint.map_or(budget::DEFAULT_PENALTY, Duration::from_secs),
+                    );
                 }
                 let error =
                     model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
@@ -6017,6 +6021,83 @@ mod tests {
         };
         assert!(wait <= Duration::from_secs(30), "{wait:?}");
         assert!(!wait.is_zero(), "{wait:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn respond_429_without_retry_after_still_sets_pacing_cooldown() -> TestResult {
+        // Regression: eine 429-Antwort ohne `Retry-After`-Header lieferte
+        // `retry_after_hint` bewusst `None` (kein erfundener Default, siehe
+        // `error::retry_after_hint`-Doku) — das durfte aber nicht dazu
+        // führen, dass gar keine gemeinsame Abkühlphase gesetzt wird:
+        // `respond_once` fällt in diesem Fall jetzt auf denselben Default
+        // wie `budget::ProviderBudgets::penalize` zurück
+        // ([`budget::DEFAULT_PENALTY`]), damit `pacing_wait` weiterhin
+        // `Some` liefert und andere im Flug befindliche Worker nicht
+        // ungebremst weitersenden.
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
+        let server = thread::spawn(move || -> TestResult<()> {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
+            let mut request_buffer = [0_u8; 4096];
+            let _read = stream
+                .read(&mut request_buffer)
+                .map_err(ctx("read mock request"))?;
+            let body = br#"{"error":{"message":"rate limited"}}"#;
+            let headers = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .map_err(ctx("write mock response headers"))?;
+            stream
+                .write_all(body)
+                .map_err(ctx("write mock response body"))?;
+            Ok(())
+        });
+
+        let provider = OpenAiResponsesProvider::new(
+            base_url,
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        assert_eq!(
+            ModelProvider::pacing_wait(&provider),
+            None,
+            "a fresh provider must not ask callers to wait"
+        );
+
+        let Err(error) = provider.respond(request_with_ids(None, None)).await else {
+            return Err(TestError::Unexpected(
+                "a 429 must surface as an error".to_owned(),
+            ));
+        };
+        assert!(
+            matches!(
+                &error,
+                ModelError::Transient {
+                    status: Some(429),
+                    ..
+                }
+            ),
+            "expected Transient{{status: Some(429), ..}}, got {error:?}"
+        );
+
+        let wait = ModelProvider::pacing_wait(&provider).ok_or(TestError::Missing(
+            "pacing_wait after a 429 without retry-after",
+        ))?;
+        assert!(!wait.is_zero(), "{wait:?}");
+        assert!(
+            wait <= budget::DEFAULT_PENALTY,
+            "wait {wait:?} exceeds the default penalty"
+        );
+
+        server.join().map_err(join_thread_error)??;
         Ok(())
     }
 

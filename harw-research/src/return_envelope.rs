@@ -59,14 +59,49 @@ pub struct ReturnEnvelope {
 ///
 /// # Description
 /// Toleriert eine umschließende ```` ```json ```` -Fence wie
-/// [`crate::validate::parse_finding`].
+/// [`crate::validate::parse_finding`]. Validiert anschließend die
+/// Pflichtfelder mit [`validate_return_envelope`] — ein syntaktisch
+/// gültiges, aber inhaltlich leeres JSON (z. B. `agent_id: ""`) reicht allein
+/// nicht aus.
 ///
 /// # Errors
 /// - [`ResearchError::Json`]: wenn der (fence-bereinigte) Text kein gültiges
 ///   `ReturnEnvelope`-JSON ist.
+/// - [`ResearchError::EnvelopeIncomplete`]: wenn `agent_id` oder `summary`
+///   leer bzw. nur Whitespace ist (siehe [`validate_return_envelope`]).
 pub fn parse_return_envelope(raw: &str) -> ResearchResult<ReturnEnvelope> {
     let cleaned = strip_code_fence(raw);
-    serde_json::from_str(cleaned).map_err(ResearchError::from)
+    let envelope: ReturnEnvelope = serde_json::from_str(cleaned).map_err(ResearchError::from)?;
+    validate_return_envelope(&envelope)?;
+    Ok(envelope)
+}
+
+/// Validiert eine bereits geparste [`ReturnEnvelope`] gegen die
+/// Pflichtfelder des reduzierten Return-Contracts (`agent-definition-dsl.md`
+/// §13).
+///
+/// # Description
+/// Prüft nur die Felder, die für jeden Ausgang (`Success`/`Partial`/`Failed`)
+/// verpflichtend sind: `agent_id` und `summary` dürfen nicht leer oder nur
+/// Whitespace sein. Weitere Felder (`artifacts`, `blockers`, `payload`, …)
+/// sind bewusst optional, weil der reduzierte Vertrag sie nicht verlangt.
+///
+/// # Errors
+/// - [`ResearchError::EnvelopeIncomplete`]: wenn `agent_id` leer bzw. nur
+///   Whitespace ist (`missing: "agent_id"`) oder `summary` leer bzw. nur
+///   Whitespace ist (`missing: "summary"`).
+pub fn validate_return_envelope(envelope: &ReturnEnvelope) -> ResearchResult<()> {
+    if envelope.agent_id.trim().is_empty() {
+        return Err(ResearchError::EnvelopeIncomplete {
+            missing: "agent_id".to_owned(),
+        });
+    }
+    if envelope.summary.trim().is_empty() {
+        return Err(ResearchError::EnvelopeIncomplete {
+            missing: "summary".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Baut eine `Success`-Envelope, die ein [`ResearchFinding`] als Payload trägt.
@@ -189,6 +224,48 @@ mod tests {
             ));
         };
         assert!(matches!(err, ResearchError::Json(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_return_envelope_blank_agent_id_is_incomplete() -> TestResult {
+        let raw = "{\"agent_id\":\"  \",\"outcome\":\"success\",\
+                   \"summary\":\"done\",\"payload\":null}";
+        let result = parse_return_envelope(raw);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "expected Err for blank agent_id".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            err,
+            ResearchError::EnvelopeIncomplete { missing } if missing == "agent_id"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_return_envelope_empty_summary_is_incomplete() -> TestResult {
+        let raw = "{\"agent_id\":\"a1\",\"outcome\":\"success\",\
+                   \"summary\":\"\",\"payload\":null}";
+        let result = parse_return_envelope(raw);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "expected Err for empty summary".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            err,
+            ResearchError::EnvelopeIncomplete { missing } if missing == "summary"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_return_envelope_accepts_populated_fields() -> TestResult {
+        let finding = sample_finding()?;
+        let env = envelope_with_finding("explorer-1", Some("node-1"), &finding);
+        assert!(validate_return_envelope(&env).is_ok());
         Ok(())
     }
 

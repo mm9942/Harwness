@@ -24,7 +24,12 @@
 //! - **Blocking I/O**: every [`JobStore`] call runs in
 //!   [`tokio::task::spawn_blocking`].
 //! - **Outbox**: after a durable status commit, [`JobOutbox::on_committed`] is
-//!   invoked exactly once for that commit.
+//!   invoked exactly once for that commit. This is an unwired extension
+//!   point today: every production caller uses [`DurableJobRunner::new`],
+//!   which installs [`NoopJobOutbox`], and no crate in this workspace
+//!   implements [`JobOutbox`]. It is kept for the future `harw-job-runtime`
+//!   coordinator (`docs/architecture/job-extraction-map.md`); nothing should
+//!   depend on it running until a caller wires a real implementation.
 //!
 //! # Key types
 //! [`DurableJobRunner`], [`DurableJobRunnerError`], [`JobOutbox`],
@@ -149,8 +154,9 @@ impl From<ExecutionRegistryError> for DurableJobRunnerError {
 ///
 /// # Description
 /// Passed to [`JobOutbox::on_committed`]. The record is already persisted,
-/// so a consumer (plan bridge, MCP notification) can act on it without
-/// becoming a second source of truth.
+/// so a future consumer (the planned `harw-job-runtime` coordinator, see the
+/// [`JobOutbox`] status note) can act on it without becoming a second
+/// source of truth. No such consumer is wired up today.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedJob {
     /// The committed job.
@@ -172,6 +178,14 @@ pub struct CommittedJob {
 /// never for a rejected commit. It runs on the blocking pool, so a short
 /// blocking write is acceptable; a panic is logged and does not change the
 /// run result.
+///
+/// # Status
+/// Unwired extension point: no crate in this workspace implements this
+/// trait today, and every production caller uses the default
+/// [`NoopJobOutbox`] rather than [`DurableJobRunner::with_outbox`]. It is
+/// kept for the future `harw-job-runtime` coordinator
+/// (`docs/architecture/job-extraction-map.md`); do not rely on it running
+/// until some caller installs a real implementation.
 ///
 /// # Concurrency
 /// Implementations must be `Send + Sync`; hooks of different jobs may run
@@ -240,6 +254,10 @@ impl DurableJobRunner {
     }
 
     /// Replaces the commit outbox hook.
+    ///
+    /// Unwired today: no production caller installs anything but the
+    /// default [`NoopJobOutbox`] (see the [`JobOutbox`] status note). Kept
+    /// for the future `harw-job-runtime` coordinator.
     #[must_use]
     pub fn with_outbox(mut self, outbox: Arc<dyn JobOutbox>) -> Self {
         self.outbox = outbox;
@@ -695,6 +713,7 @@ mod tests {
     use harw_job_core::{Budget, Job, JobKind, RetryPolicy, StoredJob};
     use harw_types::{ApprovalActor, TenantId, WorkspaceId};
     use jiff::SignedDuration;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{oneshot, watch};
 
@@ -939,6 +958,57 @@ mod tests {
             store.get(&work_id).map_err(ctx("record"))?.job.state,
             harw_job_core::JobState::Cancelled
         ));
+        Ok(())
+    }
+
+    // Records every commit it is handed, so the test below can assert the
+    // "exactly once" contract from the `JobOutbox` doc comment even though
+    // no production caller wires a non-default outbox today.
+    struct RecordingOutbox {
+        committed: Mutex<Vec<CommittedJob>>,
+    }
+
+    impl RecordingOutbox {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                committed: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl JobOutbox for RecordingOutbox {
+        fn on_committed(&self, committed: &CommittedJob) {
+            match self.committed.lock() {
+                Ok(mut guard) => guard.push(committed.clone()),
+                Err(poisoned) => poisoned.into_inner().push(committed.clone()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn with_outbox_hook_runs_exactly_once_with_the_committed_record() -> TestResult {
+        let (_temp, store, runner, work_id) = runner("work-outbox")?;
+        let outbox = RecordingOutbox::new();
+        let runner = runner.with_outbox(Arc::clone(&outbox) as Arc<dyn JobOutbox>);
+        let control = FakeControl::new();
+        let completion = runner
+            .run(&work_id, &request(Timestamp::now()), move |_claim| {
+                (control, async {
+                    JobOutcome::Succeeded {
+                        result: serde_json::json!({"ok": true}),
+                    }
+                })
+            })
+            .await
+            .map_err(ctx("run succeeds"))?;
+        let recorded = outbox.committed.lock().map_err(ctx("outbox lock"))?;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].work_id, work_id);
+        assert_eq!(recorded[0].completion, completion);
+        assert_eq!(
+            store.get(&work_id).map_err(ctx("record"))?.job.state,
+            harw_job_core::JobState::Completed
+        );
         Ok(())
     }
 }
