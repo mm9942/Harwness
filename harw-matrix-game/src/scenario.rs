@@ -279,6 +279,10 @@ pub enum ArgumentMode {
     #[default]
     Simultaneous,
     /// Nacheinander; Spieler n sieht Argumente 1..n−1.
+    ///
+    /// Noch nicht umgesetzt (siehe „Offene Punkte“ in `lib.rs`);
+    /// [`validate_rules`] lehnt Szenarien mit diesem Modus ab, statt ihn
+    /// stillschweigend wie [`Self::Simultaneous`] zu behandeln.
     Sequential,
 }
 
@@ -347,7 +351,8 @@ impl Default for NegotiationRules {
 pub struct Rules {
     /// Argumentationssystem.
     pub argument_system: ArgumentSystem,
-    /// Einreichungsmodus.
+    /// Einreichungsmodus (`sequential` scheitert an `validate_rules`, siehe
+    /// [`ArgumentMode::Sequential`]).
     pub argument_mode: ArgumentMode,
     /// Adjudikationsverfahren.
     pub adjudication: AdjudicationSystem,
@@ -2045,6 +2050,9 @@ fn check_visibility(
 }
 
 fn validate_rules(rules: &Rules, errors: &mut Vec<String>) {
+    if rules.argument_mode == ArgumentMode::Sequential {
+        errors.push("rules.argument_mode = \"sequential\" ist noch nicht umgesetzt".to_owned());
+    }
     if !(1..=2).contains(&rules.max_track_step) {
         errors.push(format!(
             "rules.max_track_step = {} (erlaubt 1..=2)",
@@ -2726,6 +2734,23 @@ mod tests {
         let errs = invalid_errors(&src);
         assert!(
             errs.iter().any(|e| e.contains("max_track_step")),
+            "{errs:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_sequential_argument_mode() -> TestResult {
+        // `sequential` parst, ist aber noch nicht umgesetzt (matrix-game.md
+        // „Offene Punkte“) — statt stillschweigend `simultaneous` zu spielen
+        // muss die Validierung fehlschlagen.
+        let src = classic_with(
+            "argument_mode = \"simultaneous\"",
+            "argument_mode = \"sequential\"",
+        )?;
+        let errs = invalid_errors(&src);
+        assert!(
+            errs.iter().any(|e| e.contains("argument_mode")),
             "{errs:?}"
         );
         Ok(())
