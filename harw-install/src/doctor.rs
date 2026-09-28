@@ -1201,8 +1201,8 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_secret_refs_lists_file_file_json_and_env_but_not_keyring_or_secrets()
-    -> TestResult {
+    fn plaintext_secret_refs_lists_file_file_json_and_env_but_not_keyring_or_secrets() -> TestResult
+    {
         let mut config = ResolvedConfig::default();
         config.auth.credentials.insert(
             "a".to_owned(),
@@ -1250,8 +1250,7 @@ mod tests {
 
     #[test]
     fn plaintext_refs_outcome_warns_naming_ref_and_migrate_hint() {
-        let outcome =
-            plaintext_refs_outcome(&["auth.credentials.a=file:/x/key".to_owned()]);
+        let outcome = plaintext_refs_outcome(&["auth.credentials.a=file:/x/key".to_owned()]);
         assert!(matches!(
             outcome,
             CheckOutcome::Warn(message)

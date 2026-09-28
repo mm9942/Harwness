@@ -27,7 +27,9 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use harw_config::{AuthConfig, ConfigWriter, CredentialEntry, ProviderToml, ResolvedConfig, SecretRef};
+use harw_config::{
+    AuthConfig, ConfigWriter, CredentialEntry, ProviderToml, ResolvedConfig, SecretRef,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 
 /// Obergrenze einer Klartext-Quelldatei (64 KiB).
@@ -420,9 +422,14 @@ fn toml_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     };
     let mut files = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|_| format!("'{}' konnte nicht gelesen werden", dir.display()))?;
+        let entry =
+            entry.map_err(|_| format!("'{}' konnte nicht gelesen werden", dir.display()))?;
         let path = entry.path();
-        if path.extension().is_some_and(|extension| extension == "toml") && path.is_file() {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+            && path.is_file()
+        {
             files.push(path);
         }
     }
@@ -495,8 +502,7 @@ fn read_plaintext_source(path: &Path) -> Result<SecretString, &'static str> {
     if bytes.len() > MAX_SOURCE_LEN {
         return Err("Quelle ist größer als 64 KiB");
     }
-    let text =
-        SecretString::from(String::from_utf8(bytes).map_err(|_| "Quelle ist kein UTF-8")?);
+    let text = SecretString::from(String::from_utf8(bytes).map_err(|_| "Quelle ist kein UTF-8")?);
     let trimmed = text.expose_secret().trim();
     if trimmed.is_empty() {
         return Err("Quelle ist leer");
@@ -745,11 +751,9 @@ mod tests {
         fn new() -> TestResult<Self> {
             let home = TempDir::new().map_err(ctx("temporary home"))?;
             let outside = TempDir::new().map_err(ctx("temporary outside dir"))?;
-            let profile = harw_home::profile_dir(
-                home.path(),
-                &harw_home::active_profile_name(home.path()),
-            )
-            .map_err(ctx("profile dir"))?;
+            let profile =
+                harw_home::profile_dir(home.path(), &harw_home::active_profile_name(home.path()))
+                    .map_err(ctx("profile dir"))?;
             fs::create_dir_all(&profile).map_err(ctx("create profile dir"))?;
             Ok(Self {
                 home,
@@ -772,8 +776,7 @@ mod tests {
                 profile: &self.profile,
                 env_layer,
             };
-            migrate(&scope, &ResolvedConfig::default(), dry_run)
-                .map_err(TestError::Unexpected)
+            migrate(&scope, &ResolvedConfig::default(), dry_run).map_err(TestError::Unexpected)
         }
     }
 
@@ -794,14 +797,18 @@ mod tests {
 
     fn read_provider_auth(path: &Path) -> TestResult<SecretRef> {
         let content = fs::read_to_string(path).map_err(ctx("read provider file"))?;
-        let provider: ProviderToml = toml::from_str(&content).map_err(ctx("parse provider file"))?;
+        let provider: ProviderToml =
+            toml::from_str(&content).map_err(ctx("parse provider file"))?;
         some_or(provider.auth, "provider auth")
     }
 
     fn read_pool(path: &Path, provider: &str) -> TestResult<Vec<CredentialEntry>> {
         let content = fs::read_to_string(path).map_err(ctx("read auth.toml"))?;
         let auth: AuthConfig = toml::from_str(&content).map_err(ctx("parse auth.toml"))?;
-        some_or(auth.credential_pool.get(provider).cloned(), "credential pool")
+        some_or(
+            auth.credential_pool.get(provider).cloned(),
+            "credential pool",
+        )
     }
 
     /// Löst `reference` über den konfigurierten Resolver auf; der KEK kommt
@@ -840,14 +847,18 @@ mod tests {
     fn unique_env_name(suffix: &str) -> TestResult<String> {
         let name = format!("HARW_MIGRATE_TEST_{}_{suffix}", std::process::id());
         if std::env::var_os(&name).is_some() {
-            return Err(TestError::Unexpected(format!("{name} is set in the process env")));
+            return Err(TestError::Unexpected(format!(
+                "{name} is set in the process env"
+            )));
         }
         Ok(name)
     }
 
-    /// Rekursiver Schnappschuss: Pfad -> (Modus, Inhalt; `None` für
-    /// Verzeichnisse).
-    fn snapshot(root: &Path) -> TestResult<BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>> {
+    /// Pfad -> (Modus, Inhalt; `None` für Verzeichnisse).
+    type Snapshot = BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>;
+
+    /// Rekursiver Schnappschuss eines Verzeichnisbaums.
+    fn snapshot(root: &Path) -> TestResult<Snapshot> {
         let mut result = BTreeMap::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -910,7 +921,9 @@ mod tests {
         let profile_auth = harw_home::auth_path(&fixture.profile);
         write_file(
             &profile_auth,
-            &format!("[[credential_pool.openai]]\nsecret = \"env:{name}\"\nlabel = \"work\"\npriority = 2\n"),
+            &format!(
+                "[[credential_pool.openai]]\nsecret = \"env:{name}\"\nlabel = \"work\"\npriority = 2\n"
+            ),
             0o600,
         )?;
         let mut env_layer = BTreeMap::new();
@@ -946,7 +959,10 @@ mod tests {
         let provider_path = fixture.home().join("providers").join("ext.toml");
         write_file(
             &provider_path,
-            &provider_toml("ext", &format!("file-json:{}#/OPENAI_API_KEY", creds.display())),
+            &provider_toml(
+                "ext",
+                &format!("file-json:{}#/OPENAI_API_KEY", creds.display()),
+            ),
             0o600,
         )?;
 
@@ -1057,7 +1073,9 @@ mod tests {
 
         assert_eq!(report.stored, 4);
         for name in ["a", "b", "c", "d"] {
-            expect_secrets_ref(&read_provider_auth(&providers.join(format!("{name}.toml")))?)?;
+            expect_secrets_ref(&read_provider_auth(
+                &providers.join(format!("{name}.toml")),
+            )?)?;
         }
         assert!(custom.exists(), "non-harw name in <home>/secrets stays");
         assert!(outside_key.exists(), "file outside <home>/secrets stays");

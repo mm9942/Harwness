@@ -548,8 +548,8 @@ fn replace_pool_entries(
     let codex_route = harw_provider_http::is_codex_login_reference(secret)
         || harw_provider_http::is_codex_base_url(base_url);
     let new_ref = secret.to_string();
-    let replaced =
-        replaced.filter(|previous| matches!(previous, SecretRef::Secrets(_)) && *previous != secret);
+    let replaced = replaced
+        .filter(|previous| matches!(previous, SecretRef::Secrets(_)) && *previous != secret);
     let previous = std::mem::take(pool);
     pool.push(harw_config::CredentialEntry {
         secret: secret.clone(),
@@ -957,8 +957,8 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn persist_outcome_stores_raw_key_encrypted() -> TestResult {
-        use secrecy::ExposeSecret as _;
         use harw_provider_http::SecretResolver as _;
+        use secrecy::ExposeSecret as _;
 
         const RAW_KEY: &str = "sk-onboarding-raw-key-4f2a9c71d0e3b865";
         let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -976,10 +976,7 @@ mod tests {
                 "provider auth must be a secrets: reference, got {auth_ref}"
             )));
         };
-        assert!(
-            uuid_like(id),
-            "secrets: id must be a UUID, got {id}"
-        );
+        assert!(uuid_like(id), "secrets: id must be a UUID, got {id}");
         let pool: Vec<SecretRef> = config.auth.credential_pool["openai"]
             .iter()
             .map(|entry| entry.secret.clone())

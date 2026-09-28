@@ -5239,8 +5239,7 @@ mod tests {
         async fn test_full_access_approval_mode_does_not_bypass_sandbox_on_default_platform()
         -> TestResult {
             let project_root = make_temp_project("full-access-non-host-profile")?;
-            let approval_mode =
-                ApprovalModeCell::new(harw_extension_api::ApprovalMode::FullAccess);
+            let approval_mode = ApprovalModeCell::new(harw_extension_api::ApprovalMode::FullAccess);
             let executor = shell_executor_for_with_approval_mode(
                 &SandboxProfile::Strict,
                 approval_mode,

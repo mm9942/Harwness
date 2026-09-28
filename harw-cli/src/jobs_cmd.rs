@@ -141,7 +141,13 @@ mod tests {
             (JobsAction::Show { id: id() }, "/review"),
             (JobsAction::Cancel { id: id() }, "/cancel"),
             (JobsAction::Retry { id: id() }, "/retry"),
-            (JobsAction::Approve { id: id(), note: None }, "/approve"),
+            (
+                JobsAction::Approve {
+                    id: id(),
+                    note: None,
+                },
+                "/approve",
+            ),
         ];
         for (action, expected) in cases {
             let (path, args) = operation_for(action)?;

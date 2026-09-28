@@ -569,9 +569,15 @@ mod tests {
             )?)
             .map_err(ctx("admit job-pending"))?;
         let (ctx, _root) = test_context(Some(store))?;
-        let output = ps(&ctx, PsArgs { kind: Some("work".to_owned()), ..PsArgs::default() })
-            .await
-            .map_err(crate::test_support::ctx("ps"))?;
+        let output = ps(
+            &ctx,
+            PsArgs {
+                kind: Some("work".to_owned()),
+                ..PsArgs::default()
+            },
+        )
+        .await
+        .map_err(crate::test_support::ctx("ps"))?;
         assert!(
             output
                 .text
@@ -618,7 +624,15 @@ mod tests {
         use crate::job_tenant::fixtures::{JOB_A, JOB_B, context, two_tenants};
         let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
         let op_ctx = context(&jobs, None)?;
-        let output = ps(&op_ctx, PsArgs { kind: Some("work".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
+        let output = ps(
+            &op_ctx,
+            PsArgs {
+                kind: Some("work".to_owned()),
+                ..PsArgs::default()
+            },
+        )
+        .await
+        .map_err(ctx("ps"))?;
         assert!(output.text.contains(JOB_A), "{}", output.text);
         assert!(output.text.contains(JOB_B), "{}", output.text);
         Ok(())
@@ -629,7 +643,15 @@ mod tests {
         use crate::job_tenant::fixtures::{JOB_A, JOB_B, TENANT_A, context, two_tenants};
         let jobs = two_tenants(harw_job_runtime::JobState::Ready)?;
         let op_ctx = context(&jobs, Some(TENANT_A))?;
-        let output = ps(&op_ctx, PsArgs { kind: Some("work".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
+        let output = ps(
+            &op_ctx,
+            PsArgs {
+                kind: Some("work".to_owned()),
+                ..PsArgs::default()
+            },
+        )
+        .await
+        .map_err(ctx("ps"))?;
         assert!(output.text.contains(JOB_A), "{}", output.text);
         assert!(!output.text.contains(JOB_B), "{}", output.text);
         Ok(())
@@ -790,7 +812,9 @@ mod tests {
         let (_home_dir, home) = home_fixture()?;
         write_succeeded_process(&home)?;
         let op_ctx = mixed_context(&home, None)?;
-        let work = ps(&op_ctx, with_kind("work")).await.map_err(ctx("ps work"))?;
+        let work = ps(&op_ctx, with_kind("work"))
+            .await
+            .map_err(ctx("ps work"))?;
         assert_eq!(
             work.text,
             "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0"
@@ -863,7 +887,9 @@ mod tests {
             .await
             .map_err(ctx("ps process"))?;
         assert_eq!(process.text, "No jobs.");
-        let work = ps(&op_ctx, with_kind("work")).await.map_err(ctx("ps work"))?;
+        let work = ps(&op_ctx, with_kind("work"))
+            .await
+            .map_err(ctx("ps work"))?;
         assert!(work.text.contains("job-pending\twork\t"), "{}", work.text);
         let summary = ps(&op_ctx, PsArgs::default()).await.map_err(ctx("ps"))?;
         assert!(summary.text.contains("process: none"), "{}", summary.text);
@@ -907,15 +933,35 @@ mod tests {
         assert!(missing.is_empty());
         assert!(!jobs_dir.exists());
         let op_ctx = mixed_context(&home, None)?;
-        let output = ps(&op_ctx, PsArgs { kind: Some("process".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
+        let output = ps(
+            &op_ctx,
+            PsArgs {
+                kind: Some("process".to_owned()),
+                ..PsArgs::default()
+            },
+        )
+        .await
+        .map_err(ctx("ps"))?;
         assert!(!output.text.contains("\tprocess\t"), "{}", output.text);
 
         // Verzeichnisname passt nicht zur job_id bzw. ungültiges JSON.
-        write_meta(&home, "job-x", &meta_json("job-y", "running", serde_json::json!({})))?;
+        write_meta(
+            &home,
+            "job-x",
+            &meta_json("job-y", "running", serde_json::json!({})),
+        )?;
         write_job_file(&home, "job-bad", b"{ not json")?;
         let listed = read_process_jobs(&jobs_dir).map_err(ctx("read jobs dir"))?;
         assert!(listed.is_empty(), "{listed:?}");
-        let output = ps(&op_ctx, PsArgs { kind: Some("process".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
+        let output = ps(
+            &op_ctx,
+            PsArgs {
+                kind: Some("process".to_owned()),
+                ..PsArgs::default()
+            },
+        )
+        .await
+        .map_err(ctx("ps"))?;
         for absent in ["job-x", "job-y", "job-bad", "\tprocess\t"] {
             assert!(!output.text.contains(absent), "{absent}: {}", output.text);
         }
@@ -931,7 +977,11 @@ mod tests {
                 "launch-error",
             ),
             ("stopped", serde_json::json!({"signal": 15}), "stopped"),
-            ("failed", serde_json::json!({"stop_requested": true}), "stopped"),
+            (
+                "failed",
+                serde_json::json!({"stop_requested": true}),
+                "stopped",
+            ),
             ("failed", serde_json::json!({"signal": 9}), "signal"),
             ("failed", serde_json::json!({"signal": 24}), "timeout"),
             ("failed", serde_json::json!({"exit_code": 2}), "exited"),
@@ -964,7 +1014,15 @@ mod tests {
         let (_home_dir, home) = home_fixture()?;
         write_succeeded_process(&home)?;
         let op_ctx = mixed_context(&home, None)?;
-        let output = ps(&op_ctx, PsArgs { kind: Some("process".to_owned()), ..PsArgs::default() }).await.map_err(ctx("ps"))?;
+        let output = ps(
+            &op_ctx,
+            PsArgs {
+                kind: Some("process".to_owned()),
+                ..PsArgs::default()
+            },
+        )
+        .await
+        .map_err(ctx("ps"))?;
         assert!(output.text.contains("job-proc-1"), "{}", output.text);
         for sentinel in [
             "SENTINEL_CMD",
@@ -972,7 +1030,11 @@ mod tests {
             "SENTINEL_CWD",
             "SENTINEL_ENV",
         ] {
-            assert!(!output.text.contains(sentinel), "{sentinel}: {}", output.text);
+            assert!(
+                !output.text.contains(sentinel),
+                "{sentinel}: {}",
+                output.text
+            );
         }
         Ok(())
     }

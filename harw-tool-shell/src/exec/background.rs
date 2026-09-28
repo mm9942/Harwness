@@ -289,7 +289,10 @@ impl ShellToolProvider {
             launched.current_dir(sandbox.workspace().canonical_root());
             // Siehe Moduldoku, Schritt 5: nur Namen zählen, nie Werte loggen.
             let passed = apply_host_job_env(&mut launched, std::env::vars_os());
-            debug!(tool_name, passed, "background launch: host environment filtered");
+            debug!(
+                tool_name,
+                passed, "background launch: host environment filtered"
+            );
             // Siehe Moduldoku: mit `setsid` KEIN `process_group(0)`.
             if setsid.is_none() {
                 launched.process_group(0);

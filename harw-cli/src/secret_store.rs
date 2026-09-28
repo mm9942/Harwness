@@ -584,7 +584,12 @@ fn bootstrap_key_file(home: &Path) -> Result<PathBuf, String> {
     match std::fs::symlink_metadata(&key_path) {
         Ok(_) => return Ok(key_path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(format!("could not inspect key file '{}'", key_path.display())),
+        Err(_) => {
+            return Err(format!(
+                "could not inspect key file '{}'",
+                key_path.display()
+            ));
+        }
     }
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -594,7 +599,12 @@ fn bootstrap_key_file(home: &Path) -> Result<PathBuf, String> {
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(key_path),
-        Err(_) => return Err(format!("could not create key file '{}'", key_path.display())),
+        Err(_) => {
+            return Err(format!(
+                "could not create key file '{}'",
+                key_path.display()
+            ));
+        }
     };
 
     let mut seed = secrecy::SecretBox::new(Box::new([0u8; 32]));
@@ -758,10 +768,9 @@ pub fn configured_secret_store_persisted_audit_chain_status(
 }
 
 fn configured_provider_uses_sealed_secret(config: &ResolvedConfig) -> bool {
-    config
-        .providers
-        .iter()
-        .any(|(provider_id, provider)| provider_uses_sealed_secret(provider_id, provider, &config.auth))
+    config.providers.iter().any(|(provider_id, provider)| {
+        provider_uses_sealed_secret(provider_id, provider, &config.auth)
+    })
 }
 
 /// `true` when `provider` is enabled and needs the sealed store: its `auth`
@@ -773,11 +782,14 @@ pub(crate) fn provider_uses_sealed_secret(
 ) -> bool {
     provider.enabled
         && (matches!(&provider.auth, Some(SecretRef::Secrets(_)))
-            || auth.credential_pool.get(provider_id).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| matches!(entry.secret, SecretRef::Secrets(_)))
-            }))
+            || auth
+                .credential_pool
+                .get(provider_id)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| matches!(entry.secret, SecretRef::Secrets(_)))
+                }))
 }
 
 fn configured_kek_provenance(kek: &KekConfig) -> Result<KekProvenance, String> {
@@ -847,8 +859,7 @@ mod tests {
     use tempfile::TempDir;
 
     use harw_infra_client::{
-        CreatedKey, InfraClientError, KeyDescription, KeyProfile, KeyRef, KeyState,
-        RemoteErrorKind,
+        CreatedKey, InfraClientError, KeyDescription, KeyProfile, KeyRef, KeyState, RemoteErrorKind,
     };
 
     use super::{
@@ -935,7 +946,10 @@ mod tests {
 
         assert_eq!(generation, 0);
         assert_eq!(hub.describe_calls.get(), 1);
-        assert_eq!(*hub.generate_calls.borrow(), vec![KeyProfile::PqHpkeDefault]);
+        assert_eq!(
+            *hub.generate_calls.borrow(),
+            vec![KeyProfile::PqHpkeDefault]
+        );
         Ok(())
     }
 
@@ -956,7 +970,10 @@ mod tests {
 
         assert_eq!(generation, 3);
         assert_eq!(hub.describe_calls.get(), 2);
-        assert_eq!(*hub.generate_calls.borrow(), vec![KeyProfile::PqHpkeDefault]);
+        assert_eq!(
+            *hub.generate_calls.borrow(),
+            vec![KeyProfile::PqHpkeDefault]
+        );
         Ok(())
     }
 
@@ -1559,9 +1576,10 @@ mod tests {
             },
             ..harw_config::ResolvedConfig::default()
         };
-        read_config
-            .providers
-            .insert("openai".to_owned(), provider_with_auth(&reference.to_string())?);
+        read_config.providers.insert(
+            "openai".to_owned(),
+            provider_with_auth(&reference.to_string())?,
+        );
         let resolver = open_configured_secret_resolver(home.path(), &read_config)
             .map_err(ctx("the recorded KEK opens the store"))?
             .ok_or(TestError::Missing("provider uses secrets:"))?;

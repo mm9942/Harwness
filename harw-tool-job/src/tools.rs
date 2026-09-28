@@ -1237,10 +1237,7 @@ mod list_view_tests {
         );
         assert!(value.get("jobs").is_none(), "{value}");
         assert_eq!(value["categories"]["work"]["visible"], json!(false));
-        assert_eq!(
-            value["categories"]["work"]["note"],
-            json!(WORK_NOT_VISIBLE)
-        );
+        assert_eq!(value["categories"]["work"]["note"], json!(WORK_NOT_VISIBLE));
         Ok(())
     }
 
@@ -1267,7 +1264,10 @@ mod list_view_tests {
             .as_array()
             .ok_or(TestError::Missing("jobs array"))?;
         assert_eq!(rows.len(), 2);
-        let expected = [("job-host", "host", "exited"), ("job-bwrap", "bwrap", "stopped")];
+        let expected = [
+            ("job-host", "host", "exited"),
+            ("job-bwrap", "bwrap", "stopped"),
+        ];
         for (row, (id, profile, reason)) in rows.iter().zip(expected) {
             assert_eq!(row["job_id"], json!(id));
             assert_eq!(row["kind"], json!("process"));

@@ -30,6 +30,7 @@
 //! `Send + Sync`; gewartet wird nur auf einem `oneshot`, begrenzt durch
 //! [`ShellExecutor::host_permit_timeout`].
 
+use super::platform::{self, HostPolicy};
 use super::{HOST_SINGLE_EXECUTION_TTL, ShellExecArgs, ShellExecutor, TOOL_NAME};
 use crate::host_escalation::{
     EscalationOutcome, HOST_ESCALATION_DENIED_MSG, HOST_ESCALATION_WORKER_PREFIX,
@@ -37,7 +38,6 @@ use crate::host_escalation::{
     SandboxDenial, audit_escalation, classify_sandbox_denial, denial_hint,
 };
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitVariant};
-use super::platform::{self, HostPolicy};
 use harw_authority::{Permission, SandboxSpec};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{HostApprovalScope, ProcessEnvironment, ProcessPermitRequest};

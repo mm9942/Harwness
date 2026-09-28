@@ -4741,13 +4741,12 @@ mod tests {
     /// Ein `secrets:`-Eintrag im `credential_pool` des ausgewählten Providers
     /// verlangt ein KEK, auch wenn dessen `auth` selbst `env:` ist.
     #[test]
-    fn open_serve_secret_resolver_counts_a_sealed_pool_entry_of_the_selected_provider()
-    -> TestResult {
+    fn open_serve_secret_resolver_counts_a_sealed_pool_entry_of_the_selected_provider() -> TestResult
+    {
         let mut config = serve_config_with_unused_sealed_provider()?;
-        config.auth = toml::from_str(
-            "[[credential_pool.plain]]\nsecret = \"secrets:pool-token\"\n",
-        )
-        .map_err(ctx("valid credential pool"))?;
+        config.auth =
+            toml::from_str("[[credential_pool.plain]]\nsecret = \"secrets:pool-token\"\n")
+                .map_err(ctx("valid credential pool"))?;
         assert!(active_serve_provider_uses_sealed_secret(&config));
         let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
 

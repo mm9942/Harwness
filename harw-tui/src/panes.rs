@@ -397,8 +397,11 @@ mod tests {
             assert_eq!(out.placement, harw_tui_layout::Placement::WideSide);
             let body_rows = rows - (1 + 3);
             let expected = split(Rect::new(0, 0, cols, body_rows), &PanelState::default());
-            assert_eq!(out.agents.map(|r| r.width), expected.agents.map(|r| r.width));
-            assert_eq!(out.chat.map(|r| r.width).unwrap_or(0), expected.chat.ok_or("expected chat")?.width);
+            assert_eq!(
+                out.agents.map(|r| r.width),
+                expected.agents.map(|r| r.width)
+            );
+            assert_eq!(out.chat.width, expected.chat.ok_or("expected chat")?.width);
             let chat = out.chat;
             assert_eq!(chat.width, cols - AGENTS_WIDTH);
         }

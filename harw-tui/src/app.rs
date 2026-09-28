@@ -9580,8 +9580,8 @@ fn render_viewport(
         // unterhalb des Docks in denselben Puffer — sie liegen also immer
         // über (zeitlich nach) dem Dock, nie darin. Diese Reihenfolge darf
         // eine spätere Änderung nicht umdrehen.
-        let queue_height = (queue_lines.len() as u16)
-            .min(area.height.saturating_sub(input_height + 4));
+        let queue_height =
+            (queue_lines.len() as u16).min(area.height.saturating_sub(input_height + 4));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -9599,15 +9599,15 @@ fn render_viewport(
         let input_area = chunks[4];
         if queue_height > 0 {
             frame.render_widget(
-                Paragraph::new(queue_lines)
-                    .style(Style::default().fg(style::border_color(theme))),
+                Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
                 queue_area,
             );
         }
         let pane_areas = crate::panes::split(below_dock, &app.panels);
-        let history_area_for_regions = pane_areas
-            .chat
-            .unwrap_or(Rect::new(below_dock.x, below_dock.y, 0, 0));
+        let history_area_for_regions =
+            pane_areas
+                .chat
+                .unwrap_or(Rect::new(below_dock.x, below_dock.y, 0, 0));
         app.last_regions.set(scroll_routing::FrameRegions {
             agents: Some(dock_area),
             dialog: dialog_open.then_some(input_area),
@@ -9662,7 +9662,7 @@ fn render_viewport(
         // Schmale Terminals: das Agenten-Panel klappt zu einer Zeile über der
         // Statuszeile zusammen (ab `AGENTS_SUMMARY_MIN_HEIGHT` Zeilen, darunter
         // entfällt es ganz), damit der Chat seine Breite behält.
-            let agents_collapsed = app.panels.agents_visible
+        let agents_collapsed = app.panels.agents_visible
             && !app.panels.maximized
             && area.width < crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH;
         let agents_summary = if agents_collapsed
@@ -9768,9 +9768,9 @@ fn render_viewport(
                 app.panels.focus == crate::panes::PaneFocus::Workbench,
             );
         }
-            let history_area = pane_areas
-                .chat
-                .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+        let history_area = pane_areas
+            .chat
+            .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
         (history_area, status_area, input_area)
     };
 
@@ -14649,7 +14649,10 @@ forbidden = [{forbidden}]
         let mut app = test_chat_app()?;
         dock_test_running_agent(&mut app, "w1", "uia-worker");
         app.agent_monitor.set_jobs(vec![dock_test_job()]);
-        app.push_line(Role::System, "einzigartige-verlaufszeile-fuer-den-dock-test".to_owned());
+        app.push_line(
+            Role::System,
+            "einzigartige-verlaufszeile-fuer-den-dock-test".to_owned(),
+        );
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40))
             .map_err(ctx("test terminal"))?;
         terminal
@@ -14671,7 +14674,10 @@ forbidden = [{forbidden}]
             .agents
             .ok_or(TestError::Missing("Portrait-Dock"))?;
         assert_eq!(dock.y, 0, "der Dock ist oben angedockt: {shown}");
-        assert_eq!(dock.width, 80, "der Dock nimmt die volle Breite ein: {shown}");
+        assert_eq!(
+            dock.width, 80,
+            "der Dock nimmt die volle Breite ein: {shown}"
+        );
         assert!(
             rows[..usize::from(dock.height)]
                 .iter()
@@ -14691,9 +14697,9 @@ forbidden = [{forbidden}]
             dock.height
         );
 
-        let last_rows = &rows[rows.len().saturating_sub(usize::from(input_height_for_test(
-            &app, 80,
-        )) + 1)..];
+        let last_rows = &rows[rows
+            .len()
+            .saturating_sub(usize::from(input_height_for_test(&app, 80)) + 1)..];
         assert!(
             last_rows.iter().any(|row| row.contains("Ask")),
             "Statuszeile (Modus) fehlt am unteren Rand: {shown}"
@@ -14773,9 +14779,7 @@ forbidden = [{forbidden}]
             .collect();
         assert!(!dialog_rows.is_empty(), "Dialogzeilen fehlen: {shown}");
         assert!(
-            dialog_rows
-                .iter()
-                .all(|&y| y >= usize::from(dock.height)),
+            dialog_rows.iter().all(|&y| y >= usize::from(dock.height)),
             "Dialogzeilen liegen im Dock statt darunter: {dialog_rows:?}, dock.height={}: {shown}",
             dock.height
         );

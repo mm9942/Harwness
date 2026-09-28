@@ -2353,7 +2353,10 @@ fn render_jobs_only_panel(
     }
     if rows.is_empty() {
         rows.push(PanelRow {
-            line: Line::styled(fit_width("Keine Jobs.", inner_width), style::dim_style(theme)),
+            line: Line::styled(
+                fit_width("Keine Jobs.", inner_width),
+                style::dim_style(theme),
+            ),
             entry: None,
         });
     }
@@ -2366,11 +2369,21 @@ fn render_jobs_only_panel(
 /// [`render_agents_panel`]: der ist hier nicht nötig, weil [`render_dock`]
 /// `follow_selection` bereits vor dem Aufruf beider Spalten auswertet
 /// (siehe [`dock_follow_column`]) und `panel_scroll` entsprechend setzt.
-fn render_dock_rows(monitor: &AgentMonitor, rows: Vec<PanelRow>, inner: Rect, buf: &mut Buffer) -> usize {
+fn render_dock_rows(
+    monitor: &AgentMonitor,
+    rows: Vec<PanelRow>,
+    inner: Rect,
+    buf: &mut Buffer,
+) -> usize {
     let height = usize::from(inner.height);
     let max_offset = rows.len().saturating_sub(height);
     let offset = monitor.panel_scroll.get().min(max_offset);
-    let visible: Vec<Line<'static>> = rows.into_iter().skip(offset).take(height).map(|row| row.line).collect();
+    let visible: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(offset)
+        .take(height)
+        .map(|row| row.line)
+        .collect();
     Paragraph::new(visible).render(inner, buf);
     height
 }
@@ -3462,7 +3475,8 @@ mod tests {
     }
 
     #[test]
-    fn render_dock_split_truncates_long_names_with_ellipsis_and_keeps_row_count_fixed() -> TestResult {
+    fn render_dock_split_truncates_long_names_with_ellipsis_and_keeps_row_count_fixed() -> TestResult
+    {
         let mut monitor = AgentMonitor::default();
         monitor.apply(&context(
             "a1",
@@ -3487,7 +3501,7 @@ mod tests {
         );
         // Kein Umbruch: die Zeilenkapazität beider Spalten bleibt exakt an
         // die Innenhöhe (Rahmenhöhe - 2) gebunden, egal wie lang der Name ist.
-        assert_eq!(monitor.panel_height.get(), usize::from(10 - 2));
+        assert_eq!(monitor.panel_height.get(), usize::from(10_u16 - 2));
         let shown = buffer_rows(&buf).join("\n");
         assert!(shown.contains('…'), "{shown}");
         Ok(())
@@ -3524,7 +3538,11 @@ mod tests {
             .map(|row| row.chars().take(24).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(left.contains("a7"), "{left}");
+        // Bei 24 Spalten kürzt die Zeile den Namen (`uia-worker…`), daher
+        // prüft der Test die Auswahlmarke und den Scroll-Versatz: drei
+        // sichtbare Zeilen (5 minus Rahmen), Auswahl 7 → Versatz 5.
+        assert!(left.contains('▸'), "{left}");
+        assert_eq!(monitor.panel_scroll.get(), 5);
         assert!(!monitor.follow_selection.get());
         Ok(())
     }

@@ -521,10 +521,9 @@ mod tests {
     #[test]
     fn test_old_meta_defaults_new_fields() -> TestResult {
         let v1: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
-        let v2: JobMeta = serde_json::from_str(&v1_json(r#""proc_start_ticks":5,"#).replace(
-            r#""version":1"#,
-            r#""version":2"#,
-        ))
+        let v2: JobMeta = serde_json::from_str(
+            &v1_json(r#""proc_start_ticks":5,"#).replace(r#""version":1"#, r#""version":2"#),
+        )
         .map_err(ctx("parse v2 without new keys"))?;
         assert_eq!(v2.version, 2);
         for meta in [&v1, &v2] {
@@ -566,12 +565,54 @@ mod tests {
             Option<JobEndReason>,
         );
         let table: [Row; 12] = [
-            (JobState::Succeeded, Some(0), None, false, None, Some(JobEndReason::Exited)),
-            (JobState::Failed, Some(2), None, false, None, Some(JobEndReason::Exited)),
-            (JobState::Failed, None, Some(9), false, None, Some(JobEndReason::Signal)),
-            (JobState::Failed, None, Some(24), false, None, Some(JobEndReason::Timeout)),
-            (JobState::Stopped, None, Some(15), false, None, Some(JobEndReason::Stopped)),
-            (JobState::Failed, None, Some(9), true, None, Some(JobEndReason::Stopped)),
+            (
+                JobState::Succeeded,
+                Some(0),
+                None,
+                false,
+                None,
+                Some(JobEndReason::Exited),
+            ),
+            (
+                JobState::Failed,
+                Some(2),
+                None,
+                false,
+                None,
+                Some(JobEndReason::Exited),
+            ),
+            (
+                JobState::Failed,
+                None,
+                Some(9),
+                false,
+                None,
+                Some(JobEndReason::Signal),
+            ),
+            (
+                JobState::Failed,
+                None,
+                Some(24),
+                false,
+                None,
+                Some(JobEndReason::Timeout),
+            ),
+            (
+                JobState::Stopped,
+                None,
+                Some(15),
+                false,
+                None,
+                Some(JobEndReason::Stopped),
+            ),
+            (
+                JobState::Failed,
+                None,
+                Some(9),
+                true,
+                None,
+                Some(JobEndReason::Stopped),
+            ),
             (
                 JobState::Failed,
                 None,
@@ -580,7 +621,14 @@ mod tests {
                 Some("spawn failed"),
                 Some(JobEndReason::LaunchError),
             ),
-            (JobState::Unknown, None, None, false, None, Some(JobEndReason::Unknown)),
+            (
+                JobState::Unknown,
+                None,
+                None,
+                false,
+                None,
+                Some(JobEndReason::Unknown),
+            ),
             (JobState::Failed, None, None, false, None, None),
             (JobState::Running, None, None, false, None, None),
             (JobState::Detached, None, None, false, None, None),
@@ -608,7 +656,14 @@ mod tests {
         .collect();
         assert_eq!(
             names,
-            ["exited", "signal", "stopped", "timeout", "launch-error", "unknown"]
+            [
+                "exited",
+                "signal",
+                "stopped",
+                "timeout",
+                "launch-error",
+                "unknown"
+            ]
         );
         let json = serde_json::to_string(&JobEndReason::LaunchError).map_err(ctx("serialize"))?;
         assert_eq!(json, "\"launch-error\"");

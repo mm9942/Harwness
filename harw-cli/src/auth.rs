@@ -541,9 +541,9 @@ mod tests {
         Ok(())
     }
 
-    use super::{anthropic_token_file_note, check_anthropic_token_format, looks_like_jwt};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::persist_token;
+    use super::{anthropic_token_file_note, check_anthropic_token_format, looks_like_jwt};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -602,7 +602,9 @@ mod tests {
         for file in &files {
             let bytes = std::fs::read(file).map_err(ctx("read home file"))?;
             assert!(
-                !bytes.windows(raw.len()).any(|window| window == raw.as_bytes()),
+                !bytes
+                    .windows(raw.len())
+                    .any(|window| window == raw.as_bytes()),
                 "plaintext token found in {}",
                 file.display()
             );
@@ -623,10 +625,9 @@ mod tests {
             ))
             .map_err(ctx("valid test provider"))?,
         );
-        let resolver =
-            crate::secret_store::open_configured_secret_resolver(home.path(), &reloaded)
-                .map_err(ctx("open configured resolver"))?
-                .ok_or(TestError::Missing("sealed resolver"))?;
+        let resolver = crate::secret_store::open_configured_secret_resolver(home.path(), &reloaded)
+            .map_err(ctx("open configured resolver"))?
+            .ok_or(TestError::Missing("sealed resolver"))?;
         let resolved = harw_provider_http::SecretResolver::resolve(&resolver, id)
             .map_err(ctx("resolve stored token"))?;
         assert_eq!(resolved.expose_secret(), token.expose_secret());
@@ -638,11 +639,13 @@ mod tests {
     fn persist_token_fails_closed_when_hub_unreachable() -> TestResult {
         let home = tempfile::TempDir::new().map_err(ctx("temporary home"))?;
         let socket_dir = tempfile::TempDir::new().map_err(ctx("temporary socket dir"))?;
-        let mut config = harw_config::ResolvedConfig::default();
-        config.infrastructure = Some(harw_config::InfrastructureSection {
-            auth_socket: Some(socket_dir.path().join("missing.sock")),
-            ..harw_config::InfrastructureSection::default()
-        });
+        let config = harw_config::ResolvedConfig {
+            infrastructure: Some(harw_config::InfrastructureSection {
+                auth_socket: Some(socket_dir.path().join("missing.sock")),
+                ..harw_config::InfrastructureSection::default()
+            }),
+            ..harw_config::ResolvedConfig::default()
+        };
         let token = secrecy::SecretString::from("sk-ant-oat01-unreachable-hub".to_owned());
 
         let result = persist_token(home.path(), &config, "anthropic", &token);

@@ -903,7 +903,9 @@ async fn test_normal_end_reaps_stragglers() -> TestResult {
     let env = Env::new()?;
     // Die Shell endet sofort mit 0; das Enkelkind ignoriert SIGTERM und
     // bleibt in der Prozessgruppe zurück — erst SIGKILL nach der Frist trifft es.
-    let prepared = env.prepare("(trap '' TERM; exec sleep 30) & echo $!").await?;
+    let prepared = env
+        .prepare("(trap '' TERM; exec sleep 30) & echo $!")
+        .await?;
     let started = env
         .manager
         .start(request("straggler", "agent-a", &[]), prepared)
@@ -924,7 +926,9 @@ async fn test_normal_end_reaps_stragglers() -> TestResult {
     assert_eq!(status.meta.end_reason(), Some(JobEndReason::Exited));
     let messages = warning_messages(&env, &id);
     assert!(
-        messages.iter().any(|message| message.contains("terminated")),
+        messages
+            .iter()
+            .any(|message| message.contains("terminated")),
         "{messages:?}"
     );
     Ok(())
@@ -1046,14 +1050,17 @@ async fn test_launch_warnings_recorded_and_notified() -> TestResult {
     assert_eq!(on_disk.launch_warnings, vec![warning.clone()]);
 
     let notified = eventually(LIMIT, || {
-        env.recorder.notifications().into_iter().any(|notification| {
-            notification.owner.session == "agent-a"
-                && matches!(
-                    &notification.event,
-                    JobEvent::Warning { job_id, message, .. }
-                        if job_id == &id && message == &warning
-                )
-        })
+        env.recorder
+            .notifications()
+            .into_iter()
+            .any(|notification| {
+                notification.owner.session == "agent-a"
+                    && matches!(
+                        &notification.event,
+                        JobEvent::Warning { job_id, message, .. }
+                            if job_id == &id && message == &warning
+                    )
+            })
     })
     .await;
     assert!(notified, "no launch warning reached the owner");

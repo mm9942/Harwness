@@ -104,11 +104,11 @@ pub use background::BackgroundLaunch;
 // Android-Anbindung: einzige `cfg!(target_os = "android")`-Abfrage des
 // Crates, dazu die reine `host_policy`-Entscheidungsfunktion.
 mod platform;
-pub use platform::ExecPlatform;
 pub use operator::{
     OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome,
     operator_escalation_message, run_operator_command,
 };
+pub use platform::ExecPlatform;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -167,8 +167,7 @@ const HOST_PERMIT_DENIED_MSG: &str = "shell.exec: host execution was not approve
 /// weder eine laufende Host-Arbeitsphase noch eine Einmalfreigabe vorliegt
 /// und kein Fragekanal angehängt ist: es gibt hier keinen Sandbox-Rückfall,
 /// also bleibt nur die Ablehnung (fail-closed).
-const NO_SANDBOX_NO_APPROVAL_MSG: &str =
-    "shell.exec: this platform has no sandbox (bwrap/user namespaces unavailable); host \
+const NO_SANDBOX_NO_APPROVAL_MSG: &str = "shell.exec: this platform has no sandbox (bwrap/user namespaces unavailable); host \
      execution needs your approval — once or for a host work phase (end it with Ctrl+H) — but \
      no approval channel is attached here (fail-closed)";
 
@@ -3488,8 +3487,7 @@ mod tests {
     async fn test_no_sandbox_without_lease_or_channel_fails_closed_fast() -> TestResult {
         let tmp = make_temp_workspace()?;
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
-        let executor =
-            executor_for_platform(ExecPlatform::NoSandbox, None, None, None);
+        let executor = executor_for_platform(ExecPlatform::NoSandbox, None, None, None);
         let args = args_for("echo must_not_run");
 
         let started = std::time::Instant::now();
@@ -3517,8 +3515,7 @@ mod tests {
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_session_approved("leased-session");
-        let executor =
-            executor_for_platform(ExecPlatform::NoSandbox, None, Some(registry), None);
+        let executor = executor_for_platform(ExecPlatform::NoSandbox, None, Some(registry), None);
         let args = args_for("echo leased_ok");
 
         let host = executor
@@ -3543,7 +3540,10 @@ mod tests {
             .determine_effective_host(&args, &sandbox, "full-access-session")
             .await
             .map_err(|message| TestError::Unexpected(format!("must not deny: {message}")))?;
-        assert!(host, "ApprovalMode::FullAccess must run on the host without a prompt");
+        assert!(
+            host,
+            "ApprovalMode::FullAccess must run on the host without a prompt"
+        );
         Ok(())
     }
 

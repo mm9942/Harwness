@@ -15,10 +15,10 @@
 mod dock;
 mod placement;
 
-pub use dock::{split_dock, DockSplit, PHONE_DOCK_SPLIT_MIN_COLS};
+pub use dock::{DockSplit, PHONE_DOCK_SPLIT_MIN_COLS, split_dock};
 pub use placement::{
-    classify, LayoutInput, Placement, ScreenLayout, PHONE_DOCK_MAX_HEIGHT, PHONE_DOCK_MIN_COLS,
-    PHONE_DOCK_MIN_HEIGHT, PHONE_DOCK_MIN_ROWS, WIDE_AGENT_PANEL_MIN_COLS,
+    LayoutInput, PHONE_DOCK_MAX_HEIGHT, PHONE_DOCK_MIN_COLS, PHONE_DOCK_MIN_HEIGHT,
+    PHONE_DOCK_MIN_ROWS, Placement, ScreenLayout, WIDE_AGENT_PANEL_MIN_COLS, classify,
 };
 
 /// Rechteck in Zellenkoordinaten (Spalten/Zeilen), Ursprung oben links --

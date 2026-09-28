@@ -1221,10 +1221,7 @@ mod tests {
 
     #[test]
     fn test_jobs_max_running_rejects_zero_and_257() -> TestResult {
-        for src in [
-            "[jobs]\nmax_running = 0",
-            "[jobs]\nmax_running = 257",
-        ] {
+        for src in ["[jobs]\nmax_running = 0", "[jobs]\nmax_running = 257"] {
             match toml::from_str::<HarnessConfig>(src) {
                 Ok(_) => {
                     return Err(TestError::Unexpected(

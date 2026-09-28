@@ -126,14 +126,31 @@ pub fn classify(input: LayoutInput) -> ScreenLayout {
     if cols >= PHONE_DOCK_MIN_COLS && rows >= PHONE_DOCK_MIN_ROWS {
         return portrait_dock(cols, body_rows, status, composer);
     }
-    fallback(cols, body_rows, rows, status_rows, composer_rows, status, composer)
+    fallback(
+        cols,
+        body_rows,
+        rows,
+        status_rows,
+        composer_rows,
+        status,
+        composer,
+    )
 }
 
 /// Breite Seitenspalte: Agenten-Panel rechts, wie `harw-tui/src/panes.rs`
 /// (Funktion `split`) es heute berechnet.
-fn wide_side(cols: u16, body_rows: u16, status: crate::Rect, composer: crate::Rect) -> ScreenLayout {
+fn wide_side(
+    cols: u16,
+    body_rows: u16,
+    status: crate::Rect,
+    composer: crate::Rect,
+) -> ScreenLayout {
     let budget = cols.saturating_sub(MIN_CHAT_WIDTH);
-    let agents_width = if budget >= AGENTS_WIDTH { AGENTS_WIDTH } else { 0 };
+    let agents_width = if budget >= AGENTS_WIDTH {
+        AGENTS_WIDTH
+    } else {
+        0
+    };
     let agents = if agents_width > 0 {
         Some(crate::Rect {
             x: cols.saturating_sub(agents_width),
@@ -164,7 +181,12 @@ fn wide_side(cols: u16, body_rows: u16, status: crate::Rect, composer: crate::Re
 /// der Arbeitsflaeche, begrenzt auf [`PHONE_DOCK_MIN_HEIGHT`]..=
 /// [`PHONE_DOCK_MAX_HEIGHT`], mit einer Mindesthoehe fuer den verbleibenden
 /// Chat-Bereich (siehe `docs/planning/68-mobile-tui/README.md`).
-fn portrait_dock(cols: u16, body_rows: u16, status: crate::Rect, composer: crate::Rect) -> ScreenLayout {
+fn portrait_dock(
+    cols: u16,
+    body_rows: u16,
+    status: crate::Rect,
+    composer: crate::Rect,
+) -> ScreenLayout {
     let target = body_rows / 3;
     let mut dock_height = target
         .clamp(PHONE_DOCK_MIN_HEIGHT, PHONE_DOCK_MAX_HEIGHT)
@@ -264,7 +286,12 @@ mod tests {
         for &(cols, rows) in &[(99u16, 40u16), (80, 40)] {
             let out = classify(input(cols, rows, 1, 3));
             let expected_split = cols >= crate::dock::PHONE_DOCK_SPLIT_MIN_COLS;
-            assert_eq!(out.placement, Placement::PortraitDock { split: expected_split });
+            assert_eq!(
+                out.placement,
+                Placement::PortraitDock {
+                    split: expected_split
+                }
+            );
             assert!(out.agents.is_some());
         }
     }
