@@ -1110,6 +1110,12 @@ pub struct ChatApp {
     /// Live-Zustand aller Agenten (Wurzel, Kinder, UIA-Worker) aus dem
     /// agenten-übergreifenden Bus; speist Agenten-Panel und Statuszeile.
     agent_monitor: crate::agent_monitor::AgentMonitor,
+    /// `child_id` → Verlaufszelle eines Kindes, über den Turn hinaus, der es
+    /// gestartet hat. Ein in den Hintergrund gegebener Orchestrator meldet
+    /// seinen Fortschritt nur noch über den Agenten-Hub; ohne diese Zuordnung
+    /// bliebe seine Zelle auf „läuft · 0 Tools · 0 Tok" stehen
+    /// (Befund 2026-09-28, siehe [`ChatApp::sync_child_cell`]).
+    child_cells: HashMap<String, Arc<Mutex<SubAgentCell>>>,
     /// Abonnement auf [`harw_core::AgentEventHub`]; nicht-blockierend geleert
     /// bei jedem Spinner-Tick und jedem Turn-Event ([`Self::drain_agent_events`]).
     agent_rx: Option<tokio::sync::broadcast::Receiver<harw_core::AgentEvent>>,
@@ -1178,6 +1184,12 @@ pub struct ChatApp {
     /// Flächen des letzten Frames (Agenten-Panel, Dialog, Plan) für das
     /// Maus-Routing ([`scroll_routing::route_scroll_input`]).
     last_regions: Cell<scroll_routing::FrameRegions>,
+    /// Nächstes Bild zeichnet den ganzen Bildschirm neu (`Terminal::clear`
+    /// vor `draw`): nach einer Größenänderung und auf `Ctrl+L`. ratatui
+    /// schreibt sonst nur geänderte Zellen; zählt der Terminal-Emulator eine
+    /// Zeichenbreite anders (tmux, Handy-Terminals), blieben Reste stehen und
+    /// Zeilen vermischten sich (Befund 2026-09-28).
+    full_redraw: Cell<bool>,
     /// Kind-Spawn-Autorität dieser Session, falls konfiguriert. Wird als
     /// [`ChildTurnDriver`] an [`ApprovalDriver::drive_to_completion`] gereicht,
     /// damit ein `TurnOutcome::AwaitingChild` real weitergetrieben wird statt
@@ -1480,6 +1492,7 @@ impl ChatApp {
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
             agent_monitor: crate::agent_monitor::AgentMonitor::default(),
+            child_cells: HashMap::new(),
             agent_rx: None,
             // Runde 5, Teil C: Kanban live.
             kanban_live: kanban_live::KanbanLiveWatch::default(),
@@ -1499,6 +1512,7 @@ impl ChatApp {
             last_history_total_lines: Cell::new(0),
             last_history_visible_rows: Cell::new(20),
             last_regions: Cell::new(scroll_routing::FrameRegions::default()),
+            full_redraw: Cell::new(false),
             managed_spawner: None,
             historic_agent_events: Vec::new(),
             active_mode: InteractionMode::default(),
@@ -2621,6 +2635,7 @@ impl ChatApp {
         changed |= self.poll_goal_marker();
         // Plan R9, Teil F: Job-Ereignisse und Jobs-Gruppe (gedrosselt).
         changed |= jobs_glue::poll(self);
+        let mut touched_agents: Vec<String> = Vec::new();
         let Some(rx) = self.agent_rx.as_mut() else {
             return changed;
         };
@@ -2650,6 +2665,7 @@ impl ChatApp {
                             );
                         }
                         changed |= self.agent_monitor.apply(&event);
+                        touched_agents.push(event.agent.as_str().to_owned());
                     }
                 },
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
@@ -2661,6 +2677,12 @@ impl ChatApp {
                     break;
                 }
             }
+        }
+        // Hintergrund-Kinder: Live-Zähler in ihre Verlaufszelle fortschreiben.
+        touched_agents.sort_unstable();
+        touched_agents.dedup();
+        for agent in &touched_agents {
+            changed |= self.sync_child_cell(agent);
         }
         // Runde 5, Teil I: neue Kind-Zellen in die Ctrl+O-Liste.
         self.absorb_child_stream_handles();
@@ -2915,6 +2937,35 @@ impl ChatApp {
     /// nicht beendet werden (Nutzerentscheidung 2026-09-24). `false`, wenn keine Runtime-Montage
     /// vorliegt (z. B. in reinen Renderer-Tests).
     #[must_use]
+    /// Schreibt die Live-Zähler eines Kindes aus dem Agenten-Monitor in seine
+    /// Verlaufszelle fort. `TurnEvent::ChildProgress` erreicht die Zelle nur,
+    /// solange der startende Turn läuft; ein Hintergrund-Orchestrator meldet
+    /// danach nur noch über den Agenten-Hub.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn sich Zähler geändert haben (Neuzeichnen nötig).
+    fn sync_child_cell(&self, agent_id: &str) -> bool {
+        let (Some(cell), Some(live)) = (
+            self.child_cells.get(agent_id),
+            self.agent_monitor.agent(agent_id),
+        ) else {
+            return false;
+        };
+        let Ok(mut cell) = cell.lock() else {
+            return false;
+        };
+        let tokens = live.usage().total();
+        // Nie rückwärts: `ChildProgress` des Turns kann höher liegen als ein
+        // verspätetes Hub-Ereignis.
+        let tool_calls = cell.tool_calls.max(live.tool_calls);
+        let tokens = cell.tokens.max(tokens);
+        if tool_calls == cell.tool_calls && tokens == cell.tokens {
+            return false;
+        }
+        cell.apply_progress(tool_calls, tokens);
+        true
+    }
+
     pub(crate) fn host_mode_active(&self) -> bool {
         self.runtime.as_ref().is_some_and(|runtime| {
             runtime
@@ -4824,6 +4875,7 @@ pub(crate) async fn run_loop(
                             frame_req.schedule_frame();
                         }
                         TuiEvent::Resize(_, _) => {
+                            app.full_redraw.set(true);
                             frame_req.schedule_frame();
                         }
                     }
@@ -5764,6 +5816,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             state
                 .child_cells
                 .insert(child_id.clone(), Arc::clone(&cell));
+            app.child_cells.insert(child_id.clone(), Arc::clone(&cell));
             app.export_entries
                 .push(ExportEntry::Agent(ExportAgentEntry {
                     agent_id: child_id.clone(),
@@ -6937,6 +6990,12 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
     // Möglichkeit, sie zu beenden"). Ohne aktive Phase tut die Taste nichts (kein Redraw).
     if action == Some(KeyAction::EndHostMode) {
         return app.end_host_mode();
+    }
+
+    // RedrawScreen (Standard Ctrl+L) — nächstes Bild zeichnet alles neu.
+    if action == Some(KeyAction::RedrawScreen) {
+        app.full_redraw.set(true);
+        return true;
     }
 
     // ── ChatScroll konsultieren (PageUp/PageDown/Shift+Up/Shift+Down etc.) ──
@@ -8841,7 +8900,11 @@ async fn drive_pauses_to_completion(
                             }
                         }
                     }
-                    Some(TuiEvent::Draw) | Some(TuiEvent::Resize(_, _)) => {
+                    Some(TuiEvent::Resize(_, _)) => {
+                        app.full_redraw.set(true);
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                    }
+                    Some(TuiEvent::Draw) => {
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     Some(TuiEvent::Mouse(mouse)) => {
@@ -9244,6 +9307,12 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             {
                 return BusyKeyOutcome::Redraw;
             }
+            // Ctrl+L zeichnet auch während eines Turns alles neu — gerade
+            // beim Streamen bleiben auf Handy-Terminals sonst Reste stehen.
+            if app.key_bindings.action_for(key) == Some(KeyAction::RedrawScreen) {
+                app.full_redraw.set(true);
+                return BusyKeyOutcome::Redraw;
+            }
         }
         // Panels bleiben auch während eines Turns bedienbar — gerade dann
         // will man den Agenten zusehen.
@@ -9467,6 +9536,85 @@ fn render_explorer_panel(
     }
 }
 
+/// Unter dieser Breite bekommen Goal-, Plan- und Host-Marke eine eigene
+/// Statuszeile (Hochformat, Handy): auf einer Zeile würden sie Modus, Modell
+/// und Kontext still verdrängen.
+const STATUS_TWO_ROWS_MAX_COLS: u16 = 80;
+
+/// Ab dieser Breite trägt die Host-Warnung noch ihren Tastenhinweis
+/// „(Strg+H beendet)"; darunter nur „HOST-MODUS AKTIV".
+const STATUS_HOST_HINT_MIN_COLS: u16 = 60;
+
+/// Zeilen der Statuszeile: zwei, wenn das Terminal schmal ist und eine
+/// Marke (Goal, Plan, Host-Modus) Platz neben den Segmenten bräuchte.
+fn status_rows_for(app: &ChatApp, theme: style::Theme, width: u16) -> u16 {
+    let has_marks = app.host_mode_active()
+        || app.current_permission_stage() == PermissionCycleStage::Plan
+        || !app.goal_status_spans(theme, width).is_empty();
+    if width < STATUS_TWO_ROWS_MAX_COLS && has_marks {
+        2
+    } else {
+        1
+    }
+}
+
+/// Host-Warnung der Statuszeile (vorne, Warnfarbe, fett).
+const HOST_MODE_MARK: &str = " HOST-MODUS AKTIV (Strg+H beendet) ·";
+
+/// Host-Warnung unter [`STATUS_HOST_HINT_MIN_COLS`]: ohne Tastenhinweis,
+/// „HOST-MODUS AKTIV" steht immer vollständig da.
+const HOST_MODE_MARK_SHORT: &str = " HOST-MODUS AKTIV ·";
+
+/// Plan-Marke, wenn die volle Marke neben der Host-Warnung nicht passt.
+const PLAN_MARK_SHORT: &str = " ⏸ plan ";
+
+/// Setzt die Marken der Statuszeile zusammen: Host-Warnung zuerst mit fest
+/// reserviertem Platz, dann die Plan-Marke (voll, sonst kurz, sonst weg) und
+/// die Goal-Marke, gekürzt auf den Rest.
+///
+/// # Rückgabe
+/// Die Spans und ihre Gesamtbreite in Spalten (nie über `width`, außer die
+/// Host-Warnung allein ist breiter — sie wird nie gekürzt).
+fn status_mark_spans(
+    host: Option<Span<'static>>,
+    plan: Option<(Span<'static>, Span<'static>)>,
+    goal: Vec<Span<'static>>,
+    width: usize,
+) -> (Vec<Span<'static>>, usize) {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    if let Some(host) = host {
+        used += host.width();
+        spans.push(host);
+    }
+    let mut remaining = width.saturating_sub(used);
+    if let Some((full, short)) = plan {
+        let pick = if full.width() <= remaining {
+            Some(full)
+        } else if short.width() <= remaining {
+            Some(short)
+        } else {
+            None
+        };
+        if let Some(span) = pick {
+            remaining -= span.width();
+            used += span.width();
+            spans.push(span);
+        }
+    }
+    for span in goal {
+        if remaining == 0 {
+            break;
+        }
+        let text = status_line::fit_width(span.content.as_ref(), remaining);
+        let width = status_line::display_width(&text);
+        remaining -= width.min(remaining);
+        used += width;
+        spans.push(Span::styled(text, span.style));
+    }
+    (spans, used)
+}
+
 /// Zeichnet die Fullscreen-Viewport: scrollbare History oben und Eingabebox unten.
 ///
 /// # Beschreibung
@@ -9482,6 +9630,9 @@ fn draw_viewport(
     spinner: &Spinner,
     quit_hint: Option<&str>,
 ) -> Result<(), TuiError> {
+    if app.full_redraw.take() {
+        guard.terminal().clear().map_err(TuiError::from)?;
+    }
     guard
         .terminal()
         .draw(|frame| render_viewport(frame, app, spinner, quit_hint))
@@ -9605,7 +9756,12 @@ fn render_viewport(
     // (1, siehe die `Constraint::Length(1)`-Statuszeile unten) und
     // `composer_rows` (`input_height`, siehe oben) sind exakt die Zeilen, die
     // die Statuszeile bzw. der Composer heute reservieren.
-    let screen = crate::panes::classify_screen(area, 1, input_height);
+    // Schmale Terminals (Hochformat, Handy): Goal-, Plan- und Host-Marke
+    // bekommen eine eigene Zeile über den Statussegmenten, statt deren Breite
+    // aufzuzehren. Auf einer Zeile würde `fit_segments` sonst Modus, Modell
+    // und Kontext still verwerfen (Befund 2026-09-28, Hochformat-TUI).
+    let status_rows = status_rows_for(app, theme, area.width);
+    let screen = crate::panes::classify_screen(area, status_rows, input_height);
     let dock = if app.panels.agents_visible && !app.panels.maximized {
         match screen.placement {
             harw_tui_layout::Placement::PortraitDock { .. } => screen.agents,
@@ -9635,7 +9791,7 @@ fn render_viewport(
                 Constraint::Length(dock_area.height),
                 Constraint::Min(history_min),
                 Constraint::Length(queue_height),
-                Constraint::Length(1),
+                Constraint::Length(status_rows),
                 Constraint::Length(input_height),
             ])
             .split(area);
@@ -9742,7 +9898,7 @@ fn render_viewport(
                 Constraint::Min(history_min),
                 Constraint::Length(queue_height),
                 Constraint::Length(summary_height),
-                Constraint::Length(1),
+                Constraint::Length(status_rows),
                 Constraint::Length(input_height),
             ])
             .split(area);
@@ -10034,64 +10190,62 @@ fn render_viewport(
         Seg::new(15, vec![agents_hint, agents_hint_short, String::new()]),
         Seg::optional(220, pending_permission_suffix),
     ];
-    // Breite der Marken vor/nach dem Text (Plan, Goal, Host-Modus) abziehen.
-    const HOST_MODE_SUFFIX: &str = " · HOST-MODUS AKTIV (Strg+H beendet)";
-    let goal_width: usize = app
-        .goal_status_spans(theme, status_area.width)
-        .iter()
-        .map(Span::width)
-        .sum();
-    let plan_width = if app.current_permission_stage() == PermissionCycleStage::Plan {
-        crate::plan_dialog::plan_status_span(theme).width()
-    } else {
-        0
-    };
-    let host_width = if app.host_mode_active() {
-        status_line::display_width(HOST_MODE_SUFFIX)
-    } else {
-        0
-    };
-    let status_width =
-        usize::from(status_area.width).saturating_sub(goal_width + plan_width + host_width);
-    let status = status_line::fit_segments(&segments, status_width);
     // Solange eine Host-Arbeitsphase läuft, muss die Statuszeile das gemäß
     // `docs/design/mediated-process-execution.md` („permanent und
     // unübersehbar `HOST-MODUS AKTIV`") in einer eigenen, hervorgehobenen
-    // Warnfarbe zeigen — ein einfacher String-Suffix in derselben Farbe wie
-    // der Rest der Zeile wäre zu leicht zu übersehen.
-    // Runde 5, Teil P: feste Goal-Marke vorne, solange ein Goal aktiv ist.
-    let mut goal_spans = app.goal_status_spans(theme, status_area.width);
-    if app.host_mode_active() {
-        goal_spans.extend([
-            Span::styled(status, Style::default().fg(style::border_color(theme))),
-            Span::styled(
-                HOST_MODE_SUFFIX,
-                Style::default()
-                    .fg(style::warning_color(theme))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(Line::from(goal_spans)), status_area);
-    } else if app.current_permission_stage() == PermissionCycleStage::Plan {
-        // Runde 5, Teil F: deutliche Plan-Marke in eigener Farbe vorne.
-        let mut spans = vec![crate::plan_dialog::plan_status_span(theme)];
-        spans.append(&mut goal_spans);
-        spans.push(Span::styled(
-            status,
-            Style::default().fg(style::border_color(theme)),
-        ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
-    } else if !goal_spans.is_empty() {
-        goal_spans.push(Span::styled(
-            status,
-            Style::default().fg(style::border_color(theme)),
-        ));
-        frame.render_widget(Paragraph::new(Line::from(goal_spans)), status_area);
+    // Warnfarbe zeigen. Die Warnung steht deshalb **vorne** und ihr Platz ist
+    // fest reserviert; Plan- und Goal-Marke (Runde 5, Teile F/P) teilen sich
+    // nur den Rest (Review #60: dahinter fiel sie im Hochformat heraus).
+    let two_rows = status_area.height >= 2;
+    let host_text = if status_area.width < STATUS_HOST_HINT_MIN_COLS {
+        HOST_MODE_MARK_SHORT
     } else {
-        frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(style::border_color(theme))),
-            status_area,
-        );
+        HOST_MODE_MARK
+    };
+    let host_span = app.host_mode_active().then(|| {
+        Span::styled(
+            host_text,
+            Style::default()
+                .fg(style::warning_color(theme))
+                .add_modifier(Modifier::BOLD),
+        )
+    });
+    let plan_spans = (app.current_permission_stage() == PermissionCycleStage::Plan).then(|| {
+        let full = crate::plan_dialog::plan_status_span(theme);
+        let short = Span::styled(PLAN_MARK_SHORT, full.style);
+        (full, short)
+    });
+    // `status_spans` teilt ihre Breite durch drei: auf zwei Zeilen darf die
+    // Goal-Marke die ganze erste Zeile nutzen, einzeilig wie bisher.
+    let goal_budget = if two_rows {
+        status_area.width.saturating_mul(3)
+    } else {
+        status_area.width
+    };
+    let goal_spans = app.goal_status_spans(theme, goal_budget);
+    let (mut marks, marks_width) = status_mark_spans(
+        host_span,
+        plan_spans,
+        goal_spans,
+        usize::from(status_area.width),
+    );
+    let status_width = if two_rows {
+        usize::from(status_area.width)
+    } else {
+        usize::from(status_area.width).saturating_sub(marks_width)
+    };
+    let status = status_line::fit_segments(&segments, status_width);
+    let status_style = Style::default().fg(style::border_color(theme));
+    if two_rows {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(status_area);
+        frame.render_widget(Paragraph::new(Line::from(marks)), rows[0]);
+        frame.render_widget(Paragraph::new(status).style(status_style), rows[1]);
+    } else {
+        marks.push(Span::styled(status, status_style));
+        frame.render_widget(Paragraph::new(Line::from(marks)), status_area);
     }
 
     // ── History ──────────────────────────────────────────────────────
@@ -14359,6 +14513,133 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Befund 2026-09-28 (Redraw-Reste in tmux/Handy-Terminals): `Ctrl+L`
+    /// merkt ein vollständiges Neuzeichnen vor, im Leerlauf wie während eines
+    /// Turns; `draw_viewport` verbraucht die Markierung genau einmal.
+    #[test]
+    fn ctrl_l_requests_a_full_redraw() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        assert!(!app.full_redraw.get());
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut app, ctrl_l, &bus));
+        assert!(app.full_redraw.take(), "idle Ctrl+L marks a full redraw");
+        assert!(!app.full_redraw.get(), "the mark is consumed once");
+
+        assert!(matches!(
+            handle_busy_event(&mut app, TuiEvent::Key(ctrl_l)),
+            BusyKeyOutcome::Redraw
+        ));
+        assert!(app.full_redraw.get(), "busy Ctrl+L marks a full redraw too");
+        Ok(())
+    }
+
+    /// Review #60 (P1): die Host-Warnung steht vorne mit fest reserviertem
+    /// Platz und bleibt neben Plan- oder Goal-Marke bei 40, 45 und 55 Spalten
+    /// vollständig im gerenderten Buffer; Plan/Goal werden gekürzt.
+    #[test]
+    fn host_warning_stays_complete_next_to_plan_and_goal_marks() -> TestResult {
+        let theme = crate::style::Theme::Dark;
+        let host_text = |width: u16| {
+            if width < STATUS_HOST_HINT_MIN_COLS {
+                HOST_MODE_MARK_SHORT
+            } else {
+                HOST_MODE_MARK
+            }
+        };
+        let plan = || {
+            let full = crate::plan_dialog::plan_status_span(theme);
+            let short = Span::styled(PLAN_MARK_SHORT, full.style);
+            (full, short)
+        };
+        let goal = || {
+            vec![Span::raw(
+                " ◎ Goal: Auf aktueller dev-Basis einen sicheren Reviewer bauen · 1/5 ",
+            )]
+        };
+        for width in [40u16, 45, 55] {
+            for (label, with_plan, with_goal) in [
+                ("host+plan", true, false),
+                ("host+goal", false, true),
+                ("host+plan+goal", true, true),
+            ] {
+                let (spans, used) = status_mark_spans(
+                    Some(Span::raw(host_text(width))),
+                    with_plan.then(plan),
+                    if with_goal { goal() } else { Vec::new() },
+                    usize::from(width),
+                );
+                assert!(used <= usize::from(width), "{label} at {width}: {used}");
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
+                        .map_err(ctx("test terminal"))?;
+                terminal
+                    .draw(|frame| {
+                        frame
+                            .render_widget(Paragraph::new(Line::from(spans.clone())), frame.area());
+                    })
+                    .map_err(ctx("draw"))?;
+                let buffer = terminal.backend().buffer();
+                let row: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+                assert!(
+                    row.contains("HOST-MODUS AKTIV"),
+                    "{label} at {width} columns lost the host warning: {row:?}"
+                );
+                if with_plan {
+                    assert!(
+                        row.contains('⏸'),
+                        "{label} at {width}: plan mark gone: {row:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Befund 2026-09-28 (Hochformat): auf schmalen Terminals bekommt eine
+    /// Marke (hier die Plan-Marke) eine eigene Statuszeile, die Segmente
+    /// darunter behalten die volle Breite; breit bleibt es eine Zeile.
+    #[test]
+    fn narrow_status_line_moves_marks_to_their_own_row() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.active_mode = InteractionMode::Plan;
+        assert_eq!(status_rows_for(&app, app.theme, 50), 2);
+        assert_eq!(status_rows_for(&app, app.theme, 120), 1);
+        app.active_mode = InteractionMode::Chat;
+        assert_eq!(status_rows_for(&app, app.theme, 50), 1);
+        app.active_mode = InteractionMode::Plan;
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 30))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let marker = crate::plan_dialog::PLAN_STATUS_MARKER;
+        let mark_row = rows
+            .iter()
+            .position(|row| row.contains(marker))
+            .ok_or_else(|| rows.join("\n"))
+            .map_err(ctx("plan marker missing"))?;
+        let segments = rows
+            .get(mark_row + 1)
+            .ok_or("no row")
+            .map_err(ctx("row below the marks"))?;
+        assert!(
+            segments.contains("Plan") && !segments.contains(marker),
+            "segments must get their own full-width row:\n{}",
+            rows.join("\n")
+        );
+        Ok(())
+    }
+
     /// Der Warteschlangen-Block steht über dem Composer, solange Nachrichten
     /// warten, und verschwindet, sobald sie ausgeliefert sind.
     #[test]
@@ -14695,6 +14976,52 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Befund 2026-09-28: ein in den Hintergrund gegebener Orchestrator
+    /// meldet nach dem Ende des startenden Turns nur noch über den Agenten-Hub.
+    /// Seine Verlaufszelle muss trotzdem mitzählen statt bei „0 Tools" zu
+    /// stehen; ein verspätetes niedrigeres Ereignis zählt nie rückwärts.
+    #[test]
+    fn background_child_cell_follows_hub_progress() -> TestResult {
+        let mut app = test_chat_app()?;
+        let child = "child-bg-1";
+        let cell = Arc::new(Mutex::new(SubAgentCell {
+            child_id: child.to_owned(),
+            role: "root-orchestrator".to_owned(),
+            question: Some("Review".to_owned()),
+            tool_calls: 0,
+            tokens: 0,
+            status: SubAgentStatus::Running,
+        }));
+        app.child_cells.insert(child.to_owned(), Arc::clone(&cell));
+        assert!(!app.sync_child_cell(child), "no monitor entry yet");
+
+        dock_test_running_agent(&mut app, child, "root-orchestrator");
+        let completed = || harw_core::AgentEvent {
+            agent: SessionId::from_str(child),
+            parent: None,
+            role: "root-orchestrator".to_owned(),
+            kind: harw_core::AgentEventKind::Turn(TurnEvent::ToolCallCompleted {
+                turn_id: harw_types::TurnId::new(),
+                call_id: harw_types::ToolCallId::new(),
+                result: harw_protocol::items::ToolCallResult::success(serde_json::json!({})),
+                duration_ms: 3,
+                placement: None,
+            }),
+        };
+        app.agent_monitor.apply(&completed());
+        app.agent_monitor.apply(&completed());
+        assert!(app.sync_child_cell(child));
+        let calls = cell.lock().map_err(ctx("cell lock"))?.tool_calls;
+        assert_eq!(calls, 2);
+
+        // Höherer Stand aus `ChildProgress` bleibt erhalten.
+        cell.lock().map_err(ctx("cell lock"))?.apply_progress(5, 0);
+        assert!(!app.sync_child_cell(child), "never counts backwards");
+        let calls = cell.lock().map_err(ctx("cell lock"))?.tool_calls;
+        assert_eq!(calls, 5);
+        Ok(())
+    }
+
     /// Baut ein `TurnEvent::ContextUpdated` für einen laufenden Kind-Agenten
     /// (gleiches Muster wie `scroll_routing::tests::running`), damit der Dock
     /// mindestens einen aktiven Agenten anzeigt.
@@ -14739,6 +15066,36 @@ forbidden = [{forbidden}]
     /// Copilot-Review #48: eine lange Warteschlange darf im Portrait-Dock
     /// Statuszeile und Composer nicht aus dem Bild schieben, denn die
     /// Dock-Höhe ist schon fest vergeben.
+    /// Befund 2026-09-28: eine schmale, hohe tmux-Pane (hier 45×60, gemessen
+    /// am Hochkant-Monitor ≈ 45–55 Spalten) zeigt den Agenten-Dock oben mit
+    /// dem laufenden Agenten statt nur der einzeiligen Zusammenfassung.
+    #[test]
+    fn narrow_tall_pane_shows_the_agent_dock() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "root-orchestrator");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 60))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let shown: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dock = app.last_regions.get().agents;
+        assert!(
+            dock.is_some_and(|dock| dock.y == 0 && dock.width == 45),
+            "portrait dock expected at the top:\n{shown}"
+        );
+        assert!(shown.contains("root-orchestrator"), "{shown}");
+        Ok(())
+    }
+
     #[test]
     fn long_queue_under_portrait_dock_keeps_status_and_composer_visible() -> TestResult {
         let mut app = test_chat_app()?;
