@@ -30,6 +30,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 mod agent_cmd;
 mod auth;
+mod auth_migrate;
 // #22: automatischer Artefakt-Build der aktiven UIA im Hintergrund.
 mod auto_build;
 mod chat;
@@ -68,6 +69,7 @@ mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
 mod uia_bootstrap;
+mod update_cmd;
 mod verify_sandbox;
 mod web;
 mod worker_cancellation;
@@ -516,6 +518,9 @@ pub fn main_entry() -> ExitCode {
     // den Start nie; ein Fehlschlag erscheint einmal als Hinweis).
     if tui_active {
         auto_build::on_start(cli.global.home.clone());
+        // Hinweis auf eine neuere Version aus `version.json`; bei Bedarf
+        // prüft `harw update --check` losgelöst im Hintergrund.
+        update_cmd::on_start(cli.global.home.clone());
     }
     let code = match dispatch(cli) {
         Ok(()) => 0,
@@ -873,7 +878,18 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
-        Some(Command::Update { check }) => lifecycle::update(home_override, check),
+        Some(Command::Update {
+            check,
+            yes,
+            dismiss,
+        }) => update_cmd::run(
+            home_override,
+            update_cmd::UpdateArgs {
+                check,
+                yes,
+                dismiss,
+            },
+        ),
         Some(Command::Install { print_systemd }) => lifecycle::install(print_systemd),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
@@ -1617,6 +1633,8 @@ fn require_home_for_sealed_refs(
 
 /// Prüft, ob der Provider, den `serve` tatsächlich verwendet
 /// (`config.harness.default_provider`), eine `secrets:`-Referenz trägt.
+/// Ein `secrets:`-Eintrag im `credential_pool` dieses Providers zählt
+/// ebenfalls (siehe [`secret_store::provider_uses_sealed_secret`]).
 ///
 /// Anders als ein Scan über alle aktivierten Provider betrachtet diese
 /// Funktion ausschließlich den Provider, den `serve_mcp` über
@@ -1629,9 +1647,14 @@ fn active_serve_provider_uses_sealed_secret(config: &ResolvedConfig) -> bool {
         .harness
         .default_provider
         .as_deref()
-        .and_then(|provider_id| config.providers.get(provider_id))
-        .is_some_and(|provider| {
-            provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_)))
+        .and_then(|provider_id| {
+            config
+                .providers
+                .get(provider_id)
+                .map(|provider| (provider_id, provider))
+        })
+        .is_some_and(|(provider_id, provider)| {
+            secret_store::provider_uses_sealed_secret(provider_id, provider, &config.auth)
         })
 }
 
@@ -1674,7 +1697,8 @@ fn configured_serve_uses_sealed_secret(config: &ResolvedConfig) -> bool {
 /// für `runtime_entry`). `resolver_config` enthält deshalb höchstens zwei
 /// Einträge:
 /// - den tatsächlich genutzten Provider (`config.harness.default_provider`),
-///   nur wenn er aktiviert ist und `secrets:` referenziert;
+///   nur wenn er aktiviert ist und `secrets:` referenziert — als `auth` oder
+///   als Eintrag in seinem `credential_pool`;
 /// - einen synthetischen `__mcp_secret_resolver__`-Provider, nur wenn
 ///   mindestens ein konfigurierter MCP-Principal ein `secrets:`-Credential
 ///   referenziert (siehe [`configured_serve_uses_sealed_secret`] für die
@@ -1686,7 +1710,8 @@ fn configured_serve_uses_sealed_secret(config: &ResolvedConfig) -> bool {
 /// bleibt das Fail-Closed-Verhalten von
 /// [`crate::secret_store::open_configured_secret_resolver`] unverändert: ohne
 /// konfiguriertes KEK schlägt der Aufruf fehl, es gibt keinen
-/// Klartext-Fallback.
+/// Klartext-Fallback. `[infrastructure]` wird in `resolver_config`
+/// übernommen, damit AuthHub-V3-Datensätze öffnen.
 fn open_serve_secret_resolver(
     config: &ResolvedConfig,
     home: Option<&Path>,
@@ -1697,13 +1722,14 @@ fn open_serve_secret_resolver(
 
     let mut resolver_config = ResolvedConfig {
         auth: config.auth.clone(),
+        infrastructure: config.infrastructure.clone(),
         ..Default::default()
     };
     let mut needs_resolver = false;
 
     if let Some(provider_id) = config.harness.default_provider.as_deref() {
         if let Some(provider) = config.providers.get(provider_id) {
-            if provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_))) {
+            if secret_store::provider_uses_sealed_secret(provider_id, provider, &config.auth) {
                 resolver_config
                     .providers
                     .insert(provider_id.to_owned(), provider.clone());
@@ -3562,8 +3588,9 @@ mod tests {
     }
 
     /// Z1-R2-03: `harw serve` muss `file:`-Credentials auflösen, die
-    /// `harw onboard` (`onboarding.rs` `write_secret_file`) und `harw-oauth`
-    /// unterhalb von `<home>/secrets/` anlegen. Ohne Home bleibt der Pfad
+    /// ältere `harw onboard`-Versionen (heute versiegelt über
+    /// `onboarding.rs` `store_provider_key`) und `harw-oauth` unterhalb von
+    /// `<home>/secrets/` angelegt haben. Ohne Home bleibt der Pfad
     /// bewusst fail-closed
     /// (`harw_provider_http::FILE_CREDENTIAL_NO_HOME_REASON`).
     #[test]
@@ -4708,6 +4735,90 @@ mod tests {
             "without --home there is nowhere to open the sealed store",
         ))?;
         assert!(resolver.is_none());
+        Ok(())
+    }
+
+    /// Ein `secrets:`-Eintrag im `credential_pool` des ausgewählten Providers
+    /// verlangt ein KEK, auch wenn dessen `auth` selbst `env:` ist.
+    #[test]
+    fn open_serve_secret_resolver_counts_a_sealed_pool_entry_of_the_selected_provider() -> TestResult
+    {
+        let mut config = serve_config_with_unused_sealed_provider()?;
+        config.auth =
+            toml::from_str("[[credential_pool.plain]]\nsecret = \"secrets:pool-token\"\n")
+                .map_err(ctx("valid credential pool"))?;
+        assert!(active_serve_provider_uses_sealed_secret(&config));
+        let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
+
+        let result = open_serve_secret_resolver(&config, Some(home.path()));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a sealed pool entry of the selected provider must require a KEK".into(),
+            ));
+        };
+        assert!(error.contains("requires a configured KEK"), "{error}");
+        Ok(())
+    }
+
+    /// `[infrastructure]` erreicht den Resolver: mit einem (nicht
+    /// existierenden) AuthHub-Socket öffnet `serve` den Store trotzdem, weil
+    /// das Anhängen des V3-Wrappers keine Verbindung aufbaut, und ein
+    /// V2-Datensatz unter dem lokalen KEK löst weiter auf.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn open_serve_secret_resolver_keeps_infrastructure() -> TestResult {
+        use secrecy::ExposeSecret as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
+        let key_dir = home.path().join("keys");
+        std::fs::create_dir_all(&key_dir).map_err(ctx("create key directory"))?;
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(ctx("restrict key directory"))?;
+        let key_path = key_dir.join("secrets.kek");
+        std::fs::write(&key_path, b"01234567890123456789012345678901")
+            .map_err(ctx("write test KEK"))?;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(ctx("restrict test KEK"))?;
+
+        let mut config = serve_config_with_unused_sealed_provider()?;
+        config.auth.kek = Some(harw_config::KekConfig {
+            provenance: harw_config::KekProvenance::KeyFile,
+            key_file_path: Some(key_path.display().to_string()),
+            keyring_entry: None,
+            env_seed_var: None,
+        });
+        let reference = secret_store::store_secret(
+            home.path(),
+            &config,
+            "provider-token",
+            "test",
+            &secrecy::SecretString::from("v2-token".to_owned()),
+        )
+        .map_err(ctx("store a local V2 record"))?;
+        let SecretRef::Secrets(id) = &reference else {
+            return Err(TestError::Unexpected(
+                "store_secret must return a secrets: reference".into(),
+            ));
+        };
+
+        config.harness.default_provider = Some("sealed".to_owned());
+        config.infrastructure = Some(harw_config::InfrastructureSection {
+            auth_socket: Some(home.path().join("missing.sock")),
+            ..harw_config::InfrastructureSection::default()
+        });
+
+        let resolver = open_serve_secret_resolver(&config, Some(home.path()))
+            .map_err(ctx("a configured hub must not be dialled while opening"))?;
+        let Some(resolver) = resolver else {
+            return Err(TestError::Unexpected(
+                "the selected sealed provider must open the store".into(),
+            ));
+        };
+        let value = resolver
+            .resolve(id)
+            .map_err(ctx("a V2 record resolves with the hub configured"))?;
+        assert_eq!(value.expose_secret(), "v2-token");
         Ok(())
     }
 

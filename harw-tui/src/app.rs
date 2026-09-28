@@ -6941,20 +6941,47 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         // Plain Enter ohne Auswahl: getippte Zeile absenden — mit aufgelösten
         // Paste-Platzhaltern, sonst bekäme das Modell nur
         // `[Pasted text #<id> +<n> lines]` statt des eingefügten Texts.
+        // Erst klassifizieren, dann leeren: eine von `classify_line`
+        // abgelehnte Zeile (unterminiertes Quote, ungültiges Escape, ...)
+        // bleibt sonst weder im Composer noch in der History erhalten —
+        // genau das gemeldete "Nachricht war weg, musste neu getippt
+        // werden". Der Composer wird deshalb nur in den akzeptierten
+        // Zweigen (Quit/Ignore/Chat/Command) geleert.
         let line = app.input.submission_text();
-        app.input.clear();
-        app.command_popup = None;
-        app.mention_popup = None;
         match classify_line(&line) {
-            LineAction::Quit => bus.send(HarwEvent::Quit),
-            LineAction::Ignore => {}
-            LineAction::System(text) => bus.send(HarwEvent::SystemMessage(text)),
+            LineAction::Quit => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
+                bus.send(HarwEvent::Quit);
+            }
+            LineAction::Ignore => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
+            }
+            LineAction::System(text) => {
+                // Composer bleibt unangetastet — inklusive Paste-Platzhalter
+                // —, damit die Zeile korrigiert oder erneut abgeschickt
+                // werden kann; Popups schließen hier bewusst nicht, ein
+                // offener `/`-Vorschlag bleibt also sichtbar. Trotzdem in
+                // die History aufnehmen, damit Pfeil-Hoch die abgelehnte
+                // Zeile ebenfalls findet.
+                app.remember_input(&line);
+                bus.send(HarwEvent::SystemMessage(text));
+            }
             LineAction::Chat(text) => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
                 app.remember_input(&line);
                 app.scroll.force_follow();
                 bus.send(HarwEvent::Submit(text));
             }
             LineAction::Command(raw) => {
+                app.input.clear();
+                app.command_popup = None;
+                app.mention_popup = None;
                 app.remember_input(&line);
                 app.scroll.force_follow();
                 bus.send(HarwEvent::Command(raw));
@@ -7049,7 +7076,15 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 match classify_line(&text) {
                     LineAction::Quit => bus.send(HarwEvent::Quit),
                     LineAction::Ignore => {}
-                    LineAction::System(msg) => bus.send(HarwEvent::SystemMessage(msg)),
+                    LineAction::System(msg) => {
+                        // Puffer wurde vom InputEditor schon geleert — die
+                        // abgelehnte Zeile geht sonst verloren. Wie
+                        // `recall_last_pending_turn` per `insert_paste`
+                        // zurückholen, damit sie korrigiert werden kann.
+                        app.input.insert_paste(&text);
+                        app.sync_popup();
+                        bus.send(HarwEvent::SystemMessage(msg));
+                    }
                     LineAction::Chat(chat_text) => bus.send(HarwEvent::Submit(chat_text)),
                     LineAction::Command(raw) => bus.send(HarwEvent::Command(raw)),
                 }
@@ -9086,7 +9121,15 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
                     BusyKeyOutcome::Redraw
                 }
                 LineAction::Command(raw) => route_busy_command(app, raw),
-                LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {
+                LineAction::Quit | LineAction::Ignore => BusyKeyOutcome::Redraw,
+                LineAction::System(message) => {
+                    // Der Puffer wurde vom InputEditor schon geleert; ohne
+                    // Rückholung und Systemzeile verschwindet eine während
+                    // des Turns abgelehnte Eingabe (z. B. unterminiertes
+                    // Quote) kommentarlos.
+                    app.push_system_text_exported(&message);
+                    app.input.insert_paste(&text);
+                    app.sync_popup();
                     BusyKeyOutcome::Redraw
                 }
             }
@@ -9501,30 +9544,11 @@ fn render_viewport(
         input_height
     };
 
-    // Schmale Terminals: das Agenten-Panel klappt zu einer Zeile über der
-    // Statuszeile zusammen (ab `AGENTS_SUMMARY_MIN_HEIGHT` Zeilen, darunter
-    // entfällt es ganz), damit der Chat seine Breite behält.
-    let agents_collapsed = app.panels.agents_visible
-        && !app.panels.maximized
-        && area.width < crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH;
-    let agents_summary = if agents_collapsed
-        && area.height >= crate::panes::AGENTS_SUMMARY_MIN_HEIGHT
-        && area.height > input_height + history_min + 2
-    {
-        crate::agent_monitor::render_collapsed_summary(
-            &app.agent_monitor,
-            area.width,
-            theme,
-            app.panels.focus == crate::panes::PaneFocus::Agents,
-        )
-    } else {
-        None
-    };
-    let summary_height = u16::from(agents_summary.is_some());
-
     // Runde 4, Teil H: während eines Turns abgeschickte Nachrichten und
     // zurückgestellte Befehle stehen sichtbar über dem Composer, bis sie
-    // ausgeliefert werden (auch nach einem Abbruch).
+    // ausgeliefert werden (auch nach einem Abbruch). Diese Berechnung hängt
+    // von nichts unten Stehendem ab und läuft deshalb vor der
+    // Bildschirm-Klassifikation.
     let queue_lines = busy_queue::queue_block_lines(
         app.pending_turns.iter().map(String::as_str),
         app.deferred_input.iter().filter_map(|event| match event {
@@ -9533,60 +9557,76 @@ fn render_viewport(
         }),
         area.width,
     );
-    // Der Block darf den Verlauf nie ganz verdrängen.
-    let queue_height = (queue_lines.len() as u16).min(
-        area.height
-            .saturating_sub(input_height + summary_height + 4),
-    );
 
-    // History | Warteschlange | permanente Statuszeile | Eingabe. Der
-    // Sicherheitsmodus muss sichtbar bleiben und darf nicht vom Verlauf
-    // verdrängt werden.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(history_min),
-            Constraint::Length(queue_height),
-            Constraint::Length(summary_height),
-            Constraint::Length(1),
-            Constraint::Length(input_height),
-        ])
-        .split(area);
-    let queue_area = chunks[1];
-    let summary_area = chunks[2];
-    let status_area = chunks[3];
-    let input_area = chunks[4];
-    if let Some(summary) = agents_summary {
-        frame.render_widget(Paragraph::new(summary), summary_area);
-    }
-    if queue_height > 0 {
-        frame.render_widget(
-            Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
-            queue_area,
+    // Klassifiziert die Terminalgröße einmal pro Bild (siehe `panes::classify_screen`):
+    // breite Seitenspalte (`WideSide`), oben angedockter Portrait-Dock
+    // (`PortraitDock`) oder Zusammenfassungs-/Kompakt-Fallback. `status_rows`
+    // (1, siehe die `Constraint::Length(1)`-Statuszeile unten) und
+    // `composer_rows` (`input_height`, siehe oben) sind exakt die Zeilen, die
+    // die Statuszeile bzw. der Composer heute reservieren.
+    let screen = crate::panes::classify_screen(area, 1, input_height);
+    let dock = if app.panels.agents_visible && !app.panels.maximized {
+        match screen.placement {
+            harw_tui_layout::Placement::PortraitDock { .. } => screen.agents,
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let (history_area, status_area, input_area) = if let Some(dock_area) = dock {
+        // Portrait-Dock: oben angedockt, darunter Chat über die volle
+        // Breite, dann Warteschlange, Statuszeile und Eingabe. Modale Dialoge
+        // und Freigabefragen zeichnen weiterhin `status_area`/`input_area`
+        // unterhalb des Docks in denselben Puffer — sie liegen also immer
+        // über (zeitlich nach) dem Dock, nie darin. Diese Reihenfolge darf
+        // eine spätere Änderung nicht umdrehen.
+        // Das Dock belegt seine Höhe bereits fest: ohne ihren Abzug könnten
+        // Dock + Warteschlange + Status + Composer die Fläche übersteigen und
+        // Statuszeile und Composer aus dem Bild schieben.
+        let queue_height = (queue_lines.len() as u16).min(
+            area.height
+                .saturating_sub(input_height + 4)
+                .saturating_sub(dock_area.height),
         );
-    }
-    // Seitenpanels (Explorer links, Agenten rechts) teilen sich die obere
-    // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
-    let pane_areas = crate::panes::split(chunks[0], &app.panels);
-    let history_area_for_regions =
-        pane_areas
-            .chat
-            .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
-    app.last_regions.set(scroll_routing::FrameRegions {
-        agents: pane_areas.agents,
-        dialog: dialog_open.then_some(input_area),
-        plan: app
-            .plan_ui
-            .covers_history()
-            .then_some(history_area_for_regions),
-    });
-    if let Some(agents_area) = pane_areas.agents {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(dock_area.height),
+                Constraint::Min(history_min),
+                Constraint::Length(queue_height),
+                Constraint::Length(1),
+                Constraint::Length(input_height),
+            ])
+            .split(area);
+        let dock_area = chunks[0];
+        let below_dock = chunks[1];
+        let queue_area = chunks[2];
+        let status_area = chunks[3];
+        let input_area = chunks[4];
+        if queue_height > 0 {
+            frame.render_widget(
+                Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
+                queue_area,
+            );
+        }
+        let pane_areas = crate::panes::split(below_dock, &app.panels);
+        let history_area_for_regions =
+            pane_areas
+                .chat
+                .unwrap_or(Rect::new(below_dock.x, below_dock.y, 0, 0));
+        app.last_regions.set(scroll_routing::FrameRegions {
+            agents: Some(dock_area),
+            dialog: dialog_open.then_some(input_area),
+            plan: app
+                .plan_ui
+                .covers_history()
+                .then_some(history_area_for_regions),
+        });
         if let Some(detail) = app.agent_detail.as_ref() {
             if detail.job.is_some() {
-                // Plan R9, Teil F: Job-Detailansicht (Kopf und Log-Ende).
                 crate::jobs_panel::render_job_detail(
                     detail.job_view.as_ref(),
-                    agents_area,
+                    dock_area,
                     frame.buffer_mut(),
                     &detail.scroll,
                     theme,
@@ -9594,36 +9634,152 @@ fn render_viewport(
             } else {
                 app.agent_monitor.render_agent_detail(
                     &detail.agent,
-                    agents_area,
+                    dock_area,
                     frame.buffer_mut(),
                     &detail.scroll,
                     detail.show_reasoning,
                 );
             }
         } else {
-            crate::agent_monitor::render_agents_panel(
+            crate::agent_monitor::render_dock(
                 &app.agent_monitor,
-                agents_area,
+                crate::panes::split_dock_areas(dock_area),
                 frame.buffer_mut(),
                 theme,
                 app.panels.focus == crate::panes::PaneFocus::Agents,
             );
         }
-    }
-    if let Some(explorer_area) = pane_areas.explorer {
-        render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
-    }
-    if let Some(workbench_area) = pane_areas.workbench {
-        app.workbench.render(
-            workbench_area,
-            frame.buffer_mut(),
-            theme,
-            app.panels.focus == crate::panes::PaneFocus::Workbench,
+        if let Some(explorer_area) = pane_areas.explorer {
+            render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
+        }
+        if let Some(workbench_area) = pane_areas.workbench {
+            app.workbench.render(
+                workbench_area,
+                frame.buffer_mut(),
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Workbench,
+            );
+        }
+        let history_area = pane_areas
+            .chat
+            .unwrap_or(Rect::new(below_dock.x, below_dock.y, 0, 0));
+        (history_area, status_area, input_area)
+    } else {
+        // Schmale Terminals: das Agenten-Panel klappt zu einer Zeile über der
+        // Statuszeile zusammen (ab `AGENTS_SUMMARY_MIN_HEIGHT` Zeilen, darunter
+        // entfällt es ganz), damit der Chat seine Breite behält.
+        let agents_collapsed = app.panels.agents_visible
+            && !app.panels.maximized
+            && area.width < crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH;
+        let agents_summary = if agents_collapsed
+            && area.height >= crate::panes::AGENTS_SUMMARY_MIN_HEIGHT
+            && area.height > input_height + history_min + 2
+        {
+            crate::agent_monitor::render_collapsed_summary(
+                &app.agent_monitor,
+                area.width,
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Agents,
+            )
+        } else {
+            None
+        };
+        let summary_height = u16::from(agents_summary.is_some());
+
+        // Der Block darf den Verlauf nie ganz verdrängen.
+        let queue_height = (queue_lines.len() as u16).min(
+            area.height
+                .saturating_sub(input_height + summary_height + 4),
         );
-    }
-    let history_area = pane_areas
-        .chat
-        .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+
+        // History | Warteschlange | permanente Statuszeile | Eingabe. Der
+        // Sicherheitsmodus muss sichtbar bleiben und darf nicht vom Verlauf
+        // verdrängt werden.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(history_min),
+                Constraint::Length(queue_height),
+                Constraint::Length(summary_height),
+                Constraint::Length(1),
+                Constraint::Length(input_height),
+            ])
+            .split(area);
+        let queue_area = chunks[1];
+        let summary_area = chunks[2];
+        let status_area = chunks[3];
+        let input_area = chunks[4];
+        if let Some(summary) = agents_summary {
+            frame.render_widget(Paragraph::new(summary), summary_area);
+        }
+        if queue_height > 0 {
+            frame.render_widget(
+                Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
+                queue_area,
+            );
+        }
+        // Seitenpanels (Explorer links, Agenten rechts) teilen sich die obere
+        // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
+        let pane_areas = crate::panes::split(chunks[0], &app.panels);
+        let history_area_for_regions =
+            pane_areas
+                .chat
+                .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+        app.last_regions.set(scroll_routing::FrameRegions {
+            agents: pane_areas.agents,
+            dialog: dialog_open.then_some(input_area),
+            plan: app
+                .plan_ui
+                .covers_history()
+                .then_some(history_area_for_regions),
+        });
+        if let Some(agents_area) = pane_areas.agents {
+            if let Some(detail) = app.agent_detail.as_ref() {
+                if detail.job.is_some() {
+                    // Plan R9, Teil F: Job-Detailansicht (Kopf und Log-Ende).
+                    crate::jobs_panel::render_job_detail(
+                        detail.job_view.as_ref(),
+                        agents_area,
+                        frame.buffer_mut(),
+                        &detail.scroll,
+                        theme,
+                    );
+                } else {
+                    app.agent_monitor.render_agent_detail(
+                        &detail.agent,
+                        agents_area,
+                        frame.buffer_mut(),
+                        &detail.scroll,
+                        detail.show_reasoning,
+                    );
+                }
+            } else {
+                crate::agent_monitor::render_agents_panel(
+                    &app.agent_monitor,
+                    agents_area,
+                    frame.buffer_mut(),
+                    theme,
+                    app.panels.focus == crate::panes::PaneFocus::Agents,
+                );
+            }
+        }
+        if let Some(explorer_area) = pane_areas.explorer {
+            render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
+        }
+        if let Some(workbench_area) = pane_areas.workbench {
+            app.workbench.render(
+                workbench_area,
+                frame.buffer_mut(),
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Workbench,
+            );
+        }
+        let history_area = pane_areas
+            .chat
+            .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+        (history_area, status_area, input_area)
+    };
+
     let permission = match app.current_permission_stage() {
         PermissionCycleStage::Ask => "Ask",
         PermissionCycleStage::Auto => "Auto",
@@ -11084,6 +11240,36 @@ mod tests {
         );
         assert_eq!(app.input.text(), "xnext prompt");
         assert!(app.deferred_input.is_empty());
+        Ok(())
+    }
+
+    /// Feldbericht: während eines laufenden Turns verschwand eine von
+    /// `classify_line` abgelehnte Zeile (hier: unterminiertes Quote)
+    /// kommentarlos — `queue_busy_key` behandelte `LineAction::System`
+    /// bisher genauso wie `Quit`/`Ignore`. Jetzt kommt die Zeile in den
+    /// Composer zurück, und eine Systemzeile erklärt die Ablehnung.
+    #[test]
+    fn busy_enter_keeps_rejected_line_and_shows_system_line() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.input.insert_str("/x 'a");
+
+        let outcome = handle_busy_event(
+            &mut app,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(outcome, BusyKeyOutcome::Redraw);
+
+        assert_eq!(app.input(), "/x 'a");
+        assert!(app.pending_turns.is_empty());
+        let message = app
+            .export_entries
+            .last()
+            .and_then(|entry| match entry {
+                ExportEntry::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .ok_or(TestError::Missing("export status message"))?;
+        assert!(message.starts_with("Eingabe abgelehnt"), "{message}");
         Ok(())
     }
 
@@ -13727,6 +13913,39 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Feldbericht: eine von `classify_line` abgelehnte Zeile (hier der
+    /// reservierte `$`-Präfix) darf nicht verschwinden — plain Enter im
+    /// Leerlauf lässt sie im Composer stehen und legt sie in die History,
+    /// statt sie zusammen mit dem Puffer wegzuwerfen.
+    #[test]
+    fn idle_enter_keeps_rejected_line_in_composer_and_history() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.input.insert_str("$nope");
+        let (bus, mut receiver) = harw_event_channel();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(handle_key(&mut app, enter, &bus));
+
+        assert_eq!(app.input(), "$nope");
+        match receiver.try_recv() {
+            Ok(HarwEvent::SystemMessage(message)) => {
+                assert!(message.starts_with("Eingabe abgelehnt"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete SystemMessage, bekam {other:?}"
+                )));
+            }
+        }
+        assert!(receiver.try_recv().is_err());
+
+        // Up-Pfeil findet die abgelehnte Zeile trotzdem in der History.
+        app.input.clear();
+        assert!(app.input.history_back());
+        assert_eq!(app.input(), "$nope");
+        Ok(())
+    }
+
     #[test]
     fn subcommand_query_is_empty_detects_bare_command_with_space() {
         assert!(subcommand_query_is_empty("/model "));
@@ -14387,6 +14606,241 @@ forbidden = [{forbidden}]
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Baut ein `TurnEvent::ContextUpdated` für einen laufenden Kind-Agenten
+    /// (gleiches Muster wie `scroll_routing::tests::running`), damit der Dock
+    /// mindestens einen aktiven Agenten anzeigt.
+    fn dock_test_running_agent(app: &mut ChatApp, id: &str, role: &str) {
+        let event = harw_core::AgentEvent {
+            agent: SessionId::from_str(id),
+            parent: Some(app.session_id().clone()),
+            role: role.to_owned(),
+            kind: harw_core::AgentEventKind::Turn(TurnEvent::ContextUpdated {
+                turn_id: harw_types::TurnId::new(),
+                used_tokens: 22_280,
+                window_tokens: 202_800,
+                history_items_dropped: 0,
+                estimated_next_tokens: None,
+                threshold_tokens: None,
+                reserve_tokens: None,
+            }),
+        };
+        app.agent_monitor.apply(&event);
+    }
+
+    /// Legt einen einzelnen Job im Agenten-Monitor ab, damit die geteilte
+    /// Dock-Spalte (Agenten links, Jobs rechts) auch eine Job-Zeile zeigt.
+    fn dock_test_job() -> crate::jobs_panel::JobRow {
+        crate::jobs_panel::JobRow {
+            id: "job-1".to_owned(),
+            name: "build".to_owned(),
+            state: "läuft",
+            progress: "13%".to_owned(),
+            runtime: "1m15s".to_owned(),
+            active: true,
+            failed: false,
+        }
+    }
+
+    /// 80×40 (schmal, hoch): `render_viewport` pinnt den Portrait-Dock oben
+    /// mit vollem Rahmen und Titel, der Chat läuft darunter über die volle
+    /// Breite, und Statuszeile sowie Composer bleiben am unteren Rand — die
+    /// gleiche Reihenfolge, die `harw-tui-layout::classify` für dieses Format
+    /// vorschreibt (`Placement::PortraitDock`).
+    /// Copilot-Review #48: eine lange Warteschlange darf im Portrait-Dock
+    /// Statuszeile und Composer nicht aus dem Bild schieben, denn die
+    /// Dock-Höhe ist schon fest vergeben.
+    #[test]
+    fn long_queue_under_portrait_dock_keeps_status_and_composer_visible() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.agent_monitor.set_jobs(vec![dock_test_job()]);
+        for index in 0..60 {
+            app.pending_turns
+                .push_back(format!("wartende-nachricht-{index}"));
+        }
+        // Portrait-Minimum (28 Zeilen) mit mehrzeiligem Composer: Dock,
+        // volle Warteschlange, Status und Composer überschreiten zusammen
+        // die Höhe, wenn die Dock-Höhe nicht abgezogen wird.
+        app.input
+            .insert_str("zeile 1\nzeile 2\nzeile 3\nzeile 4\nzeile 5\nletzte-zeile");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 28))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let shown = rows.join("\n");
+        assert!(
+            app.last_regions
+                .get()
+                .agents
+                .is_some_and(|dock| dock.y == 0),
+            "Portrait-Dock oben erwartet: {shown}"
+        );
+        let last_rows = &rows[rows
+            .len()
+            .saturating_sub(usize::from(input_height_for_test(&app, 64)) + 1)..];
+        assert!(
+            last_rows.iter().any(|row| row.contains("Ask")),
+            "Statuszeile muss trotz langer Warteschlange unten sichtbar bleiben: {shown}"
+        );
+        assert!(
+            shown.contains("letzte-zeile"),
+            "die letzte Composer-Zeile muss sichtbar bleiben: {shown}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_viewport_at_80x40_pins_a_top_dock_full_width_chat_below_and_status_composer_at_bottom()
+    -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.agent_monitor.set_jobs(vec![dock_test_job()]);
+        app.push_line(
+            Role::System,
+            "einzigartige-verlaufszeile-fuer-den-dock-test".to_owned(),
+        );
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let shown = rows.join("\n");
+
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        assert_eq!(dock.y, 0, "der Dock ist oben angedockt: {shown}");
+        assert_eq!(
+            dock.width, 80,
+            "der Dock nimmt die volle Breite ein: {shown}"
+        );
+        assert!(
+            rows[..usize::from(dock.height)]
+                .iter()
+                .any(|row| row.contains("Agenten")),
+            "Dock-Titel fehlt in den oberen Zeilen: {shown}"
+        );
+
+        // Der Chat beginnt erst unterhalb des Docks: die einzigartige
+        // Verlaufszeile taucht nie innerhalb der Dock-Höhe auf.
+        let history_row = rows
+            .iter()
+            .position(|row| row.contains("einzigartige-verlaufszeile"))
+            .ok_or(TestError::Missing("Verlaufszeile"))?;
+        assert!(
+            history_row >= usize::from(dock.height),
+            "der Chat darf nicht in den Dock hineinragen: history_row={history_row}, dock.height={}: {shown}",
+            dock.height
+        );
+
+        let last_rows = &rows[rows
+            .len()
+            .saturating_sub(usize::from(input_height_for_test(&app, 80)) + 1)..];
+        assert!(
+            last_rows.iter().any(|row| row.contains("Ask")),
+            "Statuszeile (Modus) fehlt am unteren Rand: {shown}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("› ")),
+            "Composer-Prompt fehlt: {shown}"
+        );
+        Ok(())
+    }
+
+    /// Hilfsberechnung, um die letzten Zeilen (Statuszeile/Composer) grob
+    /// einzugrenzen — orientiert sich an derselben Formel wie
+    /// `render_viewport` (Eingabezeilen geklemmt auf 1–8, plus Rahmen).
+    fn input_height_for_test(app: &ChatApp, width: u16) -> u16 {
+        let input_width = width.saturating_sub(5) as usize;
+        let input_line_count = app.input.visible_lines(input_width).len().clamp(1, 8) as u16;
+        input_line_count + 2
+    }
+
+    /// Ein offener Freigabe-Dialog zeichnet weiterhin über (zeitlich nach)
+    /// dem Dock, nie hinein: bei 80×40 mit einem aktiven Agenten liegen
+    /// Dialog-Zeilen (Optionen, Hinweis) ausschließlich unterhalb der
+    /// Dock-Höhe, während der Dock-Titel weiterhin sichtbar bleibt.
+    #[test]
+    fn modal_and_approval_dialogs_render_over_the_dock_not_inside_it_at_80x40() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.agent_monitor.set_jobs(vec![dock_test_job()]);
+        app.pending_approval_dialog = Some(ApprovalDialog::new(ApprovalDialogRequest {
+            call: harw_extension_api::ToolCall {
+                id: harw_types::ToolCallId::new(),
+                name: harw_extension_api::ToolName::new("shell.exec"),
+                arguments: serde_json::json!({ "command": "echo hi" }),
+            },
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: true,
+        }));
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let shown = rows.join("\n");
+
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        assert!(
+            rows[..usize::from(dock.height)]
+                .iter()
+                .any(|row| row.contains("Agenten")),
+            "Dock-Titel fehlt weiterhin: {shown}"
+        );
+
+        let dialog_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("Ja") || row.contains("Nein (Esc)"))
+            .map(|(y, _)| y)
+            .collect();
+        assert!(!dialog_rows.is_empty(), "Dialogzeilen fehlen: {shown}");
+        assert!(
+            dialog_rows.iter().all(|&y| y >= usize::from(dock.height)),
+            "Dialogzeilen liegen im Dock statt darunter: {dialog_rows:?}, dock.height={}: {shown}",
+            dock.height
+        );
         Ok(())
     }
 }

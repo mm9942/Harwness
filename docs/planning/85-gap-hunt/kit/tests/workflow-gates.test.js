@@ -26,8 +26,10 @@ async function run(f, args, respond, raw) {
   }
   const parallel = async ts => Promise.all(ts.map(t => t().catch(() => null)))
   const pipeline = async (items, ...stages) => Promise.all(items.map(async (it, i) => { let v = it; for (const s of stages) { try { v = await s(v, it, i) } catch (e) { return null } } return v }))
-  const fn = new Function('args', 'agent', 'parallel', 'pipeline', 'phase', 'log', 'return (async()=>{' + load(f) + '})()')
-  try { const r = await fn(args, agent, parallel, pipeline, () => {}, () => {}); return { r, calls, models, peak } } catch (e) { return { err: e.message, calls, models, peak } }
+  // A nested workflow() call is answered like an agent labelled workflow:<key>.
+  const workflow = async (ref, a) => { calls.push(`workflow:${a && a.key}`); return respond(`workflow:${a && a.key}`, a) }
+  const fn = new Function('args', 'agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'return (async()=>{' + load(f) + '})()')
+  try { const r = await fn(args, agent, parallel, pipeline, () => {}, () => {}, workflow); return { r, calls, models, peak } } catch (e) { return { err: e.message, calls, models, peak } }
 }
 const run2 = (...a) => run(...a)
 const R = '/tmp/x/repo'
@@ -163,4 +165,51 @@ const ok = (name, cond) => { console.log((cond ? 'PASS ' : 'FAIL ') + name); if 
   c = await run('contract-wave.js', { root: R, key: 'w', clusters: [C('critical')] }, cw({ ok: true, problems: [], regression_test: 'test_y' }, MET), true)
   ok('contract-wave: critical with regression test -> complete', c.r.complete === true)
   ok('contract-wave: default models all sonnet', c.models.length > 0 && c.models.every(([, m]) => m === 'sonnet'))
+})()
+;(async () => {
+  // layered-wave: macro plan validation, level order, fail-closed stop.
+  const R = '/tmp/x/repo'
+  const ok = (name, cond) => { console.log((cond ? 'PASS ' : 'FAIL ') + name); if (!cond) process.exitCode = 1 }
+  const G = { id: 'g1', statement: 's', criteria: [{ id: 'c1', text: 'leaf built' }, { id: 'c2', text: 'wired' }] }
+  const leaf = (id, crate, deps = [], criteria = ['c1']) => ({ id, kind: 'leaf', crate, files: [`${crate}/Cargo.toml`, `${crate}/src/lib.rs`], depends_on: deps, spec: `build ${id}`, tests: [`test_${id}`], criteria })
+  const wire = (id, files, deps, criteria = ['c2']) => ({ id, kind: 'wiring', files, depends_on: deps, spec: `wire ${id}`, tests: [], criteria })
+  const plan = units => ({ decisions_needed: [], summary: 's', units })
+  const levelsSeen = []
+  const respond = done => async (l, a) => {
+    if (l.startsWith('workflow:')) { levelsSeen.push(a.clusters.map(c => c.id).join('+')); return { complete: done(a), deltas: [] } }
+    if (l.startsWith('goal:')) return { criteria: [{ id: 'c1', status: 'met', evidence: 'a/src/lib.rs:1' }, { id: 'c2', status: 'met', evidence: 'harw-runtime/src/assembly.rs:1' }], deltas: [] }
+    return null
+  }
+  const good = plan([leaf('a', 'harw-a'), leaf('b', 'harw-b', ['a']), leaf('c', 'harw-c'), wire('w', ['harw-runtime/src/assembly.rs', 'Cargo.toml'], ['b', 'c'])])
+  levelsSeen.length = 0
+  let o = await run('layered-wave.js', { root: R, key: 'k', goal: G, plan: good }, respond(() => true), true)
+  ok('layered: levels follow dependencies (a+c, then b, then wiring)', JSON.stringify(levelsSeen) === JSON.stringify(['a+c', 'b', 'w']))
+  ok('layered: all levels + goal met -> complete, never achieved', o.r.complete === true && o.r.achieved === false && o.r.achieve === 'human-only')
+  levelsSeen.length = 0
+  o = await run('layered-wave.js', { root: R, key: 'k', goal: G, plan: good }, respond(a => !a.clusters.some(c => c.id === 'b')), true)
+  ok('layered: failed leaf level stops before wiring', o.r.complete === false && o.r.stoppedAt === 'L2' && !levelsSeen.includes('w'))
+  const bad = [
+    ['file in two units', plan([leaf('a', 'harw-a'), { ...leaf('b', 'harw-b'), files: ['harw-b/src/lib.rs', 'harw-a/src/lib.rs'] }, wire('w', ['x/y.rs'], ['a'])])],
+    ['leaf file outside its crate', plan([{ ...leaf('a', 'harw-a'), files: ['harw-a/src/lib.rs', 'harw-z/src/lib.rs'] }, wire('w', ['x/y.rs'], ['a'])])],
+    ['crate split across leaf units', plan([leaf('a', 'harw-a'), { ...leaf('b', 'harw-a'), files: ['harw-a/src/other.rs'] }, wire('w', ['x/y.rs'], ['a'])])],
+    ['leaf depends on wiring', plan([leaf('a', 'harw-a', ['w']), wire('w', ['x/y.rs'], [])])],
+    ['cycle', plan([leaf('a', 'harw-a', ['b']), leaf('b', 'harw-b', ['a']), wire('w', ['x/y.rs'], ['a'])])],
+    ['unknown dependency', plan([leaf('a', 'harw-a', ['nope']), wire('w', ['x/y.rs'], ['a'])])],
+    ['criterion without unit', plan([leaf('a', 'harw-a'), wire('w', ['x/y.rs'], ['a'], ['c1'])])],
+    ['absolute path outside root', plan([leaf('a', 'harw-a'), wire('w', ['/etc/passwd'], ['a'])])],
+  ]
+  for (const [name, p] of bad) {
+    levelsSeen.length = 0
+    const r = await run('layered-wave.js', { root: R, key: 'k', goal: G, plan: p }, respond(() => true), true)
+    ok(`layered: plan rejected (${name}), nothing runs`, r.r && r.r.status === 'plan-invalid' && levelsSeen.length === 0)
+  }
+  levelsSeen.length = 0
+  o = await run('layered-wave.js', { root: R, key: 'k', goal: G, plan: { ...good, decisions_needed: ['pick a default'] } }, respond(() => true), true)
+  ok('layered: open owner decision stops before any level', o.r.status === 'needs-decision' && levelsSeen.length === 0)
+  const passed = []
+  await run('layered-wave.js', { root: R, key: 'k', goal: G, plan: good, decided: ['cap stays 16'] }, async (l, a) => { if (l.startsWith('workflow:')) passed.push(a.decided); return respond(() => true)(l, a) }, true)
+  ok('layered: decided reaches every level', passed.length === 3 && passed.every(d => d.length === 1 && d[0] === 'cap stays 16'))
+  let prompt = ''
+  await run('contract-wave.js', { root: R, key: 'w', decided: ['KEK is bootstrapped'], clusters: [{ id: 'c1', files: ['a/src/x.rs'], findings: [{ file: 'a/src/x.rs', line: 1, severity: 'low', pattern: 'M1', title: 't', description: 'd', evidence: 'e', fix: 'f' }] }] }, async (l, p) => { if (l.startsWith('contract:')) prompt = p; return null })
+  ok('contract-wave: decided listed as resolved in the contract prompt', prompt.includes('KEK is bootstrapped') && prompt.includes('never list them under decisions_needed again'))
 })()

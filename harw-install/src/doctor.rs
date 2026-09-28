@@ -16,6 +16,10 @@
 //! - [`DoctorCheck`]: Trait für einen benannten, ausführbaren Check.
 //! - [`default_checks`]: baut die Standard-Check-Liste.
 //! - [`RuntimeCompositionEvidence`]: beobachtbare Evidenz der Tool-Komposition.
+//! - [`PlaintextSecretRefCheck`]: warnt vor unverschlüsselten Secret-Referenzen
+//!   (`env:`/`file:`/`file-json:`) im aufgelösten Config-Universum.
+//! - [`plaintext_secret_refs`]: reine Funktion, die solche Referenzen im
+//!   bereits geladenen [`harw_config::ResolvedConfig`] aufzählt.
 //! - [`run_all`]: führt eine Check-Liste aus und sammelt die Ergebnisse.
 //!
 //! # Fehlerbehandlung
@@ -24,9 +28,11 @@
 //! gibt daher keinen Error-Typ in diesem Modul.
 //!
 //! # Concurrency
-//! Alle Check-Structs sind `Send + Sync`. Die Ausführung ist read-only
-//! (Environment-Snapshot, Datei-Metadaten) und hält keine Locks. Der Aufruf ist
-//! von mehreren Threads aus sicher.
+//! Alle Check-Structs sind `Send + Sync`. Die meisten Checks sind read-only
+//! über Environment-Snapshot oder Datei-Metadaten und halten keine Locks.
+//! [`PlaintextSecretRefCheck`] liest zusätzlich die Config-Layer-Dateien
+//! (`harw_home::config_layers`, `harw_config::discover_config`) — ebenfalls
+//! read-only und ohne Locks. Der Aufruf ist von mehreren Threads aus sicher.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -40,6 +46,9 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+
+use harw_config::provider_toml::ProviderToml;
+use harw_config::{ResolvedConfig, SecretRef};
 
 use crate::platform::{Os, Platform};
 use crate::service::{ServiceKind, detect_service_manager};
@@ -602,13 +611,224 @@ impl DoctorCheck for KekFilePermsCheck {
     }
 }
 
+/// Warnt vor Klartext-Secret-Referenzen (`env:`, `file:`, `file-json:`) im
+/// aufgelösten Config-Universum eines harw-Home-Verzeichnisses.
+///
+/// # Description
+/// Lädt dieselben Config-Layer wie der `harw doctor`-Befehl
+/// (`harw_home::config_layers`) und wertet sie mit
+/// `harw_config::discover_config` aus. Danach zählt [`plaintext_secret_refs`]
+/// jede Referenz auf, die noch nicht durch den `harw-secrets`-SecretStore
+/// (`keyring:`/`secrets:`) abgesichert ist. Funktionieren tut so eine
+/// Referenz weiterhin — der Check meldet nur den unverschlüsselten Zustand
+/// und verweist auf `harw auth migrate`.
+///
+/// Ist die Konfiguration nicht ladbar, wird ebenfalls [`CheckOutcome::Warn`]
+/// gemeldet, aber ohne die Fehlermeldung selbst: `ConfigError::InvalidSecretRef`
+/// trägt den abgelehnten Rohstring, der ein Klartext-Secret sein kann (siehe
+/// Moduldoku von `harw_config::auth_toml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaintextSecretRefCheck {
+    /// Pfad zum harw-Home-Verzeichnis (`~/.harw`).
+    home: PathBuf,
+}
+
+impl PlaintextSecretRefCheck {
+    /// Erzeugt einen [`PlaintextSecretRefCheck`] für das gegebene Home-Verzeichnis.
+    ///
+    /// # Arguments
+    /// - `home` (`&Path`): Pfad zum harw-Home-Verzeichnis; wird kopiert.
+    ///
+    /// # Returns
+    /// Einen neuen [`PlaintextSecretRefCheck`].
+    #[must_use]
+    pub fn new(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+        }
+    }
+}
+
+impl DoctorCheck for PlaintextSecretRefCheck {
+    /// Liefert den Bezeichner `"secrets/plaintext-refs"`.
+    fn id(&self) -> &str {
+        "secrets/plaintext-refs"
+    }
+
+    /// Lädt die Config-Layer und meldet gefundene Klartext-Secret-Referenzen.
+    fn run(&self) -> CheckOutcome {
+        match harw_home::config_layers(&self.home) {
+            Ok(layers) => plaintext_refs_outcome_for_layers(&layers),
+            Err(err) => CheckOutcome::Warn(format!(
+                "Config-Layer nicht ermittelbar; Klartext-Secret-Referenzen nicht prüfbar ({err}): {}",
+                self.home.display()
+            )),
+        }
+    }
+}
+
+/// Lädt die Konfiguration aus `layers` und übersetzt gefundene
+/// Klartext-Secret-Referenzen in ein [`CheckOutcome`].
+///
+/// Gibt bei einem Ladefehler bewusst nicht die `ConfigError`-Nachricht aus:
+/// `ConfigError::InvalidSecretRef` trägt den abgelehnten Rohstring, und der
+/// kann ein Klartext-Secret sein (ein literaler Wert ist laut
+/// `harw_config::auth_toml`-Moduldoku niemals eine gültige `SecretRef`).
+fn plaintext_refs_outcome_for_layers(layers: &[PathBuf]) -> CheckOutcome {
+    match harw_config::discover_config(layers) {
+        Ok(config) => plaintext_refs_outcome(&plaintext_secret_refs(&config)),
+        Err(_) => CheckOutcome::Warn(
+            "Konfiguration nicht ladbar; Klartext-Secret-Referenzen nicht prüfbar (Details: `harw doctor`-Konfigurationsprüfung)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Prüft, ob eine [`SecretRef`] auf Klartext verweist (`env:`/`file:`/
+/// `file-json:`) statt auf einen abgesicherten Speicher (`keyring:`/
+/// `secrets:`).
+///
+/// Exhaustives Match ohne Wildcard: eine neue `SecretRef`-Variante zwingt
+/// hier zu einer expliziten Entscheidung.
+fn is_plaintext(r: &SecretRef) -> bool {
+    match r {
+        SecretRef::Env(_) | SecretRef::File(_) | SecretRef::FileJson { .. } => true,
+        SecretRef::Keyring(_) | SecretRef::Secrets(_) => false,
+    }
+}
+
+/// Zählt alle Klartext-Secret-Referenzen (`env:`, `file:`, `file-json:`) im
+/// aufgelösten Config-Universum auf.
+///
+/// # Description
+/// Durchsucht Provider-Auth, sensible Provider-Header, MCP-Server-Auth,
+/// Telegram-Channel-Tokens, `auth.toml`-Credentials (einzeln und im
+/// Credential-Pool) sowie die Principals des MCP-Listeners. Nur
+/// [`SecretRef::as_ref_string`] wird verwendet, niemals ein aufgelöster Wert.
+///
+/// # Returns
+/// Eine `Vec<String>` mit je einer Zeile `<ort>=<referenz>`, sortiert und
+/// dedupliziert — deterministisch trotz der `HashMap`-Iterationsreihenfolge
+/// im Config-Universum.
+#[must_use]
+pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
+    let mut found = Vec::new();
+
+    for (key, provider) in &config.providers {
+        if let Some(auth) = &provider.auth {
+            if is_plaintext(auth) {
+                found.push(format!("providers.{key}.auth={}", auth.as_ref_string()));
+            }
+        }
+        for (name, value) in &provider.headers {
+            if !ProviderToml::is_sensitive_header_name(name) {
+                continue;
+            }
+            // Ein Header, der nicht als SecretRef parsbar ist, kann selbst
+            // ein literaler Klartextwert sein — der wird hier niemals
+            // ausgegeben.
+            let Ok(r) = value.parse::<SecretRef>() else {
+                continue;
+            };
+            if is_plaintext(&r) {
+                found.push(format!(
+                    "providers.{key}.headers.{name}={}",
+                    r.as_ref_string()
+                ));
+            }
+        }
+    }
+
+    for (key, mcp) in &config.mcps {
+        if let Some(auth) = &mcp.auth {
+            if is_plaintext(auth) {
+                found.push(format!("mcps.{key}.auth={}", auth.as_ref_string()));
+            }
+        }
+    }
+
+    for (key, channel) in &config.channels {
+        match channel {
+            harw_config::ChannelToml::Telegram(t) => {
+                if is_plaintext(&t.bot_token_ref) {
+                    found.push(format!(
+                        "channels.{key}.bot_token_ref={}",
+                        t.bot_token_ref.as_ref_string()
+                    ));
+                }
+                if let Some(webhook) = &t.transport_webhook {
+                    if is_plaintext(&webhook.secret_token_ref) {
+                        found.push(format!(
+                            "channels.{key}.transport_webhook.secret_token_ref={}",
+                            webhook.secret_token_ref.as_ref_string()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for (name, secret) in &config.auth.credentials {
+        if is_plaintext(secret) {
+            found.push(format!(
+                "auth.credentials.{name}={}",
+                secret.as_ref_string()
+            ));
+        }
+    }
+
+    for (pool, entries) in &config.auth.credential_pool {
+        for (index, entry) in entries.iter().enumerate() {
+            if is_plaintext(&entry.secret) {
+                found.push(format!(
+                    "auth.credential_pool.{pool}[{index}].secret={}",
+                    entry.secret.as_ref_string()
+                ));
+            }
+        }
+    }
+
+    for principal in &config.harness.mcp_listener.principals {
+        if is_plaintext(&principal.credential_ref) {
+            found.push(format!(
+                "harness.mcp_listener.principals.{}.credential_ref={}",
+                principal.id,
+                principal.credential_ref.as_ref_string()
+            ));
+        }
+    }
+
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Übersetzt eine Liste gefundener Klartext-Secret-Referenzen in ein
+/// [`CheckOutcome`].
+///
+/// Meldet bewusst nie [`CheckOutcome::Fail`]: eine Klartext-Referenz
+/// funktioniert weiter, sie liegt nur unverschlüsselt vor.
+fn plaintext_refs_outcome(found: &[String]) -> CheckOutcome {
+    if found.is_empty() {
+        return CheckOutcome::Ok(
+            "keine Klartext-Secret-Referenzen (file:, file-json:, env:) konfiguriert".to_owned(),
+        );
+    }
+    let n = found.len();
+    let list = found.join(", ");
+    CheckOutcome::Warn(format!(
+        "{n} Klartext-Secret-Referenz(en) — funktionieren weiter, liegen aber unverschlüsselt vor; mit `harw auth migrate` in den verschlüsselten SecretStore überführen: {list}"
+    ))
+}
+
 /// Baut die Standard-Check-Liste für die harw-Diagnose.
 ///
 /// # Description
 /// Stellt die Reihenfolge System → Sandbox → Runtime-Tool-Grenzen →
-/// Service-Manager → Home-Existenz → Home-Berechtigungen zusammen. Die
-/// Default-Composition übergibt keine Runtime-Evidenz; der Tool-Grenzen-Check
-/// meldet deshalb ausdrücklich "unbekannt/nicht konfiguriert".
+/// Service-Manager → Home-Existenz → Home-Berechtigungen →
+/// Klartext-Secret-Referenzen zusammen. Die Default-Composition übergibt
+/// keine Runtime-Evidenz; der Tool-Grenzen-Check meldet deshalb ausdrücklich
+/// "unbekannt/nicht konfiguriert".
 ///
 /// # Arguments
 /// - `home` (`&Path`): Pfad zum harw-Home-Verzeichnis (`~/.harw`).
@@ -625,7 +845,7 @@ impl DoctorCheck for KekFilePermsCheck {
 /// use harw_install::doctor::default_checks;
 ///
 /// let checks = default_checks(Path::new("/home/u/.harw"));
-/// assert_eq!(checks.len(), 6);
+/// assert_eq!(checks.len(), 7);
 /// ```
 pub fn default_checks(home: &Path) -> Vec<Box<dyn DoctorCheck>> {
     vec![
@@ -637,6 +857,7 @@ pub fn default_checks(home: &Path) -> Vec<Box<dyn DoctorCheck>> {
         Box::new(ServiceManagerCheck),
         Box::new(HomeExistsCheck::new(home)),
         Box::new(HomePermsCheck::new(home)),
+        Box::new(PlaintextSecretRefCheck::new(home)),
     ]
 }
 
@@ -662,7 +883,7 @@ pub fn default_checks(home: &Path) -> Vec<Box<dyn DoctorCheck>> {
 ///
 /// let checks = default_checks(Path::new("/home/u/.harw"));
 /// let results = run_all(&checks);
-/// assert_eq!(results.len(), 6);
+/// assert_eq!(results.len(), 7);
 /// ```
 pub fn run_all(checks: &[Box<dyn DoctorCheck>]) -> Vec<(String, CheckOutcome)> {
     checks
@@ -674,7 +895,7 @@ pub fn run_all(checks: &[Box<dyn DoctorCheck>]) -> Vec<(String, CheckOutcome)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Ein Test-Check, der ein festes Ergebnis liefert.
     struct FixedCheck {
@@ -742,9 +963,14 @@ mod tests {
     }
 
     #[test]
-    fn test_default_checks_len_is_six() {
+    fn test_default_checks_len_is_seven() -> TestResult {
         let checks = default_checks(Path::new("/tmp/harw-doctor-test"));
-        assert_eq!(checks.len(), 6);
+        assert_eq!(checks.len(), 7);
+        checks
+            .iter()
+            .find(|check| check.id() == "secrets/plaintext-refs")
+            .ok_or(TestError::Missing("plaintext secret ref check"))?;
+        Ok(())
     }
 
     #[test]
@@ -964,5 +1190,156 @@ mod tests {
         assert!(
             matches!(check.run(), CheckOutcome::Fail(message) if message.contains("unsafe permissions 0644"))
         );
+    }
+
+    #[test]
+    fn plaintext_refs_check_id_stable() {
+        assert_eq!(
+            PlaintextSecretRefCheck::new(Path::new("/tmp/harw-doctor-test")).id(),
+            "secrets/plaintext-refs"
+        );
+    }
+
+    #[test]
+    fn plaintext_secret_refs_lists_file_file_json_and_env_but_not_keyring_or_secrets() -> TestResult
+    {
+        let mut config = ResolvedConfig::default();
+        config.auth.credentials.insert(
+            "a".to_owned(),
+            "file:/x/key".parse().map_err(ctx("file ref parsen"))?,
+        );
+        config.auth.credentials.insert(
+            "b".to_owned(),
+            "env:API_KEY".parse().map_err(ctx("env ref parsen"))?,
+        );
+        config.auth.credentials.insert(
+            "c".to_owned(),
+            "keyring:k".parse().map_err(ctx("keyring ref parsen"))?,
+        );
+        config.auth.credentials.insert(
+            "d".to_owned(),
+            "secrets:id1".parse().map_err(ctx("secrets ref parsen"))?,
+        );
+        config.auth.credential_pool.insert(
+            "pool".to_owned(),
+            vec![harw_config::CredentialEntry {
+                secret: SecretRef::FileJson {
+                    path: "/x/a.json".to_owned(),
+                    pointer: "/token".to_owned(),
+                },
+                label: None,
+                priority: 0,
+                base_url: None,
+            }],
+        );
+
+        let found = plaintext_secret_refs(&config);
+
+        assert_eq!(
+            found,
+            vec![
+                "auth.credential_pool.pool[0].secret=file-json:/x/a.json#/token".to_owned(),
+                "auth.credentials.a=file:/x/key".to_owned(),
+                "auth.credentials.b=env:API_KEY".to_owned(),
+            ]
+        );
+        assert!(!found.iter().any(|line| line.contains("keyring:")));
+        assert!(!found.iter().any(|line| line.contains("secrets:")));
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_refs_outcome_warns_naming_ref_and_migrate_hint() {
+        let outcome = plaintext_refs_outcome(&["auth.credentials.a=file:/x/key".to_owned()]);
+        assert!(matches!(
+            outcome,
+            CheckOutcome::Warn(message)
+                if message.contains("auth.credentials.a=file:/x/key")
+                    && message.contains("harw auth migrate")
+        ));
+    }
+
+    #[test]
+    fn plaintext_refs_outcome_passes_when_empty() {
+        assert!(matches!(plaintext_refs_outcome(&[]), CheckOutcome::Ok(_)));
+    }
+
+    /// Legt ein eindeutiges temporäres Verzeichnis an.
+    fn temp_dir(tag: &str) -> TestResult<PathBuf> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "harw-doctor-plain-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).map_err(ctx("temp dir anlegen"))?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn plaintext_refs_layer_with_file_ref_warns() -> TestResult {
+        let dir = temp_dir("file-ref")?;
+        std::fs::write(
+            dir.join("auth.toml"),
+            "[credentials]\nopenai = \"file:/tmp/does-not-matter/key\"\n",
+        )
+        .map_err(ctx("auth.toml schreiben"))?;
+
+        let outcome = plaintext_refs_outcome_for_layers(std::slice::from_ref(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(matches!(
+            outcome,
+            CheckOutcome::Warn(message)
+                if message.contains("auth.credentials.openai=file:/tmp/does-not-matter/key")
+                    && message.contains("harw auth migrate")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_refs_layer_with_only_secrets_refs_passes() -> TestResult {
+        let dir = temp_dir("secrets-ref")?;
+        std::fs::write(
+            dir.join("auth.toml"),
+            "[credentials]\nopenai = \"secrets:openai-1\"\n",
+        )
+        .map_err(ctx("auth.toml schreiben"))?;
+
+        let outcome = plaintext_refs_outcome_for_layers(std::slice::from_ref(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(matches!(outcome, CheckOutcome::Ok(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_refs_unloadable_config_warns_without_raw_value() -> TestResult {
+        let dir = temp_dir("literal-value")?;
+        std::fs::write(
+            dir.join("auth.toml"),
+            "[credentials]\nopenai = \"sk-LITERAL-SECRET\"\n",
+        )
+        .map_err(ctx("auth.toml schreiben"))?;
+
+        let outcome = plaintext_refs_outcome_for_layers(std::slice::from_ref(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(matches!(
+            outcome,
+            CheckOutcome::Warn(message) if !message.contains("sk-LITERAL-SECRET")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_refs_check_new_on_missing_home_does_not_fail() {
+        let check = PlaintextSecretRefCheck::new(Path::new("/nonexistent/harw/home/xyz"));
+        assert!(!matches!(check.run(), CheckOutcome::Fail(_)));
     }
 }

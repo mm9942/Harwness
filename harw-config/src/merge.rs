@@ -1745,6 +1745,38 @@ fn merge_shell_limits(
     }
 }
 
+// `[jobs]` — `max_running`. Wie `merge_shell_limits`: vertraute Layer
+// (Home und Profil) setzen frei, auch nach oben; ein nicht vertrautes
+// Projekt darf die Obergrenze nur senken (Vergleichswert: der bisher
+// gesetzte Wert, sonst die Vorgabe 16). Der Bereich 1–256 ist schon beim
+// Parsen geprüft (`harness_config::JobsToml`).
+fn merge_jobs(
+    trusted: &mut HarnessConfig,
+    incoming: crate::harness_config::JobsToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    const FIELD: &str = "jobs.max_running";
+    if !field_present(raw, &["jobs", "max_running"]) {
+        return;
+    }
+    let Some(value) = incoming.max_running else {
+        return;
+    };
+    let current = trusted
+        .jobs
+        .max_running
+        .unwrap_or(crate::harness_config::DEFAULT_JOBS_MAX_RUNNING);
+    if role != LayerRole::UntrustedProject || value <= current {
+        trusted.jobs.max_running = Some(value);
+    } else {
+        let diagnostic = ScopeDiagnostic::new(FIELD, layer_path, &value);
+        reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+    }
+}
+
 // `[agent_compiler]` (#22 Welle 2B) — alle drei Felder `ProfileReplaces`.
 fn merge_agent_compiler(
     trusted: &mut HarnessConfig,
@@ -2032,6 +2064,8 @@ pub(crate) fn merge_layer_into(
     merge_agent_limits(trusted, incoming.agents, raw, role, layer_path, &mut out);
     // Runde 5, Teil N: `[shell]` — Obergrenze für `shell.exec`-Zeitlimits.
     merge_shell_limits(trusted, incoming.shell, raw, role, layer_path, &mut out);
+    // `[jobs]` — Höchstzahl laufender Hintergrund-Jobs.
+    merge_jobs(trusted, incoming.jobs, raw, role, layer_path, &mut out);
     // #22 Welle 2B: `[agent_compiler]` — Build-Cache und Versionen.
     merge_agent_compiler(trusted, incoming.agent_compiler, raw, role, layer_path);
 
@@ -2473,6 +2507,111 @@ mod tests {
         );
         assert_eq!(fresh.shell.max_timeout_secs, None);
         assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_max_running_trusted_layers_raise_untrusted_project_only_lowers() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.jobs.effective_max_running(), 16);
+
+        let home = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.jobs.max_running, Some(8));
+
+        let raise = "[jobs]\nmax_running = 32";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(raise).map_err(ctx("parse raise"))?,
+            &raw_from(raise)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.jobs.max_running, Some(8));
+        assert_eq!(diagnostics.len(), 1, "Erhöhung sichtbar abgelehnt");
+        assert_eq!(diagnostics[0].field, "jobs.max_running");
+        assert_eq!(trusted.jobs.effective_max_running(), 8);
+
+        let lower = "[jobs]\nmax_running = 4";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(lower).map_err(ctx("parse lower"))?,
+            &raw_from(lower)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.jobs.max_running, Some(4));
+
+        // Vertraute Layer (hier: Profil-Verfeinerung) dürfen weiterhin erhöhen.
+        let mut fresh = HarnessConfig::default();
+        let refine = "[jobs]\nmax_running = 64";
+        merge_layer_into(
+            &mut fresh,
+            toml::from_str(refine).map_err(ctx("parse refine"))?,
+            &raw_from(refine)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(fresh.jobs.max_running, Some(64));
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_max_running_untrusted_project_cannot_exceed_default() -> TestResult {
+        let mut fresh = HarnessConfig::default();
+        let over_default = "[jobs]\nmax_running = 17";
+        let diagnostics = merge_layer_into(
+            &mut fresh,
+            toml::from_str(over_default).map_err(ctx("parse over default"))?,
+            &raw_from(over_default)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(fresh.jobs.max_running, None);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(fresh.jobs.effective_max_running(), 16);
+
+        let at_default = "[jobs]\nmax_running = 16";
+        let diagnostics = merge_layer_into(
+            &mut fresh,
+            toml::from_str(at_default).map_err(ctx("parse at default"))?,
+            &raw_from(at_default)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(fresh.jobs.max_running, Some(16));
+        assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_absent_layer_keeps_trusted_value() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        let home = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.jobs.max_running, Some(8));
+
+        let without_jobs = "[shell]\nmax_timeout_secs = 120";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(without_jobs).map_err(ctx("parse without jobs"))?,
+            &raw_from(without_jobs)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.jobs.max_running, Some(8));
         Ok(())
     }
 

@@ -132,6 +132,10 @@ pub struct HarnessConfig {
     /// [`crate::shell_limits::ShellToml`].
     #[serde(default)]
     pub shell: crate::shell_limits::ShellToml,
+    /// `[jobs]` — Grenzen der Hintergrund-Jobs (`job.start`), derzeit nur
+    /// `max_running`. Siehe [`JobsToml`].
+    #[serde(default)]
+    pub jobs: JobsToml,
     /// `[agent_compiler]` — Build-Cache und Versionsaufbewahrung von
     /// `harw agent build` (#22 Welle 2B). Gelesen von
     /// `harw-agent-compiler` direkt aus den Layer-`config.toml`; hier nur
@@ -330,6 +334,59 @@ impl HostToml {
             .unwrap_or(DEFAULT_SUDO_SESSION_MINUTES)
             .min(MAX_SUDO_SESSION_MINUTES)
     }
+}
+
+/// Vorgabe für `[jobs] max_running`.
+pub const DEFAULT_JOBS_MAX_RUNNING: u32 = 16;
+/// Erlaubter Bereich für `[jobs] max_running` (inklusive).
+pub const JOBS_MAX_RUNNING_RANGE: (u32, u32) = (1, 256);
+
+/// `[jobs]` — Hintergrund-Jobs einer Sitzung.
+///
+/// # Beschreibung
+/// - `max_running`: Höchstzahl gleichzeitig laufender Jobs einer Sitzung
+///   (Vorgabe [`DEFAULT_JOBS_MAX_RUNNING`], erlaubt 1–256). Ein Wert
+///   außerhalb des Bereichs ist ein Konfigurationsfehler, kein Klemmen.
+///   Merge-Regel `MinBound`: Home und Profil setzen frei, auch nach oben;
+///   ein nicht vertrautes Projekt darf nur senken (`crate::merge`, `merge_jobs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsToml {
+    /// Höchstzahl laufender Jobs; `None` → [`DEFAULT_JOBS_MAX_RUNNING`].
+    #[serde(
+        default,
+        deserialize_with = "deserialize_jobs_max_running",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_running: Option<u32>,
+}
+
+impl JobsToml {
+    /// Wirksame Höchstzahl laufender Jobs (Vorgabe 16; defensiv auf 1–256
+    /// geklemmt, falls der Wert nicht aus TOML stammt).
+    #[must_use]
+    pub fn effective_max_running(&self) -> u32 {
+        self.max_running
+            .unwrap_or(DEFAULT_JOBS_MAX_RUNNING)
+            .clamp(JOBS_MAX_RUNNING_RANGE.0, JOBS_MAX_RUNNING_RANGE.1)
+    }
+}
+
+// Lehnt `[jobs] max_running` außerhalb 1–256 beim Parsen ab: jede Layer-
+// Datei wird mit `toml::from_str` gelesen, der Fehler wird so zu
+// `ConfigError::TomlParse`.
+fn deserialize_jobs_max_running<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value < JOBS_MAX_RUNNING_RANGE.0 || value > JOBS_MAX_RUNNING_RANGE.1 {
+        return Err(serde::de::Error::custom(format!(
+            "[jobs] max_running must be between {} and {}, got {value}",
+            JOBS_MAX_RUNNING_RANGE.0, JOBS_MAX_RUNNING_RANGE.1
+        )));
+    }
+    Ok(Some(value))
 }
 
 /// `[reasoning]` — Rollen-Reasoning-Effort-Gewichtung (Addendum F+G,
@@ -1136,6 +1193,61 @@ mod tests {
             rustup_home = "/rustup"
             cargo_home = "/cache"
         "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_jobs_max_running_parses_and_defaults() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+            "#,
+        )
+        .map_err(ctx("parse config without jobs"))?;
+        assert_eq!(cfg.jobs.max_running, None);
+        assert_eq!(cfg.jobs.effective_max_running(), 16);
+
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                [jobs]
+                max_running = 3
+            "#,
+        )
+        .map_err(ctx("parse config with jobs.max_running"))?;
+        assert_eq!(cfg.jobs.max_running, Some(3));
+        assert_eq!(cfg.jobs.effective_max_running(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_max_running_rejects_zero_and_257() -> TestResult {
+        for src in ["[jobs]\nmax_running = 0", "[jobs]\nmax_running = 257"] {
+            match toml::from_str::<HarnessConfig>(src) {
+                Ok(_) => {
+                    return Err(TestError::Unexpected(
+                        "expected rejection of max_running".to_owned(),
+                    ));
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    if !message.contains("max_running") {
+                        return Err(TestError::Unexpected(
+                            "error message must mention max_running".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for src in ["[jobs]\nmax_running = 256", "[jobs]\nmax_running = 1"] {
+            assert!(toml::from_str::<HarnessConfig>(src).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_unknown_key_is_rejected() {
+        let src = "[jobs]\nfoo = 1";
         assert!(toml::from_str::<HarnessConfig>(src).is_err());
     }
 }

@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::event::JobEvent;
-use crate::logs::{LogQuery, read_log};
+use crate::logs::{LogQuery, read_log, truncation_marker};
+use crate::model::JobEndReason;
 use crate::procfs::test_process_alive;
 use crate::test_support::{Env, TestError, TestResult, ctx, eventually, request};
 use std::time::Duration;
@@ -405,6 +406,9 @@ fn previous_meta_with(
         warnings: 0,
         errors: 0,
         launch_error: None,
+        stragglers_reaped: false,
+        log_truncated: false,
+        launch_warnings: Vec::new(),
     })
 }
 
@@ -840,6 +844,11 @@ async fn test_capacity_limit() -> TestResult {
         env.manager.check_capacity(),
         Err(JobError::Capacity { max: 1 })
     ));
+    let Err(err) = env.manager.check_capacity() else {
+        return Err(TestError::Missing("capacity error"));
+    };
+    // Die Meldung nennt den Konfigurationsschlüssel, mit dem man die Grenze hebt.
+    assert!(err.to_string().contains("[jobs] max_running"), "{err}");
     let second = env.prepare("sleep 30").await?;
     assert!(matches!(
         env.manager.start(request("two", "agent-a", &[]), second),
@@ -853,6 +862,237 @@ async fn test_capacity_limit() -> TestResult {
             .ok(),
         Some(JobState::Stopped)
     );
+    Ok(())
+}
+
+/// Wartet, bis der Job `id` beendet ist, und liefert seinen Status.
+async fn wait_terminal(env: &Env, id: &JobId) -> TestResult<JobStatus> {
+    let done = eventually(LIMIT, || {
+        env.manager
+            .status(id, Caller::Operator)
+            .is_ok_and(|status| status.meta.state.is_terminal())
+    })
+    .await;
+    if !done {
+        return Err(TestError::Missing("job did not end in time"));
+    }
+    env.manager
+        .status(id, Caller::Operator)
+        .map_err(ctx("status"))
+}
+
+/// Meldungen aller `Warning`-Ereignisse des Jobs `id`.
+fn warning_messages(env: &Env, id: &JobId) -> Vec<String> {
+    events_of(env, id)
+        .into_iter()
+        .filter_map(|event| match event {
+            JobEvent::Warning { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Obergrenze einer gekürzten Logdatei: Budget plus eine Markerzeile.
+fn capped_len(budget: u64) -> TestResult<u64> {
+    let marker = u64::try_from(truncation_marker(budget).len()).map_err(ctx("marker length"))?;
+    Ok(budget.saturating_add(marker))
+}
+
+#[tokio::test]
+async fn test_normal_end_reaps_stragglers() -> TestResult {
+    let env = Env::new()?;
+    // Die Shell endet sofort mit 0; das Enkelkind ignoriert SIGTERM und
+    // bleibt in der Prozessgruppe zurück — erst SIGKILL nach der Frist trifft es.
+    let prepared = env
+        .prepare("(trap '' TERM; exec sleep 30) & echo $!")
+        .await?;
+    let started = env
+        .manager
+        .start(request("straggler", "agent-a", &[]), prepared)
+        .map_err(ctx("start"))?;
+    let id = started.meta.job_id.clone();
+    let stdout = started.log_dir.join(STDOUT_LOG);
+
+    let status = wait_terminal(&env, &id).await?;
+    let grandchild = read_all(&stdout)?
+        .first()
+        .and_then(|line| line.trim().parse::<u32>().ok())
+        .ok_or(TestError::Missing("grandchild pid"))?;
+    let dead = eventually(LIMIT, || !test_process_alive(grandchild, None)).await;
+    assert!(dead, "grandchild {grandchild} survived the end of its job");
+
+    assert_eq!(status.meta.state, JobState::Succeeded);
+    assert!(status.meta.stragglers_reaped);
+    assert_eq!(status.meta.end_reason(), Some(JobEndReason::Exited));
+    let messages = warning_messages(&env, &id);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("terminated")),
+        "{messages:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_clean_end_reaps_nothing() -> TestResult {
+    let env = Env::new()?;
+    let prepared = env.prepare("echo done").await?;
+    let id = env
+        .manager
+        .start(request("clean", "agent-a", &[]), prepared)
+        .map_err(ctx("start"))?
+        .meta
+        .job_id;
+    let status = wait_terminal(&env, &id).await?;
+    assert_eq!(status.meta.state, JobState::Succeeded);
+    assert!(!status.meta.stragglers_reaped);
+    assert!(!status.meta.log_truncated);
+    let messages = warning_messages(&env, &id);
+    assert!(messages.is_empty(), "{messages:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_small_log_budget_truncates_with_marker() -> TestResult {
+    let env = Env::with_config(|c| JobManagerConfig {
+        max_log_bytes: 1024,
+        ..c
+    })?;
+    let prepared = env
+        .prepare("i=0; while [ $i -lt 3000 ]; do echo line-$i; i=$((i+1)); done")
+        .await?;
+    let started = env
+        .manager
+        .start(request("chatty", "agent-a", &[]), prepared)
+        .map_err(ctx("start"))?;
+    let id = started.meta.job_id.clone();
+    let status = wait_terminal(&env, &id).await?;
+    assert_eq!(status.meta.state, JobState::Succeeded);
+    assert!(status.meta.log_truncated);
+
+    let marker = truncation_marker(1024);
+    let text =
+        fs::read_to_string(started.log_dir.join(STDOUT_LOG)).map_err(ctx("read stdout.log"))?;
+    let len = u64::try_from(text.len()).map_err(ctx("log length"))?;
+    assert!(len <= capped_len(1024)?, "stdout.log has {len} bytes");
+    assert!(text.ends_with(&marker), "marker missing at the end");
+    assert_eq!(text.matches(marker.as_str()).count(), 1);
+    assert!(text.starts_with("line-0\n"));
+
+    let stderr = fs::metadata(started.log_dir.join(STDERR_LOG)).map_err(ctx("stderr.log"))?;
+    assert_eq!(stderr.len(), 0);
+
+    let messages = warning_messages(&env, &id);
+    let about_stdout: Vec<&String> = messages
+        .iter()
+        .filter(|message| message.contains("stdout.log"))
+        .collect();
+    assert_eq!(about_stdout.len(), 1, "{messages:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_log_budget_applies_while_running() -> TestResult {
+    let env = Env::with_config(|c| JobManagerConfig {
+        max_log_bytes: 1024,
+        ..c
+    })?;
+    let prepared = env
+        .prepare("head -c 200000 /dev/zero | tr '\\0' 'x'; echo; sleep 30")
+        .await?;
+    let started = env
+        .manager
+        .start(request("flood", "agent-a", &[]), prepared)
+        .map_err(ctx("start"))?;
+    let id = started.meta.job_id.clone();
+    let stdout = started.log_dir.join(STDOUT_LOG);
+    let capped = capped_len(1024)?;
+
+    // Die Überwachung kürzt schon während der Laufzeit, nicht erst am Ende.
+    let bounded = eventually(LIMIT, || {
+        let running_and_truncated = env
+            .manager
+            .status(&id, Caller::Operator)
+            .is_ok_and(|status| {
+                status.meta.state == JobState::Running && status.meta.log_truncated
+            });
+        running_and_truncated && fs::metadata(&stdout).is_ok_and(|meta| meta.len() <= capped)
+    })
+    .await;
+    assert!(bounded, "log was not capped while the job ran");
+
+    assert_eq!(env.manager.stop_all().await, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_launch_warnings_recorded_and_notified() -> TestResult {
+    let env = Env::new()?;
+    let warning = "runs without resource limits: prlimit not found".to_owned();
+    let started = env
+        .manager
+        .start_with_warnings(
+            request("w", "agent-a", &[]),
+            env.prepare("echo ok").await?,
+            vec![warning.clone()],
+        )
+        .map_err(ctx("start"))?;
+    let id = started.meta.job_id.clone();
+
+    let status = env
+        .manager
+        .status(&id, Caller::Agent("agent-a"))
+        .map_err(ctx("status"))?;
+    assert_eq!(status.meta.launch_warnings, vec![warning.clone()]);
+
+    let on_disk = read_meta(&started.log_dir).ok_or(TestError::Missing("meta.json"))?;
+    assert_eq!(on_disk.launch_warnings, vec![warning.clone()]);
+
+    let notified = eventually(LIMIT, || {
+        env.recorder
+            .notifications()
+            .into_iter()
+            .any(|notification| {
+                notification.owner.session == "agent-a"
+                    && matches!(
+                        &notification.event,
+                        JobEvent::Warning { job_id, message, .. }
+                            if job_id == &id && message == &warning
+                    )
+            })
+    })
+    .await;
+    assert!(notified, "no launch warning reached the owner");
+    wait_terminal(&env, &id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_old_meta_json_loads_with_new_fields_defaulted() -> TestResult {
+    let env = Env::new()?;
+    let dir = env.state_dir().join("jobs").join("job-legacy");
+    fs::create_dir_all(&dir).map_err(ctx("create legacy dir"))?;
+    // Stand vor `stragglers_reaped`, `log_truncated` und `launch_warnings`.
+    let json = r#"{"version":2,"job_id":"job-legacy","name":"legacy","command":"make",
+        "state":"succeeded","exit_code":0,"executed_on_host":false,
+        "harw_instance":"harw-old","owner":{"session":"old"},
+        "created_at":"2026-01-01T00:00:00Z","ended_at":"2026-01-01T00:01:00Z",
+        "notify_every_secs":60}"#;
+    fs::write(dir.join(META_FILE), json).map_err(ctx("write legacy meta"))?;
+
+    let reloaded = JobManager::new(env.manager.config().clone(), Arc::new(crate::NoopNotifier))
+        .map_err(ctx("reload"))?;
+    let id = JobId::parse("job-legacy").ok_or(TestError::Missing("job id"))?;
+    let status = reloaded
+        .status(&id, Caller::Operator)
+        .map_err(ctx("status"))?;
+    assert_eq!(status.meta.state, JobState::Succeeded);
+    assert!(!status.meta.stragglers_reaped);
+    assert!(!status.meta.log_truncated);
+    assert!(status.meta.launch_warnings.is_empty());
+    assert_eq!(status.meta.sandbox_profile(), "bwrap");
+    assert_eq!(status.meta.end_reason(), Some(JobEndReason::Exited));
     Ok(())
 }
 

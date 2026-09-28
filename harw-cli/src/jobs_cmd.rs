@@ -4,6 +4,16 @@
 //! Jede Aktion ruft dieselbe Operation auf wie der entsprechende
 //! Chat-Befehl (`/ps`, `/review`, `/approve`, `/deny`, `/cancel`,
 //! `/retry`), damit Terminal und Chat identisch reagieren.
+//!
+//! `list` (`/ps`) kennt zwei Arten: Arbeitsaufträge (`work`) und die
+//! Hintergrundprozesse aus `job.start` (`process`, aus
+//! `<projekt>/.harw/state/jobs`). Ohne `--kind` zeigt es nur die Übersicht
+//! je Art mit Zählern pro Zustand; `--kind work|process` listet die Zeilen
+//! dieser Art mit Zustand, besitzendem Agenten, Sandbox-Profil und Endegrund. `show`, `approve`,
+//! `deny`, `cancel` und `retry` wirken nur auf Arbeitsaufträge (`/review`,
+//! `/approve`, `/deny`, `/cancel`, `/retry`); mit einer Prozess-ID scheitern
+//! sie, weil es keinen solchen Arbeitsauftrag gibt. Prozess-Jobs steuert man
+//! in der TUI über `/jobs`.
 
 use std::path::PathBuf;
 
@@ -25,7 +35,8 @@ pub fn run(g: &GlobalArgs, a: JobsAction) -> Result<(), String> {
 /// Übersetzt eine `jobs`-Aktion in Operationspfad und Argumente.
 fn operation_for(a: JobsAction) -> Result<(&'static str, Vec<String>), String> {
     let result = match a {
-        JobsAction::List { filter } => ("/ps", filter.into_iter().collect()),
+        // Art zuerst: `/ps` erkennt sie an erster Stelle, der Status folgt.
+        JobsAction::List { filter, kind } => ("/ps", kind.into_iter().chain(filter).collect()),
         JobsAction::Show { id } => ("/review", vec![id]),
         JobsAction::Approve { id, note } => ("/approve", with_optional_text(id, note)),
         JobsAction::Deny { id, reason } => {
@@ -103,9 +114,46 @@ mod tests {
 
     #[test]
     fn list_without_filter_has_no_args() -> Result<(), String> {
-        let (path, args) = operation_for(JobsAction::List { filter: None })?;
+        let (path, args) = operation_for(JobsAction::List {
+            filter: None,
+            kind: None,
+        })?;
         assert_eq!(path, "/ps");
         assert!(args.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_passes_kind_before_filter() -> Result<(), String> {
+        let (path, args) = operation_for(JobsAction::List {
+            filter: Some("running".to_owned()),
+            kind: Some("process".to_owned()),
+        })?;
+        assert_eq!(path, "/ps");
+        assert_eq!(args, vec!["process".to_owned(), "running".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn work_item_actions_stay_on_work_operations() -> Result<(), String> {
+        let id = || "w1".to_owned();
+        let cases = [
+            (JobsAction::Show { id: id() }, "/review"),
+            (JobsAction::Cancel { id: id() }, "/cancel"),
+            (JobsAction::Retry { id: id() }, "/retry"),
+            (
+                JobsAction::Approve {
+                    id: id(),
+                    note: None,
+                },
+                "/approve",
+            ),
+        ];
+        for (action, expected) in cases {
+            let (path, args) = operation_for(action)?;
+            assert_eq!(path, expected);
+            assert_eq!(args, vec![id()]);
+        }
         Ok(())
     }
 }

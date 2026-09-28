@@ -75,6 +75,10 @@ harw-mcp-server = { path = "../harw-mcp-server" }
 harw-mcp-client = { path = "../harw-mcp-client" }
 harw-session-store = { path = "../harw-session-store" }
 harw-secrets = { path = "../harw-secrets", features = ["keyring"] }
+# KEK-Bootstrap (`src/secret_store.rs`): 32 Zufallsbytes für `<home>/keys/secrets.kek`.
+getrandom = "0.4.3"
+# AuthHub-DEK-Wrapper (V3) für den SecretStore (`src/secret_store.rs`); Ring I, von Ring A erlaubt.
+harw-infra-client = { path = "../harw-infra-client" }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 # `Lease` appears in the `WorkerCancellationSink` trait signature the CLI
 # implements (`src/worker_cancellation.rs`), so `harw-job-runtime` is a
@@ -156,6 +160,8 @@ harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 tempfile = "3"
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# Nur Test: bindet den Hub-Namespace an `HarwKeyPurpose::SecretsKek` (Ring D nur als dev-dependency).
+harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
 
 [lints]
 workspace = true

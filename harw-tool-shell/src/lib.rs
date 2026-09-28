@@ -18,6 +18,14 @@
 //!   [`run_operator_command`]/[`OperatorCommand`] — `!`-Befehle
 //!   der Nutzerin immer auf dem Host (ohne Freigabe, sudo bleibt abgelehnt,
 //!   Audit `shell.operator_exec`)
+//!   [`ExecPlatform`] — Android-Anbindung: auf Plattformen ohne
+//!   Bubblewrap-Sandbox (`ExecPlatform::NoSandbox`) läuft Host-Ausführung nur
+//!   nach ausdrücklicher Freigabe oder mit
+//!   `harw_extension_api::ApprovalMode::FullAccess`
+//!   ([`ShellToolProvider::with_approval_mode`],
+//!   [`ShellToolProvider::with_exec_platform`]); auf jedem anderen Ziel
+//!   (`ExecPlatform::Sandboxed`, u. a. Linux) bleibt das Verhalten
+//!   unverändert.
 //! - [`limits`] — [`ShellLimits`], [`ShellLimitsError`]: rlimits über festgepinntes `prlimit`
 //!   und tmpfs-Größe (W1-03)
 //! - [`host_permit_prompt`] — [`HostPermitPrompt`], [`HostPermitVariant`],
@@ -53,7 +61,7 @@ pub mod limits;
 pub mod sudo;
 
 pub use exec::{
-    BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, BackgroundLaunch, DEFAULT_MAX_TIMEOUT_SECS,
+    BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, BackgroundLaunch, DEFAULT_MAX_TIMEOUT_SECS, ExecPlatform,
     HOST_PERMIT_PROMPT_TIMEOUT, ShellExecError, ShellExecutor, ShellToolProvider,
 };
 // Runde 6, Teil B: Operator-Weg für `!`-Befehle der Nutzerin (immer Host).

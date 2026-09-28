@@ -1,12 +1,13 @@
 name: CI
 
 on:
-  # Vorübergehend nur per Hand: GitHub Actions ist auf diesem Konto gesperrt
-  # (Abrechnung), jeder Push und PR erzeugte nur rote, nie gestartete Läufe.
-  # Bis dahin ist der zentrale lokale Build aus CLAUDE.md das Gate. Ein Lauf
-  # wird gezielt per workflow_dispatch gestartet; bleibt er rot, bleiben die
-  # Trigger aus. Zum Reaktivieren die beiden Blöcke wieder einkommentieren;
-  # die Job-Bedingungen unten behandeln `push` und `pull_request` weiterhin.
+  # Gesteuerte CI: keine automatischen Push-/PR-Läufe. Jeder Lauf wird gezielt
+  # per workflow_dispatch auf einem gepushten Stand gestartet — nach dem
+  # zentralen lokalen Build aus CLAUDE.md, von der Sitzung, die den Stand
+  # gepusht hat. Ein roter Lauf wird behoben und neu gestartet, nie
+  # übersprungen. Zum Wiedereinschalten der automatischen Trigger die
+  # beiden Blöcke einkommentieren; die Job-Bedingungen unten behandeln
+  # `push` und `pull_request` weiterhin.
   #
   # push:
   #   # `dev` ist der Integrationsbranch, `main` die stabile Linie. Beide

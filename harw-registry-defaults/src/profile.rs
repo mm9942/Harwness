@@ -2506,6 +2506,13 @@ fn profile_tool_providers(
     // `sandbox-lease` auf einem Strict/Cargo/Tmux-Profil bleibt wirkungslos,
     // weil keine Registry angehängt ist, die die Freigabe sehen könnte).
     host_permits: Option<&HostPermitWiring>,
+    // Die laufzeit-lebendige Freigabemodus-Zelle (Android-Anbindung): jeder
+    // gebaute `ShellToolProvider` bekommt denselben Klon angehängt, damit
+    // `harw_tool_shell` unter Android bei `ApprovalMode::FullAccess` ohne
+    // Rückfrage auf dem Host ausführen kann. Unter Linux liest der Shell-
+    // Provider die Zelle nicht (Verhalten unverändert), siehe
+    // `harw_tool_shell::ShellToolProvider::with_approval_mode`.
+    approval_mode: &ApprovalModeCell,
 ) -> Vec<Arc<dyn ToolProvider>> {
     // Baut einen `ShellToolProvider` für `sandbox_profile` und hängt, sobald
     // `host_permits` übergeben wurde, Ledger, Sitzungs-Registry,
@@ -2521,8 +2528,9 @@ fn profile_tool_providers(
     // Sitzungs- oder Einmalfreigabe für die aufrufende Session meldet — ohne
     // eine solche Freigabe läuft der Aufruf unverändert in bwrap.
     let build_shell = |sandbox_profile: &SandboxProfile| -> ShellToolProvider {
-        let mut provider =
-            ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
+        let mut provider = ShellToolProvider::default()
+            .with_sandbox_profile(sandbox_profile.clone())
+            .with_approval_mode(approval_mode.clone());
         if let Some(wiring) = host_permits {
             provider = provider
                 .with_permit_ledger(Arc::clone(&wiring.ledger))
@@ -3305,7 +3313,11 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// - `profile` ([`RegistryProfile`]): Werkzeug-/Identitätsprofil.
 /// - `project` (`&ProjectContext`): bereits erkannter Projektkontext.
 /// - `overrides` ([`IdentityOverrides`]): Überschreibungen für den System-Prompt.
-/// - `approval_mode` ([`ApprovalModeCell`]): Freigabemodus-Zelle der Politik.
+/// - `approval_mode` ([`ApprovalModeCell`]): Freigabemodus-Zelle der Politik;
+///   wird zusätzlich (als Klon) an jeden gebauten [`ShellToolProvider`]
+///   gereicht ([`ShellToolProvider::with_approval_mode`]), damit dieser unter
+///   Android bei `ApprovalMode::FullAccess` ohne Rückfrage auf dem Host
+///   ausführen kann — unter Linux ändert das das Verhalten nicht.
 /// - `granted` (`&PermissionSet`): Rechte der Ziel-Sandbox; nur geliehen.
 /// - `access` (`Option<`[`AgentDefinitionAccess`]`>`): nur für
 ///   [`RegistryProfile::AgentStewardship`] relevant; `None` ist der
@@ -3423,6 +3435,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
         agent_definition_access,
         sandbox_profile,
         host_permits.as_ref(),
+        &approval_mode,
     )
     .into_iter()
     .filter_map(|provider| restrict_provider(provider, &allowed))
@@ -4918,6 +4931,40 @@ mod tests {
                 ))
         }
 
+        /// Wie [`shell_executor_for`], nimmt aber zusätzlich eine
+        /// explizite [`ApprovalModeCell`] entgegen (Android-Anbindung): dient
+        /// dem Nachweis, dass eine `FullAccess`-Zelle auf der hier getesteten
+        /// (Linux-)Plattform das Sandbox-Verhalten eines Nicht-Host-Profils
+        /// unverändert lässt.
+        fn shell_executor_for_with_approval_mode(
+            sandbox_profile: &SandboxProfile,
+            approval_mode: ApprovalModeCell,
+            project_root: &std::path::Path,
+        ) -> TestResult<Arc<dyn ToolExecutor>> {
+            let project = discover_project(project_root, &DiscoveryConfig::default())
+                .map_err(ctx("Discovery im Tempdir"))?;
+            let granted = PermissionSet::from_policy([Permission::ExecuteProcess]);
+            let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                RegistryProfile::ShellExecution,
+                &project,
+                IdentityOverrides::default(),
+                approval_mode,
+                &granted,
+                None,
+                sandbox_profile,
+                None,
+            )
+            .map_err(ctx("assemble must succeed"))?;
+            assembled
+                .registry
+                .tool_providers()
+                .iter()
+                .find_map(|provider| provider.executor(&ToolName::new("shell.exec")))
+                .ok_or(TestError::Missing(
+                    "shell.exec executor must be registered for ShellExecution",
+                ))
+        }
+
         /// Wie [`shell_executor_for`], aber für
         /// `RegistryProfile::UiaShellWorker` — dessen Shell-Provider hängt sich
         /// ausdrücklich immer an `SandboxProfile::Host`, unabhängig vom
@@ -5174,6 +5221,53 @@ mod tests {
                         content.get("executed_on").is_none(),
                         "without an active approval the Strict profile must not run on \
                          the host: {content}"
+                    );
+                }
+                ToolOutput::Text { .. } => {}
+            }
+            Ok(())
+        }
+
+        /// Android-Anbindung: eine `FullAccess`-Zelle wird jetzt an jeden
+        /// gebauten `ShellToolProvider` gereicht
+        /// ([`ShellToolProvider::with_approval_mode`]), aber auf der hier
+        /// getesteten (Linux-)Plattform liest der Shell-Provider die Zelle
+        /// nicht — ein Nicht-Host-Profil (`Strict`) muss deshalb trotz
+        /// `FullAccess` unverändert im Sandbox-Pfad bleiben, statt ohne
+        /// Rückfrage auf dem Host zu laufen.
+        #[tokio::test]
+        async fn test_full_access_approval_mode_does_not_bypass_sandbox_on_default_platform()
+        -> TestResult {
+            let project_root = make_temp_project("full-access-non-host-profile")?;
+            let approval_mode = ApprovalModeCell::new(harw_extension_api::ApprovalMode::FullAccess);
+            let executor = shell_executor_for_with_approval_mode(
+                &SandboxProfile::Strict,
+                approval_mode,
+                &project_root,
+            )?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
+            let call = make_call("echo full_access_still_sandboxed");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .map_err(with_ctx("execute must not return Err"))?;
+
+            match &output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        !message.contains("host execution requires a process permit")
+                            && !message.contains("requires local UI approval"),
+                        "a FullAccess cell without host-permit wiring must never trigger a \
+                         permit denial on the sandbox path, got: {message:?}"
+                    );
+                }
+                ToolOutput::Json { content } => {
+                    assert!(
+                        content.get("executed_on").is_none(),
+                        "on the default (non-Android) platform, FullAccess must not move a \
+                         Strict-profile shell.exec call onto the host: {content}"
                     );
                 }
                 ToolOutput::Text { .. } => {}
