@@ -216,8 +216,9 @@ Design documents: ${(A.design || []).join(', ') || 'none named; find them'}
 Scope: ${A.scope || 'as the goal says'}
 ${DECIDED.length ? `Owner decisions already made (resolved; plan with them, never list them under decisions_needed again):\n${DECIDED.map(d => `- ${d}`).join('\n')}\n` : ''}
 Turn this into units that one contract wave each can build:
+- Prefer libraries: put new logic into leaf library crates (lib.rs only, no binary, as little I/O as possible, pure and table-testable), depending only on lower rings; the wiring units call them from the existing crates, which keep I/O, rendering and configuration.
 - leaf: exactly one crate (every file under its directory, Cargo.toml included), bottom-up. A new crate is a leaf unit whose files include its Cargo.toml and src/lib.rs; the root Cargo.toml membership edit belongs to a wiring unit. A leaf may depend only on other leaf units.
-- wiring: edits in composition roots (harw-runtime assembly, harw-cli, harw-tui, harw-config, root Cargo.toml, xtask/arch-policy.toml) that connect finished leaf crates.
+- wiring: edits in composition roots (harw-runtime assembly, harw-cli, harw-tui, harw-config, root Cargo.toml, xtask/arch-policy.toml) that connect finished leaf crates. A new library crate needs a wiring unit for its root Cargo.toml membership and its ring entry in xtask/arch-policy.toml.
 - One crate in at most one leaf unit; every file in exactly one unit; no cycles.
 - spec: public signatures verbatim, behaviour, error variants, doc updates, ring rules from xtask/arch-policy.toml; tests: concrete test names/ideas in the unit's own files.
 - Every acceptance criterion is served by at least one unit (criteria ids); mark units at a trust boundary security=true.

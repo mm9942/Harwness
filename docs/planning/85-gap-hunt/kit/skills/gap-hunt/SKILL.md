@@ -140,6 +140,11 @@ large contract wave:
   only one leaf unit. A **wiring** unit connects finished crates in the
   composition roots: harw-runtime assembly, harw-cli, harw-tui, harw-config,
   the root `Cargo.toml` and `xtask/arch-policy.toml`.
+- **Libraries first.** New logic goes into leaf library crates (lib only, as
+  little I/O as possible, pure and table-testable, lower rings only); the
+  wiring units call them from the existing crates, which keep I/O, rendering
+  and configuration. A new crate's root `Cargo.toml` membership and its ring
+  entry in `xtask/arch-policy.toml` belong to a wiring unit.
 - **Plan gate.** The plan is rejected before any coder starts if a file sits
   in two units, a leaf file is outside its crate, a crate is split, a leaf
   depends on wiring, the dependencies form a cycle or name unknown units, or
