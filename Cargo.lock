@@ -3785,6 +3785,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-session-host"
+version = "0.8.0"
+dependencies = [
+ "harw-fsutil",
+ "harw-protocol",
+ "harw-session-store",
+ "harw-types",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-session-store"
 version = "0.8.0"
 dependencies = [
@@ -3799,6 +3815,28 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "harw-session-ws"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "harw-protocol",
+ "harw-session-host",
+ "harw-types",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 

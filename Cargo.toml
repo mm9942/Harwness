@@ -42,6 +42,8 @@ members = [
     "harw-secrets",
     "harw-oauth",
     "harw-session-store",
+    "harw-session-host",
+    "harw-session-ws",
     "harw-memory",
     "harw-core-bridge",
     "harw-auth-hub",

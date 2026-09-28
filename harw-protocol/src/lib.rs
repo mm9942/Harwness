@@ -10,6 +10,8 @@ pub mod events;
 pub mod items;
 pub mod methods;
 pub mod orchestration;
+pub mod session_port;
+pub mod session_wire;
 pub mod wire;
 
 pub use approvals::{ApprovalKind, ApprovalRequest, ApprovalResponse};
@@ -19,6 +21,10 @@ pub use items::{
     ToolCallItem, ToolCallResult, ToolResultItem, TurnItem, UserMessageItem,
 };
 pub use orchestration::{AgentOrchestrationEvent, AgentOrchestrationStatus};
+pub use session_port::{FrameSource, PortError, PortFuture, SessionPort};
+pub use session_wire::{
+    ClientCaps, Cursor, FrameEnvelope, HostedState, PresenceEntry, SessionFrame, StreamProfile,
+};
 pub use wire::{
     NotificationEnvelope, ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireError,
     WireMessage,
