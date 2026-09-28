@@ -447,9 +447,9 @@ mod tests {
     }
 
     #[test]
-    fn search_finds_the_pyramid_skill_for_pyramide_and_minto() -> TestResult {
+    fn search_finds_the_pyramid_skill_for_pyramide_and_pyramidenprinzip() -> TestResult {
         let index = bundled_index();
-        for query in ["Pyramide", "Minto"] {
+        for query in ["Pyramide", "Pyramidenprinzip"] {
             let result = json_of(execute_search(&index, json!({ "query": query })))?;
             assert_eq!(
                 names(&result).first().map(String::as_str),

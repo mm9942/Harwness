@@ -1,0 +1,209 @@
+{
+ "schema": 1,
+ "wave": "wa-web",
+ "branch": "claude/r16/wa-web",
+ "base_sha": "1ad90219d83aa305f5bfe2ca531a30b5ab41a829",
+ "head_sha": "f48013ed51d04f309d39c7aeab06da318cdd59c6",
+ "files": [
+  "docs/design/hardening-gap-analysis.md",
+  "harw-protocol/src/approvals.rs",
+  "harw-protocol/src/items.rs",
+  "harw-security-hub/src/config.rs",
+  "harw-web/src/events.rs",
+  "harw-web/src/identity.rs",
+  "harw-web/src/meta.rs",
+  "harw-web/src/router.rs",
+  "harw-web/src/server.rs"
+ ],
+ "findings": [
+  {
+   "id": "F-3f04f94641ec",
+   "file": "harw-web/src/events.rs",
+   "line": 160,
+   "severity": "low",
+   "pattern": "P5",
+   "title": "unwrap() in four WebEvent/WebEventBus doctests"
+  },
+  {
+   "id": "F-4c2e48780ff1",
+   "file": "harw-security-hub/src/config.rs",
+   "line": 186,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "The SecurityHub reads its authority-defining policy file with no size bound, regular-file check, or owner/mode check"
+  },
+  {
+   "id": "F-5d247ae11d3a",
+   "file": "harw-web/src/identity.rs",
+   "line": 712,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "uid_tenants and uid_principals accept aliased UID keys ('1000', '01000', '+1000', ' 1000'); the last one in string order silently wins"
+  },
+  {
+   "id": "F-6c7288bfc049",
+   "file": "harw-protocol/src/items.rs",
+   "line": 106,
+   "severity": "low",
+   "pattern": "P5",
+   "title": "unwrap() in the ResultTrust and OpaqueReasoning doctests"
+  },
+  {
+   "id": "F-7aab5241f491",
+   "file": "docs/design/hardening-gap-analysis.md",
+   "line": 288,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "Gap analysis (last reviewed 2026-09-24) says harw-protocol wire types lack deny_unknown_fields; they all have it"
+  },
+  {
+   "id": "F-bd6b3e8e1adc",
+   "file": "harw-web/src/meta.rs",
+   "line": 21,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "meta.rs says /v1/health is unauthenticated 'like harw-netsec' and that PeerAuthorizer/decide_route decide; both claims are wrong"
+  },
+  {
+   "id": "F-d4ab4f3ebfd1",
+   "file": "harw-web/src/identity.rs",
+   "line": 531,
+   "severity": "medium",
+   "pattern": "M1",
+   "title": "security_hub mode with require_context=false: omitting the context header drops the hub-assigned tenant, so the caller runs without a tenant and sees all tenants"
+  },
+  {
+   "id": "F-d5a1d03b7ebc",
+   "file": "harw-protocol/src/approvals.rs",
+   "line": 165,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "Broken intra-doc link to harw_core::AgentSession::begin_approval: harw-protocol does not depend on harw-core"
+  },
+  {
+   "id": "F-dcb294dc89d1",
+   "file": "harw-web/src/router.rs",
+   "line": 198,
+   "severity": "low",
+   "pattern": "P5",
+   "title": "unwrap() in doctests of decide_route, from_registry and method_for"
+  },
+  {
+   "id": "F-df1360cf8ef2",
+   "file": "harw-web/src/server.rs",
+   "line": 717,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "Execute path silently runs with an unscoped OpContext if no resolved identity is present"
+  }
+ ],
+ "workflow_runs": [
+  "wf_6f882d38-266"
+ ],
+ "disposition": {
+  "complete": true,
+  "rippleStatus": "ok",
+  "open": [],
+  "files": [
+   {
+    "file": "harw-web/src/identity.rs",
+    "status": "ok"
+   },
+   {
+    "file": "harw-web/src/events.rs",
+    "status": "ok"
+   },
+   {
+    "file": "harw-web/src/meta.rs",
+    "status": "ok"
+   },
+   {
+    "file": "harw-web/src/router.rs",
+    "status": "ok"
+   },
+   {
+    "file": "harw-web/src/server.rs",
+    "status": "ok"
+   },
+   {
+    "file": "harw-protocol/src/approvals.rs",
+    "status": "ok"
+   },
+   {
+    "file": "harw-protocol/src/items.rs",
+    "status": "repaired"
+   },
+   {
+    "file": "docs/design/hardening-gap-analysis.md",
+    "status": "ok"
+   },
+   {
+    "file": "harw-security-hub/src/config.rs",
+    "status": "repaired"
+   }
+  ],
+  "ripple": [
+   {
+    "id": null,
+    "file": "(summary)",
+    "line": null
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-config/src/web_toml.rs",
+    "line": 108
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-web/src/identity.rs",
+    "line": 212
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-web/src/router.rs",
+    "line": 7
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-web/src/server.rs",
+    "line": 219
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-web/Cargo.toml",
+    "line": 60
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/docs/design/hardening-gap-analysis.md",
+    "line": 287
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-security-hub/src/config.rs",
+    "line": 213
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-security-hub/README.md",
+    "line": 74
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-security-hub/src/config.rs",
+    "line": 415
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Backfilled after the merge (kit-4); the wave predates the manifest. Complete by the new kit logic; its ripple items are handled by wave ripple-web."
+}

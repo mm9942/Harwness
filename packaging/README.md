@@ -33,6 +33,13 @@ existing installation is replaced.
 brew install --build-from-source ./packaging/harw.rb
 ```
 
+## Podman / Quadlet
+
+`podman/` holds a container image (`Containerfile`) and a Quadlet user unit
+for `harw web` (the control plane); see [podman/README.md](podman/README.md).
+They live here rather than under `deploy/`, which carries only the systemd,
+`sysusers.d` and `tmpfiles.d` files that `harw-install` embeds byte-identically.
+
 ## Shell completions
 
 After install:

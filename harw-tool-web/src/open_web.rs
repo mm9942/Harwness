@@ -19,6 +19,14 @@
 //!    genehmigter Aufruf (wird verbraucht, die Domain gemerkt). Sonst lehnt
 //!    das Werkzeug ab — fail-closed auch in einer Sitzung ohne diese
 //!    Freigabepolitik. Ein abgelehnter Aufruf läuft nie; sein Vermerk verfällt.
+//! 3. **Bei Weiterleitungen** prüft `web.fetch` jedes Redirect-Ziel mit
+//!    [`OpenWebAccess::admit_redirect`]
+//!    (`crate::fetch::WebFetcher::with_redirect_approvals`): gelisteter Host,
+//!    freigegebene Domain oder kein öffentlicher DNS-Name (dann entscheiden
+//!    Egress-Policy und Scope). Eine neue Domain bricht den Abruf ab und wird
+//!    genannt, damit das Modell sie selbst anfragt. Dabei wird weder ein
+//!    Vermerk verbraucht noch eine Domain gemerkt: das Ziel wählt der Server,
+//!    nicht die Nutzerin.
 //!
 //! Gemerkt wird bis Prozessende (eine harw-Sitzung), wie die
 //! Symlink-Freigaben von `harw-tool-fs`. Domain heißt: der Host ohne
@@ -28,8 +36,10 @@
 //! - Nur `web.fetch` trägt eine frei wählbare URL; `web.search`,
 //!   `web.docs_rs` und `web.crates_io` sprechen feste Hosts an.
 //! - Weiterleitungen prüft `crate::hop::check_hop` gegen Egress-Policy und
-//!   Scope (öffentlich, nie privat); eine Freigabe gilt der angefragten
-//!   Domain, nicht jedem Redirect-Ziel.
+//!   Scope, unter `web.fetch` zusätzlich [`OpenWebAccess::admit_redirect`]:
+//!   eine Freigabe gilt der angefragten Domain, nicht jedem Redirect-Ziel;
+//!   ein Redirect auf eine noch nicht freigegebene Domain bricht ab, statt zu
+//!   fragen (Cache-Treffer werden genauso geprüft).
 //! - Gesendet wird nur `GET` ohne Zugangsdaten, Cookies oder eigene Header
 //!   (`crate::fetch`); URLs mit Userinfo lehnt der Parser ab.
 //!
@@ -299,6 +309,29 @@ impl OpenWebAccess {
              (researcher-web, intel-web-researcher, researcher)."
         ))
     }
+
+    /// Die Redirect-Seite: darf `web.fetch` einer Weiterleitung auf `url` folgen?
+    ///
+    /// Anders als [`Self::admit_fetch`] verbraucht sie keinen Vermerk und gibt
+    /// nie frei: vermerkt und freigegeben wird nur, was das Modell selbst
+    /// anfragt, nie ein Ziel, das der Server wählt.
+    ///
+    /// # Errors
+    /// Eine deutsche Meldung, beginnend mit [`NOT_APPROVED_PREFIX`] und der
+    /// Domain, wenn das offene Netz an ist und die Domain des Ziels weder
+    /// gelistet noch freigegeben ist. Sie nennt nur die Domain, nie Pfad oder
+    /// Query des Ziels.
+    pub fn admit_redirect(&self, url: &str) -> Result<(), String> {
+        match self.review_url(url) {
+            OpenWebReview::NotApplicable | OpenWebReview::Granted { .. } => Ok(()),
+            OpenWebReview::NeedsApproval { domain } => Err(format!(
+                "{NOT_APPROVED_PREFIX}: {domain} (Ziel einer Weiterleitung). Eine Freigabe gilt \
+                 nur der angefragten Domain, nicht dem Redirect-Ziel: diese Domain zuerst selbst \
+                 mit `web.fetch` anfragen (die erste Anfrage je Domain braucht die Freigabe der \
+                 Nutzerin, unter `full` automatisch), danach den Abruf wiederholen."
+            )),
+        }
+    }
 }
 
 /// Einzeiliger Hinweis für den Freigabedialog (TUI), wenn `tool`/`arguments`
@@ -318,6 +351,7 @@ pub fn approval_notice(access: &OpenWebAccess, tool: &str, arguments: &Value) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use serde_json::json;
 
     fn open_access(allowlisted: &[&str]) -> OpenWebAccess {
@@ -434,5 +468,57 @@ mod tests {
         assert!(notice.contains("destatis.de"), "{notice}");
         access.grant("destatis.de");
         assert!(approval_notice(&access, OPEN_WEB_TOOL, &call).is_none());
+    }
+
+    #[test]
+    fn a_redirect_needs_its_own_domain_approval_and_never_grants() -> TestResult {
+        let access = open_access(&["docs.rs"]);
+        access.grant("destatis.de");
+        // Subdomain einer freigegebenen Domain, gelisteter Host, kein
+        // öffentlicher Name (dann entscheidet die Egress-Policy).
+        for url in [
+            "https://service.destatis.de/x",
+            "https://static.docs.rs/x.css",
+            "http://127.0.0.1/",
+        ] {
+            access.admit_redirect(url).map_err(TestError::Unexpected)?;
+        }
+
+        // Eine neue Domain bricht ab; die Meldung nennt nur die Domain.
+        let target = "https://exfil.example.org/leak?q=geheim";
+        let Err(refused) = access.admit_redirect(target) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: Redirect auf neue Domain".into(),
+            ));
+        };
+        assert!(refused.starts_with(NOT_APPROVED_PREFIX), "{refused}");
+        assert!(refused.contains("exfil.example.org"), "{refused}");
+        for leaked in ["leak", "geheim"] {
+            assert!(!refused.contains(leaked), "{leaked} in {refused}");
+        }
+
+        // Ein Vermerk für genau diese URL gibt den Redirect nicht frei, wird
+        // von ihm nicht verbraucht, und gemerkt wird nichts.
+        access.approve_call(
+            OPEN_WEB_TOOL,
+            &json!({ "url": target }),
+            "exfil.example.org",
+        );
+        if access.admit_redirect(target).is_ok() {
+            return Err(TestError::Unexpected(
+                "Err erwartet: ein Vermerk gibt keinen Redirect frei".into(),
+            ));
+        }
+        assert_eq!(access.granted_domains(), ["destatis.de"]);
+        // Der Vermerk liegt noch: der vom Modell angefragte Abruf läuft.
+        access.admit_fetch(target).map_err(TestError::Unexpected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn allowlist_mode_never_gates_a_redirect() -> TestResult {
+        OpenWebAccess::default()
+            .admit_redirect("https://exfil.example.org/")
+            .map_err(TestError::Unexpected)
     }
 }

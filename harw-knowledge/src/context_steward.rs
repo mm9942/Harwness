@@ -4,6 +4,8 @@
 //! aufbereitet, ordnet und zusammenfasst. Trägt außerdem die drei
 //! `steward_*`-Nullzähler, die der Plan (`docs/design/build-history.md`, K7) diesem
 //! Knoten zuweist, ohne sie zu benennen.
+//! Die Digest-Pipeline ist heute an keinen Produktionspfad gebunden (siehe
+//! "Stand der Verdrahtung").
 //!
 //! # Warum es keine `apply`-Funktion gibt
 //! Dieselbe tragende Regel wie bei [`crate::context_proposal`] (AW5-09) und
@@ -92,9 +94,26 @@
 //! zusammengefasst (wie `anacron`), nie einzeln nachgespielt; ein nie
 //! gelaufener Job ist sofort fällig. [`steward_digest_if_due`] verbindet
 //! Zeitplan und Steward: ist der Lauf fällig, baut es den [`StewardDigest`]
-//! über dem Standardfenster, sonst nichts. Der Aufrufer bleibt für das
+//! über dem Standardfenster, sonst nichts. Der Aufrufer bliebe für das
 //! dauerhafte Festhalten von `last_run` und das eigentliche Anstoßen des
-//! Jobs (z. B. über `harw-job-runtime`) zuständig.
+//! Jobs zuständig — einen solchen Aufrufer gibt es heute nicht (siehe
+//! "Stand der Verdrahtung").
+//!
+//! # Stand der Verdrahtung
+//! Die Digest-Pipeline — [`curate_context_proposals`],
+//! [`curate_model_behavior_proposals`], [`build_steward_digest`],
+//! [`render_digest_summary`], [`steward_digest_if_due`] sowie
+//! [`DreamSchedule::next_run_after`] — hat heute **keinen
+//! Produktionsaufrufer**. Der einzige Konsument dieses Moduls außerhalb der
+//! Crate, `harw-ops/src/dream_run.rs` (Gateway-Scheduler und `/dream run`),
+//! nutzt nur [`DreamSchedule::parse`], [`DreamSchedule::decide`] und
+//! [`DreamDecision`] für seine Scheduler-Entscheidung; kein Traumlauf erzeugt
+//! einen [`StewardDigest`], kein Traumbericht enthält einen Steward-Abschnitt.
+//! Abgedeckt ist die Pipeline nur durch die Tests und Doctests dieses Moduls.
+//! Sie in den Traumlauf zu hängen, wäre ein neuer, für Operatoren sichtbarer
+//! Berichtsabschnitt und damit eine eigene Entscheidung; bis dahin wird die
+//! Lücke hier benannt, nicht verschwiegen — dieselbe Disziplin wie bei den
+//! Nullzählern unten.
 //!
 //! # Die drei Nullzähler
 //! Alle drei liegen — wie die Mechanik es verlangt (`harw-observe`,
@@ -1272,6 +1291,8 @@ impl DreamSchedule {
 /// [`build_steward_digest`] über [`StewardWindow::default_window`]`(now)`
 /// aufgerufen, sonst nichts. Der Aufrufer hält danach `now` als neuen
 /// `last_run` fest.
+/// Heute ruft kein Produktionspfad diese Funktion auf (siehe Moduldoku,
+/// "Stand der Verdrahtung").
 ///
 /// # Arguments
 /// - `schedule` (`&DreamSchedule`): der Lauf-Zeitplan.

@@ -26,12 +26,16 @@
 //!    Redirect-Ziel laufen durch [`crate::hop::check_hop`] (Schema,
 //!    `EgressPolicy::check_url`, Sandbox-Scope). IP-Literale umgehen den
 //!    Resolver; diese Prüfung ist für sie die einzige. Höchstens
-//!    [`MAX_REDIRECTS`] Weiterleitungen.
+//!    [`MAX_REDIRECTS`] Weiterleitungen. Unter `web.fetch` muss im offenen
+//!    Recherche-Netz jedes Redirect-Ziel außerdem eine freigegebene Domain
+//!    treffen ([`WebFetcher::with_redirect_approvals`], [`crate::open_web`]);
+//!    eine Freigabe gilt nie jedem Ziel des Servers.
 //! 3. **Cache ist isoliert und wird neu geprüft.** Schlüssel =
 //!    BLAKE3(Policy-Digest ‖ Mandant/Workspace/Netz-Scope ‖ Anfrage-URL). Ein
 //!    Treffer wird nur verwendet, wenn **jede** URL seiner gespeicherten Kette
-//!    (inklusive Endziel) erneut die Hop-Prüfung besteht — auch beim
-//!    Fail-open nach Transportfehlern.
+//!    (inklusive Endziel) erneut die Hop-Prüfung besteht (einschließlich der
+//!    Domain-Freigabe der Redirect-Ziele) — auch beim Fail-open nach
+//!    Transportfehlern.
 //! 4. **Kappung.** Bytes beim Lesen ([`push_chunk`], vor dem Dekodieren),
 //!    Text nach der Aufbereitung ([`crate::html::truncate_utf8`],
 //!    UTF-8-grenzsicher).
@@ -81,6 +85,7 @@ use crate::cache::{
 use crate::error::{WebToolError, WebToolResult};
 use crate::hop::{HopTarget, check_hop, map_send_error, resolve_location};
 use crate::html::{html_to_markdown, html_to_text, truncate_utf8};
+use crate::open_web::OpenWebAccess;
 use harw_authority::NetworkScope;
 use harw_egress::EgressPolicy;
 use harw_macros::Tool;
@@ -754,6 +759,9 @@ pub struct WebFetcher {
     network: NetworkScope,
     /// Cache-Isolationsbereich des Aufrufs.
     cache_scope: CacheScope,
+    /// Domain-Freigaben des offenen Recherche-Netzes für Redirect-Ziele (nur
+    /// `web.fetch`); `None` prüft Weiterleitungen nur per [`check_hop`].
+    redirect_approvals: Option<&'static OpenWebAccess>,
 }
 
 impl std::fmt::Debug for WebFetcher {
@@ -767,6 +775,7 @@ impl std::fmt::Debug for WebFetcher {
             .field("allow_http", &self.options.allow_http)
             .field("policy_hosts", &self.policy.allow_hosts().len())
             .field("allowed_targets", &self.network.targets().count())
+            .field("redirect_approvals", &self.redirect_approvals.is_some())
             .finish()
     }
 }
@@ -823,6 +832,7 @@ impl WebFetcher {
             options: options.clamped(),
             network: NetworkScope::empty(),
             cache_scope: CacheScope::unbound(),
+            redirect_approvals: None,
         })
     }
 
@@ -830,6 +840,8 @@ impl WebFetcher {
     ///
     /// # Description
     /// Client und Policy werden geteilt. `max_bytes` kann das Limit nur senken.
+    /// Gebundene Redirect-Freigaben ([`Self::with_redirect_approvals`]) gehen
+    /// auf die Kopie über.
     ///
     /// # Arguments
     /// - `network` ([`NetworkScope`]): Scope der aktiven Sandbox.
@@ -864,6 +876,7 @@ impl WebFetcher {
             },
             network,
             cache_scope,
+            redirect_approvals: self.redirect_approvals,
         }
     }
 
@@ -921,14 +934,48 @@ impl WebFetcher {
         )
     }
 
+    /// Bindet die Domain-Freigaben des offenen Recherche-Netzes an die
+    /// Weiterleitungen dieses Fetchers.
+    ///
+    /// # Description
+    /// Danach muss jedes Redirect-Ziel (Hop ≥ 1) nach [`Self::check_target`]
+    /// auch [`OpenWebAccess::admit_redirect`] bestehen, im Netz wie bei der
+    /// Validierung eines Cache-Treffers. Die Start-URL prüft `web.fetch` selbst
+    /// ([`OpenWebAccess::admit_fetch`]). Nur `web.fetch` bindet Freigaben;
+    /// `web.docs_rs`, `web.crates_io` und `web.search` sprechen feste Hosts an.
+    ///
+    /// # Concurrency
+    /// `OpenWebAccess` ist `Send + Sync`; der Fetcher bleibt es.
+    #[must_use]
+    pub fn with_redirect_approvals(mut self, access: &'static OpenWebAccess) -> Self {
+        self.redirect_approvals = Some(access);
+        self
+    }
+
+    /// Domain-Freigabe eines bereits per [`Self::check_target`] geprüften
+    /// Redirect-Ziels; Hop `0` und Fetcher ohne Freigaben bestehen immer.
+    fn check_redirect_approval(&self, target: &HopTarget, hop: usize) -> WebToolResult<()> {
+        if hop == 0 {
+            return Ok(());
+        }
+        let Some(access) = self.redirect_approvals else {
+            return Ok(());
+        };
+        access
+            .admit_redirect(target.url())
+            .map_err(|reason| WebToolError::EgressDenied { reason })
+    }
+
     /// Prüft, ob ein gelesener Cache-Eintrag verwendet werden darf.
     ///
     /// # Description
     /// Formale Übereinstimmung ([`entry_matches`]), Kettenlänge höchstens
     /// [`MAX_REDIRECTS`]` + 1`, **jede** URL der Kette besteht erneut
-    /// [`Self::check_target`] in unveränderter Normalform, der Medientyp steht
-    /// noch auf der Positivliste (Text-Typen oder [`PDF_MEDIA_TYPE`] mit
-    /// extrahiertem Text) und der Körper passt ins aktuelle Byte-Limit.
+    /// [`Self::check_target`] in unveränderter Normalform, jedes Redirect-Ziel
+    /// bei gebundenen Freigaben ([`Self::with_redirect_approvals`]) außerdem
+    /// die Domain-Freigabe, der Medientyp steht noch auf der Positivliste
+    /// (Text-Typen oder [`PDF_MEDIA_TYPE`] mit extrahiertem Text) und der
+    /// Körper passt ins aktuelle Byte-Limit.
     ///
     /// # Arguments
     /// - `entry` (`&CacheEntry`): gelesener Eintrag.
@@ -941,6 +988,8 @@ impl WebFetcher {
     /// # Errors
     /// - [`WebToolError::CacheCorrupt`]: formale Abweichung.
     /// - Ablehnungen aus [`check_hop`] / [`check_content_type`].
+    /// - [`WebToolError::EgressDenied`]: ein Redirect-Ziel der Kette ohne
+    ///   Domain-Freigabe (nur mit [`Self::with_redirect_approvals`]).
     /// - [`WebToolError::ResponseTooLarge`]: Körper größer als das Limit.
     ///
     /// # Concurrency
@@ -963,6 +1012,7 @@ impl WebFetcher {
             if checked.url() != url {
                 return Err(mismatch());
             }
+            self.check_redirect_approval(&checked, hop)?;
             last_host = checked.host().to_owned();
         }
         check_cached_content_type(&entry.content_type, &last_host)?;
@@ -1024,7 +1074,9 @@ impl WebFetcher {
     /// # Errors
     /// - [`WebToolError::SchemeNotAllowed`], [`WebToolError::HostNotResolvable`],
     ///   [`WebToolError::EgressDenied`], [`WebToolError::RedirectHostNotAllowed`]:
-    ///   Start- oder Redirect-Ziel abgelehnt.
+    ///   Start- oder Redirect-Ziel abgelehnt; [`WebToolError::EgressDenied`]
+    ///   auch für ein Redirect-Ziel ohne Domain-Freigabe
+    ///   ([`Self::with_redirect_approvals`]).
     /// - [`WebToolError::TooManyRedirects`], [`WebToolError::ResponseTooLarge`],
     ///   [`WebToolError::UnexpectedContentType`], [`WebToolError::UpstreamStatus`],
     ///   [`WebToolError::UpstreamTimeout`], [`WebToolError::Http`],
@@ -1222,6 +1274,9 @@ impl WebFetcher {
                 // Pflicht: jedes Redirect-Ziel vor dem Senden prüfen (IP-Literale
                 // erreichen den Resolver nie).
                 let next = self.check_target(&next_url, next_hop)?;
+                // Offenes Recherche-Netz (nur `web.fetch`): ein Redirect-Ziel
+                // braucht eine eigene Domain-Freigabe, vor dem Senden.
+                self.check_redirect_approval(&next, next_hop)?;
                 tracing::debug!(from = %current.host(), to = %next.host(), hop = next_hop, "web.fetch.redirect");
                 chain.push(next.url().to_owned());
                 current = next;
@@ -1434,13 +1489,15 @@ async fn web_fetch(
 
     // Plan R9 (offenes Recherche-Netz): eine noch nicht freigegebene Domain
     // läuft nur mit dem vor dem Dispatch vermerkten, genehmigten Aufruf
-    // (`crate::open_web`); im Modus `allowlist` ändert das nichts.
+    // (`crate::open_web`); im Modus `allowlist` ändert das nichts. Jedes
+    // Redirect-Ziel braucht ebenfalls eine freigegebene Domain
+    // (`WebFetcher::with_redirect_approvals`).
     if let Err(message) = crate::open_web::global().admit_fetch(&args.url) {
         return Ok(ToolOutput::error(message));
     }
 
     let fetcher = match scoped_fetcher(context, args.max_bytes) {
-        Ok(fetcher) => fetcher,
+        Ok(fetcher) => fetcher.with_redirect_approvals(crate::open_web::global()),
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };
 
@@ -1453,6 +1510,7 @@ async fn web_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open_web::{NOT_APPROVED_PREFIX, OpenWebSettings};
     use crate::test_support::{TestError, TestResult, ctx};
     use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
@@ -1578,6 +1636,17 @@ mod tests {
             body: body.to_owned(),
         };
         (cache_path(fetcher.cache_dir(), &key), entry)
+    }
+
+    /// Ein eigener, geleakter Freigabezustand im offenen Modus je Test (der
+    /// Fetcher hält `&'static`, wie der prozessweite); nie `global()`.
+    fn open_approvals() -> &'static OpenWebAccess {
+        let access: &'static OpenWebAccess = Box::leak(Box::default());
+        access.install(OpenWebSettings {
+            open: true,
+            allowlisted: Vec::new(),
+        });
+        access
     }
 
     // --- Content-Type und Byte-Limit ----------------------------------------
@@ -1867,6 +1936,85 @@ mod tests {
         Ok(())
     }
 
+    /// Offenes Recherche-Netz: ein Redirect auf eine noch nicht freigegebene
+    /// Domain wird vor dem Senden abgelehnt, obwohl Policy und Scope sie
+    /// listen. Die Ablehnung ist kein Transportfehler und nennt nur die
+    /// Domain, nie Pfad oder Query.
+    #[tokio::test]
+    async fn test_fetch_redirect_to_unapproved_open_web_domain_is_rejected_before_sending()
+    -> TestResult {
+        let server = TestServer::spawn(vec![http_response(
+            "302 Found",
+            &[("Location", "https://exfil.example.org/leak?q=geheim")],
+            "",
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(
+            dir.path(),
+            &["127.0.0.1", "exfil.example.org"],
+            true,
+            loopback_options(),
+        )?
+        .with_redirect_approvals(open_approvals());
+
+        let Err(err) = fetcher
+            .fetch(&format!("{}/start", server.base), OutputFormat::Raw)
+            .await
+        else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: Redirect ohne Domain-Freigabe".into(),
+            ));
+        };
+        assert!(matches!(err, WebToolError::EgressDenied { .. }), "{err:?}");
+        assert!(!err.is_transport(), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(NOT_APPROVED_PREFIX), "{message}");
+        assert!(message.contains("exfil.example.org"), "{message}");
+        assert!(
+            !message.contains("leak") && !message.contains("geheim"),
+            "{message}"
+        );
+        assert_eq!(
+            server.requests()?.len(),
+            1,
+            "das Redirect-Ziel darf nie gesendet werden"
+        );
+        Ok(())
+    }
+
+    /// Die Freigabeprüfung greift nur für Redirect-Ziele (Hop ≥ 1) mit
+    /// öffentlichem DNS-Namen an einem Fetcher mit Freigaben; eine
+    /// freigegebene (Eltern-)Domain besteht.
+    #[test]
+    fn test_redirect_approval_gate_skips_start_non_public_ungated_and_granted_targets() -> TestResult
+    {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let hosts = ["127.0.0.1", "exfil.example.org"];
+        let access = open_approvals();
+        let gated = fetcher_for(dir.path(), &hosts, true, loopback_options())?
+            .with_redirect_approvals(access);
+        let loopback = gated
+            .check_target("http://127.0.0.1:9/ziel", 1)
+            .map_err(ctx("Loopback-Ziel"))?;
+        let foreign = gated
+            .check_target("https://exfil.example.org/x", 1)
+            .map_err(ctx("fremdes Ziel"))?;
+
+        assert!(gated.check_redirect_approval(&loopback, 1).is_ok());
+        assert!(gated.check_redirect_approval(&foreign, 0).is_ok());
+        assert!(matches!(
+            gated.check_redirect_approval(&foreign, 1),
+            Err(WebToolError::EgressDenied { .. })
+        ));
+
+        let ungated = fetcher_for(dir.path(), &hosts, true, loopback_options())?;
+        assert!(ungated.check_redirect_approval(&foreign, 1).is_ok());
+
+        access.grant("example.org");
+        assert!(gated.check_redirect_approval(&foreign, 1).is_ok());
+        Ok(())
+    }
+
     /// Mehr als `MAX_REDIRECTS` Weiterleitungen brechen ab.
     #[tokio::test]
     async fn test_fetch_redirect_chain_beyond_limit_is_rejected() -> TestResult {
@@ -2054,6 +2202,49 @@ mod tests {
             Err(WebToolError::CacheCorrupt { .. })
         ));
         assert!(wide.validate_cached(&entry, &entry.key, url).is_ok());
+        Ok(())
+    }
+
+    /// Offenes Recherche-Netz: ein Treffer, dessen Kette über eine noch nicht
+    /// freigegebene Domain führt, wird abgelehnt (Ablehnung, also auch kein
+    /// Fail-open); ohne Freigaben oder nach der Freigabe ist er gültig.
+    #[test]
+    fn test_validate_cached_rejects_chain_through_unapproved_open_web_domain() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let hosts = ["127.0.0.1", "exfil.example.org"];
+        let access = open_approvals();
+        let gated = fetcher_for(dir.path(), &hosts, true, loopback_options())?
+            .with_redirect_approvals(access);
+        let start = gated
+            .check_target("http://127.0.0.1:9/doc", 0)
+            .map_err(ctx("Start"))?;
+        let (_, entry) = entry_for(
+            &gated,
+            vec![
+                start.url().to_owned(),
+                "https://exfil.example.org/x".to_owned(),
+            ],
+            "x",
+            now_secs(),
+        );
+
+        assert!(matches!(
+            gated.validate_cached(&entry, &entry.key, start.url()),
+            Err(WebToolError::EgressDenied { .. })
+        ));
+        let ungated = fetcher_for(dir.path(), &hosts, true, loopback_options())?;
+        assert!(
+            ungated
+                .validate_cached(&entry, &entry.key, start.url())
+                .is_ok()
+        );
+
+        access.grant("exfil.example.org");
+        assert!(
+            gated
+                .validate_cached(&entry, &entry.key, start.url())
+                .is_ok()
+        );
         Ok(())
     }
 

@@ -11,12 +11,22 @@
 //!
 //! # Härtung
 //! - Slug-Grammatik ohne `/`, `\`, `.` und Steuerzeichen: kein Pfadausbruch.
-//! - Das Plan-Verzeichnis und sein Elternteil (`.harw`) dürfen keine
-//!   symbolischen Verknüpfungen sein; eine vorhandene Plan-Datei darf kein
-//!   Symlink sein.
-//! - Schreiben über eine frische temporäre Datei im selben Verzeichnis plus
-//!   `rename` (atomar, folgt keinem Symlink am Ziel).
+//! - Beim Lesen wie beim Schreiben dürfen das Plan-Verzeichnis und sein
+//!   Elternteil (`.harw`) keine symbolischen Verknüpfungen sein; eine
+//!   vorhandene Plan-Datei darf kein Symlink sein.
+//! - Lesen und Schreiben laufen über einen Deskriptor des Plan-Verzeichnisses:
+//!   `.harw` per `harw_fsutil::open_dir_nofollow`, `plans` und die Datei per
+//!   `harw_fsutil::open_beneath`. Ein nach einer Prüfung untergeschobener
+//!   Symlink wird nie verfolgt; FIFOs und Geräte werden abgelehnt.
+//! - Lesen nimmt höchstens [`PLAN_MAX_BYTES`] + 1 Bytes, auch wenn die Datei
+//!   währenddessen wächst.
+//! - Schreiben über eine frische temporäre Datei, angelegt nur im geöffneten
+//!   Verzeichnis, plus `rename` (atomar, folgt keinem Symlink am Ziel). Vor
+//!   dem `rename` muss der Pfad noch dasselbe Verzeichnis nennen (dev/ino).
 //! - Inhalt höchstens [`PLAN_MAX_BYTES`].
+//! - Restrisiko: der `rename` selbst ist pfadbasiert; ein Tausch des
+//!   Verzeichnisses genau zwischen dev/ino-Prüfung und `rename` bleibt ein
+//!   schmales Wettlauffenster.
 //!
 //! # Nebenläufigkeit
 //! [`PlanDir`] ist ein unveränderlicher Pfadwert (`Clone`, `Send + Sync`).
@@ -24,12 +34,22 @@
 //! atomar (der letzte `rename` gewinnt); es entsteht nie eine halbe Datei.
 
 use std::fmt;
+use std::fs::File;
+use std::io::Read as _;
 use std::io::Write as _;
+use std::os::fd::AsFd as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use harw_fsutil::OpenMode;
+
 /// Höchstgröße einer Plan-Datei in Bytes.
 pub const PLAN_MAX_BYTES: usize = 256 * 1024;
+
+/// Rechte neuer Plan-Dateien; der `umask` wird noch abgezogen. Plan-Dateien
+/// sind Projektdokumente, keine Geheimnisse.
+const PLAN_FILE_MODE: u32 = 0o644;
 
 /// Höchstlänge eines Slugs in Zeichen.
 pub const SLUG_MAX_CHARS: usize = 64;
@@ -60,7 +80,8 @@ pub enum PlanFileError {
     OutsidePlansDir(String),
     /// Der Inhalt ist größer als [`PLAN_MAX_BYTES`].
     TooLarge {
-        /// Tatsächliche Größe in Bytes.
+        /// Tatsächliche Größe in Bytes; beim Lesen einer wachsenden Datei
+        /// eine Untergrenze.
         bytes: usize,
     },
     /// Es gibt keine Plan-Datei zu diesem Slug.
@@ -98,7 +119,7 @@ impl fmt::Display for PlanFileError {
             }
             Self::Symlink(path) => write!(
                 f,
-                "{} ist ein symbolischer Link — Plan-Dateien werden dort nicht geschrieben",
+                "{} ist ein symbolischer Link — Plan-Dateien werden dort weder gelesen noch geschrieben",
                 path.display()
             ),
             Self::Io { path, detail } => write!(f, "{}: {detail}", path.display()),
@@ -300,7 +321,9 @@ impl PlanDir {
     }
 
     /// Stellt sicher, dass Plan-Verzeichnis und `.harw` echte Verzeichnisse
-    /// (keine Symlinks) sind; legt das Plan-Verzeichnis bei Bedarf an.
+    /// (keine Symlinks) sind; legt das Plan-Verzeichnis bei Bedarf an. Diese
+    /// Pfadprüfungen sind nur Diagnose; verbindlich ist das
+    /// deskriptorbasierte Öffnen in [`Self::open_dir`].
     fn ensure_dir(&self) -> PlanFileResult<()> {
         if let Some(parent) = self.root.parent() {
             reject_symlink(parent)?;
@@ -310,11 +333,94 @@ impl PlanDir {
         reject_symlink(&self.root)
     }
 
+    /// Öffnet das Plan-Verzeichnis als Deskriptor, ohne einem Symlink in
+    /// `.harw` oder `plans` zu folgen.
+    ///
+    /// # Returns
+    /// `None`, wenn `.harw` oder `plans` nicht existiert.
+    ///
+    /// # Errors
+    /// [`PlanFileError::Symlink`], wenn `.harw` oder `plans` ein Symlink ist;
+    /// [`PlanFileError::Io`] bei jedem anderen Fehler oder wenn `plans` kein
+    /// Verzeichnis ist.
+    fn open_dir(&self) -> PlanFileResult<Option<File>> {
+        let Some(name) = self.root.file_name() else {
+            return Err(io_error(
+                &self.root,
+                &std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            ));
+        };
+        let parent = self
+            .root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent_fd = match harw_fsutil::open_dir_nofollow(parent) {
+            Ok(fd) => fd,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                // Unter Linux meldet `O_DIRECTORY|O_NOFOLLOW` einen Symlink als
+                // `ENOTDIR` statt `ELOOP`. Das Öffnen ist bereits gescheitert;
+                // die Pfadprüfung liefert nur die genauere Diagnose.
+                reject_symlink(parent)?;
+                return Err(open_error(parent, &error));
+            }
+        };
+        let dir = match harw_fsutil::open_beneath(
+            parent_fd.as_fd(),
+            Path::new(name),
+            OpenMode::read_only(),
+        ) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(open_error(&self.root, &error)),
+        };
+        // fstat auf dem Deskriptor: `open_beneath` lässt auch reguläre Dateien zu.
+        let meta = dir
+            .metadata()
+            .map_err(|error| io_error(&self.root, &error))?;
+        if !meta.is_dir() {
+            return Err(io_error(
+                &self.root,
+                &std::io::Error::from(std::io::ErrorKind::NotADirectory),
+            ));
+        }
+        Ok(Some(dir))
+    }
+
+    /// Prüft, ob `self.root` noch das gepinnte Verzeichnis `dir` nennt
+    /// (gleiches `dev`/`ino`).
+    ///
+    /// # Errors
+    /// [`PlanFileError::Symlink`], wenn der Pfad inzwischen ein Symlink ist;
+    /// [`PlanFileError::Io`], wenn er fehlt oder etwas anderes nennt.
+    fn verify_pinned(&self, dir: &File) -> PlanFileResult<()> {
+        let pinned = dir
+            .metadata()
+            .map_err(|error| io_error(&self.root, &error))?;
+        match std::fs::symlink_metadata(&self.root) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                Err(PlanFileError::Symlink(self.root.clone()))
+            }
+            Ok(meta)
+                if meta.is_dir() && meta.dev() == pinned.dev() && meta.ino() == pinned.ino() =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(PlanFileError::Io {
+                path: self.root.clone(),
+                detail: "Plan-Verzeichnis wurde während des Schreibens ersetzt".to_owned(),
+            }),
+            Err(error) => Err(io_error(&self.root, &error)),
+        }
+    }
+
     /// Schreibt (oder ersetzt) die Plan-Datei zu `slug`.
     ///
     /// # Errors
     /// [`PlanFileError::InvalidSlug`], [`PlanFileError::TooLarge`],
-    /// [`PlanFileError::Symlink`] oder [`PlanFileError::Io`].
+    /// [`PlanFileError::Symlink`] oder [`PlanFileError::Io`] — Letzteres auch,
+    /// wenn das Plan-Verzeichnis während des Schreibens ersetzt wurde.
     pub fn write(&self, slug: &str, content: &str) -> PlanFileResult<PlanWriteOutcome> {
         let path = self.path_for(slug)?;
         if content.len() > PLAN_MAX_BYTES {
@@ -331,27 +437,43 @@ impl PlanDir {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(io_error(&path, &error)),
         };
+        // Ab hier gilt der Deskriptor: die temporäre Datei entsteht nur im
+        // tatsächlich geöffneten Verzeichnis.
+        let Some(dir) = self.open_dir()? else {
+            return Err(io_error(
+                &self.root,
+                &std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        };
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default();
-        let temp = self.root.join(format!(
+        let temp_name = format!(
             ".{}.{}.{nonce}.tmp",
             validate_slug(slug)?,
             std::process::id()
-        ));
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .and_then(|mut file| {
-                file.write_all(content.as_bytes())?;
-                file.sync_all()
-            });
+        );
+        let temp = self.root.join(&temp_name);
+        let written = harw_fsutil::open_beneath(
+            dir.as_fd(),
+            Path::new(&temp_name),
+            OpenMode::write_create_new(PLAN_FILE_MODE),
+        )
+        .and_then(|mut file| {
+            file.write_all(content.as_bytes())?;
+            file.sync_all()
+        });
         if let Err(error) = written {
             let _ = std::fs::remove_file(&temp);
             return Err(io_error(&temp, &error));
         }
+        // Vor dem `rename` muss der Pfad noch das gepinnte Verzeichnis nennen.
+        // Scheitert die Prüfung, bleibt die temporäre Datei bewusst im
+        // verschobenen Verzeichnis liegen (kein Löschen über einen Pfad, der
+        // jetzt woanders hinzeigt); `list` übergeht sie wegen des führenden `.`
+        // und der Slug-Grammatik.
+        self.verify_pinned(&dir)?;
         if let Err(error) = std::fs::rename(&temp, &path) {
             let _ = std::fs::remove_file(&temp);
             return Err(io_error(&path, &error));
@@ -368,25 +490,16 @@ impl PlanDir {
     ///
     /// # Errors
     /// [`PlanFileError::NotFound`], [`PlanFileError::Symlink`],
-    /// [`PlanFileError::TooLarge`] oder [`PlanFileError::Io`].
+    /// [`PlanFileError::TooLarge`] oder [`PlanFileError::Io`]. Ist `.harw`,
+    /// `plans` oder die Plan-Datei ein Symlink, folgt
+    /// [`PlanFileError::Symlink`]; ein FIFO, Gerät, Verzeichnis oder
+    /// ungültiges UTF-8 ergibt [`PlanFileError::Io`].
     pub fn read(&self, slug: &str) -> PlanFileResult<String> {
         let path = self.path_for(slug)?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(PlanFileError::Symlink(path));
-            }
-            Ok(meta) if meta.len() > PLAN_MAX_BYTES as u64 => {
-                return Err(PlanFileError::TooLarge {
-                    bytes: usize::try_from(meta.len()).unwrap_or(usize::MAX),
-                });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PlanFileError::NotFound(slug.to_owned()));
-            }
-            Err(error) => return Err(io_error(&path, &error)),
-        }
-        std::fs::read_to_string(&path).map_err(|error| io_error(&path, &error))
+        let Some(dir) = self.open_dir()? else {
+            return Err(PlanFileError::NotFound(slug.to_owned()));
+        };
+        read_plan_in(&dir, &path, slug)
     }
 
     /// Listet alle Pläne, neueste zuerst.
@@ -458,6 +571,76 @@ fn io_error(path: &Path, error: &std::io::Error) -> PlanFileError {
         path: path.to_owned(),
         detail: error.to_string(),
     }
+}
+
+/// Fehler der `harw_fsutil`-Öffner: `ELOOP` (Symlink in einem Pfadglied)
+/// wird zu [`PlanFileError::Symlink`], alles andere zu [`PlanFileError::Io`].
+fn open_error(path: &Path, error: &std::io::Error) -> PlanFileError {
+    if harw_fsutil::is_symlink_loop(error) {
+        PlanFileError::Symlink(path.to_owned())
+    } else {
+        io_error(path, error)
+    }
+}
+
+/// Liest höchstens [`PLAN_MAX_BYTES`] + 1 Bytes aus `reader` — auch eine
+/// Datei, die während des Lesens wächst, sprengt die Grenze nicht.
+///
+/// # Errors
+/// [`PlanFileError::TooLarge`] ab [`PLAN_MAX_BYTES`] + 1 Bytes,
+/// [`PlanFileError::Io`] bei Lesefehlern und ungültigem UTF-8.
+fn read_capped(reader: impl std::io::Read, path: &Path) -> PlanFileResult<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(PLAN_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(path, &error))?;
+    if bytes.len() > PLAN_MAX_BYTES {
+        return Err(PlanFileError::TooLarge { bytes: bytes.len() });
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        io_error(
+            path,
+            &std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })
+}
+
+/// Liest die Plan-Datei `path` über den Deskriptor des Plan-Verzeichnisses.
+///
+/// # Beschreibung
+/// Geöffnet wird nur der Dateiname unterhalb von `dir` (kein Symlink, kein
+/// FIFO, kein Gerät); Größe und Typ prüft `fstat` auf dem geöffneten
+/// Deskriptor, gelesen wird über [`read_capped`].
+///
+/// # Errors
+/// [`PlanFileError::NotFound`], [`PlanFileError::Symlink`],
+/// [`PlanFileError::TooLarge`] oder [`PlanFileError::Io`].
+fn read_plan_in(dir: &File, path: &Path, slug: &str) -> PlanFileResult<String> {
+    let Some(name) = path.file_name() else {
+        return Err(PlanFileError::InvalidSlug(slug.to_owned()));
+    };
+    let file = match harw_fsutil::open_beneath(dir.as_fd(), Path::new(name), OpenMode::read_only())
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PlanFileError::NotFound(slug.to_owned()));
+        }
+        Err(error) => return Err(open_error(path, &error)),
+    };
+    let meta = file.metadata().map_err(|error| io_error(path, &error))?;
+    if !meta.is_file() {
+        return Err(io_error(
+            path,
+            &std::io::Error::from(std::io::ErrorKind::IsADirectory),
+        ));
+    }
+    if meta.len() > PLAN_MAX_BYTES as u64 {
+        return Err(PlanFileError::TooLarge {
+            bytes: usize::try_from(meta.len()).unwrap_or(usize::MAX),
+        });
+    }
+    read_capped(file, path)
 }
 
 #[cfg(test)]
@@ -608,6 +791,171 @@ mod tests {
             Err(PlanFileError::Symlink(_))
         ));
         assert!(!elsewhere.join("x.md").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_refuses_symlinked_plan_file_and_dirs() -> TestResult {
+        // (1) Die Plan-Datei selbst ist ein Symlink.
+        let (temp, dir) = plan_dir()?;
+        dir.write("geheim", "# Plan\n").map_err(ctx("write"))?;
+        let secret = temp.path().join("secret.txt");
+        std::fs::write(&secret, "GEHEIM").map_err(ctx("secret"))?;
+        let plan = dir.root().join("geheim.md");
+        std::fs::remove_file(&plan).map_err(ctx("remove plan"))?;
+        std::os::unix::fs::symlink(&secret, &plan).map_err(ctx("file link"))?;
+        let result = dir.read("geheim");
+        assert!(
+            matches!(result, Err(PlanFileError::Symlink(_))),
+            "{result:?}"
+        );
+
+        // (2) `plans` ist ein Symlink.
+        let (plans_temp, plans_dir) = plan_dir()?;
+        plans_dir
+            .write("geheim", "# Plan\n")
+            .map_err(ctx("write"))?;
+        std::fs::rename(plans_dir.root(), plans_temp.path().join("alt"))
+            .map_err(ctx("move plans"))?;
+        let elsewhere = plans_temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).map_err(ctx("elsewhere"))?;
+        std::fs::write(elsewhere.join("geheim.md"), "GEHEIM").map_err(ctx("secret"))?;
+        std::os::unix::fs::symlink(&elsewhere, plans_dir.root()).map_err(ctx("plans link"))?;
+        let result = plans_dir.read("geheim");
+        assert!(
+            matches!(result, Err(PlanFileError::Symlink(_))),
+            "{result:?}"
+        );
+
+        // (3) `.harw` ist ein Symlink.
+        let harw_temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let target = harw_temp.path().join("ziel");
+        std::fs::create_dir_all(target.join("plans")).map_err(ctx("target"))?;
+        std::fs::write(target.join("plans").join("geheim.md"), "GEHEIM").map_err(ctx("secret"))?;
+        let harw = harw_temp.path().join(".harw");
+        std::os::unix::fs::symlink(&target, &harw).map_err(ctx("harw link"))?;
+        let harw_dir = PlanDir::new(harw.join("plans"));
+        let result = harw_dir.read("geheim");
+        assert!(
+            matches!(result, Err(PlanFileError::Symlink(_))),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_dir_ignores_a_swap_after_opening() -> TestResult {
+        let (temp, dir) = plan_dir()?;
+        dir.write("auth", "# echt\n").map_err(ctx("write"))?;
+        let pinned = dir
+            .open_dir()
+            .map_err(ctx("open"))?
+            .ok_or(TestError::Missing("plan dir"))?;
+
+        // Nach dem Öffnen wird das Verzeichnis gegen einen Symlink getauscht.
+        std::fs::rename(dir.root(), temp.path().join("verschoben")).map_err(ctx("move plans"))?;
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).map_err(ctx("elsewhere"))?;
+        std::fs::write(elsewhere.join("auth.md"), "GEHEIM").map_err(ctx("secret"))?;
+        std::os::unix::fs::symlink(&elsewhere, dir.root()).map_err(ctx("swap link"))?;
+
+        let path = dir.path_for("auth").map_err(ctx("path"))?;
+        assert_eq!(
+            read_plan_in(&pinned, &path, "auth").map_err(ctx("pinned read"))?,
+            "# echt\n"
+        );
+        let verified = dir.verify_pinned(&pinned);
+        assert!(
+            matches!(verified, Err(PlanFileError::Symlink(_))),
+            "{verified:?}"
+        );
+
+        // Ein neues, echtes Verzeichnis am selben Pfad ist nicht das gepinnte.
+        std::fs::remove_file(dir.root()).map_err(ctx("remove link"))?;
+        std::fs::create_dir(dir.root()).map_err(ctx("new dir"))?;
+        let verified = dir.verify_pinned(&pinned);
+        assert!(
+            matches!(verified, Err(PlanFileError::Io { .. })),
+            "{verified:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_enforces_size_cap_and_utf8() -> TestResult {
+        let (_temp, dir) = plan_dir()?;
+        let full = "x".repeat(PLAN_MAX_BYTES);
+        dir.write("voll", &full).map_err(ctx("write"))?;
+        assert_eq!(dir.read("voll").map_err(ctx("read"))?.len(), PLAN_MAX_BYTES);
+
+        std::fs::write(dir.root().join("gross.md"), vec![b'x'; PLAN_MAX_BYTES + 1])
+            .map_err(ctx("gross"))?;
+        assert!(matches!(
+            dir.read("gross"),
+            Err(PlanFileError::TooLarge { bytes }) if bytes == PLAN_MAX_BYTES + 1
+        ));
+
+        std::fs::write(dir.root().join("kaputt.md"), [0xff_u8, 0xfe]).map_err(ctx("kaputt"))?;
+        let result = dir.read("kaputt");
+        assert!(
+            matches!(result, Err(PlanFileError::Io { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_capped_stops_on_an_endless_reader() -> TestResult {
+        // Deckt eine Datei ab, die während des Lesens wächst.
+        let result = read_capped(std::io::repeat(b'x'), Path::new("x.md"));
+        assert!(matches!(
+            result,
+            Err(PlanFileError::TooLarge { bytes }) if bytes == PLAN_MAX_BYTES + 1
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_a_fifo_without_blocking() -> TestResult {
+        let (_temp, dir) = plan_dir()?;
+        std::fs::create_dir_all(dir.root()).map_err(ctx("dir"))?;
+        let fifo = dir.root().join("rohr.md");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            other => {
+                eprintln!("übersprungen: `mkfifo` nicht verfügbar ({other:?})");
+                return Ok(());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = dir.clone();
+        std::thread::spawn(move || {
+            // Nach einem Timeout gibt es keinen Empfänger mehr; dann ist der
+            // Test ohnehin schon fehlgeschlagen.
+            let _ = tx.send(reader.read("rohr"));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(ctx("read blockiert"))?;
+        assert!(
+            matches!(result, Err(PlanFileError::Io { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_creates_plan_without_group_or_world_write() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_temp, dir) = plan_dir()?;
+        dir.write("rechte", "x").map_err(ctx("write"))?;
+        let meta = std::fs::metadata(dir.root().join("rechte.md")).map_err(ctx("meta"))?;
+        assert_eq!(meta.permissions().mode() & 0o022, 0);
         Ok(())
     }
 }

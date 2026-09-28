@@ -162,7 +162,7 @@ impl ApprovalRequest {
     ///
     /// # Description
     /// `requested_at + `[`harw_types::DEFAULT_APPROVAL_TIMEOUT`] — dieselbe
-    /// Politik, die [`harw_core::AgentSession::begin_approval`] für Turn-lokale
+    /// Politik, die `harw_core::AgentSession::begin_approval` für Turn-lokale
     /// Pausen verwendet. Ein Aufrufer, der eine andere Frist braucht, berechnet
     /// `timeout_at` selbst und lässt diese Methode aus.
     ///

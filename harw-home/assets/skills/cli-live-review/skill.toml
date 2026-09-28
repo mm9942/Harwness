@@ -1,0 +1,4 @@
+name = "cli-live-review"
+description = "Use when reviewing, explaining, debugging, or changing the live Harw process CLI (`harw ...`). Trace an invocation from clap grammar through dispatch, handler/runtime composition, authority and state ownership, output/exit behavior, aliases, tests, and docs. Distinguish implemented behavior from planning and never infer semantics from a command name alone."
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "process.execute"]

@@ -2,24 +2,26 @@
 //! Persistenz: [`authorize_freeze`], [`authorize_release`],
 //! [`authorize_stage_gated`], [`reconcile_expired_freezes`].
 //!
-//! # Audit vor Fehlerpfad
-//! **Was protokolliert werden soll, wird protokolliert, bevor die Aktion
-//! versucht wird — nie danach.** [`authorize_freeze`] schreibt den
-//! `Freeze`-Datensatz über [`FreezeStore::freeze`] als **ersten** durchbrechenden
-//! Schritt, bevor [`crate::ladder::Ladder::stage_for`] oder
-//! [`crate::action::Action::authorize`] überhaupt ausgewertet werden.
-//! Schlägt einer der beiden nachfolgenden, fehlschlagbaren Schritte fehl —
-//! der Befund rechtfertigt keine Stufe, oder die Aktion ist ab der
-//! ermittelten Stufe nicht zulässig —, bleibt der bereits geschriebene
-//! Freeze-Datensatz stehen: genau der Eintrag zur fehlgeschlagenen
-//! Autorisierung, den ein Audit-Trail braucht, um die interessanteste Zeile
-//! nicht zu verlieren (Brief, Abschnitt „Die Auflagen, die diese Crate
-//! tragen"). [`authorize_release`] folgt derselben Reihenfolge:
-//! [`FreezeStore::resolve`] läuft vor der Autorisierungsprüfung.
+//! # Autorisierung vor Zustand
+//! **[`FreezeStore`] ist Zustand, kein Audit-Log:** er hält fest, ob ein
+//! Freeze noch in Kraft ist (siehe Moduldoku von
+//! `harw-session-store/src/freeze.rs`). [`authorize_freeze`] und
+//! [`authorize_release`] führen deshalb **zuerst** die nebenwirkungsfreien
+//! Prüfungen aus — [`crate::ladder::Ladder::stage_for`], dann
+//! [`crate::action::Action::authorize`]; keine der beiden berührt das
+//! Dateisystem. Erst wenn beide gelingen, wird [`FreezeStore::freeze`] bzw.
+//! [`FreezeStore::resolve`] aufgerufen — immer noch bevor das
+//! `Action<Authorized>` die Funktion verlässt, der Datensatz geht also jeder
+//! Warden-Ausführung stets voraus. Eine abgelehnte Autorisierung lässt den
+//! Store unverändert; andernfalls hielte er einen Phantom-`.active`-Datensatz
+//! für eine nie eingefrorene cgroup oder einen `Lifted`-Datensatz für eine
+//! weiterhin eingefrorene. Die Ablehnung wird ausschließlich über das
+//! inhaltsfreie `Err` gemeldet; sie durabel zu protokollieren ist Sache des
+//! Aufrufers. Scheitert der Store-Schreibvorgang nach erfolgreicher
+//! Autorisierung, wird die autorisierte Aktion verworfen, nicht
+//! zurückgegeben (fail closed: keine Anforderung ohne Datensatz).
 //! `authorize_stage_gated` (für `IsolateNetwork`/`KillProcessTree`) hat
-//! keinen `FreezeStore`-Bezug und schreibt deshalb auch keinen Audit-Eintrag
-//! — die Regel ist damit für diese beiden Aktionen leer erfüllt, nicht
-//! verletzt.
+//! keinen `FreezeStore`-Bezug.
 //!
 //! # Rekonziliationsdisziplin beim Start
 //! [`reconcile_expired_freezes`] ist die von
@@ -84,13 +86,14 @@ pub fn reconcile_expired_freezes(
     Ok(store.reconcile_expired(now)?)
 }
 
-/// Autorisiert eine `FreezeCgroup`-Aktion, nachdem der Freeze-Datensatz
-/// bereits durabel geschrieben ist.
+/// Autorisiert eine `FreezeCgroup`-Aktion und schreibt erst danach den
+/// Freeze-Datensatz durabel.
 ///
 /// # Description
-/// Siehe Moduldoku, Abschnitt „Audit vor Fehlerpfad", für die Reihenfolge:
-/// [`FreezeStore::freeze`] läuft **vor** [`crate::ladder::Ladder::stage_for`]
-/// und [`crate::action::Action::authorize`].
+/// Siehe Moduldoku, Abschnitt „Autorisierung vor Zustand", für die
+/// Reihenfolge: [`crate::ladder::Ladder::stage_for`], dann
+/// [`crate::action::Action::authorize`], und erst **danach**
+/// [`FreezeStore::freeze`].
 ///
 /// # Arguments
 /// - `freeze_store` (`&FreezeStore`): wohin der Freeze-Datensatz geschrieben
@@ -109,11 +112,13 @@ pub fn reconcile_expired_freezes(
 /// # Errors
 /// - [`EscalateError::NotAFreezeAction`]: `proposed` ist keine
 ///   `FreezeCgroup`-Variante.
+/// - [`EscalateError::NotEscalatable`]: der Befund rechtfertigt keine Stufe;
+///   der Store bleibt unverändert.
+/// - Alles, was [`crate::action::Action::authorize`] zurückgeben kann; der
+///   Store bleibt unverändert.
 /// - [`EscalateError::Store`]: der Freeze-Datensatz existiert bereits
 ///   (aktiv oder aufgelöst) oder der `FreezeStore`-Zugriff ist
-///   fehlgeschlagen.
-/// - [`EscalateError::NotEscalatable`]: der Befund rechtfertigt keine Stufe.
-/// - Alles, was [`crate::action::Action::authorize`] zurückgeben kann.
+///   fehlgeschlagen; die bereits autorisierte Aktion wird verworfen.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -149,26 +154,27 @@ pub fn authorize_freeze(
         _ => return Err(EscalateError::NotAFreezeAction),
     };
 
-    // Audit vor Fehlerpfad (siehe Moduldoku): der Freeze-Datensatz wird
-    // geschrieben, BEVOR die fehlschlagbare Stufen- und
-    // Autorisierungsprüfung läuft.
+    let stage = Ladder::stage_for(finding).ok_or(EscalateError::NotEscalatable)?;
+    let action = proposed.authorize(finding, stage, authorized_by, now)?;
+
+    // Zustand erst nach Autorisierung (siehe Moduldoku).
     freeze_store.freeze(&Freeze {
         cgroup,
         finding: finding.id().clone(),
         frozen_at: now,
         expires_at: None,
     })?;
-
-    let stage = Ladder::stage_for(finding).ok_or(EscalateError::NotEscalatable)?;
-    proposed.authorize(finding, stage, authorized_by, now)
+    Ok(action)
 }
 
-/// Autorisiert eine `ReleaseCgroup`-Aktion, nachdem der zugehörige Freeze
-/// bereits durabel aufgelöst ist.
+/// Autorisiert eine `ReleaseCgroup`-Aktion und löst erst danach den
+/// zugehörigen Freeze durabel auf.
 ///
 /// # Description
-/// Siehe Moduldoku, Abschnitt „Audit vor Fehlerpfad": [`FreezeStore::resolve`]
-/// läuft vor der Autorisierungsprüfung.
+/// Siehe Moduldoku, Abschnitt „Autorisierung vor Zustand":
+/// [`crate::ladder::Ladder::stage_for`], dann
+/// [`crate::action::Action::authorize`], und erst **danach**
+/// [`FreezeStore::resolve`].
 ///
 /// # Arguments
 /// - `freeze_store` (`&FreezeStore`): wo der aufzulösende Freeze liegt.
@@ -189,10 +195,14 @@ pub fn authorize_freeze(
 /// # Errors
 /// - [`EscalateError::NotAReleaseAction`]: `proposed` ist keine
 ///   `ReleaseCgroup`-Variante.
-/// - [`EscalateError::Store`]: kein aktiver Freeze für diesen Schlüssel, oder
-///   der `FreezeStore`-Zugriff ist fehlgeschlagen.
-/// - [`EscalateError::NotEscalatable`]: der Befund rechtfertigt keine Stufe.
-/// - Alles, was [`crate::action::Action::authorize`] zurückgeben kann.
+/// - [`EscalateError::NotEscalatable`]: der Befund rechtfertigt keine Stufe;
+///   der Freeze bleibt aktiv.
+/// - Alles, was [`crate::action::Action::authorize`] zurückgeben kann; der
+///   Freeze bleibt aktiv.
+/// - [`EscalateError::Store`]: kein aktiver Freeze für diesen Schlüssel
+///   (`FreezeNotFound`), der Freeze ist bereits aufgelöst
+///   (`FreezeAlreadyResolved`), oder der `FreezeStore`-Zugriff ist
+///   fehlgeschlagen; die bereits autorisierte Aktion wird verworfen.
 pub fn authorize_release(
     freeze_store: &FreezeStore,
     finding: &Finding<Triaged>,
@@ -206,12 +216,11 @@ pub fn authorize_release(
         _ => return Err(EscalateError::NotAReleaseAction),
     };
 
-    // Audit vor Fehlerpfad: die Auflösung wird durabel geschrieben, BEVOR
-    // die fehlschlagbare Stufen- und Autorisierungsprüfung läuft.
-    let resolution = freeze_store.resolve(&cgroup, finding.id(), frozen_at, now)?;
-
     let stage = Ladder::stage_for(finding).ok_or(EscalateError::NotEscalatable)?;
     let action = proposed.authorize(finding, stage, authorized_by, now)?;
+
+    // Zustand erst nach Autorisierung (siehe Moduldoku).
+    let resolution = freeze_store.resolve(&cgroup, finding.id(), frozen_at, now)?;
     Ok((action, resolution))
 }
 
@@ -219,9 +228,9 @@ pub fn authorize_release(
 /// (`IsolateNetwork`, `KillProcessTree`).
 ///
 /// # Description
-/// Kein Audit-Datensatz zu schreiben — diese beiden Aktionen haben keinen
-/// Bezug zu [`FreezeStore`] (siehe Moduldoku, Abschnitt „Audit vor
-/// Fehlerpfad"). Reiner Aufruf von [`crate::ladder::Ladder::stage_for`]
+/// Kein Zustand zu schreiben — diese beiden Aktionen haben keinen Bezug zu
+/// [`FreezeStore`] (siehe Moduldoku, Abschnitt „Autorisierung vor
+/// Zustand"). Reiner Aufruf von [`crate::ladder::Ladder::stage_for`]
 /// gefolgt von [`crate::action::Action::authorize`].
 ///
 /// # Arguments
@@ -330,36 +339,42 @@ mod tests {
         Ok(())
     }
 
-    /// Der Audit-Eintrag steht vor dem Fehlerpfad: eine Autorisierung, die
-    /// scheitert, weil der Befund keine Stufe rechtfertigt, hinterlässt
-    /// trotzdem ihren Freeze-Datensatz.
+    /// Autorisierung vor Zustand: eine Autorisierung, die scheitert, weil der
+    /// Befund keine Stufe rechtfertigt, hinterlässt keinen Freeze-Datensatz —
+    /// ein bestätigter Folgeaufruf für denselben Schlüssel gelingt deshalb.
     #[test]
-    fn test_a_failing_authorization_still_leaves_its_audit_entry() -> TestResult {
+    fn test_a_refused_freeze_leaves_no_record() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
         // `FalsePositive` sorgt dafür, dass `Ladder::stage_for` `None`
         // liefert und `authorize_freeze` mit `NotEscalatable` scheitert —
-        // aber erst NACHDEM der Freeze-Datensatz bereits geschrieben wurde.
-        let finding = finding_with(
+        // bevor der Store überhaupt berührt wird.
+        let refused = finding_with(
             Severity::Critical,
             Hardness::Observed,
             Verdict::FalsePositive,
         )?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
+            cgroup: cgroup.clone(),
         });
 
-        let Err(err) = authorize_freeze(&store, &finding, proposed, actor(), Timestamp::UNIX_EPOCH)
+        let Err(err) = authorize_freeze(&store, &refused, proposed, actor(), Timestamp::UNIX_EPOCH)
         else {
             return Err(TestError::Unexpected("Err erwartet".to_owned()));
         };
-
         assert!(matches!(err, EscalateError::NotEscalatable));
-        assert_eq!(
-            store.active().map_err(ctx("active"))?.len(),
-            1,
-            "the freeze record must survive the downstream authorization failure"
-        );
+        assert!(store.active().map_err(ctx("active"))?.is_empty());
+
+        // Gleicher Schlüssel (Befund-Id, cgroup, `frozen_at`): ein
+        // Phantom-Datensatz ließe diesen Aufruf mit `FreezeAlreadyExists`
+        // scheitern.
+        let confirmed = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let proposed = Action::propose(ProposedAction::FreezeCgroup { cgroup });
+        let _authorized =
+            authorize_freeze(&store, &confirmed, proposed, actor(), Timestamp::UNIX_EPOCH)
+                .map_err(ctx("no phantom record blocks the confirmed freeze"))?;
+        assert_eq!(store.active().map_err(ctx("active"))?.len(), 1);
         Ok(())
     }
 
@@ -421,6 +436,120 @@ mod tests {
                 .verify(finding.id(), &authorized.request().action)
                 .is_ok()
         );
+        Ok(())
+    }
+
+    /// Autorisierung vor Zustand: eine abgelehnte Freigabe schreibt keinen
+    /// `Lifted`-Datensatz — der Freeze bleibt aktiv, und eine bestätigte
+    /// Folgefreigabe für denselben Schlüssel gelingt.
+    #[test]
+    fn test_a_refused_release_keeps_the_freeze_active() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = FreezeStore::new(temp.path());
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+        let refused = finding_with(
+            Severity::Critical,
+            Hardness::Observed,
+            Verdict::FalsePositive,
+        )?;
+        let record = Freeze {
+            cgroup: cgroup.clone(),
+            finding: refused.id().clone(),
+            frozen_at: Timestamp::UNIX_EPOCH,
+            expires_at: None,
+        };
+        store.freeze(&record).map_err(ctx("freeze"))?;
+
+        let proposed = Action::propose(ProposedAction::ReleaseCgroup {
+            cgroup: cgroup.clone(),
+        });
+        let Err(err) = authorize_release(
+            &store,
+            &refused,
+            proposed,
+            actor(),
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::NotEscalatable));
+        assert_eq!(store.active().map_err(ctx("active"))?, vec![record]);
+
+        // Gleicher Schlüssel: ein vorzeitig geschriebener `Lifted`-Datensatz
+        // ließe diesen Aufruf mit `FreezeAlreadyResolved` scheitern.
+        let confirmed = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let proposed = Action::propose(ProposedAction::ReleaseCgroup { cgroup });
+        let _released = authorize_release(
+            &store,
+            &confirmed,
+            proposed,
+            actor(),
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx(
+            "the still active freeze resolves on a confirmed release",
+        ))?;
+        assert!(store.active().map_err(ctx("active"))?.is_empty());
+        Ok(())
+    }
+
+    /// Wie oben, aber mit `NeedsReview`: auch ein Befund, der noch eine
+    /// menschliche Prüfung braucht, lässt den Freeze aktiv.
+    #[test]
+    fn test_a_release_for_needs_review_keeps_the_freeze_active() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = FreezeStore::new(temp.path());
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+        let refused = finding_with(Severity::Critical, Hardness::Observed, Verdict::NeedsReview)?;
+        let record = Freeze {
+            cgroup: cgroup.clone(),
+            finding: refused.id().clone(),
+            frozen_at: Timestamp::UNIX_EPOCH,
+            expires_at: None,
+        };
+        store.freeze(&record).map_err(ctx("freeze"))?;
+
+        let proposed = Action::propose(ProposedAction::ReleaseCgroup { cgroup });
+        let Err(err) = authorize_release(
+            &store,
+            &refused,
+            proposed,
+            actor(),
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::NotEscalatable));
+        assert_eq!(store.active().map_err(ctx("active"))?, vec![record]);
+        Ok(())
+    }
+
+    /// Eine bestätigte Freigabe ohne aktiven Freeze scheitert am Store; die
+    /// bereits autorisierte Aktion wird verworfen, nicht zurückgegeben.
+    #[test]
+    fn test_authorize_release_without_active_freeze_is_a_store_error() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = FreezeStore::new(temp.path());
+        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let proposed = Action::propose(ProposedAction::ReleaseCgroup {
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
+        });
+
+        let Err(err) = authorize_release(
+            &store,
+            &finding,
+            proposed,
+            actor(),
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::Store(_)));
+        assert!(store.active().map_err(ctx("active"))?.is_empty());
         Ok(())
     }
 

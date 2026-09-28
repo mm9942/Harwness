@@ -31,6 +31,9 @@
 //! kann nicht fehlschlagen (jede Regel hat für jeden Eingabewert ein
 //! wohldefiniertes Ergebnis); abgelehnte Lockerungsversuche werden über den
 //! `Vec<ScopeDiagnostic>`-Rückgabewert sichtbar gemacht, nicht über `Result`.
+//! Nur der öffentliche `&str`-Einstieg `merge_layer_toml_into` kann
+//! scheitern: er parst das rohe TOML selbst und liefert für ungültiges TOML
+//! `ConfigError::TomlParse`.
 //!
 //! # Logging (`tracing`)
 //! `docs/design/config-scopes.md` Abschnitt 7e: zusätzlich zum
@@ -55,25 +58,26 @@
 //! keine Ablehnung und wird nicht geloggt.
 //!
 //! # Examples
-//! ```rust,no_run
-//! use harw_config::{merge_layer_into, HarnessConfig, LayerRole};
+//! ```rust
+//! use harw_config::{merge_layer_toml_into, HarnessConfig, LayerRole};
 //! use std::path::Path;
 //!
 //! let mut trusted = HarnessConfig::default();
 //! let incoming = HarnessConfig::default();
-//! let raw: toml::Value = toml::from_str("").unwrap();
-//! let diagnostics = merge_layer_into(
+//! let diagnostics = merge_layer_toml_into(
 //!     &mut trusted,
 //!     incoming,
-//!     &raw,
+//!     "",
 //!     LayerRole::Baseline,
 //!     Path::new("/home/user/.harw/config.toml"),
-//! );
+//! )?;
 //! assert!(diagnostics.is_empty());
+//! # Ok::<(), harw_config::ConfigError>(())
 //! ```
 
 use std::path::Path;
 
+use crate::error::{ConfigError, ConfigResult};
 use crate::harness_config::{
     CompactionToml, DreamToml, GuardsToml, HarnessConfig, HostToml, KnowledgeToml,
     McpListenerSection, McpPrincipalToml, OnboardingSection, PolicySection, ReasoningWeightsToml,
@@ -87,7 +91,7 @@ use crate::research_toml::ResearchSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
-/// Grober Vertrauens-/Ebenen-Kontext eines [`merge_layer_into`]-Aufrufs;
+/// Grober Vertrauens-/Ebenen-Kontext eines `merge_layer_into`-Aufrufs;
 /// bestimmt, welche [`crate::scope::MergeRule`]-Varianten überhaupt wirken
 /// (`docs/design/config-scopes.md` Abschnitt 7c).
 ///
@@ -110,7 +114,7 @@ pub enum LayerRole {
     UntrustedProject,
 }
 
-/// Ein abgelehnter Scope-Lockerungsversuch aus [`merge_layer_into`]
+/// Ein abgelehnter Scope-Lockerungsversuch aus `merge_layer_into`
 /// (`docs/design/config-scopes.md` Abschnitt 7e). Modelliert auf
 /// `discovery::ConfigDiagnostic` (nicht-fatal, sichtbar, blockiert den
 /// Start nicht), trägt aber die für eine Scope-Verletzung nötigen
@@ -441,16 +445,41 @@ fn min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
     *trusted = bounded;
 }
 
+// Eingebaute Vorgaben, gegen die der nicht vertraute Projekt-Layer
+// verglichen wird, wenn noch kein vertrauter Layer den Schluessel gesetzt
+// hat (gleiches Muster wie `merge_host`/`merge_agent_limits`/
+// `merge_shell_limits`). Sie spiegeln `harw_runtime::assembly::
+// default_approval_mode` (`Delegated` = `"auto"`) und
+// `harw_core::guard::GuardPolicy::default`. harw-config (Ring I) darf keine
+// Ring-A-Crates importieren, daher hier dupliziert — eine Aenderung dort
+// muss hier nachgezogen werden.
+const UNTRUSTED_BASELINE_DEFAULT_MODE: &str = "auto";
+const UNTRUSTED_BASELINE_GUARDS_ENABLED: bool = true;
+const UNTRUSTED_BASELINE_REPEATED_FAILURE_WARN: u32 = 2;
+const UNTRUSTED_BASELINE_REPEATED_FAILURE_ABORT: u32 = 3;
+const UNTRUSTED_BASELINE_NO_PROGRESS_ROUNDS_WARN: u32 = 4;
+const UNTRUSTED_BASELINE_NO_PROGRESS_ROUNDS_ABORT: u32 = 8;
+const UNTRUSTED_BASELINE_PLAN_STALE_ROUNDS: u32 = 6;
+const UNTRUSTED_BASELINE_ORCHESTRATOR_READ_WARN: u32 = 4;
+const UNTRUSTED_BASELINE_ORCHESTRATOR_READ_LIMIT: u32 = 5;
+
 // Wie `min_bound`, aber fuer `Option<T>`-Felder (`guards.*`,
-// `permissions.approval_timeout_secs`, `compaction.absolute_ceiling_tokens`):
-// ein bisher ungesetzter Home-Wert (`None`) uebernimmt den ersten explizit
-// gesetzten Wert ohne Vergleich (es gibt noch keine Baseline, gegen die
-// verengt werden koennte).
+// `permissions.approval_timeout_secs`, `compaction.absolute_ceiling_tokens`).
+// Ist noch kein Wert gesetzt (`None`), uebernimmt ein vertrauter Layer den
+// ersten explizit gesetzten Wert ohne Vergleich. Der nicht vertraute
+// Projekt-Layer wird dann gegen `untrusted_baseline` verglichen: nur ein
+// Wert, der hoechstens so gross ist, wird uebernommen, der Default-/
+// Sentinel-Wert (`0`) nie. `untrusted_baseline == None` heisst: in diesem
+// Crate ist keine Vorgabe bekannt, es bleibt beim bisherigen Verhalten.
+// 8 Parameter, weil `untrusted_baseline` zu den 7 gemeinsamen
+// Merge-Kontext-Parametern hinzukommt (wie `ordering` bei `stricter_of`).
+#[allow(clippy::too_many_arguments)]
 fn merge_optional_min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
     trusted: &mut Option<T>,
     incoming: Option<T>,
     present: bool,
     role: LayerRole,
+    untrusted_baseline: Option<T>,
     field: &str,
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
@@ -458,16 +487,28 @@ fn merge_optional_min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
     if !present {
         return;
     }
-    match (*trusted, incoming) {
-        (None, Some(value)) => *trusted = Some(value),
-        (Some(mut current), Some(value)) => {
+    // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
+    // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
+    // daher auch keine Warnung.
+    let Some(value) = incoming else {
+        return;
+    };
+    match *trusted {
+        Some(mut current) => {
             min_bound(&mut current, value, true, role, field, layer_path, out);
             *trusted = Some(current);
         }
-        // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
-        // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
-        // daher auch keine Warnung.
-        (_, None) => {}
+        None => match (role, untrusted_baseline) {
+            (LayerRole::UntrustedProject, Some(baseline)) => {
+                if value != T::default() && value <= baseline {
+                    *trusted = Some(value);
+                } else {
+                    let diagnostic = ScopeDiagnostic::new(field, layer_path, &value);
+                    reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+                }
+            }
+            _ => *trusted = Some(value),
+        },
     }
 }
 
@@ -528,12 +569,20 @@ fn or_bool(
 }
 
 // Wie `or_bool`, aber fuer `Option<bool>` (`guards.enabled`) — s.
-// `merge_optional_min_bound`.
+// `merge_optional_min_bound`: ein vertrauter Layer uebernimmt den ersten
+// Wert ohne Vergleich, der nicht vertraute Projekt-Layer darf ohne
+// vertrauten Wert nur `true` setzen oder die Vorgabe `untrusted_baseline`
+// wiederholen (abschalten ist nur erlaubt, wenn schon die Vorgabe `false`
+// ist).
+// Gleiche Begruendung wie bei `merge_optional_min_bound`:
+// `untrusted_baseline` kommt zu den 7 gemeinsamen Merge-Kontext-Parametern.
+#[allow(clippy::too_many_arguments)]
 fn merge_optional_or_bool(
     trusted: &mut Option<bool>,
     incoming: Option<bool>,
     present: bool,
     role: LayerRole,
+    untrusted_baseline: bool,
     field: &str,
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
@@ -541,16 +590,26 @@ fn merge_optional_or_bool(
     if !present {
         return;
     }
-    match (*trusted, incoming) {
-        (None, Some(value)) => *trusted = Some(value),
-        (Some(mut current), Some(value)) => {
+    // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
+    // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
+    // daher auch keine Warnung.
+    let Some(value) = incoming else {
+        return;
+    };
+    match *trusted {
+        Some(mut current) => {
             or_bool(&mut current, value, true, role, field, layer_path, out);
             *trusted = Some(current);
         }
-        // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
-        // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
-        // daher auch keine Warnung.
-        (_, None) => {}
+        None if role == LayerRole::UntrustedProject => {
+            if value || !untrusted_baseline {
+                *trusted = Some(value);
+            } else {
+                let diagnostic = ScopeDiagnostic::new(field, layer_path, &value);
+                reject(out, diagnostic, role, RejectionReason::OrBoolDisable);
+            }
+        }
+        None => *trusted = Some(value),
     }
 }
 
@@ -608,9 +667,14 @@ fn stricter_of(
 }
 
 // Wie `stricter_of`, aber fuer `Option<String>` (`permissions.default_mode`)
-// — s. `merge_optional_min_bound`.
-// Gleiche Begruendung wie bei `stricter_of` oben: `ordering` kommt zu den
-// 7 gemeinsamen Merge-Kontext-Parametern hinzu, nur eine Aufrufstelle.
+// — s. `merge_optional_min_bound`: ein vertrauter Layer uebernimmt den
+// ersten Wert ohne Vergleich, der nicht vertraute Projekt-Layer wird ohne
+// vertrauten Wert gegen `untrusted_baseline` eingeordnet (nur gleich streng
+// oder strenger wird uebernommen; ein Wert ausserhalb der Ordnung nur, wenn
+// er der Vorgabe gleicht — R1-Fallback wie in `stricter_of`).
+// Gleiche Begruendung wie bei `stricter_of` oben: `ordering` und
+// `untrusted_baseline` kommen zu den 7 gemeinsamen Merge-Kontext-Parametern
+// hinzu, nur eine Aufrufstelle.
 #[allow(clippy::too_many_arguments)]
 fn merge_optional_stricter_of(
     trusted: &mut Option<String>,
@@ -618,6 +682,7 @@ fn merge_optional_stricter_of(
     present: bool,
     role: LayerRole,
     ordering: &[&str],
+    untrusted_baseline: &str,
     field: &str,
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
@@ -625,9 +690,14 @@ fn merge_optional_stricter_of(
     if !present {
         return;
     }
-    match (trusted.clone(), incoming) {
-        (None, Some(value)) => *trusted = Some(value),
-        (Some(mut current), Some(value)) => {
+    // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
+    // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
+    // daher auch keine Warnung.
+    let Some(value) = incoming else {
+        return;
+    };
+    match trusted.clone() {
+        Some(mut current) => {
             stricter_of(
                 &mut current,
                 value,
@@ -640,10 +710,27 @@ fn merge_optional_stricter_of(
             );
             *trusted = Some(current);
         }
-        // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
-        // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
-        // daher auch keine Warnung.
-        (_, None) => {}
+        None if role == LayerRole::UntrustedProject => {
+            let base = ordering.iter().position(|v| *v == untrusted_baseline);
+            let rank = ordering.iter().position(|v| *v == value.as_str());
+            match (base, rank) {
+                (Some(b), Some(i)) if i <= b => *trusted = Some(value),
+                (Some(_), Some(_)) => {
+                    let diagnostic = ScopeDiagnostic::new(field, layer_path, &value);
+                    reject(out, diagnostic, role, RejectionReason::LessStrictValue);
+                }
+                _ => {
+                    // Mindestens einer der beiden Werte liegt ausserhalb der
+                    // Ordnung — R1-Fallback: jede Abweichung von der Vorgabe
+                    // wird abgelehnt, `trusted` bleibt `None`.
+                    if value != untrusted_baseline {
+                        let diagnostic = ScopeDiagnostic::new(field, layer_path, &value);
+                        reject(out, diagnostic, role, RejectionReason::UnorderedValue);
+                    }
+                }
+            }
+        }
+        None => *trusted = Some(value),
     }
 }
 
@@ -1259,26 +1346,32 @@ fn merge_permissions(
         present("default_mode"),
         role,
         PERMISSIONS_DEFAULT_MODE_ORDER,
+        UNTRUSTED_BASELINE_DEFAULT_MODE,
         "permissions.default_mode",
         layer_path,
         out,
     );
+    // Keine Vorgabe (`None`): sie liegt in harw-runtime, und eine laengere
+    // Wartezeit verleiht keine Befugnis.
     merge_optional_min_bound(
         &mut trusted.permissions.approval_timeout_secs,
         incoming.approval_timeout_secs,
         present("approval_timeout_secs"),
         role,
+        None,
         "permissions.approval_timeout_secs",
         layer_path,
         out,
     );
     // Runde 7, Teil L4: Klassifizierer-Zeitlimit; wie das Freigabe-Zeitlimit
-    // darf eine spätere Ebene nur verkürzen.
+    // darf eine spätere Ebene nur verkürzen. Keine Vorgabe (`None`), aus
+    // demselben Grund wie beim Freigabe-Zeitlimit.
     merge_optional_min_bound(
         &mut trusted.permissions.auto_classifier_timeout_secs,
         incoming.auto_classifier_timeout_secs,
         present("auto_classifier_timeout_secs"),
         role,
+        None,
         "permissions.auto_classifier_timeout_secs",
         layer_path,
         out,
@@ -1429,11 +1522,14 @@ fn merge_compaction(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
+    // Keine Vorgabe (`None`): sie liegt in harw-core, und das Feld ist nur
+    // eine Kostengrenze, keine Befugnis.
     merge_optional_min_bound(
         &mut trusted.compaction.absolute_ceiling_tokens,
         incoming.absolute_ceiling_tokens,
         field_present(raw, &["compaction", "absolute_ceiling_tokens"]),
         role,
+        None,
         "compaction.absolute_ceiling_tokens",
         layer_path,
         out,
@@ -1519,11 +1615,12 @@ fn merge_dream(
 // `[host]` (Abschnitt 1.19, Runde 5 Teil B) — `sudo_session_minutes` ist
 // `MinBound` (global): nur der Home-Layer setzt frei; jeder spaetere Layer
 // (Profil wie nicht vertrautes Projekt) kann die Merkfrist nur verkuerzen.
-// Anders als `merge_optional_min_bound` gilt ein ungesetzter Home-Wert hier
-// als Vorgabe (`DEFAULT_SUDO_SESSION_MINUTES`) — ein spaeterer Layer kann
-// die Frist also auch dann nicht ueber die Vorgabe hinaus verlaengern
-// (fail-closed fuer ein Geheimnis im Speicher). `0` (kein Sitzungs-Merken)
-// ist als Verkuerzung immer erlaubt.
+// Ein ungesetzter Home-Wert gilt als Vorgabe (`DEFAULT_SUDO_SESSION_MINUTES`).
+// Anders als bei `merge_optional_min_bound` bindet diese Vorgabe hier nicht
+// nur das nicht vertraute Projekt, sondern auch ein vertrautes Profil
+// (`Refinement`) — ein spaeterer Layer kann die Frist also auch dann nicht
+// ueber die Vorgabe hinaus verlaengern (fail-closed fuer ein Geheimnis im
+// Speicher). `0` (kein Sitzungs-Merken) ist als Verkuerzung immer erlaubt.
 fn merge_host(
     trusted: &mut HarnessConfig,
     incoming: HostToml,
@@ -1742,8 +1839,10 @@ fn merge_reasoning(
     );
 }
 
-// `[guards]` (Abschnitt 1.16) — `enabled` `OrBool`, die uebrigen fuenf
-// `MinBound`, alle als `Option<T>` (Laufzeit-Default liegt beim Consumer).
+// `[guards]` (Abschnitt 1.16) — `enabled` `OrBool`, die uebrigen `MinBound`,
+// alle als `Option<T>` (Laufzeit-Default liegt beim Consumer). Ein nicht
+// vertrautes Projekt ohne vertrauten Wert wird gegen die gespiegelte
+// Laufzeit-Vorgabe (`UNTRUSTED_BASELINE_*`) verglichen.
 fn merge_guards(
     trusted: &mut HarnessConfig,
     incoming: GuardsToml,
@@ -1758,6 +1857,7 @@ fn merge_guards(
         incoming.enabled,
         present("enabled"),
         role,
+        UNTRUSTED_BASELINE_GUARDS_ENABLED,
         "guards.enabled",
         layer_path,
         out,
@@ -1767,6 +1867,7 @@ fn merge_guards(
         incoming.repeated_failure_warn,
         present("repeated_failure_warn"),
         role,
+        Some(UNTRUSTED_BASELINE_REPEATED_FAILURE_WARN),
         "guards.repeated_failure_warn",
         layer_path,
         out,
@@ -1776,6 +1877,7 @@ fn merge_guards(
         incoming.repeated_failure_abort,
         present("repeated_failure_abort"),
         role,
+        Some(UNTRUSTED_BASELINE_REPEATED_FAILURE_ABORT),
         "guards.repeated_failure_abort",
         layer_path,
         out,
@@ -1785,6 +1887,7 @@ fn merge_guards(
         incoming.no_progress_rounds_warn,
         present("no_progress_rounds_warn"),
         role,
+        Some(UNTRUSTED_BASELINE_NO_PROGRESS_ROUNDS_WARN),
         "guards.no_progress_rounds_warn",
         layer_path,
         out,
@@ -1794,6 +1897,7 @@ fn merge_guards(
         incoming.no_progress_rounds_abort,
         present("no_progress_rounds_abort"),
         role,
+        Some(UNTRUSTED_BASELINE_NO_PROGRESS_ROUNDS_ABORT),
         "guards.no_progress_rounds_abort",
         layer_path,
         out,
@@ -1803,6 +1907,7 @@ fn merge_guards(
         incoming.plan_stale_rounds,
         present("plan_stale_rounds"),
         role,
+        Some(UNTRUSTED_BASELINE_PLAN_STALE_ROUNDS),
         "guards.plan_stale_rounds",
         layer_path,
         out,
@@ -1813,6 +1918,7 @@ fn merge_guards(
         incoming.orchestrator_read_warn,
         present("orchestrator_read_warn"),
         role,
+        Some(UNTRUSTED_BASELINE_ORCHESTRATOR_READ_WARN),
         "guards.orchestrator_read_warn",
         layer_path,
         out,
@@ -1822,6 +1928,7 @@ fn merge_guards(
         incoming.orchestrator_read_limit,
         present("orchestrator_read_limit"),
         role,
+        Some(UNTRUSTED_BASELINE_ORCHESTRATOR_READ_LIMIT),
         "guards.orchestrator_read_limit",
         layer_path,
         out,
@@ -1867,23 +1974,8 @@ fn merge_guards(
 /// # Concurrency
 /// Rein synchron, keine gemeinsam genutzten Zustände.
 ///
-/// # Examples
-/// ```rust,no_run
-/// use harw_config::{merge_layer_into, HarnessConfig, LayerRole};
-/// use std::path::Path;
-///
-/// let mut trusted = HarnessConfig::default();
-/// let incoming = HarnessConfig::default();
-/// let raw: toml::Value = toml::from_str("").unwrap();
-/// let _diagnostics = merge_layer_into(
-///     &mut trusted,
-///     incoming,
-///     &raw,
-///     LayerRole::Refinement,
-///     Path::new("/home/user/.harw/profiles/default/config.toml"),
-/// );
-/// ```
-pub fn merge_layer_into(
+/// Crate-intern; von außen ist `merge_layer_toml_into` der Einstieg.
+pub(crate) fn merge_layer_into(
     trusted: &mut HarnessConfig,
     incoming: HarnessConfig,
     raw: &toml::Value,
@@ -1956,6 +2048,62 @@ pub fn merge_layer_into(
     }
 
     out
+}
+
+/// Test-/Tooling-Einstieg in die Merge-Engine ohne Fremdtyp in der
+/// Signatur: wie `merge_layer_into`, nimmt das rohe TOML dieses Layers aber
+/// als `&str` statt als `toml::Value`.
+///
+/// # Description
+/// Parst `raw_toml` selbst und nutzt das Ergebnis ausschließlich für die
+/// Präsenzprüfungen je Feld. `incoming` wird so übernommen, wie es
+/// übergeben wird (es wird nicht aus `raw_toml` neu deserialisiert); der
+/// Aufrufer ist dafür verantwortlich, dass beide zum selben Layer gehören.
+///
+/// # Arguments
+/// - `trusted` (`&mut HarnessConfig`): der bisher akkumulierte Stand.
+/// - `incoming` (`HarnessConfig`): die deserialisierte `HarnessConfig`
+///   dieses Layers.
+/// - `raw_toml` (`&str`): der rohe TOML-Text dieses Layers.
+/// - `role` (`LayerRole`): Baseline/Refinement/UntrustedProject.
+/// - `layer_path` (`&Path`): Pfad der `config.toml` dieses Layers, für
+///   `ScopeDiagnostic::file`.
+///
+/// # Returns
+/// Jede `ScopeDiagnostic` eines abgelehnten Lockerungsversuchs, wie
+/// `merge_layer_into`.
+///
+/// # Errors
+/// `ConfigError::TomlParse`, wenn `raw_toml` kein gültiges TOML ist; `trusted`
+/// bleibt dann unverändert.
+///
+/// # Examples
+/// ```rust
+/// use harw_config::{merge_layer_toml_into, HarnessConfig, LayerRole};
+/// use std::path::Path;
+///
+/// let mut trusted = HarnessConfig::default();
+/// let diagnostics = merge_layer_toml_into(
+///     &mut trusted,
+///     HarnessConfig::default(),
+///     "",
+///     LayerRole::Baseline,
+///     Path::new("/home/user/.harw/config.toml"),
+/// )?;
+/// assert!(diagnostics.is_empty());
+/// # Ok::<(), harw_config::ConfigError>(())
+/// ```
+#[doc(hidden)]
+pub fn merge_layer_toml_into(
+    trusted: &mut HarnessConfig,
+    incoming: HarnessConfig,
+    raw_toml: &str,
+    role: LayerRole,
+    layer_path: &Path,
+) -> ConfigResult<Vec<ScopeDiagnostic>> {
+    let raw: toml::Value =
+        toml::from_str(raw_toml).map_err(|e| ConfigError::TomlParse(e.to_string()))?;
+    Ok(merge_layer_into(trusted, incoming, &raw, role, layer_path))
 }
 
 #[cfg(test)]
@@ -2771,6 +2919,140 @@ mod tests {
         assert!(trusted.mcp_listener.enabled);
         assert_eq!(trusted.guards.repeated_failure_warn, Some(9));
         assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    // Befund M1: ohne vertrauten Wert wird ein nicht vertrautes Projekt
+    // gegen die gespiegelte Laufzeit-Vorgabe verglichen — `full`, das
+    // Abschalten der Waechter, der Sentinel `0` und eine hoehere Schwelle
+    // werden abgelehnt und bleiben `None`.
+    #[test]
+    fn test_untrusted_project_cannot_loosen_unset_permissions_and_guards() -> TestResult {
+        let src = "[permissions]\ndefault_mode = \"full\"\n[guards]\nenabled = false\n\
+                   orchestrator_read_limit = 0\nrepeated_failure_abort = 999";
+        let incoming: HarnessConfig = toml::from_str(src).map_err(ctx("parse layer"))?;
+        let raw = raw_from(src)?;
+        let mut trusted = HarnessConfig::default();
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            incoming,
+            &raw,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.permissions.default_mode, None);
+        assert_eq!(trusted.guards.enabled, None);
+        assert_eq!(trusted.guards.orchestrator_read_limit, None);
+        assert_eq!(trusted.guards.repeated_failure_abort, None);
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+        for field in [
+            "permissions.default_mode",
+            "guards.enabled",
+            "guards.orchestrator_read_limit",
+            "guards.repeated_failure_abort",
+        ] {
+            assert!(
+                diagnostics.iter().any(|d| d.field == field),
+                "{field} fehlt in {diagnostics:?}"
+            );
+        }
+        Ok(())
+    }
+
+    // Befund M1, Gegenprobe: gleich streng oder strenger als die Vorgabe
+    // bleibt fuer das nicht vertraute Projekt erlaubt; ein Wert ausserhalb
+    // der Ordnung (R1) nicht.
+    #[test]
+    fn test_untrusted_project_may_tighten_unset_permissions_and_guards() -> TestResult {
+        for mode in ["ask", "auto"] {
+            let src = format!("[permissions]\ndefault_mode = \"{mode}\"");
+            let mut fresh = HarnessConfig::default();
+            let diagnostics = merge_layer_into(
+                &mut fresh,
+                toml::from_str(&src).map_err(ctx("parse mode"))?,
+                &raw_from(&src)?,
+                LayerRole::UntrustedProject,
+                &layer_path(),
+            );
+            assert_eq!(fresh.permissions.default_mode.as_deref(), Some(mode));
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.field == "permissions.default_mode"),
+                "{mode}: {diagnostics:?}"
+            );
+        }
+
+        let guards = "[guards]\nenabled = true\nrepeated_failure_warn = 1\n\
+                      repeated_failure_abort = 3\norchestrator_read_limit = 2";
+        let mut fresh = HarnessConfig::default();
+        let diagnostics = merge_layer_into(
+            &mut fresh,
+            toml::from_str(guards).map_err(ctx("parse guards"))?,
+            &raw_from(guards)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(fresh.guards.enabled, Some(true));
+        assert_eq!(fresh.guards.repeated_failure_warn, Some(1));
+        assert_eq!(fresh.guards.repeated_failure_abort, Some(3));
+        assert_eq!(fresh.guards.orchestrator_read_limit, Some(2));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let unordered = "[permissions]\ndefault_mode = \"yolo\"";
+        let mut fresh = HarnessConfig::default();
+        let diagnostics = merge_layer_into(
+            &mut fresh,
+            toml::from_str(unordered).map_err(ctx("parse unordered"))?,
+            &raw_from(unordered)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(fresh.permissions.default_mode, None);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.field == "permissions.default_mode"),
+            "{diagnostics:?}"
+        );
+        Ok(())
+    }
+
+    // Befund M1: vertraute Layer bleiben unveraendert — ein Profil setzt
+    // einen ungesetzten Wert weiter frei, auch lockerer als die Vorgabe.
+    #[test]
+    fn test_trusted_refinement_still_sets_unset_permissions_and_guards_freely() -> TestResult {
+        let src = "[permissions]\ndefault_mode = \"full\"\n[guards]\nenabled = false";
+        let mut trusted = HarnessConfig::default();
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(src).map_err(ctx("parse layer"))?,
+            &raw_from(src)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.permissions.default_mode.as_deref(), Some("full"));
+        assert_eq!(trusted.guards.enabled, Some(false));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        Ok(())
+    }
+
+    // Befund M1: Felder ohne gespiegelte Vorgabe (`untrusted_baseline ==
+    // None`) behalten das bisherige Verhalten — der erste Wert wird auch vom
+    // nicht vertrauten Projekt uebernommen.
+    #[test]
+    fn test_untrusted_project_unset_timeouts_keep_previous_behaviour() -> TestResult {
+        let src = "[permissions]\napproval_timeout_secs = 60";
+        let mut trusted = HarnessConfig::default();
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(src).map_err(ctx("parse layer"))?,
+            &raw_from(src)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.permissions.approval_timeout_secs, Some(60));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         Ok(())
     }
 }

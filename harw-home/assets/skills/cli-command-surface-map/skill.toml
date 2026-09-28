@@ -1,0 +1,4 @@
+name = "cli-command-surface-map"
+description = "Use when a Harw command name is ambiguous across the process CLI, TUI/slash commands, model tools, Operations, or service/control entrypoints, or when mapping parity between those surfaces. Build a provenance map from user-visible spelling to parser/catalog source, handler, runtime surface, authority, state and output. Same spelling never proves same semantics."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

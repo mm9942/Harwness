@@ -10,6 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.23.1"
+# OS-Advisory-Lock (unter Unix flock) für den Codex-Refresh-Lock; ersetzt die
+# Nonce-/Stale-Heuristik (Gap-Hunt-Muster M8). std::fs::File::try_lock gibt es
+# erst ab Rust 1.89, MSRV ist 1.85.
+fs4 = { workspace = true }
 harw-config = { path = "../harw-config" }
 rand = "0.10.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

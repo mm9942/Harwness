@@ -1,0 +1,125 @@
+{
+ "schema": 1,
+ "wave": "contract-b",
+ "branch": "claude/r16/contract-b",
+ "base_sha": "1ad90219d83aa305f5bfe2ca531a30b5ab41a829",
+ "head_sha": "f5fde8260a509d4d50327edf5f36a7b7130bcb3a",
+ "files": [
+  "Cargo.lock",
+  "docs/design/crates-inventory.md",
+  "dod/crates/harw-dod-escalate/src/freeze_ops.rs",
+  "dod/crates/harw-dod-escalate/src/lib.rs",
+  "harw-agent-artifact/src/embed.rs",
+  "harw-agent-compiler/src/commands.rs",
+  "harw-channel-telegram-transport/Cargo.toml",
+  "harw-channel-telegram-transport/src/render.rs",
+  "harw-tool-plan/Cargo.toml",
+  "harw-tool-plan/src/plan_file.rs",
+  "harw-tool-web/src/fetch.rs",
+  "harw-tool-web/src/open_web.rs"
+ ],
+ "findings": [
+  {
+   "id": "F-133fd8e66405",
+   "cluster": "c29",
+   "file": "harw-channel-telegram-transport/Cargo.toml",
+   "line": 22,
+   "severity": "low",
+   "pattern": "NEW:unused-dependency",
+   "title": "Unused dependencies secrecy_08 and backon"
+  },
+  {
+   "id": "F-86f43060054f",
+   "cluster": "c32",
+   "file": "harw-agent-compiler/src/commands.rs",
+   "line": 565,
+   "severity": "low",
+   "pattern": "NEW:insecure-temp-exec",
+   "title": "`harw agent run <file.harwa>` writes and executes a binary at a predictable path in the shared temp dir, without O_EXCL/O_NOFOLLOW"
+  },
+  {
+   "id": "F-8a610562af64",
+   "cluster": "c25",
+   "file": "harw-tool-web/src/fetch.rs",
+   "line": 1224,
+   "severity": "medium",
+   "pattern": "M1",
+   "title": "Open research web: redirects reach any public domain without the per-domain approval"
+  },
+  {
+   "id": "F-c475ef0f87c0",
+   "cluster": "c36",
+   "file": "harw-tool-plan/src/plan_file.rs",
+   "line": 389,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "PlanDir::read checks with symlink_metadata but then reads with read_to_string, which follows symlinks and has no size limit"
+  },
+  {
+   "id": "F-d3210dd87ba0",
+   "cluster": "c12",
+   "file": "harw-channel-telegram-transport/src/render.rs",
+   "line": 354,
+   "severity": "high",
+   "pattern": "M2",
+   "title": "A turn approval sent right after streamed text fails the local per-chat token bucket and is auto-rejected"
+  },
+  {
+   "id": "F-febce9bd3e3b",
+   "cluster": "c22",
+   "file": "dod/crates/harw-dod-escalate/src/freeze_ops.rs",
+   "line": 211,
+   "severity": "medium",
+   "pattern": "M1",
+   "title": "authorize_release durably marks a freeze 'Lifted' before authorization, so a refused release leaves the cgroup frozen but untracked"
+  }
+ ],
+ "workflow_runs": [
+  "wf_d0309caf-21e"
+ ],
+ "disposition": {
+  "clusters": [
+   {
+    "id": "c22",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c12",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c29",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c25",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c32",
+    "status": "repaired",
+    "reason": null
+   },
+   {
+    "id": "c36",
+    "status": "repaired",
+    "reason": null
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Backfilled after the merge (kit-4); the wave predates the manifest. c32 and c36 were re-reviewed by separate Opus agents after their repairs (ok); harw-agent-compiler/src/testing.rs moved to wave r16-w7, which owns that file."
+}

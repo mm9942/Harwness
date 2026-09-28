@@ -59,11 +59,14 @@
 //! Routenentscheidung trifft [`crate::router::decide_resolved_route`];
 //! scheitert die Auflösung, trägt die `403` den Grund
 //! [`crate::identity::IdentityError::code`]. Bei `Execute` fädelt
+//! [`scoped_context`] über
 //! [`crate::identity::ResolvedPeer::scope_op_context`] Mandant und
-//! Kontextzusammenfassung in den `OpContext` — nie aus dem Rumpf. Für
-//! unbekannte Pfade und falsche Methoden (`404`/`405`) wird keine Identität
-//! aufgelöst: dort gibt es nichts zu autorisieren, und ein Hub-Aufruf wäre
-//! reine Last.
+//! Kontextzusammenfassung in den `OpContext` — nie aus dem Rumpf. Fehlt die
+//! aufgelöste Identität, lehnt [`scoped_context`] mit `403` ab (R15/M1:
+//! Rückfallpfade lehnen ab), statt den `OpContext` ungeschützt
+//! (mandantenübergreifend) durchzureichen. Für unbekannte Pfade und falsche
+//! Methoden (`404`/`405`) wird keine Identität aufgelöst: dort gibt es
+//! nichts zu autorisieren, und ein Hub-Aufruf wäre reine Last.
 //!
 //! # Zwei Wege zum Listener
 //! [`BoundWebServer::bind`] bindet einen Pfad selbst (siehe
@@ -713,10 +716,13 @@ async fn handle(
             };
             let ctx = (context_factory)(&peer, caller_tier);
             // Mandant und Kontextzusammenfassung kommen ausschließlich aus der
-            // aufgelösten Identität (H12), nie aus Rumpf oder Headern.
-            let ctx = match resolved {
-                Some(resolved) => resolved.scope_op_context(ctx),
-                None => ctx,
+            // aufgelösten Identität (H12), nie aus Rumpf oder Headern. Ohne
+            // aufgelöste Identität gibt es nichts, worauf sich die Sicht
+            // einschränken ließe — R15/M1 verlangt, dann abzulehnen statt
+            // ungeschützt (mandantenübergreifend) auszuführen.
+            let ctx = match scoped_context(resolved, ctx) {
+                Ok(ctx) => ctx,
+                Err(response) => return Ok(response),
             };
             let operation_name = route.operation_name().to_owned();
             let result = route.invoke(&ctx, args).await;
@@ -753,6 +759,37 @@ async fn resolve_identity(
 ) -> Result<ResolvedPeer, IdentityError> {
     let presented = presented_context(headers)?;
     identity.resolve(peer, presented).await
+}
+
+/// Schränkt den `OpContext` einer freigegebenen Ausführung auf die
+/// aufgelöste Identität ein — oder lehnt ab, wenn keine vorliegt.
+///
+/// # Description
+/// Mandant und Kontextzusammenfassung kommen ausschließlich aus
+/// [`ResolvedPeer::scope_op_context`] (H12), nie aus Rumpf oder Headern.
+/// [`decide_resolved_route`] liefert `Execute` heute nur, wenn die Identität
+/// aufgelöst wurde — `resolved` ist hier also stets `Some`. Diese Funktion
+/// behandelt `None` trotzdem explizit als Ablehnung, damit eine künftige
+/// Änderung der Entscheidungslogik (z. B. ein Wechsel auf `decide_route`)
+/// nie versehentlich einen ungeschützten, mandantenübergreifenden
+/// `OpContext` erzeugt (R15/M1: Rückfallpfade lehnen ab, statt weiter
+/// auszuführen).
+///
+/// # Errors
+/// `403` mit [`ForbiddenReason::UnknownPeer`], wenn `resolved` `None` ist.
+// Wie bei `read_json_body`: der Fehlerfall ist die fertige `WebResponse`, die
+// der Aufrufer unverändert zurückgibt; sie lebt nur einen Request lang.
+#[allow(clippy::result_large_err)]
+fn scoped_context(
+    resolved: Option<&ResolvedPeer>,
+    ctx: OpContext,
+) -> Result<OpContext, WebResponse> {
+    match resolved {
+        Some(resolved) => Ok(resolved.scope_op_context(ctx)),
+        None => Err(forbidden_response(forbidden_reason_str(
+            ForbiddenReason::UnknownPeer,
+        ))),
+    }
 }
 
 /// `403` mit stabilem Grund.
@@ -1038,7 +1075,8 @@ mod tests {
         ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX, BoundWebServer, HEADER_READ_TIMEOUT,
         MAX_BODY_BYTES, WebContextFactory, WebServerConfig, accept_backoff, bind_unix_listener,
         forbidden_reason_str, http_connection_builder, is_fatal_accept_error, json_response,
-        method_not_allowed_response, op_result_response, read_json_body, status_for_op_error,
+        method_not_allowed_response, op_result_response, read_json_body, scoped_context,
+        status_for_op_error,
     };
     use crate::authz::StaticUidTierMap;
     use crate::error::WebError;
@@ -1193,6 +1231,77 @@ mod tests {
             forbidden_reason_str(ForbiddenReason::UnknownPeer),
             forbidden_reason_str(ForbiddenReason::InsufficientTier)
         );
+    }
+
+    /// Baut einen echten `OpContext` über eine reale, kanonisierte
+    /// `WorkspaceBinding` in `dir` — derselbe Weg wie
+    /// `harw-web/tests/identity_routes.rs`, da `OpContext::new` (siehe
+    /// `harw-operations/src/context.rs`) eine echte `SandboxSpec` verlangt
+    /// und `harw-authority` dafür bereits Testabhängigkeit dieser Crate ist
+    /// (siehe `harw-web/Cargo.toml`). Der konkrete Mandant der Sandbox spielt
+    /// für [`scoped_context`] keine Rolle — er wird von dessen `None`-Zweig
+    /// nie gelesen.
+    fn dummy_op_context(dir: &Path) -> TestResult<OpContext> {
+        use harw_authority::{
+            PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+        };
+        use harw_operations::context::ServiceMap;
+        use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+
+        std::fs::create_dir_all(dir.join("ws")).map_err(ctx("Workspace-Verzeichnis anlegbar"))?;
+        let tenant = TenantId::try_from_str("t").map_err(ctx("Sandbox-Mandant"))?;
+        let workspace = WorkspaceId::try_from_str("w").map_err(ctx("Workspace-Id"))?;
+        let registry = WorkspaceRegistry::build(
+            dir,
+            [WorkspaceRegistration {
+                tenant: tenant.clone(),
+                workspace: workspace.clone(),
+                root: std::path::PathBuf::from("ws"),
+            }],
+        )
+        .map_err(ctx("WorkspaceRegistry baubar"))?;
+        let binding = registry
+            .resolve(&tenant, &workspace)
+            .map_err(ctx("Workspace auflösbar"))?;
+        let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
+        Ok(OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            sandbox,
+            ServiceMap::new(),
+        ))
+    }
+
+    // R15/M1: ohne aufgelöste Identität lehnt `scoped_context` ab, statt den
+    // `OpContext` ungeschützt (mandantenübergreifend) durchzureichen — auch
+    // wenn `decide_resolved_route` diesen Zweig heute nie mit `Execute`
+    // erreicht (siehe `scoped_context`-Doku).
+    #[tokio::test]
+    async fn test_scoped_context_without_resolved_identity_is_forbidden() -> TestResult {
+        use http_body_util::BodyExt;
+
+        let dir = socket_tempdir()?;
+        let op_ctx = dummy_op_context(dir.path())?;
+
+        let response = match scoped_context(None, op_ctx) {
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "scoped_context ohne aufgelöste Identität sollte ablehnen".to_owned(),
+                ));
+            }
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(ctx("Rumpf sollte sich sammeln lassen"))?
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(ctx("JSON sollte sich dekodieren lassen"))?;
+        assert_eq!(body["reason"], serde_json::json!("unknown_peer"));
+        Ok(())
     }
 
     #[test]

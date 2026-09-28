@@ -47,7 +47,7 @@ Errors: `{"error":{"code":"…","message":"…"}}` with codes `not_found`,
 `method_not_allowed`, `peer_not_allowed`, `invalid_json`, `invalid_request`,
 `body_too_large`, `unsupported_media_type`, `body_timeout`, `node_exists`,
 `node_not_found`, `invalid_transition` (409), `unknown_zone`,
-`capacity_exhausted`, `internal`.
+`capacity_exhausted`, `durability_unconfirmed` (500), `internal`.
 
 Register example:
 
@@ -81,10 +81,15 @@ conflicts, not no-ops.
 
 `<state_dir>/state.json` (default `/var/lib/harw-netsec`), mode `0600`, plus
 `state.lock` (single-writer lock). Every mutation is applied to a copy,
-written to a temp file, `fsync`ed, renamed over `state.json`, and the
-directory is `fsync`ed; only then does the in-memory state change. A corrupt,
-oversized, symlinked, unknown-field or inconsistent state file stops the
-daemon at start-up — topology is never silently reset.
+written to a temp file, `fsync`ed, and renamed over `state.json`; that
+rename is the commit point. The in-memory state is updated right after the
+rename succeeds, before the containing directory is `fsync`ed. A failed
+directory `fsync` is still reported as an error — the API answers
+`500 durability_unconfirmed` — but the write already happened on disk and is
+not rolled back from memory. Check the resource before retrying: a retry of
+the same mutation is a conflict (`node_exists` / `invalid_transition`), not a
+no-op. A corrupt, oversized, symlinked, unknown-field or inconsistent state
+file stops the daemon at start-up — topology is never silently reset.
 
 ## Configuration
 

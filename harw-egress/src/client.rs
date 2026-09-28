@@ -4,7 +4,7 @@
 //! [`build_client`] liefert einen `reqwest::Client`, der
 //! - Namen über einen eigenen [`reqwest::dns::Resolve`] auflöst, der zuerst
 //!   den Host gegen die Allowlist prüft und danach **jede** aufgelöste Adresse
-//!   per [`EgressPolicy::check_addr`] filtert. `reqwest`/`hyper-util`
+//!   per [`EgressPolicy::check_resolved`] filtert. `reqwest`/`hyper-util`
 //!   verbinden sich ausschließlich mit den zurückgegebenen Adressen; eine
 //!   zweite Auflösung zwischen Prüfung und Verbindung gibt es nicht.
 //! - keine Proxys nutzt (`no_proxy()`: weder konfigurierte noch
@@ -76,7 +76,7 @@ impl HostLookup for SystemLookup {
 /// `dns_resolver(Arc<ScopedResolver>)`, `no_proxy()`,
 /// `redirect(Policy::none())` und einem Verbindungs-Timeout von 10 s. Der
 /// Resolver lehnt Namen außerhalb der Allowlist ab und gibt nur Adressen
-/// zurück, die [`EgressPolicy::check_addr`] besteht; bleibt keine übrig,
+/// zurück, die [`EgressPolicy::check_resolved`] besteht; bleibt keine übrig,
 /// scheitert die Anfrage mit [`EgressError::NoPermittedAddress`] in der
 /// `source()`-Kette des `reqwest::Error`.
 ///
@@ -163,8 +163,8 @@ fn boxed(err: EgressError) -> BoxError {
 // Liefert die zulässigen Adressen in Auflösungsreihenfolge. Verworfene
 // Adressen werden mit ihrer Klasse geloggt; bleibt keine Adresse übrig (auch
 // bei leerer Auflösung), ist das Ergebnis `NoPermittedAddress` mit allen
-// verworfenen Adressen. Netzfrei und synchron, damit Resolver und künftiger
-// SOCKS5-Proxy (N-EGRESS) dieselbe Regel nutzen.
+// verworfenen Adressen. Netzfrei und synchron, damit Resolver und
+// SOCKS5-Proxy (`proxy.rs`) dieselbe Regel nutzen.
 pub(crate) fn filter_resolved<I>(
     policy: &EgressPolicy,
     host: &str,

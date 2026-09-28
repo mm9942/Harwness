@@ -546,9 +546,11 @@ mod tests {
             0,
             &"x".repeat(DREAM_CONTEXT_MAX_BYTES),
         )?;
-        assert!(build_recent_dream_context(bytes.path())
-            .map_err(ctx("dream context"))?
-            .is_empty());
+        assert!(
+            build_recent_dream_context(bytes.path())
+                .map_err(ctx("dream context"))?
+                .is_empty()
+        );
 
         let provenance = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let expected = SessionId::from_str("expected-session");

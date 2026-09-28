@@ -23,9 +23,13 @@
 //! ```rust
 //! use harw_egress::{AddrClass, classify};
 //!
-//! assert_eq!(classify("169.254.169.254".parse().unwrap()), AddrClass::CloudMetadata);
-//! assert_eq!(classify("::ffff:10.0.0.1".parse().unwrap()), AddrClass::Private);
-//! assert_eq!(classify("8.8.8.8".parse().unwrap()), AddrClass::Public);
+//! let metadata: std::net::IpAddr = "169.254.169.254".parse()?;
+//! let mapped: std::net::IpAddr = "::ffff:10.0.0.1".parse()?;
+//! let public: std::net::IpAddr = "8.8.8.8".parse()?;
+//! assert_eq!(classify(metadata), AddrClass::CloudMetadata);
+//! assert_eq!(classify(mapped), AddrClass::Private);
+//! assert_eq!(classify(public), AddrClass::Public);
+//! # Ok::<(), std::net::AddrParseError>(())
 //! ```
 
 use std::fmt;
@@ -136,8 +140,11 @@ impl fmt::Display for AddrClass {
 /// ```rust
 /// use harw_egress::{AddrClass, classify};
 ///
-/// assert_eq!(classify("64:ff9b::7f00:1".parse().unwrap()), AddrClass::Loopback);
-/// assert_eq!(classify("2002:a00:1::".parse().unwrap()), AddrClass::Reserved);
+/// let nat64: std::net::IpAddr = "64:ff9b::7f00:1".parse()?;
+/// let sixtofour: std::net::IpAddr = "2002:a00:1::".parse()?;
+/// assert_eq!(classify(nat64), AddrClass::Loopback);
+/// assert_eq!(classify(sixtofour), AddrClass::Reserved);
+/// # Ok::<(), std::net::AddrParseError>(())
 /// ```
 #[must_use]
 pub fn classify(addr: IpAddr) -> AddrClass {
