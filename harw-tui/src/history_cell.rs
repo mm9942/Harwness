@@ -1401,6 +1401,7 @@ impl HistoryCell for GoalCell {
 ///
 /// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();
 
@@ -1414,42 +1415,40 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
         let mut current_len: usize = 0;
 
         for word in paragraph.split_ascii_whitespace() {
-            let word_len = word.chars().count();
+            // B14: Breite in Anzeigespalten (UnicodeWidth), nicht Zeichenanzahl
+            // — CJK/Emoji zählen doppelt bzw. breit. Überlange Wörter werden
+            // zuerst an weichen Trennpunkten (`/`, `·`, `_`) zerlegt; nur
+            // Segmente, die allein immer noch überlang sind, werden hart
+            // (width-aware) geteilt. Ergebnis: kein Einzelwort-Überhang.
+            let tokens: Vec<std::borrow::Cow<str>> =
+                if UnicodeWidthStr::width(word) >= col_width {
+                    split_at_soft_breaks(word, col_width)
+                        .into_iter()
+                        .map(std::borrow::Cow::Owned)
+                        .collect()
+                } else {
+                    vec![std::borrow::Cow::Borrowed(word)]
+                };
 
-            if word_len >= col_width {
-                // Harte Trennung: aktuell akkumulierte Zeile erst flushen
-                if !current_line.is_empty() {
+            for token in tokens {
+                let token_len = UnicodeWidthStr::width(token.as_ref());
+
+                // Token passt in eine Zeile
+                if current_len == 0 {
+                    // Erstes Token auf leerer Zeile
+                    current_line.push_str(token.as_ref());
+                    current_len = token_len;
+                } else if current_len + 1 + token_len <= col_width {
+                    // Token plus Leerzeichen passt noch auf die aktuelle Zeile
+                    current_line.push(' ');
+                    current_line.push_str(token.as_ref());
+                    current_len += 1 + token_len;
+                } else {
+                    // Aktuelle Zeile fertig; neues Token auf nächster Zeile
                     result.push(Line::from(Span::raw(current_line.clone())));
-                    current_line.clear();
-                    current_len = 0;
+                    current_line = token.to_string();
+                    current_len = token_len;
                 }
-                // Wort selbst in col_width-Häppchen aufteilen
-                let chars: Vec<char> = word.chars().collect();
-                let mut offset = 0;
-                while offset < chars.len() {
-                    let end = (offset + col_width).min(chars.len());
-                    let chunk: String = chars[offset..end].iter().collect();
-                    result.push(Line::from(Span::raw(chunk)));
-                    offset = end;
-                }
-                continue;
-            }
-
-            // Wort passt in eine Zeile
-            if current_len == 0 {
-                // Erste Wort auf leerer Zeile
-                current_line.push_str(word);
-                current_len = word_len;
-            } else if current_len + 1 + word_len <= col_width {
-                // Wort plus Leerzeichen passt noch auf die aktuelle Zeile
-                current_line.push(' ');
-                current_line.push_str(word);
-                current_len += 1 + word_len;
-            } else {
-                // Aktuelle Zeile fertig; neues Wort auf nächster Zeile
-                result.push(Line::from(Span::raw(current_line.clone())));
-                current_line = word.to_owned();
-                current_len = word_len;
             }
         }
 
@@ -1459,6 +1458,68 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
     }
 
     result
+}
+
+/// Zerlegt ein überlanges Wort greedy an weichen Trennpunkten (`/`, `·`, `_`,
+/// B14) in Segmente von höchstens `col_width` Anzeigespalten; Segmente, die
+/// allein breiter sind, werden char-weise width-aware hart geteilt (CJK- und
+/// Emoji-sicher, Vorbild `wrap_styled`). Der Trenner bleibt am Segmentende,
+/// damit Pfade/URLs am Zeichen `x/y` und nicht `x/ /y` brechen.
+fn split_at_soft_breaks(word: &str, col_width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    // Tokenisieren: jedes Token endet an einem Trennzeichen (Trenner inklusive).
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        current.push(ch);
+        if ch == '/' || ch == '·' || ch == '_' {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    // Greifend zu Segmenten <= col_width packen.
+    let mut segments: Vec<String> = Vec::new();
+    let mut segment = String::new();
+    let mut segment_width: usize = 0;
+    for token in tokens {
+        let token_width = UnicodeWidthStr::width(token.as_str());
+        if token_width > col_width {
+            // Hart-Split wie bisher, aber width-aware (Häppchen <= col_width).
+            if !segment.is_empty() {
+                segments.push(std::mem::take(&mut segment));
+                segment_width = 0;
+            }
+            let mut chunk = String::new();
+            let mut chunk_width: usize = 0;
+            for ch in token.chars() {
+                let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if chunk_width + char_width > col_width && !chunk.is_empty() {
+                    segments.push(std::mem::take(&mut chunk));
+                    chunk_width = 0;
+                }
+                chunk.push(ch);
+                chunk_width += char_width;
+            }
+            if !chunk.is_empty() {
+                segments.push(chunk);
+            }
+        } else if segment_width + token_width <= col_width {
+            segment.push_str(&token);
+            segment_width += token_width;
+        } else {
+            segments.push(std::mem::take(&mut segment));
+            segment.push_str(&token);
+            segment_width = token_width;
+        }
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
 }
 
 /// Kürzt `text` char-sicher auf höchstens `max_chars` Zeichen.
@@ -1561,6 +1622,9 @@ pub(crate) enum ToolState {
 /// Plan Schritt 2, Contract-Slice A5 („Verbosity“).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolVerbosity {
+    /// Einzeilige Aktivität: Statuspunkt + Label + Ergebnis-Zusammenfassung
+    /// (B14-Verdichtung, Vorgabe) — keine Diff-/Ergebnis-Vorschauzeilen.
+    Activity,
     /// Nur das an- bzw. ausgeklappte Ergebnis, keine rohen Argumente.
     Compact,
     /// Wie ausgeklappt, zusätzlich die rohen Aufrufargumente als JSON.
@@ -2618,6 +2682,34 @@ impl ToolCell {
         let label_style = Style::default().add_modifier(Modifier::BOLD);
         let dim = style::dim_style(theme);
 
+        // Aktivitätsmodus (B11a): genau eine Zeile — Statuspunkt, Label,
+        // Ergebnis-Zusammenfassung und Dauer; keine rohen Argumente, kein
+        // Ergebnis-Rendering. Ausgeklappt bleibt opt-in über `self.expanded`.
+        if matches!(verbosity, ToolVerbosity::Activity) && !self.expanded {
+            let tail = match &self.summary {
+                Some(summary) => format!("{summary}{}", self.header_tail()),
+                None => self.header_tail(),
+            };
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            push_header_line(
+                &mut lines,
+                HeaderPart {
+                    text: dot_glyph,
+                    style: glyph_style,
+                },
+                HeaderPart {
+                    text: &self.label,
+                    style: label_style,
+                },
+                HeaderPart {
+                    text: &tail,
+                    style: dim,
+                },
+                width,
+            );
+            return lines;
+        }
+
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         // Kopfzeile: Statuspunkt + fettes Label + gedimmte Dauer/Notiz,
@@ -3052,8 +3144,9 @@ impl ToolGroupCell {
         tally
     }
 
-    /// Rendert die Gruppe mit explizitem [`ToolVerbosity`] (siehe
-    /// [`ToolCell::display_lines_with`] für die Bedeutung von `Verbose`).
+    /// Rendert die Gruppe mit explizitem [`ToolVerbosity`]: `Activity` nutzt
+    /// die kompakte Sammelzeile (Gruppensummen), `Verbose` verhält sich wie
+    /// ausgeklappt; siehe [`ToolCell::display_lines_with`].
     pub(crate) fn display_lines_with(
         &self,
         width: u16,
@@ -3063,6 +3156,13 @@ impl ToolGroupCell {
         let expanded = self.expanded || matches!(verbosity, ToolVerbosity::Verbose);
 
         if expanded {
+            // B11a: ausgeklappt bleibt die Detailansicht wie unter `Compact`
+            // („expanded wie bisher“) — nur `Verbose` reicht die rohen
+            // Argumente an die Kindzellen durch, `Activity` nicht.
+            let child_verbosity = match verbosity {
+                ToolVerbosity::Verbose => ToolVerbosity::Verbose,
+                ToolVerbosity::Activity | ToolVerbosity::Compact => ToolVerbosity::Compact,
+            };
             let mut lines: Vec<Line<'static>> = Vec::new();
             for cell in &self.cells {
                 let Ok(guard) = cell.lock() else {
@@ -3072,7 +3172,7 @@ impl ToolGroupCell {
                     )));
                     continue;
                 };
-                lines.extend(guard.display_lines_with(width, theme, verbosity));
+                lines.extend(guard.display_lines_with(width, theme, child_verbosity));
             }
             return lines;
         }
@@ -3244,6 +3344,40 @@ mod tests {
             "Erwarte mindestens 2 Zeilen bei width=10, erhielt: {}",
             lines.len()
         );
+    }
+
+    /// B14: Keine Zeile breiter als `width`, auch bei CJK (Breite 2 je
+    /// Zeichen) — Metrik ist unicode-width, nicht Zeichenanzahl.
+    #[test]
+    fn test_wrap_plain_cjk_never_exceeds_width() {
+        use unicode_width::UnicodeWidthStr;
+        let text = "你好世界 これは 日本語の テキストです longer_ascii_word_here";
+        let lines = lines_to_strings(&wrap_plain(text, 10));
+        assert!(lines.len() >= 2, "war: {lines:?}");
+        for line in &lines {
+            let width = UnicodeWidthStr::width(line.as_str());
+            assert!(width <= 10, "Zeile '{line}' ist {width} Spalten breit");
+        }
+    }
+
+    /// B14: Überlange Pfade/URLs brechen an weichen Trennpunkten (`/`, `·`,
+    /// `_`), der Trenner bleibt am Segmentende; kein Einzelwort-Überhang.
+    #[test]
+    fn test_wrap_plain_breaks_paths_at_soft_break_points() {
+        use unicode_width::UnicodeWidthStr;
+        let text = "crates/harw-tui/src/history_cell.rs und a_very_long_section_name_here";
+        let lines = lines_to_strings(&wrap_plain(text, 12));
+        assert!(lines.len() >= 2, "war: {lines:?}");
+        for line in &lines {
+            let width = UnicodeWidthStr::width(line.as_str());
+            assert!(width <= 12, "Zeile '{line}' ist {width} Spalten breit");
+        }
+        // Bruch an '/': jedes Segment endet mit '/' oder ist der Rest.
+        let path_line = lines
+            .iter()
+            .find(|l| l.contains("crates/"))
+            .ok_or(TestError::Missing("Pfadsegment"))?;
+        assert!(path_line.ends_with('/'), "war: {path_line:?}");
     }
 
     /// Prüft, dass `AssistantHistoryCell` bei `width=10` mehr Zeilen liefert als bei `width=100`.
@@ -4661,6 +4795,116 @@ mod tests {
                 "Zeile {line} fehlt: {verbose:?}"
             );
         }
+    }
+
+    /// Aktivitätsmodus (B11a): `ToolVerbosity::Activity` rendert genau eine
+    /// Zeile — Statuspunkt, Label, Ergebnis-Zusammenfassung und Dauer; weder
+    /// rohe Argumente noch Ergebnis-Text.
+    #[test]
+    fn test_tool_cell_activity_is_single_line() {
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls", "timeout_secs": 30 }),
+        );
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "exit_code": 0,
+            "stdout": "eins\nzwei\n",
+            "stderr": "",
+        }));
+        cell.complete(&result, 2);
+
+        let activity = lines_to_strings(&cell.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert_eq!(activity.len(), 1, "war: {activity:?}");
+        assert!(activity[0].contains("Shell("), "war: {activity:?}");
+        assert!(activity[0].contains("2.0s"), "war: {activity:?}");
+        assert!(
+            !activity.join("\n").contains("timeout_secs"),
+            "rohe Argumente im Aktivitätsmodus: {activity:?}"
+        );
+        assert!(
+            !activity.join("\n").contains("eins"),
+            "Ergebnis-Text im Aktivitätsmodus: {activity:?}"
+        );
+    }
+
+    /// Ausgeklappt zeigt `Activity` die Detailansicht wie Compact-expanded —
+    /// rohe Argumente bleiben `Verbose` vorbehalten.
+    #[test]
+    fn test_tool_cell_activity_expanded_shows_details() {
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls", "timeout_secs": 30 }),
+        );
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "exit_code": 0,
+            "stdout": "eins\nzwei\n",
+            "stderr": "",
+        }));
+        cell.complete(&result, 2);
+        cell.set_expanded(true);
+
+        let expanded = lines_to_strings(&cell.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert!(expanded.len() > 1, "war: {expanded:?}");
+        for line in ["eins", "zwei"] {
+            assert!(
+                expanded.iter().any(|l| l.contains(line)),
+                "Zeile {line} fehlt: {expanded:?}"
+            );
+        }
+        assert!(
+            !expanded.join("\n").contains("timeout_secs"),
+            "rohe Argumente ohne Verbose: {expanded:?}"
+        );
+    }
+
+    /// Aktivitätsmodus in der Gruppe: kompakte Sammelzeile mit
+    /// Gruppensummen; ausgeklappt wie bisher die Detailzeilen.
+    #[test]
+    fn test_tool_group_cell_activity_summarizes_and_expands() -> TestResult {
+        let mut group = ToolGroupCell::new();
+        for path in ["a", "b"] {
+            let call = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": path }));
+            let cell = Arc::new(Mutex::new(ToolCell::started(&call)));
+            cell.lock().map_err(ctx("Mutex vergiftet"))?.complete(
+                &harw_protocol::items::ToolCallResult::success(
+                    harw_tools::serde_json::json!({ "content": "x" }),
+                ),
+                1,
+            );
+            group.push(cell);
+        }
+
+        let activity = lines_to_strings(&group.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert!(activity[0].contains("2 Dateien gelesen"), "war: {activity:?}");
+        assert!(
+            !activity.join("\n").contains("Read(a)"),
+            "Detailzeile im Aktivitätsmodus: {activity:?}"
+        );
+
+        group.expanded = true;
+        let expanded = lines_to_strings(&group.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ))
+        .join("\n");
+        assert!(expanded.contains("Read(a)"), "war: {expanded:?}");
+        assert!(expanded.contains("Read(b)"), "war: {expanded:?}");
+        Ok(())
     }
 
     /// Eine einzelne sehr lange Zeile (generischer Fallback) bleibt bei
