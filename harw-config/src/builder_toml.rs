@@ -96,6 +96,40 @@ pub struct BuilderRemoteToml {
     /// Container-Backend auf dem Ziel; Vorgabe: `rootless-podman`.
     #[serde(default)]
     pub backend: WorkerTemplate,
+    /// Pfad zum SSH-Identität-Key (z. B. `~/.ssh/id_ed25519_…`); ohne Angabe
+    /// nutzt Podman den Default-Key des Nutzers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Optionale mTLS-Sektion (Crypt Guard Erweiterung): gegenseitige
+    /// Authentifizierung zwischen Host und Pi; SSH bleibt Vorgabe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<BuilderRemoteTlsToml>,
+}
+
+/// Optionale mTLS-Konfiguration für den Remote-Worker (Crypt Guard).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderRemoteTlsToml {
+    /// Client-Zertifikat (PEM).
+    pub cert: String,
+    /// Client-Key (PEM).
+    pub key: String,
+    /// CA-Zertifikat (PEM), gegen das der Pi prüft.
+    pub ca: String,
+    /// Server-URL (z. B. `https://100.123.51.33:8080`); über Tailscale.
+    pub url: String,
+}
+
+impl BuilderRemoteToml {
+    /// Die wirksame Podman-Remote-URL: SSH-Vorgabe (mit Socket-Pfad) oder
+    /// mTLS-URL, wenn `tls` konfiguriert ist.
+    #[must_use]
+    pub fn effective_podman_url(&self) -> String {
+        match &self.tls {
+            Some(tls) => tls.url.clone(),
+            None => format!("ssh://{}/run/user/1000/podman/podman.sock", self.endpoint),
+        }
+    }
 }
 
 impl BuilderToml {

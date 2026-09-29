@@ -55,8 +55,9 @@ pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, Secre
 pub use browser_toml::BrowserSection;
 // P2 Builder-API-Contract: `[builder]`.
 pub use builder_toml::{
-    BUILDER_JOBS_RANGE, BUILDER_RAM_MIB_RANGE, BuilderBuildToml, BuilderRemoteToml, BuilderToml,
-    DEFAULT_BUILDER_JOBS, DEFAULT_BUILDER_RAM_MIB, MountSpec, WorkerTemplate,
+    BUILDER_JOBS_RANGE, BUILDER_RAM_MIB_RANGE, BuilderBuildToml, BuilderRemoteTlsToml,
+    BuilderRemoteToml, BuilderToml, DEFAULT_BUILDER_JOBS, DEFAULT_BUILDER_RAM_MIB, MountSpec,
+    WorkerTemplate,
 };
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{

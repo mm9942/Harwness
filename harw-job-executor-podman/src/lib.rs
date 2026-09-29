@@ -161,6 +161,7 @@ impl PodmanJobPlan {
 pub struct PodmanExecutor {
     executable: String,
     remote_endpoint: Option<String>,
+    remote_identity: Option<String>,
     ram_mib: u32,
     mounts: Vec<MountSpec>,
 }
@@ -176,6 +177,7 @@ impl PodmanExecutor {
                 return Ok(Self {
                     executable: candidate.to_owned(),
                     remote_endpoint: None,
+                    remote_identity: None,
                     ram_mib: 0,
                     mounts: Vec::new(),
                 });
@@ -193,19 +195,21 @@ impl PodmanExecutor {
         Self {
             executable,
             remote_endpoint: None,
+            remote_identity: None,
             ram_mib: 0,
             mounts: Vec::new(),
         }
     }
 
     /// Konfiguriert den Executor aus [`BuilderToml`] (RAM-Limit, Mounts,
-    /// SSH-Remote).
+    /// SSH-Remote mit Identity).
     #[must_use]
     pub fn from_builder_config(mut self, config: &BuilderToml) -> Self {
         self.ram_mib = config.effective_ram_mib();
         self.mounts = config.effective_mounts().to_vec();
         if let Some(remote) = &config.remote {
             self.remote_endpoint = Some(remote.endpoint.clone());
+            self.remote_identity = remote.identity.clone();
         }
         self
     }
@@ -243,10 +247,15 @@ impl PodmanExecutor {
         }
 
         let mut args: Vec<OsString> = Vec::new();
-        // Remote (Pi-Worker): --remote --url ssh://…
+        // Remote (Pi-Worker): --remote --url ssh://… [+ --identity]
         if let Some(endpoint) = &self.remote_endpoint {
             args.push("--remote".into());
-            args.push(format!("--url=ssh://{endpoint}/run/user/1000/podman/podman.sock").into());
+            args.push(
+                format!("--url=ssh://{endpoint}/run/user/1000/podman/podman.sock").into(),
+            );
+            if let Some(identity) = &self.remote_identity {
+                args.push(format!("--identity={identity}").into());
+            }
         }
         args.push("run".into());
         args.push("--rm".into());
