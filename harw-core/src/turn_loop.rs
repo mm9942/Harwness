@@ -497,9 +497,11 @@ use harw_extension_api::{
 };
 use harw_protocol::events::TurnEvent;
 use harw_protocol::items::{
-    AssistantMessageItem, ContentPart, OpaqueReasoning, ReasoningItem, ToolCallResult, TurnItem,
+    AssistantMessageItem, ContentPart, OpaqueReasoning, ReasoningItem, ToolCallResult,
+    ToolPlacement, TurnItem,
 };
 use harw_session_store::{ApprovalRecord, ApprovalStore};
+use harw_tools::executor::ExecutionPlacement;
 use harw_tools::{
     AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, ToolCall,
     ToolExecutionContext, ToolName, ToolOutput, ToolSpec, ToolsError, TracedToolExecutor,
@@ -523,8 +525,9 @@ pub const HANDOFF_PREFIX: &str = "transfer_to_";
 pub const TOKEN_BUDGET_STOP_PREFIX: &str = "Token-Budget erschöpft";
 
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
-// Letztes Feld: `true`, wenn dieser Call mit `ToolsError::Cancelled`
+// Vorletztes Feld: `true`, wenn dieser Call mit `ToolsError::Cancelled`
 // endete (siehe `try_execute_parallel_calls`s Ergebnis-Auslieferung).
+// Letztes Feld: die Platzierung aus den Ausführer-Metadaten (R18 D-D).
 type ParallelCallSlot = Option<(
     ToolCallId,
     ToolCallResult,
@@ -532,7 +535,12 @@ type ParallelCallSlot = Option<(
     String,
     serde_json::Value,
     bool,
+    Option<ToolPlacement>,
 )>;
+
+/// Ergebnis eines sequenziell ausgeführten Tool-Calls: (Ergebnis, Wandzeit
+/// ms, Platzierung aus den Ausführer-Metadaten, R18 D-D).
+type PlacedCallResult = (ToolCallResult, u64, Option<ToolPlacement>);
 
 /// Grenzwerte eines einzelnen Turns (W4a A-LOOP).
 ///
@@ -2815,6 +2823,19 @@ pub fn handoff_role(name: &ToolName) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Übersetzt die Platzierung eines Ausführers (R18 D-D) in das Wire-Feld
+/// `TurnEvent::ToolCallCompleted::placement`.
+///
+/// `None` bleibt `None` („unbekannt“): Oberflächen zeigen dann keine
+/// Platzierung, statt `host` zu raten.
+fn wire_placement(placement: Option<ExecutionPlacement>) -> Option<ToolPlacement> {
+    placement.map(|placement| match placement {
+        ExecutionPlacement::Host => ToolPlacement::Host,
+        ExecutionPlacement::Sandbox => ToolPlacement::Sandbox,
+        ExecutionPlacement::Gateway { node } => ToolPlacement::Gateway { node },
+    })
+}
+
 /// Übersetzt eine `ToolOutput` in das explizite Wire-Ergebnis eines
 /// `ToolResultItem`.
 fn output_to_result(output: ToolOutput) -> ToolCallResult {
@@ -3600,6 +3621,7 @@ async fn resume_after_child_with_approvals(
         call_id: call_id.clone(),
         result: child_result.clone(),
         duration_ms: child_duration_ms,
+        placement: None,
     };
     session
         .history_mut()
@@ -3904,20 +3926,24 @@ async fn resume_after_approval_with_store(
                     // `control`s `CancelToken`, und ein Treffer geht über
                     // denselben `cancel_turn_with_pending_calls`-Weg wie ein
                     // Prüfpunkt-Treffer.
-                    let (result, was_cancelled): ((ToolCallResult, u64), bool) = async {
+                    // R18 D-D: das dritte Tupelfeld ist die Platzierung aus den
+                    // Ausführer-Metadaten (`ToolExecutor::execute_placed`).
+                    let (result, was_cancelled): (PlacedCallResult, bool) = async {
                         match find_executor(session, &pending.call.name) {
                             Some(executor) => {
-                                let (result, duration_ms, cancelled) = match tool_execution_context(
+                                let (result, duration_ms, cancelled, placement) = match tool_execution_context(
                                     session,
                                     &ctx,
                                     control.cancel_token(),
                                 ) {
                                     Ok(execution_context) => {
                                         let started = std::time::Instant::now();
-                                        let outcome = tokio::select! {
+                                        let (outcome, placement) = tokio::select! {
                                             biased;
-                                            () = control.cancel_token().cancelled() => Err(ToolsError::Cancelled),
-                                            outcome = executor.traced_execute(&execution_context, &pending.call) => outcome,
+                                            () = control.cancel_token().cancelled() => (Err(ToolsError::Cancelled), None),
+                                            placed = executor.traced_execute_placed(&execution_context, &pending.call) => {
+                                                (placed.output, wire_placement(placed.placement))
+                                            }
                                         };
                                         let duration_ms = started.elapsed().as_millis() as u64;
                                         let cancelled = matches!(outcome, Err(ToolsError::Cancelled));
@@ -3925,10 +3951,10 @@ async fn resume_after_approval_with_store(
                                             Ok(output) => output_to_result(output),
                                             Err(e) => ToolCallResult::error(e.to_string()),
                                         };
-                                        (result, duration_ms, cancelled)
+                                        (result, duration_ms, cancelled, placement)
                                     }
                                     Err(error) => {
-                                        (missing_tool_execution_context_result(error)?, 0, false)
+                                        (missing_tool_execution_context_result(error)?, 0, false, None)
                                     }
                                 };
                                 tracing::info!(
@@ -3936,7 +3962,7 @@ async fn resume_after_approval_with_store(
                                     status = if result.is_success() { "ok" } else { "err" },
                                     "tool.execute",
                                 );
-                                Ok::<_, CoreError>(((result, duration_ms), cancelled))
+                                Ok::<_, CoreError>(((result, duration_ms, placement), cancelled))
                             }
                             None => {
                                 tracing::info!(duration_ms = 0u64, status = "err", "tool.execute",);
@@ -3947,6 +3973,7 @@ async fn resume_after_approval_with_store(
                                             pending.call.name
                                         )),
                                         0u64,
+                                        None,
                                     ),
                                     false,
                                 ))
@@ -3969,7 +3996,7 @@ async fn resume_after_approval_with_store(
                         // `ApprovalDecision::AskUser` im sequenziellen Pfad).
                         // `remaining: Vec::new()` ist deshalb korrekt, nicht nur
                         // bequem.
-                        let (result_value, result_duration_ms) = result;
+                        let (result_value, result_duration_ms, result_placement) = result;
                         emit(
                             session,
                             TurnEvent::ToolCallCompleted {
@@ -3977,6 +4004,7 @@ async fn resume_after_approval_with_store(
                                 call_id: pending.call.id.clone(),
                                 result: result_value.clone(),
                                 duration_ms: result_duration_ms,
+                                placement: result_placement,
                             },
                         );
                         notify_tool_outcome(
@@ -4000,7 +4028,7 @@ async fn resume_after_approval_with_store(
                         )
                         .await;
                     }
-                    let (result_value, result_duration_ms) = result;
+                    let (result_value, result_duration_ms, result_placement) = result;
                     emit(
                         session,
                         TurnEvent::ToolCallCompleted {
@@ -4008,6 +4036,7 @@ async fn resume_after_approval_with_store(
                             call_id: pending.call.id.clone(),
                             result: result_value.clone(),
                             duration_ms: result_duration_ms,
+                            placement: result_placement,
                         },
                     );
                     notify_tool_outcome(session, &tool_name, &pending.call.arguments, &result_value);
@@ -5008,10 +5037,12 @@ async fn drive_turn(
             // NACH `.instrument(tool_span).await?`, um denselben Weg wie ein
             // `tool_checkpoint()`-Treffer zu nehmen statt das Ergebnis als
             // normalen Tool-Fehler ans Modell zurückzuspielen.
-            let (result, was_cancelled): ((ToolCallResult, u64), bool) = async {
+            // R18 D-D: das dritte Tupelfeld ist die Platzierung aus den
+            // Ausführer-Metadaten (`ToolExecutor::execute_placed`).
+            let (result, was_cancelled): (PlacedCallResult, bool) = async {
                 match find_executor(session, &call.name) {
                     Some(executor) => {
-                        let (result, duration_ms, cancelled) = match tool_execution_context(
+                        let (result, duration_ms, cancelled, placement) = match tool_execution_context(
                             session,
                             ctx,
                             control.cancel_token(),
@@ -5024,10 +5055,12 @@ async fn drive_turn(
                                 // oben — ein Ausführer, der `ctx.cancel()`
                                 // selbst nie abfragt, blockiert den Turn damit
                                 // nicht mehr bis zu seinem eigenen Ende.
-                                let outcome = tokio::select! {
+                                let (outcome, placement) = tokio::select! {
                                     biased;
-                                    () = control.cancel_token().cancelled() => Err(ToolsError::Cancelled),
-                                    outcome = executor.traced_execute(&execution_context, &call) => outcome,
+                                    () = control.cancel_token().cancelled() => (Err(ToolsError::Cancelled), None),
+                                    placed = executor.traced_execute_placed(&execution_context, &call) => {
+                                        (placed.output, wire_placement(placed.placement))
+                                    }
                                 };
                                 let duration_ms = started.elapsed().as_millis() as u64;
                                 let cancelled = matches!(outcome, Err(ToolsError::Cancelled));
@@ -5035,16 +5068,18 @@ async fn drive_turn(
                                     Ok(output) => output_to_result(output),
                                     Err(e) => ToolCallResult::error(e.to_string()),
                                 };
-                                (result, duration_ms, cancelled)
+                                (result, duration_ms, cancelled, placement)
                             }
-                            Err(error) => (missing_tool_execution_context_result(error)?, 0, false),
+                            Err(error) => {
+                                (missing_tool_execution_context_result(error)?, 0, false, None)
+                            }
                         };
                         tracing::info!(
                             duration_ms = duration_ms,
                             status = if result.is_success() { "ok" } else { "err" },
                             "tool.execute",
                         );
-                        Ok::<_, CoreError>(((result, duration_ms), cancelled))
+                        Ok::<_, CoreError>(((result, duration_ms, placement), cancelled))
                     }
                     None => {
                         tracing::info!(duration_ms = 0u64, status = "err", "tool.execute",);
@@ -5055,6 +5090,7 @@ async fn drive_turn(
                                     call.name
                                 )),
                                 0u64,
+                                None,
                             ),
                             false,
                         ))
@@ -5072,7 +5108,7 @@ async fn drive_turn(
                 // derselben Antwort gehen über `cancel_turn_with_pending_calls`
                 // denselben Weg wie die übrigen Prüfpunkt-Treffer dieser
                 // Schleife.
-                let (result_value, result_duration_ms) = result;
+                let (result_value, result_duration_ms, result_placement) = result;
                 emit(
                     session,
                     TurnEvent::ToolCallCompleted {
@@ -5080,6 +5116,7 @@ async fn drive_turn(
                         call_id: call.id.clone(),
                         result: result_value.clone(),
                         duration_ms: result_duration_ms,
+                        placement: result_placement,
                     },
                 );
                 notify_tool_outcome(session, &tool_name, &call.arguments, &result_value);
@@ -5102,7 +5139,7 @@ async fn drive_turn(
                 )
                 .await;
             }
-            let (mut result_value, result_duration_ms) = result;
+            let (mut result_value, result_duration_ms, result_placement) = result;
             // Runde 7, Teil B5: Pitfall-Hinweis nur an das Ergebnis desselben
             // Aufrufs (gleiches Werkzeug).
             if let Some(hint) = pitfall_hint.as_deref() {
@@ -5128,6 +5165,7 @@ async fn drive_turn(
                     call_id: call_id_for_event,
                     result: result_value.clone(),
                     duration_ms: result_duration_ms,
+                    placement: result_placement,
                 },
             );
             // d. ToolResult in History.
@@ -6163,7 +6201,11 @@ async fn try_execute_parallel_calls(
         joins.spawn(
             async move {
                 let started = std::time::Instant::now();
-                let output = executor.traced_execute(&execution_context, &call).await;
+                let placed = executor
+                    .traced_execute_placed(&execution_context, &call)
+                    .await;
+                let placement = wire_placement(placed.placement);
+                let output = placed.output;
                 let cancelled = matches!(output, Err(ToolsError::Cancelled));
                 let result = output
                     .map(output_to_result)
@@ -6182,6 +6224,7 @@ async fn try_execute_parallel_calls(
                     tool_name_for_capture,
                     arguments_for_capture,
                     cancelled,
+                    placement,
                 )
             }
             .instrument(tool_span),
@@ -6205,9 +6248,16 @@ async fn try_execute_parallel_calls(
             }
             joined = joins.join_next() => {
                 match joined {
-                    Some(Ok((position, call_id, result, duration_ms, tool_name, arguments, cancelled))) => {
-                        results[position] =
-                            Some((call_id, result, duration_ms, tool_name, arguments, cancelled));
+                    Some(Ok((position, call_id, result, duration_ms, tool_name, arguments, cancelled, placement))) => {
+                        results[position] = Some((
+                            call_id,
+                            result,
+                            duration_ms,
+                            tool_name,
+                            arguments,
+                            cancelled,
+                            placement,
+                        ));
                     }
                     Some(Err(error)) => {
                         // `abort_all()` selbst kann noch laufende Jobs als
@@ -6243,6 +6293,7 @@ async fn try_execute_parallel_calls(
                     tool_name,
                     arguments,
                     true, // cancelled
+                    None, // nie ausgeliefert: Platzierung unbekannt
                 ));
             }
         }
@@ -6255,7 +6306,7 @@ async fn try_execute_parallel_calls(
     let mut results_iter = results.into_iter();
     let mut aborted: Option<CancelReason> = None;
     for result in results_iter.by_ref() {
-        let (call_id, mut value, duration_ms, tool_name, arguments, cancelled) = result
+        let (call_id, mut value, duration_ms, tool_name, arguments, cancelled, placement) = result
             .ok_or_else(|| {
                 CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
             })?;
@@ -6294,6 +6345,7 @@ async fn try_execute_parallel_calls(
                 call_id: call_id.clone(),
                 result: value.clone(),
                 duration_ms,
+                placement,
             },
         );
         notify_tool_outcome(session, &tool_name, &arguments, &value);
@@ -6309,8 +6361,8 @@ async fn try_execute_parallel_calls(
     }
     if let Some(reason) = aborted {
         for result in results_iter {
-            let (call_id, _value, _duration_ms, _tool_name, _arguments, _cancelled) = result
-                .ok_or_else(|| {
+            let (call_id, _value, _duration_ms, _tool_name, _arguments, _cancelled, _placement) =
+                result.ok_or_else(|| {
                     CoreError::ToolFailed(
                         "parallel tool scheduler lost a completed call".to_owned(),
                     )
@@ -11888,5 +11940,156 @@ mod tests {
             Some("fs.read".to_owned())
         );
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // R18 D-D (RP-T6): Platzierung aus den Ausführer-Metadaten
+    // ------------------------------------------------------------------
+
+    /// Liefert JSON wie `shell.exec`; `on_host` setzt das Eskalations-Feld.
+    struct ShellLikeExecutor {
+        on_host: bool,
+    }
+
+    impl ToolExecutor for ShellLikeExecutor {
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolExecutionContext,
+            _call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            let mut content = serde_json::json!({ "exit_code": 0 });
+            if self.on_host {
+                content[harw_tools::executor::EXECUTED_ON_FIELD] = serde_json::json!("host");
+            }
+            Box::pin(async move { Ok(ToolOutput::Json { content }) })
+        }
+    }
+
+    /// `sandboxed`/`escalated` tragen Sandbox-Metadaten, `unplaced` keine.
+    struct PlacementProvider {
+        parallel: bool,
+    }
+
+    impl ToolProvider for PlacementProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            ["sandboxed", "escalated", "unplaced"]
+                .into_iter()
+                .map(|name| {
+                    ToolSpec::Function(FunctionToolSpec {
+                        name: ToolName::new(name),
+                        description: "placement stub".to_owned(),
+                        parameters: JsonSchema::default(),
+                        strict: false,
+                    })
+                })
+                .collect()
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            let placed = |on_host: bool| -> Arc<dyn ToolExecutor> {
+                Arc::new(harw_tools::executor::PlacedToolExecutor::new(
+                    Arc::new(ShellLikeExecutor { on_host }),
+                    ExecutionPlacement::Sandbox,
+                ))
+            };
+            match name.as_str() {
+                "sandboxed" => Some(placed(false)),
+                "escalated" => Some(placed(true)),
+                "unplaced" => Some(Arc::new(ShellLikeExecutor { on_host: false })),
+                _ => None,
+            }
+        }
+
+        fn parallel_safe(&self, _name: &ToolName) -> bool {
+            self.parallel
+        }
+    }
+
+    fn completed_placement(
+        events: &[TurnEvent],
+        id: &ToolCallId,
+    ) -> TestResult<Option<ToolPlacement>> {
+        events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ToolCallCompleted {
+                    call_id, placement, ..
+                } if call_id == id => Some(placement.clone()),
+                _ => None,
+            })
+            .ok_or(TestError::Missing("ToolCallCompleted for the call"))
+    }
+
+    async fn run_placement_turn(parallel: bool) -> TestResult {
+        let sandboxed = ToolCallId::new();
+        let escalated = ToolCallId::new();
+        let unplaced = ToolCallId::new();
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let mut session = guarded_session(Arc::new(PlacementProvider { parallel }), handler)?
+            .with_turn_event_sink(turn_tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![
+                call(&sandboxed, "sandboxed"),
+                call(&escalated, "escalated"),
+                call(&unplaced, "unplaced"),
+            ]),
+            crate::model::ModelResponse::text("fertig"),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("placement"))
+            .await
+            .map_err(ctx("der Turn mit drei platzierten Aufrufen läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let events = drain_turn_events(&mut turn_rx);
+        assert_eq!(
+            completed_placement(&events, &sandboxed)?,
+            Some(ToolPlacement::Sandbox),
+            "parallel={parallel}"
+        );
+        assert_eq!(
+            completed_placement(&events, &escalated)?,
+            Some(ToolPlacement::Host),
+            "parallel={parallel}"
+        );
+        assert_eq!(
+            completed_placement(&events, &unplaced)?,
+            None,
+            "without executor metadata the placement stays unknown (parallel={parallel})"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_completion_carries_executor_placement() -> TestResult {
+        run_placement_turn(false).await
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_completion_carries_executor_placement() -> TestResult {
+        run_placement_turn(true).await
+    }
+
+    #[test]
+    fn wire_placement_maps_every_execution_placement() {
+        assert_eq!(wire_placement(None), None);
+        assert_eq!(
+            wire_placement(Some(ExecutionPlacement::Host)),
+            Some(ToolPlacement::Host)
+        );
+        assert_eq!(
+            wire_placement(Some(ExecutionPlacement::Sandbox)),
+            Some(ToolPlacement::Sandbox)
+        );
+        assert_eq!(
+            wire_placement(Some(ExecutionPlacement::Gateway {
+                node: Some("gw-1".to_owned())
+            })),
+            Some(ToolPlacement::Gateway {
+                node: Some("gw-1".to_owned())
+            })
+        );
     }
 }

@@ -370,6 +370,12 @@ layer = "A"
 layer = "A"
 [packages."harw-tui"]
 layer = "A"
+[packages."harw-session-host"]
+layer = "A"
+[packages."harw-tool-remote"]
+layer = "A"
+[packages."harw-session-ws"]
+layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
 [packages."harw-web"]
@@ -420,3 +426,26 @@ from = "harw-session-store"
 to = "harw-job-store"
 reason = "I → J: harw-session-store::JobStore ist ein Adapter über die generische Speichermechanik in harw-job-store (§33); verschwindet, wenn die Job-Persistenz ganz in den J-Ring wandert"
 until = "R12"
+
+# ---------------------------------------------------------------------------
+# Verbotene externe Crates (transitiv, über [dependencies] und
+# [build-dependencies] plus Cargo.lock)
+# ---------------------------------------------------------------------------
+# W00 D10 / ARC-02: Die WebSocket-Bibliothek gehört allein dem Ring-A-Adapter
+# `harw-session-ws`. Jobs (J), DoD (D), die TCB und alles Innere erreichen sie
+# nicht.
+[[forbidden_crates]]
+names = ["tungstenite", "tokio-tungstenite"]
+layers = ["F", "I", "C", "J", "D"]
+tcb = true
+reason = "W00 D10/ARC-02: WebSocket transport is owned by ring A (harw-session-ws) only"
+
+# W00 §2.1 / ARC-01: Der Session-Vertrag bleibt ohne Netzwerk-Transport und
+# ohne Anwendungs-Crates. `tokio` steht bewusst nicht in der Liste: harw-types
+# erreicht es über `tokio-util` (nur `CancellationToken`, kein Runtime-Feature,
+# siehe harw-types/Cargo.toml). Die öffentliche `SessionPort`-API selbst nutzt
+# nur std-Futures; das sichert harw-protocol/tests/session_wire_compat.rs.
+[[forbidden_crates]]
+names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "harw-web", "harw-cli", "harw-tui", "harw-session-host", "harw-session-ws"]
+packages = ["harw-protocol"]
+reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"

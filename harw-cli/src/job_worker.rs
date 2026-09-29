@@ -42,8 +42,10 @@
 //!   von `harw_plan_bridge::WorkDriver` bis zu Vorschlag, Eskalation oder
 //!   Aufgabe; der Rundenzustand liegt im Sidecar von `harw_ops::work_driver`.
 //!   Solche Läufe laufen in einer eigenen Lane (`WorkDriverLane`, höchstens
-//!   `MAX_CONCURRENT_WORK_DRIVER_RUNS` zugleich) neben den übrigen Arten,
-//!   statt sie für die ganze Laufdauer zu blockieren.
+//!   `JobWorkerOptions::max_work_driver_runs` zugleich, Vorgabe
+//!   `MAX_CONCURRENT_WORK_DRIVER_RUNS`, begrenzt durch `[jobs] max_running`)
+//!   neben den übrigen Arten, statt sie für die ganze Laufdauer zu
+//!   blockieren.
 //!
 //! # Runtime assembly (W2d-2 J1, docs/design/runtime-contracts.md §extension)
 //! Every executed job is assembled through
@@ -94,6 +96,7 @@ use harw_plan_bridge::{
 };
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
+use harw_runtime::contributors::AssemblyContributor;
 use harw_runtime::{RuntimeAssembly, RuntimeNarrowing};
 use harw_session_store::{ClaimRequest, JobListQuery, JobStore, TranscriptStore};
 use harw_types::{SessionId, ThreadRef, WorkId};
@@ -274,7 +277,8 @@ impl PlanNodeServices {
     }
 }
 
-/// Upper bound of `work_driver` runs one worker drives at the same time.
+/// Default upper bound of `work_driver` runs one worker drives at the same
+/// time ([`JobWorkerOptions::max_work_driver_runs`]).
 ///
 /// # Description
 /// A work-driver run holds its claim for the whole multi-round run and fans
@@ -282,6 +286,56 @@ impl PlanNodeServices {
 /// provider. The bound is enforced by [`WorkDriverLane`]: while the lane is
 /// full, further `work_driver` jobs are not claimed and stay `Ready`.
 const MAX_CONCURRENT_WORK_DRIVER_RUNS: usize = 2;
+
+/// Tunables of the job worker loop.
+///
+/// # Description
+/// `max_work_driver_runs` is the size of the `work_driver` lane
+/// ([`WorkDriverLane`]); at least 1. [`JobWorkerOptions::default`] keeps
+/// [`MAX_CONCURRENT_WORK_DRIVER_RUNS`]; [`JobWorkerOptions::from_config`]
+/// bounds it by the configured `[jobs] max_running`, so the lane never
+/// admits more concurrent runs than the service runs jobs at all.
+///
+/// # Concurrency
+/// Plain `Copy` data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobWorkerOptions {
+    /// Upper bound of concurrent `work_driver` runs (`>= 1`).
+    pub max_work_driver_runs: usize,
+}
+
+impl Default for JobWorkerOptions {
+    fn default() -> Self {
+        Self {
+            max_work_driver_runs: MAX_CONCURRENT_WORK_DRIVER_RUNS,
+        }
+    }
+}
+
+impl JobWorkerOptions {
+    /// Options from the resolved configuration: the default lane size,
+    /// bounded by `[jobs] max_running` (`JobsToml::effective_max_running`).
+    ///
+    /// # Arguments
+    /// - `config` (`&harw_config::ResolvedConfig`): the service configuration.
+    ///
+    /// # Returns
+    /// The options; the lane size is always at least 1.
+    #[must_use]
+    pub fn from_config(config: &harw_config::ResolvedConfig) -> Self {
+        let max_running = usize::try_from(config.harness.jobs.effective_max_running())
+            .unwrap_or(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+        Self {
+            max_work_driver_runs: MAX_CONCURRENT_WORK_DRIVER_RUNS.min(max_running).max(1),
+        }
+    }
+
+    // The lane size actually used (never 0: a zero-permit lane would never
+    // start a run and leave every driver job `Ready` forever).
+    fn lane_limit(self) -> usize {
+        self.max_work_driver_runs.max(1)
+    }
+}
 
 /// Everything one claimed job needs to run; built per claim inside the
 /// [`DurableJobRunner`] operation and handed to the [`ClaimExecutor`].
@@ -393,7 +447,8 @@ impl WorkerServices {
 /// [`JobExecutionRegistry`] (operator cancellation reaches the run exactly as
 /// before) and commits the outcome under the same fence.
 ///
-/// At most [`MAX_CONCURRENT_WORK_DRIVER_RUNS`] runs are in flight: a run only
+/// At most [`JobWorkerOptions::max_work_driver_runs`] runs (default
+/// [`MAX_CONCURRENT_WORK_DRIVER_RUNS`]) are in flight: a run only
 /// starts with a semaphore permit, and a job for which no permit is free is
 /// not claimed at all — it stays `Ready` for a later poll instead of being
 /// claimed and parked under a lease.
@@ -542,7 +597,8 @@ impl WorkDriverLane {
 ///
 /// # Concurrency
 /// Non-driver jobs are executed sequentially inside one poll; up to
-/// `MAX_CONCURRENT_WORK_DRIVER_RUNS` (2) driver runs proceed alongside them.
+/// `MAX_CONCURRENT_WORK_DRIVER_RUNS` (2, the default lane size) driver runs
+/// proceed alongside them.
 /// Every execution is fenced by [`DurableJobRunner`].
 ///
 /// Test entry point: production polls through `drive_worker_loop`.
@@ -631,6 +687,8 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
 /// - `context` (`Arc<JobWorkerContext>`): transcript root, configured
 ///   submitters and runtime root, handed to every poll; see
 ///   `run_job_worker_once` (tests) and `drive_worker_loop`.
+/// - `options` ([`JobWorkerOptions`]): the `work_driver` lane size;
+///   `harw serve` passes [`JobWorkerOptions::from_config`].
 ///
 /// # Returns
 /// Nothing; returns once `shutdown` is observed as `true` or its sender is
@@ -638,23 +696,29 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
 ///
 /// # Concurrency
 /// Intended to be driven by a dedicated `tokio` task. Driver runs are
-/// spawned onto the same runtime; dropping this future aborts them.
-pub async fn run_job_worker(
+/// spawned onto the same runtime; dropping this future aborts them. At most
+/// `options.max_work_driver_runs` driver runs are in flight.
+pub async fn run_job_worker_with_options(
     store: Arc<JobStore>,
     executions: Arc<JobExecutionRegistry>,
     provider: Arc<dyn ModelProvider>,
     plan_services: Option<Arc<PlanNodeServices>>,
     shutdown: watch::Receiver<bool>,
     context: Arc<JobWorkerContext>,
+    options: JobWorkerOptions,
 ) {
     let services = WorkerServices::new(store, executions, provider, plan_services, context);
-    drive_worker_loop(&services, shutdown).await;
+    drive_worker_loop(&services, shutdown, options).await;
 }
 
-// The loop behind `run_job_worker`; the driver lane lives exactly as long as
-// the loop.
-async fn drive_worker_loop(services: &WorkerServices, mut shutdown: watch::Receiver<bool>) {
-    let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+// The loop behind `run_job_worker_with_options`; the driver lane lives
+// exactly as long as the loop.
+async fn drive_worker_loop(
+    services: &WorkerServices,
+    mut shutdown: watch::Receiver<bool>,
+    options: JobWorkerOptions,
+) {
+    let mut lane = WorkDriverLane::new(options.lane_limit());
     loop {
         if *shutdown.borrow() {
             break;
@@ -1678,13 +1742,34 @@ fn assemble_job_turn(
     pause: PauseDisposition,
     required_sandbox: Option<&SandboxSpec>,
 ) -> Result<(TurnSetup, Arc<dyn ModelProvider>), String> {
+    assemble_job_turn_with(inputs, pause, required_sandbox, Vec::new())
+}
+
+// `assemble_job_turn` plus extra `AssemblyContributor`s for exactly this
+// turn. The WorkDriver worker uses it to add `work_driver.report` (R18 D-E)
+// to its own turns only. Without contributors the assembly goes through
+// `runtime_jobs::job_assembly` unchanged; with contributors through
+// `job_assembly_with_contributors`, the same builder chain plus
+// `.contributor(..)`. A contributor adds tools, never rights
+// (`harw_runtime::contributors`).
+fn assemble_job_turn_with(
+    inputs: JobAssemblyInputs<'_>,
+    pause: PauseDisposition,
+    required_sandbox: Option<&SandboxSpec>,
+    contributors: Vec<Arc<dyn AssemblyContributor>>,
+) -> Result<(TurnSetup, Arc<dyn ModelProvider>), String> {
     let session_id = inputs.session_id.clone();
     let state_store = Arc::clone(&inputs.state_store);
     // Jobs intentionally never read `uia_provider`/`uia_model`: those pin the
     // interactive TUI's root session only (see `chat::apply_uia_model_pin`),
     // and `job_assembly` below reads the real `default_provider`/
     // `default_model` unmodified.
-    let assembly: RuntimeAssembly = job_assembly(inputs).map_err(|error| {
+    let assembled = if contributors.is_empty() {
+        job_assembly(inputs)
+    } else {
+        job_assembly_with_contributors(inputs, contributors)
+    };
+    let assembly: RuntimeAssembly = assembled.map_err(|error| {
         tracing::error!(
             job_id = %session_id.as_str(),
             error = %error,
@@ -1717,6 +1802,44 @@ fn assemble_job_turn(
         },
         model,
     ))
+}
+
+// Mirror of `runtime_jobs::job_assembly` with extra contributors: same spec,
+// stores, model and narrowing, then each contributor in order. Kept next to
+// its only caller; if `JobAssemblyInputs` ever carries contributors itself,
+// this collapses into `job_assembly`.
+fn job_assembly_with_contributors(
+    inputs: JobAssemblyInputs<'_>,
+    contributors: Vec<Arc<dyn AssemblyContributor>>,
+) -> Result<RuntimeAssembly, String> {
+    let JobAssemblyInputs {
+        entry,
+        home,
+        cwd,
+        principal,
+        session_id,
+        state_store,
+        job_store,
+        model,
+        narrowing,
+    } = inputs;
+    let spec = crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal);
+    let stores = harw_runtime::RuntimeStores {
+        state_store,
+        job_store: Some(job_store),
+        approval_store: None,
+    };
+    let mut builder = RuntimeAssembly::builder(spec)
+        .model(harw_runtime::ModelSource::Override(model))
+        .stores(stores)
+        .root_session_id(session_id);
+    if let Some(narrowing) = narrowing {
+        builder = builder.narrowing(narrowing);
+    }
+    for contributor in contributors {
+        builder = builder.contributor(contributor);
+    }
+    builder.build().map_err(|error| error.to_string())
 }
 
 async fn execute_turn(
@@ -4134,6 +4257,28 @@ mod tests {
             Ok(())
         }
 
+        #[test]
+        fn test_job_worker_options_bound_the_lane_by_the_config() {
+            assert_eq!(
+                JobWorkerOptions::default().max_work_driver_runs,
+                MAX_CONCURRENT_WORK_DRIVER_RUNS
+            );
+            let mut config = harw_config::ResolvedConfig::default();
+            assert_eq!(
+                JobWorkerOptions::from_config(&config).max_work_driver_runs,
+                MAX_CONCURRENT_WORK_DRIVER_RUNS
+            );
+            config.harness.jobs.max_running = Some(1);
+            assert_eq!(
+                JobWorkerOptions::from_config(&config).max_work_driver_runs,
+                1
+            );
+            let zero = JobWorkerOptions {
+                max_work_driver_runs: 0,
+            };
+            assert_eq!(zero.lane_limit(), 1, "a zero-permit lane never runs");
+        }
+
         #[tokio::test]
         async fn test_work_driver_lane_limit_leaves_surplus_driver_jobs_ready() -> TestResult {
             let temp = temp_dir()?;
@@ -4232,7 +4377,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let worker = tokio::spawn(async move {
-                drive_worker_loop(&services, shutdown_rx).await;
+                drive_worker_loop(&services, shutdown_rx, JobWorkerOptions::default()).await;
             });
             drivers.wait_started(1).await?;
             assert_eq!(state_of(&store, "driver")?, JobState::Running);

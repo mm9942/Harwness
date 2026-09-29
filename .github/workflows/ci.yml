@@ -87,7 +87,7 @@ jobs:
               - '**/{Cargo.toml,Cargo.lock,deny.toml}'
 
   check:
-    name: fmt, clippy, test (root workspace)
+    name: fmt, clippy, test (root workspace, ${{ matrix.arch }})
     needs: changes
     # Auch bei `dod`-Änderungen: seit PL-60 sind die DoD-Crates Members des
     # Wurzel-Workspace, `--workspace` baut/testet sie mit, und die
@@ -98,7 +98,18 @@ jobs:
       || needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.dod == 'true'
       || needs.changes.outputs.workflows == 'true') }}
-    runs-on: ubuntu-latest
+    # Jede Änderung wird auf x64 und Linux-arm64 geprüft (seit R19): arm64
+    # nativ auf dem GitHub-arm64-Runner, nicht per Cross-Compile — so laufen
+    # auch die Tests (bubblewrap, Sandbox) auf der Zielarchitektur.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7

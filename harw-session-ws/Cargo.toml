@@ -1,0 +1,39 @@
+[package]
+publish.workspace = true
+name = "harw-session-ws"
+description = "WebSocket transport for the session control plane (subprotocol harw.session.v1): upgrade helpers, codec, limits, hello gate, request correlation and a fair frame multiplexer. Transport only: no identity, tenant or policy logic (W00 §2.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
+# Direct, reviewed WebSocket dependency (W00 §2.2, D10): ring A only. Same
+# 0.30 line the lockfile already carries through thirtyfour. No TLS/connect
+# features: TLS and identity come from the underlying transport.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+jiff = { workspace = true }
+# End-to-end tests drive the real host through the upgrade path.
+harw-session-host = { path = "../harw-session-host" }
+tempfile = { workspace = true }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util", "net", "test-util"] }
+
+[lints]
+workspace = true

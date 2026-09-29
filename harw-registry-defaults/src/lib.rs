@@ -284,7 +284,8 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // `JOB_READ_TOOLS`): `job.status`/`job.logs`/`job.list` lesen nur
     // Zustand und Logdateien eigener Jobs bzw. der Jobs von Nachfahren
     // (Besitzprüfung über die Sitzung aus dem Ausführungskontext);
-    // `job.wait` wartet begrenzt (höchstens 600 s) auf deren Ende. Keine
+    // `job.wait` ist ein kurzes Polling (höchstens 60 s; das Jobende kommt
+    // als Notiz, R18 F8). Keine
     // Schreibwirkung, kein Prozessstart. `job.start` fragt wie `shell.exec`,
     // `job.stop` wie jedes andere Werkzeug mit Wirkung (nicht in
     // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift).
@@ -320,6 +321,26 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // ins Journal des eigenen Laufs ein (nur Matrix-Speicher, dieselbe Klasse
     // wie `matrix.draft_scenario`; `model_tool(approval = "none")`).
     "matrix.add_fact",
+    // R18 (D-E): `work_driver.report` schreibt nur den strukturierten Bericht
+    // in den Slot des eigenen Worker-Turns (`profile::WORK_DRIVER_REPORT_TOOLS`)
+    // — kein Workspace, kein Prozess, kein Netz. Der Worker läuft
+    // unbeaufsichtigt; eine Rückfrage würde jede Runde als „blocked“ beenden.
+    "work_driver.report",
+    // R18 (D-B): die lesenden `gateway.*`-Werkzeuge
+    // (`profile::GATEWAY_READ_TOOLS`, `model_tool(readonly, approval =
+    // "none")`), nur an einer UIA-Wurzel registriert. Sie lesen Zustand des
+    // Gateways bzw. des lokalen harw-Homes (Diagnose, Kanal-Konfiguration);
+    // Ausgaben sind bereinigt, nie Tokens. Die Mutationen stehen in
+    // `ALWAYS_ASK_TOOLS`.
+    "gateway.status",
+    "gateway.connections.list",
+    "gateway.sessions.list",
+    "gateway.listeners.list",
+    "gateway.tools.list",
+    "gateway.channels.list",
+    "gateway.channels.connect_info",
+    "gateway.health",
+    "gateway.logs",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -401,6 +422,15 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // Runde 5, Teil K: Abbruch eines eigenen Hintergrund-Agenten — nie
     // automatisch im Auto-Modus (im Voll-Modus fragt nichts).
     "agent.cancel",
+    // R18 (D-B): die mutierenden `gateway.*`-Werkzeuge
+    // (`profile::GATEWAY_MUTATION_TOOLS`, `model_tool(approval = "always")`)
+    // — Widerruf, Draining, Listener, Werkzeug-Freigaben fragen unter
+    // `ask`/`auto` immer, auch gegen eine Allow-Regel.
+    "gateway.connections.revoke",
+    "gateway.drain",
+    "gateway.listeners.set",
+    "gateway.tools.grant",
+    "gateway.tools.narrow",
 ];
 
 /// Werkzeug, dessen Remote-OCR-Versand eine eigene Freigabe braucht.
@@ -1099,6 +1129,10 @@ mod tests {
         // Plan R9, Teil F: lesende Job-Werkzeuge (eigene Jobs, begrenztes
         // Warten), registriert neben `shell.exec` bzw. für Orchestratoren.
         read_only_surface.extend_from_slice(&harw_tool_job::JOB_READ_TOOLS);
+        // R18: lesende Gateway-Werkzeuge (nur UIA-Wurzel) und der Bericht der
+        // WorkDriver-Worker (schreibt nur den eigenen Berichts-Slot).
+        read_only_surface.extend_from_slice(crate::profile::GATEWAY_READ_TOOLS);
+        read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -1217,6 +1251,34 @@ mod tests {
         assert!(DefaultApprovalPolicy::requires_explicit_approval(&call(
             "agent.cancel"
         )));
+    }
+
+    /// R18 (D-B, D-E): lesende `gateway.*`-Werkzeuge und `work_driver.report`
+    /// laufen ohne Rückfrage; die mutierenden `gateway.*`-Werkzeuge fragen
+    /// immer (unter `ask`/`auto` auch gegen eine Allow-Regel).
+    #[test]
+    fn gateway_reads_and_work_driver_report_are_auto_approved_and_gateway_mutations_always_ask() {
+        assert_eq!(crate::profile::GATEWAY_READ_TOOLS.len(), 9);
+        assert_eq!(crate::profile::GATEWAY_MUTATION_TOOLS.len(), 5);
+        for tool in crate::profile::GATEWAY_READ_TOOLS
+            .iter()
+            .chain(crate::profile::WORK_DRIVER_REPORT_TOOLS)
+        {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert!(
+                !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss ohne Rückfrage laufen"
+            );
+        }
+        for tool in crate::profile::GATEWAY_MUTATION_TOOLS {
+            assert!(!AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} darf nie auto-freigegeben sein"
+            );
+        }
     }
 
     /// Runde 5, Teil M: `agent.message`/`parent.message` brauchen keine

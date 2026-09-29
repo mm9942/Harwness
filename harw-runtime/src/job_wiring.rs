@@ -17,6 +17,15 @@
 //! - [`JobEventRouter::lineage`]: die Elternkette einer Sitzung über die
 //!   Journale des Spawners (Besitz: Erzeuger plus Vorfahren).
 //!
+//! # Ende eines Jobs als Benachrichtigung (R18 F8)
+//! Das Ende eines Jobs ([`JobEvent::Finished`]) ist die Benachrichtigung,
+//! auf die ein Agent reagiert — nicht ein langes `job.wait` (das ist nur
+//! noch ein kurzes Abfragen, höchstens `harw_tool_job::MAX_WAIT_SECS`).
+//! Ein laufendes Kind liest die Notiz an seiner nächsten Runden-Grenze aus
+//! dem Postfach; an der Wurzel markiert [`JobNotification::event`]
+//! `is_finished()` die Notiz, und die TUI startet damit im Leerlauf einen
+//! Auto-Turn der UIA (`harw-tui` `app/jobs_glue.rs`).
+//!
 //! # Nebenläufigkeit
 //! Der [`harw_tool_job::JobNotifier`] der Verwaltung ist ein
 //! [`ChannelNotifier`] (blockiert nie); ein Tokio-Task
@@ -417,6 +426,49 @@ mod tests {
             }
         }
         assert_eq!(signals, 3);
+        Ok(())
+    }
+
+    /// R18 F8 (EX-06): das Ende eines Jobs der Wurzel wird als Notiz
+    /// zugestellt, die ein Ende trägt (Auslöser des Auto-Turns der TUI) und
+    /// Zustand und Exit-Code nennt; ein laufender Besitzer bekommt sie in
+    /// sein Postfach — niemand muss dafür in `job.wait` warten.
+    #[test]
+    fn job_completion_is_delivered_as_a_notification() -> TestResult {
+        let comms = Arc::new(ChildComms::default());
+        let root = SessionId::new();
+        let worker = SessionId::new();
+        comms.open_journal(&worker, &root, "executor", None);
+        let router = JobEventRouter::new();
+        router.bind(Some(Arc::clone(&comms)), root.clone());
+
+        // Job der Wurzel (UIA): Notiz an die Wurzel, als Ende markiert.
+        let own = JobNotification {
+            owner: JobOwner::new(root.as_str(), Vec::new()),
+            event: finished("job-root")?,
+        };
+        assert_eq!(router.route(own), JobDelivery::Root);
+        let notes = router.take_root_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].event.is_finished());
+        let text = notes[0].event.render_note();
+        assert!(text.contains("job-root"), "{text}");
+        assert!(text.contains("finished"), "{text}");
+        assert!(text.contains("exit code 0"), "{text}");
+
+        // Job eines laufenden Kindes: Notiz in dessen Postfach.
+        let child = JobNotification {
+            owner: JobOwner::new(worker.as_str(), vec![root.as_str().to_owned()]),
+            event: finished("job-child")?,
+        };
+        assert_eq!(
+            router.route(child),
+            JobDelivery::Child(worker.as_str().to_owned())
+        );
+        let inbound = comms.take_inbound(&worker);
+        assert_eq!(inbound.len(), 1);
+        assert!(inbound[0].contains("job-child"));
+        assert!(router.take_root_notes().is_empty());
         Ok(())
     }
 

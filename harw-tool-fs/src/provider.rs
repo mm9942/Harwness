@@ -340,8 +340,9 @@ fn fs_write_spec() -> ToolSpec {
              Creates the file if it does not exist; overwrites if it does. Parent directories \
              are not created. Requires WriteWorkspace permission. Symlinks in the path are \
              followed only when their target stays inside the workspace; path traversal, \
-             symlinks leading outside and the protected areas {} are rejected.",
-            protected_areas_description()
+             symlinks leading outside and the protected areas {} are rejected. {}",
+            protected_areas_description(),
+            crate::write::FS_WRITE_STEERING
         ),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -408,8 +409,9 @@ fn fs_edit_spec() -> ToolSpec {
              existing files. Requires WriteWorkspace permission. Symlinks in the path are \
              followed only inside the workspace; path traversal, symlinks leading outside and \
              the protected areas {} are rejected; files larger than 8 MiB are \
-             not edited.",
-            protected_areas_description()
+             not edited. {}",
+            protected_areas_description(),
+            crate::edit::FS_EDIT_STEERING
         ),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -668,6 +670,29 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// R18 F7 (EX-04): die Beschreibungen von `fs.edit`/`fs.write` lenken
+    /// Dateiänderungen weg von Shell-Heredocs und `python3 -`.
+    #[test]
+    fn test_fs_edit_and_write_specs_carry_the_steering_sentences() {
+        let ToolSpec::Function(edit) = fs_edit_spec();
+        assert!(
+            edit.description.contains("python3 -"),
+            "{}",
+            edit.description
+        );
+        assert!(
+            edit.description.contains(crate::edit::FS_EDIT_STEERING),
+            "{}",
+            edit.description
+        );
+        let ToolSpec::Function(write) = fs_write_spec();
+        assert!(
+            write.description.contains(crate::write::FS_WRITE_STEERING),
+            "{}",
+            write.description
+        );
     }
 
     #[test]

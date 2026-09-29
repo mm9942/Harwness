@@ -36,7 +36,10 @@ pub use context_load::{
     InMemoryReferenceStore, ReferenceStore,
 };
 pub use error::{ToolsError, ToolsResult};
-pub use executor::{ToolExecutionContext, ToolExecutor, ToolExecutorFuture, TracedToolExecutor};
+pub use executor::{
+    EXECUTED_ON_FIELD, ExecutionPlacement, PlacedToolExecutor, PlacedToolExecutorFuture,
+    PlacedToolOutput, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, TracedToolExecutor,
+};
 pub use output::ToolOutput;
 pub use sandbox_guard::{host_from_url, require_host_access, require_permission};
 pub use schema::{AdditionalProperties, JsonSchema, JsonSchemaType};

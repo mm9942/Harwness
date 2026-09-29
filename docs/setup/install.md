@@ -60,12 +60,23 @@ The tarball holds one directory `harw-<tag>-<target>/` with `harw`,
 line:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mm9942/Harwness/main/scripts/install.sh | bash -s -- --binary
+curl -fsSL https://get.harw.dev/harw/install.sh | bash -s -- --binary
 ```
 
 `--binary` picks the latest release (`HARW_RELEASE_TAG=vX.Y.Z` pins one) and
 the target of this machine: `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu`, or `aarch64-linux-android` under Termux.
+`aarch64-unknown-linux-gnu`, or `aarch64-linux-android` under Termux. It
+reads the mirror at `get.harw.dev/harw` (the tag from `version.json`, else
+`latest`, then `<tag>/harw-<tag>-<target>.tar.gz` and `<tag>/SHA256SUMS`); with
+`HARW_RELEASES_URL` set it reads a GitHub-style release layout instead. It
+never falls back to a source build: without a release for this machine it
+stops with an error and installs nothing. The `*-unknown-linux-gnu`
+releases need glibc (`getconf GNU_LIBC_VERSION`); on musl systems such as
+Alpine `--binary` refuses and the source installer is the way. Before it
+replaces anything, `--binary` runs the new `harw --version` from the staging
+directory, so a release that cannot execute here leaves an existing
+installation untouched. It adds `~/.local/bin` to `.bashrc`/`.zshrc` like
+the source installer.
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is
 pushed (or by hand for an existing tag); `make release` builds the same
 tarball locally.
@@ -78,7 +89,22 @@ curl -fsSL https://get.harw.dev/harw/install.sh | bash
 bash scripts/install.sh --source
 ```
 
-The piped script downloads `Harwness-main.zip`, extracts it under
+Without an argument the piped script always builds from source; prebuilt
+binaries are opt-in with `--binary` (above).
+
+`version.json` is the release manifest of the mirror, written by
+`scripts/release-manifest.sh` from the release's `SHA256SUMS`: `version`,
+`tag`, `published_at`, the `source` tarball and one entry per target, each
+with its `file` (relative to the mirror base) and `sha256`. After a
+successful install the script seeds `~/.harw/version.json` (the update
+notice's state, see below) with the installed version, unless that file
+already exists.
+
+The source path takes the versioned source tarball of the latest release
+(tag from `version.json`, else `latest`),
+`<tag>/harwness-<version>-source.tar.gz`, checked against the release's
+`SHA256SUMS` like a binary tarball. Only a mirror without one falls back to
+`Harwness-main.zip` (no checksum). It extracts the source under
 `$HARW_SOURCES_DIR` (default `~/.local/share/harw/sources`) and leaves the
 source in place for later agent builds. It installs Rustup from
 `https://sh.rustup.rs` if needed, then installs missing dependencies such as

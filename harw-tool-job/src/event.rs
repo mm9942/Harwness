@@ -35,6 +35,16 @@ pub enum JobEvent {
         pid: Option<u32>,
         /// Direkt auf dem Host (ohne `bwrap`).
         executed_on_host: bool,
+        /// R18 (TUI-07): `call_id` des startenden Werkzeugaufrufs, wie in
+        /// [`crate::JobMeta::origin_call_id`]; `None` ohne Werkzeugaufruf.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin_call_id: Option<String>,
+        /// R18: Name des startenden Werkzeugs (z. B. `job.start`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin_tool: Option<String>,
+        /// R18: Anzeigename des besitzenden Agenten, falls bekannt.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        owner_agent: Option<String>,
     },
     /// Periodischer Fortschritt (nur bei Änderung).
     Progress {
@@ -146,6 +156,7 @@ impl JobEvent {
                 command,
                 pid,
                 executed_on_host,
+                ..
             } => {
                 let place = if *executed_on_host { "host" } else { "sandbox" };
                 let pid = pid.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
@@ -362,6 +373,36 @@ mod tests {
             finished
                 .render_note()
                 .contains("succeeded after 1m01s, exit code 0 (no output)")
+        );
+        Ok(())
+    }
+
+    /// R18 (TUI-07): `Started` trägt die Herkunft; ohne Herkunft bleibt die
+    /// serialisierte Form die alte, die Agenten-Notiz ändert sich nicht.
+    #[test]
+    fn test_started_carries_origin_additively() -> TestResult {
+        let job_id = JobId::parse("job-o").ok_or(TestError::Missing("job id"))?;
+        let started = |origin_call_id: Option<&str>| JobEvent::Started {
+            job_id: job_id.clone(),
+            name: "build".into(),
+            command: "make".into(),
+            pid: Some(7),
+            executed_on_host: false,
+            origin_call_id: origin_call_id.map(str::to_owned),
+            origin_tool: origin_call_id.map(|_| "job.start".to_owned()),
+            owner_agent: None,
+        };
+        let plain = serde_json::to_value(started(None))
+            .map_err(|err| TestError::Unexpected(err.to_string()))?;
+        assert!(plain.get("origin_call_id").is_none(), "{plain}");
+        assert!(plain.get("owner_agent").is_none(), "{plain}");
+        let linked = serde_json::to_value(started(Some("call-1")))
+            .map_err(|err| TestError::Unexpected(err.to_string()))?;
+        assert_eq!(linked["origin_call_id"], "call-1");
+        assert_eq!(linked["origin_tool"], "job.start");
+        assert_eq!(
+            started(Some("call-1")).render_note(),
+            started(None).render_note()
         );
         Ok(())
     }

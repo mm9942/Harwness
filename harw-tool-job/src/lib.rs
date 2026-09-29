@@ -12,7 +12,10 @@
 //!   nötig: nur eigene Jobs bzw. die der Nachfahren)
 //! - `job.list {kind?}` — ohne `kind` nur die Übersicht je Art mit Zählern
 //!   pro Zustand; mit `kind` die Zeilen dieser Art
-//! - `job.wait {job_id, timeout_secs}` — begrenzt bis Ende oder Meilenstein
+//! - `job.wait {job_id, timeout_secs}` — kurzes Abfragen (höchstens
+//!   [`MAX_WAIT_SECS`] = 60 s, R18 F8) bis Ende oder Meilenstein; das Ende
+//!   eines Jobs kommt ohnehin als Notiz (siehe „Meldungen“), Agenten
+//!   blockieren also nicht in `job.wait`-Schleifen
 //!
 //! # Rechte
 //! `job.start` läuft über denselben Weg wie `shell.exec`
@@ -30,7 +33,15 @@
 //! # Meldungen
 //! [`JobEvent`]s (Start, gedrosselter Fortschritt, entprellte Fehlerzeilen,
 //! Hinweise, Ende mit Exit-Code/Dauer/letzten 20 Zeilen) gehen an einen
-//! [`JobNotifier`], den die Montage implementiert.
+//! [`JobNotifier`], den die Montage implementiert. Die Montage stellt das
+//! Ende zu wie eine Nachricht: in das Postfach des laufenden Besitzers
+//! (gelesen an seiner nächsten Runden-Grenze) bzw. an die Wurzel, wo es im
+//! Leerlauf einen Auto-Turn auslöst (`harw-runtime` `job_wiring`).
+//!
+//! # Herkunft
+//! [`JobOrigin`] (Aufruf-Id und Werkzeug des startenden Aufrufs) steht in
+//! `meta.json` und im `Started`-Ereignis; `job.start` setzt sie aus dem
+//! Werkzeugaufruf.
 //!
 //! # Module
 //! - [`model`] — [`JobId`], [`JobState`], [`JobOwner`], [`JobMeta`], [`JobStatus`]
@@ -67,7 +78,7 @@ pub use launcher::{JobLauncher, LaunchFuture, PreparedJob, ShellJobLauncher};
 pub use logs::{LogQuery, LogSlice};
 pub use manager::{
     Caller, DEFAULT_MAX_PIPED_LINE_BYTES, DetachSummary, JobError, JobManager, JobManagerConfig,
-    PipedJob, PipedLineError, StartRequest, WaitOutcome,
+    JobOrigin, PipedJob, PipedLineError, StartRequest, WaitOutcome,
 };
 pub use model::{JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus};
 pub use procfs::JobSignal;

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install Harwness from the source archive published at get.harw.dev.
+# Install Harwness from get.harw.dev: built from the release's source tarball
+# by default, or a prebuilt release with --binary.
 # Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
 set -euo pipefail
 
@@ -18,14 +19,21 @@ Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
        curl -fsSL https://get.harw.dev/harw/install.sh | bash -s -- --binary
        bash scripts/install.sh [--source | --binary]
 
-The piped installer downloads and extracts Harwness-main.zip, installs
-Rustup with the stable default toolchain when needed, installs missing
-Linux build dependencies including Bubblewrap, then runs make install.
+Without an argument the piped installer builds from source: it downloads
+the release's harwness-<version>-source.tar.gz (tag from
+$HARW_BASE_URL/version.json or /latest, checked against SHA256SUMS) or, when
+the mirror publishes none, Harwness-main.zip. It installs Rustup with the
+stable default toolchain when needed, installs missing Linux build
+dependencies including Bubblewrap, then runs make install.
 
---binary installs harw, killer and harw-agent-runner from a GitHub release
-instead (no Rust toolchain): it downloads harw-<tag>-<target>.tar.gz and
-SHA256SUMS, refuses a tarball whose checksum does not match or that lacks a
-binary, and only then replaces an existing installation.
+--binary (opt-in) installs harw, killer and harw-agent-runner from a
+prebuilt release and fails instead of falling back to a source build (no
+Rust toolchain): it needs glibc (x86_64 or aarch64 Linux) or Termux,
+downloads harw-<tag>-<target>.tar.gz and SHA256SUMS, refuses a tarball whose
+checksum does not match, that lacks a binary or whose harw does not run
+here, and only then replaces an existing installation. The mirror is the
+default source; with HARW_RELEASES_URL set it reads a GitHub-style release
+layout (<url>/download/<tag>/...) instead.
 
 Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME,
 HARW_RELEASE_TAG (default: the latest release), HARW_RELEASES_URL.
@@ -159,6 +167,18 @@ fetch() {
   fi
 }
 
+# Like `fetch`, but silent and without dying: for probing optional files.
+fetch_quiet() {
+  local url="$1" output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 2 "$url" -o "$output" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O "$output" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 ensure_rustup() {
   if ! command -v rustup >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/rustup" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
@@ -186,19 +206,98 @@ archive_hash() {
 
 # Release target of this machine: the Rust target triple the release
 # workflow builds for (Termux on Android reports "Android" as its OS).
-release_target() {
+# Fails (without dying) on an architecture without release builds.
+release_target_or_none() {
   local arch
   arch="$(uname -m)"
   case "$arch" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
-    *) die "no release build for architecture $arch; use the source installer" ;;
+    *) return 1 ;;
   esac
   if [ "$(uname -o 2>/dev/null)" = Android ]; then
     printf '%s-linux-android\n' "$arch"
-  else
+  elif has_glibc; then
     printf '%s-unknown-linux-gnu\n' "$arch"
+  else
+    return 1
   fi
+}
+
+# The *-unknown-linux-gnu releases need glibc and its loader; musl systems
+# such as Alpine build from source instead.
+has_glibc() {
+  getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc'
+}
+
+release_target() {
+  release_target_or_none \
+    || die "no release build for $(uname -m) $(has_glibc && echo glibc || echo "without glibc (e.g. musl)"); use the source installer (no argument)"
+}
+
+# URL of one release file: the mirror layout (<base>/<tag>/<file>, written by
+# release.yml `mirror`) by default, the GitHub layout with HARW_RELEASES_URL.
+release_file_url() {
+  local tag="$1" file="$2"
+  if [ -n "${HARW_RELEASES_URL:-}" ]; then
+    printf '%s/download/%s/%s\n' "$releases_url" "$tag" "$file"
+  else
+    printf '%s/%s/%s\n' "$base_url" "$tag" "$file"
+  fi
+}
+
+# Tag the mirror names as latest: the "tag" of <base>/version.json (the
+# release manifest), else <base>/latest (one line `vX.Y.Z`).
+mirror_latest_tag() {
+  local out tag
+  out="$(mktemp)"
+  if fetch_quiet "$base_url/version.json" "$out"; then
+    tag="$(sed -n 's/.*"tag"[[:space:]]*:[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p' "$out" | head -n 1)"
+    if [ -n "$tag" ]; then
+      rm -f "$out"
+      printf '%s\n' "$tag"
+      return 0
+    fi
+  fi
+  if fetch_quiet "$base_url/latest" "$out"; then
+    tag="$(head -n 1 "$out" | tr -d '[:space:]')"
+    rm -f "$out"
+    case "$tag" in v[0-9]*) printf '%s\n' "$tag"; return 0 ;; esac
+    return 1
+  fi
+  rm -f "$out"
+  return 1
+}
+
+# Tag to install: HARW_RELEASE_TAG, else the latest release of the chosen
+# layout (mirror by default, GitHub with HARW_RELEASES_URL).
+release_tag() {
+  if [ -n "${HARW_RELEASE_TAG:-}" ]; then
+    printf '%s\n' "$HARW_RELEASE_TAG"
+  elif [ -n "${HARW_RELEASES_URL:-}" ]; then
+    latest_release_tag
+  else
+    mirror_latest_tag || die "no release published at $base_url (missing $base_url/latest)"
+  fi
+}
+
+# Tag whose source tarball the mirror publishes: `latest` (or
+# HARW_RELEASE_TAG) names a tag whose SHA256SUMS lists
+# harwness-<version>-source.tar.gz. Fails when there is none; the source path
+# then falls back to Harwness-main.zip.
+mirror_source_release() {
+  local tag sums
+  tag="${HARW_RELEASE_TAG:-$(mirror_latest_tag)}" || return 1
+  [ -n "$tag" ] || return 1
+  sums="$(mktemp)"
+  if fetch_quiet "$base_url/$tag/SHA256SUMS" "$sums" \
+    && grep -Eq "[[:space:]]\*?(\./)?harwness-${tag#v}-source\.tar\.gz\$" "$sums"; then
+    rm -f "$sums"
+    printf '%s\n' "$tag"
+    return 0
+  fi
+  rm -f "$sums"
+  return 1
 }
 
 # Tag of the latest release, read from the redirect of /releases/latest.
@@ -239,16 +338,43 @@ LISTING
   esac
 }
 
+# Seeds ~/.harw/version.json (harw_install::VersionInfo) with the installed
+# release, so the start notice and `harw update` know it without a network
+# check. An existing file is left alone: it may hold a dismissed version.
+record_installed_version() {
+  local version="${1#v}" file
+  file="${HARW_HOME:-$HOME/.harw}/version.json"
+  [ -n "$version" ] && [ ! -e "$file" ] || return 0
+  mkdir -p "$(dirname "$file")"
+  printf '{"latest_version":"%s","last_checked_at":"%s","dismissed_version":null}\n' \
+    "$version" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$file" \
+    || log "could not write $file; harw checks for updates on its next start"
+}
+
+# Makes ~/.local/bin reachable in new shells (both install paths).
+setup_path() {
+  [ "$install_dir" = "$HOME/.local/bin" ] || return 0
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$rc" ] || continue
+    if ! grep -q 'added by harw installer' "$rc"; then
+      printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"  # added by harw installer' >> "$rc"
+    fi
+  done
+}
+
 install_binary_release() {
-  local target tag name work_dir unpacked binary runner_dir
+  # work_dir stays global: the EXIT trap runs after this function returned.
+  local target tag name unpacked binary runner_dir
   target="$(release_target)"
-  tag="${HARW_RELEASE_TAG:-$(latest_release_tag)}"
+  tag="$(release_tag)"
   name="harw-$tag-$target"
   work_dir="$(mktemp -d)"
   trap 'rm -rf "$work_dir"' EXIT
   log "Downloading $name.tar.gz"
-  fetch "$releases_url/download/$tag/$name.tar.gz" "$work_dir/$name.tar.gz"
-  fetch "$releases_url/download/$tag/SHA256SUMS" "$work_dir/SHA256SUMS"
+  fetch "$(release_file_url "$tag" "$name.tar.gz")" "$work_dir/$name.tar.gz" \
+    || die "could not download $name.tar.gz for $tag; nothing installed"
+  fetch "$(release_file_url "$tag" SHA256SUMS)" "$work_dir/SHA256SUMS" \
+    || die "could not download SHA256SUMS for $tag; nothing installed"
   (
     cd "$work_dir"
     grep -E "^[0-9a-fA-F]{64}[[:space:]]+\*?(\./)?$name\.tar\.gz\$" SHA256SUMS > "$name.sha256" \
@@ -269,6 +395,12 @@ install_binary_release() {
   for binary in $binaries; do
     [ -f "$unpacked/$binary" ] || die "$name.tar.gz has no $binary; nothing installed"
   done
+  # Run the new harw from the staging directory first: a release that cannot
+  # execute here (missing loader, wrong libc) must not replace a working
+  # installation.
+  chmod 0755 "$unpacked/harw"
+  "$unpacked/harw" --version >/dev/null 2>&1 \
+    || die "harw from $name.tar.gz does not run on this system; nothing installed (use the source installer: no argument)"
   mkdir -p "$install_dir"
   for binary in $binaries; do
     install -m 0755 "$unpacked/$binary" "$install_dir/$binary"
@@ -278,6 +410,8 @@ install_binary_release() {
   install -m 0755 "$unpacked/harw-agent-runner" "$runner_dir/harw-agent-runner"
   "$install_dir/harw" agent install-record --bindir "$install_dir" \
     || log "could not record the installation; harw update falls back to the running binary's directory"
+  setup_path
+  record_installed_version "$tag"
   log "Harwness $tag installed into $install_dir"
   "$install_dir/harw" --version
   printf '%s\n' 'Next: harw doctor; then harw to start onboarding.'
@@ -290,6 +424,7 @@ if [ "${1:-}" = --binary ]; then
 fi
 
 checkout=""
+source_tag=""
 if [ "${1:-}" = --source ]; then
   [ -f scripts/install.sh ] && [ -f Cargo.toml ] && [ -f Makefile ] \
     || die "--source must be run from the Harwness repository root"
@@ -302,19 +437,52 @@ else
   mkdir -p "$sources_dir"
   work_dir="$(mktemp -d "$sources_dir/.download-XXXXXX")"
   trap 'rm -rf "$work_dir"' EXIT
-  log "Downloading $base_url/$archive_name"
-  fetch "$base_url/$archive_name" "$work_dir/$archive_name"
-  ensure_unzip
-  hash="$(archive_hash "$work_dir/$archive_name")"
-  checkout="$sources_dir/$hash"
-  if [ ! -f "$checkout/Makefile" ]; then
-    mkdir -p "$work_dir/unpacked"
-    unzip -q "$work_dir/$archive_name" -d "$work_dir/unpacked"
-    extracted="$work_dir/unpacked/Harwness-main"
-    [ -f "$extracted/Cargo.toml" ] && [ -f "$extracted/Makefile" ] \
-      || die "$archive_name has no Harwness source root"
-    [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
-    mv "$extracted" "$checkout"
+  if source_tag="$(mirror_source_release)"; then
+    # The versioned source tarball of the release, checked against its
+    # SHA256SUMS like a binary release.
+    source_root="harwness-${source_tag#v}"
+    source_name="$source_root-source.tar.gz"
+    log "Downloading $base_url/$source_tag/$source_name"
+    fetch "$base_url/$source_tag/$source_name" "$work_dir/$source_name" \
+      || die "could not download $base_url/$source_tag/$source_name; nothing installed"
+    fetch "$base_url/$source_tag/SHA256SUMS" "$work_dir/SHA256SUMS" \
+      || die "could not download SHA256SUMS for $source_tag; nothing installed"
+    (
+      cd "$work_dir"
+      grep -E "^[0-9a-fA-F]{64}[[:space:]]+\*?(\./)?$source_name\$" SHA256SUMS > "$source_name.sha256" \
+        || die "SHA256SUMS of $source_tag has no entry for $source_name"
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$source_name.sha256" >/dev/null
+      else
+        shasum -a 256 -c "$source_name.sha256" >/dev/null
+      fi
+    ) || die "checksum of $source_name does not match SHA256SUMS; nothing installed"
+    check_release_archive "$work_dir/$source_name" "$source_root"
+    hash="$(archive_hash "$work_dir/$source_name")"
+    checkout="$sources_dir/$hash"
+    if [ ! -f "$checkout/Makefile" ]; then
+      tar -xzf "$work_dir/$source_name" -C "$work_dir"
+      [ -f "$work_dir/$source_root/Cargo.toml" ] && [ -f "$work_dir/$source_root/Makefile" ] \
+        || die "$source_name has no Harwness source root"
+      [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
+      mv "$work_dir/$source_root" "$checkout"
+    fi
+  else
+    log "Downloading $base_url/$archive_name"
+    fetch "$base_url/$archive_name" "$work_dir/$archive_name" \
+      || die "could not download $base_url/$archive_name (no source archive published there); try: bash -s -- --binary"
+    ensure_unzip
+    hash="$(archive_hash "$work_dir/$archive_name")"
+    checkout="$sources_dir/$hash"
+    if [ ! -f "$checkout/Makefile" ]; then
+      mkdir -p "$work_dir/unpacked"
+      unzip -q "$work_dir/$archive_name" -d "$work_dir/unpacked"
+      extracted="$work_dir/unpacked/Harwness-main"
+      [ -f "$extracted/Cargo.toml" ] && [ -f "$extracted/Makefile" ] \
+        || die "$archive_name has no Harwness source root"
+      [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
+      mv "$extracted" "$checkout"
+    fi
   fi
 fi
 
@@ -332,15 +500,9 @@ else
 fi
 (cd "$checkout" && make install BINDIR="$install_dir")
 
-if [ "$install_dir" = "$HOME/.local/bin" ]; then
-  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [ -f "$rc" ] || continue
-    if ! grep -q 'added by harw installer' "$rc"; then
-      printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"  # added by harw installer' >> "$rc"
-    fi
-  done
-fi
+setup_path
 
+record_installed_version "${source_tag:-}"
 log "Harwness installed from $checkout"
 "$install_dir/harw" --version
 printf '%s\n' 'Next: harw doctor; then harw to start onboarding.'

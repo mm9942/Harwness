@@ -428,6 +428,7 @@ mod tests {
                 call_id: call,
                 result: harw_protocol::ToolCallResult::success(serde_json::json!({"content": "x"})),
                 duration_ms: 3,
+                placement: None,
             },
         ));
         monitor.apply(&turn(

@@ -117,6 +117,68 @@ pub enum ResultTrust {
     Runtime,
 }
 
+/// Where a tool call was actually executed (R18 D-D, contract
+/// `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §5).
+///
+/// # Description
+/// Surfaces show the placement instead of a shell command line. The value is
+/// always set by the executing side (the runtime or the gateway tool host),
+/// never by the model or a request payload.
+///
+/// - `Host`: ran on the local host outside a sandbox (approved host
+///   escalation).
+/// - `Sandbox`: ran in the local sandbox of the agent process itself.
+/// - `Gateway`: ran in the gateway tool host, inside a gateway-side sandbox;
+///   `node` names the gateway node when known.
+/// - `Unknown`: a placement kind this version does not know (additive
+///   evolution); render it neutrally, never as `Host`.
+///
+/// # Concurrency
+/// Plain owned value, `Send + Sync`.
+///
+/// # Examples
+/// ```rust
+/// use harw_protocol::items::ToolPlacement;
+///
+/// let placement = ToolPlacement::Gateway { node: Some("gw-1".to_owned()) };
+/// let json = serde_json::to_value(&placement)?;
+/// assert_eq!(json, serde_json::json!({"kind": "gateway", "node": "gw-1"}));
+/// let future: ToolPlacement = serde_json::from_value(serde_json::json!({"kind": "zellhost", "pod": "p"}))?;
+/// assert_eq!(future, ToolPlacement::Unknown);
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolPlacement {
+    /// Local host, outside any sandbox.
+    Host,
+    /// Local sandbox of the agent process.
+    Sandbox,
+    /// Gateway tool host (always sandboxed on the gateway side).
+    Gateway {
+        /// Gateway node label, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
+    },
+    /// A placement kind this version does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ToolPlacement {
+    /// Short, stable label for surfaces (`host`, `sandbox`, `gateway`,
+    /// `unknown`).
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Sandbox => "sandbox",
+            Self::Gateway { .. } => "gateway",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResultItem {
@@ -188,7 +250,9 @@ pub struct ErrorItem {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpaqueReasoning, ResultTrust, ToolCallResult, ToolResultItem, TurnItem};
+    use super::{
+        OpaqueReasoning, ResultTrust, ToolCallResult, ToolPlacement, ToolResultItem, TurnItem,
+    };
     use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
 
@@ -334,6 +398,45 @@ mod tests {
             serde_json::to_value(result).map_err(ctx("tool outcome serializes"))?,
             json!({"status": "error", "message": "tool unavailable"})
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_placement_wire_shapes_are_tagged_by_kind() -> TestResult {
+        assert_eq!(
+            serde_json::to_value(ToolPlacement::Host).map_err(ctx("host"))?,
+            json!({"kind": "host"})
+        );
+        assert_eq!(
+            serde_json::to_value(ToolPlacement::Sandbox).map_err(ctx("sandbox"))?,
+            json!({"kind": "sandbox"})
+        );
+        assert_eq!(
+            serde_json::to_value(ToolPlacement::Gateway { node: None }).map_err(ctx("gateway"))?,
+            json!({"kind": "gateway"})
+        );
+        let back: ToolPlacement = serde_json::from_value(json!({"kind": "gateway", "node": "gw"}))
+            .map_err(ctx("gateway decodes"))?;
+        assert_eq!(
+            back,
+            ToolPlacement::Gateway {
+                node: Some("gw".to_owned())
+            }
+        );
+        assert_eq!(back.label(), "gateway");
+        Ok(())
+    }
+
+    /// Additive evolution: an unknown placement kind (even with extra
+    /// fields) decodes to `Unknown`, never to `Host`.
+    #[test]
+    fn tool_placement_unknown_kind_decodes_to_unknown() -> TestResult {
+        let future: ToolPlacement =
+            serde_json::from_value(json!({"kind": "zellhost", "pod": "p-1"}))
+                .map_err(ctx("unknown placement decodes"))?;
+        assert_eq!(future, ToolPlacement::Unknown);
+        assert_eq!(future.label(), "unknown");
+        assert!(serde_json::from_value::<ToolPlacement>(json!({"node": "x"})).is_err());
         Ok(())
     }
 
