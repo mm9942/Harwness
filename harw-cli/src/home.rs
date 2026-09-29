@@ -11,6 +11,16 @@ use std::path::{Path, PathBuf};
 
 /// Löst den Root-Space auf, ohne ihn anzulegen.
 ///
+/// # Description
+/// Der `--home`-Override wird bewusst nicht in die Prozessumgebung
+/// geschrieben: kein [`std::env::set_var`], kein
+/// [`harw_home::set_home_override`]. Die Runtime bindet den aufgelösten
+/// Root-Space in [`harw_home::ResolvedHomeContext`]. Die Operator-Kommandos
+/// lesen ihn von dort statt über [`harw_home::home_dir`]. Bekannte Ausnahmen,
+/// getrennt verfolgt: `/permissions` (Global- und Projekt-Scope) und `/agent`
+/// (Compiler-Umgebung) lösen noch den Root-Space des Prozesses auf und sehen
+/// einen `--home`-Override deshalb nicht.
+///
 /// # Arguments
 /// - `override_dir` (`Option<PathBuf>`): expliziter `--home`-Wert; hat Vorrang
 ///   vor jeder Env-/Default-Auflösung.

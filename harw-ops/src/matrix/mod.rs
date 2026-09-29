@@ -43,6 +43,14 @@
 //! des Matrix-Speichers lesen. Freitext mit Leerzeichen verweist auf den
 //! Entwurf.
 //!
+//! # Root-Space
+//! Der Matrix-Speicher (`<profil>/knowledge/matrix`: Laufverzeichnisse und
+//! Entwürfe) liegt im Profil des an die Sitzung gebundenen Root-Space
+//! (`harw_home::ResolvedHomeContext`, siehe `crate::config_util::bound_home`)
+//! — nie über `HARW_HOME`, damit eine mit `--home` gestartete Sitzung nicht
+//! in den Root-Space des Prozesses schreibt. Ohne Bindung startet kein Lauf;
+//! `list` zeigt dann keine gespeicherten Entwürfe.
+//!
 //! # Laufzustand
 //! Läufe leben prozessweit in `RUNS`. Für die Dauer eines Schritts wird der
 //! Lauf aus der Map genommen (kein `std::sync::Mutex` über ein `await`);
@@ -51,7 +59,8 @@
 //! # Fehler
 //! - [`OpError::InvalidArguments`] — Grammatik, unbekanntes Szenario/Lauf,
 //!   Steuerbefehl über den Slash-Pfad.
-//! - [`OpError::NotAvailable`] — kein Agent-Spawner (Game-Master-Werkzeuge).
+//! - [`OpError::NotAvailable`] — kein Agent-Spawner (Game-Master-Werkzeuge)
+//!   oder kein gebundener Root-Space (Matrix-Speicher).
 //! - [`OpError::Execution`] — Kern-, Datei- oder Registry-Fehler.
 
 pub mod game_master;
@@ -414,14 +423,14 @@ fn saved_scenarios(root: &Path) -> Vec<String> {
     slugs
 }
 
-/// `<profil>/knowledge/matrix`.
-fn matrix_root() -> Result<PathBuf, OpError> {
-    let home = harw_home::home_dir()
-        .map_err(|e| OpError::Execution(format!("HARW_HOME nicht auflösbar: {e}")))?;
-    let profile = harw_home::active_profile_name(&home);
-    let dir = harw_home::profile_dir(&home, &profile)
-        .map_err(|e| OpError::Execution(format!("Profil '{profile}' nicht auflösbar: {e}")))?;
-    Ok(harw_home::matrix_dir(&dir))
+/// `<profil>/knowledge/matrix` im Profil des an die Sitzung gebundenen
+/// Root-Space ([`crate::config_util::bound_home`]); bewusst kein Rückfall auf
+/// `HARW_HOME`.
+///
+/// # Errors
+/// [`OpError::NotAvailable`], wenn kein Root-Space gebunden ist.
+fn matrix_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
+    Ok(harw_home::matrix_dir(&crate::config_util::bound_home(ctx)?.profile_dir))
 }
 
 /// Dateisystemtauglicher Name (ASCII-Alphanumerik, `-`, `_`).
@@ -474,15 +483,15 @@ fn new_run_location(root: &Path, scenario_id: &str) -> (String, PathBuf) {
         busy_subcommands = "show=immediate, list=immediate"
     )
 )]
-async fn matrix(_ctx: &OpContext, args: MatrixArgs) -> Result<OpOutput, OpError> {
+async fn matrix(ctx: &OpContext, args: MatrixArgs) -> Result<OpOutput, OpError> {
     let parsed = parse_command(&args.tokens)?;
-    run_command(parsed)
+    run_command(ctx, parsed)
 }
 
-fn run_command(parsed: ParsedCommand) -> Result<OpOutput, OpError> {
+fn run_command(ctx: &OpContext, parsed: ParsedCommand) -> Result<OpOutput, OpError> {
     let ParsedCommand { run, command } = parsed;
     match command {
-        MatrixCommand::List => list_output(),
+        MatrixCommand::List => list_output(ctx),
         MatrixCommand::Compare(ids) => compare_output(&ids),
         MatrixCommand::Show => show_output(&current_id(run)?),
         MatrixCommand::Replay => {
@@ -518,7 +527,7 @@ fn start_run(
         path,
     } = resolved;
     let master = master_seed_for(&loaded, seed);
-    let (run_id, dir) = new_run_location(&matrix_root()?, loaded.scenario.id());
+    let (run_id, dir) = new_run_location(&matrix_root(ctx)?, loaded.scenario.id());
     let warnings = loaded.warnings.clone();
     let mut run = MatrixRun::start(
         loaded,
@@ -715,7 +724,9 @@ fn show_output(id: &str) -> Result<OpOutput, OpError> {
     })
 }
 
-fn list_output() -> Result<OpOutput, OpError> {
+/// Läufe dieses Prozesses plus Szenarien; gespeicherte Entwürfe nur aus dem
+/// gebundenen Root-Space (ohne Bindung keine).
+fn list_output(ctx: &OpContext) -> Result<OpOutput, OpError> {
     let mut runs: Vec<Value> = lock(&RUNS)?
         .values()
         .map(|run| {
@@ -741,7 +752,7 @@ fn list_output() -> Result<OpOutput, OpError> {
     runs.sort_by(|a, b| a["run_id"].as_str().cmp(&b["run_id"].as_str()));
     let current = lock(&CURRENT)?.clone();
     let scenarios: Vec<&str> = BUNDLED.iter().map(|(file, _)| *file).collect();
-    let saved = matrix_root()
+    let saved = matrix_root(ctx)
         .map(|root| saved_scenarios(&root))
         .unwrap_or_default();
     let mut text = format!("Gebündelte Szenarien: {}", scenarios.join(", "));
@@ -778,6 +789,7 @@ fn list_output() -> Result<OpOutput, OpError> {
 mod tests {
     use super::*;
     use crate::testutil::toks;
+    use harw_operations::context::ServiceMap;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -807,6 +819,7 @@ mod tests {
     /// blockieren.
     #[test]
     fn steering_commands_are_rejected_with_the_game_master_hint() -> TestResult {
+        let op_ctx = crate::knowledge_test_support::op_context(ServiceMap::new())?;
         let cases: [&[&str]; 6] = [
             &["start", "karst-islands"],
             &["start", "veröffentlichung", "von", "harwness"],
@@ -821,7 +834,7 @@ mod tests {
                 matches!(parsed.command, MatrixCommand::Steering(_)),
                 "{sub:?}"
             );
-            let error = run_command(parsed)
+            let error = run_command(&op_ctx, parsed)
                 .err()
                 .ok_or("Steuerbefehl muss abgewiesen werden")?;
             assert!(error.to_string().contains("Game Master"), "{error}");
@@ -919,11 +932,55 @@ mod tests {
         assert!(with_run(&id, |_| Ok(())).is_err());
         put_run(taken)?;
 
-        let listed = list_output()?.data.ok_or("list ohne Daten")?;
+        let op_ctx = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+        let listed = list_output(&op_ctx)?.data.ok_or("list ohne Daten")?;
         let runs = listed["runs"].as_array().ok_or("runs")?;
         assert!(runs.iter().any(|r| r["run_id"] == json!(id)));
         lock(&RUNS)?.remove(&id);
         assert!(show_output(&id).is_err());
+        Ok(())
+    }
+
+    /// Der Matrix-Speicher folgt dem gebundenen Root-Space: `list` liest
+    /// Entwürfe nur dort, ein Laufstart legt sein Verzeichnis dort an; ohne
+    /// Bindung gibt es keinen Rückfall auf `HARW_HOME`.
+    #[test]
+    fn matrix_store_follows_the_bound_home() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let home = crate::config_util::test_home_context(tmp.path())?;
+        let root = harw_home::matrix_dir(&home.profile_dir);
+        let drafts = root.join(SCENARIOS_DIR);
+        std::fs::create_dir_all(&drafts)?;
+        std::fs::write(drafts.join("mein-entwurf.toml"), BUNDLED[0].1)?;
+        let mut services = ServiceMap::new();
+        services.insert(home);
+        let bound = crate::knowledge_test_support::op_context(services)?;
+        let unbound = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+
+        let listed = list_output(&bound)?.data.ok_or("list ohne Daten")?;
+        assert_eq!(listed["saved"], json!(["mein-entwurf"]));
+        let listed = list_output(&unbound)?.data.ok_or("list ohne Daten")?;
+        assert_eq!(listed["saved"], json!([]));
+
+        let refused = start_run(&unbound, resolve_known_scenario("karst-islands", None)?, None)
+            .err()
+            .ok_or("Laufstart ohne gebundenen Root-Space muss scheitern")?;
+        assert!(matches!(refused, OpError::NotAvailable(_)), "{refused}");
+
+        let resolved = resolve_known_scenario("karst-islands", None)?;
+        let (_, run_id) = start_run(&bound, resolved, Some(1))?;
+        let dir = with_run(&run_id, |run| Ok(run.run_dir().map(Path::to_path_buf)));
+        lock(&RUNS)?.remove(&run_id);
+        lock(&SESSION_RUNS)?.remove(bound.session_id().as_str());
+        {
+            let mut current = lock(&CURRENT)?;
+            if current.as_deref() == Some(run_id.as_str()) {
+                *current = None;
+            }
+        }
+        let dir = dir?.ok_or("Lauf ohne Verzeichnis")?;
+        assert!(dir.starts_with(&root), "{}", dir.display());
+        assert!(dir.is_dir(), "{}", dir.display());
         Ok(())
     }
 }

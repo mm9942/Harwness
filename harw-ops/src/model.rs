@@ -24,6 +24,9 @@
 //! # Runtime-Wahrheit vs. Config-Default
 //! `show` und `list` lesen zuerst den Live-Controller-Snapshot.  Nur wenn kein
 //! Wert gesetzt ist, fällt der Pfad auf Config-Defaults zurück — mit klarem Label.
+//! Die Config stammt wie bei `switch` aus [`crate::provider::resolved_config`]:
+//! Sitzungs-Config aus dem Kontext, sonst Discovery über den gebundenen
+//! Root-Space (`harw_home::ResolvedHomeContext`) — nie aus `HARW_HOME`.
 //!
 //! # Schlüsseltypen
 //! - [`ModelArgs`] — geparste Sub-Kommando-Argumente
@@ -34,6 +37,8 @@
 //!
 //! # Fehlertypen
 //! - [`harw_operations::OpError::Execution`]: `SessionController` nicht verfügbar.
+//! - [`harw_operations::OpError::NotAvailable`]: weder ein Config-Dienst noch
+//!   ein gebundener Root-Space im Kontext.
 //! - [`harw_operations::OpError::InvalidArguments`]: Unbekanntes Sub-Kommando,
 //!   unbekannte Modell-ID, oder der aufgelöste Zielprovider ist unbekannt,
 //!   deaktiviert oder ohne Zugangsdaten (siehe [`crate::provider::handle_switch_core`]).
@@ -55,7 +60,9 @@ use harw_operations::{OpContext, OpError, OpOutput};
 // dieser `pub use` der öffentliche Pfad, über den `harw-tui`-Tests (und
 // jeder andere Downstream-Crate) `SelectionPersistence` und
 // `RecordingSelectionPersistence` erreichen — ohne `harw-ops/src/lib.rs`
-// ändern zu müssen. Siehe `crate::config_util`-Moduldoc für den Trait selbst.
+// ändern zu müssen. `FileSelectionPersistence` wird ebenfalls re-exportiert;
+// außerhalb des Crates entsteht sie nur über `for_home` aus einem gebundenen
+// Root-Space. Siehe `crate::config_util`-Moduldoc für den Trait selbst.
 pub use crate::config_util::{
     FileSelectionPersistence, RecordedSelectionPersistCall, RecordingSelectionPersistence,
     SelectionPersistence,
@@ -344,6 +351,8 @@ pub(crate) fn effective_uia_selection(
 ///
 /// # Fehler
 /// - [`OpError::Execution`]: `SessionController` nicht verfügbar.
+/// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
+///   Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`]: Unbekannte ID, aufgelöster Zielprovider
 ///   unbekannt/deaktiviert/ohne Zugangsdaten, unbekanntes Sub-Kommando.
 ///
@@ -410,7 +419,10 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let snap = controller
         .map(|c| c.snapshot())
         .unwrap_or_else(harw_operations::SessionControlSnapshot::empty);
-    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+    // Same context-scoped authority as `switch` (see
+    // `crate::provider::resolved_config`): session config, else discovery over
+    // the bound root space, never `HARW_HOME`.
+    let config = crate::provider::resolved_config(ctx)?;
 
     let text = if action == "list" {
         format_list(&snap, &config)
@@ -427,8 +439,11 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
 /// Extracted from `/model switch` so both `/model switch` and
 /// `/uia-model switch` share the exact same delegation — they differ only in
 /// which config key the resulting selection persists to. `/model switch`
-/// passes [`crate::config_util::persist_default_selection`]; `/uia-model
-/// switch` passes [`crate::config_util::persist_uia_selection`].
+/// passes the `persist_default_selection` of
+/// [`crate::config_util::selection_persistence`] (an injected service, else
+/// the profile of the bound root space, never `HARW_HOME`; without a bound
+/// root space nothing is written and the output carries a note);
+/// `/uia-model switch` passes its `persist_uia_selection`.
 ///
 /// Resolves `target` against the configured model catalog (never the static
 /// bootstrap catalog) to find its canonical ID and configured provider, then
@@ -455,6 +470,8 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
 /// # Fehler
 /// - [`OpError::Execution`]: `SessionController` nicht verfügbar, Katalog leer,
 ///   oder Config-Discovery fehlgeschlagen.
+/// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
+///   Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder der aufgelöste
 ///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten
 ///   ([`crate::provider::handle_switch_core`] validiert dies vollständig,
@@ -498,8 +515,11 @@ fn handle_switch_core(
 /// Wechselt atomar UIA-Provider+Modell: löst den konfigurierten Provider des
 /// Ziel-Modells auf und delegiert vollständig an
 /// [`crate::provider::handle_uia_switch_core`] (inklusive
-/// [`crate::config_util::persist_uia_selection`] als `persist`-Abschluss) —
-/// dieselbe Delegation wie [`handle_switch_core`] auf der generischen Achse.
+/// `persist_uia_selection` aus [`crate::config_util::selection_persistence`]
+/// als `persist`-Abschluss: injizierter Dienst, sonst das Profil des
+/// gebundenen Root-Space, nie `HARW_HOME`; ohne Bindung wird nichts
+/// geschrieben, die Antwort trägt eine Notiz) — dieselbe Delegation wie
+/// [`handle_switch_core`] auf der generischen Achse.
 ///
 /// # Beschreibung
 /// Im Gegensatz zur vorherigen Implementierung validiert diese Funktion den
@@ -511,6 +531,8 @@ fn handle_switch_core(
 ///
 /// # Fehler
 /// - [`OpError::Execution`]: Katalog leer oder Config-Discovery fehlgeschlagen.
+/// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
+///   Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder der aufgelöste
 ///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten (siehe
 ///   [`crate::provider::handle_uia_switch_core`]).
@@ -536,9 +558,10 @@ fn handle_uia_model_switch(ctx: &OpContext, target: String) -> Result<OpOutput, 
     // passed explicitly (rather than hardcoded inside `handle_uia_switch_core`)
     // so tests can inject a `RecordingSelectionPersistence` via the
     // `ServiceMap` (see `crate::config_util::selection_persistence`) instead
-    // of a bespoke no-op closure — production behavior is unchanged, this
-    // resolves to `persist_uia_selection` (via `FileSelectionPersistence`)
-    // whenever no service is injected.
+    // of a bespoke no-op closure. Without an injected service this resolves
+    // to `persist_uia_selection` via the `FileSelectionPersistence` of the
+    // bound root space; without a bound root space nothing is written and
+    // the note says the selection was not saved.
     let persistence = crate::config_util::selection_persistence(ctx);
     crate::provider::handle_uia_switch_core(
         ctx,
@@ -645,6 +668,8 @@ fn format_uia_list(selection: &UiaSelection, config: &harw_config::ResolvedConfi
 /// # Fehler
 /// - [`OpError::Execution`]: `SessionController` nicht verfügbar (nur `switch`),
 ///   Config-Discovery fehlgeschlagen.
+/// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
+///   Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`]: unbekannte ID, Provider-Mismatch, unbekanntes Sub-Kommando.
 ///
 /// # Spec
@@ -690,7 +715,8 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
 
     let controller = ctx.service::<harw_operations::SharedSessionController>();
 
-    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+    // Context-scoped-first resolution — see `crate::provider::resolved_config`.
+    let config = crate::provider::resolved_config(ctx)?;
 
     let selection = effective_uia_selection(controller, &config);
     let text = if action == "list" {
@@ -711,18 +737,18 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
 /// # Beschreibung
 /// Im Gegensatz zu [`handle_uia_model_switch`] mutiert dieser Pfad **keinen**
 /// Live-`SessionController`-Zustand — `uia_worker_model` wird ausschließlich
-/// über [`crate::config_util::persist_uia_worker_model`] in der
-/// Profil-`config.toml` verankert und wirkt erst beim nächsten
-/// Sitzungsstart, analog zu anderen `internal_models.*`-Punkten.
+/// über den Persistenz-Dienst ([`crate::config_util::selection_persistence`],
+/// Datei-Variante [`crate::config_util::persist_uia_worker_model`]) in der
+/// Profil-`config.toml` des gebundenen Root-Space verankert und wirkt erst
+/// beim nächsten Sitzungsstart, analog zu anderen `internal_models.*`-Punkten.
 ///
 /// `persist` mirrors [`handle_switch_core`]'s injected-closure design: the
-/// production caller ([`uia_worker_model`]) always passes
-/// [`crate::config_util::persist_uia_worker_model`], so runtime behavior is
-/// unchanged from a hardcoded call — the injection exists purely so tests
-/// can supply a no-op closure and never touch the real, `HARW_HOME`-resolving
-/// persistence path (this crate declares `#![forbid(unsafe_code)]`, so a
-/// testing-only `HARW_HOME` env-isolation helper, which would need `unsafe
-/// fn std::env::set_var`/`remove_var`, is not available here).
+/// production caller ([`uia_worker_model`]) always passes the
+/// `persist_uia_worker_model` of [`crate::config_util::selection_persistence`]
+/// (an injected service, else the profile of the bound root space, never
+/// `HARW_HOME`; without a bound root space nothing is written and a note is
+/// returned) — the injection exists so tests can supply a no-op closure and
+/// never touch the profile `config.toml` of the bound root space.
 ///
 /// # Argumente
 /// - `ctx` (`&OpContext`): Ausführungskontext (nur zum Lesen der effektiven
@@ -740,6 +766,8 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
 /// # Fehler
 /// - [`OpError::Execution`]: Config-Discovery fehlgeschlagen, oder der
 ///   konfigurierte Modellkatalog ist leer.
+/// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
+///   Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`]: unbekannte Modell-ID. Seit Runde 5,
 ///   Teil G nicht mehr: ein Modell eines anderen Providers als der UIA.
 ///
@@ -891,6 +919,8 @@ fn format_uia_worker_list(
 /// # Fehler
 /// - [`OpError::Execution`]: Config-Discovery fehlgeschlagen, konfigurierter
 ///   Modellkatalog leer (nur `switch`).
+/// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
+///   Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`]: unbekannte ID, Provider-Mismatch gegen
 ///   den effektiven UIA-Provider, unbekanntes Sub-Kommando.
 ///
@@ -940,9 +970,8 @@ async fn uia_worker_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, 
 
     let controller = ctx.service::<harw_operations::SharedSessionController>();
     // Context-scoped-first resolution — see `crate::provider::resolved_config`
-    // doc comment; used consistently across every branch of this brand-new
-    // operation (unlike `model`/`uia_model`, whose show/list paths predate
-    // this node and were intentionally left untouched).
+    // doc comment; the show/list paths of `model`, `uia_model` and this
+    // operation all share it.
     let config = crate::provider::resolved_config(ctx)?;
 
     let selection = effective_uia_selection(controller, &config);
@@ -1007,24 +1036,38 @@ mod tests {
 
     // ── Test-Kontext-Builder ──────────────────────────────────────────────────
 
-    /// Erstellt einen minimalen `OpContext` mit optionalem `SharedSessionController`
-    /// und optionaler context-gescopter `Arc<ResolvedConfig>`.
+    /// [`make_test_ctx_in`] ohne gebundenen Root-Space.
+    fn make_test_ctx(
+        ctrl: Option<SharedSessionController>,
+        config: Option<Arc<harw_config::ResolvedConfig>>,
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
+        make_test_ctx_in(ctrl, config, None)
+    }
+
+    /// Erstellt einen minimalen `OpContext` mit optionalem `SharedSessionController`,
+    /// optionaler context-gescopter `Arc<ResolvedConfig>` und optionalem
+    /// gebundenem Root-Space.
     ///
     /// # Description
     /// Erzeugt ein temporäres Workspace-Verzeichnis und bindet es in eine
     /// [`SandboxSpec`] ein. Falls `ctrl` Some ist, wird der Controller in die
     /// `ServiceMap` eingetragen. Falls `config` Some ist, wird sie ebenfalls
     /// eingetragen — [`crate::provider::resolved_config`] (und damit
-    /// [`handle_switch_core`]/[`handle_uia_model_switch`]) liest sie dann
-    /// bevorzugt statt echter `HARW_HOME`-Config-Discovery, genau wie es die
-    /// Laufzeit (`harw-tui::command_exec::build_services`) für `/model`- und
-    /// `/provider`-Ops tut.
+    /// [`handle_switch_core`]/[`handle_uia_model_switch`] sowie die
+    /// `show`/`list`-Pfade) liest sie dann bevorzugt vor jeder Discovery,
+    /// genau wie es die Laufzeit (`harw-tui::command_exec::build_services`)
+    /// für `/model`- und `/provider`-Ops tut. Falls `home` Some ist, wird der
+    /// Root-Space so gebunden, wie ihn die Laufzeit in jede `ServiceMap`
+    /// einträgt; Discovery und Persistenz lesen und schreiben dann dort. Ohne
+    /// Config und ohne `home` liefert die Discovery `NotAvailable` und die
+    /// Persistenz nur eine Notiz — nie `HARW_HOME`.
     ///
     /// # Spec
     /// harwness Plan v2 — Tests Task E; Welle 2 (2d) — atomarer Provider+Modell-Wechsel.
-    fn make_test_ctx(
+    fn make_test_ctx_in(
         ctrl: Option<SharedSessionController>,
         config: Option<Arc<harw_config::ResolvedConfig>>,
+        home: Option<Arc<harw_home::ResolvedHomeContext>>,
     ) -> TestResult<(OpContext, std::path::PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1057,6 +1100,9 @@ mod tests {
         }
         if let Some(config) = config {
             services.insert(config);
+        }
+        if let Some(home) = home {
+            services.insert(home);
         }
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
         Ok((ctx, tmp))
@@ -1228,7 +1274,11 @@ mod tests {
             .map_err(ctx("set_active_provider must succeed"))?;
 
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), None)?;
+        // A session config is injected so `show` never falls back to discovery.
+        let (ctx, _tmp) = make_test_ctx(
+            Some(shared),
+            Some(Arc::new(harw_config::ResolvedConfig::default())),
+        )?;
 
         let args = ModelArgs {
             action: Some("show".to_owned()),
@@ -1378,14 +1428,13 @@ mod tests {
     // Die beiden `*_switches_both_atomically`-Tests unten rufen die private
     // `handle_switch_core`/`handle_uia_switch_core`-Kernfunktion direkt mit
     // einem No-op-`persist`-Abschluss auf, statt über `super::model`/
-    // `super::uia_model` zu gehen (die den echten, `HARW_HOME`-auflösenden
-    // `persist_default_selection`/`persist_uia_selection` fest verdrahten).
-    // Diese Crate deklariert `#![forbid(unsafe_code)]`, daher steht eine
-    // `unsafe fn std::env::set_var`-basierte `HARW_HOME`-Isolation (wie sie
-    // `config_util`/`permissions` bewusst vermeiden, siehe deren
-    // Modul-Kommentare) hier nicht zur Verfügung — der No-op-`persist` prüft
-    // exakt die unter Test stehende Eigenschaft (die atomare
-    // Controller-Mutation) ohne jemals das Dateisystem zu berühren.
+    // `super::uia_model` zu gehen (die über
+    // `crate::config_util::selection_persistence` in die Profil-`config.toml`
+    // des gebundenen Root-Space schreiben). Der No-op-`persist` prüft exakt
+    // die unter Test stehende Eigenschaft (die atomare Controller-Mutation),
+    // ohne das Dateisystem zu berühren; den Schreibpfad selbst prüft
+    // `model_switch_persists_into_the_bound_home_profile` gegen einen
+    // temporären Root-Space.
 
     /// `/model switch <id>` muss Provider+Modell atomar wechseln, auch wenn
     /// das Ziel-Modell zu einem anderen Provider gehört als der aktuell
@@ -1472,7 +1521,7 @@ mod tests {
     /// mutiert haben — der Controller-Snapshot vor und nach dem Aufruf muss
     /// identisch sein. Die Ablehnung geschieht in
     /// `provider::handle_switch_core`s Step 2 (enabled-Prüfung), bevor der
-    /// Controller überhaupt berührt wird — kein `HARW_HOME`-Zugriff nötig,
+    /// Controller überhaupt berührt wird — kein gebundener Root-Space nötig,
     /// weil `persist` nie erreicht wird.
     #[tokio::test]
     async fn model_switch_to_disabled_target_provider_is_atomic_on_failure() -> TestResult {
@@ -1523,6 +1572,98 @@ mod tests {
             "a failed switch must not change the active model"
         );
         Ok(())
+    }
+
+    // ── Gebundener Root-Space und Sitzungs-Config ─────────────────────────────
+
+    /// `/model switch` verankert die neue Auswahl in der Profil-`config.toml`
+    /// des an die Sitzung gebundenen Root-Space — nie in `HARW_HOME`.
+    #[tokio::test]
+    async fn model_switch_persists_into_the_bound_home_profile() -> TestResult {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_active_provider("provider-a".to_owned())
+            .map_err(ctx("seed active provider"))?;
+        ctrl.set_active_model("model-a".to_owned())
+            .map_err(ctx("seed active model"))?;
+
+        let root = tempfile::tempdir().map_err(ctx("create root space"))?;
+        let home = crate::config_util::test_home_context(root.path())?;
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx_in(
+            Some(shared),
+            Some(Arc::new(two_provider_config())),
+            Some(home),
+        )?;
+
+        let args = ModelArgs {
+            action: Some("switch".to_owned()),
+            target: Some("model-b".to_owned()),
+            value: None,
+        };
+        let output = super::model(&ctx, args)
+            .await
+            .map_err(ctx_err("switch with a bound root space must succeed"))?;
+        assert!(
+            !output.text.contains("Hinweis"),
+            "persisting into the bound root space must not fail: {}",
+            output.text
+        );
+
+        let config_path = root
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("config.toml");
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(crate::test_support::ctx("read the bound profile config"))?;
+        let persisted: harw_config::HarnessConfig = toml::from_str(&content)
+            .map_err(crate::test_support::ctx("parse the bound profile config"))?;
+        assert_eq!(persisted.default_model.as_deref(), Some("model-b"));
+        assert_eq!(persisted.default_provider.as_deref(), Some("provider-b"));
+        Ok(())
+    }
+
+    /// `/model show` liest die Sitzungs-Config aus dem Kontext: ohne aktives
+    /// Modell meldet es deren `default_model`, nicht das einer Discovery.
+    #[tokio::test]
+    async fn model_show_reads_the_session_config() -> TestResult {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_model = Some("from-session".to_owned());
+        let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), Some(Arc::new(config)))?;
+
+        let args = ModelArgs {
+            action: Some("show".to_owned()),
+            target: None,
+            value: None,
+        };
+        let result = super::model(&ctx, args)
+            .await
+            .map_err(ctx_err("show must not fail"))?;
+        assert!(
+            result.text.contains("from-session"),
+            "show must report the session config default: {}",
+            result.text
+        );
+        Ok(())
+    }
+
+    /// Ohne Config-Dienst und ohne gebundenen Root-Space schlägt
+    /// `/uia-model show` geschlossen fehl, statt `HARW_HOME` zu lesen.
+    #[tokio::test]
+    async fn uia_model_show_without_config_or_bound_home_is_not_available() -> TestResult {
+        let (ctx, _tmp) = make_test_ctx(None, None)?;
+        let args = ModelArgs {
+            action: Some("show".to_owned()),
+            target: None,
+            value: None,
+        };
+        match super::uia_model(&ctx, args).await {
+            Err(OpError::NotAvailable(_)) => Ok(()),
+            other => Err(TestError::Unexpected(format!(
+                "expected NotAvailable without config or bound root space, got: {other:?}"
+            ))),
+        }
     }
 
     // ── Live-Modellwechsel: Provider-Client der laufenden Montage ─────────────
@@ -1653,7 +1794,7 @@ mod tests {
 
     /// Runde 5, Teil G: ein Ziel-Modell eines anderen Providers als der
     /// effektive UIA-Provider wird angenommen (Kopplung aufgehoben). Uses a
-    /// no-op `persist` closure, so no `HARW_HOME` isolation is needed.
+    /// no-op `persist` closure, so no bound root space is needed.
     #[test]
     fn handle_uia_worker_model_switch_accepts_a_model_from_a_different_provider() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
@@ -1687,8 +1828,8 @@ mod tests {
     /// `SessionController` field untouched (no `set_uia_model`/
     /// `set_uia_selection` call exists on this path, unlike `/uia-model
     /// switch`). Uses a no-op `persist` closure (see the `handle_uia_worker_model_switch`
-    /// doc comment) rather than the real, `HARW_HOME`-resolving
-    /// `persist_uia_worker_model`, so this test never touches the filesystem.
+    /// doc comment) rather than the real `persist_uia_worker_model` into the
+    /// bound root space, so this test never touches the filesystem.
     #[test]
     fn handle_uia_worker_model_switch_persists_and_confirms() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());

@@ -50,8 +50,13 @@
 //! # Scopes und Wurzeln (Contract §2, Design §2)
 //! - `Project`: `<projekt-root>/.harw/memories/` — bleibt im Repo,
 //!   versionierbar, gewährt keine Rechte (siehe [`project_memories_root`]).
-//! - `Global`: `~/.harw/profiles/<profil>/memories/` (siehe
-//!   [`global_memories_root`]).
+//! - `Global`: `<root-space>/profiles/<profil>/memories/` des an die Sitzung
+//!   gebundenen Root-Space (`harw_home::ResolvedHomeContext`, siehe
+//!   [`global_memories_root`]) — nie `HARW_HOME` oder `~/.harw` des
+//!   Prozesses. Ohne Bindung schlagen `record --global` und
+//!   `consolidate --global` geschlossen fehl; `recall`/`forget`/`promote`
+//!   überspringen die globale Wurzel dann und bleiben auf das Projekt
+//!   beschränkt.
 //!
 //! # Nebenläufigkeit
 //! Die Op selbst ist zustandslos; das v2-Backend
@@ -61,7 +66,9 @@
 //!
 //! # Fehler
 //! - [`OpError::NotAvailable`] — kein v2-Memory-Backend im Kontext
-//!   registriert (nur für `list`/`stats`/`maintain`).
+//!   registriert (nur für `list`/`stats`/`maintain`), oder kein Root-Space
+//!   an die Sitzung gebunden (nur für `record --global`/`consolidate
+//!   --global`).
 //! - [`OpError::InvalidArguments`] — Argumentgrammatik verletzt, oder
 //!   `forget` fand keinen passenden Fakt.
 //! - [`OpError::Execution`] — Backend-/Dateisystemfehler (I/O, Serde,
@@ -120,8 +127,10 @@ impl harw_operations::FromRawArgs for MemoryArgs {
 ///
 /// # Argumente
 /// - `ctx` — Ausführungskontext; `list`/`stats`/`maintain` benötigen
-///   `Arc<dyn Memory>` als Service, `recall`/`record`/`forget` lösen ihre
-///   Fakt-Wurzeln selbst über `harw_home` auf.
+///   `Arc<dyn Memory>` als Service. Die Fakt-Subcommands (`recall`/`record`/
+///   `forget`/`promote`/`consolidate`) lesen die globale Wurzel aus dem
+///   gebundenen Root-Space (`Arc<harw_home::ResolvedHomeContext>`) und
+///   erkennen die Projekt-Wurzel über die Sandbox.
 /// - `args` — bereits geparst (Subcommand + Tail-Tokens).
 ///
 /// # Rückgabe
@@ -209,13 +218,19 @@ fn run_maintain(store: &dyn Memory) -> Result<OpOutput, OpError> {
 /// Löst `<projekt-root>/.harw/memories` auf und stellt sicher, dass sie
 /// existiert (Contract §2/§3, Design §2).
 ///
+/// # Beschreibung
+/// Das Projekt wird ab dem Workspace-Root der Sandbox erkannt. Die
+/// Projekt-Marker kommen aus [`crate::provider::resolved_config`]
+/// (Live-Config, Config-Dienst, sonst Discovery im gebundenen Root-Space);
+/// ist keine Config auflösbar, gelten die Standard-Marker.
+///
 /// # Errors
-/// [`OpError::Execution`], wenn Home-Auflösung, Projekt-Erkennung oder das
-/// Anlegen des Projekt-Homes fehlschlägt.
+/// [`OpError::Execution`], wenn Projekt-Erkennung oder das Anlegen des
+/// Projekt-Homes fehlschlägt.
 fn project_memories_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
-    let markers = crate::config_util::load_default_config("")
+    let markers = crate::provider::resolved_config(ctx)
         .ok()
-        .and_then(|config| config.harness.project_root_markers)
+        .and_then(|config| config.harness.project_root_markers.clone())
         .unwrap_or_default();
     let cwd = ctx.sandbox().workspace().canonical_root();
     let project = harw_home::discover_project(cwd, &markers).map_err(|error| {
@@ -228,17 +243,21 @@ fn project_memories_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
     Ok(project_home.memories_dir())
 }
 
-/// Löst `~/.harw/profiles/<profil>/memories` auf (Contract §2, Design §2).
+/// Löst `<root-space>/profiles/<profil>/memories` des an die Sitzung
+/// gebundenen Root-Space auf (Contract §2, Design §2).
+///
+/// # Beschreibung
+/// Root-Space und Profil kommen aus der Bindung
+/// ([`crate::config_util::bound_home`]); es gibt bewusst keinen Rückfall auf
+/// `HARW_HOME`, `~/.harw` oder das aktive Profil des Prozesses.
 ///
 /// # Errors
-/// [`OpError::Execution`], wenn Home- oder Profil-Auflösung fehlschlägt.
-fn global_memories_root() -> Result<PathBuf, OpError> {
-    let home = harw_home::home_dir()
-        .map_err(|error| OpError::Execution(format!("Home nicht auflösbar: {error}")))?;
-    let profile = harw_home::active_profile_name(&home);
-    let dir = harw_home::profile_dir(&home, &profile)
-        .map_err(|error| OpError::Execution(format!("Profil-Pfad fehlgeschlagen: {error}")))?;
-    Ok(dir.join("memories"))
+/// [`OpError::NotAvailable`], wenn an die Sitzung kein Root-Space gebunden
+/// ist.
+fn global_memories_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
+    Ok(crate::config_util::bound_home(ctx)?
+        .profile_dir
+        .join("memories"))
 }
 
 /// Trennt `--project`/`--global` aus `tokens`, liefert die verbleibenden
@@ -348,7 +367,9 @@ fn record_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError
 ///
 /// # Errors
 /// - [`OpError::InvalidArguments`]: `text` ist (nach Trimmen) leer.
-/// - [`OpError::Execution`]: Wurzel-Auflösung, Öffnen oder Schreiben des
+/// - [`OpError::NotAvailable`]: `scope` ist Global, aber an die Sitzung ist
+///   kein Root-Space gebunden.
+/// - [`OpError::Execution`]: Projekt-Erkennung, Öffnen oder Schreiben des
 ///   [`FactStore`] schlug fehl.
 fn record_fact(ctx: &OpContext, scope: FactScope, text: &str) -> Result<OpOutput, OpError> {
     let trimmed = text.trim();
@@ -359,7 +380,7 @@ fn record_fact(ctx: &OpContext, scope: FactScope, text: &str) -> Result<OpOutput
     }
     let root = match scope {
         FactScope::Project => project_memories_root(ctx)?,
-        FactScope::Global => global_memories_root()?,
+        FactScope::Global => global_memories_root(ctx)?,
     };
     let store = FactStore::open(&root, scope).map_err(|error| {
         OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
@@ -390,9 +411,10 @@ fn record_fact(ctx: &OpContext, scope: FactScope, text: &str) -> Result<OpOutput
 
 /// `/memory recall <stichwort…>` — durchsucht Projekt- und Global-Wurzel,
 /// Projekt zuerst (Design §4), und zeigt je Treffer die Herkunft. Eine
-/// Wurzel, die nicht geöffnet werden kann (z. B. kein Projekt erkennbar),
-/// wird stillschweigend übersprungen statt die gesamte Suche fehlschlagen zu
-/// lassen — die jeweils andere Wurzel bleibt durchsuchbar.
+/// Wurzel, die nicht geöffnet werden kann (z. B. kein Projekt erkennbar oder
+/// kein Root-Space gebunden), wird stillschweigend übersprungen statt die
+/// gesamte Suche fehlschlagen zu lassen — die jeweils andere Wurzel bleibt
+/// durchsuchbar.
 ///
 /// # Errors
 /// [`OpError::InvalidArguments`]: keine Suchbegriffe angegeben.
@@ -412,7 +434,7 @@ fn render_fact_recall(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpEr
             }
         }
     }
-    if let Ok(root) = global_memories_root() {
+    if let Ok(root) = global_memories_root(ctx) {
         if let Ok(store) = FactStore::open(&root, FactScope::Global) {
             if let Ok(found) = store.search(&keywords, RECALL_LIMIT) {
                 hits.extend(found.into_iter().map(|fact| (FactScope::Global, fact)));
@@ -446,8 +468,8 @@ fn render_fact_recall(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpEr
 /// [`OpError::InvalidArguments`]: kein Name angegeben, oder in keiner Wurzel
 /// gefunden.
 /// [`OpError::Execution`]: Löschen in einer erreichbaren Wurzel schlug fehl
-/// (Wurzeln, die gar nicht auflösbar sind, werden wie bei `recall`
-/// übersprungen).
+/// (Wurzeln, die gar nicht auflösbar sind — etwa Global ohne gebundenen
+/// Root-Space —, werden wie bei `recall` übersprungen).
 fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let Some(name) = tail.first() else {
         return Err(OpError::InvalidArguments(
@@ -465,7 +487,7 @@ fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
             }
         }
     }
-    if let Ok(root) = global_memories_root() {
+    if let Ok(root) = global_memories_root(ctx) {
         if let Ok(store) = FactStore::open(&root, FactScope::Global) {
             if store.delete(name).map_err(|error| {
                 OpError::Execution(format!("Fakt löschen fehlgeschlagen (Global): {error}"))
@@ -503,8 +525,10 @@ const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--s
 ///
 /// # Beschreibung
 /// Sucht den Fakt im gewählten Scope bzw. ohne Flag erst im Projekt, dann
-/// global, und übergibt ihn an [`promote_fact`]. Meldet nach Erfolg das
-/// Knowledge-Ereignis `palace`/`topic/<slug>`.
+/// global, und übergibt ihn an [`promote_fact`]. Nicht auflösbare Wurzeln
+/// (etwa Global ohne gebundenen Root-Space) werden wie bei `recall`
+/// übersprungen. Meldet nach Erfolg das Knowledge-Ereignis
+/// `palace`/`topic/<slug>`.
 ///
 /// # Errors
 /// - [`OpError::InvalidArguments`] — Grammatik, widersprüchliche Flags,
@@ -531,7 +555,7 @@ fn promote_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpErro
     for scope in scopes {
         let root = match scope {
             FactScope::Project => project_memories_root(ctx),
-            FactScope::Global => global_memories_root(),
+            FactScope::Global => global_memories_root(ctx),
         };
         let Ok(root) = root else { continue };
         let Ok(store) = FactStore::open(&root, scope) else {
@@ -716,12 +740,15 @@ pub fn promote_fact(
 /// `/memory consolidate [--project|--global]` (Default `--project`).
 ///
 /// # Errors
-/// Siehe [`run_consolidate`].
+/// - [`OpError::NotAvailable`]: `--global`, aber an die Sitzung ist kein
+///   Root-Space gebunden.
+/// - [`OpError::Execution`]: Projekt-Erkennung schlug fehl.
+/// - Sonst siehe [`run_consolidate`].
 fn consolidate_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let (_positional, scope) = parse_memory_scope_flags(tail, FactScope::Project)?;
     let root = match scope {
         FactScope::Project => project_memories_root(ctx)?,
-        FactScope::Global => global_memories_root()?,
+        FactScope::Global => global_memories_root(ctx)?,
     };
     run_consolidate(&root, scope)
 }
@@ -880,6 +907,7 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_memory::{Fact, FactScope, FactStore, FactType};
+    use harw_operations::context::ServiceMap;
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, OpError, Operation};
 
@@ -1046,10 +1074,11 @@ mod tests {
     #[test]
     fn test_record_fact_and_forget_round_trip_via_fact_store_directly() -> TestResult {
         // Deckt den Fakt-Store-Teil des Rundlaufs ab (Schreiben, Lesen,
-        // Löschen), ohne `harw_home`/Projekt-Erkennung zu berühren — das
-        // übernehmen `project_memories_root`/`global_memories_root`, die
-        // bewusst nicht gegen einen echten `$HOME` getestet werden (siehe
-        // `permissions.rs`-Tests für die Begründung).
+        // Löschen), ohne Wurzel-Auflösung zu berühren. `project_memories_root`
+        // wird bewusst nicht gegen einen echten `$HOME` getestet (siehe
+        // `permissions.rs`-Tests für die Begründung); `global_memories_root`
+        // liest nur den gebundenen Root-Space und ist unten über
+        // `record_global_*` abgedeckt.
         let (_dir, store) = temp_fact_store("round-trip")?;
         let fact = sample_fact("mein-fakt", "Ein Beispieltext für den Fakt-Speicher.");
         store.write(&fact).map_err(ctx("write fact"))?;
@@ -1074,6 +1103,59 @@ mod tests {
                 .read("mein-fakt")
                 .map_err(ctx("read after delete"))?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    // -- Globale Wurzel aus dem gebundenen Root-Space ----------------------
+
+    /// `record --global` schreibt in das Profil des gebundenen Root-Space
+    /// (`<root-space>/profiles/default/memories`), nicht nach `HARW_HOME`.
+    #[tokio::test]
+    async fn record_global_writes_into_the_bound_profile() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut services = ServiceMap::new();
+        services.insert(crate::config_util::test_home_context(home.path())?);
+        let context = crate::knowledge_test_support::op_context(services)?;
+
+        super::memory(
+            &context,
+            MemoryArgs {
+                sub: Some("record".to_owned()),
+                tail: toks(&["Bound", "home", "fact", "--global"]),
+            },
+        )
+        .await
+        .map_err(ctx("record --global"))?;
+
+        let store = FactStore::open(
+            home.path().join("profiles").join("default").join("memories"),
+            FactScope::Global,
+        )
+        .map_err(ctx("open bound global store"))?;
+        let found = store.search(&["Bound"], 8).map_err(ctx("search"))?;
+        assert!(!found.is_empty(), "fact must land in the bound profile");
+        Ok(())
+    }
+
+    /// Ohne gebundenen Root-Space schlägt `record --global` geschlossen fehl,
+    /// statt in den Root-Space des Prozesses auszuweichen.
+    #[tokio::test]
+    async fn record_global_without_bound_home_is_not_available() -> TestResult {
+        let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+
+        let result = super::memory(
+            &context,
+            MemoryArgs {
+                sub: Some("record".to_owned()),
+                tail: toks(&["Unbound", "fact", "--global"]),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
         );
         Ok(())
     }

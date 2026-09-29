@@ -83,8 +83,9 @@
 //! # Fehler
 //! - [`OpError::InvalidArguments`] — Grammatik, unbekannte Id, falscher
 //!   Status, Entscheidung eines Skill-Vorschlags über `/learn`.
-//! - [`OpError::Execution`] — Home/Profil nicht auflösbar, Ein-/Ausgabe,
-//!   Lesefehler des `StateStore`.
+//! - [`OpError::NotAvailable`] — weder eine Ablage injiziert noch ein
+//!   Root-Space an die Sitzung gebunden (kein Rückfall auf `HARW_HOME`).
+//! - [`OpError::Execution`] — Ein-/Ausgabe, Lesefehler des `StateStore`.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -1206,32 +1207,34 @@ fn decide(
 
 // ── Dienste ───────────────────────────────────────────────────────────────────
 
-fn profile_dir() -> Result<PathBuf, OpError> {
-    let home = harw_home::home_dir()
-        .map_err(|error| OpError::Execution(format!("HARW_HOME nicht auflösbar: {error}")))?;
-    let profile = harw_home::active_profile_name(&home);
-    harw_home::profile_dir(&home, &profile)
-        .map_err(|error| OpError::Execution(format!("Profil '{profile}' nicht auflösbar: {error}")))
+/// Profilverzeichnis des an die Sitzung gebundenen Root-Space
+/// ([`crate::config_util::bound_home`]); bewusst kein Rückfall auf
+/// `HARW_HOME`.
+fn profile_dir(ctx: &OpContext) -> Result<PathBuf, OpError> {
+    Ok(crate::config_util::bound_home(ctx)?.profile_dir.clone())
 }
 
-/// Injizierte Lern-Ablage oder `<HARW_HOME>/profiles/<aktiv>/learn/proposals`.
+/// Injizierte Lern-Ablage oder
+/// `<gebundener Root-Space>/profiles/<profil>/learn/proposals`; ohne beides
+/// [`OpError::NotAvailable`].
 pub(crate) fn learn_store(ctx: &OpContext) -> Result<Arc<LearnProposalStore>, OpError> {
     if let Some(store) = ctx.service::<Arc<LearnProposalStore>>() {
         return Ok(Arc::clone(store));
     }
     Ok(Arc::new(LearnProposalStore::new(
-        profile_dir()?.join("learn").join("proposals"),
+        profile_dir(ctx)?.join("learn").join("proposals"),
     )))
 }
 
-/// Injizierte Skill-Vorschlagsablage oder die des aktiven Profils (wie
-/// `/skills`).
+/// Injizierte Skill-Vorschlagsablage oder die unter
+/// `<gebundener Root-Space>/profiles/<profil>/skills` (wie `/skills`); ohne
+/// beides [`OpError::NotAvailable`].
 pub(crate) fn skill_store(ctx: &OpContext) -> Result<Arc<SkillProposalStore>, OpError> {
     if let Some(store) = ctx.service::<Arc<SkillProposalStore>>() {
         return Ok(Arc::clone(store));
     }
     Ok(Arc::new(SkillProposalStore::new(
-        profile_dir()?.join("skills"),
+        profile_dir(ctx)?.join("skills"),
     )))
 }
 
@@ -1707,6 +1710,48 @@ mod tests {
                 "{tokens:?} → {result:?}"
             );
         }
+        Ok(())
+    }
+
+    /// Ohne injizierte Ablagen liegen Lern- und Skill-Vorschläge im Profil
+    /// des gebundenen Root-Space — nie unter `HARW_HOME`.
+    #[test]
+    fn learn_store_defaults_to_the_bound_profile() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut services = ServiceMap::new();
+        services.insert(crate::config_util::test_home_context(temp.path())?);
+        let op_ctx = crate::knowledge_test_support::op_context(services)?;
+
+        let learn = learn_store(&op_ctx).map_err(ctx("learn store"))?;
+        let expected = temp
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("learn")
+            .join("proposals");
+        assert_eq!(learn.dir(), expected.as_path());
+        skill_store(&op_ctx).map_err(ctx("skill store"))?;
+        Ok(())
+    }
+
+    /// Ohne injizierte Ablage und ohne gebundenen Root-Space schlagen beide
+    /// Ablagen und damit `/learn` geschlossen fehl.
+    #[tokio::test]
+    async fn learn_stores_without_injection_or_bound_home_are_not_available() -> TestResult {
+        let op_ctx = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+
+        let learn = learn_store(&op_ctx).err();
+        assert!(matches!(learn, Some(OpError::NotAvailable(_))), "{learn:?}");
+        let skills = skill_store(&op_ctx).err();
+        assert!(
+            matches!(skills, Some(OpError::NotAvailable(_))),
+            "{skills:?}"
+        );
+        let listed = run(&op_ctx, &["list"]).await;
+        assert!(
+            matches!(listed, Err(OpError::NotAvailable(_))),
+            "{listed:?}"
+        );
         Ok(())
     }
 }

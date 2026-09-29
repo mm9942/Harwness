@@ -2671,6 +2671,20 @@ impl RuntimeAssemblyBuilder {
                 crate::services::kanban_transitions(stores.job_store.as_ref(), &spec.principal),
             )
         });
+        // Der gebundene Root-Space entsteht **vor** dem Spawner, damit die
+        // Wurzel-Dienste (Schritt 11) und die Kind-Fabrik (Game Master,
+        // Matrix-Speicher) dieselbe Instanz teilen. Kein Rückfall auf
+        // `HARW_HOME`: scheitert die Bindung, scheitert die Montage.
+        let home_context = Arc::new(
+            harw_home::ResolvedHomeContext::new(
+                &spec.home,
+                profile_name.clone(),
+                home_project_root.clone(),
+            )
+            .map_err(|error| RuntimeError::Config {
+                detail: error.to_string(),
+            })?,
+        );
         let (spawner, spawner_roles) = build_spawner(
             profile.spawner,
             SpawnerInputs {
@@ -2713,6 +2727,9 @@ impl RuntimeAssemblyBuilder {
                 skill_roots: trust_report.layers.clone(),
                 // Plan Teil D: lesende Wissenswerkzeuge der Kinder.
                 knowledge: child_knowledge,
+                // Derselbe Root-Space wie `RuntimeServices::with_home_context`
+                // in Schritt 11 (Matrix-Speicher des Game Masters).
+                home_context: Arc::clone(&home_context),
                 // Welle 3C: reicht `RuntimeSpec::child_backend` an den
                 // gebauten `ManagedAgentSpawner` durch.
                 child_backend: spec
@@ -2824,16 +2841,6 @@ impl RuntimeAssemblyBuilder {
 
         // 11. Dienste. Sie entstehen **vor** dem Bau der Registry, weil die
         //     Modell-Tool-Fläche der Operationen ihre Service-Map braucht.
-        let home_context = Arc::new(
-            harw_home::ResolvedHomeContext::new(
-                &spec.home,
-                profile_name.clone(),
-                home_project_root.clone(),
-            )
-            .map_err(|error| RuntimeError::Config {
-                detail: error.to_string(),
-            })?,
-        );
         let services = RuntimeServices::new(RuntimeServicesParts {
             operations: Arc::clone(&operations),
             state_store: Arc::clone(&stores.state_store),
@@ -4788,20 +4795,24 @@ impl OrchestrationObserver for StateStoreOrchestrationObserver {
     }
 }
 
-/// Die Leihgaben, aus denen [`build_spawner`] den Spawner baut.
+/// Die Eingaben, aus denen [`build_spawner`] den Spawner baut.
 ///
 /// # Beschreibung
-/// Die zehn Werte (seit Welle 3a: zwei Modelle statt eines) stammen aus
-/// verschiedenen, voneinander unabhängigen Montageschritten (Konfiguration,
-/// Projekt, Freigabekette, Wurzel-Baum-Modell, UIA-Worker-Modell,
-/// Wurzelidentität, Spawn-Kontext, Effort, Aktivierung, gesenkte Rollen). Sie
-/// stehen hier in **einem** Typ, weil elf Positionsparameter an der einen
+/// Die Werte stammen aus verschiedenen, voneinander unabhängigen
+/// Montageschritten (Konfiguration, Projekt, Freigabekette, Modelle und
+/// Modellwahl, Wurzelidentität, Spawn-Kontext, Effort, Aktivierung, Roster,
+/// Wächter, Sandbox, Speicher, Wissen, Root-Space, Kind-Backend). Sie stehen
+/// hier in **einem** Typ, weil so viele Positionsparameter an der einen
 /// Aufrufstelle nicht mehr lesbar wären — und weil ein unterdrückter
-/// `clippy::too_many_arguments` in dieser Welle ausgeschlossen ist. Die
-/// benannten Felder sagen an der Aufrufstelle, woher jeder Wert kommt.
+/// `clippy::too_many_arguments` ausgeschlossen ist. Die benannten Felder sagen
+/// an der Aufrufstelle, woher jeder Wert kommt.
 ///
-/// Alle Felder sind Leihgaben der Montage; geklont wird erst dort, wo
-/// `ManagedAgentSpawner` Eigentum verlangt.
+/// Die Referenzfelder (`&'a …`) sind Leihgaben der Montage; geklont wird erst
+/// dort, wo `ManagedAgentSpawner` Eigentum verlangt. Alle übrigen Felder
+/// übergibt die Montage als Eigentum: geteilte `Arc`-Handles (etwa
+/// `state_store`, `reasoning_effort_config`, `home_context`), kleine Werte und
+/// Listen wie `skill_roots`; `build_spawner` reicht sie an Spawner und
+/// Kind-Fabriken weiter.
 struct SpawnerInputs<'a> {
     /// Die aufgelöste Konfiguration; gelesen werden nur das Vorgabemodell und
     /// die daraus abgeleiteten Kindlimits.
@@ -4892,6 +4903,12 @@ struct SpawnerInputs<'a> {
     /// [`RuntimeChildRegistryFactory::with_knowledge`] an `factory` **und**
     /// `uia_worker_factory`. `None` → kein Kind bekommt sie.
     knowledge: Option<crate::children::ChildKnowledgeSource>,
+    /// Der gebundene Root-Space der Sitzung — dieselbe Instanz, die die
+    /// Montage an [`crate::RuntimeServices::with_home_context`] übergibt.
+    /// Reicht über [`RuntimeChildRegistryFactory::with_home_context`] an
+    /// `factory` **und** `uia_worker_factory` durch; die Matrix-Werkzeuge des
+    /// Game Masters lesen ihren Speicher daraus, nie über `HARW_HOME`.
+    home_context: Arc<harw_home::ResolvedHomeContext>,
     /// [`RuntimeSpec::child_backend`] des Laufs (#22 Welle 3C); `Some` lässt
     /// den gebauten `ManagedAgentSpawner` jedes Kind über dieses
     /// [`harw_core::child_backend::ChildBackend`] statt in-process laufen.
@@ -4942,6 +4959,7 @@ fn build_spawner(
         agent_events,
         skill_roots,
         knowledge,
+        home_context,
         child_backend,
     } = inputs;
 
@@ -5012,6 +5030,10 @@ fn build_spawner(
         // StateStore wie die Wurzel (den Spawner löst die Fabrik selbst über
         // den Spawner-Slot auf).
         .with_delegate_wave_store(Arc::clone(&state_store))
+        // Der Game Master (Rolle `root-orchestrator`) läuft über diese Fabrik;
+        // seine Matrix-Werkzeuge lesen den Speicher aus dem gebundenen
+        // Root-Space der Wurzel (dieselbe Instanz wie in den Diensten).
+        .with_home_context(Arc::clone(&home_context))
         .with_skill_catalog(config, skill_roots.clone())?
         .with_optional_knowledge(knowledge.clone())
         // Runde 5, Teil C: Diary der Kind-Agenten.
@@ -5068,6 +5090,8 @@ fn build_spawner(
         // Teil C: ohne gültigen `uia_worker_model`-Pin ruft die Familie das
         // Modell der UIA-Sitzung (ohne aktive UIA: das Vorgabemodell).
         .with_effective_main_model(root_model_id.clone())
+        // Derselbe gebundene Root-Space wie `factory`.
+        .with_home_context(home_context)
         .with_skill_catalog(config, skill_roots.clone())?
         .with_optional_knowledge(knowledge)
         // Runde 5, Teil C: Diary der Kind-Agenten.

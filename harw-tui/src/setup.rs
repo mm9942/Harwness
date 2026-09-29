@@ -9,8 +9,8 @@
 //! Dieses Modul besitzt die **I/O-freie** Zustandsmaschine der Ersteinrichtung
 //! ([`SetupApp`]) sowie den dünnen [`ratatui`]-Loop [`run_setup`], der sie an
 //! ein echtes Terminal koppelt. Die eigentlichen Übergänge (Provider-Auswahl,
-//! Auth-Wahl, Modell-Wahl) liegen vollständig in [`SetupApp::on_key`] und sind
-//! ohne TTY testbar. Credential-Erkennung wird an
+//! Auth-Wahl, Modell-Wahl) liegen vollständig im crate-internen
+//! `SetupApp::on_key` und sind ohne TTY testbar. Credential-Erkennung wird an
 //! [`harw_model_catalog::detect_local_sources`] delegiert; die
 //! Terminal-Wiederherstellung an einen RAII-Guard.
 //!
@@ -32,7 +32,6 @@
 //! ```
 //! use harw_tui::{SetupApp, SetupStage};
 //! use harw_model_catalog::{AuthMethod, ProviderApi, ProviderSpec};
-//! use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 //!
 //! let provider = ProviderSpec {
 //!     id: "groq".to_owned(),
@@ -45,13 +44,12 @@
 //!     models: vec!["llama-3.1-8b".to_owned()],
 //! };
 //! let mut app = SetupApp::new(vec![provider]);
-//! let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
-//! app.on_key(press(KeyCode::Enter)); // Provider -> Endpoint
-//! app.on_key(press(KeyCode::Enter)); // Endpoint -> Auth (nur Foundry/Custom fragen nach der API)
-//! app.on_key(press(KeyCode::Char('k')));
-//! app.on_key(press(KeyCode::Enter)); // Auth -> Model
-//! app.on_key(press(KeyCode::Enter)); // Model -> Done
-//! assert_eq!(app.outcome().map(|o| o.provider_id.as_str()), Some("groq"));
+//! assert_eq!(app.stage(), SetupStage::Provider);
+//! assert!(app.outcome().is_none());
+//! // Tasten treibt `run_setup` crate-intern; in der Provider-Phase ändert
+//! // eingefügter Text nichts.
+//! app.on_paste("groq".to_owned());
+//! assert_eq!(app.stage(), SetupStage::Provider);
 //! ```
 
 use std::io::{self, Stdout};
@@ -185,7 +183,7 @@ impl AuthOption {
 /// # Description
 /// Hält den Katalog, den aktuellen Schritt, den Tipp-Filter der Provider-Liste,
 /// die berechneten Auth-/Modell-Optionen, das aktive Theme und das Endergebnis.
-/// Alle Übergänge erfolgen ausschließlich über [`SetupApp::on_key`] und
+/// Alle Übergänge erfolgen ausschließlich über `SetupApp::on_key` (crate-intern) und
 /// [`SetupApp::on_paste`] und sind ohne Terminal testbar. Das Theme wird einmalig
 /// beim Erzeugen via [`style::detect_theme`] bestimmt. Contract-Quelle:
 /// Abschnitt „harw-tui (neue Datei `src/setup.rs`)" sowie Redesign-Spec SLICE 1
@@ -323,7 +321,12 @@ impl SetupApp {
     ///
     /// # Concurrency
     /// Rein; verändert nur den eigenen Zustand.
-    pub fn on_key(&mut self, key: KeyEvent) {
+    ///
+    /// # Sichtbarkeit
+    /// `pub(crate)`: der Parameter ist ein Crossterm-Typ (Fremdcrate vor 1.0), der
+    /// nicht in der öffentlichen API stehen soll; Tasten treibt nur der Event-Loop
+    /// von [`run_setup`].
+    pub(crate) fn on_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -948,7 +951,7 @@ impl Drop for TerminalGuard {
 /// Aktiviert Raw-Mode/Alternate-Screen/BracketedPaste hinter einem RAII-Guard
 /// und betreibt den synchronen Event-Loop über [`crossterm::event`]. Paste-
 /// Events werden an [`SetupApp::on_paste`] weitergereicht; Tastenanschläge an
-/// [`SetupApp::on_key`]. `Esc` im Navigations-Modus bricht ab (`Ok(None)`);
+/// `SetupApp::on_key`. `Esc` im Navigations-Modus bricht ab (`Ok(None)`);
 /// `Esc` im Auth-Editing-Modus leert nur den Puffer. Das Erreichen von
 /// [`SetupStage::Done`] liefert `Ok(Some(outcome))`. Contract-Quelle: Abschnitt
 /// „harw-tui (neue Datei `src/setup.rs`)".
