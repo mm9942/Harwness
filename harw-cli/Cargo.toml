@@ -32,6 +32,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
+uuid = { version = "1", features = ["v4"] }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 # #22 Welle 2B: `harw agent check|build|inspect|…` (der Agenten-Compiler) und
 # das eingebettete Artefakt einer personalisierten harw.
@@ -114,7 +115,7 @@ serde = { workspace = true }
 harw-provider-http = { path = "../harw-provider-http" }
 harw-oauth = { path = "../harw-oauth" }
 harw-knowledge = { path = "../harw-knowledge" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 secrecy = "0.10.3"
 secrecy_08 = { package = "secrecy", version = "0.8" }
 serde_json = "1"
@@ -163,6 +164,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 # Nur Test: bindet den Hub-Namespace an `HarwKeyPurpose::SecretsKek` (Ring D nur als dev-dependency).
 harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
+# `N8nCredential::for_tests` (n8n_bridge-Tests): Feature-Kanal nur für Tests,
+# nie in Produktionsbuilds (harw-config/Cargo.toml, `test-support`).
+harw-config = { path = "../harw-config", features = ["test-support"] }
 
 [lints]
 workspace = true

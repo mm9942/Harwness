@@ -241,12 +241,15 @@ impl ImportSource {
     }
 }
 
-/// MCP-Server für `harw mcp setup|check` (derzeit nur `cloudflare`).
+/// MCP-Server für `harw mcp setup|check` (`cloudflare`, `n8n`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum McpServer {
     /// Cloudflare-MCP (Alias `cloudflare-api`).
     #[value(name = "cloudflare", alias = "cloudflare-api")]
     Cloudflare,
+    /// n8n-Brücke als MCP-Connector (Alias `n8n-workflow`).
+    #[value(name = "n8n", alias = "n8n-workflow")]
+    N8n,
 }
 
 impl McpServer {
@@ -255,6 +258,7 @@ impl McpServer {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cloudflare => "cloudflare",
+            Self::N8n => "n8n",
         }
     }
 }

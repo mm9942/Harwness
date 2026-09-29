@@ -1,0 +1,51 @@
+{
+  "name": "harw-n8n-bridge-template",
+  "description": "Importierbare n8n-Workflow-Vorlage für die harw↔n8n-Brücke. Nur ausgehende, authentifizierte Kommunikation; keine Secrets — alle Platzhalter ({{...}}) werden beim Import gesetzt, niemals eingecheckt.",
+  "nodes": [
+    {
+      "name": "harw-inbound",
+      "type": "n8n-nodes-base.webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "{{N8N_WEBHOOK_PATH}}",
+        "responseMode": "responseNode",
+        "authentication": "headerAuth",
+        "headerAuth": {
+          "name": "Authorization",
+          "value": "Bearer {{N8N_INBOUND_TOKEN_PLACEHOLDER}}"
+        }
+      },
+      "notes": "Nimmt EventMessage entgegen: event_id, correlation_id, external_origin (muss 'n8n' sein), session_id, event_type, payload."
+    },
+    {
+      "name": "validate-provenance",
+      "type": "n8n-nodes-base.function",
+      "parameters": {
+        "functionCode": "// Lehnt Nachrichten ohne korrekte Provenienz/Korrelation ab.\nconst body = $input.first().json.body ?? {};\nif (body.external_origin !== 'n8n') {\n  throw new Error('external_origin must be n8n');\n}\nif (!body.correlation_id || !body.event_id) {\n  throw new Error('correlation_id and event_id are required');\n}\nreturn [{ json: body }];"
+      }
+    },
+    {
+      "name": "process",
+      "type": "n8n-nodes-base.function",
+      "parameters": {
+        "functionCode": "// Platzhalter für die eigentliche Verarbeitung.\nreturn [{ json: $input.first().json }];"
+      }
+    },
+    {
+      "name": "respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { correlation_id: $json.correlation_id, payload: { ok: true } } }}"
+      },
+      "notes": "Antwort ist EventReply: correlation_id (muss der Anfrage entsprechen) plus payload."
+    }
+  ],
+  "connections": {
+    "harw-inbound": { "main": [[{ "node": "validate-provenance", "type": "main", "index": 0 }]] },
+    "validate-provenance": { "main": [[{ "node": "process", "type": "main", "index": 0 }]] },
+    "process": { "main": [[{ "node": "respond", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "notes": "Keine Secrets in dieser Datei: N8N_WEBHOOK_PATH und der Bearer-Platzhalter sind Platzhalter und werden beim Import durch die lokalen Werte ersetzt. Die Brücke sendet ausschließlich outbound; n8n ruft harw nie direkt an."
+}

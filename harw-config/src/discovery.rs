@@ -11,6 +11,7 @@ use crate::error::{ConfigError, ConfigResult};
 use crate::harness_config::HarnessConfig;
 use crate::infrastructure_toml::InfrastructureSection;
 use crate::mcp_toml::McpServerToml;
+use crate::n8n_toml::N8nSection;
 use crate::merge::{LayerRole, ScopeDiagnostic, merge_layer_into};
 use crate::model_toml::ModelToml;
 use crate::network_toml::NetworkSection;
@@ -105,6 +106,8 @@ pub struct ResolvedConfig {
     /// `[dod]` — Eskalations-Policy für die DoD-Kette (siehe
     /// `dod_toml`).
     pub dod: DodSection,
+    /// `[n8n]` — optionale Outbound-Integration.
+    pub n8n: N8nSection,
     /// `[web]` — Bind- und Token-Policy für die eingebettete Web-UI
     /// (siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
     /// **nie** beeinflusst (siehe [`apply_restricted_layer`]).
@@ -225,6 +228,10 @@ impl ResolvedConfig {
                 return Err(ConfigError::DuplicateChannelToken { reference: token });
             }
         }
+
+        self.n8n
+            .validate()
+            .map_err(|message| ConfigError::Invalid(format!("n8n: {message}")))?;
 
         Ok(())
     }
@@ -717,6 +724,9 @@ pub fn discover_config_with_restricted_and_project_settings(
             if let Some(section) = extract_section::<WebSection>(&fields, "web")? {
                 resolved.web = section;
             }
+            if let Some(section) = extract_section::<N8nSection>(&fields, "n8n")? {
+                resolved.n8n = section;
+            }
             if let Some(section) =
                 extract_section::<InfrastructureSection>(&fields, "infrastructure")?
             {
@@ -868,6 +878,9 @@ fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigR
     if let Some(section) = extract_section::<DodSection>(&fields, "dod")? {
         merge_restricted_dod(&mut resolved.dod, &section, &fields);
     }
+    if let Some(section) = extract_section::<N8nSection>(&fields, "n8n")? {
+        merge_restricted_n8n(&mut resolved.n8n, &section, &fields);
+    }
     Ok(())
 }
 
@@ -877,7 +890,9 @@ fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigR
 /// der `HarnessConfig`-Deserialisierung würde
 /// `#[serde(deny_unknown_fields)]` jede `config.toml` ablehnen, die eine
 /// dieser Sektionen enthält.
-const NEW_SECTION_KEYS: [&str; 5] = ["network", "browser", "dod", "web", "infrastructure"];
+const NEW_SECTION_KEYS: [&str; 6] = [
+    "network", "browser", "dod", "web", "infrastructure", "n8n",
+];
 
 /// Entfernt die in [`NEW_SECTION_KEYS`] gelisteten Top-Level-Tabellen aus
 /// `value`, damit der Rest wie zuvor als [`HarnessConfig`] deserialisiert
@@ -990,6 +1005,34 @@ fn merge_restricted_dod(trusted: &mut DodSection, restricted: &DodSection, field
         trusted
             .allowed_cgroup_prefixes
             .retain(|prefix| restricted.allowed_cgroup_prefixes.contains(prefix));
+    }
+}
+
+/// Monotone Übernahme für `[n8n]`: `enabled` nur `true` → `false` (die sichere
+/// Voreinstellung), `session_binding` nur `true` → `false`, Limits nur als
+/// kleineres Wert. `endpoint_url`/`credential_profile_ref` werden nie aus dem
+/// nicht vertrauten Layer übernommen (ein fremder Endpoint oder ein
+/// Credential-Alias wäre Rechteausweitung, kein Verengen).
+fn merge_restricted_n8n(trusted: &mut N8nSection, restricted: &N8nSection, fields: &toml::Value) {
+    if field_present(fields, &["n8n", "enabled"]) {
+        trusted.enabled &= restricted.enabled;
+    }
+    if field_present(fields, &["n8n", "session_binding"]) {
+        trusted.session_binding &= restricted.session_binding;
+    }
+    if field_present(fields, &["n8n", "retry_max_attempts"]) {
+        trusted.retry_max_attempts = min_positive(trusted.retry_max_attempts, restricted.retry_max_attempts);
+    }
+    if field_present(fields, &["n8n", "retry_initial_backoff_secs"]) {
+        trusted.retry_initial_backoff_secs =
+            min_positive(trusted.retry_initial_backoff_secs, restricted.retry_initial_backoff_secs);
+    }
+    if field_present(fields, &["n8n", "retry_max_backoff_secs"]) {
+        trusted.retry_max_backoff_secs =
+            min_positive(trusted.retry_max_backoff_secs, restricted.retry_max_backoff_secs);
+    }
+    if field_present(fields, &["n8n", "dedup_window_secs"]) {
+        trusted.dedup_window_secs = min_positive(trusted.dedup_window_secs, restricted.dedup_window_secs);
     }
 }
 

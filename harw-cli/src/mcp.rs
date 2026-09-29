@@ -8,11 +8,27 @@ use std::path::{Path, PathBuf};
 use harw_config::{McpServerToml, McpTransportToml};
 use harw_mcp_client::McpClient;
 
-use crate::cli::McpAction;
+use crate::cli::{McpAction, McpServer};
 use crate::home::resolve_home;
 use crate::mcp_auth::resolve_mcp_credential;
 
 const CLOUDFLARE_ENDPOINT: &str = "https://mcp.cloudflare.com/mcp";
+
+/// Preset der n8n-Brücke (`harw mcp setup n8n`). Die URL ist ein Platzhalter,
+/// den der Nutzer nach dem Setup auf seine eigene HTTPS-n8n-MCP-Instanz setzt;
+/// das Token liegt nie in der Datei, sondern nur als Profil-Referenz.
+const N8N_CONFIG: &str = r#"name = "n8n"
+description = "n8n bridge (outbound-only MCP connector; replace url with your instance)"
+transport = "streamable_http"
+url = "https://n8n.example.invalid/mcp/n8n"
+auth = "file:~/.harw/credentials/n8n/default.token"
+tools = []
+enabled = false
+"#;
+
+/// Standard-Endpoint der n8n-MCP-Brücke; muss vom Nutzer auf die eigene
+/// Instanz gesetzt werden, ehe `check` eine Live-Verbindung prüft.
+const N8N_PLACEHOLDER_HOST: &str = "n8n.example.invalid";
 const CLOUDFLARE_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
 
 const CLOUDFLARE_CONFIG: &str = r#"name = "cloudflare-api"
@@ -34,6 +50,7 @@ pub fn run(home_override: Option<PathBuf>, action: McpAction) -> Result<(), Stri
 }
 
 fn setup(home: &Path, server: &str) -> Result<(), String> {
+    let server = McpServer::from_arg(server)?;
     ensure_cloudflare_name(server)?;
     crate::home::ensure_home(home).map_err(|error| error.to_string())?;
     let profile = harw_home::active_profile_name(home);
@@ -42,13 +59,21 @@ fn setup(home: &Path, server: &str) -> Result<(), String> {
     std::fs::create_dir_all(&mcp_dir)
         .map_err(|error| format!("could not create '{}': {error}", mcp_dir.display()))?;
     harden_dir(&mcp_dir)?;
-    let path = mcp_config_path(home)?;
+    let path = mcp_config_path(home, server)?;
+    let config_text = match server {
+        McpServer::Cloudflare => CLOUDFLARE_CONFIG,
+        McpServer::N8n => N8N_CONFIG,
+    };
+    let display_name = match server {
+        McpServer::Cloudflare => "Cloudflare MCP",
+        McpServer::N8n => "n8n MCP",
+    };
     if path.exists() {
         let existing = std::fs::read_to_string(&path)
             .map_err(|error| format!("could not read '{}': {error}", path.display()))?;
-        if existing == CLOUDFLARE_CONFIG {
+        if existing == config_text {
             println!(
-                "Cloudflare MCP ist bereits eingerichtet: {}",
+                "{display_name} ist bereits eingerichtet: {}",
                 path.display()
             );
             return Ok(());
@@ -58,20 +83,35 @@ fn setup(home: &Path, server: &str) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::write(&path, CLOUDFLARE_CONFIG)
+    std::fs::write(&path, config_text)
         .map_err(|error| format!("could not write '{}': {error}", path.display()))?;
-    println!("Cloudflare MCP eingerichtet: {}", path.display());
-    println!("Token-Referenz: env:{CLOUDFLARE_TOKEN_ENV} (kein Token wurde gespeichert)");
+    println!("{display_name} eingerichtet: {}", path.display());
+    match server {
+        McpServer::Cloudflare => {
+            println!("Token-Referenz: env:{CLOUDFLARE_TOKEN_ENV} (kein Token wurde gespeichert)");
+        }
+        McpServer::N8n => {
+            println!(
+                "Token-Ablage: <Profil>/credentials/n8n/default.token (Modus 0600, kein Token wurde gespeichert); URL in der TOML vor Aktivierung auf die eigene Instanz setzen"
+            );
+        }
+    }
     Ok(())
 }
 
 fn check(home: &Path, server: &str) -> Result<(), String> {
+    let server = McpServer::from_arg(server)?;
     ensure_cloudflare_name(server)?;
-    let path = mcp_config_path(home)?;
+    let path = mcp_config_path(home, server)?;
+    let display_name = match server {
+        McpServer::Cloudflare => "Cloudflare MCP",
+        McpServer::N8n => "n8n MCP",
+    };
     let raw = std::fs::read_to_string(&path).map_err(|error| {
         format!(
-            "Cloudflare MCP ist nicht eingerichtet ({}): {error}; zuerst 'harw mcp setup cloudflare' ausführen",
-            path.display()
+            "{display_name} ist nicht eingerichtet ({}): {error}; zuerst 'harw mcp setup {}' ausführen",
+            path.display(),
+            server.as_str()
         )
     })?;
     let config: McpServerToml = toml::from_str(&raw)
@@ -89,10 +129,22 @@ fn check(home: &Path, server: &str) -> Result<(), String> {
         .url
         .as_deref()
         .ok_or_else(|| format!("MCP server '{}' has no URL", config.name))?;
-    if endpoint != CLOUDFLARE_ENDPOINT {
-        return Err(format!(
-            "Cloudflare MCP endpoint must be {CLOUDFLARE_ENDPOINT}"
-        ));
+    match server {
+        McpServer::Cloudflare => {
+            if endpoint != CLOUDFLARE_ENDPOINT {
+                return Err(format!(
+                    "Cloudflare MCP endpoint must be {CLOUDFLARE_ENDPOINT}"
+                ));
+            }
+        }
+        McpServer::N8n => {
+            if endpoint.contains(N8N_PLACEHOLDER_HOST) {
+                return Err(format!(
+                    "n8n MCP endpoint is still the placeholder ({N8N_PLACEHOLDER_HOST}); set your own instance URL in '{}' first",
+                    path.display()
+                ));
+            }
+        }
     }
     let token = config
         .auth
@@ -121,19 +173,32 @@ fn check(home: &Path, server: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn mcp_config_path(home: &Path) -> Result<PathBuf, String> {
+fn mcp_config_path(home: &Path, server: McpServer) -> Result<PathBuf, String> {
     let profile = harw_home::active_profile_name(home);
     let profile_dir = harw_home::profile_dir(home, &profile).map_err(|error| error.to_string())?;
-    Ok(profile_dir.join("mcps").join("cloudflare-api.toml"))
+    let file_name = match server {
+        McpServer::Cloudflare => "cloudflare-api.toml",
+        McpServer::N8n => "n8n-api.toml",
+    };
+    Ok(profile_dir.join("mcps").join(file_name))
 }
 
-fn ensure_cloudflare_name(server: &str) -> Result<(), String> {
-    if matches!(server, "cloudflare" | "cloudflare-api") {
-        Ok(())
-    } else {
-        Err(format!(
-            "unbekannter MCP-Server '{server}'; unterstützt wird 'cloudflare'"
-        ))
+fn ensure_cloudflare_name(server: McpServer) -> Result<(), String> {
+    match server {
+        McpServer::Cloudflare | McpServer::N8n => Ok(()),
+    }
+}
+
+impl McpServer {
+    /// Parses the CLI server argument into the canonical preset.
+    fn from_arg(argument: &str) -> Result<Self, String> {
+        match argument {
+            "cloudflare" | "cloudflare-api" => Ok(Self::Cloudflare),
+            "n8n" | "n8n-workflow" => Ok(Self::N8n),
+            _ => Err(format!(
+                "unbekannter MCP-Server '{argument}'; unterstützt werden 'cloudflare' und 'n8n'"
+            )),
+        }
     }
 }
 

@@ -821,6 +821,28 @@ fn test_cloudflare_mcp_setup_and_check_parse() -> TestResult {
 }
 
 #[test]
+fn test_n8n_mcp_setup_and_check_parse() -> TestResult {
+    let setup = Cli::try_parse_from(["harw", "mcp", "setup", "n8n"])
+        .map_err(ctx("n8n MCP setup muss parsen"))?;
+    assert!(matches!(
+        setup.command,
+        Some(Command::Mcp {
+            action: McpAction::Setup { server: McpServer::N8n }
+        })
+    ));
+
+    let check = Cli::try_parse_from(["harw", "mcp", "check", "n8n"])
+        .map_err(ctx("n8n MCP check muss parsen"))?;
+    assert!(matches!(
+        check.command,
+        Some(Command::Mcp {
+            action: McpAction::Check { server: McpServer::N8n }
+        })
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_lens_build_parses_with_source_and_force() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "lens", "build", "--source", "docs", "--force"])
         .map_err(ctx("`harw lens build --source docs --force` muss parsen"))?;

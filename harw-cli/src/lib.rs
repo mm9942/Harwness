@@ -50,6 +50,8 @@ mod lifecycle;
 mod mcp;
 mod mcp_auth;
 mod models;
+mod n8n_bridge;
+pub mod n8n_wire;
 mod observe;
 mod onboarding;
 mod op_bridge;

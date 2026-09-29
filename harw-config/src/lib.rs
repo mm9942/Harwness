@@ -27,6 +27,8 @@ pub mod merge;
 pub mod mode_toml;
 pub mod model_toml;
 pub mod network_toml;
+pub mod n8n_toml;
+pub mod n8n_credentials;
 pub mod permissions_toml;
 pub mod plan_toml;
 pub mod plugin_toml;
