@@ -1,0 +1,20 @@
+[package]
+publish.workspace = true
+name = "harw-job-executor-podman"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Rootless-Podman job executor backend (P2 Builder-Contract): translates a generic JobSpec + SandboxPolicy into a podman run launch (RAM limit, volume binds, optional SSH remote). No unsafe, no root."
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# JobSpec, SandboxReport, EnforcementState (platform-neutral model).
+harw-job-core = { path = "../harw-job-core" }
+# SandboxPolicy / FilesystemPolicy / NetworkPolicy / CapabilityPolicy.
+harw-job-linux = { path = "../harw-job-linux" }
+# Builder config types (WorkerTemplate, MountSpec, BuilderToml).
+harw-config = { path = "../harw-config" }
+
+[lints]
+workspace = true
