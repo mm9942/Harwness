@@ -3824,6 +3824,17 @@ mod tests {
             }
         }
         assert!(WORKER_KNOWLEDGE.contains("`tmux-inspector-worker` ist nur für bestehende"));
+        // R18 F8: das Jobende kommt als Notiz; `job.wait` ist nur ein kurzes
+        // Polling (≤ 60 s, `harw_tool_job::MAX_WAIT_SECS`).
+        for (name, text) in [
+            ("worker.md", WORKER_KNOWLEDGE),
+            ("uia-worker.md", UIA_WORKER_KNOWLEDGE),
+            ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
+        ] {
+            for needle in ["Notiz", "≤ 60 s"] {
+                assert!(text.contains(needle), "{name}: fehlt {needle}");
+            }
+        }
     }
 
     /// Runde 5, Teil P: ein `uia-worker` lehnte „0600 + Regressionstest,

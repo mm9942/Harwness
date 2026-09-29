@@ -171,6 +171,30 @@ pub struct Policy {
     sys_forbid_for_tcb: bool,
     /// Erlaubte `*-sys`-Crates mit Begründung.
     sys_allowed: BTreeMap<String, String>,
+    /// Externe Crates, die bestimmte Schichten (bzw. die TCB) in ihrer
+    /// transitiven Hülle nicht erreichen dürfen (`[[forbidden_crates]]`).
+    forbidden: Vec<ForbiddenCrates>,
+}
+
+/// Eine Regel aus `[[forbidden_crates]]`: `names` darf von keinem Paket der
+/// Schichten `layers` (und, mit `tcb = true`, von keinem TCB-Paket) über
+/// `[dependencies]`/`[build-dependencies]` erreicht werden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForbiddenCrates {
+    names: BTreeSet<String>,
+    layers: BTreeSet<String>,
+    /// Einzelne Pakete, für die die Regel zusätzlich gilt.
+    packages: BTreeSet<String>,
+    tcb: bool,
+    reason: String,
+}
+
+impl ForbiddenCrates {
+    fn applies_to(&self, name: &str, class: &PackageClass) -> bool {
+        self.layers.contains(&class.layer)
+            || self.packages.contains(name)
+            || (self.tcb && class.tcb)
+    }
 }
 
 /// Prüft, dass eine Tabelle nur bekannte Schlüssel trägt.
@@ -232,6 +256,16 @@ fn string_list(value: &toml::Value, context: &str) -> Result<Vec<String>, String
         .collect()
 }
 
+/// Liest eine optionale Liste von Zeichenketten als Menge (fehlend = leer).
+fn string_set(table: &toml::Table, key: &str, context: &str) -> Result<BTreeSet<String>, String> {
+    match table.get(key) {
+        None => Ok(BTreeSet::new()),
+        Some(value) => Ok(string_list(value, &format!("{context}.{key}"))?
+            .into_iter()
+            .collect()),
+    }
+}
+
 impl Policy {
     /// Parst und validiert die Richtlinie.
     ///
@@ -253,6 +287,7 @@ impl Policy {
                 "packages",
                 "tcb",
                 "exceptions",
+                "forbidden_crates",
             ],
             "der Wurzel",
         )?;
@@ -263,6 +298,7 @@ impl Policy {
         let tcb = Self::parse_tcb(&root, &packages)?;
         let (sys_forbid_for_tcb, sys_allowed) = Self::parse_sys(&root)?;
         let exceptions = Self::parse_exceptions(&root, &packages)?;
+        let forbidden = Self::parse_forbidden(&root, &layers, &packages)?;
 
         Ok(Self {
             rules,
@@ -271,7 +307,62 @@ impl Policy {
             tcb,
             sys_forbid_for_tcb,
             sys_allowed,
+            forbidden,
         })
+    }
+
+    fn parse_forbidden(
+        root: &toml::Table,
+        layers: &BTreeSet<String>,
+        packages: &BTreeMap<String, PackageClass>,
+    ) -> Result<Vec<ForbiddenCrates>, String> {
+        let mut rules = Vec::new();
+        let Some(value) = root.get("forbidden_crates") else {
+            return Ok(rules);
+        };
+        let array = value.as_array().ok_or_else(|| {
+            format!("{POLICY_PATH}: [[forbidden_crates]] muss eine Tabellenliste sein")
+        })?;
+        for item in array {
+            let context = "[[forbidden_crates]]";
+            let entry = as_table(item, context)?;
+            check_keys(
+                entry,
+                &["names", "layers", "packages", "tcb", "reason"],
+                context,
+            )?;
+            let names = string_set(entry, "names", context)?;
+            let rule_layers = string_set(entry, "layers", context)?;
+            for layer in &rule_layers {
+                if !layers.contains(layer) {
+                    return Err(format!(
+                        "{POLICY_PATH}: {context} nennt die unbekannte Schicht '{layer}'"
+                    ));
+                }
+            }
+            let rule_packages = string_set(entry, "packages", context)?;
+            for package in &rule_packages {
+                if !packages.contains_key(package) {
+                    return Err(format!(
+                        "{POLICY_PATH}: {context} nennt das nicht klassifizierte Paket '{package}'"
+                    ));
+                }
+            }
+            let tcb = optional_bool(entry, "tcb", context)?;
+            if names.is_empty() || (rule_layers.is_empty() && rule_packages.is_empty() && !tcb) {
+                return Err(format!(
+                    "{POLICY_PATH}: {context} braucht mindestens einen Namen und eine Schicht, ein Paket oder tcb = true"
+                ));
+            }
+            rules.push(ForbiddenCrates {
+                names,
+                layers: rule_layers,
+                packages: rule_packages,
+                tcb,
+                reason: required_str(entry, "reason", context)?,
+            });
+        }
+        Ok(rules)
     }
 
     fn parse_layers(root: &toml::Table) -> Result<BTreeSet<String>, String> {
@@ -753,6 +844,29 @@ pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> Ga
             }
         }
     }
+    for rule in &policy.forbidden {
+        for node in &graph.crates {
+            let Some(class) = policy.packages.get(&node.name) else {
+                continue;
+            };
+            if !rule.applies_to(&node.name, class) {
+                continue;
+            }
+            let hull = hull_matching(node, &by_name, lock, None, &|name| {
+                rule.names.contains(name)
+            });
+            checked += 1;
+            for (name, path) in &hull.sys_crates {
+                violations.push(format!(
+                    "{} erreicht die verbotene Crate '{name}' über {} — [[forbidden_crates]]: {}",
+                    node.name,
+                    path.join(" → "),
+                    rule.reason
+                ));
+            }
+        }
+    }
+
     for name in policy.sys_allowed.keys() {
         if !used_sys.contains(name.as_str()) {
             violations.push(format!(
@@ -813,6 +927,18 @@ fn sys_hull_impl(
     lock: &LockIndex,
     blocked: Option<&str>,
 ) -> SysHull {
+    hull_matching(root, by_name, lock, blocked, &is_native_build_crate)
+}
+
+/// Breitensuche wie [`sys_hull`]; gemeldet wird jeder erreichte Name, für den
+/// `matches` gilt (im Feld `sys_crates`, mit kürzestem Pfad).
+fn hull_matching(
+    root: &CrateNode,
+    by_name: &HashMap<&str, &CrateNode>,
+    lock: &LockIndex,
+    blocked: Option<&str>,
+    matches: &dyn Fn(&str) -> bool,
+) -> SysHull {
     let mut hull = SysHull::default();
     let mut parent: HashMap<String, String> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::from([root.name.clone()]);
@@ -849,7 +975,7 @@ fn sys_hull_impl(
 
     hull.visited = seen.len().saturating_sub(1);
     for name in &seen {
-        if is_native_build_crate(name) && *name != root.name {
+        if matches(name) && *name != root.name {
             let mut path = vec![name.clone()];
             let mut cursor = name;
             while let Some(previous) = parent.get(cursor) {
@@ -1475,5 +1601,57 @@ version = "0.2.0"
 
         assert!(report.is_green(), "{:#?}", report.violations);
         Ok(())
+    }
+
+    #[test]
+    fn forbidden_crate_in_a_layer_hull_is_a_violation() -> TestResult {
+        let policy = Policy::parse(&format!(
+            "{POLICY}\n[[forbidden_crates]]\nnames = [\"mio\"]\nlayers = [\"J\"]\nreason = \"test\"\n"
+        ))
+        .map_err(TestError::Unexpected)?;
+        let lock = LockIndex::parse(LOCK).map_err(TestError::Unexpected)?;
+        let report = evaluate(&graph(base_crates()), &policy, &lock);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("j erreicht die verbotene Crate 'mio' über j → tokio → mio")),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forbidden_crate_rule_can_target_single_packages() -> TestResult {
+        let policy = Policy::parse(&format!(
+            "{POLICY}\n[[forbidden_crates]]\nnames = [\"tokio\"]\npackages = [\"f\", \"j\"]\nreason = \"no runtime\"\n"
+        ))
+        .map_err(TestError::Unexpected)?;
+        let lock = LockIndex::parse(LOCK).map_err(TestError::Unexpected)?;
+        let report = evaluate(&graph(base_crates()), &policy, &lock);
+        let hits: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.contains("verbotene Crate 'tokio'"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].starts_with("j "));
+        Ok(())
+    }
+
+    #[test]
+    fn forbidden_crates_reject_unknown_layers_and_packages() {
+        for extra in [
+            "[[forbidden_crates]]\nnames = [\"x\"]\nlayers = [\"Q\"]\nreason = \"r\"\n",
+            "[[forbidden_crates]]\nnames = [\"x\"]\npackages = [\"nope\"]\nreason = \"r\"\n",
+            "[[forbidden_crates]]\nnames = [\"x\"]\nreason = \"r\"\n",
+            "[[forbidden_crates]]\nnames = [\"x\"]\nlayers = [\"J\"]\nreason = \"r\"\ntypo = 1\n",
+        ] {
+            assert!(
+                Policy::parse(&format!("{POLICY}\n{extra}")).is_err(),
+                "{extra}"
+            );
+        }
     }
 }

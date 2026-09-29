@@ -4,17 +4,88 @@ All notable changes to this workspace are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project uses
 Semantic Versioning within the 0.x pre-release range.
 
-## [0.8.0] — Unreleased
-
 ## [Unreleased]
 
+### Fixed
+
+- `curl -fsSL https://get.harw.dev/harw/install.sh | bash` no longer fails
+  with a bare 404 on `Harwness-main.zip`. Without an argument it still
+  builds from source. `--binary` (opt-in) reads the mirror instead of the
+  private GitHub releases, refuses systems without glibc, runs the new
+  `harw --version` in staging before replacing anything (an incompatible
+  release leaves the old installation intact) and sets up `PATH` like the
+  source path. Missing files fail with a clear message.
+- `install.sh --binary` no longer aborts with `work_dir: unbound variable`
+  at exit after a successful install.
+- The installer's source path builds from the release's versioned
+  `harwness-<version>-source.tar.gz` (checked against `SHA256SUMS`) and only
+  falls back to `Harwness-main.zip` when the mirror has none.
+- The mirror publishes `version.json`, a release manifest (version, tag,
+  source and per-target tarballs with sha256) written by
+  `scripts/release-manifest.sh`; the installer takes the tag from it before
+  falling back to `latest`, and seeds `~/.harw/version.json` with the
+  installed version.
+- The release `mirror` job also uploads `harwness-<version>-source.tar.gz`
+  (listed in `SHA256SUMS`) and `Harwness-main.zip`.
+
+## [0.9.0] — Unreleased
+
 ### Added
+- Tool gateway, round R18a (contract
+  `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md`):
+  - Tools execute in the gateway inside the sandbox; only a UIA agent
+    principal is admitted to `tool.call`, sub-agents reach tools only
+    through delegation that can only narrow rights. Admission is
+    fail-closed in a fixed order and never falls back to host execution;
+    sessions belong to their owning agent.
+  - `harw-protocol`: `tool.*` / `gateway.*` wire (wire minor 2),
+    `ToolPlacement`, `ToolPort` / `GatewayPort`.
+  - `harw-session-host`: tool host, agent registry with cascading
+    narrowing and revocation; `harw-session-ws` routes the new methods
+    behind the caps granted at hello.
+  - New crate `harw-tool-remote`: remote tool proxy; runtime mode without
+    local tools.
+  - `gateway.*` operations for the UIA: nine reads without approval (incl.
+    `gateway.health` and `gateway.logs`), five mutations that always ask;
+    key operations keep no model surface.
+  - WorkDriver: `work_driver.report` replaces free-text parsing, writable
+    workspace scope for command-only criteria, central artifact
+    verification, role instructions, judge retry then escalate, lane size
+    from config, the UIA may enqueue (with approval).
+  - TUI: `Shell(...)` instead of `Bash(...)`, placement badge (host /
+    sandbox / gateway), `Job(name)` labels, plan cells show only the delta,
+    job failure reasons and originating tool call.
+  - Auto-mode classifier retries once on an empty reply, then falls back to
+    the main model, otherwise asks with a named cause.
+- Session control plane, W00 round 1 (PL-65, contract
+  `docs/planning/65-cloud-sessions/contracts/W00-websocket-control-plane.md`):
+  - `harw-protocol`: `session_wire` (cursor, caps, frames with an additive
+    `Unknown` fallback, typed params/results for the closed method table)
+    and `session_port` (`SessionPort`/`FrameSource`, std futures only).
+  - New crate `harw-session-host`: single writer of hosted sessions with
+    tenant/capability admission, durable records and restart recovery,
+    transcript replay by cursor, a live ring with snapshots, bounded
+    per-attachment queues with coalescing and `Lagged`, compare-and-swap
+    input arbitration with idempotent `client_msg_id`, first-writer-wins
+    approvals with host-derived actors, presence, revocation and drain.
+  - New crate `harw-session-ws`: `harw.session.v1` WebSocket transport
+    (upgrade validation incl. `Origin` refusal, codec and limits, hello
+    gate, request correlation, a fair frame multiplexer that keeps
+    responses ahead of delta floods).
+  - Arch gate: `[[forbidden_crates]]` rules (tungstenite only in ring A;
+    no transport crates in `harw-protocol`).
+  Not wired into `harw gateway`/TUI yet (W04–W06).
 - Tailscale access: `harw tailscale status` and `harw web --tailnet
   [--tailnet-port]`. The control plane listens on the node's tailnet
   address only, admits peers that `tailscaled` identifies via `whois`, and
   gives every tailnet device the tier Operator through a dedicated
   `tailnet.sock` (new crate `harw-tailscale`, `ForwardedPeerResolver` in
   `harw-web`). See `docs/setup/tailscale.md`.
+
+### Changed
+- `job.wait` is a short poll: `timeout_secs` is limited to 1..=60 (larger
+  values are refused); job completion arrives as a notification.
+- `shell.exec` documents POSIX `/bin/sh` and steers file edits to `fs.*`.
 
 ### `harw update` installs updates
 
@@ -28,6 +99,8 @@ Semantic Versioning within the 0.x pre-release range.
 - The chat start names a newer version from `~/.harw/version.json` and, at
   most every 20 hours, checks in the background (`HARW_NO_UPDATE_CHECK=1`
   turns this off).
+
+## [0.8.0] — 2026-09-28
 
 ### One systemd source of truth (Crypto Masterplan v2 H10)
 

@@ -98,6 +98,9 @@ A missing CI run is not a passing check.
   advisory checks against [`deny.toml`](deny.toml).
 - `actionlint` — lints on the GitHub Actions workflows themselves.
 
+The root-workspace check job runs twice, natively on x64 (`ubuntu-latest`)
+and on Linux-arm64 (`ubuntu-24.04-arm`). Both architectures must be green.
+
 Run the closest equivalents locally before opening a pull request:
 
 ```bash
@@ -109,6 +112,10 @@ cargo test --workspace --doc
 cargo run -q -p xtask -- gates
 make -C dod test   # DoD crates only, -p selection against the root workspace
 cargo deny check
+# Linux-arm64 cross-check (rustup target add aarch64-unknown-linux-gnu,
+# apt install gcc-aarch64-linux-gnu):
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 ```
 
 ## Code style

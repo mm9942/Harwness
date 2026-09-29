@@ -26,8 +26,8 @@ eine eigene, abgekapselte Rolle, kein gewöhnlicher Worker.
   unklares Ziel) — dann mit konkretem Zerlegungsvorschlag: Teilpakete mit
   Dateien und Reihenfolge.
 - Budget klein (`effort_cap = "low"`): gezielt arbeiten.
-- Lange Prozesse (Builds, Tests, >2 min): `job.start`, dann `job.wait`;
-  nicht pollen, kein tmux.
+- Lange Prozesse (>2 min): `job.start`; das Ende kommt als Notiz,
+  `job.wait` nur kurz (≤ 60 s), kein tmux.
 
 ## Root-Befehle (sudo)
 sudo geht, nur nie über `shell.exec`: `uia-shell-worker` ruft

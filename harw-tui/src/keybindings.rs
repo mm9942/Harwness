@@ -118,11 +118,14 @@ pub(crate) enum KeyAction {
     /// Agenten-Panel bzw. Text eines offenen Dialogs nach unten scrollen,
     /// ohne den Fokus zu wechseln (Standard `Ctrl+↓`).
     ScrollPanelDown,
+    /// Bildschirm vollständig neu zeichnen (Standard `Ctrl+L`), falls der
+    /// Terminal-Emulator Zeichenbreiten anders zählt und Reste stehen bleiben.
+    RedrawScreen,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -141,6 +144,7 @@ impl KeyAction {
         Self::OpenMatrix,
         Self::ScrollPanelUp,
         Self::ScrollPanelDown,
+        Self::RedrawScreen,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -164,6 +168,7 @@ impl KeyAction {
             Self::OpenMatrix => "open_matrix",
             Self::ScrollPanelUp => "scroll_panel_up",
             Self::ScrollPanelDown => "scroll_panel_down",
+            Self::RedrawScreen => "redraw_screen",
         }
     }
 
@@ -189,6 +194,7 @@ impl KeyAction {
             Self::OpenMatrix => "Matrix-Game-Panel öffnen",
             Self::ScrollPanelUp => "Agenten-Panel/Dialogtext nach oben scrollen",
             Self::ScrollPanelDown => "Agenten-Panel/Dialogtext nach unten scrollen",
+            Self::RedrawScreen => "Bildschirm vollständig neu zeichnen",
         }
     }
 
@@ -218,6 +224,7 @@ impl KeyAction {
             Self::OpenMatrix => (KeyCode::F(9), KeyModifiers::NONE),
             Self::ScrollPanelUp => (KeyCode::Up, KeyModifiers::CONTROL),
             Self::ScrollPanelDown => (KeyCode::Down, KeyModifiers::CONTROL),
+            Self::RedrawScreen => (KeyCode::Char('l'), KeyModifiers::CONTROL),
         };
         vec![KeyChord { code, modifiers }]
     }

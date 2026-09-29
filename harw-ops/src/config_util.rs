@@ -1,12 +1,18 @@
 //! Wiederverwendbare Config-Discovery-Helfer für ops-Handler.
 //!
-//! Bündelt das Muster "harw_home::config_layers + discover_config", das in
-//! mehreren Ops (model, provider, …) mehrfach vorkam.
+//! Bündelt das Muster "Config-Layer + discover_config", das in mehreren Ops
+//! (model, provider, …) mehrfach vorkam, und bindet es an den Root-Space der
+//! Sitzung.
 //!
 //! # Verantwortungsbereich
-//! Stellt [`load_default_config`] bereit, um die Initialisierung von
-//! `HARW_HOME`, Profil-Layern und Config-Discovery auf eine einzelne,
-//! einheitliche Zeile zu reduzieren. Stellt außerdem
+//! Stellt [`bound_home`] bereit: den an die Sitzung gebundenen Root-Space
+//! (`Arc<harw_home::ResolvedHomeContext>`, von der Laufzeit in jede
+//! [`harw_operations::context::ServiceMap`] eingetragen). Fehlt die Bindung,
+//! antwortet er mit [`OpError::NotAvailable`] — bewusst ohne Rückfall auf
+//! `HARW_HOME` oder `~/.harw`. Darauf bauen [`bound_config_layers`] und
+//! [`load_bound_config`] auf, die Config-Discovery der Ops. Der ältere
+//! [`load_default_config`] liest den Root-Space des Prozesses und bleibt nur
+//! für `crate::permissions`. Stellt außerdem
 //! [`persist_default_selection`] bereit, mit dem `/provider switch` und
 //! `/model switch` den zuletzt gewählten Provider/Modell als Standard für
 //! künftige Sitzungen in der Profil-`config.toml` verankern — bestes Bemühen,
@@ -23,32 +29,40 @@
 //! [`persist_default_interaction_mode`] (`[mode] default`) hinzu, für
 //! `/agent use` außerdem [`persist_active_agent`]
 //! (`active_agent_definition`) — alle ebenfalls bestes Bemühen und erst ab
-//! der nächsten Sitzung wirksam.
+//! der nächsten Sitzung wirksam. Alle freien `persist_*`-/`clear_*`-Funktionen
+//! bekommen das Profilverzeichnis ausdrücklich übergeben und lösen selbst
+//! keinen Root-Space auf.
 //!
 //! Zusätzlich stellt dieses Modul [`SelectionPersistence`] bereit: einen
 //! austauschbaren Dienst-Trait, der die `persist_*`-/`clear_*`-Funktionen hinter
 //! einer gemeinsamen Schnittstelle bündelt, plus [`FileSelectionPersistence`]
-//! (Standard-Implementierung, ruft unverändert die freien Funktionen auf) und
+//! (schreibt in die `config.toml` eines festen Profilverzeichnisses) und
 //! [`RecordingSelectionPersistence`] (No-op-Aufzeichnung für Tests). Die
-//! Operationen (`crate::model`, `crate::effort`) fragen den Dienst über
-//! [`selection_persistence`] aus dem [`harw_operations::context::ServiceMap`]
-//! ab, bevor sie auf das bisherige Verhalten zurückfallen.
+//! Operationen (`crate::model`, `crate::effort`, …) holen den Dienst über
+//! [`selection_persistence`]: ein injizierter Dienst gewinnt, sonst schreibt
+//! [`FileSelectionPersistence`] in das Profil des gebundenen Root-Space. Ohne
+//! Bindung schlägt jede Persistenz geschlossen fehl und meldet das als Notiz.
 //!
 //! # Exportierte Typen
 //! [`SelectionPersistence`], [`FileSelectionPersistence`],
 //! [`RecordingSelectionPersistence`], [`RecordedSelectionPersistCall`] sind
 //! `pub` (dieses Modul selbst ist `pub(crate)` — siehe `crate::model`'s
 //! `pub use crate::config_util::{...}`-Re-Export für den öffentlichen Pfad,
-//! über den `harw-tui`-Tests sie erreichen). Alle anderen Items bleiben
+//! über den `harw-tui`-Tests sie erreichen). Von außen lässt sich
+//! [`FileSelectionPersistence`] nur über [`FileSelectionPersistence::for_home`]
+//! bauen; ihr Konstruktor `new` ist `pub(crate)`. Alle anderen Items bleiben
 //! `pub(crate)`.
 //!
 //! # Nebenläufigkeit
-//! Die freien `persist_*`-Funktionen und [`load_default_config`] sind
-//! zustandslos. [`RecordingSelectionPersistence`] hält intern einen
-//! `Mutex<Vec<_>>` und ist damit `Send + Sync` — sicher von mehreren Threads
-//! aus aufrufbar.
+//! Die freien `persist_*`-Funktionen, [`bound_home`], [`load_bound_config`]
+//! und [`load_default_config`] sind zustandslos. [`FileSelectionPersistence`]
+//! hält nur einen unveränderlichen Pfad. [`RecordingSelectionPersistence`]
+//! hält intern einen `Mutex<Vec<_>>` und ist damit `Send + Sync` — sicher von
+//! mehreren Threads aus aufrufbar.
 //!
 //! # Fehlertypen
+//! - [`harw_operations::OpError::NotAvailable`]: [`bound_home`]/
+//!   [`load_bound_config`], wenn an die Sitzung kein Root-Space gebunden ist.
 //! - [`harw_operations::OpError::Execution`]: wenn die Config-Discovery fehlschlägt.
 //! - [`persist_default_selection`]/[`persist_uia_selection`]/
 //!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`]/
@@ -66,9 +80,11 @@
 
 use harw_config::ResolvedConfig;
 use harw_operations::{OpContext, OpError};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Lädt die Config aus dem aktiven `HARW_HOME` und dessen Layern.
+/// Lädt die Config aus dem Root-Space des **Prozesses** (`HARW_HOME` bzw.
+/// `~/.harw`) und dessen Layern.
 ///
 /// # Description
 /// Ruft [`harw_home::home_dir`] und anschließend
@@ -76,6 +92,12 @@ use std::sync::{Arc, Mutex};
 /// berücksichtigt wird. Die resultierenden Layer werden an
 /// [`harw_config::discover_config`] übergeben. Fehler werden in
 /// [`OpError::Execution`] mit einem optionalen Kontext-Präfix umgewandelt.
+///
+/// Liest bewusst **nicht** den an die Sitzung gebundenen Root-Space. Nur
+/// `crate::permissions` nutzt diesen Pfad noch; Operationen verwenden
+/// [`load_bound_config`], das den gebundenen
+/// `harw_home::ResolvedHomeContext` liest und ohne Bindung geschlossen
+/// fehlschlägt.
 ///
 /// Fehlt ein Layer-Verzeichnis, überspringt [`harw_config::discover_config`] es
 /// stillschweigend — das Ergebnis ist dann ein leeres [`ResolvedConfig`] mit
@@ -120,10 +142,113 @@ fn execution_error(context: &str, error: impl std::fmt::Display) -> OpError {
     }
 }
 
+/// Grund, mit dem Operationen ohne gebundenen Root-Space geschlossen
+/// fehlschlagen (als [`OpError::NotAvailable`] oder als Persistenz-Notiz).
+const UNBOUND_HOME: &str =
+    "an diese Sitzung ist kein Root-Space gebunden (harw_home::ResolvedHomeContext fehlt)";
+
+/// Liefert den an die Sitzung gebundenen Root-Space.
+///
+/// # Description
+/// Liest den `Arc<harw_home::ResolvedHomeContext>`, den die Laufzeit auf
+/// jeder Oberfläche in die [`harw_operations::context::ServiceMap`] einträgt.
+/// Es gibt bewusst **keinen** Rückfall auf `HARW_HOME` oder `~/.harw`: eine
+/// Sitzung, die mit einem anderen Root-Space gestartet wurde (z. B. über
+/// `--home`), darf nie still in den Root-Space des Prozesses lesen oder
+/// schreiben.
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): Ausführungskontext, dessen `ServiceMap` befragt wird.
+///
+/// # Returns
+/// Den gebundenen [`harw_home::ResolvedHomeContext`], geliehen aus `ctx`.
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: wenn kein Root-Space gebunden ist.
+///
+/// # Panics
+/// Nie.
+///
+/// # Examples
+/// ```rust,ignore
+/// // Called from within harw-ops — module is pub(crate).
+/// let home = crate::config_util::bound_home(ctx)?;
+/// let memories = home.profile_dir.join("memories");
+/// ```
+pub(crate) fn bound_home(ctx: &OpContext) -> Result<&harw_home::ResolvedHomeContext, OpError> {
+    ctx.service::<Arc<harw_home::ResolvedHomeContext>>()
+        .map(Arc::as_ref)
+        .ok_or_else(|| OpError::NotAvailable(UNBOUND_HOME.to_owned()))
+}
+
+/// Baut die Config-Layer des gebundenen Root-Space in aufsteigender Präzedenz.
+///
+/// # Description
+/// Root-Space und Profilverzeichnis kommen aus der Bindung selbst, nicht aus
+/// [`harw_home::config_layers_report_at`]: dessen Profilwahl folgt
+/// `HARW_PROFILE`/`active_profile` des Prozesses. Aus dem Bericht wird nur
+/// der vertraute repo-lokale Layer (`<projekt>/.harw`, falls freigegeben)
+/// übernommen.
+///
+/// # Arguments
+/// - `home` (`&harw_home::ResolvedHomeContext`): der gebundene Root-Space.
+///
+/// # Returns
+/// `[root, profil, (repo)]` — nicht existente Layer überspringt
+/// [`harw_config::discover_config`] selbst.
+///
+/// # Errors
+/// Wie [`harw_home::config_layers_report_at`] (Trust-Store unlesbar,
+/// Projekt-Root nicht kanonisierbar, ungültiger Profilname).
+pub(crate) fn bound_config_layers(
+    home: &harw_home::ResolvedHomeContext,
+) -> Result<Vec<PathBuf>, harw_home::HomeError> {
+    let report = harw_home::config_layers_report_at(&home.home, &home.project.root)?;
+    let mut layers = vec![home.home.clone(), home.profile_dir.clone()];
+    layers.extend(report.layers.into_iter().skip(2));
+    Ok(layers)
+}
+
+/// Lädt die Config aus dem an die Sitzung gebundenen Root-Space.
+///
+/// # Description
+/// [`bound_home`], dann [`bound_config_layers`], dann
+/// [`harw_config::discover_config`]. Das ist die Config-Discovery der
+/// Operationen; [`load_default_config`] bleibt dem Prozess-Root-Space
+/// vorbehalten.
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): Ausführungskontext mit gebundenem Root-Space.
+/// - `context` (`&str`): Präfix für Ausführungsfehler, wie bei
+///   [`load_default_config`].
+///
+/// # Returns
+/// Die aufgelöste [`ResolvedConfig`].
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: kein Root-Space gebunden.
+/// - [`OpError::Execution`]: Layer-Ermittlung oder
+///   [`harw_config::discover_config`] schlägt fehl (`"{context}: {e}"`).
+///
+/// # Panics
+/// Nie.
+///
+/// # Examples
+/// ```rust,ignore
+/// // Called from within harw-ops — module is pub(crate).
+/// let config = crate::config_util::load_bound_config(ctx, "Config-Discovery fehlgeschlagen")?;
+/// ```
+pub(crate) fn load_bound_config(ctx: &OpContext, context: &str) -> Result<ResolvedConfig, OpError> {
+    let home = bound_home(ctx)?;
+    let layers = bound_config_layers(home).map_err(|error| execution_error(context, error))?;
+    harw_config::discover_config(&layers).map_err(|error| execution_error(context, error))
+}
+
 /// Verankert `default_provider`/`default_model` bestes Bemühen in der
-/// Profil-`config.toml` (`<home>/profiles/<aktives-profil>/config.toml`) —
-/// denselben Datei- und Schlüsselnamen, die `harw onboard` beim Ersteinstieg
-/// schreibt (siehe `harw-cli/src/onboarding.rs`).
+/// Profil-`config.toml` (`<profile_dir>/config.toml`, im Betrieb das Profil
+/// des gebundenen Root-Space) — denselben Datei- und Schlüsselnamen, die
+/// `harw onboard` beim Ersteinstieg schreibt (siehe
+/// `harw-cli/src/onboarding.rs`).
 ///
 /// # Description
 /// Wird nach einem **bereits erfolgreichen** `/provider switch` oder
@@ -137,11 +262,13 @@ fn execution_error(context: &str, error: impl std::fmt::Display) -> OpError {
 /// In-Session-Wechsel über den [`harw_operations::SessionController`] hat zu
 /// diesem Zeitpunkt bereits stattgefunden und darf durch eine
 /// Persistenz-Panne nicht rückgängig gemacht werden. Jeder interne Fehler
-/// (Home nicht auflösbar, Schreibfehler, Validierung) wird stattdessen als
-/// deutschsprachige Notiz zurückgegeben, die der Aufrufer an die
-/// Operator-Ausgabe anhängen kann.
+/// (Schreibfehler, Validierung) wird stattdessen als deutschsprachige Notiz
+/// zurückgegeben, die der Aufrufer an die Operator-Ausgabe anhängen kann.
+/// Den Root-Space löst die Funktion nicht selbst auf.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `default_provider` (`Option<&str>`): kanonische Provider-ID, die als
 ///   neuer Standard geschrieben werden soll, oder `None`, um den Schlüssel
 ///   unverändert zu lassen.
@@ -162,19 +289,23 @@ fn execution_error(context: &str, error: impl std::fmt::Display) -> OpError {
 /// # Examples
 /// ```rust,ignore
 /// // Nach einem erfolgreichen controller.set_active_provider(...):
-/// if let Some(note) = crate::config_util::persist_default_selection(Some("anthropic"), None) {
+/// let home = crate::config_util::bound_home(ctx)?;
+/// if let Some(note) =
+///     crate::config_util::persist_default_selection(&home.profile_dir, Some("anthropic"), None)
+/// {
 ///     text.push('\n');
 ///     text.push_str(&note);
 /// }
 /// ```
 pub(crate) fn persist_default_selection(
+    profile_dir: &Path,
     default_provider: Option<&str>,
     default_model: Option<&str>,
 ) -> Option<String> {
     if default_provider.is_none() && default_model.is_none() {
         return None;
     }
-    match try_persist_default_selection(default_provider, default_model) {
+    match try_persist_default_selection(profile_dir, default_provider, default_model) {
         Ok(()) => None,
         Err(reason) => Some(format!(
             "Hinweis: konnte nicht dauerhaft als Standard für künftige Sitzungen gespeichert werden ({reason})."
@@ -184,12 +315,10 @@ pub(crate) fn persist_default_selection(
 
 /// Interner, fehlschlagender Kern von [`persist_default_selection`].
 fn try_persist_default_selection(
+    profile_dir: &Path,
     default_provider: Option<&str>,
     default_model: Option<&str>,
 ) -> Result<(), String> {
-    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
-    let profile = harw_home::active_profile_name(&home);
-    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
     let config_path = profile_dir.join("config.toml");
 
     let mut writer =
@@ -220,6 +349,8 @@ fn try_persist_default_selection(
 /// deutschsprachige Notiz zurückgegeben statt propagiert.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `uia_provider` (`Option<&str>`): kanonische Provider-ID für die
 ///   UIA-Sitzung, oder `None`, um den Schlüssel unverändert zu lassen.
 /// - `uia_model` (`Option<&str>`): kanonische Modell-ID; `None` entfernt einen
@@ -238,19 +369,23 @@ fn try_persist_default_selection(
 ///
 /// # Examples
 /// ```rust,ignore
-/// if let Some(note) = crate::config_util::persist_uia_selection(Some("anthropic"), None) {
+/// let home = crate::config_util::bound_home(ctx)?;
+/// if let Some(note) =
+///     crate::config_util::persist_uia_selection(&home.profile_dir, Some("anthropic"), None)
+/// {
 ///     text.push('\n');
 ///     text.push_str(&note);
 /// }
 /// ```
 pub(crate) fn persist_uia_selection(
+    profile_dir: &Path,
     uia_provider: Option<&str>,
     uia_model: Option<&str>,
 ) -> Option<String> {
     if uia_provider.is_none() && uia_model.is_none() {
         return None;
     }
-    match try_persist_uia_selection(uia_provider, uia_model) {
+    match try_persist_uia_selection(profile_dir, uia_provider, uia_model) {
         Ok(()) => None,
         Err(reason) => Some(format!(
             "Hinweis: konnte UIA-Auswahl nicht dauerhaft speichern ({reason})."
@@ -260,12 +395,10 @@ pub(crate) fn persist_uia_selection(
 
 /// Interner, fehlschlagender Kern von [`persist_uia_selection`].
 fn try_persist_uia_selection(
+    profile_dir: &Path,
     uia_provider: Option<&str>,
     uia_model: Option<&str>,
 ) -> Result<(), String> {
-    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
-    let profile = harw_home::active_profile_name(&home);
-    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
     let config_path = profile_dir.join("config.toml");
 
     let mut writer =
@@ -306,6 +439,8 @@ fn try_persist_uia_selection(
 /// nächsten Sitzungsstart, wie andere `internal_models.*`-Punkte.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `model` (`Option<&str>`): kanonische Modell-ID für den UIA-Worker, die
 ///   als `uia_worker_model` geschrieben werden soll, oder `None`, um den Pin
 ///   zu entfernen.
@@ -322,13 +457,16 @@ fn try_persist_uia_selection(
 ///
 /// # Examples
 /// ```rust,ignore
-/// if let Some(note) = crate::config_util::persist_uia_worker_model(Some("claude-worker-x")) {
+/// let home = crate::config_util::bound_home(ctx)?;
+/// if let Some(note) =
+///     crate::config_util::persist_uia_worker_model(&home.profile_dir, Some("claude-worker-x"))
+/// {
 ///     text.push('\n');
 ///     text.push_str(&note);
 /// }
 /// ```
-pub(crate) fn persist_uia_worker_model(model: Option<&str>) -> Option<String> {
-    match try_persist_uia_worker_model(model) {
+pub(crate) fn persist_uia_worker_model(profile_dir: &Path, model: Option<&str>) -> Option<String> {
+    match try_persist_uia_worker_model(profile_dir, model) {
         Ok(()) => None,
         Err(reason) => Some(format!(
             "Hinweis: konnte UIA-Worker-Modell nicht dauerhaft speichern ({reason})."
@@ -337,10 +475,7 @@ pub(crate) fn persist_uia_worker_model(model: Option<&str>) -> Option<String> {
 }
 
 /// Interner, fehlschlagender Kern von [`persist_uia_worker_model`].
-fn try_persist_uia_worker_model(model: Option<&str>) -> Result<(), String> {
-    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
-    let profile = harw_home::active_profile_name(&home);
-    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+fn try_persist_uia_worker_model(profile_dir: &Path, model: Option<&str>) -> Result<(), String> {
     let config_path = profile_dir.join("config.toml");
 
     let mut writer =
@@ -362,14 +497,18 @@ fn try_persist_uia_worker_model(model: Option<&str>) -> Result<(), String> {
 ///
 /// # Description
 /// `value = None` entfernt den Eintrag der Rolle (dann greift der alte
-/// `uia_worker_model`-Pin bzw. die Vorgabe „wie UIA“). **Niemals
-/// fehlschlagend** für den Aufrufer.
+/// `uia_worker_model`-Pin bzw. die Vorgabe „wie UIA“). Geschrieben wird
+/// `<profile_dir>/config.toml`. **Niemals fehlschlagend** für den Aufrufer.
 ///
 /// # Returns
 /// `None` bei Erfolg; `Some(note)` bei unbekannter Rolle oder
 /// Persistenzfehler.
-pub(crate) fn persist_uia_worker_role_model(role: &str, value: Option<&str>) -> Option<String> {
-    let result = open_profile_config_writer().and_then(|mut writer| {
+pub(crate) fn persist_uia_worker_role_model(
+    profile_dir: &Path,
+    role: &str,
+    value: Option<&str>,
+) -> Option<String> {
+    let result = open_profile_config_writer(profile_dir).and_then(|mut writer| {
         write_uia_worker_role_model(&mut writer, role, value)?;
         writer.save().map_err(|error| error.to_string())
     });
@@ -431,6 +570,8 @@ fn write_uia_worker_role_model(
 /// — der gesetzte Effort wirkt erst beim nächsten Sitzungsstart.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `effort` (`Option<&str>`): serialisierter [`harw_types::ReasoningEffort`]
 ///   (`"minimal"|"low"|"medium"|"high"|"xhigh"|"max"`), der als
 ///   `reasoning.uia` geschrieben werden soll, oder `None`, um den Pin zu
@@ -448,13 +589,19 @@ fn write_uia_worker_role_model(
 ///
 /// # Examples
 /// ```rust,ignore
-/// if let Some(note) = crate::config_util::persist_uia_reasoning_effort(Some("high")) {
+/// let home = crate::config_util::bound_home(ctx)?;
+/// if let Some(note) =
+///     crate::config_util::persist_uia_reasoning_effort(&home.profile_dir, Some("high"))
+/// {
 ///     text.push('\n');
 ///     text.push_str(&note);
 /// }
 /// ```
-pub(crate) fn persist_uia_reasoning_effort(effort: Option<&str>) -> Option<String> {
-    match try_persist_uia_reasoning_effort(effort) {
+pub(crate) fn persist_uia_reasoning_effort(
+    profile_dir: &Path,
+    effort: Option<&str>,
+) -> Option<String> {
+    match try_persist_uia_reasoning_effort(profile_dir, effort) {
         Ok(()) => None,
         Err(reason) => Some(format!(
             "Hinweis: konnte UIA-Reasoning-Effort nicht dauerhaft speichern ({reason})."
@@ -463,10 +610,10 @@ pub(crate) fn persist_uia_reasoning_effort(effort: Option<&str>) -> Option<Strin
 }
 
 /// Interner, fehlschlagender Kern von [`persist_uia_reasoning_effort`].
-fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> {
-    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
-    let profile = harw_home::active_profile_name(&home);
-    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+fn try_persist_uia_reasoning_effort(
+    profile_dir: &Path,
+    effort: Option<&str>,
+) -> Result<(), String> {
     let config_path = profile_dir.join("config.toml");
 
     let mut writer =
@@ -482,16 +629,12 @@ fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> 
     writer.save().map_err(|error| error.to_string())
 }
 
-/// Öffnet die Profil-`config.toml` des aktiven Profils über
-/// [`harw_config::ConfigWriter`].
+/// Öffnet `<profile_dir>/config.toml` über [`harw_config::ConfigWriter`].
 ///
 /// # Errors
-/// Menschenlesbarer Grund als `String`, wenn Home/Profil nicht auflösbar
-/// sind oder die Datei nicht geöffnet werden kann.
-fn open_profile_config_writer() -> Result<harw_config::ConfigWriter, String> {
-    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
-    let profile = harw_home::active_profile_name(&home);
-    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+/// Menschenlesbarer Grund als `String`, wenn die Datei nicht geöffnet werden
+/// kann.
+fn open_profile_config_writer(profile_dir: &Path) -> Result<harw_config::ConfigWriter, String> {
     harw_config::ConfigWriter::open(&profile_dir.join("config.toml"))
         .map_err(|error| error.to_string())
 }
@@ -516,6 +659,8 @@ fn open_profile_config_writer() -> Result<harw_config::ConfigWriter, String> {
 /// zurückgegeben statt propagiert.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `point` ([`harw_config::InternalModelPoint`]): die Stelle; ihr
 ///   [`harw_config::InternalModelPoint::key`] bildet den TOML-Pfad.
 /// - `provider` (`Option<&str>`): kanonischer Provider-Name.
@@ -530,11 +675,12 @@ fn open_profile_config_writer() -> Result<harw_config::ConfigWriter, String> {
 /// # Concurrency
 /// Rein synchron; kein Datei-Lock, analog zu [`persist_uia_worker_model`].
 pub(crate) fn persist_internal_model(
+    profile_dir: &Path,
     point: harw_config::InternalModelPoint,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Option<String> {
-    let result = open_profile_config_writer().and_then(|mut writer| {
+    let result = open_profile_config_writer(profile_dir).and_then(|mut writer| {
         write_internal_model(&mut writer, point, provider, model)?;
         writer.save().map_err(|error| error.to_string())
     });
@@ -549,8 +695,7 @@ pub(crate) fn persist_internal_model(
 
 /// Reiner Schreibkern von [`persist_internal_model`] auf einem bereits
 /// geöffneten [`harw_config::ConfigWriter`] (ohne `save`) — getrennt, damit
-/// Tests ihn gegen eine temporäre Datei prüfen können, ohne `HARW_HOME`
-/// aufzulösen.
+/// Tests ihn direkt gegen eine temporäre Datei prüfen können.
 ///
 /// # Errors
 /// Menschenlesbarer Grund, wenn [`harw_config::ConfigWriter::set_value`]
@@ -596,6 +741,10 @@ fn write_internal_model(
 /// erst ab der nächsten Sitzung; eine bereits laufende Live-Auswahl bleibt
 /// unberührt. **Niemals fehlschlagend** für den Aufrufer.
 ///
+/// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
+///
 /// # Returns
 /// `None` bei Erfolg; `Some(note)` bei einem Persistenzfehler.
 ///
@@ -604,8 +753,8 @@ fn write_internal_model(
 ///
 /// # Concurrency
 /// Rein synchron; kein Datei-Lock.
-pub(crate) fn clear_uia_selection() -> Option<String> {
-    let result = open_profile_config_writer().and_then(|mut writer| {
+pub(crate) fn clear_uia_selection(profile_dir: &Path) -> Option<String> {
+    let result = open_profile_config_writer(profile_dir).and_then(|mut writer| {
         clear_uia_keys(&mut writer);
         writer.save().map_err(|error| error.to_string())
     });
@@ -634,6 +783,8 @@ fn clear_uia_keys(writer: &mut harw_config::ConfigWriter) {
 /// fehlschlagend** für den Aufrufer.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `mode` (`&str`): kanonischer Modusname.
 ///
 /// # Returns
@@ -644,8 +795,8 @@ fn clear_uia_keys(writer: &mut harw_config::ConfigWriter) {
 ///
 /// # Concurrency
 /// Rein synchron; kein Datei-Lock.
-pub(crate) fn persist_default_interaction_mode(mode: &str) -> Option<String> {
-    let result = open_profile_config_writer().and_then(|mut writer| {
+pub(crate) fn persist_default_interaction_mode(profile_dir: &Path, mode: &str) -> Option<String> {
+    let result = open_profile_config_writer(profile_dir).and_then(|mut writer| {
         write_default_interaction_mode(&mut writer, mode)?;
         writer.save().map_err(|error| error.to_string())
     });
@@ -684,6 +835,8 @@ fn write_default_interaction_mode(
 /// **Niemals fehlschlagend** für den Aufrufer.
 ///
 /// # Arguments
+/// - `profile_dir` (`&Path`): Profilverzeichnis, dessen `config.toml`
+///   geschrieben wird.
 /// - `name` (`Option<&str>`): Agentenname oder `None` zum Entfernen.
 ///
 /// # Returns
@@ -694,8 +847,8 @@ fn write_default_interaction_mode(
 ///
 /// # Concurrency
 /// Rein synchron; kein Datei-Lock.
-pub(crate) fn persist_active_agent(name: Option<&str>) -> Option<String> {
-    let result = open_profile_config_writer().and_then(|mut writer| {
+pub(crate) fn persist_active_agent(profile_dir: &Path, name: Option<&str>) -> Option<String> {
+    let result = open_profile_config_writer(profile_dir).and_then(|mut writer| {
         write_active_agent(&mut writer, name)?;
         writer.save().map_err(|error| error.to_string())
     });
@@ -729,34 +882,36 @@ fn write_active_agent(
 
 // ── Pluggable Persistenz-Dienst ─────────────────────────────────────────────
 //
-// Motivation: `try_persist_default_selection`/`try_persist_uia_selection`/
-// `try_persist_uia_worker_model`/`try_persist_uia_reasoning_effort` lösen
-// `HARW_HOME` intern selbst auf (`harw_home::home_dir()`), was den
-// prozessweiten Zustand mutieren würde, wäre er über `std::env::set_var`
-// isolierbar — dieses Crate deklariert `#![forbid(unsafe_code)]`, also ist
-// die dafür nötige `unsafe`-Env-Isolation hier nicht verfügbar. Bislang
-// wurde das über injizierte `FnOnce`-Abschlüsse an den einzelnen
-// Call-Sites gelöst (siehe `crate::model`/`crate::provider`/`crate::effort`
-// doc comments). [`SelectionPersistence`] verallgemeinert dasselbe Muster zu
-// einem austauschbaren Dienst, den Tests einmal über die `ServiceMap`
-// injizieren können, statt an jeder Call-Site einen eigenen Test-Abschluss
-// zu bauen — insbesondere für `harw-tui`-Integrationstests, die den
+// Die freien `persist_*`-/`clear_*`-Funktionen schreiben in ein übergebenes
+// Profilverzeichnis. Welches das ist, entscheidet [`selection_persistence`]
+// pro Aufruf aus dem [`OpContext`]: ein injizierter Dienst gewinnt, sonst
+// schreibt [`FileSelectionPersistence`] in das Profil des an die Sitzung
+// gebundenen Root-Space (`harw_home::ResolvedHomeContext`). Ohne Bindung
+// schlägt die Persistenz geschlossen fehl (`UnboundSelectionPersistence`):
+// jede Methode meldet eine Notiz und schreibt nichts, auch nicht nach
+// `HARW_HOME` oder `~/.harw`.
+//
+// Tests injizieren einmal einen Dienst über die `ServiceMap`, statt an jeder
+// Call-Site einen eigenen Abschluss zu bauen — insbesondere
+// `harw-tui`-Integrationstests, die den
 // `/model`/`/uia-model`/`/uia-worker-model`/`/uia-effort`-Dispatch über
-// [`OpContext`] end-to-end durchlaufen, ohne die echte,
-// `HARW_HOME`-auflösende Persistenz zu berühren.
+// [`OpContext`] end-to-end durchlaufen, ohne eine echte `config.toml` zu
+// berühren.
 
 /// Austauschbarer Persistenz-Dienst für die Operator-Auswahl-Persistenzen (Default, UIA, UIA-Worker, UIA-Effort, interne Modellstellen).
 ///
 /// # Description
-/// Spiegelt exakt die Signaturen der bestehenden freien Funktionen
+/// Spiegelt die Signaturen der freien Funktionen
 /// [`persist_default_selection`], [`persist_uia_selection`],
-/// [`persist_uia_worker_model`] und [`persist_uia_reasoning_effort`] wider —
+/// [`persist_uia_worker_model`] und [`persist_uia_reasoning_effort`] wider,
+/// ohne deren `profile_dir`-Argument (das Ziel hält die Implementierung) —
 /// dieselbe `Option<&str>`-Semantik ("unverändert lassen" bei den ersten
 /// beiden, "explizit entfernen" bei den letzten beiden; siehe deren jeweilige
 /// Doc-Kommentare). [`selection_persistence`] löst pro Aufruf den
 /// tatsächlich zu verwendenden Dienst auf: einen über die [`ServiceMap`]
-/// injizierten `Arc<dyn SelectionPersistence>`, sonst [`FileSelectionPersistence`]
-/// als unverändertes Standardverhalten.
+/// injizierten `Arc<dyn SelectionPersistence>`, sonst
+/// [`FileSelectionPersistence`] für das Profil des gebundenen Root-Space;
+/// ohne Bindung eine Implementierung, die geschlossen fehlschlägt.
 ///
 /// `Send + Sync`, damit `Arc<dyn SelectionPersistence>` selbst als
 /// `ServiceMap`-Eintrag (`Any + Send + Sync`) registrierbar ist.
@@ -803,28 +958,53 @@ pub trait SelectionPersistence: Send + Sync {
     /// Siehe [`persist_default_interaction_mode`] (`/mode default <modus>`).
     ///
     /// # Beschreibung
-    /// Mit Standard-Implementierung (schreibt wie bisher in die Profil-
-    /// `config.toml`), damit bestehende Implementierungen unverändert
-    /// bleiben; über den Dienst läuft der Aufruf, damit
+    /// Mit Standard-Implementierung, damit bestehende Implementierungen
+    /// unverändert bleiben; über den Dienst läuft der Aufruf, damit
     /// [`crate::live_config::MirroringSelectionPersistence`] ihn im
-    /// Live-Schnappschuss spiegeln kann.
-    fn persist_default_interaction_mode(&self, mode: &str) -> Option<String> {
-        persist_default_interaction_mode(mode)
+    /// Live-Schnappschuss spiegeln kann. Die Standard-Implementierung kennt
+    /// kein Profilverzeichnis und schlägt deshalb geschlossen fehl: sie
+    /// schreibt nichts und meldet das als Notiz. Implementierungen mit einem
+    /// Ziel (etwa [`FileSelectionPersistence`]) überschreiben sie.
+    fn persist_default_interaction_mode(&self, _mode: &str) -> Option<String> {
+        Some(format!(
+            "Hinweis: konnte den Standardmodus nicht dauerhaft speichern ({UNBOUND_HOME})."
+        ))
     }
 }
 
-/// Standard-Implementierung von [`SelectionPersistence`]: ruft unverändert
-/// die bestehenden, `HARW_HOME`-auflösenden freien Funktionen auf.
+/// Datei-Implementierung von [`SelectionPersistence`]: schreibt über die
+/// freien Funktionen in `<profile_dir>/config.toml`.
 ///
 /// # Description
-/// Das Produktionsverhalten ändert sich durch die Einführung von
-/// [`SelectionPersistence`] nicht: [`selection_persistence`] fällt genau auf
-/// diesen Typ zurück, wenn kein Dienst in der [`harw_operations::context::ServiceMap`]
-/// registriert ist — die Laufzeit (z. B. `harw-tui::command_exec::build_services`)
-/// muss also nichts Neues verdrahten, damit `/model switch` etc. weiterhin in
-/// die echte Profil-`config.toml` schreiben.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FileSelectionPersistence;
+/// Das Profilverzeichnis ist fest an die Instanz gebunden. Im Betrieb baut
+/// [`selection_persistence`] sie über [`FileSelectionPersistence::for_home`]
+/// aus dem an die Sitzung gebundenen Root-Space
+/// (`harw_home::ResolvedHomeContext`), wenn kein Dienst in der
+/// [`harw_operations::context::ServiceMap`] registriert ist. Der Typ löst
+/// selbst nie `HARW_HOME` oder `~/.harw` auf; ohne gebundenen Root-Space
+/// entsteht keine Instanz, die Persistenz schlägt dann geschlossen fehl.
+#[derive(Debug, Clone)]
+pub struct FileSelectionPersistence {
+    profile_dir: PathBuf,
+}
+
+impl FileSelectionPersistence {
+    /// Schreibt künftig in `<profile_dir>/config.toml`.
+    ///
+    /// Nur crate-intern (Tests, [`Self::for_home`]); von außen entsteht eine
+    /// Instanz nur aus einem gebundenen Root-Space.
+    #[must_use]
+    pub(crate) fn new(profile_dir: PathBuf) -> Self {
+        Self { profile_dir }
+    }
+
+    /// Schreibt in das Profil des gebundenen Root-Space
+    /// (`home.profile_dir`).
+    #[must_use]
+    pub fn for_home(home: &harw_home::ResolvedHomeContext) -> Self {
+        Self::new(home.profile_dir.clone())
+    }
+}
 
 impl SelectionPersistence for FileSelectionPersistence {
     fn persist_default_selection(
@@ -832,7 +1012,7 @@ impl SelectionPersistence for FileSelectionPersistence {
         default_provider: Option<&str>,
         default_model: Option<&str>,
     ) -> Option<String> {
-        persist_default_selection(default_provider, default_model)
+        persist_default_selection(&self.profile_dir, default_provider, default_model)
     }
 
     fn persist_uia_selection(
@@ -840,15 +1020,15 @@ impl SelectionPersistence for FileSelectionPersistence {
         uia_provider: Option<&str>,
         uia_model: Option<&str>,
     ) -> Option<String> {
-        persist_uia_selection(uia_provider, uia_model)
+        persist_uia_selection(&self.profile_dir, uia_provider, uia_model)
     }
 
     fn persist_uia_worker_model(&self, model: Option<&str>) -> Option<String> {
-        persist_uia_worker_model(model)
+        persist_uia_worker_model(&self.profile_dir, model)
     }
 
     fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String> {
-        persist_uia_reasoning_effort(effort)
+        persist_uia_reasoning_effort(&self.profile_dir, effort)
     }
 
     fn persist_internal_model(
@@ -857,19 +1037,83 @@ impl SelectionPersistence for FileSelectionPersistence {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Option<String> {
-        persist_internal_model(point, provider, model)
+        persist_internal_model(&self.profile_dir, point, provider, model)
     }
 
     fn clear_uia_selection(&self) -> Option<String> {
-        clear_uia_selection()
+        clear_uia_selection(&self.profile_dir)
     }
 
     fn persist_active_agent(&self, name: Option<&str>) -> Option<String> {
-        persist_active_agent(name)
+        persist_active_agent(&self.profile_dir, name)
     }
 
     fn persist_uia_worker_role_model(&self, role: &str, value: Option<&str>) -> Option<String> {
-        persist_uia_worker_role_model(role, value)
+        persist_uia_worker_role_model(&self.profile_dir, role, value)
+    }
+
+    fn persist_default_interaction_mode(&self, mode: &str) -> Option<String> {
+        persist_default_interaction_mode(&self.profile_dir, mode)
+    }
+}
+
+/// Geschlossen fehlschlagende Persistenz für Sitzungen ohne gebundenen
+/// Root-Space.
+///
+/// # Description
+/// Schreibt nie etwas und fällt nie auf `HARW_HOME` oder `~/.harw` zurück.
+/// Jede Methode meldet stattdessen eine Notiz, die der Aufrufer an die
+/// Operator-Ausgabe anhängt; der In-Session-Wechsel bleibt davon unberührt.
+#[derive(Debug, Clone, Copy)]
+struct UnboundSelectionPersistence;
+
+impl UnboundSelectionPersistence {
+    /// Die Notiz, die jede Methode zurückgibt.
+    fn note() -> Option<String> {
+        Some(format!("Hinweis: nicht dauerhaft gespeichert ({UNBOUND_HOME})."))
+    }
+}
+
+impl SelectionPersistence for UnboundSelectionPersistence {
+    fn persist_default_selection(&self, _: Option<&str>, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_uia_selection(&self, _: Option<&str>, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_uia_worker_model(&self, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_uia_reasoning_effort(&self, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_internal_model(
+        &self,
+        _: harw_config::InternalModelPoint,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Option<String> {
+        Self::note()
+    }
+
+    fn clear_uia_selection(&self) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_active_agent(&self, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_uia_worker_role_model(&self, _: &str, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_default_interaction_mode(&self, _: &str) -> Option<String> {
+        Self::note()
     }
 }
 
@@ -1043,9 +1287,11 @@ impl SelectionPersistence for RecordingSelectionPersistence {
 /// Bevorzugt einen über die [`harw_operations::context::ServiceMap`]
 /// injizierten `Arc<dyn SelectionPersistence>` (billig klonbar — nur der
 /// Zeiger wird kopiert, siehe [`Arc::clone`]). Ist keiner registriert, wird
-/// [`FileSelectionPersistence`] verwendet — das unveränderte
-/// Produktionsverhalten, ohne dass die Laufzeit irgendetwas neu verdrahten
-/// muss.
+/// [`FileSelectionPersistence`] für das Profil des an die Sitzung gebundenen
+/// Root-Space verwendet ([`bound_home`]); die Laufzeit trägt die Bindung auf
+/// jeder Oberfläche ein. Fehlt sie, schlägt die Persistenz geschlossen fehl:
+/// jede Methode schreibt nichts und meldet eine Notiz — es gibt keinen
+/// Rückfall auf `HARW_HOME` oder `~/.harw`.
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): Ausführungskontext, dessen `ServiceMap` befragt wird.
@@ -1058,10 +1304,14 @@ impl SelectionPersistence for RecordingSelectionPersistence {
 pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersistence> {
     let persistence = match ctx.service::<Arc<dyn SelectionPersistence>>() {
         Some(persistence) => Arc::clone(persistence),
-        // Explicit unsizing cast — a closure/`unwrap_or_else` return position
+        // Explicit unsizing casts — a closure/`unwrap_or_else` return position
         // does not reliably coerce `Arc<FileSelectionPersistence>` to
-        // `Arc<dyn SelectionPersistence>` without it.
-        None => Arc::new(FileSelectionPersistence) as Arc<dyn SelectionPersistence>,
+        // `Arc<dyn SelectionPersistence>` without them.
+        None => match bound_home(ctx) {
+            Ok(home) => Arc::new(FileSelectionPersistence::for_home(home))
+                as Arc<dyn SelectionPersistence>,
+            Err(_) => Arc::new(UnboundSelectionPersistence) as Arc<dyn SelectionPersistence>,
+        },
     };
     // Live-Schnappschuss: mit registrierter Zelle wird jede gelungene
     // Persistenz auch im Speicher gespiegelt, damit Ansichten und
@@ -1075,15 +1325,41 @@ pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersist
     }
 }
 
+/// Baut einen gebundenen Root-Space unter `home` für Tests (Profil
+/// `default`, Projekt `<home>/project` ohne Marker).
+///
+/// # Errors
+/// [`crate::test_support::TestError::Context`], wenn das Projektverzeichnis
+/// nicht angelegt oder die Bindung nicht aufgelöst werden kann.
+#[cfg(test)]
+pub(crate) fn test_home_context(
+    home: &Path,
+) -> crate::test_support::TestResult<Arc<harw_home::ResolvedHomeContext>> {
+    use crate::test_support::ctx;
+
+    let root = home.join("project");
+    std::fs::create_dir_all(&root).map_err(ctx("create test project root"))?;
+    let project = harw_home::ProjectRoot {
+        trust_key: root.clone(),
+        root,
+        kind: harw_home::ProjectKind::Directory,
+    };
+    harw_home::ResolvedHomeContext::new(home, "default".to_owned(), project)
+        .map(Arc::new)
+        .map_err(ctx("bind test home context"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FileSelectionPersistence, OpError, RecordedSelectionPersistCall,
         RecordingSelectionPersistence, SelectionPersistence, clear_uia_keys, execution_error,
-        write_active_agent, write_default_interaction_mode, write_internal_model,
+        load_bound_config, selection_persistence, test_home_context, write_active_agent,
+        write_default_interaction_mode, write_internal_model,
     };
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_config::InternalModelPoint;
+    use harw_operations::context::ServiceMap;
 
     #[test]
     fn recording_selection_persistence_records_default_selection_call() {
@@ -1130,22 +1406,136 @@ mod tests {
         );
     }
 
+    /// Ohne injizierten Dienst schreibt `selection_persistence` in das Profil
+    /// des gebundenen Root-Space — nie nach `HARW_HOME`.
     #[test]
-    fn selection_persistence_falls_back_to_file_persistence_without_injected_service() {
-        // No `Arc<dyn SelectionPersistence>` registered in the `ServiceMap` —
-        // `selection_persistence` must fall back to `FileSelectionPersistence`,
-        // proving unchanged production behavior. We cannot safely exercise the
-        // real `HARW_HOME`-resolving write path here (this crate forbids
-        // unsafe code, so no `std::env::set_var` isolation is available — see
-        // the module-level rationale above `SelectionPersistence`), so this
-        // test only asserts the *type* of the fallback via a trait-object
-        // round-trip, mirroring the existing `execution_error` unit tests'
-        // scope (behavior-adjacent, not full I/O).
-        let file_persistence: std::sync::Arc<dyn SelectionPersistence> =
-            std::sync::Arc::new(FileSelectionPersistence);
-        // A `FileSelectionPersistence` must delegate to the same free
-        // functions the round-trip tests below already cover end-to-end.
-        assert!(std::sync::Arc::strong_count(&file_persistence) >= 1);
+    fn selection_persistence_writes_into_the_bound_home_profile() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut services = ServiceMap::new();
+        services.insert(test_home_context(dir.path())?);
+        let context = crate::knowledge_test_support::op_context(services)?;
+
+        let note = selection_persistence(&context)
+            .persist_default_selection(Some("provider-b"), Some("model-b"));
+        assert!(note.is_none(), "{note:?}");
+
+        let config_path = dir
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("config.toml");
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("default_provider"),
+            Some("provider-b".to_owned())
+        );
+        assert_eq!(
+            reopened.get_value("default_model"),
+            Some("model-b".to_owned())
+        );
+        Ok(())
+    }
+
+    /// Ohne gebundenen Root-Space schlägt jede Persistenz geschlossen fehl
+    /// und meldet eine Notiz, statt auf den Prozess-Root-Space auszuweichen.
+    #[test]
+    fn selection_persistence_without_bound_home_fails_closed() -> TestResult {
+        let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+        let persistence = selection_persistence(&context);
+
+        let note = persistence
+            .persist_default_selection(Some("provider-b"), Some("model-b"))
+            .ok_or(TestError::Missing("note from persist_default_selection"))?;
+        assert!(note.contains("Root-Space"), "{note}");
+
+        let note = persistence
+            .persist_default_interaction_mode("plan")
+            .ok_or(TestError::Missing(
+                "note from persist_default_interaction_mode",
+            ))?;
+        assert!(note.contains("Root-Space"), "{note}");
+        Ok(())
+    }
+
+    /// `FileSelectionPersistence` schreibt jeden Schlüssel in die
+    /// `config.toml` ihres eigenen Profilverzeichnisses;
+    /// `clear_uia_selection` entfernt nur die UIA-Auswahl.
+    #[test]
+    fn file_selection_persistence_writes_all_keys_into_its_profile_dir() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let persistence = FileSelectionPersistence::new(dir.path().to_path_buf());
+
+        let notes = [
+            persistence.persist_uia_selection(Some("anthropic"), Some("claude-x")),
+            persistence.persist_uia_worker_model(Some("worker-x")),
+            persistence.persist_uia_reasoning_effort(Some("high")),
+            persistence.persist_internal_model(
+                InternalModelPoint::Explorer,
+                Some("openrouter"),
+                Some("nvidia/x"),
+            ),
+            persistence.persist_active_agent(Some("planner")),
+            persistence.persist_uia_worker_role_model("uia-writer", Some("openai/gpt-5")),
+            persistence.persist_default_interaction_mode("explore"),
+        ];
+        assert!(notes.iter().all(Option::is_none), "{notes:?}");
+
+        let config_path = dir.path().join("config.toml");
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        for (key, expected) in [
+            ("uia_provider", "anthropic"),
+            ("uia_model", "claude-x"),
+            ("uia_worker_model", "worker-x"),
+            ("reasoning.uia", "high"),
+            ("internal_models.explorer.provider", "openrouter"),
+            ("internal_models.explorer.model", "nvidia/x"),
+            ("active_agent_definition", "planner"),
+            ("uia_worker_models.uia_writer", "openai/gpt-5"),
+            ("mode.default", "explore"),
+        ] {
+            assert_eq!(
+                reopened.get_value(key),
+                Some(expected.to_owned()),
+                "key {key}"
+            );
+        }
+
+        assert!(persistence.clear_uia_selection().is_none());
+        let reopened =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after clear"))?;
+        assert!(reopened.get_value("uia_provider").is_none());
+        assert!(reopened.get_value("uia_model").is_none());
+        assert_eq!(
+            reopened.get_value("uia_worker_model"),
+            Some("worker-x".to_owned())
+        );
+        Ok(())
+    }
+
+    /// `load_bound_config` liest den Root-Layer des gebundenen Root-Space.
+    #[test]
+    fn load_bound_config_reads_the_bound_root_layer() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::write(dir.path().join("config.toml"), "default_model = \"bound\"\n")
+            .map_err(ctx("seed root config"))?;
+        let mut services = ServiceMap::new();
+        services.insert(test_home_context(dir.path())?);
+        let context = crate::knowledge_test_support::op_context(services)?;
+
+        let config = load_bound_config(&context, "x").map_err(ctx("load bound config"))?;
+        assert_eq!(config.harness.default_model.as_deref(), Some("bound"));
+        Ok(())
+    }
+
+    /// Ohne gebundenen Root-Space ist `load_bound_config` nicht verfügbar und
+    /// weicht nicht auf den Prozess-Root-Space aus.
+    #[test]
+    fn load_bound_config_without_bound_home_is_not_available() -> TestResult {
+        let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+
+        let result = load_bound_config(&context, "x");
+        assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 
     #[test]
@@ -1169,14 +1559,12 @@ mod tests {
         ));
     }
 
-    // ── UIA-Auswahl-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
+    // ── UIA-Auswahl-Persistenz-Rundlauf ──
     // Analog zum Muster in `harw-ops/src/permissions.rs`
     // (`test_permissions_persistence_round_trip_default_mode_and_rules`):
-    // `try_persist_uia_selection` selbst löst `HARW_HOME` über
-    // `harw_home::home_dir()` auf, was den Prozess-weiten Zustand mutieren
-    // würde (nicht thread-sicher, würde parallel laufende Tests gefährden).
-    // Der Rundlauf testet daher denselben `ConfigWriter`-Schreibpfad direkt
-    // gegen ein temporäres Verzeichnis.
+    // der Rundlauf prüft den `ConfigWriter`-Schreibpfad direkt gegen ein
+    // temporäres Verzeichnis. Den Weg über ein Profilverzeichnis deckt
+    // `file_selection_persistence_writes_all_keys_into_its_profile_dir` ab.
     #[test]
     fn test_uia_selection_persistence_round_trip_writes_uia_keys() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -1204,9 +1592,8 @@ mod tests {
         Ok(())
     }
 
-    // ── uia_worker_model-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
-    // Derselbe Grund wie beim UIA-Auswahl-Rundlauf oben: `try_persist_uia_worker_model`
-    // löst `HARW_HOME` selbst auf, deshalb testet dieser Rundlauf denselben
+    // ── uia_worker_model-Persistenz-Rundlauf ──
+    // Wie beim UIA-Auswahl-Rundlauf oben prüft dieser Rundlauf den
     // `ConfigWriter`-Schreibpfad direkt gegen ein temporäres Verzeichnis — inklusive
     // des `None`-Zweigs, der (anders als bei `persist_default_selection`/
     // `persist_uia_selection`) eine explizite Entfernung ist, kein "unverändert lassen".
@@ -1285,9 +1672,8 @@ mod tests {
         Ok(())
     }
 
-    // ── reasoning.uia-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
-    // Derselbe Grund wie bei den Rundläufen oben: `try_persist_uia_reasoning_effort`
-    // löst `HARW_HOME` selbst auf, deshalb testet dieser Rundlauf denselben
+    // ── reasoning.uia-Persistenz-Rundlauf ──
+    // Wie bei den Rundläufen oben prüft dieser Rundlauf den
     // `ConfigWriter`-Schreibpfad direkt gegen ein temporäres Verzeichnis — inklusive
     // des verschachtelten `[reasoning]`-Tabellenpfads (`"reasoning.uia"`, im
     // Unterschied zu den flachen Top-Level-Schlüsseln `uia_worker_model`/

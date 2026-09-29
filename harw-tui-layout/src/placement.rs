@@ -15,8 +15,11 @@
 pub const WIDE_AGENT_PANEL_MIN_COLS: u16 = 100;
 /// Kleinste Terminalbreite, ab der bei mittlerer Breite ein oben
 /// angedockter Portrait-Dock statt des Zusammenfassungs-/Kompakt-Fallbacks
-/// erscheint (siehe `docs/planning/68-mobile-tui/README.md`).
-pub const PHONE_DOCK_MIN_COLS: u16 = 60;
+/// erscheint (siehe `docs/planning/68-mobile-tui/README.md`). 40 statt
+/// frueher 60: schmale, hohe Terminalspalten (Hochformat-Monitor, tmux-Pane
+/// am Handy) zeigten sonst nur die einzeilige Agenten-Zusammenfassung
+/// (Befund 2026-09-28); unter 68 Spalten ist der Dock ohnehin einspaltig.
+pub const PHONE_DOCK_MIN_COLS: u16 = 40;
 /// Kleinste Terminalhoehe, ab der der Portrait-Dock statt des Fallbacks
 /// erscheint.
 pub const PHONE_DOCK_MIN_ROWS: u16 = 28;
@@ -329,9 +332,32 @@ mod tests {
     }
 
     #[test]
+    fn classify_docks_narrow_tall_portrait_panes() {
+        // Hochformat-Monitor bzw. tmux-Pane am Handy: schmal, aber hoch.
+        for (cols, rows) in [(40u16, 28u16), (45, 60), (52, 70), (59, 80)] {
+            let out = classify(input(cols, rows, 2, 3));
+            assert_eq!(
+                out.placement,
+                Placement::PortraitDock { split: false },
+                "{cols}x{rows}"
+            );
+            let agents = out.agents;
+            assert!(
+                agents.is_some_and(|rect| rect.width == cols),
+                "{cols}x{rows}"
+            );
+        }
+        // Zu niedrig bleibt beim Fallback, egal wie breit (unter 100).
+        assert_ne!(
+            classify(input(50, 27, 1, 3)).placement,
+            Placement::PortraitDock { split: false }
+        );
+    }
+
+    #[test]
     fn classify_falls_back_to_summary_or_compact_exactly_like_app_rs_today() {
-        // 59x40: zu schmal fuer den Dock (cols < 60), landet im Fallback.
-        let out = classify(input(59, 40, 1, 3));
+        // 39x40: zu schmal fuer den Dock (cols < 40), landet im Fallback.
+        let out = classify(input(39, 40, 1, 3));
         let headroom = 1u16.saturating_add(3).saturating_add(2);
         let expected = if 40 >= AGENTS_SUMMARY_MIN_HEIGHT && 40 > headroom {
             Placement::Summary
@@ -369,6 +395,9 @@ mod tests {
             (64, 36, 1, 3),
             (60, 28, 1, 3),
             (59, 40, 1, 3),
+            (45, 60, 2, 3),
+            (40, 28, 1, 3),
+            (39, 40, 1, 3),
             (80, 24, 1, 3),
             (80, 19, 1, 3),
             (0, 0, 0, 0),

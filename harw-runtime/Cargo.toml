@@ -74,6 +74,10 @@ harw-tool-plan = { path = "../harw-tool-plan" }
 # Plan R9, Teil F: Job-Verwaltung je Sitzung (`job.*`), Freigabetext von
 # `job.start` und Zustellung der Job-Ereignisse.
 harw-tool-job = { path = "../harw-tool-job" }
+# R18 D-A: der entfernte Werkzeug-Proxy eines an ein Gateway angebundenen
+# Laufs (`RuntimeAssemblyBuilder::remote_tools`). Kein Zyklus:
+# `harw-tool-remote` hängt nur an harw-protocol/-tools/-extension-api/-types.
+harw-tool-remote = { path = "../harw-tool-remote" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time"] }
@@ -93,6 +97,10 @@ toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tests/remote_tools.rs`: `#[tokio::test]` über den entfernten Proxy und
+# `harw_tools::executor::ExecutionPlacement`/Spezifikationen der Test-Attrappen.
+tokio = { version = "1.53.0", features = ["rt", "macros"] }
+harw-tools = { path = "../harw-tools" }
 # `embedded.rs` tests: `compile_agent(..., now: OffsetDateTime, ...)`
 # (`harw-agent-dsl`), Version wie dort (kein `[workspace.dependencies]`-Eintrag).
 time = "0.3.53"

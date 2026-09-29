@@ -202,6 +202,23 @@ pub struct StartRequest {
     pub owner: JobOwner,
 }
 
+/// R18 (P5/P6): Herkunft eines Jobs — der Werkzeugaufruf, der ihn
+/// gestartet hat. Die TUI verknüpft darüber einen Job mit seiner
+/// Werkzeugzelle; `meta.json` und [`JobEvent::Started`] tragen sie.
+///
+/// Ein eigener Typ statt neuer Felder in [`StartRequest`], damit die
+/// bestehenden Aufrufer (Operator-Wege, Kind-Backends) unverändert bleiben;
+/// sie starten ohne Herkunft (alle Felder `None`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobOrigin {
+    /// Id des startenden Werkzeugaufrufs (`ToolCall::id`).
+    pub call_id: Option<String>,
+    /// Name des startenden Werkzeugs (z. B. `job.start`).
+    pub tool: Option<String>,
+    /// Anzeigename des besitzenden Agenten, falls bekannt.
+    pub owner_agent: Option<String>,
+}
+
 /// Ergebnis von [`JobManager::start_piped`]: derselbe Job wie [`JobManager::start`]
 /// (Prozessgruppe, Logs, `meta.json`, Überwachung, Ereignisse), zusätzlich
 /// mit offener stdin und einem Zeilenstrom der stdout — für einen Job, dessen
@@ -683,6 +700,22 @@ impl JobManager {
         prepared: PreparedJob,
         warnings: Vec<String>,
     ) -> Result<JobStatus, JobError> {
+        self.start_with_origin(request, prepared, warnings, JobOrigin::default())
+    }
+
+    /// Wie [`JobManager::start_with_warnings`], zusätzlich mit der Herkunft
+    /// ([`JobOrigin`]): sie landet in `meta.json` (`origin_call_id`,
+    /// `origin_tool`, `owner_agent`) und im [`JobEvent::Started`].
+    ///
+    /// # Errors
+    /// Wie [`JobManager::start`].
+    pub fn start_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        warnings: Vec<String>,
+        origin: JobOrigin,
+    ) -> Result<JobStatus, JobError> {
         self.check_capacity()?;
         let (id, dir) = self.allocate()?;
         let stdout = create_log(&dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?;
@@ -717,6 +750,9 @@ impl JobManager {
             stragglers_reaped: false,
             log_truncated: false,
             launch_warnings: warnings,
+            origin_call_id: origin.call_id,
+            origin_tool: origin.tool,
+            owner_agent: origin.owner_agent,
         };
 
         let mut command = prepared.command;
@@ -755,6 +791,9 @@ impl JobManager {
                 command: meta.command.clone(),
                 pid,
                 executed_on_host: meta.executed_on_host,
+                origin_call_id: meta.origin_call_id.clone(),
+                origin_tool: meta.origin_tool.clone(),
+                owner_agent: meta.owner_agent.clone(),
             },
         });
         for text in &meta.launch_warnings {
@@ -853,6 +892,9 @@ impl JobManager {
             stragglers_reaped: false,
             log_truncated: false,
             launch_warnings: Vec::new(),
+            origin_call_id: None,
+            origin_tool: None,
+            owner_agent: None,
         };
 
         let mut command = prepared.command;
@@ -896,6 +938,9 @@ impl JobManager {
                 command: meta.command.clone(),
                 pid,
                 executed_on_host: meta.executed_on_host,
+                origin_call_id: meta.origin_call_id.clone(),
+                origin_tool: meta.origin_tool.clone(),
+                owner_agent: meta.owner_agent.clone(),
             },
         });
 

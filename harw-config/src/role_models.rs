@@ -262,6 +262,39 @@ pub fn resolve_role_models(config: &ResolvedConfig) -> Vec<RoleModelRow> {
         .collect()
 }
 
+/// R18 F2: Ersatzmodell des Auto-Modus-Klassifizierers.
+///
+/// # Beschreibung
+/// Liefert das Klassifizierer-Modell eine leere Antwort (auch nach einem
+/// zweiten Versuch), fragt der Auto-Modus einmal dieses Ersatzmodell, bevor
+/// er fail-closed die Person fragt. Ersatz ist das konfigurierte
+/// Hauptmodell (`default_provider`/`default_model`) — aber nur, wenn es sich
+/// vom aufgelösten Klassifizierer-Modell ([`ModelRole::AutoClassifier`])
+/// unterscheidet: dasselbe Modell ein drittes Mal zu fragen bringt nichts.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die Konfiguration.
+///
+/// # Returns
+/// `Some((provider, modell))` des Ersatzmodells, sonst `None` (kein
+/// Hauptmodell gesetzt oder identisch mit dem Klassifizierer-Modell).
+#[must_use]
+pub fn resolve_auto_classifier_fallback(
+    config: &ResolvedConfig,
+) -> Option<(Option<String>, String)> {
+    let (provider, model, _) = default_model(config);
+    let model = model?;
+    let primary = resolve_role_model(config, ModelRole::AutoClassifier);
+    let same_model = primary.model.as_deref() == Some(model.as_str());
+    let same_provider = primary.provider.is_none()
+        || provider.is_none()
+        || primary.provider.as_deref() == provider.as_deref();
+    if same_model && same_provider {
+        return None;
+    }
+    Some((provider, model))
+}
+
 type ProviderModelSource = (Option<String>, Option<String>, RoleModelSource);
 
 fn resolve_provider_model(config: &ResolvedConfig, role: ModelRole) -> ProviderModelSource {
@@ -810,6 +843,31 @@ mod tests {
         let row = resolve_role_model(&config, ModelRole::AutoClassifier);
         assert_eq!(row.source, RoleModelSource::Explicit);
         assert_eq!(row.model.as_deref(), Some("tiny"));
+        Ok(())
+    }
+
+    /// R18 F2 (EX-01): das Ersatzmodell des Klassifizierers ist das
+    /// Hauptmodell, aber nie dasselbe Modell wie der Klassifizierer selbst.
+    #[test]
+    fn test_auto_classifier_fallback_is_the_main_model_when_distinct() -> TestResult {
+        let mut config = base_config()?;
+        config.harness.default_provider = Some("anthropic".to_owned());
+        // Klassifizierer: claude-haiku-4-5, Hauptmodell: main-model.
+        assert_eq!(
+            resolve_auto_classifier_fallback(&config),
+            Some((Some("anthropic".to_owned()), "main-model".to_owned()))
+        );
+
+        // Explizite Klassifizierer-Wahl = Hauptmodell → kein Ersatz.
+        config.harness.internal_models.set_choice(
+            InternalModelPoint::AutoClassifier,
+            explicit("anthropic", "main-model"),
+        );
+        assert_eq!(resolve_auto_classifier_fallback(&config), None);
+
+        // Ohne Hauptmodell gibt es keinen Ersatz.
+        let config = ResolvedConfig::default();
+        assert_eq!(resolve_auto_classifier_fallback(&config), None);
         Ok(())
     }
 

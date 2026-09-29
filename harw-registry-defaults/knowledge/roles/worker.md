@@ -21,8 +21,9 @@ sobald das Ergebnis belegt ist, das Budget knapp wird, ein Blocker auftritt
 oder der Auftrag mehr verlangt als zugeteilt — melde das, statt
 auszuweiten.
 Lange oder zu verfolgende Prozesse (Builds, Paket-Restores, Testläufe,
-alles über ca. 2 min) startest du mit `job.start` und wartest mit
-`job.wait` auf Ende oder Meilenstein; nicht pollen, kein tmux.
+alles über ca. 2 min) startest du mit `job.start`; das Ende kommt als
+Notiz. `job.wait` ist nur ein kurzes Polling (≤ 60 s), nie in Schleife;
+kein tmux.
 `tmux-inspector-worker` ist nur für bestehende tmux-Sitzungen der Nutzerin.
 
 ## Übergabe

@@ -13,10 +13,20 @@
 //! `harw_operations::operation`.
 //!
 //! # No model surface
-//! None of these operations declares a `model_tool` surface: a language model
-//! must never drive key operations or probe infrastructure on its own
-//! (masterplan §11/§12). They are reachable only as operator commands and
-//! through the local Web UI. The runtime additionally puts the
+//! None of these operations declares a `model_tool` surface. The rule
+//! (masterplan §11/§12, narrowed by the R18 contract D-B,
+//! `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md`):
+//!
+//! > A language model never drives key operations (`infra.auth.keys.*`) and
+//! > never reaches `infra.*`. It may inspect the **gateway** through the
+//! > read-only `gateway.*` model tools and may request gateway mutations through
+//! > the mutating `gateway.*` model tools, each of which asks a human every time
+//! > (`approval = "always"`). Approval never expands authority: the operation
+//! > still runs with the caller's gateway caps and tenant scope.
+//!
+//! The `gateway.*` operations live in `crate::gateway_ops`. The operations
+//! here are reachable only as operator commands and through the local Web
+//! UI. The runtime additionally puts the
 //! `Arc<InfrastructureAvailability>` service only on the Slash and Web
 //! surfaces, never on the model-tool surface.
 //!

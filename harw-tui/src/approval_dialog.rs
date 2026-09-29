@@ -21,8 +21,8 @@
 //! - [`ApprovalDialogRequest`] — unveränderliche Eingaben für
 //!   [`ApprovalDialog::new`].
 //! - [`ApprovalChoice`] — die vier möglichen Entscheidungen des Nutzers.
-//! - [`DialogAction`] — Ereignis, das [`ApprovalDialog::handle_key`]
-//!   zurückgibt.
+//! - [`DialogAction`] — Ereignis, das `ApprovalDialog::handle_key`
+//!   (crate-intern) zurückgibt.
 //!
 //! # Terminal-Sicherheit
 //! Wie `history_cell.rs` (W1-08, Register G-007/G-008): Werkzeugname,
@@ -33,7 +33,7 @@
 //! (Argumentwerte, nichts wird verschluckt) bzw.
 //! [`crate::sanitize::sanitize_inline`] (einzeilige Zusatzfelder). Die vom
 //! Nutzer selbst getippte Freitext-Ablehnung nimmt nur Zeichen an, für die
-//! `char::is_control()` falsch ist (siehe [`ApprovalDialog::handle_key`]).
+//! `char::is_control()` falsch ist (siehe `ApprovalDialog::handle_key`).
 //!
 //! # Nebenläufigkeit
 //! Kein interner Zustand wird geteilt; der Aufrufer hält `ApprovalDialog`
@@ -82,6 +82,50 @@ use crate::dialog_frame::{self, BodyScroll, DialogContent, PinnedRow};
 use crate::history_cell::{
     APPROVAL_COLLAPSED_ARGUMENT_LINES, ApprovalArgument, ApprovalArgumentValue, wrap_plain,
 };
+/// Kategorie, mit der der Auto-Modus meldet, dass sein Klassifizierer kein
+/// Urteil lieferte (`harw_extension_api::AutoVerdict::fallback_ask`).
+const CLASSIFIER_UNAVAILABLE: &str = "classifier-unavailable";
+
+/// Rohe Ursache einer leeren Klassifizierer-Antwort, wie sie die
+/// Modell-Anbindung meldet (`harw_core::one_shot`).
+const EMPTY_RESPONSE_RAW: &str = "model returned an empty text response";
+
+/// R18 F2: liest aus einem Auto-Modus-Grund (`"<Kategorie> – <Grund>"`) die
+/// Ursache heraus, wenn der Klassifizierer ausfiel.
+///
+/// # Beschreibung
+/// Vorher stand im Dialog „Auto-Modus: classifier-unavailable –
+/// Klassifizierer-Fehler: model returned an empty text response“. Jetzt:
+/// Kategorie weg, das Präfix „Klassifizierer-Fehler: “ weg, die rohe
+/// englische Meldung der leeren Antwort als „Klassifizierer lieferte leere
+/// Antwort“; eine fehlende Ursache wird zu „Klassifizierer nicht erreichbar“.
+/// Andere Texte (auch deutsche Gründe mit Modellnamen) bleiben unverändert.
+///
+/// # Rückgabe
+/// `Some(Ursache)` bei der Kategorie `classifier-unavailable`, sonst `None`
+/// (dann gilt der Grund unverändert).
+fn classifier_unavailable_cause(reason: &str) -> Option<String> {
+    let rest = reason.trim().strip_prefix(CLASSIFIER_UNAVAILABLE)?;
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix('–')
+        .or_else(|| rest.strip_prefix('-'))
+        .or_else(|| rest.strip_prefix(':'))
+        .unwrap_or(rest)
+        .trim();
+    let cause = rest
+        .strip_prefix("Klassifizierer-Fehler:")
+        .map_or(rest, str::trim);
+    let cause = if cause.is_empty() {
+        "Klassifizierer nicht erreichbar".to_owned()
+    } else if cause.eq_ignore_ascii_case(EMPTY_RESPONSE_RAW) {
+        "Klassifizierer lieferte leere Antwort".to_owned()
+    } else {
+        cause.replace(EMPTY_RESPONSE_RAW, "leere Antwort")
+    };
+    Some(cause)
+}
+
 // Runde 5, Teil E: Lern-Angebot des Auto-Modus.
 use crate::permissions_view::{LearnOfferView, LearnScope};
 use crate::sanitize::{sanitize_inline, sanitize_reveal, sanitize_reveal_inline};
@@ -149,7 +193,7 @@ pub enum ApprovalChoice {
     },
 }
 
-/// Ereignis, das [`ApprovalDialog::handle_key`] zurückgibt.
+/// Ereignis, das `ApprovalDialog::handle_key` zurückgibt.
 ///
 /// # Beschreibung
 /// - `Stay`: Panel bleibt offen, keine Entscheidung.
@@ -523,7 +567,12 @@ impl ApprovalDialog {
     ///
     /// # Rückgabe
     /// Siehe [`DialogAction`].
-    pub fn handle_key(&mut self, key: KeyEvent, armed: bool) -> DialogAction {
+    ///
+    /// # Sichtbarkeit
+    /// `pub(crate)`: der Parameter ist ein Crossterm-Typ (Fremdcrate vor 1.0),
+    /// der nicht in der öffentlichen API stehen soll; einziger Aufrufer ist
+    /// der Event-Loop in `app.rs` (samt Untermodul `app/child_approvals.rs`).
+    pub(crate) fn handle_key(&mut self, key: KeyEvent, armed: bool) -> DialogAction {
         if !armed {
             return DialogAction::Stay;
         }
@@ -638,9 +687,13 @@ impl ApprovalDialog {
 
     /// Scrollt den Körper per Mausrad.
     ///
+    /// Die App leitet das Mausrad über [`Self::scroll_body`]
+    /// (`app/scroll_routing.rs`), daher rufen nur Tests diese Methode.
+    ///
     /// # Rückgabe
     /// `true`, wenn neu gezeichnet werden soll.
-    pub fn scroll_wheel(&self, kind: crossterm::event::MouseEventKind) -> bool {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn scroll_wheel(&self, kind: crossterm::event::MouseEventKind) -> bool {
         self.body_scroll.handle_wheel(kind)
     }
 
@@ -691,8 +744,10 @@ impl ApprovalDialog {
     /// Code kann keinen `Theme`-Wert konstruieren. Rendering ist damit
     /// konsequent als interne Implementierung markiert, konsistent mit
     /// `history_cell`/`style` (beide `pub(crate)`); nur der Zustand
-    /// (`ApprovalDialog` selbst, `handle_key`, `desired_height`) bleibt Teil
-    /// der öffentlichen Fläche des Crates.
+    /// (`ApprovalDialog` selbst, `desired_height`, `scroll_body`,
+    /// `body_offset`) bleibt Teil der öffentlichen Fläche des Crates;
+    /// `handle_key`/`scroll_wheel` sind ebenfalls `pub(crate)`, weil sie
+    /// Crossterm-Typen nehmen.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let theme = *theme;
         let border_color = style::warning_color(theme);
@@ -828,8 +883,16 @@ impl ApprovalDialog {
             fields.push(("angefragt von", origin.clone()));
         }
         // Runde 6, Teil A1: der Grund des Auto-Modus steht vor cwd/Risiko.
+        // R18 F2: fiel der Klassifizierer aus, steht dort in Klartext, dass
+        // der Auto-Modus nicht entscheiden konnte und warum.
         if let Some(reason) = &self.auto_reason {
-            fields.push(("Auto-Modus", reason.clone()));
+            match classifier_unavailable_cause(reason) {
+                Some(cause) => fields.push((
+                    "Auto-Modus nicht verfügbar",
+                    format!("{cause} – bitte selbst entscheiden"),
+                )),
+                None => fields.push(("Auto-Modus", reason.clone())),
+            }
         }
         if let Some(cwd) = &self.cwd {
             fields.push(("cwd", cwd.clone()));
@@ -1387,6 +1450,45 @@ mod tests {
         );
         let plain = render_dialog(&shell_dialog(None).with_auto_reason(None), 90, 24);
         assert!(!plain.contains("Auto-Modus:"), "{plain}");
+    }
+
+    /// TUI-06 (R18 F2): fiel der Klassifizierer aus, nennt der Dialog das in
+    /// Klartext statt der Kategorie `classifier-unavailable`.
+    #[test]
+    fn test_classifier_fallback_reason_is_readable() {
+        let dialog = shell_dialog(None).with_auto_reason(Some(
+            "classifier-unavailable – Klassifizierer-Fehler: model returned an empty text response"
+                .to_owned(),
+        ));
+        let rendered = render_dialog(&dialog, 120, 24);
+        assert!(
+            rendered.contains(
+                "Auto-Modus nicht verfügbar: Klassifizierer lieferte leere Antwort – bitte \
+                 selbst entscheiden"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("classifier-unavailable"), "{rendered}");
+
+        assert_eq!(
+            classifier_unavailable_cause(
+                "classifier-unavailable – Klassifizierer-Modell m lieferte zweimal eine leere \
+                 Antwort; kein Ersatzmodell konfiguriert"
+            )
+            .as_deref(),
+            Some(
+                "Klassifizierer-Modell m lieferte zweimal eine leere Antwort; kein \
+                 Ersatzmodell konfiguriert"
+            )
+        );
+        assert_eq!(
+            classifier_unavailable_cause("classifier-unavailable – ").as_deref(),
+            Some("Klassifizierer nicht erreichbar")
+        );
+        assert_eq!(
+            classifier_unavailable_cause("shell – unbekannter Befehl"),
+            None
+        );
     }
 
     #[test]

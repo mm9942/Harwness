@@ -42,6 +42,9 @@ members = [
     "harw-secrets",
     "harw-oauth",
     "harw-session-store",
+    "harw-session-host",
+    "harw-session-ws",
+    "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",
     "harw-auth-hub",
@@ -75,6 +78,10 @@ members = [
     "harw-tool-job",
     # Runde 5, Teil F: Plan-Modus (plan.write/plan.exit/plan.enter/ask_user).
     "harw-tool-plan",
+    # harw-tool-tunnel-v1: verwaltete SSH-Portforwards (v1 lokal -L,
+    # Loopback-only, Ziel-Allowlist, Approval, Keyfile-Referenz; Vertrag:
+    # docs/design/tunnel-policy-v1.md).
+    "harw-tool-tunnel",
     "harw-browser",
     "harw-browser-thirtyfour",
     "harw-tool-browser",
@@ -158,10 +165,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
-# Workspace crates are not published to crates.io. This is independent of
-# repository visibility and the MIT OR Apache-2.0 license below.
-# Internal path dependencies may omit registry version requirements.
+version = "0.9.0"
+# Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
+# damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
+# ohne Versionsangabe erlaubt).
 publish = false
 edition = "2024"
 rust-version = "1.85"

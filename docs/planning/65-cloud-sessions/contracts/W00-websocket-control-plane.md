@@ -67,6 +67,14 @@ No application frame establishes identity.
 v1 has explicit session methods. It does not expose generic operation
 execution.
 
+**R18 amendment (wire minor 2):** generic operation execution remains
+forbidden. Tool invocation is allowed only as specified in
+[`R18-tool-gateway.md`](./R18-tool-gateway.md): through the closed `tool.*`
+methods (`tool.list`, `tool.call`, `tool.cancel`), for agent principals
+derived from the UIA, with the `tool_call` cap and a tool grant; and gateway
+inspection/administration only through the closed `gateway.*` table. Both
+tables are explicit method lists, not a generic dispatcher.
+
 ### D6 — one WS can multiplex many sessions
 
 The connection is an authenticated client channel. Session attachment is
@@ -621,6 +629,21 @@ Parallel workers do not independently run workspace builds. Any commit after a
 recorded gate SHA invalidates that gate result.
 
 ---
+
+## 11a. Implementation status
+
+| Package | Status | Where |
+|---|---|---|
+| W01 contract | landed (R1) | `harw-protocol/src/session_wire.rs`, `session_port.rs`, `methods.rs`, `tests/session_wire_compat.rs`. `SessionFrame` decodes unknown kinds to `Unknown` through a manual `Deserialize` (plain `#[serde(other)]` rejects adjacent `data`, as PL-65 RS1-01-T3 anticipated). |
+| W02-03/04/05 WS substrate | landed (R1) | `harw-session-ws` (upgrade, codec, limits, dispatch, conn); arch gate `[[forbidden_crates]]` (ARC-01, ARC-02); dependency review entry for `tokio-tungstenite`. |
+| W02-01/02 NodeTransport upgrade | open (R2) | — |
+| W03 host core | landed (R1) | `harw-session-host` (identity, record, replay, live_ring, fanout, arbiter, approvals, driver port, host). The production `TurnDriver` over `harw-core` is W04. |
+| W04–W08 | open | — |
+
+Test matrix coverage after R1: WS-01..07, ID-03..05, SES-01..04, APP-01,
+BP-01, RP-01..03, REV-01 (host + transport side), ARC-01, ARC-02. Open:
+ID-01 (needs the UDS listener), ID-02 and REV-02 over the node transport,
+LOC-01.
 
 ## 12. Definition of Done for W00
 

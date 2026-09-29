@@ -198,6 +198,7 @@ fn a_finished_transfer_keeps_its_result_when_a_later_turn_is_aborted() -> TestRe
                 "Exploration fertig"
             )),
             duration_ms: 723_000,
+            placement: None,
         },
     );
 
