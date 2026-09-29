@@ -167,6 +167,21 @@ impl SelectionPersistence for MirroringSelectionPersistence {
         })
     }
 
+    fn persist_role_reasoning_effort(&self, role_key: &str, effort: Option<&str>) -> Option<String> {
+        let note = self.inner.persist_role_reasoning_effort(role_key, effort);
+        self.on_success(note, |config| {
+            let slot = match role_key {
+                "uia" => &mut config.harness.reasoning.uia,
+                "root-orchestrator" => &mut config.harness.reasoning.root_orchestrator,
+                "sub-orchestrator" => &mut config.harness.reasoning.sub_orchestrator,
+                "worker-simple" => &mut config.harness.reasoning.worker_simple,
+                "worker-complex" => &mut config.harness.reasoning.worker_complex,
+                _ => return,
+            };
+            *slot = effort.map(str::to_owned);
+        })
+    }
+
     fn persist_internal_model(
         &self,
         point: InternalModelPoint,
@@ -237,6 +252,9 @@ mod tests {
             Some("kaputt".to_owned())
         }
         fn persist_uia_reasoning_effort(&self, _: Option<&str>) -> Option<String> {
+            Some("kaputt".to_owned())
+        }
+        fn persist_role_reasoning_effort(&self, _: &str, _: Option<&str>) -> Option<String> {
             Some("kaputt".to_owned())
         }
         fn persist_internal_model(

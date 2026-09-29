@@ -482,6 +482,64 @@ fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> 
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Rollen-Reasoning-Gewicht bestes Bemühen in der Profil-`config.toml`
+/// verankern (`[reasoning.<feld>]`).
+///
+/// # Description
+/// Struktureller Zwilling von [`persist_uia_reasoning_effort`] für die
+/// Rollen-Gewichte aus `harw-config` (`resolve_effort` liest
+/// `reasoning.<feld>` zuerst). Das Mapping vom Rollenschlüssel zum
+/// TOML-Feld deckt genau die Rollen ab, für die `resolve_effort` ein
+/// Gewichtsfeld definiert; alle anderen Rollen (`uia-worker`, `explorer`,
+/// …) haben kein eigenes Gewicht und führen zu `None`.
+///
+/// # Arguments
+/// - `role_key` (`&str`): Rollenschlüssel wie in `ModelRole::key`
+///   (`"uia"`, `"root-orchestrator"`, `"sub-orchestrator"`,
+///   `"worker-simple"`, `"worker-complex"`).
+/// - `effort` (`Option<&str>`): `Some(level)` setzt das Gewicht, `None`
+///   entfernt es (zurück zum Modell-/Provider-Default).
+///
+/// # Returns
+/// `None` bei Erfolg oder wenn die Rolle kein Gewichtsfeld hat;
+/// `Some(note)` bei einem Persistenzfehler.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock, analog zu [`persist_uia_reasoning_effort`].
+pub(crate) fn persist_role_reasoning_effort(
+    role_key: &str,
+    effort: Option<&str>,
+) -> Option<String> {
+    let field = match role_key {
+        "uia" => "reasoning.uia",
+        "root-orchestrator" => "reasoning.root_orchestrator",
+        "sub-orchestrator" => "reasoning.sub_orchestrator",
+        "worker-simple" => "reasoning.worker_simple",
+        "worker-complex" => "reasoning.worker_complex",
+        _ => return None,
+    };
+    let result = open_profile_config_writer().and_then(|mut writer| {
+        match effort {
+            Some(level) => writer
+                .set_value(field, toml_edit::value(level))
+                .map_err(|error| error.to_string())?,
+            None => {
+                writer.remove_value(field);
+            }
+        }
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte Reasoning-Gewicht für '{role_key}' nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
 /// Öffnet die Profil-`config.toml` des aktiven Profils über
 /// [`harw_config::ConfigWriter`].
 ///
@@ -783,6 +841,9 @@ pub trait SelectionPersistence: Send + Sync {
     /// Siehe [`persist_uia_reasoning_effort`].
     fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String>;
 
+    /// Siehe [`persist_role_reasoning_effort`].
+    fn persist_role_reasoning_effort(&self, role_key: &str, effort: Option<&str>) -> Option<String>;
+
     /// Siehe [`persist_internal_model`].
     fn persist_internal_model(
         &self,
@@ -851,6 +912,10 @@ impl SelectionPersistence for FileSelectionPersistence {
         persist_uia_reasoning_effort(effort)
     }
 
+    fn persist_role_reasoning_effort(&self, role_key: &str, effort: Option<&str>) -> Option<String> {
+        persist_role_reasoning_effort(role_key, effort)
+    }
+
     fn persist_internal_model(
         &self,
         point: harw_config::InternalModelPoint,
@@ -895,6 +960,7 @@ pub enum RecordedSelectionPersistCall {
     UiaWorkerModel { model: Option<String> },
     /// Aufzeichnung von [`SelectionPersistence::persist_uia_reasoning_effort`].
     UiaReasoningEffort { effort: Option<String> },
+    RoleReasoningEffort { role_key: String, effort: Option<String> },
     /// Aufzeichnung von [`SelectionPersistence::persist_internal_model`].
     InternalModel {
         point: harw_config::InternalModelPoint,
@@ -990,6 +1056,14 @@ impl SelectionPersistence for RecordingSelectionPersistence {
 
     fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String> {
         self.record(RecordedSelectionPersistCall::UiaReasoningEffort {
+            effort: effort.map(str::to_owned),
+        });
+        None
+    }
+
+    fn persist_role_reasoning_effort(&self, role_key: &str, effort: Option<&str>) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::RoleReasoningEffort {
+            role_key: role_key.to_owned(),
             effort: effort.map(str::to_owned),
         });
         None
