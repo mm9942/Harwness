@@ -23,7 +23,7 @@ two domains:
 
 - the product crates at the repository root (`harw`, `harw-cli`, `harw-tui`,
   `harw-core`, and friends);
-- the Defense-on-Device (DoD) crates under `dod/crates/`, listed explicitly
+- the Detect · Orient · Defend (DoD) crates under `dod/crates/`, listed explicitly
   in a separate block of the root `members`.
 
 Until PL-60 `dod/` was a separate, nested workspace with its own lockfile; see
@@ -74,15 +74,15 @@ cargo test -p <crate-you-changed>
 clippy`, `make tests`, `make check`, `make build`); see the Makefile for the
 full target list.
 
-## What CI runs
+## Verification and CI
 
 CI runs the following (see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)); path filters skip
 jobs that cannot be affected by a given change, but a full run covers all of
-them. While GitHub Actions is unavailable for this repository, CI is started
-by hand only (`workflow_dispatch`) and the local central build described in
-`CLAUDE.md` is the gate; the push and pull-request triggers are commented out
-in `ci.yml` and come back once Actions runs again:
+them. CI is currently started by hand only (`workflow_dispatch`); automatic
+push and pull-request triggers are commented out in `ci.yml`. Use the local
+commands below and record their results for the exact commit under review.
+A missing CI run is not a passing check.
 
 - `cargo fmt --all -- --check` — formatting.
 - `cargo clippy --workspace --tests -- -D warnings` — lints, warnings treated
@@ -101,6 +101,7 @@ in `ci.yml` and come back once Actions runs again:
 Run the closest equivalents locally before opening a pull request:
 
 ```bash
+python3 -m unittest discover -s scripts/tests -v
 cargo fmt --all -- --check
 cargo clippy --workspace --tests -- -D warnings
 cargo nextest run --workspace   # or: cargo test --workspace
@@ -136,7 +137,7 @@ Harwness's value comes from a small set of invariants around approvals,
 sandboxing and privilege boundaries (see [SECURITY.md](SECURITY.md) for the
 current list). If your change touches tool permissions, the approval flow,
 `shell.exec`, `process.kill`, sudo handling, the sandbox, or the
-Defense-on-Device plane, explain in the pull request description:
+Detect · Orient · Defend plane, explain in the pull request description:
 
 - which trust boundary the change affects,
 - what happens on failure (fail-open vs. fail-closed), and
@@ -153,6 +154,12 @@ it asks for a summary, the exact change, how you tested it, and a checklist.
 Update the relevant crate documentation and tests alongside behavioral
 changes — a component described as "implemented" should be reachable from a
 real entry point, not just from an internal test.
+
+## Preparing a public release
+
+Maintainers should follow the [publication checklist](docs/maintainers/publication.md),
+including the history and branch checks. A clean working tree alone does not
+establish that the repository contains no private data.
 
 ## Reporting a vulnerability
 

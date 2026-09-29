@@ -45,8 +45,9 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# Eigene Crates sind alle `publish = false` (siehe `[workspace.package]`);
-# für sie ist noch kein Lizenzmodell entschieden, also nicht prüfen.
+# Workspace crates are not published to crates.io (see `[workspace.package]`).
+# They are dual-licensed MIT OR Apache-2.0; this setting skips cargo-deny's
+# license check for unpublished workspace packages, not their license grant.
 [licenses.private]
 ignore = true
 

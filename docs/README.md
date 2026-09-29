@@ -11,7 +11,7 @@ code wins and the document is a bug.
 - [Installation](setup/install.md) — *implemented*
 - [Build prerequisites](setup/build-prerequisites.md)
 - [Local models: vLLM, LM Studio and Ollama](setup/local-models.md)
-- [DoD (Defense-on-Device)](setup/dod.md) — *partially implemented*
+- [DoD (Detect · Orient · Defend)](setup/dod.md) — *partially implemented*
 - [Control plane (`harw web`)](setup/web.md) — *implemented*
 - [`crypt_guard` integration in `harw-secrets`](setup/crypt-guard.md)
 
@@ -19,7 +19,7 @@ code wins and the document is a bug.
 
 - [`harw` command line](cli.md)
 - [Background orchestrators: control, messaging, handoff](guides/background-agents.md)
-- [Compiling agents into standalone binaries](guides/agent-compiler.md) — *planned in #22*
+- [Compiling agents into standalone binaries](guides/agent-compiler.md) — *implemented*
 - [KMS operations: the Auth/Crypto Hub](guides/kms-operations.md) — *partially implemented*
 - [Driving workers to a goal: the WorkDriver](guides/work-driver.md) — *partially implemented*
 
@@ -51,7 +51,7 @@ Architecture decision records live in [`adr/`](adr/), numbered in order.
 | [CONTRACT MASTER — Setup & Install Lifecycle](design/CONTRACT-setup-install.md) | implemented |
 | [Agent Composition Contract — Design Only (post-0.2.0)](design/agent-composition-contract.md) | proposal |
 | [Harwness Agent Definition DSL](design/agent-definition-dsl.md) | partially implemented |
-| [Agent Artifact v1 — the binary format of a compiled agent](design/agent-artifact-v1.md) | proposal |
+| [Agent Artifact v1 — the binary format of a compiled agent](design/agent-artifact-v1.md) | implemented |
 | [Agent IR v1 — the existing pipeline as an explicit compiler channel](design/agent-ir-v1.md) | partially implemented |
 | [Agent-as-tool execution contract](design/agent-tool-loop.md) | implemented |
 | [Agents as Tools](design/agents-as-tools.md) | implemented |
