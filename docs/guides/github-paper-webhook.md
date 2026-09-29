@@ -40,19 +40,45 @@ calls use argv arrays.
 
 ## What the worker does
 
-The receiver creates a detached worktree at the exact PR head SHA, runs:
+The receiver creates a detached worktree at the exact PR head SHA. It does
+**not** launch a full-authority OneShot/UIA root.
+
+Instead it builds Harw's bundled `business-author`, `business-reviewer`
+and `latex-writer` agents and executes their installed, manifest-bound
+runners directly with `--full-access`.
+
+At that layer, `--full-access` means **auto-approve only tools already
+allowed by the compiled agent manifest**; it does not widen the manifest:
+
+- `business-author`: workspace read/write/edit, no free shell and no web;
+- `business-reviewer`: read-only review, no write, shell or web;
+- `latex-writer`: filesystem + typed LaTeX tools, no free shell and no web.
+
+The bridge itself executes the fixed pipeline from
+`paper/HARW_WORK_PACKET.md`:
 
 ```
-harw --cwd <worktree> --approval full --goal <fixed-goal> exec <fixed-prompt>
+business-author   -> Storyline
+business-reviewer -> structured review
+        |
+        +-- at most one author revision + final review
+        |
+business-author   -> manuscript
+business-reviewer -> structured review
+        |
+        +-- at most one author revision + final review
+        |
+latex-writer      -> paper/src/*
+business-author   -> paper/RESEARCH_STATUS.md
 ```
 
-The prompt tells Harw to execute `paper/HARW_WORK_PACKET.md` using the
-business-author / business-reviewer / LaTeX pipeline described there.
+Reviewer stdout is persisted by the bridge under `paper/reviews/`; the
+reviewer agent itself remains read-only. If Storyline or manuscript is still
+not `freigegeben` after the two allowed cycles, the bridge stops that
+pipeline, writes `RESEARCH_STATUS.md`, preserves the blocker, and does not
+force the next stage.
 
-`--approval full` removes interactive approval prompts for this unattended
-run. It does **not** add capabilities beyond the mounted Harw/agent ceilings.
-
-After Harw exits:
+After the agent pipeline exits:
 
 - all changed paths must be under `paper/`;
 - the PR head SHA is re-read through `gh api`;
@@ -63,6 +89,10 @@ After Harw exits:
 
 No merge, release, tag, arXiv submission, or Hugging Face publication is
 performed.
+
+Building the agent artifacts updates Harw's local agent install/cache under
+its configured home. That is local runtime state, not repository content, and
+is never staged into the PR.
 
 ## Start the receiver
 
