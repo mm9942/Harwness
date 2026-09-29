@@ -297,45 +297,306 @@ def cleanup_worktree(settings: Settings, worktree: Path) -> None:
             shutil.rmtree(worktree, ignore_errors=True)
 
 
-def run_harw(trigger: Trigger, settings: Settings, worktree: Path, log_path: Path) -> None:
-    packet = worktree / settings.packet
-    if not packet.is_file():
+def append_log(log_path: Path, label: str, stdout: str = "", stderr: str = "") -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"\n===== {label} =====\n")
+        if stdout:
+            log.write(stdout)
+            if not stdout.endswith("\n"):
+                log.write("\n")
+        if stderr:
+            log.write("\n--- stderr ---\n")
+            log.write(stderr)
+            if not stderr.endswith("\n"):
+                log.write("\n")
+
+
+def find_installed_file(value: Any) -> str | None:
+    if isinstance(value, dict):
+        installed = value.get("installed")
+        if isinstance(installed, dict) and isinstance(installed.get("file"), str):
+            return installed["file"]
+        for child in value.values():
+            found = find_installed_file(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_installed_file(child)
+            if found is not None:
+                return found
+    return None
+
+
+def build_agent(name: str, worktree: Path, log_path: Path) -> Path:
+    result = run(
+        ["harw", "--cwd", str(worktree), "--json", "agent", "build", name],
+        cwd=worktree,
+        check=False,
+    )
+    append_log(log_path, f"build {name}", result.stdout, result.stderr)
+    if result.returncode != 0:
+        raise TriggerError(f"harw agent build {name} failed with exit {result.returncode}")
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise TriggerError(f"harw agent build {name} returned invalid JSON") from exc
+    raw = find_installed_file(report)
+    if raw is None:
+        raise TriggerError(f"harw agent build {name} did not report installed.file")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (worktree / path).resolve()
+    if not path.is_file():
+        raise TriggerError(f"installed {name} runner does not exist")
+    return path
+
+
+def run_agent(
+    agent: Path,
+    prompt: str,
+    *,
+    worktree: Path,
+    log_path: Path,
+    label: str,
+) -> str:
+    # --full-access only auto-approves actions already present in this
+    # compiled agent manifest; it does not widen the agent's capability set.
+    result = run(
+        [str(agent), "--full-access", prompt],
+        cwd=worktree,
+        check=False,
+    )
+    append_log(log_path, label, result.stdout, result.stderr)
+    if result.returncode != 0:
+        raise TriggerError(f"{label} failed with exit {result.returncode}")
+    return result.stdout.strip()
+
+
+def require_output(worktree: Path, relative: str, stage: str) -> None:
+    if not (worktree / relative).is_file():
+        raise TriggerError(f"{stage} did not create {relative}")
+
+
+def author_stage(
+    author: Path,
+    *,
+    worktree: Path,
+    log_path: Path,
+    label: str,
+    prompt: str,
+    expected: str,
+) -> None:
+    run_agent(author, prompt, worktree=worktree, log_path=log_path, label=label)
+    require_output(worktree, expected, label)
+
+
+def review_stage(
+    reviewer: Path,
+    *,
+    worktree: Path,
+    log_path: Path,
+    label: str,
+    prompt: str,
+    output: str,
+) -> str:
+    text = run_agent(reviewer, prompt, worktree=worktree, log_path=log_path, label=label)
+    if not text:
+        raise TriggerError(f"{label} returned an empty review")
+    path = worktree / output
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+    return text
+
+
+def review_approved(text: str) -> bool:
+    normalized = text.lower().replace("*", "")
+    return re.search(r"\burteil:\s*freigegeben\b", normalized) is not None
+
+
+def write_research_status(
+    author: Path,
+    *,
+    trigger: Trigger,
+    settings: Settings,
+    worktree: Path,
+    log_path: Path,
+    blocker: str | None,
+) -> None:
+    state = (
+        f"The pipeline stopped at {blocker}. "
+        if blocker
+        else "The pipeline reached the LaTeX stage. "
+    )
+    author_stage(
+        author,
+        worktree=worktree,
+        log_path=log_path,
+        label="research status",
+        expected="paper/RESEARCH_STATUS.md",
+        prompt=(
+            f"PR #{trigger.pr}: read {settings.packet}, paper/EVIDENCE_LEDGER.md, "
+            "paper/drafts/*, paper/reviews/* and paper/src/* if present. "
+            f"{state}Write only paper/RESEARCH_STATUS.md using the work packet's "
+            "five status groups. Do not invent evidence, literature, measurements, "
+            "authors or publication state."
+        ),
+    )
+
+
+def run_harw(
+    trigger: Trigger,
+    settings: Settings,
+    worktree: Path,
+    log_path: Path,
+) -> str:
+    """Run the paper work packet through narrow, compiled agent manifests."""
+    if not (worktree / settings.packet).is_file():
         raise TriggerError(f"work packet missing: {settings.packet}")
 
-    prompt = (
-        f"Execute {settings.packet} exactly for GitHub PR #{trigger.pr}. "
-        "Use Harw's bundled business-author -> business-reviewer -> business-author "
-        "-> business-reviewer -> latex-writer pipeline described by that packet. "
-        "This is a draft research-paper pass. Do not merge, publish, tag, release, "
-        "or mutate GitHub. Work only inside paper/. Missing evidence, literature, "
-        "results, or author metadata must remain explicit instead of being invented."
-    )
-    goal = (
-        "Produce the reviewed draft artifacts required by paper/HARW_WORK_PACKET.md "
-        "while preserving scientific evidence boundaries and draft status."
-    )
+    # Do not expose the internet-triggered job to a full OneShot/UIA root.
+    # Each runner below carries only its compiled manifest rights.
+    author = build_agent("business-author", worktree, log_path)
+    reviewer = build_agent("business-reviewer", worktree, log_path)
+    latex = build_agent("latex-writer", worktree, log_path)
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log:
-        result = run(
-            [
-                "harw",
-                "--cwd",
-                str(worktree),
-                "--approval",
-                "full",
-                "--goal",
-                goal,
-                "exec",
-                prompt,
-            ],
-            cwd=worktree,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            check=False,
+    author_stage(
+        author,
+        worktree=worktree,
+        log_path=log_path,
+        label="storyline v1",
+        expected="paper/drafts/storyline-v1.md",
+        prompt=(
+            f"PR #{trigger.pr}: execute only Stage A of {settings.packet}. Read the "
+            "existing paper seed files and repository code/tests needed for C01-C06. "
+            "Write the full English Storyline to paper/drafts/storyline-v1.md. "
+            "Evidence-first; no web research, invented sources, results or metadata."
+        ),
+    )
+    review = review_stage(
+        reviewer,
+        worktree=worktree,
+        log_path=log_path,
+        label="storyline review v1",
+        output="paper/reviews/storyline-v1-review.md",
+        prompt=(
+            f"PR #{trigger.pr}: execute only Stage B of {settings.packet}. Review "
+            "paper/drafts/storyline-v1.md against paper/EVIDENCE_LEDGER.md. Return "
+            "the standard structured review only; do not rewrite or invent evidence."
+        ),
+    )
+    storyline = "paper/drafts/storyline-v1.md"
+    if not review_approved(review):
+        author_stage(
+            author,
+            worktree=worktree,
+            log_path=log_path,
+            label="storyline v2",
+            expected="paper/drafts/storyline-v2.md",
+            prompt=(
+                f"PR #{trigger.pr}: read {settings.packet}, storyline-v1 and its "
+                "review. Address only the review findings without widening claims. "
+                "Write paper/drafts/storyline-v2.md and preserve evidence gaps."
+            ),
         )
-    if result.returncode != 0:
-        raise TriggerError(f"harw exec failed with exit {result.returncode}")
+        review = review_stage(
+            reviewer,
+            worktree=worktree,
+            log_path=log_path,
+            label="storyline review v2",
+            output="paper/reviews/storyline-v2-review.md",
+            prompt=(
+                f"PR #{trigger.pr}: final Stage B review of storyline-v2 under "
+                f"{settings.packet}. Return the structured review only; do not rewrite."
+            ),
+        )
+        storyline = "paper/drafts/storyline-v2.md"
+        if not review_approved(review):
+            write_research_status(
+                author, trigger=trigger, settings=settings, worktree=worktree,
+                log_path=log_path, blocker="Storyline review after two cycles",
+            )
+            return "blocked at Storyline review"
+
+    author_stage(
+        author,
+        worktree=worktree,
+        log_path=log_path,
+        label="manuscript v1",
+        expected="paper/drafts/manuscript-v1.md",
+        prompt=(
+            f"PR #{trigger.pr}: execute Stage C of {settings.packet} from the approved "
+            f"{storyline}. Write paper/drafts/manuscript-v1.md. Keep [EVIDENCE: ...], "
+            "[LITERATURE NEEDED: ...] and [EXPERIMENT PENDING: ...] explicit. Never "
+            "invent citations, results, measurements, author metadata or novelty."
+        ),
+    )
+    review = review_stage(
+        reviewer,
+        worktree=worktree,
+        log_path=log_path,
+        label="manuscript review v1",
+        output="paper/reviews/manuscript-v1-review.md",
+        prompt=(
+            f"PR #{trigger.pr}: execute Stage D of {settings.packet}. Review "
+            "paper/drafts/manuscript-v1.md against the approved Storyline and evidence "
+            "ledger, including claim inflation, causality, baselines, generalization, "
+            "reproducibility and CURRENT vs FUTURE. Return review only."
+        ),
+    )
+    manuscript = "paper/drafts/manuscript-v1.md"
+    if not review_approved(review):
+        author_stage(
+            author,
+            worktree=worktree,
+            log_path=log_path,
+            label="manuscript v2",
+            expected="paper/drafts/manuscript-v2.md",
+            prompt=(
+                f"PR #{trigger.pr}: read {settings.packet}, manuscript-v1 and its "
+                "review. Address the findings without unsupported claims and write "
+                "paper/drafts/manuscript-v2.md. Keep missing literature/results explicit."
+            ),
+        )
+        review = review_stage(
+            reviewer,
+            worktree=worktree,
+            log_path=log_path,
+            label="manuscript review v2",
+            output="paper/reviews/manuscript-v2-review.md",
+            prompt=(
+                f"PR #{trigger.pr}: final Stage D review of manuscript-v2 under "
+                f"{settings.packet}. Return the structured review only; do not rewrite."
+            ),
+        )
+        manuscript = "paper/drafts/manuscript-v2.md"
+        if not review_approved(review):
+            write_research_status(
+                author, trigger=trigger, settings=settings, worktree=worktree,
+                log_path=log_path, blocker="Manuscript review after two cycles",
+            )
+            return "blocked at manuscript review"
+
+    author_stage(
+        latex,
+        worktree=worktree,
+        log_path=log_path,
+        label="latex manuscript",
+        expected="paper/src/main.tex",
+        prompt=(
+            f"PR #{trigger.pr}: execute Stage E of {settings.packet} from approved "
+            f"{manuscript} and its final review. Create the modular scientific LaTeX "
+            "sources under paper/src/, including main.tex. Do not use the business-paper "
+            "visual template, invent citations/results, install packages or publish. "
+            "Use your typed latex.check/latex.build path when available."
+        ),
+    )
+    write_research_status(
+        author, trigger=trigger, settings=settings, worktree=worktree,
+        log_path=log_path, blocker=None,
+    )
+    return "completed through LaTeX/status reconciliation"
 
 
 def commit_and_push(
