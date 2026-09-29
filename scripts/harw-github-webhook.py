@@ -682,21 +682,21 @@ def process_trigger(trigger: Trigger, settings: Settings) -> None:
     try:
         branch, sha = validate_pr(trigger, settings)
         worktree = prepare_worktree(trigger, settings, branch, sha)
-        run_harw(trigger, settings, worktree, log_path)
+        pipeline_status = run_harw(trigger, settings, worktree, log_path)
         commit = commit_and_push(trigger, settings, worktree, branch, sha)
         if commit:
             post_comment(
                 trigger,
                 settings,
-                "Harw paper pass completed and pushed "
-                f"`{commit[:12]}` to `{branch}`. "
+                "Harw paper pass "
+                f"({pipeline_status}) pushed `{commit[:12]}` to `{branch}`. "
                 "The PR remains draft; publication is not authorized.",
             )
         else:
             post_comment(
                 trigger,
                 settings,
-                "Harw paper pass completed without workspace changes. "
+                f"Harw paper pass ({pipeline_status}) completed without workspace changes. "
                 "The PR remains draft.",
             )
         success = True
