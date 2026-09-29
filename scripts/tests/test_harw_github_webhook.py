@@ -123,6 +123,15 @@ class TriggerTests(unittest.TestCase):
         )
         self.assertIsNotNone(trigger)
 
+    def test_review_approved_accepts_standard_reviewer_verdict(self):
+        self.assertTrue(MODULE.review_approved("**Urteil:** freigegeben\n"))
+        self.assertFalse(MODULE.review_approved("**Urteil:** überarbeiten\n"))
+
+    def test_paper_only_guard_rejects_non_paper_paths(self):
+        MODULE.ensure_paper_only(["paper/drafts/a.md", "paper/src/main.tex"])
+        with self.assertRaises(MODULE.TriggerError):
+            MODULE.ensure_paper_only(["paper/drafts/a.md", "src/lib.rs"])
+
 
 if __name__ == "__main__":
     unittest.main()
