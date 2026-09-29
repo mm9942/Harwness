@@ -60,11 +60,13 @@ acting as an appointed representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers through the repository — open a GitHub
-issue, or, for reports that should stay private (for example ones involving
-another contributor), contact the maintainers directly through GitHub (a
-maintainer's GitHub profile, or a private message on the relevant pull
-request or issue). All complaints will be reviewed and investigated promptly
+reported to the project maintainers. For a report suitable for public
+visibility, open a GitHub issue. For a private report, use a private contact
+channel published by the maintainer on their
+[profile](https://github.com/mm9942), if available. GitHub issue and pull
+request comments are not private messages. If no private contact channel is
+listed, ask the maintainer to provide one without posting the incident's
+sensitive details. All complaints will be reviewed and investigated promptly
 and fairly.
 
 All project maintainers are obligated to respect the privacy and security of

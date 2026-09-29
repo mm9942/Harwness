@@ -207,7 +207,7 @@ harw service install
 `harw service status` / `harw service uninstall` manage the same two
 services afterwards.
 
-## Optional: DoD (Defense-on-Device)
+## Optional: DoD (Detect · Orient · Defend)
 
 Harwness ships a separate, privileged, opt-in observation subsystem ("DoD")
 that watches host activity around agent execution. It is a distinct

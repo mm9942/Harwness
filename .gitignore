@@ -77,3 +77,9 @@ __pycache__/
 
 # Release tarballs from `make release`
 /dist/
+
+# Local worktrees and incomplete downloads
+/.worktrees/
+/worktrees/
+*.part
+*.crdownload

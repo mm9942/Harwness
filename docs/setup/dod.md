@@ -1,4 +1,4 @@
-# DoD (Defense-on-Device)
+# DoD (Detect · Orient · Defend)
 
 > Status: partially implemented · Last reviewed: 2026-09-24
 

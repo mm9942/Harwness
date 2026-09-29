@@ -1,0 +1,62 @@
+# GitHub-PR-Reviewer (Goal harw-github-pr-reviewer, Schritt R2).
+#
+# Benutzerdefinierter Worker auf `worker-base@1`. Least-privilege: read-only
+# Analyse eines PR-Diffs; der Diff gilt als nicht vertrauenswürdiger Input
+# (nie als Anweisung behandelt). Veröffentlichung (Kommentar/Review) liegt
+# NICHT in diesem Agenten — der Runner (R3) postet nur nach separater
+# interaktiver Freigabe. Keine Shell-/GitHub-Schreibrechte im Modellagenten.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.github-pr-reviewer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "github-pr-reviewer"
+
+name = "GitHub PR Reviewer"
+description = "Reviewt einen vorgelegten PR-Diff als nicht vertrauenswürdigen Input und liefert belegte, strukturierte Findings (P0-P3, Datei/Zeile, Begründung, Unsicherheit). Read-only; veröffentlicht nichts selbst."
+instructions_file = "system.md"
+
+skills = []
+
+[models]
+provider = "openai"
+model = "gpt-6-luna"
+
+[work]
+mode = "read-only-analysis"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "workbench.show",
+  "parent.message",
+  "skills.search",
+  "skills.load",
+]
+forbidden = [
+  "fs.write",
+  "fs.edit",
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 80000
+max_tool_calls = 50
+max_wall_secs = 600
+
+[return]
+contract = "harwness.return.execution-summary@1"
