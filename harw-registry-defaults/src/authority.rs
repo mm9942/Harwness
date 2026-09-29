@@ -582,6 +582,12 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 /// - `job.start` → `ExecuteProcess` (derselbe Startweg wie `shell.exec`);
 ///   `job.status/logs/stop/list/wait` → `ReadWorkspace` (Plan R9, Teil F:
 ///   kein Prozessstart, nur eigene Jobs bzw. die der Nachfahren).
+/// - `tunnel.start` → `ExecuteProcess` (harw-tool-tunnel-v1, geplant:
+///   startet einen verwalteten SSH-Prozess über denselben Startweg wie
+///   `job.start`/`shell.exec`); `tunnel.status/stop/list` →
+///   `ReadWorkspace` (starten nichts, lesen bzw. beenden nur verwaltete
+///   Tunnels des Aufrufers — Wiring folgt im Plan-Knoten `job-lifecycle`;
+///   bis dahin ist `TUNNEL_TOOLS` nur die statische Vertrags-Obermenge).
 /// - `work_driver.enqueue` → `ExecuteProcess` (R14, derselbe Startweg wie
 ///   `job.start`/`shell.exec`: startet einen dauerhaften Hintergrund-Job, der
 ///   die `[work_driver] verify`-Kommandos ausführt und Worker-Agenten

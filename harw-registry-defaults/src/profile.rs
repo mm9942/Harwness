@@ -1065,6 +1065,27 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
 
+/// harw-tool-tunnel-v1: die vier Werkzeuge von `harw-tool-tunnel`
+/// (`tunnel.start/status/stop/list`) in Registrierungsreihenfolge.
+///
+/// # Beschreibung
+/// Statische Vertrags-Obermenge nach dem Muster von [`SHELL_TOOLS`] und
+/// [`JOB_TOOLS`]: Loopback-only-Bindung, Ziel-Allowlist, Approval beim
+/// Start, Keyfile-Referenz statt Key-Inhalt (Vertrag:
+/// `docs/design/tunnel-policy-v1.md`). `tunnel.start` startet einen
+/// verwalteten SSH-Prozess (daher später `ExecuteProcess` wie `job.start`),
+/// die übrigen drei lesen bzw. beenden nur verwaltete Tunnels des
+/// Aufrufers (später `ReadWorkspace` wie die Job-Control-Tools). Tatsächlich
+/// montiert werden sie erst mit der Tunnel-Wiring der Plan-Knoten
+/// `job-lifecycle`; bis dahin bleibt die Liste die statische Obermenge und
+/// nichts wird beworben.
+pub const TUNNEL_TOOLS: &[&str] = &[
+    "tunnel.start",
+    "tunnel.status",
+    "tunnel.stop",
+    "tunnel.list",
+];
+
 /// Plan R9, Teil F: die sechs Werkzeuge von `harw-tool-job`
 /// (`job.start/status/logs/stop/list/wait`) in Registrierungsreihenfolge.
 ///

@@ -366,6 +366,8 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-shell"]
 layer = "A"
+[packages."harw-tool-tunnel"]
+layer = "A"
 [packages."harw-tool-web"]
 layer = "A"
 [packages."harw-tui"]
