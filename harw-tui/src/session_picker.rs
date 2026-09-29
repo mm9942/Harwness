@@ -93,7 +93,7 @@ pub struct SessionEntry {
     pub turns: Option<u64>,
 }
 
-/// Aktionssignal, das [`SessionPicker::handle_key`] zurückgibt.
+/// Aktionssignal, das `SessionPicker::handle_key` (crate-intern) zurückgibt.
 ///
 /// # Beschreibung
 /// Teilt dem Aufrufer mit, was mit dem Picker geschehen soll: offen lassen,
@@ -265,7 +265,7 @@ impl SessionPicker {
     /// Gibt zurück, ob der Aufrufer Sitzungen aller Projekte laden soll.
     ///
     /// # Beschreibung
-    /// Wird per `Ctrl+A` in [`SessionPicker::handle_key`] umgeschaltet.
+    /// Wird per `Ctrl+A` in `SessionPicker::handle_key` umgeschaltet.
     /// Der Aufrufer beobachtet diesen Wert und lädt bei Änderung eine neue
     /// Liste, die er über [`SessionPicker::set_entries`] einspielt.
     ///
@@ -338,7 +338,12 @@ impl SessionPicker {
     /// - `PickerAction::Open(id)` bei `Enter` mit nicht-leerer gefilterter Liste.
     /// - `PickerAction::Stay` in allen anderen Fällen (inklusive `Enter` bei
     ///   leerer Liste und `Esc` bei nicht-leerem Filter, der dabei geleert wird).
-    pub fn handle_key(&mut self, key: KeyEvent) -> PickerAction {
+    ///
+    /// # Sichtbarkeit
+    /// `pub(crate)`: der Parameter ist ein Crossterm-Typ (Fremdcrate vor 1.0),
+    /// der nicht in der öffentlichen API stehen soll; einziger Aufrufer ist
+    /// `handle_overlay_key` in `app.rs`.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PickerAction {
         match key.code {
             KeyCode::Up => {
                 self.move_by(-1);
@@ -492,7 +497,9 @@ impl SessionPicker {
     /// Code keinen `Theme`-Wert konstruieren kann. Konsistent mit
     /// `history_cell`/`style`/`approval_dialog::ApprovalDialog::render`
     /// (alle `pub(crate)`); nur der Zustand (`SessionPicker` selbst,
-    /// `handle_key`, `selected_entry`, `show_all`) bleibt öffentlich.
+    /// `set_entries`, `selected_entry`, `show_all`) bleibt öffentlich;
+    /// `handle_key` ist ebenfalls `pub(crate)`, weil es einen Crossterm-Typ
+    /// nimmt.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let theme = *theme;
         let block = Block::default().borders(Borders::ALL).title(POPUP_TITLE);

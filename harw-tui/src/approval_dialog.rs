@@ -21,8 +21,8 @@
 //! - [`ApprovalDialogRequest`] — unveränderliche Eingaben für
 //!   [`ApprovalDialog::new`].
 //! - [`ApprovalChoice`] — die vier möglichen Entscheidungen des Nutzers.
-//! - [`DialogAction`] — Ereignis, das [`ApprovalDialog::handle_key`]
-//!   zurückgibt.
+//! - [`DialogAction`] — Ereignis, das `ApprovalDialog::handle_key`
+//!   (crate-intern) zurückgibt.
 //!
 //! # Terminal-Sicherheit
 //! Wie `history_cell.rs` (W1-08, Register G-007/G-008): Werkzeugname,
@@ -33,7 +33,7 @@
 //! (Argumentwerte, nichts wird verschluckt) bzw.
 //! [`crate::sanitize::sanitize_inline`] (einzeilige Zusatzfelder). Die vom
 //! Nutzer selbst getippte Freitext-Ablehnung nimmt nur Zeichen an, für die
-//! `char::is_control()` falsch ist (siehe [`ApprovalDialog::handle_key`]).
+//! `char::is_control()` falsch ist (siehe `ApprovalDialog::handle_key`).
 //!
 //! # Nebenläufigkeit
 //! Kein interner Zustand wird geteilt; der Aufrufer hält `ApprovalDialog`
@@ -193,7 +193,7 @@ pub enum ApprovalChoice {
     },
 }
 
-/// Ereignis, das [`ApprovalDialog::handle_key`] zurückgibt.
+/// Ereignis, das `ApprovalDialog::handle_key` zurückgibt.
 ///
 /// # Beschreibung
 /// - `Stay`: Panel bleibt offen, keine Entscheidung.
@@ -567,7 +567,12 @@ impl ApprovalDialog {
     ///
     /// # Rückgabe
     /// Siehe [`DialogAction`].
-    pub fn handle_key(&mut self, key: KeyEvent, armed: bool) -> DialogAction {
+    ///
+    /// # Sichtbarkeit
+    /// `pub(crate)`: der Parameter ist ein Crossterm-Typ (Fremdcrate vor 1.0),
+    /// der nicht in der öffentlichen API stehen soll; einziger Aufrufer ist
+    /// der Event-Loop in `app.rs` (samt Untermodul `app/child_approvals.rs`).
+    pub(crate) fn handle_key(&mut self, key: KeyEvent, armed: bool) -> DialogAction {
         if !armed {
             return DialogAction::Stay;
         }
@@ -682,9 +687,13 @@ impl ApprovalDialog {
 
     /// Scrollt den Körper per Mausrad.
     ///
+    /// Die App leitet das Mausrad über [`Self::scroll_body`]
+    /// (`app/scroll_routing.rs`), daher rufen nur Tests diese Methode.
+    ///
     /// # Rückgabe
     /// `true`, wenn neu gezeichnet werden soll.
-    pub fn scroll_wheel(&self, kind: crossterm::event::MouseEventKind) -> bool {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn scroll_wheel(&self, kind: crossterm::event::MouseEventKind) -> bool {
         self.body_scroll.handle_wheel(kind)
     }
 
@@ -735,8 +744,10 @@ impl ApprovalDialog {
     /// Code kann keinen `Theme`-Wert konstruieren. Rendering ist damit
     /// konsequent als interne Implementierung markiert, konsistent mit
     /// `history_cell`/`style` (beide `pub(crate)`); nur der Zustand
-    /// (`ApprovalDialog` selbst, `handle_key`, `desired_height`) bleibt Teil
-    /// der öffentlichen Fläche des Crates.
+    /// (`ApprovalDialog` selbst, `desired_height`, `scroll_body`,
+    /// `body_offset`) bleibt Teil der öffentlichen Fläche des Crates;
+    /// `handle_key`/`scroll_wheel` sind ebenfalls `pub(crate)`, weil sie
+    /// Crossterm-Typen nehmen.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let theme = *theme;
         let border_color = style::warning_color(theme);

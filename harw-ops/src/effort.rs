@@ -19,7 +19,8 @@
 //! `show|clear|minimal|low|medium|high|xhigh|max`-Grammatik wie `/effort`,
 //! aber **keine** Live-`SessionController`-Mutation. Stattdessen persistiert
 //! sie `reasoning.uia` (`harw_config::HarnessConfig::reasoning.uia`) in der
-//! Profil-`config.toml` — analog zu `/uia-worker-model`
+//! Profil-`config.toml` des gebundenen Root-Space (ohne Bindung nur eine
+//! Notiz) — analog zu `/uia-worker-model`
 //! (`crate::model::uia_worker_model`), das `uia_worker_model` genauso
 //! Config-only verankert. Der gesetzte Wert wirkt erst ab der nächsten
 //! Sitzung (gelesen von `harw-runtime::guard_wiring::parse_effort_field`),
@@ -41,6 +42,9 @@
 //! - [`harw_operations::OpError::Execution`] — `/effort`: `SessionController`
 //!   nicht in der `ServiceMap` registriert oder der interne Mutations-Kanal
 //!   ist geschlossen. `/uia-effort`: Config-Discovery fehlgeschlagen.
+//! - [`harw_operations::OpError::NotAvailable`] — `/uia-effort show`: kein
+//!   gebundener Root-Space und weder Live- noch Sitzungs-Config (kein
+//!   Rückfall auf `HARW_HOME`).
 //! - [`harw_operations::OpError::InvalidArguments`] — Unbekannter
 //!   Effort-Level-String (beide Operationen).
 //!
@@ -188,21 +192,23 @@ async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> 
 ///
 /// # Beschreibung
 /// Im Gegensatz zu `/effort`s `other`-Zweig mutiert dieser Pfad **keinen**
-/// Live-`SessionController`-Zustand — `reasoning.uia` wird ausschließlich
-/// über [`crate::config_util::persist_uia_reasoning_effort`] in der
-/// Profil-`config.toml` verankert und wirkt erst beim nächsten
-/// Sitzungsstart, analog zu `crate::model::handle_uia_worker_model_switch`
-/// (dortiger `uia_worker_model`-Pfad; dort wie hier privat, deshalb bewusst
-/// als Klartext statt als Intra-Doc-Link referenziert).
+/// Live-`SessionController`-Zustand — `reasoning.uia` wird über den
+/// Persistenz-Dienst ([`crate::config_util::selection_persistence`]) in der
+/// Profil-`config.toml` des gebundenen Root-Space verankert (ohne Bindung nur
+/// eine Notiz) und wirkt erst beim nächsten Sitzungsstart, analog zu
+/// `crate::model::handle_uia_worker_model_switch` (dortiger
+/// `uia_worker_model`-Pfad; dort wie hier privat, deshalb bewusst als
+/// Klartext statt als Intra-Doc-Link referenziert).
 ///
-/// `persist` mirrors that function's injected-closure design: the production
-/// caller ([`uia_effort`]) always passes
-/// [`crate::config_util::persist_uia_reasoning_effort`], so runtime behavior
-/// is unchanged from a hardcoded call — the injection exists purely so tests
-/// can supply a no-op closure and never touch the real, `HARW_HOME`-resolving
-/// persistence path (this crate declares `#![forbid(unsafe_code)]`, so a
-/// testing-only `HARW_HOME` env-isolation helper, which would need `unsafe
-/// fn std::env::set_var`/`remove_var`, is not available here).
+/// `persist` ist — wie bei jener Funktion — ein injizierter Abschluss statt
+/// eines hartcodierten Aufrufs von
+/// [`crate::config_util::persist_uia_reasoning_effort`]. Der einzige
+/// Produktions-Aufrufer ([`uia_effort`]) übergibt `persist_uia_reasoning_effort`
+/// aus [`crate::config_util::selection_persistence`] (injizierter Dienst, sonst
+/// das Profil des gebundenen Root-Space, ohne Bindung nur eine Fehlernotiz;
+/// nie `HARW_HOME`); die Injektion existiert, damit Tests einen
+/// No-op-Abschluss einsetzen können und **niemals** eine echte `config.toml`
+/// berühren.
 ///
 /// # Argumente
 /// - `target` (`&str`): das zu setzende Effort-Level, roh aus der TUI-Eingabe.
@@ -290,10 +296,11 @@ fn handle_uia_effort_clear(persist: impl FnOnce(Option<&str>) -> Option<String>)
 /// `visibility = "tui_only"`.
 ///
 /// # Argumente
-/// - `ctx` (`&OpContext`): Ausführungskontext; nur für `show` genutzt, um die
-///   aufgelöste Config zu lesen (via
-///   [`crate::provider::resolved_config`] — context-scoped-first, dieselbe
-///   Autorität wie `/uia-worker-model`).
+/// - `ctx` (`&OpContext`): Ausführungskontext. `show` liest daraus die
+///   aufgelöste Config (via [`crate::provider::resolved_config`] —
+///   context-scoped-first, dieselbe Autorität wie `/uia-worker-model`);
+///   `clear` und das Setzen eines Levels lösen daraus den Persistenz-Dienst
+///   auf ([`crate::config_util::selection_persistence`]).
 /// - `args` (`EffortArgs`): geparstes Sub-Kommando; fehlendes `level` fällt
 ///   auf `"show"` zurück.
 ///
@@ -302,6 +309,8 @@ fn handle_uia_effort_clear(persist: impl FnOnce(Option<&str>) -> Option<String>)
 ///
 /// # Fehler
 /// - [`OpError::Execution`] — Config-Discovery fehlgeschlagen (nur `show`).
+/// - [`OpError::NotAvailable`] — nur `show`: weder Live-/Sitzungs-Config noch
+///   gebundener Root-Space im Kontext.
 /// - [`OpError::InvalidArguments`] — Unbekannter Effort-Level-String.
 ///
 /// # Panics
