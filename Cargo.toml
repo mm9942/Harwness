@@ -159,9 +159,9 @@ members = [
 
 [workspace.package]
 version = "0.8.0"
-# Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
-# damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
-# ohne Versionsangabe erlaubt).
+# Workspace crates are not published to crates.io. This is independent of
+# repository visibility and the MIT OR Apache-2.0 license below.
+# Internal path dependencies may omit registry version requirements.
 publish = false
 edition = "2024"
 rust-version = "1.85"

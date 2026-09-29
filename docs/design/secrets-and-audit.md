@@ -552,16 +552,14 @@ the two to be the `#[from]` target and construct the other explicitly via
 The following are explicitly **not** part of this design, regardless of how
 similar the reference material may look:
 
-- **No secureHUB deployment.** `harw-secrets` is not secureHUB, does not run
-  as a service, and has no HTTP surface.
-- **No `securehub-*` crate dependencies.** `securehub-domain`,
-  `securehub-error`, and any other `securehub-*` crate are studied here as a
-  *reference for problem shape* (how one other in-house project modeled
-  secret metadata and audit events) — no code, type, or trait from them is
-  reused, imported, or path-dependency-linked. Every type in §2–§4 above is
-  an original Harwness type with its own fields and its own semantics (e.g.
-  `SecretMetadata` here has no `organization_id`/multi-tenant fields at all,
-  because Harwness is single-operator).
+- **No external secret-service deployment.** `harw-secrets` does not run
+  as a service and has no HTTP surface.
+- **No private-project dependencies.** An internal implementation was studied
+  as a reference for problem shape. No code, type, or trait from that
+  implementation is reused, imported, or path-dependency-linked.
+  Every type in §2–§4 above is an original Harwness type with its own fields
+  and semantics. For example, `SecretMetadata` has no organization or
+  multi-tenant fields because Harwness is single-operator.
 - **No Postgres, no row-level security, no HTTP secret service.** Storage is
   local files (secret store + audit log + checkpoint file) under the
   Harwness config directory, consistent with the rest of Harwness's
