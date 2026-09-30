@@ -1,4 +1,4 @@
-# Mistral Serverless model retirement handling
+# Provider-aware model lifecycle and retirement handling
 
 > Status: planned
 > Source date: 2026-09-30
@@ -6,7 +6,7 @@
 
 ## Scope
 
-Turn the 2026-09-30 Mistral Serverless deprecation notice into a concrete Harwness migration and lifecycle-handling work package.
+Turn current provider deprecation notices into a concrete Harwness migration and lifecycle-handling work package. Initial providers: Mistral Serverless, OpenAI API, and Anthropic Claude API.
 
 ## CURRENT
 
@@ -135,3 +135,68 @@ Planning only in this PR. No runtime behavior is claimed as implemented.
 - Existing Harwness model architecture: `docs/design/model-catalog-v2.md`.
 - Existing refresh behavior: `docs/design/model-catalog-refresh.md`.
 - Existing atomic switch semantics: `docs/architecture/model-provider-routing.md`.
+
+
+## OPENAI SNAPSHOT — 2026-09-30
+
+Official OpenAI API deprecations show several near-term deadlines that should be represented in provider-scoped lifecycle metadata:
+
+- 2026-10-01: `gpt-5.4-cyber` -> `gpt-5.6-cyber`.
+- 2026-10-23: multiple legacy GPT/o-series snapshots and fine-tuned families shut down.
+- 2026-11-30: reusable prompt objects / `v1/prompts` shut down (provider-capability lifecycle, not model lifecycle).
+- 2026-12-01: older GPT Image models shut down.
+- 2026-12-11: older GPT-5 and o3 snapshots shut down.
+- 2027-01-20: legacy audio/realtime families shut down.
+- 2027-02-26: older transcription families shut down.
+
+Additionally, `gpt-3.5-turbo-instruct`, `babbage-002`, `davinci-002`, and `gpt-3.5-turbo-1106` were shut down on 2026-09-28 and must not remain implicit candidates.
+
+Full snapshot: `docs/research/models/openai-lifecycle-2026-09-30.md`.
+
+OpenAI lifecycle policy also has different minimum notice windows for GA, specialized GA variants, and Preview models. The catalog should therefore preserve lifecycle class/risk rather than treating every model identifier identically.
+
+## ANTHROPIC SNAPSHOT — 2026-09-30
+
+Anthropic currently marks `claude-mythos-preview` Deprecated, with migration to `claude-mythos-5`; its retirement date is still to be announced.
+
+Anthropic also publishes "not sooner than" dates for Active models. These are support-floor dates, **not retirement dates**. For example, `claude-sonnet-4-5-20250929` remains Active even though its published floor (2026-09-29) has elapsed. Harwness must never infer retirement merely because a support-floor date is in the past.
+
+Recently retired snapshots include Claude Opus 4.1, Claude Sonnet 4, Claude Opus 4, Claude 3.7 Sonnet, Claude 3.5 Haiku, and Claude 3 Haiku; their documented replacements are captured in the snapshot.
+
+Anthropic also deprecates request parameters by model generation: `temperature`, `top_p`, and `top_k` are deprecated for Claude Opus 4.7 and later, and non-default values can return HTTP 400. Provider request compatibility therefore needs model-scoped parameter rules.
+
+Full snapshot: `docs/research/models/anthropic-lifecycle-2026-09-30.md`.
+
+## GENERALIZED DATA MODEL DELTA
+
+The initial lifecycle overlay should distinguish at least:
+
+```rust
+pub struct ProviderLifecycle {
+    pub deprecated_at: Option<OffsetDateTime>,
+    pub retired_at: Option<OffsetDateTime>,
+    pub earliest_retirement_at: Option<OffsetDateTime>,
+    pub replacements: Vec<ModelId>,
+}
+```
+
+Semantics:
+
+- `deprecated_at`: provider has formally announced deprecation.
+- `retired_at`: provider has announced a hard shutdown/retirement timestamp.
+- `earliest_retirement_at`: support floor / "not sooner than" date; passing it does **not** change status by itself.
+- `replacements`: provider-published migration targets.
+
+Provider/API capabilities that are not model IDs (for example OpenAI `v1/prompts`) should use a sibling lifecycle record instead of being forced into `ModelDescriptor`.
+
+Model-specific request compatibility should also be represented independently from lifecycle so adapters can reject unsupported/deprecated parameter combinations before network dispatch.
+
+## SCHEDULED MAINTENANCE
+
+A recurring two-week provider lifecycle review is configured for OpenAI, Anthropic, and Mistral. Each run should:
+
+1. re-check official provider lifecycle/deprecation sources;
+2. compare against the current Harwness `dev` branch;
+3. update provider lifecycle snapshots;
+4. update/create a Draft PR against `dev`;
+5. never infer retirement from aliases, stale catalog data, or elapsed support-floor dates.
