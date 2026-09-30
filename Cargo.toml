@@ -158,7 +158,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.1"
 # Workspace crates are not published to crates.io. This is independent of
 # repository visibility and the MIT OR Apache-2.0 license below.
 # Internal path dependencies may omit registry version requirements.

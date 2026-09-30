@@ -8,6 +8,14 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+## [0.9.1] — Unreleased
+- Version alignment: workspace bumped from 0.8.0 to 0.9.1 to match the
+  internal 0.9.x state; path-dependency version pins updated
+  (`harw-tui` → harw-home, `harw-registry-defaults` → harw-tool-doc,
+  harw-tools).
+- `harw pr-review`: argument bridge fix in `harw-cli` dispatch (PrReviewArgs
+  rebuilt from CLI args).
+
 ### Added
 - Tailscale access: `harw tailscale status` and `harw web --tailnet
   [--tailnet-port]`. The control plane listens on the node's tailnet

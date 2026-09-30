@@ -36,7 +36,7 @@ harw-tool-explorer = { path = "../harw-tool-explorer" }
 harw-tool-process = { path = "../harw-tool-process" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
-harw-tool-doc = { version = "0.8.0", path = "../harw-tool-doc" }
+harw-tool-doc = { version = "0.9.1", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 harw-tool-shell = { path = "../harw-tool-shell" }
@@ -72,7 +72,7 @@ time = "0.3.53"
 toml = "1.1.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-harw-tools = { version = "0.8.0", path = "../harw-tools" }
+harw-tools = { version = "0.9.1", path = "../harw-tools" }
 # `workbench.note`/`workbench.hypothesis` (`workbench_tools.rs`) schreiben über
 # `harw_knowledge::workbench` in den Sitzungs-Scope. Kein Zyklus:
 # `harw-knowledge` hängt (auch transitiv) nicht von `harw-registry-defaults` ab.
