@@ -53,6 +53,20 @@ pub struct PrReviewArgs {
     pub post: bool,
 }
 
+impl From<crate::cli::PrReviewArgs> for PrReviewArgs {
+    fn from(cli: crate::cli::PrReviewArgs) -> Self {
+        Self {
+            pr: cli.pr,
+            repo: cli.repo,
+            max_diff_kib: cli.max_diff_kib,
+            fixture: cli.fixture,
+            fixture_only: cli.fixture_only,
+            output: cli.output,
+            post: cli.post,
+        }
+    }
+}
+
 /// Führt `harw pr-review` aus (Dispatch aus [`crate::run`]).
 ///
 /// # Errors
