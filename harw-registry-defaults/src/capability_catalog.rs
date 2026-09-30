@@ -207,6 +207,7 @@ pub mod providers {
     provider!(JOB, "job", "harw-tool-job", "tool-job");
     provider!(PROCESS, "process", "harw-tool-process", "tool-process");
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
+    provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
         KNOWLEDGE,
         "knowledge",

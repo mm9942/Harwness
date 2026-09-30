@@ -4,9 +4,10 @@
 //!
 //! # Zweck
 //! Führt eine geordnete Kette von Konfigurationsmigrationen aus, die ein
-//! `toml_edit::DocumentMut` schrittweise von einer vorgefundenen
+//! [`ConfigDocument`] schrittweise von einer vorgefundenen
 //! `config_version` auf die Zielversion (`latest`) heben. Kommentare und
-//! Formatierung des TOML-Dokuments bleiben durch `toml_edit` erhalten.
+//! Formatierung des TOML-Dokuments bleiben durch `toml_edit` erhalten; der
+//! Fremdtyp bleibt dabei hinter [`ConfigDocument`] verborgen.
 //!
 //! # Verantwortung
 //! Dieses Modul besitzt die Ablaufsteuerung (`MigrationRunner`) und die
@@ -15,6 +16,7 @@
 //! die Fehlerdefinition liegt in [`crate::error`].
 //!
 //! # Exportierte Typen
+//! - [`ConfigDocument`] — bearbeitbares Dokument für Migrationen; kapselt `toml_edit`.
 //! - [`ConfigMigration`] — Trait für einen einzelnen Versionsschritt.
 //! - [`MigrationRunner`] — orchestriert Lesen, Backup, Anwenden, Persistieren.
 //!
@@ -39,36 +41,239 @@
 //! # Examples
 //! ```rust,no_run
 //! use std::path::Path;
-//! use harw_install::migration::{ConfigMigration, MigrationRunner};
+//! use harw_install::migration::{ConfigDocument, ConfigMigration, MigrationRunner};
 //! use harw_install::error::MigrationError;
 //!
-//! struct Noop;
-//! impl ConfigMigration for Noop {
+//! struct EnableFeature;
+//! impl ConfigMigration for EnableFeature {
 //!     fn from_version(&self) -> u32 { 0 }
-//!     fn apply(&self, _doc: &mut toml_edit::DocumentMut) -> Result<(), MigrationError> {
-//!         Ok(())
+//!     fn apply(&self, doc: &mut ConfigDocument) -> Result<(), MigrationError> {
+//!         if doc.set_bool(&["feature", "enabled"], true) {
+//!             Ok(())
+//!         } else {
+//!             Err(MigrationError::Apply {
+//!                 from_version: 0,
+//!                 reason: "feature ist keine Tabelle".to_owned(),
+//!             })
+//!         }
 //!     }
 //! }
 //!
-//! let runner = MigrationRunner::new(vec![Box::new(Noop)], 1);
+//! let runner = MigrationRunner::new(vec![Box::new(EnableFeature)], 1);
 //! let _reached = runner.run(Path::new("/tmp/config.toml"));
 //! ```
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::error::MigrationError;
 
 /// TOML-Schlüssel, unter dem die Konfigurationsversion abgelegt wird.
 const VERSION_KEY: &str = "config_version";
 
+/// Bearbeitbares TOML-Dokument, das eine [`ConfigMigration`] verändert.
+///
+/// # Description
+/// Crate-eigene Hülle um das formatierungserhaltende TOML-Dokument; `toml_edit`
+/// erscheint dadurch nicht in der öffentlichen API. Pfade sind Segmentlisten
+/// (`&["sandbox", "timeout"]` = `[sandbox] timeout`) und werden nicht an
+/// Punkten zerlegt. Die Lesezugriffe (`contains`, `get_*`) folgen Tabellen und
+/// Inline-Tabellen; die Schreibhelfer (`set_*`, `remove`) folgen nur
+/// Standard-Tabellen (`[a]`, `a.b = …`), `set_*` legt fehlende davon an.
+///
+/// Fail closed: Bei leerem Pfad oder einem vorhandenen Nicht-Tabellen-Eintrag
+/// auf dem Weg (Wert, Inline-Tabelle, Array) liefern die Schreibhelfer `false`;
+/// `set_*` zusätzlich, wenn das Ziel eine Tabelle oder ein Array von Tabellen
+/// ist. Das Dokument bleibt in diesen Fällen unverändert.
+///
+/// # Concurrency
+/// Kein gemeinsam veränderlicher Zustand; Mutation nur über `&mut self`.
+#[derive(Default)]
+pub struct ConfigDocument {
+    /// Das formatierungserhaltende TOML-Dokument.
+    inner: DocumentMut,
+}
+
+impl ConfigDocument {
+    /// Erstellt ein leeres Dokument.
+    ///
+    /// # Returns
+    /// Ein Dokument ohne Einträge.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parst TOML-Text formatierungserhaltend.
+    ///
+    /// # Arguments
+    /// - `text` (`&str`): der vollständige Dateiinhalt.
+    ///
+    /// # Returns
+    /// Das geparste Dokument.
+    ///
+    /// # Errors
+    /// - [`MigrationError::Parse`]: `text` ist kein gültiges TOML; Meldung und
+    ///   Fehlerbereich stehen in der Variante.
+    pub fn parse(text: &str) -> Result<Self, MigrationError> {
+        text.parse::<DocumentMut>()
+            .map(|inner| Self { inner })
+            .map_err(|err| MigrationError::from_toml(&err))
+    }
+
+    /// Prüft, ob unter `path` ein Eintrag (Wert oder Tabelle) existiert.
+    ///
+    /// # Returns
+    /// `true`, wenn der Pfad auflösbar ist; bei leerem Pfad `false`.
+    #[must_use]
+    pub fn contains(&self, path: &[&str]) -> bool {
+        self.lookup(path).is_some()
+    }
+
+    /// Liest eine Ganzzahl unter `path`.
+    ///
+    /// # Returns
+    /// `Some(wert)`, wenn dort eine Ganzzahl steht; sonst `None` (fehlend,
+    /// anderer Typ oder leerer Pfad).
+    #[must_use]
+    pub fn get_integer(&self, path: &[&str]) -> Option<i64> {
+        self.lookup(path).and_then(Item::as_integer)
+    }
+
+    /// Liest einen Wahrheitswert unter `path`.
+    ///
+    /// # Returns
+    /// `Some(wert)`, wenn dort ein Wahrheitswert steht; sonst `None`.
+    #[must_use]
+    pub fn get_bool(&self, path: &[&str]) -> Option<bool> {
+        self.lookup(path).and_then(Item::as_bool)
+    }
+
+    /// Liest eine Zeichenkette unter `path`.
+    ///
+    /// # Returns
+    /// `Some(wert)`, wenn dort eine Zeichenkette steht; sonst `None`.
+    #[must_use]
+    pub fn get_str(&self, path: &[&str]) -> Option<&str> {
+        self.lookup(path).and_then(Item::as_str)
+    }
+
+    /// Setzt eine Ganzzahl unter `path`; fehlende Tabellen werden angelegt.
+    ///
+    /// # Returns
+    /// `true`, wenn geschrieben wurde (ein Wert anderen Typs wird ersetzt);
+    /// `false` in den Fail-closed-Fällen des Typs, das Dokument bleibt dann
+    /// unverändert.
+    #[must_use]
+    pub fn set_integer(&mut self, path: &[&str], value: i64) -> bool {
+        self.set_item(path, toml_edit::value(value))
+    }
+
+    /// Setzt einen Wahrheitswert unter `path`; fehlende Tabellen werden angelegt.
+    ///
+    /// # Returns
+    /// Wie [`set_integer`](ConfigDocument::set_integer).
+    #[must_use]
+    pub fn set_bool(&mut self, path: &[&str], value: bool) -> bool {
+        self.set_item(path, toml_edit::value(value))
+    }
+
+    /// Setzt eine Zeichenkette unter `path`; fehlende Tabellen werden angelegt.
+    ///
+    /// # Returns
+    /// Wie [`set_integer`](ConfigDocument::set_integer).
+    #[must_use]
+    pub fn set_str(&mut self, path: &[&str], value: &str) -> bool {
+        self.set_item(path, toml_edit::value(value))
+    }
+
+    /// Entfernt den Eintrag unter `path`, gleich ob Wert oder Tabelle.
+    ///
+    /// # Returns
+    /// `true`, wenn ein Eintrag entfernt wurde; `false`, wenn der Pfad fehlt,
+    /// leer ist oder über eine Nicht-Tabelle führt (Dokument unverändert).
+    #[must_use]
+    pub fn remove(&mut self, path: &[&str]) -> bool {
+        let Some((leaf, parents)) = path.split_last() else {
+            return false;
+        };
+        // Wie `table_for_write`, aber ohne fehlende Tabellen anzulegen.
+        let mut table = self.inner.as_table_mut();
+        for segment in parents {
+            let Some(next) = table.get_mut(segment).and_then(Item::as_table_mut) else {
+                return false;
+            };
+            table = next;
+        }
+        table.remove(leaf).is_some()
+    }
+
+    /// Löst `path` über Tabellen und Inline-Tabellen auf; leerer Pfad → `None`.
+    fn lookup(&self, path: &[&str]) -> Option<&Item> {
+        if path.is_empty() {
+            return None;
+        }
+        let mut item = self.inner.as_item();
+        for segment in path {
+            item = item.get(*segment)?;
+        }
+        Some(item)
+    }
+
+    /// Schreibt `value` unter `path`; `false` in den Fail-closed-Fällen des Typs.
+    fn set_item(&mut self, path: &[&str], value: Item) -> bool {
+        let Some((leaf, parents)) = path.split_last() else {
+            return false;
+        };
+        let Some(table) = table_for_write(self.inner.as_table_mut(), parents) else {
+            return false;
+        };
+        match table.get_mut(leaf) {
+            // Vorhandene Werte werden an Ort und Stelle ersetzt: `Table::insert`
+            // würde die Schlüssel-Formatierung samt Kommentar darüber verwerfen.
+            Some(existing) if existing.is_value() => *existing = value,
+            // Tabellen und Arrays von Tabellen werden nie überschrieben.
+            Some(_) => return false,
+            None => {
+                table.insert(leaf, value);
+            }
+        }
+        true
+    }
+}
+
+impl fmt::Display for ConfigDocument {
+    /// Rendert das Dokument als TOML-Text (Kommentare und Formatierung erhalten).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+/// Folgt `parents` über Standard-Tabellen und legt fehlende implizit an.
+///
+/// Liefert `None`, sobald ein vorhandenes Segment keine Standard-Tabelle ist.
+/// Tabellen entstehen erst hinter dem letzten vorhandenen Segment; ein `None`
+/// hinterlässt daher nie Teiländerungen.
+fn table_for_write<'a>(mut table: &'a mut Table, parents: &[&str]) -> Option<&'a mut Table> {
+    for segment in parents {
+        if !table.contains_key(segment) {
+            let mut fresh = Table::new();
+            fresh.set_implicit(true);
+            table.insert(segment, Item::Table(fresh));
+        }
+        table = table.get_mut(segment)?.as_table_mut()?;
+    }
+    Some(table)
+}
+
 /// Ein einzelner, versionierter Migrationsschritt.
 ///
 /// # Description
-/// Eine `ConfigMigration` transformiert ein `toml_edit::DocumentMut` in-place
+/// Eine `ConfigMigration` transformiert ein [`ConfigDocument`] in-place
 /// von ihrer Ausgangsversion ([`from_version`](ConfigMigration::from_version))
 /// auf die nächsthöhere. Der [`MigrationRunner`] wählt und ordnet die
 /// anzuwendenden Schritte; eine Implementierung muss nur ihre eigene
@@ -92,18 +297,20 @@ pub trait ConfigMigration {
     /// Wendet die Transformation dieses Schritts auf das Dokument an.
     ///
     /// # Arguments
-    /// - `doc` (`&mut toml_edit::DocumentMut`): das zu verändernde Dokument;
+    /// - `doc` (`&mut ConfigDocument`): das zu verändernde Dokument;
     ///   wird in-place mutiert, Formatierung/Kommentare bleiben erhalten.
     ///
     /// # Returns
     /// `Ok(())` bei erfolgreicher Transformation.
     ///
     /// # Errors
-    /// - [`MigrationError::Apply`]: wenn die Transformation fehlschlägt.
+    /// - [`MigrationError::Apply`]: wenn die Transformation fehlschlägt. Die
+    ///   Schreibhelfer von [`ConfigDocument`] liefern `false`, statt zu
+    ///   überschreiben; die Implementierung macht daraus diesen Fehler.
     ///
     /// # Concurrency
     /// Muss nicht threadsicher sein; wird vom Runner sequentiell aufgerufen.
-    fn apply(&self, doc: &mut DocumentMut) -> Result<(), MigrationError>;
+    fn apply(&self, doc: &mut ConfigDocument) -> Result<(), MigrationError>;
 }
 
 /// Orchestriert die Ausführung einer Migrationskette über `config.toml`.
@@ -160,7 +367,8 @@ impl MigrationRunner {
     ///
     /// # Errors
     /// - [`MigrationError::Io`]: Lesen/Schreiben von Datei oder Backup schlug fehl.
-    /// - [`MigrationError::Parse`]: der Dateiinhalt war kein gültiges TOML.
+    /// - [`MigrationError::Parse`]: der Dateiinhalt war kein gültiges TOML;
+    ///   Meldung und Fehlerbereich stehen in der Variante.
     /// - [`MigrationError::Version`]: die vorgefundene Version ist größer als
     ///   `latest` (kein Abwärts-Migrationspfad).
     /// - [`MigrationError::Apply`]: ein Migrationsschritt schlug fehl.
@@ -171,9 +379,9 @@ impl MigrationRunner {
     pub fn run(&self, config_path: &Path) -> Result<u32, MigrationError> {
         let existing = read_optional(config_path)?;
 
-        let mut doc: DocumentMut = match &existing {
-            Some(content) => content.parse::<DocumentMut>()?,
-            None => DocumentMut::new(),
+        let mut doc = match &existing {
+            Some(content) => ConfigDocument::parse(content)?,
+            None => ConfigDocument::new(),
         };
 
         let current = read_version(&doc);
@@ -204,7 +412,9 @@ impl MigrationRunner {
             step.apply(&mut doc)?;
         }
 
-        doc[VERSION_KEY] = toml_edit::value(i64::from(self.latest));
+        // Der Runner besitzt `config_version` und überschreibt den Schlüssel wie
+        // bisher, unabhängig von der vorgefundenen Form (daher nicht `set_integer`).
+        doc.inner[VERSION_KEY] = toml_edit::value(i64::from(self.latest));
         write_document(config_path, &doc)?;
 
         Ok(self.latest)
@@ -227,9 +437,8 @@ fn read_optional(path: &Path) -> Result<Option<String>, MigrationError> {
 }
 
 /// Liest die `config_version` aus dem Dokument; fehlt sie, gilt 0.
-fn read_version(doc: &DocumentMut) -> u32 {
-    doc.get(VERSION_KEY)
-        .and_then(|item| item.as_integer())
+fn read_version(doc: &ConfigDocument) -> u32 {
+    doc.get_integer(&[VERSION_KEY])
         .and_then(|i| u32::try_from(i).ok())
         .unwrap_or(0)
 }
@@ -275,7 +484,7 @@ fn backup_candidate(config_path: &Path, n: u32) -> PathBuf {
 ///
 /// # Errors
 /// - [`MigrationError::Io`]: das Schreiben schlug fehl.
-fn write_document(config_path: &Path, doc: &DocumentMut) -> Result<(), MigrationError> {
+fn write_document(config_path: &Path, doc: &ConfigDocument) -> Result<(), MigrationError> {
     fs::write(config_path, doc.to_string()).map_err(|source| MigrationError::Io {
         path: config_path.display().to_string(),
         source,
@@ -293,9 +502,15 @@ mod tests {
         fn from_version(&self) -> u32 {
             0
         }
-        fn apply(&self, doc: &mut DocumentMut) -> Result<(), MigrationError> {
-            doc["step_a"] = toml_edit::value(true);
-            Ok(())
+        fn apply(&self, doc: &mut ConfigDocument) -> Result<(), MigrationError> {
+            if doc.set_bool(&["step_a"], true) {
+                Ok(())
+            } else {
+                Err(MigrationError::Apply {
+                    from_version: 0,
+                    reason: "step_a nicht setzbar".to_owned(),
+                })
+            }
         }
     }
 
@@ -305,9 +520,15 @@ mod tests {
         fn from_version(&self) -> u32 {
             1
         }
-        fn apply(&self, doc: &mut DocumentMut) -> Result<(), MigrationError> {
-            doc["step_b"] = toml_edit::value(42);
-            Ok(())
+        fn apply(&self, doc: &mut ConfigDocument) -> Result<(), MigrationError> {
+            if doc.set_integer(&["step_b"], 42) {
+                Ok(())
+            } else {
+                Err(MigrationError::Apply {
+                    from_version: 1,
+                    reason: "step_b nicht setzbar".to_owned(),
+                })
+            }
         }
     }
 
@@ -317,7 +538,7 @@ mod tests {
         fn from_version(&self) -> u32 {
             0
         }
-        fn apply(&self, _doc: &mut DocumentMut) -> Result<(), MigrationError> {
+        fn apply(&self, _doc: &mut ConfigDocument) -> Result<(), MigrationError> {
             Err(MigrationError::Apply {
                 from_version: 0,
                 reason: "absichtlich".to_owned(),
@@ -352,10 +573,10 @@ mod tests {
         assert_eq!(reached, 2);
 
         let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?; // Testprüfung
-        let doc = text.parse::<DocumentMut>().map_err(ctx("parse"))?; // Testprüfung
+        let doc = ConfigDocument::parse(&text).map_err(ctx("parse"))?; // Testprüfung
         assert_eq!(read_version(&doc), 2);
-        assert_eq!(doc.get("step_a").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(doc.get("step_b").and_then(|v| v.as_integer()), Some(42));
+        assert_eq!(doc.get_bool(&["step_a"]), Some(true));
+        assert_eq!(doc.get_integer(&["step_b"]), Some(42));
         Ok(())
     }
 
@@ -417,9 +638,9 @@ mod tests {
         assert!(!backup_candidate(&path, 0).exists());
         // Marker aus AddStepA/B dürfen NICHT gesetzt worden sein.
         let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?; // Testprüfung
-        let doc = text.parse::<DocumentMut>().map_err(ctx("parse"))?; // Testprüfung
-        assert!(doc.get("step_a").is_none());
-        assert!(doc.get("step_b").is_none());
+        let doc = ConfigDocument::parse(&text).map_err(ctx("parse"))?; // Testprüfung
+        assert!(!doc.contains(&["step_a"]));
+        assert!(!doc.contains(&["step_b"]));
         Ok(())
     }
 
@@ -465,11 +686,26 @@ mod tests {
         let path = tmp_config("badtoml")?;
         std::fs::write(&path, "a = = 1\n").map_err(ctx("schreiben"))?; // Testaufbau
 
+        // Referenz: derselbe Inhalt direkt geparst liefert Meldung und Bereich.
+        let Err(expected) = "a = = 1\n".parse::<DocumentMut>() else {
+            return Err(TestError::Unexpected(
+                "ungültiges TOML wurde akzeptiert".to_owned(),
+            ));
+        };
+
         let runner = MigrationRunner::new(vec![Box::new(AddStepA)], 1);
-        assert!(matches!(
-            runner.run(&path),
-            Err(MigrationError::Parse { .. })
-        ));
+        match runner.run(&path) {
+            Err(MigrationError::Parse { message, span }) => {
+                assert!(!message.is_empty());
+                assert_eq!(message, expected.to_string());
+                assert_eq!(span, expected.span());
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Parse-Fehler, erhielt {other:?}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -483,9 +719,107 @@ mod tests {
         runner.run(&path).map_err(ctx("migration"))?; // Testprüfung
 
         let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?; // Testprüfung
-        let doc = text.parse::<DocumentMut>().map_err(ctx("parse"))?; // Testprüfung
-        assert!(doc.get("step_a").is_none(), "AddStepA darf nicht greifen");
-        assert_eq!(doc.get("step_b").and_then(|v| v.as_integer()), Some(42));
+        let doc = ConfigDocument::parse(&text).map_err(ctx("parse"))?; // Testprüfung
+        assert!(!doc.contains(&["step_a"]), "AddStepA darf nicht greifen");
+        assert_eq!(doc.get_integer(&["step_b"]), Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_nested_set_get_roundtrip() -> TestResult {
+        let mut doc = ConfigDocument::new();
+        assert!(doc.set_integer(&["sandbox", "timeout"], 30));
+        assert!(doc.set_str(&["sandbox", "mode"], "strict"));
+        assert_eq!(doc.get_integer(&["sandbox", "timeout"]), Some(30));
+        assert_eq!(doc.get_str(&["sandbox", "mode"]), Some("strict"));
+
+        // Gerenderter Text parst wieder zu denselben Werten.
+        let reparsed = ConfigDocument::parse(&doc.to_string()).map_err(ctx("reparse"))?; // Testprüfung
+        assert_eq!(reparsed.get_integer(&["sandbox", "timeout"]), Some(30));
+        assert_eq!(reparsed.get_str(&["sandbox", "mode"]), Some("strict"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_set_refuses_non_table_parent_and_leaves_doc_unchanged() -> TestResult {
+        let mut doc = ConfigDocument::parse("a = 1\n").map_err(ctx("parse"))?; // Testaufbau
+        assert!(!doc.set_bool(&["a", "b"], true));
+        assert_eq!(doc.to_string(), "a = 1\n");
+        assert_eq!(doc.get_integer(&["a"]), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_set_refuses_to_overwrite_table() -> TestResult {
+        let mut doc = ConfigDocument::parse("[t]\nx = 1\n").map_err(ctx("parse"))?; // Testaufbau
+        assert!(!doc.set_integer(&["t"], 5));
+        assert_eq!(doc.get_integer(&["t", "x"]), Some(1));
+        assert_eq!(doc.to_string(), "[t]\nx = 1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_inline_table_read_only() -> TestResult {
+        let mut doc = ConfigDocument::parse("a = { b = true }\n").map_err(ctx("parse"))?; // Testaufbau
+        // Lesen folgt Inline-Tabellen, Schreiben nicht.
+        assert_eq!(doc.get_bool(&["a", "b"]), Some(true));
+        assert!(!doc.set_bool(&["a", "c"], true));
+        assert!(!doc.remove(&["a", "b"]));
+        assert_eq!(doc.to_string(), "a = { b = true }\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_replaces_scalar_of_other_type() -> TestResult {
+        let mut doc = ConfigDocument::parse("n = \"x\"\n").map_err(ctx("parse"))?; // Testaufbau
+        assert_eq!(doc.get_integer(&["n"]), None);
+        assert_eq!(doc.get_str(&["n"]), Some("x"));
+        assert!(doc.set_integer(&["n"], 3));
+        assert_eq!(doc.get_integer(&["n"]), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_remove() -> TestResult {
+        let mut doc =
+            ConfigDocument::parse("keep = 1\ndrop = 2\n[old]\nx = 1\n").map_err(ctx("parse"))?; // Testaufbau
+        assert!(doc.remove(&["drop"]));
+        assert!(!doc.remove(&["drop"]));
+        assert!(doc.remove(&["old"]));
+        assert!(!doc.contains(&["old"]));
+        assert!(!doc.remove(&["missing", "x"]));
+        assert!(doc.contains(&["keep"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_empty_path_rejected() -> TestResult {
+        let mut doc = ConfigDocument::new();
+        assert!(!doc.set_bool(&[], true));
+        assert!(!doc.remove(&[]));
+        assert!(!doc.contains(&[]));
+        assert_eq!(doc.get_bool(&[]), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_preserves_comments() -> TestResult {
+        let mut doc = ConfigDocument::parse("# Kopf\nkeep = 1 # bleibt\n").map_err(ctx("parse"))?; // Testaufbau
+        assert!(doc.set_integer(&["new"], 2));
+        let text = doc.to_string();
+        assert!(text.contains("# Kopf"), "Kopfkommentar fehlt: {text}");
+        assert!(text.contains("# bleibt"), "Zeilenkommentar fehlt: {text}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_document_replace_keeps_comment_above_key() -> TestResult {
+        let mut doc = ConfigDocument::parse("# Kopf\nkeep = 1\n").map_err(ctx("parse"))?; // Testaufbau
+        // Ersetzen eines vorhandenen Werts lässt den Schlüssel samt Kommentar stehen.
+        assert!(doc.set_integer(&["keep"], 3));
+        assert_eq!(doc.get_integer(&["keep"]), Some(3));
+        let text = doc.to_string();
+        assert!(text.contains("# Kopf"), "Kopfkommentar fehlt: {text}");
         Ok(())
     }
 }

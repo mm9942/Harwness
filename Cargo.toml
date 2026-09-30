@@ -78,6 +78,10 @@ members = [
     "harw-tool-job",
     # Runde 5, Teil F: Plan-Modus (plan.write/plan.exit/plan.enter/ask_user).
     "harw-tool-plan",
+    # harw-tool-tunnel-v1: verwaltete SSH-Portforwards (v1 lokal -L,
+    # Loopback-only, Ziel-Allowlist, Approval, Keyfile-Referenz; Vertrag:
+    # docs/design/tunnel-policy-v1.md).
+    "harw-tool-tunnel",
     "harw-browser",
     "harw-browser-thirtyfour",
     "harw-tool-browser",

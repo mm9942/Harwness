@@ -72,6 +72,21 @@
 //! (`approval = "always"`), und das Gateway prüft weiter die Caps des
 //! Aufrufers.
 //!
+//! # Root-Space
+//! Ist per [`RuntimeServices::with_home_context`] ein
+//! `Arc<harw_home::ResolvedHomeContext>` gebunden, legt die Fabrik ihn auf
+//! **jede** Fläche; die Montage reicht dieselbe Instanz an die Kind-Fabrik
+//! weiter (`RuntimeChildRegistryFactory::with_home_context`), damit auch die
+//! Matrix-Werkzeuge des Game Masters ihn tragen. Die Operationen in
+//! `harw-ops` lesen Home, Profil und Projekt aus diesem Dienst
+//! (`harw_ops::config_util::bound_home`) statt über `HARW_HOME` oder
+//! `harw_home::home_dir()`; ohne Bindung melden sie `OpError::NotAvailable`
+//! (fail closed). Bekannte Ausnahmen, getrennt verfolgt: `/permissions`
+//! (Global- und Projekt-Scope, `harw_ops::permissions::scope_path`) und
+//! `/agent` (Compiler-Umgebung über `CompilerEnv::detect(None, …)`) lösen
+//! weiterhin das Home des Prozesses auf. Auch der Verbindungstest von
+//! `/provider test` löst `file:`-Referenzen nur gegen diesen Root-Space auf.
+//!
 //! # Was hier bewusst NICHT registriert wird
 //! - Web-eigene Dienste (`PeerCredentials`, `Arc<dyn ApprovalActorResolver>`,
 //!   `Arc<ApprovalStore>`): sie stammen pro Verbindung aus dem Kernel bzw. aus
@@ -682,6 +697,9 @@ impl RuntimeServices {
     /// Bindet den Dateisystem-Scope, den jede Operationsfläche erbt.
     ///
     /// # Beschreibung
+    /// Der Kontext liegt danach auf jeder Fläche; Operationen lesen den
+    /// Root-Space von dort (Ausnahmen: Moduldoku, Abschnitt Root-Space), und
+    /// der Verbindungstest löst `file:`-Referenzen gegen `context.home` auf.
     /// Baut zugleich den Wissensspeicher unter
     /// `harw_home::knowledge_dir(&context.profile_dir)`, sofern nicht schon
     /// über [`Self::with_knowledge_store`] einer gesetzt ist. Der Speicher
@@ -824,6 +842,7 @@ impl RuntimeServices {
     /// | [`Principal`] | ✓ | ✓ | ✓ | ✓ |
     /// | [`ProviderLoadRegistry`] | ✓ | ✓ | ✓ | ✓ |
     /// | `SharedProviderConnectionCheck` (`/provider test`) | ✓ | ✓ | ✓ | ✓ |
+    /// | `Arc<`[`harw_home::ResolvedHomeContext`]`>` (falls gebunden; Root-Space der Operator-Kommandos) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<dyn Memory>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<JobStore>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<`[`HostPermitHandles`]`>` (falls vorhanden, Plan Teil B3) | ✓ | ✓ | ✓ | ✓ |
@@ -936,11 +955,13 @@ impl RuntimeServices {
             self.parts.provider_load_registry.clone(),
         );
         // Live-Verbindungstest für `/provider test` und `/uia-provider test`
-        // (`GET /models`); `secrets:`-Schlüssel brauchen einen Resolver, den
+        // (`GET /models`). `file:`-Referenzen lösen gegen den gebundenen
+        // Root-Space auf, nie gegen `HARW_HOME`; ohne Bindung bleiben sie
+        // unaufgelöst. `secrets:`-Schlüssel brauchen einen Resolver, den
         // diese Montage nicht hält — sie werden dann als nicht auflösbar
-        // gemeldet, alle anderen Referenzen (env/file/keyring) funktionieren.
+        // gemeldet; env- und keyring-Referenzen funktionieren immer.
         let connection_check: harw_ops::provider::SharedProviderConnectionCheck = Arc::new(
-            harw_ops::provider::DiscoveryConnectionCheck::new(harw_home::home_dir().ok(), None),
+            harw_ops::provider::DiscoveryConnectionCheck::new(self.connection_check_home(), None),
         );
         insert_service(&mut map, &mut names, connection_check);
 
@@ -1080,6 +1101,18 @@ impl RuntimeServices {
         }
 
         (map, names)
+    }
+
+    /// Der Root-Space, gegen den der Verbindungstest (`/provider test`,
+    /// `/uia-provider test`) `file:`-Referenzen auflöst.
+    ///
+    /// # Rückgabe
+    /// `home` des gebundenen [`harw_home::ResolvedHomeContext`]; ohne Bindung
+    /// `None` — nie ein Rückgriff auf `HARW_HOME` oder `harw_home::home_dir()`.
+    fn connection_check_home(&self) -> Option<std::path::PathBuf> {
+        self.home_context
+            .as_ref()
+            .map(|context| context.home.clone())
     }
 
     /// Das Kanban-Job-Ledger einer Fläche.
@@ -2030,6 +2063,88 @@ mod tests {
             return Err(TestError::Missing("ausdrücklicher Speicher fehlt"));
         };
         assert!(Arc::ptr_eq(kept, &explicit));
+        Ok(())
+    }
+
+    /// Ein gebundener Home-Kontext unter `home` (Profil `default`, Projekt
+    /// `home/project`).
+    fn test_home_context(home: &Path) -> TestResult<Arc<harw_home::ResolvedHomeContext>> {
+        let project_dir = home.join("project");
+        let project = harw_home::ProjectRoot {
+            root: project_dir.clone(),
+            trust_key: project_dir,
+            kind: harw_home::ProjectKind::Directory,
+        };
+        harw_home::ResolvedHomeContext::new(home, "default".to_owned(), project)
+            .map(Arc::new)
+            .map_err(crate::test_support::ctx("Home-Kontext"))
+    }
+
+    /// Der Verbindungstest (`/provider test`) löst `file:`-Referenzen nur
+    /// gegen den gebundenen Root-Space auf: ungebunden `None` — kein
+    /// Rückgriff auf `HARW_HOME` —, gebunden genau `context.home`.
+    #[test]
+    fn connection_check_home_follows_the_bound_context() -> TestResult {
+        assert!(
+            RuntimeServices::new(minimal_parts())
+                .connection_check_home()
+                .is_none(),
+            "ohne Bindung kein Root-Space für file:-Referenzen"
+        );
+        let home = tempfile::tempdir()?;
+        let context = test_home_context(home.path())?;
+        let services =
+            RuntimeServices::new(minimal_parts()).with_home_context(Arc::clone(&context));
+        assert_eq!(services.connection_check_home(), Some(context.home.clone()));
+        Ok(())
+    }
+
+    /// Der gebundene Home-Kontext liegt auf jeder Fläche — dieselbe
+    /// `Arc`-Instanz —, damit Operationen den Root-Space von dort lesen
+    /// (Ausnahmen: Moduldoku, Abschnitt Root-Space); ohne Bindung fehlt er
+    /// überall.
+    #[test]
+    fn home_context_is_on_every_surface_when_bound() -> TestResult {
+        let home = tempfile::tempdir()?;
+        let context = test_home_context(home.path())?;
+        let unbound = RuntimeServices::new(full_parts());
+        let bound = RuntimeServices::new(full_parts()).with_home_context(Arc::clone(&context));
+        for surface in ServiceSurface::ALL {
+            assert!(
+                bound
+                    .registered(surface)
+                    .contains(&type_name::<Arc<harw_home::ResolvedHomeContext>>()),
+                "{} braucht den Home-Kontext",
+                surface.as_str()
+            );
+            let map = bound.service_map(surface);
+            let Some(found) = map.get::<Arc<harw_home::ResolvedHomeContext>>() else {
+                return Err(TestError::Missing(
+                    "gebundener Home-Kontext fehlt in der Map",
+                ));
+            };
+            assert!(
+                Arc::ptr_eq(found, &context),
+                "{}: derselbe Arc, kein Klon des Kontexts",
+                surface.as_str()
+            );
+
+            assert!(
+                !unbound
+                    .registered(surface)
+                    .contains(&type_name::<Arc<harw_home::ResolvedHomeContext>>()),
+                "{} darf ohne Bindung keinen Home-Kontext melden",
+                surface.as_str()
+            );
+            assert!(
+                unbound
+                    .service_map(surface)
+                    .get::<Arc<harw_home::ResolvedHomeContext>>()
+                    .is_none(),
+                "{} darf ohne Bindung keinen Home-Kontext tragen",
+                surface.as_str()
+            );
+        }
         Ok(())
     }
 

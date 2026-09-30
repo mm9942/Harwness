@@ -60,9 +60,11 @@ pub struct PrReviewArgs {
 /// PR, übergroßem Diff oder fehlender interaktiver Bestätigung bei `--post`.
 pub fn run(args: &PrReviewArgs) -> Result<(), String> {
     let meta = gh_pr_view(args)?;
-    let state = extract_json_string(&meta, "state")
-        .ok_or_else(|| "harw pr-review: `gh pr view` lieferte kein verwertbares \
-                        state-Feld; read-only Abbruch".to_owned())?;
+    let state = extract_json_string(&meta, "state").ok_or_else(|| {
+        "harw pr-review: `gh pr view` lieferte kein verwertbares \
+                        state-Feld; read-only Abbruch"
+            .to_owned()
+    })?;
     if state != "OPEN" {
         return Err(format!(
             "harw pr-review: PR {} ist nicht offen (state={state}); read-only Abbruch",
@@ -131,7 +133,10 @@ pub fn run(args: &PrReviewArgs) -> Result<(), String> {
     // Bericht ausgeben oder ablegen — die Ablage ist opt-in (`--output`).
     if let Some(out) = &args.output {
         std::fs::write(out, findings_text.as_bytes()).map_err(|error| {
-            format!("harw pr-review: Bericht {} nicht schreibbar: {error}", out.display())
+            format!(
+                "harw pr-review: Bericht {} nicht schreibbar: {error}",
+                out.display()
+            )
         })?;
     } else {
         println!("{findings_text}");
@@ -166,13 +171,11 @@ fn gh_pr_view(args: &PrReviewArgs) -> Result<String, String> {
     if let Some(repo) = &args.repo {
         gh.arg("--repo").arg(repo);
     }
-    let output = gh
-        .output()
-        .map_err(|error| {
-            format!(
-                "harw pr-review: `gh` nicht startbar (gh-CLI installiert und authentifiziert?): {error}"
-            )
-        })?;
+    let output = gh.output().map_err(|error| {
+        format!(
+            "harw pr-review: `gh` nicht startbar (gh-CLI installiert und authentifiziert?): {error}"
+        )
+    })?;
     if !output.status.success() {
         // stderr des Kindes ist nicht vertrauenswürdiger Input: nur der
         // Exit-Code wird gemeldet, der Inhalt wird nicht interpretiert.
@@ -210,8 +213,10 @@ fn gh_pr_diff(args: &PrReviewArgs) -> Result<Vec<u8>, String> {
 /// Interaktive Bestätigung der Veröffentlichung (nur TTY, nur `ja`/`y`).
 fn confirm_publish(pr: u64) -> bool {
     use std::io::BufRead;
-    eprint!("harw pr-review: Findings von PR {pr} wirklich als GitHub-Kommentar \
-             veröffentlichen? [ja/NEIN] ");
+    eprint!(
+        "harw pr-review: Findings von PR {pr} wirklich als GitHub-Kommentar \
+             veröffentlichen? [ja/NEIN] "
+    );
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return false;

@@ -2308,7 +2308,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -2325,7 +2324,6 @@ dependencies = [
  "harw-extension-api",
  "harw-operations",
  "harw-research",
- "harw-sandbox",
  "harw-types",
  "serde_json",
  "tokio",
@@ -4060,6 +4058,10 @@ dependencies = [
  "tracing",
  "zeroize",
 ]
+
+[[package]]
+name = "harw-tool-tunnel"
+version = "0.9.0"
 
 [[package]]
 name = "harw-tool-web"

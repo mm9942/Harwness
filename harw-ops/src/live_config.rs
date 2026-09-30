@@ -167,7 +167,11 @@ impl SelectionPersistence for MirroringSelectionPersistence {
         })
     }
 
-    fn persist_role_reasoning_effort(&self, role_key: &str, effort: Option<&str>) -> Option<String> {
+    fn persist_role_reasoning_effort(
+        &self,
+        role_key: &str,
+        effort: Option<&str>,
+    ) -> Option<String> {
         let note = self.inner.persist_role_reasoning_effort(role_key, effort);
         self.on_success(note, |config| {
             let slot = match role_key {

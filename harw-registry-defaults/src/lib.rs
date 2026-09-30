@@ -293,6 +293,16 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "job.logs",
     "job.list",
     "job.wait",
+    // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge (`TUNNEL_TOOLS`,
+    // `profile::TUNNEL_TOOLS`): `tunnel.status`/`tunnel.list` lesen nur den
+    // Zustand verwalteter Tunnels des Aufrufers, `tunnel.stop` beendet nur
+    // einen eigenen Tunnel (Besitzprüfung analog `harw-tool-job`, Wiring
+    // folgt im Plan-Knoten `job-lifecycle`). Keine Schreibwirkung, kein
+    // Prozessstart. `tunnel.start` fragt wie `job.start`/`shell.exec` (nicht
+    // in `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift); bis zur Montage bleibt
+    // der Eintrag die statische Vertrags-Obermenge und nichts wird beworben.
+    "tunnel.status",
+    "tunnel.list",
     // Runde 5, Teil F: `ask_user` (`harw-tool-plan`) liest nur die Antwort der
     // Nutzerin aus einem eigenen Auswahlfenster; es schreibt nichts, startet
     // nichts und geht nicht ins Netz. Nur Wurzel, nur TUI (sonst

@@ -4647,7 +4647,7 @@ specialization = "bridge-contract-test"
 
     // ── W4a/A-BRIDGE: K3 Reducer, K4 question_id, K5 Effort ──────────────────
 
-    /// Alle sieben Permissions (Stand `harw-sandbox`).
+    /// Alle sieben Permissions (Stand `harw-authority`).
     const ALL_PERMISSIONS: [Permission; 7] = [
         Permission::ReadWorkspace,
         Permission::WriteWorkspace,

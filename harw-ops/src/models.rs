@@ -406,9 +406,9 @@ fn handle_set(
 
     // Optionales Reasoning-Gewicht zusätzlich verankern (bestes Bemühen);
     // nur Rollen mit Gewichtsfeld erreichen diese Stelle überhaupt.
-    let effort_note = effort_level
-        .map(|level| persistence.persist_role_reasoning_effort(role.key(), Some(level.to_string()).as_deref()))
-        .flatten();
+    let effort_note = effort_level.and_then(|level| {
+        persistence.persist_role_reasoning_effort(role.key(), Some(level.to_string()).as_deref())
+    });
 
     let note = match (note, effort_note) {
         (_, Some(extra)) => Some(extra),
@@ -769,7 +769,10 @@ mod tests {
                     message.contains("kein eigenes Reasoning-Gewicht"),
                     "unerwartete Meldung: {message}"
                 );
-                assert!(message.contains("explorer"), "unerwartete Meldung: {message}");
+                assert!(
+                    message.contains("explorer"),
+                    "unerwartete Meldung: {message}"
+                );
             }
             other => panic!("erwartet InvalidArguments, gefunden: {other:?}"),
         }
