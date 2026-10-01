@@ -297,13 +297,20 @@ policy epoch, and attestation/node binding is re-checked on reuse, not only at
 first boot. Persistent workers inherit no wider mounts or network than the
 ephemeral path; cache volumes are isolated per `WorkerKey`.
 
-Ephemeral one-shot jobs still pass a node-wide resource admission point
-(`max_running_jobs` and a summed RAM budget); per-job `--memory` alone does
+Ephemeral one-shot jobs still pass a node-wide resource admission point.
+The existing `max_running_jobs` gate is per session
+(`JobManagerConfig::max_running_jobs`), so it does not bound a node. W1/W2
+therefore own a shared reservation/release mechanism that counts running
+workers and sums reserved RAM across sessions on the node; a job reserves
+before start and releases on every terminal path. Per-job `--memory` alone does
 not bound the total.
 
-Recovery identity is `(WorkerKey, container id or pidfd+starttime,
-image digest, boot job id, node epoch)`. Containers carry labels
-`harw.worker_key` and `harw.boot_job`; recovery re-verifies against
+Recovery identity is persisted metadata, never a descriptor: `(WorkerKey,
+container id, or PID + process start time for a native process, image digest,
+boot job id, node epoch)`. A pidfd does not survive a restart of the
+supervising process. Recovery opens a fresh pidfd and re-verifies the start
+time before trusting it, following `harw-job-linux/src/recovery.rs`. Containers
+carry labels `harw.worker_key` and `harw.boot_job`; recovery re-verifies against
 `podman inspect` (also over SSH remote) and never adopts on PID or name alone.
 
 ## 4. Node-state integration
@@ -423,7 +430,9 @@ Rules:
 - start boot processes through the existing job system;
 - persist enough runtime identity for safe recovery;
 - route boot/start/stop events through existing job notifications;
-- implement single-flight start and cancellation-safe waiters.
+- implement single-flight start and cancellation-safe waiters;
+- add the shared node-wide reservation/release mechanism (count and summed
+  RAM) used by ephemeral and persistent workers.
 
 ### W3 — P2 Podman integration
 
@@ -465,6 +474,12 @@ Required tests:
    HostRoot eligibility.
 10. A rootless Podman/container-root worker cannot call the host-root path.
 11. Cancellation of all waiters does not orphan a boot job.
+11a. Ownership race: cancel the waiter that created the flight while a second
+    waiter remains; the boot continues, only the first waiter exits, and the
+    second waiter receives the boot result.
+11b. Concurrent one-shot jobs from different sessions are admitted against both
+    the running-worker count and the summed-RAM limit; the excess job is
+    refused or queued with a typed error, never started on the host.
 12. Restart recovery never trusts PID/container name alone; persisted runtime
     identity must be re-verified.
 
