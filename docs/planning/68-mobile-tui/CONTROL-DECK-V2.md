@@ -296,13 +296,28 @@ Edge cases that must be specified by W20-A tests:
   table or count terminal state only from the agent run.
 - **Orphan.** A job tagged `AgentChild` whose agent run was evicted or never
   seen is shown as "Agent child (untracked)", never silently dropped.
+  Pending-to-untracked promotion happens at a replay-stable boundary, not on a
+  wall-clock timer: when the job reaches a terminal state and a fixed number
+  of subsequent agent events (a named constant) passed without a matching
+  `AgentEvent`, or when the session's completion watermark is reached. Both
+  inputs are part of the event stream, so replay promotes at the same point.
+  A test covers pending -> untracked on both boundaries and the case where the
+  `AgentEvent` arrives just before the boundary.
 - **Diverging outcomes.** Agent run `Completed` but job `Failed` (exit != 0):
   the agent run still owns the count, and the aggregate carries a
   "job exit != 0" badge so the signal is not lost.
 - `JobOrigin.owner_agent` is a display name and is never used as provenance.
-  Prefer one serialized tagged enum in `meta.json` / `JobEvent::Started`
-  (`#[serde(default)]` = `Unknown`) over additional `Option` fields, so
-  contradictory combinations are unrepresentable.
+  Prefer one serialized tagged enum in `meta.json` / `JobEvent::Started` over
+  additional `Option` fields, so contradictory combinations are
+  unrepresentable.
+- **Legacy compatibility.** Today `meta.json` and `JobEvent::Started` already
+  carry `origin_call_id` and `origin_tool`. They stay readable and are mapped:
+  when the new tagged `origin` is absent and `origin_tool` is present, the
+  record reads as `Tool { tool, call_id }`; when both are absent it reads as
+  `Unknown`. New records may write the tagged field in addition to the legacy
+  fields during a transition (or a version marker selects the reader), so
+  existing tool-origin categorization is not lost. Tests use pre-change
+  fixtures for both the stored meta and the `Started` event.
 
 ## 5. Active-agents pane
 
@@ -313,7 +328,8 @@ Include:
 - active/waiting agent rows;
 - role;
 - short task/current tool when it fits;
-- elapsed time;
+- elapsed time (a presentation field, see the time-input rule in the W20
+  contract, not part of the pure projection);
 - context gauge/percentage when space remains.
 
 Do not place terminal runs here.
@@ -486,9 +502,14 @@ TERM, then the existing job stop policy if it does not exit.
 
 The confirmation is a UI step only. Admission remains in the operation path.
 
-If the job reached a terminal state between confirmation and dispatch, the
-operation's "already finished" result is shown as such, not as a generic
-error. W20-E documents whether `/jobs` is admitted while a turn is busy.
+Current behavior, which W20 keeps: `JobManager::stop` returns `Ok(status)` for
+an already-terminal job and `JobsOperation` reports it as a sent signal; `/jobs`
+is registered `busy = "immediate"`, so it is admitted while a turn runs. The
+panel therefore does not rely on a special operation result. It compares the
+job state it showed at confirmation with the state after the next refresh and
+shows "already finished" itself when the job was already terminal. Adding an
+explicit "already finished" result to `JobsOperation` is an optional,
+separate operation change and is not part of W20-E unless the owner asks.
 
 ## 10. Presentation state
 
