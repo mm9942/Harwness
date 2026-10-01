@@ -47,6 +47,7 @@ use harw_knowledge::memory::recall::search;
 use harw_knowledge::{
     ArtifactKind, KnowledgeArtifact, KnowledgeIndex, KnowledgeStore, RecallQuery, VisibilityScope,
 };
+use harw_tools::args::parse_args;
 use harw_tools::schema_helpers::{object_schema, property};
 use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
@@ -287,11 +288,9 @@ fn palace_query(text: &str, max_hops: u8, limit: usize) -> RecallQuery {
 
 /// Kern von `palace.search` (testbar ohne Sandbox-Kontext).
 fn execute_search(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolOutput {
-    let args: SearchArgs = match serde_json::from_value(arguments) {
+    let args: SearchArgs = match parse_args(PALACE_SEARCH, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{PALACE_SEARCH}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     if args.query.trim().is_empty() {
         return ToolOutput::error(format!("{PALACE_SEARCH}: query ist leer"));
@@ -333,11 +332,9 @@ fn execute_search(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolO
 
 /// Kern von `palace.recall` (testbar ohne Sandbox-Kontext).
 fn execute_recall(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolOutput {
-    let args: RecallArgs = match serde_json::from_value(arguments) {
+    let args: RecallArgs = match parse_args(PALACE_RECALL, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{PALACE_RECALL}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     if args.query.trim().is_empty() {
         return ToolOutput::error(format!("{PALACE_RECALL}: query ist leer"));

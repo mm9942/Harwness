@@ -53,6 +53,7 @@ use harw_extension_api::{
 };
 use harw_knowledge::workbench::{self, DigestOptions, WorkbenchScope};
 use harw_knowledge::{AgentId, KnowledgeStore};
+use harw_tools::args::parse_args;
 use harw_tools::schema_helpers::{object_schema_all_required, string_property};
 use harw_tools::{FunctionToolSpec, Permission};
 use serde::Deserialize;
@@ -283,11 +284,9 @@ fn execute_note(
     arguments: serde_json::Value,
     now: jiff::Timestamp,
 ) -> ToolOutput {
-    let args: NoteArgs = match serde_json::from_value(arguments) {
+    let args: NoteArgs = match parse_args(WORKBENCH_NOTE, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{WORKBENCH_NOTE}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     let scope = WorkbenchScope::Session(session_id.to_owned());
     match workbench::append_note(store, &scope, &model_author(session_id), &args.text, now) {
@@ -306,13 +305,9 @@ fn execute_hypothesis(
     arguments: serde_json::Value,
     now: jiff::Timestamp,
 ) -> ToolOutput {
-    let args: HypothesisArgs = match serde_json::from_value(arguments) {
+    let args: HypothesisArgs = match parse_args(WORKBENCH_HYPOTHESIS, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!(
-                "{WORKBENCH_HYPOTHESIS}: ungültige Argumente: {error}"
-            ));
-        }
+        Err(out) => return out,
     };
     let scope = WorkbenchScope::Session(session_id.to_owned());
     let author = model_author(session_id);
@@ -464,11 +459,9 @@ fn execute_show(
     project: Option<&WorkbenchScope>,
     arguments: serde_json::Value,
 ) -> ToolOutput {
-    let args: ShowArgs = match serde_json::from_value(arguments) {
+    let args: ShowArgs = match parse_args(WORKBENCH_SHOW, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{WORKBENCH_SHOW}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     let scope = match args.scope.as_str() {
         "session" => WorkbenchScope::Session(session_id.to_owned()),

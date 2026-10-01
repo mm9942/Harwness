@@ -53,6 +53,7 @@ use harw_knowledge::KnowledgeStore;
 use harw_knowledge::kanban::board::{self, BoardId, CardId, CardRecord, CardState, LaneKind};
 use harw_knowledge::kanban::lifecycle::JobTransitions;
 use harw_knowledge::kanban::notes;
+use harw_tools::args::{parse_args, parse_args_or_default};
 use harw_tools::schema_helpers::{property, strict_object_schema};
 use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
@@ -265,17 +266,6 @@ struct ShowArgs {
     board: Option<String>,
 }
 
-fn parse_args<T: serde::de::DeserializeOwned + Default>(
-    tool: &str,
-    arguments: serde_json::Value,
-) -> Result<T, ToolOutput> {
-    if arguments.is_null() {
-        return Ok(T::default());
-    }
-    serde_json::from_value(arguments)
-        .map_err(|error| ToolOutput::error(format!("{tool}: ungültige Argumente: {error}")))
-}
-
 /// Board-Id aus dem Argument; leer bzw. fehlend heißt `default`.
 fn board_of(raw: Option<&str>) -> BoardId {
     BoardId::new(
@@ -308,7 +298,7 @@ fn execute_list(
     arguments: serde_json::Value,
 ) -> ToolOutput {
     let fail = |detail: String| ToolOutput::error(format!("{KANBAN_LIST}: {detail}"));
-    let args: ListArgs = match parse_args(KANBAN_LIST, arguments) {
+    let args: ListArgs = match parse_args_or_default(KANBAN_LIST, &arguments) {
         Ok(args) => args,
         Err(output) => return output,
     };
@@ -412,9 +402,9 @@ fn execute_show(
     arguments: serde_json::Value,
 ) -> ToolOutput {
     let fail = |detail: String| ToolOutput::error(format!("{KANBAN_SHOW}: {detail}"));
-    let args: ShowArgs = match serde_json::from_value(arguments) {
+    let args: ShowArgs = match parse_args(KANBAN_SHOW, &arguments) {
         Ok(args) => args,
-        Err(error) => return fail(format!("ungültige Argumente: {error}")),
+        Err(out) => return out,
     };
     let board_id = board_of(args.board.as_deref());
     let card_id = CardId::new(args.card.trim());

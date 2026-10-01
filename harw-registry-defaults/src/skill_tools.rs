@@ -44,6 +44,7 @@ use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
+use harw_tools::args::parse_args_null_as_object;
 use harw_tools::schema_helpers::{object_schema, property};
 use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
@@ -237,23 +238,9 @@ struct LoadArgs {
     section: Option<String>,
 }
 
-/// Parst die Argumente; `null` als Ganzes gilt als leeres Objekt.
-fn parse<T: serde::de::DeserializeOwned>(
-    tool: &str,
-    arguments: serde_json::Value,
-) -> Result<T, ToolOutput> {
-    let arguments = if arguments.is_null() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        arguments
-    };
-    serde_json::from_value(arguments)
-        .map_err(|error| ToolOutput::error(format!("{tool}: ungültige Argumente: {error}")))
-}
-
 /// Kern von `skills.search` (testbar ohne Sandbox-Kontext).
 fn execute_search(index: &SkillIndex, arguments: serde_json::Value) -> ToolOutput {
-    let args: SearchArgs = match parse(SKILLS_SEARCH, arguments) {
+    let args: SearchArgs = match parse_args_null_as_object(SKILLS_SEARCH, &arguments) {
         Ok(args) => args,
         Err(output) => return output,
     };
@@ -310,7 +297,7 @@ fn execute_search(index: &SkillIndex, arguments: serde_json::Value) -> ToolOutpu
 
 /// Kern von `skills.load` (testbar ohne Sandbox-Kontext).
 fn execute_load(index: &SkillIndex, arguments: serde_json::Value) -> ToolOutput {
-    let args: LoadArgs = match parse(SKILLS_LOAD, arguments) {
+    let args: LoadArgs = match parse_args_null_as_object(SKILLS_LOAD, &arguments) {
         Ok(args) => args,
         Err(output) => return output,
     };
