@@ -165,7 +165,18 @@ all routing or multi-session behavior already exists.
 - Goal-follow mode is read-only: it changes no permissions, approvals or step
   statuses, and does not mark unsupported work complete.
 
-## 6. Boundaries and review notes
+## 6. Installable candidate gate
+
+The current Draft PR is **not automatically installable**. Installation is not
+part of draft review and must wait until the TUI and Goal-follow-mode
+implementation is complete and the one-time consolidated build, test and review
+evidence (`h5`) has been collected successfully. Only then, at `h10`, name an
+exact commit and branch as the candidate. Before any installation, verify the
+concrete target system, affected services, backup and rollback plan, and exact
+installation commands. Obtain explicit approval before making any host, sudo,
+or service changes. This gate does not authorize installation or merging.
+
+## 7. Boundaries and review notes
 
 - No broad Cloudflare/remote-session backend or transport changes are part of
   this TUI work package.
