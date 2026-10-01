@@ -18,6 +18,7 @@ pub mod ceiling;
 pub mod children;
 pub mod config;
 pub mod contributors;
+pub mod deployment;
 pub mod diary_wiring;
 pub mod dream_run;
 // #22 Welle 3A: eingebettete Agenten-Artefakte (`EntryKind::CompiledAgent`).
