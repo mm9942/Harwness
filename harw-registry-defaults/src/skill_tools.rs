@@ -44,7 +44,8 @@ use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::schema_helpers::{object_schema, property};
+use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
 
 /// Name des Such-Werkzeugs.
@@ -134,40 +135,22 @@ impl ToolProvider for SkillCatalogToolProvider {
     }
 }
 
-fn typed(schema_type: JsonSchemaType, description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(schema_type),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-}
-
 fn search_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "query".to_owned(),
-        typed(
+        property(
             JsonSchemaType::String,
             "Stichwörter (Thema, Technik, Werkzeug). Leer: alle Skills alphabetisch.",
         ),
     );
     props.insert(
         "limit".to_owned(),
-        typed(JsonSchemaType::Integer, "Höchstzahl Treffer (1–30)."),
+        property(JsonSchemaType::Integer, "Höchstzahl Treffer (1–30)."),
     );
     props.insert(
         "offset".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Überspringt so viele Treffer (Blättern).",
         ),
@@ -188,11 +171,11 @@ fn load_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "name".to_owned(),
-        typed(JsonSchemaType::String, "Skill-Name aus skills.search."),
+        property(JsonSchemaType::String, "Skill-Name aus skills.search."),
     );
     props.insert(
         "section".to_owned(),
-        typed(
+        property(
             JsonSchemaType::String,
             "Optional: nur diesen ##-Abschnitt laden (Überschrift oder Teil davon).",
         ),

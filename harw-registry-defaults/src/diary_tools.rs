@@ -44,6 +44,7 @@ use harw_extension_api::{
 };
 use harw_knowledge::diary::{self, DiaryTrigger};
 use harw_knowledge::{AgentId, KnowledgeStore};
+use harw_tools::schema_helpers::string_property;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
 use serde::Deserialize;
 
@@ -103,14 +104,6 @@ impl ToolProvider for DiaryToolProvider {
                 agent: self.agent.clone(),
             }) as Arc<dyn ToolExecutor>
         })
-    }
-}
-
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
     }
 }
 

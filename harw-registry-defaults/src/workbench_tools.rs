@@ -53,7 +53,8 @@ use harw_extension_api::{
 };
 use harw_knowledge::workbench::{self, DigestOptions, WorkbenchScope};
 use harw_knowledge::{AgentId, KnowledgeStore};
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::schema_helpers::{object_schema_all_required, string_property};
+use harw_tools::{FunctionToolSpec, Permission};
 use serde::Deserialize;
 
 /// Name des Notiz-Werkzeugs.
@@ -158,25 +159,6 @@ impl ToolProvider for WorkbenchToolProvider {
     }
 }
 
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>) -> JsonSchema {
-    let required = props.keys().cloned().collect();
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-}
-
 fn note_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
@@ -189,7 +171,7 @@ fn note_spec() -> ToolSpec {
              Zwischenstände, Beobachtungen, nächste Schritte. Flüchtig per Design, \
              wird nicht ins Gedächtnis übernommen. Ändert keine Workspace-Datei."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -218,7 +200,7 @@ fn hypothesis_spec() -> ToolSpec {
              (hypotheses.md): offene Vermutungen festhalten und später bestätigen oder \
              verwerfen. Eine entschiedene Hypothese kann nicht erneut entschieden werden."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -440,7 +422,7 @@ fn show_spec() -> ToolSpec {
              kein Dateiinhalt), Hypothesen mit Nummer #<n> und das Ende der Notizen. \
              Gekürzt auf 4 KiB. Nur die eigene Sitzung bzw. das eigene Projekt."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }

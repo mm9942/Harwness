@@ -53,7 +53,8 @@ use harw_knowledge::KnowledgeStore;
 use harw_knowledge::kanban::board::{self, BoardId, CardId, CardRecord, CardState, LaneKind};
 use harw_knowledge::kanban::lifecycle::JobTransitions;
 use harw_knowledge::kanban::notes;
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::schema_helpers::{property, strict_object_schema};
+use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
 
 /// Name des Überblick-Werkzeugs.
@@ -159,25 +160,6 @@ impl ToolProvider for KanbanReadToolProvider {
     }
 }
 
-fn property(schema_type: JsonSchemaType, description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(schema_type),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-    .into_strict()
-}
-
 fn list_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
@@ -206,7 +188,7 @@ fn list_spec() -> ToolSpec {
              Karten und {} KiB. Details einer Karte liefert kanban.show. {USAGE_RULE}",
             MAX_OUTPUT_BYTES / 1024
         ),
-        parameters: object_schema(props, &[]),
+        parameters: strict_object_schema(props, &[]),
         strict: true,
     })
 }
@@ -229,7 +211,7 @@ fn show_spec() -> ToolSpec {
              {USAGE_RULE}",
             MAX_OUTPUT_BYTES / 1024
         ),
-        parameters: object_schema(props, &["card"]),
+        parameters: strict_object_schema(props, &["card"]),
         strict: true,
     })
 }

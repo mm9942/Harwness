@@ -47,7 +47,8 @@ use harw_knowledge::memory::recall::search;
 use harw_knowledge::{
     ArtifactKind, KnowledgeArtifact, KnowledgeIndex, KnowledgeStore, RecallQuery, VisibilityScope,
 };
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::schema_helpers::{object_schema, property};
+use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
 
 /// Name des Such-Werkzeugs.
@@ -130,33 +131,15 @@ impl ToolProvider for PalaceToolProvider {
     }
 }
 
-fn typed(schema_type: JsonSchemaType, description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(schema_type),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-}
-
 fn search_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "query".to_owned(),
-        typed(JsonSchemaType::String, "Stichwörter für die Suche."),
+        property(JsonSchemaType::String, "Stichwörter für die Suche."),
     );
     props.insert(
         "limit".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Höchstzahl Treffer (1–20, Vorgabe 5).",
         ),
@@ -176,18 +159,18 @@ fn recall_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "query".to_owned(),
-        typed(JsonSchemaType::String, "Stichwörter für den Recall."),
+        property(JsonSchemaType::String, "Stichwörter für den Recall."),
     );
     props.insert(
         "max_hops".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Wie viele Backlink-Hops vom Treffer aus mitgenommen werden (0–2, Vorgabe 1).",
         ),
     );
     props.insert(
         "limit".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Höchstzahl Knoten insgesamt (1–10, Vorgabe 5).",
         ),
