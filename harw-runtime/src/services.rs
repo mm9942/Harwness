@@ -1110,7 +1110,9 @@ impl RuntimeServices {
     /// `home` des gebundenen [`harw_home::ResolvedHomeContext`]; ohne Bindung
     /// `None` — nie ein Rückgriff auf `HARW_HOME` oder `harw_home::home_dir()`.
     fn connection_check_home(&self) -> Option<std::path::PathBuf> {
-        self.home_context.as_ref().map(|context| context.home.clone())
+        self.home_context
+            .as_ref()
+            .map(|context| context.home.clone())
     }
 
     /// Das Kanban-Job-Ledger einer Fläche.
@@ -2093,10 +2095,7 @@ mod tests {
         let context = test_home_context(home.path())?;
         let services =
             RuntimeServices::new(minimal_parts()).with_home_context(Arc::clone(&context));
-        assert_eq!(
-            services.connection_check_home(),
-            Some(context.home.clone())
-        );
+        assert_eq!(services.connection_check_home(), Some(context.home.clone()));
         Ok(())
     }
 
@@ -2120,7 +2119,9 @@ mod tests {
             );
             let map = bound.service_map(surface);
             let Some(found) = map.get::<Arc<harw_home::ResolvedHomeContext>>() else {
-                return Err(TestError::Missing("gebundener Home-Kontext fehlt in der Map"));
+                return Err(TestError::Missing(
+                    "gebundener Home-Kontext fehlt in der Map",
+                ));
             };
             assert!(
                 Arc::ptr_eq(found, &context),

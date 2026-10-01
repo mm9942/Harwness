@@ -1129,7 +1129,10 @@ mod tests {
         .map_err(ctx("record --global"))?;
 
         let store = FactStore::open(
-            home.path().join("profiles").join("default").join("memories"),
+            home.path()
+                .join("profiles")
+                .join("default")
+                .join("memories"),
             FactScope::Global,
         )
         .map_err(ctx("open bound global store"))?;
