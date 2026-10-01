@@ -45,6 +45,7 @@ mod home;
 mod job_worker;
 mod jobs_cmd;
 mod knowledge_cmd;
+mod worker_cmd;
 mod lens;
 mod lifecycle;
 mod mcp;
@@ -596,6 +597,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::Worker { .. } => "worker",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
             Command::Serve { .. } => "serve",
@@ -695,6 +697,7 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
         Some(
             Command::Session { .. }
             | Command::Jobs { .. }
+            | Command::Worker { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
             | Command::Provider { .. },
@@ -869,6 +872,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Worker { action }) => worker_cmd::run(&global, action),
         Some(Command::PrReview(args)) => {
             let args = crate::pr_review::PrReviewArgs {
                 pr: args.pr,
@@ -1011,6 +1015,7 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::Worker { .. }
             | Command::PrReview(_)
             | Command::Uia { .. }
             | Command::Analyze(_),

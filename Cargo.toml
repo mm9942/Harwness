@@ -60,6 +60,7 @@ members = [
     "harw-job-store",
     "harw-job-tokio",
     "harw-job-executor-bwrap",
+    "harw-job-executor-podman",
     "harw-job",
     "harw-knowledge",
     "harw-channel",
