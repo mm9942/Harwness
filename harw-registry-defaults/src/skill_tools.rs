@@ -39,7 +39,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use harw_catalog::{MAX_SKILL_LOAD_BYTES, SkillIndex, SkillIndexEntry};
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
@@ -94,13 +93,6 @@ pub struct SkillCatalogToolProvider {
 }
 
 impl SkillCatalogToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[SKILLS_SEARCH, SKILLS_LOAD];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`]: keine
-    /// (siehe Moduldoku).
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[None, None];
-
     /// Baut den Provider über dem Index der Montage.
     #[must_use]
     pub fn new(index: Arc<SkillIndex>) -> Self {
@@ -114,25 +106,18 @@ impl SkillCatalogToolProvider {
     }
 }
 
-impl ToolProvider for SkillCatalogToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![search_spec(), load_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            SKILLS_SEARCH => SkillTool::Search,
-            SKILLS_LOAD => SkillTool::Load,
-            _ => return None,
-        };
-        Some(Arc::new(SkillCatalogExecutor {
-            index: Arc::clone(&self.index),
-            tool,
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        Self::TOOL_NAMES.contains(&name.as_str())
+// Beide Katalog-Werkzeuge lesen nur und deklarieren bewusst keine Rechteklasse
+// (siehe Moduldoku); sie sind parallelsicher.
+harw_tools::tool_provider! {
+    impl for SkillCatalogToolProvider as provider, parallel_safe: all {
+        SKILLS_SEARCH => {
+            spec: search_spec(),
+            executor: SkillCatalogExecutor { index: Arc::clone(&provider.index), tool: SkillTool::Search },
+        },
+        SKILLS_LOAD => {
+            spec: load_spec(),
+            executor: SkillCatalogExecutor { index: Arc::clone(&provider.index), tool: SkillTool::Load },
+        },
     }
 }
 
@@ -384,6 +369,7 @@ fn unknown_skill_message(index: &SkillIndex, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
     use serde_json::json;
 
     fn bundled_index() -> Arc<SkillIndex> {

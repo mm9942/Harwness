@@ -25,11 +25,9 @@
 //! # Nebenläufigkeit
 //! `Send + Sync`; [`ToolProvider::parallel_safe`] ist `false` für alle vier.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use harw_authority::Permission;
-use harw_extension_api::ToolProvider;
 use harw_tools::schema_helpers::{object_schema_from_pairs, string_property};
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
@@ -87,25 +85,6 @@ pub struct PlanToolProvider {
 }
 
 impl PlanToolProvider {
-    /// Die Werkzeugnamen dieses Providers.
-    pub const TOOL_NAMES: &'static [&'static str] = &[
-        PLAN_WRITE_TOOL,
-        PLAN_EXIT_TOOL,
-        PLAN_ENTER_TOOL,
-        ASK_USER_TOOL,
-    ];
-
-    /// Die Rechteklasse je Werkzeug (gleiche Reihenfolge wie
-    /// [`Self::TOOL_NAMES`]): alle `ReadWorkspace`. `plan.write` schreibt nur
-    /// das Harness-Artefakt `.harw/plans/<slug>.md` und muss unter der
-    /// Plan-Decke (ohne `WriteWorkspace`) laufen.
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider.
     ///
     /// # Arguments
@@ -142,10 +121,16 @@ impl PlanToolProvider {
     }
 }
 
-impl ToolProvider for PlanToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![
-            Self::spec(
+// Die vier Plan-Werkzeuge der Wurzel. Alle sind `ReadWorkspace` (siehe
+// `TOOL_PERMISSIONS`): `plan.write` schreibt nur das Harness-Artefakt
+// `.harw/plans/<slug>.md` und muss unter der Plan-Decke (ohne
+// `WriteWorkspace`) laufen. Kein Werkzeug ist parallelsicher (`none`).
+// `tool_provider!` erzeugt `impl ToolProvider`, `TOOL_NAMES`,
+// `TOOL_PERMISSIONS` und die Compile-Zeit-Prüfung doppelter Namen.
+harw_tools::tool_provider! {
+    impl for PlanToolProvider as provider, parallel_safe: none {
+        PLAN_WRITE_TOOL => {
+            spec: Self::spec(
                 PLAN_WRITE_TOOL,
                 &format!(
                     "Write (or overwrite) your plan as Markdown to {}/<slug>.md. The only \
@@ -174,7 +159,14 @@ impl ToolProvider for PlanToolProvider {
                     &["content"],
                 ),
             ),
-            Self::spec(
+            permission: Permission::ReadWorkspace,
+            executor: PlanToolExecutor {
+                kind: PlanToolKind::Write,
+                provider: provider.clone(),
+            },
+        },
+        PLAN_EXIT_TOOL => {
+            spec: Self::spec(
                 PLAN_EXIT_TOOL,
                 "Present the finished plan to the user for approval (like ExitPlanMode). The TUI \
                  shows it with three options: implement in auto mode, implement with per-change \
@@ -191,7 +183,14 @@ impl ToolProvider for PlanToolProvider {
                     &["plan_path"],
                 ),
             ),
-            Self::spec(
+            permission: Permission::ReadWorkspace,
+            executor: PlanToolExecutor {
+                kind: PlanToolKind::Exit,
+                provider: provider.clone(),
+            },
+        },
+        PLAN_ENTER_TOOL => {
+            spec: Self::spec(
                 PLAN_ENTER_TOOL,
                 "Suggest switching to plan mode (read-only exploration, then a written plan) for \
                  a larger or risky task. The user must confirm; nothing changes without her.",
@@ -203,7 +202,14 @@ impl ToolProvider for PlanToolProvider {
                     &["reason"],
                 ),
             ),
-            Self::spec(
+            permission: Permission::ReadWorkspace,
+            executor: PlanToolExecutor {
+                kind: PlanToolKind::Enter,
+                provider: provider.clone(),
+            },
+        },
+        ASK_USER_TOOL => {
+            spec: Self::spec(
                 ASK_USER_TOOL,
                 "Ask the user 1-4 multiple-choice questions (2-4 options each, free text \
                  'Other' is always offered) in a selection window and get her answers. Use it \
@@ -211,28 +217,14 @@ impl ToolProvider for PlanToolProvider {
                  the interactive TUI: then make an assumption and state it.",
                 ask_user::parameter_schema(),
             ),
-        ]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let kind = match name.as_str() {
-            PLAN_WRITE_TOOL => PlanToolKind::Write,
-            PLAN_EXIT_TOOL => PlanToolKind::Exit,
-            PLAN_ENTER_TOOL => PlanToolKind::Enter,
-            ASK_USER_TOOL => PlanToolKind::AskUser,
-            _ => return None,
-        };
-        Some(Arc::new(PlanToolExecutor {
-            kind,
-            provider: self.clone(),
-        }))
-    }
-
-    fn parallel_safe(&self, _name: &ToolName) -> bool {
-        false
+            permission: Permission::ReadWorkspace,
+            executor: PlanToolExecutor {
+                kind: PlanToolKind::AskUser,
+                provider: provider.clone(),
+            },
+        },
     }
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanToolKind {
     Write,
@@ -559,6 +551,7 @@ mod tests {
     use crate::prompt::{AskUserAnswer, QuestionAnswer, plan_ui_channel};
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_extension_api::ToolProvider;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
 
     struct Fixture {

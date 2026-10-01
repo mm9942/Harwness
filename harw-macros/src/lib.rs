@@ -174,6 +174,8 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// | `permission` | `= "..."` | none | sandbox permission checked before anything else |
 /// | `host_from` | `= "<field>"` | none | args field holding the URL whose host is checked |
 /// | `parallel_safe` | flag or `= true`/`= false` | `false` | whether concurrent calls are safe |
+/// | `state` | `= Type` | none | the executor carries a `Type`; the fn takes `&Type` as an extra first argument |
+/// | `schema_from` | `= path` | none | `path()` returns the `ToolSpec` (externally built schema) instead of `Args::tool_spec()` |
 ///
 /// Accepted `permission` values are `"read_workspace"`, `"write_workspace"`,
 /// `"execute_process"`, `"network_access"`, `"read_secrets"`,
@@ -182,11 +184,38 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// allowed set rather than a silent fallback onto a different permission; a
 /// typo must never resolve to a *different* (possibly weaker) permission.
 ///
+/// # Stateful tools and external schemas
+///
+/// ```ignore
+/// #[tool(
+///     name = "palace.search",
+///     permission = "read_workspace",
+///     state = Arc<KnowledgeStore>,
+///     schema_from = search_spec,
+///     parallel_safe,
+/// )]
+/// async fn palace_search(
+///     store: &Arc<KnowledgeStore>,
+///     context: &ToolExecutionContext,
+///     args: SearchArgs,
+/// ) -> Result<ToolOutput, ToolsError> { ... }
+/// ```
+///
+/// With `state = Type` the wrapper is `struct PalaceSearchTool { state: Type }`
+/// with `PalaceSearchTool::new(state)` (no `Default`, no `Copy`; `Type` must be
+/// `Debug + Clone`) and the function receives `&Type` as its first argument. A
+/// `tool_provider!` with `state` builds such tools from a constructor
+/// expression. With `schema_from = path`, `spec()` calls `path()` (which must
+/// return `::harw_tools::ToolSpec`) and the args type does not need
+/// `#[derive(Tool)]`; name and description are still overwritten from
+/// `NAME` / `DESCRIPTION`.
+///
 /// # What is generated
 ///
 /// 1. The original `async fn`, unchanged.
-/// 2. A unit wrapper struct (`FsGlobTool`) deriving `Debug`, `Clone`, `Copy`
-///    and `Default`.
+/// 2. A wrapper struct (`FsGlobTool`) — a unit struct deriving `Debug`,
+///    `Clone`, `Copy` and `Default`, or (with `state`) a one-field struct with
+///    `new(state)`.
 /// 3. Associated consts `NAME`, `DESCRIPTION`, `PARALLEL_SAFE: bool` and
 ///    `PERMISSION: Option<::harw_tools::Permission>`. `PERMISSION` is the
 ///    auditable declaration; the prologue below is the actual enforcement.

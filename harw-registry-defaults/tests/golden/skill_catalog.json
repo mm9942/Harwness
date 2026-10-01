@@ -1,0 +1,66 @@
+{
+  "has_executor": {
+    "skills.load": true,
+    "skills.search": true
+  },
+  "parallel_safe": {
+    "skills.load": true,
+    "skills.search": true
+  },
+  "permissions": [
+    "None",
+    "None"
+  ],
+  "tools": [
+    {
+      "description": "Findet Skills (Arbeitsanleitungen) nach Stichwörtern: Name, Kurzbeschreibung und Quelle je Treffer. Einzige Art, Skills zu finden — nie im Dateisystem suchen. Den Text lädt skills.load. Nur lesend.",
+      "name": "skills.search",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Höchstzahl Treffer (1–30).",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "Überspringt so viele Treffer (Blättern).",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Stichwörter (Thema, Technik, Werkzeug). Leer: alle Skills alphabetisch.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Lädt einen Skill vollständig (höchstens 64 KiB) oder einen Abschnitt davon. Vor der Arbeit laden und befolgen. Nur lesend.",
+      "name": "skills.load",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Skill-Name aus skills.search.",
+            "type": "string"
+          },
+          "section": {
+            "description": "Optional: nur diesen ##-Abschnitt laden (Überschrift oder Teil davon).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

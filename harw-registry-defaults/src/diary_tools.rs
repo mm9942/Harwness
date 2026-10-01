@@ -37,7 +37,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
@@ -73,12 +72,6 @@ pub struct DiaryToolProvider {
 }
 
 impl DiaryToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[DIARY_READ];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[Some(Permission::ReadWorkspace)];
-
     /// Baut den Provider.
     ///
     /// # Argumente
@@ -93,18 +86,18 @@ impl DiaryToolProvider {
     }
 }
 
-impl ToolProvider for DiaryToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![read_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == DIARY_READ).then(|| {
-            Arc::new(DiaryReadExecutor {
-                store: Arc::clone(&self.store),
-                agent: self.agent.clone(),
-            }) as Arc<dyn ToolExecutor>
-        })
+// `diary.read` liest nur das eigene Tagebuch (`ReadWorkspace`); der Provider
+// deklariert keine Parallelitäts-Zusage (Standard `none`).
+harw_tools::tool_provider! {
+    impl for DiaryToolProvider as provider {
+        DIARY_READ => {
+            spec: read_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: DiaryReadExecutor {
+                store: Arc::clone(&provider.store),
+                agent: provider.agent.clone(),
+            },
+        },
     }
 }
 
@@ -302,6 +295,7 @@ fn parse_day(raw: &str) -> Option<jiff::civil::Date> {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
 
     fn temporary_store(label: &str) -> TestResult<Arc<KnowledgeStore>> {
         let nonce = std::time::SystemTime::now()

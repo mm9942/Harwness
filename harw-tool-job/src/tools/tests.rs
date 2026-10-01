@@ -5,6 +5,7 @@ use crate::launcher::{DirectLauncher, ShellJobLauncher};
 use crate::manager::Caller;
 use crate::model::JobState;
 use crate::test_support::{Env, TestError, TestResult, context, ctx, eventually, sandbox};
+use harw_extension_api::contributors::ToolProvider;
 use harw_tool_shell::ShellToolProvider;
 use harw_types::ToolCallId;
 use std::fs;
