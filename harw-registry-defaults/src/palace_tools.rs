@@ -37,7 +37,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
@@ -87,16 +86,6 @@ pub struct PalaceToolProvider {
 }
 
 impl PalaceToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[PALACE_SEARCH, PALACE_RECALL];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`]
-    /// (beide rein lesend).
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider über dem Speicher der Montage.
     ///
     /// # Argumente
@@ -108,25 +97,19 @@ impl PalaceToolProvider {
     }
 }
 
-impl ToolProvider for PalaceToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![search_spec(), recall_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            PALACE_SEARCH => PalaceTool::Search,
-            PALACE_RECALL => PalaceTool::Recall,
-            _ => return None,
-        };
-        Some(Arc::new(PalaceExecutor {
-            store: Arc::clone(&self.store),
-            tool,
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        Self::TOOL_NAMES.contains(&name.as_str())
+// Beide Palace-Werkzeuge lesen nur (`ReadWorkspace`) und sind parallelsicher.
+harw_tools::tool_provider! {
+    impl for PalaceToolProvider as provider, parallel_safe: all {
+        PALACE_SEARCH => {
+            spec: search_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: PalaceExecutor { store: Arc::clone(&provider.store), tool: PalaceTool::Search },
+        },
+        PALACE_RECALL => {
+            spec: recall_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: PalaceExecutor { store: Arc::clone(&provider.store), tool: PalaceTool::Recall },
+        },
     }
 }
 
@@ -426,6 +409,7 @@ fn execute_recall(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolO
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_knowledge::memory::palace::{PalaceStatus, set_status};
     use harw_knowledge::memory::topic;
     use harw_knowledge::{AgentId, ArtifactId, Frontmatter};

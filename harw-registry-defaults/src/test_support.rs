@@ -119,7 +119,8 @@ pub(crate) mod golden {
                 .parent()
                 .ok_or(TestError::Missing("golden file has a parent directory"))?;
             std::fs::create_dir_all(parent).map_err(ctx("golden directory is creatable"))?;
-            let mut text = serde_json::to_string_pretty(actual).map_err(ctx("golden serialises"))?;
+            let mut text =
+                serde_json::to_string_pretty(actual).map_err(ctx("golden serialises"))?;
             text.push('\n');
             std::fs::write(&path, text).map_err(ctx("golden file is writable"))?;
             return Ok(());

@@ -44,7 +44,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
@@ -106,15 +105,6 @@ impl std::fmt::Debug for KanbanReadToolProvider {
 }
 
 impl KanbanReadToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[KANBAN_LIST, KANBAN_SHOW];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider ohne Ledger (gebundene Karten zeigen `unknown`).
     ///
     /// # Argumente
@@ -136,26 +126,27 @@ impl KanbanReadToolProvider {
     }
 }
 
-impl ToolProvider for KanbanReadToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![list_spec(), show_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            KANBAN_LIST => KanbanTool::List,
-            KANBAN_SHOW => KanbanTool::Show,
-            _ => return None,
-        };
-        Some(Arc::new(KanbanReadExecutor {
-            store: Arc::clone(&self.store),
-            ledger: self.ledger.clone(),
-            tool,
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        Self::TOOL_NAMES.contains(&name.as_str())
+// Beide Kanban-Werkzeuge lesen nur (`ReadWorkspace`) und sind parallelsicher.
+harw_tools::tool_provider! {
+    impl for KanbanReadToolProvider as provider, parallel_safe: all {
+        KANBAN_LIST => {
+            spec: list_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: KanbanReadExecutor {
+                store: Arc::clone(&provider.store),
+                ledger: provider.ledger.clone(),
+                tool: KanbanTool::List,
+            },
+        },
+        KANBAN_SHOW => {
+            spec: show_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: KanbanReadExecutor {
+                store: Arc::clone(&provider.store),
+                ledger: provider.ledger.clone(),
+                tool: KanbanTool::Show,
+            },
+        },
     }
 }
 
@@ -517,6 +508,7 @@ fn execute_show(
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_knowledge::kanban::board::{Board, Lane, LaneId, save_board, save_card};
     use harw_knowledge::kanban::lifecycle::InMemoryJobTransitions;
     use harw_knowledge::kanban::notes::{HistoryEntry, HistoryEvent};
