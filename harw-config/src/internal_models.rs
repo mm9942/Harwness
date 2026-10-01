@@ -62,11 +62,12 @@ pub enum InternalModelPoint {
     /// sondern das schnelle Modell des aktiven Providers
     /// ([`fast_model_for_active_provider`]).
     AutoClassifier,
+    WorkDriverJudge,
 }
 
 impl InternalModelPoint {
     /// Alle Stellen in stabiler Reihenfolge (u. a. für Iteration/Merge).
-    pub const ALL: [InternalModelPoint; 11] = [
+    pub const ALL: [InternalModelPoint; 12] = [
         InternalModelPoint::SessionTitle,
         InternalModelPoint::CompactionSummary,
         InternalModelPoint::MemoryConsolidation,
@@ -78,6 +79,7 @@ impl InternalModelPoint {
         InternalModelPoint::RootOrchestrator,
         InternalModelPoint::SubOrchestrator,
         InternalModelPoint::AutoClassifier,
+        InternalModelPoint::WorkDriverJudge,
     ];
 
     /// TOML-/Config-Schlüssel dieser Stelle, z. B. `"session_title"`.
@@ -95,6 +97,7 @@ impl InternalModelPoint {
             Self::RootOrchestrator => "root_orchestrator",
             Self::SubOrchestrator => "sub_orchestrator",
             Self::AutoClassifier => "auto_classifier",
+            Self::WorkDriverJudge => "work_driver_judge",
         }
     }
 
@@ -131,6 +134,9 @@ impl InternalModelPoint {
             Self::SubOrchestrator => "Unter-Orchestrator, der Teilaufgaben weiter verteilt.",
             Self::AutoClassifier => {
                 "Beurteilt im Auto-Modus Werkzeugaufrufe (erlauben, fragen, ablehnen)."
+            }
+            Self::WorkDriverJudge => {
+                "Beurteilt im Auto-Modus, ob delegierte Arbeit abgeschlossen ist."
             }
         }
     }
@@ -170,7 +176,8 @@ impl InternalModelPoint {
             | Self::MemoryConsolidation
             | Self::DreamReflection
             | Self::WorkerSimple
-            | Self::AutoClassifier => "nvidia/nemotron-3.5-lightning",
+            | Self::AutoClassifier
+            | Self::WorkDriverJudge => "nvidia/nemotron-3.5-lightning",
         }
     }
 }
@@ -227,6 +234,9 @@ pub struct InternalModelsToml {
     /// Runde 5, Teil E: `[internal_models.auto_classifier]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_classifier: Option<InternalModelChoice>,
+    /// WorkDriver-Richter-Worker: `[internal_models.work_driver_judge]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_driver_judge: Option<InternalModelChoice>,
 }
 
 impl Default for InternalModelsToml {
@@ -244,6 +254,7 @@ impl Default for InternalModelsToml {
             root_orchestrator: None,
             sub_orchestrator: None,
             auto_classifier: None,
+            work_driver_judge: None,
         }
     }
 }
@@ -264,6 +275,7 @@ impl InternalModelsToml {
             InternalModelPoint::RootOrchestrator => self.root_orchestrator.as_ref(),
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator.as_ref(),
             InternalModelPoint::AutoClassifier => self.auto_classifier.as_ref(),
+            InternalModelPoint::WorkDriverJudge => self.work_driver_judge.as_ref(),
         }
     }
 
@@ -281,6 +293,7 @@ impl InternalModelsToml {
             InternalModelPoint::RootOrchestrator => self.root_orchestrator = choice,
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator = choice,
             InternalModelPoint::AutoClassifier => self.auto_classifier = choice,
+            InternalModelPoint::WorkDriverJudge => self.work_driver_judge = choice,
         }
     }
 }
@@ -682,7 +695,7 @@ mod tests {
     #[test]
     fn test_all_points_have_unique_keys_and_roundtrip() {
         // Runde 5, Teil E: +1 für `auto_classifier`.
-        assert_eq!(InternalModelPoint::ALL.len(), 11);
+        assert_eq!(InternalModelPoint::ALL.len(), 12);
         for point in InternalModelPoint::ALL {
             assert_eq!(InternalModelPoint::parse(point.key()), Some(point));
             let mut toml = InternalModelsToml::default();

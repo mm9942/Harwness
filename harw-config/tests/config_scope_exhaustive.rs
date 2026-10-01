@@ -514,6 +514,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         root_orchestrator,
         sub_orchestrator,
         auto_classifier,
+        work_driver_judge,
     } = InternalModelsToml::default();
     let _ = (
         use_openrouter_defaults,
@@ -528,6 +529,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         root_orchestrator,
         sub_orchestrator,
         auto_classifier,
+        work_driver_judge,
     );
     for path in [
         "internal_models.use_openrouter_defaults",
@@ -543,6 +545,8 @@ fn test_field_table_exhaustive_internal_models_toml() {
         "internal_models.sub_orchestrator",
         // Runde 5, Teil E.
         "internal_models.auto_classifier",
+        // Port 0.9.1.
+        "internal_models.work_driver_judge",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
