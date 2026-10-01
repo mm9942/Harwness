@@ -84,6 +84,11 @@ pub struct UdsConfig {
     pub header_timeout: Duration,
     /// Retry hint sent to clients while draining.
     pub drain_retry_after_ms: u64,
+    /// How long shutdown waits for live connections to finish after the
+    /// drain signal before giving up on them.
+    pub shutdown_grace: Duration,
+    /// How long a stale-socket probe may take. A timeout counts as "alive".
+    pub probe_timeout: Duration,
     /// WebSocket limits.
     pub limits: WsLimits,
 }
@@ -99,6 +104,8 @@ impl UdsConfig {
             max_connections: 16,
             header_timeout: Duration::from_secs(5),
             drain_retry_after_ms: 1000,
+            shutdown_grace: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(1),
             limits: WsLimits::default(),
         }
     }
@@ -109,6 +116,9 @@ impl UdsConfig {
 pub struct UdsServer {
     listener: UnixListener,
     config: UdsConfig,
+    /// Device and inode of the socket this server created, so shutdown only
+    /// unlinks that exact socket.
+    socket_id: (u64, u64),
 }
 
 fn check_private_dir(dir: &Path) -> Result<(), DaemonError> {
@@ -130,10 +140,17 @@ impl UdsServer {
         check_private_dir(dir)?;
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_socket() => {
-                if UnixStream::connect(&path).await.is_ok() {
-                    return Err(DaemonError::AlreadyRunning(path));
+                // Fail closed: only an explicit "connection refused" proves the
+                // socket is stale. A success, a timeout (e.g. a full backlog)
+                // or any other error is treated as a live daemon.
+                let probe =
+                    tokio::time::timeout(config.probe_timeout, UnixStream::connect(&path)).await;
+                match probe {
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(&path)?;
+                    }
+                    _ => return Err(DaemonError::AlreadyRunning(path)),
                 }
-                std::fs::remove_file(&path)?;
             }
             Ok(_) => return Err(DaemonError::NotASocket(path)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -141,7 +158,12 @@ impl UdsServer {
         }
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self { listener, config })
+        let meta = std::fs::symlink_metadata(&path)?;
+        Ok(Self {
+            listener,
+            config,
+            socket_id: (meta.dev(), meta.ino()),
+        })
     }
 
     /// The uid that owns the bound socket file, which is this process's
@@ -152,9 +174,20 @@ impl UdsServer {
     }
 
     /// Accept connections until `shutdown` flips to `true`, then drain the
-    /// host, wait for nothing further, and remove the socket file.
-    pub async fn run(self, host: SessionHost, mut shutdown: watch::Receiver<bool>) {
-        let permits = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
+    /// host, wait up to `shutdown_grace` for live connections to finish, and
+    /// remove the socket file, but only if the path still names the socket
+    /// this server created.
+    ///
+    /// Connections that outlive the grace period are logged; they are not
+    /// aborted here, so the caller's runtime shutdown ends them.
+    pub async fn run(
+        self,
+        host: SessionHost,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), DaemonError> {
+        let max = self.config.max_connections.max(1);
+        let permits = Arc::new(Semaphore::new(max));
+        let socket_id = self.socket_id;
         let config = Arc::new(self.config);
         loop {
             tokio::select! {
@@ -164,13 +197,55 @@ impl UdsServer {
                     }
                 }
                 accepted = self.listener.accept() => {
-                    let Ok((stream, _)) = accepted else { continue };
-                    handle_accept(stream, &host, &config, &permits, &shutdown);
+                    match accepted {
+                        Ok((stream, _)) => {
+                            handle_accept(stream, &host, &config, &permits, &shutdown);
+                        }
+                        Err(error) => {
+                            // Persistent errors such as EMFILE keep the listener
+                            // readable: log and back off instead of spinning.
+                            tracing::error!(%error, "session daemon: accept failed");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        }
+                    }
                 }
             }
         }
         host.drain(config.drain_retry_after_ms);
-        let _ = std::fs::remove_file(&config.socket_path);
+        // Every connection (HTTP phase and upgraded session) holds a permit,
+        // so owning all permits means nothing is left.
+        let all = u32::try_from(max).unwrap_or(u32::MAX);
+        let waited = tokio::time::timeout(config.shutdown_grace, permits.acquire_many(all)).await;
+        if waited.is_err() {
+            let live = max.saturating_sub(permits.available_permits());
+            tracing::warn!(
+                live,
+                "session daemon: connections still open after the grace period"
+            );
+        }
+        remove_own_socket(&config.socket_path, socket_id)
+    }
+}
+
+/// Pause after a failed `accept`.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Unlink `path` only if it still is the socket with `id`; report failures.
+fn remove_own_socket(path: &Path, id: (u64, u64)) -> Result<(), DaemonError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() && (meta.dev(), meta.ino()) == id => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "session daemon: socket path no longer names our socket, not removing it"
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 

@@ -63,7 +63,7 @@ struct Daemon {
     _dir: tempfile::TempDir,
     socket: PathBuf,
     shutdown: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<(), DaemonError>>,
     host: SessionHost,
 }
 
@@ -287,7 +287,7 @@ async fn shutdown_drains_closes_sessions_and_removes_the_socket() -> TestResult 
     .await?;
     assert!(hello.error.is_none());
     d.shutdown.send(true)?;
-    tokio::time::timeout(Duration::from_secs(5), d.task).await??;
+    tokio::time::timeout(Duration::from_secs(5), d.task).await???;
     assert!(!d.socket.exists(), "the socket file is removed on shutdown");
     // The live connection ends (close frame or end of stream).
     let end = tokio::time::timeout(Duration::from_secs(5), async {
@@ -302,5 +302,56 @@ async fn shutdown_drains_closes_sessions_and_removes_the_socket() -> TestResult 
     assert!(end.is_ok(), "live connections are closed while draining");
     assert!(UnixStream::connect(&d.socket).await.is_err());
     let _ = d.host;
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_headers_are_closed_after_the_header_timeout() -> TestResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let d = start(|config, _| config.header_timeout = Duration::from_millis(200)).await?;
+    let mut stream = UnixStream::connect(&d.socket).await?;
+    // A request line and one header, but never the terminating blank line.
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await?;
+    let mut sink = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut sink)).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_does_not_remove_a_replaced_path() -> TestResult {
+    let d = start(|_, _| {}).await?;
+    // Something else now occupies the pathname.
+    std::fs::remove_file(&d.socket)?;
+    std::fs::write(&d.socket, b"not ours")?;
+    d.shutdown.send(true)?;
+    tokio::time::timeout(Duration::from_secs(5), d.task).await???;
+    assert_eq!(std::fs::read(&d.socket)?, b"not ours");
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_waits_a_bounded_time_for_open_connections() -> TestResult {
+    use tokio::io::AsyncWriteExt;
+    let d = start(|config, _| {
+        config.header_timeout = Duration::from_secs(30);
+        config.shutdown_grace = Duration::from_millis(300);
+    })
+    .await?;
+    // A connection stuck in the HTTP phase keeps its permit for 30 s.
+    let mut stuck = UnixStream::connect(&d.socket).await?;
+    stuck.write_all(b"GET / HTTP/1.1\r\n").await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    d.shutdown.send(true)?;
+    tokio::time::timeout(Duration::from_secs(5), d.task).await???;
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(250),
+        "returned too early: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(3),
+        "waited past the grace period: {waited:?}"
+    );
     Ok(())
 }
