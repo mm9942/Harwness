@@ -63,8 +63,16 @@ Resource keys must be canonicalized by the subsystem that owns the resource sema
 The pattern layer must not invent a second path-security resolver.
 
 A resolver error (symlink loop, path outside the workspace, vanished file) makes
-the event standalone: it is neither grouped nor dropped. Renames and symlinks
-must never silently merge two resources into one group.
+the event standalone: it is neither grouped nor dropped.
+
+Alias and rename identity: the `ActivityKey` is the canonical resource
+identity produced by the owning resolver. Paths that the resolver canonicalizes
+to the same file (for example a symlink and its target inside the workspace)
+share one `ActivityKey`, deliberately. A rename is only followed when the
+subsystem emits an explicit rename event (`from`, `to`); the key then rebinds
+to the new canonical identity with provenance. An unobserved rename yields a
+new key. Different subsystems must not decide this differently: the resolver
+owns it, and the pattern layer only consumes the result.
 
 ## Scope
 

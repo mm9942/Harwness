@@ -77,6 +77,23 @@ Acceptance requires examples, counterexamples, deterministic matcher candidate, 
 first reduction == replay reduction
 ```
 
+### Ordering and identity
+
+- the same producer streams, ingested in different arrival orders, reduce to
+  the same projection once the sequencer has assigned `ingest_seq`;
+- a late arrival never rewrites earlier reducer state, it is applied in
+  `ingest_seq` order;
+- a rebase keeps `ProjectionId`; no second projection for the same instance
+  is emitted;
+- a symlink and its in-workspace target group under one `ActivityKey`; an
+  observed rename rebinds the key, an unobserved rename starts a new key.
+
+### Compact failure invariant
+
+- for any event sequence, every failed constituent (including mutating ones)
+  yields a visible nonzero failure indicator in the compact projection, and
+  `compact.failed == sum(constituent.failed)`.
+
 ### Security
 
 - unknown metadata → standalone;
