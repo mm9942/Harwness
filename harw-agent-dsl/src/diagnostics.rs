@@ -153,37 +153,42 @@ pub struct DiagnosticCode {
     pub fix: &'static str,
 }
 
+/// Declares one `pub const` [`DiagnosticCode`] with the doc comment set to its
+/// title. Shared by this crate's catalog and by backends that own a diagnostic
+/// area (e.g. `harw-agent-compiler` for [`Area::Build`]).
+#[macro_export]
+macro_rules! diagnostic_code {
+    (
+        $name:ident,
+        $code:literal,
+        $area:ident,
+        $sev:ident,
+        $title:literal,
+        $help:literal,
+        $example:literal,
+        $fix:literal
+    ) => {
+        #[doc = $title]
+        pub const $name: $crate::diagnostics::DiagnosticCode =
+            $crate::diagnostics::DiagnosticCode {
+                code: $code,
+                area: $crate::diagnostics::Area::$area,
+                severity: $crate::diagnostics::Severity::$sev,
+                title: $title,
+                help: $help,
+                example: $example,
+                fix: $fix,
+            };
+    };
+}
+
 /// All diagnostic codes of this crate, grouped by area.
 ///
 /// # Description
 /// Each constant is one [`DiagnosticCode`]. The numbering inside an area is
 /// assigned here and never reused (DSL §20.1).
 pub mod codes {
-    use super::{Area, DiagnosticCode, Severity};
-
-    macro_rules! code {
-        (
-            $name:ident,
-            $code:literal,
-            $area:ident,
-            $sev:ident,
-            $title:literal,
-            $help:literal,
-            $example:literal,
-            $fix:literal
-        ) => {
-            #[doc = $title]
-            pub const $name: DiagnosticCode = DiagnosticCode {
-                code: $code,
-                area: Area::$area,
-                severity: Severity::$sev,
-                title: $title,
-                help: $help,
-                example: $example,
-                fix: $fix,
-            };
-        };
-    }
+    use crate::diagnostic_code as code;
 
     // ── PARSE ──────────────────────────────────────────────────────────
     code!(
