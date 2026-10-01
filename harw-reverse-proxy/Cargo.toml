@@ -1,0 +1,15 @@
+[package]
+publish.workspace = true
+name = "harw-reverse-proxy"
+description = "Reverse proxy policy core (PL-89 P0): closed route table, host and path normalization, upstream address-class checks via harw-egress, header hygiene. Pure: no sockets, no HTTP stack, no Pingora"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-egress = { path = "../harw-egress" }
+
+[lints]
+workspace = true

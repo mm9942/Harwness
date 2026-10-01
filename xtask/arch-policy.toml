@@ -378,6 +378,8 @@ layer = "A"
 layer = "A"
 [packages."harw-session-ws"]
 layer = "A"
+[packages."harw-reverse-proxy"]
+layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
 [packages."harw-web"]
