@@ -741,8 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_document_set_refuses_non_table_parent_and_leaves_doc_unchanged() -> TestResult
-    {
+    fn test_config_document_set_refuses_non_table_parent_and_leaves_doc_unchanged() -> TestResult {
         let mut doc = ConfigDocument::parse("a = 1\n").map_err(ctx("parse"))?; // Testaufbau
         assert!(!doc.set_bool(&["a", "b"], true));
         assert_eq!(doc.to_string(), "a = 1\n");
@@ -782,8 +781,8 @@ mod tests {
 
     #[test]
     fn test_config_document_remove() -> TestResult {
-        let mut doc = ConfigDocument::parse("keep = 1\ndrop = 2\n[old]\nx = 1\n")
-            .map_err(ctx("parse"))?; // Testaufbau
+        let mut doc =
+            ConfigDocument::parse("keep = 1\ndrop = 2\n[old]\nx = 1\n").map_err(ctx("parse"))?; // Testaufbau
         assert!(doc.remove(&["drop"]));
         assert!(!doc.remove(&["drop"]));
         assert!(doc.remove(&["old"]));
@@ -805,8 +804,7 @@ mod tests {
 
     #[test]
     fn test_config_document_preserves_comments() -> TestResult {
-        let mut doc =
-            ConfigDocument::parse("# Kopf\nkeep = 1 # bleibt\n").map_err(ctx("parse"))?; // Testaufbau
+        let mut doc = ConfigDocument::parse("# Kopf\nkeep = 1 # bleibt\n").map_err(ctx("parse"))?; // Testaufbau
         assert!(doc.set_integer(&["new"], 2));
         let text = doc.to_string();
         assert!(text.contains("# Kopf"), "Kopfkommentar fehlt: {text}");
@@ -816,8 +814,7 @@ mod tests {
 
     #[test]
     fn test_config_document_replace_keeps_comment_above_key() -> TestResult {
-        let mut doc =
-            ConfigDocument::parse("# Kopf\nkeep = 1\n").map_err(ctx("parse"))?; // Testaufbau
+        let mut doc = ConfigDocument::parse("# Kopf\nkeep = 1\n").map_err(ctx("parse"))?; // Testaufbau
         // Ersetzen eines vorhandenen Werts lässt den Schlüssel samt Kommentar stehen.
         assert!(doc.set_integer(&["keep"], 3));
         assert_eq!(doc.get_integer(&["keep"]), Some(3));
