@@ -13,7 +13,8 @@ related:
   - contracts/W00-websocket-control-plane.md
   - contracts/R18-tool-gateway.md
   - ../68-local-cloud-websocket/README.md
-  - ../67-containers/on-demand-worker-boot.md
+  - ../66-placement/README.md
+  - ../67-containers/on-demand-worker-boot.md   # added by PR #80; not on dev until that merges
 ---
 
 # Cloud Home Hub v2
@@ -113,7 +114,7 @@ session-local spawned task:
 - restart/reclaim work in the durable job stack;
 - compiled child agents can already be run through JobManager.
 
-The on-demand worker plan additionally defines the intended activation rule:
+The on-demand worker plan (PR #80, `docs/planning/67-containers/on-demand-worker-boot.md`, not yet on `dev`) additionally defines the intended activation rule:
 
 - unused workers remain cold;
 - boot is job-owned;
@@ -324,10 +325,38 @@ struct HostedSessionLocation {
     tenant: TenantId,
     owner_node: NodeId,
     owner_instance: HarwInstanceId,
+    /// Directory-assigned, monotonic per SessionId. This is the fencing token.
+    placement_generation: u64,
+    /// Owner-local restart counter (`SessionHost::open` bumps it). Only
+    /// comparable within one owner; never a cross-node fencing token.
     host_epoch: u64,
     state: HostedState,
 }
 ```
+
+`host_epoch` is a per-host-store counter: epoch 7 on node A and epoch 7 on
+node B are unrelated. Cross-node single-writer protection therefore needs the
+directory-assigned `placement_generation`. The owning host accepts session
+writes only while it holds the current generation, and a client/route carrying
+an older generation fails closed and refreshes.
+
+The directory has two parts with different durability:
+
+- **Routing entries** (which owner reports which session) are a rebuildable
+  cache. Owners report the sessions they host (registration/heartbeat), so a
+  Cloud Hub restart reconstructs them; unknown locations stay unroutable until
+  an owner reports them.
+- **The generation authority is durable and linearizable.** The Hub persists
+  the highest `placement_generation` issued per `SessionId` (fsync before it is
+  handed out) and rejects any registration or heartbeat that carries a smaller
+  generation than the durable maximum. A cache rebuild can therefore never let
+  a stale owner reconstruct itself as current. v1 has a single Hub; a
+  multi-Hub or failover setup would need a consensus-backed authority and is
+  out of scope.
+
+Required tests: Hub restart with a stale and a current registration competing
+(the stale one is rejected); heartbeat with an older generation after restart;
+generation survives a crash between issue and first use.
 
 V1 does **not** live-migrate an active session.
 
@@ -342,6 +371,14 @@ Why:
   instead of accidental dual ownership.
 
 A stale location must fail closed and force directory refresh.
+
+### 5.1 No cross-node failover in v1
+
+Per PL-65 §6a, transcripts, job store/leases and hosted-session records live
+on one local volume per host and are never shared between machines. A session
+therefore lives on its owner node. If the owner is unreachable, the session is
+unavailable: Continue fails visibly and no other node starts a second writer.
+Replication or migration is a separate, later fenced-transfer design.
 
 ## 6. Multi-node topology for the first real deployment
 
@@ -366,18 +403,21 @@ Each node registers:
 
 Do not infer node role from hostname.
 
+A node may serve several profiles (e.g. Worker + Compile on the Pi). Profiles
+are capability ceilings; combining them is explicit configuration. `CloudHub`
+must not be combined with `ContainerHub`, `WorkerHub` or `CompileHub` in one
+process.
+
+The node lifecycle is owned by the implemented state machine in
+`harw-netsec/src/state_machine.rs` (`NodeState`, `TRANSITIONS`); this document
+and the placement and worker plans reference it and do not redefine it.
+
 ### 6.1 Node lifecycle
 
-At minimum:
-
-```text
-Pending
-Active
-Draining
-Drained
-Revoked
-Offline
-```
+`NodeState` is `Pending`, `Active`, `Draining`, `Drained`, `Revoked`.
+Reachability (`Offline`/online) is **not** a `NodeState`: it is an observed
+liveness flag kept next to the state, so an unreachable `Active` node stays
+`Active` but receives no routes while it is unreachable.
 
 Only Active nodes receive new automatic placements.
 
@@ -385,6 +425,14 @@ Draining:
 
 - no new sessions/jobs;
 - existing bounded work may finish according to policy.
+
+Transitions as implemented (`harw-netsec`): `Pending -> Active` (activate);
+`Active -> Draining` (drain); `Draining -> Drained` (complete drain);
+`Draining|Drained -> Active` (undrain); `Pending|Active|Draining|Drained ->
+Revoked` (revoke). `Revoked` is terminal: a revoked node re-enrols under a
+**new node id** through the Auth/Crypto Hub. Identity authority stays with the
+Auth/Crypto Hub; the Global Cloud Admin can route and revoke but does not
+assign identity. Nodes never self-activate.
 
 Revoked:
 
@@ -408,7 +456,8 @@ This is not cosmetic. It defines whether session identity remains stable.
 6. resync if generation/cursor requires it;
 7. show current live agents/jobs;
 8. if the host marks the session Interrupted and policy requires explicit
-   resume, invoke the existing session-resume intent.
+   resume, invoke the existing session-resume intent. A read-only attach
+   cannot resume; resume needs a Steer client (`[sessions] resume = "manual"`).
 
 Continue does **not** create another root session.
 
@@ -585,7 +634,7 @@ rather than an implicit local process spawned by UI code.
 
 - existing node-owned work does not gain new authority;
 - routing marks location uncertain/offline as appropriate;
-- no second session writer starts until fencing/recovery says it may.
+- no second session writer starts; v1 has no cross-node failover (§5.1).
 
 ### Worker unavailable
 
@@ -806,7 +855,10 @@ Security-sensitive waves additionally need explicit negative tests for:
 - cross-tenant session access;
 - stale/revoked device reconnect;
 - capability widening;
-- second-writer session ownership;
+- second-writer session ownership, including a stale `placement_generation`
+  after a route refresh;
+- Global Cloud Admin reading session content without a separate audited
+  transcript capability;
 - job start without required sandbox;
 - worker fallback to host;
 - container-root -> host-root confusion;
@@ -829,6 +881,11 @@ The Cloud Home v2 slice is successful when:
 11. job/agent control remains on canonical typed authority paths;
 12. Global System Admin, Global Cloud Admin and root-agent are distinct roles;
 13. the first-party attached TUI uses SessionPort rather than owning the hosted
-    turn loop;
+    turn loop. Dependency gate, scoped to what H3/H4 can satisfy: the session
+    client adapter (H3) does not depend on `harw-core`, checked with
+    `cargo tree`. The `harw-cli` binary and `harw-tui` both depend on
+    `harw-core` today, so a core-free whole binary needs either a separate
+    attach executable with a presentation split or the H9 convergence; that is
+    not claimed for H4;
 14. the implementation can later converge local `harw` onto the same client
     model without rewriting the control plane again.
