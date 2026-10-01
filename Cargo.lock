@@ -2210,6 +2210,7 @@ dependencies = [
  "harw-runtime",
  "harw-sandbox",
  "harw-secrets",
+ "harw-session-remote",
  "harw-session-store",
  "harw-tailscale",
  "harw-tool-doc",
@@ -3290,6 +3291,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-node-listener"
+version = "0.9.0"
+dependencies = [
+ "bytes",
+ "harw-node-transport",
+ "harw-protocol",
+ "harw-session-host",
+ "harw-session-ws",
+ "harw-types",
+ "http",
+ "http-body-util",
+ "hyper",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "harw-node-transport"
 version = "0.9.0"
 dependencies = [
@@ -3788,6 +3809,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-session-driver"
+version = "0.9.0"
+dependencies = [
+ "harw-core",
+ "harw-protocol",
+ "harw-session-host",
+ "harw-session-store",
+ "harw-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-session-host"
 version = "0.9.0"
 dependencies = [
@@ -3802,6 +3838,28 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "harw-session-remote"
+version = "0.9.0"
+dependencies = [
+ "bytes",
+ "harw-fsutil",
+ "harw-node-transport",
+ "harw-protocol",
+ "harw-session-ws",
+ "harw-types",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
 ]
