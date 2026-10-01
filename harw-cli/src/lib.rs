@@ -29,6 +29,7 @@
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod agent_cmd;
+mod attach_cmd;
 mod auth;
 mod auth_migrate;
 // #22: automatischer Artefakt-Build der aktiven UIA im Hintergrund.
@@ -588,6 +589,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Exec(_) => "exec",
             Command::Analyze(_) => "analyze",
             Command::Session { .. } => "session",
+            Command::Attach(_) => "attach",
             Command::Config { .. } => "config",
             Command::Provider { .. } => "provider",
             Command::Model { .. } => "model",
@@ -805,6 +807,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             ),
             None => Ok(()),
         },
+        Some(Command::Attach(args)) => attach_cmd::run(&args),
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
             let home = home::resolve_home(home_override)?;
@@ -981,7 +984,8 @@ fn run_startup_migrations(
     let layers = match command {
         // Der Modell-Katalog und der Wissensindex lesen keine Konfiguration.
         Some(
-            Command::Model {
+            Command::Attach(_)
+            | Command::Model {
                 action: Some(ModelsAction::Catalog { .. }),
             }
             | Command::Knowledge {
