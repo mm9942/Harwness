@@ -14,7 +14,7 @@ related:
   - contracts/R18-tool-gateway.md
   - ../68-local-cloud-websocket/README.md
   - ../66-placement/README.md
-  - ../67-containers/on-demand-worker-boot.md
+  - ../67-containers/on-demand-worker-boot.md   # added by PR #80; not on dev until that merges
 ---
 
 # Cloud Home Hub v2
@@ -114,7 +114,7 @@ session-local spawned task:
 - restart/reclaim work in the durable job stack;
 - compiled child agents can already be run through JobManager.
 
-The on-demand worker plan additionally defines the intended activation rule:
+The on-demand worker plan (PR #80, `docs/planning/67-containers/on-demand-worker-boot.md`, not yet on `dev`) additionally defines the intended activation rule:
 
 - unused workers remain cold;
 - boot is job-owned;
@@ -340,10 +340,23 @@ directory-assigned `placement_generation`. The owning host accepts session
 writes only while it holds the current generation, and a client/route carrying
 an older generation fails closed and refreshes.
 
-The directory is a rebuildable routing cache, not the source of truth for
-session content: owners report the sessions they host (registration/heartbeat),
-so a Cloud Hub restart reconstructs it and unknown locations stay unroutable
-until an owner reports them.
+The directory has two parts with different durability:
+
+- **Routing entries** (which owner reports which session) are a rebuildable
+  cache. Owners report the sessions they host (registration/heartbeat), so a
+  Cloud Hub restart reconstructs them; unknown locations stay unroutable until
+  an owner reports them.
+- **The generation authority is durable and linearizable.** The Hub persists
+  the highest `placement_generation` issued per `SessionId` (fsync before it is
+  handed out) and rejects any registration or heartbeat that carries a smaller
+  generation than the durable maximum. A cache rebuild can therefore never let
+  a stale owner reconstruct itself as current. v1 has a single Hub; a
+  multi-Hub or failover setup would need a consensus-backed authority and is
+  out of scope.
+
+Required tests: Hub restart with a stale and a current registration competing
+(the stale one is rejected); heartbeat with an older generation after restart;
+generation survives a crash between issue and first use.
 
 V1 does **not** live-migrate an active session.
 
@@ -363,7 +376,7 @@ A stale location must fail closed and force directory refresh.
 
 Per PL-65 §6a, transcripts, job store/leases and hosted-session records live
 on one local volume per host and are never shared between machines. A session
-therefore lives on its owner node. If the owner is `Offline`, the session is
+therefore lives on its owner node. If the owner is unreachable, the session is
 unavailable: Continue fails visibly and no other node starts a second writer.
 Replication or migration is a separate, later fenced-transfer design.
 
@@ -395,21 +408,16 @@ are capability ceilings; combining them is explicit configuration. `CloudHub`
 must not be combined with `ContainerHub`, `WorkerHub` or `CompileHub` in one
 process.
 
-The node lifecycle below is the single definition for Harw. PL-66 placement
-and the on-demand worker plan must reference it instead of redefining it.
+The node lifecycle is owned by the implemented state machine in
+`harw-netsec/src/state_machine.rs` (`NodeState`, `TRANSITIONS`); this document
+and the placement and worker plans reference it and do not redefine it.
 
 ### 6.1 Node lifecycle
 
-At minimum:
-
-```text
-Pending
-Active
-Draining
-Drained
-Revoked
-Offline
-```
+`NodeState` is `Pending`, `Active`, `Draining`, `Drained`, `Revoked`.
+Reachability (`Offline`/online) is **not** a `NodeState`: it is an observed
+liveness flag kept next to the state, so an unreachable `Active` node stays
+`Active` but receives no routes while it is unreachable.
 
 Only Active nodes receive new automatic placements.
 
@@ -418,11 +426,13 @@ Draining:
 - no new sessions/jobs;
 - existing bounded work may finish according to policy.
 
-Allowed transitions: `Pending → Active`; `Active → Draining → Drained`;
-`Active|Draining|Drained → Offline` (observed, not commanded);
-`any → Revoked`; `Offline → Active` only after re-authentication. `Revoked`
-leaves only through re-enrolment by a Global Cloud Admin. Nodes never
-self-activate.
+Transitions as implemented (`harw-netsec`): `Pending -> Active` (activate);
+`Active -> Draining` (drain); `Draining -> Drained` (complete drain);
+`Draining|Drained -> Active` (undrain); `Pending|Active|Draining|Drained ->
+Revoked` (revoke). `Revoked` is terminal: a revoked node re-enrols under a
+**new node id** through the Auth/Crypto Hub. Identity authority stays with the
+Auth/Crypto Hub; the Global Cloud Admin can route and revoke but does not
+assign identity. Nodes never self-activate.
 
 Revoked:
 
@@ -871,6 +881,11 @@ The Cloud Home v2 slice is successful when:
 11. job/agent control remains on canonical typed authority paths;
 12. Global System Admin, Global Cloud Admin and root-agent are distinct roles;
 13. the first-party attached TUI uses SessionPort rather than owning the hosted
-    turn loop (dependency gate: the attach binary does not link `harw-core`);
+    turn loop. Dependency gate, scoped to what H3/H4 can satisfy: the session
+    client adapter (H3) does not depend on `harw-core`, checked with
+    `cargo tree`. The `harw-cli` binary and `harw-tui` both depend on
+    `harw-core` today, so a core-free whole binary needs either a separate
+    attach executable with a presentation split or the H9 convergence; that is
+    not claimed for H4;
 14. the implementation can later converge local `harw` onto the same client
     model without rewriting the control plane again.
