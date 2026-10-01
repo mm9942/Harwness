@@ -961,6 +961,7 @@ mod tests {
                     base_delay: jiff::SignedDuration::ZERO,
                     factor: 1.0,
                     max_delay: jiff::SignedDuration::ZERO,
+                    jitter: 0.0,
                 },
                 sandbox: SandboxSpec::from_resolved(workspace.clone(), PermissionSet::empty()),
             })

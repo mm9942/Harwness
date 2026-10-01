@@ -122,6 +122,16 @@ pub(crate) fn ensure_active_uia(
         return Ok(None);
     }
 
+    // #22 Welle 3: eine native, personalisierte harw trägt ihre UIA
+    // eingebettet (`harw_cli::embedded_uia`); sie ist die feste Wurzel und
+    // braucht weder `active_uia_definition` noch eine entdeckte Definition.
+    // Ohne diesen Früh-Abbruch würde der Bootstrap hier einen
+    // Einrichtungsdialog starten, obwohl die Assembly später die eingebettete
+    // UIA wählt (`harw_runtime/src/assembly.rs`, `resolve_embedded_uia`).
+    if crate::embedded_uia::embedded_uia().is_some() {
+        return Ok(None);
+    }
+
     let mut candidates: Vec<String> = agents
         .executable_agents
         .iter()
