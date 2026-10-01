@@ -5,6 +5,12 @@ All notable changes to this workspace are recorded here. Format follows
 Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
+## [0.9.1] — Unreleased
+- Version alignment: workspace bumped from 0.3.0 (Dev line) to 0.9.1 to match
+  the main release line; path-dependency version pins updated
+  (`harw-tui` → harw-home, `harw-registry-defaults` → harw-tool-doc,
+  harw-tools).
+
 
 ### One systemd source of truth (Crypto Masterplan v2 H10)
 
