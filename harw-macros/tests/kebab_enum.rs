@@ -50,6 +50,18 @@ enum OptionOnly {
     DeepWork,
 }
 
+/// Eigenes `ALL` als Array (wie `InteractionMode`): `no_all` vermeidet die Kollision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, KebabEnum)]
+#[kebab_enum(case = "snake", parse_option, no_from_str, no_all)]
+enum OwnAll {
+    One,
+    Two,
+}
+
+impl OwnAll {
+    const ALL: [Self; 2] = [Self::One, Self::Two];
+}
+
 const CONST_NAME: &str = Snake::CompleteDrain.as_str();
 
 #[test]
@@ -118,4 +130,10 @@ fn round_trips_every_variant() {
         assert_eq!(Snake::parse(variant.as_str()), Some(*variant));
         assert_eq!(variant.as_str().parse::<Snake>().ok(), Some(*variant));
     }
+}
+
+#[test]
+fn no_all_keeps_a_hand_written_array_constant() {
+    let names: Vec<&str> = OwnAll::ALL.into_iter().map(|v| v.as_str()).collect();
+    assert_eq!(names, ["one", "two"]);
 }

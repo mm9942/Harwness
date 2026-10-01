@@ -500,7 +500,7 @@ pub fn derive_harw_id(input: TokenStream) -> TokenStream {
 /// `#[kebab_enum(case = "snake")]` in snake_case) für ein Enum aus reinen
 /// Unit-Varianten ab (`FromStr` akzeptiert kebab- und snake_case,
 /// case-insensitiv). Optional: `parse_option` (`parse -> Option<Self>`),
-/// `no_from_str`.
+/// `no_from_str`, `no_all`.
 ///
 /// # Errors
 /// - Nicht-Unit-Variante → `syn::Error`.

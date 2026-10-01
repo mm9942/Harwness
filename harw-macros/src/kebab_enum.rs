@@ -95,6 +95,9 @@
 //! - `#[kebab_enum(parse_option)]` (Enum-Ebene) — erzeugt zusätzlich
 //!   `pub fn parse(value: &str) -> Option<Self>`; wie `FromStr`, aber ohne
 //!   Fehlertyp und mit abgeschnittenem Leerraum um die Eingabe.
+//! - `#[kebab_enum(no_all)]` (Enum-Ebene) — erzeugt **kein** `ALL`, wenn der
+//!   Typ bereits eine eigene `ALL`-Konstante (z. B. als Array statt Slice)
+//!   mitbringt.
 //! - `#[kebab_enum(no_from_str)]` (Enum-Ebene) — erzeugt **kein** `FromStr`
 //!   (dann sind `error`/`ctor` bedeutungslos und es braucht keinen Fehlertyp).
 //! - `#[kebab_enum(rename = "...")]` (Varianten-Ebene) — überschreibt den
@@ -138,6 +141,8 @@ struct KebabEnumArgs {
     parse_option: bool,
     /// Kein `FromStr` erzeugen.
     no_from_str: bool,
+    /// Kein `ALL` erzeugen.
+    no_all: bool,
 }
 
 /// Kanonische Schreibweise der abgeleiteten Namen.
@@ -164,6 +169,7 @@ impl Default for KebabEnumArgs {
             case: Case::Kebab,
             parse_option: false,
             no_from_str: false,
+            no_all: false,
         }
     }
 }
@@ -219,13 +225,16 @@ fn parse_kebab_enum_args(attrs: &[Attribute]) -> syn::Result<KebabEnumArgs> {
             } else if meta.path.is_ident("parse_option") {
                 args.parse_option = true;
                 Ok(())
+            } else if meta.path.is_ident("no_all") {
+                args.no_all = true;
+                Ok(())
             } else if meta.path.is_ident("no_from_str") {
                 args.no_from_str = true;
                 Ok(())
             } else {
                 Err(meta.error(
                     "unbekanntes kebab_enum-Attribut auf Enum-Ebene; erwartet: \
-                     error = \"...\", ctor = \"...\", case = \"...\", parse_option, no_from_str",
+                     error = \"...\", ctor = \"...\", case = \"...\", parse_option, no_from_str, no_all",
                 ))
             }
         })?;
@@ -473,10 +482,16 @@ pub(crate) fn expand_kebab_enum(input: &DeriveInput) -> syn::Result<TokenStream>
         }
     });
 
-    Ok(quote! {
-        impl #enum_name {
+    let all_const = (!args.no_all).then(|| {
+        quote! {
             /// Alle Varianten in Deklarationsreihenfolge.
             pub const ALL: &'static [#enum_name] = &[#(#all_variants),*];
+        }
+    });
+
+    Ok(quote! {
+        impl #enum_name {
+            #all_const
 
             /// Kanonischer Name dieser Variante (kebab- oder snake-case).
             #[must_use]
@@ -745,6 +760,20 @@ mod tests {
             .to_string();
         assert!(tokens.contains("fn parse"));
         assert!(!tokens.contains("FromStr"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_no_all_omits_the_constant() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(no_all)]
+            pub enum Foo { A }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .map_err(ctx("no_all must expand"))?
+            .to_string();
+        assert!(!tokens.contains("ALL"));
+        assert!(tokens.contains("fn as_str"));
         Ok(())
     }
 }
