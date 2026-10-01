@@ -6,7 +6,39 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
-## [0.9.1] — Unreleased
+## [0.9.2] — 2026-10-01
+
+Dev snapshot after 0.9.1: the open running strands are merged into one
+workspace, the 0.9.1 `Cargo.lock` merge markers on `main` are gone, and
+the version-coherence test tracks the workspace version again.
+
+### Added
+
+- `/models set <role> <model> [effort]` persists per-role reasoning effort
+  (`#70`).
+- Builder contract P2: `[builder]` config, rootless Podman executor
+  (`harw-job-executor-podman`), `harw worker` CLI (`#74`).
+- TUI: single-line activity rendering with width-aware wrapping (`#76`).
+- `harw-tool-tunnel` policy cores for SSH `-L` and Cloudflare (`#88`).
+- Registry-derived `ToolIndex` (`#89`).
+- `DeploymentProfile` mount/deny tables (`#90`, hub wiring W1).
+- `harw-session-daemon`: local Unix-socket session listener (`#91`, W2).
+- `harw-reverse-proxy` policy core (route table, header hygiene,
+  `UpstreamGroup`; no Pingora) (`#92`).
+- Planning: provider model lifecycle (`#79`), Cloud Home hub profiles
+  (`#82`/`#83`), portrait control deck v2 (`#81`/`#84`), on-demand worker
+  boot (`#80`/`#85`), semantic activity patterns (`#68`/`#86`), tool gaps
+  and hub wiring (`#88`), reverse-proxy / SOCKS v3 (`#92`), local TUI
+  live workbench (`#87`, plan only).
+
+### Fixed
+
+- `Cargo.lock` on `main` still contained unresolved `release/0.9.1` merge
+  conflict markers; the lockfile is a single coherent 0.9.x graph again.
+- `harw/tests/version_coherence.rs` still expected `0.9.0` after the
+  0.9.1 bump.
+
+## [0.9.1] — 2026-10-01
 
 ### Fixed
 

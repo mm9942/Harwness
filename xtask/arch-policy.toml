@@ -175,6 +175,8 @@ layer = "J"
 layer = "J"
 [packages."harw-job-executor-bwrap"]
 layer = "J"
+[packages."harw-job-executor-podman"]
+layer = "J"
 [packages."harw-job"]
 layer = "J"
 

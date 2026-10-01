@@ -1401,7 +1401,7 @@ impl HistoryCell for GoalCell {
 ///
 /// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_width::UnicodeWidthStr;
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();
 
