@@ -296,13 +296,22 @@ Edge cases that must be specified by W20-A tests:
   table or count terminal state only from the agent run.
 - **Orphan.** A job tagged `AgentChild` whose agent run was evicted or never
   seen is shown as "Agent child (untracked)", never silently dropped.
-  Pending-to-untracked promotion happens at a replay-stable boundary, not on a
-  wall-clock timer: when the job reaches a terminal state and a fixed number
-  of subsequent agent events (a named constant) passed without a matching
-  `AgentEvent`, or when the session's completion watermark is reached. Both
-  inputs are part of the event stream, so replay promotes at the same point.
-  A test covers pending -> untracked on both boundaries and the case where the
-  `AgentEvent` arrives just before the boundary.
+  A count of unrelated later events is **not** a safe boundary: the current
+  `AgentEventHub` is a lossy broadcast (a slow receiver can observe
+  `Lagged`), and the agent stream and the job snapshot share no causal
+  sequence, so a matching `AgentEvent` can still arrive after any fixed N.
+  Promotion from pending to "untracked" therefore requires a boundary that
+  guarantees no earlier matching event can still arrive: either the session
+  completion watermark, or a persisted per-agent / per-job sequence watermark
+  that both sources advance (this needs a W20-A change and is a prerequisite,
+  not an assumption). Until such a watermark exists, a tagged child with no
+  agent run stays **pending** and is shown as "Agent child (pending)"; it is
+  never counted as its own category.
+  Reconciliation if a match appears after promotion: the agent run takes
+  ownership, the "untracked" row is retired, and the terminal count is derived
+  (recomputed from the owning run), so the child is never counted twice. Tests:
+  late-after-boundary arrival, `Lagged` receiver, and replay of the same stream
+  promoting at the same watermark.
 - **Diverging outcomes.** Agent run `Completed` but job `Failed` (exit != 0):
   the agent run still owns the count, and the aggregate carries a
   "job exit != 0" badge so the signal is not lost.
@@ -503,13 +512,20 @@ TERM, then the existing job stop policy if it does not exit.
 The confirmation is a UI step only. Admission remains in the operation path.
 
 Current behavior, which W20 keeps: `JobManager::stop` returns `Ok(status)` for
-an already-terminal job and `JobsOperation` reports it as a sent signal; `/jobs`
-is registered `busy = "immediate"`, so it is admitted while a turn runs. The
-panel therefore does not rely on a special operation result. It compares the
-job state it showed at confirmation with the state after the next refresh and
-shows "already finished" itself when the job was already terminal. Adding an
-explicit "already finished" result to `JobsOperation` is an optional,
-separate operation change and is not part of W20-E unless the owner asks.
+an already-terminal job and `JobsOperation` always reports it as a sent signal;
+`/jobs` is registered `busy = "immediate"`, so it is admitted while a turn runs.
+
+The panel cannot tell two cases apart from the state after a refresh: the job
+finished on its own just before dispatch, or it ended because of the requested
+signal. Both look like "running at confirmation, terminal afterwards". The
+panel therefore **does not claim** "already finished". After a stop it shows
+the neutral resulting state ("job is now <state>").
+If a distinct "already finished" label is wanted, W20-E needs a typed stop
+outcome from the operation (`AlreadyTerminal(status)` vs `Signalled(status)`) or
+an atomic terminal observation taken before the signal, which is a change to
+`JobManager::stop` / `JobsOperation` and a prerequisite, decided by the owner.
+Tests, if that outcome is added: terminal-just-before-dispatch versus
+termination-by-requested-signal.
 
 ## 10. Presentation state
 
