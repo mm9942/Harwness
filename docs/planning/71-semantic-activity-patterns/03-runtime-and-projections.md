@@ -62,6 +62,30 @@ struct ProjectionUpdate<T> {
 
 Consumers ignore stale revisions. This permits safe in-place update even if events are processed asynchronously.
 
+## Determinism rules
+
+- Time is evaluated only from event time (`occurred_at`), never from the wall
+  clock inside a reducer. A timeout break is a synthetic tick event in the
+  stream, so it is logged and replayable.
+- Reducer input is one totally ordered stream. Order is defined by an
+  `ingest_seq`: a single sequencer (the writer of the canonical event log)
+  assigns a unique, gapless, monotonic number to each event when it is
+  appended. Live ingestion and replay both reduce in `ingest_seq` order, so
+  there are no ties. `occurred_at` is informational and used only for time
+  breaks. A late arrival gets the next `ingest_seq`, never an earlier slot;
+  the reducer handles it as a normal event (it may reopen a quiescent
+  instance if its scope allows). Per-producer `(source, seq)` is kept as
+  provenance, not as the order.
+- A rebase is itself an event, not a silent mutation.
+- v1 requires `ProjectionId` stability: the id is assigned when the instance
+  is created and never changes. A rebase adds an alias binding
+  (`Call(C)` -> `Job(W)`) to the same projection and does not create a new
+  projection. Replacement via a `supersedes` link or tombstone is reserved for
+  a later version and needs a consumer contract (retire old row/message)
+  before it is allowed. Revisions are derived from the replayable stream
+  (`ingest_seq` of the last applied event), not from a process-local counter,
+  so they survive reconnect.
+
 ## Rebase
 
 Some identities are learned only after an operation returns.
@@ -137,7 +161,8 @@ It must not carry ratatui styles, HTML or Telegram markup in shared infrastructu
 
 Aggregation must not hide failure.
 
-- any failed constituent may mark the projection failed or warning;
+- any failed constituent MUST be visible in the compact state as a failure
+  count or badge, including mutating constituents;
 - failure counts remain visible in compact form;
 - expansion reveals individual failed events;
 - unrelated failures never merge merely to save rows.
