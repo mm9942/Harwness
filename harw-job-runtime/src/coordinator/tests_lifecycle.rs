@@ -13,7 +13,7 @@ use std::time::Duration;
 use harw_job_core::{
     ExitOutcome, JobState, LifecycleState, RetryPolicy, RunnerId,
 };
-use harw_job_store::{FsJobRecordStore, JobRecordStore};
+use harw_job_store::FsJobRecordStore;
 use jiff::SignedDuration;
 use tempfile::TempDir;
 
@@ -113,7 +113,7 @@ async fn lifecycle_happy_fail_retry_backoff_final() -> TestResult {
     assert_eq!(runs(&fixture)?, 2, "one retry, not more, not less");
 
     let stored = store.load(&job_id).map_err(ctx("load"))?;
-    assert_eq!(stored.job.state, JobState::Succeeded);
+    assert_eq!(stored.job.state, JobState::Completed);
     Ok(())
 }
 
@@ -127,13 +127,14 @@ async fn lifecycle_backoff_respects_the_attempt_cap() -> TestResult {
         .submit(sh("echo run >> runs; exit 5")?)
         .await
         .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
     let result = wait(handle).await?;
     assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
     assert_eq!(result.exit, Some(ExitOutcome::Exited(5)));
     assert_eq!(runs(&fixture)?, 2, "max_attempts bounds the attempts");
 
     let store = coordinator.store();
-    let stored = store.load(handle.id()).map_err(ctx("load"))?;
+    let stored = store.load(&job_id).map_err(ctx("load"))?;
     assert_eq!(stored.job.state, JobState::Failed);
     let reason = stored
         .completion

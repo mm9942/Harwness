@@ -1216,13 +1216,13 @@ async fn backoff_delay_is_capped() -> TestResult {
         .submit(sh("echo run >> runs; exit 1")?)
         .await
         .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
     let result = wait(handle).await?;
     assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
     assert_eq!(runs(&fixture)?, 3, "capped backoff does not skip attempts");
 
     let store = coordinator.store();
-    let first = handle.id().clone();
-    let stored = store.load(&first).map_err(ctx("load"))?;
+    let stored = store.load(&job_id).map_err(ctx("load"))?;
     // The persisted retry record must exist for each attempted retry; the
     // schedule stayed within the cap because the job still completed all
     // attempts quickly (well under one cap-scale backoff second in total).
