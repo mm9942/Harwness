@@ -3067,6 +3067,29 @@ fn push_indented_wrapped_capped(
 ///
 /// # Spec-Referenz
 /// Plan Schritt 2 („Gruppierung“), Contract-Slice A5.
+///
+/// # Semantische Grenze und geplanter Ausbau
+/// Diese Struktur ist der **heutige TUI-lokale** Aggregator für genau eine
+/// bekannte Darstellung: aufeinanderfolgende, lesende Werkzeugaufrufe. Sie
+/// ist damit zugleich der konkrete Migrationsanker für
+/// `docs/planning/71-semantic-activity-patterns/`.
+///
+/// Wichtig für spätere Umbauten:
+///
+/// - die enthaltenen `ToolCell`s und ihre `ToolCallId`s bleiben die
+///   konkreten Laufzeitbeobachtungen;
+/// - eine kompakte Sammelzeile ist nur eine abgeleitete Projektion und darf
+///   die zugrunde liegenden Aufrufe nicht aus Verlauf/Audit entfernen;
+/// - künftige ressourcenbezogene Muster (zum Beispiel
+///   `fs.edit(path=X) -> fs.read(path=X) *`) sollen nicht als weitere
+///   Namens-Sonderfälle direkt in diesen Renderer wachsen, sondern über eine
+///   gemeinsame Pattern-/Reducer-Schicht eingespeist werden;
+/// - `ToolGroupCell` darf während dieser Migration als kompatible
+///   Darstellungsoberfläche bestehen bleiben.
+///
+/// Die geplante Pattern-Schicht ist ausdrücklich **keine Authority-Schicht**:
+/// Gruppierung oder Mustererkennung darf weder Tool-Berechtigungen noch
+/// Approval-Entscheidungen verändern.
 #[derive(Debug)]
 pub(crate) struct ToolGroupCell {
     /// Die gruppierten Zellen in Ankunftsreihenfolge.
