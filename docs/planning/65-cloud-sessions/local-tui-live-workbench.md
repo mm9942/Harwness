@@ -51,6 +51,10 @@ The read-only architecture review for the associated Harw plan found:
 - Root/agent events are available through `AgentEventHub`; agent events carry
   stable session IDs and optional parent links, and orchestration events expose
   root/parent/child relationships.
+- The backend `session.attach` exists, but a supported CLI/TUI flow for a second
+  TUI to join an existing session as a participant is not yet verified or
+  available. Telegram channel pairing is separate and does not satisfy this
+  participant-join requirement.
 - Durable session transcripts are append-only. The new display projections
   must not rewrite history or change persistent message/event IDs.
 - Existing tests cover portions of scroll, event and session wiring; explicit
@@ -137,7 +141,18 @@ all routing or multi-session behavior already exists.
 5. **Goal-follow UI (h9):** implement the toggleable, presentational projection
    with evidence-backed progress and clear missing/stale/scope indicators; do
    not treat implementation as complete until delivered and reviewed.
-6. **Consolidated verification (h5):** after implementation, run deterministic
+6. **TODO — Interactive participant join for an existing session:** define and
+   implement authenticated session discovery/selection, an explicit session
+   target, attach/presence display, and authorized detach/reconnect. Preserve
+   per-client capabilities and distinguish this flow from Telegram channel
+   pairing; do not treat backend `session.attach` alone as a verified CLI/TUI
+   participant-join flow.
+7. **TODO — Standalone, continuously editable step/TODO-list library:** design
+   and build an independent library for an ordered, persistent list with status
+   and progress plus traceable execution; keep the library cleanly separated
+   from the TUI. Optionally display it in one of the three upper TUI windows,
+   with the choice and placement adjustable.
+8. **Consolidated verification (h5):** after implementation, run deterministic
    tests/build checks for routing, interleaved sessions, composer availability,
    recency-slot movement, scrollback, expiry and both TOML modes, plus Goal-follow
    scope, read-only behavior and session switching. This final verification
@@ -151,6 +166,13 @@ all routing or multi-session behavior already exists.
   after submission cannot change the captured destination.
 - Interleaved Root/agent events from A and B remain attached to the correct
   session and parent; a session switch does not stop or mix either run.
+- **TODO — A second TUI can intentionally attach to an existing session as a
+  participant, see its presence, and detach/reconnect with authorization; an
+  unauthorized attempt or wrong session target fails closed.**
+- **TODO — A standalone, continuously editable step/TODO-list library persists
+  an ordered list with status/progress and traceable completion; it remains
+  separate from the TUI, and its optional display can be enabled in a chosen,
+  adjustable one of the three upper TUI windows.**
 - Each new agent response moves into slot 1; the previous slot 1 becomes the
   linked slot 2; subsequent older responses remain available through scrollback.
 - A transient status is prominent before 30 seconds and follows the selected
