@@ -24,7 +24,7 @@ not touched without explicit per-PR approval.
 | macro/m1-test-support | pending | – | – | – |
 | macro/m2-harwerror | pending | – | – | – |
 | macro/m3-tool-provider | pending | – | – | – |
-| macro/m4-schema-helpers | pending | – | – | – |
+| macro/m4-schema-helpers | yes | see merge commit | schema_helpers + parse_args; net ~47 lines; harw-registry-defaults test `auto_approved_tools_are_a_subset_of_the_read_only_surface` (tunnel.status) fails, cause unverified on clean dev (tunnel code is already on dev) | NOT RUN (workspace) |
 | macro/m789-ids-limits-registry | pending | – | – | – |
 | ws/skeleton-dev | pending | – | – | – |
 | ws/skeleton-stack | not started | – | – | – |
