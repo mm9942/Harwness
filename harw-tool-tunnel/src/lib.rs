@@ -25,6 +25,9 @@
 //! Kein Remote-Forward (`-R`), kein SOCKS (`-D`), kein eigener Daemon.
 //!
 //! # Status
+//! Policy-Kern (`policy`: Validierung, Allowlist, Freigabe, Redaktion,
+//! `ssh`-Argumente) ist implementiert und getestet; die Werkzeuge selbst
+//! (Tool-Oberfläche, Job-Anbindung, Reconnect) sind noch Gerüst.
 //! Gerüst (Plan-Knoten `crate-registry`): Registrierung in
 //! `harw-registry-defaults` (capability_catalog, profile) ist angelegt; die
 //! Implementierung folgt in den Plan-Knoten `job-lifecycle` und
@@ -32,4 +35,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod policy;
 pub mod tools;
