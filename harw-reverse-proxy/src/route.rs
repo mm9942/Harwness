@@ -198,6 +198,12 @@ pub enum Decision {
     Refuse(Refusal),
 }
 
+/// A byte of an upper-case HTTP method token: the RFC 9110 `tchar` alphabet
+/// without lower-case letters (`M-SEARCH` is valid, `get` and `GE T` are not).
+fn is_method_byte(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
@@ -228,7 +234,7 @@ impl RouteTable {
             let methods_ok = !r.methods.is_empty()
                 && r.methods.iter().all(|m| {
                     !m.is_empty()
-                        && m.bytes().all(|b| b.is_ascii_uppercase())
+                        && m.bytes().all(is_method_byte)
                         && !matches!(m.as_str(), "CONNECT" | "TRACE")
                 });
             if !methods_ok {
@@ -494,6 +500,51 @@ mod tests {
     }
 
     #[test]
+    fn method_tokens_may_contain_digits_and_punctuation() -> TestResult {
+        let mut r = route("a", "a.example.org", "/", "127.0.0.1:1")?;
+        r.methods = vec!["M-SEARCH".into(), "PROPFIND".into(), "X-CUSTOM.1".into()];
+        let t = RouteTable::new(vec![r])?;
+        ensure(
+            matches!(
+                t.decide(&req("M-SEARCH", "a.example.org", "/")),
+                Decision::Forward(_)
+            ),
+            "M-SEARCH",
+        )?;
+        ensure(
+            t.decide(&req("GET", "a.example.org", "/"))
+                == Decision::Refuse(Refusal::MethodNotAllowed),
+            "unlisted",
+        )
+    }
+
+    #[test]
+    fn escaped_unreserved_characters_cannot_dodge_a_route() -> TestResult {
+        let strict = Route {
+            methods: vec!["GET".into()],
+            ..route("admin", "a.example.org", "/admin", "127.0.0.1:1")?
+        };
+        let open = Route {
+            methods: vec!["GET".into(), "POST".into()],
+            ..route("root", "a.example.org", "/", "127.0.0.1:2")?
+        };
+        let t = RouteTable::new(vec![strict, open])?;
+        // `/%61dmin` is `/admin` to an upstream decoder; it must hit the strict route.
+        ensure(
+            t.decide(&req("POST", "a.example.org", "/%61dmin"))
+                == Decision::Refuse(Refusal::MethodNotAllowed),
+            "the escaped spelling is subject to the strict route",
+        )?;
+        match t.decide(&req("GET", "a.example.org", "/%61dmin")) {
+            Decision::Forward(f) => ensure(
+                f.route_id == "admin" && f.upstream_target == "/admin",
+                "canonical target forwarded",
+            ),
+            Decision::Refuse(r) => Err(crate::test_support::TestError(format!("{r:?}"))),
+        }
+    }
+
+    #[test]
     fn methods_are_enforced() -> TestResult {
         let t = table().map_err(|e| crate::test_support::TestError(e.to_string()))?;
         ensure(
@@ -603,6 +654,8 @@ mod tests {
         bad(&|r| r.methods = vec!["CONNECT".into()])?;
         bad(&|r| r.methods = vec!["TRACE".into()])?;
         bad(&|r| r.methods = vec!["get".into()])?;
+        bad(&|r| r.methods = vec!["GE T".into()])?;
+        bad(&|r| r.methods = vec!["GET,POST".into()])?;
         bad(&|r| r.max_body_bytes = 0)?;
         let dup = vec![ok()?, {
             let mut r = ok()?;

@@ -23,15 +23,19 @@ HARW provides the SOCKS5 server, not OpenSSH:
 
 ## 3. Rules
 
-1. **Local listener:** Unix socket or loopback only (v1 section 3). No
-   `0.0.0.0`.
+1. **Local listener:** a private Unix socket only in v1. A TCP loopback
+   listener is not permitted in v1: a TCP peer carries no kernel credentials,
+   so it would need a real authenticated SOCKS method (for example RFC 1929
+   username/password with a secret reference), which this addendum does not
+   specify. In any case never `0.0.0.0`.
 2. **Same allowlist and address-class rules as v1 section 2,** applied per
    `CONNECT`, at start and at every reconnect. Private, loopback and cloud
    metadata targets are denied unless the policy names them (metadata is never
    allowable).
 3. **Only `CONNECT`.** `BIND` and `UDP ASSOCIATE` are refused.
-4. **Authentication method `NO AUTH` only on a private Unix socket** or
-   loopback with peer-credential check; anything else is refused.
+4. **Authentication method `NO AUTH` only on a private Unix socket,** where the
+   kernel peer credential is the authentication (as in `harw-egress`). On any
+   other listener `NO AUTH` is refused.
 5. **Domain-name targets** (`socks5h`) are resolved by the SSH server, which
    cannot be verified locally (the same gap as hostname targets in v1; see the
    `allow_remote_resolution` opt-in in `harw-tool-tunnel`). Default: literal

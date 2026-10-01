@@ -1,6 +1,6 @@
 //! Host and path normalization. Matching and forwarding use the normalized form.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 /// A validated `Host` header value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,9 @@ pub fn normalize_host(raw: &str) -> Option<NormalizedHost> {
     }
     let (host_part, port_part) = if let Some(rest) = raw.strip_prefix('[') {
         let (inside, after) = rest.split_once(']')?;
+        // Brackets are valid only around an IPv6 literal; `[example.org]` and
+        // `[127.0.0.1]` are malformed, not alternative spellings of a host.
+        inside.parse::<Ipv6Addr>().ok()?;
         let port = match after {
             "" => None,
             p => Some(p.strip_prefix(':')?),
@@ -147,8 +150,14 @@ pub fn normalize_path(target: &str) -> Option<(String, Option<String>)> {
             return None;
         }
     }
+    // Canonical escapes: an escaped unreserved character (`%61`) is the same
+    // character as its literal (`a`) to any decoder, so matching and forwarding
+    // must see one form; remaining escapes get upper-case hex digits.
+    let path = canonical_escapes(path);
     let mut stack: Vec<&str> = Vec::new();
+    let mut last = "";
     for seg in path.split('/') {
+        last = seg;
         match seg {
             "" | "." => {}
             ".." => {
@@ -159,10 +168,41 @@ pub fn normalize_path(target: &str) -> Option<(String, Option<String>)> {
     }
     let mut out = String::from("/");
     out.push_str(&stack.join("/"));
-    if path.ends_with('/') && out.len() > 1 {
+    // RFC 3986 5.2.4: a path ending in `/`, `/.` or `/..` keeps a trailing slash.
+    if matches!(last, "" | "." | "..") && out.len() > 1 {
         out.push('/');
     }
     Some((out, query))
+}
+
+/// Decode escaped unreserved characters (`ALPHA DIGIT - . _ ~`) and upper-case
+/// the hex digits of every other escape. The input has already been checked for
+/// well-formed escapes and hidden separators.
+fn canonical_escapes(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                let b = u8::try_from(h * 16 + l).unwrap_or(0);
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    out.push(char::from(b));
+                } else {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+                i += 3;
+                continue;
+            }
+        }
+        // Not an escape: copy the full character (path is valid UTF-8).
+        let ch = path[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -305,10 +345,62 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_escapes_survive() -> TestResult {
+    fn escapes_are_canonical_before_matching() -> TestResult {
+        let p = |t: &str| normalize_path(t).map(|(p, _)| p);
         ensure(
-            normalize_path("/a%20b/%7Euser") == Some(("/a%20b/%7Euser".into(), None)),
-            "benign percent escapes are kept as sent",
+            p("/%61dmin") == Some("/admin".into()),
+            "escaped unreserved letter is decoded",
+        )?;
+        ensure(
+            p("/%41%62%2D%5f%7e") == Some("/Ab-_~".into()),
+            "unreserved escapes of any case",
+        )?;
+        ensure(
+            p("/a%20b/%7Euser") == Some("/a%20b/~user".into()),
+            "reserved escape kept, tilde decoded",
+        )?;
+        ensure(
+            p("/a%c3%a9") == Some("/a%C3%A9".into()),
+            "other escapes get upper-case hex",
+        )?;
+        ensure(
+            p("/%61dmin") == p("/admin"),
+            "both forms match the same route",
+        )
+    }
+
+    #[test]
+    fn trailing_dot_segments_keep_the_slash() -> TestResult {
+        let p = |t: &str| normalize_path(t).map(|(p, _)| p);
+        ensure(p("/a/.") == Some("/a/".into()), "/a/.")?;
+        ensure(p("/a/b/..") == Some("/a/".into()), "/a/b/..")?;
+        ensure(p("/a/b/../") == Some("/a/".into()), "/a/b/../")?;
+        ensure(
+            p("/a/b") == Some("/a/b".into()),
+            "no slash added to a plain path",
+        )?;
+        ensure(
+            p("/.") == Some("/".into()) && p("/a/..") == Some("/".into()),
+            "root stays /",
+        )?;
+        ensure(p("/..").is_none(), "above the root is refused")
+    }
+
+    #[test]
+    fn brackets_need_an_ipv6_literal() -> TestResult {
+        for bad in [
+            "[example.org]",
+            "[127.0.0.1]",
+            "[example.org]:80",
+            "[]",
+            "[::1",
+        ] {
+            ensure(normalize_host(bad).is_none(), bad)?;
+            ensure(normalize_config_host(bad).is_none(), bad)?;
+        }
+        ensure(
+            normalize_host("[::1]:80").is_some(),
+            "a real literal still works",
         )
     }
 }

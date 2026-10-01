@@ -48,14 +48,15 @@ features = ["proxy", "rustls"] }`:
 - Version **0.9.0**, about **240 packages** added.
 - No `openssl`, `openssl-sys`, `native-tls` or boringssl in the tree
   (`openssl-probe` is only a certificate-path helper), so the `deny.toml` bans
-  are not hit. Note that `harw-node-transport/README.md` says Pingora "would add
-  BoringSSL/OpenSSL"; that holds for Pingora's default TLS backend (openssl),
+  are not hit. Note that the crate README of `harw-node-transport` states that
+  Pingora brings BoringSSL or OpenSSL crates; that holds for Pingora's default
+  TLS backend (openssl),
   not for the `rustls` feature measured here (see `EDGE-AUTH-LB-ENCRYPTION.md`
   section 7).
 - **New C code:** `zstd-sys` comes in through `pingora-core` (compression) and
   through `pingora-cache` via the `proxy` feature. It is not in `Cargo.lock`
   today. `ring` is the TLS crypto provider; both `ring` and `aws-lc-rs` are
-  already in `Cargo.lock`, but `deny.toml` documents "rustls + aws-lc-rs" as the
+  already in `Cargo.lock`, but `deny.toml` names rustls with aws-lc-rs as the
   policy, and Pingora's rustls path uses `ring`. This is a deviation to decide,
   not to ignore.
 - `proxy` pulls `pingora-cache`; there is no feature that removes it from
@@ -121,8 +122,10 @@ Rules, each enforced in the pure core and tested there:
    flags (reuse of `harw_egress::classify`). Hostnames as upstream are rejected
    unless pinned to checked addresses, to avoid the remote-resolution gap that
    the tunnel review found.
-3. **Header hygiene.** Hop-by-hop headers are dropped; inbound `Forwarded` and
-   `X-Forwarded-*` are replaced, never appended to; configured internal
+3. **Header hygiene.** Hop-by-hop headers (including `Transfer-Encoding`) are
+   dropped; an inbound `Forwarded` header is dropped (the proxy emits the
+   `X-Forwarded-*` family only); inbound `X-Forwarded-*` are replaced, never
+   appended to; every `x-harw-*` header is dropped; configured internal
    headers (identity, tenant) are stripped from client requests and only set by
    the proxy.
 4. **Host and path normalization before matching.** Reject ambiguous `Host`
@@ -151,11 +154,12 @@ lands: no workspace write, no host shell, no container socket).
 
 ## 7. Related follow-ups found while planning
 
-- `harw-tool-tunnel/src/policy.rs` (#88) has its own private/loopback
-  classification. It should call `harw_egress::classify` instead. That also
-  closes classes the tunnel check lacks (cloud metadata, CGNAT, NAT64). Not done
-  here; it needs a layering check (`harw-tool-tunnel` is ring A, `harw-egress`
-  is ring I, so the dependency direction is allowed).
+- Proposal for PR #88 (not on this branch's base): the tunnel policy core
+  there has its own, smaller private/loopback classification. It could call
+  `harw_egress::classify` instead, which also covers classes it lacks (cloud
+  metadata, CGNAT, NAT64). This needs a layering check (`harw-tool-tunnel` is
+  ring A and `harw-egress` ring I, so the dependency direction is allowed) and
+  depends on #88 landing first. Nothing is changed here.
 - SOCKS for tunnels: see `docs/design/tunnel-policy-v3-socks.md`.
 
 ## 8. Work order

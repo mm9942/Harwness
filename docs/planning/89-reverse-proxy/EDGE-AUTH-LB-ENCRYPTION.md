@@ -55,13 +55,13 @@ Effects to decide, not to assume away:
    recorded session. Needs an explicit risk acceptance or a different edge
    stack.
 2. `ring` next to `aws-lc-rs`: both are already in `Cargo.lock` (node-transport
-   README), but `deny.toml` documents "rustls + aws-lc-rs" as the TLS policy.
+   README), but `deny.toml` names rustls with aws-lc-rs as the TLS policy.
 3. Edge TLS private key custody. `HarwKeyPurpose` (masterplan section 4) has
    no TLS server purpose. If the key lives in the KMS, a purpose and a usage
    policy are needed so the KMS does not become a signing oracle (section 5):
    TLS `CertificateVerify` signing is a bounded transcript, but it must be
    modeled as its own purpose, not as a generic `sign`. If the key is a file,
-   it contradicts the "no key files" direction of the node plane and needs its
+   it contradicts the no-key-files direction of the node plane and needs its
    own custody rules (permissions, rotation, audit).
 
 ## 2. Authentication chain
@@ -87,8 +87,8 @@ Rules (masterplan 14, 32, 33):
    the policy core.)
 3. **No plaintext identity headers from the proxy.** The earlier draft let the
    proxy set identity headers for loopback upstreams; that conflicts with
-   section 14 ("if a proxy forwards identity context, it must be
-   cryptographically bound"). Generic proxy-set headers stay in the core for
+   section 14, which requires identity context forwarded by a proxy to be
+   cryptographically bound. Generic proxy-set headers stay in the core for
    non-identity use only.
    How identity actually reaches a service is **an open design question**, and
    the existing types constrain it: `SecurityContext` (`harw-types`) is
@@ -127,7 +127,7 @@ service discovery. The project's constraints change how it may be used.
    fencing, no cross-node failover in v1). Session traffic routes by directory
    lookup `SessionId -> owner node`, not by hash or round robin. A stale or
    unknown location fails closed (refresh), and an unreachable owner returns
-   503 with a retry hint. A "failover" of session traffic to another node would
+   503 with a retry hint. A failover of session traffic to another node would
    create a dual writer and is forbidden.
 2. **Stateless endpoints** (read-only control-plane queries, static assets) may
    use weighted round robin or least-loaded selection over a group of
@@ -208,11 +208,11 @@ is **no** TLS-server purpose; `SecurityContext` is mint-only as described above.
 
 ## 7. Corrections to earlier statements
 
-- `README.md` section 1 called the purpose "assumed". The masterplan (section
+- `README.md` section 1 called the purpose an assumption. The masterplan (section
   33) defines it: browser/external edge in front of the control services, not
   between nodes.
-- `harw-node-transport/README.md` states that Pingora "would add BoringSSL/
-  OpenSSL (`-sys`) crates". With the `rustls` feature that is not what was
+- The crate README of `harw-node-transport` states that Pingora brings
+  BoringSSL or OpenSSL `-sys` crates. With the `rustls` feature that is not what was
   measured here (no OpenSSL or BoringSSL; `zstd-sys` and `ring` instead). The
   README statement is true for Pingora's default TLS backend, and the
   conclusion (not between nodes) still stands, for the TLS-profile reasons
