@@ -79,8 +79,13 @@ first reduction == replay reduction
 
 ### Ordering and identity
 
-- the same producer streams, ingested in different arrival orders, reduce to
-  the same projection once the sequencer has assigned `ingest_seq`;
+- live reduction equals replay of the same persisted `(ingest_seq, event)`
+  log (same log in, same projection out);
+- `ingest_seq` is unique and gapless under concurrent append;
+- convergence across different arrival permutations is **not** required in
+  v1: the order is the arrival order fixed by the sequencer, so two arrival
+  orders are two different logs and may legitimately project differently for a
+  non-commutative reducer;
 - a late arrival never rewrites earlier reducer state, it is applied in
   `ingest_seq` order;
 - a rebase keeps `ProjectionId`; no second projection for the same instance
