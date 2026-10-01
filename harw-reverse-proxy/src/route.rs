@@ -20,6 +20,13 @@ pub enum UpstreamScope {
 }
 
 impl UpstreamScope {
+    /// Whether `addr`'s class is admitted by this scope. Shared with
+    /// [`crate::UpstreamGroup`] so route and group use one rule.
+    #[must_use]
+    pub fn admits_addr(self, addr: SocketAddr) -> bool {
+        self.admits(classify(addr.ip()))
+    }
+
     fn admits(self, class: AddrClass) -> bool {
         match class {
             AddrClass::Loopback => true,

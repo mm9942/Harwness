@@ -12,18 +12,17 @@ baseline: dev@4e49a173a8431a062f715310f7ce2bc07546e278
 > added by this change.** Whether to add it is an explicit owner decision
 > (section 4).
 
-## 1. Purpose (assumed; owner to confirm)
+## 1. Purpose
 
-The request was "plan and develop the Pingora reverse proxy". The purpose was
-not specified, so this plan assumes the most likely one and marks the rest open:
+Defined by the crypto masterplan, section 33: Pingora belongs **at the network
+edge** (browser/external ingress), not in crypto primitives and not between
+nodes. It may do connection handling, TLS, routing, upstream health,
+load/failover, rate limiting and zone routing, and it must not invent Harw
+principals from a source IP. Authentication, load balancing and the encryption
+model are worked out in `EDGE-AUTH-LB-ENCRYPTION.md`; read it with this file.
 
-- **Primary (assumed):** an authenticated edge in front of the Cloud Hub and
-  node services: TLS termination, routing by host/path to local upstreams
-  (session WebSocket, web control plane, MCP listener), connection and rate
-  limits, no upstream reachable that the policy did not name.
-- **Open:** is it also the origin side for Cloudflare tunnels (an alternative
-  to exposing a bare local port), and does it serve end-user traffic or only
-  operator/device traffic?
+Still open: whether the proxy is also the origin side for Cloudflare tunnels,
+and whether it serves end-user traffic or only operator/device traffic.
 
 ## 2. What the repo already has (evidence)
 
@@ -49,7 +48,10 @@ features = ["proxy", "rustls"] }`:
 - Version **0.9.0**, about **240 packages** added.
 - No `openssl`, `openssl-sys`, `native-tls` or boringssl in the tree
   (`openssl-probe` is only a certificate-path helper), so the `deny.toml` bans
-  are not hit.
+  are not hit. Note that `harw-node-transport/README.md` says Pingora "would add
+  BoringSSL/OpenSSL"; that holds for Pingora's default TLS backend (openssl),
+  not for the `rustls` feature measured here (see `EDGE-AUTH-LB-ENCRYPTION.md`
+  section 7).
 - **New C code:** `zstd-sys` comes in through `pingora-core` (compression) and
   through `pingora-cache` via the `proxy` feature. It is not in `Cargo.lock`
   today. `ring` is the TLS crypto provider; both `ring` and `aws-lc-rs` are
@@ -132,8 +134,10 @@ Rules, each enforced in the pure core and tested there:
    raising them is configuration, not code.
 6. **No authority from the proxy.** It never decides what a caller may do; it
    forwards to services that authenticate and authorize (session host, web
-   control plane). Proxy-set identity headers are only trusted by an upstream
-   that is reachable solely from the proxy (loopback or Unix socket).
+   control plane). Every `x-harw-*` header from a client is dropped, and the
+   proxy sets no plaintext identity header; how identity reaches a service is an
+   open design question constrained by the mint-only `SecurityContext` type
+   (masterplan section 14; details in `EDGE-AUTH-LB-ENCRYPTION.md`).
 7. **Admin/config separation.** Route changes are a separate, approved,
    audited action; the approval is bound to the full route table (same lesson
    as the tunnel approvals: canonical, length-prefixed, injective encoding).

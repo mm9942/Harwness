@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+mod group;
 mod headers;
 mod normalize;
 mod route;
@@ -25,6 +26,7 @@ mod route;
 #[cfg(test)]
 mod test_support;
 
+pub use group::{Backend, GroupError, UpstreamGroup, may_retry};
 pub use headers::{ClientInfo, HeaderPolicy, Proto, sanitize_headers};
 pub use normalize::{NormalizedHost, normalize_host, normalize_path};
 pub use route::{

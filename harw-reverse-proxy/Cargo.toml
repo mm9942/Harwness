@@ -10,6 +10,8 @@ rust-version.workspace = true
 
 [dependencies]
 harw-egress = { path = "../harw-egress" }
+# NodeState is the single source of truth for node lifecycle (no second list).
+harw-netsec = { path = "../harw-netsec" }
 
 [lints]
 workspace = true

@@ -3646,6 +3646,7 @@ name = "harw-reverse-proxy"
 version = "0.9.0"
 dependencies = [
  "harw-egress",
+ "harw-netsec",
 ]
 
 [[package]]

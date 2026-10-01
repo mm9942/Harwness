@@ -34,11 +34,13 @@ pub struct ClientInfo {
 /// Header rules for a route.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderPolicy {
-    /// Extra header names (any case) removed from client requests, e.g.
-    /// internal identity headers. They may be set again through `set`.
+    /// Extra header names (any case) removed from client requests, in addition
+    /// to the always-dropped `x-harw-*` prefix and the owned forwarding headers.
     pub strip: Vec<String>,
     /// Headers the proxy sets itself, after stripping. Names and values are
-    /// validated like client headers.
+    /// validated like client headers. **Not for identity:** the proxy sets no
+    /// plaintext principal, tenant or tier header (masterplan section 14), and a
+    /// name with the `x-harw-` prefix is refused here (`BadHeader`).
     pub set: Vec<(String, String)>,
     /// Allow the `Upgrade` mechanism (WebSocket). Off by default.
     pub allow_upgrade: bool,
@@ -54,6 +56,11 @@ const HOP_BY_HOP: &[&str] = &[
     "trailer",
     "upgrade",
 ];
+
+/// Prefix of Harw-internal headers (identity, tenant, tier, ...). A client
+/// never supplies these: every header with this prefix is dropped from client
+/// requests, whatever its exact name (crypto masterplan section 14).
+const INTERNAL_PREFIX: &str = "x-harw-";
 
 /// Headers the proxy owns: replaced, never passed through or appended to.
 const OWNED: &[&str] = &[
@@ -93,6 +100,13 @@ pub fn sanitize_headers(
             return Err(Refusal::BadHeader);
         }
     }
+    if policy
+        .set
+        .iter()
+        .any(|(n, _)| n.to_ascii_lowercase().starts_with(INTERNAL_PREFIX))
+    {
+        return Err(Refusal::BadHeader);
+    }
     let lower = |s: &str| s.to_ascii_lowercase();
     // Names listed in `Connection` are hop-by-hop for this hop.
     let named_in_connection: Vec<String> = headers
@@ -110,7 +124,13 @@ pub fn sanitize_headers(
         let upgrade_family = n == "upgrade" || n == "connection";
         let hop = HOP_BY_HOP.contains(&n.as_str()) && !(policy.allow_upgrade && upgrade_family);
         let listed = named_in_connection.contains(&n) && !(policy.allow_upgrade && n == "upgrade");
-        if n == "host" || hop || listed || OWNED.contains(&n.as_str()) || strip.contains(&n) {
+        if n == "host"
+            || hop
+            || listed
+            || OWNED.contains(&n.as_str())
+            || n.starts_with(INTERNAL_PREFIX)
+            || strip.contains(&n)
+        {
             continue;
         }
         out.push((name.clone(), value.clone()));
@@ -212,24 +232,67 @@ mod tests {
     }
 
     #[test]
-    fn host_is_dropped_and_internal_headers_are_stripped_then_set() -> TestResult {
+    fn host_is_dropped_and_configured_headers_are_stripped() -> TestResult {
         let policy = HeaderPolicy {
-            strip: vec!["X-Harw-Identity".into(), "x-harw-tenant".into()],
-            set: vec![("x-harw-identity".into(), "device:abc".into())],
+            strip: vec!["X-Internal-Note".into()],
+            set: vec![("x-request-class".into(), "edge".into())],
             allow_upgrade: false,
         };
         let input = h(&[
             ("Host", "hub.example.org"),
-            ("X-HARW-Identity", "owner"),
-            ("x-harw-tenant", "other"),
+            ("X-Internal-Note", "secret"),
+            ("X-Request-Class", "client-chosen"),
         ]);
         let out = sanitize_headers(&input, "hub.example.org", client(), &policy)?;
         ensure(get(&out, "host").is_empty(), "host removed")?;
         ensure(
-            get(&out, "x-harw-identity") == ["device:abc"],
-            "only the proxy value survives",
+            get(&out, "x-internal-note").is_empty(),
+            "configured strip applies",
         )?;
-        ensure(get(&out, "x-harw-tenant").is_empty(), "stripped")
+        ensure(
+            get(&out, "x-request-class") == ["edge"],
+            "the proxy value replaces the client value",
+        )
+    }
+
+    #[test]
+    fn every_x_harw_header_is_dropped_from_client_requests() -> TestResult {
+        // The masterplan names these three; the prefix rule also covers names
+        // added later, in any case.
+        let input = h(&[
+            ("x-harw-principal", "owner"),
+            ("X-Harw-Tenant", "other"),
+            ("X-HARW-TIER", "Owner"),
+            ("x-harw-future-header", "1"),
+            ("X-Harwish", "kept"),
+            ("Accept", "*/*"),
+        ]);
+        let out = sanitize_headers(&input, "a.example.org", client(), &HeaderPolicy::default())?;
+        for gone in [
+            "x-harw-principal",
+            "x-harw-tenant",
+            "x-harw-tier",
+            "x-harw-future-header",
+        ] {
+            ensure(get(&out, gone).is_empty(), gone)?;
+        }
+        ensure(
+            get(&out, "x-harwish") == ["kept"],
+            "the prefix is exact, not a substring match",
+        )?;
+        ensure(get(&out, "accept") == ["*/*"], "ordinary header kept")
+    }
+
+    #[test]
+    fn the_proxy_cannot_be_configured_to_set_an_internal_header() -> TestResult {
+        let policy = HeaderPolicy {
+            set: vec![("X-Harw-Principal".into(), "owner".into())],
+            ..HeaderPolicy::default()
+        };
+        ensure(
+            sanitize_headers(&[], "a.example.org", client(), &policy) == Err(Refusal::BadHeader),
+            "identity headers are not proxy-settable",
+        )
     }
 
     #[test]
