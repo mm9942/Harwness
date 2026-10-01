@@ -37,4 +37,6 @@
 
 pub mod cloudflare;
 pub mod policy;
+#[cfg(test)]
+mod test_support;
 pub mod tools;

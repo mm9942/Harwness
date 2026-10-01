@@ -191,17 +191,27 @@ impl CloudflareSpec {
         a
     }
 
-    /// Kanonische Beschreibung für die Freigabe. Der Tokenpfad fehlt bewusst;
-    /// Hostnamen sind sortiert und kleingeschrieben.
-    pub fn canonical(&self, allowed_origin_ports: &[u16]) -> String {
+    /// Kanonische Beschreibung für die Freigabe. Sie bindet die Token-
+    /// Referenz ein (Austausch gegen einen Token eines anderen Tunnels
+    /// erfordert neue Freigabe) und ist deshalb nur crate-intern sichtbar und
+    /// wird nie ausgegeben. Textfelder sind längenpräfixiert (injektiv),
+    /// Hostnamen sortiert und kleingeschrieben.
+    pub(crate) fn canonical(&self, allowed_origin_ports: &[u16]) -> String {
+        fn t(s: &str) -> String {
+            format!("{}:{}", s.len(), s)
+        }
         let mut ports = allowed_origin_ports.to_vec();
         ports.sort_unstable();
         let mode = match &self.mode {
             Mode::Quick => "quick".to_owned(),
-            Mode::Named { hostnames, .. } => {
-                let mut h: Vec<String> = hostnames.iter().map(|x| x.to_ascii_lowercase()).collect();
+            Mode::Named { token, hostnames } => {
+                let mut h: Vec<String> = hostnames
+                    .iter()
+                    .map(|x| t(&x.to_ascii_lowercase()))
+                    .collect();
                 h.sort();
-                format!("named[{}]", h.join(","))
+                h.dedup();
+                format!("named[{}]token={}", h.concat(), t(token.path()))
             }
         };
         format!(
@@ -212,9 +222,15 @@ impl CloudflareSpec {
 }
 
 /// Freigabe für genau eine wirksame Cloudflare-Konfiguration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CloudflareApproval {
     canonical: String,
+}
+
+impl fmt::Debug for CloudflareApproval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CloudflareApproval(<redacted>)")
+    }
 }
 
 impl CloudflareApproval {
@@ -259,28 +275,36 @@ pub fn parse_quick_url(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ensure};
 
-    fn quick(origin: &str) -> CloudflareSpec {
-        CloudflareSpec {
-            origin: Origin::parse(origin).unwrap(),
+    fn quick(origin: &str) -> Result<CloudflareSpec, CloudflareError> {
+        Ok(CloudflareSpec {
+            origin: Origin::parse(origin)?,
             mode: Mode::Quick,
-        }
+        })
     }
 
-    fn named(hosts: &[&str]) -> CloudflareSpec {
-        CloudflareSpec {
-            origin: Origin::parse("http://127.0.0.1:3000").unwrap(),
+    fn named_with(token: &str, hosts: &[&str]) -> Result<CloudflareSpec, CloudflareError> {
+        Ok(CloudflareSpec {
+            origin: Origin::parse("http://127.0.0.1:3000")?,
             mode: Mode::Named {
-                token: TokenFileRef::new("/run/secrets/cf-token").unwrap(),
+                token: TokenFileRef::new(token)?,
                 hostnames: hosts.iter().map(|s| (*s).to_owned()).collect(),
             },
-        }
+        })
+    }
+
+    fn named(hosts: &[&str]) -> Result<CloudflareSpec, CloudflareError> {
+        named_with("/run/secrets/cf-token", hosts)
     }
 
     #[test]
-    fn origin_must_be_loopback_http_with_port() {
-        assert!(Origin::parse("http://127.0.0.1:3000").is_ok());
-        assert!(Origin::parse("https://[::1]:8443/").is_ok());
+    fn origin_must_be_loopback_http_with_port() -> TestResult {
+        ensure(
+            Origin::parse("http://127.0.0.1:3000").is_ok(),
+            "v4 loopback",
+        )?;
+        ensure(Origin::parse("https://[::1]:8443/").is_ok(), "v6 loopback")?;
         for bad in [
             "http://0.0.0.0:3000",
             "http://192.168.1.2:80",
@@ -294,34 +318,42 @@ mod tests {
             "127.0.0.1:3000",
             "http://127.0.0.1:99999",
         ] {
-            assert!(Origin::parse(bad).is_err(), "{bad}");
+            ensure(Origin::parse(bad).is_err(), bad)?;
         }
+        Ok(())
     }
 
     #[test]
-    fn token_must_be_absolute_path() {
-        assert!(TokenFileRef::new("/run/secrets/t").is_ok());
+    fn token_must_be_absolute_path() -> TestResult {
+        ensure(TokenFileRef::new("/run/secrets/t").is_ok(), "absolute path")?;
         for bad in ["eyJhIjoiYWJjIn0=", "relative/path", "", "//x", "/a\nb"] {
-            assert!(TokenFileRef::new(bad).is_err(), "{bad:?}");
+            ensure(TokenFileRef::new(bad).is_err(), bad)?;
         }
-        assert_eq!(
-            format!("{:?}", TokenFileRef::new("/t").unwrap()),
-            "TokenFileRef(<redacted>)"
-        );
+        ensure(
+            format!("{:?}", TokenFileRef::new("/t")?) == "TokenFileRef(<redacted>)",
+            "debug redacted",
+        )
     }
 
     #[test]
-    fn port_allowlist_and_hostnames() {
-        assert!(quick("http://127.0.0.1:3000").check(&[3000]).is_ok());
-        assert_eq!(
-            quick("http://127.0.0.1:3000").check(&[]),
-            Err(CloudflareError::PortNotAllowed(3000))
-        );
-        assert!(named(&["app.example.org"]).check(&[3000]).is_ok());
-        assert_eq!(
-            named(&[]).check(&[3000]),
-            Err(CloudflareError::NoExpectedHostname)
-        );
+    fn port_allowlist_and_hostnames() -> TestResult {
+        ensure(
+            quick("http://127.0.0.1:3000")?.check(&[3000]).is_ok(),
+            "allowed port",
+        )?;
+        ensure(
+            quick("http://127.0.0.1:3000")?.check(&[])
+                == Err(CloudflareError::PortNotAllowed(3000)),
+            "empty list",
+        )?;
+        ensure(
+            named(&["app.example.org"])?.check(&[3000]).is_ok(),
+            "named ok",
+        )?;
+        ensure(
+            named(&[])?.check(&[3000]) == Err(CloudflareError::NoExpectedHostname),
+            "no hostname",
+        )?;
         for bad in [
             "*.example.org",
             "-x.example.org",
@@ -329,85 +361,110 @@ mod tests {
             "nodot",
             "",
         ] {
-            assert!(
+            ensure(
                 matches!(
-                    named(&[bad]).check(&[3000]),
+                    named(&[bad])?.check(&[3000]),
                     Err(CloudflareError::InvalidHostname(_))
                 ),
-                "{bad:?}"
-            );
+                bad,
+            )?;
         }
+        Ok(())
     }
 
     #[test]
-    fn args_never_contain_a_token_value() {
-        assert_eq!(
-            quick("http://127.0.0.1:3000").args(),
-            [
-                "tunnel",
-                "--no-autoupdate",
-                "--url",
-                "http://127.0.0.1:3000"
-            ]
-        );
-        let a = named(&["app.example.org"]).args();
-        assert_eq!(
-            a,
-            [
+    fn args_never_contain_a_token_value() -> TestResult {
+        ensure(
+            quick("http://127.0.0.1:3000")?.args()
+                == [
+                    "tunnel",
+                    "--no-autoupdate",
+                    "--url",
+                    "http://127.0.0.1:3000",
+                ],
+            "quick args",
+        )?;
+        let a = named(&["app.example.org"])?.args();
+        ensure(
+            a == [
                 "tunnel",
                 "--no-autoupdate",
                 "run",
                 "--token-file",
-                "/run/secrets/cf-token"
-            ]
-        );
-        assert!(!a.iter().any(|x| x == "--token"));
+                "/run/secrets/cf-token",
+            ],
+            "named args",
+        )?;
+        ensure(!a.iter().any(|x| x == "--token"), "no inline token flag")
     }
 
     #[test]
-    fn approval_binds_origin_mode_hostnames_and_ports() {
-        let s = named(&["a.example.org", "b.example.org"]);
+    fn approval_binds_origin_mode_hostnames_ports_and_token_ref() -> TestResult {
+        let s = named(&["a.example.org", "b.example.org"])?;
         let ap = CloudflareApproval::grant(&s, &[3000, 4000]);
-        assert!(ap.verify(&s, &[4000, 3000]).is_ok());
-        assert!(
-            ap.verify(&named(&["B.example.org", "a.example.org"]), &[3000, 4000])
-                .is_ok()
-        );
-        assert_eq!(
-            ap.verify(&named(&["a.example.org"]), &[3000, 4000]),
-            Err(CloudflareError::ApprovalMismatch)
-        );
-        assert_eq!(
-            ap.verify(&s, &[3000]),
-            Err(CloudflareError::ApprovalMismatch)
-        );
+        ensure(
+            ap.verify(&s, &[4000, 3000]).is_ok(),
+            "port order is not a change",
+        )?;
+        ensure(
+            ap.verify(&named(&["B.example.org", "a.example.org"])?, &[3000, 4000])
+                .is_ok(),
+            "host order/case",
+        )?;
+        let mismatch = Err(CloudflareError::ApprovalMismatch);
+        ensure(
+            ap.verify(&named(&["a.example.org"])?, &[3000, 4000]) == mismatch,
+            "fewer hosts",
+        )?;
+        ensure(ap.verify(&s, &[3000]) == mismatch, "fewer ports")?;
         let moved = CloudflareSpec {
-            origin: Origin::parse("http://127.0.0.1:4000").unwrap(),
+            origin: Origin::parse("http://127.0.0.1:4000")?,
             ..s.clone()
         };
-        assert_eq!(
-            ap.verify(&moved, &[3000, 4000]),
-            Err(CloudflareError::ApprovalMismatch)
-        );
-        assert_eq!(
-            ap.verify(&quick("http://127.0.0.1:3000"), &[3000, 4000]),
-            Err(CloudflareError::ApprovalMismatch)
-        );
-        assert!(!s.canonical(&[3000]).contains("cf-token"));
+        ensure(ap.verify(&moved, &[3000, 4000]) == mismatch, "moved origin")?;
+        ensure(
+            ap.verify(&quick("http://127.0.0.1:3000")?, &[3000, 4000]) == mismatch,
+            "mode change",
+        )?;
+        let swapped = named_with(
+            "/run/secrets/other-tunnel-token",
+            &["a.example.org", "b.example.org"],
+        )?;
+        ensure(
+            ap.verify(&swapped, &[3000, 4000]) == mismatch,
+            "swapped token reference",
+        )?;
+        ensure(
+            format!("{ap:?}") == "CloudflareApproval(<redacted>)",
+            "debug redacted",
+        )
     }
 
     #[test]
-    fn parses_quick_tunnel_url_only_for_trycloudflare() {
+    fn canonical_encoding_is_injective_for_hostnames() -> TestResult {
+        let one = named(&["a.example.org,b.example.org"])?;
+        let two = named(&["a.example.org", "b.example.org"])?;
+        ensure(
+            one.canonical(&[3000]) != two.canonical(&[3000]),
+            "comma smuggling",
+        )
+    }
+
+    #[test]
+    fn parses_quick_tunnel_url_only_for_trycloudflare() -> TestResult {
         let line = "2026-10-01T20:00:00Z INF |  https://random-words-here.trycloudflare.com  |";
-        assert_eq!(
-            parse_quick_url(line).as_deref(),
-            Some("https://random-words-here.trycloudflare.com")
-        );
-        assert_eq!(parse_quick_url("https://evil.example.org/x"), None);
-        assert_eq!(
-            parse_quick_url("https://x.trycloudflare.com.evil.org"),
-            None
-        );
-        assert_eq!(parse_quick_url("no url here"), None);
+        ensure(
+            parse_quick_url(line).as_deref() == Some("https://random-words-here.trycloudflare.com"),
+            "valid url",
+        )?;
+        ensure(
+            parse_quick_url("https://evil.example.org/x").is_none(),
+            "other domain",
+        )?;
+        ensure(
+            parse_quick_url("https://x.trycloudflare.com.evil.org").is_none(),
+            "suffix trick",
+        )?;
+        ensure(parse_quick_url("no url here").is_none(), "no url")
     }
 }
