@@ -59,6 +59,20 @@ features = ["proxy", "rustls"] }`:
 - `proxy` pulls `pingora-cache`; there is no feature that removes it from
   `pingora-proxy`. Cache is therefore compiled in even if unused.
 
+Spike (scratch crate outside the repo, not committed): a `ProxyHttp` adapter of
+about 45 lines that calls `RouteTable::decide` in `request_filter` and picks the
+peer from the decision in `upstream_peer`.
+
+- `cargo check` of the adapter plus all Pingora dependencies: about 66 s.
+- Run against a real local upstream through Pingora 0.9 on loopback:
+  matching request forwarded (200, upstream body returned), unknown host 421,
+  known host without a route 404, disallowed method 405, `%2e%2e` traversal 400,
+  `/api/../index.html` normalized and refused 404. The policy core decided
+  every case; the adapter contains no policy.
+- Not exercised by the spike: header sanitization and upstream-target rewriting
+  in the adapter (`upstream_request_filter`), body limits, TLS, timeouts,
+  graceful reload, WebSocket upgrade, behavior under load.
+
 Not verified: the `warden-*` and `arch` gates with Pingora in `Cargo.lock`
 (they computed green on the current tree only), `cargo deny check` (not
 installed here), binary size, MSRV against `rust-toolchain.toml`, behavior under
