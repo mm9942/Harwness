@@ -228,8 +228,15 @@ nie `sudo -S`.";
 /// assert!(InteractionMode::Chat.allowed_tools().is_none());
 /// assert!(InteractionMode::Explore.allowed_tools().is_some());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, harw_macros::KebabEnum,
+)]
 #[serde(rename_all = "snake_case")]
+// `KebabEnum` liefert `as_str`, `Display` und `parse` (kebab-/snake-case,
+// Groß-/Kleinschreibung egal, Leerraum ignoriert; unbekannt → `None`). Der
+// kanonische Name ist snake_case und damit identisch mit der serde-Wire-Form
+// (Test `test_as_str_matches_serde_wire_form`). `ALL` bleibt ein Array.
+#[kebab_enum(case = "snake", parse_option, no_from_str, no_all)]
 pub enum InteractionMode {
     /// Gespräch: keine namensbasierte Einschränkung, kein Ceiling.
     #[default]
@@ -398,61 +405,6 @@ impl InteractionMode {
         }
     }
 
-    /// Liest einen Modusnamen aus Konfiguration, CLI oder Slash-Kommando.
-    ///
-    /// # Beschreibung
-    /// Akzeptiert Kebab- und Snake-Case sowie beliebige Groß-/Kleinschreibung
-    /// und umgebende Leerzeichen. Ein unbekannter Name ergibt `None` — der
-    /// Aufrufer entscheidet, ob das ein Fehler ist oder auf den Default fällt.
-    /// Es gibt bewusst keine „ungefähre" Auflösung: ein Tippfehler darf nie
-    /// stillschweigend in einem weiteren Modus landen.
-    ///
-    /// # Arguments
-    /// - `value` (`&str`): der zu lesende Name, geliehen.
-    ///
-    /// # Returns
-    /// `Some(mode)` bei exakter (normalisierter) Übereinstimmung, sonst `None`.
-    ///
-    /// # Beispiele
-    /// ```rust
-    /// use harw_core::mode::InteractionMode;
-    ///
-    /// assert_eq!(InteractionMode::parse(" WORK "), Some(InteractionMode::Work));
-    /// assert_eq!(InteractionMode::parse("wörk"), None);
-    /// ```
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
-        match normalized.as_str() {
-            "chat" => Some(Self::Chat),
-            "plan" => Some(Self::Plan),
-            "explore" => Some(Self::Explore),
-            "work" => Some(Self::Work),
-            "shell" => Some(Self::Shell),
-            _ => None,
-        }
-    }
-
-    /// Liefert den kanonischen Namen des Modus.
-    ///
-    /// # Beschreibung
-    /// Gegenstück zu [`Self::parse`] und identisch mit der `serde`-Wire-Form
-    /// (`snake_case`). Wird für [`harw_protocol::events::TurnEvent::ModeChanged`]
-    /// verwendet.
-    ///
-    /// # Returns
-    /// Einen der Werte `"chat"`, `"plan"`, `"explore"`, `"work"`, `"shell"`.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::Plan => "plan",
-            Self::Explore => "explore",
-            Self::Work => "work",
-            Self::Shell => "shell",
-        }
-    }
-
     /// Eine deutsche Zeile, die den Modus für eine Person beschreibt.
     ///
     /// # Beschreibung
@@ -472,12 +424,6 @@ impl InteractionMode {
                 "Wie Arbeiten, Host-Werkzeuge nur über eine vom Nutzer bestätigte Sandbox-Freigabe"
             }
         }
-    }
-}
-
-impl std::fmt::Display for InteractionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
