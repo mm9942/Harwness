@@ -45,6 +45,9 @@ pub mod store;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod tests_lifecycle;
+
 pub use attempt::{ATTEMPT_RECORD_VERSION, ATTEMPTS_SIDECAR, AttemptRecord, attempt_id_for};
 pub use capture::{DEFAULT_OUTPUT_HEAD_BYTES, DEFAULT_OUTPUT_TAIL_BYTES, OutputCapture};
 #[cfg(target_os = "macos")]

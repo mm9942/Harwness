@@ -4299,6 +4299,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             now,
         );

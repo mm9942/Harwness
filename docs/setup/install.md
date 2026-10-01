@@ -84,7 +84,7 @@ tarball locally.
 ### (b) Source installer
 
 ```sh
-curl -fsSL https://get.harw.dev/harw/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mm9942/Harwness/main/scripts/install.sh | bash
 # from an existing checkout:
 bash scripts/install.sh --source
 ```

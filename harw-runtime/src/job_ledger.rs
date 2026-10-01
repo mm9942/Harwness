@@ -246,6 +246,7 @@ impl JobTransitions for JobStoreTransitions {
                 base_delay: SignedDuration::ZERO,
                 factor: 1.0,
                 max_delay: SignedDuration::ZERO,
+                jitter: 0.0,
             },
             now,
         );
@@ -546,6 +547,7 @@ mod tests {
                 base_delay: SignedDuration::ZERO,
                 factor: 1.0,
                 max_delay: SignedDuration::ZERO,
+                jitter: 0.0,
             },
             now,
         );

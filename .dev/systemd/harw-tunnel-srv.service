@@ -1,0 +1,12 @@
+[Unit]
+Description=Reverse SSH tunnel: exposes ai01 MCP (127.0.0.1:1338) on srv2009657 localhost:1338
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -R 1338:127.0.0.1:1338 mia@100.117.146.26
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

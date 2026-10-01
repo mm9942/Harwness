@@ -83,3 +83,5 @@ __pycache__/
 /worktrees/
 *.part
 *.crdownload
+.terminal-ui/
+.alice/
