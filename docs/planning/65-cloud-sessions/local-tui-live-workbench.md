@@ -167,14 +167,23 @@ all routing or multi-session behavior already exists.
 
 ## 6. Installable candidate gate
 
-The current Draft PR is **not automatically installable**. Installation is not
-part of draft review and must wait until the TUI and Goal-follow-mode
-implementation is complete and the one-time consolidated build, test and review
-evidence (`h5`) has been collected successfully. Only then, at `h10`, name an
-exact commit and branch as the candidate. Before any installation, verify the
-concrete target system, affected services, backup and rollback plan, and exact
-installation commands. Obtain explicit approval before making any host, sudo,
-or service changes. This gate does not authorize installation or merging.
+The current Draft PR is **not automatically approved or installed**. Installation has two separate stages:
+
+- **Early installation of existing functionality:** Do not wait for the unfinished
+  TUI or Goal-follow work. First complete the `h11` inventory of functionality
+  already present, then the narrowly focused successful build/regression check
+  at `h12`. At `h13`, document the concrete target system, backup and rollback
+  plan, exact commands, and obtain the required explicit approval before any
+  installation or host/service changes. This describes a gate, not a claim that
+  these steps are already complete or that the candidate is ready.
+- **Later full TUI/Goal-follow installation:** Treat this separately and wait for
+  the TUI/Goal-follow work and its `h7`/`h9`/`h5` milestones and evidence before
+  proposing installation of that complete feature set. It has its own concrete
+  target, backup/rollback, commands and required approval.
+
+A Draft PR is not itself approval, installation, or evidence that either stage is
+ready. Neither gate authorizes merging or installation without the required
+approval.
 
 ## 7. Boundaries and review notes
 
