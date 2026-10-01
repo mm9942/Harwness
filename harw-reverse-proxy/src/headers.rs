@@ -54,6 +54,7 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
     "te",
     "trailer",
+    "transfer-encoding",
     "upgrade",
 ];
 
@@ -88,7 +89,11 @@ fn valid_value(v: &str) -> bool {
 /// hop-by-hop headers, every header named in a `Connection` header, `Host`
 /// (the adapter sets the upstream `Host` itself), the owned forwarding headers
 /// and `policy.strip`; then appends the forwarding headers and `policy.set`.
-/// `Upgrade` and `Connection` pass only when `policy.allow_upgrade` is set.
+/// An upgrade (`websocket` only) is forwarded only when `policy.allow_upgrade`
+/// is set and the client asked for it; the proxy then emits its own
+/// `Connection: Upgrade`. `Transfer-Encoding` is dropped (framing is the
+/// adapter's); a message with both `Transfer-Encoding` and `Content-Length`, or
+/// with repeated or non-numeric `Content-Length`, is refused.
 pub fn sanitize_headers(
     headers: &[(String, String)],
     original_host: &str,
@@ -118,15 +123,52 @@ pub fn sanitize_headers(
         .collect();
     let strip: Vec<String> = policy.strip.iter().map(|s| lower(s)).collect();
 
+    // Request framing (RFC 9110 7.6.1, RFC 9112 6.3): a message with both
+    // `Transfer-Encoding` and `Content-Length`, repeated or non-numeric
+    // `Content-Length` values are ambiguous (smuggling) and refused. A lone
+    // `Transfer-Encoding` is dropped below: outbound framing belongs to the HTTP
+    // adapter, which re-frames the body it decoded.
+    let has_te = headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding"));
+    let lengths: Vec<&str> = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.trim())
+        .collect();
+    let bad_length = lengths.len() > 1
+        || lengths
+            .iter()
+            .any(|v| v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()));
+    if (has_te && !lengths.is_empty()) || bad_length {
+        return Err(Refusal::BadHeader);
+    }
+    // An upgrade is only forwarded when the client asked for one (`Connection`
+    // names `upgrade` and an `Upgrade` header exists) and the route allows it.
+    // The proxy then emits its own `Connection: Upgrade`; the client's
+    // `Connection` value is never forwarded, so the client cannot nominate
+    // headers the proxy adds as hop-by-hop. Only `websocket` is accepted
+    // (`h2c` and other protocols would bypass the proxy's framing).
+    let upgrade_values: Vec<&str> = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("upgrade"))
+        .map(|(_, v)| v.trim())
+        .collect();
+    let asked_for_upgrade =
+        named_in_connection.iter().any(|t| t == "upgrade") && !upgrade_values.is_empty();
+    let forward_upgrade = policy.allow_upgrade && asked_for_upgrade;
+    if forward_upgrade
+        && !(upgrade_values.len() == 1 && upgrade_values[0].eq_ignore_ascii_case("websocket"))
+    {
+        return Err(Refusal::BadHeader);
+    }
+
     let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len() + 6);
     for (name, value) in headers {
         let n = lower(name);
-        let upgrade_family = n == "upgrade" || n == "connection";
-        let hop = HOP_BY_HOP.contains(&n.as_str()) && !(policy.allow_upgrade && upgrade_family);
-        let listed = named_in_connection.contains(&n) && !(policy.allow_upgrade && n == "upgrade");
         if n == "host"
-            || hop
-            || listed
+            || HOP_BY_HOP.contains(&n.as_str())
+            || named_in_connection.contains(&n)
             || OWNED.contains(&n.as_str())
             || n.starts_with(INTERNAL_PREFIX)
             || strip.contains(&n)
@@ -134,6 +176,10 @@ pub fn sanitize_headers(
             continue;
         }
         out.push((name.clone(), value.clone()));
+    }
+    if forward_upgrade {
+        out.push(("connection".into(), "Upgrade".into()));
+        out.push(("upgrade".into(), "websocket".into()));
     }
     out.push(("x-forwarded-for".into(), client.addr.to_string()));
     out.push(("x-forwarded-host".into(), original_host.to_owned()));
@@ -296,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_passes_only_when_allowed() -> TestResult {
-        let input = h(&[("Connection", "Upgrade"), ("Upgrade", "websocket")]);
+    fn upgrade_passes_only_when_allowed_and_requested() -> TestResult {
+        let input = h(&[("Connection", "Upgrade"), ("Upgrade", "WebSocket")]);
         let allowed = HeaderPolicy {
             allow_upgrade: true,
             ..HeaderPolicy::default()
@@ -305,12 +351,105 @@ mod tests {
         let out = sanitize_headers(&input, "a.example.org", client(), &allowed)?;
         ensure(
             get(&out, "upgrade") == ["websocket"] && get(&out, "connection") == ["Upgrade"],
-            "kept for a websocket route",
+            "rebuilt for a websocket route",
         )?;
         let off = sanitize_headers(&input, "a.example.org", client(), &HeaderPolicy::default())?;
         ensure(
             get(&off, "upgrade").is_empty() && get(&off, "connection").is_empty(),
             "dropped by default",
+        )?;
+        let no_request = h(&[("Upgrade", "websocket")]);
+        let out = sanitize_headers(&no_request, "a.example.org", client(), &allowed)?;
+        ensure(
+            get(&out, "upgrade").is_empty() && get(&out, "connection").is_empty(),
+            "no Connection: upgrade, nothing forwarded",
+        )
+    }
+
+    #[test]
+    fn the_client_connection_value_is_never_forwarded() -> TestResult {
+        // The client nominates headers the proxy adds as hop-by-hop; the proxy
+        // must emit only its own `Connection: Upgrade`.
+        let input = h(&[
+            ("Connection", "Upgrade, X-Request-Class, X-Forwarded-For"),
+            ("Upgrade", "websocket"),
+        ]);
+        let policy = HeaderPolicy {
+            set: vec![("x-request-class".into(), "edge".into())],
+            allow_upgrade: true,
+            ..HeaderPolicy::default()
+        };
+        let out = sanitize_headers(&input, "a.example.org", client(), &policy)?;
+        ensure(
+            get(&out, "connection") == ["Upgrade"],
+            "exactly the proxy's own Connection value",
+        )?;
+        ensure(
+            get(&out, "x-request-class") == ["edge"],
+            "proxy-set header present",
+        )?;
+        ensure(
+            get(&out, "x-forwarded-for") == ["203.0.113.9"],
+            "forwarding header present",
+        )
+    }
+
+    #[test]
+    fn only_websocket_upgrades_are_forwarded() -> TestResult {
+        let allowed = HeaderPolicy {
+            allow_upgrade: true,
+            ..HeaderPolicy::default()
+        };
+        for proto in ["h2c", "websocket, h2c", "TLS/1.0"] {
+            let input = h(&[("Connection", "Upgrade"), ("Upgrade", proto)]);
+            ensure(
+                sanitize_headers(&input, "a.example.org", client(), &allowed)
+                    == Err(Refusal::BadHeader),
+                proto,
+            )?;
+            // On a route without upgrades the request is simply stripped.
+            ensure(
+                sanitize_headers(&input, "a.example.org", client(), &HeaderPolicy::default())
+                    .is_ok(),
+                "dropped, not refused, when upgrades are off",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_encoding_is_dropped_and_ambiguous_framing_is_refused() -> TestResult {
+        let policy = HeaderPolicy::default();
+        let lone = h(&[("TrAnSfEr-EnCoDiNg", "chunked"), ("Accept", "*/*")]);
+        let out = sanitize_headers(&lone, "a.example.org", client(), &policy)?;
+        ensure(
+            get(&out, "transfer-encoding").is_empty(),
+            "inbound transfer coding removed",
+        )?;
+        ensure(get(&out, "accept") == ["*/*"], "ordinary header kept")?;
+        let both = h(&[("Transfer-Encoding", "chunked"), ("Content-Length", "5")]);
+        ensure(
+            sanitize_headers(&both, "a.example.org", client(), &policy) == Err(Refusal::BadHeader),
+            "TE with CL",
+        )?;
+        for bad in [
+            h(&[("Content-Length", "5"), ("content-length", "5")]),
+            h(&[("Content-Length", "5"), ("Content-Length", "6")]),
+            h(&[("Content-Length", "-1")]),
+            h(&[("Content-Length", "")]),
+            h(&[("Content-Length", "1e3")]),
+        ] {
+            ensure(
+                sanitize_headers(&bad, "a.example.org", client(), &policy)
+                    == Err(Refusal::BadHeader),
+                "bad content-length",
+            )?;
+        }
+        let ok = h(&[("Content-Length", "12")]);
+        let out = sanitize_headers(&ok, "a.example.org", client(), &policy)?;
+        ensure(
+            get(&out, "content-length") == ["12"],
+            "a single numeric length is kept for the adapter to check",
         )
     }
 

@@ -61,9 +61,43 @@ pub fn normalize_host(raw: &str) -> Option<NormalizedHost> {
     if host.is_empty() {
         return None;
     }
-    let valid = host.parse::<IpAddr>().is_ok()
-        || (host.chars().all(is_name_char) && !host.starts_with('.') && !host.contains(".."));
+    // An IP literal is stored in its canonical text form, so `[0:0:0:0:0:0:0:1]`
+    // and `[::1]` are the same host.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(NormalizedHost {
+            host: ip.to_string(),
+            port,
+        });
+    }
+    let valid = host.chars().all(is_name_char) && !host.starts_with('.') && !host.contains("..");
     valid.then_some(NormalizedHost { host, port })
+}
+
+/// Normalize a host from **configuration** (no port). Accepts the wire form
+/// (`[::1]`, `app.example.org`) and, for convenience, a bare IPv6 literal
+/// (`::1`), which is not valid in a `Host` header. Returns the normalized host
+/// without brackets, the form stored in routes and compared against requests.
+pub fn normalize_config_host(raw: &str) -> Option<String> {
+    if let Ok(ip) = raw.trim().parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    normalize_host(raw)
+        .filter(|h| h.port.is_none())
+        .map(|h| h.host)
+}
+
+/// `host` as it appears in a `Host` header or `X-Forwarded-Host`: IPv6 literals
+/// get their brackets back, an explicit port is appended.
+pub fn format_authority(host: &str, port: Option<u16>) -> String {
+    let h = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    match port {
+        Some(p) => format!("{h}:{p}"),
+        None => h,
+    }
 }
 
 /// Percent escapes that would hide a dot segment or a path separator.
@@ -151,6 +185,52 @@ mod tests {
             "ipv6 literal",
         )?;
         ensure(normalize_host("127.0.0.1").is_some(), "ipv4 literal")
+    }
+
+    #[test]
+    fn ip_literals_are_canonical_and_authority_restores_brackets() -> TestResult {
+        ensure(
+            normalize_host("[0:0:0:0:0:0:0:1]:8443")
+                == Some(NormalizedHost {
+                    host: "::1".into(),
+                    port: Some(8443),
+                }),
+            "v6 canonical",
+        )?;
+        // Both spellings of the IPv4-mapped loopback normalize to one host.
+        let dotted = normalize_host("[::FFFF:127.0.0.1]").map(|h| h.host);
+        let hex = normalize_host("[::ffff:7f00:1]").map(|h| h.host);
+        ensure(
+            dotted.is_some() && dotted == hex,
+            "mapped spellings are one canonical host",
+        )?;
+        ensure(
+            normalize_config_host("[::1]") == Some("::1".into()),
+            "bracketed config",
+        )?;
+        ensure(
+            normalize_config_host("::1") == Some("::1".into()),
+            "bare v6 accepted in config only",
+        )?;
+        ensure(
+            normalize_config_host("[::1]:80").is_none()
+                && normalize_config_host("a.example.org:80").is_none(),
+            "no port in config",
+        )?;
+        ensure(
+            normalize_config_host("A.Example.org.") == Some("a.example.org".into()),
+            "name normalized",
+        )?;
+        ensure(
+            format_authority("::1", Some(8443)) == "[::1]:8443",
+            "v6 with port",
+        )?;
+        ensure(format_authority("::1", None) == "[::1]", "v6 without port")?;
+        ensure(
+            format_authority("a.example.org", Some(80)) == "a.example.org:80",
+            "name with port",
+        )?;
+        ensure(format_authority("127.0.0.1", None) == "127.0.0.1", "v4")
     }
 
     #[test]

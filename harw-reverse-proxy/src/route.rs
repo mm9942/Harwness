@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use harw_egress::{AddrClass, classify};
 
-use crate::normalize::{normalize_host, normalize_path};
+use crate::normalize::{format_authority, normalize_config_host, normalize_host, normalize_path};
 
 /// How far an upstream address may reach. Loopback is always allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,9 @@ impl UpstreamScope {
 pub struct Route {
     /// Unique id (logs, audit).
     pub id: String,
-    /// Exact host (normalized form, no port).
+    /// Exact host without port: a name, an IPv4 literal or an IPv6 literal
+    /// (`[::1]` or `::1`). [`RouteTable::new`] normalizes it (lowercase, no
+    /// trailing dot, canonical IP text, no brackets) before storing.
     pub host: String,
     /// Path prefix matched per segment (`/api` matches `/api` and `/api/x`, not
     /// `/apix`). `/` matches everything.
@@ -202,16 +204,16 @@ fn path_segments(path: &str) -> Vec<&str> {
 
 impl RouteTable {
     /// Validate `routes` and build the table.
-    pub fn new(routes: Vec<Route>) -> Result<Self, ConfigError> {
+    pub fn new(mut routes: Vec<Route>) -> Result<Self, ConfigError> {
         let mut ids = std::collections::HashSet::new();
         let mut keys = std::collections::HashSet::new();
-        for r in &routes {
+        for r in &mut routes {
             if r.id.is_empty() || !ids.insert(r.id.clone()) {
                 return Err(ConfigError::BadId(r.id.clone()));
             }
-            let host = normalize_host(&r.host)
-                .filter(|h| h.port.is_none() && h.host == r.host)
-                .ok_or_else(|| ConfigError::BadHost(r.id.clone()))?;
+            let host =
+                normalize_config_host(&r.host).ok_or_else(|| ConfigError::BadHost(r.id.clone()))?;
+            r.host = host;
             let (prefix, query) = normalize_path(&r.path_prefix)
                 .ok_or_else(|| ConfigError::BadPrefix(r.id.clone()))?;
             let prefix_ok = query.is_none()
@@ -235,7 +237,7 @@ impl RouteTable {
             if r.max_body_bytes == 0 {
                 return Err(ConfigError::BadBodyLimit(r.id.clone()));
             }
-            if !keys.insert((host.host, prefix)) {
+            if !keys.insert((r.host.clone(), prefix)) {
                 return Err(ConfigError::Duplicate(r.id.clone()));
             }
         }
@@ -296,10 +298,7 @@ impl RouteTable {
             target.push('?');
             target.push_str(&q);
         }
-        let original_host = match host.port {
-            Some(p) => format!("{}:{p}", host.host),
-            None => host.host,
-        };
+        let original_host = format_authority(&host.host, host.port);
         Decision::Forward(Forward {
             route_id: route.id.clone(),
             upstream: route.upstream,
@@ -447,6 +446,54 @@ mod tests {
     }
 
     #[test]
+    fn config_hosts_are_normalized_and_ipv6_routes_work() -> TestResult {
+        let t = RouteTable::new(vec![
+            route("v6", "[::1]", "/", "127.0.0.1:1")?,
+            route("name", "A.Example.org.", "/", "127.0.0.1:2")?,
+        ])?;
+        ensure(
+            t.routes()[0].host == "::1" && t.routes()[1].host == "a.example.org",
+            "stored normalized",
+        )?;
+        for (host, expect) in [
+            ("[::1]", "[::1]"),
+            ("[::1]:8443", "[::1]:8443"),
+            ("[0:0:0:0:0:0:0:1]", "[::1]"),
+        ] {
+            match t.decide(&req("GET", host, "/x")) {
+                Decision::Forward(f) => {
+                    ensure(f.route_id == "v6", host)?;
+                    ensure(
+                        f.original_host == expect,
+                        "brackets restored in X-Forwarded-Host",
+                    )?;
+                }
+                Decision::Refuse(r) => {
+                    return Err(crate::test_support::TestError(format!("{host}: {r:?}")));
+                }
+            }
+        }
+        // A bare IPv6 literal in configuration is accepted; in a request it is not.
+        ensure(
+            RouteTable::new(vec![route("v6", "::1", "/", "127.0.0.1:1")?]).is_ok(),
+            "bare v6 in config",
+        )?;
+        ensure(
+            t.decide(&req("GET", "::1", "/x")) == Decision::Refuse(Refusal::BadHost),
+            "bare v6 in a request",
+        )?;
+        // Two spellings of one host collide.
+        let dup = RouteTable::new(vec![
+            route("a", "[::1]", "/", "127.0.0.1:1")?,
+            route("b", "::1", "/", "127.0.0.1:2")?,
+        ]);
+        ensure(
+            matches!(dup, Err(ConfigError::Duplicate(_))),
+            "spellings of the same host are duplicates",
+        )
+    }
+
+    #[test]
     fn methods_are_enforced() -> TestResult {
         let t = table().map_err(|e| crate::test_support::TestError(e.to_string()))?;
         ensure(
@@ -545,8 +592,9 @@ mod tests {
             ensure(RouteTable::new(vec![r]).is_err(), "must be rejected")
         };
         bad(&|r| r.id = String::new())?;
-        bad(&|r| r.host = "A.example.org".into())?;
         bad(&|r| r.host = "a.example.org:80".into())?;
+        bad(&|r| r.host = "[::1]:80".into())?;
+        bad(&|r| r.host = "a b".into())?;
         bad(&|r| r.path_prefix = "x".into())?;
         bad(&|r| r.path_prefix = "/x/".into())?;
         bad(&|r| r.path_prefix = "/x/../y".into())?;

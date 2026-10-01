@@ -28,7 +28,9 @@ mod test_support;
 
 pub use group::{Backend, GroupError, UpstreamGroup, may_retry};
 pub use headers::{ClientInfo, HeaderPolicy, Proto, sanitize_headers};
-pub use normalize::{NormalizedHost, normalize_host, normalize_path};
+pub use normalize::{
+    NormalizedHost, format_authority, normalize_config_host, normalize_host, normalize_path,
+};
 pub use route::{
     ConfigError, Decision, Forward, Refusal, RequestHead, Route, RouteTable, UpstreamScope,
 };
