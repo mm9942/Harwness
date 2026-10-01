@@ -446,7 +446,8 @@ This is not cosmetic. It defines whether session identity remains stable.
 6. resync if generation/cursor requires it;
 7. show current live agents/jobs;
 8. if the host marks the session Interrupted and policy requires explicit
-   resume, invoke the existing session-resume intent.
+   resume, invoke the existing session-resume intent. A read-only attach
+   cannot resume; resume needs a Steer client (`[sessions] resume = "manual"`).
 
 Continue does **not** create another root session.
 
@@ -844,7 +845,10 @@ Security-sensitive waves additionally need explicit negative tests for:
 - cross-tenant session access;
 - stale/revoked device reconnect;
 - capability widening;
-- second-writer session ownership;
+- second-writer session ownership, including a stale `placement_generation`
+  after a route refresh;
+- Global Cloud Admin reading session content without a separate audited
+  transcript capability;
 - job start without required sandbox;
 - worker fallback to host;
 - container-root -> host-root confusion;
@@ -867,6 +871,6 @@ The Cloud Home v2 slice is successful when:
 11. job/agent control remains on canonical typed authority paths;
 12. Global System Admin, Global Cloud Admin and root-agent are distinct roles;
 13. the first-party attached TUI uses SessionPort rather than owning the hosted
-    turn loop;
+    turn loop (dependency gate: the attach binary does not link `harw-core`);
 14. the implementation can later converge local `harw` onto the same client
     model without rewriting the control plane again.
