@@ -78,6 +78,7 @@ pub mod research_web;
 pub mod roster;
 pub mod skill_proposal_tools;
 pub mod skill_tools;
+pub mod tool_index;
 pub mod workbench_tools;
 
 #[cfg(test)]
