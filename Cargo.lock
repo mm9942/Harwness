@@ -3786,6 +3786,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-session-daemon"
+version = "0.9.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "harw-protocol",
+ "harw-session-host",
+ "harw-session-ws",
+ "harw-types",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "harw-session-host"
 version = "0.9.0"
 dependencies = [

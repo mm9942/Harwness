@@ -1,0 +1,32 @@
+[package]
+publish.workspace = true
+name = "harw-session-daemon"
+description = "Local session daemon: binds a Unix socket, authenticates each peer by kernel credentials, upgrades to harw.session.v1 and serves the session host (hub wiring W2). Composition only: identity decisions use the kernel uid, protocol and policy live in the host and transport crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-session-host = { path = "../harw-session-host" }
+harw-session-ws = { path = "../harw-session-ws" }
+harw-types = { path = "../harw-types" }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+harw-protocol = { path = "../harw-protocol" }
+tempfile = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+serde_json = { workspace = true }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+
+[lints]
+workspace = true
