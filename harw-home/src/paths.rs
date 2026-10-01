@@ -693,7 +693,7 @@ pub(crate) fn config_layers_report_in(
 ) -> HomeResult<LayerReport> {
     let profile_layer = profile_dir(home, profile)?;
     let mut report = LayerReport {
-        layers: vec![home.to_path_buf(), profile_layer.clone()],
+        layers: vec![home.join("<embedded>"), home.to_path_buf(), profile_layer.clone()],
         untrusted_repo: None,
         status: None,
     };
@@ -992,6 +992,7 @@ mod tests {
         assert_eq!(
             report.layers,
             vec![
+                home.0.join("<embedded>"),
                 home.0.clone(),
                 home.0.join("profiles").join(DEFAULT_PROFILE)
             ]
@@ -1008,14 +1009,14 @@ mod tests {
         crate::trust::trust_project(&home.0, &repo.0)?;
 
         let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path()))?;
-        assert_eq!(report.layers.len(), 3);
+        assert_eq!(report.layers.len(), 4);
         assert_eq!(report.layers.last(), Some(&repo.0.join(".harw")));
         assert_eq!(report.untrusted_repo, None);
         assert_eq!(report.status, Some(TrustStatus::Trusted));
 
         std::fs::write(repo.0.join(".harw/auth.toml"), "[credentials]\n")?;
         let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path()))?;
-        assert_eq!(report.layers.len(), 2);
+        assert_eq!(report.layers.len(), 3);
         assert_eq!(report.untrusted_repo, Some(repo.0.join(".harw")));
         assert_eq!(report.status, Some(TrustStatus::Changed));
         Ok(())
@@ -1034,6 +1035,7 @@ mod tests {
         assert_eq!(
             report.layers,
             vec![
+                harw_home.join("<embedded>"),
                 harw_home.clone(),
                 harw_home.join("profiles").join(DEFAULT_PROFILE)
             ]
@@ -1051,7 +1053,8 @@ mod tests {
         let plain = TempDir::new("plain")?;
         for cwd in [Some(plain.0.as_path()), None] {
             let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, cwd)?;
-            assert_eq!(report.layers.len(), 2);
+            assert_eq!(report.layers.len(), 3);
+            assert_eq!(report.layers.first().map(|p| p.ends_with("<embedded>")), Some(true), "embedded layer must be first");
             assert_eq!(report.untrusted_repo, None);
             assert_eq!(report.status, None);
         }
@@ -1078,7 +1081,7 @@ mod tests {
         assert_eq!(trusted_report.status, Some(TrustStatus::Trusted));
 
         let untrusted_report = config_layers_report_at(&home.0, untrusted_repo.0.as_path())?;
-        assert_eq!(untrusted_report.layers.len(), 2);
+        assert_eq!(untrusted_report.layers.len(), 3);
         assert_eq!(
             untrusted_report.untrusted_repo,
             Some(untrusted_repo.0.join(".harw"))

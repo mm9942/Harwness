@@ -99,6 +99,8 @@ use crate::uia_worker_models::UiaWorkerModelsToml;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerRole {
+    /// unterste eingebettete Basisschicht; kann von allen vertrauten Layern überschrieben werden
+    Embedded,
     /// Der erste vertraute Layer (`~/.harw`, `layer_index == 0`). Jede
     /// Regel verhält sich hier identisch zu `ProfileReplaces` — es gibt
     /// noch keinen GLOBAL-Vorzustand, gegen den verengt werden könnte.
@@ -172,6 +174,7 @@ impl LayerRole {
     // `layer_role`-Feld der `tracing::warn!`-Aufrufe unten.
     fn label(self) -> &'static str {
         match self {
+            Self::Embedded => "embedded",
             Self::Baseline => "baseline",
             Self::Refinement => "refinement",
             Self::UntrustedProject => "untrusted_project",
@@ -336,7 +339,7 @@ fn global_only<T: Clone + PartialEq + std::fmt::Debug>(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming;
         }
@@ -361,7 +364,7 @@ fn union_list<T: Clone + PartialEq>(
     present: bool,
     role: LayerRole,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming.to_vec();
         }
@@ -392,7 +395,7 @@ fn intersection_list<T: Clone + PartialEq + std::fmt::Debug>(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming.to_vec();
         }
@@ -424,7 +427,7 @@ fn min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming;
         }
@@ -482,7 +485,7 @@ fn and_bool(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming;
         }
@@ -510,7 +513,7 @@ fn or_bool(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming;
         }
@@ -578,7 +581,7 @@ fn stricter_of(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming;
         }
@@ -672,7 +675,7 @@ fn merge_mcp_listener_principals(
     layer_path: &Path,
     out: &mut Vec<ScopeDiagnostic>,
 ) {
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         if present {
             *trusted = incoming.to_vec();
         }
@@ -1539,7 +1542,7 @@ fn merge_host(
     let Some(value) = incoming.sudo_session_minutes else {
         return;
     };
-    if role == LayerRole::Baseline {
+    if role == LayerRole::Baseline || role == LayerRole::Embedded {
         trusted.host.sudo_session_minutes = Some(value);
         return;
     }

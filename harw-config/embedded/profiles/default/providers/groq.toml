@@ -1,7 +1,7 @@
 name = "groq"
 api = "openai-chat"
 base_url = "https://api.groq.com/openai/v1"
-auth = "env:"
+auth = "env:GROQ_API_KEY"
 models = [
     "allam-2-7b",
     "groq/compound",

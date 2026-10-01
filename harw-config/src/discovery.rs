@@ -731,6 +731,70 @@ pub fn discover_config_with_restricted_and_project_settings(
     let mut definition_layers = BTreeMap::<String, DiscoveredDefinitionLayers>::new();
     let mut context_programs: Vec<(DefinitionLayer, String, String, PathBuf)> = Vec::new();
 
+    // Eingebettete Basisschicht (`harw-config/embedded/profiles/default/`,
+    // per `include_dir!` ins Binary kompiliert): die schwächste Layer-Quelle.
+    // Sie liefert Provider-/Model-Defaults auch mit leerem Home und wird von
+    // jedem vertrauten Layer (`~/.harw`, aktives Profil, Projekt) überschrieben
+    // — Monotonie siehe `LayerRole::Embedded` in `merge.rs`.
+    let embedded_files = crate::embedded_profile::embedded_profile_layer();
+    if let Some((_, embedded_config_text)) = embedded_files
+        .iter()
+        .find(|(path, _)| path == "config.toml")
+    {
+        let embedded_fields: toml::Value = embedded_config_text
+            .parse()
+            .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
+        if let Some(section) = extract_section::<NetworkSection>(&embedded_fields, "network")? {
+            resolved.network = section;
+        }
+        if let Some(section) = extract_section::<BrowserSection>(&embedded_fields, "browser")? {
+            resolved.browser = section;
+        }
+        if let Some(section) = extract_section::<DodSection>(&embedded_fields, "dod")? {
+            resolved.dod = section;
+        }
+        if let Some(section) = extract_section::<WebSection>(&embedded_fields, "web")? {
+            resolved.web = section;
+        }
+        if let Some(section) =
+            extract_section::<InfrastructureSection>(&embedded_fields, "infrastructure")?
+        {
+            resolved.infrastructure = Some(section);
+        }
+        let mut harness_fields = embedded_fields.clone();
+        strip_new_sections(&mut harness_fields);
+        let embedded_cfg: HarnessConfig = harness_fields
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
+        let embedded_marker: PathBuf = ["<embedded>", "profiles", "default", "config.toml"]
+            .iter()
+            .collect();
+        let scope_diagnostics = merge_layer_into(
+            &mut resolved.harness,
+            embedded_cfg,
+            &embedded_fields,
+            LayerRole::Embedded,
+            &embedded_marker,
+        );
+        resolved.scope_warnings.extend(scope_diagnostics);
+    }
+    // Eingebettete Provider-/Model-Dateien (URL-dekodierte relative Pfade).
+    for (path, text) in &embedded_files {
+        if let Some(file) = path.strip_prefix("providers/") {
+            let item: ProviderToml = toml::from_str(text)
+                .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
+            // Embedded füllt nur Lücken: eine gleichnamige Datei in einem
+            // späteren Layer überschreibt den Embedded-Eintrag.
+            resolved.providers.entry(item.name().to_owned()).or_insert(item);
+            let _ = file;
+        } else if let Some(file) = path.strip_prefix("models/") {
+            let item: ModelToml = toml::from_str(text)
+                .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
+            resolved.models.entry(item.name().to_owned()).or_insert(item);
+            let _ = file;
+        }
+    }
+
     // Env-Layer aus allen Layer-Verzeichnissen laden (letzte gewinnt).
     // Die Prozess-Umgebung wird nicht verändert.
     let dotenv_paths: Vec<PathBuf> = layers.iter().filter(|p| p.exists()).cloned().collect();
@@ -2022,6 +2086,9 @@ max_nodes = 64
                 .map_err(ctx("Eingeschränkte Konfiguration entdecken"))?;
 
         // Kataloge, Secrets, Env und Ingress bleiben ausschließlich vertraut.
+        // (Embedded Default-Modelle füllen Lücken, sind aber keine Repo-/
+        // Secret-Leak-Kanäle; der Test prüft weiterhin: keine Modelle AUS
+        // DEM REPO-LAYER, also keine bösartigen Repo-Einträge.)
         assert_eq!(
             config.providers["openai"].base_url,
             "https://api.openai.com/v1"
@@ -2035,7 +2102,13 @@ max_nodes = 64
             Some("env:OPENAI_API_KEY")
         );
         assert!(!config.providers.contains_key("evil"));
-        assert!(config.models.is_empty());
+        assert!(
+            config
+                .models
+                .values()
+                .all(|m| m.name.as_deref() != Some("evil-model")),
+            "no models from the untrusted repo layer may appear"
+        );
         assert!(config.auth.credentials.is_empty());
         assert_eq!(config.env_layer.get("OPENAI_API_KEY"), None);
         assert_eq!(
