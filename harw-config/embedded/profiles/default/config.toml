@@ -1,0 +1,7 @@
+# Embedded, secrets-free default profile base layer.
+
+[profile]
+name = "default"
+
+[models]
+# No model selected by default.

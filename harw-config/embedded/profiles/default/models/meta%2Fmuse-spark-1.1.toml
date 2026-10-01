@@ -1,0 +1,12 @@
+id = "meta/muse-spark-1.1"
+provider = "openrouter"
+aliases = []
+context_window = 1048576
+reasoning = false
+input_types = []
+
+[capabilities]
+tool_use = true
+streaming = false
+vision = false
+json_mode = false

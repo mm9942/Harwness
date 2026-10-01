@@ -1,0 +1,11 @@
+id = "gpt-image-2-2026-04-21"
+provider = "foundry"
+aliases = []
+reasoning = false
+input_types = []
+
+[capabilities]
+tool_use = false
+streaming = false
+vision = false
+json_mode = false

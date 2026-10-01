@@ -1,0 +1,27 @@
+name = "groq"
+api = "openai-chat"
+base_url = "https://api.groq.com/openai/v1"
+auth = "env:"
+models = [
+    "allam-2-7b",
+    "groq/compound",
+    "groq/compound-mini",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-prompt-guard-2-22m",
+    "meta-llama/llama-prompt-guard-2-86m",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-safeguard-20b",
+    "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b",
+    "whisper-large-v3",
+    "whisper-large-v3-turbo",
+]
+enabled = false
+
+[headers]
+
+[origin_allowlist]
+agents = []
+channels = []

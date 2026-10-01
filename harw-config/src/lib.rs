@@ -14,6 +14,7 @@ pub mod channel_toml;
 pub mod discovery;
 pub mod dod_toml;
 pub mod dotenv;
+pub mod embedded_profile;
 pub mod error;
 pub mod harness_config;
 // Crypto-Infrastruktur H4: `[infrastructure]` — Daemon-Sockets.
