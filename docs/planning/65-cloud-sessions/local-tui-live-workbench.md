@@ -106,6 +106,15 @@ all routing or multi-session behavior already exists.
 - Refresh the projection as goal/plan state changes. Clearly indicate when the
   selected session has no valid binding to an active goal/plan, or when the
   available binding/state is stale; do not present missing or stale data as live.
+- Current implementation reference: `harw-tui/src/goal_marker.rs` already shows
+  a read-only goal marker and polls through `TuiPlanServices` from the active
+  profile session; this does not establish per-session goal binding. A session
+  switch must not present a profile-wide goal state as session-specific. Until
+  a suitable API provides session binding, label the scope explicitly or state
+  that there is **no session binding**.
+- `harw-tui/src/app/plan_mode.rs` is an `InteractionMode` that can affect
+  permissions and approvals. It must **not** be reused for a purely presentational
+  Goal-follow mode.
 - Toggling or viewing this mode must leave the chat composer and transcript
   scrollback available and unaffected.
 - This mode is strictly observational: it must never change permissions,
@@ -121,10 +130,19 @@ all routing or multi-session behavior already exists.
    projection; preserve complete chronological scrollback.
 3. **Transient status policy:** implement the 30-second prominence window and
    the TOML `consolidate`/`hide` modes without deleting durable records.
-4. **Consolidated verification:** add deterministic tests for routing,
-   interleaved sessions, composer availability, recency-slot movement,
-   scrollback, expiry and both TOML modes. Run the affected test/build checks
-   together after the implementation work is complete, not after each slice.
+4. **Goal-follow contract (h8):** define the goal-state scope/binding contract,
+   including explicit scope labeling or “no session binding” until a suitable
+   session-aware API exists; keep this projection read-only and separate from
+   permission-/approval-affecting interaction modes.
+5. **Goal-follow UI (h9):** implement the toggleable, presentational projection
+   with evidence-backed progress and clear missing/stale/scope indicators; do
+   not treat implementation as complete until delivered and reviewed.
+6. **Consolidated verification (h5):** after implementation, run deterministic
+   tests/build checks for routing, interleaved sessions, composer availability,
+   recency-slot movement, scrollback, expiry and both TOML modes, plus Goal-follow
+   scope, read-only behavior and session switching. This final verification
+   remains pending until performed; do not imply implementation or checks are
+   already complete.
 
 ## 5. Acceptance checks
 
