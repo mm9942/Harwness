@@ -43,7 +43,13 @@ change runtime behavior.
 17. Modal approvals/dialogs outrank the deck.
 18. R19 narrow-portrait status/composer/goal/host-mode behavior is a regression
     contract, not historical documentation only.
-19. The projection design must remain compatible with later hosted-session
+19. The three projections are pure functions of
+    `(AgentEvent stream, JobStatus snapshot)` in a module without a `ChatApp`
+    dependency, so a recorded stream replays to the same projection.
+20. A terminal aggregate later migrates to a PL-71 `role-run-summary@1`
+    projection; W20 must not introduce a second aggregation mechanism that
+    PL-71 cannot absorb.
+21. The projection design must remain compatible with later hosted-session
     attach/replay; it must not require the local TUI process to own work
     lifetime.
 

@@ -194,6 +194,10 @@ deck
 └── running jobs: remaining height, full width
 ```
 
+When the running-jobs region has no active jobs it collapses to a single
+empty-state row and returns the spare height to the agents/terminal row, so
+"exactly three regions" holds without wasting space.
+
 Recommended typed result:
 
 ```rust
@@ -285,6 +289,21 @@ Rules:
 This allows the live deck to show one child in both useful live views without
 rendering it twice in terminal history.
 
+Edge cases that must be specified by W20-A tests:
+
+- **Race.** A job event may arrive before its `AgentEvent`. The job must not
+  count as its own terminal category in the meantime; keep a pending-link
+  table or count terminal state only from the agent run.
+- **Orphan.** A job tagged `AgentChild` whose agent run was evicted or never
+  seen is shown as "Agent child (untracked)", never silently dropped.
+- **Diverging outcomes.** Agent run `Completed` but job `Failed` (exit != 0):
+  the agent run still owns the count, and the aggregate carries a
+  "job exit != 0" badge so the signal is not lost.
+- `JobOrigin.owner_agent` is a display name and is never used as provenance.
+  Prefer one serialized tagged enum in `meta.json` / `JobEvent::Started`
+  (`#[serde(default)]` = `Unknown`) over additional `Option` fields, so
+  contradictory combinations are unrepresentable.
+
 ## 5. Active-agents pane
 
 The upper-left pane shows concrete active identities.
@@ -344,6 +363,11 @@ Acknowledgement advances the aggregate's seen revision; it does not delete
 history.
 
 ### 6.2 Retention boundary
+
+Aggregate counters are kept separately from constituent records. A counter
+survives eviction of the constituents; the drill-down does not. The UI marks
+a row whose constituents were evicted ("12 total, 8 listed"). The retention
+bound (runs per category) is a named constant with a test.
 
 W20 only promises history for data the current sources actually retain.
 
@@ -461,6 +485,10 @@ TERM, then the existing job stop policy if it does not exit.
 ```
 
 The confirmation is a UI step only. Admission remains in the operation path.
+
+If the job reached a terminal state between confirmation and dispatch, the
+operation's "already finished" result is shown as such, not as a generic
+error. W20-E documents whether `/jobs` is admitted while a turn is busy.
 
 ## 10. Presentation state
 
