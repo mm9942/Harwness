@@ -62,6 +62,19 @@ struct ProjectionUpdate<T> {
 
 Consumers ignore stale revisions. This permits safe in-place update even if events are processed asynchronously.
 
+## Determinism rules
+
+- Time is evaluated only from event time (`occurred_at`), never from the wall
+  clock inside a reducer. A timeout break is a synthetic tick event in the
+  stream, so it is logged and replayable.
+- Reducer input is one canonically sequenced stream (`(source, seq)` per
+  producer plus a defined merge rule). Without it, replay equality holds only
+  per producer.
+- A rebase is itself an event, not a silent mutation.
+- `ProjectionId` stays stable across rebase (alias table) or is replaced with
+  an explicit `supersedes` link. Revisions are derived from the replayable
+  stream, not from a process-local counter, so they survive reconnect.
+
 ## Rebase
 
 Some identities are learned only after an operation returns.
@@ -137,7 +150,8 @@ It must not carry ratatui styles, HTML or Telegram markup in shared infrastructu
 
 Aggregation must not hide failure.
 
-- any failed constituent may mark the projection failed or warning;
+- any failed constituent MUST be visible in the compact state as a failure
+  count or badge, including mutating constituents;
 - failure counts remain visible in compact form;
 - expansion reveals individual failed events;
 - unrelated failures never merge merely to save rows.

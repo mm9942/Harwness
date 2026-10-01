@@ -62,6 +62,10 @@ Resource keys must be canonicalized by the subsystem that owns the resource sema
 
 The pattern layer must not invent a second path-security resolver.
 
+A resolver error (symlink loop, path outside the workspace, vanished file) makes
+the event standalone: it is neither grouped nor dropped. Renames and symlinks
+must never silently merge two resources into one group.
+
 ## Scope
 
 Initial scopes:
