@@ -18,47 +18,24 @@
 use crate::capability_catalog::{CATALOG, CapabilityClass, ToolPattern};
 use crate::profile::RegistryProfile;
 
-/// Alle Registry-Profile. Die Funktion `_profile_list_is_complete` schlägt beim
-/// Kompilieren fehl, sobald eine Variante hinzukommt und hier fehlt.
-const PROFILES: &[(RegistryProfile, &str)] = &[
-    (RegistryProfile::Full, "full"),
-    (RegistryProfile::ShellExecution, "shell-execution"),
-    (RegistryProfile::ReadOnlyExplore, "read-only-explore"),
-    (RegistryProfile::Research, "research"),
-    (RegistryProfile::Planning, "planning"),
-    (RegistryProfile::NoTools, "no-tools"),
-    (RegistryProfile::MemoryStewardship, "memory-stewardship"),
-    (RegistryProfile::UiaQuickHelper, "uia-quick-helper"),
-    (RegistryProfile::AgentStewardship, "agent-stewardship"),
-    (RegistryProfile::UiaExplorer, "uia-explorer"),
-    (RegistryProfile::UiaWriter, "uia-writer"),
-    (RegistryProfile::UiaShellWorker, "uia-shell-worker"),
-    (RegistryProfile::ReadOnlyResearch, "read-only-research"),
-    (RegistryProfile::WorkspaceEdit, "workspace-edit"),
-    (RegistryProfile::MatrixReader, "matrix-reader"),
-    (RegistryProfile::UiaLatexWriter, "uia-latex-writer"),
-];
-
-#[allow(dead_code)]
-fn _profile_list_is_complete(p: RegistryProfile) {
-    match p {
-        RegistryProfile::Full
-        | RegistryProfile::ShellExecution
-        | RegistryProfile::ReadOnlyExplore
-        | RegistryProfile::Research
-        | RegistryProfile::Planning
-        | RegistryProfile::NoTools
-        | RegistryProfile::MemoryStewardship
-        | RegistryProfile::UiaQuickHelper
-        | RegistryProfile::AgentStewardship
-        | RegistryProfile::UiaExplorer
-        | RegistryProfile::UiaWriter
-        | RegistryProfile::UiaShellWorker
-        | RegistryProfile::ReadOnlyResearch
-        | RegistryProfile::WorkspaceEdit
-        | RegistryProfile::MatrixReader
-        | RegistryProfile::UiaLatexWriter => {}
+/// Kurzname eines Profils, abgeleitet aus dem Variantennamen (`ReadOnlyExplore`
+/// wird zu `read-only-explore`). Quelle für Profile und Namen ist
+/// [`RegistryProfile::ALL`]; es gibt keine zweite Liste, die eine neue
+/// Variante auslassen könnte.
+fn profile_label(profile: RegistryProfile) -> String {
+    let name = format!("{profile:?}");
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('-');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
     }
+    out
 }
 
 /// Eine Zeile des Index.
@@ -77,40 +54,48 @@ pub struct ToolIndexEntry {
     /// Von jedem Runner ohne eigenes Feature bedient.
     pub always_available: bool,
     /// Profile (Kurzname), in denen das Tool registriert ist.
-    pub profiles: Vec<&'static str>,
+    pub profiles: Vec<String>,
     /// Erster Satz der echten Beschreibung, falls geliefert.
     pub summary: Option<String>,
 }
 
-/// Der Index über alle exakt benannten Katalogzeilen.
+/// Der Index über alle exakt benannten Katalogzeilen. Der Speicher ist privat:
+/// die Sortierung nach Familie, dann Name, ist eine Invariante (Familien sind
+/// zusammenhängend) und wird nur von [`ToolIndex::build`] hergestellt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolIndex {
-    /// Einträge, sortiert nach Familie, dann Name.
-    pub entries: Vec<ToolIndexEntry>,
+    entries: Vec<ToolIndexEntry>,
 }
 
 /// Familie eines Namens: Präfix vor dem ersten `.`, sonst `core`.
 #[must_use]
-pub fn family_of(name: &'static str) -> &'static str {
+pub fn family_of(name: &str) -> &str {
     match name.split_once('.') {
         Some((family, _)) if !family.is_empty() => family,
         _ => "core",
     }
 }
 
-/// Erster Satz einer Beschreibung, auf eine Zeile gekürzt.
+/// Erster Satz einer Beschreibung (bis zum ersten `.`, `!` oder `?` vor
+/// Leerraum bzw. Textende), Leerraum und Zeilenumbrüche normalisiert, auf 140
+/// Zeichen gekürzt.
 #[must_use]
 pub fn first_sentence(description: &str) -> String {
-    let line = description.trim().lines().next().unwrap_or("").trim();
-    let end = line
-        .char_indices()
-        .find(|&(i, c)| c == '.' && line[i + 1..].starts_with(|n: char| n.is_whitespace()))
-        .map_or(line.len(), |(i, _)| i + 1);
-    let mut s = line[..end].to_owned();
-    if s.chars().count() > 140 {
-        s = s.chars().take(139).collect::<String>() + "…";
+    const MAX: usize = 140;
+    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = text.len();
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if matches!(c, '.' | '!' | '?') && chars.peek().is_none_or(|(_, n)| n.is_whitespace()) {
+            end = i + c.len_utf8();
+            break;
+        }
     }
-    s
+    let sentence = &text[..end];
+    match sentence.char_indices().nth(MAX) {
+        None => sentence.to_owned(),
+        Some(_) => sentence.chars().take(MAX - 1).collect::<String>() + "…",
+    }
 }
 
 impl ToolIndex {
@@ -131,16 +116,22 @@ impl ToolIndex {
                 crate_name: row.provider.crate_name,
                 class: row.class,
                 always_available: row.always_available,
-                profiles: PROFILES
+                profiles: RegistryProfile::ALL
                     .iter()
-                    .filter(|(p, _)| p.registered_tool_names().contains(&name))
-                    .map(|&(_, label)| label)
+                    .filter(|p| p.registered_tool_names().contains(&name))
+                    .map(|&p| profile_label(p))
                     .collect(),
                 summary: describe(name).map(|d| first_sentence(&d)),
             })
             .collect();
         entries.sort_by(|a, b| (a.family, a.name).cmp(&(b.family, b.name)));
         Self { entries }
+    }
+
+    /// Alle Einträge, sortiert nach Familie, dann Name (nur lesend).
+    #[must_use]
+    pub fn entries(&self) -> &[ToolIndexEntry] {
+        &self.entries
     }
 
     /// Einträge einer Familie.
@@ -225,12 +216,33 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.pattern, ToolPattern::Exact(_)))
             .count();
-        ensure(idx.entries.len() == exact, "one entry per exact row")?;
-        let mut names: Vec<_> = idx.entries.iter().map(|e| e.name).collect();
+        ensure(idx.entries().len() == exact, "one entry per exact row")?;
+        let mut names: Vec<_> = idx.entries().iter().map(|e| e.name).collect();
         names.sort_unstable();
         let before = names.len();
         names.dedup();
         ensure(names.len() == before, "no duplicate names")
+    }
+
+    #[test]
+    fn every_registry_profile_is_covered() -> TestResult {
+        let idx = ToolIndex::build(&none);
+        for p in RegistryProfile::ALL {
+            let label = profile_label(*p);
+            for tool in p.registered_tool_names() {
+                let Some(entry) = idx.entries().iter().find(|e| e.name == tool) else {
+                    continue; // prefix-only tools are not exact catalog rows
+                };
+                ensure(
+                    entry.profiles.contains(&label),
+                    "profile missing from an indexed tool it registers",
+                )?;
+            }
+        }
+        ensure(
+            profile_label(RegistryProfile::ReadOnlyExplore) == "read-only-explore",
+            "kebab case",
+        )
     }
 
     #[test]
@@ -250,7 +262,7 @@ mod tests {
             .ok_or(TestError::Missing("fs.read"))?;
         ensure(read.family == "fs" && read.provider == "fs", "provider")?;
         ensure(
-            read.profiles.contains(&"full"),
+            read.profiles.iter().any(|p| p == "full"),
             "registered in the full profile",
         )?;
         ensure(!read.profiles.is_empty(), "has profiles")
@@ -269,6 +281,16 @@ mod tests {
         ensure(
             first_sentence("v1.2 is fine. Next") == "v1.2 is fine.",
             "dot inside token",
+        )?;
+        ensure(first_sentence("Run it! More") == "Run it!", "exclamation")?;
+        ensure(first_sentence("Is it ok? Yes.") == "Is it ok?", "question")?;
+        ensure(
+            first_sentence("Reads a long\nwrapped line. Next") == "Reads a long wrapped line.",
+            "wrapped first sentence",
+        )?;
+        ensure(
+            first_sentence("  spaced   out . x") == "spaced out .",
+            "whitespace is normalized",
         )?;
         let long = "x".repeat(300);
         ensure(first_sentence(&long).chars().count() == 140, "capped")
@@ -300,7 +322,7 @@ mod tests {
         sorted.sort_by_key(|&(f, _)| f);
         ensure(fams == sorted, "sorted")?;
         ensure(
-            fams.iter().map(|&(_, n)| n).sum::<usize>() == idx.entries.len(),
+            fams.iter().map(|&(_, n)| n).sum::<usize>() == idx.entries().len(),
             "counts add up",
         )
     }
