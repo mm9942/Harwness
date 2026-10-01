@@ -191,11 +191,14 @@ impl fmt::Display for DeploymentProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type TestResult = Result<(), String>;
+    use crate::test_support::{TestError, TestResult};
 
     fn ensure(cond: bool, msg: &str) -> TestResult {
-        if cond { Ok(()) } else { Err(msg.to_owned()) }
+        if cond {
+            Ok(())
+        } else {
+            Err(TestError::Unexpected(msg.to_owned()))
+        }
     }
 
     #[test]
