@@ -35,5 +35,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cloudflare;
 pub mod policy;
 pub mod tools;
