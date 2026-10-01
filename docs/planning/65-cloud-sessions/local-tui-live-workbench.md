@@ -95,6 +95,22 @@ all routing or multi-session behavior already exists.
   transcript or event/audit evidence.
 - Age-based behavior must be deterministic and covered for both TOML modes.
 
+### 3.4 Goal-follow mode
+
+- Provide a toggleable, read-only TUI projection of the active goal and plan state
+  for the currently selected session. The projection is presentation state; it
+  does not become another source of truth or alter the stored plan.
+- Show only evidence-backed progress, explicitly list open criteria and blockers,
+  and identify the next executable plan node. Do not infer completion from
+  activity or mark any criterion or node done without supporting evidence.
+- Refresh the projection as goal/plan state changes. Clearly indicate when the
+  selected session has no valid binding to an active goal/plan, or when the
+  available binding/state is stale; do not present missing or stale data as live.
+- Toggling or viewing this mode must leave the chat composer and transcript
+  scrollback available and unaffected.
+- This mode is strictly observational: it must never change permissions,
+  approval requirements/decisions, or step status.
+
 ## 4. Work packages
 
 1. **Architecture and message targeting:** retain composer and transcript as
@@ -124,6 +140,12 @@ all routing or multi-session behavior already exists.
   are unchanged in both modes.
 - Existing tail-follow, manual scroll offset, approval/modal precedence and
   session isolation remain intact.
+- Goal-follow mode can be toggled for the selected session and displays the
+  active goal/plan projection with evidence-backed progress, open criteria,
+  blockers and the next executable node; missing or stale session binding/state
+  is clearly identified, and live updates do not disrupt composer or scrollback.
+- Goal-follow mode is read-only: it changes no permissions, approvals or step
+  statuses, and does not mark unsupported work complete.
 
 ## 6. Boundaries and review notes
 
