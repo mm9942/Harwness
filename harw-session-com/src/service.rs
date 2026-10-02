@@ -29,7 +29,7 @@ pub struct UpgradeService {
     binder: Arc<dyn ComBinder>,
     limits: WsLimits,
     shutdown: watch::Receiver<bool>,
-    hold: Arc<OwnedSemaphorePermit>,
+    hold: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl UpgradeService {
@@ -37,7 +37,7 @@ impl UpgradeService {
         binder: Arc<dyn ComBinder>,
         limits: WsLimits,
         shutdown: watch::Receiver<bool>,
-        hold: Arc<OwnedSemaphorePermit>,
+        hold: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Self {
         Self {
             binder,
@@ -68,7 +68,7 @@ impl UpgradeService {
         };
         let limits = self.limits;
         let shutdown = self.shutdown.clone();
-        let hold = Arc::clone(&self.hold);
+        let hold = self.hold.clone();
         match upgrade_server(request, limits.tungstenite_config(), move |ws| async move {
             // The permit lives as long as the WebSocket session.
             let _hold = hold;

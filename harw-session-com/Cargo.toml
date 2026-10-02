@@ -24,6 +24,9 @@ bytes = "1"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [dev-dependencies]
+harw-node-transport = { path = "../harw-node-transport" }
+# Same feature set as harw-node-transport: ML-DSA-65 test keys for the self-cloud e2e.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

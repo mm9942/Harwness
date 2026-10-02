@@ -14,7 +14,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use harw_protocol::methods::{METHOD_GATEWAY_STATUS, METHOD_SESSION_CREATE, METHOD_SESSION_HELLO};
 use harw_protocol::{ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireMessage};
-use harw_session_com::local::{local_identity, peer_identity};
+use harw_session_com::local::{local_identity, peer_identity, serve_unix};
 use harw_session_com::{
     BoxedService, ComBinder, ComConfig, ComError, ComRefusal, ComServer, HostBinder, PortOffer,
     TrustedPeer,
@@ -492,22 +492,28 @@ async fn a_real_unix_socket_ingress_derives_identity_from_peer_credentials() -> 
 
     let server = Arc::new(rig);
     let accepting = Arc::clone(&server);
+    let (stop, stopped) = watch::channel(false);
     let accept = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await?;
-        let identity = peer_identity(&stream, uid, PermissionTier::Owner).ok_or("uid refused")?;
-        accepting.server.serve_io(stream, identity)?;
-        TestResult::Ok(())
+        serve_unix(
+            &accepting.server,
+            listener,
+            uid,
+            PermissionTier::Owner,
+            stopped,
+        )
+        .await;
     });
 
     let stream = UnixStream::connect(&socket).await?;
     let mut ws = upgrade_ws(stream).await?;
-    accept.await??;
     hello(&mut ws).await?;
     let status = call(&mut ws, "1", METHOD_GATEWAY_STATUS, serde_json::json!({})).await?;
     assert!(
         status.error.is_none(),
         "owner over a real socket: {status:?}"
     );
+    stop.send(true)?;
+    tokio::time::timeout(Duration::from_secs(5), accept).await??;
     Ok(())
 }
 

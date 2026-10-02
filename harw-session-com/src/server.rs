@@ -26,6 +26,7 @@ use crate::binder::ComBinder;
 use crate::config::ComConfig;
 use crate::error::ComError;
 use crate::layer::PeerLayer;
+use crate::remote::RemoteLayer;
 use crate::service::UpgradeService;
 
 /// The erased service type extra layers wrap.
@@ -160,6 +161,22 @@ impl ComServer {
         }
     }
 
+    /// The core service with the added layers applied: the first added layer
+    /// is the outermost of them.
+    fn core(&self, hold: Option<Arc<tokio::sync::OwnedSemaphorePermit>>) -> BoxedService {
+        let core = UpgradeService::new(
+            Arc::clone(&self.binder),
+            self.config.limits,
+            self.shutdown.clone(),
+            hold,
+        );
+        let mut inner: BoxedService = BoxCloneService::new(core);
+        for layer in self.layers.iter().rev() {
+            inner = layer(inner);
+        }
+        inner
+    }
+
     /// The per-connection stack: `PeerLayer` -> trace -> added layers -> upgrade.
     fn stack(
         &self,
@@ -173,35 +190,57 @@ impl ComServer {
     > + Clone
     + Send
     + 'static {
-        let core = UpgradeService::new(
-            Arc::clone(&self.binder),
-            self.config.limits,
-            self.shutdown.clone(),
-            hold,
-        );
-        let mut inner: BoxedService = BoxCloneService::new(core);
-        for layer in self.layers.iter().rev() {
-            inner = layer(inner);
-        }
         let connection = identity.connection.0;
         ServiceBuilder::new()
             .layer(PeerLayer::new(identity))
-            .map_response(move |mut response: Response<Full<Bytes>>| {
-                let status = response.status();
-                if status == hyper::StatusCode::SWITCHING_PROTOCOLS {
-                    tracing::debug!(connection, "session com: upgrade accepted");
-                } else {
-                    // One purpose per connection: upgrade, or be refused and closed.
-                    tracing::warn!(connection, %status, "session com: handshake refused");
-                    response.headers_mut().insert(
-                        hyper::header::CONNECTION,
-                        hyper::header::HeaderValue::from_static("close"),
-                    );
-                }
-                response
-            })
-            .service(inner)
+            .map_response(move |response| finish(Some(connection), response))
+            .service(self.core(Some(hold)))
     }
+
+    /// A service for an ingress that owns its accept loop and its connection
+    /// limit, such as the node transport's `NodeTransportServer::serve`.
+    ///
+    /// `layer` resolves the transport's peer extension into the identity
+    /// (see [`crate::remote`]); the rest of the stack is the same as for
+    /// [`ComServer::serve_io`]. `max_connections` of this server does not
+    /// apply, because the ingress counts its own connections.
+    #[must_use]
+    pub fn service_for<P>(
+        &self,
+        layer: RemoteLayer<P>,
+    ) -> impl Service<
+        Request<Incoming>,
+        Response = Response<Full<Bytes>>,
+        Error = Infallible,
+        Future: Send,
+    > + Clone
+    + Send
+    + 'static
+    where
+        P: Send + Sync + 'static,
+    {
+        let traced = ServiceBuilder::new()
+            .map_response(|response| finish(None, response))
+            .service(self.core(None));
+        layer.layer(traced)
+    }
+}
+
+/// Logs the handshake outcome; a refusal also closes the connection (one
+/// purpose per connection). Never use `keep_alive(false)` for this: hyper
+/// 1.11 would also rewrite the 101's `Connection: Upgrade`.
+fn finish(connection: Option<u64>, mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    let status = response.status();
+    if status == hyper::StatusCode::SWITCHING_PROTOCOLS {
+        tracing::debug!(?connection, "session com: upgrade accepted");
+    } else {
+        tracing::warn!(?connection, %status, "session com: handshake refused");
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
+    response
 }
 
 /// How long a test or caller should allow [`ComServer::drain`] by default.

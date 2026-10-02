@@ -9,7 +9,12 @@ use harw_types::{
     ApprovalActor, AuthStrength, IngressSurface, PermissionTier, Principal, PrincipalKind,
     TrustZone,
 };
-use tokio::net::UnixStream;
+use std::time::Duration;
+
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+
+use crate::server::ComServer;
 
 /// The identity of the local user `uid` at `tier`.
 ///
@@ -62,6 +67,47 @@ pub fn peer_identity(
         return None;
     }
     Some(local_identity(credentials.uid(), tier))
+}
+
+/// Pause after a failed `accept`, so a persistent error does not spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Accepts connections on `listener` until `shutdown` flips to `true`.
+///
+/// Each peer's kernel credentials are read first; a uid other than
+/// `allowed_uid` is dropped before a byte is read, a full server drops the
+/// connection too. Binding the socket (private directory, mode, stale-socket
+/// replacement) stays with the caller.
+pub async fn serve_unix(
+    server: &ComServer,
+    listener: UnixListener,
+    allowed_uid: u32,
+    tier: PermissionTier,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let Some(identity) = peer_identity(&stream, allowed_uid, tier) else {
+                        continue;
+                    };
+                    if let Err(error) = server.serve_io(stream, identity) {
+                        tracing::warn!(%error, "session com: connection dropped");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "session com: accept failed");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

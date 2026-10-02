@@ -33,6 +33,10 @@
 //! - **Ingress policy is a Tower layer** ([`ComServer::layer`]): refuse agent
 //!   callers, demand a device, rate-limit reconnects, without touching the
 //!   upgrade or the host.
+//! - **Two ingresses, one stack.** Local: [`local::serve_unix`] reads
+//!   `SO_PEERCRED` and calls [`ComServer::serve_io`]. Self-cloud:
+//!   [`ComServer::service_for`] plus a [`RemoteLayer`] maps the node
+//!   transport's authenticated peer to an enrolled device ([`remote`]).
 //! - **One bounded server for every ingress**: a connection limit that covers
 //!   the whole WebSocket session, bounded headers, a header timeout, refusals
 //!   that close the connection, graceful [`ComServer::drain`].
@@ -50,9 +54,9 @@
 //! stricter (exact subprotocol, `Origin` refused, validated key and path).
 //!
 //! # Not covered here
-//! Listening and binding sockets (see `harw-session-daemon`), node-transport
-//! upgrades (W02), identity resolution, and policy beyond what the host
-//! enforces.
+//! Binding sockets and stale-socket handling (see `harw-session-daemon`),
+//! the node transport itself (its `serve` takes [`ComServer::service_for`]),
+//! and policy beyond what the host enforces.
 //!
 //! # Concurrency
 //! [`ComServer`] is `Send + Sync`; each connection runs on its own task.
@@ -64,6 +68,7 @@ pub mod config;
 pub mod error;
 pub mod layer;
 pub mod refusal;
+pub mod remote;
 pub mod server;
 pub mod service;
 
@@ -78,5 +83,6 @@ pub use config::ComConfig;
 pub use error::ComError;
 pub use layer::{PeerLayer, PeerService, TrustedPeer};
 pub use refusal::ComRefusal;
+pub use remote::{DeviceRecord, DeviceRegistry, EnrollError, RemoteLayer, RemoteService};
 pub use server::{BoxedService, ComServer, DEFAULT_GRACE};
 pub use service::UpgradeService;
