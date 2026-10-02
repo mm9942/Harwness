@@ -28,8 +28,8 @@ State is on the integration branch `consolidate/main` plus this branch
 | W04 | local UDS composition | **split**: socket/stale-socket lifecycle in PR #91; stack, identity and accept loop in `harw-session-com` | #91; `harw-session-com::local` |
 | W05 | session host + replay + real driver | host done; production `CoreTurnDriver` exists | `harw-session-host`, `harw-session-driver` |
 | W06 | self-cloud composition | done | `harw-node-listener` (registry, mapper, revocation); `harw-session-com::remote` composes it behind Tower |
-| W07 | approvals, concurrent controllers across the real transport | open | |
-| W08 | backpressure, reconnect | server bounded; client `harw-session-remote` exists; no end-to-end reconnect test through the Com layer | |
+| W07 | approvals, concurrent controllers across the real transport | open (needs a driver that parks on an approval) | |
+| W08 | backpressure, reconnect | server bounded; reconnect-with-resubmit and drain covered through the Com layer; slow-consumer and cursor replay across a reconnect not yet | `harw-session-com/tests/client_through_com.rs` |
 | W09 | `harw attach` | open | |
 | W10 | dependency and security gates | arch gate green with all crates; `cargo deny` not run here | |
 | W11 | operator workbench | open | |
@@ -78,12 +78,17 @@ refused).
 
 ## 2a. Verification (scratch build on this branch merged with `consolidate/main`; not a frozen-SHA central build)
 
-- `harw-session-com`: 28 tests pass: 11 unit, 13 end to end against a real
+- `harw-session-com`: 33 tests pass (6 consecutive runs stable): 11 unit, 13 end to end against a real
   `SessionHost` (in-memory stream and a real Unix socket through
   `serve_unix`), 4 self-cloud end to end through the real node transport
   (PQ-TLS + ML-DSA) using `harw-node-listener`'s device registry: an enrolled
   device runs a session; gateway rights follow the device tier; an unenrolled
   but transport-trusted node gets 403; a revoked device cannot reconnect.
+  5 client-conformance tests run `harw-session-remote` through the Com layer
+  over an in-memory stream, a real Unix socket and the real node transport (a
+  turn round trip on each), plus idempotent submit across a reconnect (the same
+  `client_msg_id` starts one turn) and a drain that ends streams with a typed
+  error and leaves no live connection.
 - `clippy --all-targets -D warnings`, `fmt --check` clean; `cargo xtask gates`
   (edges, privileges, warden budget, no-c-build, arch) green. `cargo deny` was
   not run.

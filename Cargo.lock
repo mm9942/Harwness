@@ -3900,6 +3900,7 @@ dependencies = [
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
+ "harw-session-remote",
  "harw-session-ws",
  "harw-types",
  "http-body-util",

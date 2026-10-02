@@ -7,15 +7,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use futures_util::{SinkExt, StreamExt};
 use harw_node_listener::identity::{
     DeviceRecord, DeviceRegistry, IdentityMapper, RegistryIdentityMapper,
 };
 use harw_node_transport::{
-    AuthenticatedPeer, LocalNode, ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner,
-    NodeTransportClient, NodeTransportServer, PinnedPeers, ServerOptions, SignFuture, UpgradeError,
-    empty_body,
+    AuthenticatedPeer, NodeIdentity, NodeTransportClient, NodeTransportServer, ServerOptions,
+    UpgradeError, empty_body,
 };
 use harw_protocol::methods::{METHOD_GATEWAY_STATUS, METHOD_SESSION_CREATE, METHOD_SESSION_HELLO};
 use harw_protocol::{ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireMessage};
@@ -27,14 +25,15 @@ use harw_session_host::driver::{
 use harw_session_host::replay::MemoryTranscripts;
 use harw_session_host::{HostConfig, SessionHost};
 use harw_session_ws::upgrade;
-use harw_types::{DeviceId, NodeId, PermissionTier, SessionId, TenantId};
+use harw_types::{DeviceId, PermissionTier, SessionId, TenantId};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+mod common;
+use common::{Node, TestResult, node, pinned};
 
 struct NoopDriver;
 
@@ -64,65 +63,6 @@ impl TurnDriver for NoopDriver {
     fn model_name(&self, _: &SessionId) -> Option<String> {
         None
     }
-}
-
-/// **TEST ONLY.** Deterministic ML-DSA-65 key from a seed.
-struct SeedSigner {
-    key: PqdsaKeyPair,
-}
-
-impl SeedSigner {
-    fn new(seed: u8) -> TestResult<Self> {
-        Ok(Self {
-            key: PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[seed; 32])
-                .map_err(|_| "ml-dsa seed")?,
-        })
-    }
-}
-
-impl NodeSigner for SeedSigner {
-    fn sign<'a>(&'a self, transcript: &'a [u8]) -> SignFuture<'a> {
-        let mut signature = vec![0u8; ML_DSA_65_SIGNATURE_LEN];
-        let result = self
-            .key
-            .sign(transcript, &mut signature)
-            .map(|n| {
-                signature.truncate(n);
-                signature
-            })
-            .map_err(|_| harw_node_transport::SignerError::new("test signer failed"));
-        Box::pin(std::future::ready(result))
-    }
-}
-
-struct Node {
-    id: NodeId,
-    identity: NodeIdentity,
-    local: LocalNode,
-}
-
-fn node(name: &str, seed: u8) -> TestResult<Node> {
-    let signer = SeedSigner::new(seed)?;
-    let id = NodeId::try_from_str(name)?;
-    let identity = NodeIdentity {
-        node_id: id.clone(),
-        public_key: signer.key.public_key().as_ref().to_vec(),
-        key_ref: format!("test-only/{name}"),
-    };
-    let local = LocalNode::new(identity.clone(), Arc::new(signer));
-    Ok(Node {
-        id,
-        identity,
-        local,
-    })
-}
-
-fn pinned(nodes: &[&NodeIdentity]) -> TestResult<PinnedPeers> {
-    let mut peers = PinnedPeers::new();
-    for n in nodes {
-        peers.pin_identity(n)?;
-    }
-    Ok(peers)
 }
 
 struct Cloud {
