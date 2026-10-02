@@ -68,6 +68,7 @@ mod sandbox_cmd;
 mod secret_store;
 mod session_cmd;
 mod session_serve;
+mod session_serve_remote;
 mod settings;
 mod tailscale_cmd;
 mod telegram_launcher;

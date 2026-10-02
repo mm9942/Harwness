@@ -2173,6 +2173,7 @@ dependencies = [
 name = "harw-cli"
 version = "0.9.0"
 dependencies = [
+ "aws-lc-rs",
  "clap",
  "clap_complete",
  "getrandom 0.4.3",
@@ -2204,6 +2205,8 @@ dependencies = [
  "harw-mcp-server",
  "harw-memory",
  "harw-model-catalog",
+ "harw-node-listener",
+ "harw-node-transport",
  "harw-oauth",
  "harw-observe",
  "harw-observe-file",
@@ -2225,6 +2228,7 @@ dependencies = [
  "harw-session-host",
  "harw-session-remote",
  "harw-session-store",
+ "harw-session-ws",
  "harw-tailscale",
  "harw-tool-doc",
  "harw-tool-lens",

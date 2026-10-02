@@ -140,3 +140,6 @@ Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assemb
 - Platzproblem: Scratch-Worktrees `/tmp/claude-0/wt70`, `wtdev` verloren ihr `target/`.
 
 - Doc tests: `cargo test --workspace --doc --no-fail-fast` 1571 passed / 0 failed; four pre-existing broken `harw-cli` doc examples (private module paths in `runtime_web`, `uia_bootstrap`) marked `ignore`.
+
+## Node-listener composition (remote ingress)
+`harw-cli/src/session_serve_remote.rs`: `start_remote` composes node transport + `harw-node-listener` on a TCP listener with its **own host and state** (`<profile>/session-host/remote`), `GatewayCoreFactory` cut to `RemoteServeConfig::tier` (default observer) and `RegistryIdentityMapper` (device registry). Approvals of remote sessions bind to one configured device (`approval_device`, also needs the registry `approve` opt-in); otherwise they park (fail closed). Verified over a real loopback socket (enrolled device lists sessions, revocation refuses the next handshake, unenrolled pinned node refused). NOT wired into `harw gateway`: needs a `[session_listener]` config section and the node signer (AuthHub adapter for `AuthHubSign`) plus a pinned-peer store, i.e. a key-management decision.

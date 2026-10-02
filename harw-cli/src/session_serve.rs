@@ -123,6 +123,9 @@ pub struct GatewayCoreFactory {
     /// Tier of the connection the sessions are hosted for; it cuts the
     /// session's sandbox rights (`permissions_for_tier`), never widens them.
     tier: PermissionTier,
+    /// Approval actor override (remote ingress: the one device allowed to
+    /// resolve approvals). `None` = the local owner's `uid:<euid>`.
+    actor: Option<ApprovalActor>,
 }
 
 impl std::fmt::Debug for GatewayCoreFactory {
@@ -176,7 +179,17 @@ impl GatewayCoreFactory {
             // The local socket's peer is the gateway's own uid, mapped like
             // `local_principal`: an operator.
             tier: PermissionTier::Operator,
+            actor: None,
         }
+    }
+
+    /// Binds the sessions' approval actor to `actor` instead of the local
+    /// owner (remote ingress, see `crate::session_serve_remote`).
+    #[must_use]
+    #[allow(dead_code)] // used by the remote ingress composition (not wired yet)
+    pub fn with_actor(mut self, actor: ApprovalActor) -> Self {
+        self.actor = Some(actor);
+        self
     }
 
     /// Hosts the sessions for a connection of `tier` (rights are cut to
@@ -189,9 +202,11 @@ impl GatewayCoreFactory {
 
     /// The actor the socket's peer identity carries for `uid`.
     fn operator_actor(&self) -> ApprovalActor {
-        ApprovalActor::Operator {
-            id: format!("uid:{}", self.uid),
-        }
+        self.actor
+            .clone()
+            .unwrap_or_else(|| ApprovalActor::Operator {
+                id: format!("uid:{}", self.uid),
+            })
     }
 }
 
@@ -274,7 +289,7 @@ fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-fn private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     if dir.as_os_str().is_empty() {
         return Ok(());
     }
