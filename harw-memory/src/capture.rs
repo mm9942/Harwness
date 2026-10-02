@@ -961,7 +961,7 @@ fn run_consolidation(
     let now = OffsetDateTime::now_utc();
 
     let dedupe = if scope == FactScope::Global {
-        dedupe_existing(&fact_store, memories_root, now, deadline)?
+        dedupe_existing(&fact_store, memories_root, now, deadline.clone())?
     } else {
         ConsolidationReport::default()
     };
@@ -1229,7 +1229,7 @@ mod tests {
                 .map_err(ctx("write"))?;
         }
         let deadline = Deadline::after(std::time::Duration::from_secs(30));
-        consolidate_memories_with_options(&strict, FactScope::Project, deadline, 0)
+        consolidate_memories_with_options(&strict, FactScope::Project, deadline.clone(), 0)
             .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
         consolidate_memories_with_deadline(&lax, FactScope::Project, deadline)
             .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
@@ -1244,6 +1244,39 @@ mod tests {
         assert!((read(&lax)? - 0.8).abs() < 0.01, "Vorgabe 90 Tage: unverändert");
         let _ = std::fs::remove_dir_all(&strict);
         let _ = std::fs::remove_dir_all(&lax);
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_flag_aborts_before_the_commit_point_and_is_distinguishable() -> TestResult {
+        let root = tmp_root("deadline-cancelled");
+        let incoming = IncomingStore::open(&root).map_err(ctx("incoming"))?;
+        incoming
+            .write_candidates(&[plain_fact("kandidat", FactScope::Project, 0.6)])
+            .map_err(ctx("candidates"))?;
+        let flag = crate::consolidation::CancelFlag::new();
+        flag.cancel();
+        // Long deadline: only the cancel flag can stop it.
+        let deadline = Deadline::after(std::time::Duration::from_secs(300)).with_cancel(flag);
+        let result = consolidate_memories_with_deadline(&root, FactScope::Project, deadline);
+        assert!(
+            matches!(&result, Err(ConsolidationError::Deadline(d)) if d.cancelled),
+            "{result:?}"
+        );
+        assert_eq!(incoming.list().map_err(ctx("list"))?.len(), 1);
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("open"))?;
+        assert!(store.list().map_err(ctx("facts"))?.is_empty());
+        // An expired deadline is not reported as a cancellation.
+        let expired = consolidate_memories_with_deadline(
+            &root,
+            FactScope::Project,
+            Deadline::after(std::time::Duration::ZERO),
+        );
+        assert!(
+            matches!(&expired, Err(ConsolidationError::Deadline(d)) if !d.cancelled),
+            "{expired:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
 

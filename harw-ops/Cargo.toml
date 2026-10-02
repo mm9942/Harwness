@@ -49,7 +49,7 @@ harw-tools = { path = "../harw-tools" }
 # `net`: `gateway.health` prüft je Socket unter dem harw-Home per
 # `tokio::net::UnixStream::connect` (mit Zeitlimit, ohne Nutzdaten), ob er
 # Verbindungen annimmt (R18, `src/gateway_ops/health.rs`).
-tokio = { version = "1.52.3", features = ["time", "process", "io-util", "macros", "net"] }
+tokio = { version = "1.52.3", features = ["rt", "time", "process", "io-util", "macros", "net"] }
 # UIA-Delegationsrouting (`explore`/`research_web`): `AgentRoleId` wird
 # gebraucht, um die aufrufende `organizational_role` gegen `UserInterface`
 # zu prüfen. Vormals nur dev-dependency für Test-Fixtures — jetzt auch in

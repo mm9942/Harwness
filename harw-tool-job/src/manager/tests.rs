@@ -922,6 +922,38 @@ async fn test_capacity_limit() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_capacity_is_adjustable_at_runtime_without_stopping_jobs() -> TestResult {
+    let env = Env::with_config(|config| JobManagerConfig {
+        max_running_jobs: 2,
+        ..config
+    })?;
+    assert_eq!(env.manager.max_running(), 2);
+    for name in ["one", "two"] {
+        let prepared = env.prepare("sleep 30").await?;
+        env.manager
+            .start(request(name, "agent-a", &[]), prepared)
+            .map_err(ctx("start"))?;
+    }
+    assert!(matches!(
+        env.manager.check_capacity(),
+        Err(JobError::Capacity { max: 2 })
+    ));
+    // Raising admits another job at once.
+    assert_eq!(env.manager.set_max_running(3), 3);
+    assert!(env.manager.check_capacity().is_ok());
+    // Lowering (and the clamp to at least 1) stops nothing that runs.
+    assert_eq!(env.manager.set_max_running(0), 1);
+    assert_eq!(env.manager.running_count(), 2);
+    assert!(matches!(
+        env.manager.check_capacity(),
+        Err(JobError::Capacity { max: 1 })
+    ));
+    assert_eq!(env.manager.set_max_running(10_000), 256);
+    assert_eq!(env.manager.stop_all().await, 2);
+    Ok(())
+}
+
 /// Wartet, bis der Job `id` beendet ist, und liefert seinen Status.
 async fn wait_terminal(env: &Env, id: &JobId) -> TestResult<JobStatus> {
     let done = eventually(LIMIT, || {

@@ -806,14 +806,44 @@ pub const DEFAULT_DELETION_DEADLINE: std::time::Duration = std::time::Duration::
 /// Wartezeit zwischen zwei Lock-Versuchen in [`ConsolidationLock::acquire_until`].
 const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Kooperatives Abbruchsignal eines Wartungsvorgangs.
+///
+/// Wird vom Job-System gesetzt (Operator-Abbruch, Lease-Verlust) und von
+/// [`Deadline::check`] an jeder Prüfstelle gelesen: ein gesetztes Signal
+/// bricht den Vorgang **vor** dem Commit-Punkt ab, ohne Teilzustand.
+/// Klonen teilt das Signal.
+#[derive(Clone, Debug, Default)]
+pub struct CancelFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelFlag {
+    /// Ein frisches, nicht gesetztes Signal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Setzt das Signal (idempotent).
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `true`, sobald [`Self::cancel`] aufgerufen wurde.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Frist, bis zu der ein löschender Vorgang seinen *Commit-Punkt* erreichen
-/// muss. Abgelaufen = sauberer Abbruch **vor** dem ersten schreibenden/
-/// löschenden Schritt; nach dem Commit-Punkt läuft der Vorgang zu Ende (kein
-/// halbes Löschen).
-#[derive(Clone, Copy, Debug)]
+/// muss. Abgelaufen (oder per [`CancelFlag`] abgebrochen) = sauberer Abbruch
+/// **vor** dem ersten schreibenden/löschenden Schritt; nach dem Commit-Punkt
+/// läuft der Vorgang zu Ende (kein halbes Löschen).
+#[derive(Clone, Debug)]
 pub struct Deadline {
     /// Ablaufzeitpunkt.
     at: std::time::Instant,
+    /// Optionales Abbruchsignal des Job-Systems.
+    cancel: Option<CancelFlag>,
 }
 
 impl Deadline {
@@ -823,7 +853,27 @@ impl Deadline {
     pub fn after(after: std::time::Duration) -> Self {
         Self {
             at: std::time::Instant::now() + after,
+            cancel: None,
         }
+    }
+
+    /// Dieselbe Frist, zusätzlich vom Signal `cancel` abbrechbar.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelFlag) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// `true`, wenn das Abbruchsignal gesetzt wurde.
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelFlag::is_cancelled)
+    }
+
+    /// `true`, wenn der Vorgang enden muss (Abbruch oder Fristablauf).
+    #[must_use]
+    pub fn must_stop(&self) -> bool {
+        self.cancelled() || self.expired()
     }
 
     /// Frist mit [`DEFAULT_DELETION_DEADLINE`].
@@ -838,34 +888,55 @@ impl Deadline {
         std::time::Instant::now() >= self.at
     }
 
-    /// Prüft die Frist an der Stelle `phase`.
+    /// Prüft Abbruch und Frist an der Stelle `phase`. Ein Abbruch hat
+    /// Vorrang vor dem Fristablauf (der Operator hat entschieden, nicht die
+    /// Uhr).
     ///
     /// # Errors
-    /// [`DeadlineExceeded`], wenn die Frist abgelaufen ist.
+    /// [`DeadlineExceeded`] (mit `cancelled == true` bei Abbruch), wenn der
+    /// Vorgang enden muss.
     pub fn check(&self, phase: &'static str) -> Result<(), DeadlineExceeded> {
-        if self.expired() {
-            Err(DeadlineExceeded { phase })
+        if self.cancelled() {
+            Err(DeadlineExceeded {
+                phase,
+                cancelled: true,
+            })
+        } else if self.expired() {
+            Err(DeadlineExceeded {
+                phase,
+                cancelled: false,
+            })
         } else {
             Ok(())
         }
     }
 }
 
-/// Typisierter Abbruch: die Frist ist abgelaufen, der Store blieb
-/// unverändert.
+/// Typisierter Abbruch: die Frist ist abgelaufen oder der Vorgang wurde
+/// abgebrochen; der Store blieb unverändert.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadlineExceeded {
-    /// Phase, in der die Frist abgelaufen war.
+    /// Phase, in der der Vorgang endete.
     pub phase: &'static str,
+    /// `true`, wenn nicht die Frist, sondern ein [`CancelFlag`] auslöste.
+    pub cancelled: bool,
 }
 
 impl std::fmt::Display for DeadlineExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Frist überschritten in Phase '{}' — Vorgang abgebrochen, Bestand unverändert",
-            self.phase
-        )
+        if self.cancelled {
+            write!(
+                f,
+                "Abbruch angefordert in Phase '{}' — Vorgang abgebrochen, Bestand unverändert",
+                self.phase
+            )
+        } else {
+            write!(
+                f,
+                "Frist überschritten in Phase '{}' — Vorgang abgebrochen, Bestand unverändert",
+                self.phase
+            )
+        }
     }
 }
 
@@ -916,7 +987,7 @@ impl ConsolidationLock {
         loop {
             match Self::try_acquire(root.as_ref()) {
                 Err(MemoryError::LockContention { attempted }) => {
-                    if deadline.expired() {
+                    if deadline.must_stop() {
                         return Err(MemoryError::LockContention { attempted });
                     }
                     std::thread::sleep(LOCK_POLL_INTERVAL);

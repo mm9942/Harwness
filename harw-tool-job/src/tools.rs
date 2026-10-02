@@ -858,7 +858,7 @@ fn status_json(status: &JobStatus) -> Value {
 
 /// Standardansicht von `job.list`: Zahlen je Kategorie und Zustand, keine
 /// Zeilen. `count` oben bleibt die Zahl der sichtbaren Prozess-Jobs.
-fn list_summary_json(jobs: &[JobStatus]) -> Value {
+fn list_summary_json(jobs: &[JobStatus], limit: usize, running: usize) -> Value {
     let mut by_state: BTreeMap<&str, u64> = BTreeMap::new();
     for status in jobs {
         *by_state.entry(status.meta.state.as_str()).or_insert(0) += 1;
@@ -867,7 +867,11 @@ fn list_summary_json(jobs: &[JobStatus]) -> Value {
         "view": "summary",
         "count": jobs.len(),
         "categories": {
-            "process": { "count": jobs.len(), "by_state": by_state },
+            "process": {
+                "count": jobs.len(),
+                "by_state": by_state,
+                "permits": { "limit": limit, "running": running },
+            },
             "work": { "visible": false, "note": WORK_NOT_VISIBLE },
         },
         "note": "Pass kind=\"process\" for the rows; job.status shows one job.",
@@ -1155,7 +1159,11 @@ impl JobToolExecutor {
         Ok(ToolOutput::json(match kind {
             Some(ListKind::Work) => list_work_rows_json(),
             Some(ListKind::Process) => list_process_rows_json(&self.shared.manager.list(caller)),
-            None => list_summary_json(&self.shared.manager.list(caller)),
+            None => list_summary_json(
+                &self.shared.manager.list(caller),
+                self.shared.manager.max_running(),
+                self.shared.manager.running_count(),
+            ),
         }))
     }
 }
@@ -1260,7 +1268,11 @@ mod list_view_tests {
             status_of("job-b", "running", json!({}))?,
             status_of("job-c", "failed", json!({"exit_code": 1}))?,
         ];
-        let value = list_summary_json(&jobs);
+        let value = list_summary_json(&jobs, 4, 2);
+        assert_eq!(
+            value["categories"]["process"]["permits"],
+            json!({"limit": 4, "running": 2})
+        );
         assert_eq!(value["view"], json!("summary"));
         assert_eq!(value["count"], json!(3));
         assert_eq!(value["categories"]["process"]["count"], json!(3));
