@@ -101,3 +101,8 @@ Open: sentinel export rotation still has only the fixed ~32 MiB bound; DoD spool
 ## Still open (needs the user or a later round)
 
 Context strand and automated learning design (`CONTEXT-AND-LEARNING-DESIGN.md`, decisions in §7); node-listener composition (blocked on a dedicated EntryKind); `harw-tool-container` + `ManageContainers`; any merge to dev/main; `uia-mailbox.md` in PRs #74/#76; `origin/main` Cargo.lock conflict markers.
+
+## Context strand, first slice (e9facc0)
+
+`harw-context-ledger` (layer I; labels, provider, trust, sizes, omission reason; never content; `MemoryLedger`, bounded `FileLedger`), `AgentSession::with_context_ledger`, per-turn `Offered`/`Omitted` entries in `build_request` (`harw-core/src/context_ledger_hook.rs`), config `[memory] context_ledger` (default off, profile-only), runtime opens `<home>/context-ledger`. Verified: clippy -D warnings and xtask gates green; end-to-end turn test (fragment recorded as offered, no content in the ledger); config switch test. Workspace tests re-run after the change (see result below).
+Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assembly paths, X4 used signal, X5-X9 learning loop; blocked on the user's decisions in §7.
