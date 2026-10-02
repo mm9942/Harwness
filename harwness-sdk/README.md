@@ -81,6 +81,10 @@ Prompts (überlebt einen Neustart), den erneuten Versuch bei veraltetem Stand,
 das Beantworten der Freigabe, das Neuanhängen nach `Lagged`/`Resync` und das
 Ausblenden von Wiedergabe-Frames.
 
+Die Regeln dahinter stehen einmal in `harw-session-client` (Schlüssel,
+Wiedergabe-Erkennung, Auswertung von Absenden und Freigabe, Turn-Zählung);
+SDK, Handy-Client und TUI setzen darauf auf, statt sie je neu zu bauen.
+
 Zwei Dinge, die die SDK nicht verstecken kann:
 
 - Der **Host** entscheidet, wer freigeben darf. Hat er `approve` nicht erteilt
