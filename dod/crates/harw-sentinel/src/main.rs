@@ -898,11 +898,13 @@ fn build_findings_exporter(
         );
         return None;
     };
-    let mut exporter = export::FindingsExporter::new(path, host);
+    let mut exporter =
+        export::FindingsExporter::new(path, host).with_keep(cli.findings_export_keep);
     exporter.prepare(sink);
     tracing::info!(
         path = %exporter.path().display(),
         max_bytes = export::MAX_EXPORT_BYTES,
+        keep = cli.findings_export_keep,
         "findings export enabled"
     );
     Some(exporter)

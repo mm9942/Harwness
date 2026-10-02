@@ -96,7 +96,7 @@ Fixes made during the central run: proc-macro cache (`cargo clean -p harw-macros
 ## Retention (R0-R3, wave 3)
 
 `harw-retention` + `retention_classes!` + `[retention]`; telemetry pair pruning, tui.log rotation, bug-report cap, sentinel `--telemetry-max-files`; DoD spool age/bytes limits (opt-in); session/freeze stores (opt-in); `retention_sweep` job kind and `harw cleanup` (dry run by default, async job, deadline, cooperative cancel); `harw doctor` retention checks; `dod/Makefile clean-ephemeral` (dry run by default); `deploy/tmpfiles.d` deliberately sets no age on security directories.
-Open: sentinel export rotation still has only the fixed ~32 MiB bound; DoD spool is not yet used by the product (limits apply once wired); `retention_sweep` worker handler is covered by driver unit tests, not by a live worker run.
+Sentinel export rotation is now configurable (`--findings-export-keep N`, default 1, max 64; disk bound `(N+1) x 16 MiB`). Open: DoD spool is not yet used by the product (limits apply once wired); `retention_sweep` worker handler is covered by driver unit tests, not by a live worker run.
 
 ## Still open (needs the user or a later round)
 
@@ -138,3 +138,5 @@ Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assemb
 - X5: `harw-memory::fact_signals` bildet Fakten mit entscheidender Rückmeldung (genutzt vs. korrigiert) auf `EpistemicSignal` ab und nutzt nur die Regel `OppositeOutcomes` im selben Themenkorb (Fakt-Typ + erstes Namenswort); Treffer gehen als Konflikt-Hinweise in die Konfliktliste der Konsolidierung (kein Auto-Löschen). `OutcomeTracker` selbst bleibt ungenutzt (kein Fakt-Bezug).
 - Dream-Lesepfad: `build_recent_dream_context` schwärzt Transkripttext (`facts::redact`) vor dem Modell.
 - Platzproblem: Scratch-Worktrees `/tmp/claude-0/wt70`, `wtdev` verloren ihr `target/`.
+
+- Doc tests: `cargo test --workspace --doc --no-fail-fast` 1571 passed / 0 failed; four pre-existing broken `harw-cli` doc examples (private module paths in `runtime_web`, `uia_bootstrap`) marked `ignore`.
