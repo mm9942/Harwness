@@ -85,6 +85,7 @@ fn record(node: &str, device: &str, tier: PermissionTier) -> DeviceRecord {
         tier,
         revoked: false,
         label: format!("label-{device}"),
+        approve_optin: false,
     }
 }
 
@@ -101,7 +102,10 @@ async fn mapped_identity_is_host_derived_from_the_registry() -> TestResult {
     assert_eq!(identity.device, Some(DeviceId::from_str("dev-1")));
     assert_eq!(identity.principal.id(), "device:dev-1");
     assert_eq!(identity.principal.tier(), PermissionTier::Operator);
-    assert_eq!(identity.caps, caps_for_tier(PermissionTier::Operator));
+    // Tier ceiling minus `approve`: remote approval needs the per-device opt-in.
+    let mut expected = caps_for_tier(PermissionTier::Operator);
+    expected.approve = false;
+    assert_eq!(identity.caps, expected);
     assert_eq!(identity.zone, TrustZone::Remote);
     assert_eq!(identity.strength, AuthStrength::MutualTls);
     assert_eq!(identity.connection, connection);
@@ -277,5 +281,49 @@ async fn mapped_peer_upgrades_and_hello_grants_only_the_registry_ceiling() -> Te
     assert!(ack.granted.observe);
     assert!(!ack.granted.steer && !ack.granted.control && !ack.granted.approve);
     assert_eq!(handler.live().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_approve_needs_the_per_device_opt_in_not_the_tier() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let registry = DeviceRegistry::new(dir.path());
+    registry.enroll(&record("node-op", "dev-op", PermissionTier::Operator))?;
+    let mut opted = record("node-yes", "dev-yes", PermissionTier::Operator);
+    opted.approve_optin = true;
+    registry.enroll(&opted)?;
+    let mut owner = record("node-own", "dev-own", PermissionTier::Owner);
+    owner.approve_optin = false;
+    registry.enroll(&owner)?;
+    let mapper = RegistryIdentityMapper::new(dir.path());
+
+    let plain = mapper.map(&peer("node-op"), ConnectionId::next()).await?;
+    assert!(plain.caps.steer && !plain.caps.approve);
+
+    let allowed = mapper.map(&peer("node-yes"), ConnectionId::next()).await?;
+    assert!(allowed.caps.steer && allowed.caps.approve);
+
+    // Even the owner tier does not approve without the opt-in.
+    let owner = mapper.map(&peer("node-own"), ConnectionId::next()).await?;
+    assert!(!owner.caps.approve);
+    Ok(())
+}
+
+#[test]
+fn opt_in_marker_round_trips_and_other_seventh_fields_fail_closed() -> TestResult {
+    let line = "n1|d1|acme|operator|active|phone|approve";
+    let rec = DeviceRecord::parse(line).ok_or("opt-in line must parse")?;
+    assert!(rec.approve_optin);
+    assert_eq!(rec.render(), line);
+    let plain = DeviceRecord::parse("n1|d1|acme|operator|active|phone").ok_or("plain line")?;
+    assert!(!plain.approve_optin);
+    assert_eq!(plain.render(), "n1|d1|acme|operator|active|phone");
+    for bad in [
+        "n1|d1|acme|operator|active|phone|yes",
+        "n1|d1|acme|operator|active|phone|approve|x",
+        "n1|d1|acme|operator|active|phone|",
+    ] {
+        assert!(DeviceRecord::parse(bad).is_none(), "{bad}");
+    }
     Ok(())
 }

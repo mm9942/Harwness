@@ -1124,6 +1124,9 @@ mod tests {
         read_only_surface.extend_from_slice(crate::palace_tools::PalaceToolProvider::TOOL_NAMES);
         // Runde 5, Teil H: `agent.result` liest nur eigene Kind-Ergebnisse.
         read_only_surface.extend_from_slice(crate::profile::CHILD_RESULT_TOOLS);
+        // harw-tool-tunnel-v1: `tunnel.status`/`tunnel.list` lesen nur den Zustand
+        // verwalteter Tunnels des Aufrufers (siehe `AUTO_APPROVED_TOOLS`).
+        read_only_surface.extend_from_slice(&["tunnel.status", "tunnel.list"]);
         // Runde 5, Teil F: `ask_user` liest nur die Antwort der Nutzerin.
         read_only_surface.push(harw_tool_plan::ASK_USER_TOOL);
         // Runde 5 (Integration): `plan.write` schreibt ausschließlich die
