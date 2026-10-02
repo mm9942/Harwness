@@ -24,6 +24,7 @@ bytes = "1"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [dev-dependencies]
+jiff = { workspace = true }
 harw-node-transport = { path = "../harw-node-transport" }
 harw-node-listener = { path = "../harw-node-listener" }
 harw-session-remote = { path = "../harw-session-remote" }

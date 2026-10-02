@@ -3906,6 +3906,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jiff",
  "serde_json",
  "tempfile",
  "tokio",
