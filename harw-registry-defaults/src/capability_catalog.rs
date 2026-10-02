@@ -391,6 +391,8 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("palace.recall", KNOWLEDGE, Knowledge),
     row!("kanban.list", KNOWLEDGE, Knowledge),
     row!("kanban.show", KNOWLEDGE, Knowledge),
+    row!("memory.recall", KNOWLEDGE, Knowledge),
+    row!("memory.record", KNOWLEDGE, WriteOther),
     // definition and skill authoring
     row!("agents.validate", AUTHORING, Meta),
     row!("agents.list_proposals", AUTHORING, Meta),
@@ -517,6 +519,7 @@ mod tests {
             DiaryToolProvider::TOOL_NAMES,
             PalaceToolProvider::TOOL_NAMES,
             KanbanReadToolProvider::TOOL_NAMES,
+            crate::memory_tools::MemoryToolProvider::TOOL_NAMES,
             harw_tool_plan::PlanToolProvider::TOOL_NAMES,
             ALWAYS_ASK_TOOLS,
         ] {
@@ -586,6 +589,7 @@ mod tests {
                     DiaryToolProvider::TOOL_NAMES,
                     PalaceToolProvider::TOOL_NAMES,
                     KanbanReadToolProvider::TOOL_NAMES,
+                    crate::memory_tools::MemoryToolProvider::TOOL_NAMES,
                 ],
             ),
             (
