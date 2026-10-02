@@ -559,7 +559,7 @@ mod tests {
         EntryKind::CompiledAgent,
     ];
 
-    const ALL_PERMISSIONS: [Permission; 7] = [
+    const ALL_PERMISSIONS: [Permission; 8] = [
         Permission::ReadWorkspace,
         Permission::WriteWorkspace,
         Permission::ExecuteProcess,
@@ -567,6 +567,7 @@ mod tests {
         Permission::ReadSecrets,
         Permission::ManagePlugins,
         Permission::ReadCargoRegistry,
+        Permission::ManageContainers,
     ];
 
     /// Erzwingt beim Kompilieren, dass `ALL` jede Variante kennt: eine neue
