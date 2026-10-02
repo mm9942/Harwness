@@ -3237,6 +3237,16 @@ impl RuntimeAssemblyBuilder {
                 detail: format!("could not register the handoff context provider: {error}"),
             })?;
 
+        // Rückmeldungs-Tracker (delivered/used/corrected) über beiden Stores.
+        let feedback_tracker = (config.harness.memory.enabled
+            && (project_facts.is_some() || global_facts.is_some()))
+        .then(|| {
+            Arc::new(harw_memory::feedback::FeedbackTracker::new(
+                project_facts.clone(),
+                global_facts.clone(),
+            ))
+        });
+
         // 12c. Gedächtnis-Fakten-Recall (Addendum B, §2/§4). Registriert nur,
         //      wenn mindestens eine Quelle etwas beitragen könnte (siehe
         //      `MemoryFactsContextProvider`-Doku für die Begründung, warum
@@ -3266,7 +3276,8 @@ impl RuntimeAssemblyBuilder {
                     .with_limits(
                         config.harness.memory.global_enabled,
                         config.harness.memory.token_budget,
-                    ),
+                    )
+                    .with_feedback(feedback_tracker.clone()),
                 ))
                 .map_err(|error| RuntimeError::Registry {
                     detail: format!(
@@ -3426,6 +3437,7 @@ impl RuntimeAssemblyBuilder {
             tools,
             root_session_id,
             memory_capture,
+            feedback_tracker,
             context_ledger,
             diary_recorder,
             guard_policy,
@@ -4159,6 +4171,8 @@ struct MemoryFactsContextProvider {
     /// und Dateieinträge in geschätzten Tokens (4 Zeichen je Token).
     /// `None` = nur die festen Zeilenobergrenzen wie bisher.
     token_budget: Option<usize>,
+    /// Verbucht pro Turn, welche Fakten geliefert wurden (Lernschleife).
+    feedback: Option<Arc<harw_memory::feedback::FeedbackTracker>>,
 }
 
 /// Geschätzte Tokenzahl eines Textes (4 Zeichen je Token, aufgerundet).
@@ -4209,7 +4223,18 @@ impl MemoryFactsContextProvider {
             file_index,
             global_enabled: true,
             token_budget: None,
+            feedback: None,
         }
+    }
+
+    /// Hängt den Rückmeldungs-Tracker an.
+    #[must_use]
+    fn with_feedback(
+        mut self,
+        feedback: Option<Arc<harw_memory::feedback::FeedbackTracker>>,
+    ) -> Self {
+        self.feedback = feedback;
+        self
     }
 
     /// Setzt die `[memory]`-Grenzen (`global_enabled`, `token_budget`); die
@@ -4241,6 +4266,7 @@ impl MemoryFactsContextProvider {
     ///   insgesamt [`MEMORY_FACTS_TOTAL_MAX_DELIVERED`] Zeilen erreicht sind.
     fn preferences_and_pitfalls(
         &self,
+        session_id: &str,
         keywords: &[String],
         budget: &mut MemoryTokenBudget,
     ) -> Vec<ContextFragment> {
@@ -4248,6 +4274,14 @@ impl MemoryFactsContextProvider {
         let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Ausgelieferte Fakten je Store-Rolle, für `record_usage`.
         let mut delivered: Vec<(&str, Vec<String>)> = Vec::new();
+        let mut delivered_facts: Vec<harw_memory::feedback::DeliveredFact> = Vec::new();
+        let delivered_scope = |scope_name: &str| {
+            if scope_name == "project" {
+                harw_memory::feedback::DeliveredScope::Project
+            } else {
+                harw_memory::feedback::DeliveredScope::Global
+            }
+        };
         let global_facts = if self.global_enabled {
             &self.global_facts
         } else {
@@ -4292,6 +4326,11 @@ impl MemoryFactsContextProvider {
                         }
                         seen_facts.insert(format!("{scope_name}:{}", fact.name));
                         lines.push(line);
+                        delivered_facts.push(harw_memory::feedback::DeliveredFact {
+                            scope: delivered_scope(scope_name),
+                            name: fact.name.clone(),
+                            description: fact.description.clone(),
+                        });
                         names.push(fact.name);
                     }
                     delivered.push((scope_name, names));
@@ -4335,6 +4374,11 @@ impl MemoryFactsContextProvider {
                                 break;
                             }
                             lines.push(line);
+                            delivered_facts.push(harw_memory::feedback::DeliveredFact {
+                                scope: delivered_scope(scope_name),
+                                name: fact.name.clone(),
+                                description: fact.description.clone(),
+                            });
                             names.push(fact.name);
                         }
                         delivered.push((scope_name, names));
@@ -4348,6 +4392,9 @@ impl MemoryFactsContextProvider {
                     }
                 }
             }
+        }
+        if let Some(tracker) = &self.feedback {
+            tracker.note_delivery(session_id, delivered_facts);
         }
         if lines.is_empty() {
             return Vec::new();
@@ -4488,7 +4535,8 @@ impl ContextProvider for MemoryFactsContextProvider {
             let mut budget = MemoryTokenBudget {
                 remaining: self.token_budget,
             };
-            let mut fragments = self.preferences_and_pitfalls(&keywords, &mut budget);
+            let mut fragments =
+                self.preferences_and_pitfalls(ctx.session_id.as_str(), &keywords, &mut budget);
             fragments.extend(self.known_files(&keywords, &mut budget));
             fragments
         })
@@ -5553,6 +5601,8 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] hängt daraus, falls gesetzt, einen
     /// [`crate::memory_wiring::MemoryCaptureObserver`] an die Wurzelsitzung.
     memory_capture: Option<Arc<harw_memory::capture::ProjectMemoryCapture>>,
+    /// Rückmeldungs-Tracker der Gedächtnis-Fakten (`None` ohne Gedächtnis).
+    feedback_tracker: Option<Arc<harw_memory::feedback::FeedbackTracker>>,
     /// Kontext-Ledger der Wurzelsitzung (`[memory] context_ledger`), `None`
     /// wenn abgeschaltet oder nicht öffenbar. Nur Labels und Größen.
     context_ledger: Option<Arc<dyn harw_context_ledger::LedgerSink>>,
@@ -6411,8 +6461,12 @@ impl RuntimeAssembly {
                     })
                 })
                 .with_tool_outcome_observer({
+                    let feedback = self.feedback_tracker.clone();
                     let memory = self.memory_capture.clone().map(|capture| {
-                        Arc::new(crate::memory_wiring::MemoryCaptureObserver::new(capture))
+                        Arc::new(
+                            crate::memory_wiring::MemoryCaptureObserver::new(capture)
+                                .with_feedback(feedback),
+                        )
                             as Arc<dyn harw_core::capture::ToolOutcomeObserver>
                     });
                     match &self.diary_recorder {
@@ -9275,6 +9329,51 @@ mod tests {
             "{}",
             unused.confidence
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_feedback_tracker_sees_delivery_then_use_and_correction() -> TestResult {
+        use harw_core::capture::ToolOutcomeObserver;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(
+            harw_memory::FactStore::open(dir.path(), harw_memory::FactScope::Global)
+                .map_err(ctx("open"))?,
+        );
+        store
+            .write(&memory_fact(
+                "prefer-nextest",
+                "Tests mit cargo nextest ausführen",
+                harw_memory::FactType::Preference,
+                harw_memory::FactScope::Global,
+                0.8,
+            ))
+            .map_err(ctx("seed"))?;
+        let tracker = Arc::new(harw_memory::feedback::FeedbackTracker::new(
+            None,
+            Some(Arc::clone(&store)),
+        ));
+        let provider = MemoryFactsContextProvider::new(None, Some(Arc::clone(&store)), None)
+            .with_feedback(Some(Arc::clone(&tracker)));
+        let turn = harw_extension_api::TurnInputContext::default();
+        let _ = ready(provider.contribute(&turn))?;
+
+        let capture_dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let capture = Arc::new(
+            harw_memory::capture::ProjectMemoryCapture::open(capture_dir.path())
+                .map_err(ctx("capture"))?,
+        );
+        let observer =
+            crate::memory_wiring::MemoryCaptureObserver::new(capture).with_feedback(Some(tracker));
+        observer.on_assistant_message(&turn.session_id, "Ich starte die Tests mit cargo nextest.");
+        observer.on_user_message(
+            &turn.session_id,
+            "Das ist falsch, nutze nicht cargo nextest dafür!",
+        );
+        let feedback = store
+            .feedback("prefer-nextest")
+            .ok_or_else(|| ctx("feedback")("missing"))?;
+        assert_eq!((feedback.used, feedback.corrected), (1, 1));
         Ok(())
     }
 

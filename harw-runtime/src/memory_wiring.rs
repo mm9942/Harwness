@@ -64,6 +64,8 @@ use crate::assembly::SessionLifecycleHook;
 pub struct MemoryCaptureObserver {
     /// Die geteilte Erfassungsfläche des Projekts.
     capture: Arc<ProjectMemoryCapture>,
+    /// Rückmeldungs-Tracker für gelieferte Fakten (optional).
+    feedback: Option<Arc<harw_memory::feedback::FeedbackTracker>>,
 }
 
 impl MemoryCaptureObserver {
@@ -79,7 +81,20 @@ impl MemoryCaptureObserver {
     /// Einen einsatzbereiten [`MemoryCaptureObserver`].
     #[must_use]
     pub fn new(capture: Arc<ProjectMemoryCapture>) -> Self {
-        Self { capture }
+        Self {
+            capture,
+            feedback: None,
+        }
+    }
+
+    /// Hängt den Rückmeldungs-Tracker an.
+    #[must_use]
+    pub fn with_feedback(
+        mut self,
+        feedback: Option<Arc<harw_memory::feedback::FeedbackTracker>>,
+    ) -> Self {
+        self.feedback = feedback;
+        self
     }
 }
 
@@ -108,6 +123,20 @@ impl ToolOutcomeObserver for MemoryCaptureObserver {
             is_error,
             outcome.output_text,
         );
+    }
+
+    /// Meldet eine Nutzernachricht an den Rückmeldungs-Tracker (Korrekturen).
+    fn on_user_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(feedback) = &self.feedback {
+            feedback.on_user_message(session_id.as_str(), text);
+        }
+    }
+
+    /// Meldet eine Assistentenantwort an den Rückmeldungs-Tracker (Nutzung).
+    fn on_assistant_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(feedback) = &self.feedback {
+            feedback.on_assistant_message(session_id.as_str(), text);
+        }
     }
 
     // `on_turn_finished` bleibt beim No-op-Standard aus

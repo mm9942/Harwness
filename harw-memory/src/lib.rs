@@ -61,6 +61,7 @@ pub mod epistemic;
 pub mod error;
 pub mod extraction;
 pub mod facts;
+pub mod feedback;
 pub mod file_index;
 pub mod file_store;
 pub mod heartbeat;

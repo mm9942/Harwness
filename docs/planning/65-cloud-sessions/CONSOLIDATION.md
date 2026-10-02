@@ -120,3 +120,6 @@ Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assemb
 - Behaviour change to be aware of: hosted sessions of an operator no longer get shell (they had `{R, W, X, N}` as `Tui`). A maintainer/owner tier gets shell, still behind delegated approvals.
 - Verified: rights matrix over the real assembly (`rights_matrix` 33 tests), `hosted_session_rights_follow_the_connection_tier`, clippy `-D warnings`, xtask gates green.
 - Still open for the node listener: it needs a node transport section in `harw-config` (none exists) and a per-connection factory that passes the mapped device's tier; this EntryKind removes the earlier blocker.
+
+## Lernschleife: Feedback-Signal (X2)
+`FeedbackTracker` (harw-memory) verbucht delivered/used/corrected je Fakt; Provider meldet Lieferungen, `MemoryCaptureObserver` Nachrichten; Decay demotet nutzlose (>=5 geliefert, 0 genutzt) und schädliche Fakten. clippy, Tests (core/runtime/memory), `xtask gates` grün.

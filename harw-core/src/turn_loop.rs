@@ -5289,6 +5289,7 @@ async fn drive_turn(
     // Projektgedächtnis: alle Tool-Ergebnisse dieses Turns wurden bereits
     // über `notify_tool_outcome` gemeldet; hier, am erfolgreichen Turn-Ende,
     // erfährt der Beobachter, dass die Runde abgeschlossen ist.
+    crate::turn_feedback::notify_turn_texts(session);
     if let Some(observer) = session.tool_outcome_observer().cloned() {
         observer.on_turn_finished(session.id());
     }

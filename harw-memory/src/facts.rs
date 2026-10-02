@@ -50,6 +50,11 @@ const FACT_FILE_MODE: u32 = 0o600;
 /// Teilzustand ab (siehe [`FactStore::decay_with_deadline`]).
 pub const DECAY_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
+/// Ab dieser Zahl Lieferungen ohne eine einzige Nutzung gilt ein Fakt als
+/// wirkungslos: die Verdrängung halbiert seine `confidence` (siehe
+/// [`FactStore::decay_with_deadline`]).
+pub const FEEDBACK_MIN_DELIVERIES: u64 = 5;
+
 /// Art eines Fakts — steuert laut Design §3/§4 die Ladepriorität
 /// (`preference`/`decision` werden bevorzugt geladen, `reference` nur bei
 /// Stichworttreffern).
@@ -955,6 +960,39 @@ struct UsageEntry {
     /// Zeitpunkt der letzten Nutzung.
     #[serde(with = "time::serde::rfc3339")]
     last_used: OffsetDateTime,
+    /// Wie oft der gelieferte Fakt tatsächlich genutzt wurde (Antwort oder
+    /// Werkzeugaufruf bezog sich auf ihn). Ältere Dateien kennen das Feld
+    /// nicht und lesen `0`.
+    #[serde(default)]
+    used: u64,
+    /// Wie oft eine Korrektur des Nutzers nach der Lieferung auf den Fakt
+    /// zurückging. Ältere Dateien lesen `0`.
+    #[serde(default)]
+    corrected: u64,
+}
+
+/// Rückmeldung zu einem Fakt: geliefert, genutzt, korrigiert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Feedback {
+    /// Lieferungen seit dem letzten Zurücksetzen.
+    pub delivered: u64,
+    /// Davon genutzt.
+    pub used: u64,
+    /// Korrekturen nach der Lieferung.
+    pub corrected: u64,
+}
+
+impl Feedback {
+    /// Anteil der genutzten Lieferungen (`None` ohne Lieferung).
+    #[must_use]
+    pub fn precision(&self) -> Option<f64> {
+        (self.delivered > 0).then(|| {
+            // Zähler sind klein; die Rundung ist hier unkritisch.
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = self.used as f64 / self.delivered as f64;
+            ratio.min(1.0)
+        })
+    }
 }
 
 /// Liest eine Datei symlink-sicher; `Ok(None)` wenn sie nicht existiert.
@@ -1388,11 +1426,89 @@ impl FactStore {
             let entry = map.entry((*name).to_owned()).or_insert(UsageEntry {
                 count: 0,
                 last_used: now,
+                used: 0,
+                corrected: 0,
             });
             entry.count = entry.count.saturating_add(1);
             entry.last_used = now;
         }
         self.write_usage_map(&map)
+    }
+
+    /// Zeichnet auf, dass gelieferte Fakten **genutzt** wurden (Antwort oder
+    /// Werkzeugaufruf bezog sich auf sie). Unbekannte Namen werden wie bei
+    /// [`Self::record_usage`] angelegt; `count` (Lieferungen) bleibt unberührt.
+    ///
+    /// # Errors
+    /// Wie [`Self::record_usage`].
+    pub fn record_used(&self, names: &[&str]) -> MemoryResult<()> {
+        self.update_feedback(names, |entry| entry.used = entry.used.saturating_add(1))
+    }
+
+    /// Zeichnet auf, dass der Nutzer nach der Lieferung eines Fakts
+    /// korrigiert hat (der Fakt war wahrscheinlich falsch oder veraltet).
+    ///
+    /// # Errors
+    /// Wie [`Self::record_usage`].
+    pub fn record_corrected(&self, names: &[&str]) -> MemoryResult<()> {
+        self.update_feedback(names, |entry| {
+            entry.corrected = entry.corrected.saturating_add(1);
+        })
+    }
+
+    fn update_feedback(
+        &self,
+        names: &[&str],
+        update: impl Fn(&mut UsageEntry),
+    ) -> MemoryResult<()> {
+        let mut map = self.read_usage_map()?;
+        let now = OffsetDateTime::now_utc();
+        for name in names {
+            let entry = map.entry((*name).to_owned()).or_insert(UsageEntry {
+                count: 0,
+                last_used: now,
+                used: 0,
+                corrected: 0,
+            });
+            update(entry);
+        }
+        self.write_usage_map(&map)
+    }
+
+    /// Rückmeldung zu `name`; `None`, wenn nichts aufgezeichnet ist oder
+    /// `usage.json` nicht lesbar ist.
+    #[must_use]
+    pub fn feedback(&self, name: &str) -> Option<Feedback> {
+        let map = self.read_usage_map().ok()?;
+        map.get(name).map(|entry| Feedback {
+            delivered: entry.count,
+            used: entry.used,
+            corrected: entry.corrected,
+        })
+    }
+
+    /// Rückmeldung aller Fakten mit Eintrag, nach Name sortiert (Grundlage
+    /// der Präzisionsanzeige in `harw doctor` und `/memory stats`).
+    #[must_use]
+    pub fn feedback_all(&self) -> Vec<(String, Feedback)> {
+        let Ok(map) = self.read_usage_map() else {
+            return Vec::new();
+        };
+        let mut all: Vec<_> = map
+            .into_iter()
+            .map(|(name, entry)| {
+                (
+                    name,
+                    Feedback {
+                        delivered: entry.count,
+                        used: entry.used,
+                        corrected: entry.corrected,
+                    },
+                )
+            })
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
     }
 
     /// Liest den Nutzungszähler für `name`, `None` wenn nie genutzt oder
@@ -1453,17 +1569,25 @@ impl FactStore {
         let usage_map = self.read_usage_map()?;
         // Phase 1: Plan (Fakt, Pfad, Originalbytes), ohne zu schreiben.
         let mut plan: Vec<(Fact, PathBuf, Vec<u8>)> = Vec::new();
+        let mut demoted_by_feedback: Vec<String> = Vec::new();
         for mut fact in facts {
             if Instant::now() >= deadline {
                 return Err(expired());
             }
-            let (count, last_used) = usage_map
+            let (count, last_used, used, corrected) = usage_map
                 .get(&fact.name)
-                .map_or((0, fact.updated), |e| (e.count, e.last_used));
-            if count != 0 {
-                continue;
-            }
-            if (now - last_used).whole_days() < max_unused_days {
+                .map_or((0, fact.updated, 0, 0), |e| {
+                    (e.count, e.last_used, e.used, e.corrected)
+                });
+            // Rückmeldungsregel: oft geliefert, nie genutzt, oder häufiger
+            // korrigiert als genutzt, dann ist der Fakt wirkungslos oder
+            // schädlich. Ein Zeitfenster braucht es nicht: die Evidenz sind
+            // die Zähler, die danach zurückgesetzt werden.
+            let useless = count >= FEEDBACK_MIN_DELIVERIES && used == 0;
+            let harmful = corrected > 0 && corrected > used;
+            let unused_for_too_long =
+                count == 0 && (now - last_used).whole_days() >= max_unused_days;
+            if !(useless || harmful || unused_for_too_long) {
                 continue;
             }
             let path = self.path_for(&fact.name)?;
@@ -1471,6 +1595,9 @@ impl FactStore {
                 continue;
             };
             fact.confidence *= 0.5;
+            if useless || harmful {
+                demoted_by_feedback.push(fact.name.clone());
+            }
             plan.push((fact, path, original));
         }
         if Instant::now() >= deadline {
@@ -1492,6 +1619,18 @@ impl FactStore {
             if fact.confidence < 0.2 {
                 fallen_below.push(fact.name.clone());
             }
+        }
+        // Die Zähler der per Rückmeldung herabgestuften Fakten zurücksetzen:
+        // die nächste Herabstufung braucht neue Evidenz.
+        if !demoted_by_feedback.is_empty() {
+            let mut map = self.read_usage_map()?;
+            for name in &demoted_by_feedback {
+                if let Some(entry) = map.get_mut(name) {
+                    entry.count = 0;
+                    entry.corrected = 0;
+                }
+            }
+            self.write_usage_map(&map)?;
         }
         self.write_index()?;
         Ok(fallen_below)
@@ -2047,6 +2186,125 @@ mod tests {
             .map_err(ctx("read"))?
             .ok_or(TestError::Missing("used-fact"))?;
         assert!((unchanged.confidence - 0.8).abs() < 0.01);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_counts_used_and_corrected_and_reports_precision() -> TestResult {
+        let root = tmp_root("feedback");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store.write(&sample_fact("helpful")).map_err(ctx("write"))?;
+        store
+            .record_usage(&["helpful", "helpful", "helpful", "helpful"])
+            .map_err(ctx("record_usage"))?;
+        store
+            .record_used(&["helpful"])
+            .map_err(ctx("record_used"))?;
+        store
+            .record_corrected(&["helpful"])
+            .map_err(ctx("record_corrected"))?;
+        let feedback = store
+            .feedback("helpful")
+            .ok_or(TestError::Missing("feedback"))?;
+        assert_eq!(
+            feedback,
+            Feedback {
+                delivered: 4,
+                used: 1,
+                corrected: 1
+            }
+        );
+        assert_eq!(feedback.precision(), Some(0.25));
+        assert!(store.feedback("unknown").is_none());
+        assert_eq!(store.feedback_all().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn old_usage_files_without_feedback_fields_still_load() -> TestResult {
+        let root = tmp_root("feedback-compat");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store.write(&sample_fact("legacy")).map_err(ctx("write"))?;
+        fs::write(
+            root.join("usage.json"),
+            r#"{"legacy":{"count":3,"last_used":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .map_err(ctx("write usage"))?;
+        let feedback = store
+            .feedback("legacy")
+            .ok_or(TestError::Missing("feedback"))?;
+        assert_eq!(
+            feedback,
+            Feedback {
+                delivered: 3,
+                used: 0,
+                corrected: 0
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn decay_demotes_facts_that_are_delivered_often_but_never_used() -> TestResult {
+        let root = tmp_root("decay-useless");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        for name in ["useless", "useful", "fresh"] {
+            store.write(&sample_fact(name)).map_err(ctx("write"))?;
+        }
+        let deliveries = vec!["useless"; FEEDBACK_MIN_DELIVERIES as usize];
+        store
+            .record_usage(&deliveries)
+            .map_err(ctx("record_usage"))?;
+        let deliveries = vec!["useful"; FEEDBACK_MIN_DELIVERIES as usize];
+        store
+            .record_usage(&deliveries)
+            .map_err(ctx("record_usage"))?;
+        store.record_used(&["useful"]).map_err(ctx("record_used"))?;
+        store
+            .record_usage(&["fresh"])
+            .map_err(ctx("record_usage"))?;
+
+        let now = OffsetDateTime::now_utc();
+        store.decay(90, now).map_err(ctx("decay"))?;
+        let conf = |name: &str| -> TestResult<f32> {
+            Ok(store
+                .read(name)
+                .map_err(ctx("read"))?
+                .ok_or(TestError::Missing("fact"))?
+                .confidence)
+        };
+        assert!((conf("useless")? - 0.4).abs() < 0.01, "demoted by feedback");
+        assert!((conf("useful")? - 0.8).abs() < 0.01, "used facts stay");
+        assert!((conf("fresh")? - 0.8).abs() < 0.01, "too few deliveries");
+        // The evidence is spent: a second run does not halve again.
+        store.decay(90, now).map_err(ctx("decay again"))?;
+        assert!((conf("useless")? - 0.4).abs() < 0.01);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn decay_demotes_facts_corrected_more_often_than_used() -> TestResult {
+        let root = tmp_root("decay-corrected");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store.write(&sample_fact("wrong")).map_err(ctx("write"))?;
+        store
+            .record_usage(&["wrong"])
+            .map_err(ctx("record_usage"))?;
+        store
+            .record_corrected(&["wrong"])
+            .map_err(ctx("record_corrected"))?;
+        store
+            .decay(90, OffsetDateTime::now_utc())
+            .map_err(ctx("decay"))?;
+        let fact = store
+            .read("wrong")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("wrong"))?;
+        assert!((fact.confidence - 0.4).abs() < 0.01);
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
