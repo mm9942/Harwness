@@ -23,6 +23,8 @@
 //! node-devices.conf   node_id|device|tenant|tier|status|label[|approve]
 //! ```
 //! Malformed lines are ignored and logged, never repaired into a grant.
+//! Marking a device `revoked` in `node-devices.conf` revokes it live (the
+//! gateway scans the file; see `session_serve_remote`).
 //!
 //! Failure to start is a hard error of `harw gateway` (the option is explicit
 //! and global-only), never a silent fallback.

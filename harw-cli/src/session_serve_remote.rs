@@ -42,13 +42,16 @@
 //! # Jobs rule
 //! Everything on the serve path is async on the caller's runtime.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use harw_core::ModelProvider;
 use harw_node_listener::{
-    HostRevoker, IdentityMapper, NodeListener, RegistryIdentityMapper, RevocationSink,
+    DeviceRegistry, HostRevoker, IdentityMapper, NodeListener, RegistryIdentityMapper,
+    RevocationSink,
 };
 use harw_node_transport::{LocalNode, NodeTransportServer, NodeVerifier, ServerOptions};
 use harw_session_daemon::DaemonServices;
@@ -86,6 +89,9 @@ pub struct RemoteServeConfig {
     /// The one device allowed to resolve approvals of remote sessions (it must
     /// also carry the registry `approve` opt-in). `None`: approvals park.
     pub approval_device: Option<DeviceId>,
+    /// How often `node-devices.conf` is scanned for newly revoked devices
+    /// (live revocation). Default 5 s.
+    pub revocation_poll: Duration,
 }
 
 impl RemoteServeConfig {
@@ -98,6 +104,7 @@ impl RemoteServeConfig {
             cwd: cwd.to_path_buf(),
             tier: PermissionTier::Observer,
             approval_device: None,
+            revocation_poll: Duration::from_secs(5),
         }
     }
 
@@ -118,13 +125,8 @@ impl RemoteServeConfig {
 pub struct RemoteIngress {
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
+    watcher: JoinHandle<()>,
     addr: SocketAddr,
-    // Programmatic revocation (live connections close at once). Operators
-    // revoke by marking the record `revoked` in `node-devices.conf`, which
-    // refuses the device's next handshake; no live-revoke control surface is
-    // wired to the gateway yet.
-    #[allow(dead_code)]
-    revoker: HostRevoker,
 }
 
 impl std::fmt::Debug for RemoteIngress {
@@ -142,22 +144,12 @@ impl RemoteIngress {
         self.addr
     }
 
-    /// Revokes `device`: the host drops its authority first, the registry
-    /// record is marked revoked and its live connections are closed.
-    ///
-    /// # Errors
-    /// The registry could not be updated (authority is cut regardless).
-    #[allow(dead_code)]
-    pub fn revoke_device(&self, device: &DeviceId) -> Result<usize, String> {
-        self.revoker
-            .revoke_device(device)
-            .map(|report| report.connections_closed)
-            .map_err(|error| error.to_string())
-    }
-
     /// Stops accepting, closes live connections and waits for the listener.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
+        if let Err(error) = self.watcher.await {
+            tracing::error!(%error, "remote revocation watcher failed");
+        }
         if let Err(error) = self.task.await {
             tracing::error!(%error, "remote session ingress task failed");
         } else {
@@ -235,6 +227,12 @@ pub async fn start_remote_with_driver(
     let node_listener = NodeListener::new(server, host, mapper, WsLimits::default());
     let revoker = node_listener.revoker().with_registry(&remote_dir);
     let (shutdown, mut rx) = watch::channel(false);
+    let watcher = tokio::spawn(watch_revocations(
+        revoker,
+        remote_dir.clone(),
+        config.revocation_poll,
+        shutdown.subscribe(),
+    ));
     let task = tokio::spawn(async move {
         let stop = async move {
             let _ = rx.wait_for(|stop| *stop).await;
@@ -246,9 +244,51 @@ pub async fn start_remote_with_driver(
     Ok(RemoteIngress {
         shutdown,
         task,
+        watcher,
         addr,
-        revoker,
     })
+}
+
+/// Live revocation: a device whose record in `node-devices.conf` is marked
+/// `revoked` loses its authority in the host at once and its open connections
+/// are closed. The file is the operator's control surface (the same file
+/// refuses the device's next handshake); no network endpoint is involved.
+/// Devices already revoked at start are applied on the first scan.
+async fn watch_revocations(
+    revoker: HostRevoker,
+    registry_dir: PathBuf,
+    every: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
+    let registry = DeviceRegistry::new(&registry_dir);
+    let mut applied: HashSet<DeviceId> = HashSet::new();
+    let mut ticker = tokio::time::interval(every.max(Duration::from_millis(10)));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stop.wait_for(|stop| *stop) => return,
+        }
+        let records = match registry.records() {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "revocation scan: device registry unreadable");
+                continue;
+            }
+        };
+        for record in records.into_iter().filter(|record| record.revoked) {
+            if !applied.insert(record.device.clone()) {
+                continue;
+            }
+            match revoker.revoke_device(&record.device) {
+                Ok(report) => tracing::info!(
+                    device = record.device.as_str(),
+                    connections_closed = report.connections_closed,
+                    "device revoked"
+                ),
+                Err(error) => tracing::warn!(%error, "device revocation incomplete"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,7 +430,8 @@ mod tests {
     async fn an_enrolled_device_lists_sessions_over_the_node_transport_and_revocation_cuts_it()
     -> TestResult {
         let temp = tempfile::tempdir()?;
-        let config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        let mut config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        config.revocation_poll = Duration::from_millis(50);
         let gateway = node("gateway", 1)?;
         let phone = node("phone", 2)?;
         let device = DeviceId::try_from_str("dev-1")?;
@@ -419,9 +460,18 @@ mod tests {
         let port = dial(ingress.addr(), &gateway, &phone).await?;
         assert!(port.list().await?.is_empty());
 
-        // Revocation: authority is cut and the registry says so, so the next
-        // handshake is refused too.
-        ingress.revoke_device(&device)?;
+        // Live revocation by the operator's file edit: the open connection is
+        // cut and the next handshake is refused.
+        DeviceRegistry::new(&remote_dir).mark_revoked(&device)?;
+        let mut cut = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if port.list().await.is_err() {
+                cut = true;
+                break;
+            }
+        }
+        assert!(cut, "the open connection of a revoked device is closed");
         drop(port);
         assert!(
             dial(ingress.addr(), &gateway, &phone).await.is_err(),
