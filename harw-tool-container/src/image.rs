@@ -43,7 +43,9 @@ impl ImageRef {
             .strip_prefix("sha256:")
             .ok_or(err("only sha256 digests are accepted"))?;
         if hex.len() != SHA256_HEX_LEN
-            || !hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            || !hex
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
         {
             return Err(err("digest must be 64 lowercase hex characters"));
         }
@@ -137,8 +139,9 @@ impl ImageCatalog {
     ) -> Result<Self, ContainerPolicyError> {
         let mut map = BTreeMap::new();
         for (alias, reference) in entries {
-            check_name(alias, 32, "image alias")
-                .map_err(|_| ContainerPolicyError::InvalidAlias("expected [a-z0-9][a-z0-9._-]{0,31}"))?;
+            check_name(alias, 32, "image alias").map_err(|_| {
+                ContainerPolicyError::InvalidAlias("expected [a-z0-9][a-z0-9._-]{0,31}")
+            })?;
             let image = ImageRef::parse(reference)?;
             if map.insert(alias.to_owned(), image).is_some() {
                 return Err(ContainerPolicyError::DuplicateAlias);
@@ -152,7 +155,9 @@ impl ImageCatalog {
     /// # Errors
     /// [`ContainerPolicyError::UnknownAlias`] (the alias is not echoed).
     pub fn resolve(&self, alias: &str) -> Result<&ImageRef, ContainerPolicyError> {
-        self.entries.get(alias).ok_or(ContainerPolicyError::UnknownAlias)
+        self.entries
+            .get(alias)
+            .ok_or(ContainerPolicyError::UnknownAlias)
     }
 
     /// Aliases in sorted order, for `container.engine` output.
@@ -189,7 +194,10 @@ mod tests {
         let r = ImageRef::parse(&format!("docker.io/library/rust@{}", digest()))?;
         ensure(r.name() == "docker.io/library/rust", "name")?;
         ensure(r.hex() == HEX, "hex")?;
-        ensure(r.to_arg() == format!("docker.io/library/rust@sha256:{HEX}"), "arg")
+        ensure(
+            r.to_arg() == format!("docker.io/library/rust@sha256:{HEX}"),
+            "arg",
+        )
     }
 
     #[test]
@@ -221,7 +229,16 @@ mod tests {
     #[test]
     fn refuses_option_like_and_malformed_names() -> TestResult {
         for name in [
-            "-rust", "--privileged", "Rust", "a b", "a//b", "a/../b", "a/", "/a", "a\nb", "",
+            "-rust",
+            "--privileged",
+            "Rust",
+            "a b",
+            "a//b",
+            "a/../b",
+            "a/",
+            "/a",
+            "a\nb",
+            "",
         ] {
             ensure(
                 ImageRef::parse(&format!("{name}@{}", digest())).is_err(),
@@ -252,7 +269,10 @@ mod tests {
     fn catalog_resolves_aliases_only() -> TestResult {
         let cat = ImageCatalog::new([("rust", format!("rust@{}", digest()).as_str())])?;
         ensure(cat.resolve("rust").is_ok(), "known")?;
-        ensure(cat.resolve("python") == Err(ContainerPolicyError::UnknownAlias), "unknown")?;
+        ensure(
+            cat.resolve("python") == Err(ContainerPolicyError::UnknownAlias),
+            "unknown",
+        )?;
         ensure(cat.aliases().collect::<Vec<_>>() == ["rust"], "aliases")?;
         ensure(cat.len() == 1 && !cat.is_empty(), "len")
     }
@@ -260,7 +280,10 @@ mod tests {
     #[test]
     fn catalog_rejects_bad_entries() -> TestResult {
         let good = format!("rust@{}", digest());
-        ensure(ImageCatalog::new([("Rust", good.as_str())]).is_err(), "alias case")?;
+        ensure(
+            ImageCatalog::new([("Rust", good.as_str())]).is_err(),
+            "alias case",
+        )?;
         ensure(ImageCatalog::new([("rust", "rust:latest")]).is_err(), "tag")?;
         ensure(
             ImageCatalog::new([("rust", good.as_str()), ("rust", good.as_str())])

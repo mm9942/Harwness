@@ -43,7 +43,8 @@ pub struct Mount {
 }
 
 fn check_dst(dst: &str) -> Result<(), ContainerPolicyError> {
-    check_abs_path(dst).map_err(|_| ContainerPolicyError::InvalidMount("invalid destination path"))?;
+    check_abs_path(dst)
+        .map_err(|_| ContainerPolicyError::InvalidMount("invalid destination path"))?;
     let under_root = DST_ROOTS
         .iter()
         .any(|root| dst == *root || dst.strip_prefix(root).is_some_and(|r| r.starts_with('/')));
@@ -73,7 +74,10 @@ fn check_src(src: &str) -> Result<(), ContainerPolicyError> {
     if components.iter().any(|c| CREDENTIAL_DIRS.contains(c)) {
         return Err(err("source is inside a credential directory"));
     }
-    if components.windows(2).any(|w| w == [".config", "containers"]) {
+    if components
+        .windows(2)
+        .any(|w| w == [".config", "containers"])
+    {
         return Err(err("source is inside the container engine configuration"));
     }
     if components.last().is_some_and(|c| c.ends_with(".sock")) {
@@ -186,7 +190,12 @@ mod tests {
 
     #[test]
     fn near_misses_are_allowed() -> TestResult {
-        for src in ["/runner/work", "/etcetera", "/srv/.sshx", "/home/u/.config/other"] {
+        for src in [
+            "/runner/work",
+            "/etcetera",
+            "/srv/.sshx",
+            "/home/u/.config/other",
+        ] {
             ensure(Mount::bind(src, "/workspace", true).is_ok(), src)?;
         }
         Ok(())
@@ -195,12 +204,23 @@ mod tests {
     #[test]
     fn refuses_destinations_outside_the_allowlist() -> TestResult {
         for dst in [
-            "/", "/proc", "/usr", "/usr/bin", "/etc", "/run", "/workspaces", "workspace", "/workspace/",
+            "/",
+            "/proc",
+            "/usr",
+            "/usr/bin",
+            "/etc",
+            "/run",
+            "/workspaces",
+            "workspace",
+            "/workspace/",
             "/workspace/..",
         ] {
             ensure(Mount::bind("/srv/ws", dst, true).is_err(), dst)?;
         }
-        ensure(Mount::bind("/srv/ws", "/workspace/sub", true).is_ok(), "below root")?;
+        ensure(
+            Mount::bind("/srv/ws", "/workspace/sub", true).is_ok(),
+            "below root",
+        )?;
         ensure(Mount::bind("/srv/ws", "/cache", true).is_ok(), "exact root")
     }
 
@@ -209,7 +229,13 @@ mod tests {
         for src in ["/srv/a,b", "/srv/a:b", "/srv/a=b", "/srv/a\nb", "/srv/a\"b"] {
             ensure(Mount::bind(src, "/workspace", true).is_err(), src)?;
         }
-        ensure(Mount::volume("Bad Name", "/cache", false).is_err(), "volume name")?;
-        ensure(Mount::volume("a,b", "/cache", false).is_err(), "volume comma")
+        ensure(
+            Mount::volume("Bad Name", "/cache", false).is_err(),
+            "volume name",
+        )?;
+        ensure(
+            Mount::volume("a,b", "/cache", false).is_err(),
+            "volume comma",
+        )
     }
 }

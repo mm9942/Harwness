@@ -90,7 +90,9 @@ impl Readback {
     /// `true` only when every dimension is [`Enforcement::Enforced`].
     #[must_use]
     pub fn all_enforced(&self) -> bool {
-        self.entries.iter().all(|(_, e)| *e == Enforcement::Enforced)
+        self.entries
+            .iter()
+            .all(|(_, e)| *e == Enforcement::Enforced)
     }
 
     /// Dimensions that are not enforced (weaker or unknown).
@@ -160,7 +162,10 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
                 Dimension::Memory,
                 limit(facts.memory_bytes, expected.memory_bytes),
             ),
-            (Dimension::Pids, limit(facts.pids_limit, expected.pids_limit)),
+            (
+                Dimension::Pids,
+                limit(facts.pids_limit, expected.pids_limit),
+            ),
             (Dimension::Workspace, workspace),
         ],
     }
@@ -263,7 +268,10 @@ mod tests {
         let mut f = good();
         f.memory_bytes = Some(512 * 1024 * 1024);
         f.pids_limit = Some(100);
-        ensure(verify(&expected(true), &f).all_enforced(), "stricter is fine")?;
+        ensure(
+            verify(&expected(true), &f).all_enforced(),
+            "stricter is fine",
+        )?;
         f.memory_bytes = Some(2 * 1024 * 1024 * 1024);
         f.pids_limit = Some(257);
         let r = verify(&expected(true), &f);
@@ -278,7 +286,8 @@ mod tests {
     fn workspace_access_must_match_the_profile() -> TestResult {
         let f = good();
         ensure(
-            verify(&expected(false), &f).get(Dimension::Workspace) == Some(Enforcement::NotEnforced),
+            verify(&expected(false), &f).get(Dimension::Workspace)
+                == Some(Enforcement::NotEnforced),
             "ro mount where rw expected is a mismatch",
         )?;
         let mut rw = good();
@@ -291,7 +300,11 @@ mod tests {
 
     #[test]
     fn no_new_privileges_spellings() -> TestResult {
-        for ok in ["no-new-privileges", "no-new-privileges=true", "no-new-privileges:true"] {
+        for ok in [
+            "no-new-privileges",
+            "no-new-privileges=true",
+            "no-new-privileges:true",
+        ] {
             ensure(is_no_new_privileges(ok), ok)?;
         }
         for bad in ["no-new-privileges=false", "seccomp=unconfined", ""] {
