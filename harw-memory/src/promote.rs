@@ -379,7 +379,7 @@ pub fn promote_fact_to_global(
     deadline.check("promote-validate")?;
 
     let global = FactStore::open(global_root, FactScope::Global)?;
-    let lock = crate::consolidation::ConsolidationLock::acquire_until(global_root, deadline)?;
+    let lock = crate::consolidation::ConsolidationLock::acquire_until(global_root, deadline.clone())?;
     let result: Result<GlobalPromotion, GlobalPromotionError> = (|| {
         let body = source.body.trim_end_matches('\n');
         let mut target = source.name.clone();

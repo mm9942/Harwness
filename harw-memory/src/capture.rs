@@ -961,7 +961,7 @@ fn run_consolidation(
     let now = OffsetDateTime::now_utc();
 
     let dedupe = if scope == FactScope::Global {
-        dedupe_existing(&fact_store, memories_root, now, deadline)?
+        dedupe_existing(&fact_store, memories_root, now, deadline.clone())?
     } else {
         ConsolidationReport::default()
     };
@@ -1229,7 +1229,7 @@ mod tests {
                 .map_err(ctx("write"))?;
         }
         let deadline = Deadline::after(std::time::Duration::from_secs(30));
-        consolidate_memories_with_options(&strict, FactScope::Project, deadline, 0)
+        consolidate_memories_with_options(&strict, FactScope::Project, deadline.clone(), 0)
             .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
         consolidate_memories_with_deadline(&lax, FactScope::Project, deadline)
             .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
