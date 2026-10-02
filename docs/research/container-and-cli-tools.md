@@ -353,23 +353,45 @@ Verified:
 - Local environment: Docker client 29.6.2 / API 1.55 is installed; **no daemon
   is running**, and Podman, skopeo, buildah and `cross` are **not installed**.
 
-Not verified (do these in the first implementation PR, as integration tests
-that skip when the engine is absent):
-1. That `--` before the image is accepted by `podman run` and by `docker run`.
-2. `--format json` output shape per subcommand (`ps`, `images`, `inspect`,
+Verified with a real engine (Podman 4.9.3, Ubuntu 24.04, run as root in a
+cloud container, 2026-10-02):
+- The argv produced by `harw-tool-container` is accepted by `podman run`,
+  including `--` before the image: with a non-existent digest the error is
+  "image not known", and a bogus flag is reported first ("unknown flag"), so
+  every flag in the argv parses. This does **not** prove the mount, cap or
+  limit values behave as intended; that needs a container that actually starts.
+- The argv shape PR #74 builds (program placed where the image belongs) makes
+  Podman treat the program as an image **short name**: `podman run ... echo hello`
+  fails with `short-name "echo" did not resolve ... in registries.conf`. On a
+  host with unqualified-search registries configured this would try to pull and
+  run an image named `echo`. A program word `--privileged` in that slot is
+  accepted as a Podman flag (no flag error; the next word became the image).
+
+Not verified (needs a runnable rootless setup in a test):
+1. `--mount type=volume,...,ro` semantics, and `--mount` value parsing (it was
+   not reached because image lookup failed first).
+2. `--userns=keep-id` as a non-root user (this run was root).
+3. `--format json` output shape per subcommand (`ps`, `images`, `inspect`,
    `info`) and the field that says "rootless" for each engine.
-3. The default capability set of rootless Podman and of Docker on our
-   target distros; this is why the plan always passes `--cap-drop=all`.
-4. Behaviour of `--mount` when a path contains `,` (we reject it regardless).
+4. The default capability set of rootless Podman and of Docker on our target
+   distros; this is why the plan always passes `--cap-drop=all`.
 5. `cargo` JSON message flags and `git` hardening flags listed in §8.2.
-6. Docker Content Trust and BuildKit/buildx behaviour (not researched).
+6. Docker (client 29.6.2 is installed here but no daemon runs), Docker Content
+   Trust and BuildKit/buildx behaviour.
 7. The Engine API version supported by the Docker on our worker nodes (docs
    say 1.56 is latest; the local client speaks 1.55).
 
 ## 10. Open decisions
 
 - **D1:** add `Permission::ManageContainers`, or reuse `ExecuteProcess`
-  plus the Host class? (Recommendation: new permission, §4.3.)
+  plus the Host class? Recommendation stays: new permission (§4.3). Cost,
+  measured on `main`: `harw-authority` tests iterate masks as `u8`
+  (`0_u8..(1 << Permission::ALL.len())`, overflow at 8 variants), and three
+  other crates hard-code `[Permission; 7]`
+  (`harw-core-bridge/src/agent_tool.rs`, `harw-runtime/src/spec.rs`,
+  `harw-registry-defaults/tests/role_rights_matrix.rs`), plus the
+  `tool_permission` table in `harw-registry-defaults/src/authority.rs`. It is a
+  shared-file change for the scribe wave, not a drive-by edit.
 - **D2:** CLI argv builder (A) for tools and REST (B) only for the executor?
   (Recommendation: yes, §4.1.)
 - **D3:** is Docker supported at all, or Podman only? The plans say "Podman,
