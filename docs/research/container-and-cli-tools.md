@@ -9,7 +9,7 @@
 > builds on it and says where the two meet.
 >
 > Implementation: step 1 (the pure policy core) exists as `harw-tool-container`
-> (50 tests; `--init` is deliberately not passed, it needs an init binary in
+> (73 tests; `--init` is deliberately not passed, it needs an init binary in
 > every image). Everything below that crate does not cover is still proposal.
 >
 > Evidence rule: every statement about our code cites a file; every statement
@@ -360,6 +360,16 @@ cloud container, 2026-10-02):
   "image not known", and a bogus flag is reported first ("unknown flag"), so
   every flag in the argv parses. This does **not** prove the mount, cap or
   limit values behave as intended; that needs a container that actually starts.
+- Later the same day the lifecycle was checked with a real container
+  (`harw-tool-container` has no `run` stage): `podman create` prints the full
+  64-hex id; `inspect --type=container -- <id>` reports the same `Id`, plus
+  `NetworkMode=none`, `ReadonlyRootfs=true`, `Memory == MemorySwap`,
+  `Config.Timeout`, and `Mounts[]` with `Type`, `Name`, `Source`,
+  `Destination` and `RW`; `start --attach -- <id>` runs it and `--rm` removes
+  it; `rm --force -- <id>` works; after a container is removed and its name
+  reused, the old id inspects as `[]`, so acting on the id cannot hit the new
+  container. `--mount ...,bind-nonrecursive` is accepted and reported as a
+  plain `bind` (not `rbind`).
 - The argv shape PR #74 builds (program placed where the image belongs) makes
   Podman treat the program as an image **short name**: `podman run ... echo hello`
   fails with `short-name "echo" did not resolve ... in registries.conf`. On a
