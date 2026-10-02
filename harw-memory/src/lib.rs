@@ -60,6 +60,7 @@ pub mod detect;
 pub mod epistemic;
 pub mod error;
 pub mod extraction;
+pub mod fact_signals;
 pub mod facts;
 pub mod feedback;
 pub mod file_index;

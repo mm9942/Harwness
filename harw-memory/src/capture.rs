@@ -1001,6 +1001,16 @@ fn run_consolidation(
     }
 
     let mut report = apply_plan(&fact_store, &plan)?;
+    // X5: entgegengesetzte Rückmeldung zum selben Thema als Konflikt-Hinweis.
+    if let Ok(after) = fact_store.list() {
+        let hints =
+            crate::fact_signals::conflicts_from_feedback(&after, &fact_store.feedback_all());
+        if !hints.is_empty() {
+            if let Err(err) = write_conflicts(memories_root, &hints, now) {
+                tracing::warn!(error = %err, "memory: rückmeldungs-widersprüche nicht geschrieben");
+            }
+        }
+    }
     report.merged += dedupe.merged;
     report.written += dedupe.written;
     report.deleted += dedupe.deleted;

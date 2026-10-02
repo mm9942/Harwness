@@ -133,3 +133,8 @@ Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assemb
 - X6: `[memory] llm_extraction` (Standard aus): begrenzter, geschwärzter Digest (`_digest/<sitzung>.jsonl`), Job `learning_extract` (async, Frist, Abbruch, atomar je Sitzung), Worker mit Provider-Adapter; Ergebnis nur `_incoming`-Kandidaten durch Gate + Konsolidierung. Die Runtime reiht nur ein; ohne `harw serve`-Worker bleibt der Job `Ready`. Veraltete Digests (>7 d) räumt der Job. Der Dream-Lesepfad ist NICHT zusätzlich geschwärzt.
 - X9: `[memory] security_signals` (Standard aus): Anbieter `security.signals` (nur Zähler hoher/kritischer DoD-Befunde der letzten 24 h je Regel, Evidenz).
 - Verifikation: Workspace-Clippy, Tests (memory/context/core/runtime/knowledge/config/ops/cli), `xtask gates` grün.
+
+## Lernschleife: X5-Brücke, Dream-Schwärzung
+- X5: `harw-memory::fact_signals` bildet Fakten mit entscheidender Rückmeldung (genutzt vs. korrigiert) auf `EpistemicSignal` ab und nutzt nur die Regel `OppositeOutcomes` im selben Themenkorb (Fakt-Typ + erstes Namenswort); Treffer gehen als Konflikt-Hinweise in die Konfliktliste der Konsolidierung (kein Auto-Löschen). `OutcomeTracker` selbst bleibt ungenutzt (kein Fakt-Bezug).
+- Dream-Lesepfad: `build_recent_dream_context` schwärzt Transkripttext (`facts::redact`) vor dem Modell.
+- Platzproblem: Scratch-Worktrees `/tmp/claude-0/wt70`, `wtdev` verloren ihr `target/`.
