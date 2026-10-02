@@ -275,9 +275,9 @@ pub(crate) fn enqueue_memory_maintenance(
     ctx: &OpContext,
     spec: &MemoryMaintenanceSpec,
 ) -> Result<OpOutput, OpError> {
-    let jobs = ctx
-        .service::<Arc<JobStore>>()
-        .ok_or_else(|| OpError::NotAvailable("kein dauerhafter Job-Store konfiguriert".to_owned()))?;
+    let jobs = ctx.service::<Arc<JobStore>>().ok_or_else(|| {
+        OpError::NotAvailable("kein dauerhafter Job-Store konfiguriert".to_owned())
+    })?;
     let submitter = ctx.service::<Principal>().map_or_else(
         || "memory-op".to_owned(),
         |principal| principal.id().to_owned(),
@@ -289,7 +289,9 @@ pub(crate) fn enqueue_memory_maintenance(
         ApprovalActor::Operator { id: submitter },
     );
     let work_id = admit_memory_maintenance(jobs, scope, spec).map_err(|error| {
-        OpError::Execution(format!("Gedächtnis-Job konnte nicht eingereiht werden: {error}"))
+        OpError::Execution(format!(
+            "Gedächtnis-Job konnte nicht eingereiht werden: {error}"
+        ))
     })?;
     let label = spec.operation.label();
     Ok(OpOutput {
@@ -343,7 +345,10 @@ pub fn execute_memory_maintenance_with_cancel(
             spec.schema_version
         )));
     }
-    for root in [&spec.project_root, &spec.global_root].into_iter().flatten() {
+    for root in [&spec.project_root, &spec.global_root]
+        .into_iter()
+        .flatten()
+    {
         if !root.is_absolute() {
             return Err(MaintenanceFailure::Failed(
                 "Fakt-Wurzeln müssen absolute Pfade sein".to_owned(),
@@ -470,9 +475,12 @@ fn run_op(
             };
             consolidate(root, scope.fact_scope(), spec, deadline)
         }
-        MemoryMaintenanceOp::Sweep => {
-            consolidate(spec.project_root.as_deref(), FactScope::Project, spec, deadline)
-        }
+        MemoryMaintenanceOp::Sweep => consolidate(
+            spec.project_root.as_deref(),
+            FactScope::Project,
+            spec,
+            deadline,
+        ),
         MemoryMaintenanceOp::Forget { name } => {
             let output = crate::memory::forget_with_deadline(
                 spec.project_root.clone(),
@@ -502,9 +510,7 @@ fn run_op(
                 deadline,
             )
             .map_err(|error| match error {
-                GlobalPromotionError::Deadline(detail) => {
-                    interrupted(&detail)
-                }
+                GlobalPromotionError::Deadline(detail) => interrupted(&detail),
                 other => MaintenanceFailure::Failed(other.to_string()),
             })?;
             Ok(serde_json::json!({
@@ -625,7 +631,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
 
         let data = out.data.ok_or(TestError::Missing("data"))?;
-        let id = data["job_id"].as_str().ok_or(TestError::Missing("job_id"))?;
+        let id = data["job_id"]
+            .as_str()
+            .ok_or(TestError::Missing("job_id"))?;
         assert_eq!(data["kind"], MEMORY_MAINTENANCE_JOB_KIND);
         let record = jobs
             .get(&WorkId::from_str(id))
@@ -642,7 +650,10 @@ mod tests {
         let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
         let spec = MemoryMaintenanceSpec::new(MemoryMaintenanceOp::Sweep, 30);
         let result = enqueue_memory_maintenance(&context, &spec);
-        assert!(matches!(result, Err(OpError::NotAvailable(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
+        );
         Ok(())
     }
 
@@ -672,8 +683,10 @@ mod tests {
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let ps = FactStore::open(project.path(), FactScope::Project).map_err(ctx("p"))?;
         let gs = FactStore::open(global.path(), FactScope::Global).map_err(ctx("g"))?;
-        ps.write(&fact("kurz", FactScope::Project)).map_err(ctx("pw"))?;
-        gs.write(&fact("kurz", FactScope::Global)).map_err(ctx("gw"))?;
+        ps.write(&fact("kurz", FactScope::Project))
+            .map_err(ctx("pw"))?;
+        gs.write(&fact("kurz", FactScope::Global))
+            .map_err(ctx("gw"))?;
         let spec = spec_with_roots(
             MemoryMaintenanceOp::Forget {
                 name: "kurz".to_owned(),
@@ -693,7 +706,8 @@ mod tests {
         let project = tempfile::tempdir().map_err(ctx("project"))?;
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let ps = FactStore::open(project.path(), FactScope::Project).map_err(ctx("p"))?;
-        ps.write(&fact("kurz", FactScope::Project)).map_err(ctx("pw"))?;
+        ps.write(&fact("kurz", FactScope::Project))
+            .map_err(ctx("pw"))?;
         let spec = spec_with_roots(
             MemoryMaintenanceOp::PromoteToGlobal {
                 name: "kurz".to_owned(),
@@ -717,7 +731,8 @@ mod tests {
         let project = tempfile::tempdir().map_err(ctx("project"))?;
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let ps = FactStore::open(project.path(), FactScope::Project).map_err(ctx("p"))?;
-        ps.write(&fact("kurz", FactScope::Project)).map_err(ctx("pw"))?;
+        ps.write(&fact("kurz", FactScope::Project))
+            .map_err(ctx("pw"))?;
         let expired = Deadline::after(Duration::ZERO);
 
         let promote = spec_with_roots(
@@ -789,7 +804,8 @@ mod tests {
         let project = tempfile::tempdir().map_err(ctx("project"))?;
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let gs = FactStore::open(global.path(), FactScope::Global).map_err(ctx("g"))?;
-        gs.write(&fact("kurz", FactScope::Global)).map_err(ctx("seed"))?;
+        gs.write(&fact("kurz", FactScope::Global))
+            .map_err(ctx("seed"))?;
         let held = harw_memory::consolidation::ConsolidationLock::try_acquire(global.path())
             .map_err(ctx("hold lock"))?;
         let store = Arc::new(JobStore::new(state.path()));
@@ -861,7 +877,10 @@ mod tests {
             .await
             .map_err(ctx("run observes the cancel"))?
             .map_err(ctx("join"))?;
-        assert!(matches!(outcome, JobOutcome::Cancelled { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, JobOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
         assert_eq!(outcome.disposition(), JobDisposition::Cancelled);
         assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
         let record = fx.store.get(&fx.id).map_err(ctx("get"))?;
@@ -889,7 +908,10 @@ mod tests {
             .await
             .map_err(ctx("run observes the signal"))?
             .map_err(ctx("join"))?;
-        assert!(matches!(outcome, JobOutcome::Cancelled { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, JobOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
         assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
         drop(fx.held.take());
         Ok(())
@@ -925,9 +947,15 @@ mod tests {
             std::future::pending::<()>(),
         )
         .await;
-        assert!(matches!(outcome, JobOutcome::Cancelled { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, JobOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
         assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
-        assert!(fx.global.path().join("consolidation.lock").exists(), "only our own lock");
+        assert!(
+            fx.global.path().join("consolidation.lock").exists(),
+            "only our own lock"
+        );
         drop(fx.held.take());
         Ok(())
     }
@@ -951,7 +979,10 @@ mod tests {
             std::future::pending::<()>(),
         )
         .await;
-        assert!(matches!(outcome, JobOutcome::Succeeded { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, JobOutcome::Succeeded { .. }),
+            "{outcome:?}"
+        );
         let record = store.get(&id).map_err(ctx("get"))?;
         let token = record
             .lease

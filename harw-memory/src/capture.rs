@@ -1240,8 +1240,14 @@ mod tests {
                 .map_err(ctx("read"))?
                 .map_or(-1.0, |f| f.confidence))
         };
-        assert!((read(&strict)? - 0.4).abs() < 0.01, "0 Tage: sofort verfallen");
-        assert!((read(&lax)? - 0.8).abs() < 0.01, "Vorgabe 90 Tage: unverändert");
+        assert!(
+            (read(&strict)? - 0.4).abs() < 0.01,
+            "0 Tage: sofort verfallen"
+        );
+        assert!(
+            (read(&lax)? - 0.8).abs() < 0.01,
+            "Vorgabe 90 Tage: unverändert"
+        );
         let _ = std::fs::remove_dir_all(&strict);
         let _ = std::fs::remove_dir_all(&lax);
         Ok(())

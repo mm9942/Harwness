@@ -248,12 +248,7 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
         return Ok(OpOutput::from(summary(&jobs, &processes)));
     };
     let text = match kind {
-        Kind::Work => jobs
-            .iter()
-            .map(|record| {
-                work_row(record)
-            })
-            .collect::<Vec<_>>(),
+        Kind::Work => jobs.iter().map(work_row).collect::<Vec<_>>(),
         // Nur ID, Zustand, Besitzer, Profil und Endgrund: Befehl, Name, cwd und
         // Umgebungsnamen bleiben draußen, Umgebungswerte kennt `meta.json` nicht.
         Kind::Process => processes
@@ -338,7 +333,13 @@ pub(crate) fn work_row(record: &StoredJob) -> String {
                 .map(|cancellation| cancellation.reason.as_str())
         });
     if let Some(reason) = reason {
-        let one_line: String = reason.lines().next().unwrap_or("").chars().take(160).collect();
+        let one_line: String = reason
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect();
         row.push_str(&format!("\treason {one_line}"));
     }
     row

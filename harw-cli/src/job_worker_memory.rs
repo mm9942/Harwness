@@ -324,7 +324,10 @@ mod tests {
 
         let record = stored(&store, &id)?;
         assert_eq!(record.job.state, JobState::Cancelled);
-        assert_eq!(record.disposition(), harw_job_runtime::JobDisposition::Cancelled);
+        assert_eq!(
+            record.disposition(),
+            harw_job_runtime::JobDisposition::Cancelled
+        );
         assert!(gs.read("kurz")?.is_some(), "no partial state");
         drop(held);
         Ok(())
@@ -345,15 +348,18 @@ mod tests {
         )?;
         run(&services(&store, state.path())).await;
         let record = stored(&store, &id)?;
-        assert_eq!(record.disposition(), harw_job_runtime::JobDisposition::TimedOut);
+        assert_eq!(
+            record.disposition(),
+            harw_job_runtime::JobDisposition::TimedOut
+        );
         assert_ne!(record.job.state, JobState::Cancelled);
         drop(held);
         Ok(())
     }
 
     #[tokio::test]
-    async fn raising_the_memory_lane_starts_the_waiting_job_and_exactly_one_worker_claims(
-    ) -> TestResult {
+    async fn raising_the_memory_lane_starts_the_waiting_job_and_exactly_one_worker_claims()
+    -> TestResult {
         let state = tempfile::tempdir()?;
         let project = tempfile::tempdir()?;
         let global = tempfile::tempdir()?;
@@ -382,7 +388,11 @@ mod tests {
         }
         let running = running.ok_or("no job reached running")?;
         let waiting = if running == first { &second } else { &first };
-        assert_eq!(stored(&store, waiting)?.job.state, JobState::Ready, "lane of 1 is full");
+        assert_eq!(
+            stored(&store, waiting)?.job.state,
+            JobState::Ready,
+            "lane of 1 is full"
+        );
         let status = lane.lanes.memory().status();
         assert_eq!((status.limit, status.in_use), (1, 1));
 

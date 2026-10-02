@@ -250,7 +250,9 @@ mod tests {
         assert!(pool.try_acquire().is_none(), "1 running == limit 1");
         assert!(!pool.status().draining());
         drop(c);
-        let again = pool.try_acquire().ok_or(TestError::Missing("after drain"))?;
+        let again = pool
+            .try_acquire()
+            .ok_or(TestError::Missing("after drain"))?;
         assert!(pool.try_acquire().is_none(), "the lowered limit holds");
         drop(again);
         Ok(())

@@ -106,7 +106,11 @@ fn rejects_traversal_and_invalid_aliases() -> TestResult {
     // Nothing escaped or got created.
     assert!(!tmp.path().join("evil.json").exists());
     assert!(store.list()?.is_empty());
-    assert!(AliasStore::new(tmp.path()).put(&node(&"a".repeat(64))).is_ok());
+    assert!(
+        AliasStore::new(tmp.path())
+            .put(&node(&"a".repeat(64)))
+            .is_ok()
+    );
     Ok(())
 }
 

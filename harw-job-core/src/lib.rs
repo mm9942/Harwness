@@ -98,8 +98,8 @@ pub use spec::{
     SandboxRequirement, SpecError, WorkspacePath,
 };
 pub use stored::{
-    JobCancellation, JobClaim, JobCompletion, JobDisposition, JobOutcome, JobScope,
-    ReclaimOutcome, StoredJob, TIMED_OUT_REASON_PREFIX, reason_is_timed_out,
+    JobCancellation, JobClaim, JobCompletion, JobDisposition, JobOutcome, JobScope, ReclaimOutcome,
+    StoredJob, TIMED_OUT_REASON_PREFIX, reason_is_timed_out,
 };
 
 /// Re-export of the shared work identifier so consumers can write

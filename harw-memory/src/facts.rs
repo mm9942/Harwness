@@ -1518,11 +1518,21 @@ impl FactStore {
 #[must_use]
 pub fn find_repo_specific_reference(text: &str) -> Option<String> {
     const ABS_ROOTS: &[&str] = &[
-        "home", "users", "usr", "etc", "tmp", "var", "opt", "root", "mnt", "srv", "workspace",
+        "home",
+        "users",
+        "usr",
+        "etc",
+        "tmp",
+        "var",
+        "opt",
+        "root",
+        "mnt",
+        "srv",
+        "workspace",
     ];
     const FILE_EXTS: &[&str] = &[
-        "rs", "toml", "md", "json", "yaml", "yml", "ts", "tsx", "js", "py", "go", "java", "c",
-        "h", "cpp", "sh", "lock", "txt", "html", "css", "sql",
+        "rs", "toml", "md", "json", "yaml", "yml", "ts", "tsx", "js", "py", "go", "java", "c", "h",
+        "cpp", "sh", "lock", "txt", "html", "css", "sql",
     ];
     let trim_chars = |c: char| {
         matches!(

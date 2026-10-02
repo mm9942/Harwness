@@ -192,23 +192,30 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        JobLanes, LANE_MEMORY, LANE_WORK_DRIVER, read_limits, read_status, write_limit,
-    };
+    use super::{JobLanes, LANE_MEMORY, LANE_WORK_DRIVER, read_limits, read_status, write_limit};
     use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn an_override_is_applied_clamped_and_reported_as_changed() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("dir"))?;
         let lanes = JobLanes::new(2, 1);
-        assert!(lanes.apply_overrides(dir.path()).is_empty(), "no file, no change");
+        assert!(
+            lanes.apply_overrides(dir.path()).is_empty(),
+            "no file, no change"
+        );
 
-        assert_eq!(write_limit(dir.path(), LANE_WORK_DRIVER, 5).map_err(ctx("write"))?, 5);
+        assert_eq!(
+            write_limit(dir.path(), LANE_WORK_DRIVER, 5).map_err(ctx("write"))?,
+            5
+        );
         assert_eq!(lanes.apply_overrides(dir.path()), vec![LANE_WORK_DRIVER]);
         assert_eq!(lanes.work_driver().limit(), 5);
         assert!(lanes.apply_overrides(dir.path()).is_empty(), "idempotent");
 
-        assert_eq!(write_limit(dir.path(), LANE_MEMORY, 0).map_err(ctx("write"))?, 1);
+        assert_eq!(
+            write_limit(dir.path(), LANE_MEMORY, 0).map_err(ctx("write"))?,
+            1
+        );
         assert_eq!(lanes.memory().limit(), 1);
         Ok(())
     }
@@ -217,7 +224,8 @@ mod tests {
     fn an_unknown_lane_is_rejected_and_a_corrupt_file_reads_as_empty() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("dir"))?;
         assert!(write_limit(dir.path(), "nope", 3).is_err());
-        std::fs::write(dir.path().join("lane-limits.json"), b"{not json").map_err(ctx("corrupt"))?;
+        std::fs::write(dir.path().join("lane-limits.json"), b"{not json")
+            .map_err(ctx("corrupt"))?;
         assert!(read_limits(dir.path()).is_empty());
         let lanes = JobLanes::new(2, 1);
         assert!(lanes.apply_overrides(dir.path()).is_empty());

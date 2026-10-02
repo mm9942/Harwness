@@ -539,8 +539,11 @@ mod sweep_tests {
             enabled: false,
             ..harw_config::MemorySection::default()
         };
-        let handle =
-            spawn_startup_sweep_job(capture(memories.path())?, Some(Arc::clone(&jobs)), &settings);
+        let handle = spawn_startup_sweep_job(
+            capture(memories.path())?,
+            Some(Arc::clone(&jobs)),
+            &settings,
+        );
         assert!(handle.is_none());
         assert!(jobs.list(&JobListQuery::default())?.jobs.is_empty());
         Ok(())
@@ -598,7 +601,10 @@ mod sweep_tests {
         assert_eq!(record.lease_epoch, 1);
         assert_eq!(record.job.state, JobState::Completed);
         assert!(record.lease.is_none());
-        assert_eq!(record.disposition(), harw_job_runtime::JobDisposition::Succeeded);
+        assert_eq!(
+            record.disposition(),
+            harw_job_runtime::JobDisposition::Succeeded
+        );
         Ok(())
     }
 

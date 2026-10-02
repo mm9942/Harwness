@@ -495,7 +495,9 @@ impl JobManager {
             std::process::id(),
             Timestamp::now().as_millisecond()
         );
-        let config_max_running = config.max_running_jobs.clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
+        let config_max_running = config
+            .max_running_jobs
+            .clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
         let manager = Arc::new(Self {
             config,
             instance,

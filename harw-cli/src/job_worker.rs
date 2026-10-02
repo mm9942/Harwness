@@ -763,10 +763,8 @@ async fn drive_worker_loop(
     mut shutdown: watch::Receiver<bool>,
     options: JobWorkerOptions,
 ) {
-    let mut lane = WorkDriverLane::with_lanes(JobLanes::new(
-        options.lane_limit(),
-        options.memory_limit(),
-    ));
+    let mut lane =
+        WorkDriverLane::with_lanes(JobLanes::new(options.lane_limit(), options.memory_limit()));
     let mut published: Vec<harw_job_runtime::LaneStatus> = Vec::new();
     loop {
         if *shutdown.borrow() {
@@ -854,13 +852,8 @@ async fn execute_claim(task: ClaimTask) -> JobOutcome {
         )
         .await
     } else if memory_job::is_memory_kind(&claim.job.kind) {
-        memory_job::execute_memory_maintenance_claim(
-            claim,
-            input,
-            job_store,
-            Arc::clone(&control),
-        )
-        .await
+        memory_job::execute_memory_maintenance_claim(claim, input, job_store, Arc::clone(&control))
+            .await
     } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
         work_driver_job::execute_work_driver_claim(
             claim,

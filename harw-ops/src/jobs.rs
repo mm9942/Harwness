@@ -39,9 +39,9 @@
 
 use std::sync::Arc;
 
+use harw_job_runtime::WorkId;
 use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
-use harw_job_runtime::WorkId;
 use harw_session_store::{JobListQuery, JobStore};
 use harw_tool_job::logs::tail_of_file;
 use harw_tool_job::model::{STDERR_LOG, STDOUT_LOG};
@@ -590,7 +590,11 @@ mod tests {
         let id = memory_job(&store, 45)?;
         let op_ctx = op_context_with_store(dir.path(), None, Some(Arc::clone(&store)))?;
         let ready = run(&op_ctx, &["work"]).await.map_err(ctx("work"))?;
-        assert!(ready.text.contains("\tkind memory_maintenance"), "{}", ready.text);
+        assert!(
+            ready.text.contains("\tkind memory_maintenance"),
+            "{}",
+            ready.text
+        );
         assert!(ready.text.contains("\tdeadline 45s"), "{}", ready.text);
         assert!(ready.text.contains("\tReady\t"), "{}", ready.text);
         assert!(ready.text.contains("end -"), "{}", ready.text);
@@ -620,7 +624,11 @@ mod tests {
             .map_err(ctx("wait"))?;
         assert!(done.text.contains("\tFailed\t"), "{}", done.text);
         assert!(done.text.contains("end timed_out"), "{}", done.text);
-        assert!(done.text.contains("reason timed_out: phase 'x'"), "{}", done.text);
+        assert!(
+            done.text.contains("reason timed_out: phase 'x'"),
+            "{}",
+            done.text
+        );
         Ok(())
     }
 
@@ -630,7 +638,9 @@ mod tests {
         let store = Arc::new(JobStore::new(&dir.path().join("jobs")));
         let id = memory_job(&store, 30)?;
         let op_ctx = op_context_with_store(dir.path(), None, Some(store))?;
-        let out = run(&op_ctx, &["wait", id.as_str(), "1"]).await.map_err(ctx("wait"))?;
+        let out = run(&op_ctx, &["wait", id.as_str(), "1"])
+            .await
+            .map_err(ctx("wait"))?;
         assert!(out.text.contains("\tReady\t"), "{}", out.text);
         assert!(matches!(
             run(&op_ctx, &["wait", id.as_str(), "0"]).await,
@@ -651,23 +661,48 @@ mod tests {
             Arc::new(NoopNotifier),
         )
         .map_err(ctx("manager"))?;
-        let op_ctx =
-            op_context_with_store(dir.path(), Some(Arc::clone(&manager)), Some(Arc::clone(&store)))?;
+        let op_ctx = op_context_with_store(
+            dir.path(),
+            Some(Arc::clone(&manager)),
+            Some(Arc::clone(&store)),
+        )?;
 
         let shown = run(&op_ctx, &["permits"]).await.map_err(ctx("permits"))?;
-        assert!(shown.text.contains("kein laufender Job-Worker"), "{}", shown.text);
-        assert!(shown.text.contains("process: Limit 4, belegt 0"), "{}", shown.text);
+        assert!(
+            shown.text.contains("kein laufender Job-Worker"),
+            "{}",
+            shown.text
+        );
+        assert!(
+            shown.text.contains("process: Limit 4, belegt 0"),
+            "{}",
+            shown.text
+        );
 
         // A worker publishes its status; an override is shown as requested.
         let lanes = harw_job_runtime::JobLanes::new(2, 1);
         lanes.publish_status(store.root()).map_err(ctx("publish"))?;
-        run(&op_ctx, &["permits", "memory", "3"]).await.map_err(ctx("set"))?;
+        run(&op_ctx, &["permits", "memory", "3"])
+            .await
+            .map_err(ctx("set"))?;
         let shown = run(&op_ctx, &["permits"]).await.map_err(ctx("permits"))?;
-        assert!(shown.text.contains("work_driver: Limit 2, belegt 0, frei 2"), "{}", shown.text);
-        assert!(shown.text.contains("memory: Limit 1 (angefordert 3)"), "{}", shown.text);
+        assert!(
+            shown
+                .text
+                .contains("work_driver: Limit 2, belegt 0, frei 2"),
+            "{}",
+            shown.text
+        );
+        assert!(
+            shown.text.contains("memory: Limit 1 (angefordert 3)"),
+            "{}",
+            shown.text
+        );
         assert_eq!(lanes.apply_overrides(store.root()), vec!["memory"]);
 
-        run(&op_ctx, &["permits", "process", "7"]).await.map_err(ctx("process"))?;
+        run(&op_ctx, &["permits", "process", "7"])
+            .await
+            .map_err(ctx("process"))?;
         assert_eq!(manager.max_running(), 7);
         for bad in [
             &["permits", "nope", "2"][..],
