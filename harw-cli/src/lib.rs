@@ -3190,7 +3190,31 @@ fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
         };
         println!("check {id}: {label} — {message}");
     }
+    print_retention_checks(&config.harness.retention);
     any_failed
+}
+
+/// Druckt die Aufbewahrungs-Checks: eine `WARN`-Zeile je Klasse, die Daten
+/// unbegrenzt wachsen lässt, und eine `PASS`-Zeile mit den Opt-in-Klassen
+/// (sicherheitsrelevant, nie gelöscht, solange nicht ausdrücklich erlaubt).
+fn print_retention_checks(retention: &harw_retention::RetentionConfig) {
+    let mut opt_in = Vec::new();
+    for class in harw_retention::resolve_all(retention) {
+        let id = class.class.id;
+        let security = class.class.kind == harw_retention::ClassKind::SecurityRelevant;
+        if security && !class.enabled {
+            opt_in.push(id);
+        } else if let Some(message) = class.doctor_warning() {
+            println!("check retention.{id}: WARN — {message}");
+        }
+    }
+    if !opt_in.is_empty() {
+        println!(
+            "check retention.opt-in: PASS — sicherheitsrelevante Klassen werden nie gelöscht, \
+             solange `[retention.<klasse>] enabled = true` fehlt: {}",
+            opt_in.join(", ")
+        );
+    }
 }
 
 /// Ermittelt die Evidenz für den Audit-Integritäts-Check (§4.3).
