@@ -712,6 +712,11 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || tool == WORK_DRIVER_STOP_TOOL
     {
         Some(Permission::ReadWorkspace)
+    } else if listed(&CONTAINER_TOOLS) {
+        // `container.images` (read-only listing) and `container.run` (starts a
+        // hardened container): both need the dedicated container right, which
+        // no entry grants by default.
+        Some(Permission::ManageContainers)
     } else if listed(DEPS_SOURCE_TOOLS) {
         Some(Permission::ReadCargoRegistry)
     } else if listed(WEB_TOOLS) || listed(BROWSER_TOOLS) {
@@ -720,6 +725,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         None
     }
 }
+
+/// Names of the container tools (`harw-tool-container-run`); registered by the
+/// runtime only when `[tools.container]` is enabled.
+pub const CONTAINER_TOOLS: [&str; 2] = ["container.images", "container.run"];
 
 /// Das Recht, das ein Capability-Label aus `[authority] capabilities`
 /// benennt (#22 Welle 1B).
@@ -866,6 +875,22 @@ mod tests {
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
         }
+    }
+
+    #[test]
+    fn test_container_tools_need_the_container_right_and_run_always_asks() {
+        for tool in CONTAINER_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ManageContainers),
+                "{tool}"
+            );
+        }
+        assert!(crate::ALWAYS_ASK_TOOLS.contains(&"container.run"));
+        assert!(
+            !crate::AUTO_APPROVED_TOOLS.contains(&"container.run"),
+            "never auto-approved"
+        );
     }
 
     #[test]

@@ -206,6 +206,15 @@ fn expected(entry: EntryKind) -> Expected {
         "ReadWorkspace",
         "WriteWorkspace",
     ];
+    // Only the interactive TUI also carries the container right (the
+    // `container.*` tools exist only with `[tools.container]` and always ask).
+    const RWXNM: &[&str] = &[
+        "ExecuteProcess",
+        "ManageContainers",
+        "NetworkAccess",
+        "ReadWorkspace",
+        "WriteWorkspace",
+    ];
     const RWX: &[&str] = &["ExecuteProcess", "ReadWorkspace", "WriteWorkspace"];
     const R: &[&str] = &["ReadWorkspace"];
     const RW: &[&str] = &["ReadWorkspace", "WriteWorkspace"];
@@ -225,7 +234,7 @@ fn expected(entry: EntryKind) -> Expected {
 
     match entry {
         EntryKind::Tui => Expected {
-            permissions: RWXN,
+            permissions: RWXNM,
             tools_empty: false,
             approval_chain: DEFAULT_ONLY,
             ceiling_empty: false,

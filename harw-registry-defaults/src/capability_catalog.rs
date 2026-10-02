@@ -209,6 +209,12 @@ pub mod providers {
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
     provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
+        CONTAINER,
+        "container",
+        "harw-tool-container-run",
+        "tool-container"
+    );
+    provider!(
         KNOWLEDGE,
         "knowledge",
         "harw-registry-defaults",
@@ -233,6 +239,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "knowledge",
     "matrix",
     "tool-browser",
+    "tool-container",
     "tool-deps",
     "tool-doc",
     "tool-explorer",
@@ -374,6 +381,10 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("gateway.listeners.set", AGENTS, Host),
     row!("gateway.tools.grant", AGENTS, Host),
     row!("gateway.tools.narrow", AGENTS, Host),
+    // containers (`[tools.container]`, runtime-registered; `container.run`
+    // starts a container and always asks)
+    row!("container.images", CONTAINER, Meta),
+    row!("container.run", CONTAINER, Shell),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),

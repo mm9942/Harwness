@@ -1255,6 +1255,55 @@ fn merge_tools_doc(
     }
 }
 
+// `[tools.container]` — alle vier Felder `GlobalOnly` und sicherheitskritisch:
+// Home/Profil (Baseline) setzen sie, ein Projekt kann sie nie ändern.
+fn merge_tools_container(
+    trusted: &mut HarnessConfig,
+    incoming: crate::plan_toml::ContainerToolsSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["tools", "container", field]);
+    global_only(
+        &mut trusted.tools.container.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "tools.container.enabled",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.tools.container.engine,
+        incoming.engine,
+        present("engine"),
+        role,
+        "tools.container.engine",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.tools.container.connection,
+        incoming.connection,
+        present("connection"),
+        role,
+        "tools.container.connection",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.tools.container.images,
+        incoming.images,
+        present("images"),
+        role,
+        "tools.container.images",
+        layer_path,
+        out,
+    );
+}
+
 // `[mode]` (Abschnitt 1.9) — einziges Feld `ProfileReplaces`.
 fn merge_mode(
     trusted: &mut HarnessConfig,
@@ -2227,6 +2276,14 @@ pub(crate) fn merge_layer_into(
     );
     merge_onboarding(trusted, incoming.onboarding, raw, role, layer_path);
     merge_tools_doc(trusted, incoming.tools.doc, raw, role, layer_path, &mut out);
+    merge_tools_container(
+        trusted,
+        incoming.tools.container.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_tools_plan(trusted, incoming.tools, raw, role, layer_path, &mut out);
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
@@ -2568,6 +2625,42 @@ mod tests {
         );
         assert_eq!(fresh.agents.max_root_orchestrators, None);
         assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    // [tools.container]: nur die Baseline (Home) setzt; Profil und Projekt
+    // können weder aktivieren noch Images/Engine ändern.
+    #[test]
+    fn test_tools_container_is_global_only() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.tools.container.enabled);
+        let home = "[tools.container]\nenabled = true\nimages = [\"a=docker.io/x@sha256:00\"]";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(trusted.tools.container.enabled);
+        assert_eq!(trusted.tools.container.images.len(), 1);
+
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack =
+                "[tools.container]\nengine = \"/tmp/podman\"\nimages = [\"b=evil@sha256:11\"]";
+            merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(
+                trusted.tools.container.engine, "/usr/bin/podman",
+                "{role:?}"
+            );
+            assert_eq!(trusted.tools.container.images.len(), 1, "{role:?}");
+        }
         Ok(())
     }
 

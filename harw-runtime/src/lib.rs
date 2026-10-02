@@ -38,6 +38,7 @@ pub mod mcp_wiring;
 pub mod memory_wiring;
 pub mod model;
 // Runde 5, Teil E: Lernen aus Freigaben.
+pub mod container_wiring;
 pub mod permission_rules;
 pub mod sandbox;
 pub mod security_signals;

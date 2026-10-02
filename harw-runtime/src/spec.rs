@@ -202,7 +202,9 @@ impl EntryKind {
     /// tragen nur `Tui` und `OneShot`, und zwar egress-gebunden.
     #[must_use]
     pub fn profile(self) -> EntryProfile {
-        use Permission::{ExecuteProcess, NetworkAccess, ReadWorkspace, WriteWorkspace};
+        use Permission::{
+            ExecuteProcess, ManageContainers, NetworkAccess, ReadWorkspace, WriteWorkspace,
+        };
 
         let rwx = || PermissionSet::from_policy([ReadWorkspace, WriteWorkspace, ExecuteProcess]);
         let rwxn = || {
@@ -214,9 +216,22 @@ impl EntryKind {
             ])
         };
 
+        // The interactive TUI additionally carries the container right: the
+        // `container.*` tools exist only when `[tools.container]` is enabled
+        // (global-only, default off) and `container.run` always asks.
+        let tui = || {
+            PermissionSet::from_policy([
+                ReadWorkspace,
+                WriteWorkspace,
+                ExecuteProcess,
+                NetworkAccess,
+                ManageContainers,
+            ])
+        };
+
         match self {
             EntryKind::Tui => EntryProfile {
-                permissions: rwxn(),
+                permissions: tui(),
                 registry_profile: RegistryProfile::Full,
                 operations: OperationSurface::AllWithModelTools,
                 ask: AskResolution::Interactive,
@@ -636,7 +651,8 @@ mod tests {
         use CeilingPolicy as C;
         use OperationSurface as O;
         use Permission::{
-            ExecuteProcess as X, NetworkAccess as N, ReadWorkspace as R, WriteWorkspace as W,
+            ExecuteProcess as X, ManageContainers as M, NetworkAccess as N, ReadWorkspace as R,
+            WriteWorkspace as W,
         };
         use RegistryProfile as P;
         use SpawnerPolicy as S;
@@ -644,7 +660,7 @@ mod tests {
         let expected: [Row; 12] = [
             (
                 EntryKind::Tui,
-                &[R, W, X, N],
+                &[R, W, X, N, M],
                 P::Full,
                 O::AllWithModelTools,
                 A::Interactive,
@@ -882,6 +898,7 @@ mod tests {
                 Permission::WriteWorkspace,
                 Permission::ExecuteProcess,
                 Permission::NetworkAccess,
+                Permission::ManageContainers,
             ])
         );
         for kind in ALL {
@@ -920,12 +937,12 @@ mod tests {
         let tui = EntryKind::Tui.profile();
         let doctor = EntryKind::Doctor.profile();
         // Runde 3: die TUI-Wurzel hat egress-gebundenes Netz, die Diagnose
-        // braucht keins — sonst sind die Rechte gleich.
-        let tui_without_network = PermissionSet::from_policy(
-            tui.permissions
-                .iter()
-                .filter(|p| *p != Permission::NetworkAccess),
-        );
+        // braucht keins; das Container-Recht trägt nur die TUI (die Werkzeuge
+        // fragen immer) — sonst sind die Rechte gleich.
+        let tui_without_network =
+            PermissionSet::from_policy(tui.permissions.iter().filter(|p| {
+                !matches!(p, Permission::NetworkAccess | Permission::ManageContainers)
+            }));
         assert_eq!(doctor.permissions, tui_without_network);
         assert!(!doctor.permissions.contains(Permission::NetworkAccess));
         assert_eq!(doctor.registry_profile, tui.registry_profile);
@@ -984,7 +1001,8 @@ mod tests {
                 "ReadWorkspace",
                 "WriteWorkspace",
                 "ExecuteProcess",
-                "NetworkAccess"
+                "NetworkAccess",
+                "ManageContainers"
             ]
         );
         assert_eq!(snapshot.clone(), snapshot);

@@ -3820,6 +3820,8 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tool-container",
+ "harw-tool-container-run",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-remote",
@@ -4115,6 +4117,22 @@ dependencies = [
 [[package]]
 name = "harw-tool-container"
 version = "0.9.0"
+
+[[package]]
+name = "harw-tool-container-run"
+version = "0.9.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-tool-container",
+ "harw-tools",
+ "harw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "harw-tool-deps"

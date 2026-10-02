@@ -75,6 +75,9 @@ harw-tool-plan = { path = "../harw-tool-plan" }
 # Plan R9, Teil F: Job-Verwaltung je Sitzung (`job.*`), Freigabetext von
 # `job.start` und Zustellung der Job-Ereignisse.
 harw-tool-job = { path = "../harw-tool-job" }
+# `[tools.container]`: `container.images` / `container.run` (`src/container_wiring.rs`).
+harw-tool-container = { path = "../harw-tool-container" }
+harw-tool-container-run = { path = "../harw-tool-container-run" }
 # R18 D-A: der entfernte Werkzeug-Proxy eines an ein Gateway angebundenen
 # Laufs (`RuntimeAssemblyBuilder::remote_tools`). Kein Zyklus:
 # `harw-tool-remote` hängt nur an harw-protocol/-tools/-extension-api/-types.

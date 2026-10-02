@@ -2553,6 +2553,23 @@ impl RuntimeAssemblyBuilder {
                 ),
             ));
         }
+        // `[tools.container]` (global-only, default off): `container.images` and
+        // `container.run`. Registered only when the sandbox carries the
+        // container right; the tools check it again per call.
+        if config.harness.tools.container.enabled
+            && sandbox
+                .permissions()
+                .contains(harw_authority::Permission::ManageContainers)
+        {
+            match crate::container_wiring::provider_from_config(&config.harness.tools.container) {
+                Ok(provider) => {
+                    registry_builder = registry_builder.tool_provider(Arc::new(provider));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "runtime.container_tools.withheld");
+                }
+            }
+        }
         // #22: `agents.build` nur für einen ausdrücklich gewählten Agenten,
         // dessen Definition es admittiert, innerhalb der Sandbox-Rechte und
         // mit Job-Verwaltung (nur TUI) — nie für UIA oder eingebaute Rollen.
@@ -8034,6 +8051,39 @@ mod tests {
             "mit Schalter hat die Wurzelsitzung einen Ledger"
         );
         assert!(on.home.join("context-ledger").is_dir());
+        Ok(())
+    }
+
+    /// `[tools.container]` (global-only, Standard aus): `container.images` und
+    /// `container.run` erscheinen nur mit Schalter, gültigem Katalog und für
+    /// einen Einstieg mit Container-Recht (nur `Tui`).
+    #[test]
+    fn test_container_tools_follow_the_tools_container_config() -> TestResult {
+        let tools_of = |fixture: &BuildFixture, entry: EntryKind| -> TestResult<Vec<String>> {
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let assembly = fixture_builder(entry, fixture)
+                .session_events(events)
+                .build()
+                .map_err(ctx("montiert"))?;
+            Ok(assembly.rights_snapshot().tools)
+        };
+        let has = |tools: &[String]| tools.iter().any(|t| t == "container.run");
+
+        let off = build_fixture()?;
+        assert!(!has(&tools_of(&off, EntryKind::Tui)?), "default off");
+
+        let on = build_fixture()?;
+        // Global-only: the home layer sets it; a profile layer cannot.
+        let config = on.home.join("config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap_or_default();
+        text.push_str(
+            "\n[tools.container]\nenabled = true\nimages = [\"rust=docker.io/library/rust@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"]\n",
+        );
+        std::fs::write(&config, text).map_err(ctx("config schreiben"))?;
+        let tui = tools_of(&on, EntryKind::Tui)?;
+        assert!(has(&tui) && tui.iter().any(|t| t == "container.images"));
+        // An entry without the container right never registers them.
+        assert!(!has(&tools_of(&on, EntryKind::LocalEcho)?));
         Ok(())
     }
 

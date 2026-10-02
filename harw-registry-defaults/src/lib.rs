@@ -438,6 +438,10 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // Runde 5, Teil K: Abbruch eines eigenen Hintergrund-Agenten — nie
     // automatisch im Auto-Modus (im Voll-Modus fragt nichts).
     "agent.cancel",
+    // Starts a container (isolation is read back from the engine, but the
+    // image, command and workspace access are still the model's choice): an
+    // allow rule never skips the question.
+    "container.run",
     // R18 (D-B): die mutierenden `gateway.*`-Werkzeuge
     // (`profile::GATEWAY_MUTATION_TOOLS`, `model_tool(approval = "always")`)
     // — Widerruf, Draining, Listener, Werkzeug-Freigaben fragen unter

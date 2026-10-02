@@ -341,6 +341,10 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // setzen frei, ein nicht vertrautes Projekt darf nur verschärfen
     // (`merge_tools_doc`, Ordnung `off` < `ask` < `on`).
     FieldScope { path: "tools.doc.remote_ocr", scope: Scope::Profile, merge: MergeRule::StricterOf, ordering: Some(TOOLS_DOC_REMOTE_OCR_ORDER), intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.enabled", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.engine", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.connection", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.images", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -538,7 +542,8 @@ mod merge_rule_tests {
         // [memory]: +11 für `memory.*`.
         // [retention]: +50 für `retention.<klasse>.*` (10 Klassen x 5 Schlüssel).
         // [memory]: +2 für `memory.security_signals`, `memory.llm_extraction`.
-        assert_eq!(FIELD_TABLE.len(), 183);
+        // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
+        assert_eq!(FIELD_TABLE.len(), 187);
     }
 
     #[test]
@@ -560,7 +565,7 @@ mod merge_rule_tests {
         // [memory]: +11 (`memory.*`).
         // [retention]: +20 ProfileReplaces, +30 MinBound.
         assert_eq!(count(MergeRule::ProfileReplaces), 94);
-        assert_eq!(count(MergeRule::GlobalOnly), 11);
+        assert_eq!(count(MergeRule::GlobalOnly), 15);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
         // (`permissions.auto_classifier_timeout_secs`).

@@ -310,11 +310,35 @@ fn test_field_table_exhaustive_tools_section() {
     // Unterfelder, s. die folgenden Tests). Die Destrukturierung sichert
     // dennoch zu, dass ein kuenftiges zweites `[tools.*]`-Geschwisterfeld
     // (z. B. `[tools.search]`) hier einen Compile-Fehler ausloest.
-    let ToolsSection { plan, doc } = ToolsSection::default();
-    let _ = (plan, doc);
+    let ToolsSection {
+        plan,
+        doc,
+        container,
+    } = ToolsSection::default();
+    let _ = (plan, doc, container);
 }
 
 // [tools.doc] (Abschnitt 1.8a, 1 Feld)
+// [tools.container] (4 Felder, alle global-only)
+#[test]
+fn test_field_table_exhaustive_container_section() {
+    let harw_config::ContainerToolsSection {
+        enabled,
+        engine,
+        connection,
+        images,
+    } = harw_config::ContainerToolsSection::default();
+    let _ = (enabled, engine, connection, images);
+    for path in [
+        "tools.container.enabled",
+        "tools.container.engine",
+        "tools.container.connection",
+        "tools.container.images",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
 #[test]
 fn test_field_table_exhaustive_doc_section() {
     let harw_config::DocSection { remote_ocr } = harw_config::DocSection::default();
