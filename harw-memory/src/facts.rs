@@ -1255,6 +1255,96 @@ impl FactStore {
     }
 }
 
+/// Erste repo-/maschinenspezifische Referenz in `text`, die einen Fakt für
+/// die **globale** (projektübergreifende) Ablage disqualifiziert — `None`,
+/// wenn `text` sauber ist.
+///
+/// Erkannt werden: absolute Pfade (`/home/x/y`, `/etc/…`, `~/…`,
+/// `C:\…`), repo-relative Dateipfade (`src/lib.rs`, `a/b.toml`),
+/// `file:`-Verweise, Zeilenanker (`#L42`) und Git-Remote-URLs
+/// (`github.com/…`, `git@…`). Geheimnisse prüft dieser Helfer nicht — dafür
+/// gilt [`redact`].
+///
+/// # Examples
+/// ```
+/// use harw_memory::facts::find_repo_specific_reference;
+///
+/// assert!(find_repo_specific_reference("siehe /home/me/proj/src/lib.rs").is_some());
+/// assert!(find_repo_specific_reference("bevorzuge kurze Commit-Messages").is_none());
+/// ```
+#[must_use]
+pub fn find_repo_specific_reference(text: &str) -> Option<String> {
+    const ABS_ROOTS: &[&str] = &[
+        "home", "users", "usr", "etc", "tmp", "var", "opt", "root", "mnt", "srv", "workspace",
+    ];
+    const FILE_EXTS: &[&str] = &[
+        "rs", "toml", "md", "json", "yaml", "yml", "ts", "tsx", "js", "py", "go", "java", "c",
+        "h", "cpp", "sh", "lock", "txt", "html", "css", "sql",
+    ];
+    let trim_chars = |c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+        )
+    };
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(trim_chars);
+        let token = token.trim_end_matches(['.', ':', '!', '?']);
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("file:") {
+            return Some(token.to_owned());
+        }
+        if lower.starts_with("git@")
+            || lower.contains("github.com/")
+            || lower.contains("gitlab.com/")
+            || lower.contains("bitbucket.org/")
+        {
+            return Some(token.to_owned());
+        }
+        if token.starts_with("~/") || token == "~" {
+            return Some(token.to_owned());
+        }
+        let bytes = token.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            return Some(token.to_owned());
+        }
+        if token.contains("://") {
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix('/') {
+            let mut segs = rest.split('/').filter(|s| !s.is_empty());
+            let first = segs.next().unwrap_or("");
+            let has_more = segs.next().is_some();
+            if has_more || ABS_ROOTS.contains(&first.to_ascii_lowercase().as_str()) {
+                return Some(token.to_owned());
+            }
+            continue;
+        }
+        if let Some((_, anchor)) = token.rsplit_once("#L") {
+            if !anchor.is_empty() && anchor.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                return Some(token.to_owned());
+            }
+        }
+        if token.contains('/') {
+            let last = token.rsplit('/').next().unwrap_or("");
+            let last = last.split(['#', ':']).next().unwrap_or("");
+            if let Some((stem, ext)) = last.rsplit_once('.') {
+                if !stem.is_empty() && FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+                    return Some(token.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Score einer Stichwortsuche für einen Fakt, siehe [`FactStore::search`].
 fn score_fact(fact: &Fact, lowered_keywords: &[String]) -> i64 {
     let name_l = fact.name.to_lowercase();
