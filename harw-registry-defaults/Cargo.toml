@@ -77,6 +77,8 @@ harw-tools = { version = "0.9.0", path = "../harw-tools" }
 # `harw_knowledge::workbench` in den Sitzungs-Scope. Kein Zyklus:
 # `harw-knowledge` hängt (auch transitiv) nicht von `harw-registry-defaults` ab.
 harw-knowledge = { path = "../harw-knowledge" }
+# `memory.recall`/`memory.record` (`memory_tools.rs`) arbeiten direkt auf `FactStore`.
+harw-memory = { path = "../harw-memory" }
 # Zeitstempel der Workbench-Einträge (`harw_knowledge::workbench` datiert in `jiff`).
 jiff = { workspace = true }
 # `agents.build` startet `harw agent build` als Job; `harw_tool_job::PreparedJob`
