@@ -37,6 +37,8 @@ pub enum Dimension {
     Workspace,
     /// Wall-time limit at or below the profile ceiling (`Config.Timeout`).
     Timeout,
+    /// The inspected container is the one `create` returned.
+    Identity,
 }
 
 /// Outcome of one dimension.
@@ -53,6 +55,8 @@ pub enum Enforcement {
 /// Facts read from the engine's inspect output. `None` means "not reported".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InspectFacts {
+    /// The container id the engine reports (inspect `Id`).
+    pub id: Option<String>,
     /// Privileged mode.
     pub privileged: Option<bool>,
     /// Added capabilities.
@@ -94,6 +98,12 @@ pub struct Readback {
 }
 
 impl Readback {
+    /// Adds one more dimension (used for facts only the plan can judge).
+    pub(crate) fn with_entry(mut self, dimension: Dimension, enforcement: Enforcement) -> Self {
+        self.entries.push((dimension, enforcement));
+        self
+    }
+
     /// All entries in a fixed order.
     #[must_use]
     pub fn entries(&self) -> &[(Dimension, Enforcement)] {
@@ -232,6 +242,7 @@ mod tests {
 
     fn good() -> InspectFacts {
         InspectFacts {
+            id: None,
             privileged: Some(false),
             cap_add: Some(vec![]),
             cap_drop: Some(vec!["ALL".to_owned()]),

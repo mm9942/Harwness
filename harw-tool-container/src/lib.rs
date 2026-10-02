@@ -51,6 +51,7 @@
 
 #![forbid(unsafe_code)]
 
+mod container_id;
 mod digest;
 pub mod env;
 pub mod error;
@@ -65,6 +66,7 @@ mod validate;
 #[cfg(test)]
 mod test_support;
 
+pub use container_id::ContainerId;
 pub use env::{DEFAULT_ENV_ALLOW, REDIRECTING_VARIABLES, engine_environment};
 pub use error::ContainerPolicyError;
 pub use hostpath::HostPath;
