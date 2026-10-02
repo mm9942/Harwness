@@ -605,6 +605,9 @@ pub trait CoreSessionFactory: Send + Sync + 'static {
     ) -> Result<CoreSession, DriverBridgeError>;
 }
 
+/// Per-session slots, keyed by host session id.
+type SlotMap = HashMap<SessionId, Arc<tokio::sync::Mutex<Slot>>>;
+
 struct Slot {
     core: CoreSession,
     session_events: mpsc::UnboundedReceiver<SessionEvent>,
@@ -616,7 +619,7 @@ struct Slot {
 pub struct HarwCoreRuntime {
     factory: Arc<dyn CoreSessionFactory>,
     approvals: ApprovalStore,
-    slots: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<Slot>>>>,
+    slots: Mutex<SlotMap>,
     models: Mutex<HashMap<SessionId, String>>,
 }
 
@@ -640,7 +643,7 @@ impl HarwCoreRuntime {
 
     fn slots(
         &self,
-    ) -> Result<MutexGuard<'_, HashMap<SessionId, Arc<tokio::sync::Mutex<Slot>>>>, DriverBridgeError>
+    ) -> Result<MutexGuard<'_, SlotMap>, DriverBridgeError>
     {
         self.slots
             .lock()
