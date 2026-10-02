@@ -437,7 +437,7 @@ pub fn run(
         dream: Arc::clone(assemblies.dream.model()),
     };
 
-    let telemetry_sinks = crate::observe::build(&home, &telemetry)?;
+    let telemetry_sinks = crate::observe::build(&home, &telemetry, &config.harness.retention)?;
     telemetry_sinks
         .sink
         .record(&GATEWAY_STARTED, harw_observe::MetricValue::Count(1), &[]);

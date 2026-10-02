@@ -84,6 +84,8 @@ use harw_observe_file::FileSink;
 use harw_observe_otlp::{HttpTransport, OtlpClock, OtlpConfig, OtlpSink, OtlpTransport};
 use harw_observe_prom::{BindAddr, PromEndpoint};
 
+use harw_retention::RetentionConfig;
+
 use crate::cli::TelemetryArgs;
 
 /// Obergrenze der `FileSink`-Rotationsdatei unter `<home>/telemetry`.
@@ -92,6 +94,19 @@ use crate::cli::TelemetryArgs;
 /// bei jedem Gateway-Start neu zu rotieren; endlich, damit ein vergessener
 /// Prozess das Home-Verzeichnis nicht unbegrenzt füllt.
 const FILE_SINK_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Obergrenze rotierter Telemetrie-Dateien aus der Retention-Klasse
+/// `telemetry_rotated` (`[retention.telemetry_rotated] max_files`).
+///
+/// `None` (unbegrenzt), wenn die Klasse per Konfiguration abgeschaltet ist
+/// oder kein `max_files` trägt.
+pub(crate) fn telemetry_max_files(retention: &RetentionConfig) -> Option<usize> {
+    let class = harw_retention::policy_for(retention, "telemetry_rotated")?;
+    if !class.enabled {
+        return None;
+    }
+    class.max_files.and_then(|n| usize::try_from(n).ok())
+}
 
 /// Ergebnis von [`build`]: der zusammengesetzte Sink plus die Handles, deren
 /// `Drop` einen laufenden Hintergrund-Endpunkt beendet.
@@ -125,6 +140,8 @@ pub(crate) struct TelemetrySinks {
 ///   [`harw_home::paths::telemetry_dir`] darunter.
 /// - `args` (`&TelemetryArgs`): geparste `--metrics-prometheus-port`/
 ///   `--metrics-otlp-endpoint`-Flags.
+/// - `retention` (`&RetentionConfig`): `[retention]`; Klasse
+///   `telemetry_rotated` begrenzt die rotierten Dateien (Paar-Pruning).
 ///
 /// # Returns
 /// [`TelemetrySinks`] mit dem File-Sink als `default_sink` und optional
@@ -141,7 +158,11 @@ pub(crate) struct TelemetrySinks {
 /// Rein synchroner Aufbau; der zurückgegebene Sink ist danach unveränderlich
 /// und über `Arc` teilbar. Darf nicht aus einer laufenden `tokio`-Runtime
 /// heraus aufgerufen werden (siehe Moduldoc).
-pub(crate) fn build(home: &Path, args: &TelemetryArgs) -> Result<TelemetrySinks, String> {
+pub(crate) fn build(
+    home: &Path,
+    args: &TelemetryArgs,
+    retention: &RetentionConfig,
+) -> Result<TelemetrySinks, String> {
     let telemetry_dir = harw_home::paths::telemetry_dir(home);
     std::fs::create_dir_all(&telemetry_dir).map_err(|error| {
         format!(
@@ -151,7 +172,8 @@ pub(crate) fn build(home: &Path, args: &TelemetryArgs) -> Result<TelemetrySinks,
     })?;
     let file_sink: Arc<dyn TelemetrySink> = Arc::new(
         FileSink::open(&telemetry_dir, FILE_SINK_MAX_BYTES)
-            .map_err(|error| format!("File-Sink unter {}: {error}", telemetry_dir.display()))?,
+            .map_err(|error| format!("File-Sink unter {}: {error}", telemetry_dir.display()))?
+            .with_max_rotated_files(telemetry_max_files(retention)),
     );
 
     let mut routing = RoutingSink::new(Arc::clone(&file_sink));
@@ -408,7 +430,7 @@ mod tests {
             metrics_otlp_endpoint: None,
         };
 
-        let sinks = match build(home.path(), &args) {
+        let sinks = match build(home.path(), &args, &RetentionConfig::default()) {
             Ok(sinks) => sinks,
             Err(error) => {
                 return Err(TestError::Unexpected(format!(
@@ -423,5 +445,15 @@ mod tests {
         );
         assert_eq!(sinks.sink.name(), "routing");
         Ok(())
+    }
+
+    #[test]
+    fn test_telemetry_max_files_follows_class_default_and_config() {
+        let mut cfg = RetentionConfig::default();
+        assert_eq!(telemetry_max_files(&cfg), Some(20));
+        cfg.telemetry_rotated.max_files = Some(3);
+        assert_eq!(telemetry_max_files(&cfg), Some(3));
+        cfg.telemetry_rotated.enabled = Some(false);
+        assert_eq!(telemetry_max_files(&cfg), None);
     }
 }

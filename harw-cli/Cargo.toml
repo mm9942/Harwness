@@ -32,6 +32,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
+harw-retention = { path = "../harw-retention" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 # #22 Welle 2B: `harw agent check|build|inspect|…` (der Agenten-Compiler) und
 # das eingebettete Artefakt einer personalisierten harw.

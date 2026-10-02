@@ -2216,6 +2216,7 @@ dependencies = [
  "harw-protocol",
  "harw-provider-http",
  "harw-registry-defaults",
+ "harw-retention",
  "harw-runtime",
  "harw-sandbox",
  "harw-secrets",
