@@ -13,6 +13,7 @@
 //! `EffectiveCaps`/`BoundingCaps`, `Mounts[].{Destination, RW}`,
 //! `Config.Timeout` and `Config.Labels`. Docker's inspect output is not covered.
 
+use crate::mount::MountKind;
 use crate::plan::Expected;
 
 /// A security-relevant property of a container.
@@ -33,8 +34,9 @@ pub enum Dimension {
     Memory,
     /// Process limit at or below the profile ceiling.
     Pids,
-    /// Workspace mounted with the access the profile demands.
-    Workspace,
+    /// Exactly the planned mounts, each with its source and access, and no
+    /// other.
+    Mounts,
     /// Wall-time limit at or below the profile ceiling (`Config.Timeout`).
     Timeout,
     /// The inspected container is the one `create` returned.
@@ -50,6 +52,21 @@ pub enum Enforcement {
     NotEnforced,
     /// The engine did not report the property.
     Unverifiable,
+}
+
+/// One mount as the engine reports it (inspect `Mounts[]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedMount {
+    /// `Type`: `bind`, `volume`, ...
+    pub kind: String,
+    /// `Name` of a volume.
+    pub name: Option<String>,
+    /// `Source`: the host path of a bind (a volume's is its data directory).
+    pub source: Option<String>,
+    /// `Destination` inside the container.
+    pub destination: String,
+    /// `RW`: writable.
+    pub rw: bool,
 }
 
 /// Facts read from the engine's inspect output. `None` means "not reported".
@@ -84,8 +101,8 @@ pub struct InspectFacts {
     pub memory_swap_bytes: Option<i64>,
     /// Process limit (`0` or `-1` = unlimited).
     pub pids_limit: Option<i64>,
-    /// Whether the workspace mount is read-only.
-    pub workspace_read_only: Option<bool>,
+    /// Every mount the engine reports (inspect `Mounts[]`).
+    pub mounts: Option<Vec<ObservedMount>>,
     /// Wall-time limit in seconds the engine applied (Podman: inspect
     /// `Config.Timeout`). `Some(0)` means no limit.
     pub timeout_s: Option<u32>,
@@ -154,6 +171,35 @@ fn limit(reported: Option<i64>, ceiling: i64) -> Enforcement {
     }
 }
 
+/// The reported mounts must be exactly the planned ones: every expected
+/// destination once, with the planned kind, source (path, or volume name)
+/// and access, and nothing else. An unexpected host mount, or a mount that is
+/// writable although the plan asked for read-only, fails.
+fn verify_mounts(expected: &Expected, observed: Option<&[ObservedMount]>) -> Enforcement {
+    let Some(observed) = observed else {
+        return Enforcement::Unverifiable;
+    };
+    if observed.len() != expected.mounts.len() {
+        return Enforcement::NotEnforced;
+    }
+    for want in &expected.mounts {
+        let mut at = observed
+            .iter()
+            .filter(|o| o.destination == want.destination);
+        let (Some(got), None) = (at.next(), at.next()) else {
+            return Enforcement::NotEnforced;
+        };
+        let kind_ok = match want.kind {
+            MountKind::Bind => got.kind == "bind" && got.source.as_deref() == Some(&want.source),
+            MountKind::Volume => got.kind == "volume" && got.name.as_deref() == Some(&want.source),
+        };
+        if !kind_ok || got.rw == want.read_only {
+            return Enforcement::NotEnforced;
+        }
+    }
+    Enforcement::Enforced
+}
+
 /// Compares the plan's expectations with the engine's facts.
 #[must_use]
 pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
@@ -190,11 +236,7 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
         (Enforcement::NotEnforced, _) | (_, Enforcement::NotEnforced) => Enforcement::NotEnforced,
         _ => Enforcement::Unverifiable,
     };
-    let workspace = match facts.workspace_read_only {
-        Some(ro) if ro == expected.workspace_read_only => Enforcement::Enforced,
-        Some(_) => Enforcement::NotEnforced,
-        None => Enforcement::Unverifiable,
-    };
+    let mounts = verify_mounts(expected, facts.mounts.as_deref());
     let timeout = match facts.timeout_s {
         Some(t) if t > 0 && t <= expected.timeout_s => Enforcement::Enforced,
         Some(_) => Enforcement::NotEnforced,
@@ -212,7 +254,7 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
                 Dimension::Pids,
                 limit(facts.pids_limit, expected.pids_limit),
             ),
-            (Dimension::Workspace, workspace),
+            (Dimension::Mounts, mounts),
             (Dimension::Timeout, timeout),
         ],
     }
@@ -229,11 +271,31 @@ fn is_no_new_privileges(option: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mount::ExpectedMount;
     use crate::test_support::{TestResult, ensure};
+
+    fn workspace(ro: bool) -> ExpectedMount {
+        ExpectedMount {
+            kind: MountKind::Bind,
+            source: "/srv/ws".to_owned(),
+            destination: "/workspace".to_owned(),
+            read_only: ro,
+        }
+    }
+
+    fn seen_bind(src: &str, dst: &str, rw: bool) -> ObservedMount {
+        ObservedMount {
+            kind: "bind".to_owned(),
+            name: None,
+            source: Some(src.to_owned()),
+            destination: dst.to_owned(),
+            rw,
+        }
+    }
 
     fn expected(ro: bool) -> Expected {
         Expected {
-            workspace_read_only: ro,
+            mounts: vec![workspace(ro)],
             memory_bytes: 1024 * 1024 * 1024,
             pids_limit: 256,
             timeout_s: 300,
@@ -253,7 +315,7 @@ mod tests {
             memory_bytes: Some(1024 * 1024 * 1024),
             memory_swap_bytes: Some(1024 * 1024 * 1024),
             pids_limit: Some(256),
-            workspace_read_only: Some(true),
+            mounts: Some(vec![seen_bind("/srv/ws", "/workspace", false)]),
             timeout_s: Some(300),
         }
     }
@@ -278,7 +340,7 @@ mod tests {
             Dimension::NoNewPrivileges,
             Dimension::Memory,
             Dimension::Pids,
-            Dimension::Workspace,
+            Dimension::Mounts,
         ] {
             ensure(r.get(d) == Some(Enforcement::Unverifiable), "unverifiable")?;
         }
@@ -296,7 +358,7 @@ mod tests {
         f.security_opt = Some(vec![]);
         f.memory_bytes = Some(0);
         f.pids_limit = Some(-1);
-        f.workspace_read_only = Some(false);
+        f.mounts = Some(vec![seen_bind("/etc", "/workspace", true)]);
         f.timeout_s = Some(0);
         let r = verify(&expected(true), &f);
         ensure(r.failures().len() == 9, "all nine fail")?;
@@ -409,18 +471,92 @@ mod tests {
     }
 
     #[test]
-    fn workspace_access_must_match_the_profile() -> TestResult {
+    fn mount_access_must_match_the_plan() -> TestResult {
         let f = good();
         ensure(
-            verify(&expected(false), &f).get(Dimension::Workspace)
-                == Some(Enforcement::NotEnforced),
+            verify(&expected(false), &f).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
             "ro mount where rw expected is a mismatch",
         )?;
         let mut rw = good();
-        rw.workspace_read_only = Some(false);
+        rw.mounts = Some(vec![seen_bind("/srv/ws", "/workspace", true)]);
         ensure(
-            verify(&expected(false), &rw).get(Dimension::Workspace) == Some(Enforcement::Enforced),
+            verify(&expected(false), &rw).get(Dimension::Mounts) == Some(Enforcement::Enforced),
             "rw matches rw",
+        )?;
+        ensure(
+            verify(&expected(true), &rw).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
+            "a writable mount where read-only was planned",
+        )
+    }
+
+    #[test]
+    fn an_unexpected_wrong_or_missing_mount_fails() -> TestResult {
+        let mut f = good();
+        f.mounts = Some(vec![
+            seen_bind("/srv/ws", "/workspace", false),
+            seen_bind("/home/u", "/data", true),
+        ]);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
+            "an extra host mount",
+        )?;
+        f.mounts = Some(vec![seen_bind("/srv/elsewhere", "/workspace", false)]);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
+            "the right destination from another host path",
+        )?;
+        f.mounts = Some(vec![]);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
+            "the planned mount is missing",
+        )?;
+        f.mounts = None;
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Mounts) == Some(Enforcement::Unverifiable),
+            "not reported",
+        )
+    }
+
+    #[test]
+    fn a_volume_is_matched_by_name_and_two_mounts_may_not_share_a_destination() -> TestResult {
+        let mut want = expected(true);
+        want.mounts.push(ExpectedMount {
+            kind: MountKind::Volume,
+            source: "harw-cache".to_owned(),
+            destination: "/cache".to_owned(),
+            read_only: false,
+        });
+        let volume = |name: &str, rw: bool| ObservedMount {
+            kind: "volume".to_owned(),
+            name: Some(name.to_owned()),
+            source: Some("/var/lib/containers/storage/volumes/x/_data".to_owned()),
+            destination: "/cache".to_owned(),
+            rw,
+        };
+        let mut f = good();
+        f.mounts = Some(vec![
+            seen_bind("/srv/ws", "/workspace", false),
+            volume("harw-cache", true),
+        ]);
+        ensure(
+            verify(&want, &f).get(Dimension::Mounts) == Some(Enforcement::Enforced),
+            "the volume by name",
+        )?;
+        f.mounts = Some(vec![
+            seen_bind("/srv/ws", "/workspace", false),
+            volume("someone-elses", true),
+        ]);
+        ensure(
+            verify(&want, &f).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
+            "another volume under the planned destination",
+        )?;
+        f.mounts = Some(vec![
+            seen_bind("/srv/ws", "/workspace", false),
+            seen_bind("/srv/ws", "/workspace", false),
+        ]);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Mounts) == Some(Enforcement::NotEnforced),
+            "the same destination twice",
         )
     }
 

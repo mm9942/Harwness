@@ -43,7 +43,7 @@ use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value, engine_environment};
 use crate::error::ContainerPolicyError;
 use crate::hostpath::HostPath;
 use crate::image::ImageRef;
-use crate::mount::Mount;
+use crate::mount::{ExpectedMount, Mount};
 use crate::profile::Profile;
 use crate::readback::{Dimension, Enforcement, InspectFacts, Readback, verify};
 use crate::validate::{check_abs_path, check_label_value, check_name, check_rel_path};
@@ -271,8 +271,8 @@ impl RunRequest {
 /// [`crate::readback::verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
-    /// The workspace mount is read-only.
-    pub workspace_read_only: bool,
+    /// Every mount the engine must report, and no other.
+    pub mounts: Vec<ExpectedMount>,
     /// Memory ceiling in bytes.
     pub memory_bytes: i64,
     /// Process ceiling.
@@ -399,7 +399,7 @@ impl ContainerPlan {
         args.extend(request.command.iter().cloned());
 
         let expected = Expected {
-            workspace_read_only: profile.workspace_read_only(),
+            mounts: mounts.iter().map(Mount::expectation).collect(),
             memory_bytes: i64::from(limits.memory_mib) * 1024 * 1024,
             pids_limit: i64::from(limits.pids),
             timeout_s,
@@ -589,6 +589,8 @@ fn approval_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mount::MountKind;
+    use crate::readback::ObservedMount;
     use crate::test_support::{TestResult, ensure};
 
     fn host(path: &str) -> Result<HostPath, ContainerPolicyError> {
@@ -1097,7 +1099,28 @@ mod tests {
             memory_swap_bytes: Some(plan.expected().memory_bytes),
             effective_caps: Some(vec![]),
             pids_limit: Some(plan.expected().pids_limit),
-            workspace_read_only: Some(true),
+            mounts: Some(
+                plan.expected()
+                    .mounts
+                    .iter()
+                    .map(|m| match m.kind {
+                        MountKind::Bind => ObservedMount {
+                            kind: "bind".to_owned(),
+                            name: None,
+                            source: Some(m.source.clone()),
+                            destination: m.destination.clone(),
+                            rw: !m.read_only,
+                        },
+                        MountKind::Volume => ObservedMount {
+                            kind: "volume".to_owned(),
+                            name: Some(m.source.clone()),
+                            source: Some("/var/lib/volumes/x/_data".to_owned()),
+                            destination: m.destination.clone(),
+                            rw: !m.read_only,
+                        },
+                    })
+                    .collect(),
+            ),
             timeout_s: Some(plan.expected().timeout_s),
         }
     }
@@ -1107,7 +1130,10 @@ mod tests {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
         ensure(plan.expected().memory_bytes == 1024 * 1024 * 1024, "memory")?;
         ensure(plan.expected().pids_limit == 256, "pids")?;
-        ensure(plan.expected().workspace_read_only, "ro")?;
+        ensure(
+            plan.expected().mounts.iter().all(|m| m.read_only),
+            "hermetic: every mount is read-only",
+        )?;
         ensure(
             verify(plan.expected(), &good_facts(&plan)).all_enforced(),
             "enforced",

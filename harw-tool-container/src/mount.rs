@@ -15,6 +15,28 @@ use crate::validate::{check_abs_path, check_name};
 /// Roots below which a container destination is allowed.
 const DST_ROOTS: [&str; 5] = ["/workspace", "/cache", "/mnt", "/data", "/opt"];
 
+/// What kind of source a mount has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountKind {
+    /// A host directory.
+    Bind,
+    /// A named volume.
+    Volume,
+}
+
+/// What the engine must report for one mount: the plan's expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedMount {
+    /// Bind or volume.
+    pub kind: MountKind,
+    /// The canonical host path of a bind, or the name of a volume.
+    pub source: String,
+    /// Destination inside the container.
+    pub destination: String,
+    /// The mount must be read-only.
+    pub read_only: bool,
+}
+
 /// Kind of a mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
@@ -72,6 +94,21 @@ impl Mount {
             dst: dst.to_owned(),
             read_only,
         })
+    }
+
+    /// What the engine must report for this mount after `create`.
+    #[must_use]
+    pub fn expectation(&self) -> ExpectedMount {
+        let (kind, source) = match &self.kind {
+            Kind::Bind(path) => (MountKind::Bind, path),
+            Kind::Volume(name) => (MountKind::Volume, name),
+        };
+        ExpectedMount {
+            kind,
+            source: source.clone(),
+            destination: self.dst.clone(),
+            read_only: self.read_only,
+        }
     }
 
     /// Destination inside the container.
