@@ -193,28 +193,19 @@ fn default_sudo_limits() -> ShellLimits {
 
 /// Warum ein Passwort nicht als [`SudoSecret`] angenommen wurde. Trägt nie
 /// den Inhalt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::HarwError)]
 pub enum SudoSecretError {
     /// Das Passwort ist leer.
+    #[msg("Passwort ist leer")]
     Empty,
     /// Das Passwort ist länger als [`SUDO_MAX_SECRET_BYTES`].
+    #[msg("Passwort ist zu lang")]
     TooLong,
     /// Das Passwort enthält `\n`, `\r` oder `\0` (würde die Zeile für
     /// `sudo -S` verfälschen).
+    #[msg("Passwort enthält ein unzulässiges Steuerzeichen")]
     ForbiddenByte,
 }
-
-impl fmt::Display for SudoSecretError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("Passwort ist leer"),
-            Self::TooLong => f.write_str("Passwort ist zu lang"),
-            Self::ForbiddenByte => f.write_str("Passwort enthält ein unzulässiges Steuerzeichen"),
-        }
-    }
-}
-
-impl std::error::Error for SudoSecretError {}
 
 /// Ein sudo-Passwort im Speicher.
 ///
@@ -2664,5 +2655,20 @@ mod tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::SudoSecretError;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(SudoSecretError::Empty.to_string(), "Passwort ist leer");
+        assert_eq!(SudoSecretError::TooLong.to_string(), "Passwort ist zu lang");
+        assert_eq!(
+            SudoSecretError::ForbiddenByte.to_string(),
+            "Passwort enthält ein unzulässiges Steuerzeichen"
+        );
     }
 }

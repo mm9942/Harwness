@@ -75,7 +75,7 @@ use serde_json::json;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fmt, io,
+    io,
     num::NonZeroU64,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -189,61 +189,33 @@ const NO_SANDBOX_NO_APPROVAL_MSG: &str = "shell.exec: this platform has no sandb
 /// let err = ShellExecError::InvalidArgs("command field missing".to_owned());
 /// assert!(err.to_string().contains("invalid arguments"));
 /// ```
-#[derive(Debug)]
+#[derive(Debug, harw_macros::HarwError)]
 pub enum ShellExecError {
     /// The tool call arguments could not be parsed or are semantically invalid.
+    #[msg("shell.exec: invalid arguments: {0}")]
     InvalidArgs(String),
     /// The child process could not be spawned.
+    #[msg("shell.exec: failed to spawn Bubblewrap: {0}")]
+    #[from]
     Spawn(io::Error),
     /// The child process did not complete within the allowed time.
+    #[msg("shell.exec timed out after {secs}s")]
     Timeout {
         /// Effective timeout in seconds that was exceeded.
         secs: u64,
     },
     /// The child process exited with a non-zero status.
+    #[msg("shell.exec: process exited with code {code}")]
     ExitWithError {
         /// The exit code returned by the process.
         code: i32,
     },
     /// The combined output exceeded `max_output_bytes` and was truncated.
+    #[msg("shell.exec: output truncated")]
     TruncatedOutput,
     /// Ressourcengrenzen sind ungültig oder nicht durchsetzbar (z. B. `prlimit` fehlt).
-    ResourceLimits(ShellLimitsError),
-}
-
-impl fmt::Display for ShellExecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidArgs(msg) => write!(f, "shell.exec: invalid arguments: {msg}"),
-            Self::Spawn(err) => write!(f, "shell.exec: failed to spawn Bubblewrap: {err}"),
-            Self::Timeout { secs } => write!(f, "shell.exec timed out after {secs}s"),
-            Self::ExitWithError { code } => {
-                write!(f, "shell.exec: process exited with code {code}")
-            }
-            Self::TruncatedOutput => write!(f, "shell.exec: output truncated"),
-            Self::ResourceLimits(err) => write!(f, "shell.exec: resource limits: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for ShellExecError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Spawn(err) => Some(err),
-            Self::ResourceLimits(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for ShellExecError {
-    /// Converts an [`io::Error`] into [`ShellExecError::Spawn`].
-    ///
-    /// # Description
-    /// Used by `?` propagation when a process spawn fails.
-    fn from(err: io::Error) -> Self {
-        Self::Spawn(err)
-    }
+    #[msg("shell.exec: resource limits: {0}")]
+    ResourceLimits(#[source] ShellLimitsError),
 }
 
 // ── Argument deserialization ──────────────────────────────────────────────────
@@ -3974,5 +3946,38 @@ mod tests {
             "a closed receiver must fail closed with the UI-approval message"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::ShellExecError;
+    use std::error::Error as _;
+
+    #[test]
+    fn display_and_source_are_stable() {
+        assert_eq!(
+            ShellExecError::InvalidArgs("x".to_owned()).to_string(),
+            "shell.exec: invalid arguments: x"
+        );
+        assert_eq!(
+            ShellExecError::Timeout { secs: 3 }.to_string(),
+            "shell.exec timed out after 3s"
+        );
+        assert_eq!(
+            ShellExecError::ExitWithError { code: 2 }.to_string(),
+            "shell.exec: process exited with code 2"
+        );
+        assert_eq!(
+            ShellExecError::TruncatedOutput.to_string(),
+            "shell.exec: output truncated"
+        );
+        let spawn = ShellExecError::from(std::io::Error::other("nope"));
+        assert_eq!(
+            spawn.to_string(),
+            "shell.exec: failed to spawn Bubblewrap: nope"
+        );
+        assert!(spawn.source().is_some());
+        assert!(ShellExecError::TruncatedOutput.source().is_none());
     }
 }

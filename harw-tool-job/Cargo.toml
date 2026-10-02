@@ -11,6 +11,7 @@ description = "Eingebautes Job-System für lang laufende Prozesse (job.start/sta
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 # Derselbe Rechte-/Freigabeweg wie `shell.exec` (Sandbox/Host-Lease/Permit,

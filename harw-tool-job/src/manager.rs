@@ -248,30 +248,19 @@ pub struct PipedJob {
 }
 
 /// Warum der stdout-Zeilenstrom eines [`PipedJob`] vorzeitig endete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::HarwError)]
 pub enum PipedLineError {
     /// Eine Zeile wurde länger als `limit` Bytes (ohne `\n`), bevor ihr `\n`
     /// kam; gelesen wurde höchstens `limit` Bytes davon.
+    #[msg("job stdout line exceeds the {limit}-byte limit")]
     TooLong {
         /// Die überschrittene Grenze.
         limit: usize,
     },
     /// Eine Zeile war kein gültiges UTF-8.
+    #[msg("job stdout line is not valid UTF-8")]
     InvalidUtf8,
 }
-
-impl fmt::Display for PipedLineError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooLong { limit } => {
-                write!(f, "job stdout line exceeds the {limit}-byte limit")
-            }
-            Self::InvalidUtf8 => f.write_str("job stdout line is not valid UTF-8"),
-        }
-    }
-}
-
-impl std::error::Error for PipedLineError {}
 
 /// Ausgang von [`JobManager::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,52 +299,32 @@ pub struct DetachSummary {
 }
 
 /// Fehler der Job-Verwaltung.
-#[derive(Debug)]
+#[derive(Debug, harw_macros::HarwError)]
 pub enum JobError {
     /// Unbekannte Kennung **oder** fremder Job (bewusst nicht unterschieden).
+    #[msg("unknown job `{0}` (or not started by you or one of your sub-agents)")]
     NotFound(String),
     /// Zu viele laufende Jobs; die Meldung nennt den Schlüssel
     /// `[jobs] max_running`, der die Obergrenze setzt.
+    #[msg(
+        "too many running jobs (max {max}, set by `[jobs] max_running`); wait for one to finish or stop one"
+    )]
     Capacity {
         /// Obergrenze ([`JobManagerConfig::max_running_jobs`]).
         max: usize,
     },
     /// Der Prozess konnte nicht gestartet werden.
+    #[msg("failed to start the job: {0}")]
     Spawn(String),
     /// Dateisystemfehler.
+    #[msg("{context}: {source}")]
     Io {
         /// Was gerade geschah.
         context: &'static str,
         /// Ursache.
+        #[source]
         source: io::Error,
     },
-}
-
-impl fmt::Display for JobError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(id) => write!(
-                f,
-                "unknown job `{id}` (or not started by you or one of your sub-agents)"
-            ),
-            Self::Capacity { max } => write!(
-                f,
-                "too many running jobs (max {max}, set by `[jobs] max_running`); \
-                 wait for one to finish or stop one"
-            ),
-            Self::Spawn(message) => write!(f, "failed to start the job: {message}"),
-            Self::Io { context, source } => write!(f, "{context}: {source}"),
-        }
-    }
-}
-
-impl std::error::Error for JobError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 fn io_err(context: &'static str) -> impl FnOnce(io::Error) -> JobError {
@@ -1935,3 +1904,40 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::{JobError, PipedLineError};
+    use std::error::Error as _;
+
+    #[test]
+    fn display_and_source_are_stable() {
+        assert_eq!(
+            PipedLineError::TooLong { limit: 8 }.to_string(),
+            "job stdout line exceeds the 8-byte limit"
+        );
+        assert_eq!(
+            PipedLineError::InvalidUtf8.to_string(),
+            "job stdout line is not valid UTF-8"
+        );
+        assert_eq!(
+            JobError::NotFound("j1".to_owned()).to_string(),
+            "unknown job `j1` (or not started by you or one of your sub-agents)"
+        );
+        assert_eq!(
+            JobError::Capacity { max: 4 }.to_string(),
+            "too many running jobs (max 4, set by `[jobs] max_running`); wait for one to finish or stop one"
+        );
+        assert_eq!(
+            JobError::Spawn("x".to_owned()).to_string(),
+            "failed to start the job: x"
+        );
+        let io = JobError::Io {
+            context: "ctx",
+            source: std::io::Error::other("boom"),
+        };
+        assert_eq!(io.to_string(), "ctx: boom");
+        assert!(io.source().is_some());
+        assert!(JobError::Spawn("x".to_owned()).source().is_none());
+    }
+}
