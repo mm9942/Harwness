@@ -26,7 +26,7 @@
 use std::process::{Command, Stdio};
 
 use crate::digest::argv_sha256_hex;
-use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value};
+use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value, engine_environment};
 use crate::error::ContainerPolicyError;
 use crate::image::ImageRef;
 use crate::mount::Mount;
@@ -492,15 +492,18 @@ impl ContainerPlan {
             .collect()
     }
 
-    /// Builds the process description. The environment is cleared and only
-    /// `engine_env` is set (see [`crate::env::engine_environment`]); stdin is
+    /// Builds the process description. The environment is cleared and then
+    /// built here from the allowlist ([`crate::env::engine_environment`]):
+    /// `lookup` only supplies values for the few allowed names, so a variable
+    /// that would redirect the engine (`CONTAINER_HOST`, ...) can never be
+    /// passed in, and remote mode follows the plan's connection. Stdin is
     /// closed. Constructing the command does not start anything.
     #[must_use]
-    pub fn to_command(&self, stage: Stage, engine_env: &[(String, String)]) -> Command {
+    pub fn to_command(&self, stage: Stage, lookup: &dyn Fn(&str) -> Option<String>) -> Command {
         let mut command = Command::new(&self.executable);
         command.args(self.stage_args(stage));
         command.env_clear();
-        command.envs(engine_env.iter().map(|(k, v)| (k, v)));
+        command.envs(engine_environment(lookup, self.connection.is_some()));
         command.stdin(Stdio::null());
         command
     }
@@ -979,15 +982,46 @@ mod tests {
     }
 
     #[test]
-    fn the_command_has_a_cleared_environment() -> TestResult {
+    fn the_command_environment_is_built_from_the_allowlist() -> TestResult {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
-        let env = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
-        let command = plan.to_command(Stage::Create, &env);
+        let offered = |name: &str| match name {
+            "HOME" => Some("/home/u".to_owned()),
+            "CONTAINER_HOST" => Some("ssh://evil/run/podman.sock".to_owned()),
+            "DOCKER_HOST" => Some("tcp://evil:2375".to_owned()),
+            "SSH_AUTH_SOCK" => Some("/tmp/agent".to_owned()),
+            _ => None,
+        };
+        let command = plan.to_command(Stage::Create, &offered);
         ensure(command.get_program() == "/usr/bin/podman", "program")?;
         ensure(
             command.get_args().count() == plan.create_args().len(),
             "args",
         )?;
-        ensure(command.get_envs().count() == 1, "only the given env")
+        let names: Vec<String> = command
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        ensure(names.iter().any(|n| n == "HOME"), "HOME passed")?;
+        ensure(
+            !names
+                .iter()
+                .any(|n| n == "CONTAINER_HOST" || n == "DOCKER_HOST"),
+            "redirecting variables never reach the engine",
+        )?;
+        ensure(
+            !names.iter().any(|n| n == "SSH_AUTH_SOCK"),
+            "no ssh agent for a local engine",
+        )?;
+        let remote = ContainerPlan::build(
+            &config()?.with_connection("pi")?,
+            &request(Profile::Hermetic)?,
+        )?;
+        let command = remote.to_command(Stage::Start, &offered);
+        ensure(
+            command
+                .get_envs()
+                .any(|(k, _)| k.to_string_lossy() == "SSH_AUTH_SOCK"),
+            "a remote connection may use the ssh agent",
+        )
     }
 }
