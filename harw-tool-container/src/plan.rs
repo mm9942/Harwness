@@ -13,9 +13,12 @@
 //! There is no `run`: it would start the workload before anything could be
 //! checked, and a short-lived command may be gone (`--rm`) before an inspect.
 //! The caller runs [`Stage`]s in this order:
+//! 0. [`ContainerPlan::revalidate_sources`]: the bind sources are still the
+//!    directories that were checked.
 //! 1. `Create` prints the container id; parse it with [`ContainerId::parse`].
 //! 2. `Inspect(&id)`; feed the facts to [`ContainerPlan::verify`].
-//! 3. `Start(&id)` only when every dimension is enforced, else `Remove(&id)`.
+//! 3. `revalidate_sources` again, then `Start(&id)` only when every dimension
+//!    is enforced, else `Remove(&id)`.
 //!
 //! Every step after `create` takes the id, never the name, so the container
 //! that was verified is the one that starts even if another client of the
@@ -307,6 +310,7 @@ pub struct ContainerPlan {
     image: ImageRef,
     timeout_s: u32,
     expected: Expected,
+    mounts: Vec<Mount>,
     approval: String,
 }
 
@@ -414,6 +418,7 @@ impl ContainerPlan {
             image: request.image.clone(),
             timeout_s,
             expected,
+            mounts,
             approval,
         })
     }
@@ -475,6 +480,17 @@ impl ContainerPlan {
             None => Enforcement::Unverifiable,
         };
         verify(&self.expected, facts).with_entry(Dimension::Identity, identity)
+    }
+
+    /// Revalidates every bind source (see [`crate::HostPath::revalidate`]).
+    /// Call it immediately before the `Create` stage and again immediately
+    /// before `Start`: a source that was replaced in between (a symlink, a
+    /// different directory, a new socket) is refused.
+    ///
+    /// # Errors
+    /// [`ContainerPolicyError::InvalidMount`] when a source changed.
+    pub fn revalidate_sources(&self) -> Result<(), ContainerPolicyError> {
+        self.mounts.iter().try_for_each(Mount::revalidate)
     }
 
     /// The container name (`harw-<run id>`). It labels the container for
@@ -1000,6 +1016,30 @@ mod tests {
                 .any(|a| a == "--attach"),
             "output is attached",
         )
+    }
+
+    #[test]
+    fn revalidating_the_sources_catches_a_swap_after_the_plan_was_built() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = std::env::temp_dir().join(format!("harw-plan-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(base.join("ws"))?;
+        let outcome = (|| -> TestResult {
+            let real = HostPath::canonicalize(&base.join("ws").to_string_lossy())?;
+            let cfg = RunConfig::new("/usr/bin/podman", &real, "r1", "ses1")?;
+            let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
+            ensure(plan.revalidate_sources().is_ok(), "unchanged before create")?;
+            std::fs::rename(base.join("ws"), base.join("moved"))?;
+            symlink("/run", base.join("ws"))?;
+            ensure(
+                plan.revalidate_sources().is_err(),
+                "swapped for a symlink before start",
+            )
+        })();
+        let _ = std::fs::remove_dir_all(&base);
+        outcome
     }
 
     #[test]

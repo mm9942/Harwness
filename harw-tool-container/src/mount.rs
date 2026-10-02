@@ -40,7 +40,7 @@ pub struct ExpectedMount {
 /// Kind of a mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
-    Bind(String),
+    Bind(HostPath),
     Volume(String),
 }
 
@@ -76,7 +76,7 @@ impl Mount {
     pub fn bind(src: &HostPath, dst: &str, read_only: bool) -> Result<Self, ContainerPolicyError> {
         check_dst(dst)?;
         Ok(Self {
-            kind: Kind::Bind(src.as_str().to_owned()),
+            kind: Kind::Bind(src.clone()),
             dst: dst.to_owned(),
             read_only,
         })
@@ -96,16 +96,28 @@ impl Mount {
         })
     }
 
+    /// Checks that a bind source still names the directory that was checked
+    /// (see [`HostPath::revalidate`]); a volume has nothing to revalidate.
+    ///
+    /// # Errors
+    /// [`ContainerPolicyError::InvalidMount`] when the source changed.
+    pub fn revalidate(&self) -> Result<(), ContainerPolicyError> {
+        match &self.kind {
+            Kind::Bind(path) => path.revalidate(),
+            Kind::Volume(_) => Ok(()),
+        }
+    }
+
     /// What the engine must report for this mount after `create`.
     #[must_use]
     pub fn expectation(&self) -> ExpectedMount {
         let (kind, source) = match &self.kind {
-            Kind::Bind(path) => (MountKind::Bind, path),
-            Kind::Volume(name) => (MountKind::Volume, name),
+            Kind::Bind(path) => (MountKind::Bind, path.as_str()),
+            Kind::Volume(name) => (MountKind::Volume, name.as_str()),
         };
         ExpectedMount {
             kind,
-            source: source.clone(),
+            source: source.to_owned(),
             destination: self.dst.clone(),
             read_only: self.read_only,
         }
@@ -127,8 +139,8 @@ impl Mount {
     #[must_use]
     pub fn to_arg(&self) -> String {
         let (kind, src) = match &self.kind {
-            Kind::Bind(s) => ("bind", s),
-            Kind::Volume(n) => ("volume", n),
+            Kind::Bind(s) => ("bind", s.as_str()),
+            Kind::Volume(n) => ("volume", n.as_str()),
         };
         let ro = if self.read_only { ",ro" } else { "" };
         // A bind is non-recursive: a mount nested below the source (a

@@ -10,14 +10,17 @@
 //! container the daemon.
 //!
 //! This is the one place in the crate that touches the filesystem, and only
-//! to read metadata. A path can still change between this check and the
-//! engine's mount (time of check to time of use). The mount is therefore
-//! non-recursive (nested mounts are not carried along), the container runs
-//! without network and capabilities, and the caller should canonicalize
-//! immediately before `create`.
+//! to read metadata. A path can still change between the check and the
+//! engine's mount (time of check to time of use). Two things limit that:
+//! [`HostPath::revalidate`] re-checks the identity (device and inode, not a
+//! symlink, still no socket) immediately before `create` and again before
+//! `start`, and the mount is non-recursive. What remains is the instant
+//! between the last re-check and the engine's own `mount(2)`: the engine CLI
+//! takes a path, not a held directory handle, so that window cannot be closed
+//! from here. The container also runs without network and capabilities.
 
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 
 use crate::error::ContainerPolicyError;
@@ -38,9 +41,15 @@ const MAX_SCANNED_ENTRIES: usize = 100_000;
 /// Deepest directory level examined.
 const MAX_SCAN_DEPTH: usize = 32;
 
-/// A host directory that was resolved and checked.
+/// A host directory that was resolved and checked. It remembers the device
+/// and inode it resolved to, so [`HostPath::revalidate`] can tell whether the
+/// path still names the same directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostPath(String);
+pub struct HostPath {
+    path: String,
+    dev: u64,
+    ino: u64,
+}
 
 fn refuse(reason: &'static str) -> ContainerPolicyError {
     ContainerPolicyError::InvalidMount(reason)
@@ -128,13 +137,51 @@ impl HostPath {
             .to_owned();
         check_lexical(&resolved_str)?;
         scan_for_sockets(&resolved)?;
-        Ok(Self(resolved_str))
+        let meta = fs::metadata(&resolved)
+            .map_err(|_| refuse("source does not exist or is not readable"))?;
+        Ok(Self {
+            path: resolved_str,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// Checks again that the path still names the directory that was
+    /// checked: it is not a symlink now, it is the same device and inode, it
+    /// still resolves to itself, and its tree holds no socket.
+    ///
+    /// A path can change between [`Self::canonicalize`] and the moment the
+    /// engine mounts it. Call this immediately before `create` and again
+    /// immediately before `start`: a replacement (a symlink to `/run`, another
+    /// directory, a new socket) that happened earlier is refused. A change in
+    /// the instant between this check and the engine's own `mount` cannot be
+    /// excluded from here, because the engine CLI takes a path, not a held
+    /// directory handle.
+    ///
+    /// # Errors
+    /// [`ContainerPolicyError::InvalidMount`] when anything differs.
+    pub fn revalidate(&self) -> Result<(), ContainerPolicyError> {
+        if self.ino == 0 {
+            return Err(refuse("source was not resolved on the host"));
+        }
+        let own = fs::symlink_metadata(&self.path).map_err(|_| refuse("source disappeared"))?;
+        if own.file_type().is_symlink() {
+            return Err(refuse("source is a symlink now"));
+        }
+        if !own.is_dir() || own.dev() != self.dev || own.ino() != self.ino {
+            return Err(refuse("source is not the directory that was checked"));
+        }
+        let resolved = fs::canonicalize(&self.path).map_err(|_| refuse("source disappeared"))?;
+        if resolved.to_str() != Some(self.path.as_str()) {
+            return Err(refuse("source resolves elsewhere now"));
+        }
+        scan_for_sockets(&resolved)
     }
 
     /// The canonical path.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.path
     }
 
     /// Applies only the lexical rules, for unit tests of code that takes a
@@ -142,7 +189,11 @@ impl HostPath {
     #[cfg(test)]
     pub(crate) fn lexical(path: &str) -> Result<Self, ContainerPolicyError> {
         check_lexical(path)?;
-        Ok(Self(path.to_owned()))
+        Ok(Self {
+            path: path.to_owned(),
+            dev: 0,
+            ino: 0,
+        })
     }
 }
 
@@ -215,6 +266,60 @@ mod tests {
         ensure(
             HostPath::canonicalize(&scratch.path("ws")).is_err(),
             "a nested socket, whatever its name",
+        )
+    }
+
+    #[test]
+    fn an_unchanged_directory_revalidates() -> TestResult {
+        let scratch = Scratch::new("same")?;
+        fs::create_dir_all(scratch.0.join("ws/sub"))?;
+        let host = HostPath::canonicalize(&scratch.path("ws"))?;
+        ensure(host.revalidate().is_ok(), "nothing changed")
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symlink_after_the_check_is_refused() -> TestResult {
+        let scratch = Scratch::new("swap-link")?;
+        fs::create_dir_all(scratch.0.join("ws"))?;
+        let host = HostPath::canonicalize(&scratch.path("ws"))?;
+        // An attacker who can rename replaces the checked directory.
+        fs::rename(scratch.0.join("ws"), scratch.0.join("ws-moved"))?;
+        symlink("/run", scratch.0.join("ws"))?;
+        ensure(host.revalidate().is_err(), "the symlink to /run is refused")
+    }
+
+    #[test]
+    fn a_different_directory_at_the_same_path_is_refused() -> TestResult {
+        let scratch = Scratch::new("swap-dir")?;
+        fs::create_dir_all(scratch.0.join("ws"))?;
+        let host = HostPath::canonicalize(&scratch.path("ws"))?;
+        fs::rename(scratch.0.join("ws"), scratch.0.join("ws-moved"))?;
+        fs::create_dir_all(scratch.0.join("ws"))?;
+        ensure(
+            host.revalidate().is_err(),
+            "another inode under the same name",
+        )
+    }
+
+    #[test]
+    fn a_socket_that_appears_after_the_check_is_refused() -> TestResult {
+        let scratch = Scratch::new("late-sock")?;
+        fs::create_dir_all(scratch.0.join("ws"))?;
+        let host = HostPath::canonicalize(&scratch.path("ws"))?;
+        let _listener = UnixListener::bind(scratch.0.join("ws/late"))?;
+        ensure(host.revalidate().is_err(), "a socket created later")
+    }
+
+    #[test]
+    fn a_removed_directory_and_an_unresolved_path_are_refused() -> TestResult {
+        let scratch = Scratch::new("gone")?;
+        fs::create_dir_all(scratch.0.join("ws"))?;
+        let host = HostPath::canonicalize(&scratch.path("ws"))?;
+        fs::remove_dir_all(scratch.0.join("ws"))?;
+        ensure(host.revalidate().is_err(), "gone")?;
+        ensure(
+            HostPath::lexical("/srv/ws")?.revalidate().is_err(),
+            "a path that was never resolved on the host cannot be revalidated",
         )
     }
 
