@@ -263,6 +263,8 @@ pub struct Expected {
     pub memory_bytes: i64,
     /// Process ceiling.
     pub pids_limit: i64,
+    /// Wall-time ceiling in seconds (the effective, clamped timeout).
+    pub timeout_s: u32,
 }
 
 /// One step of the container lifecycle. Run them in this order: `Create`,
@@ -386,6 +388,7 @@ impl ContainerPlan {
             workspace_read_only: profile.workspace_read_only(),
             memory_bytes: i64::from(limits.memory_mib) * 1024 * 1024,
             pids_limit: i64::from(limits.pids),
+            timeout_s,
         };
         let approval = approval_text(config, request, &mounts, timeout_s, &workdir);
         Ok(Self {
@@ -977,6 +980,7 @@ mod tests {
             effective_caps: Some(vec![]),
             pids_limit: Some(plan.expected().pids_limit),
             workspace_read_only: Some(true),
+            timeout_s: Some(plan.expected().timeout_s),
         };
         ensure(verify(plan.expected(), &facts).all_enforced(), "enforced")
     }

@@ -10,8 +10,8 @@
 //! Field names were checked against `podman inspect` of a running container
 //! (Podman 4.9.3): `HostConfig.{NetworkMode, ReadonlyRootfs, CapAdd, CapDrop,
 //! SecurityOpt, Memory, MemorySwap, PidsLimit, Privileged}`, top-level
-//! `EffectiveCaps`/`BoundingCaps`, `Mounts[].{Destination, RW}`, and
-//! `Config.Labels`. Docker's inspect output is not covered.
+//! `EffectiveCaps`/`BoundingCaps`, `Mounts[].{Destination, RW}`,
+//! `Config.Timeout` and `Config.Labels`. Docker's inspect output is not covered.
 
 use crate::plan::Expected;
 
@@ -35,6 +35,8 @@ pub enum Dimension {
     Pids,
     /// Workspace mounted with the access the profile demands.
     Workspace,
+    /// Wall-time limit at or below the profile ceiling (`Config.Timeout`).
+    Timeout,
 }
 
 /// Outcome of one dimension.
@@ -80,6 +82,9 @@ pub struct InspectFacts {
     pub pids_limit: Option<i64>,
     /// Whether the workspace mount is read-only.
     pub workspace_read_only: Option<bool>,
+    /// Wall-time limit in seconds the engine applied (Podman: inspect
+    /// `Config.Timeout`). `Some(0)` means no limit.
+    pub timeout_s: Option<u32>,
 }
 
 /// Per-dimension result of [`verify`].
@@ -180,6 +185,11 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
         Some(_) => Enforcement::NotEnforced,
         None => Enforcement::Unverifiable,
     };
+    let timeout = match facts.timeout_s {
+        Some(t) if t > 0 && t <= expected.timeout_s => Enforcement::Enforced,
+        Some(_) => Enforcement::NotEnforced,
+        None => Enforcement::Unverifiable,
+    };
     Readback {
         entries: vec![
             (Dimension::Privilege, privilege),
@@ -193,6 +203,7 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
                 limit(facts.pids_limit, expected.pids_limit),
             ),
             (Dimension::Workspace, workspace),
+            (Dimension::Timeout, timeout),
         ],
     }
 }
@@ -215,6 +226,7 @@ mod tests {
             workspace_read_only: ro,
             memory_bytes: 1024 * 1024 * 1024,
             pids_limit: 256,
+            timeout_s: 300,
         }
     }
 
@@ -231,6 +243,7 @@ mod tests {
             memory_swap_bytes: Some(1024 * 1024 * 1024),
             pids_limit: Some(256),
             workspace_read_only: Some(true),
+            timeout_s: Some(300),
         }
     }
 
@@ -239,7 +252,7 @@ mod tests {
         let r = verify(&expected(true), &good());
         ensure(r.all_enforced(), "all enforced")?;
         ensure(r.failures().is_empty(), "no failures")?;
-        ensure(r.entries().len() == 8, "eight dimensions")
+        ensure(r.entries().len() == 9, "nine dimensions")
     }
 
     #[test]
@@ -273,11 +286,37 @@ mod tests {
         f.memory_bytes = Some(0);
         f.pids_limit = Some(-1);
         f.workspace_read_only = Some(false);
+        f.timeout_s = Some(0);
         let r = verify(&expected(true), &f);
-        ensure(r.failures().len() == 8, "all eight fail")?;
+        ensure(r.failures().len() == 9, "all nine fail")?;
         ensure(
             r.get(Dimension::Network) == Some(Enforcement::NotEnforced),
             "network",
+        )
+    }
+
+    #[test]
+    fn a_missing_or_overlong_timeout_fails_closed() -> TestResult {
+        let mut f = good();
+        f.timeout_s = None;
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Timeout) == Some(Enforcement::Unverifiable),
+            "not reported",
+        )?;
+        f.timeout_s = Some(0);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Timeout) == Some(Enforcement::NotEnforced),
+            "no limit",
+        )?;
+        f.timeout_s = Some(301);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Timeout) == Some(Enforcement::NotEnforced),
+            "above the ceiling",
+        )?;
+        f.timeout_s = Some(60);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Timeout) == Some(Enforcement::Enforced),
+            "below the ceiling",
         )
     }
 
