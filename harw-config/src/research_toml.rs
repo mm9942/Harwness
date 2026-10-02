@@ -8,6 +8,7 @@
 //! (tatsächliche Netzwerksperre, Timeout-Implementierung) liegt beim
 //! Consumer.
 
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 
 /// `[research]` — erlaubte Netzwerk-Hosts sowie Größen- und Zeit-Limits für
@@ -88,9 +89,6 @@ fn default_allow_hosts() -> Vec<String> {
         "doc.rust-lang.org".to_owned(),
         "static.crates.io".to_owned(),
     ]
-}
-fn default_true() -> bool {
-    true
 }
 fn default_fetch_bytes() -> usize {
     1_048_576

@@ -25,8 +25,23 @@ use serde::{Deserialize, Serialize};
 use crate::error::{NetsecError, NetsecResult};
 
 /// Lifecycle state of a registered node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    harw_macros::KebabEnum,
+)]
 #[serde(rename_all = "snake_case")]
+// `KebabEnum` supplies `as_str` (wire name) and `Display`; snake_case matches the
+// serde form (see `test_state_wire_names_match_serde`). `ALL` stays an array.
+#[kebab_enum(case = "snake", no_from_str, no_all)]
 pub enum NodeState {
     /// Registered, identity not yet confirmed; receives no traffic.
     Pending,
@@ -50,18 +65,6 @@ impl NodeState {
         Self::Revoked,
     ];
 
-    /// Wire name of the state.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Active => "active",
-            Self::Draining => "draining",
-            Self::Drained => "drained",
-            Self::Revoked => "revoked",
-        }
-    }
-
     /// Whether no event leaves this state.
     #[must_use]
     pub fn is_terminal(self) -> bool {
@@ -72,8 +75,23 @@ impl NodeState {
 }
 
 /// An event requested against a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    harw_macros::KebabEnum,
+)]
 #[serde(rename_all = "snake_case")]
+// `KebabEnum` supplies `as_str` (wire name) and `Display`; snake_case matches the
+// serde form (see `test_state_wire_names_match_serde`). `ALL` stays an array.
+#[kebab_enum(case = "snake", no_from_str, no_all)]
 pub enum NodeEvent {
     /// Confirm a pending node.
     Activate,
@@ -96,18 +114,6 @@ impl NodeEvent {
         Self::Undrain,
         Self::Revoke,
     ];
-
-    /// Wire name of the event (the JSON/serde form).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Activate => "activate",
-            Self::Drain => "drain",
-            Self::CompleteDrain => "complete_drain",
-            Self::Undrain => "undrain",
-            Self::Revoke => "revoke",
-        }
-    }
 
     /// The URL action suffix (`POST /v1/nodes/{id}:<action>`).
     #[must_use]

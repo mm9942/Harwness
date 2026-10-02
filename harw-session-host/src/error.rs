@@ -28,6 +28,9 @@ pub enum HostError {
         refusal: ToolRefusal,
         detail: String,
     },
+    /// Skeleton stub: the named entry point is not implemented yet (W00
+    /// integration map). Never returned by finished code.
+    NotImplemented(&'static str),
 }
 
 impl fmt::Display for HostError {
@@ -40,6 +43,7 @@ impl fmt::Display for HostError {
             Self::Protocol(detail) => write!(f, "protocol: {detail}"),
             Self::Storage(detail) => write!(f, "storage: {detail}"),
             Self::Driver(detail) => write!(f, "driver: {detail}"),
+            Self::NotImplemented(what) => write!(f, "not implemented: {what}"),
             Self::ToolRefused { refusal, detail } => {
                 write!(f, "tool refused ({}): {detail}", refusal.code())
             }
@@ -60,7 +64,9 @@ impl From<HostError> for PortError {
             HostError::ToolRefused { refusal, detail } => Self::ToolRefused { refusal, detail },
             // Storage and driver details stay on the host (logs); the client
             // only learns that the host failed.
-            HostError::Storage(_) | HostError::Driver(_) => Self::Transport("host error".into()),
+            HostError::Storage(_) | HostError::Driver(_) | HostError::NotImplemented(_) => {
+                Self::Transport("host error".into())
+            }
         }
     }
 }

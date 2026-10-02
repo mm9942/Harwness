@@ -41,6 +41,10 @@ pub mod session;
 #[cfg(test)]
 mod test_support;
 
+// Golden-Test der Provider-Oberfläche (vor/nach der `tool_provider!`-Migration).
+#[cfg(test)]
+mod provider_golden;
+
 /// Name des Werkzeugs, das den Plan schreibt.
 pub const PLAN_WRITE_TOOL: &str = "plan.write";
 /// Name des Werkzeugs, das den Plan zur Freigabe vorlegt.

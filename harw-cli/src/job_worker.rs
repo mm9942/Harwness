@@ -36,6 +36,13 @@
 //!   der Rolle); Ergebnis und Verlauf landen an der Karte. Ohne
 //!   [`JobWorkerContext::knowledge`] bleiben diese Jobs unberührt.
 //!
+//! * [`JobKind::Custom`] named `memory_maintenance`
+//!   (`harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND`) — Gedächtnis-Wartung
+//!   (Konsolidieren, Vergessen, Promotion nach Global, Startup-Sweep), Modul
+//!   [`memory_job`]. Läuft in der Lane der langen Läufe (`WorkDriverLane`),
+//!   in `spawn_blocking`, mit der Frist aus der Job-Payload; Fristablauf
+//!   endet als `Failed` mit Grund `timed_out: …`.
+//!
 //! * [`JobKind::Custom`] named `work_driver`
 //!   (`harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND`) — ein Lauf des
 //!   Arbeitstreibers (Modul [`work_driver_job`]): ein Claim fährt die Runden
@@ -110,6 +117,9 @@ mod kanban_card;
 
 #[path = "job_worker_work_driver.rs"]
 mod work_driver_job;
+
+#[path = "job_worker_memory.rs"]
+mod memory_job;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -638,7 +648,12 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
         }
         // Arbeitstreiber: eigene Lane, damit ein langer Lauf die übrigen
         // Arten nicht blockiert; ohne freien Platz bleibt der Job `Ready`.
-        if work_driver_job::is_work_driver_kind(&record.job.kind) {
+        // Gedächtnis-Wartung (`memory_maintenance`): ebenfalls in der Lane,
+        // weil sie bis zu ihrer Frist (30–120 s) blockierende Dateiarbeit
+        // leistet und die übrigen Arten nicht aufhalten darf.
+        if work_driver_job::is_work_driver_kind(&record.job.kind)
+            || memory_job::is_memory_kind(&record.job.kind)
+        {
             let run_services = services.clone();
             let work_id = record.job.id.clone();
             let input = record.input.clone();
@@ -747,6 +762,7 @@ fn is_supported_kind(kind: &JobKind) -> bool {
                 || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
                 || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
                 || name == harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND
+                || name == harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND
         }
     }
 }
@@ -791,6 +807,8 @@ async fn execute_claim(task: ClaimTask) -> JobOutcome {
             &context,
         )
         .await
+    } else if memory_job::is_memory_kind(&claim.job.kind) {
+        memory_job::execute_memory_maintenance_claim(claim, input, Arc::clone(&control)).await
     } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
         work_driver_job::execute_work_driver_claim(
             claim,

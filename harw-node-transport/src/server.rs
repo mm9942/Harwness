@@ -29,30 +29,20 @@ use crate::wire::{read_frame, write_frame};
 /// The TLS stream of an accepted, authenticated connection.
 pub type ServerTlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
-/// Tunables of the accepting side.
-#[derive(Debug, Clone)]
-pub struct ServerOptions {
-    /// Deadline for TLS + node handshake of one connection.
-    pub handshake_timeout: Duration,
-    /// Freshness policy.
-    pub policy: HandshakePolicy,
-    /// Replay cache capacity.
-    pub replay_capacity: usize,
-    /// Concurrent connections; further connections are closed at once.
-    pub max_connections: usize,
-    /// HTTP/1 header read deadline (slow-loris bound).
-    pub header_read_timeout: Duration,
-}
-
-impl Default for ServerOptions {
-    fn default() -> Self {
-        Self {
-            handshake_timeout: Duration::from_secs(10),
-            policy: HandshakePolicy::default(),
-            replay_capacity: ReplayCache::DEFAULT_CAPACITY,
-            max_connections: 256,
-            header_read_timeout: Duration::from_secs(30),
-        }
+harw_types::limits_struct! {
+    /// Tunables of the accepting side.
+    #[derive(Debug, Clone)]
+    pub struct ServerOptions {
+        /// Deadline for TLS + node handshake of one connection.
+        pub handshake_timeout: Duration = DEFAULT_SERVER_HANDSHAKE_TIMEOUT = Duration::from_secs(10),
+        /// Freshness policy.
+        pub policy: HandshakePolicy = DEFAULT_SERVER_POLICY = HandshakePolicy::DEFAULT,
+        /// Replay cache capacity.
+        pub replay_capacity: usize = DEFAULT_REPLAY_CAPACITY = ReplayCache::DEFAULT_CAPACITY,
+        /// Concurrent connections; further connections are closed at once.
+        pub max_connections: usize = DEFAULT_MAX_CONNECTIONS = 256,
+        /// HTTP/1 header read deadline (slow-loris bound).
+        pub header_read_timeout: Duration = DEFAULT_HEADER_READ_TIMEOUT = Duration::from_secs(30),
     }
 }
 
@@ -151,6 +141,30 @@ impl NodeTransportServer {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         F: Future<Output = ()>,
     {
+        self.serve_loop(listener, service, shutdown, false).await
+    }
+
+    /// Shared accept loop of [`Self::serve_with_shutdown`] and
+    /// `serve_upgradable`; `upgrades` enables HTTP/1 upgrades on connections.
+    pub(crate) async fn serve_loop<S, B, F>(
+        &self,
+        listener: TcpListener,
+        service: S,
+        shutdown: F,
+        upgrades: bool,
+    ) -> Result<(), TransportError>
+    where
+        S: tower_service::Service<Request<Incoming>, Response = Response<B>>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        F: Future<Output = ()>,
+    {
         let mut shutdown = std::pin::pin!(shutdown);
         loop {
             let accepted = tokio::select! {
@@ -177,7 +191,7 @@ impl NodeTransportServer {
             let service = service.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(err) = handle_connection(inner, tcp, service).await {
+                if let Err(err) = handle_connection(inner, tcp, service, upgrades).await {
                     // `remote` is logged for operators only; it is never
                     // used as identity.
                     tracing::debug!(%remote, error = %err, "node transport connection ended");
@@ -274,6 +288,7 @@ async fn handle_connection<S, B>(
     inner: Arc<ServerInner>,
     tcp: TcpStream,
     service: S,
+    upgrades: bool,
 ) -> Result<(), TransportError>
 where
     S: tower_service::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
@@ -293,9 +308,12 @@ where
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(inner.options.header_read_timeout);
-    builder
-        .serve_connection(TokioIo::new(stream), service)
-        .await?;
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    if upgrades {
+        connection.with_upgrades().await?;
+    } else {
+        connection.await?;
+    }
     Ok(())
 }
 

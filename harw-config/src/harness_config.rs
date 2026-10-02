@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth_toml::SecretRef;
 use crate::internal_models::InternalModelsToml;
+use crate::memory_toml::MemorySection;
 use crate::mode_toml::ModeSection;
 use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
@@ -71,6 +72,10 @@ pub struct HarnessConfig {
     /// Siehe `research_toml.rs`.
     #[serde(default)]
     pub research: ResearchSection,
+    /// `[memory]` — Projektgedächtnis: Schalter, Kontextbudget, Fakt-
+    /// Obergrenzen und Fristen der Wartungsjobs. Siehe `memory_toml.rs`.
+    #[serde(default)]
+    pub memory: MemorySection,
     /// `[permissions]` — persistenter Freigabemodus, Timeout sowie
     /// Allow/Deny-Regeln und zusätzliche Arbeitswurzeln (Contract
     /// `docs/design/config-scopes.md` §2/§5 Zeile A2). Siehe `permissions_toml.rs`.

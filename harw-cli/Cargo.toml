@@ -56,6 +56,7 @@ harw-lens = { path = "../harw-lens" }
 # `lens.ask` tatsächlich befragt (`harw_tool_lens::scope::KNOWN_SELECTORS`)
 # -- sonst baute dieser Befehl einen Index, den `lens.ask` mangels
 # passendem Modell/passender Chunker-Fassung (K43) doch wieder ablehnt.
+harw-macros = { path = "../harw-macros" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 # `doc.read_pdf` (Design docs/design/doc_read_pdf_design.md): `src/doc_ocr.rs`
 # installiert deren Mistral-OCR-Backend beim Boot eines Laufzeitpfads
@@ -146,6 +147,8 @@ harw-observe-prom = { path = "../harw-observe-prom" }
 harw-observe-otlp = { path = "../harw-observe-otlp" }
 harw-runtime = { path = "../harw-runtime" }
 harw-protocol = { path = "../harw-protocol" }
+# W00 S09: `harw attach` connects through the session client (SessionPort).
+harw-session-remote = { path = "../harw-session-remote" }
 
 # `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
 # killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
