@@ -275,6 +275,20 @@ use sensors::SensorRoots;
 /// Konfigurationsfläche, die dieser Knoten vorwegnehmen soll.
 const TELEMETRY_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Wirksame Obergrenze rotierter Telemetrie-Dateien: `--telemetry-max-files`,
+/// sonst das Klassenlimit von `telemetry_rotated` (Retention-Vorgabe; dieses
+/// Binary liest keine `[retention]`-Konfiguration).
+fn telemetry_max_files(flag: Option<u64>) -> Option<usize> {
+    let n = flag.or_else(|| {
+        harw_retention::policy_for(
+            &harw_retention::RetentionConfig::default(),
+            "telemetry_rotated",
+        )
+        .and_then(|class| class.max_files)
+    })?;
+    usize::try_from(n).ok()
+}
+
 /// Kapazität der IPC-Empfangs-Inbox ([`ipc::IpcInbox`]).
 #[cfg(target_os = "linux")]
 const IPC_INBOX_CAPACITY: usize = 256;
@@ -689,7 +703,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 
     let telemetry_dir = harw_home::paths::telemetry_dir(&home);
     let sink: Arc<dyn TelemetrySink> = Arc::new(
-        FileSink::open(&telemetry_dir, TELEMETRY_MAX_BYTES).map_err(SentinelBinError::from)?,
+        FileSink::open(&telemetry_dir, TELEMETRY_MAX_BYTES)
+            .map_err(SentinelBinError::from)?
+            .with_max_rotated_files(telemetry_max_files(cli.telemetry_max_files)),
     );
     tracing::info!(dir = %telemetry_dir.display(), "telemetry sink opened");
 
@@ -1380,6 +1396,17 @@ egress_allow_cidrs = []
             poll_once(&mut sentinel, None, &harw_observe::NullSink, None);
             assert_eq!(sentinel.buffer().event_len(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_max_files_tests {
+    use super::telemetry_max_files;
+
+    #[test]
+    fn test_flag_overrides_class_default() {
+        assert_eq!(telemetry_max_files(Some(3)), Some(3));
+        assert_eq!(telemetry_max_files(None), Some(20));
     }
 }
 

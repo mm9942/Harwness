@@ -87,10 +87,11 @@ fn session_dirs(roots: &Roots) -> Vec<PathBuf> {
 harw_macros::retention_classes! {
     config = RetentionConfig;
 
-    /// `tui.log` and its rotations under `<home>/logs`.
+    /// `tui.log` and its rotations (`tui.log.<ts>`, legacy `tui.log.1`) under
+    /// `<home>/logs`; written by `harw-cli` (`TuiLogFile`).
     tui_log: ephemeral {
         dir = tui_log_dirs,
-        name = prefix("tui"),
+        name = prefix("tui.log"),
         max_age_secs = 14 * 86_400,
         max_bytes = 64 * 1_048_576,
         max_files = 5,
@@ -111,10 +112,11 @@ harw_macros::retention_classes! {
         max_bytes = 512 * 1_048_576,
         max_files = 200,
     }
-    /// Locally stored bug reports under `<home>/bug-report`.
+    /// Locally stored bug reports `<id>.md` under `<home>/bug-report`
+    /// (`harw_home::paths::bug_report_dir`; writer `harw-ops`).
     bug_reports: ephemeral {
         dir = bug_report_dirs,
-        name = any,
+        name = suffix(".md"),
         max_age_secs = 30 * 86_400,
         max_bytes = 100 * 1_048_576,
         max_files = 50,
