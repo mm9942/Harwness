@@ -3332,6 +3332,7 @@ name = "harw-mobile-core"
 version = "0.9.0"
 dependencies = [
  "harw-protocol",
+ "harw-session-client",
  "harw-session-daemon",
  "harw-session-host",
  "harw-session-remote",
