@@ -123,14 +123,20 @@ impl std::fmt::Debug for GatewayCoreFactory {
 }
 
 /// Binds the approval actor of the root session (see module docs).
-fn with_operator_actor(session: AgentSession, actor: ApprovalActor) -> AgentSession {
-    match session.spawn_context().cloned() {
-        Some(mut context) => {
-            context.approval_actor = Some(actor);
-            session.with_spawn_context(context)
-        }
-        None => session,
-    }
+///
+/// Fails closed: a session without a spawn context would keep the core's own
+/// actor, which differs from the socket peer's, and every approval would hang.
+fn with_operator_actor(
+    session: AgentSession,
+    actor: ApprovalActor,
+) -> Result<AgentSession, DriverBridgeError> {
+    let mut context = session.spawn_context().cloned().ok_or_else(|| {
+        DriverBridgeError::Runtime(
+            "hosted session has no spawn context to bind the approval actor to".to_owned(),
+        )
+    })?;
+    context.approval_actor = Some(actor);
+    Ok(session.with_spawn_context(context))
 }
 
 fn hosted_thread(session_id: &SessionId) -> ThreadRef {
@@ -197,7 +203,7 @@ impl CoreSessionFactory for GatewayCoreFactory {
         let root = assembly
             .new_root_session(session_id.clone(), wiring.event_tx, wiring.turn_tx, None)
             .map_err(|error| runtime(error.to_string()))?;
-        let session = with_operator_actor(root.session, self.operator_actor());
+        let session = with_operator_actor(root.session, self.operator_actor())?;
         Ok(CoreSession {
             session,
             model: Arc::clone(&self.model),
@@ -471,6 +477,27 @@ mod tests {
         // One assembly per session: a second session builds independently.
         let other = factory.build(&second, None, wiring())?;
         assert_eq!(other.session.id(), &second);
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_without_spawn_context_fails_closed() -> TestResult {
+        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = harw_core::AgentSession::new(
+            harw_types::roles::AgentRole::Assistant,
+            None,
+            harw_extension_api::ExtensionRegistryBuilder::default().build(),
+            event_tx,
+        );
+        let actor = ApprovalActor::Operator {
+            id: "uid:1".to_owned(),
+        };
+        // No spawn context: binding must fail instead of silently keeping the
+        // core's own actor (every approval would then hang).
+        assert!(matches!(
+            with_operator_actor(session, actor),
+            Err(DriverBridgeError::Runtime(_))
+        ));
         Ok(())
     }
 
