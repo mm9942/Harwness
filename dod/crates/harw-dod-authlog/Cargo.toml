@@ -19,6 +19,7 @@ harw-types = { path = "../../../harw-types" }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # `harw-dod-fixtures` ist inzwischen (Knoten AW2-05) eine echte Crate mit
 # `sensor_suite!`, nicht mehr das Gerüst, das bei Beginn dieses Knotens
 # vorlag. Sie greift für `AuthlogSensor` trotzdem nicht sinnvoll:

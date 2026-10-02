@@ -10,7 +10,7 @@ use std::time::Duration;
 use harw_protocol::session_wire::{
     AttachParams, CreateParams, DEFAULT_TAIL_ITEMS, StreamProfile, SubmitParams,
 };
-use harw_protocol::{FrameSource, PortError, SessionFrame, SessionPort, TurnEvent};
+use harw_protocol::{PortError, SessionFrame, SessionPort, TurnEvent};
 use harw_session_host::approvals::MemoryApprovals;
 use harw_session_host::driver::{
     CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome,

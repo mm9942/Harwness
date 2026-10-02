@@ -52,7 +52,9 @@ pub(crate) fn state_dir(
     xdg_state_home: Option<&str>,
     home: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let set = |v: Option<&str>| v.filter(|s| !s.is_empty());
+    fn set(value: Option<&str>) -> Option<&str> {
+        value.filter(|s| !s.is_empty())
+    }
     if let Some(dir) = set(harw_state_dir) {
         return Ok(PathBuf::from(dir));
     }

@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 harw-authority = { path = "../harw-authority" }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 

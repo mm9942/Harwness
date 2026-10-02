@@ -91,6 +91,9 @@ reason = "nur für wasm32-Ziele (uuid/getrandom); auf Linux nie gebaut, kein C-B
 layer = "F"
 [packages."harw-macros"]
 layer = "F"
+# Dev-only Test-Gerüst ohne Abhängigkeiten; nur über dev-dependencies erreichbar.
+[packages."harw-test-support"]
+layer = "F"
 # Enthält derzeit auch Laufzeittypen (§10); vorerst F, Aufteilung folgt.
 [packages."harw-types"]
 layer = "F"
