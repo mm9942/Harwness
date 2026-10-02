@@ -2198,3 +2198,49 @@ fn test_install_without_flag_parses_to_none() -> TestResult {
     assert_eq!(print_systemd, None);
     Ok(())
 }
+
+#[test]
+fn attach_bare_parses_without_target() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "attach"]).map_err(ctx("`harw attach` sollte parsen"))?;
+    let Some(Command::Attach(args)) = cli.command else {
+        return Err(TestError::Unexpected("erwartete attach".into()));
+    };
+    assert!(args.session.is_none() && args.socket.is_none() && args.host.is_none());
+    Ok(())
+}
+
+#[test]
+fn attach_session_and_socket_parse() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "attach", "abc123", "--socket", "/run/h.sock"])
+        .map_err(ctx("attach mit Sitzung und Socket"))?;
+    let Some(Command::Attach(args)) = cli.command else {
+        return Err(TestError::Unexpected("erwartete attach".into()));
+    };
+    assert_eq!(args.session.as_deref(), Some("abc123"));
+    assert_eq!(args.socket, Some(PathBuf::from("/run/h.sock")));
+    Ok(())
+}
+
+#[test]
+fn attach_host_alias_parses() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "attach", "--host", "cloud1"])
+        .map_err(ctx("attach --host"))?;
+    let Some(Command::Attach(args)) = cli.command else {
+        return Err(TestError::Unexpected("erwartete attach".into()));
+    };
+    assert_eq!(args.host.as_deref(), Some("cloud1"));
+    Ok(())
+}
+
+#[test]
+fn attach_socket_and_host_conflict_without_panic() {
+    let result = Cli::try_parse_from(["harw", "attach", "--socket", "/x", "--host", "h"]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn attach_flags_without_values_are_errors() {
+    assert!(Cli::try_parse_from(["harw", "attach", "--socket"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "attach", "--host"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "attach", "a", "b"]).is_err());
+}
