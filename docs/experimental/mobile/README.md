@@ -1,7 +1,9 @@
 # Mobile (experimental)
 
 Status: experimental side branch `experimental/mobile-rust`. Not part of the
-release line; nothing here changes the workspace members or the gates.
+release line. The only workspace change is the new member `harw-mobile-core`,
+registered in the root `Cargo.toml` and in `xtask/arch-policy.toml` (layer A),
+so it is covered by the architecture gates; it has no consumers yet.
 
 Goal: use the agent from a phone, Rust only (no Kotlin/Java UI code).
 

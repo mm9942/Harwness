@@ -9,6 +9,8 @@
 #![forbid(unsafe_code)]
 
 pub mod controller;
+#[cfg(test)]
+mod test_support;
 
 pub use controller::Controller;
 
@@ -67,9 +69,10 @@ impl SessionView {
         Self::default()
     }
 
-    /// Apply one frame. Frames at or behind the current cursor in the same
-    /// generation are ignored (a replay after reconnect), so applying a
-    /// frame twice is harmless.
+    /// Apply one frame. Frames strictly behind the current cursor (an older
+    /// generation, or an earlier position in this one) are ignored: they are a
+    /// late replay. Frames at the same position are applied, and applying a
+    /// frame twice is harmless because each step is idempotent.
     pub fn apply(&mut self, envelope: &FrameEnvelope) -> Action {
         if let Some(seen) = &self.cursor {
             if is_stale(seen, &envelope.cursor) {
@@ -89,6 +92,7 @@ impl SessionView {
                 by,
             } => {
                 self.pending.retain(|open| &open.id != request_id);
+                self.decided.retain(|done| &done.request_id != request_id);
                 self.decided.push(Decided {
                     request_id: request_id.clone(),
                     decision: *decision,
@@ -172,9 +176,17 @@ impl SessionView {
     }
 }
 
-/// `true` when `next` is not newer than `seen` within one generation.
+/// `true` when `next` is strictly behind `seen`: an older generation, or an
+/// earlier position within the same generation. Equal positions are not
+/// stale: a cursor is a stream position, not a frame id, and the host sends
+/// several frames at the same head (every pending approval, a snapshot,
+/// presence). Replays stay harmless because every reducer step is idempotent.
 fn is_stale(seen: &Cursor, next: &Cursor) -> bool {
-    seen.generation == next.generation && (next.durable, next.live) <= (seen.durable, seen.live)
+    match next.generation.cmp(&seen.generation) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => (next.durable, next.live) < (seen.durable, seen.live),
+    }
 }
 
 #[cfg(test)]
@@ -183,15 +195,7 @@ mod tests {
     use harw_protocol::ApprovalKind;
     use harw_types::{RiskLevel, SessionId, ThreadId, WorkId};
 
-    type TestResult = Result<(), String>;
-
-    fn ensure(condition: bool, what: &str) -> TestResult {
-        if condition {
-            Ok(())
-        } else {
-            Err(what.to_owned())
-        }
-    }
+    use crate::test_support::{TestResult, ensure};
 
     fn at(durable: u64, frame: SessionFrame) -> FrameEnvelope {
         FrameEnvelope {
@@ -241,17 +245,66 @@ mod tests {
     }
 
     #[test]
-    fn replayed_frames_are_ignored() -> TestResult {
+    fn replays_are_idempotent_and_older_positions_are_ignored() -> TestResult {
         let mut view = SessionView::new();
         let frame = at(5, SessionFrame::ApprovalRequested(request("a1")));
         view.apply(&frame);
         view.apply(&frame);
+        ensure(view.pending_approvals().count() == 1, "replay is harmless")?;
         view.apply(&at(4, SessionFrame::ApprovalRequested(request("a2"))));
         ensure(
             view.pending_approvals().count() == 1,
-            "replay and older frame ignored",
+            "older position ignored",
         )?;
-        ensure(view.cursor().map(|c| c.durable) == Some(5), "cursor stays")
+        ensure(view.cursor().map(|c| c.durable) == Some(5), "cursor stays")?;
+        let resolved = at(
+            6,
+            SessionFrame::ApprovalResolved {
+                request_id: ApprovalId::from_str("a1"),
+                decision: ReviewDecision::Approved,
+                by: "phone".to_owned(),
+            },
+        );
+        view.apply(&resolved);
+        view.apply(&resolved);
+        ensure(
+            view.decided().len() == 1,
+            "a replayed decision is kept once",
+        )
+    }
+
+    #[test]
+    fn frames_at_the_same_cursor_are_all_applied() -> TestResult {
+        // The host sends every pending approval with the same head cursor.
+        let mut view = SessionView::new();
+        view.apply(&at(5, SessionFrame::ApprovalRequested(request("a1"))));
+        view.apply(&at(5, SessionFrame::ApprovalRequested(request("a2"))));
+        view.apply(&at(5, SessionFrame::ApprovalRequested(request("a3"))));
+        ensure(
+            view.pending_approvals().count() == 3,
+            "equal positions are not stale",
+        )
+    }
+
+    #[test]
+    fn a_frame_from_an_older_generation_is_ignored() -> TestResult {
+        let mut view = SessionView::new();
+        let newer = FrameEnvelope {
+            session_id: SessionId::from_str("s1"),
+            cursor: Cursor {
+                generation: 2,
+                durable: 0,
+                live: 0,
+            },
+            frame: SessionFrame::ApprovalRequested(request("a2")),
+        };
+        view.apply(&newer);
+        view.apply(&at(99, SessionFrame::ApprovalRequested(request("old"))));
+        ensure(view.pending_approvals().count() == 1, "rollback ignored")?;
+        ensure(
+            view.cursor().map(|c| c.generation) == Some(2),
+            "generation stays",
+        )
     }
 
     #[test]

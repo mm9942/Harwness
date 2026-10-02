@@ -6,6 +6,8 @@
 //! actions a phone needs: decide an approval, send a prompt, interrupt.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, ClientCaps, Cursor, DEFAULT_TAIL_ITEMS, InterruptParams,
@@ -16,10 +18,26 @@ use harw_types::{ApprovalId, ReviewDecision, SessionId};
 
 use crate::{Action, SessionView};
 
+/// Controllers created in this process; with the start time it makes the
+/// idempotency epoch unique even for two controllers built in one tick.
+static INSTANCES: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh epoch for the idempotency keys of one controller. A device
+/// restart must not repeat `label-1`, `label-2`, ...: the host remembers
+/// recent keys and answers a duplicate `Accepted` without queueing the new
+/// prompt, which would drop the user's message silently.
+fn fresh_epoch() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("{nanos:x}.{}", INSTANCES.fetch_add(1, Ordering::Relaxed))
+}
+
 /// One attached session on one port.
 pub struct Controller {
     port: Arc<dyn SessionPort>,
     label: String,
+    epoch: String,
     session: Option<SessionId>,
     source: Option<Box<dyn FrameSource>>,
     view: SessionView,
@@ -37,13 +55,15 @@ impl std::fmt::Debug for Controller {
 }
 
 impl Controller {
-    /// A controller on `port`; `label` prefixes the idempotency keys of
-    /// submitted prompts (use something unique per device).
+    /// A controller on `port`; `label` names the device in the idempotency
+    /// keys of submitted prompts. Each controller adds its own epoch, so a
+    /// restart never reuses a key.
     #[must_use]
     pub fn new(port: Arc<dyn SessionPort>, label: impl Into<String>) -> Self {
         Self {
             port,
             label: label.into(),
+            epoch: fresh_epoch(),
             session: None,
             source: None,
             view: SessionView::new(),
@@ -168,7 +188,7 @@ impl Controller {
                 session_id: session,
                 text: text.into(),
                 expect_head,
-                client_msg_id: format!("{}-{}", self.label, self.sent),
+                client_msg_id: format!("{}-{}-{}", self.label, self.epoch, self.sent),
                 force: false,
             })
             .await?;
@@ -205,15 +225,7 @@ mod tests {
     };
     use harw_protocol::{ApprovalRequest, PortFuture};
 
-    type TestResult = Result<(), String>;
-
-    fn ensure(condition: bool, what: &str) -> TestResult {
-        if condition {
-            Ok(())
-        } else {
-            Err(what.to_owned())
-        }
-    }
+    use crate::test_support::{TestResult, ctx, ensure};
 
     fn cursor(durable: u64) -> Cursor {
         Cursor {
@@ -381,23 +393,14 @@ mod tests {
     async fn attaches_with_the_phone_profile_and_fills_the_inbox() -> TestResult {
         let port = FakePort::new(true, vec![approval_frame(1, "a1")]);
         let mut controller = Controller::new(port.clone(), "phone");
-        controller
-            .attach(SessionId::from_str("s1"), None)
-            .await
-            .map_err(|e| e.to_string())?;
-        ensure(
-            controller.next().await.map_err(|e| e.to_string())?,
-            "frame applied",
-        )?;
-        ensure(
-            !controller.next().await.map_err(|e| e.to_string())?,
-            "stream end reported",
-        )?;
+        controller.attach(SessionId::from_str("s1"), None).await?;
+        ensure(controller.next().await?, "frame applied")?;
+        ensure(!controller.next().await?, "stream end reported")?;
         ensure(
             controller.view().pending_approvals().count() == 1,
             "inbox filled",
         )?;
-        let attaches = port.attaches.lock().map_err(|e| e.to_string())?;
+        let attaches = port.attaches.lock().map_err(ctx("lock"))?;
         ensure(
             attaches.first().map(|a| a.profile) == Some(StreamProfile::Compact),
             "compact profile requested",
@@ -408,10 +411,7 @@ mod tests {
     async fn deciding_needs_the_granted_approve_cap_and_sends_no_actor() -> TestResult {
         let denied = FakePort::new(false, vec![]);
         let mut controller = Controller::new(denied.clone(), "phone");
-        controller
-            .attach(SessionId::from_str("s1"), None)
-            .await
-            .map_err(|e| e.to_string())?;
+        controller.attach(SessionId::from_str("s1"), None).await?;
         let refused = controller
             .decide(ApprovalId::from_str("a1"), ReviewDecision::Approved, None)
             .await;
@@ -420,31 +420,23 @@ mod tests {
             "refused locally",
         )?;
         ensure(
-            denied
-                .responded
-                .lock()
-                .map_err(|e| e.to_string())?
-                .is_empty(),
+            denied.responded.lock().map_err(ctx("lock"))?.is_empty(),
             "no round trip",
         )?;
 
         let allowed = FakePort::new(true, vec![]);
         let mut controller = Controller::new(allowed.clone(), "phone");
-        controller
-            .attach(SessionId::from_str("s1"), None)
-            .await
-            .map_err(|e| e.to_string())?;
+        controller.attach(SessionId::from_str("s1"), None).await?;
         let result = controller
             .decide(
                 ApprovalId::from_str("a1"),
                 ReviewDecision::Rejected,
                 Some("no".to_owned()),
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         ensure(result == RespondResult::Resolved, "resolved")?;
         ensure(
-            allowed.responded.lock().map_err(|e| e.to_string())?.len() == 1,
+            allowed.responded.lock().map_err(ctx("lock"))?.len() == 1,
             "one respond call",
         )
     }
@@ -465,13 +457,10 @@ mod tests {
         };
         let port = FakePort::new(true, vec![approval_frame(1, "a1"), resync]);
         let mut controller = Controller::new(port.clone(), "phone");
-        controller
-            .attach(SessionId::from_str("s1"), None)
-            .await
-            .map_err(|e| e.to_string())?;
-        controller.next().await.map_err(|e| e.to_string())?;
-        controller.next().await.map_err(|e| e.to_string())?;
-        let attaches = port.attaches.lock().map_err(|e| e.to_string())?;
+        controller.attach(SessionId::from_str("s1"), None).await?;
+        controller.next().await?;
+        controller.next().await?;
+        let attaches = port.attaches.lock().map_err(ctx("lock"))?;
         ensure(attaches.len() == 2, "attached twice")?;
         ensure(
             attaches.get(1).and_then(|a| a.from).map(|c| c.generation) == Some(2),
@@ -484,37 +473,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_uses_unique_keys_and_remembers_a_stale_head() -> TestResult {
+    async fn submit_keys_are_unique_across_controller_restarts() -> TestResult {
         let mut fake = FakePort::new(true, vec![]);
         if let Some(inner) = Arc::get_mut(&mut fake) {
             inner.stale = Some(cursor(7));
         }
-        let mut controller = Controller::new(fake.clone(), "phone");
-        controller
-            .attach(SessionId::from_str("s1"), None)
-            .await
-            .map_err(|e| e.to_string())?;
-        let first = controller.submit("hi").await.map_err(|e| e.to_string())?;
+        // The same device label before and after an app restart.
+        let mut before = Controller::new(fake.clone(), "phone");
+        before.attach(SessionId::from_str("s1"), None).await?;
+        let first = before.submit("hi").await?;
         ensure(
             first == SubmitResult::Stale { head: cursor(7) },
             "stale surfaced",
         )?;
-        controller
-            .submit("hi again")
-            .await
-            .map_err(|e| e.to_string())?;
-        let submits = fake.submits.lock().map_err(|e| e.to_string())?;
+        before.submit("hi again").await?;
+        let mut after = Controller::new(fake.clone(), "phone");
+        after.attach(SessionId::from_str("s1"), None).await?;
+        after.submit("hello").await?;
+
+        let submits = fake.submits.lock().map_err(ctx("lock"))?;
+        let keys: Vec<&str> = submits.iter().map(|s| s.client_msg_id.as_str()).collect();
+        ensure(keys.len() == 3, "three submits")?;
         ensure(
-            submits
-                .iter()
-                .map(|s| s.client_msg_id.as_str())
-                .collect::<Vec<_>>()
-                == ["phone-1", "phone-2"],
-            "unique idempotency keys",
+            keys.iter().all(|k| k.starts_with("phone-")),
+            "device label kept",
         )?;
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        ensure(unique.len() == 3, "no key repeats across a restart")?;
         ensure(
             submits.get(1).map(|s| s.expect_head) == Some(cursor(7)),
-            "second submit expects the newer head",
+            "the second submit expects the newer head",
         )
     }
 }
