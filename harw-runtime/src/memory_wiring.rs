@@ -66,6 +66,8 @@ pub struct MemoryCaptureObserver {
     capture: Arc<ProjectMemoryCapture>,
     /// Rückmeldungs-Tracker für gelieferte Fakten (optional).
     feedback: Option<Arc<harw_memory::feedback::FeedbackTracker>>,
+    /// Digest-Schreiber der LLM-Extraktion (nur mit `[memory] llm_extraction`).
+    digest: Option<harw_memory::llm_extract::DigestWriter>,
 }
 
 impl MemoryCaptureObserver {
@@ -84,7 +86,15 @@ impl MemoryCaptureObserver {
         Self {
             capture,
             feedback: None,
+            digest: None,
         }
+    }
+
+    /// Hängt den Digest-Schreiber der LLM-Extraktion an.
+    #[must_use]
+    pub fn with_digest(mut self, digest: Option<harw_memory::llm_extract::DigestWriter>) -> Self {
+        self.digest = digest;
+        self
     }
 
     /// Hängt den Rückmeldungs-Tracker an.
@@ -116,6 +126,9 @@ impl ToolOutcomeObserver for MemoryCaptureObserver {
     /// bleiben und darf nicht blockieren.
     fn on_tool_outcome(&self, session_id: &SessionId, outcome: &ToolOutcome<'_>) {
         let is_error = matches!(outcome.status, ToolOutcomeStatus::Error);
+        if let Some(feedback) = &self.feedback {
+            feedback.on_tool_outcome(session_id.as_str(), is_error);
+        }
         self.capture.record_tool_outcome(
             session_id.as_str(),
             outcome.tool_name,
@@ -130,12 +143,26 @@ impl ToolOutcomeObserver for MemoryCaptureObserver {
         if let Some(feedback) = &self.feedback {
             feedback.on_user_message(session_id.as_str(), text);
         }
+        if let Some(digest) = &self.digest {
+            digest.append(
+                session_id.as_str(),
+                harw_memory::extraction::EntryRole::User,
+                text,
+            );
+        }
     }
 
     /// Meldet eine Assistentenantwort an den Rückmeldungs-Tracker (Nutzung).
     fn on_assistant_message(&self, session_id: &SessionId, text: &str) {
         if let Some(feedback) = &self.feedback {
             feedback.on_assistant_message(session_id.as_str(), text);
+        }
+        if let Some(digest) = &self.digest {
+            digest.append(
+                session_id.as_str(),
+                harw_memory::extraction::EntryRole::Assistant,
+                text,
+            );
         }
     }
 
@@ -322,6 +349,44 @@ pub fn spawn_startup_sweep_job(
             tracing::warn!(%error, "memory.sweep.spawn_failed");
             None
         }
+    }
+}
+
+/// Frist des Extraktionsjobs in Sekunden (ein Modellaufruf je Sitzung).
+const LEARNING_EXTRACT_DEADLINE_SECS: u64 = 300;
+
+/// Reiht – nur mit `[memory] llm_extraction` und vorhandenen Digests – einen
+/// `learning_extract`-Job ein. Die Runtime führt ihn **nicht** selbst aus: ein
+/// Job-Worker mit Modell-Provider (`harw serve`) claimt ihn; ohne Worker bleibt
+/// er `Ready` und die (begrenzten) Digests liegen weiter. Nicht blockierend;
+/// Fehler werden nur geloggt.
+pub fn enqueue_learning_extract(
+    memories_root: &std::path::Path,
+    jobs: Option<&JobStore>,
+    settings: &harw_config::MemorySection,
+) {
+    let Some(jobs) = jobs else { return };
+    if !settings.enabled
+        || !settings.llm_extraction
+        || harw_memory::llm_extract::pending_sessions(memories_root).is_empty()
+        || !memories_root.is_absolute()
+    {
+        return;
+    }
+    let spec = harw_ops::learning_job::LearningExtractSpec::new(
+        memories_root.to_path_buf(),
+        LEARNING_EXTRACT_DEADLINE_SECS,
+    );
+    let scope = JobScope::new(
+        TenantId::from_str("local"),
+        WorkspaceId::from_str("memory"),
+        ApprovalActor::Operator {
+            id: MEMORY_JOB_HOLDER.to_owned(),
+        },
+    );
+    match harw_ops::learning_job::admit_learning_extract(jobs, scope, &spec) {
+        Ok(work_id) => tracing::info!(%work_id, "memory.learning_extract.enqueued"),
+        Err(error) => tracing::warn!(%error, "memory.learning_extract.admit_failed"),
     }
 }
 
@@ -664,6 +729,42 @@ mod sweep_tests {
         let record = jobs.get(&work_id)?;
         assert_eq!(record.job.state, JobState::Cancelled);
         assert_eq!(record.lease_epoch, 0, "never claimed");
+        Ok(())
+    }
+
+    #[test]
+    fn observer_writes_a_digest_only_when_given_a_writer_and_the_job_is_enqueued_only_with_the_flag()
+    -> TestResult {
+        use harw_core::capture::ToolOutcomeObserver;
+        let root = tempfile::tempdir()?;
+        let memories = root.path().join("memories");
+        let capture = Arc::new(ProjectMemoryCapture::open(&memories)?);
+        let session = SessionId::from_str("sess-1");
+        let plain = MemoryCaptureObserver::new(Arc::clone(&capture));
+        plain.on_user_message(&session, "Nutze immer nextest");
+        assert!(harw_memory::llm_extract::pending_sessions(&memories).is_empty());
+
+        let observer = MemoryCaptureObserver::new(capture)
+            .with_digest(Some(harw_memory::llm_extract::DigestWriter::new(&memories)));
+        observer.on_user_message(&session, "Nutze immer nextest");
+        assert_eq!(
+            harw_memory::llm_extract::pending_sessions(&memories),
+            vec!["sess-1".to_owned()]
+        );
+
+        let state = tempfile::tempdir()?;
+        let jobs = JobStore::new(state.path());
+        let mut settings = harw_config::MemorySection::default();
+        enqueue_learning_extract(&memories, Some(&jobs), &settings);
+        let none = jobs.list(&harw_session_store::JobListQuery::default())?;
+        assert!(none.jobs.is_empty(), "flag off: nothing enqueued");
+        settings.llm_extraction = true;
+        enqueue_learning_extract(&memories, Some(&jobs), &settings);
+        let page = jobs.list(&harw_session_store::JobListQuery::default())?;
+        assert_eq!(page.jobs.len(), 1);
+        assert!(harw_ops::learning_job::is_learning_extract_kind(
+            &page.jobs[0].job.kind
+        ));
         Ok(())
     }
 }

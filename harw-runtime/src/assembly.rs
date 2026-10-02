@@ -3288,6 +3288,20 @@ impl RuntimeAssemblyBuilder {
             registry_builder
         };
 
+        // 12c2. Sicherheits-Signale (`[memory] security_signals`, Standard aus):
+        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung.
+        let registry_builder = if config.harness.memory.security_signals {
+            registry_builder
+                .context_provider(Arc::new(
+                    crate::security_signals::SecuritySignalsContextProvider::new(&spec.home),
+                ))
+                .map_err(|error| RuntimeError::Registry {
+                    detail: format!("could not register the security signals provider: {error}"),
+                })?
+        } else {
+            registry_builder
+        };
+
         // 12d. Repository-Überblick (`repo.tree`) aus dem verzeichnis-
         //      gebundenen Explorer — nur für Einstiege mit Projektkontext,
         //      sonst würden Host-Pfade durchsickern.
@@ -3366,6 +3380,11 @@ impl RuntimeAssemblyBuilder {
                         .ok()
                         .map(|dir| Arc::new(JobStore::new(&dir)))
                 });
+                crate::memory_wiring::enqueue_learning_extract(
+                    capture.memories_root(),
+                    ledger.as_deref(),
+                    &config.harness.memory,
+                );
                 let _ = crate::memory_wiring::spawn_startup_sweep_job(
                     Arc::clone(capture),
                     ledger,
@@ -3985,7 +4004,7 @@ const MEMORY_FILES_MAX_DELIVERED: usize = 12;
 const MEMORY_FACTS_TOTAL_MAX_DELIVERED: usize = 15;
 
 /// Namensraum des [`MemoryFactsContextProvider`].
-const MEMORY_FACTS_NAMESPACE: &str = "harw.runtime.memory_facts";
+const MEMORY_FACTS_NAMESPACE: &str = harw_context::sources::memory_facts.namespace;
 
 /// Fakten mit geringerer Konfidenz (Verfall hat sie unter diese Schwelle
 /// gedrückt) werden nicht mehr ausgeliefert.
@@ -6462,10 +6481,15 @@ impl RuntimeAssembly {
                 })
                 .with_tool_outcome_observer({
                     let feedback = self.feedback_tracker.clone();
+                    let llm_extraction = self.config.harness.memory.llm_extraction;
                     let memory = self.memory_capture.clone().map(|capture| {
+                        let digest = llm_extraction.then(|| {
+                            harw_memory::llm_extract::DigestWriter::new(capture.memories_root())
+                        });
                         Arc::new(
                             crate::memory_wiring::MemoryCaptureObserver::new(capture)
-                                .with_feedback(feedback),
+                                .with_feedback(feedback)
+                                .with_digest(digest),
                         )
                             as Arc<dyn harw_core::capture::ToolOutcomeObserver>
                     });
@@ -9330,6 +9354,25 @@ mod tests {
             unused.confidence
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_provider_namespaces_match_the_context_source_table() {
+        use harw_extension_api::ContextProvider;
+        assert_eq!(
+            harw_context::sources::memory_facts.namespace,
+            MEMORY_FACTS_NAMESPACE
+        );
+        assert_eq!(
+            harw_tool_plan::context::PINNED_PLAN_NAMESPACE,
+            harw_context::sources::pinned_plan.namespace
+        );
+        let provider = MemoryFactsContextProvider::new(None, None, None);
+        let declared = harw_context::sources::source(provider.namespace());
+        assert_eq!(
+            declared.map(|s| s.max_trust),
+            Some(harw_context::TrustClass::Data)
+        );
     }
 
     #[test]

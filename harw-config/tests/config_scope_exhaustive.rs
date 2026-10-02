@@ -775,6 +775,8 @@ fn test_field_table_exhaustive_memory_section() {
         promote_deadline_secs,
         sweep_deadline_secs,
         context_ledger,
+        security_signals,
+        llm_extraction,
     } = harw_config::MemorySection::default();
     let _ = (
         enabled,
@@ -788,6 +790,8 @@ fn test_field_table_exhaustive_memory_section() {
         promote_deadline_secs,
         sweep_deadline_secs,
         context_ledger,
+        security_signals,
+        llm_extraction,
     );
     for path in [
         "memory.enabled",
@@ -801,6 +805,8 @@ fn test_field_table_exhaustive_memory_section() {
         "memory.promote_deadline_secs",
         "memory.sweep_deadline_secs",
         "memory.context_ledger",
+        "memory.security_signals",
+        "memory.llm_extraction",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

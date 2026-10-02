@@ -68,7 +68,7 @@ use crate::index::KnowledgeIndex;
 use crate::memory::recall::{RecallHit, search};
 
 /// Sektionspräfix, unter dem [`KnowledgeContextProvider`] liefert.
-pub const KNOWLEDGE_CONTEXT_NAMESPACE: &str = "knowledge";
+pub const KNOWLEDGE_CONTEXT_NAMESPACE: &str = harw_context::sources::knowledge.namespace;
 
 /// Höchste Vertrauensklasse, die [`KnowledgeContextProvider`] behaupten darf.
 pub const KNOWLEDGE_CONTEXT_MAX_TRUST: TrustClass = TrustClass::Data;

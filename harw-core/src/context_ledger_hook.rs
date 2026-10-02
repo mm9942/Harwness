@@ -69,7 +69,12 @@ pub(crate) fn entries_for_turn(
             entry.bytes = Some(fact.bytes);
             entry.tokens = Some(fact.tokens);
             if is_omitted {
-                entry.reason = Some("omitted-by-assembly".to_owned());
+                let reason = assembly
+                    .omission_reasons
+                    .iter()
+                    .find(|(label, _)| label == &fact.label)
+                    .map_or("omitted-by-assembly", |(_, reason)| reason.as_str());
+                entry.reason = Some(reason.to_owned());
             }
             entry
         })
@@ -110,6 +115,7 @@ mod tests {
         let assembly = ContextAssembly {
             included_fragment_labels: vec!["a".to_owned()],
             omitted_fragment_labels: vec!["b".to_owned()],
+            omission_reasons: vec![("b".to_owned(), "over-budget".to_owned())],
             ..ContextAssembly::default()
         };
         let ledger = MemoryLedger::new();
@@ -118,7 +124,7 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].kind, LedgerKind::Offered);
         assert_eq!(all[1].kind, LedgerKind::Omitted);
-        assert_eq!(all[1].reason.as_deref(), Some("omitted-by-assembly"));
+        assert_eq!(all[1].reason.as_deref(), Some("over-budget"));
         assert_eq!(all[0].trust.as_deref(), Some("data"));
     }
 

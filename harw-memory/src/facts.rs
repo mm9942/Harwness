@@ -969,6 +969,13 @@ struct UsageEntry {
     /// zurückging. Ältere Dateien lesen `0`.
     #[serde(default)]
     corrected: u64,
+    /// Werkzeugaufrufe nach der Lieferung, die erfolgreich endeten (nur
+    /// Beobachtung, kein Verfallskriterium). Ältere Dateien lesen `0`.
+    #[serde(default)]
+    outcome_ok: u64,
+    /// Werkzeugaufrufe nach der Lieferung, die fehlschlugen.
+    #[serde(default)]
+    outcome_err: u64,
 }
 
 /// Rückmeldung zu einem Fakt: geliefert, genutzt, korrigiert.
@@ -1428,6 +1435,8 @@ impl FactStore {
                 last_used: now,
                 used: 0,
                 corrected: 0,
+                outcome_ok: 0,
+                outcome_err: 0,
             });
             entry.count = entry.count.saturating_add(1);
             entry.last_used = now;
@@ -1456,6 +1465,36 @@ impl FactStore {
         })
     }
 
+    /// Zeichnet das Ergebnis eines Werkzeugaufrufs nach der Lieferung auf
+    /// (reine Beobachtung für `harw doctor`).
+    ///
+    /// # Errors
+    /// Wie [`Self::record_usage`].
+    pub fn record_outcome(&self, names: &[&str], is_error: bool) -> MemoryResult<()> {
+        self.update_feedback(names, |entry| {
+            if is_error {
+                entry.outcome_err = entry.outcome_err.saturating_add(1);
+            } else {
+                entry.outcome_ok = entry.outcome_ok.saturating_add(1);
+            }
+        })
+    }
+
+    /// Werkzeug-Ergebnisse nach Lieferung je Fakt: `(name, ok, fehlgeschlagen)`.
+    #[must_use]
+    pub fn outcomes_all(&self) -> Vec<(String, u64, u64)> {
+        let Ok(map) = self.read_usage_map() else {
+            return Vec::new();
+        };
+        let mut all: Vec<_> = map
+            .into_iter()
+            .filter(|(_, e)| e.outcome_ok + e.outcome_err > 0)
+            .map(|(name, e)| (name, e.outcome_ok, e.outcome_err))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
     fn update_feedback(
         &self,
         names: &[&str],
@@ -1469,6 +1508,8 @@ impl FactStore {
                 last_used: now,
                 used: 0,
                 corrected: 0,
+                outcome_ok: 0,
+                outcome_err: 0,
             });
             update(entry);
         }

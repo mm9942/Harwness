@@ -160,6 +160,23 @@ impl FeedbackTracker {
         self.apply(&targets, |store, names| store.record_used(names));
     }
 
+    /// Verbucht das Ergebnis eines Werkzeugaufrufs für die Fakten, die im
+    /// laufenden Turn geliefert wurden (reine Beobachtung).
+    pub fn on_tool_outcome(&self, session_id: &str, is_error: bool) {
+        let targets = {
+            let Ok(sessions) = self.sessions.lock() else {
+                return;
+            };
+            sessions
+                .get(session_id)
+                .map(|entry| entry.current.clone())
+                .unwrap_or_default()
+        };
+        self.apply(&targets, |store, names| {
+            store.record_outcome(names, is_error)
+        });
+    }
+
     /// Verbucht `corrected` für gelieferte Fakten (dieses und des vorherigen
     /// Turns), die eine Korrektur in `message` aufgreift.
     pub fn on_user_message(&self, session_id: &str, message: &str) {
@@ -228,6 +245,10 @@ pub struct FeedbackReport {
     pub corrected: u64,
     /// Fakten, die oft geliefert und nie genutzt wurden (Kandidaten für Verfall).
     pub useless: Vec<String>,
+    /// Werkzeugaufrufe nach Lieferung: erfolgreich.
+    pub outcome_ok: u64,
+    /// Werkzeugaufrufe nach Lieferung: fehlgeschlagen.
+    pub outcome_err: u64,
 }
 
 impl FeedbackReport {
@@ -249,12 +270,14 @@ impl FeedbackReport {
             .precision()
             .map_or_else(|| "n/a".to_owned(), |p| format!("{:.0}%", p * 100.0));
         format!(
-            "{} Fakten geliefert, Präzision {precision} (genutzt {}/{}), {} Korrekturen, {} ungenutzt",
+            "{} Fakten geliefert, Präzision {precision} (genutzt {}/{}), {} Korrekturen, {} ungenutzt, Werkzeuge danach {} ok / {} fehlgeschlagen",
             self.facts,
             self.used,
             self.delivered,
             self.corrected,
-            self.useless.len()
+            self.useless.len(),
+            self.outcome_ok,
+            self.outcome_err
         )
     }
 }
@@ -274,6 +297,10 @@ pub fn report(store: &FactStore) -> FeedbackReport {
         if feedback.delivered >= crate::facts::FEEDBACK_MIN_DELIVERIES && feedback.used == 0 {
             report.useless.push(name);
         }
+    }
+    for (_, ok, err) in store.outcomes_all() {
+        report.outcome_ok += ok;
+        report.outcome_err += err;
     }
     report
 }
@@ -401,6 +428,28 @@ mod tests {
         assert_eq!((report.facts, report.useless.len()), (1, 1));
         assert_eq!(report.precision(), Some(0.0));
         assert!(report.summary().contains("0%"));
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_outcomes_after_a_delivery_are_counted_for_the_current_turn() -> TestResult {
+        let (store, root) = store_with("outcome", "prefer-nextest")?;
+        let tracker = FeedbackTracker::new(Some(Arc::clone(&store)), None);
+        tracker.note_delivery(
+            "s1",
+            vec![delivered(
+                "prefer-nextest",
+                "Tests mit cargo nextest ausführen",
+            )],
+        );
+        tracker.on_tool_outcome("s1", false);
+        tracker.on_tool_outcome("s1", true);
+        tracker.on_tool_outcome("other", true);
+        assert_eq!(
+            store.outcomes_all(),
+            vec![("prefer-nextest".to_owned(), 1, 1)]
+        );
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

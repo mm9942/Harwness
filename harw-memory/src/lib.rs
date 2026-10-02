@@ -67,6 +67,7 @@ pub mod file_store;
 pub mod heartbeat;
 pub mod learning;
 pub mod learning_gate;
+pub mod llm_extract;
 pub mod outcome_tracker;
 pub mod promote;
 pub mod short_term;

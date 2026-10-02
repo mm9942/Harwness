@@ -40,6 +40,7 @@ pub mod model;
 // Runde 5, Teil E: Lernen aus Freigaben.
 pub mod permission_rules;
 pub mod sandbox;
+pub mod security_signals;
 pub mod services;
 pub mod session_title;
 pub mod spec;
