@@ -3321,10 +3321,14 @@ name = "harw-mobile-core"
 version = "0.9.0"
 dependencies = [
  "harw-protocol",
+ "harw-session-daemon",
+ "harw-session-host",
+ "harw-session-remote",
  "harw-test-support",
  "harw-types",
  "jiff",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
