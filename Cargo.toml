@@ -50,6 +50,7 @@ members = [
     "harw-session-remote",
     "harw-session-driver",
     "harw-node-listener",
+    "harw-mobile-core",
     "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",

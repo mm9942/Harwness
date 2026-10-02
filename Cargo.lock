@@ -3316,6 +3316,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-mobile-core"
+version = "0.9.0"
+dependencies = [
+ "harw-protocol",
+ "harw-types",
+ "jiff",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-model-catalog"
 version = "0.9.0"
 dependencies = [
