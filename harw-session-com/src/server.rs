@@ -26,6 +26,7 @@ use crate::binder::ComBinder;
 use crate::config::ComConfig;
 use crate::error::ComError;
 use crate::layer::PeerLayer;
+use crate::registry::LiveConnections;
 use crate::remote::RemoteLayer;
 use crate::service::UpgradeService;
 
@@ -41,6 +42,7 @@ pub struct ComServer {
     permits: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     layers: Vec<LayerFn>,
+    live: LiveConnections,
 }
 
 impl ComServer {
@@ -61,6 +63,7 @@ impl ComServer {
             binder,
             shutdown,
             layers: Vec::new(),
+            live: LiveConnections::new(),
         }
     }
 
@@ -83,6 +86,13 @@ impl ComServer {
             BoxCloneService::new(layer.layer(inner))
         }));
         self
+    }
+
+    /// The live WebSocket connections, to list them or to close one or all
+    /// connections of a device (revocation).
+    #[must_use]
+    pub fn connections(&self) -> &LiveConnections {
+        &self.live
     }
 
     /// Connections currently held (HTTP phase and WebSocket sessions).
@@ -169,6 +179,7 @@ impl ComServer {
             self.config.limits,
             self.shutdown.clone(),
             hold,
+            self.live.clone(),
         );
         let mut inner: BoxedService = BoxCloneService::new(core);
         for layer in self.layers.iter().rev() {

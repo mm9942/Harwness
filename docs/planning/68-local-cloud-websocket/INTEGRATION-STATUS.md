@@ -71,19 +71,29 @@ Pitfall recorded in the crate: hyper 1.11 `keep_alive(false)` rewrites the
 101's `Connection: Upgrade` to `close`; refusals close through an explicit
 header instead.
 
-Dependencies: `hyper`, `hyper-util`, `tokio`, `tokio-tungstenite` (through
-`harw-session-ws`), `tower` (`util` only). `hyper-tungstenite` is intentionally
-not used: `harw_session_ws::upgrade` is stricter (exact subprotocol, `Origin`
-refused).
+Dependencies (the stack the owner asked for): `hyper`, `hyper-util`,
+`hyper-tungstenite` 0.30, `tokio`, `tokio-tungstenite` (through
+`harw-session-ws`) and `tower` (`util` only). `hyper-tungstenite` does not
+inspect `Origin`, the subprotocol, the path or the method, so
+`harw_session_ws::upgrade::validate_upgrade` runs first and the 101 gets the
+subprotocol header added. The only new lockfile package is
+`hyper-tungstenite` (BSD-2-Clause, allowed by `deny.toml`).
+
+Live connections are tracked in `ComServer::connections()` (list, close one,
+close every connection of a device), which is what revocation needs when no
+session is attached. `harw-node-listener` has its own table
+(`LiveConnections`, `HostRevoker`); moving it onto the Com layer's table is a
+mechanical follow-up for its owner, because its tests call
+`UpgradeHandler::handle` directly.
 
 ## 2a. Verification (scratch build on this branch merged with `consolidate/main`; not a frozen-SHA central build)
 
-- `harw-session-com`: 36 tests pass (8 consecutive runs stable): 11 unit, 13 end to end against a real
+- `harw-session-com`: 40 tests pass: 11 unit, 13 end to end against a real
   `SessionHost` (in-memory stream and a real Unix socket through
   `serve_unix`), 4 self-cloud end to end through the real node transport
   (PQ-TLS + ML-DSA) using `harw-node-listener`'s device registry: an enrolled
   device runs a session; gateway rights follow the device tier; an unenrolled
-  but transport-trusted node gets 403; a revoked device cannot reconnect.
+  but transport-trusted node gets 403; a revoked device cannot reconnect and its live connection is closed.
   5 client-conformance tests run `harw-session-remote` through the Com layer
   over an in-memory stream, a real Unix socket and the real node transport (a
   turn round trip on each), plus idempotent submit across a reconnect (the same

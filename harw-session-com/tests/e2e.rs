@@ -468,6 +468,39 @@ async fn shutdown_closes_live_sessions_and_drain_reports_none_left() -> TestResu
 }
 
 #[tokio::test]
+async fn a_tracked_connection_is_closed_on_demand_even_without_an_attached_session() -> TestResult {
+    let rig = rig(PortOffer::All, |_| {})?;
+    let identity = local_identity(1000, PermissionTier::Owner);
+    let connection = identity.connection;
+    let io = duplex_to(&rig, identity)?;
+    let mut ws = upgrade_ws(io).await?;
+    hello(&mut ws).await?;
+    assert_eq!(rig.server.connections().len(), 1);
+    assert_eq!(rig.server.connections().list()[0].connection, connection);
+
+    // Nothing is attached, so the host has no stream to close: the table does.
+    assert!(rig.server.connections().close_connection(connection));
+    let end = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "the connection ends when it is closed");
+    // The entry is removed once the session ends.
+    for _ in 0..50 {
+        if rig.server.connections().is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("the connection table still holds the ended connection".into())
+}
+
+#[tokio::test]
 async fn a_stalled_header_read_is_closed_after_the_timeout() -> TestResult {
     let rig = rig(PortOffer::All, |c| {
         c.header_timeout = Duration::from_millis(200)

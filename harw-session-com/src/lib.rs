@@ -38,6 +38,9 @@
 //!   [`ComServer::service_for`] plus a [`RemoteLayer`] hands the node
 //!   transport's authenticated peer to the composition root's resolver
 //!   (`harw-node-listener`'s identity mapper); see [`remote`].
+//! - **Live connections are tracked** ([`LiveConnections`]): list them, close
+//!   one, or close every connection of a revoked device, also when no session
+//!   is attached (the host alone closes only attached streams).
 //! - **One bounded server for every ingress**: a connection limit that covers
 //!   the whole WebSocket session, bounded headers, a header timeout, refusals
 //!   that close the connection, graceful [`ComServer::drain`].
@@ -48,11 +51,15 @@
 //! `Connection: Upgrade` to `Connection: close`, so strict WebSocket clients
 //! refuse the handshake. Refusals close through an explicit header instead.
 //!
-//! # Dependencies, on purpose
-//! `hyper`, `hyper-util`, `tokio`, `tokio-tungstenite` (through
-//! `harw-session-ws`) and `tower` are used. `hyper-tungstenite` is not: the
-//! upgrade in `harw_session_ws::upgrade` already does the handshake and is
-//! stricter (exact subprotocol, `Origin` refused, validated key and path).
+//! # Dependencies
+//! `hyper` (HTTP/1 server, upgrades), `hyper-util` (`TowerToHyperService`,
+//! timer), `hyper-tungstenite` (accept key and the upgrade future),
+//! `tokio`, `tokio-tungstenite` (through `harw-session-ws` and
+//! `hyper-tungstenite`) and `tower` (`util` only). `hyper-tungstenite` does
+//! not inspect `Origin`, the subprotocol, the path or the method, so those
+//! stay in `harw_session_ws::upgrade::validate_upgrade` and run **before** the
+//! crate sees the request; the crate's 101 response then gets the
+//! `harw.session.v1` subprotocol header it does not set.
 //!
 //! # Not covered here
 //! Binding sockets and stale-socket handling (see `harw-session-daemon`),
@@ -67,8 +74,10 @@
 pub mod binder;
 pub mod config;
 pub mod error;
+mod handshake;
 pub mod layer;
 pub mod refusal;
+pub mod registry;
 pub mod remote;
 pub mod server;
 pub mod service;
@@ -84,6 +93,7 @@ pub use config::ComConfig;
 pub use error::ComError;
 pub use layer::{PeerLayer, PeerService, TrustedPeer};
 pub use refusal::ComRefusal;
+pub use registry::{LiveConnections, LiveInfo};
 pub use remote::{RemoteLayer, RemoteService};
 pub use server::{BoxedService, ComServer, DEFAULT_GRACE};
 pub use service::UpgradeService;

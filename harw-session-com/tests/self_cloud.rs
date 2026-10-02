@@ -66,6 +66,7 @@ impl TurnDriver for NoopDriver {
 }
 
 struct Cloud {
+    com: Arc<ComServer>,
     addr: SocketAddr,
     gateway: Node,
     host: SessionHost,
@@ -91,7 +92,7 @@ async fn cloud(trusted: &[&Node]) -> TestResult<Cloud> {
 
     let (shutdown, rx) = watch::channel(false);
     let binder = Arc::new(HostBinder::new(host.clone(), PortOffer::All));
-    let com = ComServer::new(&ComConfig::default(), binder, rx);
+    let com = Arc::new(ComServer::new(&ComConfig::default(), binder, rx));
     let service = com.service_for(RemoteLayer::<AuthenticatedPeer>::new(
         move |peer, connection| {
             let mapper = Arc::clone(&mapper);
@@ -118,6 +119,7 @@ async fn cloud(trusted: &[&Node]) -> TestResult<Cloud> {
             .await
     });
     Ok(Cloud {
+        com,
         addr,
         gateway,
         host,
@@ -275,8 +277,10 @@ async fn a_revoked_device_cannot_reconnect_and_its_live_session_is_closed() -> T
     hello(&mut live).await?;
 
     let device = DeviceId::try_from_str("dev-1")?;
+    assert_eq!(cloud.com.connections().count_for(&device), 1);
     assert_eq!(cloud.registry.mark_revoked(&device)?, 1);
     cloud.host.revoke_device(&device);
+    assert_eq!(cloud.com.connections().close_device(&device), 1);
 
     let reconnect = ws(&cloud, &phone).await;
     assert!(
@@ -284,16 +288,25 @@ async fn a_revoked_device_cannot_reconnect_and_its_live_session_is_closed() -> T
         "{:?}",
         reconnect.err()
     );
-    let after = call(
-        &mut live,
-        "2",
-        METHOD_SESSION_CREATE,
-        serde_json::json!({"title": "t"}),
-    )
+    // The live connection ends; it does not merely get refused calls.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match live.next().await {
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
     .await;
     assert!(
-        after.map(|r| r.error.is_some()).unwrap_or(true),
-        "the revoked device's live calls are refused or the stream is closed"
+        ended.is_ok(),
+        "the revoked device's live connection is closed"
     );
-    Ok(())
+    for _ in 0..50 {
+        if cloud.com.connections().count_for(&device) == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("the table still tracks the revoked device".into())
 }

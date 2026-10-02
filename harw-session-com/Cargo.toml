@@ -19,6 +19,10 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 http-body-util = "0.1"
 bytes = "1"
+# Handshake key derivation and the upgrade future. 0.30 matches the
+# tokio-tungstenite/tungstenite 0.30 line already in the lockfile. Policy
+# (exact subprotocol, no Origin, path, method) stays in harw-session-ws.
+hyper-tungstenite = "0.30"
 # `util` only: ServiceBuilder, map_response, BoxCloneService. Every transitive
 # crate of this feature set is already in the lockfile.
 tower = { version = "0.5", default-features = false, features = ["util"] }

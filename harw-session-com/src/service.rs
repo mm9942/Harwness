@@ -11,7 +11,7 @@ use std::future::{Ready, ready};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use harw_session_ws::upgrade::{rejection_response, upgrade_server, validate_upgrade};
+use harw_session_ws::upgrade::rejection_response;
 use harw_session_ws::{WsLimits, serve_connection_with};
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -20,8 +20,10 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 use tower::Service;
 
 use crate::binder::ComBinder;
+use crate::handshake;
 use crate::layer::TrustedPeer;
 use crate::refusal::plain;
+use crate::registry::LiveConnections;
 
 /// Upgrades an HTTP/1 request to `harw.session.v1` for the trusted peer.
 #[derive(Clone)]
@@ -30,6 +32,7 @@ pub struct UpgradeService {
     limits: WsLimits,
     shutdown: watch::Receiver<bool>,
     hold: Option<Arc<OwnedSemaphorePermit>>,
+    live: LiveConnections,
 }
 
 impl UpgradeService {
@@ -38,12 +41,14 @@ impl UpgradeService {
         limits: WsLimits,
         shutdown: watch::Receiver<bool>,
         hold: Option<Arc<OwnedSemaphorePermit>>,
+        live: LiveConnections,
     ) -> Self {
         Self {
             binder,
             limits,
             shutdown,
             hold,
+            live,
         }
     }
 
@@ -59,23 +64,50 @@ impl UpgradeService {
                 "connection has no identity",
             );
         };
-        if let Err(rejection) = validate_upgrade(&request) {
+        // Cheap policy checks first, so a bad request never binds an identity.
+        if let Err(rejection) = harw_session_ws::upgrade::validate_upgrade(&request) {
             return rejection_response(&rejection);
         }
+        // Register before binding: a revocation then either finds the entry
+        // or the host refuses the revoked device at `connect`.
+        let (live_guard, closer, closed) = self.live.register(
+            identity.connection,
+            identity.device.clone(),
+            identity.label.clone(),
+        );
         let ports = match self.binder.bind(identity) {
             Ok(ports) => ports,
             Err(refusal) => return refusal.response(),
         };
+        // The connection closes on its own signal or on the global shutdown.
+        let mut global = self.shutdown.clone();
+        if *global.borrow() {
+            let _ = closer.send(true);
+        }
+        let merged = Arc::clone(&closer);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = global.changed() => {
+                        if changed.is_err() || *global.borrow() {
+                            let _ = merged.send(true);
+                            break;
+                        }
+                    }
+                    () = merged.closed() => break,
+                }
+            }
+        });
         let limits = self.limits;
-        let shutdown = self.shutdown.clone();
         let hold = self.hold.clone();
-        match upgrade_server(request, limits.tungstenite_config(), move |ws| async move {
-            // The permit lives as long as the WebSocket session.
+        match handshake::accept(request, &limits, move |ws| async move {
+            // The permit and the table entry live as long as the session.
             let _hold = hold;
-            let end = serve_connection_with(ws, ports, limits, shutdown).await;
+            let _live = live_guard;
+            let end = serve_connection_with(ws, ports, limits, closed).await;
             tracing::debug!(?end, "session com: websocket connection ended");
         }) {
-            Ok(response) => response.map(|_| Full::new(Bytes::new())),
+            Ok(response) => response,
             Err(rejection) => rejection_response(&rejection),
         }
     }
