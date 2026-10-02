@@ -512,6 +512,16 @@ impl ContainerPlan {
     }
 }
 
+/// Digest of the environment key/value pairs, in key order. The values are
+/// never shown, but any change of a value changes the digest, so a grant
+/// cannot be reused for different behaviour. A low-entropy value could be
+/// guessed from its digest: keep secrets out of requested environments.
+fn env_fingerprint(env: &[(String, String)]) -> String {
+    let mut pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    argv_sha256_hex(&pairs)
+}
+
 /// The approval text names the program and binds the full command by digest.
 /// The arguments themselves are never shown or persisted: they may carry
 /// credentials, authorization headers or signed URLs.
@@ -527,7 +537,7 @@ fn approval_text(
     format!(
         "engine=podman\nconnection={}\nimage={}\nprofile={}\nnetwork=none\nmounts={:?}\n\
          env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\nprogram={}\nargc={}\n\
-         command_sha256={}",
+         command_sha256={}\nenv_sha256={}",
         config.connection.as_deref().unwrap_or("local"),
         request.image.to_arg(),
         request.profile,
@@ -536,6 +546,7 @@ fn approval_text(
         request.command.first().map_or("", String::as_str),
         request.command.len(),
         argv_sha256_hex(&request.command),
+        env_fingerprint(&request.env),
     )
 }
 
@@ -936,6 +947,27 @@ mod tests {
                 .iter()
                 .any(|a| a == "--attach"),
             "output is attached",
+        )
+    }
+
+    #[test]
+    fn a_changed_environment_value_invalidates_the_grant_without_showing_it() -> TestResult {
+        let with = |value: &str| -> Result<ContainerPlan, ContainerPolicyError> {
+            ContainerPlan::build(
+                &config()?,
+                &request(Profile::Hermetic)?.with_env("CI", value)?,
+            )
+        };
+        let a = with("hunter2")?;
+        let b = with("hunter3")?;
+        ensure(!a.approval_text().contains("hunter2"), "value not shown")?;
+        ensure(
+            a.approval_text() != b.approval_text(),
+            "a changed value changes the grant",
+        )?;
+        ensure(
+            a.approval_text() == with("hunter2")?.approval_text(),
+            "stable for the same value",
         )
     }
 
