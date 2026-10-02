@@ -55,9 +55,10 @@ pub struct InspectFacts {
     pub privileged: Option<bool>,
     /// Added capabilities.
     pub cap_add: Option<Vec<String>>,
-    /// Dropped capabilities as the engine lists them. Podman expands
-    /// `--cap-drop=all` into the explicit default set, so this alone is not
-    /// proof; prefer [`Self::effective_caps`].
+    /// Dropped capabilities as the engine lists them. This is the requested
+    /// configuration, never proof (Podman also expands `--cap-drop=all` into
+    /// the explicit default set); it is not used for the verdict, only
+    /// [`Self::effective_caps`] is.
     pub cap_drop: Option<Vec<String>>,
     /// Capabilities the container's init process actually has (Podman:
     /// inspect `EffectiveCaps`). `Some(empty)` means none. Podman 4.9.3
@@ -152,16 +153,14 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
         Some(_) => Enforcement::NotEnforced,
         None => Enforcement::Unverifiable,
     };
-    // The effective set is the proof. A literal ALL in the drop list (Docker
-    // style) counts only when the engine did not report the effective set.
-    let capabilities = match (&facts.effective_caps, &facts.cap_drop) {
-        (Some(caps), _) if caps.is_empty() => Enforcement::Enforced,
-        (Some(_), _) => Enforcement::NotEnforced,
-        (None, Some(drop)) if drop.iter().any(|c| c.eq_ignore_ascii_case("all")) => {
-            Enforcement::Enforced
-        }
-        (None, Some(_)) => Enforcement::NotEnforced,
-        (None, None) => Enforcement::Unverifiable,
+    // Only the effective set is proof. `CapDrop` is the requested host
+    // configuration: if the runtime ignored the flag it would still read
+    // `["ALL"]`, so without an effective-capability observation the result
+    // stays unverifiable (fail closed), whatever the drop list says.
+    let capabilities = match &facts.effective_caps {
+        Some(caps) if caps.is_empty() => Enforcement::Enforced,
+        Some(_) => Enforcement::NotEnforced,
+        None => Enforcement::Unverifiable,
     };
     let no_new_privileges = match &facts.security_opt {
         Some(opts) if opts.iter().any(|o| is_no_new_privileges(o)) => Enforcement::Enforced,
@@ -329,13 +328,18 @@ mod tests {
         f.effective_caps = None;
         ensure(
             verify(&expected(true), &f).get(Dimension::Capabilities)
-                == Some(Enforcement::NotEnforced),
-            "a default-set list without the effective set fails closed",
+                == Some(Enforcement::Unverifiable),
+            "a default-set list without the effective set is unverifiable",
         )?;
         f.cap_drop = Some(vec!["ALL".to_owned()]);
         ensure(
-            verify(&expected(true), &f).get(Dimension::Capabilities) == Some(Enforcement::Enforced),
-            "docker style ALL",
+            verify(&expected(true), &f).get(Dimension::Capabilities)
+                == Some(Enforcement::Unverifiable),
+            "a requested ALL is not proof without the effective set",
+        )?;
+        ensure(
+            !verify(&expected(true), &f).all_enforced(),
+            "so the readback is not all enforced",
         )
     }
 
