@@ -18,6 +18,10 @@ description = "Stabile, dokumentierte Einbettungs-API für Harwness"
 default = ["browser"]
 # Browser-Werkzeuge der Wurzelsitzung (reicht an `harw-runtime/browser` durch).
 browser = ["harw-runtime/browser"]
+# Entfernte Sitzungen über die Session-Control-Plane (`harw.session.v1`):
+# `RemoteHarwness`, `RemoteSession`. Aus, damit eingebettete Hosts ohne
+# Transport keinen Client mitziehen.
+remote = ["dep:harw-session-remote"]
 # Rohe Erweiterungspunkte (eigene `ToolProvider`/`ContextProvider`/
 # `ModelProvider`, `secrets:`-Resolver). KEINE semver-Zusage.
 unstable-internals = ["dep:harw-provider-http"]
@@ -30,6 +34,7 @@ harw-home = { path = "../harw-home" }
 harw-protocol = { path = "../harw-protocol" }
 harw-provider-http = { path = "../harw-provider-http", optional = true }
 harw-runtime = { path = "../harw-runtime", default-features = false }
+harw-session-remote = { path = "../harw-session-remote", optional = true }
 harw-session-store = { path = "../harw-session-store" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
@@ -44,6 +49,7 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+jiff = { workspace = true }
 tempfile = { workspace = true }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
 # `tests/embedded_session.rs` (#22 Welle 3A): baut ein Test-Artefakt direkt
