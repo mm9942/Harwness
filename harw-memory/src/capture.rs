@@ -50,7 +50,8 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::MemoryResult;
 use crate::consolidation::{
-    Conflict, ConsolidationLock, ConsolidationReport, apply_plan, plan_consolidation,
+    Conflict, ConsolidationError, ConsolidationLock, ConsolidationReport, Deadline, apply_plan,
+    plan_consolidation,
 };
 use crate::error::MemoryError;
 use crate::extraction::{ExtractionError, IncomingStore};
@@ -743,6 +744,17 @@ fn write_conflicts(
     };
     let now_str = format_rfc3339(now);
     for c in conflicts {
+        // Derselbe Widerspruch (gleiches Paar + Begründung) wird nicht bei
+        // jedem Lauf erneut angehängt — wichtig für den wiederholten
+        // Dedupe-Lauf über bestehende globale Fakten.
+        let already = existing.iter().any(|v| {
+            v.get("left").and_then(|x| x.as_str()) == Some(c.left.as_str())
+                && v.get("right").and_then(|x| x.as_str()) == Some(c.right.as_str())
+                && v.get("note").and_then(|x| x.as_str()) == Some(c.note.as_str())
+        });
+        if already {
+            continue;
+        }
         existing.push(serde_json::json!({
             "left": c.left,
             "right": c.right,
@@ -780,26 +792,162 @@ fn write_conflicts(
 /// Schreiben der Widersprüche wird nicht propagiert (nur `tracing::warn!`),
 /// da er die eigentliche Konsolidierung nicht ungültig macht.
 pub fn consolidate_project_memories(memories_root: &Path) -> MemoryResult<ConsolidationReport> {
+    consolidate_memories(memories_root, FactScope::Project)
+}
+
+/// Wie [`consolidate_project_memories`], aber für die globale Wurzel
+/// (`<profil>/memories`): zusätzlich werden doppelte bestehende globale
+/// Fakten verschmolzen und Widersprüche nach `facts/_conflicts.json`
+/// geschrieben.
+///
+/// # Errors
+/// Siehe [`consolidate_memories`].
+pub fn consolidate_global_memories(memories_root: &Path) -> MemoryResult<ConsolidationReport> {
+    consolidate_memories(memories_root, FactScope::Global)
+}
+
+/// Konsolidierung für beliebigen `scope` mit der Standard-Frist
+/// ([`DEFAULT_DELETION_DEADLINE`]). Ein Fristablauf wird als
+/// [`MemoryError::Io`] mit [`std::io::ErrorKind::TimedOut`] gemeldet (der
+/// Bestand bleibt dabei unverändert); wer den typisierten Fehler braucht,
+/// ruft [`consolidate_memories_with_deadline`].
+///
+/// # Errors
+/// Siehe [`consolidate_memories_with_deadline`].
+pub fn consolidate_memories(
+    memories_root: &Path,
+    scope: FactScope,
+) -> MemoryResult<ConsolidationReport> {
+    consolidate_memories_with_deadline(memories_root, scope, Deadline::default_deletion()).map_err(
+        |e| match e {
+            ConsolidationError::Memory(m) => m,
+            ConsolidationError::Deadline(d) => MemoryError::Io {
+                path: memories_root.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, d.to_string()),
+            },
+        },
+    )
+}
+
+/// Fristgebundene, scope-generische Konsolidierung.
+///
+/// # Beschreibung
+/// Nimmt den [`ConsolidationLock`] an `memories_root` (für Global wie für
+/// Projekt); bei Kontention wird der Lauf übersprungen und ein leerer
+/// Report geliefert. Alles Löschende folgt „erst prüfen, dann anwenden":
+/// Lesen und Planen laufen im Speicher, die `deadline` wird vor dem
+/// Commit-Punkt (vor `IncomingStore::take_all` bzw. vor dem ersten
+/// Schreiben/Löschen des Dedupe-Passes) geprüft. Ist sie abgelaufen, bleibt
+/// der Bestand unverändert (inkl. `_incoming/`), der Lock wird freigegeben
+/// und [`ConsolidationError::Deadline`] geliefert. Nach dem Commit-Punkt
+/// läuft der Vorgang zu Ende; Ergebnisse gehen direkt in den Ziel-Store.
+///
+/// Für [`FactScope::Global`] verschmilzt zusätzlich ein Dedupe-Pass die
+/// bestehenden Fakten untereinander (selbe Heuristik wie
+/// [`plan_consolidation`]) und hält Widersprüche in `_conflicts.json` fest.
+///
+/// # Errors
+/// [`ConsolidationError::Deadline`] bei Fristablauf, sonst
+/// [`ConsolidationError::Memory`] wie bei [`consolidate_project_memories`].
+pub fn consolidate_memories_with_deadline(
+    memories_root: &Path,
+    scope: FactScope,
+    deadline: Deadline,
+) -> Result<ConsolidationReport, ConsolidationError> {
     let lock = match ConsolidationLock::try_acquire(memories_root) {
         Ok(lock) => lock,
         Err(MemoryError::LockContention { .. }) => {
             tracing::debug!("memory: konsolidierung übersprungen (lock belegt)");
             return Ok(ConsolidationReport::default());
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
-    let result = run_consolidation(memories_root);
+    let result = run_consolidation(memories_root, scope, deadline);
     let _ = lock.release();
     result
 }
 
-/// Innerer Ablauf von [`consolidate_project_memories`] (ohne Lock-Handling),
-/// siehe dort.
-fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> {
+/// Dedupe-Pass über bestehende Fakten (nur Global): verschmilzt Duplikate
+/// untereinander, vermerkt Widersprüche. Plant vollständig im Speicher,
+/// prüft die Frist, wendet dann an (erst Merge-Ergebnisse schreiben, dann
+/// Duplikate löschen — ein Abbruch dazwischen verliert nie Inhalt).
+fn dedupe_existing(
+    store: &FactStore,
+    memories_root: &Path,
+    now: OffsetDateTime,
+    deadline: Deadline,
+) -> Result<ConsolidationReport, ConsolidationError> {
+    deadline.check("dedupe-read")?;
+    let mut facts = store.list()?;
+    facts.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut kept: Vec<Fact> = Vec::new();
+    let mut changed: HashSet<String> = HashSet::new();
+    let mut removed: Vec<String> = Vec::new();
+    let mut conflicts: Vec<Conflict> = Vec::new();
+    for fact in facts {
+        deadline.check("dedupe-plan")?;
+        let plan = plan_consolidation(&kept, std::slice::from_ref(&fact));
+        match (plan.merges.first(), plan.updates.first()) {
+            (Some(merge), Some(merged)) => {
+                if let Some(slot) = kept.iter_mut().find(|k| k.name == merge.target) {
+                    *slot = merged.clone();
+                    changed.insert(merge.target.clone());
+                    removed.push(fact.name.clone());
+                }
+            }
+            _ => {
+                conflicts.extend(plan.conflicts);
+                kept.push(fact);
+            }
+        }
+    }
+    if removed.is_empty() && conflicts.is_empty() {
+        return Ok(ConsolidationReport::default());
+    }
+    // Commit-Punkt: ab hier kein Abbruch mehr.
+    deadline.check("dedupe-apply")?;
+    if !conflicts.is_empty() {
+        if let Err(err) = write_conflicts(memories_root, &conflicts, now) {
+            tracing::warn!(error = %err, "memory: widersprüche konnten nicht geschrieben werden");
+        }
+    }
+    let mut written = 0usize;
+    for fact in kept.iter().filter(|k| changed.contains(&k.name)) {
+        store.write(fact)?;
+        written += 1;
+    }
+    let mut deleted = 0usize;
+    for name in &removed {
+        if store.delete(name)? {
+            deleted += 1;
+        }
+    }
+    store.write_index()?;
+    Ok(ConsolidationReport {
+        merged: removed.len(),
+        written,
+        deleted,
+        conflicts: conflicts.len(),
+    })
+}
+
+/// Innerer Ablauf von [`consolidate_memories_with_deadline`] (ohne
+/// Lock-Handling), siehe dort.
+fn run_consolidation(
+    memories_root: &Path,
+    scope: FactScope,
+    deadline: Deadline,
+) -> Result<ConsolidationReport, ConsolidationError> {
     let incoming_store =
         IncomingStore::open(memories_root).map_err(|e| extraction_to_memory(e, memories_root))?;
-    let fact_store = FactStore::open(memories_root, FactScope::Project)?;
+    let fact_store = FactStore::open(memories_root, scope)?;
     let now = OffsetDateTime::now_utc();
+
+    let dedupe = if scope == FactScope::Global {
+        dedupe_existing(&fact_store, memories_root, now, deadline)?
+    } else {
+        ConsolidationReport::default()
+    };
 
     let pending = incoming_store
         .list()
@@ -810,12 +958,18 @@ fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> 
             fact_store.write_index()?;
             write_last_consolidation_marker(memories_root, now)?;
         }
-        return Ok(ConsolidationReport::default());
+        return Ok(dedupe);
     }
 
-    let taken = incoming_store
+    // Commit-Punkt: `take_all` leert `_incoming/` — vorher Frist prüfen,
+    // damit ein Abbruch die Kandidaten nicht verliert.
+    deadline.check("incoming-take")?;
+    let mut taken = incoming_store
         .take_all()
         .map_err(|e| extraction_to_memory(e, memories_root))?;
+    for fact in &mut taken {
+        fact.scope = scope;
+    }
     let existing = fact_store.list()?;
     let plan = plan_consolidation(&existing, &taken);
 
@@ -825,7 +979,11 @@ fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> 
         }
     }
 
-    let report = apply_plan(&fact_store, &plan)?;
+    let mut report = apply_plan(&fact_store, &plan)?;
+    report.merged += dedupe.merged;
+    report.written += dedupe.written;
+    report.deleted += dedupe.deleted;
+    report.conflicts += dedupe.conflicts;
     fact_store.decay(DECAY_MAX_UNUSED_DAYS, now)?;
     fact_store.write_index()?;
     write_last_consolidation_marker(memories_root, now)?;

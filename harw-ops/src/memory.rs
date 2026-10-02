@@ -81,6 +81,7 @@ use std::sync::Arc;
 use harw_knowledge::KnowledgeStore;
 use harw_knowledge::memory::topic;
 use harw_macros::operation;
+use harw_memory::consolidation::Deadline;
 use harw_memory::{Fact, FactScope, FactStore, FactType, Memory, slugify};
 use harw_operations::{OpContext, OpError, OpOutput};
 
@@ -385,6 +386,12 @@ fn record_fact(ctx: &OpContext, scope: FactScope, text: &str) -> Result<OpOutput
     let store = FactStore::open(&root, scope).map_err(|error| {
         OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
     })?;
+    // Globale Wurzel: gegen gleichzeitige Konsolidierung/Promotion/Schreiber
+    // sperren (Lock bleibt bis zum Ende dieser Funktion gehalten).
+    let _global_lock = match scope {
+        FactScope::Global => Some(lock_root(&root, Deadline::default_deletion())?),
+        FactScope::Project => None,
+    };
     let base = slugify(trimmed);
     let name = unique_slug(&store, &base, trimmed)?;
     let now = time::OffsetDateTime::now_utc();
@@ -477,24 +484,61 @@ fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
         ));
     };
 
-    let mut deleted_from = Vec::new();
-    if let Ok(root) = project_memories_root(ctx) {
-        if let Ok(store) = FactStore::open(&root, FactScope::Project) {
-            if store.delete(name).map_err(|error| {
-                OpError::Execution(format!("Fakt löschen fehlgeschlagen (Projekt): {error}"))
-            })? {
-                deleted_from.push("Projekt");
-            }
+    forget_with_deadline(
+        project_memories_root(ctx).ok(),
+        global_memories_root(ctx).ok(),
+        name,
+        Deadline::default_deletion(),
+    )
+}
+
+/// Kern von [`forget_fact`] mit Frist: erst prüfen (wo existiert der Fakt?),
+/// dann alle betroffenen Wurzeln sperren, Frist erneut prüfen und erst
+/// danach löschen. Läuft die Frist vorher ab (auch beim Warten auf den
+/// Lock), bleibt alles unverändert und der Fehler nennt den Fristablauf.
+fn forget_with_deadline(
+    project_root: Option<PathBuf>,
+    global_root: Option<PathBuf>,
+    name: &str,
+    deadline: Deadline,
+) -> Result<OpOutput, OpError> {
+    let mut targets: Vec<(&'static str, PathBuf, FactStore)> = Vec::new();
+    for (label, root, scope) in [
+        ("Projekt", project_root, FactScope::Project),
+        ("Global", global_root, FactScope::Global),
+    ] {
+        let Some(root) = root else { continue };
+        let Ok(store) = FactStore::open(&root, scope) else {
+            continue;
+        };
+        let present = store.read(name).map_err(|error| {
+            OpError::Execution(format!("Fakt lesen fehlgeschlagen ({label}): {error}"))
+        })?;
+        if present.is_some() {
+            targets.push((label, root, store));
         }
     }
-    if let Ok(root) = global_memories_root(ctx) {
-        if let Ok(store) = FactStore::open(&root, FactScope::Global) {
+    let mut deleted_from = Vec::new();
+    if !targets.is_empty() {
+        deadline
+            .check("forget-validate")
+            .map_err(|error| OpError::Execution(error.to_string()))?;
+        let mut locks = Vec::new();
+        for (_, root, _) in &targets {
+            locks.push(lock_root(root, deadline)?);
+        }
+        // Commit-Punkt: ab hier wird vollständig gelöscht.
+        deadline
+            .check("forget-commit")
+            .map_err(|error| OpError::Execution(error.to_string()))?;
+        for (label, _, store) in &targets {
             if store.delete(name).map_err(|error| {
-                OpError::Execution(format!("Fakt löschen fehlgeschlagen (Global): {error}"))
+                OpError::Execution(format!("Fakt löschen fehlgeschlagen ({label}): {error}"))
             })? {
-                deleted_from.push("Global");
+                deleted_from.push(*label);
             }
         }
+        drop(locks);
     }
 
     if deleted_from.is_empty() {
@@ -516,10 +560,84 @@ const PROMOTE_FLAGS: &[FlagSpec] = &[
     FlagSpec::switch("project"),
     FlagSpec::switch("global"),
     FlagSpec::value("slug"),
+    FlagSpec::switch("to-global"),
 ];
 
 /// Grammatik von `/memory promote`.
-const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--slug <slug>]";
+const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--slug <slug>] | /memory promote --to-global <fact-id>";
+
+/// Nimmt den Konsolidierungs-Lock an `root` (wartet bis `deadline`).
+///
+/// # Errors
+/// [`OpError::Execution`], wenn der Lock bis zum Fristablauf belegt bleibt
+/// oder nicht angelegt werden kann.
+fn lock_root(
+    root: &Path,
+    deadline: Deadline,
+) -> Result<harw_memory::consolidation::ConsolidationLock, OpError> {
+    harw_memory::consolidation::ConsolidationLock::acquire_until(root, deadline).map_err(|error| {
+        OpError::Execution(format!(
+            "Gedächtnis-Wurzel gesperrt (Konsolidierung/Schreiber läuft): {error}"
+        ))
+    })
+}
+
+/// `/memory promote --to-global <fact-id>` — kopiert einen Projekt-Fakt in
+/// den globalen Scope (Herkunft `promoted_from:`), siehe
+/// [`harw_memory::promote::promote_fact_to_global`]. Absolute Pfade,
+/// repo-spezifische Verweise und Geheimnisse werden abgelehnt. Nicht zu
+/// verwechseln mit `/memory promote <fact-id>` (Palace-Thema).
+///
+/// # Errors
+/// [`OpError::InvalidArguments`] bei Grammatik/unbekanntem/abgelehntem Fakt;
+/// [`OpError::NotAvailable`] ohne gebundenen Root-Space;
+/// [`OpError::Execution`] bei Frist-/Lock-/I/O-Fehlern.
+fn promote_to_global(ctx: &OpContext, args: &KnowledgeArgs) -> Result<OpOutput, OpError> {
+    use harw_memory::promote::{GlobalPromotionError, promote_fact_to_global};
+    if args.switch("project") || args.switch("global") || args.value("slug").is_some() {
+        return Err(OpError::InvalidArguments(
+            "--to-global ist nicht mit --project/--global/--slug kombinierbar".to_owned(),
+        ));
+    }
+    let [fact_id] = args.positionals() else {
+        return Err(OpError::InvalidArguments(PROMOTE_USAGE.to_owned()));
+    };
+    let project_root = project_memories_root(ctx)?;
+    let global_root = global_memories_root(ctx)?;
+    let label = project_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map_or_else(|| "project".to_owned(), |n| n.to_string_lossy().into_owned());
+    let store = FactStore::open(&project_root, FactScope::Project).map_err(|error| {
+        OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
+    })?;
+    let done = promote_fact_to_global(
+        &store,
+        &global_root,
+        fact_id,
+        &label,
+        time::OffsetDateTime::now_utc(),
+        Deadline::default_deletion(),
+    )
+    .map_err(|error| match error {
+        GlobalPromotionError::NotFound { .. } | GlobalPromotionError::Rejected { .. } => {
+            OpError::InvalidArguments(format!("/memory promote --to-global: {error}"))
+        }
+        other => OpError::Execution(format!("/memory promote --to-global: {other}")),
+    })?;
+    let note = if done.already_present {
+        "bereits vorhanden"
+    } else {
+        "kopiert"
+    };
+    Ok(OpOutput::from(format!(
+        "Fakt '{}' → global/{} ({note}, Herkunft {}).",
+        fact_id,
+        done.fact.name,
+        done.fact.sources.join(", ")
+    )))
+}
 
 /// `/memory promote <fact-id> [--project|--global] [--slug <slug>]`.
 ///
@@ -537,6 +655,9 @@ const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--s
 /// - [`OpError::Execution`] — Lese-/Schreibfehler.
 fn promote_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let args = KnowledgeArgs::parse(tail, PROMOTE_FLAGS)?;
+    if args.switch("to-global") {
+        return promote_to_global(ctx, &args);
+    }
     let [fact_id] = args.positionals() else {
         return Err(OpError::InvalidArguments(PROMOTE_USAGE.to_owned()));
     };
@@ -1323,6 +1444,93 @@ mod tests {
                 .text
                 .contains("0 Fakt(en) seit letzter Baseline geändert")
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod forget_deadline_tests {
+    use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use std::time::Duration;
+
+    fn store_with(dir: &Path, scope: FactScope) -> TestResult<FactStore> {
+        let store = FactStore::open(dir, scope).map_err(ctx("open"))?;
+        let now = time::OffsetDateTime::now_utc();
+        store
+            .write(&Fact {
+                name: "kurz".to_owned(),
+                description: "d".to_owned(),
+                fact_type: FactType::Fact,
+                scope,
+                created: now,
+                updated: now,
+                confidence: 1.0,
+                sources: Vec::new(),
+                tags: Vec::new(),
+                body: "x".to_owned(),
+            })
+            .map_err(ctx("write"))?;
+        Ok(store)
+    }
+
+    #[test]
+    fn expired_deadline_leaves_both_scopes_unchanged() -> TestResult {
+        let p = tempfile::tempdir().map_err(ctx("p"))?;
+        let g = tempfile::tempdir().map_err(ctx("g"))?;
+        let ps = store_with(p.path(), FactScope::Project)?;
+        let gs = store_with(g.path(), FactScope::Global)?;
+        let res = forget_with_deadline(
+            Some(p.path().to_path_buf()),
+            Some(g.path().to_path_buf()),
+            "kurz",
+            Deadline::after(Duration::ZERO),
+        );
+        match res {
+            Err(OpError::Execution(msg)) if msg.contains("Frist") => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert!(ps.read("kurz").map_err(ctx("r1"))?.is_some());
+        assert!(gs.read("kurz").map_err(ctx("r2"))?.is_some());
+        assert!(!p.path().join("consolidation.lock").exists());
+        assert!(!g.path().join("consolidation.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn success_path_deletes_in_both_scopes_and_releases_locks() -> TestResult {
+        let p = tempfile::tempdir().map_err(ctx("p"))?;
+        let g = tempfile::tempdir().map_err(ctx("g"))?;
+        let ps = store_with(p.path(), FactScope::Project)?;
+        let gs = store_with(g.path(), FactScope::Global)?;
+        forget_with_deadline(
+            Some(p.path().to_path_buf()),
+            Some(g.path().to_path_buf()),
+            "kurz",
+            Deadline::default_deletion(),
+        )
+        .map_err(ctx("forget"))?;
+        assert!(ps.read("kurz").map_err(ctx("r1"))?.is_none());
+        assert!(gs.read("kurz").map_err(ctx("r2"))?.is_none());
+        assert!(!g.path().join("consolidation.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn held_lock_until_deadline_aborts_without_deleting() -> TestResult {
+        let g = tempfile::tempdir().map_err(ctx("g"))?;
+        let gs = store_with(g.path(), FactScope::Global)?;
+        let held = harw_memory::consolidation::ConsolidationLock::try_acquire(g.path())
+            .map_err(ctx("hold"))?;
+        let res = forget_with_deadline(
+            None,
+            Some(g.path().to_path_buf()),
+            "kurz",
+            Deadline::after(Duration::from_millis(60)),
+        );
+        assert!(matches!(res, Err(OpError::Execution(_))));
+        assert!(gs.read("kurz").map_err(ctx("r"))?.is_some());
+        drop(held);
         Ok(())
     }
 }
