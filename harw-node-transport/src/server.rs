@@ -293,8 +293,13 @@ where
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(inner.options.header_read_timeout);
+    // `with_upgrades` lets a handler take over the authenticated stream (a
+    // WebSocket session, PL-68 W02). The `AuthenticatedPeer` extension is
+    // already on the upgrade request; nothing else about the connection
+    // changes, and the upgraded stream still ends with this connection.
     builder
         .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades()
         .await?;
     Ok(())
 }

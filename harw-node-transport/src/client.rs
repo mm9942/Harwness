@@ -132,8 +132,10 @@ impl NodeTransportClient {
 
         let (sender, connection) =
             hyper::client::conn::http1::handshake::<_, NodeBody>(TokioIo::new(stream)).await?;
+        // `with_upgrades` lets the caller turn a 101 response into a raw
+        // stream with `hyper::upgrade::on` (PL-68 W02).
         let connection = tokio::spawn(async move {
-            if let Err(err) = connection.await {
+            if let Err(err) = connection.with_upgrades().await {
                 tracing::debug!(error = %err, "node transport client connection ended");
             }
         });
