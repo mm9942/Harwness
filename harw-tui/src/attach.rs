@@ -557,7 +557,7 @@ pub async fn attach_loop(
 
 /// What woke the pump.
 enum Event {
-    Frame(Result<Option<FrameEnvelope>, PortError>),
+    Frame(Box<Result<Option<FrameEnvelope>, PortError>>),
     Line(Option<String>),
 }
 
@@ -570,27 +570,29 @@ async fn pump(
     let mut reattaches = 0_u32;
     loop {
         let event = tokio::select! {
-            frame = frames.next() => Event::Frame(frame),
+            frame = frames.next() => Event::Frame(Box::new(frame)),
             line = input.recv() => Event::Line(line),
         };
         match event {
-            Event::Frame(Ok(Some(env))) => match view.on_frame(&env)? {
-                Flow::Continue => reattaches = 0,
-                Flow::Reattach(from) => {
-                    reattaches += 1;
-                    if reattaches > MAX_REATTACH {
-                        return Err(AttachError::Port(
-                            "too many consecutive re-attaches".to_owned(),
-                        ));
+            Event::Frame(frame) => match *frame {
+                Ok(Some(env)) => match view.on_frame(&env)? {
+                    Flow::Continue => reattaches = 0,
+                    Flow::Reattach(from) => {
+                        reattaches += 1;
+                        if reattaches > MAX_REATTACH {
+                            return Err(AttachError::Port(
+                                "too many consecutive re-attaches".to_owned(),
+                            ));
+                        }
+                        let session = view.session.clone();
+                        let (head, new_frames) = reattach(&view.port, &session, from).await?;
+                        view.head = head;
+                        frames = new_frames;
                     }
-                    let session = view.session.clone();
-                    let (head, new_frames) = reattach(&view.port, &session, from).await?;
-                    view.head = head;
-                    frames = new_frames;
-                }
+                },
+                Ok(None) => return Err(AttachError::StreamEnded),
+                Err(error) => return Err(error.into()),
             },
-            Event::Frame(Ok(None)) => return Err(AttachError::StreamEnded),
-            Event::Frame(Err(error)) => return Err(error.into()),
             Event::Line(None) => return Ok(()),
             Event::Line(Some(line)) => {
                 if view.on_input(&line).await? {
