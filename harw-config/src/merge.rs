@@ -1255,6 +1255,73 @@ fn merge_tools_doc(
     }
 }
 
+// `[session_listener]` — alle sechs Felder `GlobalOnly` und
+// sicherheitskritisch: nur die Baseline (Home) setzt sie.
+fn merge_session_listener(
+    trusted: &mut HarnessConfig,
+    incoming: crate::session_listener_toml::SessionListenerSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["session_listener", field]);
+    global_only(
+        &mut trusted.session_listener.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "session_listener.enabled",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.listen,
+        incoming.listen,
+        present("listen"),
+        role,
+        "session_listener.listen",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.allow_non_loopback,
+        incoming.allow_non_loopback,
+        present("allow_non_loopback"),
+        role,
+        "session_listener.allow_non_loopback",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.node_id,
+        incoming.node_id,
+        present("node_id"),
+        role,
+        "session_listener.node_id",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.tier,
+        incoming.tier,
+        present("tier"),
+        role,
+        "session_listener.tier",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.approval_device,
+        incoming.approval_device,
+        present("approval_device"),
+        role,
+        "session_listener.approval_device",
+        layer_path,
+        out,
+    );
+}
+
 // `[tools.container]` — alle vier Felder `GlobalOnly` und sicherheitskritisch:
 // Home/Profil (Baseline) setzen sie, ein Projekt kann sie nie ändern.
 fn merge_tools_container(
@@ -2288,6 +2355,14 @@ pub(crate) fn merge_layer_into(
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
     merge_memory(trusted, incoming.memory, raw, role, layer_path);
+    merge_session_listener(
+        trusted,
+        incoming.session_listener.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_retention(trusted, incoming.retention, raw, role, layer_path, &mut out);
     merge_permissions(
         trusted,
@@ -2660,6 +2735,45 @@ mod tests {
                 "{role:?}"
             );
             assert_eq!(trusted.tools.container.images.len(), 1, "{role:?}");
+        }
+        Ok(())
+    }
+
+    // [session_listener]: nur die Baseline (Home) setzt; Profil und Projekt
+    // können weder aktivieren noch Adresse, Identität oder Tier ändern.
+    #[test]
+    fn test_session_listener_is_global_only() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.session_listener.enabled);
+        let home = "[session_listener]\nenabled = true\nnode_id = \"gw\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(trusted.session_listener.enabled);
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack =
+                "[session_listener]\nlisten = \"0.0.0.0:1\"\ntier = \"owner\"\nnode_id = \"evil\"";
+            merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(
+                trusted.session_listener.listen, "127.0.0.1:7443",
+                "{role:?}"
+            );
+            assert_eq!(trusted.session_listener.tier, "observer", "{role:?}");
+            assert_eq!(
+                trusted.session_listener.node_id.as_deref(),
+                Some("gw"),
+                "{role:?}"
+            );
         }
         Ok(())
     }

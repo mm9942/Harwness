@@ -67,6 +67,7 @@ mod runtime_web;
 mod sandbox_cmd;
 mod secret_store;
 mod session_cmd;
+mod session_listener;
 mod session_serve;
 mod session_serve_remote;
 mod settings;

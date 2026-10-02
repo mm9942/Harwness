@@ -8,6 +8,7 @@ use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
+use crate::session_listener_toml::SessionListenerSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Globale Harness-Konfiguration aus `.harw/config.toml`.
@@ -77,6 +78,10 @@ pub struct HarnessConfig {
     /// Obergrenzen und Fristen der Wartungsjobs. Siehe `memory_toml.rs`.
     #[serde(default)]
     pub memory: MemorySection,
+    /// `[session_listener]` — Remote-Sitzungs-Ingress von `harw gateway`
+    /// (nur global). Siehe `session_listener_toml.rs`.
+    #[serde(default)]
+    pub session_listener: SessionListenerSection,
     /// `[retention]` — Aufbewahrungsgrenzen je Datenklasse (Logs, Caches,
     /// Spools); sicherheitsrelevante Klassen sind opt-in. Siehe
     /// `retention_toml.rs`.

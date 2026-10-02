@@ -93,6 +93,8 @@ fn test_field_table_exhaustive_harness_config() {
         memory: _,
         // `[retention]`, eigener Abschnittstest unten.
         retention: _,
+        // `[session_listener]`, eigener Abschnittstest unten.
+        session_listener: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -319,6 +321,37 @@ fn test_field_table_exhaustive_tools_section() {
 }
 
 // [tools.doc] (Abschnitt 1.8a, 1 Feld)
+// [session_listener] (6 Felder, alle global-only)
+#[test]
+fn test_field_table_exhaustive_session_listener_section() {
+    let harw_config::SessionListenerSection {
+        enabled,
+        listen,
+        allow_non_loopback,
+        node_id,
+        tier,
+        approval_device,
+    } = harw_config::SessionListenerSection::default();
+    let _ = (
+        enabled,
+        listen,
+        allow_non_loopback,
+        node_id,
+        tier,
+        approval_device,
+    );
+    for field in [
+        "enabled",
+        "listen",
+        "allow_non_loopback",
+        "node_id",
+        "tier",
+        "approval_device",
+    ] {
+        assert_path_in_field_table_exactly_once(&format!("session_listener.{field}"));
+    }
+}
+
 // [tools.container] (4 Felder, alle global-only)
 #[test]
 fn test_field_table_exhaustive_container_section() {

@@ -31,17 +31,16 @@
 //! actor is a placeholder nobody carries and a tool needing approval parks
 //! forever (fail closed): a remote tier or key never grants approval by itself.
 //!
-//! # Not wired yet
-//! No `harw gateway` flag and no `harw-config` section call this: the node
-//! signer (AuthHub adapter for the node-identity key, `AuthHubSign` for
-//! `AuthHubClient`) and the pinned-peer store are key-management decisions that
-//! are not made. This module takes them as parameters so the whole chain is
-//! tested over a real loopback socket without inventing a key file format.
+//! # Wiring
+//! `harw gateway` starts this from `[session_listener]` (global-only, default
+//! off) via `crate::session_listener::start_from_config`: the node signer is
+//! the AuthHub key `harw.node-identity/<node_id>`, trust comes from
+//! `node-peers.conf`, authorisation from `node-devices.conf`. This module
+//! itself takes the node, verifier and listener as parameters so the chain is
+//! tested over a real loopback socket with in-process keys.
 //!
 //! # Jobs rule
 //! Everything on the serve path is async on the caller's runtime.
-
-#![allow(dead_code)] // composition entry; no flag/config calls it yet (see "Not wired yet")
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -120,6 +119,11 @@ pub struct RemoteIngress {
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
     addr: SocketAddr,
+    // Programmatic revocation (live connections close at once). Operators
+    // revoke by marking the record `revoked` in `node-devices.conf`, which
+    // refuses the device's next handshake; no live-revoke control surface is
+    // wired to the gateway yet.
+    #[allow(dead_code)]
     revoker: HostRevoker,
 }
 
@@ -143,6 +147,7 @@ impl RemoteIngress {
     ///
     /// # Errors
     /// The registry could not be updated (authority is cut regardless).
+    #[allow(dead_code)]
     pub fn revoke_device(&self, device: &DeviceId) -> Result<usize, String> {
         self.revoker
             .revoke_device(device)
@@ -253,6 +258,7 @@ mod tests {
     use harw_node_listener::{DeviceRecord, DeviceRegistry};
     use harw_node_transport::{
         ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner, PinnedPeers, SignFuture,
+        TranscriptWrappedSigner, TranscriptWrappedVerifier,
     };
     use harw_protocol::SessionPort;
     use harw_session_host::driver::{
@@ -421,6 +427,83 @@ mod tests {
             dial(ingress.addr(), &gateway, &phone).await.is_err(),
             "a revoked device must not connect again"
         );
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    /// A node whose key signs wrapped transcripts (what `AuthHubNodeSigner`
+    /// produces in production).
+    fn wrapped_node(name: &str, seed: u8) -> TestResult<TestNode> {
+        let key = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[seed; 32]).map_err(|_| "seed")?;
+        let id = NodeId::try_from_str(name)?;
+        let identity = NodeIdentity {
+            node_id: id.clone(),
+            public_key: key.public_key().as_ref().to_vec(),
+            key_ref: format!("test-only/{name}"),
+        };
+        let local = LocalNode::new(
+            identity.clone(),
+            Arc::new(TranscriptWrappedSigner::new(SeedSigner(key))),
+        );
+        Ok(TestNode {
+            id,
+            identity,
+            local,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_fleet_connects_and_a_plain_peer_is_refused() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        let gateway = wrapped_node("gateway", 1)?;
+        let phone = wrapped_node("phone", 2)?;
+        let plain = node("plain", 3)?;
+        let remote_dir = config.remote_dir();
+        std::fs::create_dir_all(&remote_dir)?;
+        let registry = DeviceRegistry::new(&remote_dir);
+        for (peer, device) in [(&phone, "dev-1"), (&plain, "dev-2")] {
+            registry.enroll(&DeviceRecord {
+                node_id: peer.id.clone(),
+                device: DeviceId::try_from_str(device)?,
+                tenant: TenantId::try_from_str("tenant-a")?,
+                tier: PermissionTier::Operator,
+                revoked: false,
+                label: device.to_owned(),
+                approve_optin: false,
+            })?;
+        }
+        // The server pins both and verifies wrapped transcripts (fleet-wide).
+        let mut peers = PinnedPeers::new();
+        peers.pin_identity(&phone.identity)?;
+        peers.pin_identity(&plain.identity)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local.clone(),
+            Arc::new(TranscriptWrappedVerifier::new(peers)),
+            listener,
+        )
+        .await?;
+        let client_verifier = TranscriptWrappedVerifier::new(pinned(&gateway.identity)?);
+        let connect = |peer: &TestNode| {
+            let endpoint = NodeEndpoint {
+                addr: ingress.addr(),
+                expected_node: gateway.id.clone(),
+            };
+            let local = peer.local.clone();
+            let verifier = client_verifier.clone();
+            async move {
+                connect_node(endpoint, &local, &verifier, ConnectOptions::new("t"))
+                    .await
+                    .map(RemotePort::new)
+            }
+        };
+        assert!(connect(&phone).await?.list().await?.is_empty());
+        // A key that signs the raw (unwrapped) transcript is refused in a
+        // wrapped fleet, although it is pinned and enrolled.
+        assert!(connect(&plain).await.is_err());
         ingress.shutdown().await;
         Ok(())
     }

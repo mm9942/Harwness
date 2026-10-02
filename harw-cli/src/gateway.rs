@@ -480,11 +480,36 @@ pub fn run(
                 socket,
                 std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
             ),
-            session_model,
+            Arc::clone(&session_model),
+        )
+    });
+
+    // Remote (own-cloud) session ingress: `[session_listener]` is global-only
+    // and default off; when enabled, a start failure ends the gateway.
+    let remote_serve = config.harness.session_listener.enabled.then(|| {
+        (
+            roots.profile.join("session-host"),
+            Arc::clone(&session_model),
         )
     });
 
     let result = runtime.block_on(async {
+        let remote = match remote_serve {
+            Some((state_dir, model)) => {
+                let ingress = crate::session_listener::start_from_config(
+                    &config.harness.session_listener,
+                    config.infrastructure.as_ref(),
+                    &state_dir,
+                    &home,
+                    &cwd,
+                    model,
+                )
+                .await?;
+                eprintln!("  session listener: {}", ingress.addr());
+                Some(ingress)
+            }
+            None => None,
+        };
         let ingress = match session_serve {
             Some((config, model)) => {
                 let ingress = crate::session_serve::start(&config, model).await?;
@@ -507,6 +532,9 @@ pub fn run(
         // session host (and remove its socket) before the runtime ends.
         if let Some(ingress) = ingress {
             ingress.shutdown().await;
+        }
+        if let Some(remote) = remote {
+            remote.shutdown().await;
         }
         result
     });

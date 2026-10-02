@@ -186,7 +186,6 @@ impl GatewayCoreFactory {
     /// Binds the sessions' approval actor to `actor` instead of the local
     /// owner (remote ingress, see `crate::session_serve_remote`).
     #[must_use]
-    #[allow(dead_code)] // used by the remote ingress composition (not wired yet)
     pub fn with_actor(mut self, actor: ApprovalActor) -> Self {
         self.actor = Some(actor);
         self
