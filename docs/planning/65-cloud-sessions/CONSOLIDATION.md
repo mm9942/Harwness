@@ -123,3 +123,8 @@ Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assemb
 
 ## Lernschleife: Feedback-Signal (X2)
 `FeedbackTracker` (harw-memory) verbucht delivered/used/corrected je Fakt; Provider meldet Lieferungen, `MemoryCaptureObserver` Nachrichten; Decay demotet nutzlose (>=5 geliefert, 0 genutzt) und schädliche Fakten. clippy, Tests (core/runtime/memory), `xtask gates` grün.
+
+## Lernschleife: X7 Gate, X8 Präzisionsbericht
+- X7: `harw-memory::learning_gate` (Injection-Screen verwirft, Größenlimit, Schwärzung, projektlokal = auto, sonst Vorschlag) läuft vor `plan_consolidation` in `run_consolidation`.
+- X8: `feedback::report` + `harw doctor` Zeile `check memory.precision` (WARN bei oft gelieferten, nie genutzten Fakten).
+- OFFEN (bewusst nicht gebaut): X1 `context_sources!`-Makro, X3 Zusammenlegen der zwei Assembly-Pfade, X5 `OutcomeTracker`/Contradiction-Index (anderes Modell `EpistemicSignal`, kein Mapping auf Fakten), X6 `learning_extract`-Job mit LLM-Extraktion (braucht Provider im Worker), X9 `security_signals`.

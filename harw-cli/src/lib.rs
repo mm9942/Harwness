@@ -3191,7 +3191,35 @@ fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
         println!("check {id}: {label} — {message}");
     }
     print_retention_checks(&config.harness.retention);
+    print_memory_precision_check(home);
     any_failed
+}
+
+/// Druckt die Präzision der globalen Gedächtnis-Fakten (geliefert/genutzt/
+/// korrigiert); schweigt, wenn es keinen Speicher oder keine Lieferung gibt.
+fn print_memory_precision_check(home: &Path) {
+    let Ok(profile) =
+        harw_home::paths::profile_dir(home, &harw_home::paths::active_profile_name(home))
+    else {
+        return;
+    };
+    let dir = profile.join("memories");
+    if !dir.is_dir() {
+        return;
+    }
+    let Ok(store) = harw_memory::FactStore::open(&dir, harw_memory::FactScope::Global) else {
+        return;
+    };
+    let report = harw_memory::feedback::report(&store);
+    if report.delivered == 0 {
+        return;
+    }
+    let label = if report.useless.is_empty() {
+        "PASS"
+    } else {
+        "WARN"
+    };
+    println!("check memory.precision: {label} — {}", report.summary());
 }
 
 /// Druckt die Aufbewahrungs-Checks: eine `WARN`-Zeile je Klasse, die Daten

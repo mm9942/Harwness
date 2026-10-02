@@ -214,6 +214,70 @@ impl FeedbackTracker {
     }
 }
 
+/// Präzisionsbericht über die Rückmeldung eines Fakten-Speichers
+/// (`harw doctor`, `/memory stats`). Nur Zähler und Namen, kein Inhalt.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FeedbackReport {
+    /// Fakten mit mindestens einer Lieferung.
+    pub facts: usize,
+    /// Summe der Lieferungen.
+    pub delivered: u64,
+    /// Summe der genutzten Lieferungen.
+    pub used: u64,
+    /// Summe der Korrekturen.
+    pub corrected: u64,
+    /// Fakten, die oft geliefert und nie genutzt wurden (Kandidaten für Verfall).
+    pub useless: Vec<String>,
+}
+
+impl FeedbackReport {
+    /// Gesamtpräzision `used / delivered` (`None` ohne Lieferung).
+    #[must_use]
+    pub fn precision(&self) -> Option<f64> {
+        crate::facts::Feedback {
+            delivered: self.delivered,
+            used: self.used,
+            corrected: self.corrected,
+        }
+        .precision()
+    }
+
+    /// Einzeilige Zusammenfassung für Doctor und `/memory stats`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let precision = self
+            .precision()
+            .map_or_else(|| "n/a".to_owned(), |p| format!("{:.0}%", p * 100.0));
+        format!(
+            "{} Fakten geliefert, Präzision {precision} (genutzt {}/{}), {} Korrekturen, {} ungenutzt",
+            self.facts,
+            self.used,
+            self.delivered,
+            self.corrected,
+            self.useless.len()
+        )
+    }
+}
+
+/// Baut den Präzisionsbericht eines Fakten-Speichers.
+#[must_use]
+pub fn report(store: &FactStore) -> FeedbackReport {
+    let mut report = FeedbackReport::default();
+    for (name, feedback) in store.feedback_all() {
+        if feedback.delivered == 0 {
+            continue;
+        }
+        report.facts += 1;
+        report.delivered += feedback.delivered;
+        report.used += feedback.used;
+        report.corrected += feedback.corrected;
+        if feedback.delivered >= crate::facts::FEEDBACK_MIN_DELIVERIES && feedback.used == 0 {
+            report.useless.push(name);
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +385,22 @@ mod tests {
             Some(1)
         );
         tracker.forget_session("s1");
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn the_report_sums_feedback_and_lists_useless_facts() -> TestResult {
+        let (store, root) = store_with("report", "prefer-nextest")?;
+        for _ in 0..crate::facts::FEEDBACK_MIN_DELIVERIES {
+            store
+                .record_usage(&["prefer-nextest"])
+                .map_err(ctx("usage"))?;
+        }
+        let report = report(&store);
+        assert_eq!((report.facts, report.useless.len()), (1, 1));
+        assert_eq!(report.precision(), Some(0.0));
+        assert!(report.summary().contains("0%"));
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
