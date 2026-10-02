@@ -30,7 +30,7 @@ State is on the integration branch `consolidate/main` plus this branch
 | W06 | self-cloud composition | done | `harw-node-listener` (registry, mapper, revocation); `harw-session-com::remote` composes it behind Tower |
 | W07 | approvals, concurrent controllers across the real transport | done for local ingress and the tenant boundary: two clients race, exactly one wins, the loser learns the winner, the actor is the transport's identity, an observer cannot answer; a remote device of another tenant cannot reach a local session | `harw-session-com/tests/approvals_and_tenants.rs` |
 | W08 | backpressure, reconnect | server bounded; reconnect-with-resubmit and drain covered through the Com layer; slow-consumer and cursor replay across a reconnect not yet | `harw-session-com/tests/client_through_com.rs` |
-| W09 | `harw attach` | open | |
+| W09 | `harw attach` | done on `consolidate/main` (`ws/s09-attach`: `harw-tui/src/attach.rs`, `harw-cli/src/attach_cmd.rs`) | |
 | W10 | dependency and security gates | arch gate green with all crates; `cargo deny` not run here | |
 | W11 | operator workbench | open | |
 
@@ -123,8 +123,8 @@ mechanical follow-up for its owner, because its tests call
    the transcript store, the approval backend, the driver, the `ComServer`,
    `serve_unix` and (optionally) the node-transport server with a
    `DeviceRegistry` from config. Shared file: scribe wave.
-3. **`harw attach`** (W09) over `harw-session-remote`, with an end-to-end
-   reconnect test through the Com layer (W08).
+3. ~~`harw attach`~~ exists (S09). Left: an end-to-end reconnect test through
+   the Com layer with cursor replay (W08).
 4. **Tests across the real transport**: concurrent approvals (W07), slow
    consumer and drain (W08), cross-tenant session id (W06).
 5. **Gates** (W10): `cargo deny` entry for the direct `tower` and
