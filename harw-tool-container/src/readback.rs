@@ -6,6 +6,12 @@
 //! tool layer inspects the container, converts the JSON into
 //! [`InspectFacts`], and [`verify`] answers per dimension. A fact the engine
 //! did not report is [`Enforcement::Unverifiable`], never `Enforced`.
+//!
+//! Field names were checked against `podman inspect` of a running container
+//! (Podman 4.9.3): `HostConfig.{NetworkMode, ReadonlyRootfs, CapAdd, CapDrop,
+//! SecurityOpt, Memory, MemorySwap, PidsLimit, Privileged}`, top-level
+//! `EffectiveCaps`/`BoundingCaps`, `Mounts[].{Destination, RW}`, and
+//! `Config.Labels`. Docker's inspect output is not covered.
 
 use crate::plan::Expected;
 
@@ -23,7 +29,7 @@ pub enum Dimension {
     Capabilities,
     /// `no-new-privileges`.
     NoNewPrivileges,
-    /// Memory limit at or below the profile ceiling.
+    /// Memory and memory-plus-swap at or below the profile ceiling.
     Memory,
     /// Process limit at or below the profile ceiling.
     Pids,
@@ -49,8 +55,15 @@ pub struct InspectFacts {
     pub privileged: Option<bool>,
     /// Added capabilities.
     pub cap_add: Option<Vec<String>>,
-    /// Dropped capabilities.
+    /// Dropped capabilities as the engine lists them. Podman expands
+    /// `--cap-drop=all` into the explicit default set, so this alone is not
+    /// proof; prefer [`Self::effective_caps`].
     pub cap_drop: Option<Vec<String>>,
+    /// Capabilities the container's init process actually has (Podman:
+    /// inspect `EffectiveCaps`). `Some(empty)` means none. Podman 4.9.3
+    /// renders an empty set as JSON `null`, so the parse layer must map a
+    /// *present* `null` to `Some(empty)` and an *absent* key to `None`.
+    pub effective_caps: Option<Vec<String>>,
     /// Network mode.
     pub network_mode: Option<String>,
     /// Read-only root filesystem.
@@ -59,6 +72,9 @@ pub struct InspectFacts {
     pub security_opt: Option<Vec<String>>,
     /// Memory limit in bytes (`0` = unlimited).
     pub memory_bytes: Option<i64>,
+    /// Memory plus swap limit in bytes. Podman defaults it to twice the
+    /// memory limit, so a plain `--memory` doubles the real ceiling.
+    pub memory_swap_bytes: Option<i64>,
     /// Process limit (`0` or `-1` = unlimited).
     pub pids_limit: Option<i64>,
     /// Whether the workspace mount is read-only.
@@ -136,15 +152,29 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
         Some(_) => Enforcement::NotEnforced,
         None => Enforcement::Unverifiable,
     };
-    let capabilities = match &facts.cap_drop {
-        Some(drop) if drop.iter().any(|c| c.eq_ignore_ascii_case("all")) => Enforcement::Enforced,
-        Some(_) => Enforcement::NotEnforced,
-        None => Enforcement::Unverifiable,
+    // The effective set is the proof. A literal ALL in the drop list (Docker
+    // style) counts only when the engine did not report the effective set.
+    let capabilities = match (&facts.effective_caps, &facts.cap_drop) {
+        (Some(caps), _) if caps.is_empty() => Enforcement::Enforced,
+        (Some(_), _) => Enforcement::NotEnforced,
+        (None, Some(drop)) if drop.iter().any(|c| c.eq_ignore_ascii_case("all")) => {
+            Enforcement::Enforced
+        }
+        (None, Some(_)) => Enforcement::NotEnforced,
+        (None, None) => Enforcement::Unverifiable,
     };
     let no_new_privileges = match &facts.security_opt {
         Some(opts) if opts.iter().any(|o| is_no_new_privileges(o)) => Enforcement::Enforced,
         Some(_) => Enforcement::NotEnforced,
         None => Enforcement::Unverifiable,
+    };
+    let memory = match (
+        limit(facts.memory_bytes, expected.memory_bytes),
+        limit(facts.memory_swap_bytes, expected.memory_bytes),
+    ) {
+        (Enforcement::Enforced, Enforcement::Enforced) => Enforcement::Enforced,
+        (Enforcement::NotEnforced, _) | (_, Enforcement::NotEnforced) => Enforcement::NotEnforced,
+        _ => Enforcement::Unverifiable,
     };
     let workspace = match facts.workspace_read_only {
         Some(ro) if ro == expected.workspace_read_only => Enforcement::Enforced,
@@ -158,10 +188,7 @@ pub fn verify(expected: &Expected, facts: &InspectFacts) -> Readback {
             (Dimension::RootFs, tri(facts.read_only_rootfs)),
             (Dimension::Capabilities, capabilities),
             (Dimension::NoNewPrivileges, no_new_privileges),
-            (
-                Dimension::Memory,
-                limit(facts.memory_bytes, expected.memory_bytes),
-            ),
+            (Dimension::Memory, memory),
             (
                 Dimension::Pids,
                 limit(facts.pids_limit, expected.pids_limit),
@@ -197,10 +224,12 @@ mod tests {
             privileged: Some(false),
             cap_add: Some(vec![]),
             cap_drop: Some(vec!["ALL".to_owned()]),
+            effective_caps: Some(vec![]),
             network_mode: Some("none".to_owned()),
             read_only_rootfs: Some(true),
             security_opt: Some(vec!["no-new-privileges".to_owned()]),
             memory_bytes: Some(1024 * 1024 * 1024),
+            memory_swap_bytes: Some(1024 * 1024 * 1024),
             pids_limit: Some(256),
             workspace_read_only: Some(true),
         }
@@ -240,6 +269,7 @@ mod tests {
         f.network_mode = Some("host".to_owned());
         f.read_only_rootfs = Some(false);
         f.cap_drop = Some(vec!["NET_RAW".to_owned()]);
+        f.effective_caps = Some(vec!["CAP_NET_RAW".to_owned()]);
         f.security_opt = Some(vec![]);
         f.memory_bytes = Some(0);
         f.pids_limit = Some(-1);
@@ -279,6 +309,48 @@ mod tests {
             r.get(Dimension::Memory) == Some(Enforcement::NotEnforced)
                 && r.get(Dimension::Pids) == Some(Enforcement::NotEnforced),
             "looser fails",
+        )
+    }
+
+    #[test]
+    fn podman_style_cap_drop_list_is_not_proof_but_empty_effective_caps_is() -> TestResult {
+        // Real Podman 4.9.3 reports `--cap-drop=all` as the default set, not "ALL".
+        let podman_list: Vec<String> = ["CAP_CHOWN", "CAP_KILL", "CAP_SETUID"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut f = good();
+        f.cap_drop = Some(podman_list.clone());
+        f.effective_caps = Some(vec![]);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Capabilities) == Some(Enforcement::Enforced),
+            "empty effective set is the proof",
+        )?;
+        f.effective_caps = None;
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Capabilities)
+                == Some(Enforcement::NotEnforced),
+            "a default-set list without the effective set fails closed",
+        )?;
+        f.cap_drop = Some(vec!["ALL".to_owned()]);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Capabilities) == Some(Enforcement::Enforced),
+            "docker style ALL",
+        )
+    }
+
+    #[test]
+    fn swap_must_not_exceed_the_memory_ceiling() -> TestResult {
+        let mut f = good();
+        f.memory_swap_bytes = Some(2 * 1024 * 1024 * 1024);
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Memory) == Some(Enforcement::NotEnforced),
+            "podman default of twice the memory",
+        )?;
+        f.memory_swap_bytes = None;
+        ensure(
+            verify(&expected(true), &f).get(Dimension::Memory) == Some(Enforcement::Unverifiable),
+            "unknown swap",
         )
     }
 

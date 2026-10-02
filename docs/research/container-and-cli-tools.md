@@ -9,7 +9,7 @@
 > builds on it and says where the two meet.
 >
 > Implementation: step 1 (the pure policy core) exists as `harw-tool-container`
-> (48 tests; `--init` is deliberately not passed, it needs an init binary in
+> (50 tests; `--init` is deliberately not passed, it needs an init binary in
 > every image). Everything below that crate does not cover is still proposal.
 >
 > Evidence rule: every statement about our code cites a file; every statement
@@ -367,12 +367,27 @@ cloud container, 2026-10-02):
   run an image named `echo`. A program word `--privileged` in that slot is
   accepted as a Podman flag (no flag error; the next word became the image).
 
+- A container started from the plan's argv (alpine, digest-pinned, as root
+  without `--userns=keep-id`) really has: network `none` (wget: "Network is
+  unreachable"), read-only rootfs (`touch /x` fails), read-only workspace,
+  writable `/tmp` (tmpfs default), `CapEff` and `CapBnd` zero, `NoNewPrivs` 1.
+  `podman inspect` reports `HostConfig.NetworkMode="none"`,
+  `ReadonlyRootfs=true`, `SecurityOpt=["no-new-privileges"]`, `Memory`,
+  `PidsLimit`, `Privileged=false`, `Mounts[].RW=false`, labels, and
+  `Config.Timeout=300`.
+- Two assumptions were wrong and are fixed in the crate: (1) Podman reports
+  `--cap-drop=all` as the explicit default set (11 `CAP_*` names), not `ALL`;
+  the proof is top-level `EffectiveCaps` (empty is rendered as JSON `null`).
+  (2) `--memory=1024m` alone leaves `MemorySwap` at 2 GiB; the plan now also
+  passes `--memory-swap=1024m` and inspect then reports 1 GiB.
+
 Not verified (needs a runnable rootless setup in a test):
 1. `--mount type=volume,...,ro` semantics, and `--mount` value parsing (it was
    not reached because image lookup failed first).
 2. `--userns=keep-id` as a non-root user (this run was root).
-3. `--format json` output shape per subcommand (`ps`, `images`, `inspect`,
-   `info`) and the field that says "rootless" for each engine.
+3. `--format json` output shape for `ps`, `images`, `info` and the field that
+   says "rootless" (the `inspect` fields used by the read-back are verified
+   for Podman 4.9.3 only, not for Docker).
 4. The default capability set of rootless Podman and of Docker on our target
    distros; this is why the plan always passes `--cap-drop=all`.
 5. `cargo` JSON message flags and `git` hardening flags listed in §8.2.

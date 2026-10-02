@@ -13,7 +13,7 @@
 //! [--connection=NAME] run --rm --pull=never --name=harw-<run> [--cidfile=P]
 //!   --label=harw.owner=<o> --label=harw.run=<r> --label=harw.profile=<p>
 //!   --network=none --read-only --cap-drop=all --security-opt=no-new-privileges
-//!   --pids-limit=<n> --memory=<n>m --userns=keep-id --timeout=<s>
+//!   --pids-limit=<n> --memory=<n>m --memory-swap=<n>m --userns=keep-id --timeout=<s>
 //!   --mount=... [--mount=...]  --workdir=/workspace[/<rel>]  [--env=K=V]
 //!   -- <image@sha256:...> <command...>
 //! ```
@@ -350,6 +350,8 @@ impl ContainerPlan {
         );
         args.push(format!("--pids-limit={}", limits.pids));
         args.push(format!("--memory={}m", limits.memory_mib));
+        // Podman defaults swap to twice the memory limit; equal values mean no swap.
+        args.push(format!("--memory-swap={}m", limits.memory_mib));
         args.push("--userns=keep-id".to_owned());
         args.push(format!("--timeout={timeout_s}"));
         for mount in &mounts {
@@ -526,6 +528,7 @@ mod tests {
             "--security-opt=no-new-privileges",
             "--pids-limit=256",
             "--memory=1024m",
+            "--memory-swap=1024m",
             "--userns=keep-id",
             "--timeout=300",
             "--mount=type=bind,src=/srv/ws,dst=/workspace,ro",
@@ -557,6 +560,10 @@ mod tests {
             "cache",
         )?;
         ensure(a.contains(&"--memory=4096m".to_owned()), "memory")?;
+        ensure(
+            a.contains(&"--memory-swap=4096m".to_owned()),
+            "no swap beyond memory",
+        )?;
         ensure(a.contains(&"--pids-limit=512".to_owned()), "pids")?;
         ensure(a.contains(&"--timeout=1800".to_owned()), "timeout")?;
         ensure(a.contains(&"--network=none".to_owned()), "still no network")
@@ -862,6 +869,8 @@ mod tests {
             read_only_rootfs: Some(true),
             security_opt: Some(vec!["no-new-privileges".to_owned()]),
             memory_bytes: Some(plan.expected().memory_bytes),
+            memory_swap_bytes: Some(plan.expected().memory_bytes),
+            effective_caps: Some(vec![]),
             pids_limit: Some(plan.expected().pids_limit),
             workspace_read_only: Some(true),
         };
