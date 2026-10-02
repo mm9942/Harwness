@@ -522,9 +522,10 @@ fn env_fingerprint(env: &[(String, String)]) -> String {
     argv_sha256_hex(&pairs)
 }
 
-/// The approval text names the program and binds the full command by digest.
-/// The arguments themselves are never shown or persisted: they may carry
-/// credentials, authorization headers or signed URLs.
+/// The approval text binds the full command by digest and shows only its
+/// length. No part of it is shown or persisted, not even the program: the
+/// first word is free text too and may carry a token or a line break that
+/// would forge an approval field.
 fn approval_text(
     config: &RunConfig,
     request: &RunRequest,
@@ -536,14 +537,13 @@ fn approval_text(
     let env_keys: Vec<&str> = request.env.iter().map(|(k, _)| k.as_str()).collect();
     format!(
         "engine=podman\nconnection={}\nimage={}\nprofile={}\nnetwork=none\nmounts={:?}\n\
-         env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\nprogram={}\nargc={}\n\
+         env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\nargc={}\n\
          command_sha256={}\nenv_sha256={}",
         config.connection.as_deref().unwrap_or("local"),
         request.image.to_arg(),
         request.profile,
         mount_list,
         env_keys,
-        request.command.first().map_or("", String::as_str),
         request.command.len(),
         argv_sha256_hex(&request.command),
         env_fingerprint(&request.env),
@@ -958,6 +958,21 @@ mod tests {
     }
 
     #[test]
+    fn a_program_name_cannot_forge_approval_fields() -> TestResult {
+        let req = RunRequest::new(
+            image()?,
+            Profile::Hermetic,
+            cmd(&["x\nnetwork=host\ntoken=s3cr3t"]),
+        )?;
+        let plan = ContainerPlan::build(&config()?, &req)?;
+        ensure(!plan.approval_text().contains("s3cr3t"), "no raw program")?;
+        ensure(
+            plan.approval_text().matches("network=").count() == 1,
+            "no injected field",
+        )
+    }
+
+    #[test]
     fn a_changed_environment_value_invalidates_the_grant_without_showing_it() -> TestResult {
         let with = |value: &str| -> Result<ContainerPlan, ContainerPolicyError> {
             ContainerPlan::build(
@@ -993,7 +1008,10 @@ mod tests {
         let b = make("https://example.test/b")?;
         ensure(!a.approval_text().contains("s3cr3t"), "secret not shown")?;
         ensure(!a.approval_text().contains("example.test"), "no arguments")?;
-        ensure(a.approval_text().contains("program=curl"), "program named")?;
+        ensure(
+            !a.approval_text().contains("curl"),
+            "not even the program is shown",
+        )?;
         ensure(a.approval_text().contains("argc=4"), "argument count")?;
         ensure(
             a.approval_text() != b.approval_text(),
