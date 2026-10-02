@@ -1,10 +1,6 @@
 //! HTTP/1 upgrade over the authenticated node channel (W00 §2.3, W02-01/02,
 //! S02 entry points).
 //!
-//! Skeleton: signatures only; every body answers
-//! [`UpgradeError::NotImplemented`]. S02 implements them in this file plus
-//! `server.rs` / `client.rs` and keeps the public signatures.
-//!
 //! Contract (W00 D4, ID-02):
 //! - the [`AuthenticatedPeer`] is finalized before HTTP is served and is
 //!   injected as a request extension before the upgrade request reaches the
@@ -27,6 +23,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::client::{NodeBody, NodeTransportClient};
+use crate::error::TransportError;
 use crate::handshake::AuthenticatedPeer;
 use crate::server::NodeTransportServer;
 
@@ -37,7 +34,8 @@ pub type UpgradedIo = TokioIo<hyper::upgrade::Upgraded>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum UpgradeError {
-    /// Skeleton stub: not implemented yet (S02).
+    /// Retained from the skeleton so the public enum does not shrink; no
+    /// entry point returns it any more.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
     /// The request carries no [`AuthenticatedPeer`] extension (a service was
@@ -50,6 +48,9 @@ pub enum UpgradeError {
     /// The HTTP/1 upgrade itself failed.
     #[error("http upgrade: {0}")]
     Http(#[from] hyper::Error),
+    /// The underlying node transport failed (listener setup, handshake).
+    #[error("node transport: {0}")]
+    Transport(#[from] TransportError),
 }
 
 /// The server side of one upgraded connection: raw I/O plus the immutable,
@@ -89,24 +90,34 @@ pub struct UpgradedClientIo {
 /// The authenticated peer of `request` (injected by the node transport
 /// server before the service sees the request).
 ///
+/// The value comes only from the request extension the server overwrites for
+/// every request; no header is ever consulted.
+///
 /// # Errors
-/// [`UpgradeError::MissingPeer`] when absent; [`UpgradeError::NotImplemented`]
-/// in the skeleton.
+/// [`UpgradeError::MissingPeer`] when absent.
 pub fn peer_of<B>(request: &Request<B>) -> Result<AuthenticatedPeer, UpgradeError> {
-    let _ = request;
-    Err(UpgradeError::NotImplemented("peer_of (S02)"))
+    request
+        .extensions()
+        .get::<AuthenticatedPeer>()
+        .cloned()
+        .ok_or(UpgradeError::MissingPeer)
 }
 
 /// Complete the HTTP/1 upgrade of `request` and return the raw I/O together
 /// with the identity the server authenticated before serving HTTP. Call it
-/// from the service after answering `101`.
+/// from the service after answering `101` (typically on a spawned task, since
+/// it resolves only once the `101` response has been written).
 ///
 /// # Errors
-/// [`UpgradeError::MissingPeer`], [`UpgradeError::Http`];
-/// [`UpgradeError::NotImplemented`] in the skeleton.
+/// [`UpgradeError::MissingPeer`] (checked first, fail closed),
+/// [`UpgradeError::Http`] when the upgrade does not complete.
 pub async fn accept_upgrade(request: Request<Incoming>) -> Result<UpgradedServerIo, UpgradeError> {
-    let _ = request;
-    Err(UpgradeError::NotImplemented("accept_upgrade (S02)"))
+    let peer = peer_of(&request)?;
+    let upgraded = hyper::upgrade::on(request).await?;
+    Ok(UpgradedServerIo {
+        peer,
+        io: TokioIo::new(upgraded),
+    })
 }
 
 impl NodeTransportServer {
@@ -116,7 +127,7 @@ impl NodeTransportServer {
     /// behaviour is unchanged.
     ///
     /// # Errors
-    /// Listener failures; [`UpgradeError::NotImplemented`] in the skeleton.
+    /// Listener failures ([`UpgradeError::Transport`]).
     pub async fn serve_upgradable<S, B, F>(
         &self,
         listener: TcpListener,
@@ -135,8 +146,7 @@ impl NodeTransportServer {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         F: Future<Output = ()>,
     {
-        let _ = (listener, service, shutdown);
-        Err(UpgradeError::NotImplemented("serve_upgradable (S02)"))
+        Ok(self.serve_loop(listener, service, shutdown, true).await?)
     }
 }
 
@@ -147,16 +157,24 @@ impl NodeTransportClient {
     /// any other peer.
     ///
     /// # Errors
-    /// [`UpgradeError::NotSwitched`], [`UpgradeError::Http`];
-    /// [`UpgradeError::NotImplemented`] in the skeleton.
+    /// [`UpgradeError::NotSwitched`] for any status other than `101`,
+    /// [`UpgradeError::Http`] for HTTP or upgrade failures.
     pub async fn upgrade(
-        self,
+        mut self,
         request: Request<NodeBody>,
     ) -> Result<UpgradedClientIo, UpgradeError> {
-        let _ = request;
-        Err(UpgradeError::NotImplemented(
-            "NodeTransportClient::upgrade (S02)",
-        ))
+        let (peer, mut response) = self.send_for_upgrade(request).await?;
+        if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+            return Err(UpgradeError::NotSwitched(response.status().as_u16()));
+        }
+        // Dropping `self` afterwards aborts the connection task, which has by
+        // then handed the raw I/O over to `upgraded`.
+        let upgraded = hyper::upgrade::on(&mut response).await?;
+        Ok(UpgradedClientIo {
+            peer,
+            response,
+            io: TokioIo::new(upgraded),
+        })
     }
 }
 
@@ -165,11 +183,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skeleton_is_typed_not_implemented() {
+    fn peer_of_without_extension_fails_closed() {
         let request = Request::new(());
-        assert!(matches!(
-            peer_of(&request),
-            Err(UpgradeError::NotImplemented(_))
-        ));
+        assert!(matches!(peer_of(&request), Err(UpgradeError::MissingPeer)));
+    }
+
+    #[test]
+    fn peer_of_ignores_identity_headers() {
+        let mut request = Request::new(());
+        request
+            .headers_mut()
+            .insert("x-node-id", http::HeaderValue::from_static("forged"));
+        assert!(matches!(peer_of(&request), Err(UpgradeError::MissingPeer)));
     }
 }

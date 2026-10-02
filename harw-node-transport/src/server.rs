@@ -151,6 +151,30 @@ impl NodeTransportServer {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         F: Future<Output = ()>,
     {
+        self.serve_loop(listener, service, shutdown, false).await
+    }
+
+    /// Shared accept loop of [`Self::serve_with_shutdown`] and
+    /// `serve_upgradable`; `upgrades` enables HTTP/1 upgrades on connections.
+    pub(crate) async fn serve_loop<S, B, F>(
+        &self,
+        listener: TcpListener,
+        service: S,
+        shutdown: F,
+        upgrades: bool,
+    ) -> Result<(), TransportError>
+    where
+        S: tower_service::Service<Request<Incoming>, Response = Response<B>>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        F: Future<Output = ()>,
+    {
         let mut shutdown = std::pin::pin!(shutdown);
         loop {
             let accepted = tokio::select! {
@@ -177,7 +201,7 @@ impl NodeTransportServer {
             let service = service.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(err) = handle_connection(inner, tcp, service).await {
+                if let Err(err) = handle_connection(inner, tcp, service, upgrades).await {
                     // `remote` is logged for operators only; it is never
                     // used as identity.
                     tracing::debug!(%remote, error = %err, "node transport connection ended");
@@ -274,6 +298,7 @@ async fn handle_connection<S, B>(
     inner: Arc<ServerInner>,
     tcp: TcpStream,
     service: S,
+    upgrades: bool,
 ) -> Result<(), TransportError>
 where
     S: tower_service::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
@@ -293,9 +318,12 @@ where
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(inner.options.header_read_timeout);
-    builder
-        .serve_connection(TokioIo::new(stream), service)
-        .await?;
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    if upgrades {
+        connection.with_upgrades().await?;
+    } else {
+        connection.await?;
+    }
     Ok(())
 }
 
