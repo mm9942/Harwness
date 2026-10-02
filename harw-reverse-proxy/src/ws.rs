@@ -277,8 +277,8 @@ pub struct WsRoute {
 pub enum WsDecision {
     /// Forward the upgrade under these limits.
     Allow {
-        /// The admitted route.
-        route: WsRoute,
+        /// The admitted route (boxed: it is much larger than `Deny`).
+        route: Box<WsRoute>,
         /// Limits to enforce on the connection.
         limits: WsLimits,
     },
@@ -399,7 +399,10 @@ impl WsPolicy {
     #[must_use]
     pub fn decide(&self, req: &WsRequest<'_>) -> WsDecision {
         match self.check(req) {
-            Ok((route, limits)) => WsDecision::Allow { route, limits },
+            Ok((route, limits)) => WsDecision::Allow {
+                route: Box::new(route),
+                limits,
+            },
             Err(reason) => WsDecision::Deny { reason },
         }
     }
@@ -585,7 +588,7 @@ mod tests {
 
     fn allowed(d: WsDecision) -> Result<(WsRoute, WsLimits), TestError> {
         match d {
-            WsDecision::Allow { route, limits } => Ok((route, limits)),
+            WsDecision::Allow { route, limits } => Ok((*route, limits)),
             WsDecision::Deny { reason } => Err(TestError(format!("expected allow, got {reason}"))),
         }
     }
