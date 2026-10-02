@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 harw-protocol = { path = "../harw-protocol" }
+harw-session-client = { path = "../harw-session-client" }
 harw-types = { path = "../harw-types" }
 
 [dev-dependencies]

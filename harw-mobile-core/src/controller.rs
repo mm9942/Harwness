@@ -6,38 +6,21 @@
 //! actions a phone needs: decide an approval, send a prompt, interrupt.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, ClientCaps, Cursor, DEFAULT_TAIL_ITEMS, InterruptParams,
     RespondResult, StreamProfile, SubmitParams, SubmitResult,
 };
 use harw_protocol::{FrameSource, PortError, SessionPort};
+use harw_session_client::IdempotencyKeys;
 use harw_types::{ApprovalId, ReviewDecision, SessionId};
 
 use crate::{Action, SessionView};
 
-/// Controllers created in this process; with the start time it makes the
-/// idempotency epoch unique even for two controllers built in one tick.
-static INSTANCES: AtomicU64 = AtomicU64::new(0);
-
-/// A fresh epoch for the idempotency keys of one controller. A device
-/// restart must not repeat `label-1`, `label-2`, ...: the host remembers
-/// recent keys and answers a duplicate `Accepted` without queueing the new
-/// prompt, which would drop the user's message silently.
-fn fresh_epoch() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    format!("{nanos:x}.{}", INSTANCES.fetch_add(1, Ordering::Relaxed))
-}
-
 /// One attached session on one port.
 pub struct Controller {
     port: Arc<dyn SessionPort>,
-    label: String,
-    epoch: String,
+    keys: IdempotencyKeys,
     session: Option<SessionId>,
     source: Option<Box<dyn FrameSource>>,
     view: SessionView,
@@ -46,7 +29,6 @@ pub struct Controller {
     /// Where to re-attach after the host asked for it and the attach has
     /// not succeeded yet. While set there is no live source.
     resume: Option<Cursor>,
-    sent: u64,
 }
 
 impl std::fmt::Debug for Controller {
@@ -65,15 +47,13 @@ impl Controller {
     pub fn new(port: Arc<dyn SessionPort>, label: impl Into<String>) -> Self {
         Self {
             port,
-            label: label.into(),
-            epoch: fresh_epoch(),
+            keys: IdempotencyKeys::new(&label.into()),
             session: None,
             source: None,
             view: SessionView::new(),
             granted: None,
             head: None,
             resume: None,
-            sent: 0,
         }
     }
 
@@ -199,14 +179,13 @@ impl Controller {
             .copied()
             .or(self.head)
             .ok_or_else(|| PortError::Protocol("no head known".to_owned()))?;
-        self.sent += 1;
         let result = self
             .port
             .submit(SubmitParams {
                 session_id: session,
                 text: text.into(),
                 expect_head,
-                client_msg_id: format!("{}-{}-{}", self.label, self.epoch, self.sent),
+                client_msg_id: self.keys.next_key(),
                 force: false,
             })
             .await?;
