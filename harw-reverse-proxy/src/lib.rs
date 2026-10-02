@@ -13,6 +13,8 @@
 //!   an explicit [`UpstreamScope`].
 //! - `Host` and the request path are normalized once; matching and the upstream
 //!   request use the normalized form.
+//! - [`WsPolicy`] classifies a session WebSocket upgrade (subprotocol pinned,
+//!   Origin refused unless allowlisted, identity headers stripped, limits).
 //! - [`sanitize_headers`] drops hop-by-hop and spoofable headers and sets the
 //!   forwarding headers itself.
 
@@ -22,6 +24,7 @@ mod group;
 mod headers;
 mod normalize;
 mod route;
+mod ws;
 
 #[cfg(test)]
 mod test_support;
@@ -33,4 +36,8 @@ pub use normalize::{
 };
 pub use route::{
     ConfigError, Decision, Forward, Refusal, RequestHead, Route, RouteTable, UpstreamScope,
+};
+pub use ws::{
+    MAX_UPGRADE_HEADERS, SESSION_WS_PATH, SESSION_WS_SUBPROTOCOL, WsConfigError, WsDecision,
+    WsDeny, WsLimits, WsPolicy, WsRequest, WsRoute,
 };
