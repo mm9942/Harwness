@@ -5,16 +5,19 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Simple file-name matcher: optional prefix and optional suffix, no globs.
+/// Simple file-name matcher: optional prefix, suffix and substring, no globs.
 ///
-/// A name matches when it starts with `prefix` (if set) **and** ends with
-/// `suffix` (if set). [`NameMatch::any`] matches every name.
+/// A name matches when it starts with `prefix`, ends with `suffix` and
+/// contains `contains` (each only if set). [`NameMatch::any`] matches every
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NameMatch {
     /// Required name prefix, if any.
     pub prefix: Option<Cow<'static, str>>,
     /// Required name suffix, if any.
     pub suffix: Option<Cow<'static, str>>,
+    /// Required substring, if any.
+    pub contains: Option<Cow<'static, str>>,
 }
 
 impl NameMatch {
@@ -24,6 +27,7 @@ impl NameMatch {
         Self {
             prefix: None,
             suffix: None,
+            contains: None,
         }
     }
 
@@ -32,7 +36,7 @@ impl NameMatch {
     pub const fn prefix(prefix: &'static str) -> Self {
         Self {
             prefix: Some(Cow::Borrowed(prefix)),
-            suffix: None,
+            ..Self::any()
         }
     }
 
@@ -40,8 +44,17 @@ impl NameMatch {
     #[must_use]
     pub const fn suffix(suffix: &'static str) -> Self {
         Self {
-            prefix: None,
             suffix: Some(Cow::Borrowed(suffix)),
+            ..Self::any()
+        }
+    }
+
+    /// Matches names containing `needle`.
+    #[must_use]
+    pub const fn contains(needle: &'static str) -> Self {
+        Self {
+            contains: Some(Cow::Borrowed(needle)),
+            ..Self::any()
         }
     }
 
@@ -51,6 +64,7 @@ impl NameMatch {
         Self {
             prefix: Some(Cow::Borrowed(prefix)),
             suffix: Some(Cow::Borrowed(suffix)),
+            ..Self::any()
         }
     }
 
@@ -59,6 +73,7 @@ impl NameMatch {
     pub fn matches(&self, name: &str) -> bool {
         self.prefix.as_deref().is_none_or(|p| name.starts_with(p))
             && self.suffix.as_deref().is_none_or(|s| name.ends_with(s))
+            && self.contains.as_deref().is_none_or(|c| name.contains(c))
     }
 }
 

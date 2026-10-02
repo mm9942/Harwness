@@ -117,6 +117,12 @@ pub struct ClassConfig {
 }
 
 impl ClassConfig {
+    /// Whether no key is set (the table is omitted when serializing).
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Checks invariants plain deserialization cannot express.
     ///
     /// # Errors
