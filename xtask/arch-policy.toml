@@ -460,3 +460,12 @@ reason = "W00 D10/ARC-02: WebSocket transport is owned by ring A (harw-session-w
 names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "harw-web", "harw-cli", "harw-tui", "harw-session-host", "harw-session-ws"]
 packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
+
+[packages."harw-session-com"]
+layer = "A"
+
+[packages."harw-session-daemon"]
+layer = "A"
+
+[packages."harw-reverse-proxy"]
+layer = "A"

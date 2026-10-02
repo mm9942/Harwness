@@ -3743,6 +3743,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-reverse-proxy"
+version = "0.9.0"
+dependencies = [
+ "harw-egress",
+ "harw-netsec",
+]
+
+[[package]]
 name = "harw-runtime"
 version = "0.9.0"
 dependencies = [
@@ -3887,6 +3895,54 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "harw-session-com"
+version = "0.9.0"
+dependencies = [
+ "aws-lc-rs",
+ "bytes",
+ "futures-util",
+ "harw-node-listener",
+ "harw-node-transport",
+ "harw-protocol",
+ "harw-session-host",
+ "harw-session-remote",
+ "harw-session-ws",
+ "harw-types",
+ "http-body-util",
+ "hyper",
+ "hyper-tungstenite",
+ "hyper-util",
+ "jiff",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "harw-session-daemon"
+version = "0.9.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "harw-protocol",
+ "harw-session-com",
+ "harw-session-host",
+ "harw-session-ws",
+ "harw-types",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
@@ -4666,6 +4722,21 @@ dependencies = [
  "tokio-rustls",
  "tower-service",
  "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "hyper-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee7ba11c4933715ee2c2fea1d8932f19356d31648c0a1bb65223ef5d7962c4c"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "tokio",
+ "tokio-tungstenite",
+ "tungstenite",
 ]
 
 [[package]]
