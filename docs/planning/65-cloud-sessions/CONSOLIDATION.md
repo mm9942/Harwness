@@ -72,3 +72,32 @@ not touched without explicit per-PR approval.
 Known gaps: no node listener composed (harw-config has no node transport section); needs an active UIA in home config (no startup preflight); `EntryKind::Tui` gives hosted sessions TUI-level shell/net rights (dedicated EntryKind recommended); factory does sync file reads per new session (small jobs-rule break); e2e uses echo model, second-controller approval not tested end to end (driver unit test covers actor binding).
 
 Review follow-up (independent review by the research session, composition root): `with_operator_actor` now fails closed (Err(DriverBridgeError::Runtime)) when the hosted session has no spawn context, with a test. BLOCKER for the node-listener composition step: the same factory must not serve remote ingress (EntryKind::Tui grants TUI shell/net rights) — add a dedicated EntryKind or derive the tier from ClientIdentity first. Async factory trait (spawn_blocking) remains open (low).
+
+## Central gates (code state 2c744f3; later commits are docs-only)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_nested_refdefs` | clean (the allowed lint is the pre-existing `harw-ops` doc lint on dev) |
+| `cargo test --workspace --no-fail-fast` | 15,512 passed, 0 failed |
+| `cargo xtask gates` | edges 2999, privileges 6, warden-dependency-budget 52, warden-no-c-build 52 (documented blake3/cc exception), arch 2134: all green |
+| `make -C dod stage-test` | passed (static packaging checks) |
+| NOT RUN here | `cargo deny`, `actionlint`, `make -C dod clippy test` (tools not installed) |
+
+Fixes made during the central run: proc-macro cache (`cargo clean -p harw-macros` once), `tunnel.status` test surface, attach test hang (test helper kept the input sender alive), `WsDecision::Allow` boxed (clippy), `harw-retention` privileges entry, redundant closure, `cargo fmt` on 21 agent-written files, session-host approval actor fail-closed, doctor assembly session-event channel.
+
+## Native build (full personalized harw, role `user-interface`)
+
+- `harw agent check examples/agents/uia-mia`: ok (one note: no `[models]` table).
+- `harw agent build examples/agents/uia-mia --native --harw-src <checkout>`: success, first release build 12 min 56 s, binary 105 MB; rebuilt after the doctor fix (cache warm).
+- Verified on the binary: `--version`, `--help`, `doctor` (runtime rights printed without warning, retention PASS line), `cleanup` (enqueues a `retention_sweep` job and returns its id).
+- Not done: `scripts/native-e2e-uia.sh` (the Harw-flavor binary has the full harw CLI, not the runner's `--verify/--manifest` flags, so the existing script does not apply as is); an interactive chat with a model credential was not tried.
+
+## Retention (R0-R3, wave 3)
+
+`harw-retention` + `retention_classes!` + `[retention]`; telemetry pair pruning, tui.log rotation, bug-report cap, sentinel `--telemetry-max-files`; DoD spool age/bytes limits (opt-in); session/freeze stores (opt-in); `retention_sweep` job kind and `harw cleanup` (dry run by default, async job, deadline, cooperative cancel); `harw doctor` retention checks; `dod/Makefile clean-ephemeral` (dry run by default); `deploy/tmpfiles.d` deliberately sets no age on security directories.
+Open: sentinel export rotation still has only the fixed ~32 MiB bound; DoD spool is not yet used by the product (limits apply once wired); `retention_sweep` worker handler is covered by driver unit tests, not by a live worker run.
+
+## Still open (needs the user or a later round)
+
+Context strand and automated learning design (`CONTEXT-AND-LEARNING-DESIGN.md`, decisions in §7); node-listener composition (blocked on a dedicated EntryKind); `harw-tool-container` + `ManageContainers`; any merge to dev/main; `uia-mailbox.md` in PRs #74/#76; `origin/main` Cargo.lock conflict markers.
