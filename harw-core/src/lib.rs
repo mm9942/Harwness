@@ -14,6 +14,7 @@ pub mod activation;
 pub mod admission;
 pub mod agent_events;
 pub mod auto_compact;
+mod context_ledger_hook;
 // Runde 5, Teil K: Hintergrund-Kinder und Orchestrierungsgrenzen.
 pub mod background_children;
 pub mod cancel;

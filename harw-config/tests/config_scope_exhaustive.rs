@@ -758,7 +758,7 @@ fn test_field_table_exhaustive_jobs_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [memory] (10 Felder) — Projektgedächtnis
+// [memory] (11 Felder) — Projektgedächtnis
 // ---------------------------------------------------------------------
 
 #[test]
@@ -774,6 +774,7 @@ fn test_field_table_exhaustive_memory_section() {
         forget_deadline_secs,
         promote_deadline_secs,
         sweep_deadline_secs,
+        context_ledger,
     } = harw_config::MemorySection::default();
     let _ = (
         enabled,
@@ -786,6 +787,7 @@ fn test_field_table_exhaustive_memory_section() {
         forget_deadline_secs,
         promote_deadline_secs,
         sweep_deadline_secs,
+        context_ledger,
     );
     for path in [
         "memory.enabled",
@@ -798,6 +800,7 @@ fn test_field_table_exhaustive_memory_section() {
         "memory.forget_deadline_secs",
         "memory.promote_deadline_secs",
         "memory.sweep_deadline_secs",
+        "memory.context_ledger",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

@@ -5602,6 +5602,12 @@ async fn assemble_round_request(
         .or(session.max_output_tokens())
         .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
 
+    // Kontext-Ledger: die Fakten der gesammelten Fragmente festhalten, bevor
+    // die Montage sie verbraucht (nur wenn ein Ledger registriert ist).
+    let ledger_facts = session
+        .context_ledger()
+        .map(|_| crate::context_ledger_hook::snapshot(&fragments));
+
     // 4. Model-Call (provider-neutral).
     let request = ModelRequest::with_context_program(
         instructions,
@@ -5619,6 +5625,15 @@ async fn assemble_round_request(
     .with_max_output_tokens(max_output_tokens)
     .with_cancel_token(control.cancel_token().clone())
     .with_identity(request_identity(session));
+    if let (Some(ledger), Some(facts)) = (session.context_ledger(), ledger_facts.as_deref()) {
+        crate::context_ledger_hook::record_turn(
+            ledger.as_ref(),
+            session.id().as_str(),
+            turn_id.as_str(),
+            facts,
+            &request.context_assembly,
+        );
+    }
     Ok(match stream_sink_for_round(session, turn_id, total_usage) {
         Some(sink) => request.with_stream_sink(sink),
         None => request,

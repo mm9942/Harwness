@@ -1890,6 +1890,24 @@ impl RuntimeAssemblyBuilder {
                 }
             };
 
+        // Kontext-Ledger (`[memory] context_ledger`, Standard aus): best-effort
+        // öffnen; ein Fehlschlag schaltet ihn nur für diesen Lauf ab.
+        let context_ledger: Option<Arc<dyn harw_context_ledger::LedgerSink>> =
+            if config.harness.memory.context_ledger {
+                match harw_context_ledger::FileLedger::open(
+                    &spec.home.join("context-ledger"),
+                    harw_context_ledger::DEFAULT_MAX_BYTES,
+                ) {
+                    Ok(ledger) => Some(Arc::new(ledger)),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "runtime.context_ledger.open_failed");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Vorgabe der Projekt-Fakten-Wurzel, falls der Aufrufer keine über
         // `RuntimeAssemblyBuilder::fact_stores` mitgebracht hat (siehe dessen
         // Doku). Dieselbe Wurzel wie `memory_capture`, unabhängig davon, ob
@@ -3405,6 +3423,7 @@ impl RuntimeAssemblyBuilder {
             tools,
             root_session_id,
             memory_capture,
+            context_ledger,
             diary_recorder,
             guard_policy,
             role_effort_weights,
@@ -5531,6 +5550,9 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] hängt daraus, falls gesetzt, einen
     /// [`crate::memory_wiring::MemoryCaptureObserver`] an die Wurzelsitzung.
     memory_capture: Option<Arc<harw_memory::capture::ProjectMemoryCapture>>,
+    /// Kontext-Ledger der Wurzelsitzung (`[memory] context_ledger`), `None`
+    /// wenn abgeschaltet oder nicht öffenbar. Nur Labels und Größen.
+    context_ledger: Option<Arc<dyn harw_context_ledger::LedgerSink>>,
     /// Automatische Diary-Einträge der Wurzelsitzung (Plan D3), `None` ohne
     /// `KnowledgeStore`. Steht zusätzlich in [`Self::lifecycle_hooks`]
     /// (Sitzungsende); [`Self::new_root_session`] kettet daraus die
@@ -6395,6 +6417,7 @@ impl RuntimeAssembly {
                         None => memory,
                     }
                 })
+                .with_context_ledger(self.context_ledger.clone())
                 // Addendum F+G: Wächter-Verdrahtung der Wurzel-(UIA-)Sitzung.
                 .with_guard_policy(Some(self.guard_policy))
                 .with_drift_observer(Some(
@@ -7891,6 +7914,45 @@ mod tests {
             "eine erfolgreich geöffnete Erfassungsfläche muss die Wurzelsitzung \
              mit einem ToolOutcomeObserver verdrahten"
         );
+        Ok(())
+    }
+
+    /// `[memory] context_ledger` (Standard aus): ohne Schalter hat die
+    /// Wurzelsitzung keinen Ledger, mit Schalter einen, und das Verzeichnis
+    /// `<home>/context-ledger` entsteht.
+    #[test]
+    fn test_context_ledger_follows_the_memory_config_switch() -> TestResult {
+        let root_of = |fixture: &BuildFixture| -> TestResult<bool> {
+            let assembly = fixture_builder(EntryKind::LocalEcho, fixture)
+                .build()
+                .map_err(ctx("LocalEcho montiert"))?;
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let root = assembly
+                .new_root_session(
+                    assembly.root_session_id().clone(),
+                    events,
+                    turn_events,
+                    None,
+                )
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            Ok(root.session.context_ledger().is_some())
+        };
+
+        let off = build_fixture()?;
+        assert!(!root_of(&off)?, "ohne Schalter kein Ledger");
+        assert!(!off.home.join("context-ledger").exists());
+
+        let on = build_fixture()?;
+        let config = on.home.join("profiles").join("default").join("config.toml");
+        let mut text = std::fs::read_to_string(&config).map_err(ctx("config lesen"))?;
+        text.push_str("\n[memory]\ncontext_ledger = true\n");
+        std::fs::write(&config, text).map_err(ctx("config schreiben"))?;
+        assert!(
+            root_of(&on)?,
+            "mit Schalter hat die Wurzelsitzung einen Ledger"
+        );
+        assert!(on.home.join("context-ledger").is_dir());
         Ok(())
     }
 

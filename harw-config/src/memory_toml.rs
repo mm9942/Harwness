@@ -71,6 +71,11 @@ pub struct MemorySection {
     /// Frist des Jobs `memory_maintenance` / Startup-Sweep (Sekunden).
     #[serde(default = "default_sweep_deadline")]
     pub sweep_deadline_secs: u64,
+    /// Schreibt den Kontext-Ledger (`harw-context-ledger`): je Turn und
+    /// Fragment Label, Anbieter, Vertrauensklasse, Größe und Auslassungsgrund
+    /// — nie Inhalt — nach `<home>/context-ledger`. Standard: aus.
+    #[serde(default)]
+    pub context_ledger: bool,
 }
 
 impl Default for MemorySection {
@@ -86,6 +91,7 @@ impl Default for MemorySection {
             forget_deadline_secs: default_job_deadline(),
             promote_deadline_secs: default_job_deadline(),
             sweep_deadline_secs: default_sweep_deadline(),
+            context_ledger: false,
         }
     }
 }
