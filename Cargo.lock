@@ -2272,6 +2272,7 @@ version = "0.9.0"
 dependencies = [
  "harw-fsutil",
  "harw-macros",
+ "harw-retention",
  "harw-test-support",
  "harw-types",
  "serde",
