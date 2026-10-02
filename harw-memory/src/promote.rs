@@ -881,6 +881,48 @@ mod global_tests {
     }
 
     #[test]
+    fn cancelled_promotion_leaves_global_unchanged() -> TestResult {
+        let proj = root("cancel-p")?;
+        let glob = root("cancel-g")?;
+        let ps = FactStore::open(proj.path(), FactScope::Project).map_err(ctx("open"))?;
+        ps.write(&mk("pref", "d", "Kurz halten.", FactScope::Project, &[]))
+            .map_err(ctx("write"))?;
+        let flag = crate::consolidation::CancelFlag::new();
+        flag.cancel();
+        let res = promote_fact_to_global(
+            &ps,
+            glob.path(),
+            "pref",
+            "p",
+            OffsetDateTime::now_utc(),
+            Deadline::default_deletion().with_cancel(flag),
+        );
+        assert!(
+            matches!(&res, Err(GlobalPromotionError::Deadline(d)) if d.cancelled),
+            "{res:?}"
+        );
+        assert_eq!(file_count(&glob.path().join("facts")), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn lock_wait_stops_when_cancelled() -> TestResult {
+        let glob = root("cancel-wait")?;
+        let held = ConsolidationLock::try_acquire(glob.path()).map_err(ctx("hold"))?;
+        let flag = crate::consolidation::CancelFlag::new();
+        flag.cancel();
+        let started = std::time::Instant::now();
+        let res = ConsolidationLock::acquire_until(
+            glob.path(),
+            Deadline::default_deletion().with_cancel(flag),
+        );
+        assert!(matches!(res, Err(MemoryError::LockContention { .. })));
+        assert!(started.elapsed() < StdDuration::from_secs(5));
+        let _ = held.release();
+        Ok(())
+    }
+
+    #[test]
     fn acquire_until_waits_then_reports_contention() -> TestResult {
         let glob = root("wait")?;
         let held = ConsolidationLock::try_acquire(glob.path()).map_err(ctx("hold"))?;

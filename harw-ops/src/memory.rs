@@ -567,7 +567,7 @@ pub(crate) fn forget_with_deadline(
             .map_err(|error| OpError::Execution(error.to_string()))?;
         let mut locks = Vec::new();
         for (_, root, _) in &targets {
-            locks.push(lock_root(root, deadline)?);
+            locks.push(lock_root(root, deadline.clone())?);
         }
         // Commit-Punkt: ab hier wird vollständig gelöscht.
         deadline
