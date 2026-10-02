@@ -30,6 +30,10 @@ pub enum DaemonError {
     InsecureDirectory(PathBuf),
     /// The socket path has no parent directory.
     NoParent(PathBuf),
+    /// The socket's directory is a symlink or not a directory.
+    NotADirectory(PathBuf),
+    /// The session host could not be opened.
+    Host(String),
     /// I/O failure.
     Io(io::Error),
 }
@@ -48,6 +52,10 @@ impl fmt::Display for DaemonError {
                     p.display()
                 )
             }
+            Self::NotADirectory(p) => {
+                write!(f, "{} is not a plain directory", p.display())
+            }
+            Self::Host(e) => write!(f, "session host: {e}"),
             Self::NoParent(p) => write!(f, "{} has no parent directory", p.display()),
             Self::Io(e) => write!(f, "i/o error: {e}"),
         }
@@ -122,7 +130,11 @@ pub struct UdsServer {
 }
 
 fn check_private_dir(dir: &Path) -> Result<(), DaemonError> {
-    let meta = std::fs::metadata(dir)?;
+    // Not `metadata`: a symlinked directory could be swapped under us.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(DaemonError::NotADirectory(dir.to_path_buf()));
+    }
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(DaemonError::InsecureDirectory(dir.to_path_buf()));
     }
@@ -185,7 +197,10 @@ impl UdsServer {
         host: SessionHost,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), DaemonError> {
-        let max = self.config.max_connections.max(1);
+        let max = self
+            .config
+            .max_connections
+            .clamp(1, MAX_CONNECTIONS_CEILING);
         let permits = Arc::new(Semaphore::new(max));
         let socket_id = self.socket_id;
         let config = Arc::new(self.config);
@@ -226,6 +241,9 @@ impl UdsServer {
         remove_own_socket(&config.socket_path, socket_id)
     }
 }
+
+/// Upper bound for `max_connections`, keeps the permit arithmetic exact.
+const MAX_CONNECTIONS_CEILING: usize = 1 << 20;
 
 /// Pause after a failed `accept`.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);

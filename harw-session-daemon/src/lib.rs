@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+mod compose;
 mod server;
 
+pub use compose::{Daemon, DaemonServices};
 pub use server::{DaemonError, UdsConfig, UdsServer};
