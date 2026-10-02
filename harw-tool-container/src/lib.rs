@@ -23,6 +23,11 @@
 //! - [`ContainerPlan::build`] is the only way to an argument vector. Every
 //!   value is validated so that no value can add or reorder an engine flag
 //!   (`--` precedes the image; separators are rejected in paths and names).
+//! - There is no `run`. The lifecycle is `create`, inspect, verify, then
+//!   `start` ([`Stage`]); a plan that fails verification is removed without
+//!   ever having run, so the workload never executes under a weaker policy.
+//! - The approval text shows the program and a SHA-256 of the command, never
+//!   its arguments, which may carry credentials.
 //! - [`engine_environment`] builds the engine process environment from an
 //!   allowlist; variables that redirect an engine are never passed on.
 //! - [`readback::verify`] compares the plan with the engine's inspect facts;
@@ -56,6 +61,6 @@ pub use env::{DEFAULT_ENV_ALLOW, REDIRECTING_VARIABLES, engine_environment};
 pub use error::ContainerPolicyError;
 pub use image::{ImageCatalog, ImageRef};
 pub use mount::Mount;
-pub use plan::{CACHE_DST, ContainerPlan, Expected, RunConfig, RunRequest, WORKSPACE_DST};
+pub use plan::{CACHE_DST, ContainerPlan, Expected, RunConfig, RunRequest, Stage, WORKSPACE_DST};
 pub use profile::{Limits, Profile};
 pub use readback::{Dimension, Enforcement, InspectFacts, Readback, verify};
