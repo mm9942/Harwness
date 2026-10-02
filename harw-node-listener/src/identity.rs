@@ -70,6 +70,10 @@ pub struct DeviceRecord {
     pub revoked: bool,
     /// Display label for presence.
     pub label: String,
+    /// Per-device opt-in for `approval.respond` from a remote device
+    /// (PL-68 §13). Off unless the registry line says `approve`; a tier alone
+    /// never grants it.
+    pub approve_optin: bool,
 }
 
 impl DeviceRecord {
@@ -81,8 +85,15 @@ impl DeviceRecord {
             return None;
         }
         let fields: Vec<&str> = line.split('|').map(str::trim).collect();
-        let [node, device, tenant, tier, status, label] = fields.as_slice() else {
-            return None;
+        let (node, device, tenant, tier, status, label, approve_optin) = match fields.as_slice() {
+            [node, device, tenant, tier, status, label] => {
+                (node, device, tenant, tier, status, label, false)
+            }
+            // The only accepted seventh field is the literal opt-in marker.
+            [node, device, tenant, tier, status, label, "approve"] => {
+                (node, device, tenant, tier, status, label, true)
+            }
+            _ => return None,
         };
         let tier = match *tier {
             "observer" => PermissionTier::Observer,
@@ -103,6 +114,7 @@ impl DeviceRecord {
             tier,
             revoked,
             label: (*label).to_owned(),
+            approve_optin,
         })
     }
 
@@ -116,12 +128,13 @@ impl DeviceRecord {
             PermissionTier::Owner => "owner",
         };
         format!(
-            "{}|{}|{}|{tier}|{}|{}",
+            "{}|{}|{}|{tier}|{}|{}{}",
             self.node_id.as_str(),
             self.device.as_str(),
             self.tenant.as_str(),
             if self.revoked { "revoked" } else { "active" },
-            self.label
+            self.label,
+            if self.approve_optin { "|approve" } else { "" }
         )
     }
 }
@@ -260,6 +273,10 @@ impl RegistryIdentityMapper {
 /// the record or from constants of the remote profile.
 fn identity_of(record: &DeviceRecord, connection: ConnectionId) -> ClientIdentity {
     let id = format!("device:{}", record.device.as_str());
+    let mut caps = caps_for_tier(record.tier).with(gateway_caps_for_tier(record.tier));
+    // A tier is not a key authorization: remote approval needs the explicit
+    // per-device opt-in, whatever the tier says.
+    caps.approve = caps.approve && record.approve_optin;
     ClientIdentity {
         principal: Principal::trusted_ingress(
             PrincipalKind::Human,
@@ -268,7 +285,7 @@ fn identity_of(record: &DeviceRecord, connection: ConnectionId) -> ClientIdentit
             record.tier,
         ),
         tenant: Some(record.tenant.clone()),
-        caps: caps_for_tier(record.tier).with(gateway_caps_for_tier(record.tier)),
+        caps,
         device: Some(record.device.clone()),
         actor: ApprovalActor::Operator { id },
         label: record.label.clone(),

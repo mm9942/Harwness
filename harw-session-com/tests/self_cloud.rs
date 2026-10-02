@@ -137,6 +137,7 @@ fn enroll(cloud: &Cloud, node: &Node, device: &str, tier: PermissionTier) -> Tes
         tier,
         revoked: false,
         label: "phone".to_owned(),
+        approve_optin: true,
     })?;
     Ok(())
 }

@@ -62,3 +62,7 @@ not touched without explicit per-PR approval.
   - FAILED `harw-registry-defaults::auto_approved_tools_are_a_subset_of_the_read_only_surface` (`tunnel.status`): cause is a test-surface omission, `AUTO_APPROVED_TOOLS` lists `tunnel.status`/`tunnel.list` but the test's read-only surface did not (commit a953d85 added the entries only). Fixed in the test (read-only tunnel tools added to the surface). It is not caused by any worker branch.
   - HANG `harw-tui attach` tests (S09): test helper `drive` kept the input sender alive, the loop never saw EOF. Fixed (7c633f3); 10 attach tests pass.
 - NOT RUN here: `cargo deny` and `actionlint` (not installed), `make -C dod clippy test`, `cargo xtask gates` on the final SHA.
+
+## Decisions applied (user)
+- Remote `approve` is a per-device opt-in (PL-68 §13): `DeviceRecord.approve_optin`, registry line gets an optional 7th field `approve` (any other seventh field fails closed); `identity_of` strips `approve` from the tier ceiling unless opted in; session/gateway caps stay by tier. Tests: `remote_approve_needs_the_per_device_opt_in_not_the_tier`, `opt_in_marker_round_trips_and_other_seventh_fields_fail_closed`.
+- Merged to consolidate/main (not dev): `harw-session-com` (with `hyper-tungstenite`), `harw-session-daemon` on the com layer, `harw-reverse-proxy` (S10, `WsDecision::Allow` boxed for clippy). Verified: clippy -D warnings clean on the three crates, tests 50 (proxy) + 43 (com) + 5/13 (daemon compose/e2e_uds) pass, `cargo xtask gates` green.

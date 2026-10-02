@@ -292,6 +292,7 @@ async fn remote_port(rig: &Rig, opt_in: bool) -> TestResult<RemotePort> {
         tier: PermissionTier::Operator,
         revoked: false,
         label: "phone".to_owned(),
+        approve_optin: true,
     })?;
     let mapper = Arc::new(RegistryIdentityMapper::new(rig.dir.path()));
     let mut layer = RemoteLayer::<AuthenticatedPeer>::new(move |peer, connection| {

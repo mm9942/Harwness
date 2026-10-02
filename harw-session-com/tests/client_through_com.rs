@@ -210,6 +210,7 @@ async fn node_rig(
         tier: PermissionTier::Operator,
         revoked: false,
         label: "phone".to_owned(),
+        approve_optin: true,
     })?;
     let mapper = Arc::new(RegistryIdentityMapper::new(rig.dir.path()));
     let service = rig.com.service_for(RemoteLayer::<AuthenticatedPeer>::new(
