@@ -1,10 +1,11 @@
 //! `harw-tool-container`: policy core of the container tools.
 //!
 //! # Responsibility
-//! Turn a small, validated request into one hardened `podman run` argument
-//! vector, and judge afterwards whether the engine really enforced it. The
-//! crate performs **no I/O and starts no process**; it has **no
-//! dependencies**. It is the pure layer of the `container.*` tool family
+//! Turn a small, validated request into hardened `podman create`/`inspect`/
+//! `start` argument vectors, and judge after `create` whether the engine
+//! really enforced them. The crate **starts no process**, has **no
+//! dependencies**, and reads the filesystem in exactly one place: resolving a
+//! bind source to a canonical [`HostPath`]. It is the pure layer of the `container.*` tool family
 //! proposed in `docs/research/container-and-cli-tools.md`, built the way
 //! `harw-tool-tunnel` builds its policy core: the dangerous part is a plain
 //! function that can be tested exhaustively without an engine.
@@ -26,15 +27,21 @@
 //! - There is no `run`. The lifecycle is `create`, inspect, verify, then
 //!   `start` ([`Stage`]); a plan that fails verification is removed without
 //!   ever having run, so the workload never executes under a weaker policy.
-//! - The approval text shows the program and a SHA-256 of the command, never
-//!   its arguments, which may carry credentials.
+//! - A bind source is a [`HostPath`]: resolved on the host, so a symlink into
+//!   `/etc` is refused, and scanned for sockets anywhere below it. Binds are
+//!   non-recursive.
+//! - The approval text shows the program and a SHA-256 of the command and of
+//!   the environment values, never the arguments or values themselves.
+//! - A read-back covers privilege, network, root filesystem, effective
+//!   capabilities, `no-new-privileges`, memory and swap, pids, workspace
+//!   access and the wall-time limit.
 //! - [`engine_environment`] builds the engine process environment from an
 //!   allowlist; variables that redirect an engine are never passed on.
 //! - [`readback::verify`] compares the plan with the engine's inspect facts;
 //!   a fact that was not reported is `Unverifiable`, never `Enforced`.
 //!
 //! # Not covered here
-//! Running the engine, parsing inspect JSON, pulling images, signature
+//! Running the engine in sequence, parsing inspect JSON, pulling images, signature
 //! policy, Docker (flags such as `--userns=keep-id` are Podman-only),
 //! registration in the capability catalog, and the permission check. Those
 //! belong to the tool layer and to the shared registration files.
@@ -47,6 +54,7 @@
 mod digest;
 pub mod env;
 pub mod error;
+mod hostpath;
 pub mod image;
 pub mod mount;
 pub mod plan;
@@ -59,6 +67,7 @@ mod test_support;
 
 pub use env::{DEFAULT_ENV_ALLOW, REDIRECTING_VARIABLES, engine_environment};
 pub use error::ContainerPolicyError;
+pub use hostpath::HostPath;
 pub use image::{ImageCatalog, ImageRef};
 pub use mount::Mount;
 pub use plan::{CACHE_DST, ContainerPlan, Expected, RunConfig, RunRequest, Stage, WORKSPACE_DST};
