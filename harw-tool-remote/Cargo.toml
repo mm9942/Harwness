@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
 harw-protocol = { path = "../harw-protocol" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }

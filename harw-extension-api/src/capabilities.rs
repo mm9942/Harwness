@@ -227,33 +227,19 @@ impl DelegationTargets {
 ///
 /// # Beschreibung
 /// Die Meldungen nennen nur den Zustand des Aufrufers selbst, nie ein Ziel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, harw_macros::HarwError)]
 pub enum DelegationUnavailable {
     /// Die Spawn-Tiefe des Aufrufers ist ausgeschöpft.
+    #[msg("Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten")]
     DepthExhausted,
     /// Für den Aufrufer liegt kein vertrauenswürdiger Spawn-Kontext vor
     /// (interner Fehler: unbekannte Sitzung, fehlender Kontext, Sperre).
+    #[msg("Kein Spawn-Kontext (interner Fehler): {detail}")]
     NoSpawnContext {
         /// Technisches Detail für Log und Meldung.
         detail: String,
     },
 }
-
-impl std::fmt::Display for DelegationUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DepthExhausted => write!(
-                f,
-                "Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten"
-            ),
-            Self::NoSpawnContext { detail } => {
-                write!(f, "Kein Spawn-Kontext (interner Fehler): {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DelegationUnavailable {}
 
 #[derive(Debug, Clone)]
 pub struct SpawnInput {
@@ -377,5 +363,25 @@ mod tests {
 
         assert_eq!(spawner.finished.load(Ordering::SeqCst), 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delegation_display_tests {
+    use super::DelegationUnavailable;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(
+            DelegationUnavailable::DepthExhausted.to_string(),
+            "Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten"
+        );
+        assert_eq!(
+            DelegationUnavailable::NoSpawnContext {
+                detail: "d".to_owned()
+            }
+            .to_string(),
+            "Kein Spawn-Kontext (interner Fehler): d"
+        );
     }
 }
