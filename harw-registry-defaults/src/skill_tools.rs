@@ -45,7 +45,7 @@ use harw_extension_api::{
 };
 use harw_tools::args::parse_args_null_as_object;
 use harw_tools::schema_helpers::{object_schema, property};
-use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
+use harw_tools::{FunctionToolSpec, JsonSchemaType};
 use serde::Deserialize;
 
 /// Name des Such-Werkzeugs.
