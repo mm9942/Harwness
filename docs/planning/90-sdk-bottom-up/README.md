@@ -50,18 +50,33 @@ jeder Client sie neu baut (das Handy-Experiment `harw-mobile-core`, die TUI
 | L0 | `harw-protocol`, `harw-types` (Frames, Cursor, Parameter) | vorhanden |
 | L1 | Host, Daemon, Com-Layer, Zusammenbau (Z6), Freigabe-Fix (Z2) | in `consolidate/main` |
 | L2 | Client-Transport: `harw-session-remote` (Verbinden, Hello, Anhängen, Frames) | vorhanden; Wiederverbindung S07 offen |
-| **L3** | **SDK: entfernte Sitzungen** (Z2, Z3, Z4 über `harw.session.v1`, Ereignisse als `SdkEvent`) | **Draft-PR A** |
+| **L2.5** | **`harw-session-client`**: die Regeln, die jeder Client braucht, einmal (Schlüssel, Wiedergabe-Erkennung, Auswertung von Absenden und Freigabe, Beschreibung einer Freigabe, Turn-Zählung, Zustandswörter); rein und synchron | **Draft-PR #101** |
+| **L3** | **SDK: entfernte Sitzungen** (Z2, Z3, Z4 über `harw.session.v1`, Ereignisse als `SdkEvent`), gebaut auf L2.5 | **Draft-PR A (#100)** |
 | L4 | SDK: Container-Werkzeug (Z5) als `Tool` | Draft-PR B, braucht erst einen Ausführer |
 | L5 | Verbraucher: `harw-mobile-*` (#94), headless-Encoder (R5), `harw attach` | auf L3 umstellen, wenn A trägt |
 
 Wichtig für die Reihenfolge: L3 hängt **nicht** von `harw-mobile-core` ab. Das
-ist ein Experiment (#94); eine stabile SDK darf nicht von ihm abhängen. L3
-baut auf L2 (`harw-session-remote`), und #94 kann später auf L3 wechseln.
+ist ein Experiment (#94); eine stabile SDK darf nicht von ihm abhängen. Beide,
+SDK und Handy-Client, sitzen auf L2.5 (`harw-session-client`) und L2
+(`harw-session-remote`). Der Handy-Client nutzt die gemeinsamen Schlüssel schon
+(#94); #94 kann später ganz auf L3 wechseln.
+
+Eine Regel bleibt bewusst getrennt: Die `SessionView` des Handy-Clients wendet
+auch Frames an derselben Position an (der Host sendet jede offene Freigabe mit
+demselben Stand) und stützt sich auf idempotente Schritte. Ein Client, der auf
+**einen bestimmten** Turn wartet (SDK `send`), muss Wiedergabe dagegen
+ausblenden (`StreamTracker`). Zwei Regeln, zwei Zwecke.
 
 ## 4. Draft-PR-Stapel
 
 1. **PR 0 (dieses Dokument):** Analyse und Reihenfolge. Nur Doku.
-2. **PR A: `feat(sdk): entfernte Sitzungen über die Control-Plane`.** Neues
+1b. **PR #101: `harw-session-client`.** Die gemeinsame Schicht unter SDK und
+   Handy-Client. Die Regeln, die jeder Client braucht, standen vorher doppelt
+   (SDK-Remote und Handy-Client); jetzt stehen sie einmal, als benannte
+   Funktionen mit Tests. Je mehr hier unten verdrahtet ist, desto weniger
+   baut jeder Client darüber neu und desto weniger kann auseinanderlaufen.
+2. **PR A (#100, Basis #101): `feat(sdk): entfernte Sitzungen über die
+   Control-Plane`.** Neues
    Feature `remote` (Vorgabe aus): `RemoteHarwness`, `RemoteSession`,
    `RemoteSessionInfo`. `send` kapselt Z4 und Z2 und Z3; Ereignisse kommen als
    `SdkEvent`. Getestet gegen den echten Daemon über einen Unix-Socket.
