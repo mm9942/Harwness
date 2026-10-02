@@ -1,3 +1,4 @@
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,8 +15,4 @@ pub struct SkillToml {
     pub tools: Vec<String>,
     #[serde(default)]
     pub mcps: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }

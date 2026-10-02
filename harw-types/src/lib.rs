@@ -20,6 +20,7 @@ pub mod confidence;
 pub mod digest;
 pub mod error;
 pub mod ids;
+pub mod limits;
 pub mod impact;
 pub mod principal;
 pub mod provider_ids;
@@ -57,36 +58,30 @@ pub use usage::TokenUsage;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestResult;
-
-    macro_rules! assert_public_fallible_id_api_rejects_blank {
-        ($id_type:ty) => {
-            assert!(<$id_type>::try_from_str("").is_err());
-            assert!(<$id_type>::parse(" \t\n").is_err());
-            assert!("".parse::<$id_type>().is_err());
-        };
-    }
+    use crate::test_support::{
+        TestResult, assert_blank_id_apis_rejected, assert_blank_id_apis_rejected_with_try_from,
+    };
 
     #[test]
     fn public_id_types_offer_blank_rejecting_constructors() {
-        assert_public_fallible_id_api_rejects_blank!(SessionId);
-        assert_public_fallible_id_api_rejects_blank!(ThreadId);
-        assert_public_fallible_id_api_rejects_blank!(TurnId);
-        assert_public_fallible_id_api_rejects_blank!(ToolCallId);
-        assert_public_fallible_id_api_rejects_blank!(ItemId);
-        assert_public_fallible_id_api_rejects_blank!(WorkId);
-        assert_public_fallible_id_api_rejects_blank!(ChannelId);
-        assert_public_fallible_id_api_rejects_blank!(PeerId);
-        assert_public_fallible_id_api_rejects_blank!(TenantId);
-        assert_public_fallible_id_api_rejects_blank!(WorkspaceId);
-        assert_public_fallible_id_api_rejects_blank!(ThreadRef);
-        assert_public_fallible_id_api_rejects_blank!(ApprovalId);
-        assert_public_fallible_id_api_rejects_blank!(ProviderId);
-        assert_public_fallible_id_api_rejects_blank!(ProviderName);
-        assert_public_fallible_id_api_rejects_blank!(ModelId);
-        assert_public_fallible_id_api_rejects_blank!(ModelName);
-        assert_public_fallible_id_api_rejects_blank!(AgentName);
-        assert_public_fallible_id_api_rejects_blank!(CustomerId);
+        assert_blank_id_apis_rejected_with_try_from!(SessionId);
+        assert_blank_id_apis_rejected_with_try_from!(ThreadId);
+        assert_blank_id_apis_rejected_with_try_from!(TurnId);
+        assert_blank_id_apis_rejected_with_try_from!(ToolCallId);
+        assert_blank_id_apis_rejected_with_try_from!(ItemId);
+        assert_blank_id_apis_rejected_with_try_from!(WorkId);
+        assert_blank_id_apis_rejected_with_try_from!(ChannelId);
+        assert_blank_id_apis_rejected_with_try_from!(PeerId);
+        assert_blank_id_apis_rejected_with_try_from!(TenantId);
+        assert_blank_id_apis_rejected_with_try_from!(WorkspaceId);
+        assert_blank_id_apis_rejected_with_try_from!(ThreadRef);
+        assert_blank_id_apis_rejected_with_try_from!(ApprovalId);
+        assert_blank_id_apis_rejected!(ProviderId);
+        assert_blank_id_apis_rejected!(ProviderName);
+        assert_blank_id_apis_rejected!(ModelId);
+        assert_blank_id_apis_rejected!(ModelName);
+        assert_blank_id_apis_rejected!(AgentName);
+        assert_blank_id_apis_rejected!(CustomerId);
     }
 
     #[test]
@@ -100,27 +95,20 @@ mod tests {
 #[cfg(test)]
 mod aw0_03_tests {
     use super::*;
-
-    macro_rules! assert_public_fallible_id_api_rejects_blank {
-        ($id_type:ty) => {
-            assert!(<$id_type>::try_from_str("").is_err());
-            assert!(<$id_type>::parse(" \t\n").is_err());
-            assert!("".parse::<$id_type>().is_err());
-        };
-    }
+    use crate::test_support::assert_blank_id_apis_rejected_with_try_from;
 
     #[test]
     fn test_new_public_id_types_reject_blank_values() {
-        assert_public_fallible_id_api_rejects_blank!(FindingId);
-        assert_public_fallible_id_api_rejects_blank!(SensorId);
-        assert_public_fallible_id_api_rejects_blank!(ActionId);
-        assert_public_fallible_id_api_rejects_blank!(BaselineId);
-        assert_public_fallible_id_api_rejects_blank!(HostId);
-        assert_public_fallible_id_api_rejects_blank!(CgroupId);
-        assert_public_fallible_id_api_rejects_blank!(NodeId);
-        assert_public_fallible_id_api_rejects_blank!(DeviceId);
-        assert_public_fallible_id_api_rejects_blank!(ServiceIdentityId);
-        assert_public_fallible_id_api_rejects_blank!(SecurityContextId);
+        assert_blank_id_apis_rejected_with_try_from!(FindingId);
+        assert_blank_id_apis_rejected_with_try_from!(SensorId);
+        assert_blank_id_apis_rejected_with_try_from!(ActionId);
+        assert_blank_id_apis_rejected_with_try_from!(BaselineId);
+        assert_blank_id_apis_rejected_with_try_from!(HostId);
+        assert_blank_id_apis_rejected_with_try_from!(CgroupId);
+        assert_blank_id_apis_rejected_with_try_from!(NodeId);
+        assert_blank_id_apis_rejected_with_try_from!(DeviceId);
+        assert_blank_id_apis_rejected_with_try_from!(ServiceIdentityId);
+        assert_blank_id_apis_rejected_with_try_from!(SecurityContextId);
     }
 
     #[test]

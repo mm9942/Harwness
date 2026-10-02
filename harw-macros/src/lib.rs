@@ -511,7 +511,9 @@ pub fn derive_op_args(input: TokenStream) -> TokenStream {
 ///
 /// Anwendbar auf `pub struct Foo(String);`. Der Fehlertyp wird über
 /// `#[harw_id(error = "…", ctor = "…")]` konfiguriert; `#[harw_id(infallible)]`
-/// erzeugt zusätzlich einen unvalidierten Kompatibilitätskonstruktor `new`.
+/// erzeugt zusätzlich einen unvalidierten Kompatibilitätskonstruktor `new`;
+/// `#[harw_id(validate = "pfad::fn")]` ersetzt die Leerprüfung durch eine eigene
+/// Regel `fn(&str) -> Result<(), Fehler>`.
 ///
 /// # Errors
 /// - Kein Tuple-Struct mit genau einem `String`-Feld → `syn::Error`.
