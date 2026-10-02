@@ -35,8 +35,9 @@
 //!   upgrade or the host.
 //! - **Two ingresses, one stack.** Local: [`local::serve_unix`] reads
 //!   `SO_PEERCRED` and calls [`ComServer::serve_io`]. Self-cloud:
-//!   [`ComServer::service_for`] plus a [`RemoteLayer`] maps the node
-//!   transport's authenticated peer to an enrolled device ([`remote`]).
+//!   [`ComServer::service_for`] plus a [`RemoteLayer`] hands the node
+//!   transport's authenticated peer to the composition root's resolver
+//!   (`harw-node-listener`'s identity mapper); see [`remote`].
 //! - **One bounded server for every ingress**: a connection limit that covers
 //!   the whole WebSocket session, bounded headers, a header timeout, refusals
 //!   that close the connection, graceful [`ComServer::drain`].
@@ -83,6 +84,6 @@ pub use config::ComConfig;
 pub use error::ComError;
 pub use layer::{PeerLayer, PeerService, TrustedPeer};
 pub use refusal::ComRefusal;
-pub use remote::{DeviceRecord, DeviceRegistry, EnrollError, RemoteLayer, RemoteService};
+pub use remote::{RemoteLayer, RemoteService};
 pub use server::{BoxedService, ComServer, DEFAULT_GRACE};
 pub use service::UpgradeService;

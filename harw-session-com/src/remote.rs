@@ -3,38 +3,32 @@
 //!
 //! The node transport authenticates the *node* (PQ-TLS plus an ML-DSA
 //! transcript signature) and inserts its `AuthenticatedPeer` into every
-//! request. That proves a node id and nothing else. This module maps the node
-//! id to **one enrolled device** with a tenant, a tier and a label, and builds
-//! the identity the host sees:
+//! request. That proves a node id and nothing else. A [`RemoteLayer`] hands
+//! the peer to a resolver, which maps it to the identity the host admits
+//! against (device, tenant, tier). The resolver is the composition root's:
+//! `harw-node-listener`'s `IdentityMapper` over its device registry is the
+//! production one. This module holds no registry of its own.
 //!
-//! - the tenant is mandatory (a device record cannot exist without one);
-//! - one node id is one device, and one device is one node id;
-//! - an address plays no part: nothing here sees an IP;
-//! - the caps are the tier's *session* ceiling only: no `gateway_*`, never
-//!   `tool_call`, and **no `approve`** unless the record opts in
-//!   (`may_approve`), because high-risk approval stays local by default
-//!   (PL-68 §13, decision 4);
-//! - an unknown node is refused with 403 before anything is bound.
-//!
-//! Revocation stays with the host: `SessionHost::revoke_device` refuses the
-//! device on its next `connect` and closes its live streams.
+//! Rules the layer enforces regardless of the resolver:
+//! - an unresolved or refused peer is answered with the refusal's status
+//!   (403 for [`ComRefusal::Denied`]) before anything is bound;
+//! - the resolver must return the connection id it was given, so it cannot
+//!   hand out an identity that belongs to another connection;
+//! - a request without the transport's peer extension fails closed (500):
+//!   the service was mounted outside the node transport;
+//! - the resolved identity replaces any [`TrustedPeer`] already present.
 //!
 //! The layer is generic over the peer type so this crate does not depend on
-//! the node transport (and its TLS stack): the composition root names
-//! `AuthenticatedPeer` and how to read its node id.
+//! the node transport and its TLS stack; the composition root names
+//! `AuthenticatedPeer`.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use harw_session_host::{ClientIdentity, ConnectionId, caps_for_tier};
-use harw_types::{
-    ApprovalActor, AuthStrength, DeviceId, IngressSurface, NodeId, PermissionTier, Principal,
-    PrincipalKind, TenantId, TrustZone,
-};
+use harw_session_host::{ClientIdentity, ConnectionId};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Request, Response};
@@ -43,111 +37,8 @@ use tower::{Layer, Service};
 use crate::layer::TrustedPeer;
 use crate::refusal::{ComRefusal, plain};
 
-/// An enrolled device.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceRecord {
-    /// The device id (also the principal id `device:<id>`).
-    pub device: DeviceId,
-    /// Tenant scope. Every remote caller is tenant-scoped.
-    pub tenant: TenantId,
-    /// Permission tier; narrows the session caps.
-    pub tier: PermissionTier,
-    /// Presence label.
-    pub label: String,
-    /// Whether this device may answer approvals. Default policy: no.
-    pub may_approve: bool,
-}
-
-/// Why an enrollment was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnrollError {
-    /// The node id already belongs to a device.
-    NodeAlreadyEnrolled,
-    /// The device id is already bound to another node id.
-    DeviceAlreadyEnrolled,
-}
-
-impl std::fmt::Display for EnrollError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NodeAlreadyEnrolled => f.write_str("node id is already enrolled"),
-            Self::DeviceAlreadyEnrolled => f.write_str("device id is already enrolled"),
-        }
-    }
-}
-
-impl std::error::Error for EnrollError {}
-
-/// Pinned devices: node id -> device record. Built from trusted config.
-#[derive(Debug, Clone, Default)]
-pub struct DeviceRegistry {
-    by_node: HashMap<NodeId, DeviceRecord>,
-}
-
-impl DeviceRegistry {
-    /// An empty registry: every node is unknown.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Enrolls `node` as `record`.
-    ///
-    /// # Errors
-    /// The node or the device is already enrolled.
-    pub fn enroll(&mut self, node: NodeId, record: DeviceRecord) -> Result<(), EnrollError> {
-        if self.by_node.contains_key(&node) {
-            return Err(EnrollError::NodeAlreadyEnrolled);
-        }
-        if self.by_node.values().any(|r| r.device == record.device) {
-            return Err(EnrollError::DeviceAlreadyEnrolled);
-        }
-        self.by_node.insert(node, record);
-        Ok(())
-    }
-
-    /// Number of enrolled devices.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_node.len()
-    }
-
-    /// `true` when nothing is enrolled.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_node.is_empty()
-    }
-
-    /// The identity for `node`, or `None` when it is not enrolled.
-    #[must_use]
-    pub fn identity_for(&self, node: &NodeId) -> Option<ClientIdentity> {
-        let record = self.by_node.get(node)?;
-        let principal_id = format!("device:{}", record.device.as_str());
-        let mut caps = caps_for_tier(record.tier);
-        if !record.may_approve {
-            caps.approve = false;
-        }
-        Some(ClientIdentity {
-            principal: Principal::trusted_ingress(
-                PrincipalKind::Human,
-                principal_id.clone(),
-                IngressSurface::Gateway,
-                record.tier,
-            ),
-            tenant: Some(record.tenant.clone()),
-            caps,
-            device: Some(record.device.clone()),
-            actor: ApprovalActor::Operator { id: principal_id },
-            label: record.label.clone(),
-            zone: TrustZone::Remote,
-            strength: AuthStrength::MutualTls,
-            connection: ConnectionId::next(),
-            agent: None,
-        })
-    }
-}
-
-type Resolve<P> = dyn Fn(&P) -> Result<ClientIdentity, ComRefusal> + Send + Sync;
+type ResolveFuture = Pin<Box<dyn Future<Output = Result<ClientIdentity, ComRefusal>> + Send>>;
+type Resolve<P> = dyn Fn(P, ConnectionId) -> ResolveFuture + Send + Sync;
 
 /// Resolves the transport's peer extension `P` into the trusted identity.
 pub struct RemoteLayer<P> {
@@ -163,28 +54,18 @@ impl<P> Clone for RemoteLayer<P> {
 }
 
 impl<P: 'static> RemoteLayer<P> {
-    /// A layer with a custom resolver.
+    /// A layer with an async resolver. `resolve` receives an owned copy of the
+    /// peer and the id of the new connection, and must return an identity
+    /// carrying that same connection id.
     #[must_use]
-    pub fn new(
-        resolve: impl Fn(&P) -> Result<ClientIdentity, ComRefusal> + Send + Sync + 'static,
-    ) -> Self {
+    pub fn new<F, Fut>(resolve: F) -> Self
+    where
+        F: Fn(P, ConnectionId) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ClientIdentity, ComRefusal>> + Send + 'static,
+    {
         Self {
-            resolve: Arc::new(resolve),
+            resolve: Arc::new(move |peer, connection| Box::pin(resolve(peer, connection))),
         }
-    }
-
-    /// A layer that looks the peer's node id up in `registry`.
-    /// `node_of` reads the node id out of the transport's peer type.
-    #[must_use]
-    pub fn from_registry(
-        registry: Arc<DeviceRegistry>,
-        node_of: impl Fn(&P) -> NodeId + Send + Sync + 'static,
-    ) -> Self {
-        Self::new(move |peer| {
-            registry
-                .identity_for(&node_of(peer))
-                .ok_or(ComRefusal::Denied)
-        })
     }
 }
 
@@ -223,7 +104,7 @@ where
         + Send
         + 'static,
     S::Future: Send + 'static,
-    P: Send + Sync + 'static,
+    P: Clone + Send + Sync + 'static,
     B: Send + 'static,
 {
     type Response = Response<Full<Bytes>>;
@@ -235,96 +116,135 @@ where
     }
 
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        let Some(resolved) = request
-            .extensions()
-            .get::<P>()
-            .map(|peer| (self.resolve)(peer))
-        else {
+        let Some(peer) = request.extensions().get::<P>().cloned() else {
             tracing::error!("session com: request without a transport peer");
             return Box::pin(ready(Ok(plain(
                 hyper::StatusCode::INTERNAL_SERVER_ERROR,
                 "connection has no transport identity",
             ))));
         };
-        match resolved {
-            Err(refusal) => Box::pin(ready(Ok(refusal.response()))),
-            Ok(identity) => {
-                // Overwrites anything an earlier layer might have set.
-                request.extensions_mut().insert(TrustedPeer(identity));
-                let clone = self.inner.clone();
-                let mut inner = std::mem::replace(&mut self.inner, clone);
-                Box::pin(async move { inner.call(request).await })
-            }
-        }
+        let connection = ConnectionId::next();
+        let resolving = (self.resolve)(peer, connection);
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move {
+            let identity = match resolving.await {
+                Ok(identity) if identity.connection == connection => identity,
+                Ok(_) => {
+                    tracing::error!("session com: resolver returned another connection's id");
+                    return Ok(ComRefusal::Denied.response());
+                }
+                Err(refusal) => return Ok(refusal.response()),
+            };
+            // Replaces anything an earlier layer might have set.
+            request.extensions_mut().insert(TrustedPeer(identity));
+            inner.call(request).await
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use hyper::StatusCode;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::test_support::identity;
 
-    fn record(device: &str, tier: PermissionTier) -> Result<DeviceRecord, harw_types::InvalidId> {
-        Ok(DeviceRecord {
-            device: DeviceId::try_from_str(device)?,
-            tenant: TenantId::try_from_str("tenant-a")?,
-            tier,
-            label: format!("phone-{device}"),
-            may_approve: false,
-        })
+    #[derive(Clone, Debug)]
+    struct Peer(&'static str);
+
+    /// Inner service: records the label of the trusted peer it sees.
+    #[derive(Clone)]
+    struct Probe(Arc<Mutex<Vec<String>>>);
+
+    impl Service<Request<()>> for Probe {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Infallible>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<()>) -> Self::Future {
+            let label = request
+                .extensions()
+                .get::<TrustedPeer>()
+                .map_or_else(|| "none".to_owned(), |p| p.0.label.clone());
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(label);
+            }
+            ready(Ok(Response::new(Full::new(Bytes::new()))))
+        }
     }
 
-    fn node(name: &str) -> Result<NodeId, harw_types::InvalidId> {
-        NodeId::try_from_str(name)
+    fn request_with(peer: Option<Peer>) -> Request<()> {
+        let mut request = Request::new(());
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(peer);
+        }
+        request
     }
 
-    #[test]
-    fn enrollment_is_one_to_one() -> Result<(), Box<dyn std::error::Error>> {
-        let mut reg = DeviceRegistry::new();
-        reg.enroll(node("node-a")?, record("dev-1", PermissionTier::Operator)?)?;
+    #[tokio::test]
+    async fn a_resolved_peer_reaches_the_inner_service_with_its_identity() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = RemoteLayer::<Peer>::new(|peer, connection| async move {
+            let mut id = identity(peer.0);
+            id.connection = connection;
+            Ok(id)
+        });
+        let response = layer
+            .layer(Probe(Arc::clone(&seen)))
+            .oneshot(request_with(Some(Peer("phone"))))
+            .await;
+        assert!(response.is_ok());
         assert_eq!(
-            reg.enroll(node("node-a")?, record("dev-2", PermissionTier::Operator)?),
-            Err(EnrollError::NodeAlreadyEnrolled)
+            seen.lock().map(|s| s.clone()).unwrap_or_default(),
+            ["phone"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_peer_never_reaches_the_inner_service() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = RemoteLayer::<Peer>::new(|_, _| async { Err(ComRefusal::Denied) });
+        let response = layer
+            .layer(Probe(Arc::clone(&seen)))
+            .oneshot(request_with(Some(Peer("x"))))
+            .await;
+        assert_eq!(response.map(|r| r.status()), Ok(StatusCode::FORBIDDEN));
+        assert!(seen.lock().map(|s| s.is_empty()).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn a_resolver_cannot_hand_out_another_connections_identity() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // `identity()` mints its own connection id, not the one it was given.
+        let layer = RemoteLayer::<Peer>::new(|peer, _| async move { Ok(identity(peer.0)) });
+        let response = layer
+            .layer(Probe(Arc::clone(&seen)))
+            .oneshot(request_with(Some(Peer("phone"))))
+            .await;
+        assert_eq!(response.map(|r| r.status()), Ok(StatusCode::FORBIDDEN));
+        assert!(seen.lock().map(|s| s.is_empty()).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_the_transport_peer_fails_closed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = RemoteLayer::<Peer>::new(|_, _| async { Err(ComRefusal::Denied) });
+        let response = layer
+            .layer(Probe(Arc::clone(&seen)))
+            .oneshot(request_with(None))
+            .await;
         assert_eq!(
-            reg.enroll(node("node-b")?, record("dev-1", PermissionTier::Operator)?),
-            Err(EnrollError::DeviceAlreadyEnrolled)
+            response.map(|r| r.status()),
+            Ok(StatusCode::INTERNAL_SERVER_ERROR)
         );
-        assert_eq!(reg.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn a_known_node_gets_a_remote_tenant_scoped_identity_without_gateway_or_approve()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut reg = DeviceRegistry::new();
-        reg.enroll(node("node-a")?, record("dev-1", PermissionTier::Owner)?)?;
-        let id = reg.identity_for(&node("node-a")?).ok_or("enrolled")?;
-        assert!(id.validate().is_ok());
-        assert!(id.is_remote());
-        assert_eq!(id.tenant, Some(TenantId::try_from_str("tenant-a")?));
-        assert_eq!(id.device, Some(DeviceId::try_from_str("dev-1")?));
-        assert!(id.caps.control && id.caps.steer && id.caps.observe);
-        assert!(!id.caps.approve, "remote approval is opt-in");
-        assert!(!id.caps.gateway_read && !id.caps.gateway_admin && !id.caps.tool_call);
-        Ok(())
-    }
-
-    #[test]
-    fn approval_is_granted_only_when_the_record_opts_in() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut reg = DeviceRegistry::new();
-        let mut rec = record("dev-1", PermissionTier::Operator)?;
-        rec.may_approve = true;
-        reg.enroll(node("node-a")?, rec)?;
-        let id = reg.identity_for(&node("node-a")?).ok_or("enrolled")?;
-        assert!(id.caps.approve);
-        Ok(())
-    }
-
-    #[test]
-    fn an_unknown_node_has_no_identity() -> Result<(), Box<dyn std::error::Error>> {
-        let reg = DeviceRegistry::new();
-        assert!(reg.identity_for(&node("node-x")?).is_none());
-        Ok(())
+        assert!(seen.lock().map(|s| s.is_empty()).unwrap_or(false));
     }
 }

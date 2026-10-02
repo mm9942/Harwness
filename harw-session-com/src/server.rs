@@ -217,7 +217,7 @@ impl ComServer {
     + Send
     + 'static
     where
-        P: Send + Sync + 'static,
+        P: Clone + Send + Sync + 'static,
     {
         let traced = ServiceBuilder::new()
             .map_response(|response| finish(None, response))
