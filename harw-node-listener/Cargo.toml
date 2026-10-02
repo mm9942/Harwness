@@ -25,6 +25,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros", "test-util"] }
 
 [lints]

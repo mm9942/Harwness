@@ -3296,6 +3296,7 @@ name = "harw-node-listener"
 version = "0.9.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
@@ -3304,9 +3305,12 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-util",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tower-service",
  "tracing",
 ]
