@@ -49,6 +49,8 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+harw-session-daemon = { path = "../harw-session-daemon" }
+harw-session-host = { path = "../harw-session-host" }
 jiff = { workspace = true }
 tempfile = { workspace = true }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
@@ -57,6 +59,10 @@ tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time
 harw-agent-artifact = { path = "../harw-agent-artifact" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 time = "0.3.53"
+
+[[test]]
+name = "remote_session"
+required-features = ["remote"]
 
 [[example]]
 name = "minimal_chat"
