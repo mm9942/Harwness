@@ -400,6 +400,7 @@ type ActivityClock = Arc<Mutex<Instant>>;
 pub fn run(
     home_override: Option<PathBuf>,
     telemetry: crate::cli::TelemetryArgs,
+    session_socket: Option<Option<PathBuf>>,
 ) -> Result<(), String> {
     let home = resolve_home(home_override)?;
     crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
@@ -426,6 +427,7 @@ pub fn run(
     // fresh `spawn_blocking` closure on every tick (see its doc for why it
     // re-opens the configured secret store each tick instead of holding one).
     let config = Arc::clone(assemblies.dream.config());
+    let session_model = Arc::clone(assemblies.dream.model());
     let providers = GatewayProviders {
         telegram: assemblies
             .telegram
@@ -466,15 +468,46 @@ pub fn run(
         .build()
         .map_err(|error| format!("Runtime-Start fehlgeschlagen: {error}"))?;
 
-    let result = runtime.block_on(supervise(
-        &home,
-        Arc::clone(&config),
-        providers,
-        &knowledge,
-        &roots,
-        Arc::clone(&telemetry_sinks.sink),
-        audit_chain_check_interval_secs,
-    ));
+    // Opt-in session ingress (`--session-socket`); default off. The flag is
+    // explicit, so a start failure ends the gateway with an error before any
+    // other subsystem runs.
+    let session_serve = session_socket.map(|socket| {
+        (
+            crate::session_serve::SessionServeConfig::for_profile(
+                &roots.profile,
+                socket,
+                std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+            ),
+            session_model,
+        )
+    });
+
+    let result = runtime.block_on(async {
+        let ingress = match session_serve {
+            Some((config, model)) => {
+                let ingress = crate::session_serve::start(&config, model).await?;
+                eprintln!("  session socket : {}", ingress.socket().display());
+                Some(ingress)
+            }
+            None => None,
+        };
+        let result = supervise(
+            &home,
+            Arc::clone(&config),
+            providers,
+            &knowledge,
+            &roots,
+            Arc::clone(&telemetry_sinks.sink),
+            audit_chain_check_interval_secs,
+        )
+        .await;
+        // `supervise` returns on the gateway's shutdown signal; drain the
+        // session host (and remove its socket) before the runtime ends.
+        if let Some(ingress) = ingress {
+            ingress.shutdown().await;
+        }
+        result
+    });
 
     // Außerhalb der Runtime (siehe Funktionsdoku): ein aktivierter
     // OTLP-Export darf seinen letzten Stapel noch zustellen, bevor der

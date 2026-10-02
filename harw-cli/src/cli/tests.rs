@@ -2244,3 +2244,25 @@ fn attach_flags_without_values_are_errors() {
     assert!(Cli::try_parse_from(["harw", "attach", "--host"]).is_err());
     assert!(Cli::try_parse_from(["harw", "attach", "a", "b"]).is_err());
 }
+
+#[test]
+fn gateway_session_socket_is_off_by_default_and_parses_with_and_without_path() -> TestResult {
+    fn socket_of(args: &[&str]) -> Result<Option<Option<PathBuf>>, TestError> {
+        let cli = Cli::try_parse_from(args).map_err(ctx("gateway must parse"))?;
+        let Some(Command::Gateway { session_socket, .. }) = cli.command else {
+            return Err(TestError::Unexpected("expected gateway command".into()));
+        };
+        Ok(session_socket)
+    }
+
+    assert_eq!(socket_of(&["harw", "gateway"])?, None);
+    assert_eq!(
+        socket_of(&["harw", "gateway", "--session-socket"])?,
+        Some(None)
+    );
+    assert_eq!(
+        socket_of(&["harw", "gateway", "--session-socket=/tmp/h/s.sock"])?,
+        Some(Some(PathBuf::from("/tmp/h/s.sock")))
+    );
+    Ok(())
+}
