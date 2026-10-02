@@ -36,7 +36,8 @@ impl NameMatch {
     pub const fn prefix(prefix: &'static str) -> Self {
         Self {
             prefix: Some(Cow::Borrowed(prefix)),
-            ..Self::any()
+            suffix: None,
+            contains: None,
         }
     }
 
@@ -44,8 +45,9 @@ impl NameMatch {
     #[must_use]
     pub const fn suffix(suffix: &'static str) -> Self {
         Self {
+            prefix: None,
             suffix: Some(Cow::Borrowed(suffix)),
-            ..Self::any()
+            contains: None,
         }
     }
 
@@ -53,8 +55,9 @@ impl NameMatch {
     #[must_use]
     pub const fn contains(needle: &'static str) -> Self {
         Self {
+            prefix: None,
+            suffix: None,
             contains: Some(Cow::Borrowed(needle)),
-            ..Self::any()
         }
     }
 
@@ -64,7 +67,7 @@ impl NameMatch {
         Self {
             prefix: Some(Cow::Borrowed(prefix)),
             suffix: Some(Cow::Borrowed(suffix)),
-            ..Self::any()
+            contains: None,
         }
     }
 

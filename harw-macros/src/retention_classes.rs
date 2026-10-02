@@ -10,7 +10,7 @@
 //!     tui_log: ephemeral {
 //!         dir = dirs::tui_log,                    // fn(&Roots) -> Vec<PathBuf>
 //!         name = prefix_suffix("tui", ".log"),    // any | prefix(..) | suffix(..) | contains(..) | prefix_suffix(..)
-//!         max_age_secs = 1_209_600,               // integer > 0, or `none`
+//!         max_age_secs = 14 * 86_400,             // const u64 expression (literal 0 is rejected), or `none`
 //!         max_bytes = 52_428_800,
 //!         max_files = none,
 //!         keep_newest = 1,                        // optional, default 1
@@ -41,7 +41,7 @@ use std::collections::HashSet;
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{Attribute, Ident, LitInt, LitStr, Path, Token};
+use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitInt, LitStr, Path, Token};
 
 enum Matcher {
     Any,
@@ -51,7 +51,7 @@ enum Matcher {
     PrefixSuffix(LitStr, LitStr),
 }
 
-struct Limit(Option<LitInt>);
+struct Limit(Option<Expr>);
 
 struct ClassDecl {
     attrs: Vec<Attribute>,
@@ -71,24 +71,24 @@ struct Input {
 }
 
 fn parse_limit(input: ParseStream<'_>) -> syn::Result<Limit> {
-    if input.peek(Ident) {
-        let ident: Ident = input.parse()?;
-        if ident == "none" {
+    let expr: Expr = input.parse()?;
+    if let Expr::Path(path) = &expr {
+        if path.path.is_ident("none") {
             return Ok(Limit(None));
         }
-        return Err(syn::Error::new_spanned(
-            ident,
-            "expected an integer greater than 0 or `none`",
-        ));
     }
-    let lit: LitInt = input.parse()?;
-    if lit.base10_parse::<u64>()? == 0 {
-        return Err(syn::Error::new_spanned(
-            lit,
-            "a limit of 0 would delete everything; use `none` for no limit",
-        ));
+    if let Expr::Lit(ExprLit {
+        lit: Lit::Int(lit), ..
+    }) = &expr
+    {
+        if lit.base10_parse::<u64>()? == 0 {
+            return Err(syn::Error::new_spanned(
+                lit,
+                "a limit of 0 would delete everything; use `none` for no limit",
+            ));
+        }
     }
-    Ok(Limit(Some(lit)))
+    Ok(Limit(Some(expr)))
 }
 
 fn parse_matcher(input: ParseStream<'_>) -> syn::Result<Matcher> {
