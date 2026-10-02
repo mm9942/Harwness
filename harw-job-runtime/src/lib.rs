@@ -50,8 +50,10 @@ pub use harw_job_core::JobRuntimeError as JobError;
 
 pub mod coordinator;
 pub mod host;
+pub mod permits;
 
 pub use host::{HostFacts, HostLandlock, HostReport};
+pub use permits::{MAX_PERMITS, MIN_PERMITS, Permit, PermitStatus, ResizablePermits};
 
 #[cfg(target_os = "macos")]
 pub use coordinator::DarwinExecutor;
