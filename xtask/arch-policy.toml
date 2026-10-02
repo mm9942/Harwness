@@ -350,6 +350,8 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-deps"]
 layer = "A"
+[packages."harw-tool-container"]
+layer = "A"
 [packages."harw-tool-doc"]
 layer = "A"
 [packages."harw-tool-explorer"]
