@@ -43,6 +43,9 @@ pub struct Controller {
     view: SessionView,
     granted: Option<ClientCaps>,
     head: Option<Cursor>,
+    /// Where to re-attach after the host asked for it and the attach has
+    /// not succeeded yet. While set there is no live source.
+    resume: Option<Cursor>,
     sent: u64,
 }
 
@@ -69,6 +72,7 @@ impl Controller {
             view: SessionView::new(),
             granted: None,
             head: None,
+            resume: None,
             sent: 0,
         }
     }
@@ -112,6 +116,7 @@ impl Controller {
         self.head = Some(ack.head);
         self.session = Some(session);
         self.source = Some(source);
+        self.resume = None;
         Ok(())
     }
 
@@ -119,9 +124,20 @@ impl Controller {
     /// attachment ended (the caller reconnects and attaches from
     /// `view().cursor()`).
     ///
+    /// When the host asked to re-attach (`Resync`, `Lagged`) and that attach
+    /// failed, there is no live source any more: the old stream is dropped
+    /// so a stale one is never read, and the next call retries the attach.
+    ///
     /// # Errors
     /// The port's error when the stream fails or a re-attach is refused.
     pub async fn next(&mut self) -> Result<bool, PortError> {
+        if self.source.is_none() {
+            let Some(cursor) = self.resume else {
+                return Err(PortError::Protocol("not attached".to_owned()));
+            };
+            let session = self.attached()?;
+            self.attach(session, Some(cursor)).await?;
+        }
         let Some(source) = self.source.as_mut() else {
             return Err(PortError::Protocol("not attached".to_owned()));
         };
@@ -131,6 +147,8 @@ impl Controller {
         };
         self.head = Some(envelope.cursor);
         if let Action::Reattach(cursor) = self.view.apply(&envelope) {
+            self.source = None;
+            self.resume = Some(cursor);
             let session = self.attached()?;
             self.attach(session, Some(cursor)).await?;
         }
@@ -255,6 +273,8 @@ mod tests {
         responded: Mutex<Vec<ApprovalRespondParams>>,
         submits: Mutex<Vec<SubmitParams>>,
         stale: Option<Cursor>,
+        /// Number of upcoming attaches that fail after the first one.
+        failing_attaches: Mutex<u32>,
     }
 
     impl FakePort {
@@ -266,6 +286,7 @@ mod tests {
                 responded: Mutex::new(Vec::new()),
                 submits: Mutex::new(Vec::new()),
                 stale: None,
+                failing_attaches: Mutex::new(0),
             })
         }
     }
@@ -297,8 +318,20 @@ mod tests {
             params: AttachParams,
         ) -> PortFuture<'_, (AttachAck, Box<dyn FrameSource>)> {
             let session = params.session_id.clone();
+            let mut refuse = false;
             if let Ok(mut calls) = self.attaches.lock() {
+                if !calls.is_empty() {
+                    if let Ok(mut failing) = self.failing_attaches.lock() {
+                        if *failing > 0 {
+                            *failing -= 1;
+                            refuse = true;
+                        }
+                    }
+                }
                 calls.push(params);
+            }
+            if refuse {
+                return Box::pin(async { Err(PortError::Transport("link down".to_owned())) });
             }
             let frames = self
                 .frames
@@ -505,6 +538,58 @@ mod tests {
         ensure(
             submits.get(1).map(|s| s.expect_head) == Some(cursor(7)),
             "the second submit expects the newer head",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_reattach_drops_the_stale_stream_and_next_retries() -> TestResult {
+        let resync = FrameEnvelope {
+            session_id: SessionId::from_str("s1"),
+            cursor: cursor(3),
+            frame: SessionFrame::Resync {
+                reason: "compaction".to_owned(),
+                head: Cursor {
+                    generation: 2,
+                    durable: 0,
+                    live: 0,
+                },
+            },
+        };
+        // The first attach serves [approval, resync]; the stream behind the
+        // resync would keep delivering stale frames if it were read again.
+        let stale_tail = approval_frame(4, "stale");
+        let port = FakePort::new(true, vec![approval_frame(1, "a1"), resync, stale_tail]);
+        *port.failing_attaches.lock().map_err(ctx("lock"))? = 1;
+        let mut controller = Controller::new(port.clone(), "phone");
+        controller.attach(SessionId::from_str("s1"), None).await?;
+        controller.next().await?;
+
+        let failed = controller.next().await;
+        ensure(
+            matches!(failed, Err(PortError::Transport(_))),
+            "the re-attach failure is reported",
+        )?;
+        ensure(
+            controller.view().pending_approvals().count() == 0,
+            "the view was dropped on resync",
+        )?;
+
+        // The retry attaches again; the stale frame behind the resync on the
+        // old stream is never applied.
+        let again = controller.next().await;
+        ensure(
+            matches!(again, Ok(false)),
+            "the retry attaches and the new stream is empty",
+        )?;
+        let attaches = port.attaches.lock().map_err(ctx("lock"))?;
+        ensure(attaches.len() == 3, "initial, failed re-attach, retry")?;
+        ensure(
+            attaches.get(2).and_then(|a| a.from).map(|c| c.generation) == Some(2),
+            "the retry resumes at the host's head",
+        )?;
+        ensure(
+            controller.view().pending_approvals().count() == 0,
+            "the stale frame was not applied",
         )
     }
 }
