@@ -302,6 +302,23 @@ impl TranscriptStore {
         unlock_result
     }
 
+    /// Retention sweep of this store's directory for `class`
+    /// (`SessionTranscripts` or `SessionCorruptBackups`); see
+    /// [`crate::retention`]. Opt-in: nothing is deleted unless the class
+    /// config says `enabled = true` and `mode` is `Apply`.
+    ///
+    /// # Errors
+    /// See [`crate::retention::retention_sweep`].
+    pub fn retention_sweep(
+        &self,
+        class: crate::retention::StoreClass,
+        cfg: &harw_retention::ClassConfig,
+        mode: harw_retention::SweepMode,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::retention::StoreSweepReport, harw_retention::RetentionError> {
+        crate::retention::retention_sweep(&self.root, class, cfg, mode, deadline)
+    }
+
     /// Opens a session transcript for sequential replay.
     pub fn reader(&self, session_id: &SessionId) -> SessionStoreResult<TranscriptReader> {
         let path = self.transcript_path(session_id)?;
@@ -321,7 +338,7 @@ impl TranscriptStore {
     }
 }
 
-fn safe_session_component(session_id: &SessionId) -> SessionStoreResult<&str> {
+pub(crate) fn safe_session_component(session_id: &SessionId) -> SessionStoreResult<&str> {
     let value = session_id.as_str();
     let is_safe_current_id = !value.is_empty()
         && value
@@ -348,7 +365,7 @@ fn transcript_parent(path: &Path) -> SessionStoreResult<&Path> {
     })
 }
 
-fn lock_transcript(path: &Path, session_id: &SessionId) -> SessionStoreResult<File> {
+pub(crate) fn lock_transcript(path: &Path, session_id: &SessionId) -> SessionStoreResult<File> {
     let lock_path = path.with_extension(format!("{TRANSCRIPT_EXT}.lock"));
     reject_symlink(&lock_path, "transcript lock")?;
     let lock = open_lock_file(&lock_path)?;
