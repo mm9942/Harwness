@@ -9,7 +9,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harw_mobile_core::{Activity, Controller};
+use harw_mobile_core::{Activity, Controller, EntryKind};
+use harw_protocol::items::{AssistantMessageItem, ContentPart, TurnItem};
 use harw_protocol::session_wire::{CreateParams, SubmitResult};
 use harw_protocol::{ApprovalKind, ApprovalRequest, SessionPort, TurnEvent};
 use harw_session_daemon::{DaemonError, UdsConfig, UdsServer};
@@ -20,7 +21,9 @@ use harw_session_host::driver::{
 use harw_session_host::replay::MemoryTranscripts;
 use harw_session_host::{HostConfig, SessionHost};
 use harw_session_remote::{ConnectOptions, RemotePort, connect_unix};
-use harw_types::{ApprovalId, ReviewDecision, RiskLevel, SessionId, ThreadId, TurnId, WorkId};
+use harw_types::{
+    ApprovalId, ItemId, ReviewDecision, RiskLevel, SessionId, ThreadId, TurnId, WorkId,
+};
 use tokio::sync::watch;
 
 harw_test_support::define_test_error!(
@@ -95,6 +98,16 @@ impl TurnDriver for ParkingDriver {
         sink: Arc<dyn EventSink>,
     ) -> DriverFuture<'_, TurnOutcome> {
         Box::pin(async move {
+            sink.emit(DriverEvent::Turn(TurnEvent::ItemAdded {
+                turn_id: TurnId::from_str("t1"),
+                item: TurnItem::AssistantMessage(AssistantMessageItem {
+                    id: ItemId::from_str("m1"),
+                    content: vec![ContentPart::Text {
+                        text: "all done".to_owned(),
+                    }],
+                    phase: None,
+                }),
+            }));
             sink.emit(DriverEvent::Turn(TurnEvent::TurnCompleted {
                 turn_id: TurnId::from_str("t1"),
                 usage: None,
@@ -233,6 +246,14 @@ async fn a_phone_resolves_a_parked_approval_over_the_real_daemon() -> TestResult
     .await?;
     ensure(phone.view().last_failure().is_none(), "no failure")?;
     ensure(phone.view().cursor().is_some(), "a resume cursor is known")?;
+    ensure(
+        phone
+            .view()
+            .transcript()
+            .iter()
+            .any(|entry| entry.kind == EntryKind::Assistant("all done".to_owned())),
+        "the agent's answer reaches the phone's chat through the real host",
+    )?;
 
     let _ = daemon.shutdown.send(true);
     let _ = daemon.task.await;
