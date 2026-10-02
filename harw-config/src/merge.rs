@@ -1422,6 +1422,30 @@ fn merge_memory(
         "memory.sweep_deadline_secs",
         layer_path,
     );
+    profile_replaces(
+        &mut trusted.memory.context_ledger,
+        incoming.context_ledger,
+        present("context_ledger"),
+        role,
+        "memory.context_ledger",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.security_signals,
+        incoming.security_signals,
+        present("security_signals"),
+        role,
+        "memory.security_signals",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.llm_extraction,
+        incoming.llm_extraction,
+        present("llm_extraction"),
+        role,
+        "memory.llm_extraction",
+        layer_path,
+    );
 }
 
 // `[permissions]` (Abschnitt 1.11) — alle fuenf direkten Felder sowie

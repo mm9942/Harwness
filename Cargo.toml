@@ -48,6 +48,7 @@ members = [
     # contracts/W00-ws-integration-map.md): client, production TurnDriver
     # bridge, own-cloud node listener.
     "harw-session-remote",
+    "harw-session-client",
     "harw-session-driver",
     "harw-node-listener",
     "harw-mobile-core",
@@ -128,6 +129,8 @@ members = [
     "harw-egress",
     "harw-fsutil",
     # Retention core: age/count/bytes sweeps and the declared data-class registry.
+    "harw-context-ledger",
+    "harw-tool-container",
     "harw-retention",
     # Reines Dev-Gerüst (define_test_error!, Temp-Pfade); nur als dev-dependency.
     "harw-test-support",

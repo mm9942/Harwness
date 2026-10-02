@@ -48,7 +48,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_core::{AgentSession, ModelProvider, StateStore, TranscriptStateStore};
-use harw_runtime::{EntryKind, ModelSource, RuntimeAssembly, RuntimeStores};
+use harw_runtime::{
+    EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeStores, permissions_for_tier,
+};
 use harw_session_daemon::{Daemon, DaemonError, DaemonServices, UdsConfig};
 use harw_session_driver::{
     CoreDriverConfig, CoreSession, CoreSessionFactory, CoreTurnDriver, DriverBridgeError,
@@ -57,7 +59,7 @@ use harw_session_driver::{
 use harw_session_host::driver::TurnDriver;
 use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig};
 use harw_session_store::TranscriptStore;
-use harw_types::{ApprovalActor, IngressSurface, SessionId, ThreadRef};
+use harw_types::{ApprovalActor, IngressSurface, PermissionTier, SessionId, ThreadRef};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -77,6 +79,9 @@ pub struct SessionServeConfig {
     pub home: PathBuf,
     /// Workspace the hosted sessions are bound to (the gateway's cwd).
     pub cwd: PathBuf,
+    /// Tier the hosted sessions run at; it cuts their sandbox rights
+    /// (`permissions_for_tier`). Default: operator, like `local_principal`.
+    pub tier: PermissionTier,
 }
 
 impl SessionServeConfig {
@@ -103,6 +108,7 @@ impl SessionServeConfig {
             socket,
             home: home.to_path_buf(),
             cwd: cwd.to_path_buf(),
+            tier: PermissionTier::Operator,
         }
     }
 }
@@ -114,6 +120,9 @@ pub struct GatewayCoreFactory {
     home: PathBuf,
     cwd: PathBuf,
     uid: u32,
+    /// Tier of the connection the sessions are hosted for; it cuts the
+    /// session's sandbox rights (`permissions_for_tier`), never widens them.
+    tier: PermissionTier,
 }
 
 impl std::fmt::Debug for GatewayCoreFactory {
@@ -164,7 +173,18 @@ impl GatewayCoreFactory {
             home,
             cwd,
             uid,
+            // The local socket's peer is the gateway's own uid, mapped like
+            // `local_principal`: an operator.
+            tier: PermissionTier::Operator,
         }
+    }
+
+    /// Hosts the sessions for a connection of `tier` (rights are cut to
+    /// `permissions_for_tier(tier)`).
+    #[must_use]
+    pub fn with_tier(mut self, tier: PermissionTier) -> Self {
+        self.tier = tier;
+        self
     }
 
     /// The actor the socket's peer identity carries for `uid`.
@@ -184,7 +204,7 @@ impl CoreSessionFactory for GatewayCoreFactory {
     ) -> Result<CoreSession, DriverBridgeError> {
         let runtime = |error: String| DriverBridgeError::Runtime(error);
         let spec = crate::runtime_entry::runtime_spec(
-            EntryKind::Tui,
+            EntryKind::SessionHost,
             &self.home,
             &self.cwd,
             crate::runtime_entry::local_principal(IngressSurface::Tui),
@@ -198,6 +218,14 @@ impl CoreSessionFactory for GatewayCoreFactory {
             })
             .session_events(wiring.event_tx.clone())
             .root_session_id(session_id.clone())
+            // Rights follow the connection's tier: the entry's `{R, W, X}`
+            // ceiling is cut, never widened.
+            .narrowing(RuntimeNarrowing {
+                registry_profile: harw_registry_defaults::RegistryProfile::Full,
+                identity: harw_registry_defaults::IdentityOverrides::default(),
+                permissions: permissions_for_tier(self.tier),
+                workspace_root: None,
+            })
             .build()
             .map_err(|error| runtime(error.to_string()))?;
         let root = assembly
@@ -270,13 +298,16 @@ pub async fn start(
 ) -> Result<SessionIngress, String> {
     let sessions_root = config.state_dir.join(SESSIONS_DIR_NAME);
     private_dir(&sessions_root)?;
-    let factory = Arc::new(GatewayCoreFactory::new(
-        model,
-        &sessions_root,
-        config.home.clone(),
-        config.cwd.clone(),
-        own_uid(),
-    ));
+    let factory = Arc::new(
+        GatewayCoreFactory::new(
+            model,
+            &sessions_root,
+            config.home.clone(),
+            config.cwd.clone(),
+            own_uid(),
+        )
+        .with_tier(config.tier),
+    );
     let driver = CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), factory)
         .map_err(|error| format!("session driver: {error}"))?;
     start_with_driver(config, Arc::new(driver)).await
@@ -498,6 +529,37 @@ mod tests {
             with_operator_actor(session, actor),
             Err(DriverBridgeError::Runtime(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn hosted_session_rights_follow_the_connection_tier() -> TestResult {
+        use harw_authority::Permission;
+        let temp = tempfile::tempdir()?;
+        write_fixture_uia(temp.path())?;
+        let rights_for = |tier: PermissionTier| -> TestResult<Vec<Permission>> {
+            let factory = factory_in(temp.path(), 4242).with_tier(tier);
+            let built = factory.build(&SessionId::new(), None, wiring())?;
+            let context = built
+                .session
+                .spawn_context()
+                .ok_or("hosted session has a spawn context")?;
+            Ok(context.sandbox.permissions().iter().collect())
+        };
+        // The entry's `{R, W, X}` ceiling is cut, never widened, and never
+        // grants network, secrets, plugins or containers.
+        let observer = rights_for(PermissionTier::Observer)?;
+        assert_eq!(observer, vec![Permission::ReadWorkspace]);
+        let operator = rights_for(PermissionTier::Operator)?;
+        assert!(operator.contains(&Permission::WriteWorkspace));
+        assert!(!operator.contains(&Permission::ExecuteProcess));
+        let owner = rights_for(PermissionTier::Owner)?;
+        assert!(owner.contains(&Permission::ExecuteProcess));
+        for rights in [&observer, &operator, &owner] {
+            assert!(!rights.contains(&Permission::NetworkAccess));
+            assert!(!rights.contains(&Permission::ManageContainers));
+            assert!(!rights.contains(&Permission::ReadSecrets));
+        }
         Ok(())
     }
 

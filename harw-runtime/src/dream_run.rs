@@ -209,6 +209,8 @@ pub fn build_recent_dream_context(transcript_root: &Path) -> Result<String, Stri
                 harw_core::ModelMessage::ToolCall { .. }
                 | harw_core::ModelMessage::ToolResult { .. } => continue,
             };
+            // Geheimnisse schwärzen, bevor Transkripttext ein Modell erreicht.
+            let text = harw_memory::facts::redact(&text);
             let rendered = format!("[{role} | {}]\n{text}\n\n", session_id.as_str());
             if context.len().saturating_add(rendered.len()) > DREAM_CONTEXT_MAX_BYTES {
                 break 'sessions;
@@ -472,6 +474,26 @@ mod tests {
         TranscriptStore::new(root)
             .append(&record)
             .map_err(ctx("append transcript record"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn dream_context_redacts_secrets_before_they_reach_the_model() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
+        let session = SessionId::from_str("secret-session");
+        append_user_transcript_item(
+            tmp.path(),
+            &session,
+            ThreadRef::from_str("cli:secret-session"),
+            0,
+            "mein key = sk-abcdefghijklmnopqrstuvwxyz bitte merken",
+        )?;
+        let context = build_recent_dream_context(tmp.path()).map_err(ctx("build context"))?;
+        assert!(
+            !context.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "{context}"
+        );
+        assert!(context.contains("[redacted]"));
         Ok(())
     }
 

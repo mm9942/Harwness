@@ -208,6 +208,23 @@ pub enum Command {
         #[command(subcommand)]
         action: JobsAction,
     },
+    /// Räumt ephemere Daten (Logs, Caches, Spools) nach den Aufbewahrungsregeln auf.
+    ///
+    /// Reiht einen Hintergrundauftrag ein und kehrt sofort mit der Auftrags-ID
+    /// zurück (Status und Abbruch über `harw jobs`). Ohne `--apply` nur ein
+    /// Probelauf. Sicherheitsrelevante Klassen werden nur mit ausdrücklichem
+    /// `[retention.<klasse>] enabled = true` gelöscht.
+    Cleanup {
+        /// Löscht wirklich (nur erlaubte Klassen); ohne Flag ein Probelauf.
+        #[arg(long)]
+        apply: bool,
+        /// Nur diese Klasse (wiederholbar); Standard sind alle Klassen.
+        #[arg(long = "class", value_name = "ID")]
+        classes: Vec<String>,
+        /// Frist des Auftrags in Sekunden (Vorgabe 60).
+        #[arg(long, value_name = "SECS")]
+        deadline_secs: Option<u64>,
+    },
     /// Holt einen GitHub-PR read-only, legt den Diff als Fixture ab und
     /// reviewt ihn mit dem Agenten `github-pr-reviewer`.
     ///

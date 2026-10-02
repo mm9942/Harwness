@@ -18,6 +18,7 @@ harw-extension-api = { path = "../harw-extension-api" }
 # AW1-03: `Assembly<Gathered|Admitted|Budgeted>` in `context_budget.rs` packs
 # `harw_context::Fragment`s against a `ContextCeiling`/`ContextBudgetSpec`.
 harw-context = { path = "../harw-context" }
+harw-context-ledger = { path = "../harw-context-ledger" }
 # AW1-03: `Fragment::cost` and `ContextAssemblyV2::spent` are both
 # `harw_lens_types::CostEstimate` — named directly, not just transitively.
 harw-lens-types = { path = "../harw-lens-types" }

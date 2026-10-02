@@ -71,6 +71,23 @@ pub struct MemorySection {
     /// Frist des Jobs `memory_maintenance` / Startup-Sweep (Sekunden).
     #[serde(default = "default_sweep_deadline")]
     pub sweep_deadline_secs: u64,
+    /// Schreibt den Kontext-Ledger (`harw-context-ledger`): je Turn und
+    /// Fragment Label, Anbieter, Vertrauensklasse, Größe und Auslassungsgrund
+    /// — nie Inhalt — nach `<home>/context-ledger`. Standard: aus.
+    #[serde(default)]
+    pub context_ledger: bool,
+    /// Liefert abgeleitete Sicherheits-Zähler (Anzahl hoher/kritischer DoD-
+    /// Befunde der letzten 24 h je Regel — nie Inhalt) als Kontextquelle
+    /// `security_signals`. Standard: aus.
+    #[serde(default)]
+    pub security_signals: bool,
+    /// LLM-Extraktion gelernter Fakten aus dem Sitzungsverlauf (Job
+    /// `learning_extract`). Legt dafür einen geschwärzten, begrenzten Digest
+    /// der Nutzer-/Assistententexte unter `<projekt>/.harw/memories/_digest`
+    /// an, der nach der Extraktion gelöscht wird. Ergebnisse sind nur
+    /// Kandidaten (Gate + Konsolidierung). Standard: aus.
+    #[serde(default)]
+    pub llm_extraction: bool,
 }
 
 impl Default for MemorySection {
@@ -86,6 +103,9 @@ impl Default for MemorySection {
             forget_deadline_secs: default_job_deadline(),
             promote_deadline_secs: default_job_deadline(),
             sweep_deadline_secs: default_sweep_deadline(),
+            context_ledger: false,
+            security_signals: false,
+            llm_extraction: false,
         }
     }
 }

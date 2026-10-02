@@ -458,6 +458,9 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "memory.forget_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "memory.promote_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "memory.sweep_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.context_ledger", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.security_signals", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.llm_extraction", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // [retention.<klasse>] (10 Klassen x 5 = 50) — Aufbewahrungsgrenzen. enabled/keep_newest:
     // ein nicht vertrautes Projekt darf sie nicht setzen; max_*: Home/Profil setzen frei,
     // das Projekt darf nur senken (merge_retention). Pfade folgen harw_retention::CLASSES.
@@ -532,9 +535,10 @@ mod merge_rule_tests {
         // #22 Welle 2B: +3 für `agent_compiler.*`.
         // R14: +1 für `internal_models.work_driver_judge`.
         // [jobs]: +1 für `jobs.max_running`.
-        // [memory]: +10 für `memory.*`.
+        // [memory]: +11 für `memory.*`.
         // [retention]: +50 für `retention.<klasse>.*` (10 Klassen x 5 Schlüssel).
-        assert_eq!(FIELD_TABLE.len(), 180);
+        // [memory]: +2 für `memory.security_signals`, `memory.llm_extraction`.
+        assert_eq!(FIELD_TABLE.len(), 183);
     }
 
     #[test]
@@ -553,9 +557,9 @@ mod merge_rule_tests {
         // (`uia_worker_models.*`), Teil I +1 (`tui.child_stream`).
         // #22 Welle 2B: +3 (`agent_compiler.*`).
         // R14: +1 (`internal_models.work_driver_judge`).
-        // [memory]: +10 (`memory.*`).
+        // [memory]: +11 (`memory.*`).
         // [retention]: +20 ProfileReplaces, +30 MinBound.
-        assert_eq!(count(MergeRule::ProfileReplaces), 91);
+        assert_eq!(count(MergeRule::ProfileReplaces), 94);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

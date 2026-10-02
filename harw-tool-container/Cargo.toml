@@ -1,0 +1,14 @@
+[package]
+publish.workspace = true
+name = "harw-tool-container"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Container tool policy core: validated image digests, run profiles, mounts and a hardened rootless-Podman argv builder with read-back verification. No I/O, no dependencies."
+
+[dependencies]
+
+[lints]
+workspace = true

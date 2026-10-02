@@ -740,6 +740,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
 /// | `secrets.read` | `ReadSecrets` |
 /// | `plugins.manage` | `ManagePlugins` |
 /// | `cargo.registry.read` | `ReadCargoRegistry` |
+/// | `containers.manage`, `container` | `ManageContainers` |
 ///
 /// # Rückgabe
 /// `None` für ein fachliches Label ohne Rechtebezug.
@@ -765,6 +766,8 @@ pub fn capability_permission(label: &str) -> Option<Permission> {
         Some(Permission::ManagePlugins)
     } else if matches("cargo.registry.read") {
         Some(Permission::ReadCargoRegistry)
+    } else if matches("containers.manage") || matches("container") {
+        Some(Permission::ManageContainers)
     } else {
         None
     }

@@ -72,3 +72,69 @@ not touched without explicit per-PR approval.
 Known gaps: no node listener composed (harw-config has no node transport section); needs an active UIA in home config (no startup preflight); `EntryKind::Tui` gives hosted sessions TUI-level shell/net rights (dedicated EntryKind recommended); factory does sync file reads per new session (small jobs-rule break); e2e uses echo model, second-controller approval not tested end to end (driver unit test covers actor binding).
 
 Review follow-up (independent review by the research session, composition root): `with_operator_actor` now fails closed (Err(DriverBridgeError::Runtime)) when the hosted session has no spawn context, with a test. BLOCKER for the node-listener composition step: the same factory must not serve remote ingress (EntryKind::Tui grants TUI shell/net rights) — add a dedicated EntryKind or derive the tier from ClientIdentity first. Async factory trait (spawn_blocking) remains open (low).
+
+## Central gates (code state 2c744f3; later commits are docs-only)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_nested_refdefs` | clean (the allowed lint is the pre-existing `harw-ops` doc lint on dev) |
+| `cargo test --workspace --no-fail-fast` | 15,512 passed, 0 failed |
+| `cargo xtask gates` | edges 2999, privileges 6, warden-dependency-budget 52, warden-no-c-build 52 (documented blake3/cc exception), arch 2134: all green |
+| `make -C dod stage-test` | passed (static packaging checks) |
+| NOT RUN here | `cargo deny`, `actionlint`, `make -C dod clippy test` (tools not installed) |
+
+Fixes made during the central run: proc-macro cache (`cargo clean -p harw-macros` once), `tunnel.status` test surface, attach test hang (test helper kept the input sender alive), `WsDecision::Allow` boxed (clippy), `harw-retention` privileges entry, redundant closure, `cargo fmt` on 21 agent-written files, session-host approval actor fail-closed, doctor assembly session-event channel.
+
+## Native build (full personalized harw, role `user-interface`)
+
+- `harw agent check examples/agents/uia-mia`: ok (one note: no `[models]` table).
+- `harw agent build examples/agents/uia-mia --native --harw-src <checkout>`: success, first release build 12 min 56 s, binary 105 MB; rebuilt after the doctor fix (cache warm).
+- Verified on the binary: `--version`, `--help`, `doctor` (runtime rights printed without warning, retention PASS line), `cleanup` (enqueues a `retention_sweep` job and returns its id).
+- Not done: `scripts/native-e2e-uia.sh` (the Harw-flavor binary has the full harw CLI, not the runner's `--verify/--manifest` flags, so the existing script does not apply as is); an interactive chat with a model credential was not tried.
+
+## Retention (R0-R3, wave 3)
+
+`harw-retention` + `retention_classes!` + `[retention]`; telemetry pair pruning, tui.log rotation, bug-report cap, sentinel `--telemetry-max-files`; DoD spool age/bytes limits (opt-in); session/freeze stores (opt-in); `retention_sweep` job kind and `harw cleanup` (dry run by default, async job, deadline, cooperative cancel); `harw doctor` retention checks; `dod/Makefile clean-ephemeral` (dry run by default); `deploy/tmpfiles.d` deliberately sets no age on security directories.
+Open: sentinel export rotation still has only the fixed ~32 MiB bound; DoD spool is not yet used by the product (limits apply once wired); `retention_sweep` worker handler is covered by driver unit tests, not by a live worker run.
+
+## Still open (needs the user or a later round)
+
+Context strand and automated learning design (`CONTEXT-AND-LEARNING-DESIGN.md`, decisions in §7); node-listener composition (blocked on a dedicated EntryKind); `harw-tool-container` + `ManageContainers`; any merge to dev/main; `uia-mailbox.md` in PRs #74/#76; `origin/main` Cargo.lock conflict markers.
+
+## Context strand, first slice (e9facc0)
+
+`harw-context-ledger` (layer I; labels, provider, trust, sizes, omission reason; never content; `MemoryLedger`, bounded `FileLedger`), `AgentSession::with_context_ledger`, per-turn `Offered`/`Omitted` entries in `build_request` (`harw-core/src/context_ledger_hook.rs`), config `[memory] context_ledger` (default off, profile-only), runtime opens `<home>/context-ledger`. Verified: clippy -D warnings and xtask gates green; end-to-end turn test (fragment recorded as offered, no content in the ledger); config switch test. Workspace tests re-run after the change: 15,521 passed, 0 failed (a first re-run failed with `no space left on device`, not a test result; space was freed and the run repeated).
+Open (design `CONTEXT-AND-LEARNING-DESIGN.md`): X1 `context_sources!`, X3 assembly paths, X4 used signal, X5-X9 learning loop; blocked on the user's decisions in §7.
+
+## harw-tool-container and ManageContainers (user decision: all, including the permission)
+
+- `harw-tool-container` (policy core, 0 dependencies, no I/O; image refs only as name@sha256, hermetic/build profiles, mount validation, hardened rootless-Podman argv builder, readback verification) taken by path from the research session's branch (it verified the argv against Podman 4.9.3); registered as workspace member, arch layer A. 50 tests pass.
+- New `Permission::ManageContainers` (harw-authority; never implied by `ExecuteProcess`; no entry profile grants it by default, it needs an explicit policy). The four coordinated changes: `ALL` (8 variants), the exhaustive-algebra test masks widened from `u8` to `u16` (`1 << 8` overflows `u8`), the hard-coded `[Permission; 7]` lists (harw-core-bridge agent_tool tests, harw-runtime spec tests, role_rights_matrix) and the exhaustive match in `harw-core/src/mode.rs`; capability labels `container`/`containers.manage` map to it (`harw-registry-defaults/src/authority.rs`). The container *tool layer* (`container.*` tools, catalog rows) is not built yet.
+- Verified: workspace compiles, authority/core-bridge/registry-defaults/runtime/core tests pass, xtask gates green.
+
+## EntryKind::SessionHost (user decision: narrow rights, derived from the identity)
+
+- New `EntryKind::SessionHost` (harw-runtime `spec.rs`): ceiling `{R, W, X}` without network, Full registry, spawner BuiltinRoles, LocalRoot ceiling, project context; approvals are forced to `Delegated` (never automatic, not configurable), tenant `session-host`, budget unbounded-local (same machine, same user).
+- `GatewayCoreFactory` (harw-cli `session_serve.rs`) now assembles hosted sessions with `EntryKind::SessionHost` and cuts the sandbox with `RuntimeNarrowing { permissions: permissions_for_tier(tier) }`: observer `{R}`, operator `{R, W}`, maintainer/owner `{R, W, X}`; never network, secrets, plugins or containers. `SessionServeConfig.tier` (default operator, like `local_principal`).
+- Behaviour change to be aware of: hosted sessions of an operator no longer get shell (they had `{R, W, X, N}` as `Tui`). A maintainer/owner tier gets shell, still behind delegated approvals.
+- Verified: rights matrix over the real assembly (`rights_matrix` 33 tests), `hosted_session_rights_follow_the_connection_tier`, clippy `-D warnings`, xtask gates green.
+- Still open for the node listener: it needs a node transport section in `harw-config` (none exists) and a per-connection factory that passes the mapped device's tier; this EntryKind removes the earlier blocker.
+
+## Lernschleife: Feedback-Signal (X2)
+`FeedbackTracker` (harw-memory) verbucht delivered/used/corrected je Fakt; Provider meldet Lieferungen, `MemoryCaptureObserver` Nachrichten; Decay demotet nutzlose (>=5 geliefert, 0 genutzt) und schädliche Fakten. clippy, Tests (core/runtime/memory), `xtask gates` grün.
+
+## Lernschleife: X7 Gate, X8 Präzisionsbericht
+- X7: `harw-memory::learning_gate` (Injection-Screen verwirft, Größenlimit, Schwärzung, projektlokal = auto, sonst Vorschlag) läuft vor `plan_consolidation` in `run_consolidation`.
+- X8: `feedback::report` + `harw doctor` Zeile `check memory.precision` (WARN bei oft gelieferten, nie genutzten Fakten).
+- X1: `harw_context::sources` (`context_sources!`, `macro_rules`): Tabelle der Kontextquellen (Namensraum, Vertrauensobergrenze, Budgetanteil, Standard an/aus); Anbieter beziehen Namensraum/Trust daraus (Test gleicht ab).
+- X3: Auslassungsgründe (`over-budget`, `below-ceiling`, `excluded-by-program`, `superseded`, Bestandspfad `over-context-budget`) gehen in `ContextAssembly::omission_reasons` und ins Ledger. Der Bestandspfad bleibt als Fallback ohne Programm/Decke bestehen (er kann Sektion/Vertrauen nicht erfinden, siehe `context_budget.rs`-Moduldoku).
+- X5: Werkzeug-Ergebnisse nach Lieferung je Fakt (`outcome_ok/err`, nur Beobachtung, im Doctor-Bericht), Korrektur-Erkennung und Konflikt-Erkennung der Konsolidierung. `OutcomeTracker`/`EpistemicSignal` bleiben ein getrenntes, nicht auf Fakten abgebildetes Modell und sind NICHT verdrahtet.
+- X6: `[memory] llm_extraction` (Standard aus): begrenzter, geschwärzter Digest (`_digest/<sitzung>.jsonl`), Job `learning_extract` (async, Frist, Abbruch, atomar je Sitzung), Worker mit Provider-Adapter; Ergebnis nur `_incoming`-Kandidaten durch Gate + Konsolidierung. Die Runtime reiht nur ein; ohne `harw serve`-Worker bleibt der Job `Ready`. Veraltete Digests (>7 d) räumt der Job. Der Dream-Lesepfad ist NICHT zusätzlich geschwärzt.
+- X9: `[memory] security_signals` (Standard aus): Anbieter `security.signals` (nur Zähler hoher/kritischer DoD-Befunde der letzten 24 h je Regel, Evidenz).
+- Verifikation: Workspace-Clippy, Tests (memory/context/core/runtime/knowledge/config/ops/cli), `xtask gates` grün.
+
+## Lernschleife: X5-Brücke, Dream-Schwärzung
+- X5: `harw-memory::fact_signals` bildet Fakten mit entscheidender Rückmeldung (genutzt vs. korrigiert) auf `EpistemicSignal` ab und nutzt nur die Regel `OppositeOutcomes` im selben Themenkorb (Fakt-Typ + erstes Namenswort); Treffer gehen als Konflikt-Hinweise in die Konfliktliste der Konsolidierung (kein Auto-Löschen). `OutcomeTracker` selbst bleibt ungenutzt (kein Fakt-Bezug).
+- Dream-Lesepfad: `build_recent_dream_context` schwärzt Transkripttext (`facts::redact`) vor dem Modell.
+- Platzproblem: Scratch-Worktrees `/tmp/claude-0/wt70`, `wtdev` verloren ihr `target/`.

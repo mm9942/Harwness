@@ -50,6 +50,7 @@ harw-knowledge = { path = "../harw-knowledge" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-macros = { path = "../harw-macros" }
 harw-memory = { path = "../harw-memory" }
+harw-context-ledger = { path = "../harw-context-ledger" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 harw-observe = { path = "../harw-observe" }
 harw-operations = { path = "../harw-operations" }
@@ -94,6 +95,8 @@ jiff = { workspace = true }
 # Produktivpfad benötigt.
 serde_json = { workspace = true }
 toml = { workspace = true }
+# `security_signals.rs`: RFC-3339-Zeitstempel des DoD-Exports.
+time = { version = "0.3.53", features = ["parsing"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -103,7 +106,6 @@ tokio = { version = "1.53.0", features = ["rt", "macros"] }
 harw-tools = { path = "../harw-tools" }
 # `embedded.rs` tests: `compile_agent(..., now: OffsetDateTime, ...)`
 # (`harw-agent-dsl`), Version wie dort (kein `[workspace.dependencies]`-Eintrag).
-time = "0.3.53"
 
 [lints]
 workspace = true

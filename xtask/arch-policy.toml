@@ -385,6 +385,8 @@ layer = "A"
 layer = "A"
 [packages."harw-session-remote"]
 layer = "A"
+[packages."harw-session-client"]
+layer = "A"
 [packages."harw-session-driver"]
 layer = "A"
 [packages."harw-node-listener"]
@@ -474,4 +476,10 @@ layer = "A"
 layer = "A"
 
 [packages."harw-reverse-proxy"]
+layer = "A"
+
+[packages."harw-context-ledger"]
+layer = "I"
+
+[packages."harw-tool-container"]
 layer = "A"

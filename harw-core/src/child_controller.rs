@@ -2538,6 +2538,18 @@ impl crate::capture::ToolOutcomeObserver for JournalToolObserver {
             inner.on_turn_finished(session_id);
         }
     }
+
+    fn on_user_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(inner) = &self.inner {
+            inner.on_user_message(session_id, text);
+        }
+    }
+
+    fn on_assistant_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(inner) = &self.inner {
+            inner.on_assistant_message(session_id, text);
+        }
+    }
 }
 
 /// Leichter [`crate::guard::ProgressObserver`], der nur die Aktiv-Registry

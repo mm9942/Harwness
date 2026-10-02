@@ -40,6 +40,7 @@ mod completions;
 mod connect;
 mod doc_ocr;
 // #22: die personalisierte harw mit eingebetteter UIA (`--native`).
+mod cleanup_cmd;
 pub mod embedded_uia;
 mod gateway;
 mod home;
@@ -699,6 +700,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
             Command::Serve { .. } => "serve",
@@ -798,6 +800,7 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
         Some(
             Command::Session { .. }
             | Command::Jobs { .. }
+            | Command::Cleanup { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
             | Command::Provider { .. },
@@ -974,6 +977,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Cleanup {
+            apply,
+            classes,
+            deadline_secs,
+        }) => cleanup_cmd::run(&global, apply, classes, deadline_secs),
         Some(Command::PrReview(args)) => {
             let args = crate::pr_review::PrReviewArgs {
                 pr: args.pr,
@@ -1117,6 +1125,7 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::Cleanup { .. }
             | Command::PrReview(_)
             | Command::Uia { .. }
             | Command::Analyze(_),
@@ -3181,7 +3190,59 @@ fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
         };
         println!("check {id}: {label} — {message}");
     }
+    print_retention_checks(&config.harness.retention);
+    print_memory_precision_check(home);
     any_failed
+}
+
+/// Druckt die Präzision der globalen Gedächtnis-Fakten (geliefert/genutzt/
+/// korrigiert); schweigt, wenn es keinen Speicher oder keine Lieferung gibt.
+fn print_memory_precision_check(home: &Path) {
+    let Ok(profile) =
+        harw_home::paths::profile_dir(home, &harw_home::paths::active_profile_name(home))
+    else {
+        return;
+    };
+    let dir = profile.join("memories");
+    if !dir.is_dir() {
+        return;
+    }
+    let Ok(store) = harw_memory::FactStore::open(&dir, harw_memory::FactScope::Global) else {
+        return;
+    };
+    let report = harw_memory::feedback::report(&store);
+    if report.delivered == 0 {
+        return;
+    }
+    let label = if report.useless.is_empty() {
+        "PASS"
+    } else {
+        "WARN"
+    };
+    println!("check memory.precision: {label} — {}", report.summary());
+}
+
+/// Druckt die Aufbewahrungs-Checks: eine `WARN`-Zeile je Klasse, die Daten
+/// unbegrenzt wachsen lässt, und eine `PASS`-Zeile mit den Opt-in-Klassen
+/// (sicherheitsrelevant, nie gelöscht, solange nicht ausdrücklich erlaubt).
+fn print_retention_checks(retention: &harw_retention::RetentionConfig) {
+    let mut opt_in = Vec::new();
+    for class in harw_retention::resolve_all(retention) {
+        let id = class.class.id;
+        let security = class.class.kind == harw_retention::ClassKind::SecurityRelevant;
+        if security && !class.enabled {
+            opt_in.push(id);
+        } else if let Some(message) = class.doctor_warning() {
+            println!("check retention.{id}: WARN — {message}");
+        }
+    }
+    if !opt_in.is_empty() {
+        println!(
+            "check retention.opt-in: PASS — sicherheitsrelevante Klassen werden nie gelöscht, \
+             solange `[retention.<klasse>] enabled = true` fehlt: {}",
+            opt_in.join(", ")
+        );
+    }
 }
 
 /// Ermittelt die Evidenz für den Audit-Integritäts-Check (§4.3).

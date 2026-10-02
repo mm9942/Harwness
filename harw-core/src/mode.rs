@@ -440,6 +440,7 @@ fn all_permissions() -> PermissionSet {
         Permission::ReadSecrets,
         Permission::ManagePlugins,
         Permission::ReadCargoRegistry,
+        Permission::ManageContainers,
     ];
     // Der Aufruf hält den Wächter unten am Leben; die Exhaustiveness-Prüfung
     // leistet der Compiler, nicht diese Zusicherung.
@@ -460,7 +461,8 @@ fn is_known_permission(permission: Permission) -> bool {
         | Permission::NetworkAccess
         | Permission::ReadSecrets
         | Permission::ManagePlugins
-        | Permission::ReadCargoRegistry => true,
+        | Permission::ReadCargoRegistry
+        | Permission::ManageContainers => true,
     }
 }
 
@@ -791,7 +793,7 @@ mod tests {
         let full = all_permissions();
         assert_eq!(InteractionMode::Chat.permission_ceiling(), full);
         assert_eq!(InteractionMode::Work.permission_ceiling(), full);
-        assert_eq!(full.iter().count(), 7);
+        assert_eq!(full.iter().count(), Permission::ALL.len());
     }
 
     #[test]
