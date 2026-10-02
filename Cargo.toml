@@ -51,6 +51,7 @@ members = [
     "harw-session-driver",
     "harw-node-listener",
     "harw-mobile-core",
+    "harw-mobile-term",
     "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",

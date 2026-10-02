@@ -3333,6 +3333,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-mobile-term"
+version = "0.9.0"
+dependencies = [
+ "harw-mobile-core",
+ "harw-protocol",
+ "harw-session-daemon",
+ "harw-session-host",
+ "harw-session-remote",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "harw-model-catalog"
 version = "0.9.0"
 dependencies = [
