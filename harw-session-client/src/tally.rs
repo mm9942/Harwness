@@ -58,6 +58,7 @@ pub struct TurnTally {
     final_text: Option<String>,
     last_text: Option<String>,
     snapshot_text: Option<String>,
+    ahead_left: usize,
     tool_calls: u32,
     finished: usize,
     end: Option<TurnEnd>,
@@ -71,8 +72,37 @@ impl TurnTally {
         Self::default()
     }
 
+    /// A tally for a prompt with `ahead` turns before it (the host's
+    /// `position`). Those turns' events are not part of this account: only
+    /// their ends are noticed, then counting starts.
+    #[must_use]
+    pub fn behind(ahead: usize) -> Self {
+        Self {
+            ahead_left: ahead,
+            ..Self::default()
+        }
+    }
+
+    /// `true` while turns before ours still run. Their child-agent events and
+    /// snapshots do not belong to this tally either.
+    #[must_use]
+    pub fn is_ahead(&self) -> bool {
+        self.ahead_left > 0
+    }
+
     /// Counts one event of the root session.
     pub fn apply_root(&mut self, event: &TurnEvent) {
+        if self.ahead_left > 0 {
+            if matches!(
+                event,
+                TurnEvent::TurnCompleted { .. }
+                    | TurnEvent::TurnAborted { .. }
+                    | TurnEvent::TurnFailed { .. }
+            ) {
+                self.ahead_left -= 1;
+            }
+            return;
+        }
         match event {
             TurnEvent::ItemAdded {
                 item: TurnItem::AssistantMessage(message),
@@ -107,7 +137,7 @@ impl TurnTally {
     /// turn whose message items were missed, so it only stands in when no
     /// message item was seen; a final answer or a last message wins.
     pub fn apply_snapshot(&mut self, assistant_text: &str) {
-        if !assistant_text.is_empty() {
+        if self.ahead_left == 0 && !assistant_text.is_empty() {
             self.snapshot_text = Some(assistant_text.to_owned());
         }
     }
@@ -155,6 +185,29 @@ mod tests {
             turn_id: TurnId::from_str("t"),
             usage: None,
         }
+    }
+
+    #[test]
+    fn the_turns_ahead_do_not_leak_into_the_account() -> TestResult {
+        let mut tally = TurnTally::behind(1);
+        tally.apply_root(&message("ahead", Some(MessagePhase::FinalAnswer)));
+        tally.apply_root(&TurnEvent::ToolCallRequested {
+            turn_id: TurnId::from_str("t"),
+            call_id: ToolCallId::from_str("c"),
+            tool_name: "x".to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        ensure(tally.is_ahead(), "still ahead")?;
+        tally.apply_root(&done());
+        ensure(!tally.is_ahead(), "ahead ended")?;
+        ensure(tally.finished() == 0, "their end is not ours")?;
+        tally.apply_root(&TurnEvent::TurnAborted {
+            turn_id: TurnId::from_str("t"),
+        });
+        let summary = tally.summary();
+        ensure(summary.text.is_none(), "no text of the earlier turn")?;
+        ensure(summary.tool_calls == 0, "no tools of the earlier turn")?;
+        ensure(summary.end == TurnEnd::Aborted, "own end")
     }
 
     #[test]

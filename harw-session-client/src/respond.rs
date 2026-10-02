@@ -30,6 +30,12 @@ impl AnsweredSet {
     pub fn first_time(&mut self, request_id: &str) -> bool {
         self.ids.insert(request_id.to_owned())
     }
+
+    /// Takes `request_id` back: the decision did not reach the host, so a
+    /// replay of the request must be answered again.
+    pub fn forget(&mut self, request_id: &str) {
+        self.ids.remove(request_id);
+    }
 }
 
 /// The wire decision for a verdict: approve, or reject with the reason the

@@ -27,6 +27,8 @@ use harw_protocol::session_wire::Cursor;
 pub struct StreamTracker {
     head: Cursor,
     last_seen: Option<Cursor>,
+    /// Identities of the events processed at exactly `last_seen`.
+    seen_here: Vec<String>,
 }
 
 impl StreamTracker {
@@ -36,6 +38,7 @@ impl StreamTracker {
         Self {
             head,
             last_seen: None,
+            seen_here: Vec::new(),
         }
     }
 
@@ -70,6 +73,38 @@ impl StreamTracker {
         new
     }
 
+    /// Like [`Self::accept`], but with the identity of the event (for
+    /// example its serialized frame). The host stamps the last replayed
+    /// record with `(generation, head, 0)` and can stamp the next live event
+    /// with the very same cursor, so a cursor alone cannot tell them apart. At
+    /// the same cursor an event counts as new unless its identity was already
+    /// processed there.
+    ///
+    /// Limit: a replay record that arrives only *after* the new turn began is
+    /// not recognisable as replay by any client-side rule; callers drain the
+    /// frames already waiting before they submit.
+    pub fn accept_event(&mut self, cursor: &Cursor, identity: &str) -> bool {
+        if *cursor < self.head {
+            return false;
+        }
+        match self.last_seen {
+            Some(seen) if *cursor < seen => false,
+            Some(seen) if *cursor == seen => {
+                if self.seen_here.iter().any(|known| known == identity) {
+                    false
+                } else {
+                    self.seen_here.push(identity.to_owned());
+                    true
+                }
+            }
+            _ => {
+                self.last_seen = Some(*cursor);
+                self.seen_here = vec![identity.to_owned()];
+                true
+            }
+        }
+    }
+
     /// The host answered `Stale { head }`: the transcript moved on. Entries
     /// from `head` on are new; what was processed so far stays processed.
     pub fn moved_to(&mut self, head: Cursor) {
@@ -83,6 +118,7 @@ impl StreamTracker {
     pub fn reattached(&mut self, from: Option<Cursor>, host_head: Cursor) {
         self.head = from.unwrap_or(host_head);
         self.last_seen = None;
+        self.seen_here.clear();
     }
 }
 
@@ -125,6 +161,26 @@ mod tests {
         ensure(!tracker.accept(&at(0, 5, 2)), "the same cursor again")?;
         ensure(!tracker.accept(&at(0, 5, 1)), "an earlier one")?;
         ensure(tracker.accept(&at(0, 6, 0)), "a later durable item")
+    }
+
+    #[test]
+    fn the_replay_tail_and_the_first_live_event_may_share_a_cursor() -> TestResult {
+        let mut tracker = StreamTracker::new(at(0, 5, 0));
+        ensure(tracker.accept_event(&at(0, 5, 0), "replay-tail"), "first")?;
+        ensure(
+            tracker.accept_event(&at(0, 5, 0), "turn-started"),
+            "different event, same cursor: not a duplicate",
+        )?;
+        ensure(
+            !tracker.accept_event(&at(0, 5, 0), "turn-started"),
+            "the same event again is",
+        )?;
+        ensure(!tracker.accept_event(&at(0, 4, 0), "x"), "before the head")?;
+        ensure(tracker.accept_event(&at(0, 5, 1), "next"), "later")?;
+        ensure(
+            !tracker.accept_event(&at(0, 5, 0), "late"),
+            "behind the last",
+        )
     }
 
     #[test]

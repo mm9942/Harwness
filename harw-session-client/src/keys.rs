@@ -3,25 +3,15 @@
 //! The host remembers recent `client_msg_id`s and answers a duplicate
 //! `Accepted` **without queueing the new prompt**. A client that restarts and
 //! counts from 1 again would therefore see its first prompts vanish. Each
-//! [`IdempotencyKeys`] carries an epoch (start time plus a per-process
-//! instance counter), so keys never repeat across restarts or between two
-//! instances created in the same instant.
+//! [`IdempotencyKeys`] carries a random epoch (a UUID v4), so keys do not
+//! repeat across restarts or between instances, whatever the clock does.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use harw_types::SessionId;
 
-/// Instances created in this process.
-static INSTANCES: AtomicU64 = AtomicU64::new(0);
-
-/// A fresh epoch: nanoseconds since the Unix epoch in hex, a dot, and the
-/// process-wide instance number. A clock set backwards could in theory repeat
-/// the first part; the instance number still separates instances of one
-/// process.
+/// A fresh epoch: a random UUID (v4) per source, so keys cannot repeat after a
+/// restart, a clock set backwards or a coarse clock.
 fn fresh_epoch() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    format!("{nanos:x}.{}", INSTANCES.fetch_add(1, Ordering::Relaxed))
+    SessionId::new().0
 }
 
 /// The host accepts a `client_msg_id` of at most 128 bytes. Label and epoch

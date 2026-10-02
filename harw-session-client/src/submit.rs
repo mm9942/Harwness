@@ -39,6 +39,13 @@ impl fmt::Display for SubmitRefusal {
 pub enum SubmitStep {
     /// The prompt is queued. `ahead` is how many turns run or wait before
     /// it; the client waits for `ahead + 1` turn ends.
+    ///
+    /// Caveat: the host also answers `position: 0` for a *repeated*
+    /// `client_msg_id` whose turn already ran. A client that resends a key
+    /// after a lost answer must therefore reconcile with the stream (was the
+    /// turn's end already seen?) instead of waiting for a new end. A client
+    /// that sends each key once, and never after a transport error, cannot
+    /// meet this case.
     Accepted {
         /// Turns before this one.
         ahead: usize,
