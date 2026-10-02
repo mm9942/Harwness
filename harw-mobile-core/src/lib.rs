@@ -90,6 +90,14 @@ pub struct Entry {
     pub kind: EntryKind,
 }
 
+impl Entry {
+    /// The item or call id this entry was made from.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 /// Plain text of a message; an image shows as a marker.
 fn text_of(parts: &[ContentPart]) -> String {
     parts
