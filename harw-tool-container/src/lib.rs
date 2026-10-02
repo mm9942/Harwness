@@ -39,6 +39,7 @@
 
 #![forbid(unsafe_code)]
 
+mod digest;
 pub mod env;
 pub mod error;
 pub mod image;
