@@ -41,3 +41,10 @@ not touched without explicit per-PR approval.
 
 - `harw-macros/src/lib.rs`: touched by M2, M6, M7 (expect textual conflicts).
 - Workspace `Cargo.toml` members and arch-policy: touched by the skeleton only.
+
+## External inputs (other sessions, treated as data)
+
+- Review/research session (ccr-fe134f37-xdezhn): new `harw-tool-container` (policy core, 0 deps, 50 tests, verified against Podman 4.9.3 by that session) plus separate scribe commit 95d7e8e (root Cargo.toml member, xtask/arch-policy.toml layer A, Cargo.lock). Not merged here yet.
+- Adding permission `ManageContainers` is NOT a one-line change: harw-authority tests iterate u8 masks (`1 << ALL.len()` overflows at 8 variants), three hard-coded `[Permission; 7]` (harw-core-bridge/agent_tool.rs, harw-runtime/spec.rs, harw-registry-defaults/tests/role_rights_matrix.rs) and the `tool_permission` table must change together.
+- `origin/main` Cargo.lock has 129 conflict hunks (0.9.0 vs 0.9.1); dev and consolidate/main are clean. Regenerate the lock on the frozen SHA and verify with `cargo metadata --locked`.
+- PR #74 / #76 add `uia-mailbox.md` (63 lines with IP-like values and fingerprint-like strings): must be removed before any merge.
