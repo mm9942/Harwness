@@ -7,8 +7,10 @@
 //! transports apart (W00 D1). No provider credential or host secret lives
 //! here.
 //!
-//! Skeleton: every entry point answers [`RemoteError::NotImplemented`]. File
-//! ownership (see `W00-ws-integration-map.md`):
+//! Client core (S06) is implemented: connect, upgrade, hello, request
+//! correlation, frame routing and [`RemotePort`]. Reconnect and the alias
+//! store (S07) are still skeleton stubs. File ownership (see
+//! `W00-ws-integration-map.md`):
 //! - [`conn`] (S06): endpoints, connect, hello, correlation.
 //! - [`port`] (S06): the `SessionPort` implementation.
 //! - [`reconnect`] (S07): backoff with jitter, resume cursors.
@@ -23,7 +25,8 @@ pub mod reconnect;
 
 pub use alias::{AliasStore, HostAlias};
 pub use conn::{
-    ConnectOptions, Endpoint, NodeEndpoint, RemoteConnection, connect_node, connect_unix,
+    ConnectOptions, Endpoint, NodeEndpoint, RemoteConnection, RemoteFrames, connect_io,
+    connect_node, connect_unix,
 };
 pub use port::RemotePort;
 pub use reconnect::{BackoffPolicy, ResumeCursors};

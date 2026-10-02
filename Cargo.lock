@@ -3853,9 +3853,11 @@ name = "harw-session-remote"
 version = "0.9.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "harw-fsutil",
  "harw-node-transport",
  "harw-protocol",
+ "harw-session-host",
  "harw-session-ws",
  "harw-types",
  "http",

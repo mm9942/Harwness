@@ -24,10 +24,15 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+# Stream/Sink traits of the WebSocketStream (the client needs them to read and
+# write the upgraded socket; same spec as harw-session-ws, already in the lock).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 thiserror = "2"
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Client tests run against the real host through the real server transport.
+harw-session-host = { path = "../harw-session-host" }
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros", "io-util", "test-util"] }
 
