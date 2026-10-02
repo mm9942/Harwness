@@ -3896,6 +3896,7 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "futures-util",
+ "harw-node-listener",
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
