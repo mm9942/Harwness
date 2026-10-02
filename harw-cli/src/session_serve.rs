@@ -20,13 +20,21 @@
 //! # What is wired
 //! - Host, durable transcripts/approvals, the production `CoreTurnDriver`
 //!   (`harw-core` durable turn loop) and the Unix-socket ingress are real.
-//! - The core session factory ([`GatewayCoreFactory`]) assembles a
-//!   **tool-less** `AgentSession` (empty extension registry, like the Dream
-//!   and unbound-Telegram turns) over the model of the gateway's
-//!   `GatewayDream` assembly and a durable `TranscriptStateStore`. There is
-//!   no `EntryKind` for a session-host entry in the runtime contract table
-//!   yet, so tools, sandbox and an approval actor are deliberately NOT wired;
-//!   such sessions never park on an approval.
+//! - The core session factory ([`GatewayCoreFactory`]) assembles one
+//!   `RuntimeAssembly` per hosted session (the registry is single-use) with
+//!   `EntryKind::Tui` (full registry, sandbox bound to the gateway's cwd and
+//!   narrowed by the entry profile, `AskResolution::Interactive`: a tool that
+//!   needs approval parks the turn), the local owner as `Principal`
+//!   (`uid:<euid>`), the gateway's resolved model (the provider of the
+//!   `GatewayDream` assembly) and a durable `TranscriptStateStore`. The
+//!   spawn context's approval actor is set to `Operator { id: "uid:<euid>" }`,
+//!   exactly the actor the socket's peer identity carries
+//!   (`harw_session_com::local::local_identity`), so the durable approval
+//!   record binds the actor that may resolve it (a `Principal` of surface
+//!   Tui would otherwise yield `local-tui`, which never matches).
+//! - Known limitation: `RuntimeAssembly::build` reads config/trust files
+//!   synchronously; the driver's factory trait is synchronous, so this happens
+//!   on the gateway runtime thread once per newly created hosted session.
 //! - TODO(node listener): `harw-node-listener::NodeListener` is not composed
 //!   because `harw-config` has no node-transport section yet; no config is
 //!   invented here.
@@ -35,12 +43,12 @@
 //! Everything on the serve path is async (`Daemon::run` on the gateway's
 //! runtime); the only synchronous work is directory creation at start.
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_core::{AgentSession, ModelProvider, StateStore, TranscriptStateStore};
-use harw_extension_api::empty_extension_registry;
+use harw_runtime::{EntryKind, ModelSource, RuntimeAssembly, RuntimeStores};
 use harw_session_daemon::{Daemon, DaemonError, DaemonServices, UdsConfig};
 use harw_session_driver::{
     CoreDriverConfig, CoreSession, CoreSessionFactory, CoreTurnDriver, DriverBridgeError,
@@ -49,7 +57,7 @@ use harw_session_driver::{
 use harw_session_host::driver::TurnDriver;
 use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig};
 use harw_session_store::TranscriptStore;
-use harw_types::{AgentRole, SessionId, ThreadRef};
+use harw_types::{ApprovalActor, IngressSurface, SessionId, ThreadRef};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -65,6 +73,10 @@ pub struct SessionServeConfig {
     pub state_dir: PathBuf,
     /// Socket path; its parent directory is created `0700` if missing.
     pub socket: PathBuf,
+    /// The harw home (config, trust) the hosted sessions assemble from.
+    pub home: PathBuf,
+    /// Workspace the hosted sessions are bound to (the gateway's cwd).
+    pub cwd: PathBuf,
 }
 
 impl SessionServeConfig {
@@ -74,30 +86,50 @@ impl SessionServeConfig {
     /// `harw attach` looks first), else `<profile>/session-host/run/session.sock`.
     #[must_use]
     pub fn for_profile(
+        home: &Path,
+        cwd: &Path,
         profile_dir: &Path,
         socket: Option<PathBuf>,
         xdg_runtime_dir: Option<&str>,
     ) -> Self {
         let state_dir = profile_dir.join(STATE_DIR_NAME);
-        let socket = socket.unwrap_or_else(|| {
-            match xdg_runtime_dir.filter(|dir| !dir.is_empty()) {
+        let socket =
+            socket.unwrap_or_else(|| match xdg_runtime_dir.filter(|dir| !dir.is_empty()) {
                 Some(dir) => Path::new(dir).join("harw").join("session.sock"),
                 None => state_dir.join("run").join("session.sock"),
-            }
-        });
-        Self { state_dir, socket }
+            });
+        Self {
+            state_dir,
+            socket,
+            home: home.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+        }
     }
 }
 
-/// Core session factory over the gateway's model (tool-less, see module docs).
+/// Core session factory over the gateway runtime assembly (see module docs).
 pub struct GatewayCoreFactory {
     model: Arc<dyn ModelProvider>,
     store: Arc<dyn StateStore>,
+    home: PathBuf,
+    cwd: PathBuf,
+    uid: u32,
 }
 
 impl std::fmt::Debug for GatewayCoreFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewayCoreFactory").finish_non_exhaustive()
+    }
+}
+
+/// Binds the approval actor of the root session (see module docs).
+fn with_operator_actor(session: AgentSession, actor: ApprovalActor) -> AgentSession {
+    match session.spawn_context().cloned() {
+        Some(mut context) => {
+            context.approval_actor = Some(actor);
+            session.with_spawn_context(context)
+        }
+        None => session,
     }
 }
 
@@ -107,14 +139,32 @@ fn hosted_thread(session_id: &SessionId) -> ThreadRef {
 
 impl GatewayCoreFactory {
     /// Factory over `model`, persisting transcripts under `sessions_root`.
+    /// `home` is the harw home, `cwd` the workspace the sessions are bound
+    /// to and `uid` the effective uid of the socket's only permitted peer.
     #[must_use]
-    pub fn new(model: Arc<dyn ModelProvider>, sessions_root: &Path) -> Self {
+    pub fn new(
+        model: Arc<dyn ModelProvider>,
+        sessions_root: &Path,
+        home: PathBuf,
+        cwd: PathBuf,
+        uid: u32,
+    ) -> Self {
         Self {
             model,
             store: Arc::new(TranscriptStateStore::new(
                 TranscriptStore::new(sessions_root),
                 hosted_thread,
             )),
+            home,
+            cwd,
+            uid,
+        }
+    }
+
+    /// The actor the socket's peer identity carries for `uid`.
+    fn operator_actor(&self) -> ApprovalActor {
+        ApprovalActor::Operator {
+            id: format!("uid:{}", self.uid),
         }
     }
 }
@@ -126,14 +176,28 @@ impl CoreSessionFactory for GatewayCoreFactory {
         _title: Option<&str>,
         wiring: SessionWiring,
     ) -> Result<CoreSession, DriverBridgeError> {
-        let session = AgentSession::new_with_id(
-            session_id.clone(),
-            AgentRole::Assistant,
-            None,
-            empty_extension_registry(),
-            wiring.event_tx,
-        )
-        .with_turn_event_sink(wiring.turn_tx);
+        let runtime = |error: String| DriverBridgeError::Runtime(error);
+        let spec = crate::runtime_entry::runtime_spec(
+            EntryKind::Tui,
+            &self.home,
+            &self.cwd,
+            crate::runtime_entry::local_principal(IngressSurface::Tui),
+        );
+        let assembly = RuntimeAssembly::builder(spec)
+            .model(ModelSource::Override(Arc::clone(&self.model)))
+            .stores(RuntimeStores {
+                state_store: Arc::clone(&self.store),
+                job_store: None,
+                approval_store: None,
+            })
+            .session_events(wiring.event_tx.clone())
+            .root_session_id(session_id.clone())
+            .build()
+            .map_err(|error| runtime(error.to_string()))?;
+        let root = assembly
+            .new_root_session(session_id.clone(), wiring.event_tx, wiring.turn_tx, None)
+            .map_err(|error| runtime(error.to_string()))?;
+        let session = with_operator_actor(root.session, self.operator_actor());
         Ok(CoreSession {
             session,
             model: Arc::clone(&self.model),
@@ -171,6 +235,11 @@ impl SessionIngress {
     }
 }
 
+/// The gateway's effective uid: the only peer the socket serves.
+fn own_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
 fn private_dir(dir: &Path) -> Result<(), String> {
     if dir.as_os_str().is_empty() {
         return Ok(());
@@ -195,7 +264,13 @@ pub async fn start(
 ) -> Result<SessionIngress, String> {
     let sessions_root = config.state_dir.join(SESSIONS_DIR_NAME);
     private_dir(&sessions_root)?;
-    let factory = Arc::new(GatewayCoreFactory::new(model, &sessions_root));
+    let factory = Arc::new(GatewayCoreFactory::new(
+        model,
+        &sessions_root,
+        config.home.clone(),
+        config.cwd.clone(),
+        own_uid(),
+    ));
     let driver = CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), factory)
         .map_err(|error| format!("session driver: {error}"))?;
     start_with_driver(config, Arc::new(driver)).await
@@ -215,12 +290,9 @@ pub async fn start_with_driver(
     if let Some(parent) = config.socket.parent() {
         private_dir(parent)?;
     }
-    // The gateway's own uid: the owner of the directory it just created.
-    let uid = std::fs::metadata(&config.state_dir)
-        .map_err(|error| format!("{}: {error}", config.state_dir.display()))?
-        .uid();
-    let transcripts =
-        DurableTranscripts::open(&sessions_root).map_err(|error| format!("transcripts: {error}"))?;
+    let uid = own_uid();
+    let transcripts = DurableTranscripts::open(&sessions_root)
+        .map_err(|error| format!("transcripts: {error}"))?;
     let approvals =
         DurableApprovals::open(&sessions_root).map_err(|error| format!("approvals: {error}"))?;
     let services = DaemonServices::new(driver, Arc::new(transcripts), Arc::new(approvals));
@@ -284,14 +356,21 @@ mod tests {
     #[test]
     fn default_layout_prefers_xdg_runtime_dir() {
         let profile = Path::new("/p");
-        let xdg = SessionServeConfig::for_profile(profile, None, Some("/run/user/1"));
+        let xdg =
+            SessionServeConfig::for_profile(profile, profile, profile, None, Some("/run/user/1"));
         assert_eq!(xdg.socket, Path::new("/run/user/1/harw/session.sock"));
-        let fallback = SessionServeConfig::for_profile(profile, None, None);
+        let fallback = SessionServeConfig::for_profile(profile, profile, profile, None, None);
         assert_eq!(
             fallback.socket,
             Path::new("/p/session-host/run/session.sock")
         );
-        let explicit = SessionServeConfig::for_profile(profile, Some("/x/s.sock".into()), None);
+        let explicit = SessionServeConfig::for_profile(
+            profile,
+            profile,
+            profile,
+            Some("/x/s.sock".into()),
+            None,
+        );
         assert_eq!(explicit.socket, Path::new("/x/s.sock"));
         assert_eq!(explicit.state_dir, Path::new("/p/session-host"));
     }
@@ -300,7 +379,8 @@ mod tests {
     async fn composed_ingress_answers_hello_and_list_then_removes_socket() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir()?;
-        let config = SessionServeConfig::for_profile(temp.path(), None, None);
+        let config =
+            SessionServeConfig::for_profile(temp.path(), temp.path(), temp.path(), None, None);
         let ingress = start_with_driver(&config, Arc::new(NoopDriver)).await?;
         let socket = ingress.socket().to_path_buf();
 
@@ -329,11 +409,141 @@ mod tests {
     #[tokio::test]
     async fn second_start_on_a_live_socket_is_refused() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let config = SessionServeConfig::for_profile(temp.path(), None, None);
+        let config =
+            SessionServeConfig::for_profile(temp.path(), temp.path(), temp.path(), None, None);
         let first = start_with_driver(&config, Arc::new(NoopDriver)).await?;
         let second = start_with_driver(&config, Arc::new(NoopDriver)).await;
         assert!(second.is_err());
         first.shutdown().await;
+        Ok(())
+    }
+
+    /// The Tui entry requires an active UIA: write the same fixture the
+    /// runtime tests use (`<home>/profiles/default`).
+    fn write_fixture_uia(home: &Path) -> TestResult {
+        let profile_dir = home.join("profiles").join("default");
+        let agent_dir = profile_dir.join("agents").join("fixture-uia");
+        std::fs::create_dir_all(&agent_dir)?;
+        std::fs::write(
+            agent_dir.join("definition.toml"),
+            "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+        )?;
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
+        )?;
+        Ok(())
+    }
+
+    fn factory_in(dir: &Path, uid: u32) -> GatewayCoreFactory {
+        GatewayCoreFactory::new(
+            Arc::new(harw_core::EchoModelProvider::new("hello from the core")),
+            &dir.join("sessions"),
+            dir.to_path_buf(),
+            dir.to_path_buf(),
+            uid,
+        )
+    }
+
+    fn wiring() -> SessionWiring {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionWiring { event_tx, turn_tx }
+    }
+
+    #[test]
+    fn factory_binds_the_peer_identity_actor_and_builds_per_session() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        write_fixture_uia(temp.path())?;
+        let factory = factory_in(temp.path(), 4242);
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let built = factory.build(&first, None, wiring())?;
+        // Same actor the socket peer identity carries for this uid.
+        let expected = ApprovalActor::Operator {
+            id: "uid:4242".to_owned(),
+        };
+        let actor = built
+            .session
+            .spawn_context()
+            .and_then(|context| context.approval_actor.clone());
+        assert_eq!(actor, Some(expected));
+        // One assembly per session: a second session builds independently.
+        let other = factory.build(&second, None, wiring())?;
+        assert_eq!(other.session.id(), &second);
+        Ok(())
+    }
+
+    /// The whole chain over a real socket: production `CoreTurnDriver` +
+    /// `GatewayCoreFactory` (scripted echo model), durable adapters; one
+    /// client runs a turn, a second client sees the durable transcript.
+    #[tokio::test]
+    async fn e2e_turn_through_the_core_is_visible_to_a_second_client() -> TestResult {
+        use harw_protocol::session_wire::{AttachParams, CreateParams, SubmitParams, SubmitResult};
+        let temp = tempfile::tempdir()?;
+        write_fixture_uia(temp.path())?;
+        let config =
+            SessionServeConfig::for_profile(temp.path(), temp.path(), temp.path(), None, None);
+        let model: Arc<dyn ModelProvider> =
+            Arc::new(harw_core::EchoModelProvider::new("hello from the core"));
+        let ingress = start(&config, model).await?;
+        let socket = ingress.socket().to_path_buf();
+
+        let first =
+            RemotePort::new(connect_unix(socket.clone(), ConnectOptions::new("one")).await?);
+        let created = first
+            .create(CreateParams {
+                workspace: None,
+                title: Some("e2e".to_owned()),
+            })
+            .await?;
+        let session = created.session_id;
+        let (ack, _frames) = first
+            .attach(AttachParams {
+                session_id: session.clone(),
+                from: None,
+                profile: Default::default(),
+                tail_items: 50,
+            })
+            .await?;
+        let submitted = first
+            .submit(SubmitParams {
+                session_id: session.clone(),
+                text: "hi".to_owned(),
+                expect_head: ack.head,
+                client_msg_id: "m1".to_owned(),
+                force: false,
+            })
+            .await?;
+        assert!(
+            matches!(submitted, SubmitResult::Accepted { .. }),
+            "{submitted:?}"
+        );
+
+        let second = RemotePort::new(connect_unix(socket, ConnectOptions::new("two")).await?);
+        let mut seen = 0_u64;
+        for _ in 0..100 {
+            let (ack, _frames) = second
+                .attach(AttachParams {
+                    session_id: session.clone(),
+                    from: None,
+                    profile: Default::default(),
+                    tail_items: 50,
+                })
+                .await?;
+            seen = ack.head.durable;
+            let _ = second.detach(session.clone()).await;
+            if seen > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            seen > 0,
+            "the second client must see the durable transcript"
+        );
+        drop((first, second));
+        ingress.shutdown().await;
         Ok(())
     }
 }

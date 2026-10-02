@@ -2201,7 +2201,8 @@ fn test_install_without_flag_parses_to_none() -> TestResult {
 
 #[test]
 fn attach_bare_parses_without_target() -> TestResult {
-    let cli = Cli::try_parse_from(["harw", "attach"]).map_err(ctx("`harw attach` sollte parsen"))?;
+    let cli =
+        Cli::try_parse_from(["harw", "attach"]).map_err(ctx("`harw attach` sollte parsen"))?;
     let Some(Command::Attach(args)) = cli.command else {
         return Err(TestError::Unexpected("erwartete attach".into()));
     };

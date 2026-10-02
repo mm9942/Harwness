@@ -474,6 +474,8 @@ pub fn run(
     let session_serve = session_socket.map(|socket| {
         (
             crate::session_serve::SessionServeConfig::for_profile(
+                &home,
+                &cwd,
                 &roots.profile,
                 socket,
                 std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
