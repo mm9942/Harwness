@@ -279,11 +279,6 @@ impl RemoteHarwness {
 struct Run {
     tally: TurnTally,
     approvals: u32,
-    /// Wie viele Turns vor dem eigenen noch enden müssen. Ihre Ereignisse
-    /// gehören nicht zu diesem Turn: sie werden weder gezählt noch gemeldet.
-    ahead_left: usize,
-    /// Zählt nur die Enden der vorausgehenden Turns.
-    ahead_tally: TurnTally,
 }
 
 /// Eine angehängte Sitzung eines Hosts.
@@ -408,8 +403,9 @@ impl RemoteSession {
     ) -> Result<TurnReport> {
         self.drain().await;
         let ahead = self.submit(text).await?;
+        // Die Ereignisse der Turns davor gehören nicht zu diesem Turn.
         let mut run = Run {
-            ahead_left: ahead,
+            tally: TurnTally::behind(ahead),
             ..Run::default()
         };
         while run.tally.finished() < 1 {
@@ -441,7 +437,8 @@ impl RemoteSession {
         {
             match envelope.frame {
                 SessionFrame::Turn(_) | SessionFrame::Child { .. } => {
-                    self.tracker.accept(&envelope.cursor);
+                    self.tracker
+                        .accept_event(&envelope.cursor, &frame_identity(&envelope.frame));
                 }
                 // Eine offene Freigabe oder ein Neuaufbau darf nicht verloren
                 // gehen, nur weil sie vor dem Absenden eintraf.
@@ -544,18 +541,14 @@ impl RemoteSession {
         run: &mut Run,
         on_event: &mut dyn FnMut(&SdkEvent),
     ) -> Result<()> {
+        let identity = frame_identity(&envelope.frame);
         match envelope.frame {
-            SessionFrame::Turn(event) if self.tracker.accept(&envelope.cursor) => {
-                if run.ahead_left > 0 {
-                    // Ein Turn vor dem eigenen: nur sein Ende zählt.
-                    let before = run.ahead_tally.finished();
-                    run.ahead_tally.apply_root(&event);
-                    if run.ahead_tally.finished() > before {
-                        run.ahead_left -= 1;
-                    }
+            SessionFrame::Turn(event) if self.tracker.accept_event(&envelope.cursor, &identity) => {
+                let ours = !run.tally.is_ahead();
+                run.tally.apply_root(&event);
+                if !ours {
                     return Ok(());
                 }
-                run.tally.apply_root(&event);
                 let source = EventSource {
                     session_id: self.id.clone(),
                     parent: None,
@@ -570,8 +563,8 @@ impl RemoteSession {
                 parent,
                 role,
                 event,
-            } if self.tracker.accept(&envelope.cursor) => {
-                if run.ahead_left > 0 {
+            } if self.tracker.accept_event(&envelope.cursor, &identity) => {
+                if run.tally.is_ahead() {
                     return Ok(());
                 }
                 let source = EventSource {
@@ -587,7 +580,7 @@ impl RemoteSession {
                     on_event(&mapped);
                 }
             }
-            SessionFrame::Snapshot { assistant_text, .. } if run.ahead_left == 0 => {
+            SessionFrame::Snapshot { assistant_text, .. } => {
                 run.tally.apply_snapshot(&assistant_text);
             }
             SessionFrame::ApprovalRequested(request) => self.approve(&request, run).await?,
@@ -623,8 +616,13 @@ impl RemoteSession {
                 reason,
             })
             .await
-            .map_err(|error| SdkError::Approval {
-                detail: error.to_string(),
+            .map_err(|error| {
+                // Die Entscheidung kam nicht an: eine Wiederholung der Anfrage
+                // nach dem Neuanhängen muss wieder beantwortet werden.
+                self.answered.forget(request.id.as_str());
+                SdkError::Approval {
+                    detail: error.to_string(),
+                }
             })?;
         match interpret_respond(answer) {
             // Ein anderes Gerät war schneller oder die Frist lief ab: der Turn
@@ -638,6 +636,13 @@ impl RemoteSession {
             }),
         }
     }
+}
+
+/// Die Identität eines Frames für [`StreamTracker::accept_event`]: zwei Frames
+/// mit gleichem Cursor (letzte Wiedergabe, erstes Live-Ereignis) sind nur dann
+/// dasselbe Ereignis, wenn auch ihr Inhalt gleich ist.
+fn frame_identity(frame: &SessionFrame) -> String {
+    serde_json::to_string(frame).unwrap_or_default()
 }
 
 /// Der Ausgang eines Turns als SDK-Status.
