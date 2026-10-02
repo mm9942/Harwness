@@ -203,10 +203,7 @@ impl CoreRuntime for FakeCore {
         })
     }
 
-    fn parked_approval<'a>(
-        &'a self,
-        _: &'a SessionId,
-    ) -> CoreFuture<'a, Option<ParkedApproval>> {
+    fn parked_approval<'a>(&'a self, _: &'a SessionId) -> CoreFuture<'a, Option<ParkedApproval>> {
         Box::pin(async move { Ok(lock(&self.parked).map_err(|e| runtime_error(&e))?.clone()) })
     }
 
@@ -493,7 +490,10 @@ async fn a_second_park_after_resume_gets_its_durable_record_from_the_driver() ->
         "the driver issued the durable record the core skipped"
     );
     let announced = rig.sink.approval_requests()?;
-    ensure!(announced.len() == 2, "two request frames, got {announced:?}");
+    ensure!(
+        announced.len() == 2,
+        "two request frames, got {announced:?}"
+    );
     ensure!(
         announced[1].id.as_str() == second.as_str(),
         "second wire id matches the durable id"
@@ -552,5 +552,45 @@ async fn first_writer_wins_in_the_durable_backend() -> TestResult {
             )],
         "the first decision is the one the core sees: {resumed:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn another_controller_resolving_resumes_with_the_bound_actor() -> TestResult {
+    let rig = rig(vec![Leg::ParkDurable, Leg::Complete])?;
+    let request = rig.park().await?;
+
+    // A second controller (not the actor bound at park time) wins the race,
+    // as the host's `resolve_any_actor` permits.
+    let other = ApprovalActor::Operator {
+        id: "second-controller".to_owned(),
+    };
+    ensure!(other != operator(), "test needs two distinct actors");
+    rig.store
+        .resolve_any_actor(
+            &rig.session,
+            &request,
+            ReviewDecision::Approved,
+            None,
+            &other,
+            &SystemClock,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let outcome = rig.resume().await?;
+    ensure!(outcome == TurnOutcome::Completed, "outcome {outcome:?}");
+    // The core accepts only the actor bound at park time; the resolver stays
+    // in the durable record.
+    let resumed = lock(&rig.core.resumed)?.clone();
+    ensure!(
+        resumed == vec![(operator(), ApprovalResolution::Approve)],
+        "core resumed with {resumed:?}"
+    );
+    let record = rig
+        .store
+        .resolution(&rig.session, &request)
+        .map_err(|e| e.to_string())?
+        .ok_or("resolution record missing")?;
+    ensure!(record.actor == other, "audit keeps the resolver");
     Ok(())
 }
