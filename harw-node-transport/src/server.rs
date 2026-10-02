@@ -29,30 +29,20 @@ use crate::wire::{read_frame, write_frame};
 /// The TLS stream of an accepted, authenticated connection.
 pub type ServerTlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
-/// Tunables of the accepting side.
-#[derive(Debug, Clone)]
-pub struct ServerOptions {
-    /// Deadline for TLS + node handshake of one connection.
-    pub handshake_timeout: Duration,
-    /// Freshness policy.
-    pub policy: HandshakePolicy,
-    /// Replay cache capacity.
-    pub replay_capacity: usize,
-    /// Concurrent connections; further connections are closed at once.
-    pub max_connections: usize,
-    /// HTTP/1 header read deadline (slow-loris bound).
-    pub header_read_timeout: Duration,
-}
-
-impl Default for ServerOptions {
-    fn default() -> Self {
-        Self {
-            handshake_timeout: Duration::from_secs(10),
-            policy: HandshakePolicy::default(),
-            replay_capacity: ReplayCache::DEFAULT_CAPACITY,
-            max_connections: 256,
-            header_read_timeout: Duration::from_secs(30),
-        }
+harw_types::limits_struct! {
+    /// Tunables of the accepting side.
+    #[derive(Debug, Clone)]
+    pub struct ServerOptions {
+        /// Deadline for TLS + node handshake of one connection.
+        pub handshake_timeout: Duration = DEFAULT_SERVER_HANDSHAKE_TIMEOUT = Duration::from_secs(10),
+        /// Freshness policy.
+        pub policy: HandshakePolicy = DEFAULT_SERVER_POLICY = HandshakePolicy::DEFAULT,
+        /// Replay cache capacity.
+        pub replay_capacity: usize = DEFAULT_REPLAY_CAPACITY = ReplayCache::DEFAULT_CAPACITY,
+        /// Concurrent connections; further connections are closed at once.
+        pub max_connections: usize = DEFAULT_MAX_CONNECTIONS = 256,
+        /// HTTP/1 header read deadline (slow-loris bound).
+        pub header_read_timeout: Duration = DEFAULT_HEADER_READ_TIMEOUT = Duration::from_secs(30),
     }
 }
 

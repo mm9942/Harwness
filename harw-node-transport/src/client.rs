@@ -48,21 +48,14 @@ pub fn empty_body() -> NodeBody {
         .boxed()
 }
 
-/// Tunables of the dialling side.
-#[derive(Debug, Clone)]
-pub struct ClientOptions {
-    /// Deadline for TCP connect + TLS + node handshake.
-    pub handshake_timeout: Duration,
-    /// Freshness policy.
-    pub policy: HandshakePolicy,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            handshake_timeout: Duration::from_secs(10),
-            policy: HandshakePolicy::default(),
-        }
+harw_types::limits_struct! {
+    /// Tunables of the dialling side.
+    #[derive(Debug, Clone)]
+    pub struct ClientOptions {
+        /// Deadline for TCP connect + TLS + node handshake.
+        pub handshake_timeout: Duration = DEFAULT_CLIENT_HANDSHAKE_TIMEOUT = Duration::from_secs(10),
+        /// Freshness policy.
+        pub policy: HandshakePolicy = DEFAULT_CLIENT_POLICY = HandshakePolicy::DEFAULT,
     }
 }
 

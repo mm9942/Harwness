@@ -20,6 +20,7 @@ pub mod confidence;
 pub mod digest;
 pub mod error;
 pub mod ids;
+pub mod limits;
 pub mod impact;
 pub mod principal;
 pub mod provider_ids;
