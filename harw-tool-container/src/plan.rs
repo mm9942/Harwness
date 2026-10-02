@@ -265,11 +265,27 @@ pub struct Expected {
     pub pids_limit: i64,
 }
 
+/// One step of the container lifecycle. Run them in this order: `Create`,
+/// `Inspect` (feed the result to [`crate::readback::verify`]), then `Start`
+/// only when every dimension is enforced; otherwise `Remove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// `create`: the container exists but nothing runs yet.
+    Create,
+    /// `inspect`: read back what the engine actually applied.
+    Inspect,
+    /// `start --attach`: run the workload and stream its output.
+    Start,
+    /// `rm --force`: discard a container that failed verification.
+    Remove,
+}
+
 /// A validated, inspectable container run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerPlan {
     executable: String,
-    args: Vec<String>,
+    connection: Option<String>,
+    create: Vec<String>,
     name: String,
     profile: Profile,
     image: ImageRef,
@@ -332,7 +348,7 @@ impl ContainerPlan {
         if let Some(connection) = &config.connection {
             args.push(format!("--connection={connection}"));
         }
-        args.extend(["run", "--rm", "--pull=never"].map(str::to_owned));
+        args.extend(["create", "--rm", "--pull=never"].map(str::to_owned));
         args.push(format!("--name={name}"));
         if let Some(cidfile) = &config.cidfile {
             args.push(format!("--cidfile={cidfile}"));
@@ -374,7 +390,8 @@ impl ContainerPlan {
         let approval = approval_text(config, request, &mounts, timeout_s, &workdir);
         Ok(Self {
             executable: config.executable.clone(),
-            args,
+            connection: config.connection.clone(),
+            create: args,
             name,
             profile,
             image: request.image.clone(),
@@ -390,10 +407,36 @@ impl ContainerPlan {
         &self.executable
     }
 
-    /// The complete argument vector, to be passed one element per argument.
+    /// The `create` argument vector, one element per argument.
+    ///
+    /// There is deliberately no `run`: `run` starts the workload before
+    /// anything can be checked, and a short-lived command may be gone (`--rm`)
+    /// before an inspect. The sequence is `create` → inspect → verify with
+    /// [`crate::readback::verify`] → `start`, and `rm` when verification
+    /// fails (see [`Stage`]).
     #[must_use]
-    pub fn args(&self) -> &[String] {
-        &self.args
+    pub fn create_args(&self) -> &[String] {
+        &self.create
+    }
+
+    /// The argument vector of `stage`.
+    #[must_use]
+    pub fn stage_args(&self, stage: Stage) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        if let Some(connection) = &self.connection {
+            args.push(format!("--connection={connection}"));
+        }
+        match stage {
+            Stage::Create => return self.create.clone(),
+            Stage::Inspect => {
+                args.extend(["inspect", "--type=container"].map(str::to_owned));
+            }
+            Stage::Start => args.extend(["start", "--attach"].map(str::to_owned)),
+            Stage::Remove => args.extend(["rm", "--force"].map(str::to_owned)),
+        }
+        args.push("--".to_owned());
+        args.push(self.name.clone());
+        args
     }
 
     /// The container name (`harw-<run id>`).
@@ -437,7 +480,7 @@ impl ContainerPlan {
     /// The argument vector with environment values hidden, for logs.
     #[must_use]
     pub fn redacted_args(&self) -> Vec<String> {
-        self.args
+        self.create
             .iter()
             .map(|arg| match arg.strip_prefix("--env=") {
                 Some(rest) => {
@@ -453,9 +496,9 @@ impl ContainerPlan {
     /// `engine_env` is set (see [`crate::env::engine_environment`]); stdin is
     /// closed. Constructing the command does not start anything.
     #[must_use]
-    pub fn to_command(&self, engine_env: &[(String, String)]) -> Command {
+    pub fn to_command(&self, stage: Stage, engine_env: &[(String, String)]) -> Command {
         let mut command = Command::new(&self.executable);
-        command.args(&self.args);
+        command.args(self.stage_args(stage));
         command.env_clear();
         command.envs(engine_env.iter().map(|(k, v)| (k, v)));
         command.stdin(Stdio::null());
@@ -522,7 +565,7 @@ mod tests {
     fn hermetic_argv_is_exact() -> TestResult {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
         let want = strings(&[
-            "run",
+            "create",
             "--rm",
             "--pull=never",
             "--name=harw-r1",
@@ -546,8 +589,8 @@ mod tests {
             "check",
         ]);
         ensure(
-            plan.args() == want.as_slice(),
-            &format!("{:?}", plan.args()),
+            plan.create_args() == want.as_slice(),
+            &format!("{:?}", plan.create_args()),
         )?;
         ensure(plan.executable() == "/usr/bin/podman", "executable")?;
         ensure(plan.container_name() == "harw-r1", "name")
@@ -557,7 +600,7 @@ mod tests {
     fn build_profile_is_writable_with_a_cache() -> TestResult {
         let cfg = config()?.with_cache_volume("harw-cargo")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
-        let a = plan.args();
+        let a = plan.create_args();
         ensure(
             a.contains(&"--mount=type=bind,src=/srv/ws,dst=/workspace".to_owned()),
             "workspace rw",
@@ -581,7 +624,7 @@ mod tests {
         let cfg = config()?.with_cache_volume("harw-cargo")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
         ensure(
-            !plan.args().iter().any(|a| a.contains("type=volume")),
+            !plan.create_args().iter().any(|a| a.contains("type=volume")),
             "no volume",
         )
     }
@@ -599,7 +642,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--userns=keep-id",
             ] {
-                ensure(plan.args().iter().any(|a| a == flag), flag)?;
+                ensure(plan.create_args().iter().any(|a| a == flag), flag)?;
             }
         }
         Ok(())
@@ -613,7 +656,7 @@ mod tests {
             cmd(&["--privileged", "-v", "/:/host"]),
         )?;
         let plan = ContainerPlan::build(&config()?, &req)?;
-        let a = plan.args();
+        let a = plan.create_args();
         let sep = a
             .iter()
             .position(|x| x == "--")
@@ -652,11 +695,11 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_precedes_run() -> TestResult {
+    fn a_connection_precedes_create() -> TestResult {
         let cfg = config()?.with_connection("pi")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
         ensure(
-            plan.args()[0] == "--connection=pi" && plan.args()[1] == "run",
+            plan.create_args()[0] == "--connection=pi" && plan.create_args()[1] == "create",
             "order",
         )?;
         ensure(config()?.with_connection("a b").is_err(), "bad name")
@@ -667,7 +710,8 @@ mod tests {
         let cfg = config()?.with_cidfile("/srv/job/cid")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
         ensure(
-            plan.args().contains(&"--cidfile=/srv/job/cid".to_owned()),
+            plan.create_args()
+                .contains(&"--cidfile=/srv/job/cid".to_owned()),
             "cidfile",
         )?;
         ensure(config()?.with_cidfile("relative").is_err(), "relative")
@@ -678,7 +722,7 @@ mod tests {
         let ok = request(Profile::Hermetic)?.with_env("RUST_LOG", "secret-looking")?;
         let plan = ContainerPlan::build(&config()?, &ok)?;
         ensure(
-            plan.args()
+            plan.create_args()
                 .contains(&"--env=RUST_LOG=secret-looking".to_owned()),
             "passed",
         )?;
@@ -721,7 +765,7 @@ mod tests {
         let ok = request(Profile::Hermetic)?.with_workdir("crates/x")?;
         let plan = ContainerPlan::build(&config()?, &ok)?;
         ensure(
-            plan.args()
+            plan.create_args()
                 .contains(&"--workdir=/workspace/crates/x".to_owned()),
             "relative",
         )?;
@@ -742,7 +786,7 @@ mod tests {
         )?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
         ensure(
-            plan.args()
+            plan.create_args()
                 .contains(&"--mount=type=bind,src=/srv/data,dst=/data".to_owned()),
             "rw in build",
         )?;
@@ -863,6 +907,33 @@ mod tests {
     }
 
     #[test]
+    fn the_lifecycle_is_create_inspect_start_with_no_run() -> TestResult {
+        let cfg = config()?.with_connection("pi")?;
+        let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
+        ensure(!plan.create_args().iter().any(|a| a == "run"), "no run")?;
+        let name = plan.container_name().to_owned();
+        for (stage, verb) in [
+            (Stage::Inspect, "inspect"),
+            (Stage::Start, "start"),
+            (Stage::Remove, "rm"),
+        ] {
+            let args = plan.stage_args(stage);
+            ensure(args[0] == "--connection=pi", "connection first")?;
+            ensure(args[1] == verb, verb)?;
+            ensure(
+                args[args.len() - 2] == "--" && args[args.len() - 1] == name,
+                "the name follows the separator",
+            )?;
+        }
+        ensure(
+            plan.stage_args(Stage::Start)
+                .iter()
+                .any(|a| a == "--attach"),
+            "output is attached",
+        )
+    }
+
+    #[test]
     fn approval_text_hides_command_arguments_but_binds_them() -> TestResult {
         let secret = "Authorization: Bearer s3cr3t-token";
         let make = |last: &str| -> Result<ContainerPlan, ContainerPolicyError> {
@@ -911,9 +982,12 @@ mod tests {
     fn the_command_has_a_cleared_environment() -> TestResult {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
         let env = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
-        let command = plan.to_command(&env);
+        let command = plan.to_command(Stage::Create, &env);
         ensure(command.get_program() == "/usr/bin/podman", "program")?;
-        ensure(command.get_args().count() == plan.args().len(), "args")?;
+        ensure(
+            command.get_args().count() == plan.create_args().len(),
+            "args",
+        )?;
         ensure(command.get_envs().count() == 1, "only the given env")
     }
 }
