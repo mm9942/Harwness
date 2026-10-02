@@ -180,6 +180,9 @@ pub fn read_status(root: &Path) -> Vec<LaneStatus> {
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {

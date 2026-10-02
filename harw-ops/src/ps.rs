@@ -46,7 +46,7 @@
 //! let _op = harw_ops::ps::PsOperation;
 //! ```
 
-use harw_job_runtime::JobState;
+use harw_job_runtime::{JobDisposition, JobOutcome, JobState, StoredJob};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_session_store::{JobListQuery, JobStore};
@@ -195,7 +195,17 @@ fn split_kind(args: PsArgs) -> Result<(Option<Kind>, Option<String>), OpError> {
 )]
 async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     let (kind, status) = split_kind(args)?;
-    let states = status.as_deref().map(parse_state).transpose()?;
+    // `timed_out` ist kein eigener Store-Zustand, sondern die typisierte
+    // Disposition auf `failed`: Zustand `failed` wählen, danach nach
+    // Disposition filtern.
+    let want_timed_out = status
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("timed_out"));
+    let states = if want_timed_out {
+        Some(JobState::Failed)
+    } else {
+        status.as_deref().map(parse_state).transpose()?
+    };
     let store = ctx
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
@@ -213,12 +223,21 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
         )
         .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?
     };
+    let jobs: Vec<StoredJob> = if want_timed_out {
+        jobs.into_iter()
+            .filter(|record| record.disposition() == JobDisposition::TimedOut)
+            .collect()
+    } else {
+        jobs
+    };
     let mut processes = if kind == Some(Kind::Work) {
         Vec::new()
     } else {
         process_jobs(ctx)?
     };
-    if let Some(filter) = states {
+    if want_timed_out {
+        processes.clear();
+    } else if let Some(filter) = states {
         processes.retain(|meta| process_matches(filter, meta.state));
     }
     processes.sort_by(|left, right| left.job_id.cmp(&right.job_id));
@@ -232,10 +251,7 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
         Kind::Work => jobs
             .iter()
             .map(|record| {
-                format!(
-                    "{}\twork\t{:?}\towner -\tprofile -\tend -\trev {}",
-                    record.job.id, record.job.state, record.revision
-                )
+                work_row(record)
             })
             .collect::<Vec<_>>(),
         // Nur ID, Zustand, Besitzer, Profil und Endgrund: Befehl, Name, cwd und
@@ -258,6 +274,76 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     Ok(OpOutput::from(text))
 }
 
+/// Zustandsname einer Arbeitszeile: `timed_out` statt `failed` bei
+/// Fristablauf (typisierte Disposition), sonst der Store-Zustand.
+fn work_state_label(record: &StoredJob) -> &'static str {
+    match record.job.state {
+        JobState::Failed if record.disposition() == JobDisposition::TimedOut => "timed_out",
+        JobState::Pending => "pending",
+        JobState::Ready => "ready",
+        JobState::Running => "running",
+        JobState::Completed => "completed",
+        JobState::Blocked => "blocked",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+    }
+}
+
+/// Art-Name eines Jobs (`worker`, `dream` oder der `Custom`-Name, z. B.
+/// `memory_maintenance`).
+fn kind_label(kind: &harw_job_runtime::JobKind) -> String {
+    match kind {
+        harw_job_runtime::JobKind::Dream => "dream".to_owned(),
+        harw_job_runtime::JobKind::Worker => "worker".to_owned(),
+        harw_job_runtime::JobKind::Custom(name) => name.clone(),
+    }
+}
+
+/// Eine `work`-Zeile: Zustand der Store-Aufzeichnung, Disposition als `end`
+/// (`timed_out`/`cancelled`/…), danach Art, Frist und Grund, soweit bekannt.
+pub(crate) fn work_row(record: &StoredJob) -> String {
+    let disposition = record.disposition();
+    let end = if disposition.is_final() {
+        disposition.as_str()
+    } else {
+        "-"
+    };
+    let mut row = format!(
+        "{}\twork\t{:?}\towner -\tprofile -\tend {end}\trev {}\tkind {}",
+        record.job.id,
+        record.job.state,
+        record.revision,
+        kind_label(&record.job.kind)
+    );
+    if let Some(secs) = record
+        .input
+        .get("deadline_secs")
+        .and_then(serde_json::Value::as_u64)
+    {
+        row.push_str(&format!("\tdeadline {secs}s"));
+    }
+    let reason = record
+        .completion
+        .as_ref()
+        .and_then(|completion| match &completion.outcome {
+            JobOutcome::Failed { reason }
+            | JobOutcome::Cancelled { reason }
+            | JobOutcome::Blocked { reason } => Some(reason.as_str()),
+            JobOutcome::Succeeded { .. } => None,
+        })
+        .or_else(|| {
+            record
+                .cancellation
+                .as_ref()
+                .map(|cancellation| cancellation.reason.as_str())
+        });
+    if let Some(reason) = reason {
+        let one_line: String = reason.lines().next().unwrap_or("").chars().take(160).collect();
+        row.push_str(&format!("\treason {one_line}"));
+    }
+    row
+}
+
 /// Übersicht ohne Art: je Art eine Zeile mit Zählern pro Zustand, danach der
 /// Hinweis auf die Detailansicht.
 ///
@@ -266,7 +352,7 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
 fn summary(jobs: &[harw_job_runtime::StoredJob], processes: &[JobMeta]) -> String {
     let work = count_states(
         jobs.iter()
-            .map(|record| format!("{:?}", record.job.state).to_ascii_lowercase()),
+            .map(|record| work_state_label(record).to_owned()),
     );
     let process = count_states(processes.iter().map(|meta| meta.state.as_str().to_owned()));
     [
@@ -613,7 +699,7 @@ mod tests {
         .map_err(crate::test_support::ctx("ps"))?;
         assert_eq!(
             output.text,
-            "job-ready\twork\tReady\towner -\tprofile -\tend -\trev 0"
+            "job-ready\twork\tReady\towner -\tprofile -\tend -\trev 0\tkind worker"
         );
         Ok(())
     }
@@ -817,7 +903,7 @@ mod tests {
             .map_err(ctx("ps work"))?;
         assert_eq!(
             work.text,
-            "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0"
+            "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0\tkind worker"
         );
         let process = ps(&op_ctx, with_kind("process"))
             .await
@@ -855,7 +941,7 @@ mod tests {
         let output = ps(&op_ctx, args).await.map_err(ctx("ps json"))?;
         assert_eq!(
             output.text,
-            "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0"
+            "job-pending\twork\tPending\towner -\tprofile -\tend -\trev 0\tkind worker"
         );
         Ok(())
     }

@@ -11,6 +11,19 @@
 //!   Prozessgruppe, nach der Gnadenfrist SIGKILL.
 //! - `/jobs logs <id> [n]` — die letzten `n` Zeilen (Vorgabe 40, höchstens
 //!   400) von stdout und stderr sowie der Pfad der Logdateien.
+//! - `/jobs work` — die durablen Arbeitsaufträge des Job-Stores (auch
+//!   `memory_maintenance`) mit Art, Zustand, `end` (Disposition:
+//!   `succeeded`, `failed`, `timed_out`, `cancelled`), Frist und Grund;
+//!   Abbruch über `/stop <id>`.
+//! - `/jobs wait <id> [sekunden]` — wartet auf das Ende eines durablen Jobs
+//!   (Vorgabe 30 s, höchstens 300 s) und zeigt dann dieselbe Zeile; kehrt
+//!   nach Ablauf der Wartezeit mit dem aktuellen Stand zurück.
+//! - `/jobs permits [lane] [n]` — variable Parallelität: ohne Argumente die
+//!   Lanes (`work_driver`, `memory` des Job-Workers; `process` der
+//!   Prozess-Jobs) mit Limit und belegten Permits, mit `lane n` setzt es das
+//!   Limit zur Laufzeit (Erhöhen startet wartende Jobs sofort, Senken stoppt
+//!   keinen laufenden Job). Der Worker übernimmt Änderungen beim nächsten
+//!   Poll (`lane-limits.json` im Job-Store). Vorgabe aus `[jobs] max_running`.
 //!
 //! # Rechte
 //! Nur Kommando-Fläche (`tui_only`, kein Modell-Werkzeug): die getippte
@@ -28,6 +41,8 @@ use std::sync::Arc;
 
 use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
+use harw_job_runtime::WorkId;
+use harw_session_store::{JobListQuery, JobStore};
 use harw_tool_job::logs::tail_of_file;
 use harw_tool_job::model::{STDERR_LOG, STDOUT_LOG};
 use harw_tool_job::{Caller, JobId, JobManager, JobSignal, JobState, JobStatus, format_duration};
@@ -115,10 +130,17 @@ pub fn job_line(status: &JobStatus) -> String {
     command(path = "/jobs", visibility = "tui_only", busy = "immediate")
 )]
 async fn jobs(ctx: &OpContext, args: JobsArgs) -> Result<OpOutput, OpError> {
+    let tokens = args.tokens;
+    // Durable Arbeitsaufträge und Permits brauchen keine Prozess-Verwaltung.
+    match tokens.first().map(String::as_str) {
+        Some("work") => return work_text(ctx),
+        Some("wait") => return wait_text(ctx, &tokens).await,
+        Some("permits" | "limits") => return permits_text(ctx, &tokens[1..]),
+        _ => {}
+    }
     let manager = ctx
         .service::<Arc<JobManager>>()
         .ok_or_else(|| OpError::NotAvailable(NOT_AVAILABLE.to_owned()))?;
-    let tokens = args.tokens;
     match tokens.first().map(String::as_str) {
         None | Some("list" | "ls") => Ok(OpOutput::from(list_text(manager))),
         Some("show") => {
@@ -164,9 +186,126 @@ async fn jobs(ctx: &OpContext, args: JobsArgs) -> Result<OpOutput, OpError> {
             Ok(OpOutput::from(logs_text(&status, lines)))
         }
         Some(other) => Err(OpError::InvalidArguments(format!(
-            "unbekannter Unterbefehl `{other}` — /jobs [list|show <id>|stop <id> [signal]|logs <id> [n]]"
+            "unbekannter Unterbefehl `{other}` — /jobs [list|show <id>|stop <id> [signal]|logs <id> [n]|work|wait <id> [s]|permits [lane] [n]]"
         ))),
     }
+}
+
+/// Obergrenze der Wartezeit von `/jobs wait` (Sekunden).
+const MAX_WAIT_SECS: u64 = 300;
+/// Vorgabe der Wartezeit von `/jobs wait` (Sekunden).
+const DEFAULT_WAIT_SECS: u64 = 30;
+
+fn job_store(ctx: &OpContext) -> Result<&Arc<JobStore>, OpError> {
+    ctx.service::<Arc<JobStore>>()
+        .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))
+}
+
+/// `/jobs work`: die sichtbaren durablen Jobs, eine Zeile je Job
+/// (siehe [`crate::ps::work_row`]).
+fn work_text(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    let store = job_store(ctx)?;
+    let records = crate::job_tenant::list_visible_jobs(ctx, store, JobListQuery::default())
+        .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?;
+    if records.is_empty() {
+        return Ok(OpOutput::from("No durable jobs.".to_owned()));
+    }
+    Ok(OpOutput::from(
+        records
+            .iter()
+            .map(crate::ps::work_row)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
+/// `/jobs wait <id> [s]`: pollt den Store, bis die Disposition endgültig ist
+/// oder die Wartezeit abläuft.
+async fn wait_text(ctx: &OpContext, tokens: &[String]) -> Result<OpOutput, OpError> {
+    let raw_id = tokens
+        .get(1)
+        .ok_or_else(|| OpError::InvalidArguments("/jobs wait <job-id> [sekunden]".to_owned()))?;
+    let secs = match tokens.get(2) {
+        None => DEFAULT_WAIT_SECS,
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|secs| *secs > 0)
+            .ok_or_else(|| OpError::InvalidArguments(format!("ungültige Wartezeit `{raw}`")))?
+            .min(MAX_WAIT_SECS),
+    };
+    let store = job_store(ctx)?;
+    let work_id = WorkId::from_str(raw_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let record = crate::job_tenant::get_visible_job(ctx, store, &work_id)
+            .map_err(|error| OpError::Execution(format!("job `{raw_id}`: {error}")))?;
+        if record.disposition().is_final() || std::time::Instant::now() >= deadline {
+            return Ok(OpOutput::from(crate::ps::work_row(&record)));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// `/jobs permits [lane] [n]`.
+fn permits_text(ctx: &OpContext, args: &[String]) -> Result<OpOutput, OpError> {
+    let manager = ctx.service::<Arc<JobManager>>();
+    let store = ctx.service::<Arc<JobStore>>();
+    if manager.is_none() && store.is_none() {
+        return Err(OpError::NotAvailable(NOT_AVAILABLE.to_owned()));
+    }
+    if let Some(lane) = args.first() {
+        let raw = args.get(1).ok_or_else(|| {
+            OpError::InvalidArguments("/jobs permits <lane> <n> (n >= 1)".to_owned())
+        })?;
+        let wanted = raw
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| OpError::InvalidArguments(format!("ungültiges Limit `{raw}` (>= 1)")))?;
+        if lane == "process" {
+            let manager = manager.ok_or_else(|| OpError::NotAvailable(NOT_AVAILABLE.to_owned()))?;
+            let applied = manager.set_max_running(wanted);
+            return Ok(OpOutput::from(format!(
+                "process: Limit {applied} (sofort wirksam; laufende Jobs bleiben)"
+            )));
+        }
+        let store = store.ok_or_else(|| {
+            OpError::NotAvailable("durable job store is not configured".to_owned())
+        })?;
+        let applied = harw_job_runtime::lanes::write_limit(store.root(), lane, wanted)
+            .map_err(|error| OpError::InvalidArguments(error.to_string()))?;
+        return Ok(OpOutput::from(format!(
+            "{lane}: Limit {applied} vermerkt; der Job-Worker übernimmt es beim nächsten Poll \
+             (laufende Jobs bleiben, Erhöhen startet wartende sofort)"
+        )));
+    }
+    let mut lines = Vec::new();
+    if let Some(store) = store {
+        let published = harw_job_runtime::lanes::read_status(store.root());
+        let overrides = harw_job_runtime::lanes::read_limits(store.root());
+        if published.is_empty() {
+            lines.push("work_driver, memory: kein laufender Job-Worker gemeldet".to_owned());
+        }
+        for status in &published {
+            let pending = overrides
+                .get(&status.lane)
+                .filter(|wanted| **wanted != status.limit)
+                .map_or(String::new(), |wanted| format!(" (angefordert {wanted})"));
+            lines.push(format!(
+                "{}: Limit {}{pending}, belegt {}, frei {}",
+                status.lane, status.limit, status.in_use, status.available
+            ));
+        }
+    }
+    if let Some(manager) = manager {
+        lines.push(format!(
+            "process: Limit {}, belegt {}",
+            manager.max_running(),
+            manager.running_count()
+        ));
+    }
+    Ok(OpOutput::from(lines.join("\n")))
 }
 
 fn job_id_arg(tokens: &[String], sub: &str) -> Result<JobId, OpError> {
@@ -277,6 +416,14 @@ mod tests {
         dir: &std::path::Path,
         manager: Option<Arc<JobManager>>,
     ) -> TestResult<OpContext> {
+        op_context_with_store(dir, manager, None)
+    }
+
+    fn op_context_with_store(
+        dir: &std::path::Path,
+        manager: Option<Arc<JobManager>>,
+        store: Option<Arc<JobStore>>,
+    ) -> TestResult<OpContext> {
         std::fs::create_dir_all(dir.join("ws")).map_err(ctx("workspace"))?;
         let registry = WorkspaceRegistry::build(
             dir,
@@ -293,6 +440,9 @@ mod tests {
         let mut services = ServiceMap::new();
         if let Some(manager) = manager {
             services.insert(manager);
+        }
+        if let Some(store) = store {
+            services.insert(store);
         }
         Ok(OpContext::new(
             SessionId::new(),
@@ -413,6 +563,123 @@ mod tests {
             run(&op_ctx, &["frobnicate"]).await,
             Err(OpError::InvalidArguments(_))
         ));
+        Ok(())
+    }
+
+    // -- durable Jobs: Art/Frist/Zustand/Grund, wait, permits ----------------
+
+    fn memory_job(store: &JobStore, deadline: u64) -> TestResult<harw_job_runtime::WorkId> {
+        let scope = harw_job_runtime::JobScope::new(
+            TenantId::from_str("t"),
+            WorkspaceId::from_str("ws"),
+            harw_types::ApprovalActor::Operator {
+                id: "tester".to_owned(),
+            },
+        );
+        let spec = crate::memory_job::MemoryMaintenanceSpec::new(
+            crate::memory_job::MemoryMaintenanceOp::Sweep,
+            deadline,
+        );
+        crate::memory_job::admit_memory_maintenance(store, scope, &spec).map_err(ctx("admit"))
+    }
+
+    #[tokio::test]
+    async fn work_rows_show_kind_deadline_state_and_a_timed_out_end() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(JobStore::new(&dir.path().join("jobs")));
+        let id = memory_job(&store, 45)?;
+        let op_ctx = op_context_with_store(dir.path(), None, Some(Arc::clone(&store)))?;
+        let ready = run(&op_ctx, &["work"]).await.map_err(ctx("work"))?;
+        assert!(ready.text.contains("\tkind memory_maintenance"), "{}", ready.text);
+        assert!(ready.text.contains("\tdeadline 45s"), "{}", ready.text);
+        assert!(ready.text.contains("\tReady\t"), "{}", ready.text);
+        assert!(ready.text.contains("end -"), "{}", ready.text);
+
+        let claim = store
+            .claim(
+                &id,
+                &harw_session_store::ClaimRequest {
+                    worker_id: "w".to_owned(),
+                    lease_ttl: jiff::SignedDuration::from_secs(60),
+                    now: jiff::Timestamp::now(),
+                },
+            )
+            .map_err(ctx("claim"))?;
+        store
+            .complete(
+                &id,
+                &harw_session_store::CompleteRequest {
+                    token: claim.token,
+                    completed_at: jiff::Timestamp::now(),
+                    outcome: harw_job_runtime::JobOutcome::timed_out("phase 'x'"),
+                },
+            )
+            .map_err(ctx("complete"))?;
+        let done = run(&op_ctx, &["wait", id.as_str(), "5"])
+            .await
+            .map_err(ctx("wait"))?;
+        assert!(done.text.contains("\tFailed\t"), "{}", done.text);
+        assert!(done.text.contains("end timed_out"), "{}", done.text);
+        assert!(done.text.contains("reason timed_out: phase 'x'"), "{}", done.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_returns_the_current_row_when_the_time_is_up() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(JobStore::new(&dir.path().join("jobs")));
+        let id = memory_job(&store, 30)?;
+        let op_ctx = op_context_with_store(dir.path(), None, Some(store))?;
+        let out = run(&op_ctx, &["wait", id.as_str(), "1"]).await.map_err(ctx("wait"))?;
+        assert!(out.text.contains("\tReady\t"), "{}", out.text);
+        assert!(matches!(
+            run(&op_ctx, &["wait", id.as_str(), "0"]).await,
+            Err(OpError::InvalidArguments(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permits_show_set_and_validate_lanes_and_the_process_cap() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(JobStore::new(&dir.path().join("jobs")));
+        let manager = JobManager::new(
+            harw_tool_job::JobManagerConfig {
+                max_running_jobs: 4,
+                ..harw_tool_job::JobManagerConfig::new(dir.path().join("state"))
+            },
+            Arc::new(NoopNotifier),
+        )
+        .map_err(ctx("manager"))?;
+        let op_ctx =
+            op_context_with_store(dir.path(), Some(Arc::clone(&manager)), Some(Arc::clone(&store)))?;
+
+        let shown = run(&op_ctx, &["permits"]).await.map_err(ctx("permits"))?;
+        assert!(shown.text.contains("kein laufender Job-Worker"), "{}", shown.text);
+        assert!(shown.text.contains("process: Limit 4, belegt 0"), "{}", shown.text);
+
+        // A worker publishes its status; an override is shown as requested.
+        let lanes = harw_job_runtime::JobLanes::new(2, 1);
+        lanes.publish_status(store.root()).map_err(ctx("publish"))?;
+        run(&op_ctx, &["permits", "memory", "3"]).await.map_err(ctx("set"))?;
+        let shown = run(&op_ctx, &["permits"]).await.map_err(ctx("permits"))?;
+        assert!(shown.text.contains("work_driver: Limit 2, belegt 0, frei 2"), "{}", shown.text);
+        assert!(shown.text.contains("memory: Limit 1 (angefordert 3)"), "{}", shown.text);
+        assert_eq!(lanes.apply_overrides(store.root()), vec!["memory"]);
+
+        run(&op_ctx, &["permits", "process", "7"]).await.map_err(ctx("process"))?;
+        assert_eq!(manager.max_running(), 7);
+        for bad in [
+            &["permits", "nope", "2"][..],
+            &["permits", "memory", "0"][..],
+            &["permits", "memory"][..],
+            &["permits", "memory", "x"][..],
+        ] {
+            assert!(
+                matches!(run(&op_ctx, bad).await, Err(OpError::InvalidArguments(_))),
+                "{bad:?}"
+            );
+        }
         Ok(())
     }
 }
