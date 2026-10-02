@@ -10,6 +10,10 @@
 //! production one. This module holds no registry of its own.
 //!
 //! Rules the layer enforces regardless of the resolver:
+//! - **remote approval is opt-in** (PL-68 §13, decision 4): `approve` is removed
+//!   from every remote identity unless [`RemoteLayer::allow_approval_when`]
+//!   says this identity may answer approvals; gateway and session caps stay as
+//!   the resolver built them (tier-derived);
 //! - an unresolved or refused peer is answered with the refusal's status
 //!   (403 for [`ComRefusal::Denied`]) before anything is bound;
 //! - the resolver must return the connection id it was given, so it cannot
@@ -39,16 +43,19 @@ use crate::refusal::{ComRefusal, plain};
 
 type ResolveFuture = Pin<Box<dyn Future<Output = Result<ClientIdentity, ComRefusal>> + Send>>;
 type Resolve<P> = dyn Fn(P, ConnectionId) -> ResolveFuture + Send + Sync;
+type ApprovalGate = dyn Fn(&ClientIdentity) -> bool + Send + Sync;
 
 /// Resolves the transport's peer extension `P` into the trusted identity.
 pub struct RemoteLayer<P> {
     resolve: Arc<Resolve<P>>,
+    approval: Option<Arc<ApprovalGate>>,
 }
 
 impl<P> Clone for RemoteLayer<P> {
     fn clone(&self) -> Self {
         Self {
             resolve: Arc::clone(&self.resolve),
+            approval: self.approval.clone(),
         }
     }
 }
@@ -65,7 +72,21 @@ impl<P: 'static> RemoteLayer<P> {
     {
         Self {
             resolve: Arc::new(move |peer, connection| Box::pin(resolve(peer, connection))),
+            approval: None,
         }
+    }
+
+    /// Lets the identities for which `allow` returns `true` answer approvals.
+    /// Without this, **no** remote identity keeps the `approve` cap, whatever
+    /// its tier: high-risk approval stays local unless a policy opts a device
+    /// in. The predicate sees the resolved identity (device, tenant, tier).
+    #[must_use]
+    pub fn allow_approval_when(
+        mut self,
+        allow: impl Fn(&ClientIdentity) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.approval = Some(Arc::new(allow));
+        self
     }
 }
 
@@ -76,6 +97,7 @@ impl<S, P> Layer<S> for RemoteLayer<P> {
         RemoteService {
             inner,
             resolve: Arc::clone(&self.resolve),
+            approval: self.approval.clone(),
         }
     }
 }
@@ -84,6 +106,7 @@ impl<S, P> Layer<S> for RemoteLayer<P> {
 pub struct RemoteService<S, P> {
     inner: S,
     resolve: Arc<Resolve<P>>,
+    approval: Option<Arc<ApprovalGate>>,
 }
 
 impl<S: Clone, P> Clone for RemoteService<S, P> {
@@ -91,6 +114,7 @@ impl<S: Clone, P> Clone for RemoteService<S, P> {
         Self {
             inner: self.inner.clone(),
             resolve: Arc::clone(&self.resolve),
+            approval: self.approval.clone(),
         }
     }
 }
@@ -125,11 +149,20 @@ where
         };
         let connection = ConnectionId::next();
         let resolving = (self.resolve)(peer, connection);
+        let approval = self.approval.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
             let identity = match resolving.await {
-                Ok(identity) if identity.connection == connection => identity,
+                Ok(mut identity) if identity.connection == connection => {
+                    // Remote approval is opt-in: strip it unless a policy allows it.
+                    if identity.is_remote()
+                        && !approval.as_ref().is_some_and(|allow| allow(&identity))
+                    {
+                        identity.caps.approve = false;
+                    }
+                    identity
+                }
                 Ok(_) => {
                     tracing::error!("session com: resolver returned another connection's id");
                     return Ok(ComRefusal::Denied.response());
@@ -231,6 +264,84 @@ mod tests {
             .await;
         assert_eq!(response.map(|r| r.status()), Ok(StatusCode::FORBIDDEN));
         assert!(seen.lock().map(|s| s.is_empty()).unwrap_or(false));
+    }
+
+    /// An identity that looks remote, with the approve cap its tier gives.
+    fn remote_identity(label: &str, connection: ConnectionId) -> ClientIdentity {
+        let mut id = identity(label);
+        id.connection = connection;
+        id.zone = harw_types::TrustZone::Remote;
+        id.tenant = harw_types::TenantId::try_from_str("tenant-a").ok();
+        id.caps.approve = true;
+        id
+    }
+
+    /// Inner service that records whether the trusted peer may approve.
+    #[derive(Clone)]
+    struct ApproveProbe(Arc<Mutex<Vec<bool>>>);
+
+    impl Service<Request<()>> for ApproveProbe {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Infallible>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<()>) -> Self::Future {
+            let approve = request
+                .extensions()
+                .get::<TrustedPeer>()
+                .is_some_and(|p| p.0.caps.approve);
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(approve);
+            }
+            ready(Ok(Response::new(Full::new(Bytes::new()))))
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_identities_lose_approve_unless_a_policy_opts_them_in() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = RemoteLayer::<Peer>::new(|peer, connection| async move {
+            Ok(remote_identity(peer.0, connection))
+        });
+        let default = layer
+            .layer(ApproveProbe(Arc::clone(&seen)))
+            .oneshot(request_with(Some(Peer("phone"))))
+            .await;
+        assert!(default.is_ok());
+        let opted = layer
+            .clone()
+            .allow_approval_when(|id| id.label == "trusted-phone")
+            .layer(ApproveProbe(Arc::clone(&seen)));
+        let _ = opted
+            .clone()
+            .oneshot(request_with(Some(Peer("trusted-phone"))))
+            .await;
+        let _ = opted.oneshot(request_with(Some(Peer("other-phone")))).await;
+        assert_eq!(
+            seen.lock().map(|s| s.clone()).unwrap_or_default(),
+            [false, true, false],
+            "default strips approve; the predicate opts a device in"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_identities_keep_approve() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = RemoteLayer::<Peer>::new(|peer, connection| async move {
+            let mut id = identity(peer.0);
+            id.connection = connection;
+            id.caps.approve = true;
+            Ok(id)
+        });
+        let _ = layer
+            .layer(ApproveProbe(Arc::clone(&seen)))
+            .oneshot(request_with(Some(Peer("local"))))
+            .await;
+        assert_eq!(seen.lock().map(|s| s.clone()).unwrap_or_default(), [true]);
     }
 
     #[tokio::test]

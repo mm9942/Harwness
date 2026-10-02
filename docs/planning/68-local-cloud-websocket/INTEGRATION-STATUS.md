@@ -110,8 +110,9 @@ mechanical follow-up for its owner, because its tests call
    patch for the daemon is in `patches/` (all 16 original daemon tests pass
    unchanged, 2 new gateway tests). Without it, `gateway.*` stays unreachable
    locally.
-2. Remote approval and gateway caps follow the tier today (see section 4).
-3. Merging `harw-session-com` and its scribe commits into `consolidate/main`.
+2. Decided: remote approval is opt-in per device (section 4).
+3. Decided: merge `harw-session-com`, its scribe commits and the S05 daemon patch
+   into `consolidate/main` (the integration session performs it).
 
 ## 3. Remaining plan, in build order
 
@@ -131,9 +132,10 @@ mechanical follow-up for its owner, because its tests call
 
 ## 4. Decisions still open (from PL-68 §13)
 
-Unchanged. One conflict to resolve: PL-68 §13 recommends that high-risk
-approval stays local unless policy enables remote approval, but
-`harw-node-listener`'s mapper builds remote caps as `caps_for_tier` plus
-`gateway_caps_for_tier`, so every remote operator-or-above device holds
-`approve` (and maintainers/owners hold gateway caps). Either document that as
-the decision or add a per-device opt-in.
+Decided by the owner: remote approval is **opt-in per device**; session and
+gateway caps stay tier-derived. `harw-session-com`'s `RemoteLayer` strips
+`approve` from every remote identity unless `allow_approval_when(predicate)`
+opts that identity in (tested over the real node transport: denied by default,
+resolved when opted in). `harw-node-listener`'s `identity_of` still grants
+`approve` by tier; until it moves onto the Com layer or gains the same rule,
+its remote devices answer approvals.

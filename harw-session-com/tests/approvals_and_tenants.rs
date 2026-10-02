@@ -280,12 +280,9 @@ async fn an_observer_can_watch_but_not_answer_or_submit() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_remote_device_of_another_tenant_cannot_reach_a_local_session() -> TestResult {
-    let rig = rig()?;
-    let local = local_port(&rig, 1000, PermissionTier::Owner).await?;
-    let session = local.create(CreateParams::default()).await?.session_id;
-
+/// A remote device (`phone`, operator tier, tenant-a) connected through the
+/// real node transport. `opt_in` lets this device answer approvals.
+async fn remote_port(rig: &Rig, opt_in: bool) -> TestResult<RemotePort> {
     let phone = node("phone", 2)?;
     let gateway = node("gateway", 1)?;
     DeviceRegistry::new(rig.dir.path()).enroll(&DeviceRecord {
@@ -297,17 +294,20 @@ async fn a_remote_device_of_another_tenant_cannot_reach_a_local_session() -> Tes
         label: "phone".to_owned(),
     })?;
     let mapper = Arc::new(RegistryIdentityMapper::new(rig.dir.path()));
-    let service = rig.com.service_for(RemoteLayer::<AuthenticatedPeer>::new(
-        move |peer, connection| {
-            let mapper = Arc::clone(&mapper);
-            async move {
-                mapper
-                    .map(&peer, connection)
-                    .await
-                    .map_err(|_| ComRefusal::Denied)
-            }
-        },
-    ));
+    let mut layer = RemoteLayer::<AuthenticatedPeer>::new(move |peer, connection| {
+        let mapper = Arc::clone(&mapper);
+        async move {
+            mapper
+                .map(&peer, connection)
+                .await
+                .map_err(|_| ComRefusal::Denied)
+        }
+    });
+    if opt_in {
+        layer = layer
+            .allow_approval_when(|id| id.device.as_ref().is_some_and(|d| d.as_str() == "dev-1"));
+    }
+    let service = rig.com.service_for(layer);
     let server = NodeTransportServer::new(
         gateway.local.clone(),
         Arc::new(pinned(&[&phone.identity])?),
@@ -321,7 +321,7 @@ async fn a_remote_device_of_another_tenant_cannot_reach_a_local_session() -> Tes
             .await
     });
     let verifier = pinned(&[&gateway.identity])?;
-    let remote = RemotePort::new(
+    Ok(RemotePort::new(
         connect_node(
             NodeEndpoint {
                 addr,
@@ -332,7 +332,15 @@ async fn a_remote_device_of_another_tenant_cannot_reach_a_local_session() -> Tes
             ConnectOptions::new("phone"),
         )
         .await?,
-    );
+    ))
+}
+
+#[tokio::test]
+async fn a_remote_device_of_another_tenant_cannot_reach_a_local_session() -> TestResult {
+    let rig = rig()?;
+    let local = local_port(&rig, 1000, PermissionTier::Owner).await?;
+    let session = local.create(CreateParams::default()).await?.session_id;
+    let remote = remote_port(&rig, false).await?;
 
     // The remote device is tenant-scoped: it neither lists nor attaches the
     // local session, and the host does not reveal whether the id exists.
@@ -346,5 +354,39 @@ async fn a_remote_device_of_another_tenant_cannot_reach_a_local_session() -> Tes
     // It can still create and use its own session.
     let own = remote.create(CreateParams::default()).await?;
     assert!(remote.attach(attach(&own.session_id)).await.is_ok());
+    Ok(())
+}
+
+/// The remote device creates a session, submits, and gets an approval to answer.
+async fn remote_answers_an_approval(opt_in: bool) -> TestResult<Result<RespondResult, PortError>> {
+    let rig = rig()?;
+    let remote = remote_port(&rig, opt_in).await?;
+    let session = remote.create(CreateParams::default()).await?.session_id;
+    let (ack, mut frames) = remote.attach(attach(&session)).await?;
+    remote
+        .submit(SubmitParams {
+            session_id: session.clone(),
+            text: "run".into(),
+            expect_head: ack.head,
+            client_msg_id: "r1".into(),
+            force: false,
+        })
+        .await?;
+    let request = approval_frame(&mut frames).await?;
+    Ok(remote.respond(respond(&request)).await)
+}
+
+#[tokio::test]
+async fn a_remote_device_cannot_answer_approvals_unless_it_is_opted_in() -> TestResult {
+    let denied = remote_answers_an_approval(false).await?;
+    assert!(
+        matches!(denied, Err(PortError::Denied(_))),
+        "remote approval is opt-in: {denied:?}"
+    );
+    let allowed = remote_answers_an_approval(true).await?;
+    assert!(
+        matches!(allowed, Ok(RespondResult::Resolved)),
+        "an opted-in device may answer: {allowed:?}"
+    );
     Ok(())
 }
