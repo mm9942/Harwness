@@ -1,0 +1,17 @@
+[package]
+publish.workspace = true
+name = "harw-mobile-core"
+description = "Experimental: UI-agnostic view model of a hosted session for phone clients (approval inbox, turn activity, cursor and resync tracking). Pure state machine over harw-protocol frames; shared by a TUI and a Rust GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+
+[dev-dependencies]
+jiff = { workspace = true }
+serde_json = { workspace = true }
