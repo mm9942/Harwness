@@ -3233,6 +3233,7 @@ dependencies = [
  "harw-dod-signals",
  "harw-observe",
  "harw-operations",
+ "harw-retention",
  "harw-test-support",
  "harw-tools",
  "harw-types",
