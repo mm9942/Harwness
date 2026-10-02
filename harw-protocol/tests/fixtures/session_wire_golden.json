@@ -1,0 +1,77 @@
+{
+  "constants": {
+    "subprotocol": "harw.session.v1",
+    "path": "/v1/session-ws",
+    "wire_minor": 2,
+    "tool_gateway_wire_minor": 2,
+    "default_tail_items": 200
+  },
+  "hello_params": {
+    "client_label": "phone",
+    "wire_minor": 2,
+    "features": ["compact", "history"],
+    "requested_caps": {"observe": true, "steer": false, "approve": false, "control": false}
+  },
+  "hello_ack": {
+    "wire_minor": 2,
+    "features": ["compact", "history"],
+    "host_epoch": 7,
+    "granted": {"observe": true, "steer": true, "approve": true, "control": false}
+  },
+  "attach_params": {
+    "session_id": "s-1",
+    "from": {"generation": 1, "durable": 12, "live": 3},
+    "profile": "compact",
+    "tail_items": 50
+  },
+  "attach_ack": {
+    "session": {
+      "session_id": "s-1",
+      "title": "demo",
+      "tenant": null,
+      "state": {"state": "queued", "depth": 2},
+      "attached": 2,
+      "updated_at": "2026-10-01T12:00:00Z",
+      "model": null
+    },
+    "granted": {"observe": true, "steer": true, "approve": true, "control": false},
+    "head": {"generation": 1, "durable": 14, "live": 0},
+    "replay_from": {"generation": 1, "durable": 12, "live": 3},
+    "host_epoch": 7
+  },
+  "submit_stale": {"result": "stale", "head": {"generation": 1, "durable": 14, "live": 0}},
+  "approval_respond_params": {"request_id": "a-1", "decision": "approved_once", "reason": "ok"},
+  "respond_already_resolved": {"result": "already_resolved", "by": "device:laptop"},
+  "envelope_lagged": {
+    "session_id": "s-1",
+    "cursor": {"generation": 1, "durable": 14, "live": 900},
+    "frame": {"kind": "lagged", "data": {"resume_from": {"generation": 1, "durable": 14, "live": 0}}}
+  },
+  "envelope_resync": {
+    "session_id": "s-1",
+    "cursor": {"generation": 0, "durable": 4, "live": 0},
+    "frame": {"kind": "resync", "data": {"reason": "generation", "head": {"generation": 1, "durable": 0, "live": 0}}}
+  },
+  "envelope_approval_resolved": {
+    "session_id": "s-1",
+    "cursor": {"generation": 1, "durable": 15, "live": 0},
+    "frame": {"kind": "approval_resolved", "data": {"request_id": "a-1", "decision": "approved", "by": "device:laptop"}}
+  },
+  "envelope_heartbeat": {
+    "session_id": "s-1",
+    "cursor": {"generation": 1, "durable": 15, "live": 0},
+    "frame": {"kind": "heartbeat"}
+  },
+  "error_codes": {
+    "HELLO_REQUIRED": -32001,
+    "DENIED": -32002,
+    "NOT_FOUND": -32003,
+    "REVOKED": -32004,
+    "BUSY": -32005,
+    "TOOL_UNKNOWN": -32010,
+    "TOOL_NOT_GRANTED": -32011,
+    "TOOL_SANDBOX_UNAVAILABLE": -32012,
+    "HOST_DRAINING": -32013,
+    "TOOL_CALL_DUPLICATE": -32014
+  }
+}
