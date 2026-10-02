@@ -996,6 +996,24 @@ pub struct FactStore {
     root: PathBuf,
     /// Scope dieser Wurzel — Default für Fakten ohne `scope`-Frontmatter.
     scope: FactScope,
+    /// Obergrenzen für [`Self::write`]; Vorgabe: unbegrenzt.
+    limits: FactLimits,
+}
+
+/// Optionale Obergrenzen für [`FactStore::write`] (`[memory] max_facts` und
+/// `max_body_bytes`).
+///
+/// # Beschreibung
+/// `None` heißt unbegrenzt — der Vorgabewert ([`Default`]) ändert das
+/// Verhalten eines Stores nicht. Gesetzt werden die Grenzen über
+/// [`FactStore::with_limits`]; sie gelten nur für diese Instanz.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FactLimits {
+    /// Höchstzahl Fakten in der Wurzel. Wirkt nur auf *neue* Fakten; ein
+    /// vorhandener Fakt darf auch bei vollem Store aktualisiert werden.
+    pub max_facts: Option<usize>,
+    /// Höchstgröße des Bodys in Bytes, gemessen nach der Schwärzung.
+    pub max_body_bytes: Option<usize>,
 }
 
 impl FactStore {
@@ -1022,7 +1040,38 @@ impl FactStore {
                 }
             })?;
         }
-        Ok(Self { root, scope })
+        Ok(Self {
+            root,
+            scope,
+            limits: FactLimits::default(),
+        })
+    }
+
+    /// Setzt die Obergrenzen, die [`Self::write`] durchsetzt (Builder).
+    #[must_use]
+    pub fn with_limits(mut self, limits: FactLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Anzahl der Fakt-Dateien (`facts/*.md`), ohne sie zu parsen.
+    fn count_fact_files(&self) -> MemoryResult<usize> {
+        let dir = self.root.join("facts");
+        let entries = fs::read_dir(&dir).map_err(|e| MemoryError::Io {
+            path: dir.clone(),
+            source: e,
+        })?;
+        let mut count = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|e| MemoryError::Io {
+                path: dir.clone(),
+                source: e,
+            })?;
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("md") {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Pfad von `facts/<name>.md`, nach Namensvalidierung.
@@ -1054,12 +1103,15 @@ impl FactStore {
     ///
     /// # Errors
     /// [`MemoryError::InvalidFactName`] bei ungültigem `fact.name`;
+    /// [`MemoryError::LimitExceeded`], wenn eine über [`Self::with_limits`]
+    /// gesetzte Obergrenze überschritten würde (nichts wird geschrieben);
     /// [`MemoryError::Io`] bei Schreibfehlern; Fehler von
     /// [`Self::read`]/[`Self::write_index`] werden durchgereicht.
     pub fn write(&self, fact: &Fact) -> MemoryResult<()> {
         validate_name(&fact.name)?;
         let path = self.path_for(&fact.name)?;
-        let created = match self.read(&fact.name)? {
+        let existing = self.read(&fact.name)?;
+        let created = match &existing {
             Some(existing) => existing.created,
             None => fact.created,
         };
@@ -1070,6 +1122,28 @@ impl FactStore {
         to_write.description = redact(&to_write.description);
         to_write.body = redact(&to_write.body);
         to_write.tags = to_write.tags.iter().map(|t| redact(t)).collect();
+
+        if let Some(max) = self.limits.max_body_bytes {
+            if to_write.body.len() > max {
+                return Err(MemoryError::LimitExceeded {
+                    limit: "max_body_bytes",
+                    max,
+                    actual: to_write.body.len(),
+                });
+            }
+        }
+        if existing.is_none() {
+            if let Some(max) = self.limits.max_facts {
+                let count = self.count_fact_files()?;
+                if count >= max {
+                    return Err(MemoryError::LimitExceeded {
+                        limit: "max_facts",
+                        max,
+                        actual: count + 1,
+                    });
+                }
+            }
+        }
 
         let markdown = to_markdown(&to_write);
         harw_fsutil::write_atomic(
@@ -2163,6 +2237,79 @@ mod tests {
         );
         assert!(read_back.body.contains("[redacted]"));
         assert_eq!(read_back.tags[0], "[redacted]");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn default_limits_do_not_restrict_writes() -> TestResult {
+        let root = tmp_root("limits-default");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("open"))?;
+        let mut fact = sample_fact("big");
+        fact.body = "x".repeat(100_000);
+        store.write(&fact).map_err(ctx("write big"))?;
+        for i in 0..5 {
+            store
+                .write(&sample_fact(&format!("f{i}")))
+                .map_err(ctx("write"))?;
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn max_body_bytes_rejects_oversized_body_and_writes_nothing() -> TestResult {
+        let root = tmp_root("limits-body");
+        let store = FactStore::open(&root, FactScope::Project)
+            .map_err(ctx("open"))?
+            .with_limits(FactLimits {
+                max_facts: None,
+                max_body_bytes: Some(10),
+            });
+        let mut fact = sample_fact("too-big");
+        fact.body = "x".repeat(11);
+        let result = store.write(&fact);
+        assert!(matches!(
+            result,
+            Err(MemoryError::LimitExceeded {
+                limit: "max_body_bytes",
+                max: 10,
+                actual: 11
+            })
+        ));
+        assert!(store.read("too-big").map_err(ctx("read"))?.is_none());
+        fact.body = "x".repeat(10);
+        store.write(&fact).map_err(ctx("exact fit"))?;
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn max_facts_rejects_new_fact_but_allows_update() -> TestResult {
+        let root = tmp_root("limits-count");
+        let store = FactStore::open(&root, FactScope::Project)
+            .map_err(ctx("open"))?
+            .with_limits(FactLimits {
+                max_facts: Some(2),
+                max_body_bytes: None,
+            });
+        store.write(&sample_fact("one")).map_err(ctx("one"))?;
+        store.write(&sample_fact("two")).map_err(ctx("two"))?;
+        let third = store.write(&sample_fact("three"));
+        assert!(matches!(
+            third,
+            Err(MemoryError::LimitExceeded {
+                limit: "max_facts",
+                max: 2,
+                actual: 3
+            })
+        ));
+        assert!(store.read("three").map_err(ctx("read"))?.is_none());
+        // Aktualisierung eines vorhandenen Fakts bleibt bei vollem Store möglich.
+        let mut update = sample_fact("one");
+        update.body = "neu".to_owned();
+        store.write(&update).map_err(ctx("update"))?;
+        assert_eq!(store.list().map_err(ctx("list"))?.len(), 2);
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }

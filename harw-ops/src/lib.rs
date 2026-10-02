@@ -220,6 +220,7 @@ pub mod live_config;
 pub mod live_model;
 pub mod matrix;
 pub mod memory;
+pub mod memory_job;
 pub mod mode;
 pub mod model;
 pub mod models;

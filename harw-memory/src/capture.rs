@@ -90,7 +90,7 @@ const DAILY_DECAY_MIN_HOURS: i64 = 24;
 
 /// Höchstalter unbenutzter Fakten, ab dem [`crate::facts::FactStore::decay`]
 /// ihre `confidence` halbiert.
-const DECAY_MAX_UNUSED_DAYS: i64 = 90;
+pub const DECAY_MAX_UNUSED_DAYS: i64 = 90;
 
 // ---------------------------------------------------------------------
 // Kleine Textwerkzeuge
@@ -854,6 +854,22 @@ pub fn consolidate_memories_with_deadline(
     scope: FactScope,
     deadline: Deadline,
 ) -> Result<ConsolidationReport, ConsolidationError> {
+    consolidate_memories_with_options(memories_root, scope, deadline, DECAY_MAX_UNUSED_DAYS)
+}
+
+/// Wie [`consolidate_memories_with_deadline`], aber mit konfigurierbarem
+/// Verfallsfenster (`[memory] max_unused_days`): Tage ohne Nutzung, nach
+/// denen [`FactStore::decay`] die Konfidenz eines Fakts halbiert.
+/// [`DECAY_MAX_UNUSED_DAYS`] ist der bisherige feste Wert.
+///
+/// # Errors
+/// Siehe [`consolidate_memories_with_deadline`].
+pub fn consolidate_memories_with_options(
+    memories_root: &Path,
+    scope: FactScope,
+    deadline: Deadline,
+    max_unused_days: i64,
+) -> Result<ConsolidationReport, ConsolidationError> {
     let lock = match ConsolidationLock::try_acquire(memories_root) {
         Ok(lock) => lock,
         Err(MemoryError::LockContention { .. }) => {
@@ -862,7 +878,7 @@ pub fn consolidate_memories_with_deadline(
         }
         Err(e) => return Err(e.into()),
     };
-    let result = run_consolidation(memories_root, scope, deadline);
+    let result = run_consolidation(memories_root, scope, deadline, max_unused_days);
     let _ = lock.release();
     result
 }
@@ -937,6 +953,7 @@ fn run_consolidation(
     memories_root: &Path,
     scope: FactScope,
     deadline: Deadline,
+    max_unused_days: i64,
 ) -> Result<ConsolidationReport, ConsolidationError> {
     let incoming_store =
         IncomingStore::open(memories_root).map_err(|e| extraction_to_memory(e, memories_root))?;
@@ -954,7 +971,7 @@ fn run_consolidation(
         .map_err(|e| extraction_to_memory(e, memories_root))?;
     if pending.is_empty() {
         if should_run_daily_decay(memories_root, now)? {
-            fact_store.decay(DECAY_MAX_UNUSED_DAYS, now)?;
+            fact_store.decay(max_unused_days, now)?;
             fact_store.write_index()?;
             write_last_consolidation_marker(memories_root, now)?;
         }
@@ -984,7 +1001,7 @@ fn run_consolidation(
     report.written += dedupe.written;
     report.deleted += dedupe.deleted;
     report.conflicts += dedupe.conflicts;
-    fact_store.decay(DECAY_MAX_UNUSED_DAYS, now)?;
+    fact_store.decay(max_unused_days, now)?;
     fact_store.write_index()?;
     write_last_consolidation_marker(memories_root, now)?;
     Ok(report)
@@ -1181,6 +1198,71 @@ mod tests {
         let facts = store.list().map_err(ctx("Facts auflisten"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].fact_type, crate::facts::FactType::Fact);
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn plain_fact(name: &str, scope: FactScope, confidence: f32) -> Fact {
+        let now = OffsetDateTime::now_utc();
+        Fact {
+            name: name.to_owned(),
+            description: "beschreibung".to_owned(),
+            fact_type: FactType::Fact,
+            scope,
+            created: now,
+            updated: now,
+            confidence,
+            sources: Vec::new(),
+            tags: Vec::new(),
+            body: "inhalt".to_owned(),
+        }
+    }
+
+    #[test]
+    fn options_max_unused_days_controls_the_decay_window() -> TestResult {
+        let strict = tmp_root("opts-strict");
+        let lax = tmp_root("opts-lax");
+        for root in [&strict, &lax] {
+            FactStore::open(root, FactScope::Project)
+                .map_err(ctx("open"))?
+                .write(&plain_fact("alt", FactScope::Project, 0.8))
+                .map_err(ctx("write"))?;
+        }
+        let deadline = Deadline::after(std::time::Duration::from_secs(30));
+        consolidate_memories_with_options(&strict, FactScope::Project, deadline, 0)
+            .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+        consolidate_memories_with_deadline(&lax, FactScope::Project, deadline)
+            .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+        let read = |root: &PathBuf| -> TestResult<f32> {
+            Ok(FactStore::open(root, FactScope::Project)
+                .map_err(ctx("open"))?
+                .read("alt")
+                .map_err(ctx("read"))?
+                .map_or(-1.0, |f| f.confidence))
+        };
+        assert!((read(&strict)? - 0.4).abs() < 0.01, "0 Tage: sofort verfallen");
+        assert!((read(&lax)? - 0.8).abs() < 0.01, "Vorgabe 90 Tage: unverändert");
+        let _ = std::fs::remove_dir_all(&strict);
+        let _ = std::fs::remove_dir_all(&lax);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_deadline_leaves_incoming_and_facts_untouched() -> TestResult {
+        let root = tmp_root("deadline-expired");
+        let incoming = IncomingStore::open(&root).map_err(ctx("incoming"))?;
+        incoming
+            .write_candidates(&[plain_fact("kandidat", FactScope::Project, 0.6)])
+            .map_err(ctx("candidates"))?;
+        let result = consolidate_memories_with_deadline(
+            &root,
+            FactScope::Project,
+            Deadline::after(std::time::Duration::ZERO),
+        );
+        assert!(matches!(result, Err(ConsolidationError::Deadline(_))));
+        assert_eq!(incoming.list().map_err(ctx("list"))?.len(), 1);
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("open"))?;
+        assert!(store.list().map_err(ctx("facts"))?.is_empty());
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

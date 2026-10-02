@@ -3222,7 +3222,9 @@ impl RuntimeAssemblyBuilder {
         //      dies **nicht** über
         //      `harw_memory::context_provider::MemoryContextProvider`
         //      läuft).
-        let registry_builder = if project_facts.is_some() || global_facts.is_some() {
+        let registry_builder = if config.harness.memory.enabled
+            && (project_facts.is_some() || global_facts.is_some())
+        {
             let file_index =
                 harw_memory::file_index::FileKnowledgeIndex::open(&home_project.memories_dir())
                     .map(Arc::new)
@@ -3234,11 +3236,17 @@ impl RuntimeAssemblyBuilder {
                     })
                     .ok();
             registry_builder
-                .context_provider(Arc::new(MemoryFactsContextProvider::new(
-                    project_facts.clone(),
-                    global_facts.clone(),
-                    file_index,
-                )))
+                .context_provider(Arc::new(
+                    MemoryFactsContextProvider::new(
+                        project_facts.clone(),
+                        global_facts.clone(),
+                        file_index,
+                    )
+                    .with_limits(
+                        config.harness.memory.global_enabled,
+                        config.harness.memory.token_budget,
+                    ),
+                ))
                 .map_err(|error| RuntimeError::Registry {
                     detail: format!(
                         "could not register the memory facts context provider: {error}"
@@ -3318,14 +3326,19 @@ impl RuntimeAssemblyBuilder {
         // dieses Schritts bricht die Montage ab.
         if let Some(capture) = memory_capture.as_ref() {
             if entry_wants_startup_sweep(spec.entry) {
-                // Als Job im Ledger des Profils (Frist über das Jobbudget),
-                // nie inline im Build-Pfad.
+                // Als `memory_maintenance`-Job im Ledger des Profils (Frist
+                // aus `[memory] sweep_deadline_secs`), nie inline im
+                // Build-Pfad.
                 let ledger = stores.job_store.clone().or_else(|| {
                     profile_dir(&spec.home, &profile_name)
                         .ok()
                         .map(|dir| Arc::new(JobStore::new(&dir)))
                 });
-                let _ = crate::memory_wiring::spawn_startup_sweep_job(Arc::clone(capture), ledger);
+                let _ = crate::memory_wiring::spawn_startup_sweep_job(
+                    Arc::clone(capture),
+                    ledger,
+                    &config.harness.memory,
+                );
             }
         }
 
@@ -4117,6 +4130,47 @@ struct MemoryFactsContextProvider {
     global_facts: Option<Arc<harw_memory::FactStore>>,
     /// Dateiwissen-Index der Projekt-Wurzel, falls er geöffnet werden konnte.
     file_index: Option<Arc<harw_memory::file_index::FileKnowledgeIndex>>,
+    /// `[memory] global_enabled`: `false` blendet die globale Wurzel aus
+    /// (kein Recall, keine Nutzungsverbuchung). Vorgabe `true`.
+    global_enabled: bool,
+    /// `[memory] token_budget`: Obergrenze der ausgelieferten Faktenzeilen
+    /// und Dateieinträge in geschätzten Tokens (4 Zeichen je Token).
+    /// `None` = nur die festen Zeilenobergrenzen wie bisher.
+    token_budget: Option<usize>,
+}
+
+/// Geschätzte Tokenzahl eines Textes (4 Zeichen je Token, aufgerundet).
+fn estimate_memory_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
+/// Verbleibendes Tokenbudget eines Turns, geteilt von beiden Abschnitten
+/// des [`MemoryFactsContextProvider`].
+struct MemoryTokenBudget {
+    remaining: Option<usize>,
+}
+
+impl MemoryTokenBudget {
+    /// Nimmt die Kosten von `line` vom Budget; `false`, wenn sie nicht mehr
+    /// hineinpassen (das Budget gilt dann als erschöpft). Ohne Budget stets
+    /// `true`.
+    fn take(&mut self, line: &str) -> bool {
+        let Some(remaining) = self.remaining.as_mut() else {
+            return true;
+        };
+        let cost = estimate_memory_tokens(line);
+        if cost <= *remaining {
+            *remaining -= cost;
+            true
+        } else {
+            *remaining = 0;
+            false
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining == Some(0)
+    }
 }
 
 impl MemoryFactsContextProvider {
@@ -4131,7 +4185,19 @@ impl MemoryFactsContextProvider {
             project_facts,
             global_facts,
             file_index,
+            global_enabled: true,
+            token_budget: None,
         }
+    }
+
+    /// Setzt die `[memory]`-Grenzen (`global_enabled`, `token_budget`); die
+    /// Vorgaben von [`Self::new`] entsprechen dem Verhalten ohne
+    /// `[memory]`-Abschnitt.
+    #[must_use]
+    fn with_limits(mut self, global_enabled: bool, token_budget: Option<usize>) -> Self {
+        self.global_enabled = global_enabled;
+        self.token_budget = token_budget;
+        self
     }
 
     /// Rendert den Abschnitt „Präferenzen & Fallen" (Addendum B).
@@ -4151,15 +4217,21 @@ impl MemoryFactsContextProvider {
     ///   über [`harw_memory::FactStore::search`] gefundene Treffer beliebigen
     ///   Fakttyps, dedupliziert gegen bereits ausgelieferte Fakten, bis
     ///   insgesamt [`MEMORY_FACTS_TOTAL_MAX_DELIVERED`] Zeilen erreicht sind.
-    fn preferences_and_pitfalls(&self, keywords: &[String]) -> Vec<ContextFragment> {
+    fn preferences_and_pitfalls(
+        &self,
+        keywords: &[String],
+        budget: &mut MemoryTokenBudget,
+    ) -> Vec<ContextFragment> {
         let mut lines: Vec<String> = Vec::new();
         let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Ausgelieferte Fakten je Store-Rolle, für `record_usage`.
         let mut delivered: Vec<(&str, Vec<String>)> = Vec::new();
-        let stores = [
-            ("project", &self.project_facts),
-            ("global", &self.global_facts),
-        ];
+        let global_facts = if self.global_enabled {
+            &self.global_facts
+        } else {
+            &None
+        };
+        let stores = [("project", &self.project_facts), ("global", global_facts)];
         for (scope_name, store) in stores {
             let Some(store) = store else { continue };
             if lines.len() >= MEMORY_FACTS_MAX_DELIVERED {
@@ -4188,12 +4260,16 @@ impl MemoryFactsContextProvider {
                         if lines.len() >= MEMORY_FACTS_MAX_DELIVERED {
                             break;
                         }
-                        seen_facts.insert(format!("{scope_name}:{}", fact.name));
-                        lines.push(format!(
+                        let line = format!(
                             "- ({scope_name}, {}) {}",
                             fact.fact_type,
                             sanitize_untrusted_line(&fact.description)
-                        ));
+                        );
+                        if !budget.take(&line) {
+                            break;
+                        }
+                        seen_facts.insert(format!("{scope_name}:{}", fact.name));
+                        lines.push(line);
                         names.push(fact.name);
                     }
                     delivered.push((scope_name, names));
@@ -4228,11 +4304,15 @@ impl MemoryFactsContextProvider {
                             if !seen_facts.insert(format!("{scope_name}:{}", fact.name)) {
                                 continue;
                             }
-                            lines.push(format!(
+                            let line = format!(
                                 "- ({scope_name}, {} · Stichwort) {}",
                                 fact.fact_type,
                                 sanitize_untrusted_line(&fact.description)
-                            ));
+                            );
+                            if !budget.take(&line) {
+                                break;
+                            }
+                            lines.push(line);
                             names.push(fact.name);
                         }
                         delivered.push((scope_name, names));
@@ -4291,10 +4371,17 @@ impl MemoryFactsContextProvider {
     /// bisherige Recency-Liste zurück: bis zu [`MEMORY_FILES_MAX_DELIVERED`]
     /// Einträge des Dateiwissen-Index, nach `last_seen` absteigend sortiert
     /// (jüngstes zuerst). Ein Lesefehler des Index wird nur geloggt.
-    fn known_files(&self, keywords: &[String]) -> Vec<ContextFragment> {
+    fn known_files(
+        &self,
+        keywords: &[String],
+        budget: &mut MemoryTokenBudget,
+    ) -> Vec<ContextFragment> {
         let Some(index) = self.file_index.as_ref() else {
             return Vec::new();
         };
+        if budget.exhausted() {
+            return Vec::new();
+        }
         let entries = if keywords.is_empty() {
             let mut entries = match index.list() {
                 Ok(entries) => entries,
@@ -4319,21 +4406,26 @@ impl MemoryFactsContextProvider {
             return Vec::new();
         }
 
-        let lines: Vec<String> = entries
-            .iter()
-            .map(|entry| {
-                let summary = sanitize_untrusted_line(entry.summary.as_deref().unwrap_or(""));
-                if entry.symbols.is_empty() {
-                    format!("- {} — {summary}", entry.path)
-                } else {
-                    format!(
-                        "- {} — {summary} [{}]",
-                        entry.path,
-                        entry.symbols.join(", ")
-                    )
-                }
-            })
-            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        for entry in &entries {
+            let summary = sanitize_untrusted_line(entry.summary.as_deref().unwrap_or(""));
+            let line = if entry.symbols.is_empty() {
+                format!("- {} — {summary}", entry.path)
+            } else {
+                format!(
+                    "- {} — {summary} [{}]",
+                    entry.path,
+                    entry.symbols.join(", ")
+                )
+            };
+            if !budget.take(&line) {
+                break;
+            }
+            lines.push(line);
+        }
+        if lines.is_empty() {
+            return Vec::new();
+        }
         vec![ContextFragment {
             label: "memory.files.known".to_owned(),
             content: fence_untrusted_memory(&format!(
@@ -4371,8 +4463,11 @@ impl ContextProvider for MemoryFactsContextProvider {
     fn contribute<'a>(&'a self, ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
         Box::pin(async move {
             let keywords = derive_memory_search_keywords(ctx);
-            let mut fragments = self.preferences_and_pitfalls(&keywords);
-            fragments.extend(self.known_files(&keywords));
+            let mut budget = MemoryTokenBudget {
+                remaining: self.token_budget,
+            };
+            let mut fragments = self.preferences_and_pitfalls(&keywords, &mut budget);
+            fragments.extend(self.known_files(&keywords, &mut budget));
             fragments
         })
     }
@@ -9184,28 +9279,97 @@ mod tests {
         Ok(())
     }
 
+    fn two_scope_provider() -> TestResult<(
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<harw_memory::FactStore>,
+        Arc<harw_memory::FactStore>,
+    )> {
+        let project_dir = tempfile::tempdir().map_err(ctx("project dir"))?;
+        let global_dir = tempfile::tempdir().map_err(ctx("global dir"))?;
+        let project = Arc::new(
+            harw_memory::FactStore::open(project_dir.path(), harw_memory::FactScope::Project)
+                .map_err(ctx("open project"))?,
+        );
+        let global = Arc::new(
+            harw_memory::FactStore::open(global_dir.path(), harw_memory::FactScope::Global)
+                .map_err(ctx("open global"))?,
+        );
+        project
+            .write(&memory_fact(
+                "projekt-regel",
+                "PROJEKT-MARKER Regel",
+                harw_memory::FactType::Preference,
+                harw_memory::FactScope::Project,
+                0.9,
+            ))
+            .map_err(ctx("seed project"))?;
+        global
+            .write(&memory_fact(
+                "globale-regel",
+                "GLOBAL-MARKER Regel",
+                harw_memory::FactType::Preference,
+                harw_memory::FactScope::Global,
+                0.9,
+            ))
+            .map_err(ctx("seed global"))?;
+        Ok((project_dir, global_dir, project, global))
+    }
+
     #[test]
-    fn test_memory_job_runs_off_thread_and_records_failed_on_error() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let jobs = Arc::new(JobStore::new(dir.path()));
-        let handle = crate::memory_wiring::spawn_memory_job(
-            Some(Arc::clone(&jobs)),
-            "memory.test",
-            std::time::Duration::from_secs(5),
-            |_deadline| Err("boom".to_owned()),
-        )
-        .ok_or(TestError::Missing("job handle"))?;
-        handle
-            .join()
-            .map_err(|_| TestError::Unexpected("memory job thread panicked".into()))?;
-        let listed = jobs
-            .list(&harw_session_store::JobListQuery::default())
-            .map_err(ctx("list jobs"))?;
-        let record = listed
-            .jobs
-            .first()
-            .ok_or(TestError::Missing("job record"))?;
-        assert_eq!(record.job.state, harw_job_runtime::JobState::Failed);
+    fn test_memory_provider_defaults_deliver_project_and_global() -> TestResult {
+        let (_p, _g, project, global) = two_scope_provider()?;
+        let provider = MemoryFactsContextProvider::new(Some(project), Some(global), None);
+        let joined = turn_context_texts(&provider)?.join("\n");
+        assert!(joined.contains("PROJEKT-MARKER"), "{joined}");
+        assert!(joined.contains("GLOBAL-MARKER"), "{joined}");
         Ok(())
+    }
+
+    #[test]
+    fn test_memory_provider_global_disabled_skips_global_and_its_usage() -> TestResult {
+        let (_p, _g, project, global) = two_scope_provider()?;
+        let provider = MemoryFactsContextProvider::new(
+            Some(Arc::clone(&project)),
+            Some(Arc::clone(&global)),
+            None,
+        )
+        .with_limits(false, None);
+        let joined = turn_context_texts(&provider)?.join("\n");
+        assert!(joined.contains("PROJEKT-MARKER"), "{joined}");
+        assert!(!joined.contains("GLOBAL-MARKER"), "{joined}");
+        assert!(
+            global.usage("globale-regel").is_none(),
+            "ausgeblendete globale Fakten dürfen keine Nutzung verbuchen"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_provider_token_budget_limits_delivered_lines() -> TestResult {
+        let (_p, _g, project, global) = two_scope_provider()?;
+        // Eine Zeile ("- (project, preference) PROJEKT-MARKER Regel") kostet
+        // knapp 12 Token: ein Budget von 14 lässt genau die Projektzeile zu.
+        let provider = MemoryFactsContextProvider::new(Some(project), Some(global), None)
+            .with_limits(true, Some(14));
+        let joined = turn_context_texts(&provider)?.join("\n");
+        assert!(joined.contains("PROJEKT-MARKER"), "{joined}");
+        assert!(!joined.contains("GLOBAL-MARKER"), "{joined}");
+
+        let tiny = MemoryFactsContextProvider::new(None, None, None).with_limits(true, Some(1));
+        assert!(turn_context_texts(&tiny)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_token_budget_take_is_exact() {
+        let mut unbounded = MemoryTokenBudget { remaining: None };
+        assert!(unbounded.take("irgendwas"));
+        assert!(!unbounded.exhausted());
+        let mut budget = MemoryTokenBudget { remaining: Some(3) };
+        assert!(budget.take("abcd")); // 1 Token
+        assert!(budget.take("abcdefgh")); // 2 Token
+        assert!(!budget.take("a"));
+        assert!(budget.exhausted());
     }
 }

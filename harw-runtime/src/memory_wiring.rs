@@ -16,9 +16,10 @@
 //!   Konsolidierungszeitpunkt: kein `std::thread::spawn`, weil der Prozess
 //!   sonst vor dem Thread enden kann, etwa bei einem TUI-Quit).
 //!
-//! Zusätzlich baut [`spawn_startup_sweep`] beim Aufbau der Wurzelsitzung
-//! einen Hintergrund-Thread, der liegengebliebene `_incoming`-Kandidaten
-//! nach einem Absturz nachholt — dieser Fall läuft bewusst **nicht**
+//! Zusätzlich baut [`spawn_startup_sweep_job`] beim Aufbau der Wurzelsitzung
+//! einen `memory_maintenance`-Job (Art des Job-Systems, Frist aus
+//! `[memory]`), den ein Hintergrund-Thread ausführt, der liegengebliebene
+//! `_incoming`-Kandidaten nach einem Absturz nachholt — dieser Fall läuft bewusst **nicht**
 //! synchron, weil er den Start eines Laufs nicht verzögern darf.
 //!
 //! # Nebenläufigkeit
@@ -38,13 +39,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use harw_core::capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
-use harw_job_runtime::{
-    Budget, Job, JobKind, JobOutcome, JobScope, JobState, Lease, LeaseToken, RetryPolicy,
-    StoredJob, WorkId,
-};
+use harw_job_runtime::{JobOutcome, JobScope, WorkId};
 use harw_memory::capture::{ProjectMemoryCapture, consolidate_project_memories};
 use harw_memory::{FactScope, FactStore};
-use harw_session_store::{CompleteRequest, JobStore};
+use harw_ops::memory_job::{
+    MemoryMaintenanceOp, MemoryMaintenanceSpec, admit_memory_maintenance,
+    execute_memory_maintenance,
+};
+use harw_session_store::{ClaimRequest, CompleteRequest, JobStore};
 use harw_types::{ApprovalActor, SessionId, TenantId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
 
@@ -194,8 +196,9 @@ impl SessionLifecycleHook for MemoryConsolidationHook {
 /// „Präzisierung Konsolidierungszeitpunkt“).
 ///
 /// # Beschreibung
-/// Öffnet einen eigenen, mit `"harw-memory-sweep"` benannten Thread, der
-/// [`consolidate_project_memories`] einmal ausführt. Anders als
+/// Öffnet einen eigenen, mit `"harw-memory-sweep"` benannten Thread, der die
+/// Projekt-Konsolidierung einmal ausführt (ohne Ledger-Eintrag; mit Ledger
+/// siehe [`spawn_startup_sweep_job`]). Anders als
 /// [`MemoryConsolidationHook::on_session_closed`] läuft dieser Aufruf
 /// **nicht** synchron: er hängt am Aufbau der Wurzelsitzung und darf deren
 /// Start nicht verzögern — ein liegengebliebener Kandidat aus einem
@@ -213,210 +216,132 @@ impl SessionLifecycleHook for MemoryConsolidationHook {
 /// ein Panic im Sweep-Thread bleibt lokal (kein `.join()`, das ihn
 /// propagieren könnte).
 pub fn spawn_startup_sweep(capture: Arc<ProjectMemoryCapture>) {
-    spawn_startup_sweep_job(capture, None);
+    let _ = spawn_startup_sweep_job(capture, None, &harw_config::MemorySection::default());
 }
 
-/// Werthalter des Wartungsjobs im Job-Ledger.
-pub const MEMORY_JOB_HOLDER: &str = "memory-maintenance";
-/// [`harw_job_runtime::JobKind::Custom`]-Art des Startup-Sweeps.
-pub const MEMORY_SWEEP_JOB_KIND: &str = "memory.startup_sweep";
-/// Frist (Wanduhr) des Startup-Sweeps als Jobbudget.
-pub const MEMORY_SWEEP_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Werthalter der In-Prozess-Ausführung des Startup-Sweeps (Worker-Id beim
+/// Claim im Job-Store).
+pub const MEMORY_SWEEP_WORKER_ID: &str = "harw-runtime-memory-sweep";
 
-/// Ein im [`JobStore`] zugelassener Wartungsjob samt eigener Lease (Halter
-/// [`MEMORY_JOB_HOLDER`], daher von keinem Worker beanspruchbar) — dasselbe
-/// Muster wie der Traum-Lauf (`harw_ops::dream_run`), keine zweite
-/// Job-Infrastruktur.
-struct LedgerJob {
-    jobs: Arc<JobStore>,
-    work_id: WorkId,
-    token: LeaseToken,
-}
+/// Reiht den Startup-Sweep als echten Job der Art
+/// [`harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND`] im Job-Store ein und
+/// führt ihn ohne Verzögerung der Montage aus — [`spawn_startup_sweep`] mit
+/// Ledger und Konfiguration.
+///
+/// # Beschreibung
+/// Es gibt keine eigene Job-Mechanik: Der Eintrag ist ein gewöhnlicher
+/// `memory_maintenance`-Job (`harw_ops::memory_job::admit_memory_maintenance`),
+/// derselbe Handler-Kern
+/// ([`harw_ops::memory_job::execute_memory_maintenance`]) wie im Job-Worker von
+/// `harw serve`, die Frist kommt aus `[memory] sweep_deadline_secs` (Vorgabe
+/// 120 s). Weil Einstiege wie die TUI keinen Job-Worker betreiben, claimt und
+/// führt ein eigener Thread (`harw-memory-sweep`) den Job selbst aus
+/// (`JobStore::claim`/`complete`, Halter [`MEMORY_SWEEP_WORKER_ID`]) — nie im
+/// Build-Pfad. Läuft zugleich ein Worker, gewinnt, wer den Job zuerst claimt;
+/// der Verlierer tut nichts. Fristablauf bricht ohne Teilzustand ab und
+/// schließt den Job als `Failed` (`timed_out: …`) ab.
+///
+/// Ohne Ledger (`jobs == None`) läuft dieselbe Arbeit unprotokolliert auf dem
+/// Thread. Scheitert die Zulassung bei vorhandenem Ledger, läuft die Arbeit
+/// **nicht** (fail closed: kein unprotokolliertes Aufräumen). Mit
+/// `settings.enabled == false` geschieht nichts.
+///
+/// # Rückgabe
+/// Der `JoinHandle` des Threads (Tests joinen ihn; die Montage nicht), oder
+/// `None`, wenn nichts gestartet wurde.
+pub fn spawn_startup_sweep_job(
+    capture: Arc<ProjectMemoryCapture>,
+    jobs: Option<Arc<JobStore>>,
+    settings: &harw_config::MemorySection,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !settings.enabled {
+        return None;
+    }
+    let mut spec = MemoryMaintenanceSpec::new(
+        MemoryMaintenanceOp::Sweep,
+        settings.sweep_deadline_secs.max(1),
+    );
+    spec.project_root = Some(capture.memories_root().to_path_buf());
+    spec.max_unused_days = i64::from(settings.max_unused_days);
 
-impl LedgerJob {
-    fn admit(
-        jobs: Arc<JobStore>,
-        kind: &str,
-        max_wall: std::time::Duration,
-    ) -> Result<Self, String> {
-        let id = WorkId::new();
-        let now = Timestamp::now();
-        let wall = SignedDuration::try_from(max_wall).unwrap_or(SignedDuration::MAX);
-        let mut job = Job::new(
-            id.clone(),
-            JobKind::Custom(kind.to_owned()),
-            Budget {
-                max_tokens: Some(0),
-                max_wall: Some(wall),
-                max_tool_calls: Some(0),
-            },
-            RetryPolicy {
-                max_attempts: 1,
-                base_delay: SignedDuration::from_secs(30),
-                factor: 2.0,
-                max_delay: SignedDuration::from_secs(300),
-            },
-            now,
-        );
-        job.state = JobState::Running;
-        let ttl = wall
-            .checked_add(SignedDuration::from_secs(60))
-            .unwrap_or(wall);
-        let lease = Lease::acquire_fenced(
-            id.clone(),
-            MEMORY_JOB_HOLDER,
-            now,
-            ttl,
-            1,
-            WorkId::new().as_str(),
-        )
-        .map_err(|error| error.to_string())?;
-        let token = lease.token();
-        let record = StoredJob {
-            job,
-            scope: JobScope::new(
+    let ledger = match jobs {
+        Some(jobs) => {
+            let scope = JobScope::new(
                 TenantId::from_str("local"),
                 WorkspaceId::from_str("memory"),
                 ApprovalActor::Operator {
                     id: MEMORY_JOB_HOLDER.to_owned(),
                 },
-            ),
-            input: serde_json::json!({ "kind": kind }),
-            submitted_at: now,
-            not_before: now,
-            lease: Some(lease),
-            lease_epoch: 1,
-            completion: None,
-            cancellation: None,
-            revision: 0,
-            trace: None,
-        };
-        jobs.admit(&record).map_err(|error| error.to_string())?;
-        Ok(Self {
-            jobs,
-            work_id: id,
-            token,
-        })
-    }
-
-    fn finish(&self, outcome: JobOutcome) {
-        let request = CompleteRequest {
-            token: self.token.clone(),
-            completed_at: Timestamp::now(),
-            outcome,
-        };
-        if let Err(error) = self.jobs.complete(&self.work_id, &request) {
-            tracing::warn!(%error, work_id = %self.work_id, "memory.job.complete_failed");
-        }
-    }
-}
-
-/// Führt `work` als Wartungsjob im Job-Ledger aus: zugelassen mit
-/// Wanduhr-Budget `max_wall`, ausgeführt in einem eigenen Thread (nie im
-/// Turn-/Build-Pfad), abgeschlossen als `Succeeded`/`Failed`.
-///
-/// # Beschreibung
-/// `work` erhält die Frist (`Instant`) und muss sie selbst einhalten und
-/// ohne Teilzustand abbrechen (siehe
-/// [`harw_memory::FactStore::decay_with_deadline`]). Mit `jobs == None`
-/// (kein Ledger greifbar) läuft die Arbeit unverändert, nur ohne
-/// Ledger-Eintrag. Scheitert die Zulassung bei vorhandenem Ledger, läuft die
-/// Arbeit **nicht** (fail closed: kein unprotokolliertes Aufräumen).
-/// Läuft `work` über die Frist hinaus, wird der Job `Failed` abgeschlossen.
-///
-/// # Rückgabe
-/// Der `JoinHandle` des Threads (Tests joinen ihn; die Montage nicht), oder
-/// `None`, wenn Zulassung oder Thread-Start scheiterten.
-pub fn spawn_memory_job<F>(
-    jobs: Option<Arc<JobStore>>,
-    kind: &'static str,
-    max_wall: std::time::Duration,
-    work: F,
-) -> Option<std::thread::JoinHandle<()>>
-where
-    F: FnOnce(std::time::Instant) -> Result<serde_json::Value, String> + Send + 'static,
-{
-    let ledger = match jobs {
-        Some(jobs) => match LedgerJob::admit(jobs, kind, max_wall) {
-            Ok(ledger) => Some(ledger),
-            Err(error) => {
-                tracing::warn!(%error, kind, "memory.job.admit_failed");
-                return None;
+            );
+            match admit_memory_maintenance(&jobs, scope, &spec) {
+                Ok(work_id) => Some((jobs, work_id)),
+                Err(error) => {
+                    tracing::warn!(%error, "memory.sweep.admit_failed");
+                    return None;
+                }
             }
-        },
+        }
         None => None,
     };
-    let builder = std::thread::Builder::new().name("harw-memory-job".to_owned());
-    let spawned = builder.spawn(move || {
-        let started = std::time::Instant::now();
-        let deadline = started + max_wall;
-        let result = match work(deadline) {
-            Ok(_) if started.elapsed() > max_wall => Err("deadline exceeded".to_owned()),
-            other => other,
-        };
-        match result {
-            Ok(value) => {
-                if let Some(ledger) = &ledger {
-                    ledger.finish(JobOutcome::Succeeded { result: value });
-                }
-            }
-            Err(reason) => {
-                tracing::warn!(%reason, kind, "memory.job.failed");
-                if let Some(ledger) = &ledger {
-                    ledger.finish(JobOutcome::Failed { reason });
-                }
-            }
-        }
-    });
-    match spawned {
+    let builder = std::thread::Builder::new().name("harw-memory-sweep".to_owned());
+    match builder.spawn(move || run_sweep(&spec, ledger)) {
         Ok(handle) => Some(handle),
         Err(error) => {
-            tracing::warn!(%error, kind, "memory.job.spawn_failed");
+            tracing::warn!(%error, "memory.sweep.spawn_failed");
             None
         }
     }
 }
 
-/// Wie [`spawn_startup_sweep`], aber als Job im Ledger `jobs` (siehe
-/// [`spawn_memory_job`]) mit Frist [`MEMORY_SWEEP_MAX_WALL`].
-///
-/// # Beschreibung
-/// Die Frist wird vor dem Start geprüft; die Konsolidierung selbst
-/// (`harw_memory::capture`) ist keine abbrechbare Arbeit — ein Überschreiten
-/// wird im Ledger als `Failed` sichtbar, aber nicht mitten im Lauf
-/// unterbrochen.
-pub fn spawn_startup_sweep_job(
-    capture: Arc<ProjectMemoryCapture>,
-    jobs: Option<Arc<JobStore>>,
-) -> Option<std::thread::JoinHandle<()>> {
-    spawn_memory_job(
-        jobs,
-        MEMORY_SWEEP_JOB_KIND,
-        MEMORY_SWEEP_MAX_WALL,
-        move |deadline| {
-            if std::time::Instant::now() >= deadline {
-                return Err("deadline exceeded before start".to_owned());
+/// Werthalter (Submitter) der Wartungsjobs der Runtime.
+const MEMORY_JOB_HOLDER: &str = "memory-maintenance";
+
+// Thread-Körper des Sweeps: claimt den zugelassenen Job (falls es ein Ledger
+// gibt), führt den gemeinsamen Handler-Kern aus und schließt den Job ab.
+fn run_sweep(spec: &MemoryMaintenanceSpec, ledger: Option<(Arc<JobStore>, WorkId)>) {
+    let claim = match &ledger {
+        Some((jobs, work_id)) => {
+            let ttl = SignedDuration::from_secs(
+                i64::try_from(spec.deadline_secs.saturating_add(60)).unwrap_or(i64::MAX),
+            );
+            let request = ClaimRequest {
+                worker_id: MEMORY_SWEEP_WORKER_ID.to_owned(),
+                lease_ttl: ttl,
+                now: Timestamp::now(),
+            };
+            match jobs.claim(work_id, &request) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    // Ein Job-Worker hat ihn bereits geclaimt (oder der Job
+                    // ist weg): nichts zu tun.
+                    tracing::debug!(%error, %work_id, "memory.sweep.claim_skipped");
+                    return;
+                }
             }
-            let root = capture.memories_root().to_path_buf();
-            consolidate_project_memories(&root)
-                .map(|report| {
-                    tracing::info!(
-                        merged = report.merged,
-                        written = report.written,
-                        deleted = report.deleted,
-                        conflicts = report.conflicts,
-                        "memory.startup_sweep.completed"
-                    );
-                    serde_json::json!({
-                        "merged": report.merged,
-                        "written": report.written,
-                        "deleted": report.deleted,
-                        "conflicts": report.conflicts,
-                    })
-                })
-                .map_err(|error| error.to_string())
-        },
-    )
+        }
+        None => None,
+    };
+    let outcome = match execute_memory_maintenance(spec) {
+        Ok(result) => {
+            tracing::info!(%result, "memory.startup_sweep.completed");
+            JobOutcome::Succeeded { result }
+        }
+        Err(failure) => {
+            let reason = failure.reason();
+            tracing::warn!(%reason, "memory.startup_sweep.failed");
+            JobOutcome::Failed { reason }
+        }
+    };
+    if let (Some((jobs, work_id)), Some(claim)) = (&ledger, claim) {
+        let request = CompleteRequest {
+            token: claim.token,
+            completed_at: Timestamp::now(),
+            outcome,
+        };
+        if let Err(error) = jobs.complete(work_id, &request) {
+            tracing::warn!(%error, %work_id, "memory.sweep.complete_failed");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -499,4 +424,109 @@ pub fn open_fact_stores(
     cwd: &Path,
 ) -> (Option<Arc<FactStore>>, Option<Arc<FactStore>>) {
     (open_project_fact_store(cwd), open_global_fact_store(home))
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use harw_job_runtime::JobState;
+    use harw_session_store::JobListQuery;
+
+    type TestError = Box<dyn std::error::Error>;
+    type TestResult<T = ()> = Result<T, TestError>;
+
+    fn capture(root: &Path) -> TestResult<Arc<ProjectMemoryCapture>> {
+        Ok(Arc::new(ProjectMemoryCapture::open(root)?))
+    }
+
+    #[test]
+    fn sweep_is_a_real_memory_maintenance_job_completed_off_thread() -> TestResult {
+        let state = tempfile::tempdir()?;
+        let memories = tempfile::tempdir()?;
+        let jobs = Arc::new(JobStore::new(state.path()));
+        let handle = spawn_startup_sweep_job(
+            capture(memories.path())?,
+            Some(Arc::clone(&jobs)),
+            &harw_config::MemorySection::default(),
+        )
+        .ok_or("sweep thread must start")?;
+        handle.join().map_err(|_| "sweep thread panicked")?;
+
+        let page = jobs.list(&JobListQuery::default())?;
+        let record = page.jobs.first().ok_or("job record")?;
+        assert!(harw_ops::memory_job::is_memory_maintenance_kind(
+            &record.job.kind
+        ));
+        assert_eq!(record.job.state, JobState::Completed);
+        // Frist aus der Job-Payload: Vorgabe 120 s.
+        assert_eq!(record.input["deadline_secs"], 120);
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_failure_is_recorded_as_failed() -> TestResult {
+        let state = tempfile::tempdir()?;
+        let memories = tempfile::tempdir()?;
+        let jobs = Arc::new(JobStore::new(state.path()));
+        let mut spec = MemoryMaintenanceSpec::new(MemoryMaintenanceOp::Sweep, 30);
+        // Wurzel fehlt: der Handler scheitert, der Job endet `Failed`.
+        spec.project_root = None;
+        let scope = JobScope::new(
+            TenantId::from_str("local"),
+            WorkspaceId::from_str("memory"),
+            ApprovalActor::Operator {
+                id: MEMORY_JOB_HOLDER.to_owned(),
+            },
+        );
+        let work_id = admit_memory_maintenance(&jobs, scope, &spec)?;
+        run_sweep(&spec, Some((Arc::clone(&jobs), work_id.clone())));
+        assert_eq!(jobs.get(&work_id)?.job.state, JobState::Failed);
+        drop(memories);
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_memory_starts_nothing_and_admits_nothing() -> TestResult {
+        let state = tempfile::tempdir()?;
+        let memories = tempfile::tempdir()?;
+        let jobs = Arc::new(JobStore::new(state.path()));
+        let settings = harw_config::MemorySection {
+            enabled: false,
+            ..harw_config::MemorySection::default()
+        };
+        let handle =
+            spawn_startup_sweep_job(capture(memories.path())?, Some(Arc::clone(&jobs)), &settings);
+        assert!(handle.is_none());
+        assert!(jobs.list(&JobListQuery::default())?.jobs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_job_claimed_elsewhere_is_not_run_a_second_time() -> TestResult {
+        let state = tempfile::tempdir()?;
+        let jobs = Arc::new(JobStore::new(state.path()));
+        let mut spec = MemoryMaintenanceSpec::new(MemoryMaintenanceOp::Sweep, 30);
+        spec.project_root = None;
+        let scope = JobScope::new(
+            TenantId::from_str("local"),
+            WorkspaceId::from_str("memory"),
+            ApprovalActor::Operator {
+                id: MEMORY_JOB_HOLDER.to_owned(),
+            },
+        );
+        let work_id = admit_memory_maintenance(&jobs, scope, &spec)?;
+        // Ein anderer Worker claimt zuerst.
+        let _other = jobs.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "other-worker".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: Timestamp::now(),
+            },
+        )?;
+        run_sweep(&spec, Some((Arc::clone(&jobs), work_id.clone())));
+        // Unser Thread hat nichts abgeschlossen: der Job läuft weiter.
+        assert_eq!(jobs.get(&work_id)?.job.state, JobState::Running);
+        Ok(())
+    }
 }
