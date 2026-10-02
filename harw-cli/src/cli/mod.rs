@@ -226,6 +226,20 @@ pub enum Command {
         /// Zusätzliche Telemetrie-Exportziele (Vorgabe: beide aus).
         #[command(flatten)]
         telemetry: TelemetryArgs,
+        /// Opt-in: zusätzlich die Sitzungs-Kontrollebene (`harw.session.v1`) auf
+        /// einem lokalen Unix-Socket (Modus 0600, privates Verzeichnis 0700)
+        /// anbieten. Ohne Wert: `$XDG_RUNTIME_DIR/harw/session.sock`, sonst
+        /// `<profil>/session-host/run/session.sock`. Ein Pfad nur als
+        /// `--session-socket=PFAD`. Schlägt der Start fehl, endet der Dienst
+        /// mit Fehler.
+        #[arg(
+            long,
+            value_name = "PATH",
+            value_hint = ValueHint::FilePath,
+            num_args = 0..=1,
+            require_equals = true
+        )]
+        session_socket: Option<Option<PathBuf>>,
     },
     /// Startet den lokalen MCP-Server über HTTP.
     Serve {

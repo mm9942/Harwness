@@ -66,6 +66,7 @@ mod runtime_web;
 mod sandbox_cmd;
 mod secret_store;
 mod session_cmd;
+mod session_serve;
 mod settings;
 mod tailscale_cmd;
 mod telegram_launcher;
@@ -837,7 +838,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Gateway {
             action: None,
             telemetry,
-        }) => gateway::run(home_override, telemetry),
+            session_socket,
+        }) => gateway::run(home_override, telemetry, session_socket),
         Some(Command::Serve { config_dir }) => {
             let (layers, storage_root, home) = resolve_serve_paths(home_override, config_dir)?;
             serve_mcp(layers, storage_root, home)

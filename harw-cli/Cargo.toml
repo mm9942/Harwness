@@ -149,6 +149,12 @@ harw-runtime = { path = "../harw-runtime" }
 harw-protocol = { path = "../harw-protocol" }
 # W00 S09: `harw attach` connects through the session client (SessionPort).
 harw-session-remote = { path = "../harw-session-remote" }
+# Composition root of the opt-in session ingress (`src/session_serve.rs`,
+# `harw gateway --session-socket`): host + production driver + durable
+# adapters on a local Unix socket via the daemon's composition entry.
+harw-session-daemon = { path = "../harw-session-daemon" }
+harw-session-driver = { path = "../harw-session-driver" }
+harw-session-host = { path = "../harw-session-host" }
 
 # `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
 # killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
