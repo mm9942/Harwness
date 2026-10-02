@@ -222,7 +222,7 @@ the agent writes `image: "rust"` and never sees or invents a digest.
 ### 5.3 The argv a correct plan produces (Podman)
 
 ```
-podman run
+podman create                     # never `run`: verify before `start` (§9)
   --rm --pull=never
   --name=harw-<session>-<n>  --cidfile=<fresh path under the job dir>
   --label=harw.owner=<runner> --label=harw.work_id=<id> --label=harw.profile=<p>
@@ -230,10 +230,10 @@ podman run
   --read-only                     # --read-only-tmpfs defaults to true
   --cap-drop=all
   --security-opt=no-new-privileges
-  --pids-limit=256 --memory=<n>m
+  --pids-limit=256 --memory=<n>m --memory-swap=<n>m   # equal: no swap
   --userns=keep-id
   --timeout=<seconds>
-  --mount type=bind,src=<workspace>,dst=/workspace,ro
+  --mount type=bind,src=<workspace>,dst=/workspace,ro,bind-nonrecursive
   --workdir=/workspace
   --                              # ends option parsing (verify, §9)
   <image@sha256:…>

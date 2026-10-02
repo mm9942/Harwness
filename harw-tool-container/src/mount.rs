@@ -1,31 +1,19 @@
 //! Mounts. Sources come from trusted config, never from the model.
 //!
 //! Rules (fail closed):
-//! - the source is a clean absolute path without any engine-flag separator;
-//! - the source is not the host root, a pseudo filesystem, `/run` (where the
-//!   container and systemd sockets live), `/etc`, a socket file, or a
-//!   credential directory (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`,
-//!   `.config/containers`);
+//! - a bind source is a [`HostPath`]: resolved on the host (a symlink to
+//!   `/etc` is refused), not a denied tree, not a credential directory, and
+//!   free of sockets anywhere below it;
+//! - a bind is non-recursive, so nested mounts are not carried along;
 //! - the destination is below an allowlisted root, so a mount can never
 //!   shadow `/proc`, `/usr`, `/etc` or the engine's own files.
-//!
-//! A symlink is invisible to a pure function: the caller must canonicalize a
-//! source before constructing the mount.
 
 use crate::error::ContainerPolicyError;
+use crate::hostpath::HostPath;
 use crate::validate::{check_abs_path, check_name};
 
 /// Roots below which a container destination is allowed.
 const DST_ROOTS: [&str; 5] = ["/workspace", "/cache", "/mnt", "/data", "/opt"];
-
-/// Host trees that are never a bind source (exact match or prefix).
-const DENIED_SRC_TREES: [&str; 8] = [
-    "/", "/proc", "/sys", "/dev", "/run", "/var/run", "/boot", "/etc",
-];
-
-/// Directory names that hold credentials; any path component matching one is
-/// refused as a source.
-const CREDENTIAL_DIRS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", ".docker"];
 
 /// Kind of a mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,45 +45,16 @@ fn check_dst(dst: &str) -> Result<(), ContainerPolicyError> {
     }
 }
 
-fn check_src(src: &str) -> Result<(), ContainerPolicyError> {
-    let err = ContainerPolicyError::InvalidMount;
-    check_abs_path(src).map_err(|_| err("invalid source path"))?;
-    for tree in DENIED_SRC_TREES {
-        let denied = if tree == "/" {
-            src == "/"
-        } else {
-            src == tree || src.strip_prefix(tree).is_some_and(|r| r.starts_with('/'))
-        };
-        if denied {
-            return Err(err("source is a denied host tree"));
-        }
-    }
-    let components: Vec<&str> = src.split('/').filter(|c| !c.is_empty()).collect();
-    if components.iter().any(|c| CREDENTIAL_DIRS.contains(c)) {
-        return Err(err("source is inside a credential directory"));
-    }
-    if components
-        .windows(2)
-        .any(|w| w == [".config", "containers"])
-    {
-        return Err(err("source is inside the container engine configuration"));
-    }
-    if components.last().is_some_and(|c| c.ends_with(".sock")) {
-        return Err(err("sockets are never mounted"));
-    }
-    Ok(())
-}
-
 impl Mount {
-    /// A bind mount of a host path.
+    /// A bind mount of a canonical host path. The source type cannot be
+    /// built from a bare string: see [`HostPath::canonicalize`].
     ///
     /// # Errors
     /// [`ContainerPolicyError::InvalidMount`] with the reason.
-    pub fn bind(src: &str, dst: &str, read_only: bool) -> Result<Self, ContainerPolicyError> {
-        check_src(src)?;
+    pub fn bind(src: &HostPath, dst: &str, read_only: bool) -> Result<Self, ContainerPolicyError> {
         check_dst(dst)?;
         Ok(Self {
-            kind: Kind::Bind(src.to_owned()),
+            kind: Kind::Bind(src.as_str().to_owned()),
             dst: dst.to_owned(),
             read_only,
         })
@@ -135,7 +94,15 @@ impl Mount {
             Kind::Volume(n) => ("volume", n),
         };
         let ro = if self.read_only { ",ro" } else { "" };
-        format!("--mount=type={kind},src={src},dst={}{ro}", self.dst)
+        // A bind is non-recursive: a mount nested below the source (a
+        // docker socket directory mounted into the workspace, say) is not
+        // carried into the container.
+        let flat = if matches!(self.kind, Kind::Bind(_)) {
+            ",bind-nonrecursive"
+        } else {
+            ""
+        };
+        format!("--mount=type={kind},src={src},dst={}{ro}{flat}", self.dst)
     }
 }
 
@@ -144,16 +111,20 @@ mod tests {
     use super::*;
     use crate::test_support::{TestResult, ensure};
 
+    fn host(path: &str) -> Result<HostPath, ContainerPolicyError> {
+        HostPath::lexical(path)
+    }
+
     #[test]
     fn renders_one_argument_per_mount() -> TestResult {
-        let m = Mount::bind("/srv/ws", "/workspace", true)?;
+        let m = Mount::bind(&host("/srv/ws")?, "/workspace", true)?;
         ensure(
-            m.to_arg() == "--mount=type=bind,src=/srv/ws,dst=/workspace,ro",
+            m.to_arg() == "--mount=type=bind,src=/srv/ws,dst=/workspace,ro,bind-nonrecursive",
             "bind ro",
         )?;
-        let m = Mount::bind("/srv/ws", "/workspace", false)?;
+        let m = Mount::bind(&host("/srv/ws")?, "/workspace", false)?;
         ensure(
-            m.to_arg() == "--mount=type=bind,src=/srv/ws,dst=/workspace",
+            m.to_arg() == "--mount=type=bind,src=/srv/ws,dst=/workspace,bind-nonrecursive",
             "bind rw",
         )?;
         let v = Mount::volume("harw-cache", "/cache", false)?;
@@ -161,44 +132,6 @@ mod tests {
             v.to_arg() == "--mount=type=volume,src=harw-cache,dst=/cache",
             "volume",
         )
-    }
-
-    #[test]
-    fn refuses_denied_sources() -> TestResult {
-        for src in [
-            "/",
-            "/proc",
-            "/proc/1",
-            "/sys/fs",
-            "/dev",
-            "/run",
-            "/run/user/1000/podman/podman.sock",
-            "/var/run/docker.sock",
-            "/etc",
-            "/etc/ssh",
-            "/boot",
-            "/home/u/.ssh",
-            "/home/u/.ssh/id_ed25519",
-            "/home/u/.docker",
-            "/home/u/.config/containers/auth.json",
-            "/srv/app/engine.sock",
-        ] {
-            ensure(Mount::bind(src, "/workspace", true).is_err(), src)?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn near_misses_are_allowed() -> TestResult {
-        for src in [
-            "/runner/work",
-            "/etcetera",
-            "/srv/.sshx",
-            "/home/u/.config/other",
-        ] {
-            ensure(Mount::bind(src, "/workspace", true).is_ok(), src)?;
-        }
-        Ok(())
     }
 
     #[test]
@@ -215,20 +148,20 @@ mod tests {
             "/workspace/",
             "/workspace/..",
         ] {
-            ensure(Mount::bind("/srv/ws", dst, true).is_err(), dst)?;
+            ensure(Mount::bind(&host("/srv/ws")?, dst, true).is_err(), dst)?;
         }
         ensure(
-            Mount::bind("/srv/ws", "/workspace/sub", true).is_ok(),
+            Mount::bind(&host("/srv/ws")?, "/workspace/sub", true).is_ok(),
             "below root",
         )?;
-        ensure(Mount::bind("/srv/ws", "/cache", true).is_ok(), "exact root")
+        ensure(
+            Mount::bind(&host("/srv/ws")?, "/cache", true).is_ok(),
+            "exact root",
+        )
     }
 
     #[test]
-    fn separators_cannot_add_options() -> TestResult {
-        for src in ["/srv/a,b", "/srv/a:b", "/srv/a=b", "/srv/a\nb", "/srv/a\"b"] {
-            ensure(Mount::bind(src, "/workspace", true).is_err(), src)?;
-        }
+    fn volume_names_cannot_add_options() -> TestResult {
         ensure(
             Mount::volume("Bad Name", "/cache", false).is_err(),
             "volume name",

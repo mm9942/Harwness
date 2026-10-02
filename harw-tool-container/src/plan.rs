@@ -28,6 +28,7 @@ use std::process::{Command, Stdio};
 use crate::digest::argv_sha256_hex;
 use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value, engine_environment};
 use crate::error::ContainerPolicyError;
+use crate::hostpath::HostPath;
 use crate::image::ImageRef;
 use crate::mount::Mount;
 use crate::profile::Profile;
@@ -51,7 +52,7 @@ const MAX_ENV_ENTRIES: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfig {
     executable: String,
-    workspace: String,
+    workspace: HostPath,
     run_id: String,
     owner: String,
     connection: Option<String>,
@@ -65,7 +66,7 @@ impl RunConfig {
     /// Starts a configuration.
     ///
     /// `executable` is an absolute path whose file name is `podman` (no
-    /// `PATH` search). `workspace` is an absolute, canonical host path.
+    /// `PATH` search). `workspace` is a [`HostPath`], resolved and checked on the host.
     /// `run_id` is `[a-z0-9][a-z0-9._-]{0,47}` and names the container
     /// (`harw-<run_id>`). `owner` is a label value that identifies the
     /// session or runner.
@@ -74,7 +75,7 @@ impl RunConfig {
     /// The first rule that a value breaks.
     pub fn new(
         executable: &str,
-        workspace: &str,
+        workspace: &HostPath,
         run_id: &str,
         owner: &str,
     ) -> Result<Self, ContainerPolicyError> {
@@ -84,12 +85,11 @@ impl RunConfig {
                 "the engine executable must be named podman",
             ));
         }
-        check_abs_path(workspace)?;
         check_name(run_id, 48, "run id")?;
         check_label_value(owner, "owner")?;
         Ok(Self {
             executable: executable.to_owned(),
-            workspace: workspace.to_owned(),
+            workspace: workspace.clone(),
             run_id: run_id.to_owned(),
             owner: owner.to_owned(),
             connection: None,
@@ -556,6 +556,14 @@ mod tests {
     use crate::readback::{InspectFacts, verify};
     use crate::test_support::{TestResult, ensure};
 
+    fn host(path: &str) -> Result<HostPath, ContainerPolicyError> {
+        HostPath::lexical(path)
+    }
+
+    fn ws() -> Result<HostPath, ContainerPolicyError> {
+        host("/srv/ws")
+    }
+
     const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn image() -> Result<ImageRef, ContainerPolicyError> {
@@ -563,7 +571,7 @@ mod tests {
     }
 
     fn config() -> Result<RunConfig, ContainerPolicyError> {
-        RunConfig::new("/usr/bin/podman", "/srv/ws", "r1", "ses1")
+        RunConfig::new("/usr/bin/podman", &ws()?, "r1", "ses1")
     }
 
     fn cmd(words: &[&str]) -> Vec<String> {
@@ -598,7 +606,7 @@ mod tests {
             "--memory-swap=1024m",
             "--userns=keep-id",
             "--timeout=300",
-            "--mount=type=bind,src=/srv/ws,dst=/workspace,ro",
+            "--mount=type=bind,src=/srv/ws,dst=/workspace,ro,bind-nonrecursive",
             "--workdir=/workspace",
             "--",
             &format!("docker.io/library/rust@sha256:{HEX}"),
@@ -619,7 +627,9 @@ mod tests {
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
         let a = plan.create_args();
         ensure(
-            a.contains(&"--mount=type=bind,src=/srv/ws,dst=/workspace".to_owned()),
+            a.contains(
+                &"--mount=type=bind,src=/srv/ws,dst=/workspace,bind-nonrecursive".to_owned(),
+            ),
             "workspace rw",
         )?;
         ensure(
@@ -794,8 +804,8 @@ mod tests {
 
     #[test]
     fn extra_mounts_follow_the_profile() -> TestResult {
-        let rw = Mount::bind("/srv/data", "/data", false)?;
-        let ro = Mount::bind("/srv/ref", "/mnt/ref", true)?;
+        let rw = Mount::bind(&host("/srv/data")?, "/data", false)?;
+        let ro = Mount::bind(&host("/srv/ref")?, "/mnt/ref", true)?;
         let cfg = config()?.with_mount(rw)?.with_mount(ro)?;
         ensure(
             ContainerPlan::build(&cfg, &request(Profile::Hermetic)?).is_err(),
@@ -803,17 +813,18 @@ mod tests {
         )?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
         ensure(
-            plan.create_args()
-                .contains(&"--mount=type=bind,src=/srv/data,dst=/data".to_owned()),
+            plan.create_args().contains(
+                &"--mount=type=bind,src=/srv/data,dst=/data,bind-nonrecursive".to_owned(),
+            ),
             "rw in build",
         )?;
-        let clash = Mount::bind("/srv/other", "/workspace", true)?;
+        let clash = Mount::bind(&host("/srv/other")?, "/workspace", true)?;
         ensure(
             config()?.with_mount(clash).is_err(),
             "workspace destination",
         )?;
-        let dup1 = Mount::bind("/srv/a", "/data", true)?;
-        let dup2 = Mount::bind("/srv/b", "/data", true)?;
+        let dup1 = Mount::bind(&host("/srv/a")?, "/data", true)?;
+        let dup2 = Mount::bind(&host("/srv/b")?, "/data", true)?;
         ensure(
             config()?.with_mount(dup1)?.with_mount(dup2).is_err(),
             "duplicate destination",
@@ -823,35 +834,31 @@ mod tests {
     #[test]
     fn config_rejects_bad_values() -> TestResult {
         ensure(
-            RunConfig::new("/usr/bin/docker", "/srv/ws", "r1", "o").is_err(),
+            RunConfig::new("/usr/bin/docker", &ws()?, "r1", "o").is_err(),
             "not podman",
         )?;
         ensure(
-            RunConfig::new("podman", "/srv/ws", "r1", "o").is_err(),
+            RunConfig::new("podman", &ws()?, "r1", "o").is_err(),
             "relative executable",
         )?;
         ensure(
-            RunConfig::new("/usr/bin/podman", "srv/ws", "r1", "o").is_err(),
-            "relative ws",
+            host("srv/ws").is_err(),
+            "a relative workspace cannot be constructed",
         )?;
         ensure(
-            RunConfig::new("/usr/bin/podman", "/srv/ws", "R 1", "o").is_err(),
+            RunConfig::new("/usr/bin/podman", &ws()?, "R 1", "o").is_err(),
             "run id",
         )?;
         ensure(
-            RunConfig::new("/usr/bin/podman", "/srv/ws", "r1", "o p").is_err(),
+            RunConfig::new("/usr/bin/podman", &ws()?, "r1", "o p").is_err(),
             "owner",
         )
     }
 
     #[test]
-    fn a_workspace_in_a_denied_tree_fails_the_build() -> TestResult {
-        for ws in ["/", "/etc/app", "/run/user/1000", "/home/u/.ssh/keys"] {
-            let cfg = RunConfig::new("/usr/bin/podman", ws, "r1", "o")?;
-            ensure(
-                ContainerPlan::build(&cfg, &request(Profile::Hermetic)?).is_err(),
-                ws,
-            )?;
+    fn a_workspace_in_a_denied_tree_cannot_be_constructed() -> TestResult {
+        for dir in ["/", "/etc/app", "/run/user/1000", "/home/u/.ssh/keys"] {
+            ensure(host(dir).is_err(), dir)?;
         }
         Ok(())
     }
