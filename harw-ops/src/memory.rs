@@ -96,11 +96,11 @@ use harw_memory::{Fact, FactScope, FactStore, FactType, Memory, slugify};
 use harw_operations::{OpContext, OpError, OpOutput};
 
 use crate::knowledge_args::{FlagSpec, KnowledgeArgs};
-use crate::memory_job::{
-    MaintenanceScope, MemoryMaintenanceOp, MemoryMaintenanceSpec, enqueue_memory_maintenance,
-};
 use crate::knowledge_common::{
     AREA_PALACE, KnowledgeCaller, knowledge_store, map_knowledge_error, publish_knowledge,
+};
+use crate::memory_job::{
+    MaintenanceScope, MemoryMaintenanceOp, MemoryMaintenanceSpec, enqueue_memory_maintenance,
 };
 
 /// Obergrenze der Treffer je Wurzel bei `recall` (wie zuvor bei der
@@ -567,7 +567,7 @@ pub(crate) fn forget_with_deadline(
             .map_err(|error| OpError::Execution(error.to_string()))?;
         let mut locks = Vec::new();
         for (_, root, _) in &targets {
-            locks.push(lock_root(root, deadline)?);
+            locks.push(lock_root(root, deadline.clone())?);
         }
         // Commit-Punkt: ab hier wird vollständig gelöscht.
         deadline
@@ -649,7 +649,10 @@ fn promote_to_global(ctx: &OpContext, args: &KnowledgeArgs) -> Result<OpOutput, 
         .parent()
         .and_then(Path::parent)
         .and_then(Path::file_name)
-        .map_or_else(|| "project".to_owned(), |n| n.to_string_lossy().into_owned());
+        .map_or_else(
+            || "project".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
     let settings = memory_settings(ctx);
     let mut spec = maintenance_spec(
         MemoryMaintenanceOp::PromoteToGlobal {
@@ -1595,7 +1598,9 @@ mod job_dispatch_tests {
 
     fn job_id(out: &OpOutput) -> TestResult<WorkId> {
         let data = out.data.as_ref().ok_or(TestError::Missing("data"))?;
-        let id = data["job_id"].as_str().ok_or(TestError::Missing("job_id"))?;
+        let id = data["job_id"]
+            .as_str()
+            .ok_or(TestError::Missing("job_id"))?;
         Ok(WorkId::from_str(id))
     }
 
@@ -1622,7 +1627,10 @@ mod job_dispatch_tests {
     fn forget_without_job_store_is_not_available() -> TestResult {
         let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
         let result = forget_fact(&context, &["kurz".to_owned()]);
-        assert!(matches!(result, Err(OpError::NotAvailable(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
+        );
         Ok(())
     }
 }

@@ -72,13 +72,26 @@ fn session_dirs(roots: &Roots) -> Vec<PathBuf> {
     profile_subdirs(roots, "sessions")
 }
 
+// Verified against the writers in `harw-session-store` (store-level sweeps
+// with the extra active-session / unresolved-freeze safety checks live in
+// `harw_session_store::retention`):
+// - `session_transcripts`/`session_corrupt_backups`: `TranscriptStore` writes
+//   `<sessions>/<id>.jsonl` (+ `.jsonl.lock`, `.jsonl.corrupt-<ts>[-<n>]`);
+//   the CLI default is `<home>/profiles/<profile>/sessions`. A custom
+//   `[session] store_dir` or the gateway's `<state_dir>/sessions` is NOT
+//   covered by this home-relative resolver.
+// - `freeze_resolved`: `FreezeStore::new(home)` writes `<home>/freeze/
+//   <cgroup>.<finding>.<ts>.{active,resolved}.json`; the suffix matcher below
+//   is exact.
+
 harw_macros::retention_classes! {
     config = RetentionConfig;
 
-    /// `tui.log` and its rotations under `<home>/logs`.
+    /// `tui.log` and its rotations (`tui.log.<ts>`, legacy `tui.log.1`) under
+    /// `<home>/logs`; written by `harw-cli` (`TuiLogFile`).
     tui_log: ephemeral {
         dir = tui_log_dirs,
-        name = prefix("tui"),
+        name = prefix("tui.log"),
         max_age_secs = 14 * 86_400,
         max_bytes = 64 * 1_048_576,
         max_files = 5,
@@ -99,10 +112,11 @@ harw_macros::retention_classes! {
         max_bytes = 512 * 1_048_576,
         max_files = 200,
     }
-    /// Locally stored bug reports under `<home>/bug-report`.
+    /// Locally stored bug reports `<id>.md` under `<home>/bug-report`
+    /// (`harw_home::paths::bug_report_dir`; writer `harw-ops`).
     bug_reports: ephemeral {
         dir = bug_report_dirs,
-        name = any,
+        name = suffix(".md"),
         max_age_secs = 30 * 86_400,
         max_bytes = 100 * 1_048_576,
         max_files = 50,

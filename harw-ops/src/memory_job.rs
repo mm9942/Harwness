@@ -24,20 +24,27 @@
 //! ohne Teilzustand (die Operationen prüfen vor ihrem Commit-Punkt); der Job
 //! wird als `Failed` mit Grund `timed_out: …` abgeschlossen.
 //!
-//! # Lücke der Job-API
-//! [`harw_job_runtime::JobOutcome`] kennt kein `TimedOut`; der Zustand
-//! `TimedOut` wird nur vom Koordinator-Pfad (`harw-job-runtime`) erreicht, nicht
-//! über `JobStore::complete`. Ein Fristablauf wird deshalb als
-//! `JobOutcome::Failed { reason: "timed_out: …" }` festgehalten
-//! ([`MaintenanceFailure::reason`]); der Job-Zustand lautet `failed`.
+//! # Fristablauf und Abbruch
+//! Fristablauf ist ein typisierter Grund auf `Failed`
+//! ([`harw_job_runtime::JobOutcome::timed_out`], Disposition `timed_out`;
+//! die Drahtform bleibt `failed` + `timed_out: …`, siehe
+//! [`harw_job_runtime::TIMED_OUT_REASON_PREFIX`]). Ein Operator-Abbruch ist
+//! davon unterscheidbar: [`MaintenanceFailure::Cancelled`] →
+//! `JobOutcome::Cancelled`. Der Abbruch ist kooperativ: ein
+//! [`harw_memory::consolidation::CancelFlag`] hängt an der `Deadline` und wird
+//! an jeder Prüfstelle zwischen den Schritten gelesen
+//! ([`execute_memory_maintenance_with_cancel`]); [`run_memory_maintenance_job`]
+//! ist der gemeinsame asynchrone Treiber (Worker und In-Prozess-Ausführer).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harw_job_runtime::{Budget, Job, JobKind, JobScope, RetryPolicy, StoredJob, WorkId};
+use harw_job_runtime::{
+    Budget, Job, JobKind, JobOutcome, JobScope, JobState, RetryPolicy, StoredJob, WorkId,
+};
 use harw_memory::capture::consolidate_memories_with_options;
-use harw_memory::consolidation::{ConsolidationError, Deadline};
+use harw_memory::consolidation::{CancelFlag, ConsolidationError, Deadline};
 use harw_memory::promote::{GlobalPromotionError, promote_fact_to_global};
 use harw_memory::{FactScope, FactStore};
 use harw_operations::{OpContext, OpError, OpOutput};
@@ -50,9 +57,8 @@ use serde::{Deserialize, Serialize};
 pub const MEMORY_MAINTENANCE_JOB_KIND: &str = "memory_maintenance";
 /// Schema-Version der Payload [`MemoryMaintenanceSpec`].
 pub const MEMORY_MAINTENANCE_SCHEMA_VERSION: u32 = 1;
-/// Präfix des Fehlergrunds bei Fristablauf (siehe Moduldoku, „Lücke der
-/// Job-API“).
-pub const TIMED_OUT_REASON_PREFIX: &str = "timed_out";
+/// Präfix des Fehlergrunds bei Fristablauf (siehe Moduldoku).
+pub const TIMED_OUT_REASON_PREFIX: &str = harw_job_runtime::TIMED_OUT_REASON_PREFIX;
 /// Höchstzahl Ausführungsversuche: eine Wartung wird nie automatisch
 /// wiederholt (der Aufrufer reiht sie bei Bedarf neu ein).
 const MAINTENANCE_MAX_ATTEMPTS: u32 = 1;
@@ -159,18 +165,20 @@ impl MemoryMaintenanceSpec {
 pub enum MaintenanceFailure {
     /// Die Frist ist abgelaufen; der Bestand ist unverändert.
     TimedOut(String),
+    /// Ein Operator hat abgebrochen; der Bestand ist unverändert.
+    Cancelled(String),
     /// Jeder andere Fehlschlag (ungültige Payload, Lock, I/O, Ablehnung).
     Failed(String),
 }
 
 impl MaintenanceFailure {
-    /// Der Text für `JobOutcome::Failed { reason }`; Fristablauf beginnt mit
+    /// Der Text für den Job-Ausgang; Fristablauf beginnt mit
     /// [`TIMED_OUT_REASON_PREFIX`].
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
             Self::TimedOut(detail) => format!("{TIMED_OUT_REASON_PREFIX}: {detail}"),
-            Self::Failed(detail) => detail.clone(),
+            Self::Cancelled(detail) | Self::Failed(detail) => detail.clone(),
         }
     }
 
@@ -178,6 +186,23 @@ impl MaintenanceFailure {
     #[must_use]
     pub fn is_timed_out(&self) -> bool {
         matches!(self, Self::TimedOut(_))
+    }
+
+    /// `true` bei Abbruch.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
+    }
+
+    /// Der Job-Ausgang: `timed_out` (typisiert auf `Failed`), `Cancelled`
+    /// oder `Failed`.
+    #[must_use]
+    pub fn into_outcome(self) -> JobOutcome {
+        match self {
+            Self::TimedOut(detail) => JobOutcome::timed_out(detail),
+            Self::Cancelled(detail) => JobOutcome::Cancelled { reason: detail },
+            Self::Failed(reason) => JobOutcome::Failed { reason },
+        }
     }
 }
 
@@ -250,9 +275,9 @@ pub(crate) fn enqueue_memory_maintenance(
     ctx: &OpContext,
     spec: &MemoryMaintenanceSpec,
 ) -> Result<OpOutput, OpError> {
-    let jobs = ctx
-        .service::<Arc<JobStore>>()
-        .ok_or_else(|| OpError::NotAvailable("kein dauerhafter Job-Store konfiguriert".to_owned()))?;
+    let jobs = ctx.service::<Arc<JobStore>>().ok_or_else(|| {
+        OpError::NotAvailable("kein dauerhafter Job-Store konfiguriert".to_owned())
+    })?;
     let submitter = ctx.service::<Principal>().map_or_else(
         || "memory-op".to_owned(),
         |principal| principal.id().to_owned(),
@@ -264,7 +289,9 @@ pub(crate) fn enqueue_memory_maintenance(
         ApprovalActor::Operator { id: submitter },
     );
     let work_id = admit_memory_maintenance(jobs, scope, spec).map_err(|error| {
-        OpError::Execution(format!("Gedächtnis-Job konnte nicht eingereiht werden: {error}"))
+        OpError::Execution(format!(
+            "Gedächtnis-Job konnte nicht eingereiht werden: {error}"
+        ))
     })?;
     let label = spec.operation.label();
     Ok(OpOutput {
@@ -297,13 +324,31 @@ pub(crate) fn enqueue_memory_maintenance(
 pub fn execute_memory_maintenance(
     spec: &MemoryMaintenanceSpec,
 ) -> Result<serde_json::Value, MaintenanceFailure> {
+    execute_memory_maintenance_with_cancel(spec, &CancelFlag::new())
+}
+
+/// Wie [`execute_memory_maintenance`], zusätzlich kooperativ abbrechbar:
+/// `cancel` wird zwischen den Schritten (und beim Warten auf den Lock)
+/// geprüft. Ein Abbruch endet als [`MaintenanceFailure::Cancelled`], ein
+/// Fristablauf als [`MaintenanceFailure::TimedOut`]; beide lassen den
+/// Bestand unverändert (Abbruch gewinnt, wenn beides zutrifft).
+///
+/// # Errors
+/// [`MaintenanceFailure`].
+pub fn execute_memory_maintenance_with_cancel(
+    spec: &MemoryMaintenanceSpec,
+    cancel: &CancelFlag,
+) -> Result<serde_json::Value, MaintenanceFailure> {
     if spec.schema_version != MEMORY_MAINTENANCE_SCHEMA_VERSION {
         return Err(MaintenanceFailure::Failed(format!(
             "unbekannte Payload-Version {}",
             spec.schema_version
         )));
     }
-    for root in [&spec.project_root, &spec.global_root].into_iter().flatten() {
+    for root in [&spec.project_root, &spec.global_root]
+        .into_iter()
+        .flatten()
+    {
         if !root.is_absolute() {
             return Err(MaintenanceFailure::Failed(
                 "Fakt-Wurzeln müssen absolute Pfade sein".to_owned(),
@@ -315,13 +360,106 @@ pub fn execute_memory_maintenance(
             "deadline_secs muss größer als 0 sein".to_owned(),
         ));
     }
-    let deadline = Deadline::after(Duration::from_secs(spec.deadline_secs));
-    let result = run_op(spec, deadline);
+    let deadline =
+        Deadline::after(Duration::from_secs(spec.deadline_secs)).with_cancel(cancel.clone());
+    let result = run_op(spec, deadline.clone());
     match result {
+        Err(MaintenanceFailure::Failed(detail)) if deadline.cancelled() => {
+            Err(MaintenanceFailure::Cancelled(detail))
+        }
         Err(MaintenanceFailure::Failed(detail)) if deadline.expired() => {
             Err(MaintenanceFailure::TimedOut(detail))
         }
         other => other,
+    }
+}
+
+/// Wie oft der Treiber den Job-Store auf einen Abbruch abfragt.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(150);
+/// Zusätzliche Wartezeit über die Frist hinaus, bevor ein hängender
+/// blockierender Thread als zeitüberschritten aufgegeben wird.
+const BLOCKING_GRACE: Duration = Duration::from_secs(5);
+
+/// Ob der Store den Job als abgebrochen führt (Abbruch vor/während des Laufs).
+fn store_says_cancelled(store: &JobStore, work_id: &WorkId) -> bool {
+    store
+        .get(work_id)
+        .is_ok_and(|record| record.job.state == JobState::Cancelled)
+}
+
+/// Gemeinsamer asynchroner Treiber der Wartung: Worker (`harw serve`) und
+/// In-Prozess-Ausführer der Runtime rufen genau diesen Pfad auf, beide unter
+/// dem `DurableJobRunner` (ein Claim, Lease, Heartbeat, Commit).
+///
+/// # Beschreibung
+/// Der Handler-Kern läuft in `spawn_blocking`. Ein Abbruch erreicht ihn auf
+/// zwei Wegen, die beide dasselbe [`CancelFlag`] setzen: das Signal
+/// `cancel_signal` (Lease-Verlust/Registry-Abbruch des Runners) und eine
+/// Abfrage des Job-Stores alle 150 ms (ein Operator-`cancel` setzt den
+/// Zustand `Cancelled`, bevor der Heartbeat es bemerkt). Der Kern prüft das
+/// Flag zwischen den Schritten und bricht ohne Teilzustand ab.
+///
+/// # Rückgabe
+/// `Succeeded`, `Cancelled` (Abbruch), `Failed` mit `timed_out: …`
+/// (Fristablauf, auch wenn der blockierende Thread die Frist um
+/// [`BLOCKING_GRACE`] überschreitet) oder `Failed`.
+pub async fn run_memory_maintenance_job<F>(
+    spec: MemoryMaintenanceSpec,
+    work_id: WorkId,
+    store: Arc<JobStore>,
+    cancel_signal: F,
+) -> JobOutcome
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    if store_says_cancelled(&store, &work_id) {
+        return JobOutcome::Cancelled {
+            reason: "cancelled before the memory maintenance started".to_owned(),
+        };
+    }
+    let flag = CancelFlag::new();
+    let wait = Duration::from_secs(spec.deadline_secs).saturating_add(BLOCKING_GRACE);
+    let label = spec.operation.label();
+    let thread_flag = flag.clone();
+    let blocking = tokio::task::spawn_blocking(move || {
+        execute_memory_maintenance_with_cancel(&spec, &thread_flag)
+    });
+    let hard_stop = tokio::time::sleep(wait);
+    let mut ticker = tokio::time::interval(CANCEL_POLL_INTERVAL);
+    tokio::pin!(blocking, hard_stop, cancel_signal);
+    let mut signal_seen = false;
+    let joined = loop {
+        tokio::select! {
+            joined = &mut blocking => break Some(joined),
+            () = &mut cancel_signal, if !signal_seen => {
+                signal_seen = true;
+                flag.cancel();
+            }
+            _ = ticker.tick() => {
+                if store_says_cancelled(&store, &work_id) {
+                    flag.cancel();
+                }
+            }
+            () = &mut hard_stop => break None,
+        }
+    };
+    match joined {
+        Some(Ok(Ok(result))) => JobOutcome::Succeeded { result },
+        Some(Ok(Err(failure))) => {
+            tracing::warn!(work_id = %work_id.as_str(), op = label, reason = %failure.reason(), "memory maintenance ended without success");
+            failure.into_outcome()
+        }
+        Some(Err(join_error)) => {
+            tracing::warn!(work_id = %work_id.as_str(), op = label, error = %join_error, "memory maintenance task failed");
+            JobOutcome::Failed {
+                reason: "memory maintenance task failed".to_owned(),
+            }
+        }
+        None => {
+            flag.cancel();
+            MaintenanceFailure::TimedOut("the maintenance did not finish in time".to_owned())
+                .into_outcome()
+        }
     }
 }
 
@@ -337,15 +475,18 @@ fn run_op(
             };
             consolidate(root, scope.fact_scope(), spec, deadline)
         }
-        MemoryMaintenanceOp::Sweep => {
-            consolidate(spec.project_root.as_deref(), FactScope::Project, spec, deadline)
-        }
+        MemoryMaintenanceOp::Sweep => consolidate(
+            spec.project_root.as_deref(),
+            FactScope::Project,
+            spec,
+            deadline,
+        ),
         MemoryMaintenanceOp::Forget { name } => {
             let output = crate::memory::forget_with_deadline(
                 spec.project_root.clone(),
                 spec.global_root.clone(),
                 name,
-                deadline,
+                deadline.clone(),
             )
             .map_err(|error| MaintenanceFailure::Failed(error.to_string()))?;
             Ok(serde_json::json!({ "text": output.text }))
@@ -369,9 +510,7 @@ fn run_op(
                 deadline,
             )
             .map_err(|error| match error {
-                GlobalPromotionError::Deadline(detail) => {
-                    MaintenanceFailure::TimedOut(detail.to_string())
-                }
+                GlobalPromotionError::Deadline(detail) => interrupted(&detail),
                 other => MaintenanceFailure::Failed(other.to_string()),
             })?;
             Ok(serde_json::json!({
@@ -380,6 +519,15 @@ fn run_op(
                 "sources": done.fact.sources,
             }))
         }
+    }
+}
+
+// Abbruch oder Fristablauf einer Prüfstelle als typisierter Grund.
+fn interrupted(detail: &harw_memory::consolidation::DeadlineExceeded) -> MaintenanceFailure {
+    if detail.cancelled {
+        MaintenanceFailure::Cancelled(detail.to_string())
+    } else {
+        MaintenanceFailure::TimedOut(detail.to_string())
     }
 }
 
@@ -404,9 +552,7 @@ fn consolidate(
             })
         })
         .map_err(|error| match error {
-            ConsolidationError::Deadline(detail) => {
-                MaintenanceFailure::TimedOut(detail.to_string())
-            }
+            ConsolidationError::Deadline(detail) => interrupted(&detail),
             other => MaintenanceFailure::Failed(other.to_string()),
         })
 }
@@ -485,7 +631,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
 
         let data = out.data.ok_or(TestError::Missing("data"))?;
-        let id = data["job_id"].as_str().ok_or(TestError::Missing("job_id"))?;
+        let id = data["job_id"]
+            .as_str()
+            .ok_or(TestError::Missing("job_id"))?;
         assert_eq!(data["kind"], MEMORY_MAINTENANCE_JOB_KIND);
         let record = jobs
             .get(&WorkId::from_str(id))
@@ -502,7 +650,10 @@ mod tests {
         let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
         let spec = MemoryMaintenanceSpec::new(MemoryMaintenanceOp::Sweep, 30);
         let result = enqueue_memory_maintenance(&context, &spec);
-        assert!(matches!(result, Err(OpError::NotAvailable(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
+        );
         Ok(())
     }
 
@@ -532,8 +683,10 @@ mod tests {
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let ps = FactStore::open(project.path(), FactScope::Project).map_err(ctx("p"))?;
         let gs = FactStore::open(global.path(), FactScope::Global).map_err(ctx("g"))?;
-        ps.write(&fact("kurz", FactScope::Project)).map_err(ctx("pw"))?;
-        gs.write(&fact("kurz", FactScope::Global)).map_err(ctx("gw"))?;
+        ps.write(&fact("kurz", FactScope::Project))
+            .map_err(ctx("pw"))?;
+        gs.write(&fact("kurz", FactScope::Global))
+            .map_err(ctx("gw"))?;
         let spec = spec_with_roots(
             MemoryMaintenanceOp::Forget {
                 name: "kurz".to_owned(),
@@ -553,7 +706,8 @@ mod tests {
         let project = tempfile::tempdir().map_err(ctx("project"))?;
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let ps = FactStore::open(project.path(), FactScope::Project).map_err(ctx("p"))?;
-        ps.write(&fact("kurz", FactScope::Project)).map_err(ctx("pw"))?;
+        ps.write(&fact("kurz", FactScope::Project))
+            .map_err(ctx("pw"))?;
         let spec = spec_with_roots(
             MemoryMaintenanceOp::PromoteToGlobal {
                 name: "kurz".to_owned(),
@@ -577,7 +731,8 @@ mod tests {
         let project = tempfile::tempdir().map_err(ctx("project"))?;
         let global = tempfile::tempdir().map_err(ctx("global"))?;
         let ps = FactStore::open(project.path(), FactScope::Project).map_err(ctx("p"))?;
-        ps.write(&fact("kurz", FactScope::Project)).map_err(ctx("pw"))?;
+        ps.write(&fact("kurz", FactScope::Project))
+            .map_err(ctx("pw"))?;
         let expired = Deadline::after(Duration::ZERO);
 
         let promote = spec_with_roots(
@@ -588,7 +743,7 @@ mod tests {
             global.path(),
             30,
         );
-        let result = run_op(&promote, expired);
+        let result = run_op(&promote, expired.clone());
         assert!(
             matches!(result, Err(MaintenanceFailure::TimedOut(_))),
             "{result:?}"
@@ -604,7 +759,7 @@ mod tests {
             global.path(),
             30,
         );
-        let result = run_op(&forget, expired);
+        let result = run_op(&forget, expired.clone());
         assert!(result.is_err());
         assert!(ps.read("kurz").map_err(ctx("read"))?.is_some());
         // Kein Lock bleibt zurück.
@@ -624,6 +779,256 @@ mod tests {
             .map_err(ctx("list"))?;
         assert!(page.jobs.is_empty());
         Ok(())
+    }
+
+    // -- Abbruch (kooperativ) vs. Fristablauf ------------------------------
+
+    use harw_job_runtime::JobDisposition;
+    use harw_session_store::{CancelRequest, ClaimRequest};
+
+    // Job-Store mit einem zugelassenen und geclaimten Forget-Job; die globale
+    // Wurzel ist gesperrt, der Lauf wartet also auf den Lock.
+    struct Fixture {
+        _state: tempfile::TempDir,
+        _project: tempfile::TempDir,
+        global: tempfile::TempDir,
+        store: Arc<JobStore>,
+        spec: MemoryMaintenanceSpec,
+        id: WorkId,
+        fact_store: FactStore,
+        held: Option<harw_memory::consolidation::ConsolidationLock>,
+    }
+
+    fn fixture(deadline_secs: u64) -> TestResult<Fixture> {
+        let state = tempfile::tempdir().map_err(ctx("state"))?;
+        let project = tempfile::tempdir().map_err(ctx("project"))?;
+        let global = tempfile::tempdir().map_err(ctx("global"))?;
+        let gs = FactStore::open(global.path(), FactScope::Global).map_err(ctx("g"))?;
+        gs.write(&fact("kurz", FactScope::Global))
+            .map_err(ctx("seed"))?;
+        let held = harw_memory::consolidation::ConsolidationLock::try_acquire(global.path())
+            .map_err(ctx("hold lock"))?;
+        let store = Arc::new(JobStore::new(state.path()));
+        let spec = spec_with_roots(
+            MemoryMaintenanceOp::Forget {
+                name: "kurz".to_owned(),
+            },
+            project.path(),
+            global.path(),
+            deadline_secs,
+        );
+        let id = admit_memory_maintenance(&store, scope(), &spec).map_err(ctx("admit"))?;
+        Ok(Fixture {
+            _state: state,
+            _project: project,
+            global,
+            store,
+            spec,
+            id,
+            fact_store: gs,
+            held: Some(held),
+        })
+    }
+
+    fn claim(store: &JobStore, id: &WorkId) -> TestResult {
+        store
+            .claim(
+                id,
+                &ClaimRequest {
+                    worker_id: "test-worker".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("claim"))?;
+        Ok(())
+    }
+
+    fn cancel(store: &JobStore, id: &WorkId) -> TestResult {
+        store
+            .cancel(
+                id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "tester".to_owned(),
+                    },
+                    reason: "test cancel".to_owned(),
+                },
+            )
+            .map_err(ctx("cancel"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_run_ends_cancelled_not_timed_out_and_keeps_the_fact() -> TestResult {
+        let mut fx = fixture(30)?;
+        claim(&fx.store, &fx.id)?;
+        let run = tokio::spawn(run_memory_maintenance_job(
+            fx.spec.clone(),
+            fx.id.clone(),
+            Arc::clone(&fx.store),
+            std::future::pending::<()>(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!run.is_finished(), "waits on the held lock");
+        cancel(&fx.store, &fx.id)?; // operator cancel: store flag only
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .map_err(ctx("run observes the cancel"))?
+            .map_err(ctx("join"))?;
+        assert!(
+            matches!(outcome, JobOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.disposition(), JobDisposition::Cancelled);
+        assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
+        let record = fx.store.get(&fx.id).map_err(ctx("get"))?;
+        assert_eq!(record.job.state, JobState::Cancelled);
+        drop(fx.held.take());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cancel_signal_alone_also_stops_the_run() -> TestResult {
+        let mut fx = fixture(30)?;
+        claim(&fx.store, &fx.id)?;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(run_memory_maintenance_job(
+            fx.spec.clone(),
+            fx.id.clone(),
+            Arc::clone(&fx.store),
+            async move {
+                let _ = rx.await;
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .map_err(ctx("run observes the signal"))?
+            .map_err(ctx("join"))?;
+        assert!(
+            matches!(outcome, JobOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
+        assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
+        drop(fx.held.take());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_expiry_is_timed_out_and_distinct_from_cancel() -> TestResult {
+        let mut fx = fixture(1)?;
+        claim(&fx.store, &fx.id)?;
+        let outcome = run_memory_maintenance_job(
+            fx.spec.clone(),
+            fx.id.clone(),
+            Arc::clone(&fx.store),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(outcome.is_timed_out(), "{outcome:?}");
+        assert_eq!(outcome.disposition(), JobDisposition::TimedOut);
+        assert!(!matches!(outcome, JobOutcome::Cancelled { .. }));
+        assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
+        drop(fx.held.take());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_before_the_run_starts_touches_nothing() -> TestResult {
+        let mut fx = fixture(30)?;
+        cancel(&fx.store, &fx.id)?; // Ready -> Cancelled, never claimed
+        let outcome = run_memory_maintenance_job(
+            fx.spec.clone(),
+            fx.id.clone(),
+            Arc::clone(&fx.store),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, JobOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
+        assert!(fx.fact_store.read("kurz").map_err(ctx("read"))?.is_some());
+        assert!(
+            fx.global.path().join("consolidation.lock").exists(),
+            "only our own lock"
+        );
+        drop(fx.held.take());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_after_the_job_finished_is_rejected_and_keeps_the_result() -> TestResult {
+        let fx = fixture(30)?;
+        let Fixture {
+            store,
+            spec,
+            id,
+            mut held,
+            ..
+        } = fx;
+        drop(held.take()); // no lock contention: the forget runs through
+        claim(&store, &id)?;
+        let outcome = run_memory_maintenance_job(
+            spec,
+            id.clone(),
+            Arc::clone(&store),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, JobOutcome::Succeeded { .. }),
+            "{outcome:?}"
+        );
+        let record = store.get(&id).map_err(ctx("get"))?;
+        let token = record
+            .lease
+            .as_ref()
+            .ok_or(TestError::Missing("lease"))?
+            .token();
+        store
+            .complete(
+                &id,
+                &harw_session_store::CompleteRequest {
+                    token,
+                    completed_at: Timestamp::now(),
+                    outcome,
+                },
+            )
+            .map_err(ctx("complete"))?;
+        let late = store.cancel(
+            &id,
+            &CancelRequest {
+                cancelled_at: Timestamp::now(),
+                cancelled_by: ApprovalActor::Operator {
+                    id: "tester".to_owned(),
+                },
+                reason: "too late".to_owned(),
+            },
+        );
+        assert!(late.is_err(), "a finished job cannot be cancelled");
+        assert_eq!(
+            store.get(&id).map_err(ctx("get"))?.job.state,
+            JobState::Completed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failure_kinds_map_to_distinct_outcomes() {
+        let timed = MaintenanceFailure::TimedOut("d".to_owned()).into_outcome();
+        assert!(timed.is_timed_out());
+        let cancelled = MaintenanceFailure::Cancelled("c".to_owned());
+        assert!(cancelled.is_cancelled() && !cancelled.is_timed_out());
+        assert!(matches!(
+            cancelled.into_outcome(),
+            JobOutcome::Cancelled { .. }
+        ));
+        let failed = MaintenanceFailure::Failed("f".to_owned()).into_outcome();
+        assert_eq!(failed.disposition(), JobDisposition::Failed);
     }
 
     #[test]

@@ -59,7 +59,7 @@ use std::io::{self, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -457,6 +457,11 @@ fn read_meta(dir: &Path) -> Option<JobMeta> {
     serde_json::from_slice(&text).ok()
 }
 
+/// Kleinste Obergrenze laufender Prozess-Jobs.
+pub const MIN_RUNNING_JOBS: usize = 1;
+/// Größte Obergrenze laufender Prozess-Jobs (wie `[jobs] max_running`).
+pub const MAX_RUNNING_JOBS: usize = 256;
+
 /// Verwaltet die Prozess-Jobs einer harw-Sitzung.
 pub struct JobManager {
     config: JobManagerConfig,
@@ -464,6 +469,8 @@ pub struct JobManager {
     notifier: Arc<dyn JobNotifier>,
     jobs: Mutex<BTreeMap<JobId, Arc<JobEntry>>>,
     counter: AtomicU64,
+    // Zur Laufzeit verstellbare Obergrenze (Start: `config.max_running_jobs`).
+    max_running: AtomicUsize,
 }
 
 impl fmt::Debug for JobManager {
@@ -488,12 +495,16 @@ impl JobManager {
             std::process::id(),
             Timestamp::now().as_millisecond()
         );
+        let config_max_running = config
+            .max_running_jobs
+            .clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
         let manager = Arc::new(Self {
             config,
             instance,
             notifier,
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
+            max_running: AtomicUsize::new(config_max_running),
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -590,6 +601,23 @@ impl JobManager {
         }
     }
 
+    /// Aktuelle Obergrenze gleichzeitig laufender Jobs (`[jobs] max_running`
+    /// als Start, danach per [`Self::set_max_running`] verstellbar).
+    #[must_use]
+    pub fn max_running(&self) -> usize {
+        self.max_running.load(Ordering::SeqCst)
+    }
+
+    /// Setzt die Obergrenze zur Laufzeit (auf `1..=256` geklemmt) und gibt den
+    /// wirksamen Wert zurück. Erhöhen erlaubt sofort weitere Starts; Senken
+    /// beendet keinen laufenden Job, neue Starts werden abgewiesen, bis
+    /// genug Jobs fertig sind.
+    pub fn set_max_running(&self, max: usize) -> usize {
+        let max = max.clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
+        self.max_running.store(max, Ordering::SeqCst);
+        max
+    }
+
     /// Zahl der Jobs, die diese Sitzung gerade beaufsichtigt.
     #[must_use]
     pub fn running_count(&self) -> usize {
@@ -607,7 +635,7 @@ impl JobManager {
     /// # Errors
     /// [`JobError::Capacity`].
     pub fn check_capacity(&self) -> Result<(), JobError> {
-        let max = self.config.max_running_jobs;
+        let max = self.max_running();
         if self.running_count() >= max {
             return Err(JobError::Capacity { max });
         }

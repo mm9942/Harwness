@@ -325,6 +325,9 @@ mod tests {
     fn record_round_trips() {
         let line = "node-a|dev-1|acme|operator|active|phone";
         let parsed = DeviceRecord::parse(line);
-        assert_eq!(parsed.as_ref().map(DeviceRecord::render).as_deref(), Some(line));
+        assert_eq!(
+            parsed.as_ref().map(DeviceRecord::render).as_deref(),
+            Some(line)
+        );
     }
 }

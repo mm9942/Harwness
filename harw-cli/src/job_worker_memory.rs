@@ -14,29 +14,27 @@
 //! Aufruf liegt zudem in der Lane der langen Läufe (`WorkDriverLane`), damit
 //! eine Wartung bis zu ihrer Frist keine anderen Job-Arten aufhält.
 //!
-//! # Frist und Ergebnis
+//! # Frist, Abbruch und Ergebnis
 //! Die Frist kommt aus der Job-Payload (`deadline_secs`). Ablauf bricht ohne
-//! Teilzustand ab; der Job endet als `Failed` mit Grund `timed_out: …`
-//! (`JobOutcome` kennt kein `TimedOut`, siehe `harw_ops::memory_job`). Eine
-//! fehlerhafte Payload endet ebenfalls als `Failed`, ohne etwas zu berühren.
-//! Ein vor dem Start bereits angeforderter Abbruch beendet den Job als
-//! `Cancelled`; ein laufender Vorgang wird nicht unterbrochen (er ist durch
-//! seine Frist begrenzt und committet erst nach dem letzten Fristcheck).
-
-use std::time::Duration;
+//! Teilzustand ab; der Job endet typisiert als `timed_out`
+//! (`JobOutcome::timed_out`, Drahtform `failed` + `timed_out: …`). Eine
+//! fehlerhafte Payload endet als `Failed`, ohne etwas zu berühren.
+//!
+//! Abbruch ist kooperativ und unterscheidbar: der gemeinsame Treiber
+//! (`harw_ops::memory_job::run_memory_maintenance_job`) setzt ein
+//! `CancelFlag`, sobald (a) die Lease-Steuerung des Runners abbricht oder
+//! (b) der Job-Store den Job als `Cancelled` führt (Poll alle 150 ms — der
+//! Heartbeat allein würde bis zu TTL/3 brauchen). Der Kern prüft das Flag
+//! zwischen den Schritten und endet ohne Teilzustand als `Cancelled`.
 
 use harw_job_runtime::{JobClaim, JobKind, JobOutcome};
 use harw_ops::memory_job::{
-    MaintenanceFailure, MemoryMaintenanceSpec, execute_memory_maintenance,
-    is_memory_maintenance_kind,
+    MemoryMaintenanceSpec, is_memory_maintenance_kind, run_memory_maintenance_job,
 };
+use harw_session_store::JobStore;
 
 use super::WorkerExecutionControl;
 use std::sync::Arc;
-
-/// Zusätzliche Wartezeit über die Frist hinaus, bevor ein hängender
-/// blockierender Thread als zeitüberschritten aufgegeben wird.
-const BLOCKING_GRACE: Duration = Duration::from_secs(5);
 
 /// Grund bei nicht lesbarer Payload (Details nur im Log).
 const INVALID_PAYLOAD_REASON: &str = "invalid memory_maintenance payload";
@@ -49,60 +47,49 @@ pub(super) fn is_memory_kind(kind: &JobKind) -> bool {
 /// Führt einen geclaimten `memory_maintenance`-Job aus.
 ///
 /// # Arguments
-/// - `claim` (`JobClaim`): der geclaimte Job (nur Id für das Log).
+/// - `claim` (`JobClaim`): der geclaimte Job.
 /// - `input` (`serde_json::Value`): die Payload
 ///   ([`MemoryMaintenanceSpec`]).
-/// - `control` (`Arc<WorkerExecutionControl>`): Abbruchsteuerung der Lease.
+/// - `job_store` (`Arc<JobStore>`): der Job-Store; ein Operator-`cancel`
+///   setzt dort den Zustand `Cancelled`, den der Treiber zwischen den
+///   Schritten abfragt.
+/// - `control` (`Arc<WorkerExecutionControl>`): Abbruchsteuerung der Lease
+///   (Registry-Abbruch, Lease-Verlust).
 ///
 /// # Returns
-/// `Succeeded { result }` bei Erfolg, sonst `Failed { reason }` (Fristablauf
-/// mit `timed_out:`-Präfix) bzw. `Cancelled` bei Abbruch vor dem Start.
+/// `Succeeded { result }`, `Cancelled` bei Abbruch (vor dem Start oder
+/// kooperativ während des Laufs), `Failed` mit `timed_out: …` bei Fristablauf,
+/// sonst `Failed`.
 pub(super) async fn execute_memory_maintenance_claim(
     claim: JobClaim,
     input: serde_json::Value,
+    job_store: Arc<JobStore>,
     control: Arc<WorkerExecutionControl>,
 ) -> JobOutcome {
-    let work_id = claim.job.id.as_str().to_owned();
+    let work_id = claim.job.id.clone();
     let spec: MemoryMaintenanceSpec = match serde_json::from_value(input) {
         Ok(spec) => spec,
         Err(error) => {
-            tracing::warn!(work_id = %work_id, %error, "memory_maintenance payload rejected");
+            tracing::warn!(work_id = %work_id.as_str(), %error, "memory_maintenance payload rejected");
             return JobOutcome::Failed {
                 reason: INVALID_PAYLOAD_REASON.to_owned(),
             };
         }
     };
-    if *control.cancellation().borrow() {
-        return JobOutcome::Cancelled {
-            reason: "cancelled before the memory maintenance started".to_owned(),
-        };
-    }
-
-    let op = spec.operation.label();
-    let wait = Duration::from_secs(spec.deadline_secs).saturating_add(BLOCKING_GRACE);
-    let blocking = tokio::task::spawn_blocking(move || execute_memory_maintenance(&spec));
-    match tokio::time::timeout(wait, blocking).await {
-        Ok(Ok(Ok(result))) => JobOutcome::Succeeded { result },
-        Ok(Ok(Err(failure))) => failed(&work_id, op, &failure),
-        Ok(Err(join_error)) => {
-            tracing::warn!(work_id = %work_id, op, error = %join_error, "memory maintenance task failed");
-            JobOutcome::Failed {
-                reason: "memory maintenance task failed".to_owned(),
+    let mut cancellation = control.cancellation();
+    let signal = async move {
+        // Ein gesetztes oder verworfenes Signal beendet das Warten; ein
+        // verworfener Sender (Lauf endet) darf keinen Abbruch vortäuschen.
+        loop {
+            if *cancellation.borrow() {
+                return;
+            }
+            if cancellation.changed().await.is_err() {
+                std::future::pending::<()>().await;
             }
         }
-        Err(_) => failed(
-            &work_id,
-            op,
-            &MaintenanceFailure::TimedOut("the maintenance did not finish in time".to_owned()),
-        ),
-    }
-}
-
-fn failed(work_id: &str, op: &str, failure: &MaintenanceFailure) -> JobOutcome {
-    tracing::warn!(work_id, op, timed_out = failure.is_timed_out(), reason = %failure.reason(), "memory maintenance failed");
-    JobOutcome::Failed {
-        reason: failure.reason(),
-    }
+    };
+    run_memory_maintenance_job(spec, work_id, job_store, signal).await
 }
 
 #[cfg(test)]
@@ -122,6 +109,7 @@ mod tests {
     use harw_types::{ApprovalActor, TenantId, WorkId, WorkspaceId};
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::time::Duration;
 
     type TestError = Box<dyn std::error::Error>;
     type TestResult<T = ()> = Result<T, TestError>;
@@ -167,7 +155,10 @@ mod tests {
     }
 
     async fn run(services: &WorkerServices) -> usize {
-        let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+        let mut lane = WorkDriverLane::with_lanes(harw_job_runtime::JobLanes::new(
+            MAX_CONCURRENT_WORK_DRIVER_RUNS,
+            2,
+        ));
         let completed = poll_ready_jobs(services, &mut lane).await;
         completed + lane.drain().await
     }
@@ -277,6 +268,158 @@ mod tests {
         assert!(reason.starts_with(TIMED_OUT_REASON_PREFIX), "{reason}");
         // Unverändert: der Fakt existiert noch.
         assert!(gs.read("kurz")?.is_some());
+        drop(held);
+        Ok(())
+    }
+
+    fn cancel_request() -> harw_session_store::CancelRequest {
+        harw_session_store::CancelRequest {
+            cancelled_at: jiff::Timestamp::now(),
+            cancelled_by: ApprovalActor::Operator {
+                id: "operator".to_owned(),
+            },
+            reason: "test cancel".to_owned(),
+        }
+    }
+
+    // Wartet, bis der Job `Running` ist (geclaimt vom Worker).
+    async fn wait_running(store: &JobStore, id: &WorkId) -> TestResult {
+        for _ in 0..200 {
+            if stored(store, id)?.job.state == JobState::Running {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Err("job never reached running".into())
+    }
+
+    fn forget_spec(project: &Path, global: &Path, deadline: u64) -> MemoryMaintenanceSpec {
+        let mut spec = MemoryMaintenanceSpec::new(
+            MemoryMaintenanceOp::Forget {
+                name: "kurz".to_owned(),
+            },
+            deadline,
+        );
+        spec.project_root = Some(project.to_path_buf());
+        spec.global_root = Some(global.to_path_buf());
+        spec
+    }
+
+    #[tokio::test]
+    async fn cancel_during_the_run_ends_the_job_cancelled_and_keeps_the_fact() -> TestResult {
+        let state = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        let global = tempfile::tempdir()?;
+        let gs = seed_fact(global.path(), "kurz", FactScope::Global)?;
+        let held = harw_memory::consolidation::ConsolidationLock::try_acquire(global.path())?;
+        let store = Arc::new(JobStore::new(state.path()));
+        let spec = forget_spec(project.path(), global.path(), 30);
+        let id = admit_memory_maintenance(&store, scope(), &spec)?;
+
+        let svc = services(&store, state.path());
+        let worker = tokio::spawn(async move { run(&svc).await });
+        wait_running(&store, &id).await?;
+        store.cancel(&id, &cancel_request())?;
+        tokio::time::timeout(Duration::from_secs(15), worker).await??;
+
+        let record = stored(&store, &id)?;
+        assert_eq!(record.job.state, JobState::Cancelled);
+        assert_eq!(
+            record.disposition(),
+            harw_job_runtime::JobDisposition::Cancelled
+        );
+        assert!(gs.read("kurz")?.is_some(), "no partial state");
+        drop(held);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_is_a_first_class_disposition_distinct_from_cancelled() -> TestResult {
+        let state = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        let global = tempfile::tempdir()?;
+        let _gs = seed_fact(global.path(), "kurz", FactScope::Global)?;
+        let held = harw_memory::consolidation::ConsolidationLock::try_acquire(global.path())?;
+        let store = Arc::new(JobStore::new(state.path()));
+        let id = admit_memory_maintenance(
+            &store,
+            scope(),
+            &forget_spec(project.path(), global.path(), 1),
+        )?;
+        run(&services(&store, state.path())).await;
+        let record = stored(&store, &id)?;
+        assert_eq!(
+            record.disposition(),
+            harw_job_runtime::JobDisposition::TimedOut
+        );
+        assert_ne!(record.job.state, JobState::Cancelled);
+        drop(held);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raising_the_memory_lane_starts_the_waiting_job_and_exactly_one_worker_claims()
+    -> TestResult {
+        let state = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        let global = tempfile::tempdir()?;
+        let _gs = seed_fact(global.path(), "kurz", FactScope::Global)?;
+        let held = harw_memory::consolidation::ConsolidationLock::try_acquire(global.path())?;
+        let store = Arc::new(JobStore::new(state.path()));
+        let spec = forget_spec(project.path(), global.path(), 30);
+        let first = admit_memory_maintenance(&store, scope(), &spec)?;
+        let second = admit_memory_maintenance(&store, scope(), &spec)?;
+        let svc = services(&store, state.path());
+        let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+
+        poll_ready_jobs(&svc, &mut lane).await;
+        // The poll order follows the work ids: whichever came first runs.
+        let mut running = None;
+        for _ in 0..200 {
+            for id in [&first, &second] {
+                if stored(&store, id)?.job.state == JobState::Running {
+                    running = Some(id.clone());
+                }
+            }
+            if running.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let running = running.ok_or("no job reached running")?;
+        let waiting = if running == first { &second } else { &first };
+        assert_eq!(
+            stored(&store, waiting)?.job.state,
+            JobState::Ready,
+            "lane of 1 is full"
+        );
+        let status = lane.lanes.memory().status();
+        assert_eq!((status.limit, status.in_use), (1, 1));
+
+        harw_job_runtime::lanes::write_limit(state.path(), "memory", 2)?;
+        assert_eq!(lane.lanes.apply_overrides(state.path()), vec!["memory"]);
+        poll_ready_jobs(&svc, &mut lane).await;
+        wait_running(&store, waiting).await?;
+        assert_eq!(lane.lanes.memory().status().in_use, 2);
+
+        // One worker id claimed each job exactly once (no second claimer).
+        for id in [&first, &second] {
+            let record = stored(&store, id)?;
+            assert_eq!(record.lease_epoch, 1);
+            assert_eq!(
+                record.lease.as_ref().map(|l| l.holder.as_str()),
+                Some(crate::job_worker::WORKER_ID)
+            );
+        }
+        // Lowering stops nothing that runs.
+        harw_job_runtime::lanes::write_limit(state.path(), "memory", 1)?;
+        lane.lanes.apply_overrides(state.path());
+        assert_eq!(stored(&store, &first)?.job.state, JobState::Running);
+        assert_eq!(stored(&store, &second)?.job.state, JobState::Running);
+
+        store.cancel(&first, &cancel_request())?;
+        store.cancel(&second, &cancel_request())?;
+        tokio::time::timeout(Duration::from_secs(15), lane.drain()).await?;
         drop(held);
         Ok(())
     }

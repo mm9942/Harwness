@@ -134,7 +134,12 @@ harw_tools::tool_provider! {
 
 fn enum_property(description: &str, values: &[&str]) -> JsonSchema {
     let mut schema = property(JsonSchemaType::String, description);
-    schema.enum_values = Some(values.iter().map(|value| serde_json::json!(value)).collect());
+    schema.enum_values = Some(
+        values
+            .iter()
+            .map(|value| serde_json::json!(value))
+            .collect(),
+    );
     schema
 }
 

@@ -89,11 +89,7 @@ fn status(code: StatusCode, reason: &'static str) -> Response<Full<Bytes>> {
 impl UpgradeHandler {
     /// Handler admitting through `host` with identities from `mapper`.
     #[must_use]
-    pub fn new(
-        host: Arc<SessionHost>,
-        mapper: Arc<dyn IdentityMapper>,
-        limits: WsLimits,
-    ) -> Self {
+    pub fn new(host: Arc<SessionHost>, mapper: Arc<dyn IdentityMapper>, limits: WsLimits) -> Self {
         Self {
             host,
             mapper,
@@ -261,4 +257,3 @@ impl NodeListener {
             })
     }
 }
-

@@ -199,6 +199,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub once: bool,
 
+    /// Höchstzahl rotierter Telemetrie-Dateien (`rotated-*.jsonl` samt
+    /// `.blake3`-Beidatei) unter `<home>/telemetry`; die ältesten Paare
+    /// werden nach einer Rotation entfernt. Ohne Angabe gilt das Limit der
+    /// Retention-Klasse `telemetry_rotated` (`harw-retention`).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub telemetry_max_files: Option<u64>,
+
     /// Optionaler JSON-Lines-Export jedes zertifizierten Befundes für
     /// `harw-security-hub` (siehe `crate::export`), z. B.
     /// `/var/lib/harw-sentinel/findings.jsonl`. Muss absolut sein. Ohne
