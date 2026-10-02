@@ -96,6 +96,12 @@ impl Mount {
         })
     }
 
+    /// `true` for a bind of a host directory.
+    #[must_use]
+    pub fn is_bind(&self) -> bool {
+        matches!(self.kind, Kind::Bind(_))
+    }
+
     /// Checks that a bind source still names the directory that was checked
     /// (see [`HostPath::revalidate`]); a volume has nothing to revalidate.
     ///

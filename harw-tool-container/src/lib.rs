@@ -72,6 +72,9 @@ pub use error::ContainerPolicyError;
 pub use hostpath::HostPath;
 pub use image::{ImageCatalog, ImageRef};
 pub use mount::{ExpectedMount, Mount, MountKind};
-pub use plan::{CACHE_DST, ContainerPlan, Expected, RunConfig, RunRequest, Stage, WORKSPACE_DST};
+pub use plan::{
+    CACHE_DST, ContainerPlan, Expected, RunConfig, RunRequest, Stage, StartRefusal,
+    VerifiedContainer, WORKSPACE_DST,
+};
 pub use profile::{Limits, Profile};
 pub use readback::{Dimension, Enforcement, InspectFacts, ObservedMount, Readback, verify};

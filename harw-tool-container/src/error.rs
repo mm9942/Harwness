@@ -22,6 +22,8 @@ pub enum ContainerPolicyError {
     InvalidMount(&'static str),
     /// The text is not the container id that `create` prints.
     InvalidContainerId(&'static str),
+    /// The verification token belongs to another plan.
+    NotVerifiedForThisPlan,
     /// A name (run id, owner, connection, cache volume, label value) is invalid.
     InvalidName {
         /// Which field was rejected.
@@ -50,6 +52,7 @@ impl fmt::Display for ContainerPolicyError {
             Self::DuplicateAlias => f.write_str("image catalog lists an alias twice"),
             Self::InvalidMount(r) => write!(f, "invalid mount: {r}"),
             Self::InvalidContainerId(r) => write!(f, "invalid container id: {r}"),
+            Self::NotVerifiedForThisPlan => f.write_str("the verification belongs to another plan"),
             Self::InvalidName { field, reason } => write!(f, "invalid {field}: {reason}"),
             Self::InvalidCommand(r) => write!(f, "invalid command: {r}"),
             Self::InvalidWorkdir(r) => write!(f, "invalid working directory: {r}"),
