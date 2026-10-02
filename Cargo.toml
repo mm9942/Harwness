@@ -125,6 +125,8 @@ members = [
     # === Remediation (Plan P0–P3) ===
     "harw-egress",
     "harw-fsutil",
+    # Retention core: age/count/bytes sweeps and the declared data-class registry.
+    "harw-retention",
     # Reines Dev-Gerüst (define_test_error!, Temp-Pfade); nur als dev-dependency.
     "harw-test-support",
     "harw-runtime",
