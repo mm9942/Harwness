@@ -54,3 +54,11 @@ not touched without explicit per-PR approval.
 - Review/research session: new crate `harw-session-com` (commit 61fa799, scribe 1d9b614; ComServer::serve_io, tower stack, HostBinder binds identity before 101, 403/503 refusals, PortOffer::All, 20 tests). Overlaps S05 (daemon) and S08 (node listener); NOT merged, needs user decision.
 - Findings on #91/S05 from that session (unverified by us): (1) local_identity builds caps only from caps_for_tier, so gateway.* is unreachable for local tiers (gateway_caps_for_tier missing); (2) #91 calls serve_connection (session-only), never serve_connection_with, so tool.* and gateway.* are not dispatched; (3) host.connect runs after the 101 and fails silently (client sees 101 then close without reason); (4) clients must negotiate hello.wire_minor 2, otherwise the host masks R18 caps. Pitfall: hyper 1.11 keep_alive(false) rewrites `Connection: Upgrade` in the 101 to `close`; refusals must use an explicit `Connection: close`.
 - PL-68 §14 "IMPLEMENTATION STATUS" is stale (harw-session-ws and harw-session-host exist; #91 delivers W04) — docs follow-up.
+
+## Central test run (workspace, consolidate/main at 174daf2 + fixes)
+
+- `cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_nested_refdefs`: clean (after G5 merge).
+- `cargo test --workspace --no-fail-fast`: 14163 passed, 1 failed, plus 1 hang.
+  - FAILED `harw-registry-defaults::auto_approved_tools_are_a_subset_of_the_read_only_surface` (`tunnel.status`): cause is a test-surface omission, `AUTO_APPROVED_TOOLS` lists `tunnel.status`/`tunnel.list` but the test's read-only surface did not (commit a953d85 added the entries only). Fixed in the test (read-only tunnel tools added to the surface). It is not caused by any worker branch.
+  - HANG `harw-tui attach` tests (S09): test helper `drive` kept the input sender alive, the loop never saw EOF. Fixed (7c633f3); 10 attach tests pass.
+- NOT RUN here: `cargo deny` and `actionlint` (not installed), `make -C dod clippy test`, `cargo xtask gates` on the final SHA.
