@@ -33,6 +33,7 @@ pub mod plan_toml;
 pub mod plugin_toml;
 pub mod provider_toml;
 pub mod research_toml;
+pub mod retention_toml;
 mod role_models;
 pub mod scope;
 mod serde_defaults;
@@ -89,6 +90,7 @@ pub use loader::{
     load_system_prompt, load_uia_personalization, load_uia_user_name,
 };
 pub use mcp_toml::{McpServerToml, McpTransportToml};
+pub use memory_toml::MemorySection;
 pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_toml_into};
 pub use mode_toml::ModeSection;
 pub use model_toml::{ModelCapabilitiesToml, ModelToml, PromptCachingMode};
@@ -101,8 +103,8 @@ pub use provider_toml::{
     DEFAULT_REQUEST_TIMEOUT_SECS, MaxTokensField, OriginAllowlistToml, ProviderToml, RateLimitMode,
     RateLimitToml, host_is_private_lan,
 };
-pub use memory_toml::MemorySection;
 pub use research_toml::ResearchSection;
+pub use retention_toml::{RetentionClassToml, RetentionSection};
 pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use skill_toml::SkillToml;
