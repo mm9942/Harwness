@@ -20,6 +20,8 @@ pub enum ContainerPolicyError {
     DuplicateAlias,
     /// A mount source, destination or volume name is not acceptable.
     InvalidMount(&'static str),
+    /// The text is not the container id that `create` prints.
+    InvalidContainerId(&'static str),
     /// A name (run id, owner, connection, cache volume, label value) is invalid.
     InvalidName {
         /// Which field was rejected.
@@ -47,6 +49,7 @@ impl fmt::Display for ContainerPolicyError {
             Self::UnknownAlias => f.write_str("image alias is not in the catalog"),
             Self::DuplicateAlias => f.write_str("image catalog lists an alias twice"),
             Self::InvalidMount(r) => write!(f, "invalid mount: {r}"),
+            Self::InvalidContainerId(r) => write!(f, "invalid container id: {r}"),
             Self::InvalidName { field, reason } => write!(f, "invalid {field}: {reason}"),
             Self::InvalidCommand(r) => write!(f, "invalid command: {r}"),
             Self::InvalidWorkdir(r) => write!(f, "invalid working directory: {r}"),

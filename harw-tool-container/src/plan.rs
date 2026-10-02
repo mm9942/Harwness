@@ -1,5 +1,6 @@
-//! The run plan: a validated request plus trusted config becomes one
-//! inspectable `podman run` argument vector. Nothing is executed here.
+//! The run plan: a validated request plus trusted config becomes the
+//! inspectable `podman` argument vectors of one container's lifecycle.
+//! Nothing is executed here.
 //!
 //! # What the model controls and what it does not
 //! The request carries an image (already resolved from an alias), a profile
@@ -8,9 +9,21 @@
 //! fixed by the profile or by trusted config: mounts, network, capabilities,
 //! user namespace, memory, process count, pull policy, labels.
 //!
-//! # The argument vector
+//! # The lifecycle
+//! There is no `run`: it would start the workload before anything could be
+//! checked, and a short-lived command may be gone (`--rm`) before an inspect.
+//! The caller runs [`Stage`]s in this order:
+//! 1. `Create` prints the container id; parse it with [`ContainerId::parse`].
+//! 2. `Inspect(&id)`; feed the facts to [`ContainerPlan::verify`].
+//! 3. `Start(&id)` only when every dimension is enforced, else `Remove(&id)`.
+//!
+//! Every step after `create` takes the id, never the name, so the container
+//! that was verified is the one that starts even if another client of the
+//! engine reuses the name in between.
+//!
+//! # The create vector
 //! ```text
-//! [--connection=NAME] run --rm --pull=never --name=harw-<run> [--cidfile=P]
+//! [--connection=NAME] create --rm --pull=never --name=harw-<run> [--cidfile=P]
 //!   --label=harw.owner=<o> --label=harw.run=<r> --label=harw.profile=<p>
 //!   --network=none --read-only --cap-drop=all --security-opt=no-new-privileges
 //!   --pids-limit=<n> --memory=<n>m --memory-swap=<n>m --userns=keep-id --timeout=<s>
@@ -19,12 +32,12 @@
 //! ```
 //! `--` ends option parsing and the image is the first positional argument,
 //! so neither the image nor any command word can be read as an engine flag.
-//! That `podman` and `docker` accept `--` before the image must still be
-//! proven by an integration test (see `docs/research/container-and-cli-tools.md`,
-//! section 9); this crate cannot run an engine.
+//! Podman 4.9.3 accepts `--` before the image (checked); Docker is not
+//! covered by this crate.
 
 use std::process::{Command, Stdio};
 
+use crate::container_id::ContainerId;
 use crate::digest::argv_sha256_hex;
 use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value, engine_environment};
 use crate::error::ContainerPolicyError;
@@ -32,6 +45,7 @@ use crate::hostpath::HostPath;
 use crate::image::ImageRef;
 use crate::mount::Mount;
 use crate::profile::Profile;
+use crate::readback::{Dimension, Enforcement, InspectFacts, Readback, verify};
 use crate::validate::{check_abs_path, check_label_value, check_name, check_rel_path};
 
 /// Fixed destination of the workspace inside the container.
@@ -267,19 +281,19 @@ pub struct Expected {
     pub timeout_s: u32,
 }
 
-/// One step of the container lifecycle. Run them in this order: `Create`,
-/// `Inspect` (feed the result to [`crate::readback::verify`]), then `Start`
-/// only when every dimension is enforced; otherwise `Remove`.
+/// One step of the container lifecycle (see the module docs for the order).
+/// The steps after `Create` carry the [`ContainerId`] that `create` printed,
+/// so none of them can be built from a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
+pub enum Stage<'a> {
     /// `create`: the container exists but nothing runs yet.
     Create,
     /// `inspect`: read back what the engine actually applied.
-    Inspect,
+    Inspect(&'a ContainerId),
     /// `start --attach`: run the workload and stream its output.
-    Start,
+    Start(&'a ContainerId),
     /// `rm --force`: discard a container that failed verification.
-    Remove,
+    Remove(&'a ContainerId),
 }
 
 /// A validated, inspectable container run.
@@ -424,25 +438,47 @@ impl ContainerPlan {
 
     /// The argument vector of `stage`.
     #[must_use]
-    pub fn stage_args(&self, stage: Stage) -> Vec<String> {
+    pub fn stage_args(&self, stage: Stage<'_>) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
         if let Some(connection) = &self.connection {
             args.push(format!("--connection={connection}"));
         }
-        match stage {
+        let id = match stage {
             Stage::Create => return self.create.clone(),
-            Stage::Inspect => {
+            Stage::Inspect(id) => {
                 args.extend(["inspect", "--type=container"].map(str::to_owned));
+                id
             }
-            Stage::Start => args.extend(["start", "--attach"].map(str::to_owned)),
-            Stage::Remove => args.extend(["rm", "--force"].map(str::to_owned)),
-        }
+            Stage::Start(id) => {
+                args.extend(["start", "--attach"].map(str::to_owned));
+                id
+            }
+            Stage::Remove(id) => {
+                args.extend(["rm", "--force"].map(str::to_owned));
+                id
+            }
+        };
         args.push("--".to_owned());
-        args.push(self.name.clone());
+        args.push(id.as_str().to_owned());
         args
     }
 
-    /// The container name (`harw-<run id>`).
+    /// Judges the inspect facts of the container `id`: every dimension of
+    /// [`crate::readback::verify`] plus [`Dimension::Identity`], which is
+    /// enforced only when the engine reports exactly this id. Start only when
+    /// [`Readback::all_enforced`] holds.
+    #[must_use]
+    pub fn verify(&self, id: &ContainerId, facts: &InspectFacts) -> Readback {
+        let identity = match facts.id.as_deref() {
+            Some(reported) if reported == id.as_str() => Enforcement::Enforced,
+            Some(_) => Enforcement::NotEnforced,
+            None => Enforcement::Unverifiable,
+        };
+        verify(&self.expected, facts).with_entry(Dimension::Identity, identity)
+    }
+
+    /// The container name (`harw-<run id>`). It labels the container for
+    /// humans and cleanup; no stage after `create` uses it.
     #[must_use]
     pub fn container_name(&self) -> &str {
         &self.name
@@ -553,7 +589,6 @@ fn approval_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::readback::{InspectFacts, verify};
     use crate::test_support::{TestResult, ensure};
 
     fn host(path: &str) -> Result<HostPath, ContainerPolicyError> {
@@ -930,30 +965,59 @@ mod tests {
         )
     }
 
+    fn cid() -> Result<ContainerId, ContainerPolicyError> {
+        ContainerId::parse(&"ab12".repeat(16))
+    }
+
     #[test]
     fn the_lifecycle_is_create_inspect_start_with_no_run() -> TestResult {
         let cfg = config()?.with_connection("pi")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
         ensure(!plan.create_args().iter().any(|a| a == "run"), "no run")?;
-        let name = plan.container_name().to_owned();
+        let id = cid()?;
         for (stage, verb) in [
-            (Stage::Inspect, "inspect"),
-            (Stage::Start, "start"),
-            (Stage::Remove, "rm"),
+            (Stage::Inspect(&id), "inspect"),
+            (Stage::Start(&id), "start"),
+            (Stage::Remove(&id), "rm"),
         ] {
             let args = plan.stage_args(stage);
             ensure(args[0] == "--connection=pi", "connection first")?;
             ensure(args[1] == verb, verb)?;
             ensure(
-                args[args.len() - 2] == "--" && args[args.len() - 1] == name,
-                "the name follows the separator",
+                args[args.len() - 2] == "--" && args[args.len() - 1] == id.as_str(),
+                "the id follows the separator",
+            )?;
+            ensure(
+                !args.iter().any(|a| a == plan.container_name()),
+                "the mutable name is never used after create",
             )?;
         }
         ensure(
-            plan.stage_args(Stage::Start)
+            plan.stage_args(Stage::Start(&id))
                 .iter()
                 .any(|a| a == "--attach"),
             "output is attached",
+        )
+    }
+
+    #[test]
+    fn only_the_created_container_passes_the_identity_check() -> TestResult {
+        let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
+        let id = cid()?;
+        let mut facts = good_facts(&plan);
+        facts.id = Some(id.as_str().to_owned());
+        ensure(plan.verify(&id, &facts).all_enforced(), "same id")?;
+        facts.id = Some("f".repeat(64));
+        let swapped = plan.verify(&id, &facts);
+        ensure(
+            swapped.get(Dimension::Identity) == Some(Enforcement::NotEnforced),
+            "another container behind the same name",
+        )?;
+        ensure(!swapped.all_enforced(), "so it is not started")?;
+        facts.id = None;
+        ensure(
+            plan.verify(&id, &facts).get(Dimension::Identity) == Some(Enforcement::Unverifiable),
+            "not reported",
         )
     }
 
@@ -1019,13 +1083,10 @@ mod tests {
         )
     }
 
-    #[test]
-    fn expected_matches_the_profile_and_round_trips_through_readback() -> TestResult {
-        let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
-        ensure(plan.expected().memory_bytes == 1024 * 1024 * 1024, "memory")?;
-        ensure(plan.expected().pids_limit == 256, "pids")?;
-        ensure(plan.expected().workspace_read_only, "ro")?;
-        let facts = InspectFacts {
+    /// Facts of a container that matches `plan`, but without an id.
+    fn good_facts(plan: &ContainerPlan) -> InspectFacts {
+        InspectFacts {
+            id: None,
             privileged: Some(false),
             cap_add: Some(vec![]),
             cap_drop: Some(vec!["all".to_owned()]),
@@ -1038,8 +1099,19 @@ mod tests {
             pids_limit: Some(plan.expected().pids_limit),
             workspace_read_only: Some(true),
             timeout_s: Some(plan.expected().timeout_s),
-        };
-        ensure(verify(plan.expected(), &facts).all_enforced(), "enforced")
+        }
+    }
+
+    #[test]
+    fn expected_matches_the_profile_and_round_trips_through_readback() -> TestResult {
+        let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
+        ensure(plan.expected().memory_bytes == 1024 * 1024 * 1024, "memory")?;
+        ensure(plan.expected().pids_limit == 256, "pids")?;
+        ensure(plan.expected().workspace_read_only, "ro")?;
+        ensure(
+            verify(plan.expected(), &good_facts(&plan)).all_enforced(),
+            "enforced",
+        )
     }
 
     #[test]
@@ -1077,7 +1149,7 @@ mod tests {
             &config()?.with_connection("pi")?,
             &request(Profile::Hermetic)?,
         )?;
-        let command = remote.to_command(Stage::Start, &offered);
+        let command = remote.to_command(Stage::Start(&cid()?), &offered);
         ensure(
             command
                 .get_envs()
