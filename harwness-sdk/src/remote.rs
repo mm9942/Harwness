@@ -35,6 +35,7 @@
 //! [`RemoteHarwness`] ist billig klonbar. `send` nimmt `&mut self`: eine
 //! [`RemoteSession`] fährt nie zwei Turns zugleich.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -267,6 +268,7 @@ impl RemoteHarwness {
             may_approve: ack.granted.approve,
             answered: AnsweredSet::new(),
             keys: IdempotencyKeys::new(&self.label),
+            stash: VecDeque::new(),
         })
     }
 }
@@ -277,6 +279,11 @@ impl RemoteHarwness {
 struct Run {
     tally: TurnTally,
     approvals: u32,
+    /// Wie viele Turns vor dem eigenen noch enden müssen. Ihre Ereignisse
+    /// gehören nicht zu diesem Turn: sie werden weder gezählt noch gemeldet.
+    ahead_left: usize,
+    /// Zählt nur die Enden der vorausgehenden Turns.
+    ahead_tally: TurnTally,
 }
 
 /// Eine angehängte Sitzung eines Hosts.
@@ -297,6 +304,10 @@ pub struct RemoteSession {
     may_approve: bool,
     answered: AnsweredSet,
     keys: IdempotencyKeys,
+    /// Frames, die beim Leeren des Stroms auftauchten und beachtet werden
+    /// müssen (Freigaben, Neuaufbau): sie gehen vor neuen Frames durch
+    /// [`Self::on_frame`].
+    stash: VecDeque<FrameEnvelope>,
 }
 
 impl std::fmt::Debug for RemoteSession {
@@ -359,6 +370,21 @@ impl RemoteSession {
         }
     }
 
+    /// Hängt die Sitzung beim Host ab und lässt die Verbindung los. Die
+    /// Sitzung selbst läuft weiter; ein neues [`RemoteHarwness::attach`]
+    /// setzt dort an. Wer die Sitzung nur fallen lässt, hängt sich nicht ab:
+    /// der Host merkt es erst, wenn der Strom bricht.
+    ///
+    /// # Fehler
+    /// [`SdkError::Session`], wenn der Host das Abhängen nicht bestätigt.
+    pub async fn detach(mut self) -> Result<()> {
+        self.source = None;
+        self.port
+            .detach(self.wire_id.clone())
+            .await
+            .map_err(session_error)
+    }
+
     /// Bricht den laufenden Turn ab.
     ///
     /// # Fehler
@@ -382,9 +408,11 @@ impl RemoteSession {
     ) -> Result<TurnReport> {
         self.drain().await;
         let ahead = self.submit(text).await?;
-        let wanted = ahead + 1;
-        let mut run = Run::default();
-        while run.tally.finished() < wanted {
+        let mut run = Run {
+            ahead_left: ahead,
+            ..Run::default()
+        };
+        while run.tally.finished() < 1 {
             let envelope = self.next_frame().await?;
             self.on_frame(envelope, &mut run, on_event).await?;
         }
@@ -411,11 +439,16 @@ impl RemoteSession {
         };
         while let Ok(Ok(Some(envelope))) = tokio::time::timeout(Duration::ZERO, source.next()).await
         {
-            if matches!(
-                envelope.frame,
-                SessionFrame::Turn(_) | SessionFrame::Child { .. }
-            ) {
-                self.tracker.accept(&envelope.cursor);
+            match envelope.frame {
+                SessionFrame::Turn(_) | SessionFrame::Child { .. } => {
+                    self.tracker.accept(&envelope.cursor);
+                }
+                // Eine offene Freigabe oder ein Neuaufbau darf nicht verloren
+                // gehen, nur weil sie vor dem Absenden eintraf.
+                SessionFrame::ApprovalRequested(_)
+                | SessionFrame::Resync { .. }
+                | SessionFrame::Lagged { .. } => self.stash.push_back(envelope),
+                _ => {}
             }
         }
     }
@@ -454,6 +487,9 @@ impl RemoteSession {
     }
 
     async fn next_frame(&mut self) -> Result<FrameEnvelope> {
+        if let Some(stashed) = self.stash.pop_front() {
+            return Ok(stashed);
+        }
         if self.source.is_none() {
             let from = self.resume.take();
             self.reattach(from).await?;
@@ -510,6 +546,15 @@ impl RemoteSession {
     ) -> Result<()> {
         match envelope.frame {
             SessionFrame::Turn(event) if self.tracker.accept(&envelope.cursor) => {
+                if run.ahead_left > 0 {
+                    // Ein Turn vor dem eigenen: nur sein Ende zählt.
+                    let before = run.ahead_tally.finished();
+                    run.ahead_tally.apply_root(&event);
+                    if run.ahead_tally.finished() > before {
+                        run.ahead_left -= 1;
+                    }
+                    return Ok(());
+                }
                 run.tally.apply_root(&event);
                 let source = EventSource {
                     session_id: self.id.clone(),
@@ -526,6 +571,9 @@ impl RemoteSession {
                 role,
                 event,
             } if self.tracker.accept(&envelope.cursor) => {
+                if run.ahead_left > 0 {
+                    return Ok(());
+                }
                 let source = EventSource {
                     session_id: SessionId::from_core(&agent),
                     parent: Some(
@@ -538,6 +586,9 @@ impl RemoteSession {
                 if let Some(mapped) = map_turn_event(source, event) {
                     on_event(&mapped);
                 }
+            }
+            SessionFrame::Snapshot { assistant_text, .. } if run.ahead_left == 0 => {
+                run.tally.apply_snapshot(&assistant_text);
             }
             SessionFrame::ApprovalRequested(request) => self.approve(&request, run).await?,
             SessionFrame::Resync { head, .. } => self.reattach(Some(head)).await?,
@@ -664,7 +715,6 @@ mod tests {
 
     // --- Wiedergabe gegen einen scriptbaren Port ------------------------------
 
-    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use harw_protocol::PortFuture;
@@ -697,6 +747,8 @@ mod tests {
     struct ScriptPort {
         queue: Queue,
         after_submit: Mutex<Vec<FrameEnvelope>>,
+        position: u32,
+        detached: Arc<std::sync::atomic::AtomicBool>,
     }
 
     fn unsupported<T: Send + 'static>() -> PortFuture<'static, T> {
@@ -717,7 +769,9 @@ mod tests {
             unsupported()
         }
         fn detach(&self, _: harw_types::SessionId) -> PortFuture<'_, ()> {
-            unsupported()
+            self.detached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
         }
         fn history(&self, _: HistoryParams) -> PortFuture<'_, Vec<FrameEnvelope>> {
             unsupported()
@@ -726,7 +780,8 @@ mod tests {
             if let (Ok(mut queue), Ok(mut script)) = (self.queue.lock(), self.after_submit.lock()) {
                 queue.extend(script.drain(..));
             }
-            Box::pin(async { Ok(SubmitResult::Accepted { position: 0 }) })
+            let position = self.position;
+            Box::pin(async move { Ok(SubmitResult::Accepted { position }) })
         }
         fn interrupt(&self, _: InterruptParams) -> PortFuture<'_, ()> {
             unsupported()
@@ -790,12 +845,24 @@ mod tests {
         after: Vec<FrameEnvelope>,
         head: Cursor,
     ) -> RemoteSession {
+        scripted_at(before, after, head, 0).0
+    }
+
+    fn scripted_at(
+        before: Vec<FrameEnvelope>,
+        after: Vec<FrameEnvelope>,
+        head: Cursor,
+        position: u32,
+    ) -> (RemoteSession, Arc<std::sync::atomic::AtomicBool>) {
+        let detached = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let queue: Queue = Arc::new(Mutex::new(before.into()));
         let port = Arc::new(ScriptPort {
             queue: Arc::clone(&queue),
             after_submit: Mutex::new(after),
+            position,
+            detached: Arc::clone(&detached),
         });
-        RemoteSession {
+        let session = RemoteSession {
             id: SessionId::from_core(&harw_types::SessionId::from_str("s1")),
             wire_id: harw_types::SessionId::from_str("s1"),
             port,
@@ -808,6 +875,16 @@ mod tests {
             may_approve: true,
             answered: AnsweredSet::new(),
             keys: IdempotencyKeys::with_epoch("test", "e"),
+            stash: VecDeque::new(),
+        };
+        (session, detached)
+    }
+
+    fn frame(cursor: Cursor, frame: SessionFrame) -> FrameEnvelope {
+        FrameEnvelope {
+            session_id: harw_types::SessionId::from_str("s1"),
+            cursor,
+            frame,
         }
     }
 
@@ -866,6 +943,73 @@ mod tests {
         let mut session = scripted(Vec::new(), after, head);
         let report = tokio::time::timeout(Duration::from_secs(5), session.send("go")).await??;
         assert_eq!(report.text.as_deref(), Some("only"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_turns_ahead_of_ours_are_neither_reported_nor_counted() -> TestResult {
+        let head = Cursor::default();
+        let after = vec![
+            at(0, 0, 0, answer("ahead")),
+            at(0, 0, 1, done()),
+            at(0, 0, 2, answer("mine")),
+            at(0, 0, 3, done()),
+        ];
+        let (mut session, _) = scripted_at(Vec::new(), after, head, 1);
+        let mut events = 0_usize;
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.send_with("go", |_| events += 1),
+        )
+        .await??;
+        assert_eq!(report.text.as_deref(), Some("mine"));
+        assert_eq!(events, 2, "only the own message and the own end");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_supplies_the_text_a_lost_position_missed() -> TestResult {
+        let head = Cursor::default();
+        let after = vec![
+            frame(
+                Cursor::default(),
+                SessionFrame::Snapshot {
+                    turn_id: TurnId::from_str("t"),
+                    assistant_text: "partial".to_owned(),
+                    reasoning_collapsed: false,
+                },
+            ),
+            at(0, 0, 1, done()),
+        ];
+        let mut session = scripted(Vec::new(), after, head);
+        let report = tokio::time::timeout(Duration::from_secs(5), session.send("go")).await??;
+        assert_eq!(report.text.as_deref(), Some("partial"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_approval_that_arrived_before_the_submit_is_kept() -> TestResult {
+        let head = Cursor::default();
+        let waiting = frame(
+            Cursor::default(),
+            SessionFrame::Lagged {
+                resume_from: Cursor::default(),
+            },
+        );
+        let mut session = scripted(vec![waiting], vec![at(0, 0, 1, done())], head);
+        session.drain().await;
+        assert_eq!(session.stash.len(), 1, "the frame is stashed, not dropped");
+        let next = session.next_frame().await?;
+        assert!(matches!(next.frame, SessionFrame::Lagged { .. }));
+        assert!(session.stash.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detach_tells_the_host() -> TestResult {
+        let (session, detached) = scripted_at(Vec::new(), Vec::new(), Cursor::default(), 0);
+        session.detach().await?;
+        assert!(detached.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
 }
