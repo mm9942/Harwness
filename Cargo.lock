@@ -3789,8 +3789,10 @@ dependencies = [
 name = "harw-session-com"
 version = "0.9.1"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "futures-util",
+ "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
  "harw-session-ws",
