@@ -17,6 +17,7 @@ members = [
     "harw-tool-explorer",
     "harw-killer",
     "harw-tool-process",
+    "harw-tool-container",
     "harw-config",
     "harw-home",
     "harw-plan",
