@@ -8,6 +8,10 @@
 > `docs/planning/67-containers/README.md` and is not repeated here; this note
 > builds on it and says where the two meet.
 >
+> Implementation: step 1 (the pure policy core) exists as `harw-tool-container`
+> (48 tests; `--init` is deliberately not passed, it needs an init binary in
+> every image). Everything below that crate does not cover is still proposal.
+>
 > Evidence rule: every statement about our code cites a file; every statement
 > about Docker/Podman/cross cites the upstream page in §11. Items I could not
 > verify are listed in §9 and marked **(unverified)** where they appear.
@@ -219,7 +223,7 @@ the agent writes `image: "rust"` and never sees or invents a digest.
 
 ```
 podman run
-  --rm --pull=never --init
+  --rm --pull=never
   --name=harw-<session>-<n>  --cidfile=<fresh path under the job dir>
   --label=harw.owner=<runner> --label=harw.work_id=<id> --label=harw.profile=<p>
   --network=none
