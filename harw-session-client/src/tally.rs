@@ -57,6 +57,7 @@ pub fn message_text(message: &AssistantMessageItem) -> String {
 pub struct TurnTally {
     final_text: Option<String>,
     last_text: Option<String>,
+    snapshot_text: Option<String>,
     tool_calls: u32,
     finished: usize,
     end: Option<TurnEnd>,
@@ -101,6 +102,16 @@ impl TurnTally {
         }
     }
 
+    /// Counts a `Snapshot` frame: the partial assistant text the host sends
+    /// when the live ring lost this client's position. It is the text of a
+    /// turn whose message items were missed, so it only stands in when no
+    /// message item was seen; a final answer or a last message wins.
+    pub fn apply_snapshot(&mut self, assistant_text: &str) {
+        if !assistant_text.is_empty() {
+            self.snapshot_text = Some(assistant_text.to_owned());
+        }
+    }
+
     /// How many turn ends were counted.
     #[must_use]
     pub fn finished(&self) -> usize {
@@ -112,7 +123,7 @@ impl TurnTally {
     #[must_use]
     pub fn summary(self) -> TurnSummary {
         TurnSummary {
-            text: self.final_text.or(self.last_text),
+            text: self.final_text.or(self.last_text).or(self.snapshot_text),
             tool_calls: self.tool_calls,
             end: self.end.unwrap_or(TurnEnd::Completed),
             usage: self.usage,
@@ -144,6 +155,25 @@ mod tests {
             turn_id: TurnId::from_str("t"),
             usage: None,
         }
+    }
+
+    #[test]
+    fn a_snapshot_stands_in_only_when_no_message_was_seen() -> TestResult {
+        let mut missed = TurnTally::new();
+        missed.apply_snapshot("partial");
+        missed.apply_root(&done());
+        ensure(
+            missed.summary().text.as_deref() == Some("partial"),
+            "snapshot is the fallback",
+        )?;
+        let mut seen = TurnTally::new();
+        seen.apply_snapshot("partial");
+        seen.apply_root(&message("whole", None));
+        seen.apply_root(&done());
+        ensure(
+            seen.summary().text.as_deref() == Some("whole"),
+            "a message wins over the snapshot",
+        )
     }
 
     #[test]

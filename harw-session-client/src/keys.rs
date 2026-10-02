@@ -24,6 +24,20 @@ fn fresh_epoch() -> String {
     format!("{nanos:x}.{}", INSTANCES.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The host accepts a `client_msg_id` of at most 128 bytes. Label and epoch
+/// are bounded so that `label-epoch-n` always fits (48 + 1 + 40 + 1 + 20).
+const MAX_LABEL_BYTES: usize = 48;
+const MAX_EPOCH_BYTES: usize = 40;
+
+/// At most `max` bytes of `text`, ASCII only: anything else becomes `_`, so
+/// the cut can never split a character and the key stays plain text.
+fn bounded(text: &str, max: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
+        .take(max)
+        .collect()
+}
+
 /// A source of keys of the form `label-epoch-n`.
 #[derive(Debug, Clone)]
 pub struct IdempotencyKeys {
@@ -43,7 +57,11 @@ impl IdempotencyKeys {
     #[must_use]
     pub fn with_epoch(label: &str, epoch: &str) -> Self {
         Self {
-            prefix: format!("{label}-{epoch}"),
+            prefix: format!(
+                "{}-{}",
+                bounded(label, MAX_LABEL_BYTES),
+                bounded(epoch, MAX_EPOCH_BYTES)
+            ),
             sent: 0,
         }
     }
@@ -77,6 +95,17 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         ensure(all.len() == 3, "three distinct keys")
+    }
+
+    #[test]
+    fn a_long_or_odd_label_never_breaks_the_host_limit() -> TestResult {
+        let label = "ü".repeat(500);
+        let mut keys = IdempotencyKeys::new(&label);
+        let key = keys.next_key();
+        ensure(key.len() <= 128, "within 128 bytes")?;
+        ensure(key.is_ascii(), "plain ASCII")?;
+        let mut long_epoch = IdempotencyKeys::with_epoch(&"a".repeat(500), &"b".repeat(500));
+        ensure(long_epoch.next_key().len() <= 128, "epoch bounded too")
     }
 
     #[test]
