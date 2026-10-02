@@ -108,6 +108,24 @@ ist (echter Daemon, echte Verbindung), nicht nur gegen Attrappen.
 
 ## 6. Prüfen
 
-Jede Schicht: `cargo test`, `cargo clippy -D warnings`, `cargo fmt --check`
-für die berührten Crates und `cargo xtask gates`. L3 zusätzlich ein
-Ende-zu-Ende-Test gegen einen echten `harw-session-daemon`.
+Verbindliche Reihenfolge laut `.github/copilot-instructions.md` (bei wenig
+Platten: `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`):
+
+1. `cargo fmt --all`
+2. `cargo clippy --workspace --all-targets -- -D warnings`
+3. `cargo test --workspace`
+4. `cargo run -q -p xtask -- gates`
+5. `cargo deny check`
+
+Während der Arbeit an einer Schicht genügt es, 1–3 auf die berührten Crates
+zu beschränken (`-p <crate>`, bei Clippy `--no-deps`, solange eine
+Abhängigkeit wie `harw-ops` ein bekanntes Lint hat); vor dem Übergang aus dem
+Entwurf läuft die volle Reihenfolge. L3 zusätzlich ein Ende-zu-Ende-Test gegen
+einen echten `harw-session-daemon`.
+
+## 7. Basisbranch
+
+Die Repo-Regel nennt `dev` als Basis. Der Stapel zielt vorerst auf
+`consolidate/main`, weil dort die Integration liegt, auf der er aufbaut (`dev`
+liegt über 100 Commits dahinter). Sobald `consolidate/main` nach `dev`
+gemergt ist, werden die Entwurfs-PRs auf `dev` umgehängt.
