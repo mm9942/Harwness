@@ -15,3 +15,4 @@ harw-types = { path = "../harw-types" }
 [dev-dependencies]
 jiff = { workspace = true }
 serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros"] }

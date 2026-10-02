@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod controller;
+
+pub use controller::Controller;
+
 use harw_protocol::session_wire::{Cursor, FrameEnvelope, PresenceEntry, SessionFrame};
 use harw_protocol::{ApprovalRequest, TurnEvent};
 use harw_types::{ApprovalId, ReviewDecision, TurnId};
