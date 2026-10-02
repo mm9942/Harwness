@@ -16,4 +16,8 @@ harw-types = { path = "../harw-types" }
 harw-test-support = { path = "../harw-test-support" }
 jiff = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }
+tempfile = { workspace = true }
+harw-session-daemon = { path = "../harw-session-daemon" }
+harw-session-host = { path = "../harw-session-host" }
+harw-session-remote = { path = "../harw-session-remote" }
