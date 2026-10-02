@@ -26,9 +26,10 @@
 //!
 //! # Fehlerkonvention
 //! Jeder Enum implementiert `Display`, `Debug` (delegiert an `Display`),
-//! [`std::error::Error`] mit `source()` für gewrappte Ursachen und `From`-Impls
-//! für die getragenen Fremdfehler (`std::io::Error`, `serde_json::Error`,
-//! `toml_edit::TomlError`).
+//! [`std::error::Error`] mit `source()` für gewrappte Ursachen. `From`-Impls
+//! existieren nur für `std::io::Error` und `serde_json::Error`.
+//! TOML-Parserfehler werden nicht als Fremdtyp getragen; [`MigrationError::Parse`]
+//! speichert die gerenderte Meldung und den Fehlerbereich in eigenen Feldern.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -370,8 +371,10 @@ pub enum MigrationError {
     },
     /// Das TOML-Dokument konnte nicht geparst werden.
     Parse {
-        /// Zugrunde liegender `toml_edit`-Fehler.
-        source: toml_edit::TomlError,
+        /// Gerenderte Parser-Meldung (mit Zeile/Spalte und Ausschnitt, sofern bekannt).
+        message: String,
+        /// Byte-Bereich im Dateiinhalt, an dem das Parsen scheiterte (falls bekannt).
+        span: Option<std::ops::Range<usize>>,
     },
     /// Für die vorgefundene Konfigurationsversion existiert kein Migrationspfad.
     Version {
@@ -395,8 +398,8 @@ impl fmt::Display for MigrationError {
             MigrationError::Io { path, source } => {
                 write!(f, "I/O-Fehler an Pfad '{path}': {source}")
             }
-            MigrationError::Parse { source } => {
-                write!(f, "Konfiguration nicht lesbar (TOML): {source}")
+            MigrationError::Parse { message, .. } => {
+                write!(f, "Konfiguration nicht lesbar (TOML): {message}")
             }
             MigrationError::Version { found, expected } => {
                 write!(
@@ -427,8 +430,9 @@ impl StdError for MigrationError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             MigrationError::Io { source, .. } => Some(source),
-            MigrationError::Parse { source } => Some(source),
-            MigrationError::Version { .. } | MigrationError::Apply { .. } => None,
+            MigrationError::Parse { .. }
+            | MigrationError::Version { .. }
+            | MigrationError::Apply { .. } => None,
         }
     }
 }
@@ -442,9 +446,14 @@ impl From<std::io::Error> for MigrationError {
     }
 }
 
-impl From<toml_edit::TomlError> for MigrationError {
-    fn from(source: toml_edit::TomlError) -> Self {
-        MigrationError::Parse { source }
+impl MigrationError {
+    /// Übersetzt einen `toml_edit`-Parserfehler in [`MigrationError::Parse`],
+    /// ohne den Fremdtyp in die öffentliche API zu tragen.
+    pub(crate) fn from_toml(err: &toml_edit::TomlError) -> Self {
+        MigrationError::Parse {
+            message: err.to_string(),
+            span: err.span(),
+        }
     }
 }
 
@@ -621,19 +630,42 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_error_from_toml() -> TestResult {
+    fn test_migration_error_from_toml_keeps_rendered_message_and_span() -> TestResult {
         let parse_result = "a = = 1".parse::<toml_edit::DocumentMut>();
         let Err(toml_err) = parse_result else {
             return Err(TestError::Unexpected(
                 "ungültiges TOML muss als Err geparst werden".to_owned(),
             ));
         };
-        let e: MigrationError = toml_err.into();
-        assert!(
-            e.to_string()
-                .starts_with("Konfiguration nicht lesbar (TOML):")
+        let e = MigrationError::from_toml(&toml_err);
+        // Display bleibt byte-identisch zur bisherigen Ausgabe mit Fremdtyp.
+        assert_eq!(
+            e.to_string(),
+            format!("Konfiguration nicht lesbar (TOML): {toml_err}")
         );
-        assert!(e.source().is_some());
+        match &e {
+            MigrationError::Parse { message, span } => {
+                assert_eq!(message, &toml_err.to_string());
+                assert_eq!(span, &toml_err.span());
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Parse-Fehler, erhielt {other:?}"
+                )));
+            }
+        }
+        assert!(e.source().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_migration_error_parse_without_span_display_and_no_source() -> TestResult {
+        let e = MigrationError::Parse {
+            message: "kaputt".to_owned(),
+            span: None,
+        };
+        assert_eq!(e.to_string(), "Konfiguration nicht lesbar (TOML): kaputt");
+        assert!(e.source().is_none());
         Ok(())
     }
 

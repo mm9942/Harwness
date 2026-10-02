@@ -98,6 +98,19 @@
 //! `InfrastructureContributor`, sobald die Sektion konfiguriert ist. Keine
 //! davon trägt eine `ModelTool`-Fläche (siehe `infra`-Moduldoku).
 //!
+//! **Gateway-Fläche** ([`gateway_ops::register_gateway`], 10 Ops, nur mit
+//! Gateway-Port; [`gateway_ops::register_gateway_diagnostics`], 4 Ops): die
+//! `gateway.*`-Operationen des R18-Vertrags (Status, Verbindungen, Sitzungen,
+//! Listener, Werkzeuge lesen; Verbindung widerrufen, Draining, Listener
+//! schalten, Werkzeug-Freigaben ersetzen/verengen) plus die Diagnose ohne
+//! Port: `gateway.health`/`gateway.logs` (lokales harw-Home) und
+//! `gateway.channels.list`/`gateway.channels.connect_info`
+//! (Kanal-Konfiguration). Nicht Teil von [`register_all`] — die Runtime
+//! registriert sie über ihre Gateway-Contributors nur für eine UIA-Wurzel.
+//! Lesende tragen eine freie
+//! `ModelTool`-Fläche, mutierende `approval = "always"` (siehe
+//! `gateway_ops`-Moduldoku und die Regel in der `infra`-Moduldoku).
+//!
 //! **Planungsfläche** ([`register_plan_tools`], 7 Ops, hinter dem
 //! `[tools.plan] enabled`-Gate): `plan`, `goal`, `explore`, `research`,
 //! `research_deps`, `research_web`, `analyze`. Sie bilden zusammen den
@@ -180,6 +193,12 @@ pub mod dream_run;
 pub mod effort;
 pub mod explore;
 pub mod export;
+// R18 (D-B, F1): `gateway.*` — Gateway-Inspektion/-Verwaltung über
+// `Arc<dyn GatewayPort>` plus Diagnose ohne Port (`gateway.health`/`.logs`,
+// `gateway.channels.*`).
+// Nicht Teil von `register_all`: registrieren die Gateway-Contributors der
+// Runtime, nur für die UIA.
+pub mod gateway_ops;
 pub mod goal;
 pub mod help;
 // Crypto-Infrastruktur H5: `infra.*` (Status, Health, AuthHub-Schlüssel).

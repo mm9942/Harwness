@@ -1761,7 +1761,8 @@ impl ShellToolProvider {
             JsonSchema {
                 schema_type: Some(JsonSchemaType::String),
                 description: Some(
-                    "Shell command to execute in the isolated project sandbox. Uses /bin/sh -c."
+                    "Shell command to execute in the isolated project sandbox. Runs as \
+                     /bin/sh -c: POSIX sh (dash on Debian), not bash."
                         .to_owned(),
                 ),
                 ..Default::default()
@@ -1829,6 +1830,30 @@ impl Default for ShellToolProvider {
     }
 }
 
+/// Model-facing description of `shell.exec`.
+///
+/// R18 F3/F7/F1: the command runs under `/bin/sh` (dash on Debian), not bash —
+/// the interpreter is deliberately not switched (minimal sandbox images,
+/// identical behavior on host and sandbox), so the description states the
+/// POSIX rules. It also steers file edits to `fs.edit`/`fs.write` and gateway
+/// management to the `gateway.*` tools instead of the `harw` binary.
+pub const SHELL_EXEC_DESCRIPTION: &str = "Execute a shell command inside the isolated project sandbox. \
+    Runs under Bubblewrap via /bin/sh -c and captures stdout+stderr. \
+    The shell is POSIX /bin/sh (dash on Debian), not bash: no `source`, use `.` \
+    (e.g. `. \"$HOME/.cargo/env\"`); no bash arrays, no `[[ ]]` (use `[ ]`), no `{a,b}` \
+    brace expansion, no `<<<` here-strings. \
+    Do not edit or create files through shell heredocs, `sed -i`, or `python3 -`; \
+    use fs.edit / fs.write instead. \
+    Do not run `harw ...` (e.g. `harw gateway`, `harw channel`) to inspect or manage the \
+    gateway: the harw binary is not available in the sandbox; use the gateway.* tools. \
+    For long-running work (builds, test suites, servers) prefer job.start. \
+    Requires ExecuteProcess permission. Default timeout 30 s, build/test \
+    commands (cargo, make, npm, pytest, go, ...) 600 s; for long commands set \
+    timeout_secs explicitly (capped by [shell] max_timeout_secs, default 900). \
+    If the sandbox blocks the command \
+    (network, path outside, missing tool, namespace), you may retry with \
+    request_host {reason} to ask the user for Host-Mode.";
+
 impl ToolProvider for ShellToolProvider {
     /// Returns the single tool specification for `shell.exec`.
     ///
@@ -1854,15 +1879,7 @@ impl ToolProvider for ShellToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec::Function(FunctionToolSpec {
             name: ToolName::new(TOOL_NAME),
-            description: "Execute a shell command inside the isolated project sandbox. \
-                Runs under Bubblewrap via /bin/sh -c and captures stdout+stderr. \
-                Requires ExecuteProcess permission. Default timeout 30 s, build/test \
-                commands (cargo, make, npm, pytest, go, ...) 600 s; for long commands set \
-                timeout_secs explicitly (capped by [shell] max_timeout_secs, default 900). \
-                If the sandbox blocks the command \
-                (network, path outside, missing tool, namespace), you may retry with \
-                request_host {reason} to ask the user for Host-Mode."
-                .to_owned(),
+            description: SHELL_EXEC_DESCRIPTION.to_owned(),
             parameters: Self::parameter_schema(),
             strict: true,
         })]
@@ -2011,6 +2028,34 @@ mod tests {
         let tools = provider.tools();
         assert_eq!(tools.len(), 1, "provider must expose exactly one tool");
         assert_eq!(tools[0].name(), TOOL_NAME);
+    }
+
+    /// R18 EX-03/EX-04: the description states POSIX sh and steers file edits
+    /// to `fs.*` and gateway management to `gateway.*`.
+    #[test]
+    fn test_description_states_posix_sh_and_steers_edits_and_gateway() -> TestResult {
+        let provider = ShellToolProvider::new();
+        let tools = provider.tools();
+        let ToolSpec::Function(spec) =
+            tools.first().ok_or(TestError::Missing("shell.exec spec"))?;
+        let text = spec.description.as_str();
+        for needle in [
+            "POSIX /bin/sh",
+            "dash",
+            "no `source`, use `.`",
+            "no bash arrays",
+            "[[ ]]",
+            "fs.edit",
+            "fs.write",
+            "python3 -",
+            "heredoc",
+            "harw",
+            "gateway.*",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in {text}");
+        }
+        assert_eq!(text, SHELL_EXEC_DESCRIPTION);
+        Ok(())
     }
 
     #[test]

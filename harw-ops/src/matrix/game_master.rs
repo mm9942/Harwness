@@ -5,7 +5,7 @@
 //! per `transfer_to_matrix-game-master` als Hintergrund-Kind, er entwirft aus
 //! dem Freitext der Nutzerin ein Szenario, lässt es freigeben, spielt es mit
 //! dem vorhandenen Runner durch (Sitz-Agenten als seine Kinder) und liefert
-//! AAR plus `report.md`. Seine Werkzeugfläche sind genau diese fünf
+//! AAR plus `report.md`. Seine Werkzeugfläche sind genau diese sechs
 //! Operationen:
 //!
 //! | Werkzeug | Wirkung | Freigabe |
@@ -36,11 +36,13 @@
 //!
 //! # Sicherheit
 //! - Kein Werkzeug liest beliebige Dateien: Szenarien kommen nur aus dem
-//!   Bündel oder dem Matrix-Speicher des Profils (Slug-Grammatik, keine
-//!   Pfade).
-//! - Geschrieben wird nur in den Matrix-Speicher des Profils und — von
-//!   [`MATRIX_FINISH`], freigabepflichtig — genau eine neue Datei
-//!   `<workspace>/matrix/<szenario>-<lauf>.md` (nie überschreibend, kein
+//!   Bündel oder, per Slug (Slug-Grammatik, keine Pfade), aus dem
+//!   Matrix-Speicher im Profil des an die Sitzung gebundenen Root-Space
+//!   (`harw_home::ResolvedHomeContext`; ohne Bindung kein Entwurf und kein
+//!   Start, kein Rückfall auf `HARW_HOME`).
+//! - Geschrieben wird nur in diesen Matrix-Speicher des gebundenen
+//!   Root-Space und — von [`MATRIX_FINISH`], freigabepflichtig — genau eine
+//!   neue Datei `<workspace>/matrix/<szenario>-<lauf>.md` (nie überschreibend, kein
 //!   Symlink-Ziel). Das ist eine enge, dokumentierte Ausnahme wie `plan.write`;
 //!   die Sandbox des Game Masters selbst bleibt nur lesend und ohne Netz.
 //! - Würfel wirft ausschließlich die Engine (`harw-matrix-game`), nie das
@@ -96,7 +98,7 @@ const MAX_SCENARIO_BYTES: usize = 256 * 1024;
 /// Unterordner der Workspace-Kopie des Berichts.
 pub const WORKSPACE_REPORT_DIR: &str = "matrix";
 
-/// Die fünf Game-Master-Operationen in Werkzeugreihenfolge — Eingabe des
+/// Die sechs Game-Master-Operationen in Werkzeugreihenfolge — Eingabe des
 /// rollengebundenen `ModelToolProvider` in `harw-runtime/src/children.rs`.
 #[must_use]
 pub fn game_master_operations() -> Vec<Arc<dyn Operation>> {
@@ -385,10 +387,13 @@ pub fn scenario_summary(loaded: &LoadedScenario) -> String {
 
 // ── Operationen ──────────────────────────────────────────────────────────────
 
-/// `matrix.draft_scenario`: Szenario validieren und im Matrix-Speicher ablegen.
+/// `matrix.draft_scenario`: Szenario validieren und im Matrix-Speicher des
+/// gebundenen Root-Space ablegen.
 ///
 /// # Errors
-/// Siehe [`save_draft`].
+/// - [`OpError::NotAvailable`], wenn an die Sitzung kein Root-Space gebunden
+///   ist.
+/// - Siehe [`save_draft`].
 #[operation(
     name = "matrix.draft_scenario",
     summary = "Validiert ein Matrix-Game-Szenario (TOML, harwness.matrix-scenario/v1) und speichert es als Entwurf; liefert die Zusammenfassung zur Freigabe. Bei Befunden korrigieren und erneut aufrufen.",
@@ -397,10 +402,10 @@ pub fn scenario_summary(loaded: &LoadedScenario) -> String {
     model_tool(approval = "none")
 )]
 async fn matrix_draft_scenario(
-    _ctx: &OpContext,
+    ctx: &OpContext,
     args: DraftScenarioArgs,
 ) -> Result<OpOutput, OpError> {
-    let root = matrix_root()?;
+    let root = matrix_root(ctx)?;
     let (path, loaded) = save_draft(
         &root,
         &args.toml,
@@ -424,7 +429,8 @@ async fn matrix_draft_scenario(
 }
 
 /// `matrix.status`: Stand eines Laufs, Liste der Szenarien oder Quelltext
-/// eines Beispiels.
+/// eines Beispiels. Ohne gebundenen Root-Space löst `example` nur gebündelte
+/// Szenarien auf, und die Liste zeigt keine Entwürfe.
 ///
 /// # Errors
 /// [`OpError::InvalidArguments`] bei unbekanntem Beispiel oder Lauf.
@@ -437,7 +443,7 @@ async fn matrix_draft_scenario(
 )]
 async fn matrix_status(ctx: &OpContext, args: StatusArgs) -> Result<OpOutput, OpError> {
     if let Some(example) = args.example.as_deref().filter(|e| !e.trim().is_empty()) {
-        let root = matrix_root().ok();
+        let root = matrix_root(ctx).ok();
         let resolved = resolve_known_scenario(example, root.as_deref())?;
         return Ok(OpOutput {
             text: resolved.source,
@@ -447,7 +453,7 @@ async fn matrix_status(ctx: &OpContext, args: StatusArgs) -> Result<OpOutput, Op
     match session_run_id(args.run_id, ctx.session_id().as_str()) {
         Ok(id) => show_output(&id),
         Err(_) => {
-            let saved = matrix_root()
+            let saved = matrix_root(ctx)
                 .map(|root| saved_scenarios(&root))
                 .unwrap_or_default();
             let bundled: Vec<&str> = BUNDLED.iter().map(|(file, _)| *file).collect();
@@ -470,8 +476,11 @@ async fn matrix_status(ctx: &OpContext, args: StatusArgs) -> Result<OpOutput, Op
 /// `matrix.start`: eröffnet einen Lauf aus einem freigegebenen Entwurf.
 ///
 /// # Errors
-/// [`OpError::InvalidArguments`] bei unbekanntem Szenario (Freitext →
-/// Hinweis auf `matrix.draft_scenario`).
+/// - [`OpError::NotAvailable`], wenn an die Sitzung kein Root-Space gebunden
+///   ist (auch für gebündelte Szenarien: das Laufverzeichnis liegt im
+///   Matrix-Speicher).
+/// - [`OpError::InvalidArguments`] bei unbekanntem Szenario (Freitext →
+///   Hinweis auf `matrix.draft_scenario`).
 #[operation(
     name = "matrix.start",
     summary = "Eröffnet einen Matrix-Game-Lauf aus einem gespeicherten Entwurf (Slug) oder gebündelten Szenario — erst nach Freigabe der Szenario-Zusammenfassung durch die Nutzerin.",
@@ -480,7 +489,7 @@ async fn matrix_status(ctx: &OpContext, args: StatusArgs) -> Result<OpOutput, Op
     model_tool(approval = "always")
 )]
 async fn matrix_start(ctx: &OpContext, args: StartArgs) -> Result<OpOutput, OpError> {
-    let root = matrix_root()?;
+    let root = matrix_root(ctx)?;
     let resolved = resolve_known_scenario(&args.scenario, Some(&root))?;
     let summary = scenario_summary(&resolved.loaded);
     let (mut out, run_id) = start_run(ctx, resolved, args.seed)?;
@@ -710,6 +719,7 @@ async fn matrix_add_fact(ctx: &OpContext, args: AddFactArgs) -> Result<OpOutput,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harw_operations::context::ServiceMap;
     use harw_operations::{ApprovalPolicy, FromRawArgs, Surface};
     use harw_registry_defaults::profile::MATRIX_GAME_MASTER_TOOLS;
 
@@ -805,6 +815,70 @@ mod tests {
             .ok_or("ungültiges Szenario muss abgewiesen werden")?;
         assert!(error.to_string().contains("korrigieren"), "{error}");
         assert!(save_draft(tmp.path(), "   ", None, false).is_err());
+        Ok(())
+    }
+
+    /// Die Werkzeuge des Game Masters lesen und schreiben den Matrix-Speicher
+    /// des an die Sitzung gebundenen Root-Space; ohne Bindung gibt es weder
+    /// Entwurf noch Start und in der Liste keine Entwürfe (kein Rückfall auf
+    /// `HARW_HOME`).
+    #[tokio::test]
+    async fn game_master_store_follows_the_bound_home() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let home = crate::config_util::test_home_context(tmp.path())?;
+        let root = harw_home::matrix_dir(&home.profile_dir);
+        let mut services = ServiceMap::new();
+        services.insert(home);
+        let bound = crate::knowledge_test_support::op_context(services)?;
+        let unbound = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+        let source = KARST.replace("id = \"karst-wasserkrise\"", "id = \"karst-gebunden\"");
+
+        matrix_draft_scenario(
+            &bound,
+            DraftScenarioArgs {
+                toml: source.clone(),
+                slug: None,
+                overwrite: None,
+            },
+        )
+        .await?;
+        let draft = root.join(SCENARIOS_DIR).join("karst-gebunden.toml");
+        assert!(draft.is_file(), "{}", draft.display());
+
+        let listed = matrix_status(&bound, StatusArgs::default())
+            .await?
+            .data
+            .ok_or("status ohne Daten")?;
+        assert_eq!(listed["saved"], json!(["karst-gebunden"]));
+        let listed = matrix_status(&unbound, StatusArgs::default())
+            .await?
+            .data
+            .ok_or("status ohne Daten")?;
+        assert_eq!(listed["saved"], json!([]));
+
+        let refused = matrix_draft_scenario(
+            &unbound,
+            DraftScenarioArgs {
+                toml: source,
+                slug: None,
+                overwrite: None,
+            },
+        )
+        .await
+        .err()
+        .ok_or("Entwurf ohne gebundenen Root-Space muss scheitern")?;
+        assert!(matches!(refused, OpError::NotAvailable(_)), "{refused}");
+        let refused = matrix_start(
+            &unbound,
+            StartArgs {
+                scenario: "karst-gebunden".to_owned(),
+                seed: None,
+            },
+        )
+        .await
+        .err()
+        .ok_or("Laufstart ohne gebundenen Root-Space muss scheitern")?;
+        assert!(matches!(refused, OpError::NotAvailable(_)), "{refused}");
         Ok(())
     }
 

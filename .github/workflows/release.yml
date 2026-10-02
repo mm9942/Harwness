@@ -176,13 +176,27 @@ jobs:
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           s3() { aws s3 cp --endpoint-url "$endpoint" --only-show-errors "$@"; }
           cd dist
+          # Versioned source tarball of the tag: the installer's source path
+          # prefers it (checked against SHA256SUMS) over Harwness-main.zip.
+          version="${tag#v}"
+          git -C .. archive --format=tar.gz --prefix="harwness-${version}/" \
+            -o "$PWD/harwness-${version}-source.tar.gz" HEAD
           sha256sum -- *.tar.gz > SHA256SUMS
           for file in *.tar.gz SHA256SUMS; do
             s3 "$file" "s3://${R2_BUCKET}/${R2_PREFIX}/${tag}/${file}"
           done
+          # Source archive of the tag for the installer's source path
+          # (install.sh without a release for this machine).
+          git -C .. archive --format=zip --prefix=Harwness-main/ -o "$PWD/Harwness-main.zip" HEAD
+          s3 Harwness-main.zip "s3://${R2_BUCKET}/${R2_PREFIX}/Harwness-main.zip" \
+            --content-type "application/zip" --cache-control "no-cache"
           s3 ../scripts/install.sh "s3://${R2_BUCKET}/${R2_PREFIX}/install.sh" \
             --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
-          # `latest` last, so it never points at a half-uploaded tag.
+          # version.json (release manifest) and `latest` last, so neither
+          # points at a half-uploaded tag.
+          ../scripts/release-manifest.sh "$tag" . > version.json
+          s3 version.json "s3://${R2_BUCKET}/${R2_PREFIX}/version.json" \
+            --content-type "application/json; charset=utf-8" --cache-control "no-cache"
           printf '%s\n' "$tag" > latest
           s3 latest "s3://${R2_BUCKET}/${R2_PREFIX}/latest" \
             --content-type "text/plain; charset=utf-8" --cache-control "no-cache"

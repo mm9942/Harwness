@@ -4,7 +4,7 @@
 use harw_types::{SessionId, ThreadId, TokenUsage, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 
-use crate::items::{ToolCallResult, TurnItem};
+use crate::items::{ToolCallResult, ToolPlacement, TurnItem};
 
 /// Lifecycle eines kompletten Sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +71,11 @@ pub enum TurnEvent {
         /// Explicit success/error wire outcome for the completed call.
         result: ToolCallResult,
         duration_ms: u64,
+        /// Wo der Aufruf tatsächlich lief (R18 D-D). Fehlt bei älteren
+        /// Sendern und bei Aufrufen, deren Ort unbekannt ist; Oberflächen
+        /// zeigen dann keinen Ort statt „host“ zu raten.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement: Option<ToolPlacement>,
     },
     /// Alle Aktionen abgeschlossen, Antwort finalisiert.
     TurnCompleted {
@@ -444,6 +449,61 @@ mod tests {
             "mode": "plan",
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
+    }
+
+    /// R18 D-D: `placement` ist additiv. Ältere Sender ohne das Feld bleiben
+    /// lesbar (`None`), `None` wird nicht serialisiert (alte Wire-Form bleibt
+    /// byte-gleich), ein gesetzter Ort macht den Roundtrip.
+    #[test]
+    fn tool_call_completed_placement_is_additive() -> TestResult {
+        let legacy = json!({
+            "type": "tool_call_completed",
+            "turn_id": "turn-1",
+            "call_id": "call-1",
+            "result": {"status": "success", "value": 1},
+            "duration_ms": 5,
+        });
+        let event: TurnEvent =
+            serde_json::from_value(legacy.clone()).map_err(ctx("Alt-Event deserialisiert"))?;
+        match &event {
+            TurnEvent::ToolCallCompleted { placement, .. } => assert_eq!(placement, &None),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
+        }
+        let rewritten = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
+        assert_eq!(rewritten, legacy);
+
+        let placed = TurnEvent::ToolCallCompleted {
+            turn_id: TurnId::try_from_str("turn-2").map_err(ctx("gültige TurnId"))?,
+            call_id: ToolCallId::try_from_str("call-2").map_err(ctx("gültige ToolCallId"))?,
+            result: ToolCallResult::success(json!("ok")),
+            duration_ms: 9,
+            placement: Some(ToolPlacement::Gateway {
+                node: Some("gw-1".to_owned()),
+            }),
+        };
+        let value = serde_json::to_value(&placed).map_err(ctx("Event serialisiert"))?;
+        assert_eq!(
+            value["placement"],
+            json!({"kind": "gateway", "node": "gw-1"})
+        );
+        match serde_json::from_value::<TurnEvent>(value).map_err(ctx("Event deserialisiert"))? {
+            TurnEvent::ToolCallCompleted { placement, .. } => assert_eq!(
+                placement,
+                Some(ToolPlacement::Gateway {
+                    node: Some("gw-1".to_owned())
+                })
+            ),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
+        }
         Ok(())
     }
 

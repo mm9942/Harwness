@@ -981,6 +981,7 @@ Rebindable via `[tui].keybindings_file` (a flat TOML table `action =
 | `Ctrl+E` | focus the explorer (`focus_explorer`) |
 | `Ctrl+O` | toggle tool cells (`toggle_tool_cells`), also mid-turn |
 | `Ctrl+H` | end a host work phase (`end_host_mode`), also a process-wide one from `/sandbox-lease` or `request_host`; together with the typed `/sandbox-lease revoke` the only way to end one (no expiry, the model cannot end it) |
+| `Ctrl+L` | redraw the whole screen (`redraw_screen`), also mid-turn; every terminal resize does the same once. Clears leftovers when a terminal emulator (tmux, phone terminals) counts a glyph width differently than ratatui |
 | `Ctrl+K` | delete the input line (`delete_line`) |
 | `Ctrl+J` | insert a newline (`insert_newline`) |
 | `Shift+Tab` | approval cycle `ask → auto → full → plan → ask` (`cycle_permission_mode`); the `plan` step is plan mode (marker "⏸ plan mode on (shift+tab to cycle)", the lock is immediate); has no effect while a `/`-popup is open |

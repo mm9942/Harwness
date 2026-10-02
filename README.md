@@ -8,6 +8,14 @@ The runtime separates model output from authority. Agents may propose actions, b
 
 > **Status:** active development. The workspace version is defined in `Cargo.toml`. Interfaces and configuration may change between revisions.
 
+## What Harwness is for
+
+Harwness is for developers running coding, research, and operational agents that need explicit tool permissions, approvals, durable jobs, and traceable execution. The `harw` command provides the interactive entry point; Rust applications can integrate through `harwness-sdk`.
+
+The workspace also contains Detect · Orient · Defend (DoD), an optional host-security domain with its own sensors and privileged enforcement components. Running the agent harness does not require enabling DoD.
+
+[Get started](#installation) · [CLI reference](docs/cli.md) · [Documentation](docs/README.md) · [Contribute](CONTRIBUTING.md) · [Security policy](SECURITY.md)
+
 ## Architecture
 
 ```text

@@ -73,3 +73,79 @@ pub(crate) fn ctx<E: std::fmt::Display>(context: &'static str) -> impl FnOnce(E)
         source: source.to_string(),
     }
 }
+
+/// Gateway-Port ohne Gateway (R18 D-B): jede Methode meldet
+/// `PortError::Transport`. Für Tests, die nur prüfen, **wo** der Port landet
+/// (Service-Maps, Registrierung der `gateway.*`-Operationen).
+pub(crate) struct NullGatewayPort;
+
+fn null_port<'a, T: Send + 'a>() -> harw_protocol::PortFuture<'a, T> {
+    Box::pin(std::future::ready(Err(
+        harw_protocol::PortError::Transport("null gateway port".to_owned()),
+    )))
+}
+
+impl harw_protocol::GatewayPort for NullGatewayPort {
+    fn status(&self) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayStatus> {
+        null_port()
+    }
+
+    fn connections(
+        &self,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayConnectionsResult> {
+        null_port()
+    }
+
+    fn sessions(
+        &self,
+    ) -> harw_protocol::PortFuture<'_, Vec<harw_protocol::session_wire::SessionSummary>> {
+        null_port()
+    }
+
+    fn listeners(
+        &self,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayListenersResult> {
+        null_port()
+    }
+
+    fn tools(
+        &self,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayToolsResult> {
+        null_port()
+    }
+
+    fn revoke_connection(
+        &self,
+        _params: harw_protocol::session_wire::GatewayRevokeParams,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayRevokeResult> {
+        null_port()
+    }
+
+    fn drain(
+        &self,
+        _params: harw_protocol::session_wire::GatewayDrainParams,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayStatus> {
+        null_port()
+    }
+
+    fn set_listener(
+        &self,
+        _params: harw_protocol::session_wire::GatewayListenerSetParams,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayListenerInfo> {
+        null_port()
+    }
+
+    fn grant_tools(
+        &self,
+        _params: harw_protocol::session_wire::GatewayToolRightsParams,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayToolRights> {
+        null_port()
+    }
+
+    fn narrow_tools(
+        &self,
+        _params: harw_protocol::session_wire::GatewayToolRightsParams,
+    ) -> harw_protocol::PortFuture<'_, harw_protocol::session_wire::GatewayToolRights> {
+        null_port()
+    }
+}

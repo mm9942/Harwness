@@ -1,0 +1,34 @@
+[package]
+publish.workspace = true
+name = "harw-session-host"
+description = "Persistent session control plane host: single writer of hosted sessions, attach/replay/fan-out, input arbitration, approvals and capability/tenant admission (W00 §2.4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+harw-session-store = { path = "../harw-session-store" }
+harw-fsutil = { path = "../harw-fsutil" }
+# R18 D-A: gateway tool host. Executors and their vocabulary (`harw-tools`),
+# the gateway-side sandbox authority (`harw-authority`: `SandboxSpec`,
+# `ensure_child_of`) and the process sandbox probe (`harw-sandbox`:
+# `BwrapLauncher::discover`). None of them reaches hyper or tungstenite.
+harw-tools = { path = "../harw-tools" }
+harw-authority = { path = "../harw-authority" }
+harw-sandbox = { path = "../harw-sandbox" }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+
+[lints]
+workspace = true

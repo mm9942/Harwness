@@ -51,6 +51,15 @@ use std::path::{Component, Path};
 /// Rechte-Bits neu angelegter Dateien (unabhängig vom `umask`).
 const NEW_FILE_MODE: u32 = 0o644;
 
+/// R18 F7: Lenkungssatz für die Modellbeschreibung von `fs.write`.
+///
+/// Gegenstück zu [`crate::edit::FS_EDIT_STEERING`]: neue Dateien und
+/// vollständige Neufassungen gehen über `fs.write`, nie über Shell-Umwege.
+/// Die Beschreibung in `provider.rs` hängt diesen Satz an.
+pub const FS_WRITE_STEERING: &str = "Use fs.write to create a file or replace its whole \
+    content, and fs.edit for partial changes. Never write files through shell.exec \
+    heredocs (cat > file <<EOF), echo/printf redirection or python3 -.";
+
 /// Pfadkomponenten, unter die `fs.write` nie schreibt.
 ///
 /// `.harw` bleibt fest geschützt, auch wenn eine personalisierte harw (#22)
@@ -659,5 +668,17 @@ mod tests {
         assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
         assert!(!fixture.outside.join("file.txt").exists());
         Ok(())
+    }
+
+    /// R18 EX-04: der Lenkungssatz nennt das Werkzeug und die Shell-Umwege,
+    /// die er ersetzt.
+    #[test]
+    fn fs_write_steering_names_the_shell_detours() {
+        for needle in ["fs.write", "fs.edit", "heredoc", "python3 -", "shell.exec"] {
+            assert!(
+                FS_WRITE_STEERING.contains(needle),
+                "missing {needle:?} in {FS_WRITE_STEERING}"
+            );
+        }
     }
 }

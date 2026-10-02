@@ -18,6 +18,15 @@
 //! `<profil>/skills/<name>/`; einem Agenten zugewiesen wird der Skill dadurch
 //! nicht.
 //!
+//! # Root-Space
+//! Ohne injizierten Dienst lesen und schreiben `activate`/`deactivate` und die
+//! Vorschlags-Aktionen ausschließlich im an die Sitzung gebundenen Root-Space
+//! (`Arc<harw_home::ResolvedHomeContext>` in der `ServiceMap`, von der
+//! Laufzeit auf jeder Oberfläche eingetragen); `<profil>` ist dessen
+//! Profilverzeichnis. Fehlt die Bindung, antworten sie mit
+//! [`OpError::NotAvailable`] — es gibt keinen Rückfall auf `HARW_HOME` oder
+//! `~/.harw`.
+//!
 //! # Verantwortungsbereich
 //! Implementiert die `skills`-Operation ausschließlich als `/skills`-Command
 //! (`channel_reduced`); sie wird nicht als Model-Tool exponiert, weil das
@@ -31,7 +40,8 @@
 //!   des `enabled`-Felds; per `Arc<dyn SkillStatePersistence>` in der
 //!   `ServiceMap` injizierbar.
 //! - [`LayeredSkillStatePersistence`] — Standard-Implementierung über die
-//!   vertrauten Config-Layer (`harw_home::config_layers`).
+//!   vertrauten Config-Layer des gebundenen Root-Space
+//!   ([`LayeredSkillStatePersistence::from_home_context`]).
 //! - [`SkillStateOutcome`] — Ergebnis einer Umschaltung (Manifest-Pfad,
 //!   ob tatsächlich geschrieben wurde).
 //!
@@ -44,8 +54,9 @@
 //! Wie `harw_config::discover_config` gewinnt der **letzte** vertraute Layer,
 //! und innerhalb eines Layers das nach Verzeichnisnamen letzte Manifest, dessen
 //! `name`-Feld passt. Genau diese Datei wird geändert — also die, aus der die
-//! geladene Konfiguration den Skill tatsächlich bezieht. Nicht vertraute
-//! Repo-Layer liefert `harw_home::config_layers` gar nicht erst.
+//! geladene Konfiguration den Skill tatsächlich bezieht. Die Layer stammen aus
+//! dem gebundenen Root-Space (Root, dessen Profil, vertrauter Repo-Layer);
+//! nicht vertraute Repo-Layer liefert die Layer-Auflösung gar nicht erst.
 //!
 //! # Surface-Matrix
 //! | Surface | Sichtbarkeit      |
@@ -162,10 +173,12 @@ pub struct SkillStateOutcome {
 ///
 /// # Beschreibung
 /// Die `/skills`-Operation fragt zuerst `Arc<dyn SkillStatePersistence>` aus der
-/// [`harw_operations::context::ServiceMap`] ab und fällt ohne registrierten
-/// Dienst auf [`LayeredSkillStatePersistence::from_home`] zurück. Tests und
-/// Oberflächen mit eigener Config-Wurzel injizieren so eine eigene
-/// Implementierung, ohne `HARW_HOME` zu verändern.
+/// [`harw_operations::context::ServiceMap`] ab. Ohne registrierten Dienst baut
+/// sie [`LayeredSkillStatePersistence::from_home_context`] über den an die
+/// Sitzung gebundenen Root-Space (`Arc<harw_home::ResolvedHomeContext>`); ohne
+/// Bindung ist die Umschaltung [`OpError::NotAvailable`], ein Rückfall auf
+/// `HARW_HOME` findet nicht statt. Tests und Oberflächen mit eigener
+/// Config-Wurzel injizieren eine eigene Implementierung.
 ///
 /// # Nebenläufigkeit
 /// `Send + Sync`; Implementierungen sichern parallele Schreibzugriffe auf
@@ -226,17 +239,25 @@ impl LayeredSkillStatePersistence {
         Self { layers }
     }
 
-    /// Erstellt die Persistenz über die vertrauten Layer des aktiven `HARW_HOME`.
+    /// Erstellt die Persistenz über die vertrauten Layer eines gebundenen
+    /// Root-Space.
+    ///
+    /// # Beschreibung
+    /// Layer in aufsteigender Präzedenz: Root-Space, dessen Profilverzeichnis
+    /// (aus der Bindung, nicht aus `HARW_PROFILE`), dann der vertraute
+    /// Repo-Layer, falls freigegeben. Das ist der Standardweg von `/skills`.
+    ///
+    /// # Argumente
+    /// - `home` (`&harw_home::ResolvedHomeContext`): der an die Sitzung
+    ///   gebundene Root-Space.
     ///
     /// # Fehler
-    /// - [`OpError::Execution`]: Home oder Layer nicht auflösbar.
-    pub fn from_home() -> Result<Self, OpError> {
-        let home = harw_home::home_dir()
-            .map_err(|error| OpError::Execution(format!("HARW_HOME nicht auflösbar: {error}")))?;
-        let layers = harw_home::config_layers(&home).map_err(|error| {
-            OpError::Execution(format!("Config-Layer nicht auflösbar: {error}"))
-        })?;
-        Ok(Self::new(layers))
+    /// - [`OpError::Execution`]: Layer nicht auflösbar (Trust-Store unlesbar,
+    ///   Projekt-Root nicht kanonisierbar, ungültiger Profilname).
+    pub fn from_home_context(home: &harw_home::ResolvedHomeContext) -> Result<Self, OpError> {
+        crate::config_util::bound_config_layers(home)
+            .map(Self::new)
+            .map_err(|error| OpError::Execution(format!("Config-Layer nicht auflösbar: {error}")))
     }
 
     /// Findet das wirksame Manifest des Skills `name` samt aktuellem `enabled`.
@@ -328,38 +349,39 @@ fn read_failed(path: &Path, error: std::io::Error) -> OpError {
     OpError::Execution(format!("'{}' ist nicht lesbar: {error}", path.display()))
 }
 
-/// Liefert den injizierten Persistenzdienst oder die Layer-Standardimplementierung.
+/// Liefert den injizierten Persistenzdienst oder die Layer-Standardimplementierung
+/// über den an die Sitzung gebundenen Root-Space.
 ///
 /// # Fehler
-/// - [`OpError::Execution`]: kein Dienst registriert und `HARW_HOME`/Layer
-///   nicht auflösbar.
+/// - [`OpError::NotAvailable`]: kein Dienst registriert und kein Root-Space
+///   gebunden (kein Rückfall auf `HARW_HOME`).
+/// - [`OpError::Execution`]: Layer des gebundenen Root-Space nicht auflösbar.
 fn skill_state_persistence(ctx: &OpContext) -> Result<Arc<dyn SkillStatePersistence>, OpError> {
     if let Some(persistence) = ctx.service::<Arc<dyn SkillStatePersistence>>() {
         return Ok(Arc::clone(persistence));
     }
-    Ok(Arc::new(LayeredSkillStatePersistence::from_home()?) as Arc<dyn SkillStatePersistence>)
+    let home = crate::config_util::bound_home(ctx)?;
+    Ok(
+        Arc::new(LayeredSkillStatePersistence::from_home_context(home)?)
+            as Arc<dyn SkillStatePersistence>,
+    )
 }
 
 // ── Skill-Vorschläge ──────────────────────────────────────────────────────────
 
-/// Liefert die injizierte Vorschlagsablage oder die des aktiven Profils
-/// (`<HARW_HOME>/profiles/<aktiv>/skills`).
+/// Liefert die injizierte Vorschlagsablage oder die des Profils im an die
+/// Sitzung gebundenen Root-Space (`<profilverzeichnis>/skills`).
 ///
 /// # Fehler
-/// - [`OpError::Execution`]: kein Dienst registriert und Home/Profil nicht
-///   auflösbar.
+/// - [`OpError::NotAvailable`]: kein Dienst registriert und kein Root-Space
+///   gebunden (kein Rückfall auf `HARW_HOME`).
 fn skill_proposal_store(ctx: &OpContext) -> Result<Arc<SkillProposalStore>, OpError> {
     if let Some(store) = ctx.service::<Arc<SkillProposalStore>>() {
         return Ok(Arc::clone(store));
     }
-    let home = harw_home::home_dir()
-        .map_err(|error| OpError::Execution(format!("HARW_HOME nicht auflösbar: {error}")))?;
-    let profile = harw_home::active_profile_name(&home);
-    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| {
-        OpError::Execution(format!("Profil '{profile}' nicht auflösbar: {error}"))
-    })?;
+    let home = crate::config_util::bound_home(ctx)?;
     Ok(Arc::new(SkillProposalStore::new(
-        profile_dir.join("skills"),
+        home.profile_dir.join("skills"),
     )))
 }
 
@@ -554,12 +576,15 @@ fn render_proposal_review(loaded: &LoadedSkillProposal) -> String {
 }
 
 /// Führt die Vorschlags-Aktionen aus (`proposals`, `review`, `accept`,
-/// `reject`). Braucht keinen Config-Service.
+/// `reject`). Braucht keinen Config-Service, aber eine injizierte Ablage oder
+/// einen gebundenen Root-Space.
 ///
 /// # Fehler
+/// - [`OpError::NotAvailable`]: keine Ablage injiziert und kein Root-Space
+///   gebunden.
 /// - [`OpError::InvalidArguments`]: fehlende/ungültige ID, unbekannter,
 ///   abgelaufener oder nicht offener Vorschlag, ungültiger Kandidat.
-/// - [`OpError::Execution`]: Ablage nicht auflösbar, Lese-/Schreibfehler.
+/// - [`OpError::Execution`]: Lese-/Schreibfehler der Ablage.
 fn run_proposal_action(
     ctx: &OpContext,
     action: &str,
@@ -623,8 +648,13 @@ fn run_proposal_action(
 ///   Config-Laden.
 ///
 /// # Argumente
-/// - `ctx` (`&OpContext`): Ausführungskontext; benötigt `Arc<ResolvedConfig>`,
-///   optional `Arc<dyn SkillStatePersistence>`.
+/// - `ctx` (`&OpContext`): Ausführungskontext; `list`/`show`/`activate`/
+///   `deactivate` benötigen `Arc<ResolvedConfig>` (oder die Live-Config).
+///   `activate`/`deactivate` nutzen einen injizierten
+///   `Arc<dyn SkillStatePersistence>`, sonst den gebundenen Root-Space
+///   (`Arc<harw_home::ResolvedHomeContext>`); die Vorschlags-Aktionen ebenso
+///   eine injizierte `Arc<SkillProposalStore>`, sonst das Profil des
+///   gebundenen Root-Space.
 /// - `args` (`SkillsArgs`): Typisierte Sub-Kommando-Argumente.
 ///
 /// # Rückgabe
@@ -632,10 +662,14 @@ fn run_proposal_action(
 ///
 /// # Fehler
 /// - [`OpError::NotAvailable`]: kein `Arc<ResolvedConfig>`-Service (statische
-///   Meldung ohne Echo der Argumente).
+///   Meldung ohne Echo der Argumente); bei `activate`/`deactivate` und den
+///   Vorschlags-Aktionen außerdem, wenn weder ein Dienst injiziert noch ein
+///   Root-Space gebunden ist (kein Rückfall auf `HARW_HOME`).
 /// - [`OpError::InvalidArguments`]: fehlender/unbekannter Skill-Name oder
 ///   unbekanntes Sub-Kommando.
-/// - [`OpError::Execution`]: Persistenzfehler bei `activate`/`deactivate`.
+/// - [`OpError::Execution`]: Persistenzfehler bei `activate`/`deactivate`
+///   (auch: Layer des gebundenen Root-Space nicht auflösbar) oder
+///   Ablagefehler der Vorschlags-Aktionen.
 ///
 /// # Nebenläufigkeit
 /// Zustandslos; Schreibzugriffe sind nicht gegen parallele Aufrufe auf
@@ -1196,6 +1230,67 @@ mod tests {
         Ok(())
     }
 
+    /// Baut einen Kontext mit genau den übergebenen Diensten.
+    fn context_with_services(services: ServiceMap) -> TestResult<(OpContext, PathBuf)> {
+        let (base, root) = test_context()?;
+        Ok((
+            OpContext::new(
+                base.session_id().clone(),
+                base.turn_id().clone(),
+                base.sandbox().clone(),
+                services,
+            ),
+            root,
+        ))
+    }
+
+    /// Ohne injizierte Persistenz schreibt `deactivate` in die Layer des
+    /// gebundenen Root-Space — nie über `HARW_HOME`.
+    #[tokio::test]
+    async fn skills_deactivate_writes_the_manifest_of_the_bound_home() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        // Root-Layer statt Profil-Layer: unabhängig von `HARW_PROFILE`.
+        let manifest =
+            write_manifest(temp.path(), "review", "name = \"review\"\nenabled = true\n")?;
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(review_config()));
+        services.insert(crate::config_util::test_home_context(temp.path())?);
+        let (op_ctx, root) = context_with_services(services)?;
+
+        let result = super::skills(&op_ctx, args("deactivate", Some("review"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        let output = result.map_err(ctx("deactivate"))?;
+        assert!(
+            output.text.contains("'review' deaktiviert"),
+            "{}",
+            output.text
+        );
+        assert!(!read_enabled(&manifest)?);
+        Ok(())
+    }
+
+    /// Ohne Persistenzdienst und ohne gebundenen Root-Space ist `deactivate`
+    /// nicht verfügbar, statt auf den Prozess-Root-Space auszuweichen.
+    #[tokio::test]
+    async fn skills_deactivate_without_persistence_or_bound_home_is_not_available() -> TestResult {
+        let (op_ctx, root) = context_with(None)?;
+        let result = super::skills(&op_ctx, args("deactivate", Some("review"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("Root-Space"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     // ── Skill-Vorschläge ─────────────────────────────────────────────────────
 
     use harw_registry_defaults::skill_proposal_tools::{
@@ -1293,6 +1388,51 @@ mod tests {
         assert!(matches!(accepted, Err(OpError::InvalidArguments(_))));
         assert!(matches!(unknown, Err(OpError::InvalidArguments(_))));
         assert!(!temp.path().join("skills/review").exists());
+        Ok(())
+    }
+
+    /// Ohne injizierte Ablage liest `/skills proposals` das Profil des
+    /// gebundenen Root-Space — nie `HARW_HOME`.
+    #[tokio::test]
+    async fn skill_proposals_default_to_the_bound_profile() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(temp.path())?;
+        let store =
+            SkillProposalStore::new(temp.path().join("profiles").join("default").join("skills"));
+        let id = propose_review_skill(&store)?;
+        let mut services = ServiceMap::new();
+        services.insert(home);
+        let (op_ctx, root) = context_with_services(services)?;
+
+        let listed = super::skills(&op_ctx, args("proposals", None)).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        let listed = listed.map_err(ctx("proposals"))?;
+        assert!(listed.text.contains(&id), "{}", listed.text);
+        Ok(())
+    }
+
+    /// Ohne Ablage und ohne gebundenen Root-Space sind die Vorschlags-Aktionen
+    /// nicht verfügbar, statt auf den Prozess-Root-Space auszuweichen.
+    #[tokio::test]
+    async fn skill_proposals_without_store_or_bound_home_are_not_available() -> TestResult {
+        let (op_ctx, root) = context_with_services(ServiceMap::new())?;
+        let listed = super::skills(&op_ctx, args("proposals", None)).await;
+        let reviewed = super::skills(&op_ctx, args("review", Some("some-proposal"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        for result in [listed, reviewed] {
+            match result {
+                Err(OpError::NotAvailable(message)) => {
+                    assert!(message.contains("Root-Space"), "{message}");
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected NotAvailable, got: {other:?}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -384,6 +384,13 @@ pub struct RuntimeChildRegistryFactory {
     /// Operation wird dennoch montiert, scheitert dann aber beim Aufruf
     /// fail-closed mit `OpError::NotAvailable` (kein StateStore).
     delegate_wave_store: Option<Arc<dyn StateStore>>,
+    /// Der gebundene Root-Space der Wurzel, gesetzt über
+    /// [`Self::with_home_context`]. Die Matrix-Werkzeuge des Game Masters
+    /// lesen ihren Speicher (`<profil>/knowledge/matrix`) ausschließlich von
+    /// dort. `None`: `matrix.start`/`matrix.draft_scenario` scheitern
+    /// fail-closed mit `OpError::NotAvailable`, `matrix.status` listet keine
+    /// Entwürfe; ein Rückfall auf `HARW_HOME` findet nicht statt.
+    home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
     /// Wissensspeicher (und optional Kanban-Ledger) für die lesenden
     /// Wissenswerkzeuge der Kinder (Plan Teil D). `None`, solange
     /// [`Self::with_knowledge`] nicht aufgerufen wurde — dann bekommt kein
@@ -520,6 +527,7 @@ impl RuntimeChildRegistryFactory {
             host_permit_wiring: None,
             skill_catalog: None,
             delegate_wave_store: None,
+            home_context: None,
             knowledge: None,
             diary: None,
             uia_worker_routing: None,
@@ -970,6 +978,25 @@ impl RuntimeChildRegistryFactory {
         self
     }
 
+    /// Hinterlegt den gebundenen Root-Space der Wurzel für die
+    /// Matrix-Werkzeuge des Game Masters.
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_delegate_wave_store`].
+    /// Danach trägt der `OpContext` jedes Matrix-Werkzeugs
+    /// (`matrix_game_master_provider`) diesen Kontext; ohne Aufruf
+    /// scheitern die Operationen, die den Matrix-Speicher brauchen,
+    /// fail-closed statt auf `HARW_HOME` zurückzufallen.
+    ///
+    /// # Arguments
+    /// - `context` (`Arc<ResolvedHomeContext>`): dieselbe Instanz, die die
+    ///   Montage an [`crate::RuntimeServices::with_home_context`] übergibt.
+    #[must_use]
+    pub fn with_home_context(mut self, context: Arc<harw_home::ResolvedHomeContext>) -> Self {
+        self.home_context = Some(context);
+        self
+    }
+
     /// Hinterlegt den Wissensspeicher für die lesenden Wissenswerkzeuge der
     /// Kinder (Plan Teil D: „Agenten dürfen Workbench, Palace und Diary
     /// lesen“; Kanban nur der Root-Orchestrator).
@@ -1329,31 +1356,29 @@ impl RuntimeChildRegistryFactory {
     /// Die Matrix-Werkzeuge des Game Masters (Runde 7, Teil M).
     ///
     /// # Description
-    /// Baut einen [`ModelToolProvider`] mit genau den fünf Operationen aus
+    /// Baut einen [`ModelToolProvider`] mit genau den sechs Operationen aus
     /// `harw_ops::matrix::game_master::game_master_operations`
     /// (`matrix.draft_scenario`, `matrix.status`, `matrix.start`,
-    /// `matrix.run`, `matrix.finish`) — nur für die Rolle
+    /// `matrix.run`, `matrix.finish`, `matrix.add_fact`) — nur für die Rolle
     /// `matrix-game-master` montiert, nie über einen allgemeinen Provider
     /// (Kind-Registries tragen sonst keine Operations-Werkzeuge). Die
-    /// Freigabe folgt der Deklaration der Operationen: `status`/`draft` sind
-    /// auto-freigegeben, `start`/`run`/`finish` laufen durch die Freigabekette
-    /// des Kindes. Der `OpContext` entsteht je Aufruf wie bei
-    /// [`Self::delegate_wave_provider`]: Spawner (schwach gehalten) und
-    /// `StateStore` für die Sitz-Agenten, Sandbox und `CancelToken` aus dem
-    /// Ausführungskontext.
+    /// Freigabe folgt der Deklaration der Operationen: `status`/`draft`/
+    /// `add_fact` sind auto-freigegeben, `start`/`run`/`finish` laufen durch
+    /// die Freigabekette des Kindes. Der `OpContext` entsteht je Aufruf wie
+    /// bei [`Self::delegate_wave_provider`]; seine Dienste stellt
+    /// [`game_master_services`] zusammen: Spawner (schwach gehalten) und
+    /// `StateStore` für die Sitz-Agenten sowie den gebundenen Root-Space
+    /// ([`Self::with_home_context`]) für den Matrix-Speicher. Sandbox und
+    /// `CancelToken` kommen aus dem Ausführungskontext.
     fn matrix_game_master_provider(&self) -> ModelToolProvider {
         let slot = Arc::clone(&self.spawner_slot);
         let state_store = self.delegate_wave_store.clone();
+        let home_context = self.home_context.clone();
         ModelToolProvider::new(
             harw_ops::matrix::game_master::game_master_operations(),
             move |execution_context| {
-                let mut services = ServiceMap::new();
-                if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
-                    services.insert(spawner);
-                }
-                if let Some(store) = &state_store {
-                    services.insert(Arc::clone(store));
-                }
+                let services =
+                    game_master_services(&slot, state_store.as_ref(), home_context.as_ref());
                 let ctx = OpContext::new(
                     execution_context.session_id().clone(),
                     execution_context.turn_id().clone(),
@@ -1525,6 +1550,38 @@ impl RuntimeChildRegistryFactory {
             model_id,
         ))
     }
+}
+
+/// Die Dienste des `OpContext` eines Matrix-Werkzeugs des Game Masters.
+///
+/// # Description
+/// Legt den Spawner (aus dem schwachen Slot, erst hier aufgelöst), den
+/// `StateStore` und den gebundenen Root-Space in die [`ServiceMap`], jeden
+/// nur, wenn er vorhanden ist. Fehlt ein Dienst, scheitert die Operation,
+/// die ihn verlangt, fail-closed mit `OpError::NotAvailable`; insbesondere
+/// liest ohne `home_context` keine Operation den Matrix-Speicher über
+/// `HARW_HOME`.
+///
+/// # Arguments
+/// - `slot`: die Rückwärtsreferenz auf den Managed-Spawner.
+/// - `state_store`: der geteilte `StateStore` des Laufs, falls gesetzt.
+/// - `home_context`: der gebundene Root-Space der Wurzel, falls gesetzt.
+fn game_master_services(
+    slot: &OnceLock<Weak<ManagedAgentSpawner>>,
+    state_store: Option<&Arc<dyn StateStore>>,
+    home_context: Option<&Arc<harw_home::ResolvedHomeContext>>,
+) -> ServiceMap {
+    let mut services = ServiceMap::new();
+    if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
+        services.insert(spawner);
+    }
+    if let Some(store) = state_store {
+        services.insert(Arc::clone(store));
+    }
+    if let Some(context) = home_context {
+        services.insert(Arc::clone(context));
+    }
+    services
 }
 
 impl ChildRegistryFactory for RuntimeChildRegistryFactory {
@@ -2488,7 +2545,7 @@ impl AgentSpawner for DeferredManagedSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn internal_point_for_role_maps_explorer() {
@@ -3901,6 +3958,58 @@ mod tests {
                 assert!(!role_gets_delegate_wave(role), "kein delegate_wave");
             }
         }
+        Ok(())
+    }
+
+    /// Befund c15b: der `OpContext` der Matrix-Werkzeuge trägt den über
+    /// [`RuntimeChildRegistryFactory::with_home_context`] gebundenen
+    /// Root-Space (dieselbe Instanz); ohne Bindung fehlt er, statt über
+    /// `HARW_HOME` ersetzt zu werden.
+    #[test]
+    fn game_master_services_carry_the_bound_home_context() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let project_dir = home.path().join("project");
+        let project = harw_home::ProjectRoot {
+            root: project_dir.clone(),
+            trust_key: project_dir,
+            kind: harw_home::ProjectKind::Directory,
+        };
+        let context = Arc::new(
+            harw_home::ResolvedHomeContext::new(home.path(), "default".to_owned(), project)
+                .map_err(ctx("home context"))?,
+        );
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+
+        let unbound = game_master_services(
+            &factory.spawner_slot,
+            factory.delegate_wave_store.as_ref(),
+            factory.home_context.as_ref(),
+        );
+        assert!(
+            unbound
+                .get::<Arc<harw_home::ResolvedHomeContext>>()
+                .is_none(),
+            "ohne with_home_context kein Root-Space im OpContext"
+        );
+
+        let factory = factory.with_home_context(Arc::clone(&context));
+        let bound = game_master_services(
+            &factory.spawner_slot,
+            factory.delegate_wave_store.as_ref(),
+            factory.home_context.as_ref(),
+        );
+        let found = bound
+            .get::<Arc<harw_home::ResolvedHomeContext>>()
+            .ok_or(TestError::Missing("Game-Master-ServiceMap ohne Root-Space"))?;
+        assert!(
+            Arc::ptr_eq(found, &context),
+            "die ServiceMap muss dieselbe Instanz tragen"
+        );
         Ok(())
     }
 

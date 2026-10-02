@@ -281,6 +281,20 @@ pub struct JobMeta {
     /// von Umgebungsvariablen.
     #[serde(default)]
     pub launch_warnings: Vec<String>,
+    /// R18 (TUI-07): `call_id` des Werkzeugaufrufs, der den Job startete.
+    /// Die Oberfläche verknüpft darüber Job und Werkzeugzelle und zeigt den
+    /// Aufruf in der Job-Detailansicht zuerst. Additiv: fehlt in
+    /// `meta.json` älterer Versionen und bei Starts ohne Werkzeugaufruf
+    /// (Operator-Wege, Kind-Backends); dann nicht serialisiert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_call_id: Option<String>,
+    /// R18: Name des startenden Werkzeugs (z. B. `job.start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_tool: Option<String>,
+    /// R18: Anzeigename des besitzenden Agenten, falls bekannt (sonst gilt
+    /// [`JobOwner::session`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent: Option<String>,
 }
 
 /// Signalnummer von SIGXCPU (CPU-Budget erschöpft) unter Linux.
@@ -455,6 +469,29 @@ mod tests {
         assert!(!owner.may_control(""));
         let chain: Vec<&str> = owner.delivery_chain().collect();
         assert_eq!(chain, vec!["worker", "orchestrator", "uia"]);
+    }
+
+    /// R18 (TUI-07): die Herkunft ist additiv — alte `meta.json` lesen sich
+    /// ohne sie und schreiben sich ohne sie zurück; gesetzt überlebt sie den
+    /// Rundlauf.
+    #[test]
+    fn test_meta_origin_is_additive_and_roundtrips() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        assert_eq!(meta.origin_call_id, None);
+        assert_eq!(meta.origin_tool, None);
+        assert_eq!(meta.owner_agent, None);
+        let plain = serde_json::to_string(&meta).map_err(ctx("serialize plain"))?;
+        for key in ["origin_call_id", "origin_tool", "owner_agent"] {
+            assert!(!plain.contains(key), "{key} in {plain}");
+        }
+
+        meta.origin_call_id = Some("call-7".to_owned());
+        meta.origin_tool = Some("job.start".to_owned());
+        meta.owner_agent = Some("uia".to_owned());
+        let json = serde_json::to_string(&meta).map_err(ctx("serialize origin"))?;
+        let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse origin"))?;
+        assert_eq!(back, meta);
+        Ok(())
     }
 
     fn v1_json(ticks: &str) -> String {

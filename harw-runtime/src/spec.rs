@@ -24,11 +24,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_authority::{Permission, PermissionSet};
 use harw_core::child_backend::ChildBackend;
 use harw_core::mode::InteractionMode;
 use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
+use harw_protocol::session_wire::AgentRole;
 use harw_registry_defaults::profile::RegistryProfile;
 use harw_types::{ApprovalActor, Principal, ReasoningEffort};
 
@@ -377,6 +379,76 @@ impl EntryProfile {
             ceiling: CeilingPolicy::LocalRoot,
             project_context: true,
         }
+    }
+}
+
+impl EntryProfile {
+    /// Die Zeile eines an ein Gateway angebundenen Laufs (R18 D-A, Vertrag
+    /// `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §1).
+    ///
+    /// # Beschreibung
+    /// Werkzeuge laufen nur im Gateway; der Agentenprozess selbst führt
+    /// nichts aus. Deshalb, ausgehend von der Zeile des Einstiegs:
+    /// - [`RegistryProfile::NoTools`] — kein lokaler Werkzeugsatz; die
+    ///   Montage registriert daneben nur den entfernten Proxy
+    ///   (`crate::assembly::RuntimeAssemblyBuilder::remote_tools`);
+    /// - [`OperationSurface::AllWithModelTools`] wird zu
+    ///   [`OperationSurface::CommandsOnly`] — Operationen bleiben als
+    ///   Befehle erreichbar, aber kein Operations-Modell-Werkzeug läuft
+    ///   lokal;
+    /// - [`SpawnerPolicy::None`] — Unteragenten bekommen Werkzeuge nur über
+    ///   die Delegation der UIA im Gateway, nie über eine lokale
+    ///   Kind-Registry.
+    ///
+    /// Rechte, Rückfrage-Auflösung, Decke und Projektkontext bleiben die des
+    /// Einstiegs; ohne lokales Werkzeug nutzt sie kein Ausführer.
+    #[must_use]
+    pub fn for_tool_gateway(self) -> EntryProfile {
+        let operations = match self.operations {
+            OperationSurface::AllWithModelTools => OperationSurface::CommandsOnly,
+            other => other,
+        };
+        EntryProfile {
+            registry_profile: RegistryProfile::NoTools,
+            operations,
+            spawner: SpawnerPolicy::None,
+            ..self
+        }
+    }
+}
+
+/// Die Wire-Rolle (`harw_protocol::session_wire::AgentRole`) einer
+/// Organisationsrolle (R18 §2.2).
+///
+/// # Beschreibung
+/// `harw-protocol` kann nicht von `harw-agent-dsl` abhängen; die Abbildung
+/// lebt deshalb an der Composition-Root und ist Wert für Wert gepinnt
+/// (`tests/remote_tools.rs`, RP-T5).
+#[must_use]
+pub const fn wire_agent_role(role: AgentRoleId) -> AgentRole {
+    match role {
+        AgentRoleId::UserInterface => AgentRole::UserInterface,
+        AgentRoleId::RootOrchestrator => AgentRole::RootOrchestrator,
+        AgentRoleId::ChildOrchestrator => AgentRole::ChildOrchestrator,
+        AgentRoleId::Worker => AgentRole::Worker,
+        AgentRoleId::UiaWorker => AgentRole::UiaWorker,
+        AgentRoleId::AgentSteward => AgentRole::AgentSteward,
+    }
+}
+
+/// Die Organisationsrolle einer Wire-Rolle; `None` für
+/// [`AgentRole::Unknown`] (fail closed: eine unbekannte Rolle wird nie als
+/// bekannte behandelt).
+#[must_use]
+pub const fn agent_role_from_wire(role: AgentRole) -> Option<AgentRoleId> {
+    match role {
+        AgentRole::UserInterface => Some(AgentRoleId::UserInterface),
+        AgentRole::RootOrchestrator => Some(AgentRoleId::RootOrchestrator),
+        AgentRole::ChildOrchestrator => Some(AgentRoleId::ChildOrchestrator),
+        AgentRole::Worker => Some(AgentRoleId::Worker),
+        AgentRole::UiaWorker => Some(AgentRoleId::UiaWorker),
+        AgentRole::AgentSteward => Some(AgentRoleId::AgentSteward),
+        AgentRole::Unknown => None,
     }
 }
 
@@ -973,5 +1045,32 @@ mod tests {
         );
         let profile = EntryProfile::for_embedded(&full_rights);
         assert!(profile.permissions.is_subset_of(&tui));
+    }
+
+    #[test]
+    fn for_tool_gateway_removes_every_local_tool_path() {
+        for kind in ALL {
+            let local = kind.profile();
+            let gateway = local.clone().for_tool_gateway();
+            assert_eq!(
+                gateway.registry_profile,
+                RegistryProfile::NoTools,
+                "{kind:?}"
+            );
+            assert_ne!(
+                gateway.operations,
+                OperationSurface::AllWithModelTools,
+                "{kind:?}"
+            );
+            assert_eq!(gateway.spawner, SpawnerPolicy::None, "{kind:?}");
+            assert_eq!(gateway.permissions, local.permissions, "{kind:?}");
+            assert_eq!(gateway.ask, local.ask, "{kind:?}");
+            assert_eq!(gateway.ceiling, local.ceiling, "{kind:?}");
+            assert_eq!(gateway.project_context, local.project_context, "{kind:?}");
+        }
+        assert_eq!(
+            EntryKind::Tui.profile().for_tool_gateway().operations,
+            OperationSurface::CommandsOnly
+        );
     }
 }

@@ -45,7 +45,10 @@ harw-tools = { path = "../harw-tools" }
 # externe Crate. `process`/`io-util`/`macros`: das `diff`-Werkzeug startet
 # `git` als rein lesenden Prozess in einer eigenen bwrap-Sandbox
 # (`src/diff.rs`), mit Zeitlimit und begrenzter Ausgabe.
-tokio = { version = "1.52.3", features = ["time", "process", "io-util", "macros"] }
+# `net`: `gateway.health` prüft je Socket unter dem harw-Home per
+# `tokio::net::UnixStream::connect` (mit Zeitlimit, ohne Nutzdaten), ob er
+# Verbindungen annimmt (R18, `src/gateway_ops/health.rs`).
+tokio = { version = "1.52.3", features = ["time", "process", "io-util", "macros", "net"] }
 # UIA-Delegationsrouting (`explore`/`research_web`): `AgentRoleId` wird
 # gebraucht, um die aufrufende `organizational_role` gegen `UserInterface`
 # zu prüfen. Vormals nur dev-dependency für Test-Fixtures — jetzt auch in
@@ -116,6 +119,11 @@ harw-agent-compiler = { path = "../harw-agent-compiler" }
 # Socket. Kein Zyklus: `harw-infra-client` (Schicht I) hängt von keiner
 # harw-Crate ab.
 harw-infra-client = { path = "../harw-infra-client" }
+# R18 (D-B): `gateway.*`-Operationen (`src/gateway_ops.rs`) lesen
+# `Arc<dyn harw_protocol::GatewayPort>` aus dem `OpContext` und zeigen die
+# Wire-Typen (`GatewayStatus`, `GatewayConnectionInfo`, …). Kein Zyklus:
+# `harw-protocol` (Schicht F) hängt nicht von `harw-ops` ab.
+harw-protocol = { path = "../harw-protocol" }
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`

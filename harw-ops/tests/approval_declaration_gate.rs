@@ -46,6 +46,14 @@ fn full_registry() -> OperationRegistry {
         harw_ops::WORK_DRIVER_TOOL_COUNT,
         "WorkDriver-Fläche muss registriert sein"
     );
+    // R18: die `gateway.*`-Fläche einer UIA-Wurzel (mit und ohne Port).
+    let added = harw_ops::gateway_ops::register_gateway(&mut registry);
+    assert_eq!(added.ok(), Some(harw_ops::gateway_ops::GATEWAY_OP_COUNT));
+    let added = harw_ops::gateway_ops::register_gateway_diagnostics(&mut registry);
+    assert_eq!(
+        added.ok(),
+        Some(harw_ops::gateway_ops::GATEWAY_DIAGNOSTICS_OP_COUNT)
+    );
     registry
 }
 

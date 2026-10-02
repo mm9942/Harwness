@@ -19,7 +19,15 @@
 //!   [`WorkDriveLimits::max_parallel_workers`] freie Plätze lässt. Scopes
 //!   besitzen disjunkte Pfade: überschneidet ein neuer Scope einen laufenden
 //!   Worker, wird er zurückgestellt; überschneiden sich zwei neue Scopes
-//!   derselben Runde, werden sie zu einem verschmolzen.
+//!   derselben Runde, werden sie zu einem verschmolzen. Pfade kommen aus
+//!   Scope-Hinweisen ([`scope_hints_from_plan`]), sonst aus den
+//!   `Artifact`-Schritten des Kriteriums, sonst ist es der Workspace-Scope
+//!   ([`WORKSPACE_SCOPE`]).
+//! - **Wer ein Kriterium beansprucht, bekommt sein Feedback.** Ein Worker
+//!   deckt die Kriterien seines Scopes plus die ab, die er in
+//!   `work_driver.report` als bearbeitet meldet
+//!   ([`WorkerResultSummary::criteria_addressed`]); für sie wird kein zweiter
+//!   Worker delegiert, und ihre offenen Punkte gehen an ihn.
 //! - **Denselben Worker weiterführen statt neu starten.**
 //!   [`WorkDriveStep::Continue`] schickt knappes Feedback (nur die offenen
 //!   Kriterien seines Scopes und die fehlschlagende Evidenz) an *denselben*
@@ -62,9 +70,10 @@
 //!   Wellenstand: sobald ein Worker neue Arbeit bekommt, setzt der Aufrufer
 //!   beide zurück (`NotRun` / `None`). Nach `Verify` wertet er das Goal mit der
 //!   neuen Evidenz neu aus (`harw_plan::goal::evaluate_goal`).
-//! - `usage.iterations_without_progress` zählt Runden ohne neu erfülltes
-//!   Kriterium; der Treiber vergleicht nur mit
-//!   [`WorkDriveLimits::stall_iterations`].
+//! - `usage.iterations_without_progress` zählt Runden ohne Fortschritt —
+//!   weder ein neu erfülltes Kriterium noch weniger fehlschlagende
+//!   Verifikationsschritte als bisher bestenfalls; der Treiber vergleicht nur
+//!   mit [`WorkDriveLimits::stall_iterations`].
 //!
 //! # Reihenfolge der Schritte
 //! `ProposeAchieved` oder `GiveUp` stehen jeweils allein. Sonst:
@@ -103,7 +112,8 @@
 use std::collections::BTreeSet;
 
 use harw_plan::goal::{Goal, GoalReport, GoalStatus};
-use harw_plan::types::{Criterion, VerificationStep};
+use harw_plan::ids::PathOrSymbol;
+use harw_plan::types::{Criterion, Plan, VerificationStep};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
@@ -114,6 +124,28 @@ pub const DEFAULT_WORKER_ROLE: &str = "implementer";
 
 /// Scope-ID des Workers, der Bewerter-Lücken ohne zuständigen Worker übernimmt.
 pub const JUDGE_FOLLOWUP_SCOPE: &str = "judge-followup";
+
+/// `owned_paths`-Eintrag „der Workspace": der Worker darf jede Datei ändern,
+/// die kein anderer Worker besitzt.
+///
+/// # Description
+/// Ein Kriterium, das weder ein Scope-Hinweis noch ein `Artifact`-Schritt an
+/// Pfade bindet (etwa eines, das nur ein `Command` nachweist), bekäme sonst
+/// keinen Schreibbereich und damit einen Worker, der nichts ändern darf. Der
+/// Eintrag überschneidet in [`WorkDriver::decide`] keinen anderen Scope (auch
+/// keinen zweiten Workspace-Scope); die Trennung leistet der Aufrufer bei der
+/// Ausführung: höchstens ein Workspace-Worker je gleichzeitig laufendem
+/// Block, und jede Änderung wird danach gegen die `owned_paths` aller anderen
+/// Worker geprüft (fail closed).
+pub const WORKSPACE_SCOPE: &str = ".";
+
+/// `true`, wenn `owned_paths` den Workspace-Scope ([`WORKSPACE_SCOPE`]) trägt.
+#[must_use]
+pub fn is_workspace_scope(owned_paths: &[String]) -> bool {
+    owned_paths
+        .iter()
+        .any(|path| path.trim() == WORKSPACE_SCOPE)
+}
 
 /// Grenzen eines Treiberlaufs.
 ///
@@ -210,6 +242,268 @@ pub struct WorkerResultSummary {
     pub artifacts: Vec<String>,
     /// Vorschlag des Workers für seinen nächsten Schritt.
     pub suggested_next: Option<String>,
+    /// Kriterien, die der Worker laut `work_driver.report` bearbeitet hat
+    /// (Indizes, sortiert, ohne Doppelte). Speist nur das Routing (wer
+    /// Feedback zu welchem Kriterium bekommt, welches Kriterium schon
+    /// abgedeckt ist) — nie den Goal-Status: den setzen nur Verifikation und
+    /// Mensch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria_addressed: Vec<usize>,
+}
+
+impl WorkerResultSummary {
+    /// Ergebnis einer Runde, die **ohne** `work_driver.report` endete
+    /// (R18 D-E): `Partial` mit dem ausdrücklichen Grund
+    /// [`NO_REPORT_REASON`] am Anfang der Zusammenfassung — nie still als
+    /// `Done` gedeutet, nie aus Freitext geraten.
+    ///
+    /// # Arguments
+    /// - `last_text`: letzte Worker-Antwort, vom Aufrufer bereits gekürzt;
+    ///   darf leer sein.
+    #[must_use]
+    pub fn no_report(last_text: &str) -> Self {
+        let text = last_text.trim();
+        let summary = if text.is_empty() {
+            NO_REPORT_REASON.to_owned()
+        } else {
+            format!("{NO_REPORT_REASON}: {text}")
+        };
+        Self {
+            outcome: WorkerOutcome::Partial,
+            summary,
+            artifacts: Vec::new(),
+            suggested_next: Some(format!(
+                "Schließe die Runde mit dem Werkzeug `{WORK_DRIVER_REPORT_TOOL}` ab."
+            )),
+            criteria_addressed: Vec::new(),
+        }
+    }
+}
+
+/// Name des Werkzeugs, mit dem ein WorkDriver-Worker seine Runde abschließt
+/// (R18 D-E, Vertrag
+/// `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §8).
+pub const WORK_DRIVER_REPORT_TOOL: &str = "work_driver.report";
+
+/// Ausdrücklicher Grund, wenn ein Worker ohne [`WORK_DRIVER_REPORT_TOOL`]
+/// endet (siehe [`WorkerResultSummary::no_report`]).
+pub const NO_REPORT_REASON: &str = "no report";
+
+/// Status, den ein Worker in [`WorkerReport`] meldet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReportStatus {
+    /// Scope erledigt; wartet auf die zentrale Verifikation.
+    Done,
+    /// Teilweise erledigt; kann fortgesetzt werden.
+    Partial,
+    /// Braucht eine Entscheidung; `blockers` nennt sie.
+    Blocked,
+    /// Hart gescheitert.
+    Failed,
+}
+
+/// Strukturierte Rückmeldung eines WorkDriver-Workers (R18 D-E).
+///
+/// # Description
+/// Die Argumente des Werkzeugs [`WORK_DRIVER_REPORT_TOOL`]. Ersetzt das
+/// tolerante Deuten von Statuszeilen und JSON-Blöcken im Freitext: der
+/// Worker **muss** das Werkzeug aufrufen; fehlt der Aufruf, gilt
+/// [`WorkerResultSummary::no_report`]. Unbekannte Felder werden abgelehnt
+/// (`deny_unknown_fields`), damit ein Tippfehler nicht still verloren geht.
+///
+/// # Concurrency
+/// Reiner Werttyp, `Send + Sync`.
+///
+/// # Examples
+/// ```rust
+/// use harw_plan_bridge::work_driver::{WorkerOutcome, WorkerReport};
+///
+/// let report: WorkerReport = serde_json::from_str(
+///     r#"{"status":"blocked","summary":"API unklar","blockers":["Welche Version?"]}"#,
+/// )?;
+/// assert!(report.validate(3).is_ok());
+/// let summary = report.into_summary();
+/// assert_eq!(summary.outcome, WorkerOutcome::Blocked { reason: "Welche Version?".into() });
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReport {
+    /// Ausgang der Runde.
+    pub status: WorkerReportStatus,
+    /// Bearbeitete Akzeptanzkriterien (Indizes in
+    /// `Goal::acceptance_criteria`).
+    #[serde(default)]
+    pub criteria_addressed: Vec<usize>,
+    /// Geänderte Pfade, relativ zum Workspace, `/`-getrennt.
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    /// Kurze Zusammenfassung des Erreichten.
+    pub summary: String,
+    /// Offene Entscheidungen bzw. Hindernisse; Pflicht bei `blocked`.
+    #[serde(default)]
+    pub blockers: Vec<String>,
+}
+
+/// Warum ein [`WorkerReport`] abgelehnt wird.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerReportError {
+    /// `summary` ist leer.
+    EmptySummary,
+    /// `status = blocked` ohne einen einzigen nicht leeren Blocker.
+    BlockedWithoutBlocker,
+    /// Ein Kriterium-Index liegt außerhalb des Goals.
+    CriterionOutOfRange {
+        /// Gemeldeter Index.
+        index: usize,
+        /// Anzahl der Kriterien des Goals.
+        total: usize,
+    },
+    /// Ein Pfad ist leer, absolut, enthält `..` oder `:` (Laufwerk/Schema).
+    InvalidPath {
+        /// Der gemeldete Pfad.
+        path: String,
+    },
+}
+
+impl std::fmt::Display for WorkerReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySummary => f.write_str("work_driver.report: summary is empty"),
+            Self::BlockedWithoutBlocker => {
+                f.write_str("work_driver.report: status `blocked` needs at least one blocker")
+            }
+            Self::CriterionOutOfRange { index, total } => write!(
+                f,
+                "work_driver.report: criterion {index} is out of range (goal has {total})"
+            ),
+            Self::InvalidPath { path } => write!(
+                f,
+                "work_driver.report: path `{path}` must be relative, non-empty, without `..` and `:`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkerReportError {}
+
+impl WorkerReport {
+    /// Prüft den Bericht gegen ein Goal mit `criteria_total` Kriterien.
+    ///
+    /// # Errors
+    /// Die erste verletzte Regel als [`WorkerReportError`]. Der Aufrufer
+    /// meldet sie dem Worker als Werkzeugfehler zurück (der Worker kann
+    /// korrigieren); ein abgelehnter Bericht zählt nicht als Bericht.
+    pub fn validate(&self, criteria_total: usize) -> Result<(), WorkerReportError> {
+        if self.summary.trim().is_empty() {
+            return Err(WorkerReportError::EmptySummary);
+        }
+        if self.status == WorkerReportStatus::Blocked
+            && self
+                .blockers
+                .iter()
+                .all(|blocker| blocker.trim().is_empty())
+        {
+            return Err(WorkerReportError::BlockedWithoutBlocker);
+        }
+        if let Some(&index) = self
+            .criteria_addressed
+            .iter()
+            .find(|&&index| index >= criteria_total)
+        {
+            return Err(WorkerReportError::CriterionOutOfRange {
+                index,
+                total: criteria_total,
+            });
+        }
+        if let Some(path) = self
+            .changed_paths
+            .iter()
+            .find(|path| !is_relative_path(path))
+        {
+            return Err(WorkerReportError::InvalidPath { path: path.clone() });
+        }
+        Ok(())
+    }
+
+    /// Übersetzt den Bericht in die Rückmeldung, die [`WorkDriver::decide`]
+    /// liest.
+    ///
+    /// `blocked`/`failed` tragen die nicht leeren `blockers` (mit `; `
+    /// verbunden) als Grund, ohne Blocker die Zusammenfassung;
+    /// `changed_paths` werden zu `artifacts`, `criteria_addressed` sortiert
+    /// und ohne Doppelte übernommen.
+    #[must_use]
+    pub fn into_summary(self) -> WorkerResultSummary {
+        let summary = self.summary.trim().to_owned();
+        let blockers: Vec<&str> = self
+            .blockers
+            .iter()
+            .map(|blocker| blocker.trim())
+            .filter(|blocker| !blocker.is_empty())
+            .collect();
+        let reason = if blockers.is_empty() {
+            summary.clone()
+        } else {
+            blockers.join("; ")
+        };
+        let outcome = match self.status {
+            WorkerReportStatus::Done => WorkerOutcome::Done,
+            WorkerReportStatus::Partial => WorkerOutcome::Partial,
+            WorkerReportStatus::Blocked => WorkerOutcome::Blocked { reason },
+            WorkerReportStatus::Failed => WorkerOutcome::Failed { reason },
+        };
+        let mut criteria_addressed = self.criteria_addressed;
+        criteria_addressed.sort_unstable();
+        criteria_addressed.dedup();
+        WorkerResultSummary {
+            outcome,
+            summary,
+            artifacts: self.changed_paths,
+            suggested_next: None,
+            criteria_addressed,
+        }
+    }
+
+    /// JSON-Schema der Werkzeugargumente von [`WORK_DRIVER_REPORT_TOOL`].
+    #[must_use]
+    pub fn input_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "summary"],
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["done", "partial", "blocked", "failed"]
+                },
+                "criteria_addressed": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0}
+                },
+                "changed_paths": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "summary": {"type": "string", "minLength": 1},
+                "blockers": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        })
+    }
+}
+
+/// Relativer, nicht leerer Pfad ohne `..`-Bestandteil und ohne `:`.
+fn is_relative_path(path: &str) -> bool {
+    let path = path.trim();
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains(':')
+        && path.split(['/', '\\']).all(|part| part != "..")
 }
 
 /// Beobachteter Zustand eines Workers.
@@ -290,7 +584,8 @@ pub struct BudgetUsageSnapshot {
     pub tokens_used: u64,
     /// Start des Laufs (Bezug für das Wandzeit-Budget).
     pub started_at: OffsetDateTime,
-    /// Aufeinanderfolgende Runden ohne neu erfülltes Kriterium.
+    /// Aufeinanderfolgende Runden ohne Fortschritt (kein neu erfülltes
+    /// Kriterium, keine verbesserte Verifikation).
     pub iterations_without_progress: u32,
 }
 
@@ -308,9 +603,10 @@ pub struct WorkDriveInput<'a> {
     pub iteration: u32,
     /// Alle aktuell existierenden Worker der Welle.
     pub workers: &'a [WorkerState],
-    /// Vorgeschlagene Scopes (z. B. aus `write_scope` der Plan-Knoten); für
-    /// ein Kriterium ohne Hinweis leitet der Treiber einen Scope aus dessen
-    /// Artefakt-Schritten ab.
+    /// Vorgeschlagene Scopes (aus `write_scope` der Plan-Knoten, siehe
+    /// [`scope_hints_from_plan`]); für ein Kriterium ohne Hinweis leitet der
+    /// Treiber einen Scope aus dessen Artefakt-Schritten ab, ohne solche den
+    /// Workspace-Scope ([`WORKSPACE_SCOPE`]).
     pub scope_hints: &'a [WorkScope],
     /// Verbrauch bis `now`.
     pub usage: BudgetUsageSnapshot,
@@ -675,7 +971,7 @@ fn drive_settled_wave(
         }
         VerificationState::Failed { failing } => {
             let continued = drive_done_workers(input, workers, out, |worker| {
-                let mut lines = scope_open_lines(input.goal, &worker.scope, &view.open);
+                let mut lines = scope_open_lines(input.goal, worker, &view.open);
                 lines.extend(failing_lines_for(worker, workers, failing));
                 lines
             });
@@ -697,7 +993,7 @@ fn drive_settled_wave(
                 drive_judge(input, workers, view, out);
             } else {
                 let continued = drive_done_workers(input, workers, out, |worker| {
-                    let mut lines = scope_open_lines(input.goal, &worker.scope, &view.open);
+                    let mut lines = scope_open_lines(input.goal, worker, &view.open);
                     if !lines.is_empty() || !invariants_ok {
                         lines.extend(invariant_lines(input.report));
                     }
@@ -762,7 +1058,7 @@ fn drive_judge(
                     .iter()
                     .map(|missing| format!("Bewerter vermisst: {missing}"))
                     .collect();
-                lines.extend(scope_open_lines(input.goal, &worker.scope, &judge_set));
+                lines.extend(scope_open_lines(input.goal, worker, &judge_set));
                 lines
             });
             if continued == 0 {
@@ -791,18 +1087,18 @@ fn drive_running_wave(
     for worker in workers {
         match outcome(worker) {
             Some(WorkerOutcome::Partial) => {
-                let mut lines = scope_open_lines(input.goal, &worker.scope, &view.open);
+                let mut lines = scope_open_lines(input.goal, worker, &view.open);
                 lines.extend(failing_lines_for(worker, workers, failing));
                 if lines.is_empty() {
-                    lines.push(
-                        "Alle Kriterien deines Scopes sind belegt — schließe ab und melde Done."
-                            .to_owned(),
-                    );
+                    lines.push(format!(
+                        "Alle Kriterien deines Scopes sind belegt — schließe ab und melde \
+                         `done` über `{WORK_DRIVER_REPORT_TOOL}`."
+                    ));
                 }
                 continue_or_respawn(input, worker, &lines, out);
             }
             Some(WorkerOutcome::Failed { reason }) => {
-                let mut lines = scope_open_lines(input.goal, &worker.scope, &view.open);
+                let mut lines = scope_open_lines(input.goal, worker, &view.open);
                 lines.push(format!("Vorgänger scheiterte: {reason}"));
                 out.rationale.push(format!(
                     "{} hart gescheitert: frischer Worker mit Übergabe.",
@@ -899,7 +1195,9 @@ fn continue_or_respawn(
 /// nicht der Verlauf des Vorgängers.
 fn handoff(worker: &WorkerState, lines: &[String]) -> String {
     let mut text = format!("Scope {}: {}", worker.scope.id, worker.scope.summary);
-    if !worker.scope.owned_paths.is_empty() {
+    if is_workspace_scope(&worker.scope.owned_paths) {
+        text.push_str("\nSchreibbereich: der Workspace, außer Pfaden anderer Worker");
+    } else if !worker.scope.owned_paths.is_empty() {
         text.push_str(&format!(
             "\nNur diese Pfade ändern: {}",
             worker.scope.owned_paths.join(", ")
@@ -921,18 +1219,23 @@ fn handoff(worker: &WorkerState, lines: &[String]) -> String {
     text
 }
 
-/// Offene Kriterien des Scopes, je eine Zeile.
-fn scope_open_lines(goal: &Goal, scope: &WorkScope, open: &BTreeSet<usize>) -> Vec<String> {
-    let mut criteria: Vec<usize> = scope
-        .criteria
-        .iter()
-        .copied()
-        .filter(|idx| open.contains(idx))
-        .collect();
-    criteria.sort_unstable();
-    criteria.dedup();
-    criteria
+/// Kriterien, die `worker` beansprucht: die seines Scopes plus die, die er in
+/// seiner letzten Rückmeldung als bearbeitet gemeldet hat
+/// ([`WorkerResultSummary::criteria_addressed`]).
+fn claimed_criteria(worker: &WorkerState) -> BTreeSet<usize> {
+    let mut claimed: BTreeSet<usize> = worker.scope.criteria.iter().copied().collect();
+    if let Some(result) = &worker.last_result {
+        claimed.extend(result.criteria_addressed.iter().copied());
+    }
+    claimed
+}
+
+/// Offene Kriterien, die `worker` beansprucht ([`claimed_criteria`]), je eine
+/// Zeile in Indexreihenfolge.
+fn scope_open_lines(goal: &Goal, worker: &WorkerState, open: &BTreeSet<usize>) -> Vec<String> {
+    claimed_criteria(worker)
         .into_iter()
+        .filter(|idx| open.contains(idx))
         .filter_map(|idx| {
             goal.acceptance_criteria
                 .get(idx)
@@ -950,7 +1253,9 @@ fn invariant_lines(report: &GoalReport) -> Vec<String> {
 }
 
 /// Fehlschlagzeilen für `worker`: die, die einen seiner Pfade nennen, plus
-/// die, die keinen Pfad irgendeines Workers nennen.
+/// die, die keinen Pfad irgendeines Workers nennen. Der Workspace-Scope
+/// ([`WORKSPACE_SCOPE`]) nennt keinen Pfad: ein Workspace-Worker bekommt nur
+/// die keinem Worker zuordenbaren Zeilen.
 fn failing_lines_for(
     worker: &WorkerState,
     workers: &[&WorkerState],
@@ -959,6 +1264,7 @@ fn failing_lines_for(
     let mentions = |line: &str, candidate: &WorkerState| {
         normalize_paths(&candidate.scope.owned_paths)
             .iter()
+            .filter(|path| path.as_str() != WORKSPACE_SCOPE)
             .any(|path| line.contains(path.as_str()))
     };
     failing
@@ -993,7 +1299,7 @@ fn delegate_uncovered(
 ) {
     let covered: BTreeSet<usize> = workers
         .iter()
-        .flat_map(|worker| worker.scope.criteria.iter().copied())
+        .flat_map(|worker| claimed_criteria(worker))
         .collect();
     let judge_met = input.judge.is_some_and(|verdict| verdict.passed);
     let uncovered: Vec<usize> = view
@@ -1096,7 +1402,9 @@ fn delegate_judge_followup(
     let scope = WorkScope {
         id: JUDGE_FOLLOWUP_SCOPE.to_owned(),
         summary: "Lücken aus dem Bewerterurteil schließen".to_owned(),
-        owned_paths: Vec::new(),
+        // Bewerter-Lücken (Doku, Begründungen …) nennen keine Pfade; ohne
+        // Schreibbereich könnte der Worker sie nicht schließen.
+        owned_paths: vec![WORKSPACE_SCOPE.to_owned()],
         criteria: view.judge_open.clone(),
     };
     let missing: Vec<String> = verdict
@@ -1117,7 +1425,9 @@ fn delegate_judge_followup(
 }
 
 /// Scope für ein Kriterium: erster passender Hinweis (nach `id`), sonst aus
-/// den Artefakt-Schritten des Kriteriums abgeleitet.
+/// den Artefakt-Schritten des Kriteriums abgeleitet, ohne solche der
+/// Workspace-Scope ([`WORKSPACE_SCOPE`]) — ein nur per `Command`
+/// nachgewiesenes Kriterium bekommt so einen Worker, der schreiben darf.
 fn scope_for(
     goal: &Goal,
     idx: usize,
@@ -1153,11 +1463,96 @@ fn scope_for(
                 .collect()
         })
         .unwrap_or_default();
+    let mut owned_paths = normalize_paths(&paths);
+    if owned_paths.is_empty() {
+        owned_paths.push(WORKSPACE_SCOPE.to_owned());
+    }
     WorkScope {
         id: format!("criterion-{idx}"),
         summary: criterion.map_or_else(String::new, |c| c.description.clone()),
-        owned_paths: normalize_paths(&paths),
+        owned_paths,
         criteria: vec![idx],
+    }
+}
+
+/// Leitet Scope-Hinweise aus den Knoten eines Plans ab.
+///
+/// # Description
+/// Ein Knoten wird zum Hinweis `plan-<knoten-id>`, wenn er
+/// - einen Schreibbereich (`write_scope`) mit mindestens einem konkreten
+///   Pfad hat — Glob-Muster (`*`, `?`, `[`) werden übersprungen, weil der
+///   Schreibbereichs-Abgleich des Aufrufers nur Datei- und
+///   Verzeichnispfade kennt (fail closed: lieber kein Hinweis als ein zu
+///   weiter), bei Symbol-Einträgen zählt deren Datei — und
+/// - mindestens ein Akzeptanzkriterium des Goals trägt: gleiche
+///   (getrimmte, nicht leere) Beschreibung oder gleiche, nicht leere
+///   Verifikationsschritte.
+///
+/// `summary` ist das Ziel des Knotens. Die Reihenfolge folgt dem Plan;
+/// [`WorkDriver::decide`] sortiert Hinweise ohnehin nach `id`.
+///
+/// # Arguments
+/// - `goal`: das getriebene Goal (Kriterien-Indizes beziehen sich darauf).
+/// - `plan`: der an das Goal gebundene Plan.
+///
+/// # Returns
+/// Die Hinweise; leer, wenn kein Knoten beide Bedingungen erfüllt.
+#[must_use]
+pub fn scope_hints_from_plan(goal: &Goal, plan: &Plan) -> Vec<WorkScope> {
+    let mut hints = Vec::new();
+    for node in &plan.nodes {
+        let paths: Vec<String> = node
+            .write_scope
+            .iter()
+            .map(|entry| match entry {
+                PathOrSymbol::Path(path) | PathOrSymbol::Symbol { path, .. } => path.clone(),
+            })
+            .filter(|path| !path.contains(['*', '?', '[']))
+            .collect();
+        let owned_paths = normalize_paths(&paths);
+        if owned_paths.is_empty() {
+            continue;
+        }
+        let criteria: Vec<usize> = goal
+            .acceptance_criteria
+            .iter()
+            .enumerate()
+            .filter(|(_, criterion)| {
+                node.acceptance_criteria
+                    .iter()
+                    .any(|own| same_criterion(own, criterion))
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        if criteria.is_empty() {
+            continue;
+        }
+        hints.push(WorkScope {
+            id: format!("plan-{}", node.id.as_str()),
+            summary: node.objective.clone(),
+            owned_paths,
+            criteria,
+        });
+    }
+    hints
+}
+
+/// Gleiche (getrimmte, nicht leere) Beschreibung oder gleiche, nicht leere
+/// Verifikationsschritte.
+fn same_criterion(a: &Criterion, b: &Criterion) -> bool {
+    let description = a.description.trim();
+    if !description.is_empty() && description == b.description.trim() {
+        return true;
+    }
+    if a.verification.is_empty() || b.verification.is_empty() {
+        return false;
+    }
+    match (
+        serde_json::to_value(&a.verification),
+        serde_json::to_value(&b.verification),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -1176,49 +1571,70 @@ fn merge_scopes(base: WorkScope, other: WorkScope) -> WorkScope {
     }
 }
 
+/// Regelblock am Ende jeder Aufgabe (Teil des stabilen Präfixes).
+pub const TASK_RULES: &str = "- Do not build or test yourself: one central verification runs \
+per wave over the combined state of all workers.\n- Change only your owned paths; a change \
+elsewhere blocks the whole run.\n- Finish by calling the tool `work_driver.report`; a status \
+line in your text is not read.";
+
+/// Die in sich geschlossene Aufgabe eines neuen Workers, in festen Abschnitten
+/// (Ziel, Scope, Kriterien mit Index und Nachweis, Schreibbereich, Hinweise,
+/// Regeln). Die Kriterien-Indizes sind die, die der Worker in
+/// `work_driver.report` unter `criteria_addressed` meldet.
 fn render_task(goal: &Goal, scope: &WorkScope, extra: &[String]) -> String {
     let mut text = format!(
-        "Ziel: {}\nScope {}: {}",
+        "## Goal\n{}\n\n## Scope `{}`\n{}\n\n## Acceptance criteria (index = position in the goal)",
         goal.statement, scope.id, scope.summary
     );
-    if scope.owned_paths.is_empty() {
-        text.push_str("\nKeine eigenen Pfade: nur lesen und berichten, nichts ändern.");
-    } else {
-        text.push_str(&format!(
-            "\nNur diese Pfade ändern: {}",
-            scope.owned_paths.join(", ")
-        ));
-    }
-    text.push_str("\nKriterien:");
     for idx in &scope.criteria {
         if let Some(criterion) = goal.acceptance_criteria.get(*idx) {
             text.push_str(&format!("\n- [{idx}] {}", criterion.description));
             let checks: Vec<String> = criterion.verification.iter().map(render_check).collect();
             if !checks.is_empty() {
-                text.push_str(&format!(" (Nachweis: {})", checks.join("; ")));
+                text.push_str(&format!("\n  verified by: {}", checks.join("; ")));
             }
         }
     }
-    for line in extra {
-        text.push('\n');
-        text.push_str(line);
+    text.push_str("\n\n## Owned paths\n");
+    text.push_str(&owned_paths_text(&scope.owned_paths));
+    if !extra.is_empty() {
+        text.push_str("\n\n## Notes");
+        for line in extra {
+            text.push_str("\n- ");
+            text.push_str(line);
+        }
     }
-    text.push_str(
-        "\nNicht selbst bauen oder testen: die zentrale Verifikation läuft einmal pro Welle. \
-         Melde Done, Blocked (mit Frage), Failed (mit Grund) oder Partial, \
-         mit Artefakten und nächstem Schritt.",
-    );
+    text.push_str("\n\n## Rules\n");
+    text.push_str(TASK_RULES);
     text
+}
+
+/// Schreibbereich eines Scopes als Text: keiner, der Workspace oder die
+/// Pfadliste.
+fn owned_paths_text(owned_paths: &[String]) -> String {
+    if owned_paths.is_empty() {
+        "none: read and report only, change no file.".to_owned()
+    } else if is_workspace_scope(owned_paths) {
+        "the workspace: any file that no other worker owns; every change is checked after the \
+         wave."
+            .to_owned()
+    } else {
+        owned_paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn render_check(step: &VerificationStep) -> String {
     match step {
         VerificationStep::Command { cmd, expect_exit } => {
-            format!("`{cmd}` endet mit {expect_exit}")
+            format!("`{cmd}` exits {expect_exit}")
         }
-        VerificationStep::Artifact { path } => format!("Artefakt {path}"),
-        VerificationStep::TraceEvent { name } => format!("Trace-Event {name}"),
-        VerificationStep::Manual { note } => format!("manuell: {note}"),
+        VerificationStep::Artifact { path } => format!("file `{path}` exists"),
+        VerificationStep::TraceEvent { name } => format!("trace event `{name}`"),
+        VerificationStep::Manual { note } => format!("manual review: {note}"),
     }
 }
 
@@ -1278,9 +1694,18 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     a == b || within(a, b) || within(b, a)
 }
 
+/// Erster Pfad aus `a`, der einen aus `b` überschneidet. Der Workspace-Scope
+/// ([`WORKSPACE_SCOPE`]) überschneidet hier nichts: seine Trennung übernimmt
+/// der Aufrufer bei der Ausführung (siehe dort).
 fn first_path_overlap(a: &[String], b: &[String]) -> Option<String> {
-    let a = normalize_paths(a);
-    let b = normalize_paths(b);
+    let concrete = |paths: &[String]| -> Vec<String> {
+        normalize_paths(paths)
+            .into_iter()
+            .filter(|path| path != WORKSPACE_SCOPE)
+            .collect()
+    };
+    let a = concrete(a);
+    let b = concrete(b);
     a.iter()
         .find(|left| {
             b.iter()
@@ -1304,6 +1729,7 @@ fn conflicting_worker(candidate: &WorkScope, workers: &[&WorkerState]) -> Option
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult};
+    use harw_plan::PlanNode;
     use harw_plan::goal::GoalId;
 
     fn now() -> OffsetDateTime {
@@ -1389,6 +1815,7 @@ mod tests {
             summary: "erledigt, was ging".to_owned(),
             artifacts: vec!["src/a.rs".to_owned()],
             suggested_next: Some("Tests ergänzen".to_owned()),
+            criteria_addressed: Vec::new(),
         }
     }
 
@@ -1518,7 +1945,7 @@ mod tests {
         for step in &plan.steps {
             if let WorkDriveStep::Delegate { task, role, .. } = step {
                 assert_eq!(role, DEFAULT_WORKER_ROLE);
-                assert!(task.contains("Nicht selbst bauen"), "{task}");
+                assert!(task.contains("Do not build or test yourself"), "{task}");
             }
         }
         Ok(())
@@ -2030,6 +2457,388 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first, reordered);
+    }
+
+    fn worker_report(status: WorkerReportStatus) -> WorkerReport {
+        WorkerReport {
+            status,
+            criteria_addressed: vec![0],
+            changed_paths: vec!["src/a.rs".to_owned()],
+            summary: " a erledigt ".to_owned(),
+            blockers: vec![],
+        }
+    }
+
+    #[test]
+    fn test_worker_report_status_maps_onto_outcome() {
+        assert_eq!(
+            worker_report(WorkerReportStatus::Done)
+                .into_summary()
+                .outcome,
+            WorkerOutcome::Done
+        );
+        assert_eq!(
+            worker_report(WorkerReportStatus::Partial)
+                .into_summary()
+                .outcome,
+            WorkerOutcome::Partial
+        );
+        let blocked = WorkerReport {
+            blockers: vec!["Frage A".to_owned(), " ".to_owned(), "Frage B".to_owned()],
+            ..worker_report(WorkerReportStatus::Blocked)
+        };
+        assert_eq!(
+            blocked.into_summary().outcome,
+            WorkerOutcome::Blocked {
+                reason: "Frage A; Frage B".to_owned()
+            }
+        );
+        let failed = worker_report(WorkerReportStatus::Failed).into_summary();
+        assert_eq!(
+            failed.outcome,
+            WorkerOutcome::Failed {
+                reason: "a erledigt".to_owned()
+            }
+        );
+        assert_eq!(failed.summary, "a erledigt");
+        assert_eq!(failed.artifacts, vec!["src/a.rs".to_owned()]);
+        assert_eq!(failed.suggested_next, None);
+    }
+
+    #[test]
+    fn test_worker_report_validation_fails_closed() {
+        assert_eq!(worker_report(WorkerReportStatus::Done).validate(1), Ok(()));
+        assert_eq!(
+            worker_report(WorkerReportStatus::Blocked).validate(1),
+            Err(WorkerReportError::BlockedWithoutBlocker)
+        );
+        assert_eq!(
+            worker_report(WorkerReportStatus::Done).validate(0),
+            Err(WorkerReportError::CriterionOutOfRange { index: 0, total: 0 })
+        );
+        let empty = WorkerReport {
+            summary: "  ".to_owned(),
+            ..worker_report(WorkerReportStatus::Done)
+        };
+        assert_eq!(empty.validate(1), Err(WorkerReportError::EmptySummary));
+        for bad in ["/etc/passwd", "../x", "src/../../x", "", "C:\\x"] {
+            let with_path = WorkerReport {
+                changed_paths: vec![bad.to_owned()],
+                ..worker_report(WorkerReportStatus::Done)
+            };
+            assert!(
+                matches!(
+                    with_path.validate(1),
+                    Err(WorkerReportError::InvalidPath { .. })
+                ),
+                "{bad:?} muss abgelehnt werden"
+            );
+        }
+    }
+
+    #[test]
+    fn test_worker_report_wire_shape_and_unknown_fields() -> TestResult {
+        let parsed: WorkerReport = serde_json::from_str(
+            r#"{"status":"done","criteria_addressed":[0,2],"changed_paths":["src/a.rs"],"summary":"ok","blockers":[]}"#,
+        )
+        .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert_eq!(parsed.status, WorkerReportStatus::Done);
+        assert_eq!(parsed.criteria_addressed, vec![0, 2]);
+        let minimal: WorkerReport = serde_json::from_str(r#"{"status":"partial","summary":"s"}"#)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(minimal.changed_paths.is_empty() && minimal.blockers.is_empty());
+        assert!(
+            serde_json::from_str::<WorkerReport>(
+                r#"{"status":"done","summary":"s","outcome":"done"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<WorkerReport>(r#"{"status":"finished","summary":"s"}"#).is_err()
+        );
+        let back =
+            serde_json::to_value(&parsed).map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert_eq!(back["status"], serde_json::json!("done"));
+        let schema = WorkerReport::input_schema();
+        assert_eq!(schema["required"], serde_json::json!(["status", "summary"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_report_is_partial_with_explicit_reason() {
+        let summary = WorkerResultSummary::no_report("  ");
+        assert_eq!(summary.outcome, WorkerOutcome::Partial);
+        assert_eq!(summary.summary, NO_REPORT_REASON);
+        let with_text = WorkerResultSummary::no_report("Status: done");
+        assert_eq!(with_text.outcome, WorkerOutcome::Partial);
+        assert_eq!(with_text.summary, "no report: Status: done");
+        assert!(
+            with_text
+                .suggested_next
+                .as_deref()
+                .is_some_and(|next| next.contains(WORK_DRIVER_REPORT_TOOL))
+        );
+    }
+
+    #[test]
+    fn test_worker_report_addressed_criteria_are_sorted_into_the_summary() {
+        let report = WorkerReport {
+            criteria_addressed: vec![2, 0, 2],
+            ..worker_report(WorkerReportStatus::Done)
+        };
+        assert_eq!(report.into_summary().criteria_addressed, vec![0, 2]);
+        assert!(
+            WorkerResultSummary::no_report("x")
+                .criteria_addressed
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_command_only_criteria_get_separate_workspace_scopes() -> TestResult {
+        let fx = Fixture::new(goal_n(2), report(2, &[0, 1]));
+
+        let plan = fx.decide();
+
+        let scopes = delegates(&plan);
+        assert_eq!(scopes.len(), 2, "{plan:?}");
+        for scope in &scopes {
+            assert_eq!(scope.owned_paths, vec![WORKSPACE_SCOPE.to_owned()]);
+        }
+        let task = plan
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                WorkDriveStep::Delegate { task, .. } => Some(task.as_str()),
+                _ => None,
+            })
+            .ok_or(TestError::Missing("delegate task"))?;
+        assert!(task.contains("## Owned paths\nthe workspace"), "{task}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_running_workspace_worker_does_not_defer_a_path_scope() {
+        let mut fx = Fixture::new(goal_n(2), report(2, &[0, 1]));
+        fx.workers = vec![worker("w1", &[0], &[WORKSPACE_SCOPE], None)];
+        fx.hints = vec![scope("h-1", &[1], &["src/b.rs"])];
+
+        let plan = fx.decide();
+
+        let scopes = delegates(&plan);
+        assert_eq!(scopes.len(), 1, "{plan:?}");
+        assert_eq!(scopes[0].owned_paths, vec!["src/b.rs".to_owned()]);
+    }
+
+    #[test]
+    fn test_failing_lines_never_match_the_workspace_scope_marker() {
+        let wide = worker("w1", &[0], &[WORKSPACE_SCOPE], Some(WorkerOutcome::Done));
+        let narrow = worker("w2", &[1], &["src/b.rs"], Some(WorkerOutcome::Done));
+        let workers = [&wide, &narrow];
+        let failing = vec!["src/b.rs: error".to_owned(), "linker failed.".to_owned()];
+        assert_eq!(
+            failing_lines_for(&wide, &workers, &failing),
+            vec!["Fehlschlag: linker failed.".to_owned()]
+        );
+        assert_eq!(failing_lines_for(&narrow, &workers, &failing).len(), 2);
+    }
+
+    #[test]
+    fn test_criteria_a_worker_reports_count_as_covered_and_get_its_feedback() -> TestResult {
+        let mut fx = Fixture::new(goal_n(2), report(2, &[0, 1]));
+        let mut claimer = worker("w1", &[0], &["src/a"], Some(WorkerOutcome::Partial));
+        if let Some(result) = claimer.last_result.as_mut() {
+            result.criteria_addressed = vec![1];
+        }
+        fx.workers = vec![claimer];
+
+        let plan = fx.decide();
+
+        match only_step(&plan)? {
+            WorkDriveStep::Continue {
+                worker_id,
+                feedback,
+            } => {
+                assert_eq!(worker_id, "w1");
+                assert_eq!(feedback, "Offen: [0] k0\nOffen: [1] k1");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_judge_followup_scope_may_write_the_workspace() -> TestResult {
+        let mut fx = Fixture::new(goal(vec![manual_criterion("Doku")]), report(1, &[0]));
+        fx.verification = VerificationState::Passed;
+        fx.judge = Some(JudgeVerdict {
+            passed: false,
+            comment: "fehlt".to_owned(),
+            missing: vec!["Abschnitt".to_owned()],
+        });
+
+        let plan = fx.decide();
+
+        let scopes = delegates(&plan);
+        let followup = scopes
+            .iter()
+            .find(|scope| scope.id == JUDGE_FOLLOWUP_SCOPE)
+            .ok_or(TestError::Missing("judge-followup scope"))?;
+        assert_eq!(followup.owned_paths, vec![WORKSPACE_SCOPE.to_owned()]);
+        Ok(())
+    }
+
+    fn plan_node(id: &str, write_scope: Vec<PathOrSymbol>, criteria: Vec<Criterion>) -> PlanNode {
+        PlanNode {
+            id: harw_plan::TaskId::new(id),
+            objective: format!("Knoten {id}"),
+            dependencies: Vec::new(),
+            input_contracts: Vec::new(),
+            output_contracts: Vec::new(),
+            read_scope: Vec::new(),
+            write_scope,
+            forbidden_scope: Vec::new(),
+            acceptance_criteria: criteria,
+            invalidation_conditions: Vec::new(),
+            status: harw_plan::PlanNodeStatus::Ready,
+            evidence: Vec::new(),
+            kind: harw_plan::PlanNodeKind::default(),
+            wave: None,
+            assignment: None,
+            parent: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn test_scope_hints_from_plan_map_write_scopes_onto_goal_criteria() -> TestResult {
+        let goal = goal_n(3);
+        let by_description = Criterion {
+            description: " k0 ".to_owned(),
+            verification: Vec::new(),
+        };
+        let by_verification = Criterion {
+            description: "anders formuliert".to_owned(),
+            verification: vec![VerificationStep::Command {
+                cmd: "check k1".to_owned(),
+                expect_exit: 0,
+            }],
+        };
+        let plan = Plan {
+            id: harw_plan::PlanId::parse("p-drive")
+                .map_err(|e| TestError::Unexpected(e.to_string()))?,
+            revision: harw_plan::RevisionId::new(1),
+            parent_revision: None,
+            goal_statement: "Treiberziel".to_owned(),
+            goal_id: Some("g-drive".to_owned()),
+            nodes: vec![
+                plan_node(
+                    "n-a",
+                    vec![
+                        PathOrSymbol::new("./src/parser/"),
+                        PathOrSymbol::new("src/**/*.rs"),
+                        PathOrSymbol::symbol("src/lib.rs", "Parser"),
+                    ],
+                    vec![by_description.clone()],
+                ),
+                plan_node("n-b", Vec::new(), vec![by_description]),
+                plan_node(
+                    "n-c",
+                    vec![PathOrSymbol::new("docs")],
+                    vec![by_verification],
+                ),
+                plan_node(
+                    "n-d",
+                    vec![PathOrSymbol::new("src/**")],
+                    vec![command_criterion("k2")],
+                ),
+            ],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
+        };
+
+        let hints = scope_hints_from_plan(&goal, &plan);
+
+        assert_eq!(
+            hints,
+            vec![
+                WorkScope {
+                    id: "plan-n-a".to_owned(),
+                    summary: "Knoten n-a".to_owned(),
+                    owned_paths: vec!["src/lib.rs".to_owned(), "src/parser".to_owned()],
+                    criteria: vec![0],
+                },
+                WorkScope {
+                    id: "plan-n-c".to_owned(),
+                    summary: "Knoten n-c".to_owned(),
+                    owned_paths: vec!["docs".to_owned()],
+                    criteria: vec![1],
+                },
+            ]
+        );
+
+        let mut fx = Fixture::new(goal, report(3, &[0, 1, 2]));
+        fx.hints = hints;
+        let plan = fx.decide();
+        let ids: Vec<&str> = delegates(&plan).iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["plan-n-a", "plan-n-c", "criterion-2"], "{plan:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_task_is_structured_and_asks_for_the_report_tool() -> TestResult {
+        let mut criteria = vec![command_criterion("k0")];
+        criteria.push(Criterion {
+            description: "Datei da".to_owned(),
+            verification: vec![VerificationStep::Artifact {
+                path: "src/a.rs".to_owned(),
+            }],
+        });
+        let fx = Fixture::new(goal(criteria), report(2, &[0, 1]));
+
+        let plan = fx.decide();
+
+        let tasks: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                WorkDriveStep::Delegate { task, .. } => Some(task.as_str()),
+                _ => None,
+            })
+            .collect();
+        let artifact_task = tasks
+            .iter()
+            .find(|task| task.contains("[1] Datei da"))
+            .ok_or(TestError::Missing("artifact task"))?;
+        for needle in [
+            "## Goal\nTreiberziel",
+            "## Scope `criterion-1`",
+            "## Acceptance criteria (index = position in the goal)\n- [1] Datei da\n  verified by: file `src/a.rs` exists",
+            "## Owned paths\n- src/a.rs",
+            "## Rules\n",
+            WORK_DRIVER_REPORT_TOOL,
+        ] {
+            assert!(
+                artifact_task.contains(needle),
+                "{needle} missing in:\n{artifact_task}"
+            );
+        }
+        let command_task = tasks
+            .iter()
+            .find(|task| task.contains("[0] k0"))
+            .ok_or(TestError::Missing("command task"))?;
+        assert!(
+            command_task.contains("verified by: `check k0` exits 0"),
+            "{command_task}"
+        );
+        assert!(
+            !command_task.contains("Ziel:"),
+            "no German free text: {command_task}"
+        );
+        assert!(TASK_RULES.contains(WORK_DRIVER_REPORT_TOOL));
+        Ok(())
     }
 
     #[test]

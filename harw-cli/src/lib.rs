@@ -870,6 +870,15 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
         Some(Command::PrReview(args)) => {
+            let args = crate::pr_review::PrReviewArgs {
+                pr: args.pr,
+                repo: args.repo,
+                max_diff_kib: args.max_diff_kib,
+                fixture: args.fixture,
+                fixture_only: args.fixture_only,
+                output: args.output,
+                post: args.post,
+            };
             if let Err(message) = crate::pr_review::run(&args) {
                 eprintln!("{message}");
                 return Err(message);
@@ -1413,14 +1422,18 @@ fn serve_mcp(
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // R18 P4: WorkDriver-Spur nach `[harness.jobs]` (höchstens so viele
+    // Läufe gleichzeitig wie Jobs laufen dürfen, mindestens einer).
+    let worker_options = job_worker::JobWorkerOptions::from_config(&config);
     let worker = spawn_job_worker_thread(worker_runtime, move || {
-        job_worker::run_job_worker(
+        job_worker::run_job_worker_with_options(
             store,
             executions,
             provider,
             plan_node_services,
             shutdown_rx,
             worker_context,
+            worker_options,
         )
     })?;
 

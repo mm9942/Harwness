@@ -1,0 +1,27 @@
+[package]
+name = "harw-tool-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Remote tool proxy (R18 D-A): ToolProvider/ToolExecutor over harw_protocol::ToolPort; every call runs in the gateway, never locally."
+publish.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-protocol = { path = "../harw-protocol" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+serde_json = { workspace = true }
+# `select!` (Aufruf gegen den Turn-`CancelToken`) und `Handle::try_current`
+# (`tool.cancel` beim Verwerfen eines laufenden Aufrufs).
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+harw-authority = { path = "../harw-authority" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

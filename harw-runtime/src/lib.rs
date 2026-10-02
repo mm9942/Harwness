@@ -66,8 +66,8 @@ pub use config::{
     load_config_with_agents,
 };
 pub use contributors::{
-    AssemblyContributor, AssemblyInputs, AssemblyParts, InfrastructureContributor,
-    default_contributors,
+    AssemblyContributor, AssemblyInputs, AssemblyParts, GatewayContributor,
+    GatewayDiagnosticsContributor, InfrastructureContributor, default_contributors,
 };
 pub use embedded::{EffectiveRights, EmbeddedAgent, RightsFlags};
 pub use error::{RuntimeError, RuntimeResult};

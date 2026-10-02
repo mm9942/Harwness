@@ -28,7 +28,7 @@ latest release.
 ## Core security invariants
 
 These are invariants the project maintains across the runtime, the terminal
-UI, and the Defense-on-Device host-security plane. A change that weakens one
+UI, and the Detect · Orient · Defend host-security plane. A change that weakens one
 of them is a security regression even if it is otherwise a passing change,
 and should be flagged rather than merged silently — see
 [CONTRIBUTING.md](CONTRIBUTING.md#security-sensitive-changes).

@@ -205,7 +205,8 @@ impl UpdateChecker {
 
 ### `src/migration.rs`
 ```rust
-pub trait ConfigMigration { fn from_version(&self) -> u32; fn apply(&self, doc: &mut toml_edit::DocumentMut) -> Result<(), MigrationError>; }
+pub struct ConfigDocument { /* wraps toml_edit::DocumentMut; get_* / set_* / remove via segment paths, fail closed */ }
+pub trait ConfigMigration { fn from_version(&self) -> u32; fn apply(&self, doc: &mut ConfigDocument) -> Result<(), MigrationError>; }
 pub struct MigrationRunner { migrations: Vec<Box<dyn ConfigMigration>>, latest: u32 }
 impl MigrationRunner {
     pub fn new(migrations: Vec<Box<dyn ConfigMigration>>, latest: u32) -> Self;

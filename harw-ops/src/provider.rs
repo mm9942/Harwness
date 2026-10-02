@@ -46,9 +46,11 @@
 //! - [`harw_operations::OpError::InvalidArguments`]: unknown subcommand, unknown
 //!   provider ID, missing credentials, incompatible active model, or (for
 //!   `/provider-concurrency`) a malformed `<n|unlimited>` value.
-//! - [`harw_operations::OpError::NotAvailable`]: (`/provider-concurrency`
-//!   only) no `ProviderLoadRegistry` service registered, or the resolved
-//!   provider has no registered load-control handle.
+//! - [`harw_operations::OpError::NotAvailable`]: neither a config service nor
+//!   a bound root space (`harw_home::ResolvedHomeContext`) in the context —
+//!   there is no fallback to `HARW_HOME`; or (`/provider-concurrency` only) no
+//!   `ProviderLoadRegistry` service registered, or the resolved provider has
+//!   no registered load-control handle.
 //!
 //! # Concurrency
 //! The function is `async` but performs only synchronous reads except for the
@@ -149,7 +151,8 @@ impl DiscoveryConnectionCheck {
     ///
     /// # Arguments
     /// - `home` (`Option<PathBuf>`): harw-Home für `file:`-Credentials;
-    ///   `None` lässt solche Referenzen unaufgelöst.
+    ///   `None` lässt solche Referenzen unaufgelöst. Die Laufzeit übergibt
+    ///   den an die Sitzung gebundenen Root-Space, nie `HARW_HOME`.
     /// - `resolver`: sealed-secret-Resolver der Runtime; `None` lässt
     ///   `secrets:`-Referenzen unaufgelöst.
     #[must_use]
@@ -266,18 +269,26 @@ fn configured_auth_status_label(provider: &harw_config::ProviderToml) -> &'stati
 
 /// Resolves the operation's provider catalog from the execution context.
 ///
-/// The context-scoped configuration is authoritative when present, which makes
-/// provider operations composable with callers that already resolved their
-/// configuration. Standalone operation execution retains the discovery fallback.
+/// Resolution order: the live configuration
+/// ([`crate::live_config::SharedLiveConfig`]), then a context-scoped
+/// `Arc<harw_config::ResolvedConfig>`, then config discovery over the root
+/// space bound to the session (`Arc<harw_home::ResolvedHomeContext>`, see
+/// [`crate::config_util::load_bound_config`]). It never reads `HARW_HOME` or
+/// `~/.harw`: a session started with a different root space (e.g. `--home`)
+/// must not silently see the process's configuration.
 ///
 /// `pub(crate)` so [`crate::model::handle_switch_core`],
-/// [`crate::model::handle_uia_model_switch`] and
-/// [`crate::model::handle_uia_worker_model_switch`] resolve the target
-/// model's configured provider through the same context-scoped-first
-/// authority that this function's own `handle_switch_core`/
-/// `handle_uia_switch_core` already use — the runtime (`harw-tui`'s
-/// `command_exec::build_services`) injects `Arc<harw_config::ResolvedConfig>`
-/// into the `ServiceMap` specifically for `/model`- and `/provider`-ops.
+/// [`crate::model::handle_uia_model_switch`],
+/// [`crate::model::handle_uia_worker_model_switch`] and the `show`/`list`
+/// paths of `/model` and `/uia-model` resolve the configuration through the
+/// same authority that this function's own `handle_switch_core`/
+/// `handle_uia_switch_core` already use.
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: neither a config service nor a bound root
+///   space is registered in `ctx`.
+/// - [`OpError::Execution`]: config discovery over the bound root space
+///   failed.
 pub(crate) fn resolved_config(
     ctx: &OpContext,
 ) -> Result<Arc<harw_config::ResolvedConfig>, OpError> {
@@ -290,7 +301,7 @@ pub(crate) fn resolved_config(
         return Ok(Arc::clone(config));
     }
 
-    crate::config_util::load_default_config("Config-Discovery fehlgeschlagen").map(Arc::new)
+    crate::config_util::load_bound_config(ctx, "Config-Discovery fehlgeschlagen").map(Arc::new)
 }
 
 /// Shows, lists and tests configured providers, using live runtime state.
@@ -319,6 +330,8 @@ pub(crate) fn resolved_config(
 ///
 /// # Errors
 /// - [`OpError::Execution`]: when the [`SharedSessionController`] is not registered in context.
+/// - [`OpError::NotAvailable`]: neither a config service nor a bound root
+///   space in context (see [`resolved_config`]).
 /// - [`OpError::InvalidArguments`]: unknown sub-command; unknown provider ID;
 ///   missing credentials; incompatible active model.
 ///
@@ -388,6 +401,7 @@ async fn provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpErr
 ///
 /// # Errors
 /// - [`OpError::Execution`]: controller not in context.
+/// - [`OpError::NotAvailable`]: no configuration resolvable (see [`resolved_config`]).
 ///
 /// # Spec Reference
 /// harwness Plan v2 — Task A: `/provider show` becomes runtime-truthful.
@@ -533,6 +547,7 @@ fn display_permits(available_permits: usize) -> String {
 ///
 /// # Errors
 /// - [`OpError::Execution`]: controller not in context.
+/// - [`OpError::NotAvailable`]: no configuration resolvable (see [`resolved_config`]).
 ///
 /// # Spec Reference
 /// harwness Plan v2 — Task B: `/provider list` becomes configuration-driven.
@@ -599,18 +614,20 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// 4. Only when all checks pass, calls `controller.set_active_provider(id)`
 ///    and, if a model argument was given, `controller.set_active_model(id)`.
 /// 5. Best-effort persists the resulting active provider/model as the
-///    profile's on-disk default via
-///    [`crate::config_util::persist_default_selection`], so future sessions
-///    start with the same selection. A persistence failure never fails the
-///    operation — it is appended to the success text as a clear note instead.
+///    on-disk default of the bound root space's profile via the injected
+///    `persist` closure, so future sessions start with the same selection.
+///    A persistence failure never fails the operation — it is appended to
+///    the success text as a clear note instead.
 ///
 /// `pub(crate)` because this is now the sole atomic provider(+model) switch
 /// path: `/provider switch`/`/uia-provider switch` were retired as
 /// sub-commands (an operator now always goes through `/model switch` or
 /// `/uia-model switch`, which resolve the target model's configured provider
 /// and delegate here so a provider+model pair never passes through a moment
-/// of incompatibility). [`crate::model::handle_switch_core`] calls this
-/// directly with `persist = `[`crate::config_util::persist_default_selection`].
+/// of incompatibility). `/model switch` passes the
+/// `persist_default_selection` of [`crate::config_util::selection_persistence`]
+/// (an injected service, else the profile of the bound root space, never
+/// `HARW_HOME`).
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): used to obtain the controller.
@@ -628,6 +645,7 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 ///
 /// # Errors
 /// - [`OpError::Execution`]: controller not in context, or controller mutation failed.
+/// - [`OpError::NotAvailable`]: no configuration resolvable (see [`resolved_config`]).
 /// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, unknown
 ///   model, or provider/model incompatibility.
 ///
@@ -772,13 +790,17 @@ pub(crate) fn handle_switch_core(
 /// `persist` ist — wie bei [`handle_switch_core`] — ein injizierter Abschluss
 /// statt eines hartcodierten Aufrufs von
 /// [`crate::config_util::persist_uia_selection`]. Der einzige Produktions-
-/// Aufrufer ([`crate::model::handle_uia_model_switch`]) übergibt weiterhin
-/// genau diese Funktion, sodass sich am Laufzeitverhalten nichts ändert;
-/// die Injektion existiert, damit Tests einen No-op-Abschluss einsetzen
-/// können und **niemals** die echte, `HARW_HOME`-auflösende Persistenz
-/// berühren — diese Crate deklariert `#![forbid(unsafe_code)]`, sodass eine
-/// testweise `HARW_HOME`-Env-Isolation (die `unsafe fn
-/// std::env::set_var`/`remove_var` bräuchte) hier nicht zur Verfügung steht.
+/// Aufrufer ([`crate::model::handle_uia_model_switch`]) übergibt
+/// `persist_uia_selection` aus [`crate::config_util::selection_persistence`]
+/// (injizierter Dienst, sonst das Profil des gebundenen Root-Space, nie
+/// `HARW_HOME`); die Injektion existiert, damit Tests einen No-op-Abschluss
+/// einsetzen können und **niemals** eine echte `config.toml` berühren.
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: keine Config auflösbar (siehe [`resolved_config`]).
+/// - [`OpError::Execution`]: Controller fehlt oder Mutation schlug fehl.
+/// - [`OpError::InvalidArguments`]: unbekannter oder deaktivierter Provider,
+///   fehlende Zugangsdaten, unbekanntes oder inkompatibles Modell.
 pub(crate) fn handle_uia_switch_core(
     ctx: &OpContext,
     target: String,
@@ -976,7 +998,9 @@ async fn live_connection_line(
 /// [`OpOutput`] with auth-type label, provider status and live-test line.
 ///
 /// # Errors
-/// - [`OpError::Execution`]: config discovery failed.
+/// - [`OpError::Execution`]: config discovery over the bound root space failed.
+/// - [`OpError::NotAvailable`]: neither a config service nor a bound root
+///   space in context (see [`resolved_config`]).
 ///
 /// # Concurrency
 /// Stateless; thread-safe. Awaits at most one HTTP request (20 s timeout).
@@ -1196,7 +1220,8 @@ fn parse_concurrency_value(raw: &str) -> Result<Option<usize>, OpError> {
 /// # Errors
 /// - [`OpError::InvalidArguments`]: missing provider, unknown provider, or a
 ///   malformed value (see [`parse_concurrency_value`]).
-/// - [`OpError::NotAvailable`]: no [`harw_provider_http::ProviderLoadRegistry`]
+/// - [`OpError::NotAvailable`]: no configuration resolvable (see
+///   [`resolved_config`]), no [`harw_provider_http::ProviderLoadRegistry`]
 ///   is registered in the [`OpContext`] (the runtime registers one on every
 ///   surface, so this only happens in standalone/test contexts), or the
 ///   resolved provider has no registered handle (it was not built as the
@@ -1314,7 +1339,10 @@ async fn provider_concurrency(
 /// [`OpOutput`] with compact, multi-line text.
 ///
 /// # Errors
-/// - [`OpError::Execution`]: controller not in context, or config discovery failed.
+/// - [`OpError::Execution`]: controller not in context, or config discovery
+///   over the bound root space failed.
+/// - [`OpError::NotAvailable`]: neither a config service nor a bound root
+///   space in context (see [`resolved_config`]).
 /// - [`OpError::InvalidArguments`]: unknown sub-command; unknown provider ID;
 ///   missing credentials; incompatible active model.
 ///
@@ -1376,8 +1404,9 @@ async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, O
 /// a fallback note.
 ///
 /// # Errors
-/// - [`OpError::Execution`]: config discovery failed, or the configured
-///   provider catalog is unavailable.
+/// - [`OpError::Execution`]: config discovery over the bound root space
+///   failed, or the configured provider catalog is unavailable.
+/// - [`OpError::NotAvailable`]: no configuration resolvable (see [`resolved_config`]).
 ///
 /// # Spec Reference
 /// harwness Plan v2 — UIA-specific pinned provider/model selection.
@@ -1671,6 +1700,42 @@ mod tests {
         assert!(
             Arc::ptr_eq(&resolved, &config),
             "the context-scoped resolved config must be authoritative"
+        );
+        Ok(())
+    }
+
+    /// Without a config service the configuration is discovered in the root
+    /// space bound to the session, not in `HARW_HOME`.
+    #[test]
+    fn resolved_config_discovers_from_the_bound_home() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_model = \"bound\"\n",
+        )
+        .map_err(ctx("seed bound root config"))?;
+        let mut services = ServiceMap::new();
+        services.insert(crate::config_util::test_home_context(dir.path())?);
+        let context = crate::knowledge_test_support::op_context(services)?;
+
+        let resolved =
+            super::resolved_config(&context).map_err(ctx("bound config must resolve"))?;
+
+        assert_eq!(resolved.harness.default_model.as_deref(), Some("bound"));
+        Ok(())
+    }
+
+    /// Neither a config service nor a bound root space: fail closed instead
+    /// of falling back to the process's root space.
+    #[test]
+    fn resolved_config_without_config_or_bound_home_is_not_available() -> TestResult {
+        let (ctx, _tmp) = make_test_ctx(None, None)?;
+
+        let result = super::resolved_config(&ctx);
+
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
         );
         Ok(())
     }

@@ -355,6 +355,25 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("work_driver.enqueue", AGENTS, Shell),
     row!("work_driver.status", AGENTS, Meta),
     row!("work_driver.stop", AGENTS, Meta),
+    // Only WorkDriver worker turns get it; it records the worker's report.
+    row!("work_driver.report", AGENTS, Meta),
+    // gateway (R18): operations in `harw-ops`, served to the UIA root like
+    // `work_driver.*`. Reads inspect the gateway; mutations act on it outside
+    // the sandbox and always ask.
+    row!("gateway.status", AGENTS, Meta),
+    row!("gateway.connections.list", AGENTS, Meta),
+    row!("gateway.sessions.list", AGENTS, Meta),
+    row!("gateway.listeners.list", AGENTS, Meta),
+    row!("gateway.tools.list", AGENTS, Meta),
+    row!("gateway.channels.list", AGENTS, Meta),
+    row!("gateway.channels.connect_info", AGENTS, Meta),
+    row!("gateway.health", AGENTS, Meta),
+    row!("gateway.logs", AGENTS, Meta),
+    row!("gateway.connections.revoke", AGENTS, Host),
+    row!("gateway.drain", AGENTS, Host),
+    row!("gateway.listeners.set", AGENTS, Host),
+    row!("gateway.tools.grant", AGENTS, Host),
+    row!("gateway.tools.narrow", AGENTS, Host),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),

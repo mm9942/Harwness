@@ -77,6 +77,38 @@ pub struct ModelsArgs {
     #[serde(default)]
     #[raw(nth = 2)]
     pub target: Option<String>,
+    /// Optionales Reasoning-Gewicht für `set` (minimal|low|medium|high|xhigh|max).
+    #[serde(default)]
+    #[raw(nth = 3)]
+    pub effort: Option<String>,
+}
+
+/// Parst ein optionales Effort-Argument gegen [`harw_types::ReasoningEffort`]
+/// und akzeptiert nur Rollen mit eigenem Gewichtsfeld (siehe
+/// `harw-config::resolve_effort`).
+pub(crate) fn parse_role_effort(
+    raw: Option<&str>,
+    role_key: &str,
+) -> Result<Option<harw_types::ReasoningEffort>, OpError> {
+    let raw = match raw.map(str::trim) {
+        Some("") | None => return Ok(None),
+        Some(value) => value,
+    };
+    use std::str::FromStr;
+    let level = harw_types::ReasoningEffort::from_str(raw).map_err(|_| {
+        OpError::InvalidArguments(format!(
+            "Unbekanntes Effort-Level: '{raw}'. \
+             Erwartet: minimal | low | medium | high | xhigh | max."
+        ))
+    })?;
+    if role_effort_field(role_key).is_none() {
+        return Err(OpError::InvalidArguments(format!(
+            "Rolle '{role_key}' hat kein eigenes Reasoning-Gewicht. \
+             Gültig: uia, root-orchestrator, sub-orchestrator, \
+             worker-simple, worker-complex."
+        )));
+    }
+    Ok(Some(level))
 }
 
 // ── Hilfsfunktionen ──────────────────────────────────────────────────────────
@@ -321,12 +353,13 @@ fn render_show(
     }
 }
 
-/// Führt `set <rolle> <ziel>` aus.
+/// Führt `set <rolle> <ziel> [effort]` aus.
 fn handle_set(
     ctx: &OpContext,
     config: &ResolvedConfig,
     role: ModelRole,
     target: &str,
+    effort_level: Option<harw_types::ReasoningEffort>,
 ) -> Result<OpOutput, OpError> {
     let (provider, model) = resolve_target(config, target)?;
     let persistence = crate::config_util::selection_persistence(ctx);
@@ -371,6 +404,17 @@ fn handle_set(
         }
     };
 
+    // Optionales Reasoning-Gewicht zusätzlich verankern (bestes Bemühen);
+    // nur Rollen mit Gewichtsfeld erreichen diese Stelle überhaupt.
+    let effort_note = effort_level.and_then(|level| {
+        persistence.persist_role_reasoning_effort(role.key(), Some(level.to_string()).as_deref())
+    });
+
+    let note = match (note, effort_note) {
+        (_, Some(extra)) => Some(extra),
+        (base, None) => base,
+    };
+
     let text = finish_role_text(
         format!("Modell für {} gesetzt: {provider}/{model}", role.label()),
         note.as_deref(),
@@ -387,6 +431,19 @@ fn handle_set(
             "note": note,
         })),
     })
+}
+
+/// TOML-Feldname des Reasoning-Gewichts für eine Rolle (siehe
+/// `harw-config::resolve_effort`); `None` für Rollen ohne Gewichtsfeld.
+fn role_effort_field(role_key: &str) -> Option<&'static str> {
+    match role_key {
+        "uia" => Some("reasoning.uia"),
+        "root-orchestrator" => Some("reasoning.root_orchestrator"),
+        "sub-orchestrator" => Some("reasoning.sub_orchestrator"),
+        "worker-simple" => Some("reasoning.worker_simple"),
+        "worker-complex" => Some("reasoning.worker_complex"),
+        _ => None,
+    }
 }
 
 /// Führt `reset <rolle>` aus.
@@ -481,7 +538,7 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
             Ok(render_show(&rows, live_provider, live_model))
         }
         "set" => {
-            let usage = "/models set <rolle> <modell|provider/modell>";
+            let usage = "/models set <rolle> <modell|provider/modell> [effort]";
             let role = parse_role(args.role.as_deref(), usage)?;
             let target = match args.target.as_deref().map(str::trim) {
                 Some(target) if !target.is_empty() => target.to_owned(),
@@ -491,8 +548,12 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
                     )));
                 }
             };
+            // Optionales Reasoning-Gewicht: nur Rollen mit eigenem
+            // Gewichtsfeld (siehe harw-config resolve_effort) akzeptieren
+            // einen Wert; das Level wird wie in /effort validiert.
+            let effort_level = parse_role_effort(args.effort.as_deref(), role.key())?;
             let config = crate::provider::resolved_config(ctx)?;
-            handle_set(ctx, &config, role, &target)
+            handle_set(ctx, &config, role, &target, effort_level)
         }
         "reset" | "clear" => {
             let role = parse_role(args.role.as_deref(), "/models reset <rolle>")?;
@@ -684,6 +745,53 @@ mod tests {
         let empty = ModelsArgs::from_raw_args(&toks(&[])).map_err(ctx("leer"))?;
         assert_eq!(empty, ModelsArgs::default());
         Ok(())
+    }
+
+    /// Prüft, dass `parse_role_effort` ein gültiges Level für eine Rolle mit
+    /// Gewichtsfeld akzeptiert und es als `Some` zurückgibt.
+    #[test]
+    fn parse_role_effort_accepts_level_for_weighted_role() -> TestResult {
+        let level = super::parse_role_effort(Some("high"), "root-orchestrator")
+            .map_err(ctx("parse_role_effort"))?;
+        assert_eq!(level, Some(harw_types::ReasoningEffort::High));
+        Ok(())
+    }
+
+    /// Prüft, dass `parse_role_effort` für eine Rolle ohne Gewichtsfeld
+    /// (z. B. `explorer`) mit deutschem Hinweis ablehnt.
+    #[test]
+    fn parse_role_effort_rejects_role_without_weight_field() {
+        let error = super::parse_role_effort(Some("high"), "explorer")
+            .expect_err("Rolle ohne Gewichtsfeld muss abgelehnt werden");
+        match error {
+            OpError::InvalidArguments(message) => {
+                assert!(
+                    message.contains("kein eigenes Reasoning-Gewicht"),
+                    "unerwartete Meldung: {message}"
+                );
+                assert!(
+                    message.contains("explorer"),
+                    "unerwartete Meldung: {message}"
+                );
+            }
+            other => panic!("erwartet InvalidArguments, gefunden: {other:?}"),
+        }
+    }
+
+    /// Prüft, dass `parse_role_effort` ein unbekanntes Level ablehnt.
+    #[test]
+    fn parse_role_effort_rejects_unknown_level() {
+        let error = super::parse_role_effort(Some("extrem"), "uia")
+            .expect_err("unbekanntes Level muss abgelehnt werden");
+        match error {
+            OpError::InvalidArguments(message) => {
+                assert!(
+                    message.contains("Unbekanntes Effort-Level: 'extrem'"),
+                    "unerwartete Meldung: {message}"
+                );
+            }
+            other => panic!("erwartet InvalidArguments, gefunden: {other:?}"),
+        }
     }
 
     #[test]
