@@ -47,7 +47,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Alle elf Einstiege.
-const ALL_ENTRIES: [EntryKind; 11] = [
+const ALL_ENTRIES: [EntryKind; 12] = [
     EntryKind::Tui,
     EntryKind::OneShot,
     EntryKind::LocalEcho,
@@ -58,6 +58,7 @@ const ALL_ENTRIES: [EntryKind; 11] = [
     EntryKind::JobPrompt,
     EntryKind::JobPlanNode,
     EntryKind::GatewayTelegram,
+    EntryKind::SessionHost,
     EntryKind::GatewayDream,
 ];
 
@@ -234,6 +235,16 @@ fn expected(entry: EntryKind) -> Expected {
             permissions: RWXN,
             tools_empty: false,
             approval_chain: DEFAULT_AND_ASK,
+            ceiling_empty: false,
+            spawner_empty: false,
+        },
+        // Gehostete Sitzung: Obergrenze wie `Analyze`/`Doctor` ohne Netz, aber
+        // mit Spawner und lokaler Decke; die Tier-Verengung greift erst über
+        // `RuntimeNarrowing` in der Factory.
+        EntryKind::SessionHost => Expected {
+            permissions: RWX,
+            tools_empty: false,
+            approval_chain: DEFAULT_ONLY,
             ceiling_empty: false,
             spawner_empty: false,
         },

@@ -339,6 +339,7 @@ impl std::fmt::Debug for RootSession {
 pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
     match entry {
         EntryKind::GatewayTelegram
+        | EntryKind::SessionHost
         | EntryKind::Tui
         | EntryKind::OneShot
         | EntryKind::LocalEcho
@@ -372,7 +373,9 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
 #[must_use]
 pub const fn forced_approval_mode(entry: EntryKind) -> Option<ApprovalMode> {
     match entry {
-        EntryKind::GatewayTelegram => Some(ApprovalMode::Delegated),
+        // Gehostete Sitzungen: Freigaben immer delegiert (an den angehängten
+        // Controller über den dauerhaften Freigabespeicher), nie automatisch.
+        EntryKind::GatewayTelegram | EntryKind::SessionHost => Some(ApprovalMode::Delegated),
         EntryKind::Tui
         | EntryKind::OneShot
         | EntryKind::LocalEcho

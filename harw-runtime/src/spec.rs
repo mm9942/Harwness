@@ -84,6 +84,11 @@ pub enum EntryKind {
     GatewayTelegram,
     /// Dream-Gateway.
     GatewayDream,
+    /// Von `harw gateway --session-socket` gehostete Sitzung (WebSocket-
+    /// Kontrollebene). Obergrenze `{R, W, X}` ohne Netz; die tatsächlichen
+    /// Rechte schneidet die Tier der Verbindung (`RuntimeNarrowing`), und
+    /// jede Freigabe ist delegiert (nie automatisch).
+    SessionHost,
     /// Ein kompilierter Agent (#22 Welle 3A): Konfiguration, Agent, Skills
     /// und Wissen kommen aus [`RuntimeSpec::embedded`] statt aus `~/.harw`.
     /// [`EntryKind::profile`] liefert dafür nur eine konservative
@@ -178,6 +183,7 @@ impl EntryKind {
     /// | JobPlanNode | {R, W} | Full + None | Fail | None | LocalRoot | ja |
     /// | GatewayTelegram | {R, W} | WorkspaceEdit + None | Interactive | None | Closed | nein |
     /// | GatewayDream | {} | NoTools + None | Fail | None | Closed | nein |
+    /// | SessionHost | {R, W, X} (Tier schneidet) | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot | ja |
     ///
     /// `R` = [`Permission::ReadWorkspace`], `W` = [`Permission::WriteWorkspace`],
     /// `X` = [`Permission::ExecuteProcess`], `N` = [`Permission::NetworkAccess`]
@@ -289,6 +295,15 @@ impl EntryKind {
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::Closed,
                 project_context: false,
+            },
+            EntryKind::SessionHost => EntryProfile {
+                permissions: rwx(),
+                registry_profile: RegistryProfile::Full,
+                operations: OperationSurface::AllWithModelTools,
+                ask: AskResolution::Interactive,
+                spawner: SpawnerPolicy::BuiltinRoles,
+                ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::GatewayDream => EntryProfile {
                 permissions: PermissionSet::empty(),
@@ -544,7 +559,7 @@ mod tests {
     use super::*;
     use harw_types::{IngressSurface, PermissionTier, PrincipalKind};
 
-    const ALL: [EntryKind; 12] = [
+    const ALL: [EntryKind; 13] = [
         EntryKind::Tui,
         EntryKind::OneShot,
         EntryKind::LocalEcho,
@@ -557,6 +572,7 @@ mod tests {
         EntryKind::GatewayTelegram,
         EntryKind::GatewayDream,
         EntryKind::CompiledAgent,
+        EntryKind::SessionHost,
     ];
 
     const ALL_PERMISSIONS: [Permission; 8] = [
@@ -586,6 +602,7 @@ mod tests {
             EntryKind::GatewayTelegram => 9,
             EntryKind::GatewayDream => 10,
             EntryKind::CompiledAgent => 11,
+            EntryKind::SessionHost => 12,
         }
     }
 
@@ -837,6 +854,7 @@ mod tests {
             EntryKind::Analyze,
             EntryKind::Doctor,
             EntryKind::JobPlanNode,
+            EntryKind::SessionHost,
         ];
         for kind in ALL {
             assert_eq!(
@@ -873,12 +891,15 @@ mod tests {
     }
 
     #[test]
-    fn only_tui_and_telegram_ask_interactively() {
+    fn only_attended_entries_ask_interactively() {
         for kind in ALL {
             let interactive = kind.profile().ask == AskResolution::Interactive;
             assert_eq!(
                 interactive,
-                matches!(kind, EntryKind::Tui | EntryKind::GatewayTelegram),
+                matches!(
+                    kind,
+                    EntryKind::Tui | EntryKind::GatewayTelegram | EntryKind::SessionHost
+                ),
                 "{kind:?}"
             );
         }
