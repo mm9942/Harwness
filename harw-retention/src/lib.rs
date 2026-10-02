@@ -20,6 +20,7 @@
 extern crate self as harw_retention;
 
 mod class;
+mod classes;
 mod policy;
 mod sweep;
 
@@ -30,6 +31,7 @@ pub use class::{
     CLASS_CONFIG_FIELDS, Class, ClassConfig, ClassDefaults, ClassKind, DirOutcome, DirResolver,
     ResolvedClass, Roots,
 };
+pub use classes::{CLASSES, RetentionConfig, policy_for, resolve_all};
 pub use policy::{
     ItemError, NameMatch, Removal, RemovalReason, Report, RetentionError, RetentionPolicy,
     SweepMode,
