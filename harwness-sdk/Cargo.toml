@@ -34,6 +34,7 @@ harw-home = { path = "../harw-home" }
 harw-protocol = { path = "../harw-protocol" }
 harw-provider-http = { path = "../harw-provider-http", optional = true }
 harw-runtime = { path = "../harw-runtime", default-features = false }
+harw-session-client = { path = "../harw-session-client" }
 harw-session-remote = { path = "../harw-session-remote", optional = true }
 harw-session-store = { path = "../harw-session-store" }
 harw-tools = { path = "../harw-tools" }

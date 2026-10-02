@@ -35,40 +35,27 @@
 //! [`RemoteHarwness`] ist billig klonbar. `send` nimmt `&mut self`: eine
 //! [`RemoteSession`] fährt nie zwei Turns zugleich.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, CreateParams, Cursor, DEFAULT_TAIL_ITEMS, FrameEnvelope,
-    HostedState, InterruptParams, RespondResult, SessionFrame, StreamProfile, SubmitParams,
-    SubmitResult,
+    InterruptParams, SessionFrame, StreamProfile, SubmitParams,
 };
-use harw_protocol::{ApprovalKind, FrameSource, PortError, SessionPort};
+use harw_protocol::{FrameSource, PortError, SessionPort};
+use harw_session_client::{
+    AnsweredSet, IdempotencyKeys, MAX_SUBMIT_ATTEMPTS, RespondStep, StreamTracker, SubmitStep,
+    TurnEnd, TurnTally, describe, hosted_state_word, interpret_respond, interpret_submit, review,
+};
 use harw_session_remote::{ConnectOptions, RemotePort, connect_unix};
-use harw_types::{ApprovalId, ReviewDecision};
+use harw_types::ApprovalId;
 
 use crate::approval::{ApprovalHandler, ApprovalRequest, Decision, default_handler};
 use crate::error::{Result, SdkError};
-use crate::event::{EventSource, FinishStatus, SdkEvent, Usage, map_turn_event};
+use crate::event::{EventSource, SdkEvent, Usage, map_turn_event};
 use crate::ids::SessionId;
 use crate::session::{TurnReport, TurnStatus};
-
-/// Wie oft ein Prompt bei einem veralteten Stand erneut abgesendet wird.
-const MAX_SUBMIT_ATTEMPTS: usize = 3;
-
-/// Instanzen in diesem Prozess; mit der Startzeit ergibt das die Epoche der
-/// Idempotenzschlüssel.
-static INSTANCES: AtomicU64 = AtomicU64::new(0);
-
-fn fresh_epoch() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    format!("{nanos:x}.{}", INSTANCES.fetch_add(1, Ordering::Relaxed))
-}
 
 /// Eine Sitzung des Hosts, wie `sessions` sie auflistet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,21 +71,6 @@ pub struct RemoteSessionInfo {
     pub state: String,
     /// Wie viele Clients gerade angehängt sind.
     pub attached: u32,
-}
-
-fn state_word(state: &HostedState) -> &'static str {
-    match state {
-        HostedState::Idle => "idle",
-        HostedState::Running => "running",
-        HostedState::WaitingForApproval => "waiting_for_approval",
-        HostedState::WaitingForChild => "waiting_for_child",
-        HostedState::Queued { .. } => "queued",
-        HostedState::Interrupted => "interrupted",
-        HostedState::Failed => "failed",
-        HostedState::Closed => "closed",
-        #[allow(unreachable_patterns)]
-        _ => "unknown",
-    }
 }
 
 /// Übersetzt einen Portfehler an der Grenze in den SDK-Fehler.
@@ -232,7 +204,7 @@ impl RemoteHarwness {
             .map(|summary| RemoteSessionInfo {
                 id: SessionId::from_core(&summary.session_id),
                 title: summary.title,
-                state: state_word(&summary.state).to_owned(),
+                state: hosted_state_word(&summary.state).to_owned(),
                 attached: summary.attached,
             })
             .collect())
@@ -290,27 +262,21 @@ impl RemoteHarwness {
             compact: self.compact,
             turn_timeout: self.turn_timeout,
             source: Some(source),
-            head: ack.head,
-            last_seen: None,
+            tracker: StreamTracker::new(ack.head),
             resume: None,
             may_approve: ack.granted.approve,
-            answered: HashSet::new(),
-            key_prefix: format!("{}-{}", self.label, fresh_epoch()),
-            sent: 0,
+            answered: AnsweredSet::new(),
+            keys: IdempotencyKeys::new(&self.label),
         })
     }
 }
 
-/// Was während eines Turns eingesammelt wird.
+/// Was während eines Turns eingesammelt wird: die Zählung der Wurzelsitzung
+/// (aus `harw-session-client`) und wie viele Freigaben vorgelegt wurden.
 #[derive(Default)]
-struct Collected {
-    final_text: Option<String>,
-    last_text: Option<String>,
-    tool_calls: u32,
+struct Run {
+    tally: TurnTally,
     approvals: u32,
-    usage: Usage,
-    finished: usize,
-    status: Option<TurnStatus>,
 }
 
 /// Eine angehängte Sitzung eines Hosts.
@@ -322,20 +288,15 @@ pub struct RemoteSession {
     compact: bool,
     turn_timeout: Option<Duration>,
     source: Option<Box<dyn FrameSource>>,
-    /// Der Stand des Hosts beim (Neu-)Anhängen: die Position des nächsten
-    /// Eintrags, den dieser Client noch nicht gesehen hat. Ein Ereignis davor
-    /// ist Wiedergabe; eines **auf** diesem Stand ist neu (auf einer frischen
-    /// Sitzung trägt schon der erste Live-Frame genau diese Position).
-    head: Cursor,
-    /// Position des zuletzt verarbeiteten Ereignisses; neue Ereignisse liegen
-    /// strikt dahinter.
-    last_seen: Option<Cursor>,
+    /// Welche Ereignisse neu sind und welche Wiedergabe (siehe
+    /// [`StreamTracker`]: ein Ereignis **auf** dem Stand des Anhängens ist neu,
+    /// Wiedergabe liegt davor).
+    tracker: StreamTracker,
     /// Wohin neu angehängt wird, solange keine Quelle da ist.
     resume: Option<Cursor>,
     may_approve: bool,
-    answered: HashSet<String>,
-    key_prefix: String,
-    sent: u64,
+    answered: AnsweredSet,
+    keys: IdempotencyKeys,
 }
 
 impl std::fmt::Debug for RemoteSession {
@@ -422,56 +383,54 @@ impl RemoteSession {
         self.drain().await;
         let ahead = self.submit(text).await?;
         let wanted = ahead + 1;
-        let mut got = Collected::default();
-        while got.finished < wanted {
+        let mut run = Run::default();
+        while run.tally.finished() < wanted {
             let envelope = self.next_frame().await?;
-            self.on_frame(envelope, &mut got, on_event).await?;
+            self.on_frame(envelope, &mut run, on_event).await?;
         }
+        let summary = run.tally.summary();
         Ok(TurnReport {
             session_id: self.id.clone(),
-            status: got.status.unwrap_or(TurnStatus::Completed),
-            text: got.final_text.or(got.last_text),
-            usage: got.usage,
-            tool_calls: got.tool_calls,
-            approvals: got.approvals,
+            status: status_of(summary.end),
+            text: summary.text,
+            usage: summary
+                .usage
+                .as_ref()
+                .map(Usage::from_core)
+                .unwrap_or_default(),
+            tool_calls: summary.tool_calls,
+            approvals: run.approvals,
         })
     }
 
     /// Verbraucht bereits wartende Frames (Wiedergabe beim Anhängen, Ereignisse
     /// anderer Clients) und merkt sich ihre Position.
     async fn drain(&mut self) {
-        let head = self.head;
-        let mut seen = self.last_seen;
-        if let Some(source) = self.source.as_mut() {
-            while let Ok(Ok(Some(envelope))) =
-                tokio::time::timeout(Duration::ZERO, source.next()).await
-            {
-                let event = matches!(
-                    envelope.frame,
-                    SessionFrame::Turn(_) | SessionFrame::Child { .. }
-                );
-                let new = envelope.cursor >= head
-                    && seen.as_ref().is_none_or(|last| envelope.cursor > *last);
-                if event && new {
-                    seen = Some(envelope.cursor);
-                }
+        let Some(source) = self.source.as_mut() else {
+            return;
+        };
+        while let Ok(Ok(Some(envelope))) = tokio::time::timeout(Duration::ZERO, source.next()).await
+        {
+            if matches!(
+                envelope.frame,
+                SessionFrame::Turn(_) | SessionFrame::Child { .. }
+            ) {
+                self.tracker.accept(&envelope.cursor);
             }
         }
-        self.last_seen = seen;
     }
 
-    /// Sendet den Prompt; wiederholt bei veraltetem Stand. Liefert, wie viele
-    /// Turns vor dem eigenen laufen oder warten.
+    /// Sendet den Prompt; wiederholt bei veraltetem Stand (derselbe Schlüssel).
+    /// Liefert, wie viele Turns vor dem eigenen laufen oder warten.
     async fn submit(&mut self, text: String) -> Result<usize> {
-        self.sent += 1;
-        let key = format!("{}-{}", self.key_prefix, self.sent);
+        let key = self.keys.next_key();
         for _ in 0..MAX_SUBMIT_ATTEMPTS {
             let result = self
                 .port
                 .submit(SubmitParams {
                     session_id: self.wire_id.clone(),
                     text: text.clone(),
-                    expect_head: self.head,
+                    expect_head: self.tracker.expect_head(),
                     client_msg_id: key.clone(),
                     force: false,
                 })
@@ -479,25 +438,12 @@ impl RemoteSession {
                 .map_err(|error| SdkError::Turn {
                     detail: error.to_string(),
                 })?;
-            match result {
-                SubmitResult::Accepted { position } => {
-                    return Ok(usize::try_from(position).unwrap_or(usize::MAX));
-                }
-                SubmitResult::Stale { head } => self.head = head,
-                SubmitResult::QueueFull => {
+            match interpret_submit(result) {
+                SubmitStep::Accepted { ahead } => return Ok(ahead),
+                SubmitStep::Retry { head } => self.tracker.moved_to(head),
+                SubmitStep::Refused(refusal) => {
                     return Err(SdkError::Turn {
-                        detail: "the host's queue for this session is full".to_owned(),
-                    });
-                }
-                SubmitResult::Denied { reason } => {
-                    return Err(SdkError::Turn {
-                        detail: format!("not allowed: {reason}"),
-                    });
-                }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(SdkError::Turn {
-                        detail: "the host answered with an unknown submit result".to_owned(),
+                        detail: refusal.to_string(),
                     });
                 }
             }
@@ -505,11 +451,6 @@ impl RemoteSession {
         Err(SdkError::Turn {
             detail: "the session kept moving; the prompt could not be sent".to_owned(),
         })
-    }
-
-    /// `true`, wenn ein Ereignis an `cursor` neu ist und keine Wiedergabe.
-    fn is_new(&self, cursor: &Cursor) -> bool {
-        *cursor >= self.head && self.last_seen.as_ref().is_none_or(|seen| cursor > seen)
     }
 
     async fn next_frame(&mut self) -> Result<FrameEnvelope> {
@@ -555,10 +496,7 @@ impl RemoteSession {
             .await
             .map_err(session_error)?;
         self.may_approve = ack.granted.approve;
-        // Nach einem Verlust zählt alles ab dem Ziel als neu (es wurde nicht
-        // gesehen); sonst gilt der Stand, den der Host jetzt meldet.
-        self.head = from.unwrap_or(ack.head);
-        self.last_seen = None;
+        self.tracker.reattached(from, ack.head);
         self.source = Some(source);
         self.resume = None;
         Ok(())
@@ -567,20 +505,18 @@ impl RemoteSession {
     async fn on_frame(
         &mut self,
         envelope: FrameEnvelope,
-        got: &mut Collected,
+        run: &mut Run,
         on_event: &mut dyn FnMut(&SdkEvent),
     ) -> Result<()> {
-        let fresh = self.is_new(&envelope.cursor);
         match envelope.frame {
-            SessionFrame::Turn(event) if fresh => {
-                self.last_seen = Some(envelope.cursor);
+            SessionFrame::Turn(event) if self.tracker.accept(&envelope.cursor) => {
+                run.tally.apply_root(&event);
                 let source = EventSource {
                     session_id: self.id.clone(),
                     parent: None,
                     role: "assistant".to_owned(),
                 };
                 if let Some(mapped) = map_turn_event(source, event) {
-                    collect(&mapped, got);
                     on_event(&mapped);
                 }
             }
@@ -589,8 +525,7 @@ impl RemoteSession {
                 parent,
                 role,
                 event,
-            } if fresh => {
-                self.last_seen = Some(envelope.cursor);
+            } if self.tracker.accept(&envelope.cursor) => {
                 let source = EventSource {
                     session_id: SessionId::from_core(&agent),
                     parent: Some(
@@ -604,7 +539,7 @@ impl RemoteSession {
                     on_event(&mapped);
                 }
             }
-            SessionFrame::ApprovalRequested(request) => self.approve(&request, got).await?,
+            SessionFrame::ApprovalRequested(request) => self.approve(&request, run).await?,
             SessionFrame::Resync { head, .. } => self.reattach(Some(head)).await?,
             SessionFrame::Lagged { resume_from } => self.reattach(Some(resume_from)).await?,
             _ => {}
@@ -616,18 +551,18 @@ impl RemoteSession {
     async fn approve(
         &mut self,
         request: &harw_protocol::ApprovalRequest,
-        got: &mut Collected,
+        run: &mut Run,
     ) -> Result<()> {
-        if !self.may_approve || !self.answered.insert(request.id.as_str().to_owned()) {
+        if !self.may_approve || !self.answered.first_time(request.id.as_str()) {
             return Ok(());
         }
-        got.approvals += 1;
-        let mapped = map_request(&self.id, request);
-        let (decision, reason) = match self.approvals.decide(&mapped).await {
-            Decision::Approve => (ReviewDecision::Approved, None),
-            Decision::Deny { reason } => (ReviewDecision::Rejected, Some(reason)),
+        run.approvals += 1;
+        let asked = to_sdk_request(&self.id, describe(request));
+        let (decision, reason) = match self.approvals.decide(&asked).await {
+            Decision::Approve => review(true, None),
+            Decision::Deny { reason } => review(false, Some(reason)),
             #[allow(unreachable_patterns)]
-            _ => (ReviewDecision::Rejected, Some("denied".to_owned())),
+            _ => review(false, Some("denied".to_owned())),
         };
         let answer = self
             .port
@@ -640,236 +575,91 @@ impl RemoteSession {
             .map_err(|error| SdkError::Approval {
                 detail: error.to_string(),
             })?;
-        match answer {
-            // Ein anderes Gerät war schneller oder die Frist lief ab: der
-            // Turn geht trotzdem weiter, das ist kein Fehler dieses Clients.
-            RespondResult::Resolved
-            | RespondResult::AlreadyResolved { .. }
-            | RespondResult::Expired => Ok(()),
-            RespondResult::Denied { reason } => Err(SdkError::Approval {
+        match interpret_respond(answer) {
+            // Ein anderes Gerät war schneller oder die Frist lief ab: der Turn
+            // geht trotzdem weiter, das ist kein Fehler dieses Clients.
+            RespondStep::Settled => Ok(()),
+            RespondStep::Refused(reason) => Err(SdkError::Approval {
                 detail: format!("not allowed to decide: {reason}"),
             }),
-            #[allow(unreachable_patterns)]
-            _ => Err(SdkError::Approval {
+            RespondStep::Unknown => Err(SdkError::Approval {
                 detail: "the host answered with an unknown result".to_owned(),
             }),
         }
     }
 }
 
-/// Zählt ein Ereignis der Wurzelsitzung in den Bericht.
-fn collect(event: &SdkEvent, got: &mut Collected) {
-    match event {
-        SdkEvent::Message {
-            source,
-            text,
-            final_answer,
-        } if source.is_root() => {
-            got.last_text = Some(text.clone());
-            if *final_answer {
-                got.final_text = Some(text.clone());
-            }
-        }
-        SdkEvent::ToolCall { source, .. } if source.is_root() => got.tool_calls += 1,
-        SdkEvent::Finished {
-            source,
-            status,
-            usage,
-        } if source.is_root() => {
-            got.finished += 1;
-            got.usage = usage.unwrap_or_default();
-            got.status = Some(match status {
-                FinishStatus::Completed => TurnStatus::Completed,
-                FinishStatus::Aborted => TurnStatus::Cancelled {
-                    reason: "user".to_owned(),
-                },
-                #[allow(unreachable_patterns)]
-                _ => TurnStatus::Completed,
-            });
-        }
-        SdkEvent::Error {
-            source, message, ..
-        } if source.is_root() => {
-            got.finished += 1;
-            got.status = Some(TurnStatus::Failed {
-                reason: message.clone(),
-            });
-        }
-        _ => {}
+/// Der Ausgang eines Turns als SDK-Status.
+fn status_of(end: TurnEnd) -> TurnStatus {
+    match end {
+        TurnEnd::Completed => TurnStatus::Completed,
+        TurnEnd::Aborted => TurnStatus::Cancelled {
+            reason: "user".to_owned(),
+        },
+        TurnEnd::Failed(reason) => TurnStatus::Failed { reason },
     }
 }
 
-/// Übersetzt eine Freigabeanfrage des Hosts in die SDK-Form.
-///
-/// Der Host kennt keine Aufruf-Kennung der Runtime; `call_id` trägt die
-/// Kennung des Governance-Handles der Anfrage.
-fn map_request(session: &SessionId, request: &harw_protocol::ApprovalRequest) -> ApprovalRequest {
-    let (tool, arguments) = match &request.kind {
-        ApprovalKind::DynamicTool {
-            tool_name,
-            arguments,
-            ..
-        } => (tool_name.clone(), arguments.clone()),
-        ApprovalKind::Exec {
-            command,
-            cwd,
-            reasoning,
-            ..
-        } => (
-            "shell.exec".to_owned(),
-            serde_json::json!({ "command": command, "cwd": cwd, "reasoning": reasoning }),
-        ),
-        ApprovalKind::Patch { changes, .. } => {
-            let mut files: Vec<&String> = changes.keys().collect();
-            files.sort();
-            ("fs.patch".to_owned(), serde_json::json!({ "files": files }))
-        }
-    };
+/// Die Beschreibung einer Freigabeanfrage des Hosts in der SDK-Form.
+fn to_sdk_request(
+    session: &SessionId,
+    summary: harw_session_client::ApprovalSummary,
+) -> ApprovalRequest {
     ApprovalRequest {
         session_id: session.clone(),
-        request_id: request.id.as_str().to_owned(),
-        call_id: request.work_id.as_str().to_owned(),
-        tool,
-        arguments,
+        request_id: summary.request_id,
+        call_id: summary.call_id,
+        tool: summary.tool,
+        arguments: summary.arguments,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_protocol::ApprovalRequest as Wire;
-    use harw_types::{RiskLevel, TurnId, WorkId};
+    use harw_protocol::session_wire::{RespondResult, SubmitResult};
+    use harw_session_client::ApprovalSummary;
+    use harw_types::TurnId;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-    fn wire(kind: ApprovalKind) -> Wire {
-        let now = jiff::Timestamp::UNIX_EPOCH;
-        Wire {
-            id: ApprovalId::from_str("a1"),
-            work_id: WorkId::from_str("w1"),
-            kind,
-            summary: "x".to_owned(),
-            risk: RiskLevel::Low,
-            requested_at: now,
-            timeout_at: Wire::default_timeout_at(now),
-            decisions: vec![ReviewDecision::Approved, ReviewDecision::Rejected],
-        }
-    }
-
     #[test]
-    fn a_dynamic_tool_request_maps_name_and_arguments() -> TestResult {
+    fn the_host_description_becomes_the_sdk_request() -> TestResult {
         let session = SessionId::new("s1")?;
-        let mapped = map_request(
+        let asked = to_sdk_request(
             &session,
-            &wire(ApprovalKind::DynamicTool {
-                turn_id: TurnId::from_str("t"),
-                tool_name: "fs.write".to_owned(),
-                arguments: serde_json::json!({"path": "a"}),
-            }),
+            ApprovalSummary {
+                request_id: "a1".to_owned(),
+                call_id: "w1".to_owned(),
+                tool: "shell".to_owned(),
+                arguments: serde_json::json!({"cmd": "ls"}),
+            },
         );
-        assert_eq!(mapped.tool, "fs.write");
-        assert_eq!(mapped.arguments, serde_json::json!({"path": "a"}));
+        assert_eq!(asked.session_id, session);
         assert_eq!(
-            (mapped.request_id.as_str(), mapped.call_id.as_str()),
+            (asked.request_id.as_str(), asked.call_id.as_str()),
             ("a1", "w1")
         );
+        assert_eq!(asked.tool, "shell");
+        assert_eq!(asked.arguments, serde_json::json!({"cmd": "ls"}));
         Ok(())
     }
 
     #[test]
-    fn exec_and_patch_requests_get_stable_tool_names_and_no_diff_bodies() -> TestResult {
-        let session = SessionId::new("s1")?;
-        let exec = map_request(
-            &session,
-            &wire(ApprovalKind::Exec {
-                turn_id: TurnId::from_str("t"),
-                command: vec!["ls".to_owned(), "-l".to_owned()],
-                cwd: "/w".to_owned(),
-                reasoning: None,
-            }),
-        );
-        assert_eq!(exec.tool, "shell.exec");
-        assert_eq!(exec.arguments["command"], serde_json::json!(["ls", "-l"]));
-
-        let mut changes = std::collections::HashMap::new();
-        changes.insert("b.rs".to_owned(), "SECRET DIFF".to_owned());
-        changes.insert("a.rs".to_owned(), "SECRET DIFF".to_owned());
-        let patch = map_request(
-            &session,
-            &wire(ApprovalKind::Patch {
-                turn_id: TurnId::from_str("t"),
-                changes,
-            }),
-        );
-        assert_eq!(patch.tool, "fs.patch");
+    fn the_ways_a_turn_ends_become_sdk_statuses() {
+        assert_eq!(status_of(TurnEnd::Completed), TurnStatus::Completed);
         assert_eq!(
-            patch.arguments,
-            serde_json::json!({"files": ["a.rs", "b.rs"]})
+            status_of(TurnEnd::Aborted),
+            TurnStatus::Cancelled {
+                reason: "user".to_owned()
+            }
         );
-        assert!(!patch.arguments.to_string().contains("SECRET"));
-        Ok(())
-    }
-
-    #[test]
-    fn positions_order_by_generation_then_durable_then_live() {
-        let at = |generation, durable, live| Cursor {
-            generation,
-            durable,
-            live,
-        };
-        assert!(at(2, 0, 0) > at(1, 99, 99));
-        assert!(at(1, 5, 0) > at(1, 4, 9));
-        assert!(at(1, 5, 2) > at(1, 5, 1));
-        assert!(at(1, 5, 1) == at(1, 5, 1));
-    }
-
-    #[test]
-    fn the_report_counts_only_the_root() {
-        let root = EventSource {
-            session_id: SessionId::from_core(&harw_types::SessionId::from_str("r")),
-            parent: None,
-            role: "assistant".to_owned(),
-        };
-        let mut child = root.clone();
-        child.parent = Some(root.session_id.clone());
-        let mut got = Collected::default();
-        collect(
-            &SdkEvent::ToolCall {
-                source: root.clone(),
-                call_id: "c".into(),
-                tool: "t".into(),
-                arguments: serde_json::Value::Null,
-            },
-            &mut got,
+        assert_eq!(
+            status_of(TurnEnd::Failed("boom".to_owned())),
+            TurnStatus::Failed {
+                reason: "boom".to_owned()
+            }
         );
-        collect(
-            &SdkEvent::ToolCall {
-                source: child.clone(),
-                call_id: "c2".into(),
-                tool: "t".into(),
-                arguments: serde_json::Value::Null,
-            },
-            &mut got,
-        );
-        collect(
-            &SdkEvent::Finished {
-                source: child,
-                status: FinishStatus::Completed,
-                usage: None,
-            },
-            &mut got,
-        );
-        assert_eq!(got.tool_calls, 1);
-        assert_eq!(got.finished, 0, "a child's end is not the turn's end");
-        collect(
-            &SdkEvent::Finished {
-                source: root,
-                status: FinishStatus::Completed,
-                usage: None,
-            },
-            &mut got,
-        );
-        assert_eq!(got.finished, 1);
     }
 
     // --- Wiedergabe gegen einen scriptbaren Port ------------------------------
@@ -1013,13 +803,11 @@ mod tests {
             compact: false,
             turn_timeout: None,
             source: Some(Box::new(QueueSource(queue))),
-            head,
-            last_seen: None,
+            tracker: StreamTracker::new(head),
             resume: None,
             may_approve: true,
-            answered: HashSet::new(),
-            key_prefix: "test".to_owned(),
-            sent: 0,
+            answered: AnsweredSet::new(),
+            keys: IdempotencyKeys::with_epoch("test", "e"),
         }
     }
 
