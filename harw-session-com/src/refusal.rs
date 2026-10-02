@@ -53,10 +53,10 @@ impl ComRefusal {
         match error {
             HostError::Revoked => Self::Revoked,
             HostError::Denied(_) | HostError::NotFound | HostError::HelloRequired => Self::Denied,
-            HostError::Protocol(_)
-            | HostError::Storage(_)
-            | HostError::Driver(_)
-            | HostError::ToolRefused { .. } => {
+            // Every other variant, including ones a later host adds, is a
+            // host-side failure: detail is logged, the client sees `Internal`.
+            #[allow(unreachable_patterns)]
+            _ => {
                 tracing::warn!(%error, "session host refused a connection");
                 Self::Internal
             }
