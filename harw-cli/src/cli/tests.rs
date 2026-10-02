@@ -2267,3 +2267,59 @@ fn gateway_session_socket_is_off_by_default_and_parses_with_and_without_path() -
     );
     Ok(())
 }
+
+#[test]
+fn test_cleanup_defaults_to_a_dry_run_over_all_classes() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "cleanup"]).map_err(ctx("`harw cleanup` sollte parsen"))?;
+    let Some(Command::Cleanup {
+        apply,
+        classes,
+        deadline_secs,
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Cleanup, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert!(!apply, "ohne --apply ist es ein Probelauf");
+    assert!(classes.is_empty());
+    assert_eq!(deadline_secs, None);
+    Ok(())
+}
+
+#[test]
+fn test_cleanup_apply_class_and_deadline_parse() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "cleanup",
+        "--apply",
+        "--class",
+        "tui_log",
+        "--class",
+        "bug_reports",
+        "--deadline-secs",
+        "30",
+    ])
+    .map_err(ctx("`harw cleanup --apply --class ...` sollte parsen"))?;
+    let Some(Command::Cleanup {
+        apply,
+        classes,
+        deadline_secs,
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Cleanup, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert!(apply);
+    assert_eq!(
+        classes,
+        vec!["tui_log".to_owned(), "bug_reports".to_owned()]
+    );
+    assert_eq!(deadline_secs, Some(30));
+    assert!(Cli::try_parse_from(["harw", "cleanup", "--deadline-secs", "x"]).is_err());
+    Ok(())
+}

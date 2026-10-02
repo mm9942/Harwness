@@ -123,6 +123,9 @@ mod work_driver_job;
 #[path = "job_worker_memory.rs"]
 mod memory_job;
 
+#[path = "job_worker_retention.rs"]
+mod retention_job;
+
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
 const MAX_REASON_BYTES: usize = 160;
@@ -678,11 +681,14 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
         // leistet und die übrigen Arten nicht aufhalten darf.
         if work_driver_job::is_work_driver_kind(&record.job.kind)
             || memory_job::is_memory_kind(&record.job.kind)
+            || retention_job::is_retention_kind(&record.job.kind)
         {
             let run_services = services.clone();
             let work_id = record.job.id.clone();
             let input = record.input.clone();
-            let lane_name = if memory_job::is_memory_kind(&record.job.kind) {
+            let lane_name = if memory_job::is_memory_kind(&record.job.kind)
+                || retention_job::is_retention_kind(&record.job.kind)
+            {
                 harw_job_runtime::lanes::LANE_MEMORY
             } else {
                 harw_job_runtime::lanes::LANE_WORK_DRIVER
@@ -807,6 +813,7 @@ fn is_supported_kind(kind: &JobKind) -> bool {
                 || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
                 || name == harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND
                 || name == harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND
+                || name == harw_ops::retention_job::RETENTION_SWEEP_JOB_KIND
         }
     }
 }
@@ -853,6 +860,9 @@ async fn execute_claim(task: ClaimTask) -> JobOutcome {
         .await
     } else if memory_job::is_memory_kind(&claim.job.kind) {
         memory_job::execute_memory_maintenance_claim(claim, input, job_store, Arc::clone(&control))
+            .await
+    } else if retention_job::is_retention_kind(&claim.job.kind) {
+        retention_job::execute_retention_sweep_claim(claim, input, job_store, Arc::clone(&control))
             .await
     } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
         work_driver_job::execute_work_driver_claim(

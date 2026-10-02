@@ -237,6 +237,7 @@ pub mod provider;
 pub mod ps;
 pub mod quit;
 pub mod research;
+pub mod retention_job;
 pub mod retry;
 pub mod review;
 pub mod sandbox_lease;

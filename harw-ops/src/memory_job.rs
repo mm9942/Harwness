@@ -375,13 +375,13 @@ pub fn execute_memory_maintenance_with_cancel(
 }
 
 /// Wie oft der Treiber den Job-Store auf einen Abbruch abfragt.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(150);
+pub(crate) const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// Zusätzliche Wartezeit über die Frist hinaus, bevor ein hängender
 /// blockierender Thread als zeitüberschritten aufgegeben wird.
-const BLOCKING_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const BLOCKING_GRACE: Duration = Duration::from_secs(5);
 
 /// Ob der Store den Job als abgebrochen führt (Abbruch vor/während des Laufs).
-fn store_says_cancelled(store: &JobStore, work_id: &WorkId) -> bool {
+pub(crate) fn store_says_cancelled(store: &JobStore, work_id: &WorkId) -> bool {
     store
         .get(work_id)
         .is_ok_and(|record| record.job.state == JobState::Cancelled)

@@ -40,6 +40,7 @@ mod completions;
 mod connect;
 mod doc_ocr;
 // #22: die personalisierte harw mit eingebetteter UIA (`--native`).
+mod cleanup_cmd;
 pub mod embedded_uia;
 mod gateway;
 mod home;
@@ -699,6 +700,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
             Command::Serve { .. } => "serve",
@@ -798,6 +800,7 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
         Some(
             Command::Session { .. }
             | Command::Jobs { .. }
+            | Command::Cleanup { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
             | Command::Provider { .. },
@@ -974,6 +977,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Cleanup {
+            apply,
+            classes,
+            deadline_secs,
+        }) => cleanup_cmd::run(&global, apply, classes, deadline_secs),
         Some(Command::PrReview(args)) => {
             let args = crate::pr_review::PrReviewArgs {
                 pr: args.pr,
@@ -1117,6 +1125,7 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::Cleanup { .. }
             | Command::PrReview(_)
             | Command::Uia { .. }
             | Command::Analyze(_),
