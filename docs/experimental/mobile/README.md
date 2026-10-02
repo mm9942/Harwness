@@ -9,9 +9,14 @@ Goal: use the agent from a phone, Rust only (no Kotlin/Java UI code).
 
 ## Stages
 
-1. **Termux + `harw attach` (no build).** The TUI is already Rust. Reach the
-   gateway's `session.sock` through an SSH tunnel. No Kitty graphics on
-   Android terminals; plain TUI only.
+1. **Termux + `harw-mobile` (built).** A line-oriented client in Rust with
+   no TUI dependency, so it runs in any phone terminal, including Termux:
+   `harw-mobile [--socket PATH] [--session ID | --new]`. The default socket
+   is the one `harw gateway --session-socket` and `harw attach` use. Type to
+   send a prompt; `/y [n]` and `/n [n] [why]` decide the numbered open
+   approvals, `/p` lists them, `/stop` interrupts, `/q` leaves. Reach a
+   gateway on another machine by forwarding its socket over SSH. No Kitty
+   graphics on Android terminals; plain text only.
 2. **Node listener composed (prerequisite).** `harw-config` has no node
    transport section yet, so `NodeListener` is not wired
    (see COMPOSITION-ROOT notes in docs/planning/65-cloud-sessions/CONSOLIDATION.md).
@@ -27,3 +32,15 @@ Goal: use the agent from a phone, Rust only (no Kotlin/Java UI code).
 - Kitty graphics/keyboard protocol as a transport (a desktop TUI renderer
   option only).
 - Secret-store login (YubiKey / Ledger Stax) for the host root session: later.
+
+## What exists
+
+- `harw-mobile-core`: UI-agnostic view model (chat, approvals, turn activity,
+  resume cursor) and a `Controller` over any `SessionPort`. Tested against
+  the real session daemon over a Unix socket.
+- `harw-mobile-term`: the `harw-mobile` binary: command parser, short
+  plain-ASCII renderer, the loop. Tested end to end against the real daemon
+  and smoke-tested as a binary.
+
+Not yet: reconnect with backoff (S07, `ws/s07-reconnect-alias`), the node
+listener for remote access, the Rust GUI.
