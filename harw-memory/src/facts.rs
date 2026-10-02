@@ -36,6 +36,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{Duration as StdDuration, Instant};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -44,6 +45,10 @@ use crate::error::{MemoryError, MemoryResult};
 
 /// Rechte-Bits für neu angelegte Fakt-Dateien und `MEMORY.md`/`usage.json`.
 const FACT_FILE_MODE: u32 = 0o600;
+
+/// Standardfrist von [`FactStore::decay`]; danach bricht der Verfall ohne
+/// Teilzustand ab (siehe [`FactStore::decay_with_deadline`]).
+pub const DECAY_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// Art eines Fakts — steuert laut Design §3/§4 die Ladepriorität
 /// (`preference`/`decision` werden bevorzugt geladen, `reference` nur bei
@@ -297,6 +302,7 @@ fn validate_name(name: &str) -> MemoryResult<()> {
 pub fn redact(text: &str) -> String {
     let mut out = text.to_owned();
     out = redact_pem_blocks(&out);
+    out = redact_url_credentials(&out);
     out = redact_bearer(&out);
     out = redact_key_value_pairs(&out);
     out = redact_prefix_tokens(&out, &["sk-"], |c| c.is_ascii_alphanumeric(), 16);
@@ -319,6 +325,110 @@ pub fn redact(text: &str) -> String {
         10,
     );
     out = redact_near_keyword_base64(&out);
+    out = redact_high_entropy_tokens(&out);
+    out
+}
+
+/// Mindestlänge eines Laufs, den [`redact_high_entropy_tokens`] überhaupt
+/// prüft.
+const HIGH_ENTROPY_MIN_LEN: usize = 32;
+
+/// Shannon-Entropie (Bit pro Zeichen) ab der ein Lauf als Geheimnis gilt.
+/// Hex-Hashes (z. B. Commit-SHAs) erreichen höchstens 4,0 und bleiben
+/// deshalb unangetastet.
+const HIGH_ENTROPY_THRESHOLD: f64 = 4.2;
+
+/// Shannon-Entropie von `run` in Bit pro Zeichen.
+fn shannon_entropy(run: &[char]) -> f64 {
+    let mut counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+    for c in run {
+        *counts.entry(*c).or_insert(0) += 1;
+    }
+    let len = run.len() as f64;
+    counts
+        .values()
+        .map(|&count| {
+            let p = count as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Ersetzt Zugangsdaten in URL-Authority-Teilen
+/// (`scheme://user:pw@host/...` wird zu `scheme://[redacted]@host/...`).
+///
+/// Erkannt wird jeder `://`-Marker, dessen Authority (bis `/`, `?`, `#` oder
+/// Leerraum) ein `@` mit `:` im Userinfo-Teil enthält.
+fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        let head_end = pos + 3;
+        out.push_str(&rest[..head_end]);
+        let after = &rest[head_end..];
+        let authority_end = after
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let authority = &after[..authority_end];
+        match authority.rfind('@') {
+            Some(at) if authority[..at].contains(':') => {
+                out.push_str("[redacted]");
+                out.push_str(&authority[at..]);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = &after[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Ersetzt Läufe ab [`HIGH_ENTROPY_MIN_LEN`] Zeichen mit hoher Entropie
+/// ([`HIGH_ENTROPY_THRESHOLD`]), Groß-, Kleinbuchstaben und Ziffern, sowie
+/// JWT-förmige Läufe (`eyJ….….…`), ganz ohne Schlüsselwort-Kontext.
+fn redact_high_entropy_tokens(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let is_tok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-');
+    let is_jwt_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < n {
+        if chars[i..].starts_with(&['e', 'y', 'J']) && (i == 0 || !is_jwt_char(chars[i - 1])) {
+            let mut j = i;
+            while j < n && is_jwt_char(chars[j]) {
+                j += 1;
+            }
+            let run = &chars[i..j];
+            if run.iter().filter(|c| **c == '.').count() == 2 && run.len() >= 20 {
+                out.push_str("[redacted]");
+                i = j;
+                continue;
+            }
+        }
+        if is_tok(chars[i]) {
+            let mut j = i;
+            while j < n && is_tok(chars[j]) {
+                j += 1;
+            }
+            let run = &chars[i..j];
+            let mixed = run.iter().any(char::is_ascii_lowercase)
+                && run.iter().any(char::is_ascii_uppercase)
+                && run.iter().any(char::is_ascii_digit);
+            if run.len() >= HIGH_ENTROPY_MIN_LEN
+                && mixed
+                && shannon_entropy(run) >= HIGH_ENTROPY_THRESHOLD
+            {
+                out.push_str("[redacted]");
+            } else {
+                out.extend(run);
+            }
+            i = j;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
     out
 }
 
@@ -979,7 +1089,14 @@ impl FactStore {
     /// und keine „Nutzung" des Inhalts darstellt.
     fn write_raw(&self, fact: &Fact) -> MemoryResult<()> {
         let path = self.path_for(&fact.name)?;
-        let markdown = to_markdown(fact);
+        // Auch der Rohpfad redigiert: ein bereits (vor dem Härten von
+        // `redact`) abgelegtes Geheimnis wird beim Verfall nicht
+        // weitergeschrieben.
+        let mut safe = fact.clone();
+        safe.description = redact(&safe.description);
+        safe.body = redact(&safe.body);
+        safe.tags = safe.tags.iter().map(|t| redact(t)).collect();
+        let markdown = to_markdown(&safe);
         harw_fsutil::write_atomic(
             &path,
             markdown.as_bytes(),
@@ -1218,6 +1335,15 @@ impl FactStore {
         }
     }
 
+    /// Verdrängung nach Design §5.4 mit Standardfrist
+    /// ([`DECAY_DEFAULT_TIMEOUT`]); siehe [`Self::decay_with_deadline`].
+    ///
+    /// # Errors
+    /// Wie [`Self::decay_with_deadline`].
+    pub fn decay(&self, max_unused_days: i64, now: OffsetDateTime) -> MemoryResult<Vec<String>> {
+        self.decay_with_deadline(max_unused_days, now, Instant::now() + DECAY_DEFAULT_TIMEOUT)
+    }
+
     /// Verdrängung nach Design §5.4: für jeden Fakt ohne Nutzung
     /// (`usage_count == 0`) seit mindestens `max_unused_days` (gemessen ab
     /// `last_used`, oder — ohne Nutzungseintrag — ab `updated`) wird
@@ -1225,28 +1351,71 @@ impl FactStore {
     /// `confidence` unter `0.2` fällt, werden **nicht** gelöscht, sondern
     /// nur in der Rückgabe gemeldet.
     ///
+    /// # Beschreibung
+    /// Zweiphasig: erst wird der gesamte Plan berechnet und dabei `deadline`
+    /// geprüft (kein Schreibzugriff); läuft die Frist ab, bricht der Aufruf
+    /// ohne jeden Teilzustand ab. Erst danach werden die Dateien atomar
+    /// einzeln angewendet; scheitert eine Datei, werden die bereits
+    /// geschriebenen auf ihre Originalbytes zurückgesetzt.
+    ///
     /// # Errors
-    /// Fehler von [`Self::list`]/[`Self::write_index`]; `usage.json`- und
-    /// Schreibfehler pro Fakt.
-    pub fn decay(&self, max_unused_days: i64, now: OffsetDateTime) -> MemoryResult<Vec<String>> {
+    /// [`MemoryError::LockContention`], wenn `deadline` vor dem Anwenden
+    /// abläuft (nichts wurde geändert); Fehler von
+    /// [`Self::list`]/[`Self::write_index`]; `usage.json`- und Schreibfehler
+    /// pro Fakt (nach Rücksetzen der bereits angewendeten Änderungen).
+    pub fn decay_with_deadline(
+        &self,
+        max_unused_days: i64,
+        now: OffsetDateTime,
+        deadline: Instant,
+    ) -> MemoryResult<Vec<String>> {
+        let expired = || MemoryError::LockContention {
+            attempted: "facts decay: deadline exceeded before apply",
+        };
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
         let facts = self.list()?;
         let usage_map = self.read_usage_map()?;
-        let mut fallen_below = Vec::new();
+        // Phase 1: Plan (Fakt, Pfad, Originalbytes), ohne zu schreiben.
+        let mut plan: Vec<(Fact, PathBuf, Vec<u8>)> = Vec::new();
         for mut fact in facts {
+            if Instant::now() >= deadline {
+                return Err(expired());
+            }
             let (count, last_used) = usage_map
                 .get(&fact.name)
                 .map_or((0, fact.updated), |e| (e.count, e.last_used));
             if count != 0 {
                 continue;
             }
-            let age_days = (now - last_used).whole_days();
-            if age_days < max_unused_days {
+            if (now - last_used).whole_days() < max_unused_days {
                 continue;
             }
-            let new_confidence = fact.confidence * 0.5;
-            fact.confidence = new_confidence;
-            self.write_raw(&fact)?;
-            if new_confidence < 0.2 {
+            let path = self.path_for(&fact.name)?;
+            let Some(original) = read_optional_no_symlink(&path)? else {
+                continue;
+            };
+            fact.confidence *= 0.5;
+            plan.push((fact, path, original));
+        }
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        // Phase 2: anwenden; bei Fehler alles Angewendete zurücksetzen.
+        let mut fallen_below = Vec::new();
+        for (idx, (fact, _, _)) in plan.iter().enumerate() {
+            if let Err(error) = self.write_raw(fact) {
+                for (_, path, original) in &plan[..idx] {
+                    let _ = harw_fsutil::write_atomic(
+                        path,
+                        original,
+                        harw_fsutil::AtomicWriteOptions::with_mode(FACT_FILE_MODE),
+                    );
+                }
+                return Err(error);
+            }
+            if fact.confidence < 0.2 {
                 fallen_below.push(fact.name.clone());
             }
         }
@@ -1862,6 +2031,115 @@ mod tests {
         let text =
             "Dieser Hash hat viele Zeichen: aGVsbG93b3JsZGhlbGxvd29ybGRoZWxsb3dvcmxk am Ende.";
         assert_eq!(redact(text), text);
+    }
+
+    #[test]
+    fn redact_catches_url_credentials() {
+        assert_eq!(
+            redact("db: postgres://admin:s3cr3tPw@db.internal:5432/app ok"),
+            "db: postgres://[redacted]@db.internal:5432/app ok"
+        );
+        assert_eq!(
+            redact("https://user:pw@example.com/path?q=1"),
+            "https://[redacted]@example.com/path?q=1"
+        );
+        // Ohne Zugangsdaten bleibt die URL unberührt.
+        let plain = "siehe https://example.com/docs und mailto://a@b.de";
+        assert_eq!(redact(plain), plain);
+    }
+
+    #[test]
+    fn redact_catches_high_entropy_tokens_without_keyword() {
+        let secret = "Zk9xQ2vB7nLp4RtYw8Hs3DfGj6McE1aU";
+        let text = format!("der Wert {secret} steht hier");
+        let redacted = redact(&text);
+        assert!(!redacted.contains(secret), "{redacted}");
+        assert!(redacted.contains("[redacted]"));
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF123_-xyz";
+        assert_eq!(redact(jwt), "[redacted]");
+    }
+
+    #[test]
+    fn redact_keeps_hashes_paths_and_identifiers() {
+        let sha = "commit 0123456789abcdef0123456789abcdef01234567 fertig";
+        assert_eq!(redact(sha), sha);
+        let path =
+            "harw-runtime/src/memory_wiring.rs und harw_memory::facts::redact_url_credentials";
+        assert_eq!(redact(path), path);
+    }
+
+    #[test]
+    fn redact_is_idempotent() {
+        let text = "postgres://u:p@h/db Bearer abc Zk9xQ2vB7nLp4RtYw8Hs3DfGj6McE1aU";
+        let once = redact(text);
+        assert_eq!(redact(&once), once);
+    }
+
+    #[test]
+    fn decay_write_raw_redacts_legacy_secrets() -> TestResult {
+        let root = tmp_root("decay-redacts");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        let fact = sample_fact("legacy");
+        store.write(&fact).map_err(ctx("write"))?;
+        // Ein vor dem Härten abgelegtes Geheimnis direkt in die Datei legen.
+        let path = store.path_for("legacy").map_err(ctx("path"))?;
+        let mut stored = store
+            .read("legacy")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("legacy"))?;
+        stored.body = "DSN postgres://u:topsecret@h/db".to_owned();
+        fs::write(&path, to_markdown(&stored)).map_err(ctx("plant"))?;
+        store
+            .decay(90, OffsetDateTime::now_utc() + Duration::days(200))
+            .map_err(ctx("decay"))?;
+        let after = fs::read_to_string(&path).map_err(ctx("read file"))?;
+        assert!(!after.contains("topsecret"), "{after}");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn decay_with_expired_deadline_aborts_without_partial_state() -> TestResult {
+        let root = tmp_root("decay-deadline");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        for name in ["one", "two", "three"] {
+            store.write(&sample_fact(name)).map_err(ctx("write"))?;
+        }
+        let paths: Vec<PathBuf> = ["one", "two", "three"]
+            .iter()
+            .map(|n| store.path_for(n))
+            .collect::<Result<_, _>>()
+            .map_err(ctx("paths"))?;
+        let before: Vec<Vec<u8>> = paths
+            .iter()
+            .map(fs::read)
+            .collect::<Result<_, _>>()
+            .map_err(ctx("read before"))?;
+
+        let far = OffsetDateTime::now_utc() + Duration::days(200);
+        let expired = Instant::now();
+        let result = store.decay_with_deadline(90, far, expired);
+        assert!(matches!(result, Err(MemoryError::LockContention { .. })));
+
+        let after: Vec<Vec<u8>> = paths
+            .iter()
+            .map(fs::read)
+            .collect::<Result<_, _>>()
+            .map_err(ctx("read after"))?;
+        assert_eq!(before, after, "abgelaufene Frist darf nichts ändern");
+
+        // Mit ausreichender Frist läuft derselbe Verfall durch.
+        let ok = store
+            .decay_with_deadline(90, far, Instant::now() + StdDuration::from_secs(30))
+            .map_err(ctx("decay with deadline"))?;
+        assert!(ok.is_empty());
+        let one = store
+            .read("one")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("one"))?;
+        assert!((one.confidence - 0.4).abs() < 0.01);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
