@@ -25,6 +25,7 @@
 
 use std::process::{Command, Stdio};
 
+use crate::digest::argv_sha256_hex;
 use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value};
 use crate::error::ContainerPolicyError;
 use crate::image::ImageRef;
@@ -462,6 +463,9 @@ impl ContainerPlan {
     }
 }
 
+/// The approval text names the program and binds the full command by digest.
+/// The arguments themselves are never shown or persisted: they may carry
+/// credentials, authorization headers or signed URLs.
 fn approval_text(
     config: &RunConfig,
     request: &RunRequest,
@@ -473,13 +477,16 @@ fn approval_text(
     let env_keys: Vec<&str> = request.env.iter().map(|(k, _)| k.as_str()).collect();
     format!(
         "engine=podman\nconnection={}\nimage={}\nprofile={}\nnetwork=none\nmounts={:?}\n\
-         env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\ncommand={:?}",
+         env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\nprogram={}\nargc={}\n\
+         command_sha256={}",
         config.connection.as_deref().unwrap_or("local"),
         request.image.to_arg(),
         request.profile,
         mount_list,
         env_keys,
-        request.command,
+        request.command.first().map_or("", String::as_str),
+        request.command.len(),
+        argv_sha256_hex(&request.command),
     )
 }
 
@@ -852,6 +859,29 @@ mod tests {
         ensure(
             !plan.approval_text().contains("hunter2"),
             "no values in approval",
+        )
+    }
+
+    #[test]
+    fn approval_text_hides_command_arguments_but_binds_them() -> TestResult {
+        let secret = "Authorization: Bearer s3cr3t-token";
+        let make = |last: &str| -> Result<ContainerPlan, ContainerPolicyError> {
+            let req = RunRequest::new(
+                image()?,
+                Profile::Hermetic,
+                cmd(&["curl", "-H", secret, last]),
+            )?;
+            ContainerPlan::build(&config()?, &req)
+        };
+        let a = make("https://example.test/a")?;
+        let b = make("https://example.test/b")?;
+        ensure(!a.approval_text().contains("s3cr3t"), "secret not shown")?;
+        ensure(!a.approval_text().contains("example.test"), "no arguments")?;
+        ensure(a.approval_text().contains("program=curl"), "program named")?;
+        ensure(a.approval_text().contains("argc=4"), "argument count")?;
+        ensure(
+            a.approval_text() != b.approval_text(),
+            "a changed argument invalidates the approval",
         )
     }
 
