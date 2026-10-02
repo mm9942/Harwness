@@ -108,7 +108,10 @@ mod tests {
     fn every_profile_has_a_positive_ceiling() -> TestResult {
         for p in Profile::ALL {
             let l = p.limits();
-            ensure(l.memory_mib > 0 && l.pids > 0 && l.timeout_s > 0, "positive")?;
+            ensure(
+                l.memory_mib > 0 && l.pids > 0 && l.timeout_s > 0,
+                "positive",
+            )?;
         }
         ensure(
             Profile::Build.limits().timeout_s >= Profile::Hermetic.limits().timeout_s,

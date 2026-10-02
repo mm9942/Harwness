@@ -77,9 +77,8 @@ pub fn engine_environment(
     lookup: &dyn Fn(&str) -> Option<String>,
     remote: bool,
 ) -> Vec<(String, String)> {
-    let plain_abs = |v: &str| {
-        v.starts_with('/') && v.len() <= 4096 && !v.contains(['\0', '\n', '\r'])
-    };
+    let plain_abs =
+        |v: &str| v.starts_with('/') && v.len() <= 4096 && !v.contains(['\0', '\n', '\r']);
     let mut env = vec![("PATH".to_owned(), ENGINE_PATH.to_owned())];
     let mut keys = vec!["HOME", "XDG_RUNTIME_DIR"];
     if remote {

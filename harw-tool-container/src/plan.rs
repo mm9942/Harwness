@@ -128,7 +128,9 @@ impl RunConfig {
             || mount.dst() == CACHE_DST
             || self.extra_mounts.iter().any(|m| m.dst() == mount.dst());
         if used {
-            return Err(ContainerPolicyError::InvalidMount("destination already used"));
+            return Err(ContainerPolicyError::InvalidMount(
+                "destination already used",
+            ));
         }
         self.extra_mounts.push(mount);
         Ok(self)
@@ -320,18 +322,16 @@ impl ContainerPlan {
         }
 
         let name = format!("harw-{}", config.run_id);
-        let workdir = request
-            .workdir
-            .as_ref()
-            .map_or_else(|| WORKSPACE_DST.to_owned(), |rel| format!("{WORKSPACE_DST}/{rel}"));
+        let workdir = request.workdir.as_ref().map_or_else(
+            || WORKSPACE_DST.to_owned(),
+            |rel| format!("{WORKSPACE_DST}/{rel}"),
+        );
 
         let mut args: Vec<String> = Vec::new();
         if let Some(connection) = &config.connection {
             args.push(format!("--connection={connection}"));
         }
-        args.extend(
-            ["run", "--rm", "--pull=never"].map(str::to_owned),
-        );
+        args.extend(["run", "--rm", "--pull=never"].map(str::to_owned));
         args.push(format!("--name={name}"));
         if let Some(cidfile) = &config.cidfile {
             args.push(format!("--cidfile={cidfile}"));
@@ -535,7 +535,10 @@ mod tests {
             "cargo",
             "check",
         ]);
-        ensure(plan.args() == want.as_slice(), &format!("{:?}", plan.args()))?;
+        ensure(
+            plan.args() == want.as_slice(),
+            &format!("{:?}", plan.args()),
+        )?;
         ensure(plan.executable() == "/usr/bin/podman", "executable")?;
         ensure(plan.container_name() == "harw-r1", "name")
     }
@@ -597,11 +600,18 @@ mod tests {
         )?;
         let plan = ContainerPlan::build(&config()?, &req)?;
         let a = plan.args();
-        let sep = a.iter().position(|x| x == "--").ok_or_else(|| {
-            crate::test_support::TestError::Unexpected("no separator".to_owned())
-        })?;
-        ensure(a[sep + 1] == format!("docker.io/library/rust@sha256:{HEX}"), "image")?;
-        ensure(a[sep + 2..] == ["--privileged", "-v", "/:/host"], "command verbatim")?;
+        let sep = a
+            .iter()
+            .position(|x| x == "--")
+            .ok_or_else(|| crate::test_support::TestError::Unexpected("no separator".to_owned()))?;
+        ensure(
+            a[sep + 1] == format!("docker.io/library/rust@sha256:{HEX}"),
+            "image",
+        )?;
+        ensure(
+            a[sep + 2..] == ["--privileged", "-v", "/:/host"],
+            "command verbatim",
+        )?;
         ensure(
             !a[..sep].iter().any(|x| x == "--privileged" || x == "-v"),
             "no injected option before the separator",
@@ -611,18 +621,30 @@ mod tests {
     #[test]
     fn timeout_is_clamped_to_the_profile_ceiling() -> TestResult {
         let long = request(Profile::Hermetic)?.with_timeout_s(99_999);
-        ensure(ContainerPlan::build(&config()?, &long)?.timeout_s() == 300, "ceiling")?;
+        ensure(
+            ContainerPlan::build(&config()?, &long)?.timeout_s() == 300,
+            "ceiling",
+        )?;
         let short = request(Profile::Hermetic)?.with_timeout_s(30);
-        ensure(ContainerPlan::build(&config()?, &short)?.timeout_s() == 30, "shorter")?;
+        ensure(
+            ContainerPlan::build(&config()?, &short)?.timeout_s() == 30,
+            "shorter",
+        )?;
         let zero = request(Profile::Hermetic)?.with_timeout_s(0);
-        ensure(ContainerPlan::build(&config()?, &zero)?.timeout_s() == 1, "floor")
+        ensure(
+            ContainerPlan::build(&config()?, &zero)?.timeout_s() == 1,
+            "floor",
+        )
     }
 
     #[test]
     fn a_connection_precedes_run() -> TestResult {
         let cfg = config()?.with_connection("pi")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
-        ensure(plan.args()[0] == "--connection=pi" && plan.args()[1] == "run", "order")?;
+        ensure(
+            plan.args()[0] == "--connection=pi" && plan.args()[1] == "run",
+            "order",
+        )?;
         ensure(config()?.with_connection("a b").is_err(), "bad name")
     }
 
@@ -630,7 +652,10 @@ mod tests {
     fn a_cidfile_is_passed_when_configured() -> TestResult {
         let cfg = config()?.with_cidfile("/srv/job/cid")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
-        ensure(plan.args().contains(&"--cidfile=/srv/job/cid".to_owned()), "cidfile")?;
+        ensure(
+            plan.args().contains(&"--cidfile=/srv/job/cid".to_owned()),
+            "cidfile",
+        )?;
         ensure(config()?.with_cidfile("relative").is_err(), "relative")
     }
 
@@ -638,13 +663,21 @@ mod tests {
     fn environment_is_allowlisted_deduplicated_and_redacted() -> TestResult {
         let ok = request(Profile::Hermetic)?.with_env("RUST_LOG", "secret-looking")?;
         let plan = ContainerPlan::build(&config()?, &ok)?;
-        ensure(plan.args().contains(&"--env=RUST_LOG=secret-looking".to_owned()), "passed")?;
         ensure(
-            plan.redacted_args().contains(&"--env=RUST_LOG=***".to_owned()),
+            plan.args()
+                .contains(&"--env=RUST_LOG=secret-looking".to_owned()),
+            "passed",
+        )?;
+        ensure(
+            plan.redacted_args()
+                .contains(&"--env=RUST_LOG=***".to_owned()),
             "redacted",
         )?;
         ensure(
-            !plan.redacted_args().iter().any(|a| a.contains("secret-looking")),
+            !plan
+                .redacted_args()
+                .iter()
+                .any(|a| a.contains("secret-looking")),
             "value hidden",
         )?;
         let off = request(Profile::Hermetic)?.with_env("AWS_SECRET_ACCESS_KEY", "x")?;
@@ -658,9 +691,15 @@ mod tests {
         ensure(ContainerPlan::build(&config()?, &dup).is_err(), "duplicate")?;
         let widened = config()?.with_env_allow(["MY_FLAG"])?;
         let req = request(Profile::Hermetic)?.with_env("MY_FLAG", "1")?;
-        ensure(ContainerPlan::build(&widened, &req).is_ok(), "configured key")?;
+        ensure(
+            ContainerPlan::build(&widened, &req).is_ok(),
+            "configured key",
+        )?;
         let default_key = request(Profile::Hermetic)?.with_env("CI", "1")?;
-        ensure(ContainerPlan::build(&widened, &default_key).is_err(), "defaults replaced")
+        ensure(
+            ContainerPlan::build(&widened, &default_key).is_err(),
+            "defaults replaced",
+        )
     }
 
     #[test]
@@ -668,7 +707,8 @@ mod tests {
         let ok = request(Profile::Hermetic)?.with_workdir("crates/x")?;
         let plan = ContainerPlan::build(&config()?, &ok)?;
         ensure(
-            plan.args().contains(&"--workdir=/workspace/crates/x".to_owned()),
+            plan.args()
+                .contains(&"--workdir=/workspace/crates/x".to_owned()),
             "relative",
         )?;
         for bad in ["/etc", "../x", "a/../b", "a:b", ""] {
@@ -688,23 +728,45 @@ mod tests {
         )?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
         ensure(
-            plan.args().contains(&"--mount=type=bind,src=/srv/data,dst=/data".to_owned()),
+            plan.args()
+                .contains(&"--mount=type=bind,src=/srv/data,dst=/data".to_owned()),
             "rw in build",
         )?;
         let clash = Mount::bind("/srv/other", "/workspace", true)?;
-        ensure(config()?.with_mount(clash).is_err(), "workspace destination")?;
+        ensure(
+            config()?.with_mount(clash).is_err(),
+            "workspace destination",
+        )?;
         let dup1 = Mount::bind("/srv/a", "/data", true)?;
         let dup2 = Mount::bind("/srv/b", "/data", true)?;
-        ensure(config()?.with_mount(dup1)?.with_mount(dup2).is_err(), "duplicate destination")
+        ensure(
+            config()?.with_mount(dup1)?.with_mount(dup2).is_err(),
+            "duplicate destination",
+        )
     }
 
     #[test]
     fn config_rejects_bad_values() -> TestResult {
-        ensure(RunConfig::new("/usr/bin/docker", "/srv/ws", "r1", "o").is_err(), "not podman")?;
-        ensure(RunConfig::new("podman", "/srv/ws", "r1", "o").is_err(), "relative executable")?;
-        ensure(RunConfig::new("/usr/bin/podman", "srv/ws", "r1", "o").is_err(), "relative ws")?;
-        ensure(RunConfig::new("/usr/bin/podman", "/srv/ws", "R 1", "o").is_err(), "run id")?;
-        ensure(RunConfig::new("/usr/bin/podman", "/srv/ws", "r1", "o p").is_err(), "owner")
+        ensure(
+            RunConfig::new("/usr/bin/docker", "/srv/ws", "r1", "o").is_err(),
+            "not podman",
+        )?;
+        ensure(
+            RunConfig::new("podman", "/srv/ws", "r1", "o").is_err(),
+            "relative executable",
+        )?;
+        ensure(
+            RunConfig::new("/usr/bin/podman", "srv/ws", "r1", "o").is_err(),
+            "relative ws",
+        )?;
+        ensure(
+            RunConfig::new("/usr/bin/podman", "/srv/ws", "R 1", "o").is_err(),
+            "run id",
+        )?;
+        ensure(
+            RunConfig::new("/usr/bin/podman", "/srv/ws", "r1", "o p").is_err(),
+            "owner",
+        )
     }
 
     #[test]
@@ -722,7 +784,10 @@ mod tests {
     #[test]
     fn commands_are_bounded() -> TestResult {
         let img = image()?;
-        ensure(RunRequest::new(img.clone(), Profile::Hermetic, vec![]).is_err(), "empty")?;
+        ensure(
+            RunRequest::new(img.clone(), Profile::Hermetic, vec![]).is_err(),
+            "empty",
+        )?;
         ensure(
             RunRequest::new(img.clone(), Profile::Hermetic, cmd(&[""])).is_err(),
             "empty program",
@@ -766,7 +831,10 @@ mod tests {
             let plan = ContainerPlan::build(&config()?, &req)?;
             ensure(plan.approval_text() != base.approval_text(), label)?;
         }
-        let remote = ContainerPlan::build(&config()?.with_connection("pi")?, &request(Profile::Hermetic)?)?;
+        let remote = ContainerPlan::build(
+            &config()?.with_connection("pi")?,
+            &request(Profile::Hermetic)?,
+        )?;
         ensure(remote.approval_text() != base.approval_text(), "connection")
     }
 
@@ -774,7 +842,10 @@ mod tests {
     fn approval_text_does_not_contain_env_values() -> TestResult {
         let req = request(Profile::Hermetic)?.with_env("CI", "hunter2")?;
         let plan = ContainerPlan::build(&config()?, &req)?;
-        ensure(!plan.approval_text().contains("hunter2"), "no values in approval")
+        ensure(
+            !plan.approval_text().contains("hunter2"),
+            "no values in approval",
+        )
     }
 
     #[test]

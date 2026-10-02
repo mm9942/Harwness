@@ -36,7 +36,9 @@ pub(crate) fn check_name(
         return Err(err("must start with a lowercase letter or digit"));
     }
     if !value.chars().all(is_name_char) {
-        return Err(err("only lowercase letters, digits, '.', '_' and '-' are allowed"));
+        return Err(err(
+            "only lowercase letters, digits, '.', '_' and '-' are allowed",
+        ));
     }
     Ok(())
 }
@@ -57,7 +59,9 @@ pub(crate) fn check_label_value(
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
     {
-        return Err(err("only letters, digits, '.', '_', ':' and '-' are allowed"));
+        return Err(err(
+            "only letters, digits, '.', '_', ':' and '-' are allowed",
+        ));
     }
     Ok(())
 }
