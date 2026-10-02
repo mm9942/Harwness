@@ -63,7 +63,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harw_authority::{Permission, SandboxSpec};
-use harw_extension_api::contributors::ToolProvider;
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
@@ -194,28 +193,19 @@ fn default_sudo_limits() -> ShellLimits {
 
 /// Warum ein Passwort nicht als [`SudoSecret`] angenommen wurde. Trägt nie
 /// den Inhalt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::HarwError)]
 pub enum SudoSecretError {
     /// Das Passwort ist leer.
+    #[msg("Passwort ist leer")]
     Empty,
     /// Das Passwort ist länger als [`SUDO_MAX_SECRET_BYTES`].
+    #[msg("Passwort ist zu lang")]
     TooLong,
     /// Das Passwort enthält `\n`, `\r` oder `\0` (würde die Zeile für
     /// `sudo -S` verfälschen).
+    #[msg("Passwort enthält ein unzulässiges Steuerzeichen")]
     ForbiddenByte,
 }
-
-impl fmt::Display for SudoSecretError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("Passwort ist leer"),
-            Self::TooLong => f.write_str("Passwort ist zu lang"),
-            Self::ForbiddenByte => f.write_str("Passwort enthält ein unzulässiges Steuerzeichen"),
-        }
-    }
-}
-
-impl std::error::Error for SudoSecretError {}
 
 /// Ein sudo-Passwort im Speicher.
 ///
@@ -1821,11 +1811,15 @@ impl SudoToolProvider {
     }
 }
 
-impl ToolProvider for SudoToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::Function(FunctionToolSpec {
-            name: ToolName::new(SUDO_EXEC_TOOL),
-            description: "Run ONE command as root on the local host via sudo. sudo works: the \
+// `host.sudo_exec` ist das einzige Werkzeug; der Executor trägt Kanal, Worker,
+// Limits, Zeitfenster und Audit-Senke des Providers. `parallel_safe: none` —
+// ein Aufruf als root ist nie kommutativ.
+harw_tools::tool_provider! {
+    impl for SudoToolProvider as provider, parallel_safe: none {
+        SUDO_EXEC_TOOL => {
+            spec: ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new(SUDO_EXEC_TOOL),
+                description: "Run ONE command as root on the local host via sudo. sudo works: the \
                 user sees the exact argv and your reason in a TUI approval window, confirms and \
                 types their sudo password there if sudo asks (passwordless sudo works too). The \
                 password never reaches you — never ask for it in chat, put it into a command or \
@@ -1834,32 +1828,24 @@ impl ToolProvider for SudoToolProvider {
                 the user. Never call sudo via shell.exec; never say sudo is impossible while this \
                 tool is available."
                 .to_owned(),
-            parameters: Self::parameter_schema(),
-            strict: true,
-        })]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == SUDO_EXEC_TOOL).then(|| {
-            Arc::new(SudoExecExecutor {
-                prompts: self.prompts.clone(),
-                worker: self.worker.clone(),
-                timeout_secs: self.timeout_secs,
-                max_output_bytes: self.max_output_bytes,
-                limits: self.limits,
-                prompt_timeout: self.prompt_timeout,
-                password_window: self.password_window,
-                audit: Arc::clone(&self.audit),
+                parameters: SudoToolProvider::parameter_schema(),
+                strict: true,
+            }),
+            executor: SudoExecExecutor {
+                prompts: provider.prompts.clone(),
+                worker: provider.worker.clone(),
+                timeout_secs: provider.timeout_secs,
+                max_output_bytes: provider.max_output_bytes,
+                limits: provider.limits,
+                prompt_timeout: provider.prompt_timeout,
+                password_window: provider.password_window,
+                audit: Arc::clone(&provider.audit),
                 #[cfg(test)]
-                sudo_path: self.sudo_path.clone(),
+                sudo_path: provider.sudo_path.clone(),
                 #[cfg(not(test))]
                 sudo_path: None,
-            }) as Arc<dyn ToolExecutor>
-        })
-    }
-
-    fn parallel_safe(&self, _name: &ToolName) -> bool {
-        false
+            },
+        },
     }
 }
 
@@ -1870,6 +1856,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use serde_json::Value;
     use std::fs;
@@ -2668,5 +2655,20 @@ mod tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::SudoSecretError;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(SudoSecretError::Empty.to_string(), "Passwort ist leer");
+        assert_eq!(SudoSecretError::TooLong.to_string(), "Passwort ist zu lang");
+        assert_eq!(
+            SudoSecretError::ForbiddenByte.to_string(),
+            "Passwort enthält ein unzulässiges Steuerzeichen"
+        );
     }
 }

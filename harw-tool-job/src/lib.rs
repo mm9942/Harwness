@@ -95,3 +95,7 @@ pub use tools::{
 
 #[cfg(test)]
 mod test_support;
+
+// Golden-Test der Provider-Oberfläche (vor/nach der `tool_provider!`-Migration).
+#[cfg(test)]
+mod provider_golden;

@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
+harw-macros = { path = "../harw-macros" }
 harw-types = { path = "../harw-types" }
 harw-tools = { path = "../harw-tools" }
 harw-sandbox = { path = "../harw-sandbox" }

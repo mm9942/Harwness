@@ -17,6 +17,7 @@ quote = "1"
 proc-macro2 = "1"
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 harw-operations = { path = "../harw-operations" }
 harw-observe = { path = "../harw-observe" }
 # AW2-06 (`#[derive(SensorSource)]`): Zieltypen für Positivtests und trybuild.

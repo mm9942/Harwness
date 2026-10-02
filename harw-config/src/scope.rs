@@ -445,6 +445,19 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "agent_compiler.cache_max_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "agent_compiler.keep_versions", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "agent_compiler.auto_build_uia", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // [memory] (10) — Projektgedächtnis. Keine Rechtewirkung, aber ein nicht
+    // vertrautes Projekt darf Kontextbudget, Fakt-Obergrenzen und Fristen nicht
+    // setzen (`merge_memory`); Home und Profil ersetzen.
+    FieldScope { path: "memory.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.global_enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.token_budget", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.max_facts", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.max_body_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.max_unused_days", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.consolidate_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.forget_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.promote_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.sweep_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
 ];
 
 #[cfg(test)]
@@ -466,7 +479,8 @@ mod merge_rule_tests {
         // #22 Welle 2B: +3 für `agent_compiler.*`.
         // R14: +1 für `internal_models.work_driver_judge`.
         // [jobs]: +1 für `jobs.max_running`.
-        assert_eq!(FIELD_TABLE.len(), 120);
+        // [memory]: +10 für `memory.*`.
+        assert_eq!(FIELD_TABLE.len(), 130);
     }
 
     #[test]
@@ -485,7 +499,8 @@ mod merge_rule_tests {
         // (`uia_worker_models.*`), Teil I +1 (`tui.child_stream`).
         // #22 Welle 2B: +3 (`agent_compiler.*`).
         // R14: +1 (`internal_models.work_driver_judge`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 61);
+        // [memory]: +10 (`memory.*`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 71);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

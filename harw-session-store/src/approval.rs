@@ -232,6 +232,43 @@ impl ApprovalStore {
         actor: &ApprovalActor,
         clock: &dyn Clock,
     ) -> SessionStoreResult<ApprovalResolutionRecord> {
+        self.resolve_inner(session, request, decision, comment, actor, clock, true)
+    }
+
+    /// Like [`Self::resolve`], but the responding `actor` need not equal the
+    /// actor bound at issuance (first writer wins among all authorized
+    /// responders; the host authorizes the responder before it gets here).
+    ///
+    /// The resolution record carries the *responding* actor. Every other
+    /// check (already resolved, not found, TTL, lock, atomic persist) is
+    /// identical to [`Self::resolve`].
+    ///
+    /// # Errors
+    /// Same as [`Self::resolve`], except [`SessionStoreError::ApprovalActorMismatch`]
+    /// is never returned.
+    pub fn resolve_any_actor(
+        &self,
+        session: &SessionId,
+        request: &ItemId,
+        decision: ReviewDecision,
+        comment: Option<String>,
+        actor: &ApprovalActor,
+        clock: &dyn Clock,
+    ) -> SessionStoreResult<ApprovalResolutionRecord> {
+        self.resolve_inner(session, request, decision, comment, actor, clock, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_inner(
+        &self,
+        session: &SessionId,
+        request: &ItemId,
+        decision: ReviewDecision,
+        comment: Option<String>,
+        actor: &ApprovalActor,
+        clock: &dyn Clock,
+        enforce_bound_actor: bool,
+    ) -> SessionStoreResult<ApprovalResolutionRecord> {
         let pending_path = self.pending_path(session, request)?;
         let resolved_path = self.resolved_path(session, request)?;
         let directory = pending_path.parent().ok_or_else(|| {
@@ -269,7 +306,7 @@ impl ApprovalStore {
                     request: request.clone(),
                 });
             }
-            if &record.actor != actor {
+            if enforce_bound_actor && &record.actor != actor {
                 return Err(SessionStoreError::ApprovalActorMismatch {
                     request: request.clone(),
                 });
@@ -302,6 +339,179 @@ impl ApprovalStore {
             (Ok(_), Err(error)) => Err(error),
             (Ok(resolution), Ok(())) => Ok(resolution),
         }
+    }
+
+    /// Issues a request together with an opaque JSON `payload` (the full
+    /// wire request a host replays on attach). The payload sits in
+    /// `<request>.payload.json` next to the pending record and is written
+    /// atomically *before* the pending record, so a crash can leave an
+    /// orphan payload (ignored) but never a pending record without payload.
+    ///
+    /// # Errors
+    /// [`SessionStoreError::ApprovalAlreadyExists`] when the request id is
+    /// taken (the existing payload is left untouched),
+    /// [`SessionStoreError::LockContended`], `Io`, `Serde`.
+    pub fn issue_with_payload(
+        &self,
+        record: &ApprovalRecord,
+        payload: &serde_json::Value,
+    ) -> SessionStoreResult<()> {
+        let pending_path = self.pending_path(&record.session, &record.request)?;
+        let payload_path = self.payload_path(&record.session, &record.request)?;
+        let directory = pending_path.parent().ok_or_else(|| {
+            SessionStoreError::Io(std::io::Error::other("approval path has no parent"))
+        })?;
+        std::fs::create_dir_all(directory)?;
+        let lock = self.lock_session(&record.session)?;
+        let outcome = (|| -> SessionStoreResult<()> {
+            if std::fs::symlink_metadata(&pending_path).is_ok() {
+                return Err(SessionStoreError::ApprovalAlreadyExists {
+                    session: record.session.clone(),
+                    request: record.request.clone(),
+                });
+            }
+            if path_is_symlink(&payload_path)? {
+                return Err(SessionStoreError::UnsafeApprovalPath(
+                    payload_path.display().to_string(),
+                ));
+            }
+            let mut temp = NamedTempFile::new_in(directory)?;
+            serde_json::to_writer(temp.as_file_mut(), payload)?;
+            temp.as_file().sync_all()?;
+            temp.persist(&payload_path)
+                .map_err(|error| SessionStoreError::Io(error.error))?;
+            sync_parent_directory(directory)?;
+            self.issue(record)
+        })();
+        let unlock = FileExt::unlock(&lock).map_err(SessionStoreError::Io);
+        outcome.and(unlock)
+    }
+
+    /// Reads the payload stored by [`Self::issue_with_payload`].
+    ///
+    /// `Ok(None)` only when no payload file exists; a symlink, non-file or
+    /// undecodable content is [`SessionStoreError::ApprovalCorrupt`]
+    /// (fail-closed).
+    pub fn payload(
+        &self,
+        session: &SessionId,
+        request: &ItemId,
+    ) -> SessionStoreResult<Option<serde_json::Value>> {
+        let path = self.payload_path(session, request)?;
+        let corrupt = |detail: String| SessionStoreError::ApprovalCorrupt {
+            session: session.clone(),
+            request: request.clone(),
+            detail,
+        };
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SessionStoreError::Io(error)),
+            Ok(_) => {}
+        }
+        let bytes = read_pending(&path).map_err(|error| {
+            corrupt(format!("payload unreadable or not a regular file: {error}"))
+        })?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| corrupt(error.to_string()))
+    }
+
+    /// Session that owns `request`, found by scanning the session
+    /// directories for its pending record. `Ok(None)` for an unknown or
+    /// unsafe id. A request id present under more than one session is
+    /// ambiguous and an error (fail-closed).
+    pub fn find_session(&self, request: &ItemId) -> SessionStoreResult<Option<SessionId>> {
+        let Ok(stem) = safe_component(request.as_str()) else {
+            return Ok(None);
+        };
+        let file = format!("{stem}{PENDING_SUFFIX}");
+        let sessions = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        };
+        let mut found: Option<SessionId> = None;
+        for entry in sessions {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if safe_component(&name).is_err() || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let candidate = entry.path().join(&file);
+            let present = match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata.file_type().is_file(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(SessionStoreError::Io(error)),
+            };
+            if present {
+                if found.is_some() {
+                    return Err(SessionStoreError::Io(std::io::Error::other(format!(
+                        "approval request '{stem}' exists under more than one session"
+                    ))));
+                }
+                found = Some(SessionId::from_str(name));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Strict listing of the open, unexpired requests of one session,
+    /// ascending by `issued_at`. Unlike [`Self::pending_all`] a corrupt or
+    /// untrusted entry is an error, not skipped: an attach must not silently
+    /// hide a pending approval.
+    pub fn pending_for_session(
+        &self,
+        session: &SessionId,
+        clock: &dyn Clock,
+    ) -> SessionStoreResult<Vec<ApprovalRecord>> {
+        let dir = self.session_dir(session)?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        };
+        let now = clock.now();
+        let mut open = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Some(stem) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(PENDING_SUFFIX))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let request = ItemId::from_str(safe_component(&stem)?);
+            let corrupt = |detail: String| SessionStoreError::ApprovalCorrupt {
+                session: session.clone(),
+                request: request.clone(),
+                detail,
+            };
+            if self.resolution(session, &request)?.is_some() {
+                continue;
+            }
+            let record = self
+                .pending(session, &request)
+                .map_err(|error| match error {
+                    SessionStoreError::Serde(inner) => corrupt(inner.to_string()),
+                    other => other,
+                })?;
+            if record.session != *session || record.request != request {
+                return Err(corrupt("record is keyed to another path".to_owned()));
+            }
+            if self.expiry_if_expired(&record, now).is_none() {
+                open.push(record);
+            }
+        }
+        open.sort_by(|left, right| {
+            left.issued_at
+                .cmp(&right.issued_at)
+                .then_with(|| left.request.as_str().cmp(right.request.as_str()))
+        });
+        Ok(open)
     }
 
     pub fn pending(
@@ -630,6 +840,13 @@ impl ApprovalStore {
             .session_dir(session)?
             .join(safe_component(request.as_str())?)
             .with_extension("pending.json"))
+    }
+
+    fn payload_path(&self, session: &SessionId, request: &ItemId) -> SessionStoreResult<PathBuf> {
+        Ok(self
+            .session_dir(session)?
+            .join(safe_component(request.as_str())?)
+            .with_extension("payload.json"))
     }
 
     fn resolved_path(&self, session: &SessionId, request: &ItemId) -> SessionStoreResult<PathBuf> {

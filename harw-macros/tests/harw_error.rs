@@ -58,3 +58,60 @@ fn result_alias_exists() -> TestResult {
     assert_eq!(ok().map_err(ctx("result alias must resolve"))?, 1);
     Ok(())
 }
+
+#[derive(HarwError, Debug)]
+enum StructSourceError {
+    #[msg("read {path}: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[msg("wrapped")]
+    Wrapped {
+        #[from]
+        inner: std::fmt::Error,
+    },
+
+    #[from]
+    Tuple(std::num::ParseIntError),
+
+    #[msg("pair {0}")]
+    Pair(u8, #[source] std::io::Error),
+
+    #[msg("plain {why}")]
+    Plain { why: String },
+}
+
+#[test]
+fn named_source_is_wired() -> TestResult {
+    let io = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+    let e = StructSourceError::Read {
+        path: "/x".to_owned(),
+        source: io,
+    };
+    assert_eq!(e.to_string(), "read /x: missing");
+    let src = e.source().ok_or(common::TestError::Missing("source"))?;
+    assert_eq!(src.to_string(), "missing");
+    Ok(())
+}
+
+#[test]
+fn named_from_generates_from_and_source() {
+    let e: StructSourceError = std::fmt::Error.into();
+    assert_eq!(e.to_string(), "wrapped");
+    assert!(e.source().is_some());
+}
+
+#[test]
+fn tuple_source_field_and_none_cases() {
+    let e = StructSourceError::Pair(3, std::io::Error::other("boom"));
+    assert_eq!(e.to_string(), "pair 3");
+    assert!(e.source().is_some());
+    let plain = StructSourceError::Plain {
+        why: "x".to_owned(),
+    };
+    assert!(plain.source().is_none());
+    assert!("z".parse::<u8>().map_err(StructSourceError::from).is_err());
+}

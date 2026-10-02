@@ -3991,7 +3991,9 @@ mod tests {
             factory.home_context.as_ref(),
         );
         assert!(
-            unbound.get::<Arc<harw_home::ResolvedHomeContext>>().is_none(),
+            unbound
+                .get::<Arc<harw_home::ResolvedHomeContext>>()
+                .is_none(),
             "ohne with_home_context kein Root-Space im OpContext"
         );
 

@@ -20,6 +20,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueHint};
 
 mod agent;
 mod analyze;
+mod attach;
 mod auth;
 mod channel;
 mod completions;
@@ -46,6 +47,7 @@ mod tests;
 
 pub use agent::*;
 pub use analyze::*;
+pub use attach::*;
 pub use auth::*;
 pub use channel::*;
 pub use completions::*;
@@ -150,6 +152,8 @@ pub enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Hängt sich an eine laufende Host-Sitzung an (lokaler Socket oder Own-Cloud-Host).
+    Attach(AttachArgs),
 
     // ── Konfiguration ───────────────────────────────────────────────────
     /// Zeigt und ändert Konfigurationswerte und Freigaben; ohne Unterbefehl startet ein Menü.

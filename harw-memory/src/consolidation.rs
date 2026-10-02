@@ -768,7 +768,20 @@ impl ConsolidationLock {
                 let age = OffsetDateTime::now_utc() - ts;
                 Ok(age.whole_seconds() >= LOCK_MAX_AGE_SECS)
             }
-            None => Ok(true),
+            // Unlesbarer/noch leerer Inhalt: der Besitzer hat die Datei
+            // evtl. gerade erst per `create_new` angelegt und den
+            // Zeitstempel noch nicht geschrieben. Dann entscheidet das
+            // Datei-Alter — sonst würde ein zweiter Aufrufer einen frisch
+            // gehaltenen Lock "übernehmen" (zwei gleichzeitige Halter).
+            None => {
+                let age = fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok());
+                Ok(age.is_none_or(|a| {
+                    i64::try_from(a.as_secs()).map_or(true, |s| s >= LOCK_MAX_AGE_SECS)
+                }))
+            }
         }
     }
 }
@@ -779,6 +792,138 @@ impl Drop for ConsolidationLock {
     /// liefern — wer Löschfehler sehen will, ruft `release()` auf.
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Frist (Deadline) für löschende Vorgänge
+// ---------------------------------------------------------------------
+
+/// Standard-Frist für löschende Gedächtnis-Vorgänge (`/memory forget`,
+/// Konsolidierung/Merge mit Löschungen, globale Promotion).
+pub const DEFAULT_DELETION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wartezeit zwischen zwei Lock-Versuchen in [`ConsolidationLock::acquire_until`].
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Frist, bis zu der ein löschender Vorgang seinen *Commit-Punkt* erreichen
+/// muss. Abgelaufen = sauberer Abbruch **vor** dem ersten schreibenden/
+/// löschenden Schritt; nach dem Commit-Punkt läuft der Vorgang zu Ende (kein
+/// halbes Löschen).
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline {
+    /// Ablaufzeitpunkt.
+    at: std::time::Instant,
+}
+
+impl Deadline {
+    /// Frist, die `after` ab jetzt abläuft. `Duration::ZERO` ist sofort
+    /// abgelaufen.
+    #[must_use]
+    pub fn after(after: std::time::Duration) -> Self {
+        Self {
+            at: std::time::Instant::now() + after,
+        }
+    }
+
+    /// Frist mit [`DEFAULT_DELETION_DEADLINE`].
+    #[must_use]
+    pub fn default_deletion() -> Self {
+        Self::after(DEFAULT_DELETION_DEADLINE)
+    }
+
+    /// `true`, wenn die Frist abgelaufen ist.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        std::time::Instant::now() >= self.at
+    }
+
+    /// Prüft die Frist an der Stelle `phase`.
+    ///
+    /// # Errors
+    /// [`DeadlineExceeded`], wenn die Frist abgelaufen ist.
+    pub fn check(&self, phase: &'static str) -> Result<(), DeadlineExceeded> {
+        if self.expired() {
+            Err(DeadlineExceeded { phase })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Typisierter Abbruch: die Frist ist abgelaufen, der Store blieb
+/// unverändert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadlineExceeded {
+    /// Phase, in der die Frist abgelaufen war.
+    pub phase: &'static str,
+}
+
+impl std::fmt::Display for DeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Frist überschritten in Phase '{}' — Vorgang abgebrochen, Bestand unverändert",
+            self.phase
+        )
+    }
+}
+
+impl std::error::Error for DeadlineExceeded {}
+
+/// Fehler fristgebundener Konsolidierung.
+#[derive(Debug)]
+pub enum ConsolidationError {
+    /// Frist abgelaufen (Bestand unverändert).
+    Deadline(DeadlineExceeded),
+    /// Sonstiger Speicherfehler.
+    Memory(MemoryError),
+}
+
+impl std::fmt::Display for ConsolidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deadline(e) => e.fmt(f),
+            Self::Memory(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ConsolidationError {}
+
+impl From<DeadlineExceeded> for ConsolidationError {
+    fn from(e: DeadlineExceeded) -> Self {
+        Self::Deadline(e)
+    }
+}
+
+impl From<MemoryError> for ConsolidationError {
+    fn from(e: MemoryError) -> Self {
+        Self::Memory(e)
+    }
+}
+
+impl ConsolidationLock {
+    /// Wie [`Self::try_acquire`], wartet bei Kontention aber (Polling) bis
+    /// `deadline`. Dient kurzen Schreibern (`record --global`, Promotion,
+    /// `forget`), die nicht sofort aufgeben sollen, wenn gerade konsolidiert
+    /// wird.
+    ///
+    /// # Errors
+    /// [`MemoryError::LockContention`], wenn der Lock bis zum Fristablauf
+    /// belegt blieb; sonst Fehler von [`Self::try_acquire`].
+    pub fn acquire_until(root: impl AsRef<Path>, deadline: Deadline) -> MemoryResult<Self> {
+        loop {
+            match Self::try_acquire(root.as_ref()) {
+                Err(MemoryError::LockContention { attempted }) => {
+                    if deadline.expired() {
+                        return Err(MemoryError::LockContention { attempted });
+                    }
+                    std::thread::sleep(LOCK_POLL_INTERVAL);
+                }
+                other => return other,
+            }
+        }
     }
 }
 

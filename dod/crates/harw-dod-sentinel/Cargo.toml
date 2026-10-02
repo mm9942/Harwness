@@ -36,6 +36,7 @@ harw-fsutil = { path = "../../../harw-fsutil" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 harw-sandbox = { path = "../../../harw-sandbox" }
 tempfile = { workspace = true }
 # Nur für `spool.rs`-Tests: `correlate_advisories` ist der einzige öffentliche

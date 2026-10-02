@@ -84,7 +84,7 @@ pub use extraction::{
     EntryRole, ExtractionCandidate, ExtractionError, ExtractionPolicy, IncomingStore,
     TranscriptEntry, build_input, parse_response, select_sessions, system_prompt, user_prompt,
 };
-pub use facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
+pub use facts::{Fact, FactLimits, FactScope, FactStore, FactType, redact, slugify};
 pub use file_index::{FileKnowledge, FileKnowledgeIndex};
 pub use file_store::FileMemoryStore;
 pub use promote::{

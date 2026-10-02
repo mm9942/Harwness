@@ -110,11 +110,17 @@ mod test_support;
 /// - `#[msg("...")]` controls the `Display` output. `{0}`, `{1}`, ... refer to
 ///   tuple fields, `{name}` refers to named fields.
 /// - `#[from]` generates a `From<Inner>` impl and wires `source()` to the inner
-///   error. Only valid on single-field tuple variants.
+///   error. On a variant it is valid on single-field tuple variants; on the
+///   single field of a named (struct) variant it also generates `From` and,
+///   without `#[msg]`, displays the inner error.
+/// - `#[source]` on a field (named or tuple) wires `source()` to that field
+///   without generating `From`; use it for variants like
+///   `Read { path, #[source] source }`. At most one `#[source]`/`#[from]` field
+///   per variant; the field type must implement `std::error::Error + 'static`.
 ///
 /// When the enum name ends in `Error`, a `pub type <Prefix>Result<T> =
 /// Result<T, <Enum>>;` alias is also emitted (e.g. `CoreError` -> `CoreResult`).
-#[proc_macro_derive(HarwError, attributes(msg, from))]
+#[proc_macro_derive(HarwError, attributes(msg, from, source))]
 pub fn derive_harw_error(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match error::expand_harw_error(&input) {
@@ -174,6 +180,8 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// | `permission` | `= "..."` | none | sandbox permission checked before anything else |
 /// | `host_from` | `= "<field>"` | none | args field holding the URL whose host is checked |
 /// | `parallel_safe` | flag or `= true`/`= false` | `false` | whether concurrent calls are safe |
+/// | `state` | `= Type` | none | the executor carries a `Type`; the fn takes `&Type` as an extra first argument |
+/// | `schema_from` | `= path` | none | `path()` returns the `ToolSpec` (externally built schema) instead of `Args::tool_spec()` |
 ///
 /// Accepted `permission` values are `"read_workspace"`, `"write_workspace"`,
 /// `"execute_process"`, `"network_access"`, `"read_secrets"`,
@@ -182,11 +190,38 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// allowed set rather than a silent fallback onto a different permission; a
 /// typo must never resolve to a *different* (possibly weaker) permission.
 ///
+/// # Stateful tools and external schemas
+///
+/// ```ignore
+/// #[tool(
+///     name = "palace.search",
+///     permission = "read_workspace",
+///     state = Arc<KnowledgeStore>,
+///     schema_from = search_spec,
+///     parallel_safe,
+/// )]
+/// async fn palace_search(
+///     store: &Arc<KnowledgeStore>,
+///     context: &ToolExecutionContext,
+///     args: SearchArgs,
+/// ) -> Result<ToolOutput, ToolsError> { ... }
+/// ```
+///
+/// With `state = Type` the wrapper is `struct PalaceSearchTool { state: Type }`
+/// with `PalaceSearchTool::new(state)` (no `Default`, no `Copy`; `Type` must be
+/// `Debug + Clone`) and the function receives `&Type` as its first argument. A
+/// `tool_provider!` with `state` builds such tools from a constructor
+/// expression. With `schema_from = path`, `spec()` calls `path()` (which must
+/// return `::harw_tools::ToolSpec`) and the args type does not need
+/// `#[derive(Tool)]`; name and description are still overwritten from
+/// `NAME` / `DESCRIPTION`.
+///
 /// # What is generated
 ///
 /// 1. The original `async fn`, unchanged.
-/// 2. A unit wrapper struct (`FsGlobTool`) deriving `Debug`, `Clone`, `Copy`
-///    and `Default`.
+/// 2. A wrapper struct (`FsGlobTool`) — a unit struct deriving `Debug`,
+///    `Clone`, `Copy` and `Default`, or (with `state`) a one-field struct with
+///    `new(state)`.
 /// 3. Associated consts `NAME`, `DESCRIPTION`, `PARALLEL_SAFE: bool` and
 ///    `PERMISSION: Option<::harw_tools::Permission>`. `PERMISSION` is the
 ///    auditable declaration; the prologue below is the actual enforcement.
@@ -482,7 +517,9 @@ pub fn derive_op_args(input: TokenStream) -> TokenStream {
 ///
 /// Anwendbar auf `pub struct Foo(String);`. Der Fehlertyp wird über
 /// `#[harw_id(error = "…", ctor = "…")]` konfiguriert; `#[harw_id(infallible)]`
-/// erzeugt zusätzlich einen unvalidierten Kompatibilitätskonstruktor `new`.
+/// erzeugt zusätzlich einen unvalidierten Kompatibilitätskonstruktor `new`;
+/// `#[harw_id(validate = "pfad::fn")]` ersetzt die Leerprüfung durch eine eigene
+/// Regel `fn(&str) -> Result<(), Fehler>`.
 ///
 /// # Errors
 /// - Kein Tuple-Struct mit genau einem `String`-Feld → `syn::Error`.
@@ -496,9 +533,11 @@ pub fn derive_harw_id(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Leitet `ALL`, `as_str`, `Display` und `FromStr` in kebab-case für ein Enum
-/// aus reinen Unit-Varianten ab (`FromStr` akzeptiert kebab- und snake_case,
-/// case-insensitiv).
+/// Leitet `ALL`, `as_str`, `Display` und `FromStr` in kebab-case (oder mit
+/// `#[kebab_enum(case = "snake")]` in snake_case) für ein Enum aus reinen
+/// Unit-Varianten ab (`FromStr` akzeptiert kebab- und snake_case,
+/// case-insensitiv). Optional: `parse_option` (`parse -> Option<Self>`),
+/// `no_from_str`, `no_all`.
 ///
 /// # Errors
 /// - Nicht-Unit-Variante → `syn::Error`.

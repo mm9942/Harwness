@@ -46,6 +46,12 @@ members = [
     "harw-session-host",
     "harw-session-ws",
     "harw-session-com",
+    # W00 WebSocket control plane skeleton (docs/planning/65-cloud-sessions/
+    # contracts/W00-ws-integration-map.md): client, production TurnDriver
+    # bridge, own-cloud node listener.
+    "harw-session-remote",
+    "harw-session-driver",
+    "harw-node-listener",
     "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",
@@ -118,6 +124,8 @@ members = [
     # === Remediation (Plan P0–P3) ===
     "harw-egress",
     "harw-fsutil",
+    # Reines Dev-Gerüst (define_test_error!, Temp-Pfade); nur als dev-dependency.
+    "harw-test-support",
     "harw-runtime",
     "harwness-sdk",
     "xtask",

@@ -72,6 +72,7 @@ pub mod config_agents;
 pub mod diary_tools;
 pub mod embedded_agents;
 pub mod kanban_tools;
+pub mod memory_tools;
 pub mod palace_tools;
 pub mod profile;
 pub mod research_web;
@@ -82,6 +83,10 @@ pub mod workbench_tools;
 
 #[cfg(test)]
 mod test_support;
+
+// Golden-Tests der Provider-Oberfläche (vor/nach der `tool_provider!`-Migration).
+#[cfg(test)]
+mod provider_golden;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -110,6 +115,7 @@ pub use config_agents::{AgentDefinitionMeta, ConfigAgents, discover_run_agent_de
 pub use diary_tools::DiaryToolProvider;
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use kanban_tools::KanbanReadToolProvider;
+pub use memory_tools::MemoryToolProvider;
 pub use palace_tools::PalaceToolProvider;
 pub use profile::{
     AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, JobWiring, RegistryProfile,

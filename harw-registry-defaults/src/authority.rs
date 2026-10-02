@@ -74,6 +74,7 @@ use crate::capability_catalog::{
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
+use crate::memory_tools::{MEMORY_RECALL, MEMORY_RECORD};
 use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
@@ -657,6 +658,8 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // Runde 7, Teil T2: `latex.template` schreibt Vorlage und Gerüst in
         // den Workspace (kein Prozess) — vor dem `LATEX_TOOLS`-Zweig geprüft.
         || tool == crate::profile::LATEX_TEMPLATE_TOOL
+        // `memory.record` schreibt Fakten (Projekt oder global); nie auto-freigegeben.
+        || tool == MEMORY_RECORD
         || listed(AGENT_DEFINITION_WRITE_TOOLS)
         || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
         || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
@@ -691,6 +694,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(DiaryToolProvider::TOOL_NAMES)
         || listed(PalaceToolProvider::TOOL_NAMES)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
+        || tool == MEMORY_RECALL
         // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
         // Harness-Artefakt `.harw/plans/<slug>.md` und muss unter der
         // Plan-Decke (ohne `WriteWorkspace`) laufen; die übrigen drei lesen
