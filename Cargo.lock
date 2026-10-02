@@ -4029,6 +4029,7 @@ dependencies = [
  "harw-job-store",
  "harw-macros",
  "harw-observe",
+ "harw-retention",
  "harw-types",
  "jiff",
  "serde",
