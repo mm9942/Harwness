@@ -4490,6 +4490,7 @@ dependencies = [
  "harw-protocol",
  "harw-provider-http",
  "harw-runtime",
+ "harw-session-client",
  "harw-session-daemon",
  "harw-session-host",
  "harw-session-remote",
