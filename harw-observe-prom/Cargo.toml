@@ -16,6 +16,7 @@ harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = { workspace = true }
 
 [lints]

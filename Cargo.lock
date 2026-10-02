@@ -1942,6 +1942,7 @@ dependencies = [
  "harw-registry-defaults",
  "harw-research",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "time",
  "tokio",
@@ -2032,6 +2033,7 @@ dependencies = [
  "getrandom 0.4.3",
  "harw-dod-encrypt",
  "harw-fsutil",
+ "harw-test-support",
  "http",
  "http-body-util",
  "hyper",
@@ -2065,6 +2067,7 @@ name = "harw-browser"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "harw-test-support",
  "serde",
  "serde_json",
  "time",
@@ -2081,6 +2084,7 @@ dependencies = [
  "base64 0.23.1",
  "futures-util",
  "harw-browser",
+ "harw-test-support",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -2100,6 +2104,7 @@ version = "0.9.0"
 dependencies = [
  "harw-config",
  "harw-home",
+ "harw-test-support",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -2114,6 +2119,7 @@ dependencies = [
  "harw-macros",
  "harw-secrets",
  "harw-session-store",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2129,6 +2135,7 @@ dependencies = [
  "harw-channel",
  "harw-sandbox",
  "harw-session-store",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "rand 0.10.3",
@@ -2149,6 +2156,7 @@ dependencies = [
  "harw-channel-telegram",
  "harw-config",
  "harw-secrets",
+ "harw-test-support",
  "harw-types",
  "infer",
  "jiff",
@@ -2239,6 +2247,7 @@ name = "harw-code-graph"
 version = "0.9.0"
 dependencies = [
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "serde",
  "toml 1.1.3+spec-1.1.0",
@@ -2261,6 +2270,7 @@ version = "0.9.0"
 dependencies = [
  "harw-fsutil",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "serde",
  "serde_json",
@@ -2277,6 +2287,7 @@ dependencies = [
  "harw-authority",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2324,6 +2335,7 @@ dependencies = [
  "harw-extension-api",
  "harw-operations",
  "harw-research",
+ "harw-test-support",
  "harw-types",
  "serde_json",
  "tokio",
@@ -2363,6 +2375,7 @@ dependencies = [
  "harw-dod-thermal",
  "harw-dod-workspace",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2377,6 +2390,7 @@ dependencies = [
  "harw-dod-netlink",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2391,6 +2405,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2403,6 +2418,7 @@ dependencies = [
  "aya",
  "harw-dod-cap",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "rustix 1.1.5",
@@ -2415,6 +2431,7 @@ version = "0.9.0"
 dependencies = [
  "harw-authority",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "serde",
  "serde_json",
@@ -2430,6 +2447,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde_json",
@@ -2441,6 +2459,7 @@ name = "harw-dod-config"
 version = "0.9.0"
 dependencies = [
  "blake3",
+ "harw-test-support",
  "ipnet",
  "rustix 1.1.5",
  "serde",
@@ -2457,6 +2476,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2468,6 +2488,7 @@ version = "0.9.0"
 dependencies = [
  "crypt_guard_service",
  "harw-macros",
+ "harw-test-support",
 ]
 
 [[package]]
@@ -2481,6 +2502,7 @@ dependencies = [
  "harw-macros",
  "harw-sandbox",
  "harw-session-store",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2496,6 +2518,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2513,6 +2536,7 @@ dependencies = [
  "harw-dod-signals",
  "harw-macros",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "ipnet",
  "jiff",
@@ -2529,6 +2553,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde_json",
@@ -2544,6 +2569,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2558,6 +2584,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2572,6 +2599,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2586,6 +2614,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde_json",
@@ -2610,6 +2639,7 @@ dependencies = [
  "harw-dod-cap",
  "harw-macros",
  "harw-sandbox",
+ "harw-test-support",
  "ipnet",
  "serde",
  "serde_json",
@@ -2623,6 +2653,7 @@ dependencies = [
  "harw-dod-cap",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2634,6 +2665,7 @@ version = "0.9.0"
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
+ "harw-test-support",
  "tempfile",
 ]
 
@@ -2646,6 +2678,7 @@ dependencies = [
  "harw-dod-signals",
  "harw-knowledge",
  "harw-research",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "rayon",
@@ -2664,6 +2697,7 @@ dependencies = [
  "harw-dod-signals",
  "harw-home",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2684,6 +2718,7 @@ dependencies = [
  "harw-macros",
  "harw-observe",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "semver",
@@ -2698,6 +2733,7 @@ dependencies = [
  "harw-dod-cap",
  "harw-macros",
  "harw-observe",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2713,6 +2749,7 @@ dependencies = [
  "harw-dod-readfs",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -2724,6 +2761,7 @@ version = "0.9.0"
 dependencies = [
  "harw-dod-warden-proto",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde_json",
@@ -2736,6 +2774,7 @@ version = "0.9.0"
 dependencies = [
  "blake3",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2751,6 +2790,7 @@ dependencies = [
  "harw-dod-fixtures",
  "harw-dod-signals",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "semver",
@@ -2766,6 +2806,7 @@ dependencies = [
  "blake3",
  "harw-authority",
  "harw-sandbox",
+ "harw-test-support",
  "reqwest 0.12.28",
  "tempfile",
  "tokio",
@@ -2797,6 +2838,7 @@ dependencies = [
  "harw-lens-types",
  "harw-macros",
  "harw-sandbox",
+ "harw-test-support",
  "harw-tools",
  "harw-types",
  "jiff",
@@ -2855,6 +2897,7 @@ dependencies = [
  "getrandom 0.4.3",
  "harw-config",
  "harw-home",
+ "harw-test-support",
  "jiff",
  "serde",
  "serde_json",
@@ -2868,6 +2911,7 @@ version = "0.9.0"
 dependencies = [
  "harw-extension-api",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "tokio",
 ]
@@ -2890,6 +2934,7 @@ version = "0.9.0"
 dependencies = [
  "harw-macros",
  "harw-observe",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -2913,6 +2958,7 @@ version = "0.9.0"
 dependencies = [
  "harw-job-core",
  "harw-job-linux",
+ "harw-test-support",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -2927,6 +2973,7 @@ dependencies = [
  "harw-job-core",
  "harw-job-linux",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "tempfile",
 ]
@@ -3037,6 +3084,7 @@ dependencies = [
  "harw-lens-source",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "tempfile",
 ]
 
@@ -3046,6 +3094,7 @@ version = "0.9.0"
 dependencies = [
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
 ]
 
@@ -3056,6 +3105,7 @@ dependencies = [
  "blake3",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "reqwest 0.12.28",
  "secrecy 0.10.3",
@@ -3076,6 +3126,7 @@ dependencies = [
  "harw-lens-source",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -3089,6 +3140,7 @@ dependencies = [
  "harw-lens-store",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "serde",
  "serde_json",
@@ -3108,6 +3160,7 @@ dependencies = [
  "harw-lens-store",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "tempfile",
@@ -3149,6 +3202,7 @@ dependencies = [
  "harw-home",
  "harw-lens-types",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "serde",
  "serde_json",
@@ -3161,6 +3215,7 @@ version = "0.9.0"
 dependencies = [
  "harw-digest",
  "harw-macros",
+ "harw-test-support",
  "serde",
  "serde_json",
 ]
@@ -3175,6 +3230,7 @@ dependencies = [
  "harw-dod-signals",
  "harw-observe",
  "harw-operations",
+ "harw-test-support",
  "harw-tools",
  "harw-types",
  "jiff",
@@ -3221,6 +3277,7 @@ dependencies = [
  "bytes",
  "harw-job-core",
  "harw-session-store",
+ "harw-test-support",
  "harw-types",
  "http-body-util",
  "hyper",
@@ -3240,6 +3297,7 @@ dependencies = [
  "harw-extension-api",
  "harw-fsutil",
  "harw-lens-types",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -3317,6 +3375,7 @@ dependencies = [
  "base64 0.23.1",
  "fs4",
  "harw-config",
+ "harw-test-support",
  "rand 0.10.3",
  "reqwest 0.12.28",
  "secrecy 0.10.3",
@@ -3331,6 +3390,7 @@ name = "harw-observe"
 version = "0.9.0"
 dependencies = [
  "harw-macros",
+ "harw-test-support",
  "serde",
  "serde_json",
 ]
@@ -3342,6 +3402,7 @@ dependencies = [
  "blake3",
  "harw-macros",
  "harw-observe",
+ "harw-test-support",
  "jiff",
  "serde",
  "serde_json",
@@ -3355,6 +3416,7 @@ dependencies = [
  "bytes",
  "harw-macros",
  "harw-observe",
+ "harw-test-support",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3370,6 +3432,7 @@ version = "0.9.0"
 dependencies = [
  "harw-macros",
  "harw-observe",
+ "harw-test-support",
  "tempfile",
 ]
 
@@ -3476,6 +3539,7 @@ dependencies = [
  "harw-research",
  "harw-sandbox",
  "harw-session-store",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -3499,6 +3563,7 @@ dependencies = [
  "harw-dod-procmon",
  "harw-dod-signals",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "ipnet",
  "jiff",
@@ -3519,6 +3584,7 @@ dependencies = [
  "harw-dod-cap",
  "harw-dod-fsmon",
  "harw-dod-signals",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "landlock",
@@ -3536,6 +3602,7 @@ version = "0.9.0"
 dependencies = [
  "harw-extension-api",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "tempfile",
  "tokio",
@@ -3546,6 +3613,7 @@ dependencies = [
 name = "harw-protocol"
 version = "0.9.0"
 dependencies = [
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -3577,6 +3645,7 @@ dependencies = [
  "harw-protocol",
  "harw-provider",
  "harw-sandbox",
+ "harw-test-support",
  "harw-tools",
  "harw-types",
  "keyring",
@@ -3606,6 +3675,7 @@ dependencies = [
  "harw-knowledge",
  "harw-project-discovery",
  "harw-sandbox",
+ "harw-test-support",
  "harw-tool-browser",
  "harw-tool-deps",
  "harw-tool-doc",
@@ -3635,6 +3705,7 @@ name = "harw-research"
 version = "0.9.0"
 dependencies = [
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -3699,6 +3770,7 @@ name = "harw-sandbox"
 version = "0.9.0"
 dependencies = [
  "harw-authority",
+ "harw-test-support",
  "harw-types",
  "tokio",
  "tracing",
@@ -3732,6 +3804,7 @@ version = "0.9.0"
 dependencies = [
  "bytes",
  "clap",
+ "harw-test-support",
  "harw-types",
  "http-body-util",
  "hyper",
@@ -3774,6 +3847,7 @@ dependencies = [
  "harw-observe",
  "harw-observe-file",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "landlock",
@@ -3856,6 +3930,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-test-support"
+version = "0.9.0"
+
+[[package]]
 name = "harw-tool-browser"
 version = "0.9.0"
 dependencies = [
@@ -3864,6 +3942,7 @@ dependencies = [
  "harw-browser",
  "harw-extension-api",
  "harw-sandbox",
+ "harw-test-support",
  "harw-tools",
  "serde",
  "serde_json",
@@ -3958,6 +4037,7 @@ dependencies = [
  "harw-extension-api",
  "harw-job-core",
  "harw-job-linux",
+ "harw-test-support",
  "harw-tool-shell",
  "harw-tools",
  "harw-types",
@@ -3982,6 +4062,7 @@ dependencies = [
  "harw-lens-query",
  "harw-macros",
  "harw-sandbox",
+ "harw-test-support",
  "harw-tools",
  "harw-types",
  "secrecy 0.10.3",
@@ -4031,6 +4112,7 @@ dependencies = [
  "harw-authority",
  "harw-extension-api",
  "harw-protocol",
+ "harw-test-support",
  "harw-tools",
  "harw-types",
  "serde_json",
@@ -4048,6 +4130,7 @@ dependencies = [
  "harw-macros",
  "harw-observe",
  "harw-sandbox",
+ "harw-test-support",
  "harw-tools",
  "harw-types",
  "jiff",
@@ -4096,6 +4179,7 @@ dependencies = [
  "harw-lens-types",
  "harw-macros",
  "harw-sandbox",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "serde",
@@ -4131,6 +4215,7 @@ dependencies = [
  "harw-runtime",
  "harw-sandbox",
  "harw-session-store",
+ "harw-test-support",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-shell",
@@ -4177,6 +4262,7 @@ dependencies = [
  "harw-dod-warden",
  "harw-dod-warden-proto",
  "harw-macros",
+ "harw-test-support",
  "harw-types",
  "jiff",
  "landlock",
@@ -4199,6 +4285,7 @@ dependencies = [
  "harw-macros",
  "harw-operations",
  "harw-session-store",
+ "harw-test-support",
  "harw-types",
  "http-body-util",
  "hyper",
@@ -8155,6 +8242,7 @@ name = "xtask"
 version = "0.9.0"
 dependencies = [
  "harw-code-graph",
+ "harw-test-support",
  "toml 1.1.3+spec-1.1.0",
 ]
 
