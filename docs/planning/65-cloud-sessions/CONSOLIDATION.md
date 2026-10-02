@@ -24,6 +24,7 @@ not touched without explicit per-PR approval.
 | ws/s01-contract | yes (UNBUILT merged) | c6e5ec5 | W00 §3.5/3.6 contract delta, PlacementGeneration, golden fixtures; fmt+tests passed on branch, clippy unverified; H0–H9 labels do not exist in hub docs (hub uses RS0–RS9) — drop/replace H column in W00-ws-integration-map.md | NOT RUN |
 | ws/s07-reconnect-alias | yes (UNBUILT) | see merge commit | backoff, resume cursors, AliasStore; never compiled; expected_node charset unchecked vs NodeId | NOT RUN |
 | ws/s02-node-upgrade | yes (UNBUILT merged) | see merge commit | upgrade fns implemented; clippy passed before last small edits, tests never ran; tests use raw I/O not harw-session-ws (needs dev-deps harw-session-ws + futures-util added by orchestrator) | NOT RUN |
+| ws/s08-node-listener | yes (UNBUILT) | see merge commit | RegistryIdentityMapper (invented file format node-devices.conf, no workspace device registry exists — needs design decision), UpgradeHandler, HostRevoker; never compiled; serve() depends on S02 stub replaced by S02; extra dev-deps in Cargo.toml/lock; revocation report counts inputs_dropped/contexts_revoked always 0 | NOT RUN |
 | ws/s10-edge-ws | NOT merged | 91c69d7 | pure WS route policy in harw-reverse-proxy/src/ws.rs; never compiled; on #92 base; ceilings in WsLimits::CEILING are the agent's own choice | – |
 | ws/s05-daemon | NOT merged | de8e789 | based on #91 (coop/hub-daemon); needs workspace member + arch-policy via stacked skeleton; fmt+clippy clean, tests never ran | – |
 | macro/m1-test-support | pending | – | – | – |
