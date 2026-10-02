@@ -91,6 +91,8 @@ fn test_field_table_exhaustive_harness_config() {
         jobs: _,
         // `[memory]`, eigener Abschnittstest unten.
         memory: _,
+        // `[retention]`, eigener Abschnittstest unten.
+        retention: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -799,6 +801,39 @@ fn test_field_table_exhaustive_memory_section() {
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
+}
+
+// ---------------------------------------------------------------------
+// [retention] (je Klasse 5 Felder) — Aufbewahrung flüchtiger Daten
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_retention_section() {
+    // Die Klassentabelle ist die einzige Quelle: jede deklarierte Klasse
+    // braucht genau die fünf Pfade `retention.<klasse>.<schluessel>`.
+    let harw_config::RetentionClassToml {
+        enabled,
+        max_age_secs,
+        max_bytes,
+        max_files,
+        keep_newest,
+    } = harw_config::RetentionClassToml::default();
+    let _ = (enabled, max_age_secs, max_bytes, max_files, keep_newest);
+    assert_eq!(harw_retention::CLASS_CONFIG_FIELDS.len(), 5);
+    assert_eq!(harw_retention::CLASSES.len(), 10);
+    for class in harw_retention::CLASSES {
+        for field in harw_retention::CLASS_CONFIG_FIELDS {
+            assert_path_in_field_table_exactly_once(&format!("retention.{}.{field}", class.id));
+        }
+    }
+    let retention_paths = FIELD_TABLE
+        .iter()
+        .filter(|f| f.path.starts_with("retention."))
+        .count();
+    assert_eq!(
+        retention_paths,
+        harw_retention::CLASSES.len() * harw_retention::CLASS_CONFIG_FIELDS.len()
+    );
 }
 
 // ---------------------------------------------------------------------

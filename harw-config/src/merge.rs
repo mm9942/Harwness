@@ -84,11 +84,12 @@ use crate::harness_config::{
     SandboxSection, SessionSection, TuiSection,
 };
 use crate::internal_models::InternalModelsToml;
+use crate::memory_toml::MemorySection;
 use crate::mode_toml::ModeSection;
 use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
-use crate::memory_toml::MemorySection;
 use crate::research_toml::ResearchSection;
+use crate::retention_toml::RetentionSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
@@ -1871,6 +1872,82 @@ fn merge_jobs(
     }
 }
 
+// `[retention.<klasse>]` — je Klasse (aus `harw_retention::CLASSES`):
+// `enabled` und `keep_newest` sind `ProfileReplaces` (ein nicht vertrautes
+// Projekt kann also weder eine sicherheitsrelevante Löschung einschalten
+// noch Schutzdateien reduzieren); `max_age_secs`/`max_bytes`/`max_files`
+// sind `MinBound`: vertraute Layer (Home, Profil) setzen frei, ein nicht
+// vertrautes Projekt darf nur senken (Vergleichswert: der bisher gesetzte
+// Wert, sonst die Klassenvorgabe; `None` = unbegrenzt, jeder Wert senkt).
+fn merge_retention(
+    trusted: &mut HarnessConfig,
+    incoming: RetentionSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    for class in harw_retention::CLASSES {
+        let (Some(inc), Some(cur)) = (
+            incoming.class_config(class.id),
+            trusted.retention.class_config_mut(class.id),
+        ) else {
+            continue;
+        };
+        let present = |key: &str| field_present(raw, &["retention", class.id, key]);
+        profile_replaces(
+            &mut cur.enabled,
+            inc.enabled,
+            present("enabled"),
+            role,
+            &format!("retention.{}.enabled", class.id),
+            layer_path,
+        );
+        profile_replaces(
+            &mut cur.keep_newest,
+            inc.keep_newest,
+            present("keep_newest"),
+            role,
+            &format!("retention.{}.keep_newest", class.id),
+            layer_path,
+        );
+        let limits = [
+            (
+                "max_age_secs",
+                &mut cur.max_age_secs,
+                inc.max_age_secs,
+                class.defaults.max_age_secs,
+            ),
+            (
+                "max_bytes",
+                &mut cur.max_bytes,
+                inc.max_bytes,
+                class.defaults.max_bytes,
+            ),
+            (
+                "max_files",
+                &mut cur.max_files,
+                inc.max_files,
+                class.defaults.max_files,
+            ),
+        ];
+        for (key, slot, value, default) in limits {
+            let Some(value) = value else { continue };
+            if !present(key) {
+                continue;
+            }
+            let current = (*slot).or(default);
+            if role != LayerRole::UntrustedProject || current.is_none_or(|c| value <= c) {
+                *slot = Some(value);
+            } else {
+                let field = format!("retention.{}.{key}", class.id);
+                let diagnostic = ScopeDiagnostic::new(&field, layer_path, &value);
+                reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+            }
+        }
+    }
+}
+
 // `[agent_compiler]` (#22 Welle 2B) — alle drei Felder `ProfileReplaces`.
 fn merge_agent_compiler(
     trusted: &mut HarnessConfig,
@@ -2130,6 +2207,7 @@ pub(crate) fn merge_layer_into(
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
     merge_memory(trusted, incoming.memory, raw, role, layer_path);
+    merge_retention(trusted, incoming.retention, raw, role, layer_path, &mut out);
     merge_permissions(
         trusted,
         incoming.permissions,
@@ -2602,6 +2680,58 @@ mod tests {
         );
         assert_eq!(fresh.shell.max_timeout_secs, None);
         assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_retention_untrusted_project_can_only_tighten_and_never_opt_in() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        let home = "[retention.tui_log]\nmax_files = 10\n[retention.dod_spool]\nenabled = true";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.retention.tui_log.max_files, Some(10));
+        assert_eq!(trusted.retention.dod_spool.enabled, Some(true));
+
+        // Projekt: lockern (hoeher), Opt-in einer anderen Klasse, `enabled =
+        // false` und `keep_newest` werden verworfen; Senken wirkt.
+        let project = "[retention.tui_log]\nmax_files = 50\nmax_age_secs = 60\nkeep_newest = 0\n\
+                       [retention.dod_spool]\nenabled = false\n\
+                       [retention.freeze_resolved]\nenabled = true\nmax_files = 5";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.retention.tui_log.max_files, Some(10));
+        // Vorgabe 14 Tage; 60 s ist niedriger und damit erlaubt.
+        assert_eq!(trusted.retention.tui_log.max_age_secs, Some(60));
+        assert_eq!(trusted.retention.tui_log.keep_newest, None);
+        assert_eq!(trusted.retention.dod_spool.enabled, Some(true));
+        assert_eq!(trusted.retention.freeze_resolved.enabled, None);
+        // Unbegrenzte Vorgabe (`None`): jeder Wert senkt.
+        let fields: Vec<&str> = diagnostics.iter().map(|d| d.field.as_str()).collect();
+        assert!(
+            fields.contains(&"retention.tui_log.max_files"),
+            "{fields:?}"
+        );
+
+        // Ein vertrauter Profil-Layer darf auch lockern.
+        let profile = "[retention.tui_log]\nmax_files = 99";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.retention.tui_log.max_files, Some(99));
         Ok(())
     }
 
