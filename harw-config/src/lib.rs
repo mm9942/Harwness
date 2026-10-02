@@ -34,6 +34,7 @@ pub mod provider_toml;
 pub mod research_toml;
 mod role_models;
 pub mod scope;
+mod serde_defaults;
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub mod shell_limits;
 pub mod skill_toml;
