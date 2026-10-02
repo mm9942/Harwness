@@ -3220,7 +3220,14 @@ fn print_memory_precision_check(home: &Path) {
     } else {
         "WARN"
     };
-    println!("check memory.precision: {label} — {}", report.summary());
+    let verdicts = harw_memory::fact_outcomes::verdict_stats(&dir);
+    println!(
+        "check memory.precision: {label} — {}; Outcomes {} bestätigt / {} widerlegt / {} offen",
+        report.summary(),
+        verdicts.confirmed,
+        verdicts.refuted,
+        verdicts.inconclusive
+    );
 }
 
 /// Druckt die Aufbewahrungs-Checks: eine `WARN`-Zeile je Klasse, die Daten

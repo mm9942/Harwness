@@ -972,6 +972,7 @@ fn run_consolidation(
     if pending.is_empty() {
         if should_run_daily_decay(memories_root, now)? {
             fact_store.decay(max_unused_days, now)?;
+            crate::fact_outcomes::run_outcome_cycle(&fact_store, memories_root, now);
             fact_store.write_index()?;
             write_last_consolidation_marker(memories_root, now)?;
         }
@@ -1015,6 +1016,9 @@ fn run_consolidation(
     report.written += dedupe.written;
     report.deleted += dedupe.deleted;
     report.conflicts += dedupe.conflicts;
+    // Outcome-Zyklus vor dem Verfall: bestätigte Fakten gewinnen Konfidenz, bevor
+    // der Verfall zählt; der Verfall demotet widerlegte.
+    crate::fact_outcomes::run_outcome_cycle(&fact_store, memories_root, now);
     fact_store.decay(max_unused_days, now)?;
     fact_store.write_index()?;
     write_last_consolidation_marker(memories_root, now)?;
