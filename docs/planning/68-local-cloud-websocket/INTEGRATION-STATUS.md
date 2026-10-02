@@ -62,6 +62,20 @@ Dependencies: `hyper`, `hyper-util`, `tokio`, `tokio-tungstenite` (through
 `hyper-tungstenite` is intentionally not used: `harw_session_ws::upgrade` is
 stricter (exact subprotocol, `Origin` refused).
 
+## 2a. Verification (scratch build on this branch, not a frozen-SHA central build)
+
+- `harw-node-transport`: 36 tests pass (2 new: an upgrade carries the
+  authenticated peer and ends with the connection; plain requests still work).
+- `harw-session-com`: 28 tests pass, 5 consecutive runs stable: 11 unit, 13
+  end to end against a real `SessionHost` (in-memory stream and a real Unix
+  socket through `serve_unix`), 4 self-cloud end to end through the real node
+  transport (PQ-TLS + ML-DSA handshake): an enrolled device runs a session; a
+  remote owner never gets `gateway_*`; a transport-trusted but unenrolled node
+  gets 403; a revoked device cannot reconnect.
+- `clippy --all-targets -D warnings` and `fmt --check` clean;
+  `cargo xtask gates` (edges, privileges, warden budget, no-c-build, arch)
+  green. `cargo deny` was not run.
+
 ## 3. Remaining plan, in build order
 
 1. **Adopt in #91** (`harw-session-daemon`): replace `serve_stream` by
