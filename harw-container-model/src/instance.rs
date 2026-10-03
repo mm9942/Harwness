@@ -116,7 +116,7 @@ pub struct ContainerInstance {
 
 /// A pod (and one container in it) managed through Kubernetes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PodInstanceRaw")]
 pub struct PodInstance {
     /// Namespace (one per tenant).
     pub namespace: String,
@@ -124,6 +124,23 @@ pub struct PodInstance {
     pub pod_uid: String,
     /// Container name inside the pod.
     pub container: String,
+}
+
+/// Unvalidated wire form of [`PodInstance`]; deserializing re-runs [`PodInstance::new`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PodInstanceRaw {
+    namespace: String,
+    pod_uid: String,
+    container: String,
+}
+
+impl TryFrom<PodInstanceRaw> for PodInstance {
+    type Error = InstanceError;
+
+    fn try_from(raw: PodInstanceRaw) -> Result<Self, Self::Error> {
+        Self::new(&raw.namespace, &raw.pod_uid, &raw.container)
+    }
 }
 
 impl PodInstance {
@@ -198,6 +215,18 @@ mod tests {
             PodInstance::new("a", "short", "job"),
             Err(InstanceError::InvalidPodUid)
         );
+    }
+
+    #[test]
+    fn forged_pod_json_is_refused_on_deserialize() {
+        let bad = r#"{"namespace":"Evil NS","pod_uid":"123e4567-e89b","container":"job"}"#;
+        assert!(serde_json::from_str::<PodInstance>(bad).is_err());
+        let short = r#"{"namespace":"ok","pod_uid":"x","container":"job"}"#;
+        assert!(serde_json::from_str::<PodInstance>(short).is_err());
+        let good = r#"{"namespace":"ok","pod_uid":"123e4567-e89b","container":"job"}"#;
+        assert!(serde_json::from_str::<PodInstance>(good).is_ok());
+        let extra = r#"{"namespace":"ok","pod_uid":"123e4567-e89b","container":"job","x":1}"#;
+        assert!(serde_json::from_str::<PodInstance>(extra).is_err());
     }
 
     #[test]

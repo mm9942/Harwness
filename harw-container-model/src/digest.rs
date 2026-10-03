@@ -87,7 +87,8 @@ impl ImageDigest {
         format!("{}@sha256:{}", self.name, self.hex)
     }
 
-    /// `sha256:<hex>` (the form engines report as an image id).
+    /// `sha256:<hex>` — the manifest digest as engines list it in `RepoDigests`
+    /// (not the config digest an engine reports as the image id).
     #[must_use]
     pub fn digest(&self) -> String {
         format!("sha256:{}", self.hex)
