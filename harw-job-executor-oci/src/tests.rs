@@ -342,3 +342,29 @@ fn garbage_collection_removes_stale_epochs_only_after_grace() -> TestResult {
     assert_eq!(engine.container_count(), 1);
     Ok(())
 }
+
+#[test]
+fn a_container_of_another_image_is_refused_and_probe_notices() -> TestResult {
+    let engine = FakeEngine::start(Behavior::default())?;
+    let (exec, identity) = started_identity(
+        &engine,
+        Behavior {
+            run_forever: true,
+            ..Behavior::default()
+        },
+    )?;
+    engine.set_behavior(|b| b.wrong_image = true);
+    assert!(matches!(exec.probe(&identity), Ok(Probe::Mismatch(_))));
+    let result = exec.start(&spec(SandboxRequirement::None, None)?, &context(7)?);
+    assert!(result.is_err(), "created from another image than the pin");
+    let starts = engine
+        .requests()
+        .iter()
+        .filter(|(_, p)| p.contains("/start"))
+        .count();
+    assert_eq!(
+        starts, 1,
+        "only the first (valid) container was ever started"
+    );
+    Ok(())
+}

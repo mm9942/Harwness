@@ -272,10 +272,15 @@ impl OciExecutor {
         if created != identity.created_unix {
             return Err("creation time differs from the recorded one".into());
         }
-        let suffix = format!("@{}", identity.image_digest.digest());
-        match doc.config.image.as_deref() {
-            Some(image) if image.ends_with(&suffix) => {}
-            _ => return Err("container was not created from the recorded image digest".into()),
+        // Evidence of the pin is the image *id*: look the pinned image up again
+        // and compare (a real engine reports the local name in `Config.Image`).
+        let pinned = self
+            .engine
+            .require_image(&identity.image_digest)
+            .map_err(|_| "the pinned image is not available to verify against".to_owned())?;
+        match doc.image.as_deref().map(crate::engine::normalize_image_id) {
+            Some(id) if id == pinned => {}
+            _ => return Err("container was not created from the recorded image".into()),
         }
         let labels = doc
             .config
@@ -373,6 +378,7 @@ impl OciExecutor {
         let labels = self.labels_for(spec, ctx)?;
         let (network, intent) = network_for(spec.sandbox_profile);
         let requested = Requested {
+            engine: cfg.engine,
             network: intent,
             memory: spec.resources.memory_max,
             cpu_shares: spec.resources.cpu_weight.map(cpu_shares),
@@ -380,7 +386,7 @@ impl OciExecutor {
         };
         let body = create_body(cfg, spec, &image.reference(), &labels, network)?;
 
-        self.engine.require_image(image)?;
+        let image_id = self.engine.require_image(image)?;
         let id = self.engine.create(&body)?;
         let doc = match self.engine.inspect(&id) {
             Ok(doc) => doc,
@@ -396,6 +402,13 @@ impl OciExecutor {
                 return Err(error.into());
             }
         };
+        if doc.image.as_deref().map(crate::engine::normalize_image_id) != Some(image_id) {
+            self.discard(&id);
+            return Err(OciError::Protocol(
+                "the container was created from a different image than the pinned one".into(),
+            )
+            .into());
+        }
         let carried = doc
             .config
             .labels

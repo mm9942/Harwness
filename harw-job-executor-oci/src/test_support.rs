@@ -25,11 +25,12 @@ pub(crate) struct Behavior {
     pub(crate) huge_inspect: Option<usize>,
     /// Replace the owner label in inspect.
     pub(crate) spoof_owner: bool,
+    /// Report a different image id than the pinned image's.
+    pub(crate) wrong_image: bool,
 }
 
 #[derive(Debug, Clone)]
 struct Container {
-    image: String,
     labels: serde_json::Value,
     host: serde_json::Value,
     running: bool,
@@ -52,6 +53,9 @@ pub(crate) struct FakeEngine {
     _dir: tempfile::TempDir,
 }
 
+/// Image id (config digest) of the fake image; differs from the manifest digest.
+pub(crate) const IMAGE_ID_HEX: &str =
+    "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 pub(crate) const IMAGE_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -187,7 +191,7 @@ fn serve(mut conn: UnixStream, state: &Arc<Mutex<State>>) {
         if behavior.image_missing {
             return respond(&mut conn, 404, b"{}");
         }
-        let doc = serde_json::json!({"RepoDigests": [format!("rust@sha256:{IMAGE_HEX}")]});
+        let doc = serde_json::json!({"Id": format!("sha256:{IMAGE_ID_HEX}"), "RepoDigests": [format!("rust@sha256:{IMAGE_HEX}")]});
         return respond(&mut conn, 200, doc.to_string().as_bytes());
     }
     if path.ends_with("/containers/create") {
@@ -197,7 +201,6 @@ fn serve(mut conn: UnixStream, state: &Arc<Mutex<State>>) {
         st.containers.insert(
             id.clone(),
             Container {
-                image: req["Image"].as_str().unwrap_or("").to_owned(),
                 labels: req["Labels"].clone(),
                 host: req["HostConfig"].clone(),
                 running: false,
@@ -253,7 +256,9 @@ fn serve(mut conn: UnixStream, state: &Arc<Mutex<State>>) {
             let doc = serde_json::json!({
                 "Id": id,
                 "Created": "2026-10-03T10:00:00.123456789Z",
-                "Config": {"Image": c.image, "Labels": labels},
+                // Like a real engine: the local *name* here, the id below.
+                "Config": {"Image": "docker.io/library/rust:latest", "Labels": labels},
+                "Image": if behavior.wrong_image { format!("sha256:{}", "0".repeat(64)) } else { format!("sha256:{IMAGE_ID_HEX}") },
                 "HostConfig": host,
                 "State": {"Running": c.running, "ExitCode": c.exit_code.unwrap_or(0)},
                 "Mounts": mounts,

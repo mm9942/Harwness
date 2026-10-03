@@ -27,6 +27,10 @@ pub struct InspectDoc {
     pub host_config: HostConfigDoc,
     /// Runtime state.
     pub state: StateDoc,
+    /// The image **id** the container was created from (`sha256:<hex>`, the
+    /// config digest). `Config.Image` is not evidence of the pin: Podman
+    /// reports the local *name* (`alpine:3.20`) there.
+    pub image: Option<String>,
     /// Mounts actually attached (`None` when not reported).
     pub mounts: Option<Vec<MountDoc>>,
 }
@@ -85,6 +89,11 @@ pub struct MountDoc {
     pub r#type: String,
     /// Destination in the container.
     pub destination: String,
+}
+
+/// `sha256:<hex>` and `<hex>` name the same image id.
+pub(crate) fn normalize_image_id(id: &str) -> String {
+    id.strip_prefix("sha256:").unwrap_or(id).to_owned()
 }
 
 fn encode(text: &str) -> String {
@@ -150,7 +159,8 @@ impl Engine {
 
     /// Verifies the pinned image exists locally with exactly this manifest
     /// digest (`RepoDigests`). Nothing is pulled.
-    pub(crate) fn require_image(&self, image: &ImageDigest) -> Result<(), OciError> {
+    /// Returns the image id (hex, no `sha256:` prefix) of that exact image.
+    pub(crate) fn require_image(&self, image: &ImageDigest) -> Result<String, OciError> {
         let reference = image.reference();
         if !reference.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b':' | b'-' | b'@')
@@ -167,6 +177,7 @@ impl Engine {
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "PascalCase", default)]
         struct ImageDoc {
+            id: Option<String>,
             repo_digests: Option<Vec<String>>,
         }
         let doc: ImageDoc = serde_json::from_slice(&body)
@@ -178,7 +189,11 @@ impl Engine {
             .iter()
             .any(|d| d.ends_with(&suffix))
         {
-            Ok(())
+            doc.id
+                .as_deref()
+                .map(normalize_image_id)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| OciError::Protocol("image inspect has no Id".into()))
         } else {
             Err(OciError::ImageMissing(format!(
                 "{reference} (local image has another digest)"

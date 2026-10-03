@@ -3,6 +3,7 @@
 //! The report describes what the engine says it applied, not what was
 //! asked: a field the engine does not report is never `Enforced`.
 
+use harw_container_model::EngineKind;
 use harw_job_core::{EnforcementState, SandboxReport};
 
 use crate::engine::InspectDoc;
@@ -10,6 +11,8 @@ use crate::engine::InspectDoc;
 /// What the job requested, as far as the report needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Requested {
+    /// Which engine answered (decides how a dropped capability set is read).
+    pub engine: EngineKind,
     /// The network the profile asks for.
     pub network: NetworkIntent,
     /// Requested memory ceiling in bytes.
@@ -103,15 +106,45 @@ fn no_new_privs(doc: &InspectDoc) -> EnforcementState {
     }
 }
 
-fn capabilities(doc: &InspectDoc) -> EnforcementState {
+/// Podman's default capability set (`containers.conf`). Real Podman reports
+/// `CapDrop: ["ALL"]` **expanded** to exactly this list, without the literal
+/// `ALL`; dropping all of them leaves nothing. Docker keeps the literal `ALL`.
+const PODMAN_DEFAULT_CAPS: [&str; 11] = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "NET_BIND_SERVICE",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_CHROOT",
+];
+
+fn cap_name(raw: &str) -> String {
+    let upper = raw.to_ascii_uppercase();
+    upper.strip_prefix("CAP_").unwrap_or(&upper).to_owned()
+}
+
+fn capabilities(doc: &InspectDoc, engine: EngineKind) -> EnforcementState {
     let host = &doc.host_config;
     if host.privileged != Some(false) && host.privileged.is_some() {
         return EnforcementState::NotEnforced;
     }
-    let dropped_all = host
+    let dropped: Vec<String> = host
         .cap_drop
         .as_ref()
-        .is_some_and(|drop| drop.iter().any(|c| c.eq_ignore_ascii_case("ALL")));
+        .map(|drop| drop.iter().map(|c| cap_name(c)).collect())
+        .unwrap_or_default();
+    // Dropped everything: the literal `ALL`, or (Podman only) the expanded
+    // default list.
+    let dropped_all = dropped.iter().any(|c| c == "ALL")
+        || (engine == EngineKind::Podman
+            && PODMAN_DEFAULT_CAPS
+                .iter()
+                .all(|d| dropped.iter().any(|c| c == d)));
     let added = host.cap_add.as_ref().is_some_and(|add| !add.is_empty());
     if !dropped_all || added {
         return EnforcementState::NotEnforced;
@@ -148,7 +181,7 @@ pub fn report_from_inspect(doc: &InspectDoc, want: &Requested) -> SandboxReport 
         filesystem: filesystem(doc),
         network: network(doc, want.network),
         no_new_privs: no_new_privs(doc),
-        capabilities: capabilities(doc),
+        capabilities: capabilities(doc, want.engine),
         resource_limits: resource_limits(doc, want),
     }
 }
@@ -182,6 +215,7 @@ mod tests {
 
     fn want() -> Requested {
         Requested {
+            engine: EngineKind::Podman,
             network: NetworkIntent::None,
             memory: Some(1 << 28),
             cpu_shares: Some(1024),
@@ -235,6 +269,65 @@ mod tests {
         assert_eq!(
             report_from_inspect(&doc, &want()).filesystem,
             EnforcementState::NotEnforced
+        );
+    }
+
+    #[test]
+    fn podmans_expanded_drop_list_counts_as_dropping_everything() {
+        let mut doc = hardened();
+        // Exactly what a real Podman 4.9 reports for `--cap-drop=ALL`.
+        doc.host_config.cap_drop = Some(
+            PODMAN_DEFAULT_CAPS
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
+        );
+        assert_eq!(
+            report_from_inspect(&doc, &want()).capabilities,
+            EnforcementState::Enforced
+        );
+        // Also with the `CAP_` prefix the CLI form uses.
+        doc.host_config.cap_drop = Some(
+            PODMAN_DEFAULT_CAPS
+                .iter()
+                .map(|c| format!("CAP_{c}"))
+                .collect(),
+        );
+        assert_eq!(
+            report_from_inspect(&doc, &want()).capabilities,
+            EnforcementState::Enforced
+        );
+        // One of them missing: still granted.
+        doc.host_config.cap_drop = Some(
+            PODMAN_DEFAULT_CAPS
+                .iter()
+                .skip(1)
+                .map(|c| (*c).to_owned())
+                .collect(),
+        );
+        assert_eq!(
+            report_from_inspect(&doc, &want()).capabilities,
+            EnforcementState::NotEnforced
+        );
+        // Docker keeps the literal `ALL`; an expanded list proves nothing there.
+        let docker = Requested {
+            engine: EngineKind::Docker,
+            ..want()
+        };
+        doc.host_config.cap_drop = Some(
+            PODMAN_DEFAULT_CAPS
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
+        );
+        assert_eq!(
+            report_from_inspect(&doc, &docker).capabilities,
+            EnforcementState::NotEnforced
+        );
+        doc.host_config.cap_drop = Some(vec!["all".into()]);
+        assert_eq!(
+            report_from_inspect(&doc, &docker).capabilities,
+            EnforcementState::Enforced
         );
     }
 

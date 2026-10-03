@@ -22,7 +22,7 @@ rustix = { workspace = true, features = ["net", "process"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 tempfile = { workspace = true }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
