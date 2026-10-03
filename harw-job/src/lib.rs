@@ -69,6 +69,8 @@ pub use harw_job_core::{
     JobSpec, JobSpecBuilder, JobSpecEnvelope, LifecycleState, ResourceRequest, RunnerId,
     SandboxProfileName, SandboxReport, SandboxRequirement, SpecError, WorkspacePath,
 };
+#[cfg(all(feature = "oci", unix))]
+pub use harw_job_executor_oci::{OciConfig, OciError, OciExecutor, PeerPolicy};
 #[cfg(target_os = "macos")]
 pub use harw_job_runtime::coordinator::DarwinExecutor;
 pub use harw_job_runtime::coordinator::{
@@ -78,8 +80,6 @@ pub use harw_job_runtime::coordinator::{
 #[cfg(target_os = "linux")]
 pub use harw_job_runtime::coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
 pub use harw_job_runtime::host::{HostFacts, HostLandlock, HostReport};
-#[cfg(all(feature = "oci", unix))]
-pub use harw_job_executor_oci::{OciConfig, OciError, OciExecutor, PeerPolicy};
 pub use harw_job_store::FsJobRecordStore;
 pub use harw_types::WorkId;
 
