@@ -48,6 +48,7 @@ members = [
     # contracts/W00-ws-integration-map.md): client, production TurnDriver
     # bridge, own-cloud node listener.
     "harw-session-remote",
+    "harw-session-client",
     "harw-session-driver",
     "harw-node-listener",
     "harw-tool-remote",

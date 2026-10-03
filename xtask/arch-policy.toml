@@ -391,6 +391,8 @@ layer = "A"
 layer = "A"
 [packages."harw-session-remote"]
 layer = "A"
+[packages."harw-session-client"]
+layer = "A"
 [packages."harw-session-driver"]
 layer = "A"
 [packages."harw-node-listener"]
