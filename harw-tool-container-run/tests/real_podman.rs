@@ -21,11 +21,20 @@ type R<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 async fn a_hermetic_run_works_and_the_read_back_verifies_against_real_podman() -> R {
     let image = ImageRef::parse(&std::env::var("HARW_OCI_IMAGE")?)?;
     let workspace = tempfile::tempdir()?;
-    let config = RunConfig::new("/usr/bin/podman", workspace.path().to_str().ok_or("path")?, "t1", "ses1")?;
+    let config = RunConfig::new(
+        "/usr/bin/podman",
+        workspace.path().to_str().ok_or("path")?,
+        "t1",
+        "ses1",
+    )?;
     let request = RunRequest::new(
         image,
         Profile::Hermetic,
-        vec!["sh".to_owned(), "-c".to_owned(), "echo hello; echo oops >&2".to_owned()],
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo hello; echo oops >&2".to_owned(),
+        ],
     )?
     .with_timeout_s(60);
     let plan = ContainerPlan::build(&config, &request)?;
@@ -36,6 +45,9 @@ async fn a_hermetic_run_works_and_the_read_back_verifies_against_real_podman() -
     assert_eq!(run.output.stderr.trim(), "oops");
     // The read-back must have happened and verified (not "ended before inspect").
     println!("readback = {:?}", run.readback);
-    assert!(run.readback.is_some(), "the container must live long enough to be inspected");
+    assert!(
+        run.readback.is_some(),
+        "the container must live long enough to be inspected"
+    );
     Ok(())
 }
