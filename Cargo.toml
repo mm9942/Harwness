@@ -153,6 +153,7 @@ members = [
     "dod/crates/harw-dod-bpf",
     "dod/crates/harw-dod-cap",
     "dod/crates/harw-dod-cgroup",
+    "dod/crates/harw-dod-container",
     "dod/crates/harw-dod-config",
     "dod/crates/harw-dod-cpu",
     "dod/crates/harw-dod-encrypt",

@@ -2499,6 +2499,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-container"
+version = "0.9.0"
+dependencies = [
+ "harw-container-model",
+ "harw-dod-cap",
+ "harw-dod-readfs",
+ "harw-dod-signals",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "tempfile",
+]
+
+[[package]]
 name = "harw-dod-cpu"
 version = "0.9.0"
 dependencies = [

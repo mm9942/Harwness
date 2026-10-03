@@ -428,6 +428,7 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-dod-netcounters", RequiredPrivilege::Unprivileged),
     ("harw-dod-gpu", RequiredPrivilege::Unprivileged),
     ("harw-dod-cgroup", RequiredPrivilege::Unprivileged),
+    ("harw-dod-container", RequiredPrivilege::Unprivileged),
     ("harw-dod-listener", RequiredPrivilege::Unprivileged),
     ("harw-dod-scanreport", RequiredPrivilege::Unprivileged),
     ("harw-dod-workspace", RequiredPrivilege::Unprivileged),
