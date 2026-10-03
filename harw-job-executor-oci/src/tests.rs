@@ -306,3 +306,39 @@ async fn cancel_stops_the_container_and_ends_the_stream_once() -> TestResult {
     assert_eq!(stops, 1, "cancel is idempotent");
     Ok(())
 }
+
+struct StoreView(u64);
+
+impl crate::AttemptView for StoreView {
+    fn current_epoch(&self, _: &str) -> Option<u64> {
+        Some(self.0)
+    }
+    fn is_live(&self, _: &str, _: u64) -> bool {
+        false
+    }
+}
+
+#[test]
+fn garbage_collection_removes_stale_epochs_only_after_grace() -> TestResult {
+    let engine = FakeEngine::start(Behavior::default())?;
+    let exec = executor(&engine)?;
+    for epoch in [1, 2, 3] {
+        exec.start(&spec(SandboxRequirement::None, None)?, &context(epoch)?)
+            .map_err(ctx("start"))?;
+    }
+    assert_eq!(engine.container_count(), 3);
+    let created = 1_791_021_600;
+    let policy = crate::GcPolicy::default();
+    // Inside the grace window nothing goes.
+    let early = exec
+        .collect_garbage(&StoreView(2), created + 5, policy)
+        .map_err(ctx("gc"))?;
+    assert!(early.removed.is_empty() && early.seen == 3);
+    // After it: epoch 1 (stale) and epoch 2 (finished) go, epoch 3 (ahead) stays.
+    let late = exec
+        .collect_garbage(&StoreView(2), created + 600, policy)
+        .map_err(ctx("gc"))?;
+    assert_eq!(late.removed.len(), 2, "{late:?}");
+    assert_eq!(engine.container_count(), 1);
+    Ok(())
+}

@@ -303,6 +303,39 @@ impl OciExecutor {
     fn discard(&self, id: &ContainerId) {
         let _ = self.engine.remove(id);
     }
+
+    pub(crate) fn owner_tenant(&self) -> (String, String) {
+        let cfg = self.engine.config();
+        (cfg.owner.clone(), cfg.tenant.clone())
+    }
+
+    /// Ids of every container labelled with this runner and tenant.
+    pub(crate) fn list_owned(&self) -> Result<Vec<ContainerId>, OciError> {
+        let (owner, tenant) = self.owner_tenant();
+        self.engine.list_by_labels(&[
+            (LABEL_OWNER.to_owned(), owner),
+            (LABEL_TENANT.to_owned(), tenant),
+        ])
+    }
+
+    /// Labels, creation time and state of one container; `None` if it is gone.
+    pub(crate) fn describe(&self, id: &ContainerId) -> Result<Option<crate::gc::Listed>, OciError> {
+        let doc = match self.engine.inspect(id) {
+            Ok(doc) => doc,
+            Err(OciError::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(crate::gc::Listed {
+            id: id.clone(),
+            labels: doc.config.labels.clone().unwrap_or_default(),
+            created_unix: parse_created(&doc)?,
+            running: doc.state.running == Some(true),
+        }))
+    }
+
+    pub(crate) fn remove_by_id(&self, id: &ContainerId) -> Result<(), OciError> {
+        self.engine.remove(id)
+    }
 }
 
 impl Executor for OciExecutor {

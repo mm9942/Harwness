@@ -30,7 +30,11 @@ mod error;
 #[cfg(unix)]
 mod executor;
 #[cfg(unix)]
+mod gc;
+#[cfg(unix)]
 mod http;
+#[cfg(unix)]
+mod pool;
 
 #[cfg(all(test, unix))]
 mod test_support;
@@ -47,3 +51,7 @@ pub use engine::InspectDoc;
 pub use error::OciError;
 #[cfg(unix)]
 pub use executor::OciExecutor;
+#[cfg(unix)]
+pub use gc::{AttemptView, GcPolicy, GcReport, Listed, Reason, Removal, plan_gc};
+#[cfg(unix)]
+pub use pool::{PoolKey, Slot, WarmPool};
