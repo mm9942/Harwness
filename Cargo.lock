@@ -3025,6 +3025,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-job-executor-k8s"
+version = "0.9.0"
+dependencies = [
+ "harw-container-model",
+ "harw-job-core",
+ "harw-job-runtime",
+ "harw-test-support",
+ "harw-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "harw-job-executor-oci"
 version = "0.9.0"
 dependencies = [

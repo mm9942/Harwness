@@ -70,6 +70,7 @@ members = [
     "harw-job-tokio",
     "harw-job-executor-bwrap",
     "harw-job-executor-oci",
+    "harw-job-executor-k8s",
     "harw-container-model",
     "harw-job",
     "harw-knowledge",
