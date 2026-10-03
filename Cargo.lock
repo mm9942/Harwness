@@ -2338,6 +2338,7 @@ dependencies = [
  "harw-job-core",
  "harw-lens-types",
  "harw-macros",
+ "harw-media",
  "harw-observe",
  "harw-protocol",
  "harw-sandbox",
