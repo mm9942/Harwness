@@ -91,39 +91,7 @@ impl MediaStore {
     /// [`MediaError`]: empty, too large, not an accepted format, malformed,
     /// too many pixels, or a file system failure.
     pub fn put(&self, bytes: &[u8]) -> Result<MediaRef, MediaError> {
-        if bytes.is_empty() {
-            return Err(MediaError::Empty);
-        }
-        let limit = self.limits.max_bytes;
-        if u64::try_from(bytes.len()).map_or(true, |len| len > limit) {
-            return Err(MediaError::TooLarge { limit });
-        }
-        let seen = inspect(bytes)?;
-        let clean = sanitize(bytes, seen.format)?;
-        // The sanitized copy must still be the same image.
-        let after = inspect(&clean)?;
-        if after != seen {
-            return Err(MediaError::Malformed("sanitizing changed the image"));
-        }
-        let pixels = u64::from(seen.width) * u64::from(seen.height);
-        if seen.width > self.limits.max_edge
-            || seen.height > self.limits.max_edge
-            || pixels > self.limits.max_pixels
-        {
-            return Err(MediaError::DimensionsTooLarge {
-                width: seen.width,
-                height: seen.height,
-            });
-        }
-        let size = u64::try_from(clean.len()).map_err(|_| MediaError::TooLarge { limit })?;
-        let media = MediaRef::new(
-            ContentDigest::of(&clean),
-            seen.format,
-            size,
-            seen.width,
-            seen.height,
-        )
-        .map_err(|_| MediaError::Malformed("implausible size or dimensions"))?;
+        let (media, clean) = ingest(bytes, self.limits)?;
         let path = self.path_of(&media);
         if let Some(parent) = path.parent() {
             DirBuilder::new()
@@ -174,6 +142,42 @@ impl MediaSource for MediaStore {
         }
         Ok(bytes)
     }
+}
+
+/// Checks, measures and sanitizes `bytes`; returns the reference and the
+/// sanitized bytes it names. Shared by every [`MediaSource`] that ingests.
+pub(crate) fn ingest(bytes: &[u8], limits: MediaLimits) -> Result<(MediaRef, Vec<u8>), MediaError> {
+    if bytes.is_empty() {
+        return Err(MediaError::Empty);
+    }
+    let limit = limits.max_bytes;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > limit) {
+        return Err(MediaError::TooLarge { limit });
+    }
+    let seen = inspect(bytes)?;
+    let clean = sanitize(bytes, seen.format)?;
+    // The sanitized copy must still be the same image.
+    let after = inspect(&clean)?;
+    if after != seen {
+        return Err(MediaError::Malformed("sanitizing changed the image"));
+    }
+    let pixels = u64::from(seen.width) * u64::from(seen.height);
+    if seen.width > limits.max_edge || seen.height > limits.max_edge || pixels > limits.max_pixels {
+        return Err(MediaError::DimensionsTooLarge {
+            width: seen.width,
+            height: seen.height,
+        });
+    }
+    let size = u64::try_from(clean.len()).map_err(|_| MediaError::TooLarge { limit })?;
+    let media = MediaRef::new(
+        ContentDigest::of(&clean),
+        seen.format,
+        size,
+        seen.width,
+        seen.height,
+    )
+    .map_err(|_| MediaError::Malformed("implausible size or dimensions"))?;
+    Ok((media, clean))
 }
 
 fn check_private_dir(root: &Path) -> Result<(), MediaError> {

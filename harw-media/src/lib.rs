@@ -19,11 +19,13 @@ mod error;
 mod fixtures;
 mod inspect;
 mod limits;
+mod memory;
 mod sanitize;
 mod store;
 
 pub use error::MediaError;
 pub use inspect::{Inspected, inspect, sniff};
 pub use limits::MediaLimits;
+pub use memory::MemorySource;
 pub use sanitize::sanitize;
 pub use store::{MediaSource, MediaStore};
