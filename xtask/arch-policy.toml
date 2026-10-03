@@ -180,6 +180,8 @@ layer = "J"
 layer = "J"
 [packages."harw-job-executor-bwrap"]
 layer = "J"
+[packages."harw-job-executor-oci"]
+layer = "J"
 [packages."harw-job"]
 layer = "J"
 

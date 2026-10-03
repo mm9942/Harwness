@@ -1299,6 +1299,7 @@ mod tests {
             job_id: WorkId::from_str("j"),
             attempt_id: AttemptId::new("j-e1").map_err(ctx("attempt"))?,
             runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
         })
     }
@@ -1392,6 +1393,7 @@ mod tests {
             job_id: WorkId::from_str("j"),
             attempt_id: AttemptId::new("job:1.x-e2").map_err(ctx("attempt"))?,
             runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
         };
         assert_eq!(cgroup_name(&context), "harw-job-job_1.x-e2");

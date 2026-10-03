@@ -2952,6 +2952,7 @@ name = "harw-job"
 version = "0.9.0"
 dependencies = [
  "harw-job-core",
+ "harw-job-executor-oci",
  "harw-job-runtime",
  "harw-job-store",
  "harw-types",
@@ -3007,6 +3008,23 @@ dependencies = [
  "harw-test-support",
  "harw-types",
  "tempfile",
+]
+
+[[package]]
+name = "harw-job-executor-oci"
+version = "0.9.0"
+dependencies = [
+ "harw-container-model",
+ "harw-job-core",
+ "harw-job-runtime",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

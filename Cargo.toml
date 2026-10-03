@@ -69,6 +69,7 @@ members = [
     "harw-job-store",
     "harw-job-tokio",
     "harw-job-executor-bwrap",
+    "harw-job-executor-oci",
     "harw-container-model",
     "harw-job",
     "harw-knowledge",
