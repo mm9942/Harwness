@@ -3372,6 +3372,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-media"
+version = "0.9.0"
+dependencies = [
+ "harw-digest",
+ "harw-fsutil",
+ "harw-protocol",
+ "harw-test-support",
+ "rustix 1.1.5",
+ "tempfile",
+]
+
+[[package]]
 name = "harw-memory"
 version = "0.9.0"
 dependencies = [
