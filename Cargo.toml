@@ -129,6 +129,7 @@ members = [
     # === Remediation (Plan P0–P3) ===
     "harw-egress",
     "harw-fsutil",
+    "harw-media",
     # Retention core: age/count/bytes sweeps and the declared data-class registry.
     "harw-context-ledger",
     "harw-tool-container",
