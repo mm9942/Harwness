@@ -347,17 +347,18 @@ fn filesystem(doc: &PodDoc) -> EnforcementState {
 }
 
 fn network(doc: &PodDoc, want: &Requested, attested: bool) -> EnforcementState {
-    if doc.spec.host_network == Some(true) {
+    // The API omits a `false` for the plain-bool `hostNetwork` (omitempty), so
+    // absent means false on a real pod object. A document without any
+    // container is not an admitted pod: nothing in it is trusted.
+    if doc.spec.containers.is_empty() {
+        return EnforcementState::Partial;
+    }
+    if doc.spec.host_network.unwrap_or(false) {
         return EnforcementState::NotEnforced;
     }
     match want.network {
-        NetworkIntent::Allowed => match doc.spec.host_network {
-            Some(false) => EnforcementState::Enforced,
-            _ => EnforcementState::Partial,
-        },
-        NetworkIntent::None if attested && doc.spec.host_network == Some(false) => {
-            EnforcementState::Enforced
-        }
+        NetworkIntent::Allowed => EnforcementState::Enforced,
+        NetworkIntent::None if attested => EnforcementState::Enforced,
         // A pod spec cannot deny egress; without an operator attestation of
         // the namespace's NetworkPolicy the best honest answer is Partial.
         NetworkIntent::None | NetworkIntent::Restricted => EnforcementState::Partial,
@@ -484,6 +485,22 @@ mod tests {
         assert_eq!(plain.filesystem, EnforcementState::Enforced);
         let attested = report_from_pod(&doc, &want(), true);
         assert_eq!(attested, SandboxReport::uniform(EnforcementState::Enforced));
+    }
+
+    #[test]
+    fn an_omitted_host_network_means_false_as_a_real_api_server_sends_it() {
+        let mut doc = hardened();
+        doc.spec.host_network = None;
+        assert_eq!(
+            report_from_pod(&doc, &want(), true).network,
+            EnforcementState::Enforced
+        );
+        // ... but not for a document that is not an admitted pod at all.
+        doc.spec.containers.clear();
+        assert_ne!(
+            report_from_pod(&doc, &want(), true).network,
+            EnforcementState::Enforced
+        );
     }
 
     #[test]
