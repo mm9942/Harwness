@@ -70,7 +70,6 @@ use crate::capture::{BoundedCapture, DrainEnd};
 use crate::exec::{configure_stdio, terminate};
 use crate::limits::{ShellLimits, launch_command};
 use harw_authority::{Permission, SandboxSpec};
-use harw_extension_api::contributors::ToolProvider;
 use harw_sandbox::{BwrapLauncher, HostPathBinding};
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
@@ -86,7 +85,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::ExitStatus,
-    sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::process::Command as TokioCommand;
@@ -1386,10 +1384,14 @@ impl Default for LatexToolProvider {
     }
 }
 
-impl ToolProvider for LatexToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![
-            ToolSpec::Function(FunctionToolSpec {
+// Die drei LaTeX-Werkzeuge. Spezifikationen stammen aus den Provider-Funktionen
+// (`parameter_schema`, `template::tool_spec`, `check::tool_spec`); die
+// Executor tragen Zeitlimit, Suchpfad und Runner des Providers.
+// `parallel_safe: none` — Builds schreiben ins Projekt, Aufrufer serialisieren.
+harw_tools::tool_provider! {
+    impl for LatexToolProvider as provider, parallel_safe: none {
+        LATEX_BUILD_TOOL => {
+            spec: ToolSpec::Function(FunctionToolSpec {
                 name: ToolName::new(LATEX_BUILD_TOOL),
                 description: "Build a LaTeX document inside the isolated project sandbox \
                     (no network, no shell escape, .latexmkrc ignored). Uses latexmk; without \
@@ -1403,35 +1405,27 @@ impl ToolProvider for LatexToolProvider {
                     stop and pass user_message to the user verbatim. Requires ExecuteProcess \
                     and WriteWorkspace."
                     .to_owned(),
-                parameters: Self::parameter_schema(),
+                parameters: LatexToolProvider::parameter_schema(),
                 strict: true,
             }),
-            template::tool_spec(),
-            check::tool_spec(),
-        ]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        match name.as_str() {
-            LATEX_BUILD_TOOL => Some(Arc::new(LatexBuildExecutor {
-                timeout_secs: self.timeout_secs,
-                search_path: self.search_path.clone(),
-                runner: self.runner(),
-            }) as Arc<dyn ToolExecutor>),
-            LATEX_TEMPLATE_TOOL => {
-                Some(Arc::new(template::LatexTemplateExecutor::bundled()) as Arc<dyn ToolExecutor>)
-            }
-            LATEX_CHECK_TOOL => Some(Arc::new(check::LatexCheckExecutor {
-                timeout_secs: self.timeout_secs.min(check::CHECK_TIMEOUT_SECS),
-                search_path: self.search_path.clone(),
-                runner: self.runner(),
-            }) as Arc<dyn ToolExecutor>),
-            _ => None,
-        }
-    }
-
-    fn parallel_safe(&self, _name: &ToolName) -> bool {
-        false
+            executor: LatexBuildExecutor {
+                timeout_secs: provider.timeout_secs,
+                search_path: provider.search_path.clone(),
+                runner: provider.runner(),
+            },
+        },
+        LATEX_TEMPLATE_TOOL => {
+            spec: template::tool_spec(),
+            executor: template::LatexTemplateExecutor::bundled(),
+        },
+        LATEX_CHECK_TOOL => {
+            spec: check::tool_spec(),
+            executor: check::LatexCheckExecutor {
+                timeout_secs: provider.timeout_secs.min(check::CHECK_TIMEOUT_SECS),
+                search_path: provider.search_path.clone(),
+                runner: provider.runner(),
+            },
+        },
     }
 }
 
@@ -1442,6 +1436,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

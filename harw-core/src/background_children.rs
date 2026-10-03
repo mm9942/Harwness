@@ -74,31 +74,23 @@ pub fn is_orchestrator_role(role: AgentRoleId) -> bool {
 
 // ── Orchestrierungsgrenzen ────────────────────────────────────────────────────
 
-/// Die in der Admission durchgesetzten Orchestrierungsgrenzen.
-///
-/// # Beschreibung
-/// Die Werte kommen aus `[agents]` (`harw_config::AgentLimitsToml`, bereits
-/// geklemmt); die allgemeine Tiefe (`max_spawn_depth`) steckt dagegen in
-/// [`crate::ChildLimits::max_depth`]. Die Vorgaben entsprechen der
-/// Konfigurationsvorgabe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OrchestrationLimits {
-    /// Gleichzeitig laufende Orchestratoren der UIA-Wurzel.
-    pub max_root_orchestrators: usize,
-    /// Gleichzeitig laufende Sub-Orchestratoren je Root-Orchestrator-Baum.
-    pub max_sub_orchestrators: usize,
-    /// Höchste Verschachtelung der Sub-Orchestratoren (direkt unter dem
-    /// Root-Orchestrator = 1; `0` = keine Sub-Orchestratoren).
-    pub max_sub_orchestrator_depth: u32,
-}
-
-impl Default for OrchestrationLimits {
-    fn default() -> Self {
-        Self {
-            max_root_orchestrators: 1,
-            max_sub_orchestrators: 2,
-            max_sub_orchestrator_depth: 2,
-        }
+harw_types::limits_struct! {
+    /// Die in der Admission durchgesetzten Orchestrierungsgrenzen.
+    ///
+    /// # Beschreibung
+    /// Die Werte kommen aus `[agents]` (`harw_config::AgentLimitsToml`, bereits
+    /// geklemmt); die allgemeine Tiefe (`max_spawn_depth`) steckt dagegen in
+    /// [`crate::ChildLimits::max_depth`]. Die Vorgaben entsprechen der
+    /// Konfigurationsvorgabe.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OrchestrationLimits {
+        /// Gleichzeitig laufende Orchestratoren der UIA-Wurzel.
+        pub max_root_orchestrators: usize = DEFAULT_MAX_ROOT_ORCHESTRATORS = 1,
+        /// Gleichzeitig laufende Sub-Orchestratoren je Root-Orchestrator-Baum.
+        pub max_sub_orchestrators: usize = DEFAULT_MAX_SUB_ORCHESTRATORS = 2,
+        /// Höchste Verschachtelung der Sub-Orchestratoren (direkt unter dem
+        /// Root-Orchestrator = 1; `0` = keine Sub-Orchestratoren).
+        pub max_sub_orchestrator_depth: u32 = DEFAULT_MAX_SUB_ORCHESTRATOR_DEPTH = 2,
     }
 }
 

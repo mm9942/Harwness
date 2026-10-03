@@ -2198,3 +2198,128 @@ fn test_install_without_flag_parses_to_none() -> TestResult {
     assert_eq!(print_systemd, None);
     Ok(())
 }
+
+#[test]
+fn attach_bare_parses_without_target() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "attach"]).map_err(ctx("`harw attach` sollte parsen"))?;
+    let Some(Command::Attach(args)) = cli.command else {
+        return Err(TestError::Unexpected("erwartete attach".into()));
+    };
+    assert!(args.session.is_none() && args.socket.is_none() && args.host.is_none());
+    Ok(())
+}
+
+#[test]
+fn attach_session_and_socket_parse() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "attach", "abc123", "--socket", "/run/h.sock"])
+        .map_err(ctx("attach mit Sitzung und Socket"))?;
+    let Some(Command::Attach(args)) = cli.command else {
+        return Err(TestError::Unexpected("erwartete attach".into()));
+    };
+    assert_eq!(args.session.as_deref(), Some("abc123"));
+    assert_eq!(args.socket, Some(PathBuf::from("/run/h.sock")));
+    Ok(())
+}
+
+#[test]
+fn attach_host_alias_parses() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "attach", "--host", "cloud1"])
+        .map_err(ctx("attach --host"))?;
+    let Some(Command::Attach(args)) = cli.command else {
+        return Err(TestError::Unexpected("erwartete attach".into()));
+    };
+    assert_eq!(args.host.as_deref(), Some("cloud1"));
+    Ok(())
+}
+
+#[test]
+fn attach_socket_and_host_conflict_without_panic() {
+    let result = Cli::try_parse_from(["harw", "attach", "--socket", "/x", "--host", "h"]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn attach_flags_without_values_are_errors() {
+    assert!(Cli::try_parse_from(["harw", "attach", "--socket"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "attach", "--host"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "attach", "a", "b"]).is_err());
+}
+
+#[test]
+fn gateway_session_socket_is_off_by_default_and_parses_with_and_without_path() -> TestResult {
+    fn socket_of(args: &[&str]) -> Result<Option<Option<PathBuf>>, TestError> {
+        let cli = Cli::try_parse_from(args).map_err(ctx("gateway must parse"))?;
+        let Some(Command::Gateway { session_socket, .. }) = cli.command else {
+            return Err(TestError::Unexpected("expected gateway command".into()));
+        };
+        Ok(session_socket)
+    }
+
+    assert_eq!(socket_of(&["harw", "gateway"])?, None);
+    assert_eq!(
+        socket_of(&["harw", "gateway", "--session-socket"])?,
+        Some(None)
+    );
+    assert_eq!(
+        socket_of(&["harw", "gateway", "--session-socket=/tmp/h/s.sock"])?,
+        Some(Some(PathBuf::from("/tmp/h/s.sock")))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_cleanup_defaults_to_a_dry_run_over_all_classes() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "cleanup"]).map_err(ctx("`harw cleanup` sollte parsen"))?;
+    let Some(Command::Cleanup {
+        apply,
+        classes,
+        deadline_secs,
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Cleanup, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert!(!apply, "ohne --apply ist es ein Probelauf");
+    assert!(classes.is_empty());
+    assert_eq!(deadline_secs, None);
+    Ok(())
+}
+
+#[test]
+fn test_cleanup_apply_class_and_deadline_parse() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "cleanup",
+        "--apply",
+        "--class",
+        "tui_log",
+        "--class",
+        "bug_reports",
+        "--deadline-secs",
+        "30",
+    ])
+    .map_err(ctx("`harw cleanup --apply --class ...` sollte parsen"))?;
+    let Some(Command::Cleanup {
+        apply,
+        classes,
+        deadline_secs,
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Cleanup, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert!(apply);
+    assert_eq!(
+        classes,
+        vec!["tui_log".to_owned(), "bug_reports".to_owned()]
+    );
+    assert_eq!(deadline_secs, Some(30));
+    assert!(Cli::try_parse_from(["harw", "cleanup", "--deadline-secs", "x"]).is_err());
+    Ok(())
+}

@@ -31,3 +31,7 @@ pub mod upgrade;
 pub use conn::{ConnectionEnd, serve_connection, serve_connection_with};
 pub use dispatch::Ports;
 pub use limits::WsLimits;
+// Skeleton (W00 D10): client crates wrap an upgraded stream without taking a
+// direct tungstenite dependency; this crate stays the only owner.
+pub use tokio_tungstenite::WebSocketStream;
+pub use tokio_tungstenite::tungstenite::protocol::Role;

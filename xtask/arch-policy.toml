@@ -91,6 +91,9 @@ reason = "nur für wasm32-Ziele (uuid/getrandom); auf Linux nie gebaut, kein C-B
 layer = "F"
 [packages."harw-macros"]
 layer = "F"
+# Dev-only Test-Gerüst ohne Abhängigkeiten; nur über dev-dependencies erreichbar.
+[packages."harw-test-support"]
+layer = "F"
 # Enthält derzeit auch Laufzeittypen (§10); vorerst F, Aufteilung folgt.
 [packages."harw-types"]
 layer = "F"
@@ -117,6 +120,8 @@ layer = "I"
 [packages."harw-sandbox"]
 layer = "I"
 [packages."harw-fsutil"]
+layer = "I"
+[packages."harw-retention"]
 layer = "I"
 [packages."harw-observe"]
 layer = "I"
@@ -175,6 +180,10 @@ layer = "J"
 layer = "J"
 [packages."harw-job-executor-bwrap"]
 layer = "J"
+[packages."harw-job-executor-oci"]
+layer = "J"
+[packages."harw-job-executor-k8s"]
+layer = "A"
 [packages."harw-job"]
 layer = "J"
 
@@ -188,6 +197,8 @@ layer = "D"
 [packages."harw-dod-bpf"]
 layer = "D"
 [packages."harw-dod-cap"]
+layer = "D"
+[packages."harw-dod-container"]
 layer = "D"
 [packages."harw-dod-cgroup"]
 layer = "D"
@@ -378,6 +389,12 @@ layer = "A"
 layer = "A"
 [packages."harw-session-ws"]
 layer = "A"
+[packages."harw-session-remote"]
+layer = "A"
+[packages."harw-session-driver"]
+layer = "A"
+[packages."harw-node-listener"]
+layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
 [packages."harw-web"]
@@ -451,3 +468,24 @@ reason = "W00 D10/ARC-02: WebSocket transport is owned by ring A (harw-session-w
 names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "harw-web", "harw-cli", "harw-tui", "harw-session-host", "harw-session-ws"]
 packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
+
+[packages."harw-session-com"]
+layer = "A"
+
+[packages."harw-session-daemon"]
+layer = "A"
+
+[packages."harw-reverse-proxy"]
+layer = "A"
+
+[packages."harw-context-ledger"]
+layer = "I"
+[packages."harw-placement-model"]
+layer = "I"
+[packages."harw-container-model"]
+layer = "I"
+
+[packages."harw-tool-container"]
+layer = "A"
+[packages."harw-tool-container-run"]
+layer = "A"

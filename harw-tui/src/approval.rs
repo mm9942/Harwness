@@ -978,9 +978,6 @@ impl fmt::Display for ResumeStage {
     }
 }
 
-/// Bequemer Ergebnistyp dieses Moduls.
-pub type ApprovalDriverResult<T> = Result<T, ApprovalDriverError>;
-
 /// Fehler, die beim Wiederaufnehmen eines pausierten Turns entstehen.
 ///
 /// # Description
@@ -992,17 +989,21 @@ pub type ApprovalDriverResult<T> = Result<T, ApprovalDriverError>;
 /// ansehen, und ein blindes `?` würde diese Information verlieren. Die
 /// Aufrufstellen benutzen deshalb `.map_err(|source| …)` mit explizitem
 /// [`ResumeStage`].
+#[derive(harw_macros::HarwError)]
 pub enum ApprovalDriverError {
     /// Ein Wiederaufnahme-Aufruf des Kerns ist fehlgeschlagen.
+    #[msg("{stage} failed: {source}")]
     Resume {
         /// Welcher Wiederaufnahmepfad betroffen war.
         stage: ResumeStage,
         /// Der Fehler des Kerns.
+        #[source]
         source: CoreError,
     },
     /// Der Turn meldete eine Freigabepause, die Session hielt aber keinen
     /// zugehörigen Aufruf fest. Ohne ihn gibt es nichts zu fragen und nichts
     /// auszuführen.
+    #[msg("session {session} reported an approval pause without a pending tool call")]
     MissingPendingApproval {
         /// ID der betroffenen Session.
         session: String,
@@ -1010,6 +1011,9 @@ pub enum ApprovalDriverError {
     /// Die Abbruchgrenze für aufeinanderfolgende Wiederaufnahmen wurde
     /// überschritten. Die Session wurde daraufhin ausdrücklich als
     /// fehlgeschlagen markiert, damit kein halbfertiger Pausezustand bleibt.
+    #[msg(
+        "turn still paused ({last_pause}) after {limit} consecutive resumes; the session was failed instead of resuming again"
+    )]
     ResumeLimitExceeded {
         /// Die überschrittene Grenze.
         limit: usize,
@@ -1018,43 +1022,10 @@ pub enum ApprovalDriverError {
     },
 }
 
-impl fmt::Display for ApprovalDriverError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Resume { stage, source } => {
-                write!(formatter, "{stage} failed: {source}")
-            }
-            Self::MissingPendingApproval { session } => write!(
-                formatter,
-                "session {session} reported an approval pause without a pending tool call"
-            ),
-            Self::ResumeLimitExceeded { limit, last_pause } => write!(
-                formatter,
-                "turn still paused ({last_pause}) after {limit} consecutive resumes; \
-                 the session was failed instead of resuming again"
-            ),
-        }
-    }
-}
-
 /// Debug delegiert an [`fmt::Display`], damit es nur eine Formatierung gibt.
 impl fmt::Debug for ApprovalDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl std::error::Error for ApprovalDriverError {
-    /// Liefert den eingebetteten [`CoreError`], falls vorhanden.
-    ///
-    /// # Returns
-    /// - `Some(&CoreError)` für [`ApprovalDriverError::Resume`].
-    /// - `None` für alle anderen Varianten.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Resume { source, .. } => Some(source),
-            Self::MissingPendingApproval { .. } | Self::ResumeLimitExceeded { .. } => None,
-        }
     }
 }
 

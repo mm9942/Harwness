@@ -59,7 +59,7 @@ use std::io::{self, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -248,30 +248,19 @@ pub struct PipedJob {
 }
 
 /// Warum der stdout-Zeilenstrom eines [`PipedJob`] vorzeitig endete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::HarwError)]
 pub enum PipedLineError {
     /// Eine Zeile wurde länger als `limit` Bytes (ohne `\n`), bevor ihr `\n`
     /// kam; gelesen wurde höchstens `limit` Bytes davon.
+    #[msg("job stdout line exceeds the {limit}-byte limit")]
     TooLong {
         /// Die überschrittene Grenze.
         limit: usize,
     },
     /// Eine Zeile war kein gültiges UTF-8.
+    #[msg("job stdout line is not valid UTF-8")]
     InvalidUtf8,
 }
-
-impl fmt::Display for PipedLineError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooLong { limit } => {
-                write!(f, "job stdout line exceeds the {limit}-byte limit")
-            }
-            Self::InvalidUtf8 => f.write_str("job stdout line is not valid UTF-8"),
-        }
-    }
-}
-
-impl std::error::Error for PipedLineError {}
 
 /// Ausgang von [`JobManager::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,52 +299,32 @@ pub struct DetachSummary {
 }
 
 /// Fehler der Job-Verwaltung.
-#[derive(Debug)]
+#[derive(Debug, harw_macros::HarwError)]
 pub enum JobError {
     /// Unbekannte Kennung **oder** fremder Job (bewusst nicht unterschieden).
+    #[msg("unknown job `{0}` (or not started by you or one of your sub-agents)")]
     NotFound(String),
     /// Zu viele laufende Jobs; die Meldung nennt den Schlüssel
     /// `[jobs] max_running`, der die Obergrenze setzt.
+    #[msg(
+        "too many running jobs (max {max}, set by `[jobs] max_running`); wait for one to finish or stop one"
+    )]
     Capacity {
         /// Obergrenze ([`JobManagerConfig::max_running_jobs`]).
         max: usize,
     },
     /// Der Prozess konnte nicht gestartet werden.
+    #[msg("failed to start the job: {0}")]
     Spawn(String),
     /// Dateisystemfehler.
+    #[msg("{context}: {source}")]
     Io {
         /// Was gerade geschah.
         context: &'static str,
         /// Ursache.
+        #[source]
         source: io::Error,
     },
-}
-
-impl fmt::Display for JobError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(id) => write!(
-                f,
-                "unknown job `{id}` (or not started by you or one of your sub-agents)"
-            ),
-            Self::Capacity { max } => write!(
-                f,
-                "too many running jobs (max {max}, set by `[jobs] max_running`); \
-                 wait for one to finish or stop one"
-            ),
-            Self::Spawn(message) => write!(f, "failed to start the job: {message}"),
-            Self::Io { context, source } => write!(f, "{context}: {source}"),
-        }
-    }
-}
-
-impl std::error::Error for JobError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 fn io_err(context: &'static str) -> impl FnOnce(io::Error) -> JobError {
@@ -488,6 +457,11 @@ fn read_meta(dir: &Path) -> Option<JobMeta> {
     serde_json::from_slice(&text).ok()
 }
 
+/// Kleinste Obergrenze laufender Prozess-Jobs.
+pub const MIN_RUNNING_JOBS: usize = 1;
+/// Größte Obergrenze laufender Prozess-Jobs (wie `[jobs] max_running`).
+pub const MAX_RUNNING_JOBS: usize = 256;
+
 /// Verwaltet die Prozess-Jobs einer harw-Sitzung.
 pub struct JobManager {
     config: JobManagerConfig,
@@ -495,6 +469,8 @@ pub struct JobManager {
     notifier: Arc<dyn JobNotifier>,
     jobs: Mutex<BTreeMap<JobId, Arc<JobEntry>>>,
     counter: AtomicU64,
+    // Zur Laufzeit verstellbare Obergrenze (Start: `config.max_running_jobs`).
+    max_running: AtomicUsize,
 }
 
 impl fmt::Debug for JobManager {
@@ -519,12 +495,16 @@ impl JobManager {
             std::process::id(),
             Timestamp::now().as_millisecond()
         );
+        let config_max_running = config
+            .max_running_jobs
+            .clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
         let manager = Arc::new(Self {
             config,
             instance,
             notifier,
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
+            max_running: AtomicUsize::new(config_max_running),
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -621,6 +601,23 @@ impl JobManager {
         }
     }
 
+    /// Aktuelle Obergrenze gleichzeitig laufender Jobs (`[jobs] max_running`
+    /// als Start, danach per [`Self::set_max_running`] verstellbar).
+    #[must_use]
+    pub fn max_running(&self) -> usize {
+        self.max_running.load(Ordering::SeqCst)
+    }
+
+    /// Setzt die Obergrenze zur Laufzeit (auf `1..=256` geklemmt) und gibt den
+    /// wirksamen Wert zurück. Erhöhen erlaubt sofort weitere Starts; Senken
+    /// beendet keinen laufenden Job, neue Starts werden abgewiesen, bis
+    /// genug Jobs fertig sind.
+    pub fn set_max_running(&self, max: usize) -> usize {
+        let max = max.clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
+        self.max_running.store(max, Ordering::SeqCst);
+        max
+    }
+
     /// Zahl der Jobs, die diese Sitzung gerade beaufsichtigt.
     #[must_use]
     pub fn running_count(&self) -> usize {
@@ -638,7 +635,7 @@ impl JobManager {
     /// # Errors
     /// [`JobError::Capacity`].
     pub fn check_capacity(&self) -> Result<(), JobError> {
-        let max = self.config.max_running_jobs;
+        let max = self.max_running();
         if self.running_count() >= max {
             return Err(JobError::Capacity { max });
         }
@@ -1935,3 +1932,40 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::{JobError, PipedLineError};
+    use std::error::Error as _;
+
+    #[test]
+    fn display_and_source_are_stable() {
+        assert_eq!(
+            PipedLineError::TooLong { limit: 8 }.to_string(),
+            "job stdout line exceeds the 8-byte limit"
+        );
+        assert_eq!(
+            PipedLineError::InvalidUtf8.to_string(),
+            "job stdout line is not valid UTF-8"
+        );
+        assert_eq!(
+            JobError::NotFound("j1".to_owned()).to_string(),
+            "unknown job `j1` (or not started by you or one of your sub-agents)"
+        );
+        assert_eq!(
+            JobError::Capacity { max: 4 }.to_string(),
+            "too many running jobs (max 4, set by `[jobs] max_running`); wait for one to finish or stop one"
+        );
+        assert_eq!(
+            JobError::Spawn("x".to_owned()).to_string(),
+            "failed to start the job: x"
+        );
+        let io = JobError::Io {
+            context: "ctx",
+            source: std::io::Error::other("boom"),
+        };
+        assert_eq!(io.to_string(), "ctx: boom");
+        assert!(io.source().is_some());
+        assert!(JobError::Spawn("x".to_owned()).source().is_none());
+    }
+}

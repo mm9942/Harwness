@@ -1,0 +1,71 @@
+{
+  "has_executor": {
+    "diary.read": true
+  },
+  "parallel_safe": {
+    "diary.read": false
+  },
+  "permissions": [
+    "Some(ReadWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Liest DEIN eigenes Tagebuch (Zusammenfassungen nach Verdichtungen, Sitzungsenden, Reflexionen, Operator-Notizen) für einen Datumsbereich; ohne Angaben heute. Höchstens 31 Tage, 50 Einträge und 16 KiB je Aufruf, die jüngsten gewinnen. Nur lesend.",
+      "name": "diary.read",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Erster Tag (YYYY-MM-DD, UTC). Ohne Angabe: heute bzw. `to`."
+          },
+          "to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Letzter Tag (YYYY-MM-DD, UTC). Ohne Angabe: heute."
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "enum": [
+                  "end-of-session",
+                  "compaction",
+                  "dream-reflection",
+                  "manual"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Nur Einträge dieses Auslösers."
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "trigger"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

@@ -151,7 +151,10 @@ const TARGET_FIELDS: &[&str] = &[
 ///
 /// # Concurrency
 /// `Copy`, zustandslos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `KebabEnum` liefert `as_str` und `parse` (`Option`, unbekannt → `None`).
+// Die Labels sind einwortig, kebab- und snake_case fallen also zusammen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::KebabEnum)]
+#[kebab_enum(case = "snake", parse_option, no_from_str)]
 pub enum WaveJoin {
     /// `"all"` → [`JoinSemantics::AllTerminal`].
     All,
@@ -162,30 +165,6 @@ pub enum WaveJoin {
 }
 
 impl WaveJoin {
-    /// Parst das Modell-Label.
-    ///
-    /// # Returns
-    /// `Some(join)` für `"all"`, `"any"`, `"collect"`; sonst `None`.
-    #[must_use]
-    pub fn parse(label: &str) -> Option<Self> {
-        match label {
-            "all" => Some(Self::All),
-            "any" => Some(Self::Any),
-            "collect" => Some(Self::Collect),
-            _ => None,
-        }
-    }
-
-    /// Das stabile Label.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Any => "any",
-            Self::Collect => "collect",
-        }
-    }
-
     /// Die Join-Semantik des Kind-Controllers.
     #[must_use]
     pub const fn semantics(self) -> JoinSemantics {
@@ -199,23 +178,13 @@ impl WaveJoin {
 
 /// Komplexitätsangabe eines Ziels (steuert die Modellstufe des Kindes, nie
 /// seine Rechte — `harw_core::child_controller::TaskComplexity`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::KebabEnum)]
+#[kebab_enum(case = "snake", no_from_str)]
 pub enum WaveComplexity {
     /// `"simple"`.
     Simple,
     /// `"complex"`.
     Complex,
-}
-
-impl WaveComplexity {
-    /// Das stabile Label, so wie der Kind-Controller es im Spawn-Kontext liest.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Simple => "simple",
-            Self::Complex => "complex",
-        }
-    }
 }
 
 /// Ein Ziel der Welle.
@@ -1574,6 +1543,17 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn test_wave_labels_round_trip_and_unknown_labels_are_none() {
+        for join in WaveJoin::ALL {
+            assert_eq!(WaveJoin::parse(join.as_str()), Some(*join));
+        }
+        assert_eq!(WaveJoin::parse("some"), None);
+        assert_eq!(WaveJoin::parse(""), None);
+        assert_eq!(WaveComplexity::Simple.as_str(), "simple");
+        assert_eq!(WaveComplexity::Complex.to_string(), "complex");
     }
 
     #[test]

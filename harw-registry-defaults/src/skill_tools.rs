@@ -39,12 +39,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use harw_catalog::{MAX_SKILL_LOAD_BYTES, SkillIndex, SkillIndexEntry};
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::args::parse_args_null_as_object;
+use harw_tools::schema_helpers::{object_schema, property};
+use harw_tools::{FunctionToolSpec, JsonSchemaType};
 use serde::Deserialize;
 
 /// Name des Such-Werkzeugs.
@@ -92,13 +93,6 @@ pub struct SkillCatalogToolProvider {
 }
 
 impl SkillCatalogToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[SKILLS_SEARCH, SKILLS_LOAD];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`]: keine
-    /// (siehe Moduldoku).
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[None, None];
-
     /// Baut den Provider über dem Index der Montage.
     #[must_use]
     pub fn new(index: Arc<SkillIndex>) -> Self {
@@ -112,43 +106,18 @@ impl SkillCatalogToolProvider {
     }
 }
 
-impl ToolProvider for SkillCatalogToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![search_spec(), load_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            SKILLS_SEARCH => SkillTool::Search,
-            SKILLS_LOAD => SkillTool::Load,
-            _ => return None,
-        };
-        Some(Arc::new(SkillCatalogExecutor {
-            index: Arc::clone(&self.index),
-            tool,
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        Self::TOOL_NAMES.contains(&name.as_str())
-    }
-}
-
-fn typed(schema_type: JsonSchemaType, description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(schema_type),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
+// Beide Katalog-Werkzeuge lesen nur und deklarieren bewusst keine Rechteklasse
+// (siehe Moduldoku); sie sind parallelsicher.
+harw_tools::tool_provider! {
+    impl for SkillCatalogToolProvider as provider, parallel_safe: all {
+        SKILLS_SEARCH => {
+            spec: search_spec(),
+            executor: SkillCatalogExecutor { index: Arc::clone(&provider.index), tool: SkillTool::Search },
+        },
+        SKILLS_LOAD => {
+            spec: load_spec(),
+            executor: SkillCatalogExecutor { index: Arc::clone(&provider.index), tool: SkillTool::Load },
+        },
     }
 }
 
@@ -156,18 +125,18 @@ fn search_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "query".to_owned(),
-        typed(
+        property(
             JsonSchemaType::String,
             "Stichwörter (Thema, Technik, Werkzeug). Leer: alle Skills alphabetisch.",
         ),
     );
     props.insert(
         "limit".to_owned(),
-        typed(JsonSchemaType::Integer, "Höchstzahl Treffer (1–30)."),
+        property(JsonSchemaType::Integer, "Höchstzahl Treffer (1–30)."),
     );
     props.insert(
         "offset".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Überspringt so viele Treffer (Blättern).",
         ),
@@ -188,11 +157,11 @@ fn load_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "name".to_owned(),
-        typed(JsonSchemaType::String, "Skill-Name aus skills.search."),
+        property(JsonSchemaType::String, "Skill-Name aus skills.search."),
     );
     props.insert(
         "section".to_owned(),
-        typed(
+        property(
             JsonSchemaType::String,
             "Optional: nur diesen ##-Abschnitt laden (Überschrift oder Teil davon).",
         ),
@@ -254,23 +223,9 @@ struct LoadArgs {
     section: Option<String>,
 }
 
-/// Parst die Argumente; `null` als Ganzes gilt als leeres Objekt.
-fn parse<T: serde::de::DeserializeOwned>(
-    tool: &str,
-    arguments: serde_json::Value,
-) -> Result<T, ToolOutput> {
-    let arguments = if arguments.is_null() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        arguments
-    };
-    serde_json::from_value(arguments)
-        .map_err(|error| ToolOutput::error(format!("{tool}: ungültige Argumente: {error}")))
-}
-
 /// Kern von `skills.search` (testbar ohne Sandbox-Kontext).
 fn execute_search(index: &SkillIndex, arguments: serde_json::Value) -> ToolOutput {
-    let args: SearchArgs = match parse(SKILLS_SEARCH, arguments) {
+    let args: SearchArgs = match parse_args_null_as_object(SKILLS_SEARCH, &arguments) {
         Ok(args) => args,
         Err(output) => return output,
     };
@@ -327,7 +282,7 @@ fn execute_search(index: &SkillIndex, arguments: serde_json::Value) -> ToolOutpu
 
 /// Kern von `skills.load` (testbar ohne Sandbox-Kontext).
 fn execute_load(index: &SkillIndex, arguments: serde_json::Value) -> ToolOutput {
-    let args: LoadArgs = match parse(SKILLS_LOAD, arguments) {
+    let args: LoadArgs = match parse_args_null_as_object(SKILLS_LOAD, &arguments) {
         Ok(args) => args,
         Err(output) => return output,
     };
@@ -414,6 +369,7 @@ fn unknown_skill_message(index: &SkillIndex, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
     use serde_json::json;
 
     fn bundled_index() -> Arc<SkillIndex> {

@@ -1,0 +1,5 @@
+error: #[tool(state = ..)] requires `(state: &State, context: &ToolExecutionContext, args: Args)`
+  --> tests/compile_fail/34_tool_state_without_state_argument.rs:10:1
+   |
+10 | async fn t(
+   | ^^^^^

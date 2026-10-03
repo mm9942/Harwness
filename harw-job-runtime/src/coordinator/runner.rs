@@ -710,6 +710,7 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             job_id: job_id.clone(),
             attempt_id: attempt_id.clone(),
             runner_id: runner.clone(),
+            lease_epoch: lease.epoch,
             workspace_root: inner.config.workspace_root.clone(),
         };
         let mut record = match bytes {
@@ -1272,11 +1273,13 @@ fn attempt_context(
     config: &CoordinatorConfig,
     job_id: &WorkId,
     attempt_id: &AttemptId,
+    lease_epoch: u64,
 ) -> AttemptContext {
     AttemptContext {
         job_id: job_id.clone(),
         attempt_id: attempt_id.clone(),
         runner_id: config.runner_id.clone(),
+        lease_epoch,
         workspace_root: config.workspace_root.clone(),
     }
 }
@@ -1512,7 +1515,12 @@ where
         delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
         "retrying job"
     );
-    let ctx = attempt_context(&inner.config, &claim.job.id, &record.attempt_id);
+    let ctx = attempt_context(
+        &inner.config,
+        &claim.job.id,
+        &record.attempt_id,
+        claim.lease.epoch,
+    );
     match backoff(inner, claim, delay, cancel).await {
         Backoff::Elapsed => {}
         Backoff::Cancelled => {
@@ -1650,7 +1658,12 @@ where
     E: Executor,
 {
     let mut record = record;
-    let ctx = attempt_context(&inner.config, &claim.job.id, &record.attempt_id);
+    let ctx = attempt_context(
+        &inner.config,
+        &claim.job.id,
+        &record.attempt_id,
+        claim.lease.epoch,
+    );
     record.apply(LifecycleEvent::Start, Timestamp::now())?;
     persist(inner, &record).await?;
 
