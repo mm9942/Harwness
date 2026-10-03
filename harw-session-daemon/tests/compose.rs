@@ -253,3 +253,31 @@ async fn symlinked_socket_directory_is_refused() -> TestResult {
     );
     Ok(())
 }
+
+/// While a connection holds the daemon in its grace period, the socket must
+/// stop accepting: a client that connects then used to be taken into the
+/// kernel backlog and never served (found by an external review).
+#[tokio::test]
+async fn a_new_client_is_refused_at_once_while_the_daemon_drains() -> TestResult {
+    let d = start(|c, _| {
+        c.shutdown_grace = Duration::from_secs(5);
+        c.header_timeout = Duration::from_secs(30);
+    })
+    .await?;
+    // A stuck peer: connected, never sends a byte, holds its permit for the
+    // whole header timeout, so the drain really waits.
+    let stuck = UnixStream::connect(&d.socket).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    d.shutdown.send(true)?;
+    let gone = tokio::time::timeout(Duration::from_secs(2), async {
+        while UnixStream::connect(&d.socket).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "new connections must fail while draining");
+    assert!(!d.socket.exists(), "the path is removed before the drain");
+    drop(stuck);
+    tokio::time::timeout(Duration::from_secs(10), d.task).await???;
+    Ok(())
+}

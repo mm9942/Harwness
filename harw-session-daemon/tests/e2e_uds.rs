@@ -396,3 +396,50 @@ async fn shutdown_waits_a_bounded_time_for_open_connections() -> TestResult {
     );
     Ok(())
 }
+
+/// Two daemons starting together see the same stale socket. Without the
+/// start-up lock the second unlinked the first one's fresh socket and both
+/// believed they were serving (found by an external review).
+///
+/// Deterministic form: daemon A is up (holds the lock) and its path is then
+/// replaced by a stale socket, exactly what B observes in the race. B must
+/// still refuse instead of unlinking and re-binding.
+#[tokio::test]
+async fn a_running_daemon_is_not_displaced_by_a_stale_looking_socket() -> TestResult {
+    let dir = private_tempdir()?;
+    let uid = own_uid(dir.path())?;
+    let socket = dir.path().join("s.sock");
+    let a = UdsServer::bind(UdsConfig::new(&socket, uid)).await?;
+    std::fs::remove_file(&socket)?;
+    drop(std::os::unix::net::UnixListener::bind(&socket)?);
+    let b = UdsServer::bind(UdsConfig::new(&socket, uid)).await;
+    assert!(matches!(b, Err(DaemonError::AlreadyRunning(_))), "{b:?}");
+    drop(a);
+    // Once A is gone the lock is free and the stale socket is replaced.
+    let c = UdsServer::bind(UdsConfig::new(&socket, uid)).await;
+    assert!(c.is_ok(), "{c:?}");
+    Ok(())
+}
+
+/// The racy form of the same bug: both start at once on a stale socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_daemons_never_both_win_a_stale_socket() -> TestResult {
+    let dir = private_tempdir()?;
+    let uid = own_uid(dir.path())?;
+    let socket = dir.path().join("s.sock");
+    for round in 0..1000 {
+        drop(std::os::unix::net::UnixListener::bind(&socket)?);
+        let a = tokio::spawn(UdsServer::bind(UdsConfig::new(&socket, uid)));
+        let b = tokio::spawn(UdsServer::bind(UdsConfig::new(&socket, uid)));
+        let (a, b) = (a.await?, b.await?);
+        let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+        assert_eq!(winners, 1, "round {round}: exactly one daemon may bind");
+        assert!(
+            tokio::net::UnixStream::connect(&socket).await.is_ok(),
+            "round {round}: the winner must be reachable"
+        );
+        drop((a, b));
+        std::fs::remove_file(&socket)?;
+    }
+    Ok(())
+}

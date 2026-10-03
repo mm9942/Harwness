@@ -123,6 +123,33 @@ pub struct UdsServer {
     /// Device and inode of the socket this server created, so shutdown only
     /// unlinks that exact socket.
     socket_id: (u64, u64),
+    /// Exclusive lock on `<socket>.lock`, held for the server's lifetime: two
+    /// daemons that start together both see the same stale socket, and
+    /// without it the second one would unlink the first one's fresh socket.
+    _lock: std::fs::File,
+}
+
+/// Takes the start-up lock next to the socket (inside the private directory).
+fn lock_socket_dir(socket: &Path) -> Result<std::fs::File, DaemonError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        // Never follow a planted symlink.
+        .custom_flags(i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap_or(0))
+        .open(&lock_path)?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => {
+            Err(DaemonError::AlreadyRunning(socket.to_path_buf()))
+        }
+        Err(errno) => Err(DaemonError::Io(io::Error::from(errno))),
+    }
 }
 
 fn check_private_dir(dir: &Path) -> Result<(), DaemonError> {
@@ -132,6 +159,11 @@ fn check_private_dir(dir: &Path) -> Result<(), DaemonError> {
         return Err(DaemonError::NotADirectory(dir.to_path_buf()));
     }
     if meta.permissions().mode() & 0o077 != 0 {
+        return Err(DaemonError::InsecureDirectory(dir.to_path_buf()));
+    }
+    // Mode alone is not enough: a private directory of another user is not
+    // ours to put a socket into.
+    if meta.uid() != rustix::process::geteuid().as_raw() {
         return Err(DaemonError::InsecureDirectory(dir.to_path_buf()));
     }
     Ok(())
@@ -146,6 +178,7 @@ impl UdsServer {
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| DaemonError::NoParent(path.clone()))?;
         check_private_dir(dir)?;
+        let lock = lock_socket_dir(&path)?;
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_socket() => {
                 // Fail closed: only an explicit "connection refused" proves the
@@ -171,6 +204,7 @@ impl UdsServer {
             listener,
             config,
             socket_id: (meta.dev(), meta.ino()),
+            _lock: lock,
         })
     }
 
@@ -193,8 +227,13 @@ impl UdsServer {
         host: SessionHost,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), DaemonError> {
-        let socket_id = self.socket_id;
-        let config = Arc::new(self.config);
+        let Self {
+            listener,
+            config,
+            socket_id,
+            _lock,
+        } = self;
+        let config = Arc::new(config);
         // The per-connection path (peer identity, upgrade, bounded
         // connections, drain) is the Com layer's; this crate keeps the socket
         // lifecycle. `PortOffer::All` also serves `tool.*` and `gateway.*`.
@@ -216,7 +255,7 @@ impl UdsServer {
                         break;
                     }
                 }
-                accepted = self.listener.accept() => {
+                accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
                             let Some(identity) =
@@ -238,10 +277,18 @@ impl UdsServer {
                 }
             }
         }
+        // Stop being reachable *before* the drain: a client that connects
+        // during the grace period would be accepted by the kernel into the
+        // backlog and then never served. With the listener closed and the
+        // path gone it gets `ENOENT`/`ECONNREFUSED` at once and can retry or
+        // restart the daemon; only already connected sessions hear
+        // `HostDraining`.
+        drop(listener);
+        let removed = remove_own_socket(&config.socket_path, socket_id);
         host.drain(config.drain_retry_after_ms);
         // Every connection (HTTP phase and upgraded session) holds a permit.
         com.drain().await;
-        remove_own_socket(&config.socket_path, socket_id)
+        removed
     }
 }
 
