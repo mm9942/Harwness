@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use harw_container_model::{
-    ContainerId, ContainerInstance, LABEL_ATTEMPT, LABEL_EPOCH, LABEL_OWNER, LABEL_TENANT,
-    LABEL_WORK_ID, OwnerLabels,
+    ContainerId, ContainerInstance, ImageDigest, LABEL_ATTEMPT, LABEL_EPOCH, LABEL_OWNER,
+    LABEL_TENANT, LABEL_WORK_ID, OwnerLabels,
 };
 use harw_job_core::{ExitOutcome, JobSpec, SandboxProfileName, SandboxReport};
 use harw_job_runtime::RuntimeError;
@@ -304,6 +304,14 @@ impl OciExecutor {
         let _ = self.engine.remove(id);
     }
 
+    pub(crate) fn engine_config(&self) -> &OciConfig {
+        self.engine.config()
+    }
+
+    pub(crate) fn discard_container(&self, id: &ContainerId) {
+        self.discard(id);
+    }
+
     pub(crate) fn owner_tenant(&self) -> (String, String) {
         let cfg = self.engine.config();
         (cfg.owner.clone(), cfg.tenant.clone())
@@ -338,14 +346,22 @@ impl OciExecutor {
     }
 }
 
-impl Executor for OciExecutor {
-    type Identity = ContainerInstance;
+/// A created, read-back, not yet started container.
+pub(crate) struct Prepared {
+    pub(crate) id: ContainerId,
+    pub(crate) report: SandboxReport,
+    pub(crate) created_unix: i64,
+    pub(crate) image: ImageDigest,
+}
 
-    fn start(
+impl OciExecutor {
+    /// Creates the container and reads its applied configuration back.
+    /// Nothing has run; a failed internal check removes the container.
+    pub(crate) fn create_and_readback(
         &self,
         spec: &JobSpec,
         ctx: &AttemptContext,
-    ) -> Result<StartedAttempt<Self::Identity>, RuntimeError> {
+    ) -> Result<Prepared, RuntimeError> {
         spec.validate()?;
         let cfg = self.engine.config();
         let image = cfg.image_for(spec.sandbox_profile).ok_or_else(|| {
@@ -366,8 +382,6 @@ impl Executor for OciExecutor {
 
         self.engine.require_image(image)?;
         let id = self.engine.create(&body)?;
-
-        // Read the applied configuration back BEFORE anything runs.
         let doc = match self.engine.inspect(&id) {
             Ok(doc) => doc,
             Err(error) => {
@@ -393,26 +407,43 @@ impl Executor for OciExecutor {
                 OciError::Protocol("the engine did not keep the ownership labels".into()).into(),
             );
         }
-        let report: SandboxReport = report_from_inspect(&doc, &requested);
-        if let Err(error) = check_requirement(spec.sandbox, &report) {
+        Ok(Prepared {
+            report: report_from_inspect(&doc, &requested),
+            id,
+            created_unix,
+            image: image.clone(),
+        })
+    }
+}
+
+impl Executor for OciExecutor {
+    type Identity = ContainerInstance;
+
+    fn start(
+        &self,
+        spec: &JobSpec,
+        ctx: &AttemptContext,
+    ) -> Result<StartedAttempt<Self::Identity>, RuntimeError> {
+        let prepared = self.create_and_readback(spec, ctx)?;
+        let id = prepared.id.clone();
+        if let Err(error) = check_requirement(spec.sandbox, &prepared.report) {
             self.discard(&id);
             return Err(error);
         }
-
         if let Err(error) = self.engine.start(&id) {
             self.discard(&id);
             return Err(error.into());
         }
         let identity = ContainerInstance {
-            engine: cfg.engine,
+            engine: self.engine.config().engine,
             container_id: id.clone(),
-            created_unix,
-            image_digest: image.clone(),
+            created_unix: prepared.created_unix,
+            image_digest: prepared.image,
         };
         let run = supervise(&self.engine, &id, "all");
         Ok(StartedAttempt {
             identity: Some(identity),
-            sandbox: Some(report),
+            sandbox: Some(prepared.report),
             pid: None,
             run,
         })

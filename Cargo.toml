@@ -72,6 +72,7 @@ members = [
     "harw-job-executor-oci",
     "harw-job-executor-k8s",
     "harw-container-model",
+    "harw-placement-model",
     "harw-job",
     "harw-knowledge",
     "harw-channel",

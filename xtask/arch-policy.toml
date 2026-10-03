@@ -480,6 +480,8 @@ layer = "A"
 
 [packages."harw-context-ledger"]
 layer = "I"
+[packages."harw-placement-model"]
+layer = "I"
 [packages."harw-container-model"]
 layer = "I"
 

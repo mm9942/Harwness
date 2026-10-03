@@ -25,6 +25,7 @@
 mod config;
 mod error;
 mod executor;
+mod offer;
 mod pod;
 mod transport;
 

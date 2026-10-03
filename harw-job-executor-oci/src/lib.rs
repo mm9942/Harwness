@@ -34,6 +34,8 @@ mod gc;
 #[cfg(unix)]
 mod http;
 #[cfg(unix)]
+mod offer;
+#[cfg(unix)]
 mod pool;
 
 #[cfg(all(test, unix))]

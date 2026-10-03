@@ -51,6 +51,7 @@ pub use harw_job_core::JobRuntimeError as JobError;
 pub mod coordinator;
 pub mod host;
 pub mod lanes;
+pub mod offer;
 pub mod permits;
 
 pub use host::{HostFacts, HostLandlock, HostReport};

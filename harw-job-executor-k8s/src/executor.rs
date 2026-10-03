@@ -367,14 +367,21 @@ fn supervise(inner: &Arc<Inner>, name: &str, follow_from_now: bool) -> AttemptRu
     AttemptRun::new(events, control)
 }
 
-impl Executor for K8sExecutor {
-    type Identity = PodInstance;
+/// A created, gated, read-back pod.
+pub(crate) struct Prepared {
+    pub(crate) name: String,
+    pub(crate) identity: PodInstance,
+    pub(crate) report: harw_job_core::SandboxReport,
+}
 
-    fn start(
+impl K8sExecutor {
+    /// Creates the pod behind its scheduling gate and reads the admitted pod
+    /// back. Nothing is scheduled; a failed internal check deletes the pod.
+    pub(crate) fn create_and_readback(
         &self,
         spec: &JobSpec,
         ctx: &AttemptContext,
-    ) -> Result<StartedAttempt<Self::Identity>, RuntimeError> {
+    ) -> Result<Prepared, RuntimeError> {
         spec.validate()?;
         let inner = &self.inner;
         let cfg = &inner.cfg;
@@ -403,7 +410,6 @@ impl Executor for K8sExecutor {
         };
         let manifest = pod::manifest(cfg, spec, &name, &image.reference(), &labels)?;
 
-        // Created gated: nothing is scheduled until the read-back passed.
         let admitted = inner.create(&manifest)?;
         let discard = |inner: &Inner| {
             let _ = inner.delete(&name, 0);
@@ -439,10 +445,6 @@ impl Executor for K8sExecutor {
             return Err(error.into());
         }
         let report = report_from_pod(&admitted, &requested, cfg.network_attested);
-        if let Err(error) = check_requirement(spec.sandbox, &report) {
-            discard(inner);
-            return Err(error);
-        }
         let identity = match inner.identity_of(&admitted) {
             Ok(identity) => identity,
             Err(error) => {
@@ -450,14 +452,48 @@ impl Executor for K8sExecutor {
                 return Err(error.into());
             }
         };
+        Ok(Prepared {
+            name,
+            identity,
+            report,
+        })
+    }
+
+    pub(crate) fn config(&self) -> &K8sConfig {
+        &self.inner.cfg
+    }
+
+    pub(crate) fn delete_now(&self, name: &str) {
+        let _ = self.inner.delete(name, 0);
+    }
+}
+
+impl Executor for K8sExecutor {
+    type Identity = PodInstance;
+
+    fn start(
+        &self,
+        spec: &JobSpec,
+        ctx: &AttemptContext,
+    ) -> Result<StartedAttempt<Self::Identity>, RuntimeError> {
+        let prepared = self.create_and_readback(spec, ctx)?;
+        let inner = &self.inner;
+        let name = prepared.name.clone();
+        let discard = || {
+            let _ = inner.delete(&name, 0);
+        };
+        if let Err(error) = check_requirement(spec.sandbox, &prepared.report) {
+            discard();
+            return Err(error);
+        }
         if let Err(error) = inner.lift_gate(&name) {
-            discard(inner);
+            discard();
             return Err(error.into());
         }
         let run = supervise(inner, &name, false);
         Ok(StartedAttempt {
-            identity: Some(identity),
-            sandbox: Some(report),
+            identity: Some(prepared.identity),
+            sandbox: Some(prepared.report),
             pid: None,
             run,
         })

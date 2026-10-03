@@ -14,6 +14,7 @@ harw-job-core = { path = "../harw-job-core" }
 harw-job-runtime = { path = "../harw-job-runtime" }
 harw-container-model = { path = "../harw-container-model" }
 harw-types = { path = "../harw-types" }
+harw-placement-model = { path = "../harw-placement-model" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jiff = { workspace = true }
