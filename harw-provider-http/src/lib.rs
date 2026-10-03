@@ -89,6 +89,7 @@ pub mod retry;
 pub mod routing;
 mod sse;
 mod text_tool_calls;
+mod tool_call_ids;
 mod tool_names;
 
 use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
@@ -3439,6 +3440,9 @@ pub(crate) struct ChatCompat {
     strict_tools: bool,
     /// Wert für `parallel_tool_calls`, sofern Werkzeuge angeboten werden.
     parallel_tool_calls: Option<bool>,
+    /// Wie `tool_call_id`s auf den Draht gehen (Mistral verlangt 9
+    /// alphanumerische Zeichen).
+    tool_call_ids: tool_call_ids::ToolCallIdFormat,
 }
 
 impl Default for ChatCompat {
@@ -3448,7 +3452,19 @@ impl Default for ChatCompat {
             send_reasoning_effort: true,
             strict_tools: true,
             parallel_tool_calls: None,
+            tool_call_ids: tool_call_ids::ToolCallIdFormat::Verbatim,
         }
+    }
+}
+
+/// Das Format der `tool_call_id`s für einen Endpunkt: nur die offizielle
+/// Mistral-API verlangt 9 alphanumerische Zeichen; Subdomain-Tricks und
+/// andere Server bleiben beim unveränderten Format.
+fn tool_call_id_format_for(base_url: &str) -> tool_call_ids::ToolCallIdFormat {
+    if endpoint_is_official_host(base_url, "api.mistral.ai") {
+        tool_call_ids::ToolCallIdFormat::Alnum9
+    } else {
+        tool_call_ids::ToolCallIdFormat::Verbatim
     }
 }
 
@@ -3467,6 +3483,7 @@ impl ChatCompat {
             send_reasoning_effort: provider.effective_send_reasoning_effort(),
             strict_tools: provider.effective_strict_tools(),
             parallel_tool_calls: provider.effective_parallel_tool_calls(),
+            tool_call_ids: tool_call_id_format_for(&provider.base_url),
         }
     }
 }
@@ -3594,6 +3611,7 @@ fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
 fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat) -> Value {
     let renderer = ToolResultRenderer::new(request);
     let names = tool_names::ToolNameCodec::for_request(request);
+    let ids = tool_call_ids::ToolCallIdCodec::for_request(request, compat.tool_call_ids);
     let mut messages: Vec<Value> = Vec::new();
 
     let mut system = request.system_prompt.clone();
@@ -3621,7 +3639,7 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
                 push_chat_tool_call(
                     &mut messages,
                     serde_json::json!({
-                        "id": call_id.as_str(),
+                        "id": ids.encode(call_id.as_str()),
                         "type": "function",
                         "function": {
                             "name": names.encode(&name),
@@ -3634,7 +3652,7 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
                 let content = renderer.render(&call_id, &result);
                 messages.push(serde_json::json!({
                     "role": "tool",
-                    "tool_call_id": call_id.as_str(),
+                    "tool_call_id": ids.encode(call_id.as_str()),
                     "content": content,
                 }));
             }
@@ -7378,6 +7396,86 @@ mod tests {
             Some("call_b")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_mistral_gets_nine_character_tool_call_ids_and_others_stay_verbatim() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("weather?");
+        history.push_tool_call(
+            harw_types::ToolCallId::from_str("call_1740241912345"),
+            "get_weather",
+            serde_json::json!({"location": "Paris"}),
+        );
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_1740241912345"),
+            ToolCallResult::success(serde_json::json!({"temp": 20})),
+            5,
+        );
+        let request = ModelRequest {
+            stream: None,
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: Vec::new(),
+            context_assembly: Default::default(),
+            reasoning_effort: None,
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+            cancel: None,
+            identity: None,
+        };
+        let mistral = ChatCompat {
+            tool_call_ids: tool_call_ids::ToolCallIdFormat::Alnum9,
+            ..ChatCompat::default()
+        };
+        let body = build_chat_body_with(&request, "mistral-large-latest", mistral);
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or(TestError::Missing("messages"))?;
+        let call_id = messages[1]
+            .pointer("/tool_calls/0/id")
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("call id"))?;
+        let result_id = messages[2]
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("result id"))?;
+        assert_eq!(call_id.len(), 9);
+        assert!(call_id.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        assert_eq!(call_id, result_id, "call and result share one id");
+
+        let other = build_chat_body(&request, "gpt-4o-mini");
+        assert_eq!(
+            other
+                .pointer("/messages/1/tool_calls/0/id")
+                .and_then(Value::as_str),
+            Some("call_1740241912345")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_only_the_official_mistral_host_selects_the_nine_character_format() {
+        use tool_call_ids::ToolCallIdFormat::{Alnum9, Verbatim};
+        assert_eq!(tool_call_id_format_for("https://api.mistral.ai/v1"), Alnum9);
+        assert_eq!(
+            tool_call_id_format_for("https://api.mistral.ai.evil.example/v1"),
+            Verbatim
+        );
+        assert_eq!(
+            tool_call_id_format_for("https://api.openai.com/v1"),
+            Verbatim
+        );
+        assert_eq!(
+            tool_call_id_format_for("http://localhost:8000/v1"),
+            Verbatim
+        );
     }
 
     #[test]
