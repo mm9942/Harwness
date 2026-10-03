@@ -419,7 +419,8 @@ pub(crate) fn assistant_text(message: &harw_protocol::AssistantMessageItem) -> S
         .iter()
         .filter_map(|part| match part {
             harw_protocol::ContentPart::Text { text } => Some(text.as_str()),
-            harw_protocol::ContentPart::ImageUrl { .. } => None,
+            harw_protocol::ContentPart::ImageUrl { .. }
+            | harw_protocol::ContentPart::Media { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("")

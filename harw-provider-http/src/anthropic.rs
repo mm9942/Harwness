@@ -577,7 +577,7 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
     let mut messages: Vec<Value> = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text } => {
+            harw_core::ModelMessage::User { text, .. } => {
                 messages.push(serde_json::json!({ "role": "user", "content": text }));
             }
             harw_core::ModelMessage::Assistant { text } => {

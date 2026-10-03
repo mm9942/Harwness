@@ -204,7 +204,7 @@ pub fn build_recent_dream_context(transcript_root: &Path) -> Result<String, Stri
 
         for message in history.to_model_messages() {
             let (role, text) = match message {
-                harw_core::ModelMessage::User { text } => ("Nutzerin", text),
+                harw_core::ModelMessage::User { text, .. } => ("Nutzerin", text),
                 harw_core::ModelMessage::Assistant { text } => ("Assistent", text),
                 harw_core::ModelMessage::ToolCall { .. }
                 | harw_core::ModelMessage::ToolResult { .. } => continue,

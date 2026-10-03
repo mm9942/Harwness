@@ -4492,7 +4492,7 @@ impl ManagedAgentSpawner {
                         .iter()
                         .filter_map(|part| match part {
                             ContentPart::Text { text } => Some(text.as_str()),
-                            ContentPart::ImageUrl { .. } => None,
+                            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
                         })
                         .collect(),
                 ),
@@ -6308,7 +6308,7 @@ impl ManagedAgentSpawner {
                 .iter()
                 .filter_map(|part| match part {
                     ContentPart::Text { text } => Some(text.as_str()),
-                    ContentPart::ImageUrl { .. } => None,
+                    ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
                 })
                 .collect();
             (!text.trim().is_empty()).then_some(text)
@@ -13019,7 +13019,7 @@ max_depth = 0
                         .iter()
                         .filter_map(|part| match part {
                             ContentPart::Text { text } => Some(text.as_str()),
-                            ContentPart::ImageUrl { .. } => None,
+                            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
                         })
                         .collect::<String>(),
                 ),

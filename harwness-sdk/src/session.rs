@@ -273,7 +273,7 @@ impl Session {
             .to_model_messages()
             .into_iter()
             .filter_map(|message| match message {
-                ModelMessage::User { text } => Some(Message {
+                ModelMessage::User { text, .. } => Some(Message {
                     role: Role::User,
                     text,
                 }),
