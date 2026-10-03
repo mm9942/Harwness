@@ -474,6 +474,8 @@ layer = "A"
 
 [packages."harw-context-ledger"]
 layer = "I"
+[packages."harw-container-model"]
+layer = "I"
 
 [packages."harw-tool-container"]
 layer = "A"
