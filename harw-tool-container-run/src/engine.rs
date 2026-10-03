@@ -177,6 +177,27 @@ async fn capture<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> (Vec<u8>,
     (kept, truncated)
 }
 
+/// `ETXTBSY` ("text file busy", errno 26) on `exec` means another thread of
+/// this process still holds a write handle to the executable (a freshly
+/// written or replaced binary, or an fd inherited by a concurrent fork until
+/// that child execs). It is transient; retry a few times, nothing else.
+const ETXTBSY: i32 = 26;
+const SPAWN_ATTEMPTS: usize = 5;
+
+async fn spawn_with_retry(command: &mut Command) -> Result<tokio::process::Child, EngineError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) && attempt < SPAWN_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(EngineError::Spawn(error.to_string())),
+        }
+    }
+}
+
 impl ContainerEngine for PodmanEngine {
     fn run<'a>(
         &'a self,
@@ -188,9 +209,7 @@ impl ContainerEngine for PodmanEngine {
             command.stdout(Stdio::piped());
             command.stderr(Stdio::piped());
             command.kill_on_drop(true);
-            let mut child = command
-                .spawn()
-                .map_err(|error| EngineError::Spawn(error.to_string()))?;
+            let mut child = spawn_with_retry(&mut command).await?;
             let out = child.stdout.take();
             let err = child.stderr.take();
             let out_task = tokio::spawn(async move {
