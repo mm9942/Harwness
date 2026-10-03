@@ -55,7 +55,7 @@ fn valid(value: &str) -> bool {
 /// Who an instance belongs to; compared on recovery and by garbage
 /// collection. Never holds secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "OwnerLabelsRaw")]
 pub struct OwnerLabels {
     /// The runner id.
     pub owner: String,
@@ -69,6 +69,34 @@ pub struct OwnerLabels {
     pub tenant: String,
     /// The run/sandbox profile.
     pub profile: String,
+}
+
+/// Unvalidated wire form; deserializing re-runs [`OwnerLabels::new`], so a
+/// persisted record cannot smuggle an unsafe value past the validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerLabelsRaw {
+    owner: String,
+    work_id: String,
+    attempt: u64,
+    lease_epoch: u64,
+    tenant: String,
+    profile: String,
+}
+
+impl TryFrom<OwnerLabelsRaw> for OwnerLabels {
+    type Error = LabelError;
+
+    fn try_from(raw: OwnerLabelsRaw) -> Result<Self, Self::Error> {
+        Self::new(
+            &raw.owner,
+            &raw.work_id,
+            raw.attempt,
+            raw.lease_epoch,
+            &raw.tenant,
+            &raw.profile,
+        )
+    }
 }
 
 impl OwnerLabels {
@@ -128,10 +156,18 @@ impl OwnerLabels {
                 .map(String::as_str)
                 .ok_or(LabelError::Missing(key))
         };
+        // Canonical decimal only: "+7" and "007" name the same number as "7"
+        // but are different label strings, which breaks label filters.
         let number = |key: &'static str| {
-            text(key)?
+            let raw = text(key)?;
+            let value = raw
                 .parse::<u64>()
-                .map_err(|_| LabelError::NotANumber(key))
+                .map_err(|_| LabelError::NotANumber(key))?;
+            if value.to_string() == raw {
+                Ok(value)
+            } else {
+                Err(LabelError::NotANumber(key))
+            }
         };
         Self::new(
             text(LABEL_OWNER)?,
@@ -148,34 +184,51 @@ impl OwnerLabels {
 mod tests {
     use super::*;
 
-    fn labels() -> OwnerLabels {
+    fn labels() -> Result<OwnerLabels, LabelError> {
         OwnerLabels::new("runner-1", "work-9", 2, 7, "tenant-a", "hermetic")
-            .unwrap_or_else(|_| unreachable!())
     }
 
     #[test]
-    fn labels_round_trip_through_the_engine_map() {
-        let map = labels().to_map();
+    fn labels_round_trip_through_the_engine_map() -> Result<(), LabelError> {
+        let map = labels()?.to_map();
         assert_eq!(map.get(LABEL_OWNER).map(String::as_str), Some("runner-1"));
-        assert_eq!(OwnerLabels::from_map(&map), Ok(labels()));
+        assert_eq!(OwnerLabels::from_map(&map)?, labels()?);
+        Ok(())
     }
 
     #[test]
-    fn extra_keys_are_ignored_but_missing_or_bad_ones_are_not() {
-        let mut map = labels().to_map();
+    fn extra_keys_are_ignored_but_missing_or_bad_ones_are_not() -> Result<(), LabelError> {
+        let mut map = labels()?.to_map();
         map.insert("com.example/x".to_owned(), "y".to_owned());
-        assert_eq!(OwnerLabels::from_map(&map), Ok(labels()));
+        assert_eq!(OwnerLabels::from_map(&map)?, labels()?);
         map.remove(LABEL_TENANT);
         assert_eq!(
             OwnerLabels::from_map(&map),
             Err(LabelError::Missing(LABEL_TENANT))
         );
-        let mut bad = labels().to_map();
+        let mut bad = labels()?.to_map();
         bad.insert(LABEL_EPOCH.to_owned(), "seven".to_owned());
         assert_eq!(
             OwnerLabels::from_map(&bad),
             Err(LabelError::NotANumber(LABEL_EPOCH))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn numbers_must_be_canonical_decimals() -> Result<(), LabelError> {
+        for text in ["+7", "007", " 7", "7 ", "0x7", "-1"] {
+            let mut map = labels()?.to_map();
+            map.insert(LABEL_EPOCH.to_owned(), text.to_owned());
+            assert!(OwnerLabels::from_map(&map).is_err(), "{text:?}");
+        }
+        let mut map = labels()?.to_map();
+        map.insert(LABEL_ATTEMPT.to_owned(), "0".to_owned());
+        assert!(
+            OwnerLabels::from_map(&map).is_ok(),
+            "zero itself is canonical"
+        );
+        Ok(())
     }
 
     #[test]
@@ -185,6 +238,21 @@ mod tests {
                 OwnerLabels::new(bad, "w", 1, 1, "t", "p").is_err(),
                 "{bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_persisted_record_cannot_bypass_the_validation() {
+        let ok =
+            r#"{"owner":"r","work_id":"w","attempt":1,"lease_epoch":1,"tenant":"t","profile":"p"}"#;
+        assert!(serde_json::from_str::<OwnerLabels>(ok).is_ok());
+        let long = "x".repeat(10_000);
+        for bad in [
+            r#"{"owner":"a b=c\n","work_id":"w","attempt":1,"lease_epoch":1,"tenant":"t","profile":"p"}"#.to_owned(),
+            format!(r#"{{"owner":"{long}","work_id":"w","attempt":1,"lease_epoch":1,"tenant":"t","profile":"p"}}"#),
+            ok.replace('}', r#","x":1}"#),
+        ] {
+            assert!(serde_json::from_str::<OwnerLabels>(&bad).is_err());
         }
     }
 }

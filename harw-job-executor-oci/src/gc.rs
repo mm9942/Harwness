@@ -105,6 +105,9 @@ pub fn plan_gc(
                 }
                 Reason::Finished
             }
+            // A lost or reset store must not cost running containers: an
+            // unknown job is only collected once its container is not running.
+            None if item.running => continue,
             None => Reason::Orphaned,
         };
         out.push(Removal {
@@ -258,6 +261,10 @@ mod tests {
         };
         let out = plan(&[item("me", 1, 0, false)?], &view);
         assert_eq!(out.first().map(|r| r.reason), Some(Reason::Orphaned));
+        assert!(
+            plan(&[item("me", 1, 0, true)?], &view).is_empty(),
+            "a running container of an unknown job is kept"
+        );
         Ok(())
     }
 }

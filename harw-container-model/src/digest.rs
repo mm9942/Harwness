@@ -52,9 +52,12 @@ impl ImageDigest {
                     .rsplit('/')
                     .next()
                     .is_some_and(|last| !last.contains(':'))
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b':'))
+            || !name.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'_' | b'-' | b'/' | b':')
+            })
+            || name.split('/').any(|seg| seg.is_empty() || seg == ".")
             || name.starts_with(['/', '.', '-'])
             || name.contains("..")
         {

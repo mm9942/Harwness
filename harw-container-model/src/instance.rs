@@ -33,27 +33,32 @@ impl EngineKind {
 /// Why an identity value was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceError {
-    /// Not 12 to 64 lowercase hex characters.
+    /// Not exactly 64 lowercase hex characters.
     InvalidContainerId,
     /// Not a Kubernetes DNS label (`[a-z0-9-]`, at most 63, alphanumeric ends).
     InvalidNamespace,
     /// Not a UID-like token (`[A-Za-z0-9-]`, 8 to 64 characters).
     InvalidPodUid,
+    /// Not a DNS label.
+    InvalidContainerName,
 }
 
 impl fmt::Display for InstanceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidContainerId => "container id must be 12-64 lowercase hex characters",
+            Self::InvalidContainerId => "container id must be 64 lowercase hex characters",
             Self::InvalidNamespace => "namespace must be a DNS label",
             Self::InvalidPodUid => "pod uid must be 8-64 characters of [A-Za-z0-9-]",
+            Self::InvalidContainerName => "container name must be a DNS label",
         })
     }
 }
 
 impl std::error::Error for InstanceError {}
 
-/// An engine-assigned container id (hex). The only handle acted upon.
+/// An engine-assigned container id: the full 64 hex digits. A short prefix is
+/// not a stable handle (an engine resolves a container *name* equal to the
+/// prefix first), so only the full id is accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ContainerId(String);
@@ -64,9 +69,7 @@ impl ContainerId {
     /// # Errors
     /// [`InstanceError::InvalidContainerId`].
     pub fn new(raw: &str) -> Result<Self, InstanceError> {
-        if (12..=64).contains(&raw.len())
-            && raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
+        if raw.len() == 64 && raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             Ok(Self(raw.to_owned()))
         } else {
             Err(InstanceError::InvalidContainerId)
@@ -159,6 +162,16 @@ impl PodInstance {
         if !dns {
             return Err(InstanceError::InvalidNamespace);
         }
+        let name_ok = !container.is_empty()
+            && container.len() <= 63
+            && container
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !container.starts_with('-')
+            && !container.ends_with('-');
+        if !name_ok {
+            return Err(InstanceError::InvalidContainerName);
+        }
         if !(8..=64).contains(&pod_uid.len())
             || !pod_uid
                 .bytes()
@@ -190,13 +203,13 @@ mod tests {
 
     #[test]
     fn container_ids_are_hex_of_engine_length() {
-        assert!(ContainerId::new("0123456789ab").is_ok());
         assert!(ContainerId::new(&"a".repeat(64)).is_ok());
         for bad in [
             "",
             "short",
             "ZZZZZZZZZZZZ",
-            "0123456789a",
+            "0123456789ab",
+            &"a".repeat(63),
             &"a".repeat(65),
             "my-container-name",
         ] {
@@ -225,26 +238,29 @@ mod tests {
         assert!(serde_json::from_str::<PodInstance>(short).is_err());
         let good = r#"{"namespace":"ok","pod_uid":"123e4567-e89b","container":"job"}"#;
         assert!(serde_json::from_str::<PodInstance>(good).is_ok());
+        let bad_container = r#"{"namespace":"ok","pod_uid":"123e4567-e89b","container":"a b"}"#;
+        assert!(serde_json::from_str::<PodInstance>(bad_container).is_err());
         let extra = r#"{"namespace":"ok","pod_uid":"123e4567-e89b","container":"job","x":1}"#;
         assert!(serde_json::from_str::<PodInstance>(extra).is_err());
     }
 
     #[test]
-    fn instances_round_trip_through_json_and_reject_unknown_fields() {
+    fn instances_round_trip_through_json_and_reject_unknown_fields() -> Result<(), String> {
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let instance = ContainerInstance {
             engine: EngineKind::Podman,
-            container_id: ContainerId::new("0123456789ab").unwrap_or_else(|_| unreachable!()),
+            container_id: ContainerId::new(hex).map_err(|e| e.to_string())?,
             created_unix: 1_790_000_000,
             image_digest: ImageDigest::parse(&format!("rust@sha256:{hex}"))
-                .unwrap_or_else(|_| unreachable!()),
+                .map_err(|e| e.to_string())?,
         };
-        let reference = InstanceRef::Container(instance.clone());
-        let json = serde_json::to_string(&reference).unwrap_or_default();
+        let reference = InstanceRef::Container(instance);
+        let json = serde_json::to_string(&reference).map_err(|e| e.to_string())?;
         assert!(json.contains("\"kind\":\"container\""), "{json}");
-        let back: Result<InstanceRef, _> = serde_json::from_str(&json);
-        assert_eq!(back.ok(), Some(reference));
+        let back: InstanceRef = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        assert_eq!(back, reference);
         let extra = json.replace('}', ",\"x\":1}");
         assert!(serde_json::from_str::<InstanceRef>(&extra).is_err());
+        Ok(())
     }
 }
