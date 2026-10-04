@@ -3,7 +3,7 @@
 //! Transcripts carry only [`MediaRef`]s. A provider adapter needs bytes, and it
 //! reaches them through [`ModelMessage::User::images`]: when the history is
 //! projected for a request ([`ConversationHistory::to_model_messages`]), every
-//! `Media` part is resolved through the **process media source** installed with
+//! `Media` part is resolved through the **process media sources** installed with
 //! [`install_media_source`]. The runtime installs the media store once at
 //! start-up; tests install a map.
 //!
@@ -54,7 +54,14 @@ impl ModelImage {
     }
 }
 
-static SOURCE: RwLock<Option<Arc<dyn MediaSource>>> = RwLock::new(None);
+/// The installed sources, tried in order. More than one can exist in a
+/// process (two embedded runtimes with different homes); every image is
+/// verified against its digest by the source that supplies it, so asking
+/// them all in turn is safe.
+static SOURCES: RwLock<Vec<Arc<dyn MediaSource>>> = RwLock::new(Vec::new());
+
+/// How many sources a process may install.
+const MAX_SOURCES: usize = 16;
 static CACHE: Mutex<Cache> = Mutex::new(Cache::new());
 
 struct Cache {
@@ -97,25 +104,47 @@ impl Cache {
     }
 }
 
-/// Installs the process media source (replacing any earlier one) and forgets
-/// what was cached from it.
+/// Adds a media source to the process (an `Arc` already installed is not added
+/// twice; at most 16 are kept, the oldest is dropped beyond that). The runtime
+/// installs its media store once at start-up; tests install a map.
 pub fn install_media_source(source: Arc<dyn MediaSource>) {
-    if let Ok(mut slot) = SOURCE.write() {
-        *slot = Some(source);
-    }
-    if let Ok(mut cache) = CACHE.lock() {
-        *cache = Cache::new();
+    if let Ok(mut sources) = SOURCES.write() {
+        if sources.iter().any(|known| Arc::ptr_eq(known, &source)) {
+            return;
+        }
+        if sources.len() >= MAX_SOURCES {
+            sources.remove(0);
+        }
+        sources.push(source);
     }
 }
 
-fn current_source() -> Option<Arc<dyn MediaSource>> {
-    SOURCE.read().ok().and_then(|slot| slot.clone())
+/// Asks the installed sources in order; the first that has the image wins.
+struct Chain(Vec<Arc<dyn MediaSource>>);
+
+impl MediaSource for Chain {
+    fn load(&self, media: &MediaRef) -> Result<Vec<u8>, harw_media::MediaError> {
+        let mut last = harw_media::MediaError::NotFound;
+        for source in &self.0 {
+            match source.load(media) {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
 }
 
-/// Resolves one image through the process media source.
+fn current_source() -> Option<Chain> {
+    let sources = SOURCES.read().ok()?.clone();
+    (!sources.is_empty()).then_some(Chain(sources))
+}
+
+/// Resolves one image through the process media sources.
 #[must_use]
 pub fn resolve_media(media: &MediaRef, detail: Option<ImageDetail>) -> ModelImage {
-    resolve_media_with(current_source().as_deref(), media, detail)
+    let chain = current_source();
+    resolve_media_with(chain.as_ref().map(|c| c as &dyn MediaSource), media, detail)
 }
 
 /// Resolves one image through `source` (no cache). `None` means no source.
@@ -221,5 +250,44 @@ mod tests {
             cache.get("c").is_none(),
             "an image over the bound is not cached"
         );
+    }
+
+    #[test]
+    fn several_installed_sources_are_asked_in_turn_and_never_twice() -> TestResult {
+        struct Has(Vec<u8>, harw_protocol::MediaRef);
+        impl MediaSource for Has {
+            fn load(&self, media: &MediaRef) -> Result<Vec<u8>, MediaError> {
+                if *media == self.1 {
+                    Ok(self.0.clone())
+                } else {
+                    Err(MediaError::NotFound)
+                }
+            }
+        }
+        let wanted = media()?;
+        let other = MediaRef::new(
+            harw_types::ContentDigest::of(b"other"),
+            ImageFormat::Png,
+            4,
+            1,
+            1,
+        )
+        .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let first: Arc<dyn MediaSource> = Arc::new(Has(vec![9], other));
+        let second: Arc<dyn MediaSource> = Arc::new(Has(vec![1, 2, 3, 4], wanted.clone()));
+        install_media_source(Arc::clone(&first));
+        install_media_source(Arc::clone(&first));
+        install_media_source(Arc::clone(&second));
+        let image = resolve_media(&wanted, None);
+        assert_eq!(
+            image.bytes(),
+            Some(&[1, 2, 3, 4][..]),
+            "the second source answers"
+        );
+        let count = SOURCES
+            .read()
+            .map_or(0, |s| s.iter().filter(|k| Arc::ptr_eq(k, &first)).count());
+        assert_eq!(count, 1, "an installed source is not added twice");
+        Ok(())
     }
 }
