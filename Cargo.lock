@@ -4579,6 +4579,7 @@ dependencies = [
  "harw-core",
  "harw-extension-api",
  "harw-home",
+ "harw-media",
  "harw-protocol",
  "harw-provider-http",
  "harw-runtime",
