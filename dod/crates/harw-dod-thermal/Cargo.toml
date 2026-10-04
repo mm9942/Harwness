@@ -31,6 +31,7 @@ harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # `sensor_suite!` — die geerbte Fixture-Testsuite (sechs Pflichtprüfungen
 # plus optionale Adversarial-Prüfung).
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }

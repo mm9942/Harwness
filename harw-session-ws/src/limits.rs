@@ -8,45 +8,31 @@ use std::time::Duration;
 
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-/// Size, time and queue bounds of one session WebSocket connection.
-#[derive(Clone, Copy, Debug)]
-pub struct WsLimits {
-    /// Largest inbound message (after reassembly) in bytes.
-    pub max_message_bytes: usize,
-    /// Largest single inbound frame payload in bytes.
-    pub max_frame_bytes: usize,
-    /// Time a client has to complete `session.hello` after the upgrade.
-    pub hello_timeout: Duration,
-    /// Concurrent requests per connection before calls are refused as busy.
-    pub max_in_flight: usize,
-    /// Frames buffered per attachment inside the connection multiplexer.
-    pub attachment_buffer: usize,
-    /// Responses and control messages buffered ahead of the writer.
-    pub response_buffer: usize,
-    /// Attached sessions per connection.
-    pub max_attachments: usize,
-    /// Interval between server pings.
-    pub ping_interval: Duration,
-    /// Time without any inbound message (pongs included) before the
-    /// connection is closed.
-    pub idle_timeout: Duration,
-}
-
 const MIB: usize = 1024 * 1024;
 
-impl Default for WsLimits {
-    fn default() -> Self {
-        Self {
-            max_message_bytes: MIB,
-            max_frame_bytes: MIB,
-            hello_timeout: Duration::from_secs(10),
-            max_in_flight: 32,
-            attachment_buffer: 16,
-            response_buffer: 64,
-            max_attachments: 32,
-            ping_interval: Duration::from_secs(15),
-            idle_timeout: Duration::from_secs(60),
-        }
+harw_types::limits_struct! {
+    /// Size, time and queue bounds of one session WebSocket connection.
+    #[derive(Clone, Copy, Debug)]
+    pub struct WsLimits {
+        /// Largest inbound message (after reassembly) in bytes.
+        pub max_message_bytes: usize = DEFAULT_MAX_MESSAGE_BYTES = MIB,
+        /// Largest single inbound frame payload in bytes.
+        pub max_frame_bytes: usize = DEFAULT_MAX_FRAME_BYTES = MIB,
+        /// Time a client has to complete `session.hello` after the upgrade.
+        pub hello_timeout: Duration = DEFAULT_HELLO_TIMEOUT = Duration::from_secs(10),
+        /// Concurrent requests per connection before calls are refused as busy.
+        pub max_in_flight: usize = DEFAULT_MAX_IN_FLIGHT = 32,
+        /// Frames buffered per attachment inside the connection multiplexer.
+        pub attachment_buffer: usize = DEFAULT_ATTACHMENT_BUFFER = 16,
+        /// Responses and control messages buffered ahead of the writer.
+        pub response_buffer: usize = DEFAULT_RESPONSE_BUFFER = 64,
+        /// Attached sessions per connection.
+        pub max_attachments: usize = DEFAULT_MAX_ATTACHMENTS = 32,
+        /// Interval between server pings.
+        pub ping_interval: Duration = DEFAULT_PING_INTERVAL = Duration::from_secs(15),
+        /// Time without any inbound message (pongs included) before the
+        /// connection is closed.
+        pub idle_timeout: Duration = DEFAULT_IDLE_TIMEOUT = Duration::from_secs(60),
     }
 }
 

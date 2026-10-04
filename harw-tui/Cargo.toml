@@ -23,6 +23,7 @@ harw-lens-types = { path = "../harw-lens-types" }
 harw-extension-api = { path = "../harw-extension-api" }
 # Atomares, überschreibsicheres Schreiben der `/export`-Markdown-Datei (src/export.rs).
 harw-fsutil = { path = "../harw-fsutil" }
+harw-macros = { path = "../harw-macros" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 harw-operations = { path = "../harw-operations" }
@@ -57,7 +58,7 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 # Version bewusst identisch zu harw-cli/Cargo.toml.
 tracing = "0.1.44"
 serde_json = "1"
-harw-home = { version = "0.9.0", path = "../harw-home" }
+harw-home = { version = "0.9.1", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
 # `PendingApproval::requested_at`/`timeout_at` (harw-core) sind `jiff::Timestamp`;
 # der Freigabe-/Wiederaufnahme-Treiber (`src/approval.rs`) liest den
@@ -70,6 +71,7 @@ time = { version = "0.3.53", features = ["formatting"] }
 zeroize = "1"
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 harw-tools = { path = "../harw-tools" }
 harw-operations = { path = "../harw-operations" }
 harw-provider = { path = "../harw-provider" }

@@ -29,6 +29,7 @@ tokio = { version = "1.52.3", features = ["time", "sync"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 base64 = "0.23.1"
 tempfile = { workspace = true }
 tokio = { version = "1.52.3", features = ["macros", "rt"] }

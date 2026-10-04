@@ -18,5 +18,8 @@ crypt_guard_service = { workspace = true }
 # crate, like every other DoD crate). Proc-macro only; no runtime weight.
 harw-macros = { path = "../../../harw-macros" }
 
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+
 [lints]
 workspace = true
