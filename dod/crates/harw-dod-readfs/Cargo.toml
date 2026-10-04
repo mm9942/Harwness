@@ -13,6 +13,7 @@ harw-dod-cap = { path = "../harw-dod-cap" }
 harw-macros = { path = "../../../harw-macros" }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 tempfile = { workspace = true }
 
 [lints]

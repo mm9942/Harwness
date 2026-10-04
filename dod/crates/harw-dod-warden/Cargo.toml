@@ -25,6 +25,7 @@ harw-types = { path = "../../../harw-types" }
 harw-macros = { path = "../../../harw-macros" }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # Nur für den Test „unbekanntes Feld in der Anfrage -> abgelehnt" (Rundlauf
 # über die tatsächliche Wire-Deserialisierung von
 # `harw_dod_warden_proto::WardenActionRequest`) und für die

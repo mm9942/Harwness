@@ -116,6 +116,8 @@ members = [
     # === Remediation (Plan P0–P3) ===
     "harw-egress",
     "harw-fsutil",
+    # Reines Dev-Gerüst (define_test_error!, Temp-Pfade); nur als dev-dependency.
+    "harw-test-support",
     "harw-runtime",
     "harwness-sdk",
     "xtask",

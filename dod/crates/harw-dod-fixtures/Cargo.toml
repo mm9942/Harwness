@@ -29,5 +29,8 @@ jiff = { workspace = true }
 # Bibliothekscode — deshalb reguläre Abhängigkeit, keine Dev-Dependency.
 tempfile = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+
 [lints]
 workspace = true

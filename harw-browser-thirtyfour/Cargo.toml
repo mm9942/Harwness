@@ -27,5 +27,8 @@ url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true
