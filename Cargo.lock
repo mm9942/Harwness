@@ -2264,6 +2264,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-command"
+version = "0.9.0"
+dependencies = [
+ "harw-job",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "tokio",
+]
+
+[[package]]
 name = "harw-completions"
 version = "0.9.0"
 dependencies = [

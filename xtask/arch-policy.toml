@@ -186,6 +186,8 @@ layer = "J"
 layer = "A"
 [packages."harw-job"]
 layer = "J"
+[packages."harw-command"]
+layer = "J"
 
 # --- D: DoD domain (dod/crates/*) -----------------------------------------
 [packages."harw-dod"]
