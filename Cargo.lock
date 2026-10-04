@@ -2334,6 +2334,7 @@ dependencies = [
  "harw-core",
  "harw-dod-signals",
  "harw-extension-api",
+ "harw-macros",
  "harw-operations",
  "harw-research",
  "harw-test-support",
@@ -3331,6 +3332,7 @@ version = "0.9.1"
 dependencies = [
  "bytes",
  "fs4",
+ "harw-macros",
  "harw-types",
  "http-body-util",
  "hyper",
