@@ -1221,7 +1221,7 @@ mod operation_tests {
         assert!(
             error
                 .to_string()
-                .contains("requires `channel_subcommands = \\"...\\"`")
+                .contains(r#"requires `channel_subcommands = "..."`"#)
         );
         Ok(())
     }
