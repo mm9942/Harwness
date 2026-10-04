@@ -2363,6 +2363,8 @@ mod tests {
         ("exit", "deferred", ""),
         ("export", "deferred", ""),
         ("help", "immediate", ""),
+        // `/image <pfad>` merkt nur ein Bild vor, auch im laufenden Turn.
+        ("image", "immediate", ""),
         // Plan R9, Teil F: `/jobs` (lesen, stoppen) läuft sofort.
         ("jobs", "immediate", ""),
         (
