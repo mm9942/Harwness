@@ -27,6 +27,8 @@ harw-config = { path = "../harw-config" }
 harw-core = { path = "../harw-core" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-home = { path = "../harw-home" }
+# Images: the media store under `<home>/media` (`media.rs`).
+harw-media = { path = "../harw-media" }
 harw-protocol = { path = "../harw-protocol" }
 harw-provider-http = { path = "../harw-provider-http", optional = true }
 harw-runtime = { path = "../harw-runtime", default-features = false }

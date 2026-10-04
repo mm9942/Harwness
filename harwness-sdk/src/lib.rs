@@ -52,6 +52,7 @@ mod error;
 mod event;
 mod harwness;
 mod ids;
+mod media;
 mod session;
 mod tool;
 
@@ -71,6 +72,7 @@ pub use error::{Result, SdkError};
 pub use event::{EventSource, EventStream, FinishStatus, SdkEvent, ToolOutput, Usage};
 pub use harwness::Harwness;
 pub use ids::SessionId;
+pub use media::{Image, MAX_IMAGES_PER_MESSAGE};
 pub use session::{
     CancelHandle, MAX_RESUMES_PER_TURN, Message, Role, Session, TurnReport, TurnStatus,
 };
@@ -83,8 +85,8 @@ pub use serde_json;
 pub mod prelude {
     pub use crate::{
         ApprovalHandler, ApprovalPolicy, ApprovalRequest, AutoDeny, BoxFuture, ContextItem,
-        ContextSource, Decision, EventStream, FnTool, Harwness, HarwnessBuilder, Mode, SdkError,
-        SdkEvent, Session, SessionId, Tool, ToolContext, ToolError, TurnReport, TurnStatus,
-        approval_fn,
+        ContextSource, Decision, EventStream, FnTool, Harwness, HarwnessBuilder, Image, Mode,
+        SdkError, SdkEvent, Session, SessionId, Tool, ToolContext, ToolError, TurnReport,
+        TurnStatus, approval_fn,
     };
 }
