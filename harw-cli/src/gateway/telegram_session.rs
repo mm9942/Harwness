@@ -77,6 +77,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::telegram_attachments::{IngestReport, TelegramAttachmentIntake};
 use super::telegram_callbacks::TurnApprovalSink;
+use super::telegram_commands::operation_catalog;
+use super::telegram_commands::telegram_operations::{
+    OperationResolve, TelegramOperationInvocation,
+};
+use crate::op_bridge::{ChannelOpTarget, run_channel_operation};
 use crate::runtime_gateway::{GatewayEntry, channel_principal};
 
 /// Mindestabstand zwischen zwei Streaming-Aktualisierungen.
@@ -640,6 +645,23 @@ impl Engine {
             .map(|sender| PeerId::from_str(sender.id.clone()))
             .unwrap_or_else(|| event.peer.clone());
 
+        if let Some(text) = event.text.as_deref() {
+            match operation_catalog().resolve(text) {
+                OperationResolve::Invocation(invocation) => {
+                    self.process_operation(runtime, key, &event, target, invocation);
+                    return;
+                }
+                OperationResolve::Invalid(reply) => {
+                    // Normalerweise bereits vom Command-Handler beantwortet;
+                    // dieser Guard hält den Worker auch bei direkter Nutzung
+                    // der Session-Komponente fail-closed.
+                    self.notify(runtime, target, reply);
+                    return;
+                }
+                OperationResolve::NoMatch => {}
+            }
+        }
+
         let report = if event.attachments.is_empty() {
             None
         } else {
@@ -764,6 +786,115 @@ impl Engine {
         self.conclude(
             runtime, key, target, approver, session, turn_rx, stream, outcome,
         );
+    }
+
+    /// Direkter Human-Slash-Aufruf einer Registry-Operation.
+    ///
+    /// Er läuft synchron innerhalb **dieses** Scheduler-Jobs und bleibt damit
+    /// in derselben FIFO wie Chat-Turns desselben Topics. Der Command-Handler
+    /// hat nur die Alias-Auflösung zugelassen; Autorisierung, reduzierte
+    /// Channel-Grammatik und Sandbox werden hier beim echten Dispatch erneut
+    /// geprüft.
+    fn process_operation(
+        &self,
+        runtime: &Runtime,
+        key: &SessionKey,
+        event: &InboundEvent,
+        target: TurnTarget,
+        invocation: TelegramOperationInvocation,
+    ) {
+        let Some(sender) = event
+            .sender
+            .as_ref()
+            .filter(|sender| !sender.id.trim().is_empty())
+            .map(|sender| PeerId::from_str(sender.id.clone()))
+        else {
+            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram direct operation without sender identity dropped");
+            self.notify(
+                runtime,
+                target,
+                "Der Absender dieses Befehls konnte nicht verifiziert werden.".to_owned(),
+            );
+            return;
+        };
+        let session_id = match self.config.chat_state.session_id(key) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram operation session id unavailable");
+                self.notify(runtime, target, "Die Sitzung konnte nicht geladen werden.".to_owned());
+                return;
+            }
+        };
+        let workspace = match self.config.chat_state.get(key) {
+            Ok(state) => select_turn_workspace(
+                state.workspace_alias.as_deref(),
+                self.config.default_workspace_alias.as_deref(),
+                &key.tenant,
+                self.config.workspaces.as_ref(),
+            ),
+            Err(error) => {
+                tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram operation chat state could not be read");
+                self.notify(runtime, target, "Der Chat-Zustand konnte nicht gelesen werden.".to_owned());
+                return;
+            }
+        };
+        let root = match workspace {
+            TurnWorkspace::Bound(root) => root,
+            TurnWorkspace::None => {
+                self.notify(
+                    runtime,
+                    target,
+                    "Kein Arbeitsbereich gewählt. Wähle zuerst /workspace <alias>.".to_owned(),
+                );
+                return;
+            }
+            TurnWorkspace::Unresolved(alias) => {
+                tracing::warn!(channel = %key.channel, peer = %key.peer, alias = %alias, "Telegram operation workspace does not resolve");
+                self.notify(
+                    runtime,
+                    target,
+                    "Der gewählte Arbeitsbereich ist nicht mehr verfügbar. Wähle ihn mit /workspace neu."
+                        .to_owned(),
+                );
+                return;
+            }
+        };
+        let state_store: Arc<dyn StateStore> = Arc::new(super::build_telegram_state_store(
+            &self.config.transcript_root,
+        ));
+        let command = invocation.canonical_path.clone();
+        match run_channel_operation(
+            runtime,
+            ChannelOpTarget {
+                home: &self.config.home,
+                cwd: &root,
+                binding_id: key.channel.as_str(),
+                sender: &sender,
+                session_id,
+                state_store,
+            },
+            &command,
+            invocation.args,
+        ) {
+            Ok(output) => {
+                let text = if output.text.trim().is_empty() {
+                    "(Befehl ohne Textausgabe abgeschlossen)".to_owned()
+                } else {
+                    output.text
+                };
+                self.notify(runtime, target, text);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    channel = %key.channel,
+                    peer = %key.peer,
+                    command = %command,
+                    detail = %error.detail(),
+                    "Telegram direct operation failed"
+                );
+                self.notify(runtime, target, error.user_message().to_owned());
+            }
+        }
     }
 
     /// Baut die Wurzelsitzung eines Turns mit Arbeitsbereich über eine

@@ -1134,6 +1134,14 @@ pub trait Operation: Send + Sync {
         &[]
     }
 
+    /// Unterbefehle, die eine `ChannelReduced`-Command-Fläche remote ausführen darf.
+    ///
+    /// `"-"` bezeichnet die bare Form ohne Argumente, `"*"` jede
+    /// Argumentform. Der Default ist leer und damit fail-closed.
+    fn channel_subcommands(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Busy-Klasse eines konkreten Aufrufs.
     ///
     /// # Argumente

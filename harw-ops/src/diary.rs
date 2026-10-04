@@ -107,6 +107,7 @@ impl harw_operations::FromRawArgs for DiaryArgs {
     command(
         path = "/diary",
         visibility = "channel_reduced",
+        channel_subcommands = "-,show,today,search,note,agents",
         busy_subcommands = "-=immediate, show=immediate, today=immediate, search=immediate, agents=immediate"
     )
 )]

@@ -690,6 +690,7 @@ fn run_proposal_action(
     command(
         path = "/skills",
         visibility = "channel_reduced",
+        channel_subcommands = "-,list,show",
         busy_subcommands = "-=immediate, list=immediate, show=immediate"
     )
 )]

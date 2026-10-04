@@ -137,6 +137,7 @@ impl harw_operations::FromRawArgs for DreamArgs {
     command(
         path = "/dream",
         visibility = "channel_reduced",
+        channel_subcommands = "-,list,show,status,review",
         busy_subcommands = "-=immediate, list=immediate, show=immediate, status=immediate"
     )
 )]
