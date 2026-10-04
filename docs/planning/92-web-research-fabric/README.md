@@ -75,7 +75,8 @@ Nur Pfad C ist breit und nicht blockierend für die UIA. Er hat die drei Schwäc
 
 - `harw-tool-web/src/lib.rs` beschreibt drei Tools; es sind vier (`web.search` fehlt in der Tabelle), dazu `open_web`.
 - `harw-registry-defaults/src/research_web.rs` (Moduldoku) sagt, `WebToolProvider` habe noch keinen Konstruktor mit Policy („Folgearbeit W6“); `harw_tool_web::configure` und `install_web_tools` existieren.
-- Es gibt **keine** Anwenderdoku für `[network].research_web`, `[network].researcher_web_hosts`, `[web.search]`, `[research]`. `docs/setup/web.md` beschreibt die Kontrollfläche `harw web` und nicht die Web-Recherche (Namensverwechslung).
+- Es gibt **keine** Anwenderdoku für `[network].research_web`, `[network].researcher_web_hosts`, `[web.search]`, `[research]`. `docs/setup/web.md` beschreibt die Kontrollfläche `harw web` und nicht die Web-Recherche (Namensverwechslung). Eine Anwenderdoku liegt als Entwurf in PR #115 (`docs/setup/research-web.md`).
+- `research.fetch_timeout_secs` wird geparst, validiert und nach den Regeln für eingeschränkte Layer gemergt, aber **kein** Code außerhalb von `harw-config` liest es; `web.fetch` und `web.search` nutzen die festen Konstanten (20 s je Anfrage, 45 s Gesamtfrist). `cache_ttl_secs` und `max_fetch_bytes` dagegen sind verdrahtet (`install_web_tools`). Eine wirkungslose Konfigurationsoption ist gefährlicher als eine fehlende, weil sie Sicherheit vortäuscht; P1 muss sie entweder anschließen (die Fabric übernimmt die Fristen) oder entfernen.
 
 ### 2.4 Was ich unter „Exports“ verstanden habe
 
