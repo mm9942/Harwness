@@ -45,7 +45,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::{ContextProvider, ExtFuture, ToolProvider};
+use harw_extension_api::contributors::{ContextProvider, ExtFuture};
 use harw_extension_api::types::{ContextFragment, TurnInputContext};
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
@@ -105,16 +105,6 @@ impl std::fmt::Debug for WorkbenchToolProvider {
 }
 
 impl WorkbenchToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[WORKBENCH_NOTE, WORKBENCH_HYPOTHESIS];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`]
-    /// (siehe Moduldoku „read-only-safe").
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider über dem Speicher der Montage.
     ///
     /// # Argumente
@@ -139,22 +129,29 @@ impl WorkbenchToolProvider {
     }
 }
 
-impl ToolProvider for WorkbenchToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![note_spec(), hypothesis_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            WORKBENCH_NOTE => WorkbenchTool::Note,
-            WORKBENCH_HYPOTHESIS => WorkbenchTool::Hypothesis,
-            _ => return None,
-        };
-        Some(Arc::new(WorkbenchExecutor {
-            store: Arc::clone(&self.store),
-            tool,
-            notifier: self.notifier.clone(),
-        }))
+// Notiz und Hypothese schreiben nur harness-eigene Workbench-Dateien
+// (`ReadWorkspace`, siehe Moduldoku „read-only-safe"); kein Werkzeug ist
+// parallelsicher (Standard `none`).
+harw_tools::tool_provider! {
+    impl for WorkbenchToolProvider as provider {
+        WORKBENCH_NOTE => {
+            spec: note_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: WorkbenchExecutor {
+                store: Arc::clone(&provider.store),
+                tool: WorkbenchTool::Note,
+                notifier: provider.notifier.clone(),
+            },
+        },
+        WORKBENCH_HYPOTHESIS => {
+            spec: hypothesis_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: WorkbenchExecutor {
+                store: Arc::clone(&provider.store),
+                tool: WorkbenchTool::Hypothesis,
+                notifier: provider.notifier.clone(),
+            },
+        },
     }
 }
 
@@ -379,12 +376,6 @@ pub struct WorkbenchReadToolProvider {
 }
 
 impl WorkbenchReadToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[WORKBENCH_SHOW];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[Some(Permission::ReadWorkspace)];
-
     /// Baut den Provider; ohne [`Self::with_project`] kennt er nur die Sitzung.
     #[must_use]
     pub fn new(store: Arc<KnowledgeStore>) -> Self {
@@ -404,22 +395,17 @@ impl WorkbenchReadToolProvider {
     }
 }
 
-impl ToolProvider for WorkbenchReadToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![show_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == WORKBENCH_SHOW).then(|| {
-            Arc::new(WorkbenchShowExecutor {
-                store: Arc::clone(&self.store),
-                project: self.project.clone(),
-            }) as Arc<dyn ToolExecutor>
-        })
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        name.as_str() == WORKBENCH_SHOW
+// `workbench.show` liest nur (`ReadWorkspace`) und ist parallelsicher.
+harw_tools::tool_provider! {
+    impl for WorkbenchReadToolProvider as provider, parallel_safe: all {
+        WORKBENCH_SHOW => {
+            spec: show_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: WorkbenchShowExecutor {
+                store: Arc::clone(&provider.store),
+                project: provider.project.clone(),
+            },
+        },
     }
 }
 
@@ -592,6 +578,7 @@ fn workbench_context_fragment(store: &KnowledgeStore, session_id: &str) -> Optio
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
 
     fn temporary_store(label: &str) -> TestResult<Arc<KnowledgeStore>> {
         let nonce = std::time::SystemTime::now()

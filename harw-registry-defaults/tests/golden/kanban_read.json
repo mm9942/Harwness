@@ -1,0 +1,99 @@
+{
+  "has_executor": {
+    "kanban.list": true,
+    "kanban.show": true
+  },
+  "parallel_safe": {
+    "kanban.list": true,
+    "kanban.show": true
+  },
+  "permissions": [
+    "Some(ReadWorkspace)",
+    "Some(ReadWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Liest ein Kanban-Board (nur lesend): vorhandene Boards, Spalten (Status- und Worker-Lanes mit Rolle) und Karten mit Zustand. Höchstens 100 Karten und 8 KiB. Details einer Karte liefert kanban.show. Kanban nur benutzen, wenn die Nutzerin ausdrücklich darum bittet (Board ansehen, Karte anlegen, Worker starten) – nie von selbst Aufgaben aufs Board legen oder daraus ableiten.",
+      "name": "kanban.list",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "board": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Board-Id; ohne Angabe \"default\"."
+          },
+          "include_archived": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Auch archivierte Karten zeigen (Vorgabe: nein)."
+          },
+          "lane": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Nur Karten dieser Lane (z. B. \"todo\" oder \"worker/explorer\")."
+          }
+        },
+        "required": [
+          "board",
+          "include_archived",
+          "lane"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Liest eine Kanban-Karte (nur lesend): Titel, Text, Zustand, Belege, letzte Kommentare, Verlauf und Ergebnis des letzten Worker-Laufs. Gekürzt auf 8 KiB. Kanban nur benutzen, wenn die Nutzerin ausdrücklich darum bittet (Board ansehen, Karte anlegen, Worker starten) – nie von selbst Aufgaben aufs Board legen oder daraus ableiten.",
+      "name": "kanban.show",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "board": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Board-Id; ohne Angabe \"default\"."
+          },
+          "card": {
+            "description": "Karten-Id, z. B. \"card-3\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "board",
+          "card"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

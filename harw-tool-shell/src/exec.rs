@@ -60,7 +60,6 @@ use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPe
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_authority::{Permission, SandboxSpec};
 use harw_extension_api::approval_mode::ApprovalModeCell;
-use harw_extension_api::contributors::ToolProvider;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
     ProcessEnvironment, ProcessPermitLedger, ProcessPermitRequest, SandboxProfile,
@@ -1826,97 +1825,32 @@ pub const SHELL_EXEC_DESCRIPTION: &str = "Execute a shell command inside the iso
     (network, path outside, missing tool, namespace), you may retry with \
     request_host {reason} to ask the user for Host-Mode.";
 
-impl ToolProvider for ShellToolProvider {
-    /// Returns the single tool specification for `shell.exec`.
-    ///
-    /// # Description
-    /// Constructs a [`ToolSpec::Function`] with the JSON schema, description, and
-    /// `strict = true` so the model cannot inject extra fields.
-    ///
-    /// # Returns
-    /// A one-element `Vec<ToolSpec>`.
-    ///
-    /// # Concurrency
-    /// Safe to call from multiple threads.
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// use harw_tool_shell::ShellToolProvider;
-    /// use harw_extension_api::contributors::ToolProvider;
-    ///
-    /// let specs = ShellToolProvider::new().tools();
-    /// assert_eq!(specs.len(), 1);
-    /// assert_eq!(specs[0].name(), "shell.exec");
-    /// ```
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::Function(FunctionToolSpec {
-            name: ToolName::new(TOOL_NAME),
-            description: SHELL_EXEC_DESCRIPTION.to_owned(),
-            parameters: Self::parameter_schema(),
-            strict: true,
-        })]
-    }
-
-    /// Returns a [`ShellExecutor`] for `shell.exec`, or `None` for any other name.
-    ///
-    /// # Description
-    /// Constructs an executor carrying the provider's timeout and output-cap configuration.
-    /// Each call allocates a new `Arc<ShellExecutor>`; the executor itself is stateless.
-    ///
-    /// # Arguments
-    /// - `name` (`&ToolName`): the requested tool name.
-    ///
-    /// # Returns
-    /// `Some(Arc<ShellExecutor>)` when `name == "shell.exec"`, `None` otherwise.
-    ///
-    /// # Concurrency
-    /// Safe to call from multiple threads.
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// use harw_tool_shell::ShellToolProvider;
-    /// use harw_extension_api::contributors::ToolProvider;
-    /// use harw_tools::spec::ToolName;
-    ///
-    /// let provider = ShellToolProvider::new();
-    /// assert!(provider.executor(&ToolName::new("shell.exec")).is_some());
-    /// assert!(provider.executor(&ToolName::new("other")).is_none());
-    /// ```
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        if name.as_str() == TOOL_NAME {
-            // Runde 5, Teil N: jeder Executor ist umhüllt — ohne
-            // `request_host` verhält er sich wie bisher (plus Sandbox-Hinweis).
-            Some(Arc::new(escalation::EscalatingShellExecutor::new(
-                self.build_executor(),
-                self.host_escalation.clone(),
-                self.timeout_policy(),
-            )))
-        } else {
-            None
+// `shell.exec` ist das einzige Werkzeug. Spezifikation, Name und Executor
+// stammen aus den Konfigurationsfeldern des Providers; `tool_provider!` erzeugt
+// daraus `impl ToolProvider`, `TOOL_NAMES`/`TOOL_PERMISSIONS` und die
+// Compile-Zeit-Prüfung doppelter Namen.
+//
+// - Spezifikation: `strict = true`, damit das Modell keine Zusatzfelder
+//   einschleusen kann.
+// - Executor: Runde 5, Teil N — jeder Executor ist umhüllt; ohne
+//   `request_host` verhält er sich wie bisher (plus Sandbox-Hinweis).
+// - `parallel_safe: none` — Shell-Seiteneffekte (Dateisystem, Umgebung,
+//   Prozesstabelle) gelten als nicht kommutativ; Aufrufer serialisieren.
+harw_tools::tool_provider! {
+    impl for ShellToolProvider as provider, parallel_safe: none {
+        TOOL_NAME => {
+            spec: ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new(TOOL_NAME),
+                description: SHELL_EXEC_DESCRIPTION.to_owned(),
+                parameters: ShellToolProvider::parameter_schema(),
+                strict: true,
+            }),
+            executor: escalation::EscalatingShellExecutor::new(
+                provider.build_executor(),
+                provider.host_escalation.clone(),
+                provider.timeout_policy(),
+            ),
         }
-    }
-
-    /// Returns `false` — shell side-effects are presumed non-commutative.
-    ///
-    /// # Description
-    /// Shell commands modify filesystem state, environment variables, and process
-    /// tables. Running them in parallel without coordination risks data races.
-    /// Callers must serialize `shell.exec` invocations.
-    ///
-    /// # Returns
-    /// Always `false`.
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// use harw_tool_shell::ShellToolProvider;
-    /// use harw_extension_api::contributors::ToolProvider;
-    /// use harw_tools::spec::ToolName;
-    ///
-    /// let provider = ShellToolProvider::new();
-    /// assert!(!provider.parallel_safe(&ToolName::new("shell.exec")));
-    /// ```
-    fn parallel_safe(&self, _name: &ToolName) -> bool {
-        false
     }
 }
 
@@ -1929,6 +1863,7 @@ mod tests {
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
+    use harw_extension_api::contributors::ToolProvider;
     use harw_tools::{ToolCall, ToolExecutionContext};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;

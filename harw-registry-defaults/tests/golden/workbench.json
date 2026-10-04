@@ -1,0 +1,66 @@
+{
+  "has_executor": {
+    "workbench.hypothesis": true,
+    "workbench.note": true
+  },
+  "parallel_safe": {
+    "workbench.hypothesis": false,
+    "workbench.note": false
+  },
+  "permissions": [
+    "Some(ReadWorkspace)",
+    "Some(ReadWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Hängt eine Notiz an die Workbench DIESER Sitzung an (NOTES.md): Zwischenstände, Beobachtungen, nächste Schritte. Flüchtig per Design, wird nicht ins Gedächtnis übernommen. Ändert keine Workspace-Datei.",
+      "name": "workbench.note",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "description": "Notiztext (Markdown, höchstens 16 KiB).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Pflegt die Hypothesenliste der Workbench DIESER Sitzung (hypotheses.md): offene Vermutungen festhalten und später bestätigen oder verwerfen. Eine entschiedene Hypothese kann nicht erneut entschieden werden.",
+      "name": "workbench.hypothesis",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "\"add\" legt eine offene Hypothese an; \"confirm\"/\"reject\" entscheidet eine offene.",
+            "enum": [
+              "add",
+              "confirm",
+              "reject"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "Bei add: der einzeilige Hypothesentext. Bei confirm/reject: exakt der Hypothesentext oder ihre Nummer als \"#<n>\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "text"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}
