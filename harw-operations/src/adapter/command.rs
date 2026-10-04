@@ -501,6 +501,10 @@ mod tests {
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
             Box::pin(async { Ok(OpOutput::from("two".to_owned())) })
         }
+
+        fn channel_subcommands(&self) -> &'static [&'static str] {
+            &["-", "show"]
+        }
     }
 
     /// Op mit gemischten Surfaces: ein Command und ein ModelTool.
@@ -657,6 +661,31 @@ mod tests {
             "Nur der Command-Eintrag soll einen Adapter erzeugen; ModelTool wird ignoriert"
         );
         assert_eq!(adapters[0].path(), "/mixed");
+    }
+
+    // ── channel policy tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_channel_policy_tui_only_is_always_rejected() {
+        let adapters = CommandAdapter::from_operation(Arc::new(TwoCommandOp));
+        assert!(!adapters[0].allows_channel_invocation(&[]));
+        assert!(!adapters[0].allows_channel_invocation(&["show".to_owned()]));
+    }
+
+    #[test]
+    fn test_channel_policy_parity_accepts_arbitrary_args() {
+        let adapters = CommandAdapter::from_operation(Arc::new(MixedSurfaceOp));
+        assert!(adapters[0].allows_channel_invocation(&[]));
+        assert!(adapters[0].allows_channel_invocation(&["anything".to_owned()]));
+    }
+
+    #[test]
+    fn test_channel_policy_reduced_is_fail_closed_to_declared_subcommands() {
+        let adapters = CommandAdapter::from_operation(Arc::new(TwoCommandOp));
+        let reduced = &adapters[1];
+        assert!(reduced.allows_channel_invocation(&[]));
+        assert!(reduced.allows_channel_invocation(&["show".to_owned()]));
+        assert!(!reduced.allows_channel_invocation(&["run".to_owned()]));
     }
 
     // ── dispatch tests ────────────────────────────────────────────────────────
