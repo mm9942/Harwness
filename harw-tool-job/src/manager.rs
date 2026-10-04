@@ -59,7 +59,7 @@ use std::io::{self, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -495,6 +495,24 @@ pub struct JobManager {
     notifier: Arc<dyn JobNotifier>,
     jobs: Mutex<BTreeMap<JobId, Arc<JobEntry>>>,
     counter: AtomicU64,
+    // Reservierte, noch nicht in `jobs` eingetragene Starts (siehe
+    // `reserve_slot`): zusammen mit den laufenden Jobs die belegte Kapazität.
+    starting: AtomicUsize,
+}
+
+/// Ein reservierter Startplatz von [`JobManager::reserve_slot`].
+///
+/// Gibt den Platz beim Drop frei. Der erfolgreiche Start lässt ihn erst
+/// fallen, nachdem der Job in `jobs` steht und solange dessen Sperre noch
+/// gehalten wird; so zählt ihn kein gleichzeitiger Start doppelt.
+struct StartSlot<'a> {
+    starting: &'a AtomicUsize,
+}
+
+impl Drop for StartSlot<'_> {
+    fn drop(&mut self) {
+        self.starting.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl fmt::Debug for JobManager {
@@ -525,6 +543,7 @@ impl JobManager {
             notifier,
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
+            starting: AtomicUsize::new(0),
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -624,8 +643,11 @@ impl JobManager {
     /// Zahl der Jobs, die diese Sitzung gerade beaufsichtigt.
     #[must_use]
     pub fn running_count(&self) -> usize {
-        lock(&self.jobs)
-            .values()
+        Self::count_running(&lock(&self.jobs))
+    }
+
+    fn count_running(jobs: &BTreeMap<JobId, Arc<JobEntry>>) -> usize {
+        jobs.values()
             .filter(|entry| {
                 let state = lock(&entry.state);
                 state.monitored && !state.meta.state.is_terminal()
@@ -635,14 +657,41 @@ impl JobManager {
 
     /// Prüft vorab, ob noch ein Job starten darf (vor einer Host-Freigabe).
     ///
+    /// Nur eine Frühprüfung für eine schnelle, freundliche Ablehnung: zwischen
+    /// ihr und dem Start kann ein anderer Aufrufer den Platz belegen. Verbindlich
+    /// entscheidet erst der Start selbst ([`JobManager::start`] und die
+    /// Varianten reservieren den Platz atomar).
+    ///
     /// # Errors
     /// [`JobError::Capacity`].
     pub fn check_capacity(&self) -> Result<(), JobError> {
         let max = self.config.max_running_jobs;
-        if self.running_count() >= max {
+        let occupied = {
+            let jobs = lock(&self.jobs);
+            Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst)
+        };
+        if occupied >= max {
             return Err(JobError::Capacity { max });
         }
         Ok(())
+    }
+
+    /// Belegt atomar einen Startplatz oder lehnt mit [`JobError::Capacity`] ab.
+    ///
+    /// Zählen und Reservieren geschehen unter derselben Sperre, die auch das
+    /// Eintragen des Jobs nimmt. Ohne die Reservierung sähen gleichzeitige
+    /// Starts alle noch freie Kapazität (der Job steht erst nach `spawn` in
+    /// `jobs`) und überschritten die Obergrenze, auch bei `max_running = 1`.
+    fn reserve_slot(&self) -> Result<StartSlot<'_>, JobError> {
+        let max = self.config.max_running_jobs;
+        let jobs = lock(&self.jobs);
+        if Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst) >= max {
+            return Err(JobError::Capacity { max });
+        }
+        self.starting.fetch_add(1, Ordering::SeqCst);
+        Ok(StartSlot {
+            starting: &self.starting,
+        })
     }
 
     fn allocate(&self) -> Result<(JobId, PathBuf), JobError> {
@@ -716,7 +765,7 @@ impl JobManager {
         warnings: Vec<String>,
         origin: JobOrigin,
     ) -> Result<JobStatus, JobError> {
-        self.check_capacity()?;
+        let slot = self.reserve_slot()?;
         let (id, dir) = self.allocate()?;
         let stdout = create_log(&dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?;
         let stderr = create_log(&dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
@@ -780,7 +829,12 @@ impl JobManager {
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
         entry.persist();
-        lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
+        {
+            let mut jobs = lock(&self.jobs);
+            jobs.insert(id.clone(), Arc::clone(&entry));
+            // Erst jetzt, mit gehaltener Sperre: der Job zählt als laufend.
+            drop(slot);
+        }
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "job started");
 
         self.notifier.notify(JobNotification {
@@ -857,7 +911,7 @@ impl JobManager {
         prepared: PreparedJob,
         max_line_bytes: usize,
     ) -> Result<PipedJob, JobError> {
-        self.check_capacity()?;
+        let slot = self.reserve_slot()?;
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
         let stdout_log = create_log(&stdout_log_path).map_err(io_err("create stdout.log"))?;
@@ -927,7 +981,12 @@ impl JobManager {
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
         entry.persist();
-        lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
+        {
+            let mut jobs = lock(&self.jobs);
+            jobs.insert(id.clone(), Arc::clone(&entry));
+            // Erst jetzt, mit gehaltener Sperre: der Job zählt als laufend.
+            drop(slot);
+        }
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "piped job started");
 
         self.notifier.notify(JobNotification {

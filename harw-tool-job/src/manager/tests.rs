@@ -1403,3 +1403,87 @@ fn test_milestone_key_buckets() {
         milestone_key(&snapshot(None, "finished dev"))
     );
 }
+
+/// Gleichzeitige Starts (mit und ohne Pipes) teilen sich die Obergrenze: der
+/// Platz wird atomar reserviert, bevor der Job in `jobs` steht.
+#[tokio::test]
+async fn test_concurrent_starts_never_exceed_max_running() -> TestResult {
+    const STARTERS: usize = 8;
+    let env = Env::with_config(|config| JobManagerConfig {
+        max_running_jobs: 1,
+        ..config
+    })?;
+    let mut prepared = Vec::new();
+    for n in 0..STARTERS {
+        prepared.push(if n % 2 == 0 {
+            env.prepare("sleep 30").await?
+        } else {
+            env.prepare_piped(&["sleep", "30"]).await?
+        });
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(STARTERS));
+    let mut handles = Vec::new();
+    for (n, job) in prepared.into_iter().enumerate() {
+        let manager = Arc::clone(&env.manager);
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            let name = format!("job-{n}");
+            if n % 2 == 0 {
+                manager
+                    .start(request(&name, "agent-a", &[]), job)
+                    .map(|_| None)
+            } else {
+                manager
+                    .start_piped(request(&name, "agent-a", &[]), job)
+                    .map(Some)
+            }
+        }));
+    }
+    let mut started = 0;
+    let mut rejected = 0;
+    let mut piped = Vec::new();
+    for handle in handles {
+        match handle.await.map_err(ctx("join"))? {
+            Ok(job) => {
+                started += 1;
+                piped.extend(job);
+            }
+            Err(JobError::Capacity { max: 1 }) => rejected += 1,
+            Err(other) => return Err(TestError::Unexpected(format!("unexpected: {other}"))),
+        }
+    }
+    assert_eq!(started, 1, "exactly one start may win max_running = 1");
+    assert_eq!(rejected, STARTERS - 1);
+    assert_eq!(env.manager.running_count(), 1);
+    drop(piped);
+    env.manager.stop_all().await;
+    Ok(())
+}
+
+/// Ein gescheiterter Start gibt seinen reservierten Platz wieder frei.
+#[tokio::test]
+async fn test_failed_launch_releases_its_slot() -> TestResult {
+    let env = Env::with_config(|config| JobManagerConfig {
+        max_running_jobs: 1,
+        ..config
+    })?;
+    let mut command = tokio::process::Command::new("/nonexistent/harw-job-binary");
+    command.stdin(Stdio::null());
+    let broken = PreparedJob {
+        command,
+        executed_on_host: true,
+    };
+    assert!(matches!(
+        env.manager.start(request("broken", "agent-a", &[]), broken),
+        Err(JobError::Spawn(_))
+    ));
+    // Der Fehlstart belegt nichts: der nächste Start geht durch.
+    let next = env.prepare("sleep 30").await?;
+    env.manager
+        .start(request("next", "agent-a", &[]), next)
+        .map_err(ctx("start after failed launch"))?;
+    assert_eq!(env.manager.running_count(), 1);
+    env.manager.stop_all().await;
+    Ok(())
+}
