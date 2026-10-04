@@ -4,7 +4,7 @@
 //! set as JSON `null`; a *present* `null` for `EffectiveCaps`/`CapAdd` is an
 //! empty set, an *absent* key is not reported.
 
-use harw_tool_container::InspectFacts;
+use harw_tool_container::{InspectFacts, ObservedMount};
 use serde_json::Value;
 
 /// Parses the output of `podman inspect <container>` (an array with one
@@ -24,6 +24,7 @@ pub fn parse_inspect(text: &str) -> Result<InspectFacts, String> {
     let host_field = |key: &str| host.and_then(|h| h.get(key));
 
     Ok(InspectFacts {
+        id: object.get("Id").and_then(Value::as_str).map(str::to_owned),
         privileged: host_field("Privileged").and_then(Value::as_bool),
         cap_add: string_list(host_field("CapAdd"), true),
         cap_drop: string_list(host_field("CapDrop"), true),
@@ -36,7 +37,12 @@ pub fn parse_inspect(text: &str) -> Result<InspectFacts, String> {
         memory_bytes: host_field("Memory").and_then(Value::as_i64),
         memory_swap_bytes: host_field("MemorySwap").and_then(Value::as_i64),
         pids_limit: host_field("PidsLimit").and_then(Value::as_i64),
-        workspace_read_only: workspace_read_only(object),
+        mounts: observed_mounts(object),
+        timeout_s: object
+            .get("Config")
+            .and_then(|config| config.get("Timeout"))
+            .and_then(Value::as_u64)
+            .and_then(|seconds| u32::try_from(seconds).ok()),
     })
 }
 
@@ -54,13 +60,27 @@ fn string_list(value: Option<&Value>, null_is_empty: bool) -> Option<Vec<String>
     }
 }
 
-/// `Some(true)` when the `/workspace` mount exists and is not writable.
-fn workspace_read_only(object: &Value) -> Option<bool> {
-    let mounts = object.get("Mounts")?.as_array()?;
-    let mount = mounts
+/// Every mount the engine reports; `None` when the key is absent, an empty
+/// list when it is `null` or `[]` (the engine says there are none).
+fn observed_mounts(object: &Value) -> Option<Vec<ObservedMount>> {
+    let mounts = match object.get("Mounts")? {
+        Value::Null => return Some(Vec::new()),
+        Value::Array(items) => items,
+        _ => return None,
+    };
+    let text = |m: &Value, key: &str| m.get(key).and_then(Value::as_str).map(str::to_owned);
+    mounts
         .iter()
-        .find(|m| m.get("Destination").and_then(Value::as_str) == Some("/workspace"))?;
-    mount.get("RW").and_then(Value::as_bool).map(|rw| !rw)
+        .map(|m| {
+            Some(ObservedMount {
+                kind: text(m, "Type")?,
+                name: text(m, "Name"),
+                source: text(m, "Source"),
+                destination: text(m, "Destination")?,
+                rw: m.get("RW").and_then(Value::as_bool)?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -75,7 +95,9 @@ mod tests {
             "SecurityOpt": ["no-new-privileges"],
             "Memory": 1073741824, "MemorySwap": 1073741824, "PidsLimit": 256
         },
-        "Mounts": [{"Destination": "/workspace", "RW": false}]
+        "Id": "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12",
+        "Config": {"Timeout": 30},
+        "Mounts": [{"Type": "bind", "Source": "/w", "Destination": "/workspace", "RW": false}]
     }]"#;
 
     #[test]
@@ -92,22 +114,25 @@ mod tests {
         assert_eq!(facts.read_only_rootfs, Some(true));
         assert_eq!(facts.memory_bytes, Some(1_073_741_824));
         assert_eq!(facts.pids_limit, Some(256));
-        assert_eq!(facts.workspace_read_only, Some(true));
+        assert_eq!(facts.id.as_deref().map(str::len), Some(64));
+        assert_eq!(facts.timeout_s, Some(30));
+        let mounts = facts.mounts.unwrap_or_default();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].destination, "/workspace");
+        assert!(!mounts[0].rw);
     }
 
     #[test]
     fn absent_keys_stay_unreported() {
         let facts = parse_inspect(r#"[{"HostConfig": {}}]"#).unwrap_or_default();
         assert_eq!(facts, InspectFacts::default(), "nothing invented");
-        let writable =
-            parse_inspect(r#"[{"Mounts": [{"Destination": "/workspace", "RW": true}]}]"#)
-                .unwrap_or_default();
-        assert_eq!(writable.workspace_read_only, Some(false));
-        let other = parse_inspect(r#"[{"Mounts": [{"Destination": "/x", "RW": false}]}]"#)
-            .unwrap_or_default();
+        // `null` is "none", an incomplete mount makes the whole list unreported.
+        let none = parse_inspect(r#"[{"Mounts": null}]"#).unwrap_or_default();
+        assert_eq!(none.mounts, Some(Vec::new()));
+        let partial = parse_inspect(r#"[{"Mounts": [{"Destination": "/x"}]}]"#).unwrap_or_default();
         assert_eq!(
-            other.workspace_read_only, None,
-            "no /workspace mount reported"
+            partial.mounts, None,
+            "a mount without type or RW is not evidence"
         );
     }
 

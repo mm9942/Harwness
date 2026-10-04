@@ -1,11 +1,12 @@
-//! Running one [`ContainerPlan`]: spawn, runtime read-back, bounded output.
+//! Running one [`ContainerPlan`]: `create`, read back, verify, only then
+//! `start`; bounded output.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use harw_tool_container::{ContainerPlan, Enforcement, InspectFacts, Readback, verify};
+use harw_tool_container::{ContainerId, ContainerPlan, Readback, Stage, StartRefusal};
 use harw_types::cancel::CancelToken;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -15,12 +16,8 @@ use crate::inspect::parse_inspect;
 /// Largest captured size of stdout and of stderr in bytes; more is drained and
 /// dropped (`truncated`).
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
-/// How long the first successful inspect is awaited.
-const INSPECT_WINDOW: Duration = Duration::from_secs(8);
-/// Pause between inspect attempts.
-const INSPECT_PAUSE: Duration = Duration::from_millis(100);
-/// Time one engine helper command (inspect, kill) may take.
-const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time one engine helper command (`create`, `inspect`, `rm`) may take.
+const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long pipe readers are awaited after a kill.
 const READER_GRACE_AFTER_KILL: Duration = Duration::from_secs(2);
 /// Extra wall time beyond the plan's timeout before the container is killed.
@@ -48,8 +45,8 @@ pub struct RunOutput {
 pub struct EngineRun {
     /// Process result.
     pub output: RunOutput,
-    /// Runtime read-back; `None` when the container ended before the first
-    /// inspect (nothing could be verified).
+    /// The read-back the container passed **before** it was started (always
+    /// present: a container that could not be verified never runs).
     pub readback: Option<Readback>,
 }
 
@@ -58,9 +55,13 @@ pub struct EngineRun {
 pub enum EngineError {
     /// The engine process could not be started.
     Spawn(String),
-    /// The read-back reported a violation; the container was killed. The list
-    /// names the dimensions that were not enforced.
+    /// The read-back did not prove every restriction; the container was
+    /// removed without ever running. The list names the dimensions that were
+    /// not enforced or could not be verified.
     NotEnforced(Vec<String>),
+    /// The engine could not create or read back the container, or a bind
+    /// source changed; nothing ran.
+    Unverified(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -69,9 +70,15 @@ impl std::fmt::Display for EngineError {
             Self::Spawn(reason) => write!(f, "could not start the container engine: {reason}"),
             Self::NotEnforced(dimensions) => write!(
                 f,
-                "the engine did not enforce the requested isolation ({}); the container was killed",
+                "the engine did not prove the requested isolation ({}); the container was removed without running",
                 dimensions.join(", ")
             ),
+            Self::Unverified(reason) => {
+                write!(
+                    f,
+                    "the container could not be verified, nothing ran: {reason}"
+                )
+            }
         }
     }
 }
@@ -107,53 +114,50 @@ impl PodmanEngine {
     }
 
     /// Extra wall time beyond the plan's timeout before the container is
-    /// killed (tests shorten it).
+    /// removed (tests shorten it).
     #[must_use]
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
         self
     }
 
-    /// `podman [--connection=X] <verb> <args…>` with the plan's connection.
-    fn helper(&self, plan: &ContainerPlan, verb: &str, extra: &[&str]) -> Command {
-        let mut command = Command::new(plan.executable());
-        if let Some(connection) = plan
-            .args()
-            .first()
-            .filter(|arg| arg.starts_with("--connection="))
-        {
-            command.arg(connection);
-        }
-        command.arg(verb);
-        command.args(extra);
-        command.env_clear();
-        command.envs(self.env.iter().map(|(k, v)| (k, v)));
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::null());
+    /// The command of one lifecycle stage: argument vector and environment
+    /// come from the plan (the environment is rebuilt from an allowlist, our
+    /// `env` only supplies the values).
+    fn command(&self, plan: &ContainerPlan, stage: Stage<'_>) -> Result<Command, EngineError> {
+        let lookup = |name: &str| {
+            self.env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let command = plan
+            .to_command(stage, &lookup)
+            .map_err(|error| EngineError::Unverified(error.to_string()))?;
+        let mut command = Command::from(command);
         command.kill_on_drop(true);
-        command
+        Ok(command)
     }
 
-    async fn inspect(&self, plan: &ContainerPlan) -> Option<InspectFacts> {
-        let mut command = self.helper(
-            plan,
-            "inspect",
-            &["--type=container", plan.container_name()],
-        );
-        let output = tokio::time::timeout(HELPER_TIMEOUT, command.output())
+    /// Runs a short stage to completion with captured output.
+    async fn short(
+        &self,
+        plan: &ContainerPlan,
+        stage: Stage<'_>,
+    ) -> Result<std::process::Output, EngineError> {
+        let mut command = self.command(plan, stage)?;
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let child = spawn_with_retry(&mut command).await?;
+        tokio::time::timeout(HELPER_TIMEOUT, child.wait_with_output())
             .await
-            .ok()?
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_inspect(&String::from_utf8_lossy(&output.stdout)).ok()
+            .map_err(|_| EngineError::Unverified("the engine did not answer in time".to_owned()))?
+            .map_err(|error| EngineError::Spawn(error.to_string()))
     }
 
-    async fn kill(&self, plan: &ContainerPlan) {
-        let mut command = self.helper(plan, "kill", &[plan.container_name()]);
-        let _ = tokio::time::timeout(HELPER_TIMEOUT, command.output()).await;
+    /// `rm --force` (kills a running container too); best effort.
+    async fn remove(&self, plan: &ContainerPlan, id: &ContainerId) {
+        let _ = self.short(plan, Stage::Remove(id)).await;
     }
 }
 
@@ -198,6 +202,17 @@ async fn spawn_with_retry(command: &mut Command) -> Result<tokio::process::Child
     }
 }
 
+/// First line of an engine's stderr, bounded, for an error message.
+fn first_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 impl ContainerEngine for PodmanEngine {
     fn run<'a>(
         &'a self,
@@ -205,11 +220,69 @@ impl ContainerEngine for PodmanEngine {
         cancel: Option<&'a CancelToken>,
     ) -> EngineFuture<'a, Result<EngineRun, EngineError>> {
         Box::pin(async move {
-            let mut command = Command::from(plan.to_command(&self.env));
+            // 1. create: the container exists, nothing runs.
+            let created = self.short(plan, Stage::Create).await?;
+            if !created.status.success() {
+                return Err(EngineError::Unverified(format!(
+                    "create failed: {}",
+                    first_line(&created.stderr)
+                )));
+            }
+            let id = ContainerId::parse(String::from_utf8_lossy(&created.stdout).trim()).map_err(
+                |_| EngineError::Unverified("the engine did not print a container id".to_owned()),
+            )?;
+
+            // 2. read back what the engine applied.
+            let inspected = match self.short(plan, Stage::Inspect(&id)).await {
+                Ok(output) if output.status.success() => output,
+                _ => {
+                    self.remove(plan, &id).await;
+                    return Err(EngineError::Unverified(
+                        "the container could not be read back".to_owned(),
+                    ));
+                }
+            };
+            let facts = match parse_inspect(&String::from_utf8_lossy(&inspected.stdout)) {
+                Ok(facts) => facts,
+                Err(reason) => {
+                    self.remove(plan, &id).await;
+                    return Err(EngineError::Unverified(format!(
+                        "unreadable inspect output: {reason}"
+                    )));
+                }
+            };
+
+            // 3. verify; only a `VerifiedContainer` can be started.
+            let readback = plan.verify(&id, &facts);
+            let verified = match plan.authorize_start(&id, &facts) {
+                Ok(verified) => verified,
+                Err(refusal) => {
+                    self.remove(plan, &id).await;
+                    return Err(match refusal {
+                        StartRefusal::Sources(error) => EngineError::Unverified(error.to_string()),
+                        StartRefusal::NotEnforced(readback) => EngineError::NotEnforced(
+                            readback
+                                .failures()
+                                .iter()
+                                .map(|dimension| format!("{dimension:?}"))
+                                .collect(),
+                        ),
+                    });
+                }
+            };
+
+            // 4. start attached, with output bounds, the wall-time limit and
+            // cancellation.
+            let mut command = self.command(plan, Stage::Start(&verified))?;
             command.stdout(Stdio::piped());
             command.stderr(Stdio::piped());
-            command.kill_on_drop(true);
-            let mut child = spawn_with_retry(&mut command).await?;
+            let mut child = match spawn_with_retry(&mut command).await {
+                Ok(child) => child,
+                Err(error) => {
+                    self.remove(plan, &id).await;
+                    return Err(error);
+                }
+            };
             let out = child.stdout.take();
             let err = child.stderr.take();
             let out_task = tokio::spawn(async move {
@@ -225,68 +298,31 @@ impl ContainerEngine for PodmanEngine {
                 }
             });
 
-            let expected = plan.expected();
-            let started = tokio::time::Instant::now();
-            let mut readback: Option<Readback> = None;
-            let mut violation: Option<Vec<String>> = None;
-            let mut exited: Option<std::process::ExitStatus> = None;
-
-            // Phase 1: runtime read-back while the container starts.
-            while readback.is_none() && started.elapsed() < INSPECT_WINDOW {
-                if let Ok(Some(status)) = child.try_wait() {
-                    exited = Some(status);
-                    break;
-                }
-                if let Some(facts) = self.inspect(plan).await {
-                    let result = verify(expected, &facts);
-                    let bad: Vec<String> = result
-                        .entries()
-                        .iter()
-                        .filter(|(_, state)| *state == Enforcement::NotEnforced)
-                        .map(|(dimension, _)| format!("{dimension:?}"))
-                        .collect();
-                    if !bad.is_empty() {
-                        violation = Some(bad);
-                    }
-                    readback = Some(result);
-                } else {
-                    tokio::time::sleep(INSPECT_PAUSE).await;
-                }
-            }
-            if let Some(dimensions) = violation {
-                self.kill(plan).await;
-                let _ = child.kill().await;
-                return Err(EngineError::NotEnforced(dimensions));
-            }
-
-            // Phase 2: wait for exit, the wall-time limit or cancellation.
             let limit = Duration::from_secs(u64::from(plan.timeout_s())) + self.grace;
             let (mut timed_out, mut cancelled) = (false, false);
-            let status = if let Some(status) = exited {
-                Some(status)
-            } else {
-                let cancel_wait = async {
-                    match cancel {
-                        Some(token) => token.cancelled().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                };
-                tokio::select! {
-                    result = child.wait() => result.ok(),
-                    () = tokio::time::sleep(limit) => {
-                        timed_out = true;
-                        None
-                    }
-                    () = cancel_wait => {
-                        cancelled = true;
-                        None
-                    }
+            let cancel_wait = async {
+                match cancel {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let status = tokio::select! {
+                result = child.wait() => result.ok(),
+                () = tokio::time::sleep(limit) => {
+                    timed_out = true;
+                    None
+                }
+                () = cancel_wait => {
+                    cancelled = true;
+                    None
                 }
             };
             if timed_out || cancelled {
-                self.kill(plan).await;
                 let _ = child.kill().await;
             }
+            // The container never outlives the call: `rm --force` also stops a
+            // running one.
+            self.remove(plan, &id).await;
             // After a kill a grandchild may still hold a pipe open: do not wait
             // for end-of-stream forever.
             let reader_wait = if timed_out || cancelled {
@@ -309,7 +345,7 @@ impl ContainerEngine for PodmanEngine {
                     timed_out,
                     cancelled,
                 },
-                readback,
+                readback: Some(readback),
             })
         })
     }
@@ -318,36 +354,70 @@ impl ContainerEngine for PodmanEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_tool_container::{ImageRef, Profile, RunConfig, RunRequest};
+    use harw_tool_container::{HostPath, ImageRef, Profile, RunConfig, RunRequest};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const GOOD: &str = r#"[{
-        "EffectiveCaps": null,
-        "HostConfig": {"Privileged": false, "CapAdd": null, "CapDrop": ["ALL"],
-            "NetworkMode": "none", "ReadonlyRootfs": true,
-            "SecurityOpt": ["no-new-privileges"],
-            "Memory": 1073741824, "MemorySwap": 1073741824, "PidsLimit": 256},
-        "Mounts": [{"Destination": "/workspace", "RW": false}]
-    }]"#;
+    const CID: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
 
-    /// A fake `podman`: `run` prints and sleeps, `inspect` cats `inspect.json`
-    /// (fails when absent), `kill` appends to `kill.log`.
+    /// The inspect document a correct engine would return for `plan`.
+    fn inspect_json(plan: &ContainerPlan, tweak: impl FnOnce(&mut serde_json::Value)) -> String {
+        let expected = plan.expected();
+        let mounts: Vec<serde_json::Value> = expected
+            .mounts
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "Type": "bind", "Source": m.source,
+                    "Destination": m.destination, "RW": !m.read_only
+                })
+            })
+            .collect();
+        let mut doc = serde_json::json!([{
+            "Id": CID,
+            "EffectiveCaps": null,
+            "HostConfig": {
+                "Privileged": false, "CapAdd": null,
+                "NetworkMode": "none", "ReadonlyRootfs": true,
+                "SecurityOpt": ["no-new-privileges"],
+                "Memory": expected.memory_bytes, "MemorySwap": expected.memory_bytes,
+                "PidsLimit": expected.pids_limit
+            },
+            "Config": {"Timeout": expected.timeout_s},
+            "Mounts": mounts
+        }]);
+        tweak(&mut doc[0]);
+        doc.to_string()
+    }
+
+    /// A fake `podman`: `create` prints the id, `inspect` cats `inspect.json`
+    /// (fails when absent), `start` runs `run_body`, `rm` appends to
+    /// `rm.log`. Every verb is logged to `calls.log`.
     fn fake_podman(dir: &Path, run_body: &str) -> TestResult<String> {
         let path = dir.join("podman");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  run) {run_body} ;;\n  inspect) cat \"$(dirname \"$0\")/inspect.json\" ;;\n  kill) echo killed >> \"$(dirname \"$0\")/kill.log\" ;;\nesac\n"
+            "#!/bin/sh
+d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  create) echo {CID} ;;\n  inspect) cat \"$d/inspect.json\" ;;\n  start) {run_body} ;;\n  rm) echo removed >> \"$d/rm.log\" ;;\nesac\n"
         );
         std::fs::write(&path, script)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         Ok(path.to_string_lossy().into_owned())
     }
 
-    fn plan(executable: &str, workspace: &str, timeout: Option<u32>) -> TestResult<ContainerPlan> {
-        let config = RunConfig::new(executable, workspace, "t1", "ses1")?;
+    fn calls(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn plan(executable: &str, workspace: &Path, timeout: Option<u32>) -> TestResult<ContainerPlan> {
+        let ws = HostPath::canonicalize(&workspace.to_string_lossy())?;
+        let config = RunConfig::new(executable, &ws, "t1", "ses1")?;
         let image = ImageRef::parse(&format!("docker.io/library/rust@sha256:{HEX}"))?;
         let mut request = RunRequest::new(image, Profile::Hermetic, vec!["true".to_owned()])?;
         if let Some(seconds) = timeout {
@@ -361,66 +431,105 @@ mod tests {
             .with_grace(Duration::ZERO)
     }
 
+    /// A workspace directory with the fake engine next to it (the engine
+    /// directory is not the mounted one).
+    fn setup(run_body: &str) -> TestResult<(tempfile::TempDir, tempfile::TempDir, String)> {
+        let bin = tempfile::tempdir()?;
+        let ws = tempfile::tempdir()?;
+        let exe = fake_podman(bin.path(), run_body)?;
+        Ok((bin, ws, exe))
+    }
+
     #[tokio::test]
-    async fn a_verified_run_returns_bounded_output_and_an_enforced_readback() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let exe = fake_podman(dir.path(), "echo out-line; echo err-line >&2; sleep 1")?;
-        std::fs::write(dir.path().join("inspect.json"), GOOD)?;
-        let plan = plan(&exe, &dir.path().to_string_lossy(), None)?;
+    async fn a_verified_container_is_created_inspected_started_and_removed_in_order() -> TestResult
+    {
+        let (bin, ws, exe) = setup("echo out-line; echo err-line >&2; sleep 1")?;
+        let plan = plan(&exe, ws.path(), None)?;
+        std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
         let run = engine().run(&plan, None).await?;
         assert_eq!(run.output.exit_code, Some(0));
         assert_eq!(run.output.stdout.trim(), "out-line");
         assert_eq!(run.output.stderr.trim(), "err-line");
         assert!(run.readback.as_ref().is_some_and(Readback::all_enforced));
+        assert_eq!(calls(bin.path()), ["create", "inspect", "start", "rm"]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_reported_violation_kills_the_container() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let exe = fake_podman(dir.path(), "sleep 30")?;
+    async fn an_unenforced_dimension_is_removed_and_never_started() -> TestResult {
+        let (bin, ws, exe) = setup("echo SHOULD-NOT-RUN")?;
+        let plan = plan(&exe, ws.path(), None)?;
         std::fs::write(
-            dir.path().join("inspect.json"),
-            GOOD.replace("\"none\"", "\"host\""),
+            bin.path().join("inspect.json"),
+            inspect_json(&plan, |doc| {
+                doc["HostConfig"]["NetworkMode"] = "host".into()
+            }),
         )?;
-        let plan = plan(&exe, &dir.path().to_string_lossy(), None)?;
-        let started = std::time::Instant::now();
         let result = engine().run(&plan, None).await;
         assert!(
             matches!(&result, Err(EngineError::NotEnforced(d)) if d == &["Network".to_owned()]),
             "{result:?}"
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "killed, not waited out"
-        );
-        assert!(
-            dir.path().join("kill.log").exists(),
-            "engine kill was issued"
-        );
+        assert_eq!(calls(bin.path()), ["create", "inspect", "rm"], "no start");
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_container_that_ends_before_inspect_is_reported_unverified() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let exe = fake_podman(dir.path(), "echo quick")?;
-        // No inspect.json: every inspect fails.
-        let plan = plan(&exe, &dir.path().to_string_lossy(), None)?;
-        let run = engine().run(&plan, None).await?;
-        assert_eq!(run.output.stdout.trim(), "quick");
+    async fn capabilities_count_only_when_the_effective_set_is_empty() -> TestResult {
+        let (bin, ws, exe) = setup("echo SHOULD-NOT-RUN")?;
+        let plan = plan(&exe, ws.path(), None)?;
+        // The engine claims CapDrop ALL but the process still holds a capability.
+        std::fs::write(
+            bin.path().join("inspect.json"),
+            inspect_json(&plan, |doc| {
+                doc["HostConfig"]["CapDrop"] = serde_json::json!(["ALL"]);
+                doc["EffectiveCaps"] = serde_json::json!(["CAP_NET_RAW"]);
+            }),
+        )?;
+        let result = engine().run(&plan, None).await;
         assert!(
-            run.readback.is_none(),
-            "nothing was verified and it says so"
+            matches!(&result, Err(EngineError::NotEnforced(d)) if d == &["Capabilities".to_owned()]),
+            "{result:?}"
+        );
+        assert!(!calls(bin.path()).contains(&"start".to_owned()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_cannot_be_read_back_means_nothing_runs() -> TestResult {
+        let (bin, ws, exe) = setup("echo SHOULD-NOT-RUN")?;
+        let plan = plan(&exe, ws.path(), None)?;
+        // No inspect.json: every inspect fails.
+        let result = engine().run(&plan, None).await;
+        assert!(
+            matches!(result, Err(EngineError::Unverified(_))),
+            "{result:?}"
+        );
+        assert_eq!(calls(bin.path()), ["create", "inspect", "rm"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn another_container_id_in_the_read_back_is_refused() -> TestResult {
+        let (bin, ws, exe) = setup("echo SHOULD-NOT-RUN")?;
+        let plan = plan(&exe, ws.path(), None)?;
+        std::fs::write(
+            bin.path().join("inspect.json"),
+            inspect_json(&plan, |doc| doc["Id"] = "cd".repeat(32).into()),
+        )?;
+        let result = engine().run(&plan, None).await;
+        assert!(
+            matches!(&result, Err(EngineError::NotEnforced(d)) if d == &["Identity".to_owned()]),
+            "{result:?}"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn output_beyond_the_bound_is_dropped_and_flagged() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let exe = fake_podman(dir.path(), "head -c 200000 /dev/zero | tr '\\0' x")?;
-        let plan = plan(&exe, &dir.path().to_string_lossy(), None)?;
+        let (bin, ws, exe) = setup("head -c 200000 /dev/zero | tr '\\0' x")?;
+        let plan = plan(&exe, ws.path(), None)?;
+        std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
         let run = engine().run(&plan, None).await?;
         assert_eq!(run.output.stdout.len(), MAX_STREAM_BYTES);
         assert!(run.output.truncated);
@@ -428,25 +537,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_wall_time_limit_kills_a_hanging_container() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let exe = fake_podman(dir.path(), "sleep 30")?;
-        std::fs::write(dir.path().join("inspect.json"), GOOD)?;
-        let plan = plan(&exe, &dir.path().to_string_lossy(), Some(1))?;
+    async fn the_wall_time_limit_removes_a_hanging_container() -> TestResult {
+        let (bin, ws, exe) = setup("sleep 30")?;
+        let plan = plan(&exe, ws.path(), Some(1))?;
+        std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
         let started = std::time::Instant::now();
         let run = engine().run(&plan, None).await?;
         assert!(run.output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(15));
-        assert!(dir.path().join("kill.log").exists());
+        assert!(bin.path().join("rm.log").exists(), "rm --force was issued");
         Ok(())
     }
 
     #[tokio::test]
-    async fn cancellation_kills_the_container() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let exe = fake_podman(dir.path(), "sleep 30")?;
-        std::fs::write(dir.path().join("inspect.json"), GOOD)?;
-        let plan = plan(&exe, &dir.path().to_string_lossy(), None)?;
+    async fn cancellation_removes_the_container() -> TestResult {
+        let (bin, ws, exe) = setup("sleep 30")?;
+        let plan = plan(&exe, ws.path(), None)?;
+        std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
         let token = CancelToken::new();
         let canceller = token.clone();
         tokio::spawn(async move {
@@ -455,13 +562,14 @@ mod tests {
         });
         let run = engine().run(&plan, Some(&token)).await?;
         assert!(run.output.cancelled);
-        assert!(dir.path().join("kill.log").exists());
+        assert!(bin.path().join("rm.log").exists());
         Ok(())
     }
 
     #[tokio::test]
     async fn a_missing_engine_is_a_spawn_error() -> TestResult {
-        let plan = plan("/nonexistent/podman", "/tmp", None)?;
+        let ws = tempfile::tempdir()?;
+        let plan = plan("/nonexistent/podman", ws.path(), None)?;
         let result = engine().run(&plan, None).await;
         assert!(matches!(result, Err(EngineError::Spawn(_))), "{result:?}");
         Ok(())
