@@ -136,7 +136,6 @@ members = [
     "harw-media",
     # Retention core: age/count/bytes sweeps and the declared data-class registry.
     "harw-context-ledger",
-    "harw-tool-container",
     "harw-tool-container-run",
     "harw-retention",
     # Reines Dev-Gerüst (define_test_error!, Temp-Pfade); nur als dev-dependency.
