@@ -104,7 +104,7 @@ fn text_of(parts: &[ContentPart]) -> String {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => text.as_str(),
-            ContentPart::ImageUrl { .. } => "[image]",
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => "[image]",
         })
         .collect::<Vec<_>>()
         .join("\n")
