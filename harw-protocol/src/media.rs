@@ -224,6 +224,17 @@ impl MediaRef {
         self.height
     }
 
+    /// A provider-neutral estimate of what the image costs in input tokens:
+    /// one token per 28x28 pixel patch (Anthropic's formula; OpenAI and Qwen
+    /// use 32 pixel patches, so this is the higher estimate), capped at the
+    /// 4784 visual tokens of the largest tier we know. Budgets use it to make
+    /// room; the provider's own usage report is the truth.
+    #[must_use]
+    pub fn estimated_tokens(&self) -> u64 {
+        let patches = u64::from(self.width.div_ceil(28)) * u64::from(self.height.div_ceil(28));
+        patches.min(4784)
+    }
+
     /// A short, safe description for places that cannot show the image:
     /// no bytes, no path, no URL.
     #[must_use]
@@ -318,6 +329,18 @@ mod tests {
     fn the_description_has_no_bytes_path_or_url() -> TestResult {
         let text = sample()?.describe();
         assert_eq!(text, "image 640x480 image/png (1234 bytes)");
+        Ok(())
+    }
+
+    #[test]
+    fn the_token_estimate_follows_the_patch_formula_and_is_capped() -> TestResult {
+        let small = MediaRef::new(digest(), ImageFormat::Png, 1, 28, 28)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert_eq!(small.estimated_tokens(), 1);
+        assert_eq!(sample()?.estimated_tokens(), 23 * 18, "640x480");
+        let large = MediaRef::new(digest(), ImageFormat::Png, 1, 8000, 8000)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert_eq!(large.estimated_tokens(), 4784);
         Ok(())
     }
 }

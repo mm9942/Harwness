@@ -68,13 +68,21 @@ impl ContainerToolConfig {
             pairs.push((alias.trim(), reference.trim()));
         }
         let catalog = ImageCatalog::new(pairs).map_err(|error| error.to_string())?;
-        // Validate the engine path and connection once, at startup.
-        let mut probe =
-            RunConfig::new(executable, "/", "probe", "probe").map_err(|error| error.to_string())?;
-        if let Some(name) = connection {
-            probe = probe.with_connection(name).map_err(|e| e.to_string())?;
+        // Validate the engine path and connection once, at startup (the plan
+        // builder re-checks both on every run).
+        if !executable.starts_with('/') || executable.rsplit('/').next() != Some("podman") {
+            return Err("the engine executable must be an absolute path named podman".to_owned());
         }
-        drop(probe);
+        if let Some(name) = connection {
+            let valid = !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+            if !valid {
+                return Err(format!("invalid connection name `{name}`"));
+            }
+        }
         Ok(Self {
             executable: executable.to_owned(),
             connection: connection.map(str::to_owned),
@@ -290,6 +298,7 @@ impl ContainerToolExecutor {
             "r{stamp:x}{:x}",
             self.shared.counter.fetch_add(1, Ordering::Relaxed)
         );
+        let workspace = harw_tool_container::HostPath::canonicalize(&workspace)?;
         let mut run_config = RunConfig::new(
             &config.executable,
             &workspace,
@@ -478,7 +487,7 @@ mod tests {
             _cancel: Option<&'a CancelToken>,
         ) -> EngineFuture<'a, Result<EngineRun, EngineError>> {
             if let Ok(mut plans) = self.plans.lock() {
-                plans.push(plan.args().to_vec());
+                plans.push(plan.create_args().to_vec());
             }
             Box::pin(async {
                 Ok(EngineRun {

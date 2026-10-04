@@ -17,6 +17,7 @@ members = [
     "harw-tool-explorer",
     "harw-killer",
     "harw-tool-process",
+    "harw-tool-container",
     "harw-config",
     "harw-home",
     "harw-plan",
@@ -48,8 +49,11 @@ members = [
     # contracts/W00-ws-integration-map.md): client, production TurnDriver
     # bridge, own-cloud node listener.
     "harw-session-remote",
+    "harw-session-client",
     "harw-session-driver",
     "harw-node-listener",
+    "harw-mobile-core",
+    "harw-mobile-term",
     "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",
@@ -132,7 +136,6 @@ members = [
     "harw-media",
     # Retention core: age/count/bytes sweeps and the declared data-class registry.
     "harw-context-ledger",
-    "harw-tool-container",
     "harw-tool-container-run",
     "harw-retention",
     # Reines Dev-Gerüst (define_test_error!, Temp-Pfade); nur als dev-dependency.

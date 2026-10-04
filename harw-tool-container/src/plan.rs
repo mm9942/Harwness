@@ -1,5 +1,6 @@
-//! The run plan: a validated request plus trusted config becomes one
-//! inspectable `podman run` argument vector. Nothing is executed here.
+//! The run plan: a validated request plus trusted config becomes the
+//! inspectable `podman` argument vectors of one container's lifecycle.
+//! Nothing is executed here.
 //!
 //! # What the model controls and what it does not
 //! The request carries an image (already resolved from an alias), a profile
@@ -8,9 +9,24 @@
 //! fixed by the profile or by trusted config: mounts, network, capabilities,
 //! user namespace, memory, process count, pull policy, labels.
 //!
-//! # The argument vector
+//! # The lifecycle
+//! There is no `run`: it would start the workload before anything could be
+//! checked, and a short-lived command may be gone (`--rm`) before an inspect.
+//! The caller runs [`Stage`]s in this order:
+//! 0. [`ContainerPlan::revalidate_sources`]: the bind sources are still the
+//!    directories that were checked.
+//! 1. `Create` prints the container id; parse it with [`ContainerId::parse`].
+//! 2. `Inspect(&id)`; feed the facts to [`ContainerPlan::verify`].
+//! 3. `revalidate_sources` again, then `Start(&id)` only when every dimension
+//!    is enforced, else `Remove(&id)`.
+//!
+//! Every step after `create` takes the id, never the name, so the container
+//! that was verified is the one that starts even if another client of the
+//! engine reuses the name in between.
+//!
+//! # The create vector
 //! ```text
-//! [--connection=NAME] run --rm --pull=never --name=harw-<run> [--cidfile=P]
+//! [--connection=NAME] create --rm --pull=never --name=harw-<run> [--cidfile=P]
 //!   --label=harw.owner=<o> --label=harw.run=<r> --label=harw.profile=<p>
 //!   --network=none --read-only --cap-drop=all --security-opt=no-new-privileges
 //!   --pids-limit=<n> --memory=<n>m --memory-swap=<n>m --userns=keep-id --timeout=<s>
@@ -19,17 +35,20 @@
 //! ```
 //! `--` ends option parsing and the image is the first positional argument,
 //! so neither the image nor any command word can be read as an engine flag.
-//! That `podman` and `docker` accept `--` before the image must still be
-//! proven by an integration test (see `docs/research/container-and-cli-tools.md`,
-//! section 9); this crate cannot run an engine.
+//! Podman 4.9.3 accepts `--` before the image (checked); Docker is not
+//! covered by this crate.
 
 use std::process::{Command, Stdio};
 
-use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value};
+use crate::container_id::ContainerId;
+use crate::digest::argv_sha256_hex;
+use crate::env::{DEFAULT_ENV_ALLOW, check_key, check_value, engine_environment};
 use crate::error::ContainerPolicyError;
+use crate::hostpath::HostPath;
 use crate::image::ImageRef;
-use crate::mount::Mount;
+use crate::mount::{ExpectedMount, Mount};
 use crate::profile::Profile;
+use crate::readback::{Dimension, Enforcement, InspectFacts, Readback, verify};
 use crate::validate::{check_abs_path, check_label_value, check_name, check_rel_path};
 
 /// Fixed destination of the workspace inside the container.
@@ -50,7 +69,7 @@ const MAX_ENV_ENTRIES: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfig {
     executable: String,
-    workspace: String,
+    workspace: HostPath,
     run_id: String,
     owner: String,
     connection: Option<String>,
@@ -64,7 +83,7 @@ impl RunConfig {
     /// Starts a configuration.
     ///
     /// `executable` is an absolute path whose file name is `podman` (no
-    /// `PATH` search). `workspace` is an absolute, canonical host path.
+    /// `PATH` search). `workspace` is a [`HostPath`], resolved and checked on the host.
     /// `run_id` is `[a-z0-9][a-z0-9._-]{0,47}` and names the container
     /// (`harw-<run_id>`). `owner` is a label value that identifies the
     /// session or runner.
@@ -73,7 +92,7 @@ impl RunConfig {
     /// The first rule that a value breaks.
     pub fn new(
         executable: &str,
-        workspace: &str,
+        workspace: &HostPath,
         run_id: &str,
         owner: &str,
     ) -> Result<Self, ContainerPolicyError> {
@@ -83,12 +102,11 @@ impl RunConfig {
                 "the engine executable must be named podman",
             ));
         }
-        check_abs_path(workspace)?;
         check_name(run_id, 48, "run id")?;
         check_label_value(owner, "owner")?;
         Ok(Self {
             executable: executable.to_owned(),
-            workspace: workspace.to_owned(),
+            workspace: workspace.clone(),
             run_id: run_id.to_owned(),
             owner: owner.to_owned(),
             connection: None,
@@ -100,6 +118,10 @@ impl RunConfig {
     }
 
     /// Uses a named remote connection (`podman --connection NAME`).
+    ///
+    /// Bind mounts are local only: a remote engine would resolve the path on
+    /// its own host, where the local checks prove nothing. `build` therefore
+    /// refuses a plan that has a remote connection and a bind mount.
     ///
     /// # Errors
     /// An invalid connection name.
@@ -256,25 +278,101 @@ impl RunRequest {
 /// [`crate::readback::verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
-    /// The workspace mount is read-only.
-    pub workspace_read_only: bool,
+    /// Every mount the engine must report, and no other.
+    pub mounts: Vec<ExpectedMount>,
     /// Memory ceiling in bytes.
     pub memory_bytes: i64,
     /// Process ceiling.
     pub pids_limit: i64,
+    /// Wall-time ceiling in seconds (the effective, clamped timeout).
+    pub timeout_s: u32,
+}
+
+/// One step of the container lifecycle (see the module docs for the order).
+/// The steps after `Create` carry the [`ContainerId`] that `create` printed,
+/// so none of them can be built from a name. `Start` needs more than an id: a
+/// [`VerifiedContainer`], which exists only after verification.
+///
+/// A plain id cannot start a container (this must not compile):
+///
+/// ```compile_fail
+/// use harw_tool_container::{ContainerId, Stage};
+///
+/// if let Ok(id) = ContainerId::parse(&"ab12".repeat(16)) {
+///     let _ = Stage::Start(&id);
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage<'a> {
+    /// `create`: the container exists but nothing runs yet.
+    Create,
+    /// `inspect`: read back what the engine actually applied.
+    Inspect(&'a ContainerId),
+    /// `start --attach`: run the workload and stream its output. Only with a
+    /// [`VerifiedContainer`], which [`ContainerPlan::authorize_start`] hands
+    /// out after identity, read-back and source revalidation all hold.
+    Start(&'a VerifiedContainer),
+    /// `rm --force`: discard a container that failed verification.
+    Remove(&'a ContainerId),
+}
+
+/// Proof that a created container was verified against its plan: it is the
+/// one `create` returned, the engine applied every requested restriction, and
+/// the bind sources still are the directories that were checked.
+///
+/// There is no public constructor: only [`ContainerPlan::authorize_start`]
+/// makes one, and `Stage::Start` takes nothing else, so a caller cannot start
+/// a container it did not verify by forgetting a step. The token belongs to
+/// one plan; another plan refuses it.
+///
+/// It cannot be built by hand either (this must not compile):
+///
+/// ```compile_fail
+/// use harw_tool_container::{ContainerId, VerifiedContainer};
+///
+/// if let Ok(id) = ContainerId::parse(&"ab12".repeat(16)) {
+///     let _ = VerifiedContainer { id, plan: String::new() };
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedContainer {
+    id: ContainerId,
+    plan: String,
+}
+
+impl VerifiedContainer {
+    /// The verified container's id.
+    #[must_use]
+    pub fn id(&self) -> &ContainerId {
+        &self.id
+    }
+}
+
+/// Why a container may not be started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRefusal {
+    /// A bind source is not the directory that was checked any more.
+    Sources(ContainerPolicyError),
+    /// The engine did not enforce everything (or did not report it); the
+    /// read-back says which dimension.
+    NotEnforced(Readback),
 }
 
 /// A validated, inspectable container run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerPlan {
     executable: String,
-    args: Vec<String>,
+    connection: Option<String>,
+    create: Vec<String>,
     name: String,
     profile: Profile,
     image: ImageRef,
     timeout_s: u32,
     expected: Expected,
+    mounts: Vec<Mount>,
     approval: String,
+    /// Digest of the whole create vector: names this plan for its tokens.
+    fingerprint: String,
 }
 
 impl ContainerPlan {
@@ -310,6 +408,17 @@ impl ContainerPlan {
             mounts.push(extra.clone());
         }
 
+        // A bind source was resolved and checked on THIS host. With
+        // `--connection` the engine runs elsewhere and resolves the same
+        // string there: `/srv/ws` can be harmless here and `/etc`, a daemon
+        // socket or another directory on the engine host. Fail closed until
+        // a trusted worker attests a canonical path on the engine host.
+        if config.connection.is_some() && mounts.iter().any(Mount::is_bind) {
+            return Err(ContainerPolicyError::InvalidMount(
+                "bind mounts are local only: a remote engine resolves the path on its own host",
+            ));
+        }
+
         let mut seen: Vec<&str> = Vec::new();
         for (key, _) in &request.env {
             if !config.env_allow.iter().any(|allowed| allowed == key) {
@@ -331,7 +440,7 @@ impl ContainerPlan {
         if let Some(connection) = &config.connection {
             args.push(format!("--connection={connection}"));
         }
-        args.extend(["run", "--rm", "--pull=never"].map(str::to_owned));
+        args.extend(["create", "--rm", "--pull=never"].map(str::to_owned));
         args.push(format!("--name={name}"));
         if let Some(cidfile) = &config.cidfile {
             args.push(format!("--cidfile={cidfile}"));
@@ -366,19 +475,23 @@ impl ContainerPlan {
         args.extend(request.command.iter().cloned());
 
         let expected = Expected {
-            workspace_read_only: profile.workspace_read_only(),
+            mounts: mounts.iter().map(Mount::expectation).collect(),
             memory_bytes: i64::from(limits.memory_mib) * 1024 * 1024,
             pids_limit: i64::from(limits.pids),
+            timeout_s,
         };
         let approval = approval_text(config, request, &mounts, timeout_s, &workdir);
         Ok(Self {
             executable: config.executable.clone(),
-            args,
+            connection: config.connection.clone(),
+            fingerprint: argv_sha256_hex(&args),
+            create: args,
             name,
             profile,
             image: request.image.clone(),
             timeout_s,
             expected,
+            mounts,
             approval,
         })
     }
@@ -389,13 +502,105 @@ impl ContainerPlan {
         &self.executable
     }
 
-    /// The complete argument vector, to be passed one element per argument.
+    /// The `create` argument vector, one element per argument.
+    ///
+    /// There is deliberately no `run`: `run` starts the workload before
+    /// anything can be checked, and a short-lived command may be gone (`--rm`)
+    /// before an inspect. The sequence is `create` → inspect → verify with
+    /// [`crate::readback::verify`] → `start`, and `rm` when verification
+    /// fails (see [`Stage`]).
     #[must_use]
-    pub fn args(&self) -> &[String] {
-        &self.args
+    pub fn create_args(&self) -> &[String] {
+        &self.create
     }
 
-    /// The container name (`harw-<run id>`).
+    /// The argument vector of `stage`.
+    ///
+    /// # Errors
+    /// [`ContainerPolicyError::NotVerifiedForThisPlan`] when a `Start` token
+    /// was issued by another plan.
+    pub fn stage_args(&self, stage: Stage<'_>) -> Result<Vec<String>, ContainerPolicyError> {
+        let mut args: Vec<String> = Vec::new();
+        if let Some(connection) = &self.connection {
+            args.push(format!("--connection={connection}"));
+        }
+        let id = match stage {
+            Stage::Create => return Ok(self.create.clone()),
+            Stage::Inspect(id) => {
+                args.extend(["inspect", "--type=container"].map(str::to_owned));
+                id
+            }
+            Stage::Start(verified) => {
+                if verified.plan != self.fingerprint {
+                    return Err(ContainerPolicyError::NotVerifiedForThisPlan);
+                }
+                args.extend(["start", "--attach"].map(str::to_owned));
+                verified.id()
+            }
+            Stage::Remove(id) => {
+                args.extend(["rm", "--force"].map(str::to_owned));
+                id
+            }
+        };
+        args.push("--".to_owned());
+        args.push(id.as_str().to_owned());
+        Ok(args)
+    }
+
+    /// Decides whether the created container `id` may be started, and if so
+    /// hands out the only token `Stage::Start` accepts.
+    ///
+    /// It requires, in this order: the bind sources are still the directories
+    /// that were checked ([`Self::revalidate_sources`]); the engine reported
+    /// exactly this container and enforced every requested restriction
+    /// ([`Self::verify`], all dimensions enforced). Anything weaker is a
+    /// refusal, and the caller removes the container (`Stage::Remove`).
+    ///
+    /// # Errors
+    /// [`StartRefusal`] with the reason.
+    pub fn authorize_start(
+        &self,
+        id: &ContainerId,
+        facts: &InspectFacts,
+    ) -> Result<VerifiedContainer, StartRefusal> {
+        self.revalidate_sources().map_err(StartRefusal::Sources)?;
+        let readback = self.verify(id, facts);
+        if !readback.all_enforced() {
+            return Err(StartRefusal::NotEnforced(readback));
+        }
+        Ok(VerifiedContainer {
+            id: id.clone(),
+            plan: self.fingerprint.clone(),
+        })
+    }
+
+    /// Judges the inspect facts of the container `id`: every dimension of
+    /// [`crate::readback::verify`] plus [`Dimension::Identity`], which is
+    /// enforced only when the engine reports exactly this id. Start only when
+    /// [`Readback::all_enforced`] holds.
+    #[must_use]
+    pub fn verify(&self, id: &ContainerId, facts: &InspectFacts) -> Readback {
+        let identity = match facts.id.as_deref() {
+            Some(reported) if reported == id.as_str() => Enforcement::Enforced,
+            Some(_) => Enforcement::NotEnforced,
+            None => Enforcement::Unverifiable,
+        };
+        verify(&self.expected, facts).with_entry(Dimension::Identity, identity)
+    }
+
+    /// Revalidates every bind source (see [`crate::HostPath::revalidate`]).
+    /// Call it immediately before the `Create` stage and again immediately
+    /// before `Start`: a source that was replaced in between (a symlink, a
+    /// different directory, a new socket) is refused.
+    ///
+    /// # Errors
+    /// [`ContainerPolicyError::InvalidMount`] when a source changed.
+    pub fn revalidate_sources(&self) -> Result<(), ContainerPolicyError> {
+        self.mounts.iter().try_for_each(Mount::revalidate)
+    }
+
+    /// The container name (`harw-<run id>`). It labels the container for
+    /// humans and cleanup; no stage after `create` uses it.
     #[must_use]
     pub fn container_name(&self) -> &str {
         &self.name
@@ -436,7 +641,7 @@ impl ContainerPlan {
     /// The argument vector with environment values hidden, for logs.
     #[must_use]
     pub fn redacted_args(&self) -> Vec<String> {
-        self.args
+        self.create
             .iter()
             .map(|arg| match arg.strip_prefix("--env=") {
                 Some(rest) => {
@@ -448,20 +653,43 @@ impl ContainerPlan {
             .collect()
     }
 
-    /// Builds the process description. The environment is cleared and only
-    /// `engine_env` is set (see [`crate::env::engine_environment`]); stdin is
+    /// Builds the process description. The environment is cleared and then
+    /// built here from the allowlist ([`crate::env::engine_environment`]):
+    /// `lookup` only supplies values for the few allowed names, so a variable
+    /// that would redirect the engine (`CONTAINER_HOST`, ...) can never be
+    /// passed in, and remote mode follows the plan's connection. Stdin is
     /// closed. Constructing the command does not start anything.
-    #[must_use]
-    pub fn to_command(&self, engine_env: &[(String, String)]) -> Command {
+    ///
+    /// # Errors
+    /// As [`Self::stage_args`].
+    pub fn to_command(
+        &self,
+        stage: Stage<'_>,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Command, ContainerPolicyError> {
         let mut command = Command::new(&self.executable);
-        command.args(&self.args);
+        command.args(self.stage_args(stage)?);
         command.env_clear();
-        command.envs(engine_env.iter().map(|(k, v)| (k, v)));
+        command.envs(engine_environment(lookup, self.connection.is_some()));
         command.stdin(Stdio::null());
-        command
+        Ok(command)
     }
 }
 
+/// Digest of the environment key/value pairs, in key order. The values are
+/// never shown, but any change of a value changes the digest, so a grant
+/// cannot be reused for different behaviour. A low-entropy value could be
+/// guessed from its digest: keep secrets out of requested environments.
+fn env_fingerprint(env: &[(String, String)]) -> String {
+    let mut pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    argv_sha256_hex(&pairs)
+}
+
+/// The approval text binds the full command by digest and shows only its
+/// length. No part of it is shown or persisted, not even the program: the
+/// first word is free text too and may carry a token or a line break that
+/// would forge an approval field.
 fn approval_text(
     config: &RunConfig,
     request: &RunRequest,
@@ -473,21 +701,33 @@ fn approval_text(
     let env_keys: Vec<&str> = request.env.iter().map(|(k, _)| k.as_str()).collect();
     format!(
         "engine=podman\nconnection={}\nimage={}\nprofile={}\nnetwork=none\nmounts={:?}\n\
-         env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\ncommand={:?}",
+         env_keys={:?}\ntimeout_s={timeout_s}\nworkdir={workdir}\nargc={}\n\
+         command_sha256={}\nenv_sha256={}",
         config.connection.as_deref().unwrap_or("local"),
         request.image.to_arg(),
         request.profile,
         mount_list,
         env_keys,
-        request.command,
+        request.command.len(),
+        argv_sha256_hex(&request.command),
+        env_fingerprint(&request.env),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::readback::{InspectFacts, verify};
+    use crate::mount::MountKind;
+    use crate::readback::ObservedMount;
     use crate::test_support::{TestResult, ensure};
+
+    fn host(path: &str) -> Result<HostPath, ContainerPolicyError> {
+        HostPath::lexical(path)
+    }
+
+    fn ws() -> Result<HostPath, ContainerPolicyError> {
+        host("/srv/ws")
+    }
 
     const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -496,7 +736,7 @@ mod tests {
     }
 
     fn config() -> Result<RunConfig, ContainerPolicyError> {
-        RunConfig::new("/usr/bin/podman", "/srv/ws", "r1", "ses1")
+        RunConfig::new("/usr/bin/podman", &ws()?, "r1", "ses1")
     }
 
     fn cmd(words: &[&str]) -> Vec<String> {
@@ -515,7 +755,7 @@ mod tests {
     fn hermetic_argv_is_exact() -> TestResult {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
         let want = strings(&[
-            "run",
+            "create",
             "--rm",
             "--pull=never",
             "--name=harw-r1",
@@ -531,7 +771,7 @@ mod tests {
             "--memory-swap=1024m",
             "--userns=keep-id",
             "--timeout=300",
-            "--mount=type=bind,src=/srv/ws,dst=/workspace,ro",
+            "--mount=type=bind,src=/srv/ws,dst=/workspace,ro,bind-nonrecursive",
             "--workdir=/workspace",
             "--",
             &format!("docker.io/library/rust@sha256:{HEX}"),
@@ -539,8 +779,8 @@ mod tests {
             "check",
         ]);
         ensure(
-            plan.args() == want.as_slice(),
-            &format!("{:?}", plan.args()),
+            plan.create_args() == want.as_slice(),
+            &format!("{:?}", plan.create_args()),
         )?;
         ensure(plan.executable() == "/usr/bin/podman", "executable")?;
         ensure(plan.container_name() == "harw-r1", "name")
@@ -550,9 +790,11 @@ mod tests {
     fn build_profile_is_writable_with_a_cache() -> TestResult {
         let cfg = config()?.with_cache_volume("harw-cargo")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
-        let a = plan.args();
+        let a = plan.create_args();
         ensure(
-            a.contains(&"--mount=type=bind,src=/srv/ws,dst=/workspace".to_owned()),
+            a.contains(
+                &"--mount=type=bind,src=/srv/ws,dst=/workspace,bind-nonrecursive".to_owned(),
+            ),
             "workspace rw",
         )?;
         ensure(
@@ -574,7 +816,7 @@ mod tests {
         let cfg = config()?.with_cache_volume("harw-cargo")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
         ensure(
-            !plan.args().iter().any(|a| a.contains("type=volume")),
+            !plan.create_args().iter().any(|a| a.contains("type=volume")),
             "no volume",
         )
     }
@@ -592,7 +834,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--userns=keep-id",
             ] {
-                ensure(plan.args().iter().any(|a| a == flag), flag)?;
+                ensure(plan.create_args().iter().any(|a| a == flag), flag)?;
             }
         }
         Ok(())
@@ -606,7 +848,7 @@ mod tests {
             cmd(&["--privileged", "-v", "/:/host"]),
         )?;
         let plan = ContainerPlan::build(&config()?, &req)?;
-        let a = plan.args();
+        let a = plan.create_args();
         let sep = a
             .iter()
             .position(|x| x == "--")
@@ -645,12 +887,12 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_precedes_run() -> TestResult {
+    fn a_remote_connection_is_refused_while_binds_are_local_only() -> TestResult {
         let cfg = config()?.with_connection("pi")?;
-        let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
+        let refused = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?);
         ensure(
-            plan.args()[0] == "--connection=pi" && plan.args()[1] == "run",
-            "order",
+            matches!(refused, Err(ContainerPolicyError::InvalidMount(_))),
+            "the workspace bind was resolved here, not on the engine host",
         )?;
         ensure(config()?.with_connection("a b").is_err(), "bad name")
     }
@@ -660,7 +902,8 @@ mod tests {
         let cfg = config()?.with_cidfile("/srv/job/cid")?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
         ensure(
-            plan.args().contains(&"--cidfile=/srv/job/cid".to_owned()),
+            plan.create_args()
+                .contains(&"--cidfile=/srv/job/cid".to_owned()),
             "cidfile",
         )?;
         ensure(config()?.with_cidfile("relative").is_err(), "relative")
@@ -671,7 +914,7 @@ mod tests {
         let ok = request(Profile::Hermetic)?.with_env("RUST_LOG", "secret-looking")?;
         let plan = ContainerPlan::build(&config()?, &ok)?;
         ensure(
-            plan.args()
+            plan.create_args()
                 .contains(&"--env=RUST_LOG=secret-looking".to_owned()),
             "passed",
         )?;
@@ -714,7 +957,7 @@ mod tests {
         let ok = request(Profile::Hermetic)?.with_workdir("crates/x")?;
         let plan = ContainerPlan::build(&config()?, &ok)?;
         ensure(
-            plan.args()
+            plan.create_args()
                 .contains(&"--workdir=/workspace/crates/x".to_owned()),
             "relative",
         )?;
@@ -726,8 +969,8 @@ mod tests {
 
     #[test]
     fn extra_mounts_follow_the_profile() -> TestResult {
-        let rw = Mount::bind("/srv/data", "/data", false)?;
-        let ro = Mount::bind("/srv/ref", "/mnt/ref", true)?;
+        let rw = Mount::bind(&host("/srv/data")?, "/data", false)?;
+        let ro = Mount::bind(&host("/srv/ref")?, "/mnt/ref", true)?;
         let cfg = config()?.with_mount(rw)?.with_mount(ro)?;
         ensure(
             ContainerPlan::build(&cfg, &request(Profile::Hermetic)?).is_err(),
@@ -735,17 +978,18 @@ mod tests {
         )?;
         let plan = ContainerPlan::build(&cfg, &request(Profile::Build)?)?;
         ensure(
-            plan.args()
-                .contains(&"--mount=type=bind,src=/srv/data,dst=/data".to_owned()),
+            plan.create_args().contains(
+                &"--mount=type=bind,src=/srv/data,dst=/data,bind-nonrecursive".to_owned(),
+            ),
             "rw in build",
         )?;
-        let clash = Mount::bind("/srv/other", "/workspace", true)?;
+        let clash = Mount::bind(&host("/srv/other")?, "/workspace", true)?;
         ensure(
             config()?.with_mount(clash).is_err(),
             "workspace destination",
         )?;
-        let dup1 = Mount::bind("/srv/a", "/data", true)?;
-        let dup2 = Mount::bind("/srv/b", "/data", true)?;
+        let dup1 = Mount::bind(&host("/srv/a")?, "/data", true)?;
+        let dup2 = Mount::bind(&host("/srv/b")?, "/data", true)?;
         ensure(
             config()?.with_mount(dup1)?.with_mount(dup2).is_err(),
             "duplicate destination",
@@ -755,35 +999,31 @@ mod tests {
     #[test]
     fn config_rejects_bad_values() -> TestResult {
         ensure(
-            RunConfig::new("/usr/bin/docker", "/srv/ws", "r1", "o").is_err(),
+            RunConfig::new("/usr/bin/docker", &ws()?, "r1", "o").is_err(),
             "not podman",
         )?;
         ensure(
-            RunConfig::new("podman", "/srv/ws", "r1", "o").is_err(),
+            RunConfig::new("podman", &ws()?, "r1", "o").is_err(),
             "relative executable",
         )?;
         ensure(
-            RunConfig::new("/usr/bin/podman", "srv/ws", "r1", "o").is_err(),
-            "relative ws",
+            host("srv/ws").is_err(),
+            "a relative workspace cannot be constructed",
         )?;
         ensure(
-            RunConfig::new("/usr/bin/podman", "/srv/ws", "R 1", "o").is_err(),
+            RunConfig::new("/usr/bin/podman", &ws()?, "R 1", "o").is_err(),
             "run id",
         )?;
         ensure(
-            RunConfig::new("/usr/bin/podman", "/srv/ws", "r1", "o p").is_err(),
+            RunConfig::new("/usr/bin/podman", &ws()?, "r1", "o p").is_err(),
             "owner",
         )
     }
 
     #[test]
-    fn a_workspace_in_a_denied_tree_fails_the_build() -> TestResult {
-        for ws in ["/", "/etc/app", "/run/user/1000", "/home/u/.ssh/keys"] {
-            let cfg = RunConfig::new("/usr/bin/podman", ws, "r1", "o")?;
-            ensure(
-                ContainerPlan::build(&cfg, &request(Profile::Hermetic)?).is_err(),
-                ws,
-            )?;
+    fn a_workspace_in_a_denied_tree_cannot_be_constructed() -> TestResult {
+        for dir in ["/", "/etc/app", "/run/user/1000", "/home/u/.ssh/keys"] {
+            ensure(host(dir).is_err(), dir)?;
         }
         Ok(())
     }
@@ -838,11 +1078,9 @@ mod tests {
             let plan = ContainerPlan::build(&config()?, &req)?;
             ensure(plan.approval_text() != base.approval_text(), label)?;
         }
-        let remote = ContainerPlan::build(
-            &config()?.with_connection("pi")?,
-            &request(Profile::Hermetic)?,
-        )?;
-        ensure(remote.approval_text() != base.approval_text(), "connection")
+        // A remote connection would change the text too, but it is refused
+        // while binds are local only (see the remote test).
+        Ok(())
     }
 
     #[test]
@@ -855,13 +1093,260 @@ mod tests {
         )
     }
 
+    fn cid() -> Result<ContainerId, ContainerPolicyError> {
+        ContainerId::parse(&"ab12".repeat(16))
+    }
+
+    /// Runs `body` with a plan over a real temporary workspace (revalidation
+    /// needs a directory that exists), and removes it afterwards.
+    fn with_real_plan(
+        run_id: &str,
+        body: impl FnOnce(&ContainerPlan, &std::path::Path) -> TestResult,
+    ) -> TestResult {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = std::env::temp_dir().join(format!("harw-plan-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(base.join("ws"))?;
+        let outcome = (|| -> TestResult {
+            let real = HostPath::canonicalize(&base.join("ws").to_string_lossy())?;
+            let cfg = RunConfig::new("/usr/bin/podman", &real, run_id, "ses1")?;
+            let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
+            body(&plan, &base)
+        })();
+        let _ = std::fs::remove_dir_all(&base);
+        outcome
+    }
+
     #[test]
-    fn expected_matches_the_profile_and_round_trips_through_readback() -> TestResult {
+    fn the_lifecycle_is_create_inspect_start_with_no_run() -> TestResult {
+        with_real_plan("life1", |plan, _| {
+            ensure(!plan.create_args().iter().any(|a| a == "run"), "no run")?;
+            let id = cid()?;
+            let token = plan
+                .authorize_start(&id, &id_facts(plan, &id))
+                .map_err(|_| crate::test_support::TestError::Unexpected("authorize".to_owned()))?;
+            // A remote engine would put `--connection` first; the stage
+            // vectors follow the plan's connection.
+            let mut remote = plan.clone();
+            remote.connection = Some("pi".to_owned());
+            for (stage, verb) in [
+                (Stage::Inspect(&id), "inspect"),
+                (Stage::Start(&token), "start"),
+                (Stage::Remove(&id), "rm"),
+            ] {
+                let args = remote.stage_args(stage)?;
+                ensure(args[0] == "--connection=pi", "connection first")?;
+                ensure(args[1] == verb, verb)?;
+                ensure(
+                    args[args.len() - 2] == "--" && args[args.len() - 1] == id.as_str(),
+                    "the id follows the separator",
+                )?;
+                ensure(
+                    !args.iter().any(|a| a == plan.container_name()),
+                    "the mutable name is never used after create",
+                )?;
+            }
+            ensure(
+                plan.stage_args(Stage::Start(&token))?
+                    .iter()
+                    .any(|a| a == "--attach"),
+                "output is attached",
+            )
+        })
+    }
+
+    /// Facts that match `plan` and report `id`.
+    fn id_facts(plan: &ContainerPlan, id: &ContainerId) -> InspectFacts {
+        let mut facts = good_facts(plan);
+        facts.id = Some(id.as_str().to_owned());
+        facts
+    }
+
+    #[test]
+    fn start_needs_the_token_and_the_token_needs_everything_to_hold() -> TestResult {
+        with_real_plan("auth1", |plan, base| {
+            let id = cid()?;
+            // Everything holds: a token is issued, for this id.
+            let token = plan
+                .authorize_start(&id, &id_facts(plan, &id))
+                .map_err(|_| crate::test_support::TestError::Unexpected("authorize".to_owned()))?;
+            ensure(token.id() == &id, "the token names the verified container")?;
+
+            // The engine did not enforce the network: no token.
+            let mut weak = id_facts(plan, &id);
+            weak.network_mode = Some("host".to_owned());
+            ensure(
+                matches!(
+                    plan.authorize_start(&id, &weak),
+                    Err(StartRefusal::NotEnforced(_))
+                ),
+                "an unenforced restriction",
+            )?;
+
+            // Another container behind the name: no token.
+            let mut other = id_facts(plan, &id);
+            other.id = Some("f".repeat(64));
+            ensure(
+                matches!(
+                    plan.authorize_start(&id, &other),
+                    Err(StartRefusal::NotEnforced(_))
+                ),
+                "the identity is not the created container",
+            )?;
+
+            // Nothing reported: no token (unknown is not enforced).
+            ensure(
+                matches!(
+                    plan.authorize_start(&id, &InspectFacts::default()),
+                    Err(StartRefusal::NotEnforced(_))
+                ),
+                "unreported facts",
+            )?;
+
+            // The source was swapped after the plan was built: no token.
+            std::fs::rename(base.join("ws"), base.join("moved"))?;
+            std::os::unix::fs::symlink("/run", base.join("ws"))?;
+            ensure(
+                matches!(
+                    plan.authorize_start(&id, &id_facts(plan, &id)),
+                    Err(StartRefusal::Sources(_))
+                ),
+                "a swapped bind source",
+            )
+        })
+    }
+
+    #[test]
+    fn a_token_belongs_to_one_plan() -> TestResult {
+        let mut stolen: Option<VerifiedContainer> = None;
+        with_real_plan("plan-a", |plan, _| {
+            let id = cid()?;
+            stolen = plan.authorize_start(&id, &id_facts(plan, &id)).ok();
+            ensure(stolen.is_some(), "plan A authorized its container")
+        })?;
+        let token = stolen
+            .ok_or_else(|| crate::test_support::TestError::Unexpected("no token".to_owned()))?;
+        with_real_plan("plan-b", |plan, _| {
+            ensure(
+                plan.stage_args(Stage::Start(&token))
+                    == Err(ContainerPolicyError::NotVerifiedForThisPlan),
+                "another plan refuses the token",
+            )
+        })
+    }
+
+    #[test]
+    fn revalidating_the_sources_catches_a_swap_after_the_plan_was_built() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = std::env::temp_dir().join(format!("harw-plan-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(base.join("ws"))?;
+        let outcome = (|| -> TestResult {
+            let real = HostPath::canonicalize(&base.join("ws").to_string_lossy())?;
+            let cfg = RunConfig::new("/usr/bin/podman", &real, "r1", "ses1")?;
+            let plan = ContainerPlan::build(&cfg, &request(Profile::Hermetic)?)?;
+            ensure(plan.revalidate_sources().is_ok(), "unchanged before create")?;
+            std::fs::rename(base.join("ws"), base.join("moved"))?;
+            symlink("/run", base.join("ws"))?;
+            ensure(
+                plan.revalidate_sources().is_err(),
+                "swapped for a symlink before start",
+            )
+        })();
+        let _ = std::fs::remove_dir_all(&base);
+        outcome
+    }
+
+    #[test]
+    fn only_the_created_container_passes_the_identity_check() -> TestResult {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
-        ensure(plan.expected().memory_bytes == 1024 * 1024 * 1024, "memory")?;
-        ensure(plan.expected().pids_limit == 256, "pids")?;
-        ensure(plan.expected().workspace_read_only, "ro")?;
-        let facts = InspectFacts {
+        let id = cid()?;
+        let mut facts = good_facts(&plan);
+        facts.id = Some(id.as_str().to_owned());
+        ensure(plan.verify(&id, &facts).all_enforced(), "same id")?;
+        facts.id = Some("f".repeat(64));
+        let swapped = plan.verify(&id, &facts);
+        ensure(
+            swapped.get(Dimension::Identity) == Some(Enforcement::NotEnforced),
+            "another container behind the same name",
+        )?;
+        ensure(!swapped.all_enforced(), "so it is not started")?;
+        facts.id = None;
+        ensure(
+            plan.verify(&id, &facts).get(Dimension::Identity) == Some(Enforcement::Unverifiable),
+            "not reported",
+        )
+    }
+
+    #[test]
+    fn a_program_name_cannot_forge_approval_fields() -> TestResult {
+        let req = RunRequest::new(
+            image()?,
+            Profile::Hermetic,
+            cmd(&["x\nnetwork=host\ntoken=s3cr3t"]),
+        )?;
+        let plan = ContainerPlan::build(&config()?, &req)?;
+        ensure(!plan.approval_text().contains("s3cr3t"), "no raw program")?;
+        ensure(
+            plan.approval_text().matches("network=").count() == 1,
+            "no injected field",
+        )
+    }
+
+    #[test]
+    fn a_changed_environment_value_invalidates_the_grant_without_showing_it() -> TestResult {
+        let with = |value: &str| -> Result<ContainerPlan, ContainerPolicyError> {
+            ContainerPlan::build(
+                &config()?,
+                &request(Profile::Hermetic)?.with_env("CI", value)?,
+            )
+        };
+        let a = with("hunter2")?;
+        let b = with("hunter3")?;
+        ensure(!a.approval_text().contains("hunter2"), "value not shown")?;
+        ensure(
+            a.approval_text() != b.approval_text(),
+            "a changed value changes the grant",
+        )?;
+        ensure(
+            a.approval_text() == with("hunter2")?.approval_text(),
+            "stable for the same value",
+        )
+    }
+
+    #[test]
+    fn approval_text_hides_command_arguments_but_binds_them() -> TestResult {
+        let secret = "Authorization: Bearer s3cr3t-token";
+        let make = |last: &str| -> Result<ContainerPlan, ContainerPolicyError> {
+            let req = RunRequest::new(
+                image()?,
+                Profile::Hermetic,
+                cmd(&["curl", "-H", secret, last]),
+            )?;
+            ContainerPlan::build(&config()?, &req)
+        };
+        let a = make("https://example.test/a")?;
+        let b = make("https://example.test/b")?;
+        ensure(!a.approval_text().contains("s3cr3t"), "secret not shown")?;
+        ensure(!a.approval_text().contains("example.test"), "no arguments")?;
+        ensure(
+            !a.approval_text().contains("curl"),
+            "not even the program is shown",
+        )?;
+        ensure(a.approval_text().contains("argc=4"), "argument count")?;
+        ensure(
+            a.approval_text() != b.approval_text(),
+            "a changed argument invalidates the approval",
+        )
+    }
+
+    /// Facts of a container that matches `plan`, but without an id.
+    fn good_facts(plan: &ContainerPlan) -> InspectFacts {
+        InspectFacts {
+            id: None,
             privileged: Some(false),
             cap_add: Some(vec![]),
             cap_drop: Some(vec!["all".to_owned()]),
@@ -872,18 +1357,86 @@ mod tests {
             memory_swap_bytes: Some(plan.expected().memory_bytes),
             effective_caps: Some(vec![]),
             pids_limit: Some(plan.expected().pids_limit),
-            workspace_read_only: Some(true),
-        };
-        ensure(verify(plan.expected(), &facts).all_enforced(), "enforced")
+            mounts: Some(
+                plan.expected()
+                    .mounts
+                    .iter()
+                    .map(|m| match m.kind {
+                        MountKind::Bind => ObservedMount {
+                            kind: "bind".to_owned(),
+                            name: None,
+                            source: Some(m.source.clone()),
+                            destination: m.destination.clone(),
+                            rw: !m.read_only,
+                        },
+                        MountKind::Volume => ObservedMount {
+                            kind: "volume".to_owned(),
+                            name: Some(m.source.clone()),
+                            source: Some("/var/lib/volumes/x/_data".to_owned()),
+                            destination: m.destination.clone(),
+                            rw: !m.read_only,
+                        },
+                    })
+                    .collect(),
+            ),
+            timeout_s: Some(plan.expected().timeout_s),
+        }
     }
 
     #[test]
-    fn the_command_has_a_cleared_environment() -> TestResult {
+    fn expected_matches_the_profile_and_round_trips_through_readback() -> TestResult {
         let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
-        let env = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
-        let command = plan.to_command(&env);
+        ensure(plan.expected().memory_bytes == 1024 * 1024 * 1024, "memory")?;
+        ensure(plan.expected().pids_limit == 256, "pids")?;
+        ensure(
+            plan.expected().mounts.iter().all(|m| m.read_only),
+            "hermetic: every mount is read-only",
+        )?;
+        ensure(
+            verify(plan.expected(), &good_facts(&plan)).all_enforced(),
+            "enforced",
+        )
+    }
+
+    #[test]
+    fn the_command_environment_is_built_from_the_allowlist() -> TestResult {
+        let plan = ContainerPlan::build(&config()?, &request(Profile::Hermetic)?)?;
+        let offered = |name: &str| match name {
+            "HOME" => Some("/home/u".to_owned()),
+            "CONTAINER_HOST" => Some("ssh://evil/run/podman.sock".to_owned()),
+            "DOCKER_HOST" => Some("tcp://evil:2375".to_owned()),
+            "SSH_AUTH_SOCK" => Some("/tmp/agent".to_owned()),
+            _ => None,
+        };
+        let command = plan.to_command(Stage::Create, &offered)?;
         ensure(command.get_program() == "/usr/bin/podman", "program")?;
-        ensure(command.get_args().count() == plan.args().len(), "args")?;
-        ensure(command.get_envs().count() == 1, "only the given env")
+        ensure(
+            command.get_args().count() == plan.create_args().len(),
+            "args",
+        )?;
+        let names: Vec<String> = command
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        ensure(names.iter().any(|n| n == "HOME"), "HOME passed")?;
+        ensure(
+            !names
+                .iter()
+                .any(|n| n == "CONTAINER_HOST" || n == "DOCKER_HOST"),
+            "redirecting variables never reach the engine",
+        )?;
+        ensure(
+            !names.iter().any(|n| n == "SSH_AUTH_SOCK"),
+            "no ssh agent for a local engine",
+        )?;
+        let mut remote = plan.clone();
+        remote.connection = Some("pi".to_owned());
+        let command = remote.to_command(Stage::Inspect(&cid()?), &offered)?;
+        ensure(
+            command
+                .get_envs()
+                .any(|(k, _)| k.to_string_lossy() == "SSH_AUTH_SOCK"),
+            "a remote connection may use the ssh agent",
+        )
     }
 }

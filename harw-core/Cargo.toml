@@ -13,6 +13,9 @@ harw-authority = { path = "../harw-authority" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-types = { path = "../harw-types" }
 harw-protocol = { path = "../harw-protocol" }
+# Images: `MediaSource` resolves the `MediaRef`s of a transcript to bytes for
+# the provider adapters (`media.rs`).
+harw-media = { path = "../harw-media" }
 harw-tools = { path = "../harw-tools" }
 harw-extension-api = { path = "../harw-extension-api" }
 # AW1-03: `Assembly<Gathered|Admitted|Budgeted>` in `context_budget.rs` packs

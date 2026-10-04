@@ -10,7 +10,7 @@
 //! The image must already be present locally (the engine never pulls).
 
 use harw_tool_container::{
-    ContainerPlan, ImageRef, Profile, RunConfig, RunRequest, engine_environment,
+    ContainerPlan, HostPath, ImageRef, Profile, RunConfig, RunRequest, engine_environment,
 };
 use harw_tool_container_run::{ContainerEngine, PodmanEngine};
 
@@ -21,12 +21,8 @@ type R<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 async fn a_hermetic_run_works_and_the_read_back_verifies_against_real_podman() -> R {
     let image = ImageRef::parse(&std::env::var("HARW_OCI_IMAGE")?)?;
     let workspace = tempfile::tempdir()?;
-    let config = RunConfig::new(
-        "/usr/bin/podman",
-        workspace.path().to_str().ok_or("path")?,
-        "t1",
-        "ses1",
-    )?;
+    let workspace = HostPath::canonicalize(workspace.path().to_str().ok_or("path")?)?;
+    let config = RunConfig::new("/usr/bin/podman", &workspace, "t1", "ses1")?;
     let request = RunRequest::new(
         image,
         Profile::Hermetic,

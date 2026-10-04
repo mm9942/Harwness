@@ -64,6 +64,27 @@ impl MediaStore {
         Ok(Self { root, limits })
     }
 
+    /// Opens the store at `root` only if it exists; `None` otherwise. It never
+    /// creates anything, so a program can attach an existing store at start-up
+    /// without leaving a directory behind.
+    ///
+    /// # Errors
+    /// See [`Self::open`] for a directory that exists but is unsafe.
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Option<Self>, MediaError> {
+        let root = root.into();
+        match fs::symlink_metadata(&root) {
+            Ok(_) => {
+                check_private_dir(&root)?;
+                Ok(Some(Self {
+                    root,
+                    limits: MediaLimits::default(),
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// The directory of this store.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -91,39 +112,7 @@ impl MediaStore {
     /// [`MediaError`]: empty, too large, not an accepted format, malformed,
     /// too many pixels, or a file system failure.
     pub fn put(&self, bytes: &[u8]) -> Result<MediaRef, MediaError> {
-        if bytes.is_empty() {
-            return Err(MediaError::Empty);
-        }
-        let limit = self.limits.max_bytes;
-        if u64::try_from(bytes.len()).map_or(true, |len| len > limit) {
-            return Err(MediaError::TooLarge { limit });
-        }
-        let seen = inspect(bytes)?;
-        let clean = sanitize(bytes, seen.format)?;
-        // The sanitized copy must still be the same image.
-        let after = inspect(&clean)?;
-        if after != seen {
-            return Err(MediaError::Malformed("sanitizing changed the image"));
-        }
-        let pixels = u64::from(seen.width) * u64::from(seen.height);
-        if seen.width > self.limits.max_edge
-            || seen.height > self.limits.max_edge
-            || pixels > self.limits.max_pixels
-        {
-            return Err(MediaError::DimensionsTooLarge {
-                width: seen.width,
-                height: seen.height,
-            });
-        }
-        let size = u64::try_from(clean.len()).map_err(|_| MediaError::TooLarge { limit })?;
-        let media = MediaRef::new(
-            ContentDigest::of(&clean),
-            seen.format,
-            size,
-            seen.width,
-            seen.height,
-        )
-        .map_err(|_| MediaError::Malformed("implausible size or dimensions"))?;
+        let (media, clean) = ingest(bytes, self.limits)?;
         let path = self.path_of(&media);
         if let Some(parent) = path.parent() {
             DirBuilder::new()
@@ -174,6 +163,42 @@ impl MediaSource for MediaStore {
         }
         Ok(bytes)
     }
+}
+
+/// Checks, measures and sanitizes `bytes`; returns the reference and the
+/// sanitized bytes it names. Shared by every [`MediaSource`] that ingests.
+pub(crate) fn ingest(bytes: &[u8], limits: MediaLimits) -> Result<(MediaRef, Vec<u8>), MediaError> {
+    if bytes.is_empty() {
+        return Err(MediaError::Empty);
+    }
+    let limit = limits.max_bytes;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > limit) {
+        return Err(MediaError::TooLarge { limit });
+    }
+    let seen = inspect(bytes)?;
+    let clean = sanitize(bytes, seen.format)?;
+    // The sanitized copy must still be the same image.
+    let after = inspect(&clean)?;
+    if after != seen {
+        return Err(MediaError::Malformed("sanitizing changed the image"));
+    }
+    let pixels = u64::from(seen.width) * u64::from(seen.height);
+    if seen.width > limits.max_edge || seen.height > limits.max_edge || pixels > limits.max_pixels {
+        return Err(MediaError::DimensionsTooLarge {
+            width: seen.width,
+            height: seen.height,
+        });
+    }
+    let size = u64::try_from(clean.len()).map_err(|_| MediaError::TooLarge { limit })?;
+    let media = MediaRef::new(
+        ContentDigest::of(&clean),
+        seen.format,
+        size,
+        seen.width,
+        seen.height,
+    )
+    .map_err(|_| MediaError::Malformed("implausible size or dimensions"))?;
+    Ok((media, clean))
 }
 
 fn check_private_dir(root: &Path) -> Result<(), MediaError> {
@@ -338,6 +363,17 @@ mod tests {
         let again = put(&store, &webp_extended(64, 64))?;
         assert_eq!(again, media);
         assert!(store.contains(&media));
+        Ok(())
+    }
+
+    #[test]
+    fn open_existing_never_creates_anything() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let root = dir.path().join("media");
+        assert!(matches!(MediaStore::open_existing(&root), Ok(None)));
+        assert!(!root.exists(), "nothing was created");
+        MediaStore::open(&root).map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(matches!(MediaStore::open_existing(&root), Ok(Some(_))));
         Ok(())
     }
 

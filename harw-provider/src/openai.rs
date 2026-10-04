@@ -100,9 +100,19 @@ pub enum InputItem {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    InputText { text: String },
-    OutputText { text: String },
-    InputImage { image_url: String },
+    InputText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+    },
+    InputImage {
+        /// A `data:` URL: the harness only sends bytes it holds itself.
+        image_url: String,
+        /// `low`, `high` or `auto`; omitted when the sender has no preference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 /// Tool-Definition (Function-Calling).

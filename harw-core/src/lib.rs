@@ -43,6 +43,7 @@ pub mod guard;
 pub mod history;
 pub mod history_tail;
 pub mod live_mode;
+pub mod media;
 pub mod mode;
 pub mod model;
 pub mod one_shot;
@@ -115,6 +116,7 @@ pub use history::{ConversationHistory, ModelMessage};
 pub use history_tail::{
     HISTORY_TAIL_GUARANTEED_GROUPS, HISTORY_TAIL_SECTION, HistoryTailRender, render_history_tail,
 };
+pub use media::{ModelImage, install_media_source, resolve_media, resolve_media_with};
 pub use mode::InteractionMode;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,

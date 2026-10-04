@@ -184,7 +184,7 @@ fn text_of(parts: &[ContentPart]) -> String {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => text.clone(),
-            ContentPart::ImageUrl { .. } => "[image]".to_owned(),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => "[image]".to_owned(),
         })
         .collect::<Vec<_>>()
         .join("\n")

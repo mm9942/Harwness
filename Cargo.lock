@@ -2338,6 +2338,7 @@ dependencies = [
  "harw-job-core",
  "harw-lens-types",
  "harw-macros",
+ "harw-media",
  "harw-observe",
  "harw-protocol",
  "harw-sandbox",
@@ -3402,6 +3403,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-mobile-core"
+version = "0.9.0"
+dependencies = [
+ "harw-protocol",
+ "harw-session-client",
+ "harw-session-daemon",
+ "harw-session-host",
+ "harw-session-remote",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "harw-mobile-term"
+version = "0.9.0"
+dependencies = [
+ "harw-mobile-core",
+ "harw-protocol",
+ "harw-session-daemon",
+ "harw-session-host",
+ "harw-session-remote",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "harw-model-catalog"
 version = "0.9.0"
 dependencies = [
@@ -3770,6 +3805,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-fsutil",
+ "harw-media",
  "harw-oauth",
  "harw-protocol",
  "harw-provider",
@@ -4010,6 +4046,17 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "harw-session-client"
+version = "0.9.0"
+dependencies = [
+ "harw-protocol",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde_json",
 ]
 
 [[package]]
@@ -4577,12 +4624,18 @@ dependencies = [
  "harw-core",
  "harw-extension-api",
  "harw-home",
+ "harw-media",
  "harw-protocol",
  "harw-provider-http",
  "harw-runtime",
+ "harw-session-client",
+ "harw-session-daemon",
+ "harw-session-host",
+ "harw-session-remote",
  "harw-session-store",
  "harw-tools",
  "harw-types",
+ "jiff",
  "serde_json",
  "tempfile",
  "time",
