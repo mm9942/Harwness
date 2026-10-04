@@ -46,7 +46,8 @@ pub fn message_text(message: &AssistantMessageItem) -> String {
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::ImageUrl { .. } => None,
+            // Images and other media are not text.
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("")

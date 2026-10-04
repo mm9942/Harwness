@@ -13,7 +13,7 @@ fn text_of(parts: &[ContentPart]) -> String {
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::ImageUrl { .. } => None,
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")

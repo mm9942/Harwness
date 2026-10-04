@@ -121,6 +121,8 @@ layer = "I"
 layer = "I"
 [packages."harw-fsutil"]
 layer = "I"
+[packages."harw-media"]
+layer = "I"
 [packages."harw-retention"]
 layer = "I"
 [packages."harw-observe"]

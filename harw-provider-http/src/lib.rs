@@ -2853,7 +2853,7 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
     let mut input = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text } => {
+            harw_core::ModelMessage::User { text, .. } => {
                 input.push(InputItem::Message {
                     role: "user".to_owned(),
                     content: vec![ContentPart::InputText { text }],
@@ -3625,7 +3625,7 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
 
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text } => {
+            harw_core::ModelMessage::User { text, .. } => {
                 messages.push(serde_json::json!({ "role": "user", "content": text }));
             }
             harw_core::ModelMessage::Assistant { text } => {

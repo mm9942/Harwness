@@ -4206,7 +4206,9 @@ fn visible_message_text(content: &[ContentPart]) -> String {
     for part in content {
         match part {
             ContentPart::Text { text } => visible.push_str(text),
-            ContentPart::ImageUrl { .. } => visible.push_str(NON_TEXT_CONTENT_PLACEHOLDER),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => {
+                visible.push_str(NON_TEXT_CONTENT_PLACEHOLDER);
+            }
         }
     }
     visible

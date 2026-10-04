@@ -2121,7 +2121,11 @@ pub fn estimate_request_bytes(request: &crate::model::ModelRequest) -> u64 {
     }
     for message in request.history.to_model_messages() {
         let payload = match &message {
-            ModelMessage::User { text } | ModelMessage::Assistant { text } => text.len() as u64,
+            ModelMessage::User { text, images } => images
+                .iter()
+                .map(|image| image.media.estimated_tokens().saturating_mul(4))
+                .fold(text.len() as u64, u64::saturating_add),
+            ModelMessage::Assistant { text } => text.len() as u64,
             ModelMessage::ToolCall {
                 call_id,
                 name,
