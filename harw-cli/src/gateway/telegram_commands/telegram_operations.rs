@@ -16,7 +16,7 @@ const TELEGRAM_DESCRIPTION_MAX_CHARS: usize = 256;
 
 /// Ein auf Telegram projizierter Harwness-Command.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TelegramOperationSpec {
+pub(crate) struct TelegramOperationSpec {
     /// Telegram-tauglicher Name ohne führenden Slash.
     pub telegram_name: String,
     /// Verlustfreier kanonischer Harwness-Pfad, z. B. `/context-proposal`.
@@ -27,14 +27,14 @@ pub(super) struct TelegramOperationSpec {
 
 /// Verlustfreie direkte Ausführung einer kanalfähigen Operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TelegramOperationInvocation {
+pub(crate) struct TelegramOperationInvocation {
     pub canonical_path: String,
     pub args: Vec<String>,
 }
 
 /// Ergebnis der Telegram-spezifischen Slash-Auflösung.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum OperationResolve {
+pub(crate) enum OperationResolve {
     NoMatch,
     Invalid(String),
     Invocation(TelegramOperationInvocation),
@@ -42,7 +42,7 @@ pub(super) enum OperationResolve {
 
 /// Deterministische Projektion aller kanalfähigen Operationen.
 #[derive(Clone, Debug, Default)]
-pub(super) struct TelegramOperationCatalog {
+pub(crate) struct TelegramOperationCatalog {
     specs: Arc<[TelegramOperationSpec]>,
     by_alias: Arc<BTreeMap<String, usize>>,
     by_canonical: Arc<BTreeMap<String, usize>>,
