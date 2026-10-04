@@ -4700,6 +4700,10 @@ pub(crate) async fn run_loop(
     // die eine Verlaufszelle je Kind-Session.
     let mut turn_state = TurnEventState::default();
 
+    // Bilder früherer Nachrichten (fortgesetzte Sitzung) wieder auffindbar machen.
+    app.images
+        .attach_existing(harw_home::paths::home_dir().ok().as_deref());
+
     let mut spinner = Spinner::new();
     let mut provider_error_streak = 0_u32;
     // Ein fertiger Busy-Auftrag weckt die Schleife über einen Frame, auch

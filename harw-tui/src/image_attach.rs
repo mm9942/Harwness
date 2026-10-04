@@ -46,6 +46,25 @@ impl ImageAttachments {
         }
     }
 
+    /// Hängt beim Start einen schon vorhandenen Speicher ein (legt nichts an),
+    /// damit eine fortgesetzte Sitzung ihre früheren Bilder wieder senden
+    /// kann, statt sie als Platzhalter zu zeigen.
+    pub(crate) fn attach_existing(&mut self, home: Option<&Path>) {
+        if self.store.is_some() {
+            return;
+        }
+        let Some(home) = home else { return };
+        match MediaStore::open_existing(home.join("media")) {
+            Ok(Some(store)) => {
+                let store = Arc::new(store);
+                harw_core::install_media_source(Arc::clone(&store) as _);
+                self.store = Some(store);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "media store not attached"),
+        }
+    }
+
     /// Die vorgemerkten Bilder für den nächsten Turn; leert die Liste.
     pub(crate) fn take(&mut self) -> Vec<MediaRef> {
         std::mem::take(&mut self.pending)
@@ -211,6 +230,22 @@ mod tests {
         let cleared = images.command("clear", Some(&home), dir.path());
         assert!(cleared.contains("10"), "{cleared}");
         assert_eq!(images.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_existing_store_is_attached_at_start_and_none_is_created() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let mut images = ImageAttachments::default();
+        images.attach_existing(Some(&home));
+        assert!(images.store.is_none());
+        assert!(!home.join("media").exists(), "nothing is created");
+
+        MediaStore::open(home.join("media"))?;
+        images.attach_existing(Some(&home));
+        assert!(images.store.is_some());
         Ok(())
     }
 
