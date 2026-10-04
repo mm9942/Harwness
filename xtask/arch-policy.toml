@@ -397,6 +397,10 @@ layer = "A"
 layer = "A"
 [packages."harw-node-listener"]
 layer = "A"
+[packages."harw-mobile-core"]
+layer = "A"
+[packages."harw-mobile-term"]
+layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
 [packages."harw-web"]
