@@ -1900,7 +1900,9 @@ fn handoff_properties() -> BTreeMap<String, JsonSchema> {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
                 "Optional (nur UIA-Orchestratoren in der TUI, dort Vorgabe true): sofort \
-                 zurück, Ergebnis kommt als Benachrichtigung; false wartet."
+                 zurück, Ergebnis kommt als Benachrichtigung; false wartet. Bei einem \
+                 pausierverbotenen Ziel `background=true` setzen, damit der Elternlauf \
+                 nicht auf das Kind wartet."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -2328,6 +2330,30 @@ fn delegation_call(call: &ToolCall) -> Option<(String, serde_json::Value)> {
         return Some((role, call.arguments.clone()));
     }
     delegate_tool_role(call).and_then(Result::ok)
+}
+
+fn blocking_handoff_pause_rejection(
+    spawner: &dyn harw_extension_api::AgentSpawner,
+    role: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if arguments
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || spawner.role_allows_pause(role) != Some(false)
+    {
+        return None;
+    }
+    Some(format!(
+        "Blocking handoff to '{role}' is not allowed because the target lifecycle forbids \
+         pausing ([lifecycle] allow_pause = false). Set background=true to avoid blocking."
+    ))
+}
+
+fn is_blocking_handoff_pause_rejection(message: &str) -> bool {
+    message.starts_with("Blocking handoff to '")
+        && message.contains("[lifecycle] allow_pause = false")
 }
 
 /// Plan R9, Teil C: die Delegationsziele der Session ohne die, deren
@@ -3854,10 +3880,19 @@ async fn resume_after_approval_with_store(
                                 .await;
                         }
                     };
-                    let child = match spawner
-                        .spawn_child(&role, input, context.sandbox, context.suggestions)
-                        .await
-                    {
+                    let spawned = match blocking_handoff_pause_rejection(
+                        spawner.as_ref(),
+                        &role,
+                        &input.context,
+                    ) {
+                        Some(message) => Err(harw_extension_api::AgentSpawnError { message }),
+                        None => {
+                            spawner
+                                .spawn_child(&role, input, context.sandbox, context.suggestions)
+                                .await
+                        }
+                    };
+                    let child = match spawned {
                         Ok(child) => child,
                         // Runde 5, Teil K: eine Orchestrierungsgrenze ist eine
                         // Antwort an das Modell, kein Turn-Abbruch.
@@ -3869,7 +3904,7 @@ async fn resume_after_approval_with_store(
                                 &error.message,
                             ) || crate::delegation_visibility::is_plan_mode_refusal(
                                 &error.message,
-                            ) =>
+                            ) || is_blocking_handoff_pause_rejection(&error.message) =>
                         {
                             session.history_mut().push_tool_result(
                                 pending.call.id,
@@ -4950,9 +4985,18 @@ async fn drive_turn(
                         continue;
                     }
                 };
-                let spawned = spawner
-                    .spawn_child(&role, spawn_input, context.sandbox, context.suggestions)
-                    .await;
+                let spawned = match blocking_handoff_pause_rejection(
+                    spawner.as_ref(),
+                    &role,
+                    &spawn_input.context,
+                ) {
+                    Some(message) => Err(harw_extension_api::AgentSpawnError { message }),
+                    None => {
+                        spawner
+                            .spawn_child(&role, spawn_input, context.sandbox, context.suggestions)
+                            .await
+                    }
+                };
                 // Runde 5, Teil K: eine Orchestrierungsgrenze (`[agents]`) ist
                 // eine Antwort an das Modell — Werkzeugfehler statt Turn-Abbruch.
                 // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung
@@ -4961,7 +5005,8 @@ async fn drive_turn(
                     && (crate::background_children::is_orchestration_limit_rejection(
                         &error.message,
                     ) || crate::child_handoff::is_continuation_rejection(&error.message)
-                        || crate::delegation_visibility::is_plan_mode_refusal(&error.message))
+                        || crate::delegation_visibility::is_plan_mode_refusal(&error.message)
+                        || is_blocking_handoff_pause_rejection(&error.message))
                 {
                     let mut result = ToolCallResult::error(error.message.clone());
                     let abort_reason = apply_tool_guard(
@@ -8469,6 +8514,175 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    struct PauseForbiddenSpawner {
+        child: SessionId,
+        spawns: AtomicUsize,
+    }
+
+    impl AgentSpawner for PauseForbiddenSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            let child = self.child.clone();
+            Box::pin(async move { Ok(child) })
+        }
+
+        fn role_allows_pause(&self, _role: &str) -> Option<bool> {
+            Some(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_handoff_to_pause_forbidden_role_is_rejected_before_spawn() -> TestResult {
+        let spawner = Arc::new(PauseForbiddenSpawner {
+            child: SessionId::new(),
+            spawns: AtomicUsize::new(0),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(spawner.clone())
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let call_id = ToolCallId::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: call_id.clone(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"task": "warte auf mich"}),
+            }]),
+            response_with(Vec::new()),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere")).await;
+        assert!(
+            matches!(outcome, Ok(TurnOutcome::Completed)),
+            "die Ablehnung muss als Werkzeugfehler zum Modell zurückkehren: {outcome:?}"
+        );
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+        let result = session
+            .history()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(result) if result.call_id == call_id => {
+                    Some(result.result.clone())
+                }
+                _ => None,
+            })
+            .ok_or(TestError::Missing(
+                "der Handoff bekommt ein Werkzeugergebnis",
+            ))?;
+        match result {
+            ToolCallResult::Error { message } => {
+                assert!(message.contains("[lifecycle] allow_pause = false"));
+                assert!(message.contains("background=true"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ein Werkzeugfehler, nicht {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_handoff_to_pause_forbidden_role_is_spawned() -> TestResult {
+        let spawner = Arc::new(PauseForbiddenSpawner {
+            child: SessionId::new(),
+            spawns: AtomicUsize::new(0),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(spawner.clone())
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("transfer_to_worker"),
+            arguments: serde_json::json!({"task": "arbeite weiter", "background": true}),
+        }])]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere")).await;
+        assert!(matches!(outcome, Ok(TurnOutcome::AwaitingChild { .. })));
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approved_blocking_handoff_to_pause_forbidden_role_is_rejected() -> TestResult {
+        let spawner = Arc::new(PauseForbiddenSpawner {
+            child: SessionId::new(),
+            spawns: AtomicUsize::new(0),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(spawner.clone())
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
+        let call_id = ToolCallId::new();
+        let actor = ApprovalActor::Operator {
+            id: "test-operator".to_owned(),
+        };
+        session
+            .begin_approval(
+                ToolCall {
+                    id: call_id.clone(),
+                    name: ToolName::new("transfer_to_worker"),
+                    arguments: serde_json::json!({"task": "warte auf mich"}),
+                },
+                harw_types::ItemId::new(),
+                actor.clone(),
+                jiff::Timestamp::now(),
+            )
+            .map_err(ctx("pause before approved handoff"))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(Vec::new())]);
+
+        let outcome = resume_after_approval(
+            &mut session,
+            &model,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(TurnOutcome::Completed)),
+            "die Ablehnung muss als Werkzeugfehler zum Modell zurückkehren: {outcome:?}"
+        );
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+        let result = session
+            .history()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(result) if result.call_id == call_id => {
+                    Some(result.result.clone())
+                }
+                _ => None,
+            })
+            .ok_or(TestError::Missing(
+                "der Handoff bekommt ein Werkzeugergebnis",
+            ))?;
+        assert!(matches!(
+            result,
+            ToolCallResult::Error { message } if message.contains("background=true")
+        ));
         Ok(())
     }
 

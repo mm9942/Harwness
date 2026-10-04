@@ -2475,6 +2475,13 @@ impl AgentSpawner for DeferredManagedSpawner {
         })
     }
 
+    fn role_allows_pause(&self, role: &str) -> Option<bool> {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|spawner| spawner.role_allows_pause(role))
+    }
+
     fn child_finished(&self, child: &harw_types::SessionId) {
         if let Some(spawner) = self.slot.get().and_then(Weak::upgrade) {
             spawner.child_finished(child);
