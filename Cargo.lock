@@ -3771,6 +3771,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-fsutil",
+ "harw-media",
  "harw-oauth",
  "harw-protocol",
  "harw-provider",
