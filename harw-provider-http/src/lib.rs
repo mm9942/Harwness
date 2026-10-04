@@ -84,6 +84,7 @@ pub mod budget;
 pub mod cache_strategy;
 pub mod discovery;
 mod error;
+mod images;
 pub mod rate_limiter;
 pub mod retry;
 pub mod routing;
@@ -1697,6 +1698,8 @@ pub struct OpenAiResponsesProvider {
     /// `[capabilities] tool_calling = false` — ihnen werden keine Werkzeuge
     /// angeboten (siehe [`strip_tools_for_toolless_model`]).
     toolless_models: BTreeSet<String>,
+    /// Modelle mit `image_input = false`: Bilder werden durch einen Hinweis ersetzt.
+    imageless_models: BTreeSet<String>,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -1837,6 +1840,7 @@ impl OpenAiResponsesProvider {
             stream_idle_timeout: DEFAULT_REQUEST_TIMEOUT,
             chat_compat: ChatCompat::default(),
             toolless_models: BTreeSet::new(),
+            imageless_models: BTreeSet::new(),
         })
     }
 
@@ -2090,6 +2094,7 @@ impl OpenAiResponsesProvider {
             Duration::from_secs(provider.effective_stream_idle_timeout_secs());
         http_provider.chat_compat = ChatCompat::from_provider(provider);
         http_provider.toolless_models = toolless_models(provider_name, config);
+        http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
     }
 
@@ -2853,10 +2858,10 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
     let mut input = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text, .. } => {
+            harw_core::ModelMessage::User { text, images } => {
                 input.push(InputItem::Message {
                     role: "user".to_owned(),
-                    content: vec![ContentPart::InputText { text }],
+                    content: images::responses_user_content(text, &images),
                 });
             }
             harw_core::ModelMessage::Assistant { text } => {
@@ -3504,6 +3509,41 @@ fn toolless_models(provider_name: &str, config: &harw_config::ResolvedConfig) ->
     models
 }
 
+/// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
+/// `[capabilities] image_input = false` sagt.
+fn imageless_models(provider_name: &str, config: &harw_config::ResolvedConfig) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    for model in config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_name)
+        .filter(|model| model.capabilities.image_input == Some(false))
+    {
+        models.insert(model.id.clone());
+        models.extend(model.aliases.iter().cloned());
+    }
+    models
+}
+
+/// Ersetzt in `request` jedes Bild durch einen Hinweistext, wenn `model` keine
+/// Bilder versteht. Das Bild verschwindet nicht still: der Verlauf nennt es
+/// mit Maßen. Liefert `true`, wenn etwas ersetzt wurde.
+fn replace_images_for_imageless_model(
+    request: &mut ModelRequest,
+    model: &str,
+    imageless: &BTreeSet<String>,
+) -> bool {
+    if !imageless.contains(model) || !request.history.has_images() {
+        return false;
+    }
+    tracing::warn!(
+        model,
+        "model has image_input = false; images are replaced by a notice for this request"
+    );
+    request.history = request.history.without_images(images::IMAGELESS_REASON);
+    true
+}
+
 /// Hinweis an ein Modell ohne Werkzeugaufrufe (Runde 7, Teil L7).
 const TOOLLESS_MODEL_NOTICE: &str = "Hinweis: Dieses Modell unterstützt keine Werkzeugaufrufe. Es stehen dir in dieser Runde keine Werkzeuge zur Verfügung; antworte ausschließlich mit Text und beschreibe gegebenenfalls, welche Werkzeuge du bräuchtest.";
 
@@ -3625,8 +3665,11 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
 
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text, .. } => {
-                messages.push(serde_json::json!({ "role": "user", "content": text }));
+            harw_core::ModelMessage::User { text, images } => {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": images::chat_user_content(text, &images),
+                }));
             }
             harw_core::ModelMessage::Assistant { text } => {
                 messages.push(serde_json::json!({ "role": "assistant", "content": text }));
@@ -4124,6 +4167,7 @@ impl OpenAiResponsesProvider {
         // Runde 7, Teil L7: Modelle ohne Werkzeugaufrufe bekommen keine
         // Werkzeuge angeboten (plus Hinweis in den Instruktionen).
         strip_tools_for_toolless_model(&mut request, model, &self.toolless_models);
+        replace_images_for_imageless_model(&mut request, model, &self.imageless_models);
         // Für `authorized_request` (Gateway-Identity-Header, siehe
         // [`Self::gateway_identity_headers`]) — geliehen von `request`, das
         // bis nach dem Response-Parsing im Scope bleibt.
@@ -8868,5 +8912,7 @@ mod tests {
 mod test_support;
 
 // Runde 7, Teil L: Tests für lokale Modell-Server gegen Fake-HTTP-Server.
+#[cfg(test)]
+mod image_tests;
 #[cfg(test)]
 mod local_model_tests;

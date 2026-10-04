@@ -64,6 +64,27 @@ impl MediaStore {
         Ok(Self { root, limits })
     }
 
+    /// Opens the store at `root` only if it exists; `None` otherwise. It never
+    /// creates anything, so a program can attach an existing store at start-up
+    /// without leaving a directory behind.
+    ///
+    /// # Errors
+    /// See [`Self::open`] for a directory that exists but is unsafe.
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Option<Self>, MediaError> {
+        let root = root.into();
+        match fs::symlink_metadata(&root) {
+            Ok(_) => {
+                check_private_dir(&root)?;
+                Ok(Some(Self {
+                    root,
+                    limits: MediaLimits::default(),
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// The directory of this store.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -342,6 +363,17 @@ mod tests {
         let again = put(&store, &webp_extended(64, 64))?;
         assert_eq!(again, media);
         assert!(store.contains(&media));
+        Ok(())
+    }
+
+    #[test]
+    fn open_existing_never_creates_anything() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let root = dir.path().join("media");
+        assert!(matches!(MediaStore::open_existing(&root), Ok(None)));
+        assert!(!root.exists(), "nothing was created");
+        MediaStore::open(&root).map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(matches!(MediaStore::open_existing(&root), Ok(Some(_))));
         Ok(())
     }
 
