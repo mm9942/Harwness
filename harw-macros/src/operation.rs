@@ -1200,6 +1200,49 @@ mod operation_tests {
     }
 
     #[test]
+    fn channel_reduced_requires_explicit_remote_subcommands() -> TestResult {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "channel_reduced")
+        };
+        let args = parse_operation_args(attr)
+            .map_err(ctx("channel_reduced muss syntaktisch parsbar bleiben"))?;
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            return Err(TestError::Unexpected(
+                "channel_reduced ohne channel_subcommands muss fehlschlagen".to_owned(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requires `channel_subcommands = \\"...\\"`")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reduced_emits_remote_subcommand_allowlist() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "channel_reduced",
+                channel_subcommands = "-,show,list"
+            )
+        })?;
+
+        assert!(flat.contains("fnchannel_subcommands(&self)->&'static[&'staticstr]"));
+        assert!(flat.contains("constTABLE:&[&str]=&[\"-\",\"show\",\"list\"]"));
+        Ok(())
+    }
+
+    #[test]
     fn expand_operation_web_with_path_only_fails_missing_method() -> TestResult {
         // W3/C-OPS, F-031: `method` no longer defaults from `readonly` — a
         // `web(...)` without it must fail to expand with a clear message.
