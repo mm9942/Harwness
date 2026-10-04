@@ -53,7 +53,9 @@ use harw_extension_api::{
 };
 use harw_knowledge::workbench::{self, DigestOptions, WorkbenchScope};
 use harw_knowledge::{AgentId, KnowledgeStore};
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::args::parse_args;
+use harw_tools::schema_helpers::{object_schema_all_required, string_property};
+use harw_tools::{FunctionToolSpec, Permission};
 use serde::Deserialize;
 
 /// Name des Notiz-Werkzeugs.
@@ -155,25 +157,6 @@ harw_tools::tool_provider! {
     }
 }
 
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>) -> JsonSchema {
-    let required = props.keys().cloned().collect();
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-}
-
 fn note_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
@@ -186,7 +169,7 @@ fn note_spec() -> ToolSpec {
              Zwischenstände, Beobachtungen, nächste Schritte. Flüchtig per Design, \
              wird nicht ins Gedächtnis übernommen. Ändert keine Workspace-Datei."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -215,7 +198,7 @@ fn hypothesis_spec() -> ToolSpec {
              (hypotheses.md): offene Vermutungen festhalten und später bestätigen oder \
              verwerfen. Eine entschiedene Hypothese kann nicht erneut entschieden werden."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -298,11 +281,9 @@ fn execute_note(
     arguments: serde_json::Value,
     now: jiff::Timestamp,
 ) -> ToolOutput {
-    let args: NoteArgs = match serde_json::from_value(arguments) {
+    let args: NoteArgs = match parse_args(WORKBENCH_NOTE, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{WORKBENCH_NOTE}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     let scope = WorkbenchScope::Session(session_id.to_owned());
     match workbench::append_note(store, &scope, &model_author(session_id), &args.text, now) {
@@ -321,13 +302,9 @@ fn execute_hypothesis(
     arguments: serde_json::Value,
     now: jiff::Timestamp,
 ) -> ToolOutput {
-    let args: HypothesisArgs = match serde_json::from_value(arguments) {
+    let args: HypothesisArgs = match parse_args(WORKBENCH_HYPOTHESIS, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!(
-                "{WORKBENCH_HYPOTHESIS}: ungültige Argumente: {error}"
-            ));
-        }
+        Err(out) => return out,
     };
     let scope = WorkbenchScope::Session(session_id.to_owned());
     let author = model_author(session_id);
@@ -426,7 +403,7 @@ fn show_spec() -> ToolSpec {
              kein Dateiinhalt), Hypothesen mit Nummer #<n> und das Ende der Notizen. \
              Gekürzt auf 4 KiB. Nur die eigene Sitzung bzw. das eigene Projekt."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -468,11 +445,9 @@ fn execute_show(
     project: Option<&WorkbenchScope>,
     arguments: serde_json::Value,
 ) -> ToolOutput {
-    let args: ShowArgs = match serde_json::from_value(arguments) {
+    let args: ShowArgs = match parse_args(WORKBENCH_SHOW, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{WORKBENCH_SHOW}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     let scope = match args.scope.as_str() {
         "session" => WorkbenchScope::Session(session_id.to_owned()),

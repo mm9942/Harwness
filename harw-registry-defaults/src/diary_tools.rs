@@ -43,6 +43,8 @@ use harw_extension_api::{
 };
 use harw_knowledge::diary::{self, DiaryTrigger};
 use harw_knowledge::{AgentId, KnowledgeStore};
+use harw_tools::args::parse_args_or_default;
+use harw_tools::schema_helpers::string_property;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
 use serde::Deserialize;
 
@@ -96,14 +98,6 @@ harw_tools::tool_provider! {
                 agent: provider.agent.clone(),
             },
         },
-    }
-}
-
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
     }
 }
 
@@ -205,13 +199,9 @@ fn execute_read(
     if agent.as_str() == OPERATOR_ID || diary::validate_agent_id(agent).is_err() {
         return fail("kein Agenten-Tagebuch für diese Sitzung".to_owned());
     }
-    let args: ReadArgs = if arguments.is_null() {
-        ReadArgs::default()
-    } else {
-        match serde_json::from_value(arguments) {
-            Ok(args) => args,
-            Err(error) => return fail(format!("ungültige Argumente: {error}")),
-        }
+    let args: ReadArgs = match parse_args_or_default(DIARY_READ, &arguments) {
+        Ok(args) => args,
+        Err(out) => return out,
     };
     let today = now.strftime("%Y-%m-%d").to_string();
     let to = args.to.unwrap_or_else(|| today.clone());

@@ -25,13 +25,13 @@
 //! # Nebenläufigkeit
 //! `Send + Sync`; [`ToolProvider::parallel_safe`] ist `false` für alle vier.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use harw_authority::Permission;
+use harw_tools::schema_helpers::{object_schema_from_pairs, string_property};
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
-    schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
+    schema::JsonSchema,
     spec::{FunctionToolSpec, ToolName, ToolSpec},
 };
 use harw_types::cancel::CancelToken;
@@ -121,28 +121,6 @@ impl PlanToolProvider {
     }
 }
 
-fn string_prop(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(properties: &[(&str, JsonSchema)], required: &[&str]) -> JsonSchema {
-    let properties: BTreeMap<String, JsonSchema> = properties
-        .iter()
-        .map(|(name, schema)| ((*name).to_owned(), schema.clone()))
-        .collect();
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(properties),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-}
-
 // Die vier Plan-Werkzeuge der Wurzel. Alle sind `ReadWorkspace` (siehe
 // `TOOL_PERMISSIONS`): `plan.write` schreibt nur das Harness-Artefakt
 // `.harw/plans/<slug>.md` und muss unter der Plan-Decke (ohne
@@ -161,19 +139,19 @@ harw_tools::tool_provider! {
                      structure: Context / Approach in steps / Affected files / Verification.",
                     plan_file::plan_display_prefix()
                 ),
-                object_schema(
+                object_schema_from_pairs(
                     &[
-                        ("content", string_prop("The complete plan as Markdown.")),
+                        ("content", string_property("The complete plan as Markdown.")),
                         (
                             "slug",
-                            string_prop(
+                            string_property(
                                 "Optional file name: lowercase a-z, 0-9 and '-', max 64 chars. \
                                  Omit to keep the current plan of this session.",
                             ),
                         ),
                         (
                             "title",
-                            string_prop("Optional title; used to derive the slug of a new plan."),
+                            string_property("Optional title; used to derive the slug of a new plan."),
                         ),
                     ],
                     &["content"],
@@ -192,10 +170,10 @@ harw_tools::tool_provider! {
                  shows it with three options: implement in auto mode, implement with per-change \
                  approval, or keep planning with feedback. Only works in plan mode, only in the \
                  interactive TUI. Call it only after plan.write.",
-                object_schema(
+                object_schema_from_pairs(
                     &[(
                         "plan_path",
-                        string_prop(&format!(
+                        string_property(&format!(
                             "The plan written with plan.write, e.g. {}/<slug>.md",
                             plan_file::plan_display_prefix()
                         )),
@@ -214,10 +192,10 @@ harw_tools::tool_provider! {
                 PLAN_ENTER_TOOL,
                 "Suggest switching to plan mode (read-only exploration, then a written plan) for \
                  a larger or risky task. The user must confirm; nothing changes without her.",
-                object_schema(
+                object_schema_from_pairs(
                     &[(
                         "reason",
-                        string_prop("One sentence why planning first is worth it."),
+                        string_property("One sentence why planning first is worth it."),
                     )],
                     &["reason"],
                 ),
