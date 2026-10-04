@@ -474,7 +474,8 @@ struct SendMessageDraftRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     message_thread_id: Option<i64>,
     draft_id: i64,
-    #[serde(skip_serializing_if = "str::is_empty")]
+    // Bot API 10.3: ein explizites `""` zeigt den nativen
+    // "Thinking…"-Platzhalter; daher nicht per serde auslassen.
     text: &'a str,
     can_stop: bool,
     keep_on_stop: bool,
