@@ -228,6 +228,27 @@ impl CommandAdapter {
         self.permission
     }
 
+    /// Prüft, ob dieser konkrete Aufruf auf einer Channel-Fläche zulässig ist.
+    ///
+    /// `TuiOnly` ist immer gesperrt, `ChannelParity` übernimmt die gesamte
+    /// Command-Grammatik. `ChannelReduced` ist fail-closed und erlaubt nur
+    /// die von [`Operation::channel_subcommands`] deklarierten Formen.
+    #[must_use]
+    pub fn allows_channel_invocation(&self, raw_args: &[String]) -> bool {
+        match self.visibility {
+            CommandVisibility::TuiOnly => false,
+            CommandVisibility::ChannelParity => true,
+            CommandVisibility::ChannelReduced => {
+                let allowed = self.op.channel_subcommands();
+                if allowed.contains(&"*") {
+                    return true;
+                }
+                let first = raw_args.first().map(String::as_str).unwrap_or("-");
+                allowed.contains(&first)
+            }
+        }
+    }
+
     /// Gibt den maschinellen Namen der zugrundeliegenden Operation zurück.
     ///
     /// # Beschreibung
