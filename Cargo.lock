@@ -1926,11 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "harw"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
@@ -1955,11 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-artifact"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "serde",
@@ -1969,11 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-compiler"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-artifact",
  "harw-agent-dsl",
@@ -1990,11 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-dsl"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-context",
@@ -2007,11 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-runner"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "futures-core",
@@ -2040,11 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "harw-auth-hub"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "bytes",
@@ -2075,11 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "harw-authority"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-types",
@@ -2092,11 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "harw-browser"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "async-trait",
  "harw-test-support",
@@ -2110,11 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "harw-browser-thirtyfour"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2136,11 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "harw-catalog"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-config",
  "harw-home",
@@ -2153,11 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "harw-channel"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "fs4",
  "harw-macros",
@@ -2173,11 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "harw-channel-telegram"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-channel",
@@ -2196,11 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "harw-channel-telegram-transport"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "axum",
  "fs4",
@@ -2223,11 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "harw-cli"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "clap_complete",
@@ -2255,6 +2199,7 @@ dependencies = [
  "harw-knowledge",
  "harw-lens",
  "harw-lens-types",
+ "harw-macros",
  "harw-mcp-client",
  "harw-mcp-server",
  "harw-memory",
@@ -2300,11 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "harw-code-graph"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -2315,11 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "harw-completions"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "clap_complete",
@@ -2330,11 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "harw-config"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-fsutil",
  "harw-macros",
@@ -2350,11 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "harw-context"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-lens-types",
@@ -2368,11 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "harw-core"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
@@ -2401,11 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "harw-core-bridge"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
@@ -2424,11 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "harw-digest"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "serde",
@@ -2437,11 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-dod-authlog",
@@ -2471,11 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-authlog"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2490,11 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-blockio"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2509,11 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-bpf"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "aya",
  "harw-dod-cap",
@@ -2527,11 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-cap"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-macros",
@@ -2544,11 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-cgroup"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2564,11 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-config"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-test-support",
@@ -2581,11 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-cpu"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2600,11 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-encrypt"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "crypt_guard_service",
  "harw-macros",
@@ -2613,11 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-escalate"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-dod-rules",
@@ -2636,11 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-fixtures"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-readfs",
@@ -2656,11 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-flow"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-dod-bpf",
@@ -2678,11 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-fsmon"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2698,11 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-gpu"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2717,11 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-listener"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2736,11 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-memory"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2755,11 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-netcounters"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2775,11 +2624,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-netlink"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
@@ -2789,11 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-netpolicy"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-dod-cap",
@@ -2807,11 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-procmon"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-bpf",
  "harw-dod-cap",
@@ -2825,11 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-readfs"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
@@ -2839,11 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-rules"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-code-graph",
@@ -2861,11 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-scanreport"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2883,11 +2708,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-sentinel"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-code-graph",
@@ -2908,11 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-signals"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
@@ -2926,11 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-thermal"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2945,11 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-warden"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-dod-warden-proto",
  "harw-macros",
@@ -2962,11 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-warden-proto"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-macros",
@@ -2979,11 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-workspace"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-code-graph",
  "harw-dod-cap",
@@ -3001,11 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "harw-egress"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-authority",
@@ -3020,11 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "harw-explorer"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "globset",
  "ignore",
@@ -3038,11 +2831,7 @@ dependencies = [
 
 [[package]]
 name = "harw-extension-api"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-catalog",
@@ -3060,11 +2849,7 @@ dependencies = [
 
 [[package]]
 name = "harw-fsutil"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "rustix 1.1.5",
  "tempfile",
@@ -3072,11 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "harw-home"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-agent-dsl",
@@ -3091,11 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "harw-infra-client"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "crypt_guard",
@@ -3115,11 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "harw-install"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "flate2",
  "getrandom 0.4.3",
@@ -3135,11 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "harw-instructions"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-extension-api",
  "harw-macros",
@@ -3150,11 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-job-core",
  "harw-job-runtime",
@@ -3166,11 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-core"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-observe",
@@ -3183,11 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-darwin"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-job-core",
  "rustix 1.1.5",
@@ -3198,11 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-exec"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-job-core",
  "harw-job-linux",
@@ -3215,11 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-executor-bwrap"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-job-core",
@@ -3232,11 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-linux"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "cap-std",
  "harw-job-core",
@@ -3251,11 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-runtime"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-job-core",
  "harw-job-darwin",
@@ -3275,11 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-store"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "cap-std",
  "fs4",
@@ -3294,11 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-tokio"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "harw-job-core",
@@ -3309,11 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "harw-killer"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "rustix 1.1.5",
@@ -3325,11 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "harw-knowledge"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "fs4",
  "harw-agent-dsl",
@@ -3353,11 +3078,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-lens-embed",
  "harw-lens-query",
@@ -3370,11 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-chunk"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-lens-types",
  "harw-macros",
@@ -3384,11 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-embed"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-lens-types",
@@ -3404,11 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-federation"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-knowledge",
  "harw-lens-embed",
@@ -3426,11 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-index"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-lens-rank",
  "harw-lens-store",
@@ -3445,11 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-query"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-home",
  "harw-knowledge",
@@ -3468,11 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-rank"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-lens-types",
  "harw-types",
@@ -3480,11 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-source"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-home",
  "harw-knowledge",
@@ -3504,11 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-store"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "fs4",
  "harw-home",
@@ -3523,11 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-types"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-digest",
  "harw-macros",
@@ -3538,11 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "harw-macros"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-dod-cap",
@@ -3566,11 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "harw-matrix-game"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "jiff",
  "rand_chacha 0.10.0",
@@ -3582,11 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "harw-mcp-client"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-extension-api",
  "harw-tools",
@@ -3600,11 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "harw-mcp-server"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "harw-job-core",
@@ -3623,11 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "harw-memory"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-context",
  "harw-extension-api",
@@ -3645,11 +3310,7 @@ dependencies = [
 
 [[package]]
 name = "harw-model-catalog"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-config",
  "harw-context",
@@ -3666,11 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "harw-netsec"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "fs4",
@@ -3691,11 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "harw-node-transport"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -3718,11 +3371,7 @@ dependencies = [
 
 [[package]]
 name = "harw-oauth"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "base64 0.23.1",
  "fs4",
@@ -3739,11 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -3753,11 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe-file"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-macros",
@@ -3771,11 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe-otlp"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "harw-macros",
@@ -3792,11 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe-prom"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-observe",
@@ -3806,14 +3439,11 @@ dependencies = [
 
 [[package]]
 name = "harw-operations"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-extension-api",
+ "harw-macros",
  "harw-sandbox",
  "harw-tools",
  "harw-types",
@@ -3826,11 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "harw-ops"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-compiler",
  "harw-agent-dsl",
@@ -3880,11 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "harw-plan"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-types",
@@ -3897,11 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "harw-plan-bridge"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "fs4",
  "harw-agent-dsl",
@@ -3935,11 +3553,7 @@ dependencies = [
 
 [[package]]
 name = "harw-probe-bpf"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "harw-authority",
@@ -3965,11 +3579,7 @@ dependencies = [
 
 [[package]]
 name = "harw-probe-fs"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "harw-completions",
@@ -3990,11 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "harw-project-discovery"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-extension-api",
  "harw-macros",
@@ -4007,11 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "harw-protocol"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-test-support",
  "harw-types",
@@ -4022,11 +3624,7 @@ dependencies = [
 
 [[package]]
 name = "harw-provider"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-types",
@@ -4039,11 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "harw-provider-http"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "base64 0.23.1",
  "harw-config",
@@ -4067,11 +3661,7 @@ dependencies = [
 
 [[package]]
 name = "harw-registry-defaults"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-compiler",
  "harw-agent-dsl",
@@ -4114,11 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "harw-research"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -4130,11 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "harw-runtime"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-agent-artifact",
  "harw-agent-dsl",
@@ -4187,11 +3769,7 @@ dependencies = [
 
 [[package]]
 name = "harw-sandbox"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-test-support",
@@ -4203,11 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "harw-secrets"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "aes-gcm-siv 0.12.1",
  "chacha20poly1305 0.11.0",
@@ -4228,11 +3802,7 @@ dependencies = [
 
 [[package]]
 name = "harw-security-hub"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "clap",
@@ -4254,11 +3824,7 @@ dependencies = [
 
 [[package]]
 name = "harw-sentinel"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "harw-authority",
@@ -4297,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-host"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "harw-authority",
  "harw-fsutil",
@@ -4316,11 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-store"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "fs4",
  "harw-fsutil",
@@ -4338,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-ws"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4360,11 +3922,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tailscale"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "serde",
  "serde_json",
@@ -4375,15 +3933,11 @@ dependencies = [
 
 [[package]]
 name = "harw-test-support"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "harw-tool-browser"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "async-trait",
  "harw-authority",
@@ -4401,11 +3955,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-deps"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-code-graph",
@@ -4422,11 +3972,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-doc"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "base64 0.23.1",
  "harw-authority",
@@ -4447,11 +3993,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-explorer"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-explorer",
@@ -4469,11 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-fs"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "globset",
  "harw-authority",
@@ -4495,16 +4033,13 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-job"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-extension-api",
  "harw-job-core",
  "harw-job-linux",
+ "harw-macros",
  "harw-test-support",
  "harw-tool-shell",
  "harw-tools",
@@ -4520,11 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-lens"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4545,11 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-plan"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4566,11 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-process"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4587,10 +4110,11 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-remote"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
+ "harw-macros",
  "harw-protocol",
  "harw-test-support",
  "harw-tools",
@@ -4602,11 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-shell"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-authority",
@@ -4628,15 +4148,11 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-tunnel"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "harw-tool-web"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "blake3",
  "harw-authority",
@@ -4659,11 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tools"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "async-trait",
  "harw-authority",
@@ -4681,11 +4193,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tui"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "crossterm 0.29.0",
  "harw-agent-artifact",
@@ -4700,6 +4208,7 @@ dependencies = [
  "harw-fsutil",
  "harw-home",
  "harw-lens-types",
+ "harw-macros",
  "harw-memory",
  "harw-model-catalog",
  "harw-operations",
@@ -4734,19 +4243,11 @@ dependencies = [
 
 [[package]]
 name = "harw-tui-layout"
-<<<<<<< HEAD
-version = "0.9.0"
-
-[[package]]
-name = "harw-types"
-version = "0.9.0"
-=======
 version = "0.9.1"
 
 [[package]]
 name = "harw-types"
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-digest",
  "jiff",
@@ -4759,11 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "harw-warden"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "clap",
  "harw-completions",
@@ -4784,11 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "harw-web"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "bytes",
  "harw-authority",
@@ -4815,11 +4308,7 @@ dependencies = [
 
 [[package]]
 name = "harwness-sdk"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "futures-core",
  "harw-agent-artifact",
@@ -8755,11 +8244,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-<<<<<<< HEAD
-version = "0.9.0"
-=======
 version = "0.9.1"
->>>>>>> release/0.9.1
 dependencies = [
  "harw-code-graph",
  "harw-test-support",

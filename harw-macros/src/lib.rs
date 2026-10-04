@@ -110,11 +110,17 @@ mod test_support;
 /// - `#[msg("...")]` controls the `Display` output. `{0}`, `{1}`, ... refer to
 ///   tuple fields, `{name}` refers to named fields.
 /// - `#[from]` generates a `From<Inner>` impl and wires `source()` to the inner
-///   error. Only valid on single-field tuple variants.
+///   error. On a variant it is valid on single-field tuple variants; on the
+///   single field of a named (struct) variant it also generates `From` and,
+///   without `#[msg]`, displays the inner error.
+/// - `#[source]` on a field (named or tuple) wires `source()` to that field
+///   without generating `From`; use it for variants like
+///   `Read { path, #[source] source }`. At most one `#[source]`/`#[from]` field
+///   per variant; the field type must implement `std::error::Error + 'static`.
 ///
 /// When the enum name ends in `Error`, a `pub type <Prefix>Result<T> =
 /// Result<T, <Enum>>;` alias is also emitted (e.g. `CoreError` -> `CoreResult`).
-#[proc_macro_derive(HarwError, attributes(msg, from))]
+#[proc_macro_derive(HarwError, attributes(msg, from, source))]
 pub fn derive_harw_error(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match error::expand_harw_error(&input) {

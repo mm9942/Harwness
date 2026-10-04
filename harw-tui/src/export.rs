@@ -42,7 +42,6 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -79,47 +78,18 @@ const MAX_SUFFIX_ATTEMPTS: u32 = 99;
 ///   entweder nicht verfügbar oder der Text ist dafür zu groß.
 /// - [`ExportError::PathRejected`]: Der Zielpfad ist ein Traversal-Versuch
 ///   oder es wurde binnen 99 Versuchen kein freier Dateiname gefunden.
-#[derive(Debug)]
+#[derive(Debug, harw_macros::HarwError)]
 pub enum ExportError {
     /// Ein-/Ausgabefehler beim atomaren Schreiben der Exportdatei.
+    #[msg("Export konnte nicht geschrieben werden: {0}")]
+    #[from]
     Io(std::io::Error),
     /// Keine Zwischenablage erreichbar (weder Systemwerkzeug noch OSC-52-Fallback).
+    #[msg("Keine Zwischenablage verfügbar (weder wl-copy/xclip/xsel/pbcopy noch OSC-52 möglich)")]
     NoClipboard,
     /// Der übergebene Zielpfad wurde abgelehnt (Traversal oder erschöpfte Suffixe).
+    #[msg("Zielpfad für den Export abgelehnt: {0}")]
     PathRejected(String),
-}
-
-impl fmt::Display for ExportError {
-    /// Menschenlesbare, deutsche Fehlermeldung ohne interne Details.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExportError::Io(err) => write!(f, "Export konnte nicht geschrieben werden: {err}"),
-            ExportError::NoClipboard => write!(
-                f,
-                "Keine Zwischenablage verfügbar (weder wl-copy/xclip/xsel/pbcopy noch OSC-52 möglich)"
-            ),
-            ExportError::PathRejected(reason) => {
-                write!(f, "Zielpfad für den Export abgelehnt: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExportError {
-    /// Verlinkt auf den zugrunde liegenden `io::Error`, sofern vorhanden.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ExportError::Io(err) => Some(err),
-            ExportError::NoClipboard | ExportError::PathRejected(_) => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for ExportError {
-    /// Erlaubt `?` auf `io::Result`-Rückgaben von `harw_fsutil::write_atomic`.
-    fn from(err: std::io::Error) -> Self {
-        ExportError::Io(err)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2386,5 +2356,26 @@ mod tests {
         let out = render_markdown(&meta, &[], &ExportOptions::default());
         assert!(!out.contains("- **Datum:** 1700000000"));
         assert!(out.contains("2023"));
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::ExportError;
+    use std::error::Error as _;
+
+    #[test]
+    fn display_and_source_are_stable() {
+        let io = ExportError::from(std::io::Error::other("boom"));
+        assert_eq!(
+            io.to_string(),
+            "Export konnte nicht geschrieben werden: boom"
+        );
+        assert!(io.source().is_some());
+        assert_eq!(
+            ExportError::PathRejected("r".to_owned()).to_string(),
+            "Zielpfad für den Export abgelehnt: r"
+        );
+        assert!(ExportError::NoClipboard.source().is_none());
     }
 }

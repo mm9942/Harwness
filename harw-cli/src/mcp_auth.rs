@@ -5,84 +5,34 @@
 //! unsupported backend fails closed rather than turning a reference into an
 //! accidental plaintext credential.
 
-use std::fmt;
 use std::path::Path;
 
 use harw_config::SecretRef;
 use harw_provider_http::SecretResolver;
 use secrecy::ExposeSecret as _;
 
-#[derive(Debug)]
+#[derive(Debug, harw_macros::HarwError)]
 pub enum McpCredentialError {
-    MissingEnvironment {
-        name: String,
-    },
-    EmptyCredential {
-        reference: String,
-    },
+    #[msg("MCP credential environment variable '{name}' is not set")]
+    MissingEnvironment { name: String },
+    #[msg("MCP credential '{reference}' resolved to an empty value")]
+    EmptyCredential { reference: String },
+    #[msg("could not read MCP credential file '{path}': {source}")]
     FileRead {
         path: String,
         source: std::io::Error,
     },
-    UnsupportedReference {
-        reference: String,
-    },
-    InvalidKeyringReference {
-        reference: String,
-    },
-    KeyringAccess {
-        reference: String,
-    },
-    JsonField {
-        path: String,
-        pointer: String,
-    },
-    SecretResolution {
-        reference: String,
-        reason: String,
-    },
+    #[msg("MCP credential backend is not available: {reference}")]
+    UnsupportedReference { reference: String },
+    #[msg("MCP keyring credential reference must be service/account: {reference}")]
+    InvalidKeyringReference { reference: String },
+    #[msg("could not access MCP keyring credential '{reference}'")]
+    KeyringAccess { reference: String },
+    #[msg("MCP credential JSON pointer '{pointer}' not found or not a string in '{path}'")]
+    JsonField { path: String, pointer: String },
+    #[msg("could not resolve MCP credential '{reference}': {reason}")]
+    SecretResolution { reference: String, reason: String },
 }
-
-impl fmt::Display for McpCredentialError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingEnvironment { name } => {
-                write!(f, "MCP credential environment variable '{name}' is not set")
-            }
-            Self::EmptyCredential { reference } => {
-                write!(f, "MCP credential '{reference}' resolved to an empty value")
-            }
-            Self::FileRead { path, source } => {
-                write!(f, "could not read MCP credential file '{path}': {source}")
-            }
-            Self::UnsupportedReference { reference } => {
-                write!(f, "MCP credential backend is not available: {reference}")
-            }
-            Self::InvalidKeyringReference { reference } => {
-                write!(
-                    f,
-                    "MCP keyring credential reference must be service/account: {reference}"
-                )
-            }
-            Self::KeyringAccess { reference } => {
-                write!(f, "could not access MCP keyring credential '{reference}'")
-            }
-            Self::JsonField { path, pointer } => {
-                write!(
-                    f,
-                    "MCP credential JSON pointer '{pointer}' not found or not a string in '{path}'"
-                )
-            }
-            Self::SecretResolution { reference, reason } => {
-                write!(
-                    f,
-                    "could not resolve MCP credential '{reference}': {reason}"
-                )
-            }
-        }
-    }
-}
-impl std::error::Error for McpCredentialError {}
 
 /// Resolves a local MCP credential, optionally using a sealed-secret resolver.
 ///
