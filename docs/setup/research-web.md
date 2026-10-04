@@ -1,6 +1,6 @@
 # Web research: network policy, search backend and fetch limits
 
-> **Status:** implemented. Describes the code at `consolidate/main`
+> **Status:** implemented. Describes the current implementation
 > (`harw-tool-web`, `harw-egress`, `harw-config`, `harw-registry-defaults`).
 > What is *not* implemented yet is listed at the end.
 
@@ -21,9 +21,12 @@ Three layers decide whether a request goes out; the effective reach is the
    forbidden), so what it reads from the network cannot be combined with local
    files.
 2. **Process egress policy.** One policy for all web tools, built from the
-   configuration below. Every URL, and every redirect target, is checked
-   against it before anything is sent. Private, loopback and link-local
-   addresses are classified and refused unless explicitly allowed.
+   configuration below. Every URL, every redirect target and every address a
+   name resolves to is checked against it before anything is sent. Loopback,
+   private (RFC 1918), CGNAT and unique-local addresses are reachable only
+   with `allow_private = true`. Link-local, cloud-metadata, multicast and
+   other special ranges are **never** allowed, not even with `allow_private`
+   and not even when the address is listed literally.
 3. **Sandbox network scope of the calling agent.** Only entry points with
    network permission (the TUI and one-shot runs) start with a network scope,
    built from the same lists as the process policy. A child never has a wider
@@ -31,18 +34,19 @@ Three layers decide whether a request goes out; the effective reach is the
 
 **Defaults.** `[research].network_allow_hosts` lists four Rust documentation
 hosts, so by default research-capable agents started from the TUI or a
-one-shot run can reach those, plus the host of the search backend.
-`researcher-web` is stricter: its own policy comes only from
-`researcher_web_hosts`, which is empty by default, so it has no network until
-you set that list or enable the open web. An empty union of all lists means no
-network at all (fail-closed); the search host alone never opens network.
+one-shot run can reach those, plus the host of the search backend. An empty
+union of all lists means no network at all (fail-closed); the search host
+alone never opens network. There is no role-specific network list today:
+`researcher-web` gets the same scope as any other role that holds web tools
+(its parent's scope). What sets the role apart is its tool surface (no
+workspace access) and the open-web approval rule below; see "Known gaps".
 
 ## `[network]`
 
 ```toml
 [network]
 allow_hosts = []                 # general harness egress allowlist
-allow_private = false            # RFC 1918, loopback, link-local, ULA, CGNAT
+allow_private = false            # loopback, RFC 1918, CGNAT, unique-local
 researcher_web_hosts = ["docs.rs", "crates.io", "doc.rust-lang.org"]
 research_web = "allowlist"       # or "open"
 ```
@@ -50,8 +54,8 @@ research_web = "allowlist"       # or "open"
 | Key | Default | Meaning |
 |---|---|---|
 | `allow_hosts` | `[]` | Plain host names (no scheme, no path) the harness may reach in general. |
-| `allow_private` | `false` | Allow private/local destinations. `researcher-web` never gets them, whatever this says: a web research role has no reason to reach the LAN, and that is the SSRF path. |
-| `researcher_web_hosts` | `[]` | Extra hosts, only for `researcher-web`. Kept separate so a broader `allow_hosts` does not silently widen the research role. |
+| `allow_private` | `false` | Allow loopback, private (RFC 1918), CGNAT and unique-local destinations. It applies to the shared process policy and therefore to every role: an allowlisted host name that resolves to such an address becomes reachable. Link-local, cloud-metadata and multicast ranges stay refused regardless. |
+| `researcher_web_hosts` | `[]` | Extra hosts. Meant for `researcher-web` only, but today merged into the same shared lists as `allow_hosts` (see below), so it widens the network of every role that has web tools. |
 | `research_web` | `"allowlist"` | `"allowlist"`: only the configured hosts. `"open"`: see below. |
 
 Entries are host names, not URLs; an entry with a scheme prefix or an empty
@@ -61,8 +65,9 @@ subdomains.
 The **process-wide** policy that the web tools are configured with is the
 union of `[network].allow_hosts`, `[network].researcher_web_hosts`,
 `[research].network_allow_hosts` and the host of the configured search
-backend. It is the upper bound; each agent still only reaches what its own
-sandbox scope allows.
+backend. The same union is the root sandbox network scope of the TUI and
+one-shot entry points. It is the upper bound; a child agent still only reaches
+what its parent's scope allows.
 
 ### The open research web
 
@@ -71,7 +76,9 @@ With `research_web = "open"`, the research roles (`researcher-web`,
 `intel-web-researcher`) may read **any public DNS host**, read-only:
 
 - `GET` only, no cookies, no credentials, no custom headers.
-- Private, loopback and link-local targets stay refused.
+- A host reachable only through the open web must resolve to a public
+  address; names that resolve to private, loopback or link-local addresses are
+  refused, whatever `allow_private` says.
 - Under the `ask` and `auto` approval modes, the **first request to a domain
   asks you**; the answer is remembered for the session (until the process
   ends). A domain is the host without a leading `www.`; an approval covers
@@ -161,6 +168,12 @@ not yet have:
   and no handling of `429` or `Retry-After`. (Rate limiting exists for model
   providers, not for `web.*`.)
 - **`research.fetch_timeout_secs` has no effect** (see above).
+- **No role-specific network policy.** Code for a stricter `researcher-web`
+  policy exists (`researcher_web_policy` and `researcher_web_network_scope` in
+  `harw-registry-defaults`: a list taken only from `researcher_web_hosts`, with
+  `allow_private` forced to `false`), but the runtime never calls it.
+  `researcher_web_hosts` is only read into the shared union described above,
+  so in effect it is not separate from `allow_hosts`.
 - No URL de-duplication, no batch fetch, no run-level state for long
   research.
 
