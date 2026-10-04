@@ -4,6 +4,9 @@
 # trixie: the release binary requires GLIBC >= 2.38 (bookworm ships 2.36).
 FROM debian:trixie-slim
 
+# Harwness is dual-licensed (SPDX: MIT OR Apache-2.0); both texts ship in the image.
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
 # Runtime deps: bubblewrap for harw's own sandboxed tool execution, ca-certificates
 # for provider HTTPS, libdbus for the TUI/dbus path. Nothing else.
 RUN apt-get update \
@@ -19,6 +22,7 @@ RUN useradd --create-home --uid 1000 --user-group harw
 
 COPY target/release/harw /usr/bin/harw
 COPY deploy/systemd/harw-control.service /usr/share/doc/harw/deploy/systemd/harw-control.service
+COPY LICENSE-MIT LICENSE-APACHE /usr/share/doc/harw/
 RUN chmod 0755 /usr/bin/harw && chown -R harw:harw /home/harw
 
 USER harw
