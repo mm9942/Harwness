@@ -63,9 +63,11 @@ pub(crate) struct OpTarget<'a> {
 
 /// Governter Channel-Aufruf einer Slash-Operation.
 ///
-/// Anders als [`OpTarget`] kommt der Principal nicht aus der lokalen
-/// Prozessidentität, sondern aus einer bereits admittierten Channel-Identität.
-/// Der StateStore und die Session-ID binden sitzungsbezogene Read-Operationen
+/// Anders als [`OpTarget`] kommt die Identität nicht aus der lokalen
+/// Prozess-UID, sondern aus einer bereits admittierten Channel-Identität.
+/// Der Principal wird erst nach dem Laden der vertrauensgeprüften Binding-
+/// Policy aus Binding-ID und tatsächlichem Sender konstruiert.
+/// StateStore und Session-ID binden sitzungsbezogene Read-Operationen
 /// an denselben Chat-Verlauf.
 pub(crate) struct ChannelOpTarget<'a> {
     pub home: &'a Path,
@@ -261,7 +263,7 @@ pub(crate) fn run_channel_operation(
     if actual < required {
         return Err(ChannelOpFailure::new(
             format!(
-                "`{command}` erfordert mindestens Berechtigungsstufe {required:?};                  dieser Telegram-Absender hat {actual:?}."
+                "`{command}` erfordert mindestens Berechtigungsstufe {required:?}; dieser Telegram-Absender hat {actual:?}."
             ),
             format!("channel permission denied for {command}: {actual:?} < {required:?}"),
         ));

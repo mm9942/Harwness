@@ -103,11 +103,6 @@ const HANDLED_COMMANDS: &[CommandSpec] = &[
         description: "Status dieses Chats und offener Arbeitsaufträge",
     },
     CommandSpec {
-        name: "op",
-        usage: "/op <harw-befehl> [argumente…]",
-        description: "Harwness-Operation über ihren kanonischen Pfad ausführen",
-    },
-    CommandSpec {
         name: "help",
         usage: "/help",
         description: "Hilfe zu den verfügbaren Befehlen",
@@ -125,6 +120,13 @@ const PAIR_COMMAND: CommandSpec = CommandSpec {
     name: "pair",
     usage: "/pair <code>",
     description: "Chat mit einem Kopplungscode verbinden: /pair <code>",
+};
+
+/// Verlustfreie Brücke in den makro-/registry-getriebenen Operationskatalog.
+const OP_COMMAND: CommandSpec = CommandSpec {
+    name: "op",
+    usage: "/op <harw-befehl> [argumente…]",
+    description: "Harwness-Operation über ihren kanonischen Pfad ausführen",
 };
 
 fn bot_command(spec: &CommandSpec) -> BotCommand {
@@ -149,7 +151,7 @@ fn reserved_command_names() -> Vec<&'static str> {
     HANDLED_COMMANDS
         .iter()
         .map(|spec| spec.name)
-        .chain(std::iter::once(PAIR_COMMAND.name))
+        .chain([PAIR_COMMAND.name, OP_COMMAND.name])
         .collect()
 }
 
@@ -169,12 +171,17 @@ pub(super) fn operation_catalog() -> &'static TelegramOperationCatalog {
     })
 }
 
-/// Die Befehle, die dieser Gateway für **jeden** admittierten Peer
-/// tatsächlich verarbeitet ([`TelegramCommandHandler::handle`]); ohne
-/// `/pair`. Telegram zeigt höchstens 100 Einträge; der vollständige
-/// Katalog bleibt über `/op` ausführbar.
+/// Die nativ vom geschlossenen TelegramCommand-Parser verarbeiteten Befehle.
 pub(super) fn telegram_handled_commands() -> Vec<BotCommand> {
-    let mut commands = HANDLED_COMMANDS.iter().map(bot_command).collect::<Vec<_>>();
+    HANDLED_COMMANDS.iter().map(bot_command).collect()
+}
+
+/// Vollständige sichtbare Telegram-Fläche: native Gateway-Befehle, die
+/// verlustfreie `/op`-Brücke und so viele Registry-Ops, wie Telegrams
+/// 100-Command-Limit erlaubt.
+fn telegram_full_commands() -> Vec<BotCommand> {
+    let mut commands = telegram_handled_commands();
+    commands.push(bot_command(&OP_COMMAND));
     let remaining = TELEGRAM_MENU_COMMAND_LIMIT.saturating_sub(commands.len());
     commands.extend(operation_catalog().menu_commands(remaining));
     commands
@@ -186,7 +193,7 @@ pub(super) fn telegram_handled_commands() -> Vec<BotCommand> {
 /// - `"policy_visible"` (Vorgabe): Telegram wählt je Chat den
 ///   spezifischsten Scope. Allgemeine Scopes zeigen nur, was jeder sieht:
 ///   `Default` und `AllGroupChats` → `help`, `start`; `AllPrivateChats` →
-///   `help`, `start`, `pair`. Das volle Menü ([`telegram_handled_commands`])
+///   `help`, `start`, `pair`. Das volle Menü (native Befehle + `/op` + Registry-Projektion)
 ///   erhält `Chat{id}` je gepinnter Identität (DM-Chat-ID = User-ID) und je
 ///   erlaubter Gruppe; bei konfigurierten Admin-Identitäten zusätzlich
 ///   `ChatAdministrators{id}` je erlaubter Gruppe, damit ein veraltetes
@@ -205,7 +212,7 @@ pub(super) fn telegram_menu_plan(
             let basic = commands_named(&["help", "start"]);
             let mut private = basic.clone();
             private.push(bot_command(&PAIR_COMMAND));
-            let full = telegram_handled_commands();
+            let full = telegram_full_commands();
             let mut plan = vec![
                 (BotCommandScope::Default, basic.clone()),
                 (BotCommandScope::AllGroupChats, basic),
@@ -235,10 +242,7 @@ pub(super) fn telegram_menu_plan(
             }
             Ok(plan)
         }
-        "static" => Ok(vec![(
-            BotCommandScope::Default,
-            telegram_handled_commands(),
-        )]),
+        "static" => Ok(vec![(BotCommandScope::Default, telegram_full_commands())]),
         "none" => Ok(Vec::new()),
         other => Err(format!(
             "unbekannte commands.menu_source {other:?} (erwartet policy_visible, static oder none)"
@@ -805,6 +809,10 @@ pub(super) fn help_text() -> String {
         );
         text.push('\n');
     }
+    text.push_str(OP_COMMAND.usage);
+    text.push_str(" – ");
+    text.push_str(OP_COMMAND.description);
+    text.push('\n');
     if !operation_catalog().specs().is_empty() {
         text.push_str("\nHarwness-Operationen:\n");
         for spec in operation_catalog().specs() {
@@ -1016,7 +1024,7 @@ mod tests {
                 "pair".to_owned()
             ])
         );
-        let full: Vec<String> = telegram_handled_commands()
+        let full: Vec<String> = telegram_full_commands()
             .into_iter()
             .map(|command| command.command)
             .collect();
@@ -1062,7 +1070,7 @@ mod tests {
                 .map_err(TestError::Unexpected)?;
         assert_eq!(
             static_plan,
-            vec![(BotCommandScope::Default, telegram_handled_commands())]
+            vec![(BotCommandScope::Default, telegram_full_commands())]
         );
         let none = telegram_menu_plan(&toml_binding("[commands]\nmenu_source = \"none\"\n")?)
             .map_err(TestError::Unexpected)?;

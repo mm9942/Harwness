@@ -11,8 +11,6 @@ use harw_channel_telegram_transport::BotCommand;
 use harw_operations::adapter::CommandAdapter;
 use harw_operations::operation::CommandVisibility;
 use harw_operations::registry::OperationRegistry;
-use harw_types::{PeerId, PermissionTier};
-
 const TELEGRAM_COMMAND_MAX_BYTES: usize = 32;
 const TELEGRAM_DESCRIPTION_MAX_CHARS: usize = 256;
 
@@ -32,14 +30,6 @@ pub(super) struct TelegramOperationSpec {
 pub(super) struct TelegramOperationInvocation {
     pub canonical_path: String,
     pub args: Vec<String>,
-}
-
-/// Vom Command-Handler an die Chat-FIFO übergebener Human-Aufruf.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TelegramOperationRequest {
-    pub invocation: TelegramOperationInvocation,
-    pub sender: PeerId,
-    pub tier: PermissionTier,
 }
 
 /// Ergebnis der Telegram-spezifischen Slash-Auflösung.
