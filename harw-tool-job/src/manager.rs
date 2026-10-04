@@ -662,10 +662,12 @@ impl JobManager {
     /// # Errors
     /// [`JobError::Capacity`].
     pub fn check_capacity(&self) -> Result<(), JobError> {
-        let max = self.max_running();
-        let occupied = {
+        let (max, occupied) = {
             let jobs = lock(&self.jobs);
-            Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst)
+            (
+                self.max_running(),
+                Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst),
+            )
         };
         if occupied >= max {
             return Err(JobError::Capacity { max });
@@ -680,8 +682,11 @@ impl JobManager {
     /// Starts alle noch freie Kapazität (der Job steht erst nach `spawn` in
     /// `jobs`) und überschritten die Obergrenze, auch bei `max_running = 1`.
     fn reserve_slot(&self) -> Result<StartSlot<'_>, JobError> {
-        let max = self.max_running();
         let jobs = lock(&self.jobs);
+        // Die Grenze erst unter der Sperre lesen: ein vor dem Warten gelesener
+        // Wert kann von `set_max_running` überholt sein, und ein Start würde
+        // dann einen veralteten Wert mit neueren Reservierungen kombinieren.
+        let max = self.max_running();
         if Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst) >= max {
             return Err(JobError::Capacity { max });
         }
