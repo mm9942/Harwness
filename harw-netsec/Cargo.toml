@@ -23,6 +23,7 @@ path = "src/main.rs"
 # `NodeId` (H1 infrastructure identity vocabulary) and `Clock`/`SystemClock`.
 harw-types = { path = "../harw-types" }
 # `#[derive(KebabEnum)]` for the snake_case wire names of `NodeState`/`NodeEvent`.
+# `#[derive(HarwId)]` for the zone/route identifier newtypes.
 harw-macros = { path = "../harw-macros" }
 
 jiff = { workspace = true }
