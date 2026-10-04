@@ -22,6 +22,14 @@
 //! erlaubten Ziele; welche davon ein einzelner Agent erreicht, bestimmt sein
 //! Sandbox-`NetworkScope`.
 //!
+//! **Stand heute:** [`researcher_web_policy`] und [`researcher_web_network_scope`]
+//! beschreiben die vorgesehene rollenspezifische Beschränkung (nur
+//! `researcher_web_hosts`, `allow_private` immer `false`), werden von der
+//! Laufzeit aber nicht aufgerufen; sie sind nur re-exportiert und in diesem
+//! Modul getestet. Wirksam sind die Prozess-Policy aus [`install_web_tools`]
+//! und der Wurzel-Scope aus `harw_runtime::sandbox::root_network_scope`, in die
+//! `researcher_web_hosts` wie `allow_hosts` eingeht.
+//!
 //! # Regeln
 //! - Quelle ist **nur** `researcher_web_hosts`; `allow_hosts` (die allgemeine
 //!   Harness-Liste) fließt nicht ein.
