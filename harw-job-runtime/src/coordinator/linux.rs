@@ -782,17 +782,21 @@ impl LinuxExecutor {
         // `SandboxRequirement::None`: no sandbox requested, run plainly.
         let sandboxed = spec.sandbox != SandboxRequirement::None;
         match (sandboxed, &self.options.sandbox) {
-            (false, _) | (true, LinuxSandboxBackend::None) => Ok(Prepared {
-                launch: Launch {
+            (false, _) | (true, LinuxSandboxBackend::None) => {
+                let mut launch = Launch {
                     program: OsString::from(&spec.program),
                     args: spec.args.iter().map(OsString::from).collect(),
                     env: spec.env.clone(),
                     cwd: Some(workdir),
-                },
-                report: Some(unsandboxed_report(resource_limits)),
-                trampoline_report: None,
-                trampoline_plan: None,
-            }),
+                };
+                let rlimits = apply_prlimit(&mut launch, spec);
+                Ok(Prepared {
+                    launch,
+                    report: Some(unsandboxed_report(worse(resource_limits, rlimits))),
+                    trampoline_report: None,
+                    trampoline_plan: None,
+                })
+            }
             (
                 true,
                 LinuxSandboxBackend::LandlockTrampoline {
@@ -814,6 +818,11 @@ impl LinuxExecutor {
                 let mut plan = harw_job_exec::ExecPlanV1::new(&spec.program)
                     .with_args(spec.args.iter().cloned())
                     .with_sandbox(policy, spec.sandbox);
+                // The trampoline applies the rlimits itself, before the
+                // sandbox, and fails the job instead of continuing without.
+                if spec.resources.requests_rlimits() {
+                    plan = plan.with_rlimits(rlimit_set(spec));
+                }
                 if let Some((backend, handle)) = cgroup {
                     plan = plan.with_cgroup(harw_job_exec::CgroupJoin {
                         root: backend.root_path().to_path_buf(),
@@ -856,18 +865,22 @@ impl LinuxExecutor {
                             detail: other.to_string(),
                         },
                     })?;
+                let mut launch = Launch {
+                    program: plan.executable().as_os_str().to_owned(),
+                    args: plan.args().to_vec(),
+                    // bwrap sets the job environment inside (--setenv).
+                    env: Vec::new(),
+                    cwd: None,
+                };
+                // `prlimit` runs in front of bwrap; the limits are inherited
+                // by the sandboxed program.
+                let rlimits = apply_prlimit(&mut launch, spec);
                 let report = SandboxReport {
-                    resource_limits,
+                    resource_limits: worse(resource_limits, rlimits),
                     ..plan.report()
                 };
                 Ok(Prepared {
-                    launch: Launch {
-                        program: plan.executable().as_os_str().to_owned(),
-                        args: plan.args().to_vec(),
-                        // bwrap sets the job environment inside (--setenv).
-                        env: Vec::new(),
-                        cwd: None,
-                    },
+                    launch,
                     report: Some(report),
                     trampoline_report: None,
                     trampoline_plan: None,
@@ -905,6 +918,78 @@ impl LinuxExecutor {
         tokio::spawn(forward(handle, events, sender, after));
         AttemptRun::new(attempt_events, control)
     }
+}
+
+/// Fixed search paths for `prlimit` (util-linux); `PATH` is never consulted.
+const PRLIMIT_CANDIDATES: [&str; 2] = ["/usr/bin/prlimit", "/bin/prlimit"];
+
+/// The per-process rlimits the spec asks for.
+fn rlimit_set(spec: &JobSpec) -> harw_job_linux::RlimitSet {
+    use harw_job_linux::{RlimitResource, RlimitSet, RlimitValue};
+    let resources = &spec.resources;
+    let mut set = RlimitSet::new();
+    if let Some(bytes) = resources.address_space_max {
+        set.set(RlimitResource::AddressSpace, RlimitValue::fixed(bytes));
+    }
+    if let Some(seconds) = resources.cpu_time_max {
+        set.set(RlimitResource::Cpu, RlimitValue::fixed(seconds));
+    }
+    if let Some(bytes) = resources.file_size_max {
+        set.set(RlimitResource::FileSize, RlimitValue::fixed(bytes));
+    }
+    if let Some(count) = resources.open_files_max {
+        set.set(RlimitResource::Nofile, RlimitValue::fixed(u64::from(count)));
+    }
+    set
+}
+
+/// The more restrictive of two per-dimension states (what the report says
+/// when two mechanisms each cover part of the request).
+fn worse(a: EnforcementState, b: EnforcementState) -> EnforcementState {
+    let rank = |state: EnforcementState| match state {
+        EnforcementState::Enforced => 0,
+        EnforcementState::Partial => 1,
+        EnforcementState::NotEnforced => 2,
+        _ => 3,
+    };
+    if rank(b) > rank(a) { b } else { a }
+}
+
+/// Starts the launch through `prlimit` so the limits hold for the program
+/// (and, rlimits being inherited, for everything it starts). `prlimit`
+/// `exec`s the program, so the PID stays the primary's. Returns whether the
+/// limits are applied: without a `prlimit` they are **not**, and the report
+/// says so (a `Required` job then fails before it runs).
+fn apply_prlimit(launch: &mut Launch, spec: &JobSpec) -> EnforcementState {
+    let resources = &spec.resources;
+    if !resources.requests_rlimits() {
+        return EnforcementState::Enforced;
+    }
+    let Some(prlimit) = PRLIMIT_CANDIDATES
+        .iter()
+        .find(|candidate| Path::new(candidate).is_file())
+    else {
+        return EnforcementState::NotEnforced;
+    };
+    let mut wrapped: Vec<OsString> = Vec::new();
+    if let Some(bytes) = resources.address_space_max {
+        wrapped.push(format!("--as={bytes}").into());
+    }
+    if let Some(seconds) = resources.cpu_time_max {
+        wrapped.push(format!("--cpu={seconds}").into());
+    }
+    if let Some(bytes) = resources.file_size_max {
+        wrapped.push(format!("--fsize={bytes}").into());
+    }
+    if let Some(count) = resources.open_files_max {
+        wrapped.push(format!("--nofile={count}").into());
+    }
+    wrapped.push("--".into());
+    wrapped.push(std::mem::take(&mut launch.program));
+    wrapped.append(&mut launch.args);
+    launch.program = OsString::from(prlimit);
+    launch.args = wrapped;
+    EnforcementState::Enforced
 }
 
 /// The sandbox policy of a profile rooted at the workspace.

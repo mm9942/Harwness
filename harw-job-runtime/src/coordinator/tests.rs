@@ -1381,3 +1381,305 @@ fn recovered_job_without_its_cgroup_falls_back_to_the_process() -> TestResult {
     );
     Ok(())
 }
+
+// --- live frames and persistence classes ---------------------------------
+
+use super::frames::{FrameEvent, JobFrame, JobFrames};
+use super::runner::{Persistence, SubmitOptions};
+
+/// Reads every frame until the stream ends.
+async fn collect_frames(mut frames: JobFrames) -> TestResult<Vec<FrameEvent>> {
+    let mut all = Vec::new();
+    loop {
+        match tokio::time::timeout(LIMIT, frames.next())
+            .await
+            .map_err(ctx("frames did not end in time"))?
+        {
+            Some(event) => all.push(event),
+            None => return Ok(all),
+        }
+    }
+}
+
+fn stdout_of(events: &[FrameEvent]) -> Vec<u8> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            FrameEvent::Frame(JobFrame::Stdout(bytes)) => Some(bytes.to_vec()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[tokio::test]
+async fn frames_stream_the_output_between_the_attempt_boundaries() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-frames")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let (handle, frames) = coordinator
+        .submit_with(
+            sh("echo hello; echo oops >&2")?,
+            SubmitOptions {
+                stream: true,
+                ..SubmitOptions::default()
+            },
+        )
+        .await
+        .map_err(ctx("submit"))?;
+    let frames = frames.ok_or(TestError::Missing("subscription"))?;
+    let result = wait(handle).await?;
+    let events = collect_frames(frames).await?;
+
+    assert!(
+        matches!(
+            events.first(),
+            Some(FrameEvent::Frame(JobFrame::AttemptStarted { .. }))
+        ),
+        "the stream opens with the attempt: {events:?}"
+    );
+    assert_eq!(stdout_of(&events), b"hello\n");
+    let stderr: Vec<u8> = events
+        .iter()
+        .filter_map(|event| match event {
+            FrameEvent::Frame(JobFrame::Stderr(bytes)) => Some(bytes.to_vec()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(stderr, b"oops\n");
+    assert!(
+        matches!(
+            events.last(),
+            Some(FrameEvent::Frame(JobFrame::AttemptEnded {
+                outcome: ExitOutcome::Exited(0),
+                ..
+            }))
+        ),
+        "and closes with its end: {events:?}"
+    );
+    // The result still has everything.
+    assert_eq!(result.stdout, b"hello\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_later_subscription_ends_when_the_job_is_finished() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-late-frames")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let handle = coordinator
+        .submit(sh("sleep 0.3; echo late")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let frames = handle.subscribe();
+    let result = wait(handle).await?;
+    assert!(result.is_success());
+    let events = collect_frames(frames).await?;
+    assert_eq!(stdout_of(&events), b"late\n");
+    // Once finished, a new subscription is an already finished stream.
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_subscriber_that_never_reads_does_not_slow_the_job_down() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-slow-subscriber")?;
+    let executor = LinuxExecutor::new(LinuxExecutorOptions::default()).map_err(ctx("executor"))?;
+    let mut config =
+        CoordinatorConfig::new(runner, fixture.workspace()).with_lease_ttl(Duration::from_secs(3));
+    config.frame_buffer = 2;
+    let coordinator =
+        Coordinator::new(fixture.store()?, executor, config).map_err(ctx("coordinator"))?;
+    let (handle, frames) = coordinator
+        .submit_with(
+            sh("i=0; while [ $i -lt 3000 ]; do echo line-$i; i=$((i+1)); done")?,
+            SubmitOptions {
+                stream: true,
+                ..SubmitOptions::default()
+            },
+        )
+        .await
+        .map_err(ctx("submit"))?;
+    let mut frames = frames.ok_or(TestError::Missing("subscription"))?;
+    // Nobody reads while the job runs.
+    let result = wait(handle).await?;
+    assert!(result.is_success(), "{result:?}");
+    assert!(result.stdout_total_bytes() > 20_000);
+    // The subscriber learns that it missed frames, and then the stream ends.
+    let first = tokio::time::timeout(LIMIT, frames.next())
+        .await
+        .map_err(ctx("first frame"))?;
+    assert!(
+        matches!(first, Some(FrameEvent::Lagged(missed)) if missed > 0),
+        "{first:?}"
+    );
+    Ok(())
+}
+
+fn stored_input(coordinator: &LinuxCoordinator, job: &WorkId) -> TestResult<String> {
+    Ok(coordinator
+        .store()
+        .load(job)
+        .map_err(ctx("load job"))?
+        .input
+        .to_string())
+}
+
+fn secret_job() -> TestResult<JobSpecEnvelope> {
+    envelope(
+        JobSpec::command("/bin/sh")
+            .arg("-c")
+            .arg("echo ran-$HARW_TEST_SECRET >/dev/null; echo SECRET-ARGUMENT-in-argv >/dev/null")
+            .env("HARW_TEST_SECRET", "topsecret-value")
+            .build()
+            .map_err(ctx("spec"))?,
+    )
+}
+
+#[tokio::test]
+async fn the_persistence_class_decides_what_the_job_record_keeps() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-persistence")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let mut recorded = Vec::new();
+    for persistence in [
+        Persistence::Durable,
+        Persistence::MetadataOnly,
+        Persistence::Ephemeral,
+    ] {
+        let (handle, _) = coordinator
+            .submit_with(
+                secret_job()?,
+                SubmitOptions {
+                    persistence,
+                    ..SubmitOptions::default()
+                },
+            )
+            .await
+            .map_err(ctx("submit"))?;
+        let job_id = handle.id().clone();
+        let result = wait(handle).await?;
+        assert!(result.is_success(), "the job runs the same way: {result:?}");
+        recorded.push((persistence, stored_input(&coordinator, &job_id)?));
+    }
+    let [(_, durable), (_, metadata), (_, ephemeral)] = recorded.as_slice() else {
+        return Err(TestError::Missing("three records"));
+    };
+    assert!(durable.contains("topsecret-value") && durable.contains("SECRET-ARGUMENT"));
+    for text in [metadata, ephemeral] {
+        assert!(!text.contains("topsecret-value"), "no env value: {text}");
+        assert!(!text.contains("SECRET-ARGUMENT"), "no argument: {text}");
+    }
+    assert!(
+        metadata.contains("HARW_TEST_SECRET"),
+        "names are kept: {metadata}"
+    );
+    assert!(metadata.contains("/bin/sh") && metadata.contains("arg_count"));
+    assert!(
+        !ephemeral.contains("/bin/sh"),
+        "nothing about the command: {ephemeral}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_redacted_record_can_never_be_read_back_as_a_runnable_spec() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-redacted")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let now = Timestamp::now();
+    for persistence in [Persistence::MetadataOnly, Persistence::Ephemeral] {
+        let record = coordinator
+            .new_record_with(&secret_job()?, now, persistence)
+            .map_err(ctx("record"))?;
+        // Recovery parses the input as an envelope to get a spec; for a
+        // redacted record that must fail, so nothing is re-run from it.
+        assert!(
+            serde_json::from_value::<JobSpecEnvelope>(record.input.clone()).is_err(),
+            "{persistence:?}: {}",
+            record.input
+        );
+    }
+    Ok(())
+}
+
+// --- per-process rlimits ---------------------------------------------------
+
+fn prlimit_present() -> bool {
+    ["/usr/bin/prlimit", "/bin/prlimit"]
+        .iter()
+        .any(|path| std::path::Path::new(path).is_file())
+}
+
+#[tokio::test]
+async fn per_process_rlimits_reach_the_program_and_are_reported() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-rlimits")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let spec = JobSpec::command("/bin/sh")
+        .arg("-c")
+        .arg("ulimit -n; ulimit -t")
+        .resources(ResourceRequest {
+            open_files_max: Some(77),
+            cpu_time_max: Some(33),
+            ..ResourceRequest::default()
+        })
+        .build()
+        .map_err(ctx("spec"))?;
+    let handle = coordinator
+        .submit(envelope(spec)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert!(result.is_success(), "{result:?}");
+    let report = result.sandbox.ok_or(TestError::Missing("report"))?;
+    if prlimit_present() {
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "77\n33\n");
+        assert_eq!(report.resource_limits, EnforcementState::Enforced);
+    } else {
+        // No prlimit: the limits are not applied, and the report says so.
+        assert_eq!(report.resource_limits, EnforcementState::NotEnforced);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_without_rlimits_is_not_wrapped() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-no-rlimits")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let handle = coordinator
+        .submit(sh("echo plain")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert_eq!(result.stdout, b"plain\n");
+    let report = result.sandbox.ok_or(TestError::Missing("report"))?;
+    assert_eq!(report.resource_limits, EnforcementState::Enforced);
+    Ok(())
+}

@@ -198,9 +198,33 @@ pub struct ResourceRequest {
     /// Wall-clock timeout of one attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_timeout: Option<SignedDuration>,
+    /// Address-space ceiling **per process** in bytes (`RLIMIT_AS`). Unlike
+    /// `memory_max` (the whole job's cgroup) this also bounds a single
+    /// runaway allocation in a process that has no cgroup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_space_max: Option<u64>,
+    /// CPU time ceiling per process in seconds (`RLIMIT_CPU`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_time_max: Option<u64>,
+    /// Largest file a process may create, in bytes (`RLIMIT_FSIZE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_max: Option<u64>,
+    /// Open file descriptors per process (`RLIMIT_NOFILE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_files_max: Option<u32>,
 }
 
 impl ResourceRequest {
+    /// Whether any per-process rlimit (`address_space_max`, `cpu_time_max`,
+    /// `file_size_max`, `open_files_max`) is requested.
+    #[must_use]
+    pub fn requests_rlimits(&self) -> bool {
+        self.address_space_max.is_some()
+            || self.cpu_time_max.is_some()
+            || self.file_size_max.is_some()
+            || self.open_files_max.is_some()
+    }
+
     /// Maximum permitted [`ResourceRequest::cpu_weight`].
     pub const MAX_CPU_WEIGHT: u16 = 10_000;
 
@@ -229,6 +253,19 @@ impl ResourceRequest {
                 resource: "pids_max",
                 constraint: "must be greater than zero",
             });
+        }
+        for (resource, zero) in [
+            ("address_space_max", self.address_space_max == Some(0)),
+            ("cpu_time_max", self.cpu_time_max == Some(0)),
+            ("file_size_max", self.file_size_max == Some(0)),
+            ("open_files_max", self.open_files_max == Some(0)),
+        ] {
+            if zero {
+                return Err(SpecError::InvalidResource {
+                    resource,
+                    constraint: "must be greater than zero",
+                });
+            }
         }
         if self
             .wall_timeout
@@ -538,6 +575,7 @@ mod tests {
                 cpu_weight: Some(100),
                 pids_max: Some(256),
                 wall_timeout: Some(SignedDuration::from_secs(600)),
+                ..ResourceRequest::default()
             },
             sandbox: SandboxRequirement::Required,
             sandbox_profile: SandboxProfileName::WorkspaceBuild,
@@ -695,6 +733,7 @@ mod tests {
             cpu_weight: Some(ResourceRequest::MAX_CPU_WEIGHT),
             pids_max: Some(1),
             wall_timeout: Some(SignedDuration::from_nanos(1)),
+            ..ResourceRequest::default()
         };
         assert_eq!(edge.validate(), Ok(()));
     }
@@ -817,6 +856,7 @@ mod tests {
                 cpu_weight: Some(100),
                 pids_max: Some(256),
                 wall_timeout: None,
+                ..ResourceRequest::default()
             })
             .timeout(SignedDuration::from_secs(600))
             .sandbox(SandboxProfileName::WorkspaceBuild)
@@ -843,5 +883,60 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rlimit_requests_are_validated_and_detected() {
+        let none = ResourceRequest::default();
+        assert!(!none.requests_rlimits());
+        assert!(none.validate().is_ok());
+        for request in [
+            ResourceRequest {
+                address_space_max: Some(1 << 30),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                cpu_time_max: Some(60),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                file_size_max: Some(1 << 20),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                open_files_max: Some(256),
+                ..ResourceRequest::default()
+            },
+        ] {
+            assert!(request.requests_rlimits());
+            assert!(request.validate().is_ok());
+        }
+        for request in [
+            ResourceRequest {
+                address_space_max: Some(0),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                cpu_time_max: Some(0),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                file_size_max: Some(0),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                open_files_max: Some(0),
+                ..ResourceRequest::default()
+            },
+        ] {
+            assert!(request.validate().is_err(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn an_old_spec_without_rlimits_still_deserializes() {
+        let old = r#"{"memory_max": 1024}"#;
+        let parsed: Result<ResourceRequest, _> = serde_json::from_str(old);
+        assert!(parsed.is_ok_and(|r| !r.requests_rlimits()));
     }
 }
