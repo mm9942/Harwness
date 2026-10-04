@@ -151,6 +151,47 @@ impl ConversationHistory {
         id
     }
 
+    /// Ob eine User-Nachricht ein gespeichertes Bild trägt.
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        self.items.iter().any(|item| match item {
+            TurnItem::UserMessage(m) => m
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::Media { .. })),
+            _ => false,
+        })
+    }
+
+    /// Eine Kopie, in der jedes gespeicherte Bild durch einen Hinweistext
+    /// ersetzt ist (`reason` sagt, warum es nicht gesendet wird). Für Modelle,
+    /// die keine Bilder verstehen: Das Bild verschwindet nicht still, der
+    /// Verlauf nennt es und die Maße, nie die Bytes.
+    #[must_use]
+    pub fn without_images(&self, reason: &str) -> Self {
+        let items = self
+            .items
+            .iter()
+            .map(|item| match item {
+                TurnItem::UserMessage(m) => TurnItem::UserMessage(UserMessageItem {
+                    id: m.id.clone(),
+                    content: m
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            ContentPart::Media { media, .. } => ContentPart::Text {
+                                text: format!("[{} not sent: {reason}]", media.describe()),
+                            },
+                            other => other.clone(),
+                        })
+                        .collect(),
+                }),
+                other => other.clone(),
+            })
+            .collect();
+        Self { items }
+    }
+
     /// Komfort: eine Assistant-Textnachricht anhängen.
     pub fn push_assistant_text(
         &mut self,
