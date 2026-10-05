@@ -2062,21 +2062,30 @@ fn panel_rows(
             ),
             entry: None,
         });
-        let (text, line_style) = if live.preview.is_empty() {
-            (
-                format!("∴ {}", sanitize_inline(&live.reasoning_preview)),
-                style::dim_style(theme).add_modifier(Modifier::ITALIC),
-            )
-        } else {
-            (sanitize_inline(&live.preview), Style::default())
-        };
-        // Die Vorschau zeigt das Ende des Texts (neueste Zeichen).
-        let count = text.chars().count();
-        let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
-        rows.push(PanelRow {
-            line: Line::styled(fit_width(&tail, width), line_style),
-            entry: None,
-        });
+
+        let mut preview_room = height.saturating_sub(rows.len());
+        if preview_room > 0 && !live.reasoning_preview.is_empty() {
+            let text = format!("∴ {}", sanitize_inline(&live.reasoning_preview));
+            let count = text.chars().count();
+            let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
+            rows.push(PanelRow {
+                line: Line::styled(
+                    fit_width(&tail, width),
+                    style::dim_style(theme).add_modifier(Modifier::ITALIC),
+                ),
+                entry: None,
+            });
+            preview_room = preview_room.saturating_sub(1);
+        }
+        if preview_room > 0 && !live.preview.is_empty() {
+            let text = sanitize_inline(&live.preview);
+            let count = text.chars().count();
+            let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
+            rows.push(PanelRow {
+                line: Line::styled(fit_width(&tail, width), Style::default()),
+                entry: None,
+            });
+        }
     }
     rows
 }
@@ -3206,6 +3215,33 @@ mod tests {
             .collect())
     }
 
+    #[test]
+    fn focused_agent_keeps_reasoning_visible_with_answer_text() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        let turn_id = TurnId::new();
+        monitor.apply(&ev(
+            "a",
+            None,
+            "root-orchestrator",
+            TurnEvent::ReasoningDelta {
+                turn_id: turn_id.clone(),
+                text: "Prüfe zuerst die Runtime".to_owned(),
+            },
+        )?);
+        monitor.apply(&ev(
+            "a",
+            None,
+            "root-orchestrator",
+            TurnEvent::AssistantDelta {
+                turn_id,
+                text: "Runtime sieht gut aus".to_owned(),
+            },
+        )?);
+        let shown = panel_screen(&monitor, 72, 12, true)?.join("\n");
+        assert!(shown.contains("∴ Prüfe zuerst die Runtime"), "{shown}");
+        assert!(shown.contains("Runtime sieht gut aus"), "{shown}");
+        Ok(())
+    }
     #[test]
     fn finished_agents_collapse_into_one_summary_line() -> TestResult {
         let mut monitor = busy_monitor()?;
