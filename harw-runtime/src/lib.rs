@@ -5,6 +5,8 @@
 
 // Runde 5, Teil K: Hintergrund-Agenten (`agent.status`/`agent.cancel`, `[agents]`).
 pub mod agent_background_wiring;
+// Async-by-default delegation: durable agent work lives in the shared job ledger.
+pub mod agent_job_wiring;
 // Runde 5, Teil M: Montage von `agent.message`/`parent.message`.
 pub mod agent_messaging_wiring;
 // Runde 5, Teil H: Montage von `agent.result`.
