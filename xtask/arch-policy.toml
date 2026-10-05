@@ -393,6 +393,8 @@ layer = "A"
 layer = "A"
 [packages."harw-session-ws"]
 layer = "A"
+[packages."harw-session-com"]
+layer = "A"
 [packages."harw-session-remote"]
 layer = "A"
 [packages."harw-session-client"]
@@ -406,6 +408,8 @@ layer = "A"
 [packages."harw-mobile-term"]
 layer = "A"
 [packages."harw-reverse-proxy"]
+layer = "A"
+[packages."harw-session-daemon"]
 layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
