@@ -2798,6 +2798,27 @@ impl RuntimeAssemblyBuilder {
             let spawner: Arc<dyn AgentSpawner> = managed_spawner;
             registry_builder = registry_builder.spawner(spawner);
         }
+        // Async-by-default agent delegation is mounted at the composition root.
+        // The submitter is available only when the runtime has all three trusted
+        // ingredients: managed spawner, durable job ledger and authenticated
+        // approval actor. There is deliberately no unmanaged tokio fallback.
+        if let (Some(spawner), Some(job_store), Some(actor)) = (
+            spawner.as_ref(),
+            stores.job_store.as_ref(),
+            spawn_context.approval_actor.clone(),
+        ) {
+            let submitter: Arc<dyn harw_extension_api::AgentJobSubmitter> = Arc::new(
+                crate::agent_job_wiring::RuntimeAgentJobSubmitter::new(
+                    Arc::clone(spawner),
+                    Arc::clone(&stores.state_store),
+                    stores.approval_store.clone(),
+                    Arc::clone(job_store),
+                    actor,
+                ),
+            );
+            registry_builder = registry_builder.agent_job_submitter(submitter);
+        }
+
         // Addendum F+G ("Zombies"): der periodische Kind-Reaper braucht eine
         // laufende Tokio-Runtime — geprüft **hier**, nicht in
         // `guard_wiring::spawn_child_reaper` selbst (dessen `tokio::task::spawn`
