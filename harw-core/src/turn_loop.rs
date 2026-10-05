@@ -1901,7 +1901,7 @@ fn one_line(text: &str, max: usize) -> String {
 }
 
 /// Die gemeinsamen Felder von `transfer_to_<name>` und `agents.delegate`
-/// (`task`, `context`, `continue_from`, `background`, `user_approved`).
+/// (`task`, `context`, `continue_from`, `background`, `wait`, `user_approved`).
 ///
 /// # Beschreibung
 /// Plan R9, Teil C: die Beschreibungen sind bewusst knapp — sie stehen in
@@ -1935,16 +1935,25 @@ fn handoff_properties() -> BTreeMap<String, JsonSchema> {
         crate::user_approval::USER_APPROVED_FIELD.to_owned(),
         crate::user_approval::user_approved_schema(),
     );
-    // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
-    // Orchestrator-Ziele der UIA-Wurzel (Vorgabe dort `true`); jeder andere
-    // Einstieg und jedes Worker-Ziel läuft synchron.
+    // Async-by-default: every delegation enters the durable job runtime.
+    // background=false or wait=true is the explicit compatibility escape hatch.
     properties.insert(
         "background".to_owned(),
         JsonSchema {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
-                "Optional (nur UIA-Orchestratoren in der TUI, dort Vorgabe true): sofort \
-                 zurück, Ergebnis kommt als Benachrichtigung; false wartet."
+                "Optional; Vorgabe true. Startet den Agenten als durable Job und gibt sofort work_id/child_id zurück. false wartet inline."
+                    .to_owned(),
+            ),
+            ..JsonSchema::default()
+        },
+    );
+    properties.insert(
+        "wait".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "Optional; Vorgabe false. true erzwingt den synchronen Legacy-Pfad und wartet auf das Kind."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -1989,7 +1998,7 @@ fn handoff_tool_spec(role: &str, description: Option<&str>) -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
-            "Delegiert an '{role}' und wartet auf das Ergebnis.{summary}{}",
+            "Delegiert an '{role}' als durable Job und gibt standardmäßig sofort einen Handle zurück; background=false oder wait=true wartet inline.{summary}{}",
             handoff_role_hint(role)
         ),
         parameters: closed_object(handoff_properties(), &["task"]),
@@ -2018,8 +2027,7 @@ fn agents_delegate_tool_spec(names: &[String]) -> ToolSpec {
     );
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(AGENTS_DELEGATE_TOOL),
-        description: "Delegiert an einen sichtbaren Agenten und wartet auf das Ergebnis \
-                      (wie transfer_to_<name>)."
+        description: "Delegiert an einen sichtbaren Agenten als durable Job und gibt standardmäßig sofort work_id/child_id zurück; background=false oder wait=true wartet inline."
             .to_owned(),
         parameters: closed_object(properties, &["agent", "task"]),
         strict: false,
@@ -10980,6 +10988,7 @@ mod tests {
             "context",
             "continue_from",
             "background",
+            "wait",
             "user_approved",
         ] {
             assert!(properties.contains_key(field), "{field}");
