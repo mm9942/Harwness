@@ -3961,15 +3961,9 @@ async fn resume_after_approval_with_store(
                         },
                     );
 
-                    if !delegation_runs_inline(&pending.call.arguments) {
-                        let submitter = session
-                            .registry()
-                            .agent_job_submitter()
-                            .cloned()
-                            .ok_or_else(|| CoreError::HandoffFailed {
-                                role: role.clone(),
-                                reason: "durable agent job submitter is not mounted".to_owned(),
-                            })?;
+                    if !delegation_runs_inline(&pending.call.arguments)
+                        && let Some(submitter) = session.registry().agent_job_submitter().cloned()
+                    {
                         let job = submitter
                             .submit_child(&child, question.as_deref())
                             .await
@@ -5117,15 +5111,9 @@ async fn drive_turn(
                 // authority; the durable job runtime now owns its lifecycle.
                 // Only an explicit background=false / wait=true keeps the
                 // historical AwaitingChild contract.
-                if !delegation_runs_inline(&handoff_arguments) {
-                    let submitter = session
-                        .registry()
-                        .agent_job_submitter()
-                        .cloned()
-                        .ok_or_else(|| CoreError::HandoffFailed {
-                            role: role.clone(),
-                            reason: "durable agent job submitter is not mounted".to_owned(),
-                        })?;
+                if !delegation_runs_inline(&handoff_arguments)
+                    && let Some(submitter) = session.registry().agent_job_submitter().cloned()
+                {
                     let job = submitter
                         .submit_child(&child, question.as_deref())
                         .await
