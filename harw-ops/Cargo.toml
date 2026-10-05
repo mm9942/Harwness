@@ -132,6 +132,7 @@ harw-protocol = { path = "../harw-protocol" }
 chatgpt-oauth = ["harw-provider/chatgpt-oauth"]
 
 [dev-dependencies]
+harw-command = { path = "../harw-command" }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 secrecy = "0.8"
 # Slice B4: Persistenz-Rundlauf-Tests (`/permissions`, `/add-workdir`,

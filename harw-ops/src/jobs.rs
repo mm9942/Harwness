@@ -492,6 +492,7 @@ mod tests {
     /// echten Job als Bedienerin (fremder Besitzer).
     #[tokio::test]
     async fn jobs_list_show_logs_and_stop() -> TestResult {
+        harw_command::install_host_default(&std::env::temp_dir().join("harw-ops-command-jobs"));
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let manager = JobManager::new(
             harw_tool_job::JobManagerConfig::new(dir.path().join("state")),

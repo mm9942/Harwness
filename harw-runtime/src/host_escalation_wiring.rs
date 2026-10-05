@@ -232,6 +232,7 @@ mod tests {
     /// Aufruf läuft ohne erneute Frage auf dem Host.
     #[tokio::test]
     async fn test_active_sandbox_lease_applies_to_strict_and_cargo_children() -> TestResult {
+        harw_command::install_host_default(&std::env::temp_dir().join("harw-runtime-command-jobs"));
         let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let profiles = [SandboxProfile::Strict, cargo_profile(&tmp)?];
         for profile in profiles {
