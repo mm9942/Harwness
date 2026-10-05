@@ -3,13 +3,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::process::Stdio;
 use std::time::Duration;
 
+use harw_command::{
+    CommandEnd, CommandOutput, CommandPort, CommandRequest, CommandSandbox,
+};
+use harw_job::Persistence;
 use harw_tool_container::{ContainerId, ContainerPlan, Readback, Stage, StartRefusal};
 use harw_types::cancel::CancelToken;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 
 use crate::inspect::parse_inspect;
 
@@ -104,13 +105,34 @@ pub trait ContainerEngine: Send + Sync {
 pub struct PodmanEngine {
     env: Vec<(String, String)>,
     grace: Duration,
+    port: Option<std::sync::Arc<dyn CommandPort>>,
 }
 
 impl PodmanEngine {
     /// Engine whose process environment is exactly `env`.
     #[must_use]
     pub fn new(env: Vec<(String, String)>) -> Self {
-        Self { env, grace: GRACE }
+        Self {
+            env,
+            grace: GRACE,
+            port: None,
+        }
+    }
+
+    /// Explicit command-runtime injection for embedders and tests.
+    #[must_use]
+    pub fn with_command_port(mut self, port: std::sync::Arc<dyn CommandPort>) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    fn port(&self) -> Result<std::sync::Arc<dyn CommandPort>, EngineError> {
+        self.port
+            .clone()
+            .or_else(harw_command::global::installed)
+            .ok_or_else(|| EngineError::Spawn(
+                "no job-backed command runtime is installed for the container engine".to_owned(),
+            ))
     }
 
     /// Extra wall time beyond the plan's timeout before the container is
@@ -121,10 +143,13 @@ impl PodmanEngine {
         self
     }
 
-    /// The command of one lifecycle stage: argument vector and environment
-    /// come from the plan (the environment is rebuilt from an allowlist, our
-    /// `env` only supplies the values).
-    fn command(&self, plan: &ContainerPlan, stage: Stage<'_>) -> Result<Command, EngineError> {
+    /// Convert one verified lifecycle stage into a job-backed command request.
+    fn request(
+        &self,
+        plan: &ContainerPlan,
+        stage: Stage<'_>,
+        timeout: Duration,
+    ) -> Result<CommandRequest, EngineError> {
         let lookup = |name: &str| {
             self.env
                 .iter()
@@ -134,71 +159,57 @@ impl PodmanEngine {
         let command = plan
             .to_command(stage, &lookup)
             .map_err(|error| EngineError::Unverified(error.to_string()))?;
-        let mut command = Command::from(command);
-        command.kill_on_drop(true);
-        Ok(command)
+
+        let mut request = CommandRequest::new(
+            command.get_program().to_string_lossy().into_owned(),
+            std::path::PathBuf::from("/"),
+            timeout,
+        );
+        request.args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        request.env = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        request.max_output_bytes = MAX_STREAM_BYTES.saturating_mul(2);
+        request.sandbox = CommandSandbox::Host;
+        request.persistence = Persistence::MetadataOnly;
+        request.output = CommandOutput::Capture;
+        Ok(request)
     }
 
-    /// Runs a short stage to completion with captured output.
+    /// Runs one engine helper stage through the shared job runtime.
     async fn short(
         &self,
         plan: &ContainerPlan,
         stage: Stage<'_>,
-    ) -> Result<std::process::Output, EngineError> {
-        let mut command = self.command(plan, stage)?;
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        let child = spawn_with_retry(&mut command).await?;
-        tokio::time::timeout(HELPER_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| EngineError::Unverified("the engine did not answer in time".to_owned()))?
-            .map_err(|error| EngineError::Spawn(error.to_string()))
+    ) -> Result<harw_command::CommandOutcome, EngineError> {
+        let request = self.request(plan, stage, HELPER_TIMEOUT)?;
+        let outcome = self.port()?.run(request, CancelToken::default()).await;
+        match &outcome.end {
+            CommandEnd::Failed(reason) => Err(EngineError::Spawn(reason.clone())),
+            CommandEnd::TimedOut => Err(EngineError::Unverified(
+                "the engine did not answer in time".to_owned(),
+            )),
+            CommandEnd::Cancelled => Err(EngineError::Unverified(
+                "the engine helper was cancelled".to_owned(),
+            )),
+            _ => Ok(outcome),
+        }
     }
 
     /// `rm --force` (kills a running container too); best effort.
     async fn remove(&self, plan: &ContainerPlan, id: &ContainerId) {
         let _ = self.short(plan, Stage::Remove(id)).await;
-    }
-}
-
-/// Reads at most `limit` bytes; the rest is drained and dropped.
-async fn capture<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let mut truncated = false;
-    let mut chunk = [0u8; 8192];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let room = limit.saturating_sub(kept.len());
-                if n > room {
-                    truncated = true;
-                }
-                kept.extend_from_slice(&chunk[..n.min(room)]);
-            }
-        }
-    }
-    (kept, truncated)
-}
-
-/// `ETXTBSY` ("text file busy", errno 26) on `exec` means another thread of
-/// this process still holds a write handle to the executable (a freshly
-/// written or replaced binary, or an fd inherited by a concurrent fork until
-/// that child execs). It is transient; retry a few times, nothing else.
-const ETXTBSY: i32 = 26;
-const SPAWN_ATTEMPTS: usize = 5;
-
-async fn spawn_with_retry(command: &mut Command) -> Result<tokio::process::Child, EngineError> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match command.spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) if error.raw_os_error() == Some(ETXTBSY) && attempt < SPAWN_ATTEMPTS => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            Err(error) => return Err(EngineError::Spawn(error.to_string())),
-        }
     }
 }
 
@@ -222,7 +233,7 @@ impl ContainerEngine for PodmanEngine {
         Box::pin(async move {
             // 1. create: the container exists, nothing runs.
             let created = self.short(plan, Stage::Create).await?;
-            if !created.status.success() {
+            if !created.is_success() {
                 return Err(EngineError::Unverified(format!(
                     "create failed: {}",
                     first_line(&created.stderr)
@@ -234,7 +245,7 @@ impl ContainerEngine for PodmanEngine {
 
             // 2. read back what the engine applied.
             let inspected = match self.short(plan, Stage::Inspect(&id)).await {
-                Ok(output) if output.status.success() => output,
+                Ok(output) if output.is_success() => output,
                 _ => {
                     self.remove(plan, &id).await;
                     return Err(EngineError::Unverified(
@@ -271,77 +282,35 @@ impl ContainerEngine for PodmanEngine {
                 }
             };
 
-            // 4. start attached, with output bounds, the wall-time limit and
-            // cancellation.
-            let mut command = self.command(plan, Stage::Start(&verified))?;
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-            let mut child = match spawn_with_retry(&mut command).await {
-                Ok(child) => child,
-                Err(error) => {
-                    self.remove(plan, &id).await;
-                    return Err(error);
-                }
-            };
-            let out = child.stdout.take();
-            let err = child.stderr.take();
-            let out_task = tokio::spawn(async move {
-                match out {
-                    Some(reader) => capture(reader, MAX_STREAM_BYTES).await,
-                    None => (Vec::new(), false),
-                }
-            });
-            let err_task = tokio::spawn(async move {
-                match err {
-                    Some(reader) => capture(reader, MAX_STREAM_BYTES).await,
-                    None => (Vec::new(), false),
-                }
-            });
-
+            // 4. start attached. The Podman client itself is a normal
+            // job-runtime command; cancellation and the wall-clock limit are
+            // enforced by CommandPort/harw-job, never by a direct spawn here.
             let limit = Duration::from_secs(u64::from(plan.timeout_s())) + self.grace;
-            let (mut timed_out, mut cancelled) = (false, false);
-            let cancel_wait = async {
-                match cancel {
-                    Some(token) => token.cancelled().await,
-                    None => std::future::pending::<()>().await,
+            let request = self.request(plan, Stage::Start(&verified), limit)?;
+            let token = cancel.cloned().unwrap_or_default();
+            let outcome = self.port()?.run(request, token).await;
+            let timed_out = outcome.end == CommandEnd::TimedOut;
+            let cancelled = outcome.end == CommandEnd::Cancelled;
+            let truncated = outcome.truncated || outcome.end == CommandEnd::OutputLimit;
+            let exit_code = match outcome.end {
+                CommandEnd::Exited => Some(outcome.exit_code),
+                CommandEnd::Signaled(_) | CommandEnd::TimedOut | CommandEnd::OutputLimit
+                | CommandEnd::Cancelled => None,
+                CommandEnd::Failed(reason) => {
+                    self.remove(plan, &id).await;
+                    return Err(EngineError::Spawn(reason));
                 }
             };
-            let status = tokio::select! {
-                result = child.wait() => result.ok(),
-                () = tokio::time::sleep(limit) => {
-                    timed_out = true;
-                    None
-                }
-                () = cancel_wait => {
-                    cancelled = true;
-                    None
-                }
-            };
-            if timed_out || cancelled {
-                let _ = child.kill().await;
-            }
-            // The container never outlives the call: `rm --force` also stops a
-            // running one.
+            // The container never outlives the call.
             self.remove(plan, &id).await;
-            // After a kill a grandchild may still hold a pipe open: do not wait
-            // for end-of-stream forever.
-            let reader_wait = if timed_out || cancelled {
-                READER_GRACE_AFTER_KILL
-            } else {
-                Duration::from_secs(3600)
-            };
-            let (stdout, out_truncated) = tokio::time::timeout(reader_wait, out_task)
-                .await
-                .map_or_else(|_| (Vec::new(), true), Result::unwrap_or_default);
-            let (stderr, err_truncated) = tokio::time::timeout(reader_wait, err_task)
-                .await
-                .map_or_else(|_| (Vec::new(), true), Result::unwrap_or_default);
+            let stdout = outcome.stdout;
+            let stderr = outcome.stderr;
             Ok(EngineRun {
                 output: RunOutput {
-                    exit_code: status.and_then(|s| s.code()),
+                    exit_code,
                     stdout: String::from_utf8_lossy(&stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    truncated: out_truncated || err_truncated,
+                    truncated,
                     timed_out,
                     cancelled,
                 },
