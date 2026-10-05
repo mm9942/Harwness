@@ -19,6 +19,7 @@ members = [
     "harw-tool-process",
     # PL-93: typisierte Werkzeuge für häufige Kommandos.
     "harw-tool-fsread",
+    "harw-tool-sys",
     "harw-tool-container",
     "harw-config",
     "harw-home",
