@@ -14,13 +14,11 @@ use harw_types::cancel::CancelToken;
 
 use crate::inspect::parse_inspect;
 
-/// Largest captured size of stdout and of stderr in bytes; more is drained and
-/// dropped (`truncated`).
+/// Maximum captured output budget for one engine command; excess output is
+/// dropped and reported as truncated by the job runtime.
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
 /// Time one engine helper command (`create`, `inspect`, `rm`) may take.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long pipe readers are awaited after a kill.
-const READER_GRACE_AFTER_KILL: Duration = Duration::from_secs(2);
 /// Extra wall time beyond the plan's timeout before the container is killed.
 const GRACE: Duration = Duration::from_secs(5);
 
