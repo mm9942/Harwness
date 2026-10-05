@@ -68,6 +68,7 @@ impl RuntimeAgentJobSubmitter {
         approval_store: Option<Arc<ApprovalStore>>,
         job_store: Arc<JobStore>,
         actor: ApprovalActor,
+        workspace: WorkspaceId,
     ) -> Self {
         let executions = Arc::new(JobExecutionRegistry::new());
         let runner = Arc::new(DurableJobRunner::new(
@@ -82,7 +83,7 @@ impl RuntimeAgentJobSubmitter {
             runner,
             scope: JobScope::new(
                 TenantId::from_str("local"),
-                WorkspaceId::from_str("agents"),
+                workspace,
                 actor,
             ),
         }
