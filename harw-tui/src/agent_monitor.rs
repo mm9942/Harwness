@@ -2043,25 +2043,40 @@ fn panel_rows(
         }
         room = height.saturating_sub(rows.len());
     }
-    if focused
-        && room >= 3
-        && let Some(live) = monitor.selected_live()
+    let live_preview = if focused {
+        monitor.selected_live().filter(|live| live.phase.is_active())
+    } else {
+        monitor
+            .rows()
+            .into_iter()
+            .map(|(_, live)| live)
+            .find(|live| {
+                live.phase.is_active()
+                    && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
+            })
+    };
+    if let Some(live) = live_preview
         && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
     {
-        rows.push(PanelRow {
-            line: Line::default(),
-            entry: None,
-        });
-        rows.push(PanelRow {
-            line: Line::styled(
-                fit_width(
-                    &format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
-                    width,
+        // Fokus bekommt weiterhin den Trenner/Details-Hinweis. Ohne Fokus
+        // bleibt die Live-Projektion kompakt und nutzt nur tatsächlich freien
+        // Platz im Panel.
+        if focused && room >= 3 {
+            rows.push(PanelRow {
+                line: Line::default(),
+                entry: None,
+            });
+            rows.push(PanelRow {
+                line: Line::styled(
+                    fit_width(
+                        &format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
+                        width,
+                    ),
+                    style::dim_style(theme),
                 ),
-                style::dim_style(theme),
-            ),
-            entry: None,
-        });
+                entry: None,
+            });
+        }
 
         let mut preview_room = height.saturating_sub(rows.len());
         if preview_room > 0 && !live.reasoning_preview.is_empty() {
@@ -2078,7 +2093,7 @@ fn panel_rows(
             preview_room = preview_room.saturating_sub(1);
         }
         if preview_room > 0 && !live.preview.is_empty() {
-            let text = sanitize_inline(&live.preview);
+            let text = format!("» {}", sanitize_inline(&live.preview));
             let count = text.chars().count();
             let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
             rows.push(PanelRow {
@@ -2350,6 +2365,60 @@ fn render_agents_only_panel(
             ),
             entry: None,
         });
+    }
+
+    // Split-Dock: Live-Reasoning gehört in die Agenten-Spalte und darf nicht
+    // vom Fokus abhängen. Pflicht-/Auswahlzeilen bleiben unverändert vorne;
+    // Preview-Zeilen werden ausschließlich in den noch freien Raum angehängt,
+    // sodass Selection- und Scroll-Indizes weiterhin auf den echten Agenten-
+    // Einträgen liegen.
+    let max_rows = usize::from(inner.height);
+    let mut preview_room = max_rows.saturating_sub(rows.len());
+    if preview_room > 0 {
+        let active: Vec<&AgentLive> = monitor
+            .rows()
+            .into_iter()
+            .map(|(_, live)| live)
+            .filter(|live| live.phase.is_active())
+            .collect();
+        let show_role = active.len() > 1;
+        for live in active {
+            if preview_room == 0 {
+                break;
+            }
+            if !live.reasoning_preview.is_empty() {
+                let body = sanitize_inline(&live.reasoning_preview);
+                let text = if show_role {
+                    format!("∴ {} · {body}", sanitize_inline(&live.role))
+                } else {
+                    format!("∴ {body}")
+                };
+                rows.push(PanelRow {
+                    line: Line::styled(
+                        fit_width(&text, inner_width),
+                        style::dim_style(theme).add_modifier(Modifier::ITALIC),
+                    ),
+                    entry: None,
+                });
+                preview_room -= 1;
+            }
+            if preview_room == 0 {
+                break;
+            }
+            if !live.preview.is_empty() {
+                let body = sanitize_inline(&live.preview);
+                let text = if show_role {
+                    format!("» {} · {body}", sanitize_inline(&live.role))
+                } else {
+                    format!("» {body}")
+                };
+                rows.push(PanelRow {
+                    line: Line::styled(fit_width(&text, inner_width), Style::default()),
+                    entry: None,
+                });
+                preview_room -= 1;
+            }
+        }
     }
     render_dock_rows(monitor, rows, inner, buf)
 }
@@ -3608,6 +3677,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn render_dock_split_shows_live_reasoning_without_focus() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        let turn = TurnId::new();
+        monitor.apply(&orch(
+            "a1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Running,
+        )?);
+        monitor.apply(&ev(
+            "a1",
+            None,
+            "root-orchestrator",
+            TurnEvent::ReasoningDelta {
+                turn_id: turn.clone(),
+                text: "Prüfe zuerst die DoD-Konfiguration".to_owned(),
+            },
+        )?);
+        monitor.apply(&ev(
+            "a1",
+            None,
+            "root-orchestrator",
+            TurnEvent::AssistantDelta {
+                turn_id: turn,
+                text: "Validator ist geprüft".to_owned(),
+            },
+        )?);
+        monitor.set_jobs(vec![job_row("job-1", "build", false, false)]);
+
+        let agents = Rect::new(0, 0, 40, 12);
+        let jobs = Rect::new(40, 0, 40, 12);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Split { agents, jobs },
+            &mut buf,
+            Theme::Dark,
+            false,
+        );
+        let rows = buffer_rows(&buf);
+        let left = rows
+            .iter()
+            .map(|row| row.chars().take(40).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let right = rows
+            .iter()
+            .map(|row| row.chars().skip(40).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(left.contains("∴ Prüfe zuerst die DoD"), "{left}");
+        assert!(left.contains("» Validator ist geprüft"), "{left}");
+        assert!(!right.contains("Prüfe zuerst die DoD"), "{right}");
+        Ok(())
+    }
     #[test]
     fn render_dock_split_truncates_long_names_with_ellipsis_and_keeps_row_count_fixed() -> TestResult
     {
