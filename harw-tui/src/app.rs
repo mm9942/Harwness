@@ -5555,6 +5555,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             ..
         } => {
             app.clear_live_stream();
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .surface_root_tool(&surface_root_id, "assistant", Some(&tool_name));
             // Runde 5, Teil O: Turn des Aufrufs für die Abbruch-Markierung.
             state.tool_call_turns.insert(call_id.clone(), turn_id);
             let already_known = state.pending_tool_cells.contains_key(&call_id);
@@ -5633,6 +5636,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             if tool_name.as_deref() == Some("shell.exec") {
                 app.request_terminal_reassert();
             }
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .surface_root_tool(&surface_root_id, "assistant", None);
             if !state.export_tool_calls.contains_key(&call_id) {
                 app.export_entries.push(export_tool_call_entry(
                     &call_id,
@@ -5706,6 +5712,13 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         }
         TurnEvent::AssistantDelta { text, .. } => {
             app.live_stream.push_str(&text);
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor.sync_surface_root_stream(
+                &surface_root_id,
+                "assistant",
+                &app.live_reasoning,
+                &app.live_stream,
+            );
             true
         }
         TurnEvent::ReasoningDelta { text, .. } => {
@@ -5720,6 +5733,13 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     .skip(count - LIVE_REASONING_MAX_CHARS)
                     .collect();
             }
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor.sync_surface_root_stream(
+                &surface_root_id,
+                "assistant",
+                &app.live_reasoning,
+                &app.live_stream,
+            );
             true
         }
         TurnEvent::CompactionApplied {
@@ -5984,9 +6004,15 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         TurnEvent::TurnFailed {
             turn_id, reason, ..
         } => {
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .finish_surface_root(&surface_root_id, false, true);
             mark_incomplete_tool_exports(app, state, &turn_id, &format!("unvollständig ({reason})"))
         }
         TurnEvent::TurnAborted { turn_id } => {
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .finish_surface_root(&surface_root_id, true, false);
             let label = turn_safety::aborted_label(app);
             mark_incomplete_tool_exports(app, state, &turn_id, &label)
         }
@@ -7285,6 +7311,12 @@ async fn run_turn_streaming(
     // cooperative checkpoints instead of merely queuing a character.
     let cancel = CancelToken::new();
     app.active_cancel = Some(cancel.clone());
+    // Die direkt von der TUI getriebene Root-Session ist ebenfalls ein
+    // sichtbarer Agentenlauf. Ohne diese Projektion konnte der Status unten
+    // "denkt…" zeigen, während der Agenten-Dock "0 aktiv" meldete.
+    let surface_root_id = app.session_id().as_str().to_owned();
+    app.agent_monitor
+        .begin_surface_root(&surface_root_id, "assistant");
     // Ein neuer Turn startet: ein evtl. noch angezeigter "Abbruch
     // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
     // gehört nicht mehr zum aktuellen Zustand. Derselbe Reset gilt für den
@@ -7351,6 +7383,13 @@ async fn run_turn_streaming(
     )
     .await;
     spinner.stop();
+    // Falls kein terminales TurnEvent angekommen ist, schließt der äußere
+    // Turn-Lifecycle die Surface-Projektion. Ein bereits verarbeitetes
+    // Failed/Aborted-Event gewinnt (finish_surface_root ist idempotent).
+    let surface_cancelled = app.cancel_requested_at.is_some();
+    let surface_failed = reply.is_err() && !surface_cancelled;
+    app.agent_monitor
+        .finish_surface_root(&surface_root_id, surface_cancelled, surface_failed);
     // Runde 5, Teil O: Abbruchgrund für spät verarbeitete `TurnAborted` merken.
     turn_safety::end_turn(app);
     app.active_cancel = None;
