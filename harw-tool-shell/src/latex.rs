@@ -66,10 +66,10 @@ pub use self::log::{LogReport, OverfullBox, parse_build_log};
 pub use check::LATEX_CHECK_TOOL;
 pub use template::{LATEX_TEMPLATE_TOOL, TemplateKind, TemplateLanguage};
 
-use crate::capture::{BoundedCapture, DrainEnd};
-use crate::exec::{configure_stdio, terminate};
+use crate::capture::BoundedCapture;
 use crate::limits::{ShellLimits, launch_command};
 use harw_authority::{Permission, SandboxSpec};
+use harw_command::{CommandEnd, CommandRequest, CommandSandbox, Persistence};
 use harw_sandbox::{BwrapLauncher, HostPathBinding};
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
@@ -79,6 +79,7 @@ use harw_tools::{
 use harw_types::cancel::CancelToken;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::os::unix::process::ExitStatusExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -87,7 +88,6 @@ use std::{
     process::ExitStatus,
     time::{Duration, SystemTime},
 };
-use tokio::process::Command as TokioCommand;
 use tracing::{info, warn};
 
 // ── Konstanten ────────────────────────────────────────────────────────────────
@@ -625,6 +625,15 @@ fn relative(root: &Path, path: &Path) -> String {
 
 // ── Ausführung ────────────────────────────────────────────────────────────────
 
+/// Ein fertig geplanter Start (bwrap-argv bzw. Test-Direktstart).
+struct PreparedLaunch {
+    program: OsString,
+    args: Vec<OsString>,
+    cwd: PathBuf,
+    /// Zusätzliche Variablen über der geerbten Umgebung.
+    env: Vec<(String, String)>,
+}
+
 /// Wie ein Prozess endete.
 enum RunEnd {
     /// Regulär beendet (oder wegen Ausgabeüberlauf getötet).
@@ -691,12 +700,13 @@ struct SandboxRunner {
 }
 
 impl SandboxRunner {
-    /// Startet `command`, sammelt die Ausgabe gekappt und beachtet die
-    /// gemeinsame `deadline` und den Abbruch.
+    /// Führt `launch` über den Command-Port der Job-Runtime aus, sammelt die
+    /// Ausgabe gekappt und beachtet die gemeinsame `deadline` und den Abbruch.
+    /// Start, Prozessgruppe, Frist und Kill gehören der Runtime (PL-93).
     ///
     /// # Argumente
     /// - `tool` (`&'static str`): Werkzeugname für Meldungen.
-    /// - `command` (`&mut TokioCommand`): der vorbereitete Befehl.
+    /// - `launch` (`&PreparedLaunch`): der vorbereitete Befehl.
     /// - `cancel` (`Option<&CancelToken>`): Abbruchsignal.
     /// - `deadline` (`tokio::time::Instant`): gemeinsame Frist aller Läufe
     ///   eines Aufrufs (Runde 7, Teil T3).
@@ -706,81 +716,65 @@ impl SandboxRunner {
     async fn collect(
         &self,
         tool: &'static str,
-        command: &mut TokioCommand,
+        launch: &PreparedLaunch,
         cancel: Option<&CancelToken>,
         deadline: tokio::time::Instant,
     ) -> Result<(RunEnd, BoundedCapture), Option<ToolOutput>> {
-        let mut child = configure_stdio(command).spawn().map_err(|err| {
-            warn!(error = %err, tool, "LaTeX-Werkzeug: Start fehlgeschlagen");
-            Some(ToolOutput::error(format!(
-                "{tool}: Start fehlgeschlagen: {err}"
-            )))
-        })?;
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
-            terminate(&mut child).await;
+        let Some(port) = harw_command::installed() else {
             return Err(Some(ToolOutput::error(format!(
-                "{tool}: stdout/stderr-Pipes fehlen"
+                "{tool}: keine Job-Runtime montiert; Programme laufen nur über die Job-Runtime"
             ))));
         };
-        let mut capture = BoundedCapture::new(self.max_output_bytes);
-        let drained = match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    result = tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)) => result,
-                    () = cancel.cancelled() => {
-                        terminate(&mut child).await;
-                        return Err(None);
-                    }
-                }
-            }
-            None => {
-                tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await
-            }
-        };
-        match drained {
-            Err(_elapsed) => {
-                terminate(&mut child).await;
-                Ok((RunEnd::TimedOut, capture))
-            }
-            Ok(Err(err)) => {
-                terminate(&mut child).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok((RunEnd::TimedOut, BoundedCapture::new(self.max_output_bytes)));
+        }
+        let mut request = CommandRequest::new(
+            launch.program.to_string_lossy().into_owned(),
+            &launch.cwd,
+            remaining,
+        );
+        request.args = launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        request.env = std::env::vars().collect();
+        for (key, value) in &launch.env {
+            request.env.retain(|(name, _)| name != key);
+            request.env.push((key.clone(), value.clone()));
+        }
+        request.max_output_bytes = self.max_output_bytes;
+        request.sandbox = CommandSandbox::Host;
+        request.persistence = Persistence::Ephemeral;
+
+        let done = port.run(request, cancel.cloned().unwrap_or_default()).await;
+        let exceeded = done.end == CommandEnd::OutputLimit;
+        let capture = BoundedCapture::from_parts(
+            done.stdout.clone(),
+            done.stderr.clone(),
+            self.max_output_bytes,
+            exceeded,
+        );
+        match done.end {
+            CommandEnd::Cancelled => Err(None),
+            CommandEnd::TimedOut => Ok((RunEnd::TimedOut, capture)),
+            // TeX-Programme schreiben begrenzt; wer das Budget sprengt, läuft
+            // aus dem Ruder — die Runtime hat den Baum beendet.
+            CommandEnd::OutputLimit => Ok((RunEnd::Finished(None), capture)),
+            CommandEnd::Exited => Ok((
+                RunEnd::Finished(Some(ExitStatus::from_raw(done.exit_code << 8))),
+                capture,
+            )),
+            CommandEnd::Signaled(signal) => Ok((
+                RunEnd::Finished(Some(ExitStatus::from_raw(signal))),
+                capture,
+            )),
+            CommandEnd::Failed(message) => {
+                warn!(error = %message, tool, "LaTeX-Werkzeug: Start fehlgeschlagen");
                 Err(Some(ToolOutput::error(format!(
-                    "{tool}: I/O-Fehler: {err}"
+                    "{tool}: Start fehlgeschlagen: {message}"
                 ))))
-            }
-            Ok(Ok(DrainEnd::LimitExceeded)) => {
-                // TeX-Programme schreiben begrenzt; wer das Budget sprengt,
-                // läuft aus dem Ruder — Baum beenden statt bis zur Frist warten.
-                let status = terminate(&mut child).await;
-                Ok((RunEnd::Finished(status), capture))
-            }
-            Ok(Ok(DrainEnd::Eof)) => {
-                let waited = match cancel {
-                    Some(cancel) => {
-                        tokio::select! {
-                            result = tokio::time::timeout_at(deadline, child.wait()) => result,
-                            () = cancel.cancelled() => {
-                                terminate(&mut child).await;
-                                return Err(None);
-                            }
-                        }
-                    }
-                    None => tokio::time::timeout_at(deadline, child.wait()).await,
-                };
-                match waited {
-                    Ok(Ok(status)) => Ok((RunEnd::Finished(Some(status)), capture)),
-                    Ok(Err(err)) => {
-                        terminate(&mut child).await;
-                        Err(Some(ToolOutput::error(format!(
-                            "{tool}: Warten fehlgeschlagen: {err}"
-                        ))))
-                    }
-                    Err(_elapsed) => {
-                        terminate(&mut child).await;
-                        Ok((RunEnd::TimedOut, capture))
-                    }
-                }
             }
         }
     }
@@ -802,7 +796,7 @@ impl SandboxRunner {
         sandbox: &SandboxSpec,
         env: &ProgramEnv,
         call: &ProgramCall,
-    ) -> Result<TokioCommand, String> {
+    ) -> Result<PreparedLaunch, String> {
         self.limits
             .validate()
             .map_err(|err| format!("{tool}: Ressourcengrenzen: {err}"))?;
@@ -850,9 +844,12 @@ impl SandboxRunner {
             launcher.executable(),
             &plan_args,
         );
-        let mut command = TokioCommand::new(&launch.program);
-        command.args(&launch.args);
-        Ok(command)
+        Ok(PreparedLaunch {
+            program: launch.program.into_os_string(),
+            args: launch.args,
+            cwd: root.to_path_buf(),
+            env: Vec::new(),
+        })
     }
 
     /// Bereitet `call` vor (in Tests wahlweise ohne Sandbox) und führt ihn
@@ -872,22 +869,22 @@ impl SandboxRunner {
     ) -> Result<(RunEnd, BoundedCapture), Option<ToolOutput>> {
         #[cfg(test)]
         let prepared = if self.launch_directly {
-            let mut command = TokioCommand::new(&call.program);
-            command
-                .args(&call.args)
-                .current_dir(&call.cwd)
-                .env("PATH", &env.sandbox_path);
-            Ok(command)
+            Ok(PreparedLaunch {
+                program: call.program.clone().into_os_string(),
+                args: call.args.clone(),
+                cwd: call.cwd.clone(),
+                env: vec![("PATH".to_owned(), env.sandbox_path.clone())],
+            })
         } else {
             self.sandboxed_command(tool, sandbox, env, call)
         };
         #[cfg(not(test))]
         let prepared = self.sandboxed_command(tool, sandbox, env, call);
-        let mut command = prepared.map_err(|message| {
+        let launch = prepared.map_err(|message| {
             warn!(%message, tool, "LaTeX-Werkzeug: Sandbox-Start nicht möglich");
             Some(ToolOutput::error(message))
         })?;
-        self.collect(tool, &mut command, cancel, deadline).await
+        self.collect(tool, &launch, cancel, deadline).await
     }
 }
 

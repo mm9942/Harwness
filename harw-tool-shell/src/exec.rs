@@ -55,10 +55,10 @@
 //!   (z. B. Maus-Reporting) verändern. Ohne `setsid` bleibt der bisherige Pfad
 //!   unverändert (`tracing::debug!` einmalig).
 
-use crate::capture::{BoundedCapture, DrainEnd};
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_authority::{Permission, SandboxSpec};
+use harw_command::{CommandEnd, CommandRequest, CommandSandbox, Persistence, ResourceRequest};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
@@ -78,11 +78,11 @@ use std::{
     io,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::ExitStatus,
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::process::{Child, Command as TokioCommand};
+use tokio::process::Child;
 use tracing::{debug, info, warn};
 
 // Runde 5, Teil N: Host-Mode-Anfrage (`request_host`) und Sandbox-Hinweis;
@@ -797,12 +797,15 @@ impl ShellExecutor {
             launcher.executable(),
             plan.args(),
         );
-        let mut command = TokioCommand::new(&launch.program);
-        command.args(&launch.args);
 
-        self.spawn_and_collect(
-            &mut command,
-            "Bubblewrap",
+        self.run_on_port(
+            PortLaunch {
+                program: launch.program.as_os_str(),
+                args: &launch.args,
+                cwd: sandbox.workspace().canonical_root().to_path_buf(),
+                limits: ResourceRequest::default(),
+                context: "Bubblewrap",
+            },
             effective_timeout,
             session_id,
             cancel,
@@ -887,54 +890,24 @@ impl ShellExecutor {
             );
         }
 
-        let setsid = resolve_setsid();
+        // The job runtime starts the command in a new session (no controlling
+        // terminal) and owns the kill of its whole tree; the environment is the
+        // harness's own (no `env_clear`), unlike the hermetic bwrap path.
         let shell = resolve_host_shell(self.exec_platform);
-        let (program, shell_args) = host_shell_argv_with_shell(setsid, &shell, &args.command);
         // Runde 5, Teil N: RLIMIT_CPU wächst mit dem gewährten Zeitlimit.
         let limits = timeouts::limits_for(self.limits, effective_timeout);
-        let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
-
-        let mut command = TokioCommand::new(&launch.program);
-        command.args(&launch.args);
-        command.current_dir(sandbox.workspace().canonical_root());
-        // Prozessgruppen-/Sitzungs-Isolation des Host-Befehls von harws eigenem
-        // Terminal. Zwei Fälle, je nachdem ob `setsid` gefunden wurde
-        // (`host_shell_argv_with_shell`):
-        //
-        // - MIT setsid: `process_group(0)` wird hier BEWUSST NICHT gesetzt. Das
-        //   util-linux-`setsid` forkt nur dann einen Enkelprozess (und wartet
-        //   dank `--wait` auf ihn), wenn es selbst bereits Prozessgruppenführer
-        //   ist (`getpgrp() == getpid()`). Ohne `process_group(0)` erbt der
-        //   direkte Kindprozess (der spätere `setsid`) harws Prozessgruppe
-        //   (deren pgid == harws eigene PID ist, nicht die des Kindes) — er ist
-        //   also KEIN Gruppenführer. `setsid` ruft daraufhin `setsid(2)` auf
-        //   sich selbst auf und `exec`t `/bin/sh` an derselben PID weiter, statt
-        //   zu forken: diese eine PID wird Sitzungs- UND Gruppenführer einer
-        //   neuen, von harws Terminal vollständig gelösten Sitzung (kein
-        //   Controlling-Terminal mehr — `open("/dev/tty")` scheitert dort mit
-        //   ENXIO, das eigentliche Ziel dieses Fixes). `terminate()` killt
-        //   unverändert genau diese eine PID (`child.start_kill()`), die damit
-        //   weiterhin die Spitze des gesamten Kommandobaums ist — kein Änderung
-        //   an `terminate()` nötig.
-        //   Würde hier stattdessen `process_group(0)` gesetzt, wäre der direkte
-        //   Kindprozess bereits Gruppenführer, `setsid` würde also forken und
-        //   (dank `--wait`) auf den Enkel warten; `terminate()` träfe dann nur
-        //   den wartenden Elternprozess, während `/bin/sh` in seiner eigenen,
-        //   neuen Sitzung als Waise weiterliefe — exakt das Leck, das dieser Fix
-        //   beheben soll. Deshalb bewusst vermieden.
-        // - OHNE setsid (Fallback, unverändertes Verhalten): `process_group(0)`
-        //   wie bisher, trennt den Host-Befehl zumindest von harws eigener
-        //   Prozessgruppe (keine Sitzungs-Trennung, `/dev/tty` bleibt erreichbar).
-        if setsid.is_none() {
-            command.process_group(0);
-        }
-        // Umgebung wird bewusst NICHT gecleart (kein `env_clear`): der Host-Pfad erbt
-        // den vollen zsh-Kontext des Nutzers (PATH/HOME/CARGO_HOME/…), im Unterschied
-        // zum hermetischen bwrap-Pfad.
-
-        self.spawn_and_collect(
-            &mut command,
-            "host shell",
+        let shell_args = [OsString::from("-c"), OsString::from(&args.command)];
+        self.run_on_port(
+            PortLaunch {
+                program: shell.as_os_str(),
+                args: &shell_args,
+                cwd: sandbox.workspace().canonical_root().to_path_buf(),
+                limits: rlimit_request(
+                    &limits,
+                    limits.require_rlimits && self.exec_platform == ExecPlatform::Sandboxed,
+                ),
+                context: "host shell",
+            },
             effective_timeout,
             session_id,
             cancel,
@@ -943,128 +916,89 @@ impl ShellExecutor {
         .await
     }
 
-    /// Spawns an already-configured, not-yet-started `TokioCommand`, drains
-    /// stdout/stderr together under one byte budget, applies the timeout and
-    /// optional cancel-race, and returns the finished `ToolOutput`. Shared
-    /// core for the sandboxed (`bwrap`) and host (`/bin/sh -c`, no `bwrap`)
-    /// paths (Plan Teil B1) — only the `command` construction differs
-    /// between [`Self::run_command`] and [`Self::run_host_command`].
+    /// Runs a prepared launch through the installed command port (PL-93):
+    /// the job runtime owns spawn, process group/session, deadline, output
+    /// budget and the kill; this only builds the request and shapes the
+    /// result for the model. Shared by the sandboxed (`bwrap`) and the host
+    /// (`/bin/sh -c`) path.
     ///
     /// # Errors
-    /// Returns `Ok(ToolOutput::error(...))` for spawn failure, missing
-    /// stdio pipes, I/O errors, or timeout. Returns
-    /// `Err(ToolsError::Cancelled)` when `cancel` fires before completion —
-    /// the process tree is killed via [`terminate`] before this is returned.
-    ///
-    /// # Concurrency
-    /// Timeout, cancellation, and output overflow all kill and reap the
-    /// child explicitly via [`terminate`]; `kill_on_drop(true)` still covers
-    /// a dropped future.
-    async fn spawn_and_collect(
+    /// `Ok(ToolOutput::error(...))` when no job runtime is installed, the job
+    /// cannot start, or the deadline elapses. `Err(ToolsError::Cancelled)` when
+    /// `cancel` fires — the runtime has killed the process tree by then.
+    async fn run_on_port(
         &self,
-        command: &mut TokioCommand,
-        spawn_error_context: &str,
+        launch: PortLaunch<'_>,
         effective_timeout: u64,
         session_id: &str,
         cancel: Option<&CancelToken>,
         executed_on_host: bool,
     ) -> Result<ToolOutput, ToolsError> {
-        let mut child = match configure_stdio(command).spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                warn!(error = %err, "shell.exec spawn failed");
-                return Ok(ToolOutput::error(format!(
-                    "shell.exec: failed to spawn {spawn_error_context}: {err}"
-                )));
-            }
-        };
-
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
-            terminate(&mut child).await;
+        let Some(port) = harw_command::installed() else {
             return Ok(ToolOutput::error(
-                "shell.exec: process I/O error: stdout/stderr pipes missing",
+                "shell.exec: no job runtime is installed; commands run only through the job runtime",
             ));
         };
+        let mut request = CommandRequest::new(
+            launch.program.to_string_lossy().into_owned(),
+            launch.cwd,
+            Duration::from_secs(effective_timeout),
+        );
+        request.args = launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        request.env = std::env::vars().collect();
+        request.max_output_bytes = self.max_output_bytes;
+        request.limits = launch.limits;
+        request.sandbox = CommandSandbox::Host;
+        request.persistence = Persistence::Ephemeral;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_timeout);
-        let mut capture = BoundedCapture::new(self.max_output_bytes);
-        let drained = match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    result = tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)) => result,
-                    () = cancel.cancelled() => {
-                        terminate(&mut child).await;
-                        info!(session_id, "shell.exec cancelled while draining output");
-                        return Err(ToolsError::Cancelled);
-                    }
-                }
+        let done = port.run(request, cancel.cloned().unwrap_or_default()).await;
+        match done.end {
+            CommandEnd::Failed(message) => {
+                warn!(error = %message, "shell.exec job failed to run");
+                Ok(ToolOutput::error(format!(
+                    "shell.exec: failed to spawn {}: {message}",
+                    launch.context
+                )))
             }
-            None => {
-                tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await
+            CommandEnd::Cancelled => {
+                info!(session_id, "shell.exec cancelled");
+                Err(ToolsError::Cancelled)
             }
-        };
-
-        let status = match drained {
-            Err(_elapsed) => {
-                terminate(&mut child).await;
+            CommandEnd::TimedOut => {
                 warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                return Ok(self.timeout_output(effective_timeout, &capture, executed_on_host));
+                Ok(self.timeout_output(
+                    effective_timeout,
+                    &done.stdout,
+                    &done.stderr,
+                    executed_on_host,
+                ))
             }
-            Ok(Err(err)) => {
-                terminate(&mut child).await;
-                warn!(error = %err, "shell.exec output read failed");
-                return Ok(ToolOutput::error(format!(
-                    "shell.exec: process I/O error: {err}"
-                )));
-            }
-            Ok(Ok(DrainEnd::LimitExceeded)) => {
-                // Niemand liest mehr: Prozessbaum sofort beenden statt bis zum Timeout
-                // weiterlaufen zu lassen (Pipe voll → Kind blockiert, CPU/Disk-Last bleibt).
-                let status = terminate(&mut child).await;
+            CommandEnd::OutputLimit => {
                 warn!(
                     max_output_bytes = self.max_output_bytes,
                     "shell.exec output limit exceeded; process tree killed"
                 );
-                return Ok(self.completed_output(status, &capture, true, executed_on_host));
+                Ok(self.completed_output(None, &done.stdout, &done.stderr, true, executed_on_host))
             }
-            Ok(Ok(DrainEnd::Eof)) => {
-                let waited = match cancel {
-                    Some(cancel) => {
-                        tokio::select! {
-                            result = tokio::time::timeout_at(deadline, child.wait()) => result,
-                            () = cancel.cancelled() => {
-                                terminate(&mut child).await;
-                                info!(session_id, "shell.exec cancelled while waiting for exit");
-                                return Err(ToolsError::Cancelled);
-                            }
-                        }
-                    }
-                    None => tokio::time::timeout_at(deadline, child.wait()).await,
-                };
-                match waited {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(err)) => {
-                        terminate(&mut child).await;
-                        warn!(error = %err, "shell.exec wait failed");
-                        return Ok(ToolOutput::error(format!(
-                            "shell.exec: process I/O error: {err}"
-                        )));
-                    }
-                    Err(_elapsed) => {
-                        terminate(&mut child).await;
-                        warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                        return Ok(self.timeout_output(
-                            effective_timeout,
-                            &capture,
-                            executed_on_host,
-                        ));
-                    }
-                }
-            }
-        };
-
-        Ok(self.completed_output(Some(status), &capture, false, executed_on_host))
+            CommandEnd::Exited => Ok(self.completed_output(
+                Some(done.exit_code),
+                &done.stdout,
+                &done.stderr,
+                done.truncated,
+                executed_on_host,
+            )),
+            CommandEnd::Signaled(_) => Ok(self.completed_output(
+                None,
+                &done.stdout,
+                &done.stderr,
+                done.truncated,
+                executed_on_host,
+            )),
+        }
     }
 
     /// Prüft die Limits und löst `prlimit` an den festen Pfaden auf.
@@ -1114,17 +1048,15 @@ impl ShellExecutor {
     /// byte-identisch zu vorher, ohne dieses Feld.
     fn completed_output(
         &self,
-        status: Option<ExitStatus>,
-        capture: &BoundedCapture,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
         killed_by_output_limit: bool,
         executed_on_host: bool,
     ) -> ToolOutput {
-        let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
-        let (stdout_str, stderr_str, truncated) = Self::truncate_combined_output(
-            capture.stdout(),
-            capture.stderr(),
-            self.max_output_bytes,
-        );
+        let exit_code = exit_code.unwrap_or(-1);
+        let (stdout_str, stderr_str, truncated) =
+            Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
         let truncated = truncated || killed_by_output_limit;
 
         info!(
@@ -1152,19 +1084,40 @@ impl ShellExecutor {
     fn timeout_output(
         &self,
         timeout_secs: u64,
-        capture: &BoundedCapture,
+        stdout: &[u8],
+        stderr: &[u8],
         executed_on_host: bool,
     ) -> ToolOutput {
-        let (stdout, stderr, truncated) = Self::truncate_combined_output(
-            capture.stdout(),
-            capture.stderr(),
-            self.max_output_bytes,
-        );
+        let (stdout, stderr, truncated) =
+            Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
         let prefix = if executed_on_host { "[host] " } else { "" };
         ToolOutput::error(format!(
             "{prefix}shell.exec timed out after {timeout_secs}s; process tree killed. \
              Partial output (truncated: {truncated}):\n[stdout]\n{stdout}\n[stderr]\n{stderr}"
         ))
+    }
+}
+
+/// What [`ShellExecutor::run_on_port`] runs.
+struct PortLaunch<'a> {
+    program: &'a std::ffi::OsStr,
+    args: &'a [OsString],
+    cwd: PathBuf,
+    limits: ResourceRequest,
+    context: &'static str,
+}
+
+/// [`ShellLimits`] as the job runtime's per-process rlimits. `RLIMIT_NPROC`
+/// has no counterpart there (a user-wide ceiling, see [`ShellLimits::nproc`]).
+/// A missing `prlimit` fails the start when the limits are required.
+fn rlimit_request(limits: &ShellLimits, require: bool) -> ResourceRequest {
+    ResourceRequest {
+        address_space_max: Some(limits.as_bytes),
+        cpu_time_max: Some(limits.cpu_secs),
+        file_size_max: Some(limits.fsize_bytes),
+        open_files_max: u32::try_from(limits.nofile).ok(),
+        require_rlimits: require,
+        ..ResourceRequest::default()
     }
 }
 
@@ -1289,16 +1242,6 @@ fn resolve_host_shell(platform: ExecPlatform) -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("/bin/sh"))
         }
     }
-}
-
-/// Setzt die Standard-Streams für den Sandbox-Start: stdin `/dev/null` (nie das geerbte
-/// Terminal), stdout/stderr als Pipes, SIGKILL beim Drop des `Child`.
-pub(crate) fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
 }
 
 /// Beendet den direkten Kindprozess (`prlimit` hat sich per `exec` durch `bwrap` bzw.
@@ -1849,11 +1792,11 @@ mod tests {
     use std::path::Path;
     use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::io::AsyncWriteExt;
 
     // ── Test helpers ───────────────────────────────────────────────────────────
 
     fn make_temp_workspace() -> TestResult<TempDir> {
+        crate::test_support::install_host_port();
         tempfile::tempdir().map_err(ctx("tempdir creation must succeed in tests"))
     }
 
@@ -2200,43 +2143,6 @@ mod tests {
 
     // ── Pure Tests ohne Sandbox (W1-03) ────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_configure_stdio_sets_stdin_to_dev_null() -> TestResult {
-        if !Path::new("/proc/self/fd/0").exists() || !Path::new("/bin/sh").exists() {
-            eprintln!("übersprungen: /proc oder /bin/sh fehlt, stdin-Ziel nicht beobachtbar");
-            return Ok(());
-        }
-        // Absichtlich ohne bwrap: prüft genau die Stream-Konfiguration, die der
-        // Sandbox-Start verwendet.
-        let mut command = TokioCommand::new("/bin/sh");
-        command.args(["-c", "readlink /proc/self/fd/0"]);
-        let mut child = configure_stdio(&mut command)
-            .spawn()
-            .map_err(ctx("spawn /bin/sh"))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or(TestError::Missing("stdout piped"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or(TestError::Missing("stderr piped"))?;
-        let mut capture = BoundedCapture::new(4096);
-        let end = capture
-            .drain(&mut stdout, &mut stderr)
-            .await
-            .map_err(ctx("read child output"))?;
-        let status = child.wait().await.map_err(ctx("wait child"))?;
-
-        assert_eq!(end, DrainEnd::Eof);
-        assert!(status.success(), "readlink must succeed: {status:?}");
-        assert_eq!(
-            String::from_utf8_lossy(capture.stdout()).trim(),
-            "/dev/null"
-        );
-        Ok(())
-    }
-
     #[test]
     fn test_completed_output_marks_output_limit_kill_as_truncated() -> TestResult {
         let executor = ShellExecutor {
@@ -2253,9 +2159,7 @@ mod tests {
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
         };
-        let capture = BoundedCapture::new(16);
-
-        match executor.completed_output(None, &capture, true, false) {
+        match executor.completed_output(None, b"", b"", true, false) {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], -1);
                 assert_eq!(content["truncated"], true);
@@ -2286,20 +2190,9 @@ mod tests {
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
         };
-        let (mut writer, mut stdout) = tokio::io::duplex(1024);
-        let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
-        writer
-            .write_all(b"partial-output-longer-than-budget")
-            .await
-            .map_err(ctx("write"))?;
-        let mut capture = BoundedCapture::new(executor.max_output_bytes);
-        let _ = tokio::time::timeout(
-            Duration::from_millis(50),
-            capture.drain(&mut stdout, &mut stderr),
-        )
-        .await;
+        let stdout = b"partial-output-longer-than-budget";
 
-        match executor.timeout_output(1, &capture, false) {
+        match executor.timeout_output(1, stdout, b"", false) {
             ToolOutput::Error { message } => {
                 assert!(message.contains("timed out after 1s"), "{message}");
                 assert!(message.contains("partial-"), "{message}");
@@ -2430,9 +2323,9 @@ mod tests {
             );
             std::process::Command::new(prlimit)
                 .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
                 .is_ok_and(|status| status.success())
         })

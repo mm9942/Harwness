@@ -78,3 +78,15 @@ pub(crate) mod golden {
         Ok(())
     }
 }
+
+/// Installs the host command port once per test binary (shell commands run
+/// only through the job runtime).
+pub(crate) fn install_host_port() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = harw_test_support::unique_tmp("harw-tool-shell", "command-jobs");
+        if let Ok(port) = harw_command::JobCommandPort::host(&dir) {
+            let _ = harw_command::install(std::sync::Arc::new(port));
+        }
+    });
+}
