@@ -71,6 +71,7 @@ time = { version = "0.3.53", features = ["formatting"] }
 zeroize = "1"
 
 [dev-dependencies]
+harw-command = { path = "../harw-command" }
 harw-test-support = { path = "../harw-test-support" }
 harw-tools = { path = "../harw-tools" }
 harw-operations = { path = "../harw-operations" }

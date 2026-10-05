@@ -119,6 +119,7 @@ impl OperatorShellJobs {
     /// Nur Tests: Zulassung ohne Runtime-Montage (Operator-Stufe).
     #[cfg(test)]
     pub(super) fn allow_without_runtime(&mut self) {
+        crate::test_support::install_host_port();
         self.allow_without_runtime = true;
     }
 }

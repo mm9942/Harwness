@@ -4461,6 +4461,7 @@ dependencies = [
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
+ "harw-command",
  "harw-config",
  "harw-context",
  "harw-core",
