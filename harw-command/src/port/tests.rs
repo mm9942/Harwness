@@ -1,10 +1,14 @@
 use super::*;
 use crate::{CommandFrame, CommandOutput, CommandStdin};
-use harw_job::{FsJobRecordStore, LinuxExecutor};
+#[cfg(target_os = "macos")]
+use harw_job::DarwinExecutor as HostExecutor;
+use harw_job::FsJobRecordStore;
+#[cfg(target_os = "linux")]
+use harw_job::LinuxExecutor as HostExecutor;
 
 harw_test_support::define_test_error!(pub(crate));
 
-type Port = JobCommandPort<FsJobRecordStore, LinuxExecutor>;
+type Port = JobCommandPort<FsJobRecordStore, HostExecutor>;
 
 fn port(dir: &std::path::Path) -> TestResult<Port> {
     JobCommandPort::host(dir).map_err(TestError::Unexpected)
@@ -143,6 +147,7 @@ async fn a_relative_directory_and_a_missing_program_fail_cleanly() -> TestResult
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_job_has_no_controlling_terminal_and_its_tree_dies_with_it() -> TestResult {
     let root = dir("session")?;
@@ -179,6 +184,7 @@ async fn the_job_has_no_controlling_terminal_and_its_tree_dies_with_it() -> Test
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn is_zombie(pid: i32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         stat.rsplit(')')
