@@ -1333,7 +1333,7 @@ pub struct ChatApp {
     pending_turn_user_cell_override: Option<String>,
     /// Vormerkung für [`TerminalGuard::reassert_terminal_modes`] (Register
     /// "CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7): `true`, sobald
-    /// ein Ereignis eingetreten ist, nach dem Raw-Mode/Bracketed-Paste/
+    /// ein Ereignis eingetreten ist, nach dem Raw-Mode/Alternate-Screen/Bracketed-Paste/
     /// Maus-Capture beschädigt zurückgekommen sein könnten (Ctrl+H beendet
     /// eine Host-Arbeitsphase, siehe [`Self::end_host_mode`], oder ein
     /// `shell.exec`-Werkzeugaufruf endet, siehe `handle_turn_event`).
@@ -3011,7 +3011,7 @@ impl ChatApp {
         let _ = runtime.host_permit_ledger().revoke_session(&session);
         self.push_line(Role::System, "Host-Modus beendet — Isolation wieder aktiv.");
         // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7: die
-        // beendete Host-Arbeitsphase kann Terminal-Modi (Raw-Mode/Bracketed-
+        // beendete Host-Arbeitsphase kann Terminal-Modi (Raw-Mode/Alternate-Screen/Bracketed-
         // Paste/Maus-Capture) beschädigt zurückgelassen haben — der Aufrufer
         // mit Zugriff auf den `TerminalGuard` reasserted sie best-effort.
         self.request_terminal_reassert();
@@ -3605,27 +3605,30 @@ impl TerminalGuard {
         &mut self.terminal
     }
 
-    /// Reassertiert Raw-Mode, Bracketed-Paste und Maus-Capture best-effort
-    /// (Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7).
+    /// Stellt die vollständige TUI-Terminal-Ownership best-effort wieder her.
     ///
     /// # Beschreibung
-    /// Ein Host-`shell.exec`/`!`-Lauf oder das Ende einer Host-Arbeitsphase
-    /// (Ctrl+H) kann diese Terminal-Modi beschädigt zurücklassen — z. B.
-    /// wenn eine ausgeführte Fremd-Anwendung sie selbst geändert hat. Diese
-    /// Funktion stellt sie erneut her, ohne den Bildschirm zu löschen oder
-    /// den Alternate-Screen zu verlassen/erneut zu betreten. Fehler werden
-    /// protokolliert, aber nicht propagiert — ein fehlgeschlagenes
-    /// Selbstheilen darf die TUI niemals abstürzen lassen.
+    /// Host-Arbeit kann nicht nur Raw-Mode/Paste/Mouse-Capture verändern,
+    /// sondern auch den Alternate-Screen verlassen. Passiert das, würde der
+    /// nächste ratatui-Frame in den normalen tmux-Scrollback zeichnen und
+    /// frühere Agenten-/Jobs-Docks als scheinbare Duplikate stehen lassen.
+    /// Deshalb wird die komplette Terminal-Sequenz reassertiert und das
+    /// ratatui-Terminal anschließend zu einem vollständigen Redraw gezwungen.
+    /// Fehler bleiben best-effort: Self-Healing darf die TUI nicht beenden.
     pub(crate) fn reassert_terminal_modes(&mut self) {
         if let Err(error) = enable_raw_mode() {
             tracing::warn!(%error, "tui.terminal.reassert_raw_mode_failed");
         }
         if let Err(error) = crossterm::execute!(
             self.terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
         ) {
             tracing::warn!(%error, "tui.terminal.reassert_modes_failed");
+        }
+        if let Err(error) = self.terminal.clear() {
+            tracing::warn!(%error, "tui.terminal.reassert_clear_failed");
         }
     }
 }
@@ -5623,7 +5626,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 });
             // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7:
             // ein abgeschlossener `shell.exec`-Aufruf kann Terminal-Modi
-            // (Raw-Mode/Bracketed-Paste/Maus-Capture) beschädigt
+            // (Raw-Mode/Alternate-Screen/Bracketed-Paste/Maus-Capture) beschädigt
             // zurücklassen — der Aufrufer (mit Zugriff auf den
             // `TerminalGuard`) reasserted sie best-effort, sobald diese
             // Vormerkung ansteht (siehe `ChatApp::take_needs_terminal_reassert`).
