@@ -2735,7 +2735,7 @@ impl RuntimeAssemblyBuilder {
                 detail: error.to_string(),
             })?,
         );
-        let (spawner, spawner_roles) = build_spawner(
+        let (spawner, spawner_roles, agent_job_submitter_slot) = build_spawner(
             profile.spawner,
             SpawnerInputs {
                 config: &config,
@@ -2816,6 +2816,11 @@ impl RuntimeAssemblyBuilder {
                     actor,
                 ),
             );
+            if let Some(slot) = agent_job_submitter_slot.as_ref() {
+                slot.set(Arc::downgrade(&submitter)).map_err(|_| RuntimeError::Spawner {
+                    detail: "durable agent job submitter slot was initialized twice".to_owned(),
+                })?;
+            }
             registry_builder = registry_builder.agent_job_submitter(submitter);
         }
 
@@ -5264,12 +5269,16 @@ fn build_spawner(
     policy: SpawnerPolicy,
     inputs: SpawnerInputs<'_>,
     session_events: Option<UnboundedSender<SessionEvent>>,
-) -> RuntimeResult<(Option<Arc<ManagedAgentSpawner>>, Vec<String>)> {
+) -> RuntimeResult<(
+    Option<Arc<ManagedAgentSpawner>>,
+    Vec<String>,
+    Option<Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>>,
+)> {
     // Erschöpfend statt `if policy == …`: eine künftige Variante (etwa
     // `ConfiguredRoles`) fiele sonst still in den `BuiltinRoles`-Zweig,
     // statt den Compiler zu brechen (Befund Z2c-03).
     match policy {
-        SpawnerPolicy::None => return Ok((None, Vec::new())),
+        SpawnerPolicy::None => return Ok((None, Vec::new(), None)),
         SpawnerPolicy::BuiltinRoles => {}
     }
 
@@ -5309,6 +5318,9 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
+    let agent_job_submitter_slot: Arc<
+        std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
+    > = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
     // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
@@ -5350,6 +5362,7 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir.clone())
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_agent_job_submitter_slot(Arc::clone(&agent_job_submitter_slot))
         .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
         // Teil B4: dasselbe Sandbox-Profil und dieselbe Host-Permit-
         // Verdrahtung wie die Root-Registry — ohne diesen Aufruf bliebe jede
@@ -5418,6 +5431,7 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir)
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_agent_job_submitter_slot(Arc::clone(&agent_job_submitter_slot))
         .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
         // Teil B4: dieselbe Verdrahtung wie `factory` — erreicht damit auch
         // `uia-shell-worker` und `host-process-worker` (beide Rollen der
@@ -5571,7 +5585,7 @@ fn build_spawner(
             detail: "managed child spawner slot was initialized twice".to_owned(),
         })?;
 
-    Ok((Some(spawner), roles))
+    Ok((Some(spawner), roles, Some(agent_job_submitter_slot)))
 }
 
 /// Plan R9, Teil C: die Katalogdaten eines Roster-Eintrags für
