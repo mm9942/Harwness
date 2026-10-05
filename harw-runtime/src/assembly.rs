@@ -2814,7 +2814,8 @@ impl RuntimeAssemblyBuilder {
                     stores.approval_store.clone(),
                     Arc::clone(job_store),
                     actor,
-                    harw_types::WorkspaceId::from_str(root_session_id.as_str()),
+                    sandbox.workspace().tenant().clone(),
+                    sandbox.workspace().workspace().clone(),
                 ),
             );
             if let Some(slot) = agent_job_submitter_slot.as_ref() {

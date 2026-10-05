@@ -1769,9 +1769,9 @@ fn agent_job_started_result(
         "work_id": handle.work_id.as_str(),
         "child_id": handle.child.as_str(),
         "role": role,
-        "status": "running",
+        "status": "submitted",
         "async": true,
-        "hint": "Work continues independently. Use agent.status/agent.result with child_id; work_id is the durable runtime/operator handle."
+        "hint": "Work continues independently. work_id is the durable lifecycle handle; child_id addresses the live agent projection. Durable job controls use work_id; agent.status/agent.result use child_id until the work-id result surface is unified."
     }))
 }
 

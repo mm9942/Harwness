@@ -18,7 +18,7 @@ use harw_extension_api::{
 use harw_job_core::{
     Budget, Job, JobKind, JobOutcome, JobScope, RetryPolicy, StoredJob,
 };
-use harw_session_store::{ApprovalStore, ClaimRequest, JobStore};
+use harw_session_store::{ApprovalStore, CancelRequest, ClaimRequest, JobStore};
 use harw_types::{ApprovalActor, TenantId, WorkId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
@@ -68,6 +68,7 @@ impl RuntimeAgentJobSubmitter {
         approval_store: Option<Arc<ApprovalStore>>,
         job_store: Arc<JobStore>,
         actor: ApprovalActor,
+        tenant: TenantId,
         workspace: WorkspaceId,
     ) -> Self {
         let executions = Arc::new(JobExecutionRegistry::new());
@@ -81,11 +82,7 @@ impl RuntimeAgentJobSubmitter {
             approval_store,
             job_store,
             runner,
-            scope: JobScope::new(
-                TenantId::from_str("local"),
-                workspace,
-                actor,
-            ),
+            scope: JobScope::new(tenant, workspace, actor),
         }
     }
 
@@ -109,12 +106,6 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 .unwrap_or("Continue the delegated task.")
                 .to_owned();
 
-            // Detach before the parent continues so parent completion cannot
-            // release the child admission while its durable job is running.
-            self.spawner
-                .detach_for_background(&child, Some(&task))
-                .map_err(|error| Self::rejection(error.message))?;
-
             let work_id = WorkId::new();
             let now = Timestamp::now();
             let retry = RetryPolicy::try_new(
@@ -124,15 +115,17 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 SignedDuration::ZERO,
             )
             .map_err(|error| Self::rejection(error.to_string()))?;
-            let mut job = Job::new(
+            // Phase 1: persist the work as Pending. A Pending record is
+            // durable but not claimable, so a crash before ownership transfer
+            // cannot start an agent whose background lifecycle was never
+            // established.
+            let job = Job::new(
                 work_id.clone(),
                 JobKind::Custom(AGENT_JOB_KIND.to_owned()),
                 Budget::unbounded(),
                 retry,
                 now,
             );
-            job.mark_ready(now)
-                .map_err(|error| Self::rejection(error.to_string()))?;
             let record = StoredJob {
                 job,
                 scope: self.scope.clone(),
@@ -157,6 +150,94 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 .await
                 .map_err(|error| Self::rejection(format!("agent job admission task failed: {error}")))?
                 .map_err(|error| Self::rejection(format!("agent job admission failed: {error}")))?;
+
+            // Phase 2: transfer the already-admitted child to the background
+            // owner. Only after this succeeds may the durable record become
+            // claimable.
+            if let Err(error) = self.spawner.detach_for_background(&child, Some(&task)) {
+                let reason =
+                    format!("agent background ownership transfer failed: {}", error.message);
+                let store = Arc::clone(&self.job_store);
+                let work_id_for_cancel = work_id.clone();
+                let cancelled_by = self.scope.submitter().clone();
+                let reason_for_cancel = reason.clone();
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    store.cancel(
+                        &work_id_for_cancel,
+                        &CancelRequest {
+                            cancelled_at: Timestamp::now(),
+                            cancelled_by,
+                            reason: reason_for_cancel,
+                        },
+                    )
+                })
+                .await;
+                match cleanup {
+                    Err(join_error) => tracing::error!(
+                        work_id = %work_id,
+                        error = %join_error,
+                        "agent_job.pending_cleanup_task_failed"
+                    ),
+                    Ok(Err(cancel_error)) => tracing::error!(
+                        work_id = %work_id,
+                        error = %cancel_error,
+                        "agent_job.pending_cleanup_failed"
+                    ),
+                    Ok(Ok(_)) => {}
+                }
+                return Err(Self::rejection(reason));
+            }
+
+            // Phase 3: Ready means both durable admission and background
+            // ownership are established. A worker can only claim after this
+            // transition.
+            let store = Arc::clone(&self.job_store);
+            let work_id_for_ready = work_id.clone();
+            let activation = tokio::task::spawn_blocking(move || {
+                store.mark_ready(&work_id_for_ready, Timestamp::now())
+            })
+            .await;
+            let activation_error = match activation {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(format!("agent job activation failed: {error}")),
+                Err(error) => Some(format!("agent job activation task failed: {error}")),
+            };
+            if let Some(reason) = activation_error {
+                let _ = self.spawner.finish_background_child(
+                    &child,
+                    BackgroundStatus::Failed,
+                    reason.clone(),
+                );
+                let store = Arc::clone(&self.job_store);
+                let work_id_for_cancel = work_id.clone();
+                let cancelled_by = self.scope.submitter().clone();
+                let reason_for_cancel = reason.clone();
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    store.cancel(
+                        &work_id_for_cancel,
+                        &CancelRequest {
+                            cancelled_at: Timestamp::now(),
+                            cancelled_by,
+                            reason: reason_for_cancel,
+                        },
+                    )
+                })
+                .await;
+                match cleanup {
+                    Err(join_error) => tracing::error!(
+                        work_id = %work_id,
+                        error = %join_error,
+                        "agent_job.activation_cleanup_task_failed"
+                    ),
+                    Ok(Err(cancel_error)) => tracing::error!(
+                        work_id = %work_id,
+                        error = %cancel_error,
+                        "agent_job.activation_cleanup_failed"
+                    ),
+                    Ok(Ok(_)) => {}
+                }
+                return Err(Self::rejection(reason));
+            }
 
             let spawner = Arc::clone(&self.spawner);
             let state_store = Arc::clone(&self.state_store);

@@ -68,13 +68,14 @@ PL-93's conflict-free implementation was ported onto the current `dev` baseline 
 `harw-runtime::agent_job_wiring::RuntimeAgentJobSubmitter`:
 
 1. receives an already-admitted child;
-2. detaches it from parent lifetime;
-3. admits a `JobKind::Custom("agent")` record;
-4. claims and drives it using `DurableJobRunner`;
-5. renews the lease while it runs;
-6. links job cancellation to the child cancellation token;
-7. commits success/failure/cancellation/blocked outcomes under the lease fence;
-8. keeps `BackgroundChildren` only as a result/notification projection.
+2. admits a canonical-scope `JobKind::Custom("agent")` record as `Pending`;
+3. transfers the child to background ownership;
+4. publishes `Pending -> Ready` only after that ownership transfer succeeds;
+5. claims and drives it using `DurableJobRunner`;
+6. renews the lease while it runs;
+7. links job cancellation to the child cancellation token;
+8. commits success/failure/cancellation/blocked outcomes under the lease fence;
+9. keeps `BackgroundChildren` only as a result/notification projection.
 
 The runtime mounts the submitter once at the composition root and passes a weak deferred adapter into every child registry. This avoids a strong registry/spawner/runtime cycle while preserving async-by-default behavior for the full delegation tree.
 
@@ -91,7 +92,8 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 ### CURRENT on this branch
 
 - Workload command execution has one application-facing port.
-- Agent delegation has a durable job submission capability.
+- Agent delegation has a durable job submission capability with a three-phase `Pending -> ownership transfer -> Ready` admission boundary.
+- Agent-job scope is the canonical resolved tenant/workspace plus authenticated submitter, not a session-ID surrogate.
 - Root and descendant registries share the same logical job contract.
 - Missing approval UI rejects-and-continues.
 - Grep is process-free.
@@ -113,7 +115,7 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 - Add/extend surface presentation for `work_id` where the current UI still prioritizes child/session IDs.
 - Add crash/restart integration coverage for an in-flight durable agent job.
 - Add explicit job-status/result lookup by `work_id` for agent jobs where only child-oriented result tooling currently exists.
-- Replace the temporary local tenant binding in the root-runtime adapter with the canonical resolved tenant binding when that value is exposed at the composition root.
+- Add startup reconciliation for agent-job records left `Pending` between durable admission and background ownership transfer; these records must never be auto-run unless the child session and authority can be reconstructed and proven.
 - Decide whether CLI/build/editor/MCP/service-manager direct process exceptions should later get dedicated ports; they are not model workload execution and are intentionally outside this wave.
 
 ## Required validation before merge
