@@ -155,11 +155,10 @@ impl<'a, 'o> LogWalk<'a, 'o> {
         Ok(Some((item.oid, commit)))
     }
 
-    /// Verzichtet auf die Eltern von `oid` (Pfadfilter-Vereinfachung): wird
-    /// nach [`LogWalk::next_commit`] nicht mehr gebraucht; hier für die
-    /// Vereinfachung „nur dem treesame-Elternteil folgen“ bereitgestellt.
-    pub fn forget(&mut self, oid: &Oid) {
-        self.hidden.insert(*oid);
+    /// Warten noch Commits in der Warteschlange?
+    #[must_use]
+    pub fn has_more(&self) -> bool {
+        !self.heap.is_empty()
     }
 }
 

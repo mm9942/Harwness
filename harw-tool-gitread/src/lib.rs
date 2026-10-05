@@ -4,11 +4,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blame;
+pub mod branch;
 pub mod config;
 pub mod diffcore;
+pub mod fmtutil;
 pub mod graph;
 pub mod ignores;
 pub mod index;
+pub mod log;
 pub mod object;
 pub mod odb;
 pub mod oid;
@@ -16,6 +20,7 @@ pub mod pathspec;
 pub mod refs;
 pub mod repo;
 pub mod rev;
+pub mod show;
 pub mod snapshot;
 pub mod status;
 pub mod tree;
