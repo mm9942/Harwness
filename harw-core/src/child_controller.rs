@@ -5756,11 +5756,10 @@ impl ManagedAgentSpawner {
 
         let turn = {
             let session = running.session_mut()?;
-            // Runde 5, Teil O: Lease-Herzschlag, solange der Lauf lebt
-            // (`crate::child_lease_heartbeat`), und Freigabe-Fragen eines
-            // pausierverbotenen Kindes über den Kanal der Oberfläche
-            // (`crate::child_approval`), falls einer angebunden ist.
-            let relay_approvals = !record.allow_pause;
+            // Lease-Herzschlag, solange der Lauf lebt, und jede Approval-Pause
+            // über den zentralen Kind-Approval-Pfad. Ist kein Responder
+            // erreichbar, wird die konkrete Operation abgelehnt und der Agent
+            // läuft weiter; ein fehlendes Surface darf keinen Job blockieren.
             crate::child_lease_heartbeat::with_lease_heartbeat(self, child, async {
                 tokio::select! {
                     biased;
@@ -5771,7 +5770,7 @@ impl ManagedAgentSpawner {
                             None => run_turn(session, model.as_ref(), store, input).await,
                         };
                         match first {
-                            Ok(outcome) if relay_approvals => {
+                            Ok(outcome) => {
                                 crate::child_approval::relay_child_approvals(
                                     self, child, session, model.as_ref(), store, approvals, outcome,
                                 )
