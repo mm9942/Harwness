@@ -111,7 +111,7 @@ surfaces carry `migrate: PL-93 step N`.
 | 5 `latex.*` | done: same bwrap planning, spawn/deadline/kill by the runtime |
 | 6 `job.start` | done for non-piped jobs: `JobManager::start` (now `async`) hands the prepared command to the runtime with **file output** (`SubmitOptions::output_files`), keeps ownership, logs, progress, stop/detach |
 | 7 delete old code | done for the shell/latex/operator paths (`spawn_and_collect`, `BoundedCapture::drain`, `configure_stdio`, `host_shell_argv`) |
-| 8 `host.sudo_exec` | open (needs the stdin/secret side channel) |
+| 8 `host.sudo_exec` | done: the password goes through the **stdio handoff** (a pipe handed to the caller, never part of a `JobSpec`/record); the prompt marker is scanned on the live frames; probe through `run` |
 
 Executor gaps closed on the way: **new-session mode** (`LinuxExecutorOptions::new_session`:
 `setsid` in place, process group = PID, tree kill intact, no controlling terminal; a missing
@@ -124,8 +124,12 @@ program is still a failed spawn), `require_rlimits` (no `prlimit` = no start), o
 - Jobs stopped by `job.stop` are still signalled by `JobManager` through the identity-checked
   `OwnLeader` (adoption after a restart); the runtime only owns *starting* and supervising.
 
-### Still on the ratchet (`xtask/spawn-policy.toml`, entries marked `migrate`)
-`harw-tool-job` `start_piped` (agent child stdio), `harw-agent-runner` job child backend,
-`harw-tool-shell` `sudo` and the background `PreparedJob` command builders, `harw-ops`
-(`/agent`, `/diff`), `harw-tui` plan mode/clipboard helpers. Each needs either the stdin
-side channel (piped children, sudo) or a decision that the call is tooling, not a workload.
+### The ratchet today (`xtask/spawn-policy.toml`)
+No entry says `migrate` any more. What stays listed is either infrastructure (executors, the
+killer, the sandbox launcher, MCP stdio servers, the egress relay, build tooling, service
+managers), a *recipe* builder (`PreparedJob`, `BackgroundLaunch`, the child-agent command: the
+job runtime starts what they build), or an interactive helper that needs the user's terminal
+(editor, clipboard). `/diff` runs its sandboxed git through the port.
+
+Open: macOS (`DarwinExecutor` behind the same port; nothing is installed there, the surfaces
+fail closed), and the stdio handoff is Linux only.

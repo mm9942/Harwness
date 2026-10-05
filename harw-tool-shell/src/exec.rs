@@ -49,7 +49,7 @@
 //! - Host-Ausführung ([`ShellExecutor::run_host_command`], Plan Teil B1) läuft, wenn
 //!   `setsid` (util-linux) auffindbar ist, zusätzlich über `setsid --wait /bin/sh -c
 //!   <command>` statt `/bin/sh -c <command>` direkt: das löst den Befehl aus harws
-//!   Sitzung und Controlling-Terminal ([`host_shell_argv_with_shell`], [`resolve_setsid`]) —
+//!   Sitzung und Controlling-Terminal ([`host_shell_argv`], [`resolve_setsid`]) —
 //!   ein Kind, das `/dev/tty` öffnet (git, Pager,
 //!   Fortschrittsbalken), kann dann nicht mehr die Terminalmodi der harw-TUI
 //!   (z. B. Maus-Reporting) verändern. Ohne `setsid` bleibt der bisherige Pfad
@@ -78,11 +78,9 @@ use std::{
     io,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    process::ExitStatus,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
-use tokio::process::Child;
 use tracing::{debug, info, warn};
 
 // Runde 5, Teil N: Host-Mode-Anfrage (`request_host`) und Sandbox-Hinweis;
@@ -115,16 +113,6 @@ const TOOL_NAME: &str = "shell.exec";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const TRUNCATION_MARKER: &str = "\n[...truncated...]";
-/// Obergrenze für das Einsammeln des Exit-Status nach SIGKILL. `kill_on_drop` bleibt
-/// als Rückfallebene, falls der Kernel den Prozess nicht rechtzeitig freigibt.
-const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Feste Suchpfade für `setsid` (util-linux), geprüft vor der `PATH`-Suche in
-/// [`find_setsid`]. Anders als [`crate::limits::PRLIMIT_CANDIDATES`] fällt die
-/// Suche zusätzlich auf `PATH` zurück ([`std::env::split_paths`]): `setsid`
-/// dient nur der Sitzungs-Trennung des Host-Befehls von harws eigenem
-/// Terminal, nicht der Durchsetzung sicherheitskritischer Grenzen wie
-/// `bwrap`/`prlimit`, für die `PATH` bewusst nie ausgewertet wird.
-const SETSID_FIXED_CANDIDATES: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
 /// Einzige heute existierende Worker-Definition, die [`SandboxProfile::Host`]
 /// aktiviert (siehe `harw-registry-defaults/agents/host-process-worker.toml`).
 /// Sobald ein zweiter Host-fähiger Worker entsteht, muss dieser Konstante ein
@@ -826,7 +814,7 @@ impl ShellExecutor {
     ///
     /// Builds `/bin/sh -c <command>` — or, if `setsid` (util-linux) is
     /// resolvable via [`resolve_setsid`], `setsid --wait /bin/sh -c <command>`
-    /// via [`host_shell_argv_with_shell`] — with `current_dir` set to the sandbox's
+    /// via [`host_shell_argv`] — with `current_dir` set to the sandbox's
     /// canonical workspace root, the harness's own environment fully
     /// inherited (no `env_clear`, unlike the `bwrap` path), and stdin
     /// `/dev/null`. Process-group/session isolation depends on whether
@@ -1121,97 +1109,14 @@ fn rlimit_request(limits: &ShellLimits, require: bool) -> ResourceRequest {
     }
 }
 
-/// Löst `setsid` (util-linux) einmalig pro Prozess auf und merkt das Ergebnis.
-///
-/// # Description
-/// Prüft zuerst [`SETSID_FIXED_CANDIDATES`], danach jeden Eintrag von `PATH`
-/// ([`find_setsid_in_path`]). `None` wird genau einmal mit
-/// [`tracing::debug!`] begründet — dank [`OnceLock`] läuft die Suche (und
-/// damit auch das Log) nur beim ersten Aufruf.
-///
-/// # Returns
-/// `Some(path)` zum ersten gefundenen ausführbaren `setsid`, sonst `None`.
-///
-/// # Concurrency
-/// `Send + Sync`; sicher von mehreren Tasks gleichzeitig aufrufbar, die
-/// zugrundeliegende Suche läuft dank `OnceLock` nur einmal.
-pub(crate) fn resolve_setsid() -> Option<&'static Path> {
-    static SETSID_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    SETSID_PATH.get_or_init(find_setsid).as_deref()
-}
-
-/// Sucht `setsid` an [`SETSID_FIXED_CANDIDATES`], dann in `PATH`. Reine
-/// Auflösungslogik ohne `OnceLock`-Caching, damit [`resolve_setsid`] die
-/// Suche über `get_or_init` einmalig anstoßen kann.
-fn find_setsid() -> Option<PathBuf> {
-    let fixed = SETSID_FIXED_CANDIDATES.map(Path::new);
-    if let Some(found) = find_setsid_in(&fixed) {
-        return Some(found);
-    }
-    match find_setsid_in_path() {
-        Some(found) => Some(found),
-        None => {
-            debug!(
-                "shell.exec: setsid not found (fixed paths or PATH); host commands stay in \
-                 harw's own session (no /dev/tty isolation from this run)"
-            );
-            None
-        }
-    }
-}
-
-/// Prüft `candidates` der Reihe nach und liefert den ersten, der eine
-/// ausführbare reguläre Datei ist. Kein `PATH`-Zugriff — reine
-/// Kandidatenliste, deshalb ohne Spawn unit-testbar (z. B. mit einem
-/// garantiert nicht existierenden Pfad).
-fn find_setsid_in(candidates: &[&Path]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|candidate| is_executable_file(candidate))
-        .map(|candidate| candidate.to_path_buf())
-}
-
-/// Durchsucht `PATH` (in Reihenfolge) nach einer ausführbaren `setsid`-Datei.
-/// Fehlt `PATH` oder ist es leer, liefert dies `None`.
-fn find_setsid_in_path() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join("setsid"))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-/// `true`, wenn `path` eine reguläre Datei mit mindestens einem
-/// Ausführ-Bit (owner/group/other) ist. Ein fehlender Pfad oder ein
-/// `stat`-Fehler zählt als `false`, nie als Panic.
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-/// Argv des Host-Pfads mit einem explizit aufgelösten Shell-Pfad
+/// Argv des Host-Pfads: `<shell> -c <command>`, mit dem aufgelösten Shell-Pfad
 /// statt des fest verdrahteten `/bin/sh` (Android-Anbindung, siehe
-/// [`resolve_host_shell`]).
-fn host_shell_argv_with_shell(
-    setsid: Option<&Path>,
-    shell: &Path,
-    command: &str,
-) -> (PathBuf, Vec<OsString>) {
-    match setsid {
-        Some(setsid) => (
-            setsid.to_path_buf(),
-            vec![
-                OsString::from("--wait"),
-                shell.as_os_str().to_owned(),
-                OsString::from("-c"),
-                OsString::from(command),
-            ],
-        ),
-        None => (
-            shell.to_path_buf(),
-            vec![OsString::from("-c"), OsString::from(command)],
-        ),
-    }
+/// [`resolve_host_shell`]). Die neue Sitzung legt die Job-Runtime an.
+fn host_shell_argv(shell: &Path, command: &str) -> (PathBuf, Vec<OsString>) {
+    (
+        shell.to_path_buf(),
+        vec![OsString::from("-c"), OsString::from(command)],
+    )
 }
 
 /// Löst den Host-Shell-Pfad auf.
@@ -1240,39 +1145,6 @@ fn resolve_host_shell(platform: ExecPlatform) -> PathBuf {
                 .into_iter()
                 .find(|candidate| candidate.is_file())
                 .unwrap_or_else(|| PathBuf::from("/bin/sh"))
-        }
-    }
-}
-
-/// Beendet den direkten Kindprozess (`prlimit` hat sich per `exec` durch `bwrap` bzw.
-/// `setsid`/`/bin/sh` ersetzt) per SIGKILL und sammelt den Exit-Status ein.
-///
-/// Im `bwrap`-Pfad beenden `--die-with-parent` und der PID-Namespace daraufhin den
-/// gesamten Sandbox-Prozessbaum, auch per `setsid`/`nohup` abgekoppelte Nachfahren. Im
-/// Host-Pfad ohne `bwrap` ([`ShellExecutor::run_host_command`]) ist die direkte
-/// Kind-PID durch die bewusste Wahl an der `process_group`-Aufrufstelle dort immer die
-/// Spitze des Kommandobaums — mit gefundenem `setsid` die `exec`te `/bin/sh`-PID der
-/// neuen Sitzung, ohne `setsid` die `process_group(0)`-Gruppenführer-PID von `/bin/sh`
-/// selbst — deshalb bleibt diese Funktion unverändert bei einem einzelnen SIGKILL statt
-/// einer Prozessgruppen-weiten Signalisierung.
-///
-/// Nur SIGKILL: Ein vorgelagertes SIGTERM (kurze Gnadenfrist vor SIGKILL) bräuchte eine
-/// Signalauswahl jenseits von [`tokio::process::Child::start_kill`] (immer SIGKILL) —
-/// dafür gibt es in diesem `forbid(unsafe_code)`-Crate ohne neue Abhängigkeit (kein
-/// `nix`/`libc`) keinen sicheren Weg, also bleibt es bei SIGKILL.
-pub(crate) async fn terminate(child: &mut Child) -> Option<ExitStatus> {
-    if let Err(err) = child.start_kill() {
-        warn!(error = %err, "shell.exec kill failed");
-    }
-    match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(err)) => {
-            warn!(error = %err, "shell.exec reap after kill failed");
-            None
-        }
-        Err(_elapsed) => {
-            warn!("shell.exec reap after kill timed out; relying on kill_on_drop");
-            None
         }
     }
 }
@@ -1788,7 +1660,6 @@ mod tests {
     use harw_tools::{ToolCall, ToolExecutionContext};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::OnceLock;
     use tempfile::TempDir;
@@ -2062,83 +1933,14 @@ mod tests {
         );
     }
 
-    // ── setsid-Detach (Host-Pfad, Plan Teil B1 Ergänzung) ───────────────────────
+    // ── Host-Argv ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_host_shell_argv_with_setsid_wraps_wait_and_bin_sh() {
-        let setsid = Path::new("/usr/bin/setsid");
-
-        let (program, args) =
-            host_shell_argv_with_shell(Some(setsid), Path::new("/bin/sh"), "echo hi");
-
-        assert_eq!(program, PathBuf::from("/usr/bin/setsid"));
-        assert_eq!(
-            args,
-            vec![
-                OsString::from("--wait"),
-                OsString::from("/bin/sh"),
-                OsString::from("-c"),
-                OsString::from("echo hi"),
-            ],
-            "with setsid the command must be wrapped in `setsid --wait /bin/sh -c <cmd>` \
-             so exit status/timing still propagate to spawn_and_collect"
-        );
-    }
-
-    #[test]
-    fn test_host_shell_argv_without_setsid_is_unchanged_bin_sh_dash_c() {
-        let (program, args) = host_shell_argv_with_shell(None, Path::new("/bin/sh"), "echo hi");
+    fn test_host_shell_argv_is_bin_sh_dash_c() {
+        let (program, args) = host_shell_argv(Path::new("/bin/sh"), "echo hi");
 
         assert_eq!(program, PathBuf::from("/bin/sh"));
-        assert_eq!(
-            args,
-            vec![OsString::from("-c"), OsString::from("echo hi")],
-            "without setsid the argv must stay byte-identical to the pre-fix host path"
-        );
-    }
-
-    #[test]
-    fn test_find_setsid_in_returns_none_for_nonexistent_explicit_path() {
-        let missing = Path::new("/nonexistent/definitely-not-here/setsid");
-
-        assert_eq!(
-            find_setsid_in(&[missing]),
-            None,
-            "a candidate path that does not exist must never resolve"
-        );
-    }
-
-    #[test]
-    fn test_find_setsid_in_finds_an_executable_regular_file() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let fake_setsid = dir.path().join("setsid");
-        fs::write(&fake_setsid, b"#!/bin/sh\nexec \"$@\"\n").map_err(ctx("write fake setsid"))?;
-        fs::set_permissions(&fake_setsid, std::fs::Permissions::from_mode(0o755))
-            .map_err(ctx("chmod fake setsid executable"))?;
-        let missing = dir.path().join("does-not-exist");
-
-        // Non-existent candidates before the real one must be skipped, not error.
-        assert_eq!(
-            find_setsid_in(&[missing.as_path(), fake_setsid.as_path()]),
-            Some(fake_setsid)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_setsid_in_skips_non_executable_file() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let not_executable = dir.path().join("setsid");
-        fs::write(&not_executable, b"not a program").map_err(ctx("write file"))?;
-        fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
-            .map_err(ctx("chmod without exec bits"))?;
-
-        assert_eq!(
-            find_setsid_in(&[not_executable.as_path()]),
-            None,
-            "a regular file without any execute bit must not resolve"
-        );
-        Ok(())
+        assert_eq!(args, vec![OsString::from("-c"), OsString::from("echo hi")]);
     }
 
     // ── Pure Tests ohne Sandbox (W1-03) ────────────────────────────────────────
@@ -2745,7 +2547,7 @@ mod tests {
             .map_err(ctx("canceller task must not panic"))?;
 
         assert!(
-            started.elapsed() < KILL_REAP_TIMEOUT + Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(10),
             "cancel must kill the process tree (SIGKILL) well within the kill-reap \
              timeout, instead of waiting out `sleep 30`, took: {:?}",
             started.elapsed()

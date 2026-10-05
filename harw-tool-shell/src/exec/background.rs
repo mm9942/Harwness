@@ -49,8 +49,7 @@
 //! der Job trotzdem mit harw (`--die-with-parent`).
 
 use super::{
-    ShellExecArgs, ShellExecError, ShellToolProvider, host_shell_argv_with_shell,
-    resolve_host_shell, resolve_setsid, timeouts,
+    ShellExecArgs, ShellExecError, ShellToolProvider, host_shell_argv, resolve_host_shell, timeouts,
 };
 use crate::limits::launch_command;
 use harw_authority::Permission;
@@ -290,9 +289,9 @@ impl ShellToolProvider {
 
         let env_cleared = effective_host;
         let mut launched = if effective_host {
-            let setsid = resolve_setsid();
+            // The job runtime starts the command in a new session itself.
             let shell = resolve_host_shell(executor.exec_platform);
-            let (program, shell_args) = host_shell_argv_with_shell(setsid, &shell, command);
+            let (program, shell_args) = host_shell_argv(&shell, command);
             let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
             let mut launched = TokioCommand::new(&launch.program);
             launched.args(&launch.args);
@@ -303,10 +302,6 @@ impl ShellToolProvider {
                 tool_name,
                 passed, "background launch: host environment filtered"
             );
-            // Siehe Moduldoku: mit `setsid` KEIN `process_group(0)`.
-            if setsid.is_none() {
-                launched.process_group(0);
-            }
             launched
         } else {
             let launcher = BwrapLauncher::discover().map_err(|err| {

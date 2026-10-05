@@ -25,11 +25,16 @@
 //! run concurrently (one per admitted child), each with its own process,
 //! stdio pipes and stderr tail buffer.
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::child_protocol::FrameReader;
 use harw_core::child_backend::{
     ChildBackend, ChildBackendFuture, ChildIo, ChildRunOutcome, ChildRunSpec, ChildRunStatus,
 };
@@ -39,13 +44,19 @@ use harw_tool_job::{
     StartRequest,
 };
 use harw_types::cancel::CancelReason;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+#[cfg(test)]
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+#[cfg(test)]
+use tokio::io::BufReader;
+#[cfg(test)]
+use tokio::process::Child;
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use crate::child_protocol::{
     ChildResultStatus, ChildRights, ChildToParent, ChildUsage as WireUsage, FrameReadError,
-    FrameReader, MAX_FRAME_BYTES, ParentToChild, decode_line, encode_line, verify_protocol,
+    MAX_FRAME_BYTES, ParentToChild, decode_line, encode_line, verify_protocol,
 };
 
 /// How long the job-managed path waits for the job's own monitor to record
@@ -136,6 +147,7 @@ impl<S: ChildProcessSpawner> JobChildBackend<S> {
     /// Builds a backend that spawns `spawner`'s command itself, without a
     /// `JobManager` (tests use this with a plain `/bin/sh` command).
     #[must_use]
+    #[cfg(test)]
     pub fn with_spawner(spawner: S) -> Self {
         Self {
             spawner,
@@ -160,7 +172,18 @@ impl<S: ChildProcessSpawner> ChildBackend for JobChildBackend<S> {
         Box::pin(async move {
             match &self.job_manager {
                 Some(job_manager) => run_job_managed(job_manager, &self.spawner, spec, io).await,
+                #[cfg(test)]
                 None => run_direct(&self.spawner, spec, io).await,
+                #[cfg(not(test))]
+                None => ChildRunOutcome {
+                    status: ChildRunStatus::Crashed {
+                        exit_code: None,
+                        stderr_tail: "no job manager: child agents run only as jobs".to_owned(),
+                    },
+                    text: None,
+                    usage: ChildUsage::default(),
+                    continuation: None,
+                },
             }
         })
     }
@@ -180,6 +203,7 @@ fn cancel_reason_label(reason: Option<CancelReason>) -> String {
     .to_owned()
 }
 
+#[cfg(test)]
 /// Terminates the child's whole process group — best-effort. Only the
 /// direct (test) path needs this; the job-managed path goes through
 /// [`JobManager::stop`]. The signal goes through
@@ -201,6 +225,7 @@ fn kill_process_group(child: &Child) {
 /// is a protocol violation ([`Err`]).
 enum StdoutSource {
     /// Read here, bounded by [`MAX_FRAME_BYTES`] before buffering past it.
+    #[cfg(test)]
     Direct(FrameReader<BufReader<tokio::process::ChildStdout>>),
     /// Lines `harw_tool_job`'s stdout tee already split, bounded by
     /// [`MAX_FRAME_BYTES`] there (`start_piped_with_line_limit`): an
@@ -212,6 +237,7 @@ enum StdoutSource {
 impl StdoutSource {
     async fn next_line(&mut self) -> Result<Option<String>, FrameReadError> {
         match self {
+            #[cfg(test)]
             Self::Direct(frames) => match frames.next_frame().await {
                 Err(FrameReadError::Io(_)) => Ok(None),
                 other => other,
@@ -363,6 +389,7 @@ fn describe_command(command: &Command) -> String {
 
 /// Runs `spec` by spawning `spawner`'s command directly and driving/killing
 /// it here (the test seam — production goes through [`run_job_managed`]).
+#[cfg(test)]
 async fn run_direct<S: ChildProcessSpawner>(
     spawner: &S,
     spec: ChildRunSpec,
@@ -458,6 +485,7 @@ async fn run_direct<S: ChildProcessSpawner>(
     outcome
 }
 
+#[cfg(test)]
 async fn outcome_from_missing_pipe(child: &mut Child, which: &str) -> ChildRunOutcome {
     kill_process_group(child);
     let _ = child.wait().await;
@@ -472,6 +500,7 @@ async fn outcome_from_missing_pipe(child: &mut Child, which: &str) -> ChildRunOu
     }
 }
 
+#[cfg(test)]
 fn fill_stderr_tail(
     outcome: ChildRunOutcome,
     stderr_tail: &Arc<Mutex<VecDeque<String>>>,
