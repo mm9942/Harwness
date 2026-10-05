@@ -53,8 +53,8 @@ pub use darwin::DarwinExecutor;
 pub use error::RuntimeError;
 pub use executor::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
-    Executor, OutputFiles, Probe, StartedAttempt, check_requirement, requests_resource_limits,
-    unsandboxed_report,
+    Executor, HandedStdio, OutputFiles, Probe, StartedAttempt, StdioHandoff, check_requirement,
+    requests_resource_limits, unsandboxed_report,
 };
 pub use frames::{DEFAULT_FRAME_BUFFER, FrameEvent, JobFrame, JobFrames};
 #[cfg(target_os = "linux")]

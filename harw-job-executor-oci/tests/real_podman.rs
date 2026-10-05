@@ -52,6 +52,7 @@ fn ctx(job: &str, epoch: u64) -> R<AttemptContext> {
         lease_epoch: epoch,
         workspace_root: PathBuf::from("/"),
         output_files: None,
+        stdio_handoff: None,
     })
 }
 

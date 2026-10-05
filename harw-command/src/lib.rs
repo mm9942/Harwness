@@ -26,6 +26,7 @@ pub use global::{install, install_host_default, installed, replace};
 
 pub use harw_job::{Persistence, ResourceRequest, SandboxProfileName, SandboxRequirement};
 pub use port::{
-    CommandEnd, CommandOutcome, CommandOutput, CommandPort, CommandRequest, CommandSandbox,
-    JobCommandPort, RunFuture, StartFuture, StartedCommand,
+    CommandEnd, CommandFrame, CommandFrames, CommandOutcome, CommandOutput, CommandPort,
+    CommandRequest, CommandSandbox, CommandStdin, JobCommandPort, RunFuture, StartFuture,
+    StartedCommand,
 };

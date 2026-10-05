@@ -61,7 +61,9 @@ use tokio::time::Instant;
 use super::attempt::{AttemptRecord, attempt_id_for};
 use super::capture::{Output, OutputCapture};
 use super::error::RuntimeError;
-use super::executor::{AttemptContext, AttemptEvent, AttemptRun, Executor, OutputFiles, Probe};
+use super::executor::{
+    AttemptContext, AttemptEvent, AttemptRun, Executor, OutputFiles, Probe, StdioHandoff,
+};
 use super::frames::{DEFAULT_FRAME_BUFFER, FrameTap, JobFrame, JobFrames};
 use super::store::CoordinatorStore;
 
@@ -297,6 +299,8 @@ pub struct SubmitOptions {
     /// Append standard output and error to these files instead of piping them
     /// (no frames, no captured output in the result).
     pub output_files: Option<OutputFiles>,
+    /// Hand pipes of the first attempt to the submitter (see [`StdioHandoff`]).
+    pub stdio_handoff: Option<StdioHandoff>,
     /// How much of the spec the job record keeps.
     pub persistence: Persistence,
     /// Also return a subscription that sees the job from its very first
@@ -398,6 +402,8 @@ struct Inner<S, E> {
     taps: Mutex<HashMap<String, FrameTap>>,
     /// Output files of jobs submitted with [`SubmitOptions::output_files`].
     outputs: Mutex<HashMap<String, OutputFiles>>,
+    /// Stdio handoffs of jobs submitted with [`SubmitOptions::stdio_handoff`].
+    handoffs: Mutex<HashMap<String, StdioHandoff>>,
 }
 
 /// Coordinates a job store and an executor (Job-Runtime-Doc §14).
@@ -538,6 +544,7 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
                 active: Mutex::new(HashMap::new()),
                 taps: Mutex::new(HashMap::new()),
                 outputs: Mutex::new(HashMap::new()),
+                handoffs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -628,6 +635,13 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(job_id.as_str().to_owned(), files);
+        }
+        if let Some(handoff) = options.stdio_handoff.clone() {
+            self.inner
+                .handoffs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job_id.as_str().to_owned(), handoff);
         }
         let (handle, mut cancel, done) = self.register(&job_id, &attempt_id);
         let frames = options.stream.then(|| handle.subscribe());
@@ -819,6 +833,7 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             lease_epoch: lease.epoch,
             workspace_root: inner.config.workspace_root.clone(),
             output_files: None,
+            stdio_handoff: None,
         };
         let mut record = match bytes {
             Some(bytes) => AttemptRecord::<E::Identity>::from_bytes(attempt_id.as_str(), &bytes)?,
@@ -1146,6 +1161,10 @@ fn redacted_input(spec: &JobSpec, persistence: Persistence) -> serde_json::Value
 
 impl<S, E> Inner<S, E> {
     fn unregister(&self, job: &WorkId) {
+        self.handoffs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job.as_str());
         self.outputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1430,6 +1449,12 @@ fn attempt_context<S, E>(
         workspace_root: inner.config.workspace_root.clone(),
         output_files: inner
             .outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id.as_str())
+            .cloned(),
+        stdio_handoff: inner
+            .handoffs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(job_id.as_str())

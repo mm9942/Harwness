@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use harw_job::{
     CancellationCause, CoordinatorStore, Executor, ExitOutcome, FrameEvent, JobFrame, JobResult,
     JobRuntime, JobSpec, LifecycleState, OutputFiles, Persistence, ResourceRequest,
-    SandboxProfileName, SandboxRequirement, SubmitOptions, WorkspacePath,
+    SandboxProfileName, SandboxRequirement, StdioHandoff, SubmitOptions, WorkspacePath,
 };
 use harw_types::cancel::CancelToken;
 use jiff::SignedDuration;
@@ -42,6 +42,24 @@ pub enum CommandOutput {
         /// Standard error.
         stderr: PathBuf,
     },
+    /// Standard output is handed to the caller as a pipe
+    /// ([`StartedCommand::stdout`]); standard error is appended to a file.
+    StdoutPipe {
+        /// Standard error.
+        stderr: PathBuf,
+    },
+}
+
+/// What the command's standard input is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandStdin {
+    /// `/dev/null`.
+    #[default]
+    Null,
+    /// A pipe handed to the caller ([`StartedCommand::stdin`]). What the
+    /// caller writes (a password, an interactive protocol) never becomes part
+    /// of the job record.
+    Pipe,
 }
 
 /// A command to run.
@@ -69,6 +87,11 @@ pub struct CommandRequest {
     pub persistence: Persistence,
     /// Where the output goes.
     pub output: CommandOutput,
+    /// What standard input is.
+    pub stdin: CommandStdin,
+    /// Also deliver the live output as frames ([`StartedCommand::frames`]),
+    /// for [`CommandPort::start`] with [`CommandOutput::Capture`].
+    pub stream: bool,
 }
 
 impl CommandRequest {
@@ -87,6 +110,8 @@ impl CommandRequest {
             sandbox: CommandSandbox::Host,
             persistence: Persistence::Ephemeral,
             output: CommandOutput::Capture,
+            stdin: CommandStdin::Null,
+            stream: false,
         }
     }
 }
@@ -162,11 +187,54 @@ pub type RunFuture<'a> = Pin<Box<dyn Future<Output = CommandOutcome> + Send + 'a
 
 /// A command the runtime has started and that keeps running.
 pub struct StartedCommand {
+    /// The command's stdin when [`CommandStdin::Pipe`] was requested.
+    pub stdin: Option<tokio::process::ChildStdin>,
+    /// The command's stdout when [`CommandOutput::StdoutPipe`] was requested.
+    pub stdout: Option<tokio::process::ChildStdout>,
+    /// Live output when [`CommandRequest::stream`] was set.
+    pub frames: Option<CommandFrames>,
+    /// Stops the command (its whole process tree) through the runtime.
+    pub cancel: Box<dyn Fn() + Send + Sync>,
     /// Diagnostic PID of the primary process (it leads its own session and
     /// process group), if known.
     pub pid: Option<u32>,
     /// Resolves when the command ended. Dropping it does not stop the command.
     pub done: RunFuture<'static>,
+}
+
+/// One piece of live output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandFrame {
+    /// A chunk of standard output.
+    Stdout(Vec<u8>),
+    /// A chunk of standard error.
+    Stderr(Vec<u8>),
+    /// The consumer fell behind; this many frames were dropped for it.
+    Lagged(u64),
+}
+
+/// A subscription to a started command's live output (lossy by design).
+#[derive(Debug)]
+pub struct CommandFrames {
+    inner: harw_job::JobFrames,
+}
+
+impl CommandFrames {
+    /// The next piece of output; `None` once the job is finished.
+    pub async fn next(&mut self) -> Option<CommandFrame> {
+        loop {
+            match self.inner.next().await? {
+                FrameEvent::Frame(JobFrame::Stdout(chunk)) => {
+                    return Some(CommandFrame::Stdout(chunk.to_vec()));
+                }
+                FrameEvent::Frame(JobFrame::Stderr(chunk)) => {
+                    return Some(CommandFrame::Stderr(chunk.to_vec()));
+                }
+                FrameEvent::Lagged(missed) => return Some(CommandFrame::Lagged(missed)),
+                _ => {}
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for StartedCommand {
@@ -356,6 +424,11 @@ fn output_files(request: &CommandRequest) -> Option<OutputFiles> {
             stdout: stdout.clone(),
             stderr: stderr.clone(),
         }),
+        // Standard output is piped by the handoff; the file is never written.
+        CommandOutput::StdoutPipe { stderr } => Some(OutputFiles {
+            stdout: PathBuf::from("/dev/null"),
+            stderr: stderr.clone(),
+        }),
     }
 }
 
@@ -364,16 +437,27 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
         Box::pin(async move {
             let started = Instant::now();
             let spec = Self::spec(&request)?;
+            let want_stdin = request.stdin == CommandStdin::Pipe;
+            let want_stdout = matches!(request.output, CommandOutput::StdoutPipe { .. });
+            let (handoff, handed) = if want_stdin || want_stdout {
+                let (handoff, receiver) = StdioHandoff::new(want_stdin, want_stdout);
+                (Some(handoff), Some(receiver))
+            } else {
+                (None, None)
+            };
             let options = SubmitOptions {
                 persistence: request.persistence,
                 stream: true,
                 output_files: output_files(&request),
+                stdio_handoff: handoff,
             };
             let (handle, frames) = self
                 .runtime
                 .submit_with(spec, options)
                 .await
                 .map_err(|error| error.to_string())?;
+            let job_id = handle.id().clone();
+            let runtime = self.runtime.clone();
             let Some(mut frames) = frames else {
                 return Err("the runtime returned no frame stream".to_owned());
             };
@@ -392,7 +476,7 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                 }
             };
             let _ = tokio::time::timeout(START_TIMEOUT, wait_for_start).await;
-            drop(frames);
+            let frames = request.stream.then_some(frames);
             if !began {
                 // The attempt never started (spawn, sandbox or admission
                 // failed): that is a failed start, not a running command.
@@ -404,6 +488,25 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                     Err(error) => Err(error.to_string()),
                 };
             }
+            let handed = match handed {
+                Some(receiver) => match tokio::time::timeout(START_TIMEOUT, receiver).await {
+                    Ok(Ok(handed)) => handed,
+                    _ => {
+                        return Err("the runtime did not hand over the standard streams".to_owned());
+                    }
+                },
+                None => harw_job::HandedStdio::default(),
+            };
+            let stdin = handed
+                .stdin
+                .map(tokio::process::ChildStdin::from_std)
+                .transpose()
+                .map_err(|error| format!("stdin pipe: {error}"))?;
+            let stdout = handed
+                .stdout
+                .map(tokio::process::ChildStdout::from_std)
+                .transpose()
+                .map_err(|error| format!("stdout pipe: {error}"))?;
             let done: RunFuture<'static> = Box::pin(async move {
                 match handle.wait().await {
                     Ok(result) => {
@@ -422,7 +525,16 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                     Err(error) => CommandOutcome::failed(error.to_string(), started),
                 }
             });
-            Ok(StartedCommand { pid, done })
+            Ok(StartedCommand {
+                stdin,
+                stdout,
+                frames: frames.map(|inner| CommandFrames { inner }),
+                cancel: Box::new(move || {
+                    runtime.cancel(&job_id);
+                }),
+                pid,
+                done,
+            })
         })
     }
 
@@ -437,6 +549,7 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                 persistence: request.persistence,
                 stream: true,
                 output_files: output_files(&request),
+                stdio_handoff: None,
             };
             let (handle, frames) = match self.runtime.submit_with(spec, options).await {
                 Ok(submitted) => submitted,

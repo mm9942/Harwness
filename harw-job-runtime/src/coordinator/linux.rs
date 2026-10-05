@@ -1161,6 +1161,14 @@ impl Executor for LinuxExecutor {
                 .stdout(open(&files.stdout)?)
                 .stderr(open(&files.stderr)?);
         }
+        if let Some(handoff) = &ctx.stdio_handoff {
+            if handoff.stdin {
+                command.stdin(Stdio::piped());
+            }
+            if handoff.stdout {
+                command.stdout(Stdio::piped());
+            }
+        }
         let spawned = match cgroup {
             Some((backend, handle)) => {
                 let backend: Arc<dyn CgroupBackend> = backend;
@@ -1183,7 +1191,7 @@ impl Executor for LinuxExecutor {
             None => LinuxJobGroup::spawn(&mut command)
                 .map_err(|error| process_error("spawn", &spec.program, error)),
         };
-        let (group, stdio) = match spawned {
+        let (group, mut stdio) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
                 if let Some(plan) = &prepared.trampoline_plan {
@@ -1193,6 +1201,22 @@ impl Executor for LinuxExecutor {
             }
         };
         let pid = group.primary().pid();
+        if let Some(handoff) = &ctx.stdio_handoff {
+            // The submitter owns these pipes from here on; the supervisor
+            // neither reads nor closes them.
+            handoff.deliver(super::executor::HandedStdio {
+                stdin: if handoff.stdin {
+                    stdio.stdin.take()
+                } else {
+                    None
+                },
+                stdout: if handoff.stdout {
+                    stdio.stdout.take()
+                } else {
+                    None
+                },
+            });
+        }
         // 5. identity after attach
         let identity = match LinuxRecoveryIdentity::capture(
             group.primary(),
@@ -1483,6 +1507,7 @@ mod tests {
             lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
             output_files: None,
+            stdio_handoff: None,
         })
     }
 
@@ -1578,6 +1603,7 @@ mod tests {
             lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
             output_files: None,
+            stdio_handoff: None,
         };
         assert_eq!(cgroup_name(&context), "harw-job-job_1.x-e2");
         Ok(())

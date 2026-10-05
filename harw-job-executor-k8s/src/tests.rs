@@ -36,6 +36,7 @@ fn context(epoch: u64) -> TestResult<AttemptContext> {
         lease_epoch: epoch,
         workspace_root: PathBuf::from("/"),
         output_files: None,
+        stdio_handoff: None,
     })
 }
 

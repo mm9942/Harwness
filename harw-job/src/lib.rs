@@ -74,9 +74,9 @@ pub use harw_job_executor_oci::{OciConfig, OciError, OciExecutor, PeerPolicy};
 #[cfg(target_os = "macos")]
 pub use harw_job_runtime::coordinator::DarwinExecutor;
 pub use harw_job_runtime::coordinator::{
-    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, FrameEvent, JobFrame, JobFrames,
-    JobHandle, JobResult, OutputCapture, OutputFiles, Persistence, RecoveredJob, RecoveryDecision,
-    RuntimeError, SubmitOptions,
+    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, FrameEvent, HandedStdio, JobFrame,
+    JobFrames, JobHandle, JobResult, OutputCapture, OutputFiles, Persistence, RecoveredJob,
+    RecoveryDecision, RuntimeError, StdioHandoff, SubmitOptions,
 };
 #[cfg(target_os = "linux")]
 pub use harw_job_runtime::coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};

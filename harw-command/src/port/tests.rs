@@ -1,5 +1,5 @@
 use super::*;
-use crate::CommandOutput;
+use crate::{CommandFrame, CommandOutput, CommandStdin};
 use harw_job::{FsJobRecordStore, LinuxExecutor};
 
 harw_test_support::define_test_error!(pub(crate));
@@ -207,6 +207,73 @@ async fn a_started_command_writes_its_output_to_files_and_reports_its_pid() -> T
     assert_eq!(outcome.exit_code, 4);
     assert_eq!(std::fs::read(&out).map_err(ctx("out"))?, b"to-out\n");
     assert_eq!(std::fs::read(&err).map_err(ctx("err"))?, b"to-err\n");
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn piped_stdin_and_stdout_are_handed_over_and_stay_out_of_the_store() -> TestResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = dir("pipes")?;
+    let port = port(&root)?;
+    let mut request = sh(
+        "read line; echo got:$line; echo to-err >&2",
+        Duration::from_secs(20),
+    );
+    request.stdin = CommandStdin::Pipe;
+    request.output = CommandOutput::StdoutPipe {
+        stderr: root.join("err.log"),
+    };
+    let mut started = port.start(request).await.map_err(TestError::Unexpected)?;
+    let mut stdin = started.stdin.take().ok_or(TestError::Missing("stdin"))?;
+    let mut stdout = started.stdout.take().ok_or(TestError::Missing("stdout"))?;
+    stdin
+        .write_all(b"s3cret-password\n")
+        .await
+        .map_err(ctx("write"))?;
+    drop(stdin);
+    let mut text = String::new();
+    stdout
+        .read_to_string(&mut text)
+        .await
+        .map_err(ctx("read"))?;
+    assert_eq!(text, "got:s3cret-password\n");
+    let outcome = started.done.await;
+    assert_eq!(outcome.end, CommandEnd::Exited, "{outcome:?}");
+    assert_eq!(
+        std::fs::read(root.join("err.log")).map_err(ctx("err"))?,
+        b"to-err\n"
+    );
+    for entry in walk(&root)? {
+        if entry.ends_with("err.log") {
+            continue;
+        }
+        let bytes = std::fs::read(&entry).map_err(ctx("read"))?;
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("s3cret-password"),
+            "{} keeps the secret",
+            entry.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_frames_and_cancel_work_on_a_started_command() -> TestResult {
+    let root = dir("stream")?;
+    let port = port(&root)?;
+    let mut request = sh("echo first >&2; sleep 30", Duration::from_secs(60));
+    request.stream = true;
+    let mut started = port.start(request).await.map_err(TestError::Unexpected)?;
+    let mut frames = started.frames.take().ok_or(TestError::Missing("frames"))?;
+    let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+        .await
+        .map_err(|_| TestError::Missing("a frame in time"))?;
+    assert_eq!(frame, Some(CommandFrame::Stderr(b"first\n".to_vec())));
+    (started.cancel)();
+    let outcome = started.done.await;
+    assert_eq!(outcome.end, CommandEnd::Cancelled, "{outcome:?}");
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
