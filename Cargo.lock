@@ -2177,6 +2177,7 @@ name = "harw-cli"
 version = "0.9.1"
 dependencies = [
  "aws-lc-rs",
+ "blake3",
  "clap",
  "clap_complete",
  "getrandom 0.4.3",
