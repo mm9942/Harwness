@@ -482,6 +482,7 @@ fn new_run_location(root: &Path, scenario_id: &str) -> (String, PathBuf) {
     command(
         path = "/matrix",
         visibility = "channel_reduced",
+        channel_subcommands = "-,show,list,replay,compare",
         busy_subcommands = "show=immediate, list=immediate"
     )
 )]

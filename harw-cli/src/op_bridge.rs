@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_agent_dsl::roles::AgentRoleId;
-use harw_config::ResolvedConfig;
-use harw_core::InMemoryStateStore;
+use harw_config::{ChannelToml, ResolvedConfig};
+use harw_core::{InMemoryStateStore, StateStore};
 use harw_operations::OpContext;
 use harw_operations::OpError;
 use harw_operations::OpOutput;
@@ -43,7 +43,7 @@ use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores, ServiceSurface,
 };
 use harw_session_store::JobStore;
-use harw_types::{IngressSurface, TurnId};
+use harw_types::{IngressSurface, PeerId, PermissionTier, Principal, PrincipalKind, SessionId, TurnId};
 
 use crate::runtime_entry::{local_principal, runtime_spec};
 
@@ -60,6 +60,52 @@ pub(crate) struct OpTarget<'a> {
     pub home: Option<PathBuf>,
     /// Arbeitsverzeichnis (bestimmt Projekt und Sandbox).
     pub cwd: &'a Path,
+}
+
+/// Governter Channel-Aufruf einer Slash-Operation.
+///
+/// Anders als [`OpTarget`] kommt die Identität nicht aus der lokalen
+/// Prozess-UID, sondern aus einer bereits admittierten Channel-Identität.
+/// Der Principal wird erst nach dem Laden der vertrauensgeprüften Binding-
+/// Policy aus Binding-ID und tatsächlichem Sender konstruiert.
+/// StateStore und Session-ID binden sitzungsbezogene Read-Operationen
+/// an denselben Chat-Verlauf.
+pub(crate) struct ChannelOpTarget<'a> {
+    pub home: &'a Path,
+    pub cwd: &'a Path,
+    /// ID der bereits admittierten Telegram-Bindung.
+    pub binding_id: &'a str,
+    /// Tatsächlicher Telegram-Absender, nie die Gruppen-Peer-ID.
+    pub sender: &'a PeerId,
+    pub session_id: SessionId,
+    pub state_store: Arc<dyn StateStore>,
+}
+
+/// Getrennte Nutzer-/Log-Meldung: interne Pfade oder Konfigurationsdetails
+/// verlassen die Channel-Grenze nicht.
+#[derive(Debug)]
+pub(crate) struct ChannelOpFailure {
+    user_message: String,
+    detail: String,
+}
+
+impl ChannelOpFailure {
+    fn new(user_message: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            user_message: user_message.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn user_message(&self) -> &str {
+        &self.user_message
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 /// Führt eine Slash-Operation außerhalb einer Chat-Sitzung aus.
@@ -156,8 +202,157 @@ fn with_assembly<R>(
     // Die Assembly braucht den Ereigniskanal für `SpawnerPolicy::BuiltinRoles`;
     // der Empfänger bleibt bis zum Ende dieser Funktion gebunden, damit keine
     // Sendung an einem geschlossenen Kanal endet.
-    let (assembly, _event_rx) = bridge_assembly(spec, &home, &config, &agents)?;
+    let (assembly, _event_rx) = bridge_assembly(
+        spec,
+        &home,
+        &config,
+        &agents,
+        Arc::new(InMemoryStateStore::new()),
+        None,
+    )?;
     f(&assembly, &home, &config)
+}
+
+/// Führt eine bereits admittierte Human-Operation eines Channels aus.
+///
+/// Die Montage nutzt weiterhin `EntryKind::Analyze` (CommandsOnly), aber den
+/// vom Channel gelieferten Human-Principal. Damit entstehen weder Modell-Tools
+/// noch Owner-Rechte. `ChannelReduced` wird unmittelbar vor dem Dispatch
+/// erneut geprüft; Menü-/Alias-Sichtbarkeit ist niemals Autorisierung.
+pub(crate) fn run_channel_operation(
+    runtime: &tokio::runtime::Runtime,
+    target: ChannelOpTarget<'_>,
+    path: &str,
+    args: Vec<String>,
+) -> Result<OpOutput, ChannelOpFailure> {
+    let command = normalize_command_path(path)
+        .map_err(|error| ChannelOpFailure::new("Ungültiger Harwness-Befehl.", error))?;
+    crate::home::ensure_home(target.home).map_err(|error| {
+        ChannelOpFailure::new(
+            "Der Befehl konnte nicht vorbereitet werden.",
+            format!("channel operation home unavailable: {error}"),
+        )
+    })?;
+    // Konfiguration/Trust werden mit maximal Operator geladen. Erst danach
+    // darf die statische Telegram-Binding-Policy einen konkreten Absender auf
+    // Maintainer hochstufen; Telegram erzeugt niemals Owner.
+    let bootstrap_principal = telegram_command_principal(
+        target.binding_id,
+        target.sender,
+        PermissionTier::Operator,
+    );
+    let bootstrap_spec = runtime_spec(
+        EntryKind::Analyze,
+        target.home,
+        target.cwd,
+        bootstrap_principal,
+    );
+    let (config, agents, _trust) =
+        harw_runtime::load_config_with_agents(&bootstrap_spec).map_err(|error| {
+            ChannelOpFailure::new(
+                "Der Befehl konnte im Arbeitsbereich nicht vorbereitet werden.",
+                format!("channel operation config load failed: {error}"),
+            )
+        })?;
+    let tier = telegram_command_tier(&config, target.binding_id, target.sender);
+    let spec = runtime_spec(
+        EntryKind::Analyze,
+        target.home,
+        target.cwd,
+        telegram_command_principal(target.binding_id, target.sender, tier),
+    );
+    let (assembly, _event_rx) = bridge_assembly(
+        spec,
+        target.home,
+        &config,
+        &agents,
+        target.state_store,
+        Some(target.session_id),
+    )
+    .map_err(|error| {
+        ChannelOpFailure::new(
+            "Der Befehl konnte im Arbeitsbereich nicht vorbereitet werden.",
+            error,
+        )
+    })?;
+
+    let adapter = find_command(&assembly, &command).map_err(|error| {
+        ChannelOpFailure::new(
+            format!("Befehl `{command}` ist in diesem Arbeitsbereich nicht verfügbar."),
+            error,
+        )
+    })?;
+    if !adapter.allows_channel_invocation(&args) {
+        return Err(ChannelOpFailure::new(
+            format!(
+                "Diese Form von `{command}` ist über Telegram nicht verfügbar."
+            ),
+            format!("channel policy rejected {command} with {} args", args.len()),
+        ));
+    }
+    let required = adapter.permission();
+    let actual = assembly.principal().tier();
+    if actual < required {
+        return Err(ChannelOpFailure::new(
+            format!(
+                "`{command}` erfordert mindestens Berechtigungsstufe {required:?}; dieser Telegram-Absender hat {actual:?}."
+            ),
+            format!("channel permission denied for {command}: {actual:?} < {required:?}"),
+        ));
+    }
+
+    let ctx = assembly.op_context(
+        ServiceSurface::Slash,
+        assembly.root_session_id().clone(),
+        TurnId::new(),
+        assembly.sandbox().clone(),
+    );
+    runtime.block_on(adapter.dispatch(&ctx, args)).map_err(|error| {
+        let detail = op_error_message(&command, &error);
+        let user = match error {
+            OpError::InvalidArguments(message) => {
+                format!("Ungültige Angaben für `{command}`: {message}")
+            }
+            OpError::NotAvailable(_) => {
+                format!("`{command}` ist in diesem Arbeitsbereich nicht verfügbar.")
+            }
+            OpError::Execution(_) => format!("Ausführung von `{command}` ist fehlgeschlagen."),
+        };
+        ChannelOpFailure::new(user, detail)
+    })
+}
+
+fn telegram_command_tier(
+    config: &ResolvedConfig,
+    binding_id: &str,
+    sender: &PeerId,
+) -> PermissionTier {
+    let Ok(sender_id) = sender.as_str().parse::<i64>() else {
+        return PermissionTier::Operator;
+    };
+    let is_admin = config.channels.values().any(|channel| match channel {
+        ChannelToml::Telegram(binding) => {
+            binding.id == binding_id && binding.security.admin_identities.contains(&sender_id)
+        }
+    });
+    if is_admin {
+        PermissionTier::Maintainer
+    } else {
+        PermissionTier::Operator
+    }
+}
+
+fn telegram_command_principal(
+    binding_id: &str,
+    sender: &PeerId,
+    tier: PermissionTier,
+) -> Principal {
+    Principal::trusted_ingress(
+        PrincipalKind::Human,
+        format!("telegram:{binding_id}:{}", sender.as_str()),
+        IngressSurface::Telegram,
+        tier,
+    )
 }
 
 /// Montiert die Runtime der Brücke.
@@ -169,6 +364,8 @@ fn bridge_assembly(
     home: &Path,
     config: &ResolvedConfig,
     agents: &ConfigAgents,
+    state_store: Arc<dyn StateStore>,
+    root_session_id: Option<SessionId>,
 ) -> Result<
     (
         RuntimeAssembly,
@@ -184,11 +381,14 @@ fn bridge_assembly(
     let mut builder = RuntimeAssembly::builder(spec)
         .model(ModelSource::Echo(ECHO_REPLY.to_owned()))
         .stores(RuntimeStores {
-            state_store: Arc::new(InMemoryStateStore::new()),
+            state_store,
             job_store: Some(job_store),
             approval_store: None,
         })
         .session_events(event_tx);
+    if let Some(session_id) = root_session_id {
+        builder = builder.root_session_id(session_id);
+    }
     if let Some(plan) = plan {
         builder = builder.plan_services(plan);
     }

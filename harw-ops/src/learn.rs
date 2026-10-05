@@ -522,7 +522,11 @@ impl harw_operations::FromRawArgs for LearnArgs {
     summary = "Lernschleife: dauerhafte Erkenntnisse der Sitzung als Vorschläge ablegen (scan, note, list, show, accept, reject). Übernimmt nie selbst.",
     domain = "knowledge",
     permission = "operator",
-    command(path = "/learn", visibility = "channel_reduced")
+    command(
+        path = "/learn",
+        visibility = "channel_reduced",
+        channel_subcommands = "-,scan,note,list,show,accept,reject"
+    )
 )]
 async fn learn(ctx: &OpContext, args: LearnArgs) -> Result<OpOutput, OpError> {
     let tokens = args.tokens;

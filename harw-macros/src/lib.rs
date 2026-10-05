@@ -450,8 +450,10 @@ pub fn agent(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     permission = "observer",  // observer | operator | maintainer | owner
 ///     command(path = "/status", visibility = "channel_parity"),   // optional
 ///     // command(...) kennt zusätzlich `busy = "immediate" | "staged" | "deferred"`
-///     // und `busy_subcommands = "show=immediate, switch=staged, -=immediate"`
-///     // (`-` = bare Form; überschreibt `Operation::busy_subcommands`).
+///     // und `busy_subcommands = "show=immediate, switch=staged, -=immediate"`.
+///     // Bei `visibility = "channel_reduced"` ist zusätzlich
+///     // `channel_subcommands = "-,show,list"` Pflicht; `*` erlaubt alle
+///     // Argumentformen. `-` steht jeweils für die bare Form.
 ///     model_tool(readonly, approval = "none"),                    // optional; approval: none | always
 ///     agent_tool(child = "researcher", authority = "reduce_to_read_only", budget = "8k"), // optional
 /// )]
@@ -480,6 +482,8 @@ pub fn agent(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - Missing required keys (`name`, `summary`, `domain`, `permission`) → `syn::Error`.
 /// - Unknown top-level or nested attribute key → `syn::Error`.
 /// - Unknown domain / permission / visibility / approval string → `syn::Error`.
+/// - `visibility = "channel_reduced"` without `channel_subcommands` → `syn::Error`.
+/// - `channel_subcommands` on any other visibility → `syn::Error`.
 /// - `agent_tool(...)` declared without all three of `child`, `authority`, `budget` → `syn::Error`.
 /// - Not an `async fn` → `syn::Error`.
 /// - Wrong argument count or types → `syn::Error`.

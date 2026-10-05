@@ -83,6 +83,9 @@ pub(crate) struct OperationArgs {
     /// `Operation::busy_subcommands` (see `parse_busy_subcommands`). Absent ⇒
     /// no override (every invocation inherits `busy`).
     cmd_busy_subcommands: Option<LitStr>,
+    /// Explizite Remote-Unterbefehle für `visibility = "channel_reduced"`.
+    /// `-` bezeichnet die bare Form, `*` alle Argumentformen.
+    cmd_channel_subcommands: Option<LitStr>,
     has_model_tool: bool,
     mt_readonly: bool,
     mt_approval: Option<LitStr>,
@@ -149,6 +152,7 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
     let mut cmd_visibility: Option<LitStr> = None;
     let mut cmd_busy: Option<LitStr> = None;
     let mut cmd_busy_subcommands: Option<LitStr> = None;
+    let mut cmd_channel_subcommands: Option<LitStr> = None;
     let mut has_command = false;
     // model_tool(...) fields
     let mut mt_readonly = false;
@@ -204,10 +208,15 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
                     let lit: LitStr = nested.value()?.parse()?;
                     cmd_busy_subcommands = Some(lit);
                     Ok(())
+                } else if nested.path.is_ident("channel_subcommands") {
+                    let lit: LitStr = nested.value()?.parse()?;
+                    cmd_channel_subcommands = Some(lit);
+                    Ok(())
                 } else {
                     Err(nested.error(
                         "unsupported `operation` `command` key \
-                         (expected `path`, `visibility`, `busy`, or `busy_subcommands`)",
+                         (expected `path`, `visibility`, `busy`, `busy_subcommands`, or \
+                         `channel_subcommands`)",
                     ))
                 }
             })
@@ -311,6 +320,7 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
         cmd_visibility,
         cmd_busy,
         cmd_busy_subcommands,
+        cmd_channel_subcommands,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -361,6 +371,7 @@ pub(crate) fn expand_operation(
         cmd_visibility,
         cmd_busy,
         cmd_busy_subcommands,
+        cmd_channel_subcommands,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -436,6 +447,34 @@ pub(crate) fn expand_operation(
                     const TABLE: &[::harw_operations::operation::BusySubcommand] = &[
                         #( #entries ),*
                     ];
+                    TABLE
+                }
+            }
+        }
+        None => quote! {},
+    };
+
+    let is_channel_reduced = cmd_visibility
+        .as_ref()
+        .is_some_and(|visibility| visibility.value() == "channel_reduced");
+    if is_channel_reduced && cmd_channel_subcommands.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`visibility = \"channel_reduced\"` requires `channel_subcommands = \"...\"`",
+        ));
+    }
+    if !is_channel_reduced && cmd_channel_subcommands.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`channel_subcommands` is only valid with `visibility = \"channel_reduced\"`",
+        ));
+    }
+    let channel_subcommands_tokens = match cmd_channel_subcommands.as_ref() {
+        Some(lit) => {
+            let entries = parse_channel_subcommands(lit)?;
+            quote! {
+                fn channel_subcommands(&self) -> &'static [&'static str] {
+                    const TABLE: &[&str] = &[ #( #entries ),* ];
                     TABLE
                 }
             }
@@ -726,6 +765,7 @@ pub(crate) fn expand_operation(
             }
 
             #busy_subcommands_tokens
+            #channel_subcommands_tokens
 
             fn run<'a>(
                 &'a self,
@@ -882,6 +922,39 @@ fn busy_class_tokens(value: &str) -> Option<proc_macro2::TokenStream> {
 /// # Errors
 /// `syn::Error` bei leerer Liste, fehlendem `=`, leerem Namen, unbekannter
 /// Klasse oder doppeltem Unterbefehl.
+fn parse_channel_subcommands(lit: &LitStr) -> syn::Result<Vec<LitStr>> {
+    let value = lit.value();
+    let mut seen: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for raw in value.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.chars().any(char::is_whitespace) || name.contains('=') {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("channel_subcommands: ungültiger Unterbefehl '{name}'"),
+            ));
+        }
+        if seen.iter().any(|prior| prior == name) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("channel_subcommands: Unterbefehl '{name}' doppelt"),
+            ));
+        }
+        seen.push(name.to_owned());
+        entries.push(LitStr::new(name, lit.span()));
+    }
+    if entries.is_empty() {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "channel_subcommands: mindestens ein Unterbefehl, '-' oder '*' nötig",
+        ));
+    }
+    Ok(entries)
+}
+
 fn parse_busy_subcommands(lit: &LitStr) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let value = lit.value();
     let mut seen: Vec<String> = Vec::new();
@@ -1124,6 +1197,49 @@ mod operation_tests {
         let tokens =
             expand_operation(func, args).map_err(ctx("eine gültige Operation muss expandieren"))?;
         Ok(normalize(&tokens))
+    }
+
+    #[test]
+    fn channel_reduced_requires_explicit_remote_subcommands() -> TestResult {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "channel_reduced")
+        };
+        let args = parse_operation_args(attr)
+            .map_err(ctx("channel_reduced muss syntaktisch parsbar bleiben"))?;
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            return Err(TestError::Unexpected(
+                "channel_reduced ohne channel_subcommands muss fehlschlagen".to_owned(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(r#"requires `channel_subcommands = "..."`"#)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reduced_emits_remote_subcommand_allowlist() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "channel_reduced",
+                channel_subcommands = "-,show,list"
+            )
+        })?;
+
+        assert!(flat.contains("fnchannel_subcommands(&self)->&'static[&'staticstr]"));
+        assert!(flat.contains("constTABLE:&[&str]=&[\"-\",\"show\",\"list\"]"));
+        Ok(())
     }
 
     #[test]
