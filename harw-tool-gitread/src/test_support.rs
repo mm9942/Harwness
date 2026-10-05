@@ -171,6 +171,86 @@ impl TestRepo {
         self.write_git("HEAD", &format!("{oid}\n"))
     }
 
+    /// Baut verschachtelte Bäume aus `(pfad, modus, inhalt)`.
+    pub(crate) fn tree_from(&self, files: &[(&str, u32, &str)]) -> TestResult<Oid> {
+        self.tree_level(files, "")
+    }
+
+    fn tree_level(&self, files: &[(&str, u32, &str)], prefix: &str) -> TestResult<Oid> {
+        let mut direct: Vec<(u32, String, Oid)> = Vec::new();
+        let mut dirs: std::collections::BTreeMap<String, Vec<(&str, u32, &str)>> =
+            std::collections::BTreeMap::new();
+        for file in files {
+            let rest = file.0.strip_prefix(prefix).unwrap_or(file.0);
+            match rest.split_once('/') {
+                Some((dir, _)) => dirs.entry(dir.to_owned()).or_default().push(*file),
+                None => direct.push((file.1, rest.to_owned(), self.blob(file.2)?)),
+            }
+        }
+        for (dir, items) in dirs {
+            let sub = self.tree_level(&items, &format!("{prefix}{dir}/"))?;
+            direct.push((0o040_000, dir, sub));
+        }
+        let entries: Vec<(u32, &str, Oid)> = direct
+            .iter()
+            .map(|(m, n, o)| (*m, n.as_str(), *o))
+            .collect();
+        self.tree(&entries)
+    }
+
+    /// Schreibt den Index zu `files` (mtime 0, damit immer gehasht wird).
+    pub(crate) fn stage(&self, files: &[(&str, u32, &str)]) -> TestResult {
+        let mut entries: Vec<(&str, u32, Oid, u32, u32, u32)> = Vec::new();
+        for (path, mode, text) in files {
+            entries.push((
+                path,
+                *mode,
+                self.blob(text)?,
+                u32::try_from(text.len()).unwrap_or(0),
+                0,
+                0,
+            ));
+        }
+        self.write_git_bytes("index", &build_index(&entries))
+    }
+
+    /// Schreibt Dateien ins Arbeitsverzeichnis (Symlinks bei Modus 120000).
+    pub(crate) fn checkout(&self, files: &[(&str, u32, &str)]) -> TestResult {
+        for (path, mode, text) in files {
+            if *mode == 0o120_000 {
+                if let Some(parent) = self.ws.join(path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(text, self.ws.join(path))?;
+            } else {
+                self.write(path, text.as_bytes())?;
+                let perm = if *mode == 0o100_755 { 0o755 } else { 0o644 };
+                std::fs::set_permissions(
+                    self.ws.join(path),
+                    std::os::unix::fs::PermissionsExt::from_mode(perm),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit des Standes `files` auf `main` samt Index und Arbeitsverzeichnis.
+    pub(crate) fn commit_files(
+        &self,
+        files: &[(&str, u32, &str)],
+        parents: &[Oid],
+        message: &str,
+        when: i64,
+    ) -> TestResult<Oid> {
+        let tree = self.tree_from(files)?;
+        let commit = self.commit(tree, parents, message, when)?;
+        self.set_ref("refs/heads/main", commit)?;
+        self.head_branch("main")?;
+        self.stage(files)?;
+        self.checkout(files)?;
+        Ok(commit)
+    }
+
     /// Ausführungskontext mit den angegebenen Rechten.
     pub(crate) fn ctx(&self, permissions: Vec<Permission>) -> TestResult<ToolExecutionContext> {
         let registry = WorkspaceRegistry::build(

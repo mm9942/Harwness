@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod diffcore;
 pub mod graph;
 pub mod ignores;
 pub mod index;
@@ -15,6 +16,8 @@ pub mod pathspec;
 pub mod refs;
 pub mod repo;
 pub mod rev;
+pub mod snapshot;
+pub mod status;
 pub mod tree;
 
 #[cfg(test)]
