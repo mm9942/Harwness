@@ -17,10 +17,21 @@ use harw_config::{
 use sha2::{Digest, Sha256};
 
 mod skill_index;
+mod skill_select;
+mod skill_triggers;
 
 pub use skill_index::{
     BUNDLED_SKILL_SOURCE, MAX_SKILL_LOAD_BYTES, SHORT_DESCRIPTION_CHARS, SkillHeading, SkillIndex,
-    SkillIndexEntry, SkillSearchHit, SkillSource, SkippedSkill, bundled_skill_files,
+    SkillIndexEntry, SkillSearchHit, SkillSource, SkippedSkill, TRIGGERS_FILE, bundled_skill_files,
+};
+pub use skill_select::{
+    DEFAULT_L0_BYTES, DEFAULT_PER_SESSION_BYTES, DEFAULT_PER_TURN_BYTES, DropReason, Dropped,
+    Injection, InjectionBudget, InjectionState, Selection, catalog_lines, select,
+};
+pub use skill_triggers::{
+    DEFAULT_TRIGGER_PRIORITY, MAX_SCAN_BYTES, MAX_TRIGGER_ENTRIES, MAX_TRIGGERS_FILE_BYTES,
+    MAX_WHEN_CHARS, SkillTriggerSpec, SkillTriggers, SkillWarning, TriggerEvent, TriggerIndex,
+    TriggerKind, TriggerReason, parse_triggers_file,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
