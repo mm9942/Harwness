@@ -151,9 +151,7 @@ harw_tools::tool_provider! {
                         ),
                         (
                             "title",
-                            string_property(
-                                "Optional title; used to derive the slug of a new plan.",
-                            ),
+                            string_property("Optional title; used to derive the slug of a new plan."),
                         ),
                     ],
                     &["content"],
