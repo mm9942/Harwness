@@ -1771,7 +1771,7 @@ fn agent_job_started_result(
         "role": role,
         "status": "running",
         "async": true,
-        "hint": "Work continues independently. Use job.status/job.wait with work_id or agent.result with child_id."
+        "hint": "Work continues independently. Use agent.status/agent.result with child_id; work_id is the durable runtime/operator handle."
     }))
 }
 
