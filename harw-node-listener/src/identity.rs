@@ -221,12 +221,191 @@ impl DeviceRegistry {
             out.push('\n');
         }
         if changed > 0 {
-            let tmp = self.path.with_extension("conf.tmp");
-            fs::write(&tmp, out).map_err(io)?;
-            fs::rename(&tmp, &self.path).map_err(io)?;
+            write_atomic(&self.path, &out).map_err(io)?;
         }
         Ok(changed)
     }
+
+    /// Path of the registry file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Like [`Self::records`], but also reports every line the parser
+    /// discards (neither blank, nor a comment, nor a valid record) with its
+    /// 1-based line number. The loading rules do not change: such a line
+    /// still grants nothing; this only makes the silent drop visible.
+    ///
+    /// # Errors
+    /// [`ListenerError::Io`] when the file exists but cannot be read.
+    pub fn scan(&self) -> Result<RegistryScan, ListenerError> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RegistryScan::default());
+            }
+            Err(error) => return Err(io(error)),
+        };
+        let mut scan = RegistryScan::default();
+        for (index, line) in text.lines().enumerate() {
+            if let Some(record) = DeviceRecord::parse(line) {
+                scan.records.push(record);
+            } else {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    scan.rejected.push(RejectedLine {
+                        line: index + 1,
+                        text: trimmed.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(scan)
+    }
+
+    /// Set the tier of the one record of `device`, rewriting only that line
+    /// (all other lines, comments and line endings stay byte-for-byte) via a
+    /// temporary file and `rename` (mode 0600 on Unix). Nothing is written
+    /// when the device is unknown, ambiguous (several records), revoked, or
+    /// already holds `tier`.
+    ///
+    /// # Errors
+    /// [`TierChangeError`] as described above or on I/O failure.
+    pub fn set_tier(
+        &self,
+        device: &DeviceId,
+        tier: PermissionTier,
+    ) -> Result<TierChange, TierChangeError> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(TierChangeError::UnknownDevice);
+            }
+            Err(error) => return Err(TierChangeError::Io(error.to_string())),
+        };
+        let mut hits: Vec<(usize, DeviceRecord)> = Vec::new();
+        for (index, line) in text.split_inclusive('\n').enumerate() {
+            if let Some(record) = DeviceRecord::parse(line) {
+                if &record.device == device {
+                    hits.push((index, record));
+                }
+            }
+        }
+        let (index, before) = match hits.len() {
+            0 => return Err(TierChangeError::UnknownDevice),
+            1 => hits.remove(0),
+            count => return Err(TierChangeError::Ambiguous { count }),
+        };
+        if before.revoked {
+            return Err(TierChangeError::Revoked);
+        }
+        let mut after = before.clone();
+        after.tier = tier;
+        if before.tier == tier {
+            return Ok(TierChange {
+                before,
+                after,
+                written: false,
+            });
+        }
+        let mut out = String::with_capacity(text.len() + 16);
+        for (i, raw) in text.split_inclusive('\n').enumerate() {
+            if i == index {
+                out.push_str(&after.render());
+                // Keep this line's own ending (`\n`, `\r\n` or none).
+                out.push_str(&raw[raw.trim_end_matches(['\n', '\r']).len()..]);
+            } else {
+                out.push_str(raw);
+            }
+        }
+        write_atomic(&self.path, &out).map_err(|error| TierChangeError::Io(error.to_string()))?;
+        Ok(TierChange {
+            before,
+            after,
+            written: true,
+        })
+    }
+}
+
+/// One line of the registry file the parser discards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedLine {
+    /// 1-based line number in the file.
+    pub line: usize,
+    /// The trimmed line text.
+    pub text: String,
+}
+
+/// Parsed records plus the lines the parser discarded
+/// ([`DeviceRegistry::scan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistryScan {
+    /// Records exactly as [`DeviceRegistry::records`] returns them.
+    pub records: Vec<DeviceRecord>,
+    /// Non-blank, non-comment lines that did not parse.
+    pub rejected: Vec<RejectedLine>,
+}
+
+/// Result of [`DeviceRegistry::set_tier`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierChange {
+    /// The record before the change.
+    pub before: DeviceRecord,
+    /// The record after the change.
+    pub after: DeviceRecord,
+    /// `false` when the tier already matched and nothing was written.
+    pub written: bool,
+}
+
+/// Why [`DeviceRegistry::set_tier`] changed nothing.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TierChangeError {
+    /// No record of that device.
+    #[error("no record for this device")]
+    UnknownDevice,
+    /// Several records of that device; nothing is guessed.
+    #[error("{count} records match this device")]
+    Ambiguous {
+        /// Number of matching records.
+        count: usize,
+    },
+    /// The record is revoked.
+    #[error("the record is revoked")]
+    Revoked,
+    /// The registry could not be read or written.
+    #[error("io: {0}")]
+    Io(String),
+}
+
+/// Write `contents` to `path` through a sibling temporary file and `rename`,
+/// so a reader sees the old or the new file, never a mix. The temporary file
+/// is created exclusively with mode 0600 on Unix and removed on failure.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("conf.tmp");
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn io(error: std::io::Error) -> ListenerError {
@@ -329,5 +508,168 @@ mod tests {
             parsed.as_ref().map(DeviceRecord::render).as_deref(),
             Some(line)
         );
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    const FILE: &str = "# my devices\n\
+        node-a|dev-1|acme|observer|active|phone\n\
+        \n\
+        garbage line\n\
+        node-b|dev-2|acme|operator|active|laptop|approve\n\
+        # trailing comment\n";
+
+    fn registry(text: &str) -> TestResult<(tempfile::TempDir, DeviceRegistry)> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(REGISTRY_FILE), text)?;
+        let registry = DeviceRegistry::new(dir.path());
+        Ok((dir, registry))
+    }
+
+    fn device(raw: &str) -> TestResult<DeviceId> {
+        Ok(DeviceId::try_from_str(raw)?)
+    }
+
+    #[test]
+    fn scan_reports_discarded_lines_with_their_numbers() -> TestResult {
+        let (_dir, registry) = registry(FILE)?;
+        let scan = registry.scan()?;
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(
+            scan.rejected,
+            vec![RejectedLine {
+                line: 4,
+                text: "garbage line".to_owned()
+            }]
+        );
+        // The loader itself is unchanged: same two records, nothing repaired.
+        assert_eq!(registry.records()?, scan.records);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_of_a_missing_file_is_empty() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let scan = DeviceRegistry::new(dir.path()).scan()?;
+        assert_eq!(scan, RegistryScan::default());
+        Ok(())
+    }
+
+    #[test]
+    fn set_tier_changes_only_the_target_line() -> TestResult {
+        let (_dir, registry) = registry(FILE)?;
+        let change = registry.set_tier(&device("dev-1")?, PermissionTier::Maintainer)?;
+        assert!(change.written);
+        assert_eq!(change.before.tier, PermissionTier::Observer);
+        assert_eq!(change.after.tier, PermissionTier::Maintainer);
+        let expected = FILE.replace(
+            "node-a|dev-1|acme|observer|active|phone",
+            "node-a|dev-1|acme|maintainer|active|phone",
+        );
+        assert_eq!(std::fs::read_to_string(registry.path())?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn set_tier_keeps_the_approve_optin_and_crlf_endings() -> TestResult {
+        let (_dir, registry) =
+            registry("n|d|t|operator|active|x|approve\r\nn2|d2|t|observer|active|y\r\n")?;
+        registry.set_tier(&device("d")?, PermissionTier::Observer)?;
+        assert_eq!(
+            std::fs::read_to_string(registry.path())?,
+            "n|d|t|observer|active|x|approve\r\nn2|d2|t|observer|active|y\r\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_tier_refuses_unknown_ambiguous_and_revoked_without_writing() -> TestResult {
+        let text = "n1|dup|t|observer|active|a\nn2|dup|t|observer|active|b\nn3|gone|t|observer|revoked|c\n";
+        let (_dir, registry) = registry(text)?;
+        assert_eq!(
+            registry.set_tier(&device("nope")?, PermissionTier::Owner),
+            Err(TierChangeError::UnknownDevice)
+        );
+        assert_eq!(
+            registry.set_tier(&device("dup")?, PermissionTier::Owner),
+            Err(TierChangeError::Ambiguous { count: 2 })
+        );
+        assert_eq!(
+            registry.set_tier(&device("gone")?, PermissionTier::Owner),
+            Err(TierChangeError::Revoked)
+        );
+        assert_eq!(std::fs::read_to_string(registry.path())?, text);
+        Ok(())
+    }
+
+    #[test]
+    fn set_tier_to_the_same_tier_writes_nothing() -> TestResult {
+        let (_dir, registry) = registry(FILE)?;
+        let change = registry.set_tier(&device("dev-1")?, PermissionTier::Observer)?;
+        assert!(!change.written);
+        assert_eq!(std::fs::read_to_string(registry.path())?, FILE);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_are_atomic_and_mode_0600() -> TestResult {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let (dir, registry) = registry(FILE)?;
+        // A world-readable file must come out owner-only after a rewrite.
+        std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o644))?;
+        let inode_before = std::fs::metadata(registry.path())?.ino();
+        registry.set_tier(&device("dev-1")?, PermissionTier::Operator)?;
+        let meta = std::fs::metadata(registry.path())?;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            meta.ino(),
+            inode_before,
+            "replaced by rename, not rewritten in place"
+        );
+        assert!(!dir.path().join("node-devices.conf.tmp").exists());
+
+        // Same for revoke.
+        std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o644))?;
+        assert_eq!(registry.mark_revoked(&device("dev-2")?)?, 1);
+        assert_eq!(
+            std::fs::metadata(registry.path())?.permissions().mode() & 0o777,
+            0o600
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_leaves_the_original_untouched() -> TestResult {
+        let (dir, registry) = registry(FILE)?;
+        // A directory squatting on the temporary name makes the write fail.
+        std::fs::create_dir(dir.path().join("node-devices.conf.tmp"))?;
+        let result = registry.set_tier(&device("dev-1")?, PermissionTier::Owner);
+        assert!(matches!(result, Err(TierChangeError::Io(_))), "{result:?}");
+        assert_eq!(std::fs::read_to_string(registry.path())?, FILE);
+        Ok(())
+    }
+
+    #[test]
+    fn revoke_is_idempotent_and_reaches_record_for() -> TestResult {
+        let (_dir, registry) = registry(FILE)?;
+        let node = NodeId::try_from_str("node-b")?;
+        assert_eq!(registry.record_for(&node)?.map(|r| r.revoked), Some(false));
+        assert_eq!(registry.mark_revoked(&device("dev-2")?)?, 1);
+        assert_eq!(registry.mark_revoked(&device("dev-2")?)?, 0);
+        assert_eq!(registry.record_for(&node)?.map(|r| r.revoked), Some(true));
+        // Round trip: the file written by the library still parses; the
+        // untouched garbage line is still reported, comments survive.
+        let scan = registry.scan()?;
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(std::fs::read_to_string(registry.path())?.contains("# my devices"));
+        Ok(())
     }
 }
