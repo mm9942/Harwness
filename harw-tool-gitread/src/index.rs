@@ -309,6 +309,24 @@ mod tests {
     }
 
     #[test]
+    fn entries_whose_length_is_a_multiple_of_eight_get_a_full_padding_block() -> TestResult {
+        // 62 Bytes Kopf + 2 Namensbytes = 64: Git füllt dann mit 8 (nicht 0) NUL-Bytes auf.
+        let data = build_index(&[
+            ("ab", 0o100_644, oid(1), 1, 1, 1),
+            ("cd", 0o100_644, oid(2), 2, 2, 2),
+            ("e", 0o100_644, oid(3), 3, 3, 3),
+        ]);
+        let index = parse(&data)?;
+        let paths: Vec<&[u8]> = index.entries.iter().map(|e| e.path.as_slice()).collect();
+        assert_eq!(
+            paths,
+            vec![b"ab".as_slice(), b"cd".as_slice(), b"e".as_slice()]
+        );
+        assert_eq!(index.entries[1].size, 2);
+        Ok(())
+    }
+
+    #[test]
     fn parses_version_four_prefix_compression() -> TestResult {
         let data = v4(&[
             (b"src/lib.rs", 1, 0),

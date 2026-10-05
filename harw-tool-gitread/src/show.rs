@@ -340,13 +340,13 @@ mod tests {
             .ok_or(TestError::Missing("error"))?;
         assert!(error.contains("secret"), "{error}");
         assert!(!error.contains("zzz"));
-        for bad in [
-            "HEAD:nope.txt",
-            "HEAD:../x",
-            "HEAD:.git/config",
-            "nope",
-            "HEAD:a.txt/x",
-        ] {
+        for escape in ["HEAD:../x", "HEAD:.git/config", "HEAD:docs/../.env"] {
+            let error = show(&repo, &opts(escape))
+                .err()
+                .ok_or(TestError::Missing("error"))?;
+            assert!(error.contains("must not contain"), "{escape}: {error}");
+        }
+        for bad in ["HEAD:nope.txt", "nope", "HEAD:a.txt/x"] {
             assert!(show(&repo, &opts(bad)).is_err(), "{bad}");
         }
         let blob_id = hash_of(&repo)?;

@@ -362,7 +362,8 @@ mod tests {
             let error = r.object("HEAD~1000000").err().unwrap_or_default();
             assert!(error.contains("exceeds the limit"), "{error}");
             let long = "a".repeat(MAX_SPEC_BYTES + 1);
-            assert!(r.object(&long).is_err());
+            let error = r.object(&long).err().unwrap_or_default();
+            assert!(error.contains("longer than"), "{error}");
             Ok(())
         })
     }

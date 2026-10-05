@@ -158,6 +158,10 @@ async fn tools_answer_over_the_executor_interface() -> TestResult {
         status["entries"][1],
         json!({"area": "untracked", "path": "new.txt"})
     );
+    let limited = call(&p, &repo, "git.status", json!({"limit": 1})).await?;
+    assert_eq!(limited["entries"].as_array().map(Vec::len), Some(1));
+    assert_eq!(limited["truncated"], true);
+    assert_eq!(limited["counts"]["untracked"], 1);
     let diff = call(&p, &repo, "git.diff", json!({"paths": ["a.txt"]})).await?;
     assert_eq!(diff["comparison"], "unstaged");
     assert!(
