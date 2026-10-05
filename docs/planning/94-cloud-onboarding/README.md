@@ -166,7 +166,8 @@ Two levels, in this order:
 | **N0** | This plan | no |
 | **N1** | `harw device list|set-tier|revoke`, `harw node status` on top of `DeviceRegistry` (read and change paths, tolerant new fields) | no |
 | **N2** | `harw node init` (key bootstrap, config writer that edits `[session_listener]` through the config crate, not by string) and `harw node doctor` | no |
-| **N3** | Pairing: one-time secret store, `device pair|approve|join`, protocol tests | wire format of the pairing message (§5.2) |
+| **N3a** | `device join --show` / `device add <keyfile|code>`: key transfer and pinning without a wire change; fingerprint display | no |
+| **N3b** | One-time pairing endpoint (window, secret, rate limit), only if N3a is too manual | protocol review |
 | **N4** | Reachability profiles incl. `tailnet` via `harw-tailscale`; address in the code | no |
 | **N5** | `harw node enroll <ssh-target>` and `peer add|list|remove`; thin-node install from the release mirror (R2); generated supervised unit (R3) | SSH use is acceptable (§5.3) |
 | **N6** | Mobile/SDK side of `join` (scan the code, store the key) | mobile key storage |
@@ -176,19 +177,58 @@ Each cycle: own branch, own PR, tests without `unwrap`/`panic`, mutation check
 on every security check, `xtask gates` green, honest note on what ran against a
 fake and what against a real peer.
 
-## 5. Decisions for the owner
+## 5. Decisions for the owner — checked against the code
 
-1. Which providers, if any, should N7 target (Hetzner, AWS, any)? Is cost
-   control (a hard instance/budget cap) required before a provisioner may
-   create anything?
-2. Pairing message: carried inside the existing node-transport handshake
-   (preferred: no new port) or as a separate short-lived HTTP endpoint?
-3. May `harw node enroll` use the user's SSH access, or must nodes always be
-   brought up by running a command locally on them?
-4. Default reach profile for a phone: `tailnet` only, or also `public` behind
-   a reverse proxy (PL-89)?
-5. Is a hardware-key confirmation (YubiKey / Ledger) a requirement for
-   `approve` of an `owner`-tier device, or later?
+**5.1 Pairing needs a pre-authentication step (decides the wire question).**
+The server verifies a client's ML-DSA-65 signature against a public key it
+already holds: `node-peers.conf` pins `node_id|public_key_hex`, and the key is
+1952 bytes, i.e. 3904 hex characters (`harw-cli/src/session_listener.rs`).
+`ClientHello` carries only `{version, client, server, client_nonce,
+client_time_ms}` (`harw-node-transport/src/handshake.rs`), and
+`AuthenticatedPeer` only `{node_id, protocol_version}`. A new device's key is
+therefore **unknown to the host until someone transfers it**, and the device
+cannot complete the handshake before that. Pasting 3.9 KB of hex by hand is the
+pain point itself. Two ways, in this order:
+(a) **No wire change:** `harw device join --show` prints the device's key as a
+short fingerprint plus a file/QR with the full key; the host runs
+`harw device add <keyfile|code>` which pins it and writes the registry record
+(host-fixed tier). Both sides compare the fingerprint out of band. Ships in N3a.
+(b) **One-time pairing endpoint:** a separate, rate-limited route on the TLS
+listener, reachable only while a pairing window is open, that accepts the
+secret plus the device key and nothing else; the host pins on `approve`. This is
+a protocol addition and needs its own review; N3b, only if (a) is judged too
+manual. The pairing message does **not** go into `ClientHello`, because that
+message is signed by a key the server does not know yet.
+Recommendation: (a) first.
+
+**5.2 SSH.** `harw-tool-tunnel` exists only as a scaffold (local `-L` forwards,
+no daemon, keyfile by reference, bounded back-off), and the field sessions show
+hand-edited SSH units failing thousands of times while the tailnet connection
+worked. Recommendation: `harw node enroll` **does not use SSH by default**. A
+node is brought up by running one command on it (`harw node install` then
+`harw device join`); SSH is an opt-in convenience (`--via-ssh`) that only runs
+those same commands, through the existing sandboxed process path.
+
+**5.3 Reachability for the phone.** The tailnet already provides the encrypted
+path (devices direct and active in the field logs) and `harw web` already
+serves on it; the one failure seen was the machine's own address. Recommendation:
+`local` and `tailnet` only in N4; `public` waits for the reverse-proxy plan
+(PL-89, PR #92) and stays off in `doctor`'s "recommended" list.
+
+**5.4 Provisioning at a cloud provider (N7).** Nothing in the code creates
+machines, and `harw-job-executor-oci`/`harw-placement-model` place work on
+machines that already exist. Recommendation: do not build a provider
+integration now; N7 stays a dry-run `HostProvisioner` plan until a provider and a
+hard cost cap are chosen. This is the only decision that needs the owner.
+
+**5.5 Hardware key for `owner` approval.** Secrets already go through the
+sealed store with an Auth/Crypto Hub KEK (`harw-cli/src/secret_store.rs`), so a
+hardware-key step would be an additional approver in the Hub, not a new
+mechanism. Deferred as before; `device set-tier owner` already requires an
+explicit `--yes-owner` in N1.
+
+**Remaining owner decisions:** (a) pairing path (a) before (b), (b) SSH only as
+opt-in, (c) whether any cloud provider is wanted for N7.
 
 ## 6. Out of scope
 
