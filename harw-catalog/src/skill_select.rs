@@ -146,6 +146,43 @@ pub struct Injection {
     pub bytes: usize,
 }
 
+impl Injection {
+    /// Wandelt den Auszug in ein Kontextfragment (Sektion `skills.triggered`,
+    /// `Stability::Fresh`, Vertrauensklasse `Instruction`) — rein, ohne
+    /// Laufzeitverdrahtung. `produced_at` gibt der Aufrufer vor (die Funktion
+    /// liest keine Uhr).
+    ///
+    /// # Errors
+    /// [`harw_context::ContextError`], wenn Label oder Sektionsname ungültig
+    /// sind (Steuerzeichen in einer Überschrift).
+    pub fn into_fragment(
+        self,
+        produced_at: jiff::Timestamp,
+    ) -> Result<harw_context::Fragment, harw_context::ContextError> {
+        let label = match &self.section {
+            Some(section) => format!("skill:{}:{section}", self.skill),
+            None => format!("skill:{}", self.skill),
+        };
+        Ok(harw_context::Fragment {
+            label: harw_context::FragmentLabel::try_new(label)?,
+            section: harw_context::SectionName::try_new(FRAGMENT_SECTION)?,
+            trust: harw_context::TrustClass::Instruction,
+            stability: harw_context::Stability::Fresh,
+            origin: harw_context::FragmentOrigin {
+                provider: "harw-catalog".to_owned(),
+                namespace: FRAGMENT_SECTION.to_owned(),
+                produced_at,
+            },
+            cost: harw_lens_types::CostEstimate(u32::try_from(self.bytes).unwrap_or(u32::MAX)),
+            digest: harw_types::ContentDigest::of(self.text.as_bytes()),
+            body: self.text,
+        })
+    }
+}
+
+/// Sektionsname der getriggerten Skill-Fragmente.
+pub const FRAGMENT_SECTION: &str = "skills.triggered";
+
 /// Warum ein Treffer nicht geliefert wurde.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
@@ -692,6 +729,35 @@ mod tests {
         );
         state.forget_skill("borrow");
         assert!(!state.has_delivered("borrow", Some("Ursache E0505")));
+        Ok(())
+    }
+
+    #[test]
+    fn injection_converts_to_an_instruction_fragment() -> TestResult {
+        let (_layer, index) = fixture()?;
+        let mut state = InjectionState::new();
+        let selection = index.select(
+            &[TriggerEvent::ToolOutput {
+                tool: "t",
+                text: "E0505",
+            }],
+            &mut state,
+            &InjectionBudget::default(),
+        );
+        let injection = selection
+            .injections
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("Auszug"))?;
+        let text = injection.text.clone();
+        let fragment = injection
+            .into_fragment(jiff::Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fragment"))?;
+        assert_eq!(fragment.section.as_str(), FRAGMENT_SECTION);
+        assert_eq!(fragment.trust, harw_context::TrustClass::Instruction);
+        assert_eq!(fragment.stability, harw_context::Stability::Fresh);
+        assert_eq!(fragment.body, text);
+        assert_eq!(fragment.label.as_str(), "skill:borrow:Ursache E0505");
         Ok(())
     }
 

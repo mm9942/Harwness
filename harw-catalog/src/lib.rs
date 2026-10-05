@@ -26,7 +26,7 @@ pub use skill_index::{
 };
 pub use skill_select::{
     DEFAULT_L0_BYTES, DEFAULT_PER_SESSION_BYTES, DEFAULT_PER_TURN_BYTES, DropReason, Dropped,
-    Injection, InjectionBudget, InjectionState, Selection, catalog_lines, select,
+    FRAGMENT_SECTION, Injection, InjectionBudget, InjectionState, Selection, catalog_lines, select,
 };
 pub use skill_triggers::{
     DEFAULT_TRIGGER_PRIORITY, MAX_SCAN_BYTES, MAX_TRIGGER_ENTRIES, MAX_TRIGGERS_FILE_BYTES,
