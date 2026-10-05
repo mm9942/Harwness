@@ -238,7 +238,7 @@ fn to_u32(value: i64) -> u32 {
 pub fn index_mtime(repo: &Repo) -> Option<u32> {
     let rel = repo.git_path("index").ok()?;
     let stat = repo.scope.lstat(&rel).ok()?;
-    Some(to_u32(i64::from(stat.st_mtime)))
+    Some(to_u32(stat.st_mtime))
 }
 
 fn worktree_entry(
@@ -292,7 +292,7 @@ fn worktree_entry(
             if let Some(entry) = cached {
                 let size_matches = u64::try_from(stat.st_size)
                     .is_ok_and(|size| u32::try_from(size & 0xFFFF_FFFF).unwrap_or(0) == entry.size);
-                let mtime_matches = to_u32(i64::from(stat.st_mtime)) == entry.mtime_sec
+                let mtime_matches = to_u32(stat.st_mtime) == entry.mtime_sec
                     && nsec_u32(stat.st_mtime_nsec) == entry.mtime_nsec;
                 let racy = ctx.index_mtime.is_none_or(|index| entry.mtime_sec >= index);
                 if size_matches && mtime_matches && !racy && type_bits(entry.mode) == 0o100_000 {
@@ -554,7 +554,7 @@ mod tests {
             mode: 0o100_644,
             oid: stale_oid,
             size: u32::try_from(stat.st_size).unwrap_or(0),
-            mtime_sec: to_u32(i64::from(stat.st_mtime)),
+            mtime_sec: to_u32(stat.st_mtime),
             mtime_nsec: nsec_u32(stat.st_mtime_nsec),
             stage: 0,
             assume_valid: false,

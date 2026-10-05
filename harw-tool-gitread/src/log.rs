@@ -8,10 +8,12 @@
 //! `first_parent`, `no_merges`, `skip`, `max_count`.
 //!
 //! # Pfadfilter
-//! Ein Commit wird gezeigt, wenn sein Baum sich unter den Pfaden von **allen**
-//! Eltern unterscheidet (Wurzel: wenn der Pfad existiert). Es gibt keine
-//! Historienvereinfachung wie bei `git log -- pfad` (kein Verfolgen nur des
-//! „treesame“-Elternteils) und keine Umbenennungsverfolgung.
+//! Semantik wie `git log --full-history -- pfad`: ein Commit wird gezeigt,
+//! wenn sein Baum sich unter den Pfaden von **mindestens einem** Elternteil
+//! unterscheidet (Wurzel: wenn der Pfad existiert). Es gibt keine
+//! Historienvereinfachung (das Standard-`git log -- pfad` folgt bei Merges nur
+//! dem „treesame“-Elternteil und kann Commits auslassen) und keine
+//! Umbenennungsverfolgung.
 //!
 //! # Grenzen
 //! `max_count` höchstens [`HARD_MAX_COUNT`]; Ausgabe über [`Collector`]
@@ -79,13 +81,15 @@ fn touches(odb: &Odb<'_>, commit: &Commit, spec: &Pathspec) -> Result<bool, Stri
     if commit.parents.is_empty() {
         return Ok(!new.is_empty());
     }
+    // Wie `git log --full-history`: ein Commit zählt, sobald er sich von
+    // mindestens einem Elternteil unterscheidet.
     for parent in &commit.parents {
         let old = from_flat(flatten(odb, &read_commit(odb, parent)?.tree, spec)?);
-        if changes(&old, &new).is_empty() {
-            return Ok(false);
+        if !changes(&old, &new).is_empty() {
+            return Ok(true);
         }
     }
-    Ok(true)
+    Ok(false)
 }
 
 fn wanted(commit: &Commit, opts: &LogOpts) -> bool {

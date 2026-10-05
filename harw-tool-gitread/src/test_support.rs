@@ -13,7 +13,7 @@ use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 harw_test_support::define_test_error!(
@@ -343,9 +343,4 @@ pub(crate) fn error_of(output: ToolOutput) -> TestResult<String> {
         ToolOutput::Error { message } => Ok(message),
         other => Err(TestError::Unexpected(format!("kein Fehler: {other:?}"))),
     }
-}
-
-/// Pfad eines Unterverzeichnisses (nur Lesehilfe für Tests).
-pub(crate) fn join(base: &Path, rel: &str) -> PathBuf {
-    base.join(rel)
 }

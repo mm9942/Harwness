@@ -135,6 +135,7 @@ pub fn parse(data: &[u8]) -> Result<Index, String> {
     }
     let mut entries: Vec<IndexEntry> = Vec::with_capacity(count.min(65_536));
     let mut previous: Vec<u8> = Vec::new();
+    let mut deferred: Option<String> = None;
     for _ in 0..count {
         let start = cur.pos;
         cur.take(8)?; // ctime
@@ -197,7 +198,9 @@ pub fn parse(data: &[u8]) -> Result<Index, String> {
             || path.starts_with(b"/")
             || path.split(|b| *b == b'/').any(|part| !safe_name(part))
         {
-            return Err("index: unsafe or invalid path".to_owned());
+            // Erst die Erweiterungen prüfen: ein geteilter Index (`link`) hat
+            // absichtlich leere Pfade und soll als solcher gemeldet werden.
+            deferred.get_or_insert_with(|| "index: unsafe or invalid path".to_owned());
         }
         previous.clone_from(&path);
         entries.push(IndexEntry {
@@ -224,6 +227,9 @@ pub fn parse(data: &[u8]) -> Result<Index, String> {
                 String::from_utf8_lossy(signature)
             ));
         }
+    }
+    if let Some(message) = deferred {
+        return Err(message);
     }
     Ok(Index { version, entries })
 }

@@ -25,5 +25,11 @@ pub mod snapshot;
 pub mod status;
 pub mod tree;
 
+pub mod tools;
+
+pub use tools::{GIT_TOOL_NAMES, GitReadToolProvider};
+
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod tools_tests;

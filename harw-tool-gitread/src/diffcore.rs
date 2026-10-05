@@ -389,7 +389,32 @@ pub fn render(
         patch_truncated: false,
     };
     let mut patch_room = PATCH_BUDGET;
-    for change in changes {
+    // Git zeigt einen Typwechsel im Patch als Löschung plus Neuanlage (im
+    // Stat/numstat als eine Zeile).
+    let expanded: Vec<Change> = changes
+        .iter()
+        .flat_map(|change| {
+            if opts.format == Format::Patch && change.kind == ChangeKind::TypeChange {
+                vec![
+                    Change {
+                        path: change.path.clone(),
+                        kind: ChangeKind::Deleted,
+                        old: change.old,
+                        new: None,
+                    },
+                    Change {
+                        path: change.path.clone(),
+                        kind: ChangeKind::Added,
+                        old: None,
+                        new: change.new,
+                    },
+                ]
+            } else {
+                vec![change.clone()]
+            }
+        })
+        .collect();
+    for change in &expanded {
         let out = one_file(reader, change, opts, with_patch)?;
         if out.skip {
             continue;

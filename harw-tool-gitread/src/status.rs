@@ -160,9 +160,33 @@ impl Walker<'_> {
             .is_some_and(|p| p.starts_with(&prefix))
     }
 
+    /// Ist `path` ein eigenes (gültiges) Repository? Wie bei Git zählt ein
+    /// `.git`-Verzeichnis nur mit `HEAD`, `objects` und `refs`, eine
+    /// `.git`-Datei nur mit `gitdir:`-Zeile.
     fn has_nested_repo(&self, path: &[u8]) -> bool {
-        let rel = rel_of(&join(path, b".git"));
-        self.repo.scope.lstat(&rel).is_ok()
+        let dot_git = join(path, b".git");
+        let Ok(stat) = self.repo.scope.lstat(&rel_of(&dot_git)) else {
+            return false;
+        };
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+            rustix::fs::FileType::Directory => ["HEAD", "objects", "refs"].iter().all(|name| {
+                self.repo
+                    .scope
+                    .lstat(&rel_of(&join(&dot_git, name.as_bytes())))
+                    .is_ok()
+            }),
+            rustix::fs::FileType::RegularFile => {
+                use std::io::Read;
+                self.repo
+                    .scope
+                    .open_read(&rel_of(&dot_git))
+                    .is_ok_and(|file| {
+                        let mut head = Vec::new();
+                        file.take(64).read_to_end(&mut head).is_ok() && head.starts_with(b"gitdir:")
+                    })
+            }
+            _ => false,
+        }
     }
 
     fn check_limits(&mut self, found: &Found) -> bool {
