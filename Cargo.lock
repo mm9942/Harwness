@@ -2103,8 +2103,12 @@ name = "harw-catalog"
 version = "0.9.0"
 dependencies = [
  "harw-config",
+ "harw-context",
  "harw-home",
+ "harw-lens-types",
  "harw-test-support",
+ "harw-types",
+ "jiff",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
