@@ -904,7 +904,8 @@ mod tests {
         let path = format!("{}b", "a".repeat(4000));
         assert!(!glob.is_match(&path));
         let deep = Glob::compile(&"**/x/".repeat(25));
-        assert!(!deep.is_match(&"x/".repeat(1500)));
+        assert!(deep.is_match(&"x/".repeat(1500)));
+        assert!(!deep.is_match(&"y/".repeat(1500)));
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
