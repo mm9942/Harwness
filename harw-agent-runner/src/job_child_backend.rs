@@ -916,9 +916,10 @@ mod tests {
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
         let job_manager =
             harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        harw_command::install_host_default(
-            &std::env::temp_dir().join("harw-agent-runner-command-jobs"),
-        );
+        harw_command::install_host_default(&std::env::temp_dir().join(format!(
+            "harw-agent-runner-command-jobs-{}",
+            std::process::id()
+        )));
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: hello_then_result_script(),
@@ -1014,9 +1015,10 @@ mod tests {
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
         let job_manager =
             harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        harw_command::install_host_default(
-            &std::env::temp_dir().join("harw-agent-runner-command-jobs"),
-        );
+        harw_command::install_host_default(&std::env::temp_dir().join(format!(
+            "harw-agent-runner-command-jobs-{}",
+            std::process::id()
+        )));
         // This variant ends its oversized line; the job tee refuses it by
         // length before the `\n` arrives, like the unterminated one below.
         let script = format!(
@@ -1054,9 +1056,10 @@ mod tests {
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
         let job_manager =
             harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        harw_command::install_host_default(
-            &std::env::temp_dir().join("harw-agent-runner-command-jobs"),
-        );
+        harw_command::install_host_default(&std::env::temp_dir().join(format!(
+            "harw-agent-runner-command-jobs-{}",
+            std::process::id()
+        )));
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: oversized_frame_script(),

@@ -5442,9 +5442,10 @@ mod tests {
         #[tokio::test]
         async fn test_and_permits_with_active_session_approval_runs_on_host_for_strict_profile()
         -> TestResult {
-            harw_command::install_host_default(
-                &std::env::temp_dir().join("harw-regdefaults-command-jobs"),
-            );
+            harw_command::install_host_default(&std::env::temp_dir().join(format!(
+                "harw-regdefaults-command-jobs-{}",
+                std::process::id()
+            )));
             let project_root = make_temp_project("permits-strict-approved")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
