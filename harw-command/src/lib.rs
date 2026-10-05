@@ -22,7 +22,7 @@
 mod global;
 mod port;
 
-pub use global::{install, install_host_default, installed};
+pub use global::{install, install_host_default, installed, replace};
 
 pub use harw_job::{Persistence, ResourceRequest, SandboxProfileName, SandboxRequirement};
 pub use port::{
