@@ -69,6 +69,22 @@ use crate::session_serve::{GatewayCoreFactory, private_dir};
 /// Directory below the profile's session-host state that belongs to the
 /// remote ingress.
 const REMOTE_DIR_NAME: &str = "remote";
+
+/// The remote ingress state directory of the active profile:
+/// `<profile>/session-host/remote/` (where `node-devices.conf` and
+/// `node-peers.conf` live). Resolved exactly as `harw gateway` does; nothing
+/// is created.
+///
+/// # Errors
+/// An invalid active profile name.
+pub(crate) fn remote_state_dir(home: &Path) -> Result<PathBuf, String> {
+    let profile = harw_home::active_profile_name(home);
+    let dir = harw_home::profile_dir(home, &profile)
+        .map_err(|error| format!("Profilverzeichnis '{profile}' nicht auflösbar: {error}"))?;
+    Ok(dir
+        .join(crate::session_serve::STATE_DIR_NAME)
+        .join(REMOTE_DIR_NAME))
+}
 /// Hosted sessions' transcripts and approvals below the remote directory.
 const SESSIONS_DIR_NAME: &str = "sessions";
 /// Actor of remote sessions when no approving device is configured: no

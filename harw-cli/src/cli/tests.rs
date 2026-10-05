@@ -2323,3 +2323,114 @@ fn test_cleanup_apply_class_and_deadline_parse() -> TestResult {
     assert!(Cli::try_parse_from(["harw", "cleanup", "--deadline-secs", "x"]).is_err());
     Ok(())
 }
+
+#[test]
+fn device_list_parses_with_global_json() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "device", "list", "--json"])
+        .map_err(ctx("`harw device list --json` sollte parsen"))?;
+    assert!(cli.global.json);
+    let Some(Command::Device {
+        action: DeviceAction::List,
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected("erwartete device list".into()));
+    };
+    Ok(())
+}
+
+#[test]
+fn device_set_tier_parses_tier_and_owner_confirmation() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "device",
+        "set-tier",
+        "dev-1",
+        "owner",
+        "--yes-owner",
+    ])
+    .map_err(ctx("set-tier mit --yes-owner"))?;
+    let Some(Command::Device {
+        action:
+            DeviceAction::SetTier {
+                device,
+                tier,
+                yes_owner,
+            },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected("erwartete device set-tier".into()));
+    };
+    assert_eq!(device, "dev-1");
+    assert_eq!(tier, DeviceTier::Owner);
+    assert!(yes_owner);
+    let plain = Cli::try_parse_from(["harw", "device", "set-tier", "dev-1", "observer"])
+        .map_err(ctx("set-tier ohne Flag"))?;
+    let Some(Command::Device {
+        action: DeviceAction::SetTier { yes_owner, .. },
+    }) = plain.command
+    else {
+        return Err(TestError::Unexpected("erwartete device set-tier".into()));
+    };
+    assert!(!yes_owner);
+    Ok(())
+}
+
+#[test]
+fn device_set_tier_rejects_unknown_tiers_and_missing_arguments() {
+    for args in [
+        &["harw", "device", "set-tier", "dev-1", "root"][..],
+        &["harw", "device", "set-tier", "dev-1"][..],
+        &["harw", "device", "set-tier"][..],
+        &["harw", "device", "revoke"][..],
+        &["harw", "device"][..],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
+}
+
+#[test]
+fn device_revoke_and_node_status_parse() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "device", "revoke", "dev-1"]).map_err(ctx("device revoke"))?;
+    let Some(Command::Device {
+        action: DeviceAction::Revoke { device },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected("erwartete device revoke".into()));
+    };
+    assert_eq!(device, "dev-1");
+    let status = Cli::try_parse_from(["harw", "node", "status", "--json"])
+        .map_err(ctx("node status --json"))?;
+    assert!(matches!(
+        status.command,
+        Some(Command::Node {
+            action: NodeAction::Status
+        })
+    ));
+    assert!(Cli::try_parse_from(["harw", "node"]).is_err());
+    Ok(())
+}
+
+#[test]
+fn device_and_node_help_is_german_and_listed_in_the_root_help() -> TestResult {
+    let mut root = command();
+    let help = root.render_help().to_string();
+    assert!(help.contains("device") && help.contains("node"), "{help}");
+    for (path, needle) in [
+        (&["device"][..], "set-tier"),
+        (&["device", "set-tier"][..], "--yes-owner"),
+        (&["device", "revoke"][..], "Handshakes"),
+        (&["node", "status"][..], "Auth-Hub"),
+    ] {
+        let mut sub = command();
+        for name in path {
+            sub = sub
+                .find_subcommand(name)
+                .cloned()
+                .ok_or(TestError::Missing("Subcommand"))?;
+        }
+        let text = sub.render_long_help().to_string();
+        assert!(text.contains(needle), "{path:?}: {text}");
+    }
+    Ok(())
+}

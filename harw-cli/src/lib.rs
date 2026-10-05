@@ -32,6 +32,7 @@ mod agent_cmd;
 mod attach_cmd;
 mod auth;
 mod auth_migrate;
+mod device_cmd;
 // #22: automatischer Artefakt-Build der aktiven UIA im Hintergrund.
 mod auto_build;
 mod chat;
@@ -52,6 +53,7 @@ mod lifecycle;
 mod mcp;
 mod mcp_auth;
 mod models;
+mod node_cmd;
 mod observe;
 mod onboarding;
 mod op_bridge;
@@ -714,6 +716,8 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Onboard => "onboard",
             Command::Doctor { .. } => "doctor",
             Command::Update { .. } => "update",
+            Command::Device { .. } => "device",
+            Command::Node { .. } => "node",
             Command::Tailscale { .. } => "tailscale",
             Command::Install { .. } => "install",
             Command::Uninstall { .. } => "uninstall",
@@ -805,6 +809,8 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
             | Command::Cleanup { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
+            | Command::Device { .. }
+            | Command::Node { .. }
             | Command::Provider { .. },
         ) => Ok(()),
         other => printer.require_text(&command_label(other)),
@@ -1017,6 +1023,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
         Some(Command::Tailscale { action }) => tailscale_cmd::run(action),
+        Some(Command::Device { action }) => device_cmd::run(&global, action),
+        Some(Command::Node { action }) => node_cmd::run(&global, action),
         Some(Command::Update {
             check,
             yes,
@@ -1157,6 +1165,8 @@ fn run_startup_migrations(
             | Command::Run { .. }
             | Command::Debug { .. }
             | Command::Completions(_)
+            | Command::Device { .. }
+            | Command::Node { .. }
             | Command::Tailscale { .. }
             | Command::Update { .. }
             | Command::Install { .. }

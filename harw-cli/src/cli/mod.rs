@@ -32,6 +32,7 @@ mod knowledge;
 mod lens;
 mod mcp;
 mod models;
+mod node;
 mod pr_review;
 mod project;
 mod provider;
@@ -59,6 +60,7 @@ pub use knowledge::*;
 pub use lens::*;
 pub use mcp::*;
 pub use models::*;
+pub use node::*;
 pub use pr_review::*;
 pub use project::*;
 pub use provider::*;
@@ -314,6 +316,18 @@ pub enum Command {
         /// Auszuführende Kanal-Aktion.
         #[command(subcommand)]
         action: ChannelAction,
+    },
+    /// Verwaltet die enrollten Geräte des Own-Cloud-Listeners (`node-devices.conf`).
+    Device {
+        /// Auszuführende Geräte-Aktion.
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// Zeigt den Zustand des Own-Cloud-Listeners dieses Knotens.
+    Node {
+        /// Auszuführende Knoten-Aktion.
+        #[command(subcommand)]
+        action: NodeAction,
     },
 
     // ── System ──────────────────────────────────────────────────────────

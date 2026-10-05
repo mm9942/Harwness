@@ -135,7 +135,7 @@ pub fn resolve_listen(section: &SessionListenerSection) -> Result<SocketAddr, St
     Ok(addr)
 }
 
-fn parse_tier(raw: &str) -> Result<PermissionTier, String> {
+pub(crate) fn parse_tier(raw: &str) -> Result<PermissionTier, String> {
     match raw {
         "observer" => Ok(PermissionTier::Observer),
         "operator" => Ok(PermissionTier::Operator),

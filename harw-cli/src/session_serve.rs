@@ -64,7 +64,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// Directory below the profile that holds the session host's state.
-const STATE_DIR_NAME: &str = "session-host";
+pub(crate) const STATE_DIR_NAME: &str = "session-host";
 /// Transcripts and approvals of hosted sessions below the state directory.
 const SESSIONS_DIR_NAME: &str = "sessions";
 
