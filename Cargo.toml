@@ -45,15 +45,13 @@ members = [
     "harw-session-store",
     "harw-session-host",
     "harw-session-ws",
-    # W00 WebSocket control plane skeleton (docs/planning/65-cloud-sessions/
-    # contracts/W00-ws-integration-map.md): client, production TurnDriver
-    # bridge, own-cloud node listener.
     "harw-session-remote",
     "harw-session-client",
     "harw-session-driver",
     "harw-node-listener",
     "harw-mobile-core",
     "harw-mobile-term",
+    "harw-reverse-proxy",
     "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",

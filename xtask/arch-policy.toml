@@ -405,6 +405,8 @@ layer = "A"
 layer = "A"
 [packages."harw-mobile-term"]
 layer = "A"
+[packages."harw-reverse-proxy"]
+layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
 [packages."harw-web"]
