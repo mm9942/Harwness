@@ -81,6 +81,8 @@ pub(crate) struct AgentRowLive {
     pub last_step: Option<String>,
     /// Ende des sichtbaren Antworttexts (gekürzt).
     pub preview: Option<String>,
+    /// Ende des sichtbaren Reasoning-Texts (gekürzt), getrennt vom Antworttext.
+    pub reasoning_preview: Option<String>,
 }
 
 impl AgentRowLive {
@@ -105,6 +107,9 @@ impl AgentRowLive {
         let preview = Some(live.preview.trim())
             .filter(|text| !text.is_empty())
             .map(|text| tail_chars(text, LAST_STEP_CHARS));
+        let reasoning_preview = Some(live.reasoning_preview.trim())
+            .filter(|text| !text.is_empty())
+            .map(|text| tail_chars(text, LAST_STEP_CHARS));
         Self {
             prompt_tokens: usage.prompt_tokens(),
             output_tokens: usage.output_tokens,
@@ -116,6 +121,7 @@ impl AgentRowLive {
             active,
             last_step: live.trace.entries().last().map(step_text),
             preview,
+            reasoning_preview,
         }
     }
 
@@ -324,18 +330,20 @@ pub(crate) fn detail_lines(row: &AgentRow) -> Vec<String> {
         }
     } else {
         let live = row.live.as_ref();
-        match (
-            live.and_then(|live| live.last_step.clone()),
-            live.and_then(|live| live.preview.clone()),
-        ) {
-            (Some(step), preview) => {
-                lines.push(format!("Letzter Schritt: {step}"));
-                if let Some(preview) = preview {
-                    lines.push(format!("Zwischenstand: {preview}"));
-                }
-            }
-            (None, Some(preview)) => lines.push(format!("Zwischenstand: {preview}")),
-            (None, None) => lines.push("Läuft …".to_owned()),
+        let step = live.and_then(|live| live.last_step.clone());
+        let preview = live.and_then(|live| live.preview.clone());
+        let reasoning = live.and_then(|live| live.reasoning_preview.clone());
+        if let Some(step) = step.clone() {
+            lines.push(format!("Letzter Schritt: {step}"));
+        }
+        if let Some(reasoning) = reasoning.clone() {
+            lines.push(format!("Reasoning: ∴ {reasoning}"));
+        }
+        if let Some(preview) = preview.clone() {
+            lines.push(format!("Zwischenstand: {preview}"));
+        }
+        if step.is_none() && reasoning.is_none() && preview.is_none() {
+            lines.push("Läuft …".to_owned());
         }
     }
     lines
@@ -447,6 +455,41 @@ mod tests {
         monitor
     }
 
+    #[test]
+    fn tree_projection_keeps_reasoning_separate_from_answer() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        let turn_id = TurnId::new();
+        monitor.apply(&turn(
+            "reasoning-child",
+            TurnEvent::ReasoningDelta {
+                turn_id: turn_id.clone(),
+                text: "Ich prüfe die Abhängigkeiten".to_owned(),
+            },
+        ));
+        monitor.apply(&turn(
+            "reasoning-child",
+            TurnEvent::AssistantDelta {
+                turn_id,
+                text: "Zwischenstand vorhanden".to_owned(),
+            },
+        ));
+        let live = monitor
+            .agent("reasoning-child")
+            .ok_or(TestError::Missing("Agent"))?;
+        let projected = AgentRowLive::from_live(live, Instant::now());
+        assert_eq!(
+            projected.reasoning_preview.as_deref(),
+            Some("Ich prüfe die Abhängigkeiten")
+        );
+        assert_eq!(projected.preview.as_deref(), Some("Zwischenstand vorhanden"));
+
+        let mut rows = vec![row("reasoning-child", Some("uia"))];
+        enrich_rows(&mut rows, &monitor, |_| None, Instant::now());
+        let details = detail_lines(&rows[0]).join("\n");
+        assert!(details.contains("Reasoning: ∴ Ich prüfe die Abhängigkeiten"), "{details}");
+        assert!(details.contains("Zwischenstand: Zwischenstand vorhanden"), "{details}");
+        Ok(())
+    }
     /// Ein laufendes Kind zeigt Live-Tokens, Tools und Dauer statt `—`.
     #[test]
     fn running_child_shows_live_tokens_tools_and_duration() -> TestResult {
