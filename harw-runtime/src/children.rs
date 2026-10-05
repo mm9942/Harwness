@@ -44,7 +44,8 @@ use harw_core::{
     ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider, StateStore,
 };
 use harw_extension_api::{
-    AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
+    AgentJobFuture, AgentJobSubmitter, AgentSpawnError, AgentSpawner, ExtensionRegistry,
+    SpawnFuture, SpawnInput,
 };
 use harw_operations::OpContext;
 use harw_operations::adapter::ModelToolProvider;
@@ -334,6 +335,10 @@ pub struct RuntimeChildRegistryFactory {
     /// obwohl die Kind-Registry gebaut wird, bevor der Spawner selbst in der
     /// Assembly vollständig konstruiert ist.
     spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
+    /// Deferred weak reference to the runtime-wide durable agent-job submitter.
+    /// Child registries receive the same async-by-default scheduling contract
+    /// as the root without creating a strong registry/spawner/runtime cycle.
+    agent_job_submitter_slot: Arc<OnceLock<Weak<dyn AgentJobSubmitter>>>,
     /// Die aufgelöste Config des Elternlaufs, nur für
     /// [`ChildRegistryFactory::reasoning_effort_defaults_for_role_task`]
     /// (Welle 8: Rangfolge Provider > Modell > Agent > Rolle) — liefert die
@@ -520,6 +525,7 @@ impl RuntimeChildRegistryFactory {
             profile_agents_dir: None,
             browser: harw_config::BrowserSection::default(),
             spawner_slot: Arc::new(OnceLock::new()),
+            agent_job_submitter_slot: Arc::new(OnceLock::new()),
             reasoning_effort_config: None,
             main_model_selection: None,
             effective_main_model: None,
@@ -728,6 +734,15 @@ impl RuntimeChildRegistryFactory {
         spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
     ) -> Self {
         self.spawner_slot = spawner_slot;
+        self
+    }
+    /// Connects child registries to the runtime-wide durable agent-job submitter.
+    #[must_use]
+    pub fn with_agent_job_submitter_slot(
+        mut self,
+        slot: Arc<OnceLock<Weak<dyn AgentJobSubmitter>>>,
+    ) -> Self {
+        self.agent_job_submitter_slot = slot;
         self
     }
 
@@ -1774,6 +1789,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
             }))
+            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
+                slot: Arc::clone(&self.agent_job_submitter_slot),
+            }))
             // Plan R9, offenes Recherche-Netz (`[network].research_web =
             // "open"`): erste Anfrage je Domain fragt (unter `full` nicht),
             // offenes Web lesen nur Recherche-Rollen — gemessen an der
@@ -2207,6 +2225,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .install_over_default(assembled.registry)
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
+            }))
+            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
+                slot: Arc::clone(&self.agent_job_submitter_slot),
             }));
         // Plan R9, Teil A: auch der Steward findet und lädt Skills.
         let registry = self
@@ -2453,6 +2474,31 @@ pub fn enabled_skill_fragments(
 /// explizit fehl.
 struct DeferredManagedSpawner {
     slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
+}
+
+/// Weak adapter that gives every child registry the same durable job submitter
+/// as the root while avoiding a strong reference cycle.
+struct DeferredAgentJobSubmitter {
+    slot: Arc<OnceLock<Weak<dyn AgentJobSubmitter>>>,
+}
+
+impl AgentJobSubmitter for DeferredAgentJobSubmitter {
+    fn submit_child<'a>(
+        &'a self,
+        child: &'a harw_types::SessionId,
+        task: Option<&'a str>,
+    ) -> AgentJobFuture<'a> {
+        Box::pin(async move {
+            let submitter = self
+                .slot
+                .get()
+                .and_then(Weak::upgrade)
+                .ok_or_else(|| AgentSpawnError {
+                    message: "durable agent job submitter is not available".to_owned(),
+                })?;
+            submitter.submit_child(child, task).await
+        })
+    }
 }
 
 impl AgentSpawner for DeferredManagedSpawner {
