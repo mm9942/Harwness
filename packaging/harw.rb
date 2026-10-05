@@ -9,7 +9,7 @@ class Harw < Formula
   homepage "https://github.com/your-org/harwness"
   url "https://example.invalid/harwness-0.2.0.tar.gz" # TODO
   sha256 "0000000000000000000000000000000000000000000000000000000000000000" # TODO
-  license "MIT"
+  license any_of: ["MIT", "Apache-2.0"]
 
   depends_on "rust" => :build
 
