@@ -1,6 +1,28 @@
 import { DurableObject } from "cloudflare:workers";
 
-const GATEWAY_ID = "mias-lab";
+const CONTROL_GATEWAY_ID = "mias-lab";
+const GATEWAY_POOL = [
+  "default",
+  "claw",
+  "clawd",
+  "cyberclaw",
+  "whisper",
+  "sgh-chatbot",
+  "agentic",
+  "more-exessive-work",
+  "new-worker-of-the-day",
+  "new-worker-of-the-day-5",
+  "new-worker-of-the-week",
+  "new-worker-of-the-month",
+  "new-worker-of-the-year",
+  "new-worker-of-the-century",
+  "new-worker-of-the-millennium",
+  "new-worker-of-the-eon",
+  "new-worker-of-the-eternity",
+  "new-worker-of-the-universe",
+  "new-worker-of-the-multiverse",
+];
+const MAX_GATEWAY_ATTEMPTS = 3;
 const DEFAULT_MODEL = "@cf/moonshotai/kimi-k2.7-code";
 const DEFAULT_CACHE_TTL_SECONDS = 1800;
 const CACHE_KEY_VERSION = "v1";
@@ -51,6 +73,7 @@ const corsHeaders = {
     "x-harw-cache-mode",
     "x-harw-concurrency-limit",
     "x-harw-queue-depth",
+    "x-harw-ai-failovers",
   ].join(","),
 };
 
@@ -92,6 +115,46 @@ function concurrencyLimitForModel(model) {
     return 3;
   }
   return 6;
+}
+
+function fnv1a32(value) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function gatewayErrorCode(error) {
+  for (const candidate of [
+    error?.code,
+    error?.cause?.code,
+    error?.errorCode,
+    error?.status,
+  ]) {
+    const code = Number(candidate);
+    if (Number.isInteger(code) && code > 0) return code;
+  }
+  const match = /\b(2003|3007|3036|3040|3043|429|5\d\d)\b/.exec(
+    String(error?.message || error),
+  );
+  return match ? Number(match[1]) : null;
+}
+
+function gatewayErrorKind(error) {
+  const code = gatewayErrorCode(error);
+  if (code === 2003) return "gateway_limit";
+  if (code === 3040 || code === 3036 || code === 429) return "shared_capacity";
+  if (code === 3007 || code === 3043 || (code >= 500 && code <= 599)) {
+    return "transient";
+  }
+  const message = String(error?.message || error);
+  if (/capacity|account limit|too many requests/i.test(message)) return "shared_capacity";
+  if (/gateway.*rate|service unavailable|bad gateway|timed? ?out|internal server/i.test(message)) {
+    return "transient";
+  }
+  return "fatal";
 }
 
 function cloneJson(value) {
@@ -277,6 +340,49 @@ export class ModelLane extends DurableObject {
     this.inflight = 0;
     this.waiters = [];
     this.coalesced = new Map();
+    this.gatewayState = GATEWAY_POOL.map(() => ({
+      cooldownUntil: 0,
+      consecutiveLimits: 0,
+      consecutiveErrors: 0,
+      latencyEwma: 0,
+    }));
+  }
+
+  gatewayCandidates(affinity) {
+    const preferred = fnv1a32(affinity) % GATEWAY_POOL.length;
+    const order = Array.from(
+      { length: GATEWAY_POOL.length },
+      (_, offset) => (preferred + offset) % GATEWAY_POOL.length,
+    );
+    const now = Date.now();
+    const healthy = order.filter(
+      (index) => this.gatewayState[index].cooldownUntil <= now,
+    );
+    return healthy.length ? healthy : order;
+  }
+
+  markGatewaySuccess(index, latencyMs) {
+    const state = this.gatewayState[index];
+    state.consecutiveLimits = 0;
+    state.consecutiveErrors = 0;
+    state.latencyEwma = state.latencyEwma
+      ? state.latencyEwma * 0.8 + latencyMs * 0.2
+      : latencyMs;
+  }
+
+  markGatewayFailure(index, kind) {
+    const state = this.gatewayState[index];
+    const now = Date.now();
+    if (kind === "gateway_limit") {
+      state.consecutiveLimits += 1;
+      state.cooldownUntil =
+        now + Math.min(60_000, 5_000 * 2 ** (state.consecutiveLimits - 1));
+      return;
+    }
+    if (kind === "transient") {
+      state.consecutiveErrors += 1;
+      state.cooldownUntil = now + Math.min(15_000, 2_000 * state.consecutiveErrors);
+    }
   }
 
   async acquire(limit) {
@@ -385,62 +491,168 @@ export class ModelLane extends DurableObject {
 
     try {
       const upstream = mapUpstreamBody(body, model);
-      const answer = await this.env.AI.run(model, upstream, {
-        gateway: {
-          id: GATEWAY_ID,
-          skipCache: !cacheEnabled,
-          cacheTtl: cacheEnabled ? cacheTtl : undefined,
-          cacheKey: cacheEnabled ? cacheKey : undefined,
-          metadata,
-        },
-        extraHeaders: {
-          "x-session-affinity": affinity,
-          "cf-aig-collect-log-payload": "false",
-        },
-      });
+      const candidates = this.gatewayCandidates(affinity);
+      const attempted = [];
+      let lastError = null;
 
-      const headers = {
-        ...corsHeaders,
-        "x-harw-ai-model": model,
-        "x-harw-ai-gateway": GATEWAY_ID,
-        "x-harw-affinity": affinity.slice(0, 128),
-        "x-harw-cache-mode": cacheEnabled ? "exact+prefix" : "prefix-only",
-        "x-harw-concurrency-limit": String(limit),
-        "x-harw-queue-depth": String(this.waiters.length),
-      };
+      for (
+        const gatewayIndex of candidates.slice(0, MAX_GATEWAY_ATTEMPTS)
+      ) {
+        const gatewayId = GATEWAY_POOL[gatewayIndex];
+        attempted.push(gatewayId);
+        const started = Date.now();
 
-      if (stream || answer instanceof ReadableStream) {
-        if (!(answer instanceof ReadableStream)) {
-          return json(
-            { error: { message: "upstream did not return a stream" } },
-            502,
-            headers,
-          );
+        try {
+          const answer = await this.env.AI.run(model, upstream, {
+            gateway: {
+              id: gatewayId,
+              skipCache: !cacheEnabled,
+              cacheTtl: cacheEnabled ? cacheTtl : undefined,
+              cacheKey: cacheEnabled ? cacheKey : undefined,
+              metadata: {
+                ...metadata,
+                route: gatewayId,
+              },
+            },
+            extraHeaders: {
+              "x-session-affinity": affinity,
+              "cf-aig-collect-log-payload": "false",
+            },
+          });
+
+          this.markGatewaySuccess(gatewayIndex, Date.now() - started);
+
+          const headers = {
+            ...corsHeaders,
+            "x-harw-ai-model": model,
+            "x-harw-ai-gateway": gatewayId,
+            "x-harw-affinity": affinity.slice(0, 128),
+            "x-harw-cache-mode": cacheEnabled ? "exact+prefix" : "prefix-only",
+            "x-harw-concurrency-limit": String(limit),
+            "x-harw-queue-depth": String(this.waiters.length),
+            "x-harw-ai-failovers": String(attempted.length - 1),
+          };
+
+          if (stream || answer instanceof ReadableStream) {
+            if (!(answer instanceof ReadableStream)) {
+              return json(
+                { error: { message: "upstream did not return a stream" } },
+                502,
+                headers,
+              );
+            }
+            streamOwnsPermit = true;
+            return new Response(this.trackedStream(answer), {
+              status: 200,
+              headers: {
+                ...headers,
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache",
+              },
+            });
+          }
+
+          return json(normalizeChatCompletion(answer, model), 200, headers);
+        } catch (error) {
+          lastError = error;
+          const kind = gatewayErrorKind(error);
+
+          if (kind === "shared_capacity") {
+            return json(
+              {
+                error: {
+                  type: "rate_limit_error",
+                  message: "Workers AI shared capacity pressure",
+                },
+              },
+              429,
+              {
+                "retry-after": "20",
+                "x-harw-ai-gateway": gatewayId,
+                "x-harw-ai-failovers": String(attempted.length - 1),
+              },
+            );
+          }
+
+          if (kind === "fatal") throw error;
+
+          this.markGatewayFailure(gatewayIndex, kind);
         }
-        streamOwnsPermit = true;
-        return new Response(this.trackedStream(answer), {
-          status: 200,
-          headers: {
-            ...headers,
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache",
-          },
-        });
       }
 
-      return json(normalizeChatCompletion(answer, model), 200, headers);
-    } catch (error) {
-      const message = String(error?.message || error);
-      const capacity = /3040|capacity|rate.?limit|too many requests|\b429\b/i.test(message);
+      // The mias-lab AI Gateway is kept out of the normal hash ring so adding
+      // or removing backend gateways does not recursively route through itself.
+      // It is a final control-plane fallback only for route-local/transient
+      // backend failures.
+      try {
+        const answer = await this.env.AI.run(model, upstream, {
+          gateway: {
+            id: CONTROL_GATEWAY_ID,
+            skipCache: !cacheEnabled,
+            cacheTtl: cacheEnabled ? cacheTtl : undefined,
+            cacheKey: cacheEnabled ? cacheKey : undefined,
+            metadata: {
+              ...metadata,
+              route: CONTROL_GATEWAY_ID,
+            },
+          },
+          extraHeaders: {
+            "x-session-affinity": affinity,
+            "cf-aig-collect-log-payload": "false",
+          },
+        });
+
+        const headers = {
+          ...corsHeaders,
+          "x-harw-ai-model": model,
+          "x-harw-ai-gateway": CONTROL_GATEWAY_ID,
+          "x-harw-affinity": affinity.slice(0, 128),
+          "x-harw-cache-mode": cacheEnabled ? "exact+prefix" : "prefix-only",
+          "x-harw-concurrency-limit": String(limit),
+          "x-harw-queue-depth": String(this.waiters.length),
+          "x-harw-ai-failovers": String(attempted.length),
+        };
+
+        if (stream || answer instanceof ReadableStream) {
+          if (!(answer instanceof ReadableStream)) {
+            return json(
+              { error: { message: "upstream did not return a stream" } },
+              502,
+              headers,
+            );
+          }
+          streamOwnsPermit = true;
+          return new Response(this.trackedStream(answer), {
+            status: 200,
+            headers: {
+              ...headers,
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+            },
+          });
+        }
+
+        return json(normalizeChatCompletion(answer, model), 200, headers);
+      } catch (error) {
+        lastError = error;
+      }
+
+      const kind = gatewayErrorKind(lastError);
+      const capacity = kind === "shared_capacity";
       return json(
         {
           error: {
             type: capacity ? "rate_limit_error" : "api_error",
-            message: capacity ? "Workers AI capacity pressure" : "Workers AI request failed",
+            message: capacity
+              ? "Workers AI shared capacity pressure"
+              : "All mias-lab gateway routes failed",
           },
         },
         capacity ? 429 : 502,
-        capacity ? { "retry-after": "20" } : {},
+        {
+          ...(capacity ? { "retry-after": "20" } : {}),
+          "x-harw-ai-failovers": String(attempted.length),
+        },
       );
     } finally {
       if (!streamOwnsPermit) this.release();
@@ -471,7 +683,7 @@ export default {
     }
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-      return json({ ok: true, service: "mias-lab", gateway: GATEWAY_ID });
+      return json({ ok: true, service: "mias-lab", gateway: CONTROL_GATEWAY_ID, backend_gateways: GATEWAY_POOL.length });
     }
 
     if (!(await authorized(request, env))) {
