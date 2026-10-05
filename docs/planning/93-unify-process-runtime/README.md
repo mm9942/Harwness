@@ -99,3 +99,33 @@ that spawns is a violation; an allowlisted file that no longer spawns is a viola
 the browser driver, the egress relay, the engine clients of the container tools,
 `harw-killer`, the executors themselves) is allowlisted with its reason; the shell/job/TUI
 surfaces carry `migrate: PL-93 step N`.
+
+## 5. Status (branch `arch/unify-process-runtime`)
+
+| Step | State |
+|---|---|
+| 1 frames / rlimits / persistence | done, tested (`harw-job-core`, `harw-job-runtime`) |
+| 2 command adapter | done: `harw-command` (`CommandPort`, `JobCommandPort`, `run` and `start`); installed once by the composition root (`SessionJobs::open`, `run_chat`) — nothing installed means the surfaces fail closed |
+| 3 `shell.exec` | done: host and bwrap launches run through the port; tool keeps planning (bwrap plan, prlimit wrapper, binds) |
+| 4 TUI `!`/`!!` | done: `OperatorCommand::run` builds a `CommandRequest`, ephemeral, one attempt |
+| 5 `latex.*` | done: same bwrap planning, spawn/deadline/kill by the runtime |
+| 6 `job.start` | done for non-piped jobs: `JobManager::start` (now `async`) hands the prepared command to the runtime with **file output** (`SubmitOptions::output_files`), keeps ownership, logs, progress, stop/detach |
+| 7 delete old code | done for the shell/latex/operator paths (`spawn_and_collect`, `BoundedCapture::drain`, `configure_stdio`, `host_shell_argv`) |
+| 8 `host.sudo_exec` | open (needs the stdin/secret side channel) |
+
+Executor gaps closed on the way: **new-session mode** (`LinuxExecutorOptions::new_session`:
+`setsid` in place, process group = PID, tree kill intact, no controlling terminal; a missing
+program is still a failed spawn), `require_rlimits` (no `prlimit` = no start), output to files.
+
+### Known differences to the old paths
+- `RLIMIT_NPROC` is not mapped (a user-wide ceiling, no counterpart in `ResourceRequest`).
+- On non-Linux hosts no port is installed; `!`, `shell.exec`, `latex.*` and `job.start` report
+  "no job runtime" instead of spawning (macOS needs `DarwinExecutor` behind the same port).
+- Jobs stopped by `job.stop` are still signalled by `JobManager` through the identity-checked
+  `OwnLeader` (adoption after a restart); the runtime only owns *starting* and supervising.
+
+### Still on the ratchet (`xtask/spawn-policy.toml`, entries marked `migrate`)
+`harw-tool-job` `start_piped` (agent child stdio), `harw-agent-runner` job child backend,
+`harw-tool-shell` `sudo` and the background `PreparedJob` command builders, `harw-ops`
+(`/agent`, `/diff`), `harw-tui` plan mode/clipboard helpers. Each needs either the stdin
+side channel (piped children, sudo) or a decision that the call is tooling, not a workload.
