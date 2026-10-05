@@ -903,6 +903,9 @@ async fn compiled_family_runs_two_workers_as_jobs() -> TestResult {
     let out = tempfile::tempdir()?;
     let exe = build_agent_binary(out.path(), "lead", &compiled.artifact)?;
     let home = tempfile::tempdir()?;
+    harw_command::install_host_default(
+        &std::env::temp_dir().join("harw-agent-runner-e2e-command-jobs"),
+    );
     let manager = harw_tool_job::JobManager::new(
         harw_tool_job::JobManagerConfig::new(home.path()),
         Arc::new(harw_tool_job::NoopNotifier),

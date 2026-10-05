@@ -1210,7 +1210,7 @@ async fn test_old_meta_json_loads_with_new_fields_defaulted() -> TestResult {
 async fn test_spawn_failure_is_recorded_as_failed() -> TestResult {
     let env = Env::new()?;
     let mut command = tokio::process::Command::new("/nonexistent/harw-job-binary");
-    command.stdin(Stdio::null());
+    command.stdin(std::process::Stdio::null());
     let prepared = PreparedJob {
         command,
         executed_on_host: true,
@@ -1235,6 +1235,7 @@ async fn test_start_piped_echoes_stdin_tees_stdout_and_detects_exit() -> TestRes
     let mut piped = env
         .manager
         .start_piped(request("echo", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
     assert_eq!(piped.status.meta.state, JobState::Running);
@@ -1290,6 +1291,7 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
     let mut piped = env
         .manager
         .start_piped(request("group", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
 
@@ -1342,6 +1344,7 @@ async fn run_piped_script(
     let mut piped = env
         .manager
         .start_piped_with_line_limit(request("limit", "agent-a", &[]), prepared, limit)
+        .await
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
     let items = drain_lines(&mut piped.stdout_lines).await?;
