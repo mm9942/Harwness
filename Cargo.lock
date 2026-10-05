@@ -3090,6 +3090,7 @@ dependencies = [
  "harw-job-store",
  "harw-job-tokio",
  "harw-placement-model",
+ "harw-provider",
  "harw-types",
  "jiff",
  "serde",
@@ -3097,6 +3098,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
