@@ -5,6 +5,7 @@ status: planned
 date: 2026-09-27
 tags: [planning, remote-sessions, cloud-home, tui, storage, network]
 related:
+  - local-tui-live-workbench.md
   - ../70-decisions/README.md
   - ../80-copilot-backlog/README.md
   - ../90-migration-ledger/MIGRATION_LEDGER.md

@@ -6,6 +6,8 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+- Die widersprüchlich wirkende Freigabe der Host-Lease wurde durch Mias eigenen Bestätigungsklick ausgelöst; ein ergänzender Wächterhinweis ist für sich genommen nicht als Ablehnung durch Mia zu werten.
+
 ## [0.9.1] — Unreleased
 
 ### Fixed

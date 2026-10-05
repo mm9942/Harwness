@@ -61,6 +61,8 @@ harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap", optional = true
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+harw-provider = { path = "../harw-provider" }
+url = "2"
 
 [lints]
 workspace = true

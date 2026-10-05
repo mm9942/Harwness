@@ -113,6 +113,7 @@ impl CoordinatorConfig {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             output_capture: OutputCapture::default(),
         }
@@ -1252,7 +1253,19 @@ fn retry_delay(
     if !state.is_retryable() || reason.is_some_and(|reason| reason.starts_with(POLICY_PREFIX)) {
         return None;
     }
-    let delay = claim.job.retry.next_delay(attempt).ok()?;
+    // Jitter support: when the policy configures a non-zero jitter, scale the
+    // base delay by a deterministic sample derived from the attempt number and
+    // the job id, so retries spread out without breaking reproducibility.
+    let base = if claim.job.retry.jitter > 0.0 {
+        let sample = jitter_sample(&claim.job.id, attempt);
+        claim
+            .job
+            .retry
+            .next_delay_with_jitter(attempt, sample)
+            .ok()?
+    } else {
+        claim.job.retry.next_delay(attempt).ok()?
+    };
     let budget = &claim.job.budget;
     let ran = started_at.map_or(SignedDuration::ZERO, |started| {
         Timestamp::now()
@@ -1261,12 +1274,28 @@ fn retry_delay(
     });
     let charged = budget
         .charge_wall(usage, ran)
-        .and_then(|()| budget.charge_wall(usage, delay));
+        .and_then(|()| budget.charge_wall(usage, base));
     if let Err(error) = charged {
         tracing::info!(job = %claim.job.id, attempt, %error, "no retry: wall-time budget exhausted");
         return None;
     }
-    Some(delay)
+    Some(base)
+}
+
+/// Deterministic jitter sample in `0.0..=1.0` derived from the job id and the
+/// attempt number: retries spread out across the jitter window without making
+/// the schedule irreproducible. Uses a simple FNV-1a-style hash of the job id
+/// plus attempt so the same job+attempt always maps to the same sample.
+fn jitter_sample(job_id: &WorkId, attempt: u32) -> f64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in job_id.to_string().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= u64::from(attempt);
+    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    // Take the high 53 bits so the value fits exactly into an f64 fraction.
+    ((hash >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
 fn attempt_context(
