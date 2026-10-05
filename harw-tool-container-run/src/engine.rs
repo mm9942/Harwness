@@ -180,7 +180,7 @@ impl PodmanEngine {
                 })
             })
             .collect();
-        request.max_output_bytes = MAX_STREAM_BYTES.saturating_mul(2);
+        request.max_output_bytes = MAX_STREAM_BYTES;
         request.sandbox = CommandSandbox::Host;
         request.persistence = Persistence::MetadataOnly;
         request.output = CommandOutput::Capture;
@@ -395,9 +395,15 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
         Ok(ContainerPlan::build(&config, &request)?)
     }
 
-    fn engine() -> PodmanEngine {
-        PodmanEngine::new(vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())])
-            .with_grace(Duration::ZERO)
+    fn engine(state_dir: &Path) -> TestResult<PodmanEngine> {
+        let port = harw_command::JobCommandPort::host(&state_dir.join("jobs"))
+            .map_err(std::io::Error::other)?;
+        let port: std::sync::Arc<dyn harw_command::CommandPort> = std::sync::Arc::new(port);
+        Ok(
+            PodmanEngine::new(vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())])
+                .with_command_port(port)
+                .with_grace(Duration::ZERO),
+        )
     }
 
     /// A workspace directory with the fake engine next to it (the engine
@@ -415,7 +421,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
         let (bin, ws, exe) = setup("echo out-line; echo err-line >&2; sleep 1")?;
         let plan = plan(&exe, ws.path(), None)?;
         std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
-        let run = engine().run(&plan, None).await?;
+        let run = engine(bin.path())?.run(&plan, None).await?;
         assert_eq!(run.output.exit_code, Some(0));
         assert_eq!(run.output.stdout.trim(), "out-line");
         assert_eq!(run.output.stderr.trim(), "err-line");
@@ -434,7 +440,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
                 doc["HostConfig"]["NetworkMode"] = "host".into()
             }),
         )?;
-        let result = engine().run(&plan, None).await;
+        let result = engine(bin.path())?.run(&plan, None).await;
         assert!(
             matches!(&result, Err(EngineError::NotEnforced(d)) if d == &["Network".to_owned()]),
             "{result:?}"
@@ -455,7 +461,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
                 doc["EffectiveCaps"] = serde_json::json!(["CAP_NET_RAW"]);
             }),
         )?;
-        let result = engine().run(&plan, None).await;
+        let result = engine(bin.path())?.run(&plan, None).await;
         assert!(
             matches!(&result, Err(EngineError::NotEnforced(d)) if d == &["Capabilities".to_owned()]),
             "{result:?}"
@@ -469,7 +475,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
         let (bin, ws, exe) = setup("echo SHOULD-NOT-RUN")?;
         let plan = plan(&exe, ws.path(), None)?;
         // No inspect.json: every inspect fails.
-        let result = engine().run(&plan, None).await;
+        let result = engine(bin.path())?.run(&plan, None).await;
         assert!(
             matches!(result, Err(EngineError::Unverified(_))),
             "{result:?}"
@@ -486,7 +492,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
             bin.path().join("inspect.json"),
             inspect_json(&plan, |doc| doc["Id"] = "cd".repeat(32).into()),
         )?;
-        let result = engine().run(&plan, None).await;
+        let result = engine(bin.path())?.run(&plan, None).await;
         assert!(
             matches!(&result, Err(EngineError::NotEnforced(d)) if d == &["Identity".to_owned()]),
             "{result:?}"
@@ -499,7 +505,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
         let (bin, ws, exe) = setup("head -c 200000 /dev/zero | tr '\\0' x")?;
         let plan = plan(&exe, ws.path(), None)?;
         std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
-        let run = engine().run(&plan, None).await?;
+        let run = engine(bin.path())?.run(&plan, None).await?;
         assert_eq!(run.output.stdout.len(), MAX_STREAM_BYTES);
         assert!(run.output.truncated);
         Ok(())
@@ -511,7 +517,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
         let plan = plan(&exe, ws.path(), Some(1))?;
         std::fs::write(bin.path().join("inspect.json"), inspect_json(&plan, |_| {}))?;
         let started = std::time::Instant::now();
-        let run = engine().run(&plan, None).await?;
+        let run = engine(bin.path())?.run(&plan, None).await?;
         assert!(run.output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(15));
         assert!(bin.path().join("rm.log").exists(), "rm --force was issued");
@@ -529,7 +535,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
             tokio::time::sleep(Duration::from_millis(600)).await;
             canceller.cancel(harw_types::cancel::CancelReason::User);
         });
-        let run = engine().run(&plan, Some(&token)).await?;
+        let run = engine(bin.path())?.run(&plan, Some(&token)).await?;
         assert!(run.output.cancelled);
         assert!(bin.path().join("rm.log").exists());
         Ok(())
@@ -539,7 +545,7 @@ d=\"$(dirname \"$0\")\"\necho \"$1\" >> \"$d/calls.log\"\ncase \"$1\" in\n  crea
     async fn a_missing_engine_is_a_spawn_error() -> TestResult {
         let ws = tempfile::tempdir()?;
         let plan = plan("/nonexistent/podman", ws.path(), None)?;
-        let result = engine().run(&plan, None).await;
+        let result = engine(ws.path())?.run(&plan, None).await;
         assert!(matches!(result, Err(EngineError::Spawn(_))), "{result:?}");
         Ok(())
     }
