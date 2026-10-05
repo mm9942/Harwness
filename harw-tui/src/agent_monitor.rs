@@ -1017,6 +1017,9 @@ impl AgentMonitor {
         let Some(live) = self.agents.get_mut(id) else {
             return;
         };
+        if !live.phase.is_active() {
+            return;
+        }
         live.phase = if cancelled {
             AgentPhase::Cancelled
         } else if failed {
