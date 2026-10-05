@@ -954,6 +954,87 @@ impl AgentMonitor {
         self.agents.values().filter(|a| a.phase.is_active()).count()
     }
 
+    /// Projiziert den direkt von der TUI getriebenen Root-Turn in denselben
+    /// Agenten-Monitor wie Kind-Agenten. Das ist reine Surface-Projektion:
+    /// Zähler bleiben beim AgentEvent-Bus, damit nichts doppelt gezählt wird.
+    pub(crate) fn begin_surface_root(&mut self, id: &str, role: &str) {
+        if !self.agents.contains_key(id) {
+            self.order.push(id.to_owned());
+        }
+        let live = self
+            .agents
+            .entry(id.to_owned())
+            .or_insert_with(|| AgentLive::new(id.to_owned(), None, role.to_owned()));
+        live.role = role.to_owned();
+        if live.finished.is_some() || !live.phase.is_active() {
+            live.begin_run();
+        }
+        live.phase = AgentPhase::Thinking;
+        live.finished = None;
+        live.current_tool = None;
+        live.preview.clear();
+        live.reasoning_preview.clear();
+    }
+
+    /// Spiegelt die sichtbaren Root-Streams in den Agenten-Dock, ohne
+    /// Token-/Tool-Zähler oder Trace-Einträge des AgentEvent-Busses zu duplizieren.
+    pub(crate) fn sync_surface_root_stream(
+        &mut self,
+        id: &str,
+        role: &str,
+        reasoning: &str,
+        answer: &str,
+    ) {
+        self.begin_surface_root_if_missing(id, role);
+        if let Some(live) = self.agents.get_mut(id) {
+            live.phase = AgentPhase::Thinking;
+            live.reasoning_preview.clear();
+            live.push_reasoning_preview(reasoning);
+            live.preview.clear();
+            live.push_preview(answer);
+        }
+    }
+
+    /// Markiert den Root-Turn als Werkzeugphase, ohne den Bus-Zähler zu verändern.
+    pub(crate) fn surface_root_tool(&mut self, id: &str, role: &str, tool: Option<&str>) {
+        self.begin_surface_root_if_missing(id, role);
+        if let Some(live) = self.agents.get_mut(id) {
+            match tool {
+                Some(tool) => {
+                    live.phase = AgentPhase::Tool;
+                    live.current_tool = Some(tool.to_owned());
+                }
+                None => {
+                    live.phase = AgentPhase::Thinking;
+                    live.current_tool = None;
+                }
+            }
+        }
+    }
+
+    /// Schließt die Root-Projektion konsistent mit dem Spinner/Turn-Lifecycle.
+    pub(crate) fn finish_surface_root(&mut self, id: &str, cancelled: bool, failed: bool) {
+        let Some(live) = self.agents.get_mut(id) else {
+            return;
+        };
+        live.phase = if cancelled {
+            AgentPhase::Cancelled
+        } else if failed {
+            AgentPhase::Failed
+        } else {
+            AgentPhase::Done
+        };
+        live.finished = Some(Instant::now());
+        live.current_tool = None;
+        live.trace.close_streams();
+    }
+
+    fn begin_surface_root_if_missing(&mut self, id: &str, role: &str) {
+        if !self.agents.contains_key(id) {
+            self.begin_surface_root(id, role);
+        }
+    }
+
     /// Kontextbelegung eines bestimmten Agenten.
     #[must_use]
     pub(crate) fn agent(&self, id: &str) -> Option<&AgentLive> {
@@ -3282,6 +3363,36 @@ mod tests {
                     .collect::<String>()
             })
             .collect())
+    }
+
+    #[test]
+    fn surface_root_projection_tracks_reasoning_and_closes_with_turn() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.begin_surface_root("root", "assistant");
+        assert_eq!(monitor.active_count(), 1);
+
+        monitor.sync_surface_root_stream(
+            "root",
+            "assistant",
+            "Prüfe die Konfiguration",
+            "Validator geprüft",
+        );
+        let live = monitor.agent("root").ok_or("root")?;
+        assert_eq!(live.reasoning_preview, "Prüfe die Konfiguration");
+        assert_eq!(live.preview, "Validator geprüft");
+
+        monitor.surface_root_tool("root", "assistant", Some("fs.read"));
+        assert_eq!(monitor.agent("root").map(|live| live.phase), Some(AgentPhase::Tool));
+        monitor.surface_root_tool("root", "assistant", None);
+        assert_eq!(monitor.agent("root").map(|live| live.phase), Some(AgentPhase::Thinking));
+
+        monitor.finish_surface_root("root", true, false);
+        assert_eq!(monitor.active_count(), 0);
+        assert_eq!(
+            monitor.agent("root").map(|live| live.phase),
+            Some(AgentPhase::Cancelled)
+        );
+        Ok(())
     }
 
     #[test]
