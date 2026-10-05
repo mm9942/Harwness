@@ -25,6 +25,8 @@ harw-job-core = { path = "../harw-job-core" }
 # Durable, fenced job records (JobRecordStore, FsJobRecordStore) and the
 # attempt sidecars (RecordStore::write_sidecar).
 harw-job-store = { path = "../harw-job-store" }
+# Offer vocabulary (RuntimeOffer) produced from a SandboxReport.
+harw-placement-model = { path = "../harw-placement-model" }
 # `WorkId` is re-exported explicitly (knowledge-surfaces §6.1, §8.1).
 harw-types = { path = "../harw-types" }
 # Attempt sidecar (de)serialization; `StoredJob::input` carries the spec

@@ -1,0 +1,11 @@
+error[E0080]: evaluation panicked: tool_provider!(Existing): `parallel_safe` nennt ein Tool, das der Provider nicht deklariert
+  --> tests/compile_fail/39_provider_parallel_unknown_name.rs:28:1
+   |
+28 | / harw_tools::tool_provider_core! {
+29 | |     impl for Existing as provider, parallel_safe: ["a.typo"] {
+30 | |         "a.tool" => { spec: spec(), executor: Noop }
+31 | |     }
+32 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `harw_tools::tool_provider_core` (in Nightly builds, run with -Z macro-backtrace for more info)

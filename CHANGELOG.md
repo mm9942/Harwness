@@ -18,6 +18,13 @@ Semantic Versioning within the 0.x pre-release range.
   inheriting the workspace license, a license text goes missing, or the
   packaging metadata drifts. `cargo deny` skips private crates, so nothing
   checked this before.
+- `harw-tool-job`: concurrent job starts no longer exceed `[jobs] max_running`.
+  The capacity check and the insertion of the job were separate steps, so
+  several agents starting jobs at the same time all saw free capacity (with
+  `max_running = 1`, 7 or 8 of 8 simultaneous starts succeeded). `start`,
+  `start_with_warnings`, `start_with_origin` and `start_piped` now reserve a
+  slot atomically; a failed launch gives the slot back. `check_capacity`
+  stays an early, advisory check.
 - `curl -fsSL https://get.harw.dev/harw/install.sh | bash` no longer fails
   with a bare 404 on `Harwness-main.zip`. Without an argument it still
   builds from source. `--binary` (opt-in) reads the mirror instead of the

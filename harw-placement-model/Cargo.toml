@@ -1,0 +1,18 @@
+[package]
+publish.workspace = true
+name = "harw-placement-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Placement vocabulary (P1 minimum): per-dimension enforcement states, runtime backends, RuntimeOffer and NodeOffer with explicit freshness. Pure data, no I/O; unknown or stale offer data is never eligible."
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

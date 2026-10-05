@@ -306,7 +306,7 @@ fn nominal_kek_provenance(home: &Path) -> KekProvenance {
 }
 
 /// Builds the AuthHub client from `[infrastructure]`. Opens no socket.
-fn authhub_client(section: &InfrastructureSection) -> Result<AuthHubClient, String> {
+pub(crate) fn authhub_client(section: &InfrastructureSection) -> Result<AuthHubClient, String> {
     let availability = InfrastructureAvailability::from_config(
         &harw_runtime::infrastructure::client_config(section),
     )

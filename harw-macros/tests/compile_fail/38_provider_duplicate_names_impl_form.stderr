@@ -1,0 +1,12 @@
+error[E0080]: evaluation panicked: tool_provider!(Existing): zwei Tools deklarieren denselben NAME — tools() würde einen Namen bewerben, den executor()/parallel_safe() nicht eindeutig auflösen können
+  --> tests/compile_fail/38_provider_duplicate_names_impl_form.rs:28:1
+   |
+28 | / harw_tools::tool_provider_core! {
+29 | |     impl for Existing as provider {
+30 | |         "dup.name" => { spec: spec(), executor: Noop },
+31 | |         "dup.name" => { spec: spec(), executor: Noop }
+32 | |     }
+33 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `harw_tools::tool_provider_core` (in Nightly builds, run with -Z macro-backtrace for more info)

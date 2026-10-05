@@ -1,0 +1,40 @@
+{
+  "has_executor": {
+    "host.sudo_exec": true
+  },
+  "parallel_safe": {
+    "host.sudo_exec": false
+  },
+  "permissions": null,
+  "tools": [
+    {
+      "description": "Run ONE command as root on the local host via sudo. sudo works: the user sees the exact argv and your reason in a TUI approval window, confirms and types their sudo password there if sudo asks (passwordless sudo works too). The password never reaches you — never ask for it in chat, put it into a command or use `sudo -S`/`echo … | sudo`. Returns exit_code/stdout/stderr, or an error if the user denied it or authentication failed — then do not retry on your own, ask the user. Never call sudo via shell.exec; never say sudo is impossible while this tool is available.",
+      "name": "host.sudo_exec",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "argv": {
+            "description": "Exact argv of the command to run as root, e.g. [\"apt-get\", \"install\", \"-y\", \"ripgrep\"]. No shell: no pipes, redirections or globbing. Do not include sudo.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Short reason shown to the user in the approval window.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "argv",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

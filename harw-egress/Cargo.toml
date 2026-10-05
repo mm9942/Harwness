@@ -31,6 +31,7 @@ tokio = { version = "1.53.0", features = ["net", "rt", "io-util", "time", "macro
 url = "2.5.8"
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 # `sync` (oneshot) nur für Proxy-Tests; `tempfile` für Unix-Socket-Tempdirs
 # (Workspace-Dep, Cargo.lock: tempfile 3.27.0).
 tokio = { version = "1.53.0", features = ["rt", "macros", "net", "io-util", "time", "sync"] }

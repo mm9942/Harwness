@@ -1,0 +1,21 @@
+[package]
+publish.workspace = true
+name = "harw-retention"
+description = "Retention core: symlink-safe, deadline-bounded sweeps and the declared data-class registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-macros = { path = "../harw-macros" }
+serde = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+tempfile = { workspace = true }
+toml = "1.1"
+
+[lints]
+workspace = true

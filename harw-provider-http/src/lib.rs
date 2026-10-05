@@ -84,11 +84,13 @@ pub mod budget;
 pub mod cache_strategy;
 pub mod discovery;
 mod error;
+mod images;
 pub mod rate_limiter;
 pub mod retry;
 pub mod routing;
 mod sse;
 mod text_tool_calls;
+mod tool_call_ids;
 mod tool_names;
 
 use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
@@ -1696,6 +1698,8 @@ pub struct OpenAiResponsesProvider {
     /// `[capabilities] tool_calling = false` — ihnen werden keine Werkzeuge
     /// angeboten (siehe [`strip_tools_for_toolless_model`]).
     toolless_models: BTreeSet<String>,
+    /// Modelle mit `image_input = false`: Bilder werden durch einen Hinweis ersetzt.
+    imageless_models: BTreeSet<String>,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -1836,6 +1840,7 @@ impl OpenAiResponsesProvider {
             stream_idle_timeout: DEFAULT_REQUEST_TIMEOUT,
             chat_compat: ChatCompat::default(),
             toolless_models: BTreeSet::new(),
+            imageless_models: BTreeSet::new(),
         })
     }
 
@@ -2089,6 +2094,7 @@ impl OpenAiResponsesProvider {
             Duration::from_secs(provider.effective_stream_idle_timeout_secs());
         http_provider.chat_compat = ChatCompat::from_provider(provider);
         http_provider.toolless_models = toolless_models(provider_name, config);
+        http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
     }
 
@@ -2852,10 +2858,10 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
     let mut input = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text } => {
+            harw_core::ModelMessage::User { text, images } => {
                 input.push(InputItem::Message {
                     role: "user".to_owned(),
-                    content: vec![ContentPart::InputText { text }],
+                    content: images::responses_user_content(text, &images),
                 });
             }
             harw_core::ModelMessage::Assistant { text } => {
@@ -3439,6 +3445,9 @@ pub(crate) struct ChatCompat {
     strict_tools: bool,
     /// Wert für `parallel_tool_calls`, sofern Werkzeuge angeboten werden.
     parallel_tool_calls: Option<bool>,
+    /// Wie `tool_call_id`s auf den Draht gehen (Mistral verlangt 9
+    /// alphanumerische Zeichen).
+    tool_call_ids: tool_call_ids::ToolCallIdFormat,
 }
 
 impl Default for ChatCompat {
@@ -3448,7 +3457,19 @@ impl Default for ChatCompat {
             send_reasoning_effort: true,
             strict_tools: true,
             parallel_tool_calls: None,
+            tool_call_ids: tool_call_ids::ToolCallIdFormat::Verbatim,
         }
+    }
+}
+
+/// Das Format der `tool_call_id`s für einen Endpunkt: nur die offizielle
+/// Mistral-API verlangt 9 alphanumerische Zeichen; Subdomain-Tricks und
+/// andere Server bleiben beim unveränderten Format.
+fn tool_call_id_format_for(base_url: &str) -> tool_call_ids::ToolCallIdFormat {
+    if endpoint_is_official_host(base_url, "api.mistral.ai") {
+        tool_call_ids::ToolCallIdFormat::Alnum9
+    } else {
+        tool_call_ids::ToolCallIdFormat::Verbatim
     }
 }
 
@@ -3467,6 +3488,7 @@ impl ChatCompat {
             send_reasoning_effort: provider.effective_send_reasoning_effort(),
             strict_tools: provider.effective_strict_tools(),
             parallel_tool_calls: provider.effective_parallel_tool_calls(),
+            tool_call_ids: tool_call_id_format_for(&provider.base_url),
         }
     }
 }
@@ -3485,6 +3507,41 @@ fn toolless_models(provider_name: &str, config: &harw_config::ResolvedConfig) ->
         models.extend(model.aliases.iter().cloned());
     }
     models
+}
+
+/// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
+/// `[capabilities] image_input = false` sagt.
+fn imageless_models(provider_name: &str, config: &harw_config::ResolvedConfig) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    for model in config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_name)
+        .filter(|model| model.capabilities.image_input == Some(false))
+    {
+        models.insert(model.id.clone());
+        models.extend(model.aliases.iter().cloned());
+    }
+    models
+}
+
+/// Ersetzt in `request` jedes Bild durch einen Hinweistext, wenn `model` keine
+/// Bilder versteht. Das Bild verschwindet nicht still: der Verlauf nennt es
+/// mit Maßen. Liefert `true`, wenn etwas ersetzt wurde.
+fn replace_images_for_imageless_model(
+    request: &mut ModelRequest,
+    model: &str,
+    imageless: &BTreeSet<String>,
+) -> bool {
+    if !imageless.contains(model) || !request.history.has_images() {
+        return false;
+    }
+    tracing::warn!(
+        model,
+        "model has image_input = false; images are replaced by a notice for this request"
+    );
+    request.history = request.history.without_images(images::IMAGELESS_REASON);
+    true
 }
 
 /// Hinweis an ein Modell ohne Werkzeugaufrufe (Runde 7, Teil L7).
@@ -3594,6 +3651,7 @@ fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
 fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat) -> Value {
     let renderer = ToolResultRenderer::new(request);
     let names = tool_names::ToolNameCodec::for_request(request);
+    let ids = tool_call_ids::ToolCallIdCodec::for_request(request, compat.tool_call_ids);
     let mut messages: Vec<Value> = Vec::new();
 
     let mut system = request.system_prompt.clone();
@@ -3607,8 +3665,11 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
 
     for message in request.history.to_model_messages() {
         match message {
-            harw_core::ModelMessage::User { text } => {
-                messages.push(serde_json::json!({ "role": "user", "content": text }));
+            harw_core::ModelMessage::User { text, images } => {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": images::chat_user_content(text, &images),
+                }));
             }
             harw_core::ModelMessage::Assistant { text } => {
                 messages.push(serde_json::json!({ "role": "assistant", "content": text }));
@@ -3621,7 +3682,7 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
                 push_chat_tool_call(
                     &mut messages,
                     serde_json::json!({
-                        "id": call_id.as_str(),
+                        "id": ids.encode(call_id.as_str()),
                         "type": "function",
                         "function": {
                             "name": names.encode(&name),
@@ -3634,7 +3695,7 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
                 let content = renderer.render(&call_id, &result);
                 messages.push(serde_json::json!({
                     "role": "tool",
-                    "tool_call_id": call_id.as_str(),
+                    "tool_call_id": ids.encode(call_id.as_str()),
                     "content": content,
                 }));
             }
@@ -4106,6 +4167,7 @@ impl OpenAiResponsesProvider {
         // Runde 7, Teil L7: Modelle ohne Werkzeugaufrufe bekommen keine
         // Werkzeuge angeboten (plus Hinweis in den Instruktionen).
         strip_tools_for_toolless_model(&mut request, model, &self.toolless_models);
+        replace_images_for_imageless_model(&mut request, model, &self.imageless_models);
         // Für `authorized_request` (Gateway-Identity-Header, siehe
         // [`Self::gateway_identity_headers`]) — geliehen von `request`, das
         // bis nach dem Response-Parsing im Scope bleibt.
@@ -7381,6 +7443,86 @@ mod tests {
     }
 
     #[test]
+    fn test_mistral_gets_nine_character_tool_call_ids_and_others_stay_verbatim() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("weather?");
+        history.push_tool_call(
+            harw_types::ToolCallId::from_str("call_1740241912345"),
+            "get_weather",
+            serde_json::json!({"location": "Paris"}),
+        );
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_1740241912345"),
+            ToolCallResult::success(serde_json::json!({"temp": 20})),
+            5,
+        );
+        let request = ModelRequest {
+            stream: None,
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: Vec::new(),
+            context_assembly: Default::default(),
+            reasoning_effort: None,
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+            cancel: None,
+            identity: None,
+        };
+        let mistral = ChatCompat {
+            tool_call_ids: tool_call_ids::ToolCallIdFormat::Alnum9,
+            ..ChatCompat::default()
+        };
+        let body = build_chat_body_with(&request, "mistral-large-latest", mistral);
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or(TestError::Missing("messages"))?;
+        let call_id = messages[1]
+            .pointer("/tool_calls/0/id")
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("call id"))?;
+        let result_id = messages[2]
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("result id"))?;
+        assert_eq!(call_id.len(), 9);
+        assert!(call_id.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        assert_eq!(call_id, result_id, "call and result share one id");
+
+        let other = build_chat_body(&request, "gpt-4o-mini");
+        assert_eq!(
+            other
+                .pointer("/messages/1/tool_calls/0/id")
+                .and_then(Value::as_str),
+            Some("call_1740241912345")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_only_the_official_mistral_host_selects_the_nine_character_format() {
+        use tool_call_ids::ToolCallIdFormat::{Alnum9, Verbatim};
+        assert_eq!(tool_call_id_format_for("https://api.mistral.ai/v1"), Alnum9);
+        assert_eq!(
+            tool_call_id_format_for("https://api.mistral.ai.evil.example/v1"),
+            Verbatim
+        );
+        assert_eq!(
+            tool_call_id_format_for("https://api.openai.com/v1"),
+            Verbatim
+        );
+        assert_eq!(
+            tool_call_id_format_for("http://localhost:8000/v1"),
+            Verbatim
+        );
+    }
+
+    #[test]
     fn test_build_chat_body_single_tool_call_stays_one_assistant_message() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
@@ -8770,5 +8912,7 @@ mod tests {
 mod test_support;
 
 // Runde 7, Teil L: Tests für lokale Modell-Server gegen Fake-HTTP-Server.
+#[cfg(test)]
+mod image_tests;
 #[cfg(test)]
 mod local_model_tests;

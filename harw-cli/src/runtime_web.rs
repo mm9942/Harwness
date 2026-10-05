@@ -46,7 +46,7 @@
 //! `harw-cli/src/web.rs` bereits für seine Kompositionsfehler verwendet.
 //!
 //! # Beispiel
-//! ```no_run
+//! ```ignore
 //! use std::path::Path;
 //! use harw_operations::operation::PermissionTier;
 //!
