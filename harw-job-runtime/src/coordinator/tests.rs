@@ -188,6 +188,7 @@ fn plant_running_attempt(
         job_id: job_id.clone(),
         attempt_id: attempt_id.clone(),
         runner_id: runner.clone(),
+        lease_epoch: claim.lease.epoch,
         workspace_root: coordinator.config().workspace_root.clone(),
     };
     let mut attempt = AttemptRecord::claimed(

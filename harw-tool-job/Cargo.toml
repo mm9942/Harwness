@@ -11,6 +11,7 @@ description = "Eingebautes Job-System für lang laufende Prozesse (job.start/sta
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 # Derselbe Rechte-/Freigabeweg wie `shell.exec` (Sandbox/Host-Lease/Permit,
@@ -33,6 +34,7 @@ harw-job-core = { path = "../harw-job-core" }
 harw-job-linux = { path = "../harw-job-linux" }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync"] }
 

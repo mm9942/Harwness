@@ -41,6 +41,7 @@ harw-session-store = { path = "../../../harw-session-store" }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # Nur für Tests: baut einen `serde_json::Error`, um den `#[from]`-Pfad von
 # `EscalateError::ActionEncoding` (wrappt `WardenProtoError`) ohne echte
 # Digestbildungspanne auszulösen.

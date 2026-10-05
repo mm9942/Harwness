@@ -4647,8 +4647,8 @@ specialization = "bridge-contract-test"
 
     // ── W4a/A-BRIDGE: K3 Reducer, K4 question_id, K5 Effort ──────────────────
 
-    /// Alle sieben Permissions (Stand `harw-authority`).
-    const ALL_PERMISSIONS: [Permission; 7] = [
+    /// Alle acht Permissions (Stand `harw-authority`).
+    const ALL_PERMISSIONS: [Permission; 8] = [
         Permission::ReadWorkspace,
         Permission::WriteWorkspace,
         Permission::ExecuteProcess,
@@ -4656,9 +4656,10 @@ specialization = "bridge-contract-test"
         Permission::ReadSecrets,
         Permission::ManagePlugins,
         Permission::ReadCargoRegistry,
+        Permission::ManageContainers,
     ];
 
-    /// Alle 2⁷ Teilmengen der Permissions.
+    /// Alle 2⁸ Teilmengen der Permissions.
     fn every_permission_subset() -> Vec<PermissionSet> {
         (0_u32..(1 << ALL_PERMISSIONS.len()))
             .map(|mask| {

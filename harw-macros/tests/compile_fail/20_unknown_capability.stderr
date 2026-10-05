@@ -1,4 +1,4 @@
-error: unbekannte capability `Bogus`; erwartet eine von: ReadSysfsThermal, ReadProcStat, ReadProcMeminfo, ReadSysfsBlock, ReadProcNetDev, ReadSysfsDrm, ReadCgroupV2, ReadProcNet, ReadJournal, ReadAuditNetlink, ReadScanReports, ReadWorkspaceGraph, WatchFilesystem, LoadBpfProgram
+error: unbekannte capability `Bogus`; erwartet eine von: ReadSysfsThermal, ReadProcStat, ReadProcMeminfo, ReadSysfsBlock, ReadProcNetDev, ReadSysfsDrm, ReadCgroupV2, ReadProcNet, ReadJournal, ReadAuditNetlink, ReadScanReports, ReadWorkspaceGraph, ReadContainerScopes, WatchFilesystem, LoadBpfProgram
  --> tests/compile_fail/20_unknown_capability.rs:7:18
   |
 7 |     capability = Bogus,

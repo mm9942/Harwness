@@ -88,6 +88,8 @@ core = []
 knowledge = []
 matrix = []
 tool-browser = []
+# Not in the default set: the runner does not link the container tools yet.
+tool-container = []
 tool-deps = []
 tool-doc = []
 tool-explorer = []

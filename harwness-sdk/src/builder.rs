@@ -552,7 +552,9 @@ impl HarwnessBuilder {
         #[cfg(feature = "unstable-internals")]
         contexts.extend(raw_contexts);
 
+        let media = Arc::new(crate::media::MediaHandle::new(&spec_inputs.home));
         Ok(Harwness::from_inner(Inner {
+            media,
             spec: spec_inputs,
             model,
             model_id: self.model_id,

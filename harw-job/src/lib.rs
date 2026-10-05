@@ -57,6 +57,7 @@
 //!
 //! # Features
 //! - `bwrap`: the Bubblewrap sandbox backend (`LinuxSandboxBackend::Bwrap`).
+//! - `oci`: the container backend (`OciExecutor`, `OciConfig`) for Podman/Docker.
 
 #![forbid(unsafe_code)]
 
@@ -68,6 +69,8 @@ pub use harw_job_core::{
     JobSpec, JobSpecBuilder, JobSpecEnvelope, LifecycleState, ResourceRequest, RunnerId,
     SandboxProfileName, SandboxReport, SandboxRequirement, SpecError, WorkspacePath,
 };
+#[cfg(all(feature = "oci", unix))]
+pub use harw_job_executor_oci::{OciConfig, OciError, OciExecutor, PeerPolicy};
 #[cfg(target_os = "macos")]
 pub use harw_job_runtime::coordinator::DarwinExecutor;
 pub use harw_job_runtime::coordinator::{

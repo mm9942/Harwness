@@ -217,9 +217,11 @@ pub mod learn;
 // Live-Stand der aufgelösten Konfiguration (Spiegel gelungener Persistenz).
 pub mod live_config;
 // Live-Übernahme von Modellwechseln (Provider-Neubau, Rollenwahl).
+pub mod learning_job;
 pub mod live_model;
 pub mod matrix;
 pub mod memory;
+pub mod memory_job;
 pub mod mode;
 pub mod model;
 pub mod models;
@@ -236,6 +238,7 @@ pub mod provider;
 pub mod ps;
 pub mod quit;
 pub mod research;
+pub mod retention_job;
 pub mod retry;
 pub mod review;
 pub mod sandbox_lease;
@@ -300,6 +303,28 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
+/// Declares one operation list: a private constructor `fn $ops()` returning
+/// the operations as an array whose length is derived from the list itself,
+/// plus the matching `const $count` (the number of listed operations).
+///
+/// There is no hand-maintained array length or count constant: adding or
+/// removing a line changes both. The registering functions iterate
+/// `$ops()` and return `$count`.
+macro_rules! register_ops {
+    (
+        $(#[$meta:meta])*
+        $vis:vis const $count:ident;
+        fn $ops:ident = [ $($op:expr),+ $(,)? ];
+    ) => {
+        $(#[$meta])*
+        $vis const $count: usize = [$(stringify!($op)),+].len();
+
+        fn $ops() -> [Arc<dyn Operation>; $count] {
+            [ $($op),+ ]
+        }
+    };
+}
+
 /// Registriert alle 46 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
@@ -360,7 +385,17 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/dream").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 46] = [
+    let ops = base_ops();
+    for op in ops {
+        registry.register(op);
+    }
+}
+
+register_ops! {
+    /// Anzahl der Operationen der Grundausstattung ([`register_all`]).
+    const BASE_OP_COUNT;
+    fn base_ops = [
+
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -463,13 +498,7 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // handelt als Bedienerin; kein Modell-Werkzeug).
         Arc::new(jobs::JobsOperation),
     ];
-    for op in ops {
-        registry.register(op);
-    }
 }
-
-/// Anzahl der Operationen, die [`register_plan_tools`] bei aktivem Gate hinzufügt.
-pub const PLAN_TOOL_COUNT: usize = 7;
 
 /// Registriert die Planungs-, Explorations- und Recherche-Operationen — gegated.
 ///
@@ -529,7 +558,18 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
     if !config.enabled {
         return 0;
     }
-    let ops: [Arc<dyn Operation>; PLAN_TOOL_COUNT] = [
+    let ops = plan_ops();
+    for op in ops {
+        registry.register(op);
+    }
+    PLAN_TOOL_COUNT
+}
+
+register_ops! {
+    /// Anzahl der Operationen, die [`register_plan_tools`] bei aktivem Gate hinzufügt.
+    pub const PLAN_TOOL_COUNT;
+    fn plan_ops = [
+
         Arc::new(plan::PlanOperation),
         Arc::new(goal::GoalOperation),
         Arc::new(explore::ExploreOperation),
@@ -538,14 +578,7 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
         Arc::new(research::ResearchWebOperation),
         Arc::new(analyze::AnalyzeOperation),
     ];
-    for op in ops {
-        registry.register(op);
-    }
-    PLAN_TOOL_COUNT
 }
-
-/// Anzahl der Operationen, die [`register_work_driver_tools`] bei aktivem Gate hinzufügt.
-pub const WORK_DRIVER_TOOL_COUNT: usize = 3;
 
 /// Registriert die WorkDriver-Operationen — hinter demselben Gate wie die
 /// Planungsfläche.
@@ -595,15 +628,22 @@ pub fn register_work_driver_tools(
     if !config.enabled {
         return 0;
     }
-    let ops: [Arc<dyn Operation>; WORK_DRIVER_TOOL_COUNT] = [
-        Arc::new(work_driver::WorkDriverEnqueueOperation),
-        Arc::new(work_driver::WorkDriverStatusOperation),
-        Arc::new(work_driver::WorkDriverStopOperation),
-    ];
+    let ops = work_driver_ops();
     for op in ops {
         registry.register(op);
     }
     WORK_DRIVER_TOOL_COUNT
+}
+
+register_ops! {
+    /// Anzahl der Operationen, die [`register_work_driver_tools`] bei aktivem Gate hinzufügt.
+    pub const WORK_DRIVER_TOOL_COUNT;
+    fn work_driver_ops = [
+
+        Arc::new(work_driver::WorkDriverEnqueueOperation),
+        Arc::new(work_driver::WorkDriverStatusOperation),
+        Arc::new(work_driver::WorkDriverStopOperation),
+    ];
 }
 
 #[cfg(test)]

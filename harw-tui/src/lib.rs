@@ -15,6 +15,7 @@ pub(crate) mod agent_tree_live;
 pub mod app;
 pub mod approval;
 pub mod approval_dialog;
+pub mod attach;
 // Runde 5, Teil F: Auswahlfenster für `ask_user`.
 pub(crate) mod ask_user_dialog;
 pub(crate) mod chat_scroll;

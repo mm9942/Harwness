@@ -2538,6 +2538,18 @@ impl crate::capture::ToolOutcomeObserver for JournalToolObserver {
             inner.on_turn_finished(session_id);
         }
     }
+
+    fn on_user_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(inner) = &self.inner {
+            inner.on_user_message(session_id, text);
+        }
+    }
+
+    fn on_assistant_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(inner) = &self.inner {
+            inner.on_assistant_message(session_id, text);
+        }
+    }
 }
 
 /// Leichter [`crate::guard::ProgressObserver`], der nur die Aktiv-Registry
@@ -4480,7 +4492,7 @@ impl ManagedAgentSpawner {
                         .iter()
                         .filter_map(|part| match part {
                             ContentPart::Text { text } => Some(text.as_str()),
-                            ContentPart::ImageUrl { .. } => None,
+                            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
                         })
                         .collect(),
                 ),
@@ -6296,7 +6308,7 @@ impl ManagedAgentSpawner {
                 .iter()
                 .filter_map(|part| match part {
                     ContentPart::Text { text } => Some(text.as_str()),
-                    ContentPart::ImageUrl { .. } => None,
+                    ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
                 })
                 .collect();
             (!text.trim().is_empty()).then_some(text)
@@ -13007,7 +13019,7 @@ max_depth = 0
                         .iter()
                         .filter_map(|part| match part {
                             ContentPart::Text { text } => Some(text.as_str()),
-                            ContentPart::ImageUrl { .. } => None,
+                            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
                         })
                         .collect::<String>(),
                 ),

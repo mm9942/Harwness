@@ -50,7 +50,7 @@ use harw_extension_api::{ContextFragment, ContextProvider, ExtFuture, TurnInputC
 pub const REPO_TREE_LABEL: &str = "repo.tree";
 
 /// Namensraum, unter dem [`RepoTreeContextProvider`] registriert wird.
-pub const REPO_TREE_NAMESPACE: &str = "harw.runtime.repo_tree";
+pub const REPO_TREE_NAMESPACE: &str = harw_context::sources::repo_tree.namespace;
 
 /// Mindestabstand zwischen zwei Fingerabdruck-Prüfungen der Wurzel.
 pub const REPO_TREE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);

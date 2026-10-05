@@ -1,0 +1,28 @@
+[package]
+publish.workspace = true
+name = "harw-job-executor-k8s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Kubernetes job executor backend: runs a JobSpec as one restricted pod, created behind a scheduling gate, read back from the API (securityContext, volumes, resources, uid) into a per-dimension SandboxReport before the gate is lifted. Digest-pinned images only."
+
+[dependencies]
+harw-job-core = { path = "../harw-job-core" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+harw-container-model = { path = "../harw-container-model" }
+harw-types = { path = "../harw-types" }
+harw-placement-model = { path = "../harw-placement-model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Same TLS stack as harw-oauth / harw-mcp-client (rustls); `blocking` because
+# `Executor::start` is synchronous (calls run on their own thread).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

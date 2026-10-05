@@ -1,0 +1,36 @@
+[package]
+publish.workspace = true
+name = "harw-node-listener"
+description = "Own-cloud session listener: serves harw.session.v1 over the authenticated node transport, maps AuthenticatedPeer to a host ClientIdentity and closes connections on revocation (W00 §2.4 remote_listener, §7, S08)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+harw-node-transport = { path = "../harw-node-transport" }
+harw-session-host = { path = "../harw-session-host" }
+harw-session-ws = { path = "../harw-session-ws" }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
+hyper = { version = "1", features = ["server", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tower-service = "0.3"
+thiserror = "2"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros", "test-util"] }
+
+[lints]
+workspace = true
