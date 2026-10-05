@@ -401,16 +401,12 @@ mod tests {
     #[test]
     fn errors_and_refusals() -> TestResult {
         let (repo, _) = history()?;
-        for bad in [
-            "",
-            "../x",
-            ".git/config",
-            "a//b",
-            "nope.txt",
-            "f.txt/x",
-            "/",
-        ] {
-            assert!(blame(&repo, bad).is_err(), "{bad}");
+        for bad in ["", "../x", ".git/config", "a//b", "/"] {
+            let error = blame(&repo, bad).err().unwrap_or_default();
+            assert!(error.contains("invalid path"), "{bad}: {error}");
+        }
+        for missing in ["nope.txt", "f.txt/x"] {
+            assert!(blame(&repo, missing).is_err(), "{missing}");
         }
         let secret = TestRepo::new()?;
         secret.commit_files(&[(".env", 0o100_644, "TOKEN=1\n")], &[], "s", 1)?;

@@ -292,10 +292,47 @@ mod tests {
         assert_eq!(subjects(&repo, &o)?, vec!["touch src FIX", "side work"]);
         let mut o = opts("HEAD");
         o.spec = Pathspec::parse(&["src".to_owned()])?;
-        assert_eq!(subjects(&repo, &o)?, vec!["touch src FIX", "first commit"]);
+        assert_eq!(
+            subjects(&repo, &o)?,
+            vec!["merge side", "touch src FIX", "first commit"]
+        );
         let mut o = opts("HEAD");
         o.spec = Pathspec::parse(&["side.txt".to_owned()])?;
-        assert_eq!(subjects(&repo, &o)?, vec!["side work"]);
+        assert_eq!(subjects(&repo, &o)?, vec!["merge side", "side work"]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_hard_count_limit_applies() -> TestResult {
+        let repo = TestRepo::new()?;
+        let blob = repo.blob("x")?;
+        let tree = repo.tree(&[(0o100_644, "f", blob)])?;
+        let mut parent: Vec<Oid> = Vec::new();
+        for i in 0..(HARD_MAX_COUNT + 20) {
+            let commit = repo.commit(
+                tree,
+                &parent,
+                &format!("c{i}"),
+                1_000 + i64::try_from(i).unwrap_or(0),
+            )?;
+            parent = vec![commit];
+        }
+        repo.set_ref("refs/heads/main", parent[0])?;
+        repo.head_branch("main")?;
+        let mut o = opts("HEAD");
+        o.max_count = 1_000_000;
+        let opened = Repo::open(&repo.ws)?;
+        let odb = Odb::new(&opened);
+        let refs = Refs::new(&opened);
+        let result = run(&odb, &refs, &o)?;
+        // Die Byte-Obergrenze der Ausgabe greift vor der Zahlgrenze: nie mehr als erlaubt, und ehrlich gekürzt.
+        assert!(result.commits.len() <= HARD_MAX_COUNT && result.commits.len() > 50);
+        assert!(
+            matches!(result.reason, Some("output_limit" | "max_count")),
+            "{:?}",
+            result.reason
+        );
+        assert!(result.truncated);
         Ok(())
     }
 

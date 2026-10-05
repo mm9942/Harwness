@@ -77,6 +77,10 @@ pub struct StatusOpts {
     pub spec: Pathspec,
     /// Frist.
     pub deadline: Instant,
+    /// Höchstzahl besuchter Verzeichniseinträge (Standard [`MAX_VISITED`]).
+    pub max_visited: usize,
+    /// Höchstzahl Untracked-/Ignored-Einträge (Standard [`MAX_ENTRIES`]).
+    pub max_entries: usize,
 }
 
 /// Ergebnis von [`compute`].
@@ -137,6 +141,8 @@ struct Walker<'a> {
     mode: Untracked,
     want_ignored: bool,
     visited: usize,
+    max_visited: usize,
+    max_entries: usize,
     deadline: Instant,
     stop: Option<&'static str>,
 }
@@ -193,9 +199,9 @@ impl Walker<'_> {
         if self.stop.is_some() {
             return false;
         }
-        if self.visited > MAX_VISITED {
+        if self.visited > self.max_visited {
             self.stop = Some("visit_limit");
-        } else if found.untracked.len() + found.ignored.len() > MAX_ENTRIES {
+        } else if found.untracked.len() + found.ignored.len() > self.max_entries {
             self.stop = Some("entry_limit");
         } else if Instant::now() > self.deadline {
             self.stop = Some("timeout");
@@ -332,6 +338,8 @@ pub fn compute(
             },
             want_ignored: opts.ignored,
             visited: 0,
+            max_visited: opts.max_visited,
+            max_entries: opts.max_entries,
             deadline: opts.deadline,
             stop: None,
         };
@@ -361,6 +369,8 @@ mod tests {
             ignored,
             spec: Pathspec::all(),
             deadline: Instant::now() + Duration::from_secs(30),
+            max_visited: MAX_VISITED,
+            max_entries: MAX_ENTRIES,
         }
     }
 
@@ -562,6 +572,51 @@ mod tests {
         repo.write(".env", b"TOKEN=new-secret\n")?;
         let status = run(&repo, &opts(Untracked::No, false))?;
         assert_eq!(summary(&status.unstaged), vec![(".env".into(), 'M')]);
+        Ok(())
+    }
+
+    #[test]
+    fn walk_limits_stop_with_a_reason() -> TestResult {
+        let repo = TestRepo::new()?;
+        repo.commit_files(BASE, &[], "init", 1)?;
+        for i in 0..20 {
+            repo.write(&format!("many/f{i:02}.txt"), b"x")?;
+        }
+        let mut options = opts(Untracked::All, false);
+        options.max_visited = 5;
+        assert_eq!(run(&repo, &options)?.incomplete, Some("visit_limit"));
+        let mut options = opts(Untracked::All, false);
+        options.max_entries = 3;
+        let status = run(&repo, &options)?;
+        assert_eq!(status.incomplete, Some("entry_limit"));
+        assert!(status.untracked.len() <= 4);
+        assert_eq!(run(&repo, &opts(Untracked::All, false))?.incomplete, None);
+        Ok(())
+    }
+
+    #[test]
+    fn only_valid_nested_repositories_are_opaque() -> TestResult {
+        let repo = TestRepo::new()?;
+        repo.commit_files(BASE, &[], "init", 1)?;
+        // unvollständiges `.git`: kein Repository, Dateien werden einzeln gezeigt
+        std::fs::create_dir_all(repo.ws.join("fake/.git"))?;
+        repo.write("fake/x.rs", b"x")?;
+        // vollständiges `.git`-Verzeichnis
+        for part in ["objects", "refs"] {
+            std::fs::create_dir_all(repo.ws.join("real/.git").join(part))?;
+        }
+        repo.write("real/.git/HEAD", b"ref: refs/heads/main\n")?;
+        repo.write("real/y.rs", b"y")?;
+        // `.git`-Datei mit gitdir-Zeile (Worktree/Submodul)
+        repo.write("linked/.git", b"gitdir: /elsewhere\n")?;
+        repo.write("linked/z.rs", b"z")?;
+        repo.write("junkfile/.git", b"garbage")?;
+        repo.write("junkfile/w.rs", b"w")?;
+        let status = run(&repo, &opts(Untracked::All, false))?;
+        assert_eq!(
+            names(&status.untracked),
+            vec!["fake/x.rs", "junkfile/w.rs", "linked/", "real/"]
+        );
         Ok(())
     }
 

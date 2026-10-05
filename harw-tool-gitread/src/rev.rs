@@ -359,6 +359,8 @@ mod tests {
                 assert!(r.object(bad).is_err(), "{bad:?} must fail");
             }
             assert!(r.commit(&format!("{}", r.object("HEAD^{tree}")?)).is_err());
+            let error = r.object("HEAD~1000000").err().unwrap_or_default();
+            assert!(error.contains("exceeds the limit"), "{error}");
             let long = "a".repeat(MAX_SPEC_BYTES + 1);
             assert!(r.object(&long).is_err());
             Ok(())

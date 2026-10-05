@@ -127,6 +127,8 @@ pub fn run_status(root: &Path, args: &StatusArgs) -> ToolOutput {
                 ignored: flag(args.ignored),
                 spec,
                 deadline: deadline(),
+                max_visited: status::MAX_VISITED,
+                max_entries: status::MAX_ENTRIES,
             },
         )?;
         let name = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
