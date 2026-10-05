@@ -1,4 +1,5 @@
 use super::*;
+use crate::CommandOutput;
 use harw_job::{FsJobRecordStore, LinuxExecutor};
 
 harw_test_support::define_test_error!(pub(crate));
@@ -184,4 +185,28 @@ fn is_zombie(pid: i32) -> bool {
             .next()
             .is_some_and(|rest| rest.trim_start().starts_with('Z'))
     })
+}
+
+#[tokio::test]
+async fn a_started_command_writes_its_output_to_files_and_reports_its_pid() -> TestResult {
+    let root = dir("start")?;
+    let port = port(&root)?;
+    let (out, err) = (root.join("out.log"), root.join("err.log"));
+    let mut request = sh(
+        "echo to-out; echo to-err >&2; exit 4",
+        Duration::from_secs(20),
+    );
+    request.output = CommandOutput::Files {
+        stdout: out.clone(),
+        stderr: err.clone(),
+    };
+    let started = port.start(request).await.map_err(TestError::Unexpected)?;
+    assert!(started.pid.is_some(), "{started:?}");
+    let outcome = started.done.await;
+    assert_eq!(outcome.end, CommandEnd::Exited, "{outcome:?}");
+    assert_eq!(outcome.exit_code, 4);
+    assert_eq!(std::fs::read(&out).map_err(ctx("out"))?, b"to-out\n");
+    assert_eq!(std::fs::read(&err).map_err(ctx("err"))?, b"to-err\n");
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }

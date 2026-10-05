@@ -1130,6 +1130,24 @@ impl Executor for LinuxExecutor {
         }
         // 4. spawn → pidfd → cgroup attach
         let mut command = launch.command();
+        if let Some(files) = &ctx.output_files {
+            let open = |path: &Path| {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map(Stdio::from)
+                    .map_err(|error| RuntimeError::Os {
+                        operation: "open output file",
+                        detail: format!("{}: {error}", path.display()),
+                    })
+            };
+            command
+                .stdout(open(&files.stdout)?)
+                .stderr(open(&files.stderr)?);
+        }
         let spawned = match cgroup {
             Some((backend, handle)) => {
                 let backend: Arc<dyn CgroupBackend> = backend;
@@ -1451,6 +1469,7 @@ mod tests {
             runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
             lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
+            output_files: None,
         })
     }
 
@@ -1545,6 +1564,7 @@ mod tests {
             runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
             lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
+            output_files: None,
         };
         assert_eq!(cgroup_name(&context), "harw-job-job_1.x-e2");
         Ok(())

@@ -25,6 +25,17 @@ use tokio::sync::mpsc;
 
 use super::error::RuntimeError;
 
+/// Files the attempt's standard output and error are appended to instead of
+/// pipes (no frames, no captured head/tail). For jobs whose output outlives
+/// the submitting process, such as a background job's `stdout.log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputFiles {
+    /// Standard output is appended here.
+    pub stdout: PathBuf,
+    /// Standard error is appended here.
+    pub stderr: PathBuf,
+}
+
 /// Everything an executor needs to know about the attempt besides the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptContext {
@@ -40,6 +51,8 @@ pub struct AttemptContext {
     pub lease_epoch: u64,
     /// Absolute workspace root; `JobSpec::working_dir` is relative to it.
     pub workspace_root: PathBuf,
+    /// Where output goes instead of pipes, when the submitter asked for files.
+    pub output_files: Option<OutputFiles>,
 }
 
 /// What happened to a running attempt.

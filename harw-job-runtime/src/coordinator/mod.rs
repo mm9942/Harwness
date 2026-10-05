@@ -53,7 +53,7 @@ pub use darwin::DarwinExecutor;
 pub use error::RuntimeError;
 pub use executor::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
-    Executor, Probe, StartedAttempt, check_requirement, requests_resource_limits,
+    Executor, OutputFiles, Probe, StartedAttempt, check_requirement, requests_resource_limits,
     unsandboxed_report,
 };
 pub use frames::{DEFAULT_FRAME_BUFFER, FrameEvent, JobFrame, JobFrames};
