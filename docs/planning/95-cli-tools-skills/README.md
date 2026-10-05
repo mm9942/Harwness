@@ -153,9 +153,9 @@ store.
 | Cycle | Content | Decision needed |
 |---|---|---|
 | **S0** | This plan | no |
-| **S1** | Manifest fields (`when`, `[triggers]`), parser and index in `harw-catalog`; `select(event, budget)` as a pure function with dedupe and budget; unit tests; no runtime wiring | no |
+| **S1** | Optional `triggers.toml` (`when`, `[triggers]`), parser and index in `harw-catalog`; `select(event, budget)` as a pure function with dedupe and budget; unit tests; no runtime wiring | no |
 | **S2** | `harw skill list|show|preview|validate` on top of S1 | no |
-| **S3** | Wire L0 (budgeted catalog lines) and L1 (task-text and tool-result triggers) into the runtime assembly and turn loop; injection events | where fragments are placed relative to compaction |
+| **S3** | Wire L0 and L1 into `assemble_round_request` as `Fragment`s (section `skills.triggered`, `Stability::Fresh`), fed by new history items; injection events | after a compaction the dedupe state is reset for dropped items |
 | **S4** | Tool -> skill link in the registry; first-use trigger; usage skills for the common-command tools | depends on #89 |
 | **S5** | `harw tool list|describe|call` and generated docs/completions | depends on #89 |
 | **S6** | CLI rules and the clap-tree test; `--json` gaps closed | which old spellings stay |
@@ -167,15 +167,91 @@ Each cycle: own branch and PR, tests without `unwrap`/`panic`, a mutation check
 on every budget and trust check, `xtask gates` green, an honest note on what
 ran against a fake provider and what against a real model.
 
-## 5. Decisions for the owner
+## 5. Decisions for the owner — checked against the code
 
-1. Budgets: per turn 4 KiB / per session 16 KiB / L0 1.5 KiB as defaults, or
-   different for local small-context models?
-2. Should L1 be on by default, or opt-in per agent definition first?
-3. May `skill import` accept the `SKILL.md` format (Claude Code / Mistral
-   Vibe), and from which locations?
-4. A model-ranked second stage: wanted at all, or deterministic only?
-5. Which old CLI spellings must keep working (S6)?
+Each answer below was re-derived from the code on `dev@ee1bb10`, not assumed.
+
+**5.1 Budgets.** Measured on the 75 bundled skills: median 4.7 KiB, p90 8.9 KiB,
+max 16.7 KiB; 46 of 75 are larger than 4 KiB; median 5 `##` sections, so one
+section is about 1 KiB. Whole-skill injection under a 4 KiB turn cap would
+therefore fit only a third of the skills, section injection fits nearly all.
+Decision: **inject a section, never the whole skill**, per turn 4 KiB, per
+session 16 KiB, L0 1.5 KiB as defaults. The caps must not be a second budget
+system: the context assembly already has `ContextBudgetSpec` with per-section
+budgets that can only be tightened (`harw-context`), and the 32k fallback window
+(`child_controller`) shows small local windows exist. So the skill section gets
+its own context section `skills.triggered` with a per-section budget derived from
+the window (about 3 % of it, clamped to 1-4 KiB per turn), and the session cap
+is the only extra state.
+
+**5.2 L1 on by default?** Where it goes matters more than the switch. The
+system prompt and bound skills are `instruction_fragments`, a plain `Vec<String>`
+that is part of the cache-stable prefix; changing it mid-session would break
+provider prompt caching. Per-turn material goes through `gather_context`, which
+runs in `assemble_round_request` **every model round** and yields typed
+`harw_context::Fragment`s (trust class, `Stability`, section). So L1 is a
+`Fragment` with `Stability::Fresh` in the per-turn context, after the stable
+prefix. Trust class: bundled and trusted-layer skills `Instruction` (as bound
+skills already are), skills imported from outside `Evidence`. Decision:
+**on by default for bundled skills, off for imported ones**, with a config switch.
+
+**5.3 Where the trigger logic lives.** `ContextProvider::contribute` receives only
+`TurnInputContext {session_id, turn_id, metadata}`: no history and no tool
+results, and `TurnObserver` has only turn start/stop. A provider therefore
+cannot see "the compiler just printed E0505". The injector must be core code in
+`assemble_round_request` (which has the session and its history), fed by the new
+history items since the last round (user text, tool results). S3 is scoped to
+that, not to a context-provider plug-in.
+
+**5.4 Manifest compatibility.** `SkillToml` is `#[serde(deny_unknown_fields)]`
+(`harw-config/src/skill_toml.rs`) and `SkillIndex` skips a skill whose manifest
+does not parse. Adding `when`/`[triggers]` to `skill.toml` would make every skill
+that uses them **disappear on an older `harw`**, and the field evidence shows
+mixed versions on one tailnet (a thin node with an older binary). Decision:
+triggers live in an **optional `triggers.toml` next to `skill.toml`**, which older
+builds never read. `when` stays optional there; the L0 line falls back to the
+first sentence of `description` (the bundled descriptions already start with
+"Use when ...", median 278 characters, so the L0 limit is 160 characters, the
+existing `SHORT_DESCRIPTION_CHARS`, not 120). S9 can derive many triggers
+mechanically: the descriptions name error codes such as `E0505`.
+
+**5.5 `SKILL.md` import.** The loader today reads `skill.toml` +
+`instructions_file` with a 512 KiB cap and symlink/traversal protection; nothing
+parses front matter. Import is a pure converter (front matter to `skill.toml`,
+body to `instructions.md`) that writes into a layer directory; it adds no new
+loading path, so the existing protections apply unchanged. Decision: **yes, as an
+explicit `harw skill import`**, never auto-discovered from other tools'
+directories.
+
+**5.6 Model-ranked second stage.** No. The deterministic stage has no model call,
+which keeps the per-round cost at zero and the result reproducible in
+`harw skill preview`. Revisit only if `harw skill stats` (S7) shows many missed
+injections.
+
+**5.7 One landscape.** The code already has two layers, and the plan must use
+them instead of adding a third: `harw-operations` (`Operation` trait, surfaces
+`Command` and `ModelTool`, permission tiers, registry, adapters for the TUI,
+channels and model tools; `harw-cli/src/op_bridge.rs::run_operation` already runs
+an operation from the CLI) and the `harw-tool-*` provider crates
+(`ToolProvider`/`ToolExecutor`, sandbox classes). So `harw tool list|describe`
+reads both registries, `harw tool call` goes through `op_bridge` for operations
+and through the sandboxed executor path for provider tools. `harw skill ...`
+should be an operation with a `Command` surface so the TUI gets `/skill` for
+free.
+
+**5.8 CLI rules and old spellings.** `--json` is already a global flag with a
+`Printer`; a command without a JSON form calls `Printer::require_text` and fails
+loudly. The rule is therefore "every command uses `Printer` or `require_text`",
+checked by a test over the clap tree. Old spellings are already governed by
+`docs/cli.md` ("Older spellings"): hidden with a note on stderr
+(`connect`, `lens`, `uia`, `catalog`, `run`, `classify`, `--bottom-up`) and
+permanent aliases (`settings`, `models`, `completion`, `-r`, `HARW_PROFILE`).
+Decision: keep that policy as it is; the clap-tree test exempts `hide = true`
+commands and lists the permanent aliases explicitly.
+
+**Remaining owner decisions:** (a) the 3 % / 1-4 KiB budget rule, (b) L1 on by
+default for bundled skills, (c) the `triggers.toml` file instead of extending
+`skill.toml`. Everything else follows from the code.
 
 ## 6. Not in scope
 
