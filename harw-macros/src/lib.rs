@@ -56,6 +56,12 @@
 //! `harw-tools`, `harw-types` oder dem später gebauten
 //! `harw-dod-warden-proto` ab — alle erzeugten Pfade sind rein textuell.
 //!
+//! [`macro@retention_classes`] declares every class of ephemeral data (logs,
+//! caches, spools) once and derives the `[retention]` config struct, the
+//! `CLASSES` registry and `policy_for` (with the opt-in rule for
+//! security-relevant classes) from that single list. Generated paths are
+//! textual (`::harw_retention::..`).
+//!
 //! # Modulaufbau
 //!
 //! Proc-Macro-Crates dürfen `#[proc_macro*]`-Funktionen nur aus dem Crate-Root
@@ -94,6 +100,7 @@ mod op_args;
 mod operation;
 mod raw_args;
 mod redact;
+mod retention_classes;
 mod schema;
 mod sensor_source;
 mod tool;
@@ -671,6 +678,44 @@ pub fn field(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn metrics(input: TokenStream) -> TokenStream {
     match metrics::expand_metrics(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Declares retention classes once and derives config, registry and policy
+/// resolution from the list.
+///
+/// # Description
+/// Expects `config = <Name>;` followed by one block per class:
+/// `id: ephemeral | security_relevant { dir = <fn path>, name = <matcher>,
+/// max_age_secs = <n|none>, max_bytes = <n|none>, max_files = <n|none>,
+/// keep_newest = <n> }`. `name` is `any`, `prefix("..")`, `suffix("..")`,
+/// `contains("..")` or `prefix_suffix("..", "..")`; `dir` is a `fn(&::harw_retention::Roots) ->
+/// Vec<PathBuf>`. Expands (in the calling module) to the config struct
+/// (`serde(default, deny_unknown_fields)`, one `ClassConfig` per class),
+/// `pub static CLASSES`, `policy_for` and `resolve_all`. Security-relevant
+/// classes resolve to `enabled = false` unless config says `enabled = true`.
+/// See the `retention_classes` module docs for the full grammar.
+///
+/// # Compile-Fehler bei
+/// - doppelter Klassen-ID, unbekannter Art/Matcher/Schlüssel;
+/// - fehlendem Pflichtschlüssel (`dir`, `name`, `max_age_secs`, `max_bytes`,
+///   `max_files`) oder einem Limit von `0`.
+///
+/// # Examples
+/// ```ignore
+/// harw_macros::retention_classes! {
+///     config = RetentionConfig;
+///     tui_log: ephemeral {
+///         dir = tui_log_dirs, name = prefix("tui"),
+///         max_age_secs = 1_209_600, max_bytes = none, max_files = 5,
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn retention_classes(input: TokenStream) -> TokenStream {
+    match retention_classes::expand_retention_classes(input.into()) {
         Ok(ts) => ts.into(),
         Err(err) => err.to_compile_error().into(),
     }

@@ -216,8 +216,9 @@ fn input(session: &SessionId, text: &str) -> TurnInput {
 
 fn driver_over(core: Arc<FakeCore>) -> Result<(Arc<CoreTurnDriver>, tempfile::TempDir), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let driver = CoreTurnDriver::with_runtime(CoreDriverConfig::new(dir.path().to_path_buf()), core)
-        .map_err(|e| e.to_string())?;
+    let driver =
+        CoreTurnDriver::with_runtime(CoreDriverConfig::new(dir.path().to_path_buf()), core)
+            .map_err(|e| e.to_string())?;
     Ok((Arc::new(driver), dir))
 }
 
@@ -249,7 +250,10 @@ async fn normal_turn_streams_events_and_completes() -> TestResult {
         events[0]
     );
     ensure!(
-        matches!(events[1], DriverEvent::Turn(TurnEvent::TurnCompleted { .. })),
+        matches!(
+            events[1],
+            DriverEvent::Turn(TurnEvent::TurnCompleted { .. })
+        ),
         "second event {:?}",
         events[1]
     );
@@ -321,9 +325,7 @@ async fn a_dropped_cancel_sender_does_not_cancel_the_turn() -> TestResult {
     let (tx, rx) = cancel_pair();
     drop(tx);
 
-    let outcome = driver
-        .run_turn(input(&session, "hi"), rx, sink)
-        .await?;
+    let outcome = driver.run_turn(input(&session, "hi"), rx, sink).await?;
     ensure!(outcome == TurnOutcome::Completed, "outcome {outcome:?}");
     Ok(())
 }

@@ -217,9 +217,11 @@ pub mod learn;
 // Live-Stand der aufgelösten Konfiguration (Spiegel gelungener Persistenz).
 pub mod live_config;
 // Live-Übernahme von Modellwechseln (Provider-Neubau, Rollenwahl).
+pub mod learning_job;
 pub mod live_model;
 pub mod matrix;
 pub mod memory;
+pub mod memory_job;
 pub mod mode;
 pub mod model;
 pub mod models;
@@ -236,6 +238,7 @@ pub mod provider;
 pub mod ps;
 pub mod quit;
 pub mod research;
+pub mod retention_job;
 pub mod retry;
 pub mod review;
 pub mod sandbox_lease;

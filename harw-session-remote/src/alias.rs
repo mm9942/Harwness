@@ -131,11 +131,7 @@ pub fn validate_record(record: &HostAlias) -> Result<(), RemoteError> {
     }
     if let Some(path) = endpoint.strip_prefix("unix:") {
         let path = Path::new(path);
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-        {
+        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(state_err(
                 "invalid endpoint",
                 "unix endpoint must be an absolute path without '..'",

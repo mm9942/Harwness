@@ -1096,6 +1096,9 @@ impl TurnControl {
 pub struct TurnInput {
     /// Optionaler User-Text, der zu Beginn in den Verlauf gespielt wird.
     pub user_text: Option<String>,
+    /// Gespeicherte Bilder, die mit dem User-Text in dieselbe Nachricht gehen
+    /// (siehe `harw-media`). Leer = kein Bild.
+    pub user_images: Vec<harw_protocol::MediaRef>,
     /// Metadaten, die dem `TurnInputContext` mitgegeben werden.
     pub metadata: serde_json::Value,
     /// Steuerblock (Abbruch, Grenzwerte, Uhr, Zähler) dieses Turns.
@@ -1107,9 +1110,23 @@ impl TurnInput {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             user_text: Some(text.into()),
+            user_images: Vec::new(),
             metadata: serde_json::Value::Null,
             control: TurnControl::new(),
         }
+    }
+
+    /// Hängt gespeicherte Bilder an die User-Nachricht dieses Turns. Die
+    /// Bilder müssen im Medienspeicher liegen, den die Laufzeit mit
+    /// [`crate::install_media_source`] eingerichtet hat; sonst nennt der
+    /// Provider sie im Text als nicht gesendet.
+    #[must_use]
+    pub fn with_images(
+        mut self,
+        images: impl IntoIterator<Item = harw_protocol::MediaRef>,
+    ) -> Self {
+        self.user_images.extend(images);
+        self
     }
 
     /// Replaces the control block of this input.
@@ -2995,7 +3012,7 @@ fn deliver_round_boundary(session: &mut AgentSession) {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ImageUrl { .. } => None,
+                ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
             })
             .collect();
         (!text.trim().is_empty()).then_some(text)
@@ -3420,7 +3437,8 @@ async fn run_turn_with_approvals(
     // Hydrate it before appending the new user item so the model sees the
     // complete transcript and the live session remains the single append
     // authority for the rest of this turn.
-    if input.user_text.is_some() && session.history().is_empty() {
+    let has_user_input = input.user_text.is_some() || !input.user_images.is_empty();
+    if has_user_input && session.history().is_empty() {
         let history = match store.load_history(session.id()).await {
             Ok(history) => history,
             Err(error) => {
@@ -3433,8 +3451,15 @@ async fn run_turn_with_approvals(
     }
 
     // User-Input in den Verlauf spielen und persistieren.
-    if let Some(text) = input.user_text {
-        session.history_mut().push_user_text(text);
+    if has_user_input {
+        let text = input.user_text.unwrap_or_default();
+        if input.user_images.is_empty() {
+            session.history_mut().push_user_text(text);
+        } else {
+            session
+                .history_mut()
+                .push_user_message(text, input.user_images);
+        }
         if let Err(error) = persist_last(session, store).await {
             transition_after_turn_failure(session, &ctx, &error);
             return Err(error);
@@ -5289,6 +5314,7 @@ async fn drive_turn(
     // Projektgedächtnis: alle Tool-Ergebnisse dieses Turns wurden bereits
     // über `notify_tool_outcome` gemeldet; hier, am erfolgreichen Turn-Ende,
     // erfährt der Beobachter, dass die Runde abgeschlossen ist.
+    crate::turn_feedback::notify_turn_texts(session);
     if let Some(observer) = session.tool_outcome_observer().cloned() {
         observer.on_turn_finished(session.id());
     }
@@ -5602,6 +5628,12 @@ async fn assemble_round_request(
         .or(session.max_output_tokens())
         .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
 
+    // Kontext-Ledger: die Fakten der gesammelten Fragmente festhalten, bevor
+    // die Montage sie verbraucht (nur wenn ein Ledger registriert ist).
+    let ledger_facts = session
+        .context_ledger()
+        .map(|_| crate::context_ledger_hook::snapshot(&fragments));
+
     // 4. Model-Call (provider-neutral).
     let request = ModelRequest::with_context_program(
         instructions,
@@ -5619,6 +5651,15 @@ async fn assemble_round_request(
     .with_max_output_tokens(max_output_tokens)
     .with_cancel_token(control.cancel_token().clone())
     .with_identity(request_identity(session));
+    if let (Some(ledger), Some(facts)) = (session.context_ledger(), ledger_facts.as_deref()) {
+        crate::context_ledger_hook::record_turn(
+            ledger.as_ref(),
+            session.id().as_str(),
+            turn_id.as_str(),
+            facts,
+            &request.context_assembly,
+        );
+    }
     Ok(match stream_sink_for_round(session, turn_id, total_usage) {
         Some(sink) => request.with_stream_sink(sink),
         None => request,
@@ -10056,6 +10097,126 @@ mod tests {
                 .pop_front();
             Box::pin(async move { next.ok_or(crate::model::ModelError::EmptyResponse) })
         }
+    }
+
+    #[tokio::test]
+    async fn an_attached_image_reaches_the_model_request_with_its_bytes() -> TestResult {
+        use harw_media::MemorySource;
+        let source = std::sync::Arc::new(MemorySource::new());
+        crate::media::install_media_source(source.clone());
+        let png = {
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut out = u32::try_from(data.len())
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out
+            };
+            let mut ihdr = 12u32.to_be_bytes().to_vec();
+            ihdr.extend_from_slice(&9u32.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+            out.extend_from_slice(&chunk(b"IDAT", b"turn-loop-image"));
+            out.extend_from_slice(&chunk(b"IEND", b""));
+            out
+        };
+        let media = source
+            .put(&png)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("a small image")]);
+
+        run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("what is this?").with_images([media.clone()]),
+        )
+        .await
+        .map_err(ctx("turn with an image"))?;
+
+        let requests = model.take_requests();
+        let first = requests
+            .first()
+            .ok_or(TestError::Missing("model request"))?;
+        let Some(crate::ModelMessage::User { text, images }) = first.messages.first() else {
+            return Err(TestError::Unexpected(format!("{:?}", first.messages)));
+        };
+        assert_eq!(text, "what is this?");
+        assert_eq!(images.len(), 1);
+        let image = images.first().ok_or(TestError::Missing("image"))?;
+        assert_eq!(image.media, media);
+        assert!(image.bytes().is_some_and(|b| b.starts_with(b"\x89PNG")));
+        // The persisted transcript holds the reference, not the pixels.
+        let stored = serde_json::to_string(session.history())
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(stored.contains("\"type\":\"media\""));
+        assert!(!stored.contains("turn-loop-image"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_image_without_text_starts_a_turn_too() -> TestResult {
+        use harw_media::MemorySource;
+        let source = std::sync::Arc::new(MemorySource::new());
+        crate::media::install_media_source(source.clone());
+        let png = {
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut out = u32::try_from(data.len())
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out
+            };
+            let mut ihdr = 5u32.to_be_bytes().to_vec();
+            ihdr.extend_from_slice(&5u32.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+            out.extend_from_slice(&chunk(b"IDAT", b"image-only"));
+            out.extend_from_slice(&chunk(b"IEND", b""));
+            out
+        };
+        let media = source
+            .put(&png)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("ok")]);
+        let input = TurnInput {
+            user_images: vec![media],
+            ..TurnInput::default()
+        };
+        run_turn(&mut session, &model, &store, input)
+            .await
+            .map_err(ctx("image-only turn"))?;
+        let requests = model.take_requests();
+        let Some(crate::ModelMessage::User { text, images }) = requests
+            .first()
+            .and_then(|request| request.messages.first())
+        else {
+            return Err(TestError::Missing("user message"));
+        };
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]

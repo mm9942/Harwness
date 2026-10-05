@@ -177,6 +177,51 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// # Errors
 /// [`BugReportError::Io`] bei Verzeichnis-/Schreibfehlern.
 pub fn write_bug_report(home: &Path, report: &BugReport) -> Result<PathBuf, BugReportError> {
+    write_bug_report_with_retention(home, report, &harw_retention::RetentionConfig::default())
+}
+
+/// Zeitbudget für das Aufräumen nach dem Schreiben (Klasse `bug_reports`).
+const PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Wie [`write_bug_report`], begrenzt danach aber das Verzeichnis über die
+/// Retention-Klasse `bug_reports` aus `retention` (Alter/Anzahl/Bytes).
+///
+/// Das Aufräumen läuft erst nach erfolgreichem Schreiben, ist zeitbegrenzt
+/// und best effort: ein Fehler dort lässt das Schreiben nie scheitern, und
+/// der soeben geschriebene Report ist der neueste und bleibt (`keep_newest`).
+///
+/// # Errors
+/// [`BugReportError::Io`] bei Verzeichnis-/Schreibfehlern; [`BugReportError::InvalidId`].
+pub fn write_bug_report_with_retention(
+    home: &Path,
+    report: &BugReport,
+    retention: &harw_retention::RetentionConfig,
+) -> Result<PathBuf, BugReportError> {
+    let path = write_bug_report_file(home, report)?;
+    prune_bug_reports(home, retention);
+    Ok(path)
+}
+
+fn prune_bug_reports(home: &Path, retention: &harw_retention::RetentionConfig) {
+    let Some(class) = harw_retention::policy_for(retention, "bug_reports") else {
+        return;
+    };
+    if !class.enabled {
+        return;
+    }
+    let roots = harw_retention::Roots {
+        home: home.to_path_buf(),
+        project: None,
+    };
+    let _ = class.sweep(
+        &roots,
+        harw_retention::SweepMode::Apply,
+        Some(std::time::Instant::now() + PRUNE_BUDGET),
+        SystemTime::now(),
+    );
+}
+
+fn write_bug_report_file(home: &Path, report: &BugReport) -> Result<PathBuf, BugReportError> {
     let dir = harw_home::paths::bug_report_dir(home);
     std::fs::create_dir_all(&dir)?;
     if report.id.is_empty()
@@ -414,6 +459,34 @@ mod tests {
         assert!(content.contains("Run `harw chat` then type a long message."));
         assert!(content.contains("stderr: thread panicked at ..."));
         assert!(content.contains("Task category: coding"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_bug_report_caps_directory_and_keeps_newest() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut cfg = harw_retention::RetentionConfig::default();
+        cfg.bug_reports.max_files = Some(3);
+        let dir = harw_home::paths::bug_report_dir(tmp.path());
+        std::fs::create_dir_all(&dir).map_err(ctx("mkdir"))?;
+        let old = SystemTime::now() - std::time::Duration::from_secs(3_600);
+        for n in 0..6_u64 {
+            let file = std::fs::File::create(dir.join(format!("old-{n}.md")))
+                .map_err(ctx("create old"))?;
+            file.set_modified(old + std::time::Duration::from_secs(n))
+                .map_err(ctx("mtime"))?;
+        }
+        let report = sample_report("bug-new-0001");
+        let path = write_bug_report_with_retention(tmp.path(), &report, &cfg)
+            .map_err(ctx("write succeeds"))?;
+        assert!(path.exists(), "the fresh report must survive pruning");
+        let count = std::fs::read_dir(&dir)
+            .map_err(ctx("readdir"))?
+            .flatten()
+            .count();
+        assert_eq!(count, 3);
+        assert!(dir.join("old-5.md").exists());
+        assert!(!dir.join("old-0.md").exists());
         Ok(())
     }
 

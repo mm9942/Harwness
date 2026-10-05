@@ -89,6 +89,12 @@ fn test_field_table_exhaustive_harness_config() {
         shell: _,
         // `[jobs]`, eigener Abschnittstest unten.
         jobs: _,
+        // `[memory]`, eigener Abschnittstest unten.
+        memory: _,
+        // `[retention]`, eigener Abschnittstest unten.
+        retention: _,
+        // `[session_listener]`, eigener Abschnittstest unten.
+        session_listener: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -306,11 +312,66 @@ fn test_field_table_exhaustive_tools_section() {
     // Unterfelder, s. die folgenden Tests). Die Destrukturierung sichert
     // dennoch zu, dass ein kuenftiges zweites `[tools.*]`-Geschwisterfeld
     // (z. B. `[tools.search]`) hier einen Compile-Fehler ausloest.
-    let ToolsSection { plan, doc } = ToolsSection::default();
-    let _ = (plan, doc);
+    let ToolsSection {
+        plan,
+        doc,
+        container,
+    } = ToolsSection::default();
+    let _ = (plan, doc, container);
 }
 
 // [tools.doc] (Abschnitt 1.8a, 1 Feld)
+// [session_listener] (6 Felder, alle global-only)
+#[test]
+fn test_field_table_exhaustive_session_listener_section() {
+    let harw_config::SessionListenerSection {
+        enabled,
+        listen,
+        allow_non_loopback,
+        node_id,
+        tier,
+        approval_device,
+    } = harw_config::SessionListenerSection::default();
+    let _ = (
+        enabled,
+        listen,
+        allow_non_loopback,
+        node_id,
+        tier,
+        approval_device,
+    );
+    for field in [
+        "enabled",
+        "listen",
+        "allow_non_loopback",
+        "node_id",
+        "tier",
+        "approval_device",
+    ] {
+        assert_path_in_field_table_exactly_once(&format!("session_listener.{field}"));
+    }
+}
+
+// [tools.container] (4 Felder, alle global-only)
+#[test]
+fn test_field_table_exhaustive_container_section() {
+    let harw_config::ContainerToolsSection {
+        enabled,
+        engine,
+        connection,
+        images,
+    } = harw_config::ContainerToolsSection::default();
+    let _ = (enabled, engine, connection, images);
+    for path in [
+        "tools.container.enabled",
+        "tools.container.engine",
+        "tools.container.connection",
+        "tools.container.images",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
 #[test]
 fn test_field_table_exhaustive_doc_section() {
     let harw_config::DocSection { remote_ocr } = harw_config::DocSection::default();
@@ -751,6 +812,94 @@ fn test_field_table_exhaustive_jobs_toml() {
         harw_config::harness_config::JobsToml::default();
     let _ = max_running;
     assert_path_in_field_table_exactly_once("jobs.max_running");
+}
+
+// ---------------------------------------------------------------------
+// [memory] (11 Felder) — Projektgedächtnis
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_memory_section() {
+    let harw_config::MemorySection {
+        enabled,
+        global_enabled,
+        token_budget,
+        max_facts,
+        max_body_bytes,
+        max_unused_days,
+        consolidate_deadline_secs,
+        forget_deadline_secs,
+        promote_deadline_secs,
+        sweep_deadline_secs,
+        context_ledger,
+        security_signals,
+        llm_extraction,
+    } = harw_config::MemorySection::default();
+    let _ = (
+        enabled,
+        global_enabled,
+        token_budget,
+        max_facts,
+        max_body_bytes,
+        max_unused_days,
+        consolidate_deadline_secs,
+        forget_deadline_secs,
+        promote_deadline_secs,
+        sweep_deadline_secs,
+        context_ledger,
+        security_signals,
+        llm_extraction,
+    );
+    for path in [
+        "memory.enabled",
+        "memory.global_enabled",
+        "memory.token_budget",
+        "memory.max_facts",
+        "memory.max_body_bytes",
+        "memory.max_unused_days",
+        "memory.consolidate_deadline_secs",
+        "memory.forget_deadline_secs",
+        "memory.promote_deadline_secs",
+        "memory.sweep_deadline_secs",
+        "memory.context_ledger",
+        "memory.security_signals",
+        "memory.llm_extraction",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// [retention] (je Klasse 5 Felder) — Aufbewahrung flüchtiger Daten
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_retention_section() {
+    // Die Klassentabelle ist die einzige Quelle: jede deklarierte Klasse
+    // braucht genau die fünf Pfade `retention.<klasse>.<schluessel>`.
+    let harw_config::RetentionClassToml {
+        enabled,
+        max_age_secs,
+        max_bytes,
+        max_files,
+        keep_newest,
+    } = harw_config::RetentionClassToml::default();
+    let _ = (enabled, max_age_secs, max_bytes, max_files, keep_newest);
+    assert_eq!(harw_retention::CLASS_CONFIG_FIELDS.len(), 5);
+    assert_eq!(harw_retention::CLASSES.len(), 10);
+    for class in harw_retention::CLASSES {
+        for field in harw_retention::CLASS_CONFIG_FIELDS {
+            assert_path_in_field_table_exactly_once(&format!("retention.{}.{field}", class.id));
+        }
+    }
+    let retention_paths = FIELD_TABLE
+        .iter()
+        .filter(|f| f.path.starts_with("retention."))
+        .count();
+    assert_eq!(
+        retention_paths,
+        harw_retention::CLASSES.len() * harw_retention::CLASS_CONFIG_FIELDS.len()
+    );
 }
 
 // ---------------------------------------------------------------------

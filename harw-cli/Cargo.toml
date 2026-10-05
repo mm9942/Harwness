@@ -32,6 +32,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
+harw-retention = { path = "../harw-retention" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 # #22 Welle 2B: `harw agent check|build|inspect|…` (der Agenten-Compiler) und
 # das eingebettete Artefakt einer personalisierten harw.
@@ -149,6 +150,17 @@ harw-runtime = { path = "../harw-runtime" }
 harw-protocol = { path = "../harw-protocol" }
 # W00 S09: `harw attach` connects through the session client (SessionPort).
 harw-session-remote = { path = "../harw-session-remote" }
+# Composition root of the opt-in session ingress (`src/session_serve.rs`,
+# `harw gateway --session-socket`): host + production driver + durable
+# adapters on a local Unix socket via the daemon's composition entry.
+harw-session-daemon = { path = "../harw-session-daemon" }
+harw-session-driver = { path = "../harw-session-driver" }
+harw-session-host = { path = "../harw-session-host" }
+# Remote ingress composition (`src/session_serve_remote.rs`): node transport
+# + own-cloud listener on a TCP socket, separate host and tier.
+harw-node-listener = { path = "../harw-node-listener" }
+harw-node-transport = { path = "../harw-node-transport" }
+harw-session-ws = { path = "../harw-session-ws" }
 
 # `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
 # killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
@@ -163,7 +175,9 @@ harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+# Nur Test: ML-DSA-65-Testschlüssel für die Loopback-Tests des Remote-Ingress.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # Nur Test: bindet den Hub-Namespace an `HarwKeyPurpose::SecretsKek` (Ring D nur als dev-dependency).
 harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
 

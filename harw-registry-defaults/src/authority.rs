@@ -74,6 +74,7 @@ use crate::capability_catalog::{
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
+use crate::memory_tools::{MEMORY_RECALL, MEMORY_RECORD};
 use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
@@ -662,6 +663,8 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // Runde 7, Teil T2: `latex.template` schreibt Vorlage und Gerüst in
         // den Workspace (kein Prozess) — vor dem `LATEX_TOOLS`-Zweig geprüft.
         || tool == crate::profile::LATEX_TEMPLATE_TOOL
+        // `memory.record` schreibt Fakten (Projekt oder global); nie auto-freigegeben.
+        || tool == MEMORY_RECORD
         || listed(AGENT_DEFINITION_WRITE_TOOLS)
         || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
         || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
@@ -698,6 +701,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // Obsidian vault reads (first four entries of the provider list).
         || listed(OBSIDIAN_READ_TOOLS)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
+        || tool == MEMORY_RECALL
         // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
         // Harness-Artefakt `.harw/plans/<slug>.md` und muss unter der
         // Plan-Decke (ohne `WriteWorkspace`) laufen; die übrigen drei lesen
@@ -715,6 +719,11 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || tool == WORK_DRIVER_STOP_TOOL
     {
         Some(Permission::ReadWorkspace)
+    } else if listed(&CONTAINER_TOOLS) {
+        // `container.images` (read-only listing) and `container.run` (starts a
+        // hardened container): both need the dedicated container right, which
+        // no entry grants by default.
+        Some(Permission::ManageContainers)
     } else if listed(DEPS_SOURCE_TOOLS) {
         Some(Permission::ReadCargoRegistry)
     } else if listed(WEB_TOOLS) || listed(BROWSER_TOOLS) {
@@ -723,6 +732,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         None
     }
 }
+
+/// Names of the container tools (`harw-tool-container-run`); registered by the
+/// runtime only when `[tools.container]` is enabled.
+pub const CONTAINER_TOOLS: [&str; 2] = ["container.images", "container.run"];
 
 /// Das Recht, das ein Capability-Label aus `[authority] capabilities`
 /// benennt (#22 Welle 1B).
@@ -743,6 +756,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
 /// | `secrets.read` | `ReadSecrets` |
 /// | `plugins.manage` | `ManagePlugins` |
 /// | `cargo.registry.read` | `ReadCargoRegistry` |
+/// | `containers.manage`, `container` | `ManageContainers` |
 ///
 /// # Rückgabe
 /// `None` für ein fachliches Label ohne Rechtebezug.
@@ -768,6 +782,8 @@ pub fn capability_permission(label: &str) -> Option<Permission> {
         Some(Permission::ManagePlugins)
     } else if matches("cargo.registry.read") {
         Some(Permission::ReadCargoRegistry)
+    } else if matches("containers.manage") || matches("container") {
+        Some(Permission::ManageContainers)
     } else {
         None
     }
@@ -866,6 +882,22 @@ mod tests {
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
         }
+    }
+
+    #[test]
+    fn test_container_tools_need_the_container_right_and_run_always_asks() {
+        for tool in CONTAINER_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ManageContainers),
+                "{tool}"
+            );
+        }
+        assert!(crate::ALWAYS_ASK_TOOLS.contains(&"container.run"));
+        assert!(
+            !crate::AUTO_APPROVED_TOOLS.contains(&"container.run"),
+            "never auto-approved"
+        );
     }
 
     #[test]

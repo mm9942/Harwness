@@ -79,6 +79,7 @@ fn enroll(registry: &DeviceRegistry, node: &str, device: &str) -> TestResult {
         tier: PermissionTier::Operator,
         revoked: false,
         label: device.to_owned(),
+        approve_optin: false,
     })?;
     Ok(())
 }

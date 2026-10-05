@@ -184,7 +184,7 @@ fn text_of(parts: &[ContentPart]) -> String {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => text.clone(),
-            ContentPart::ImageUrl { .. } => "[image]".to_owned(),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => "[image]".to_owned(),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -796,7 +796,13 @@ mod tests {
         for l in lines {
             let _ = tx.send((*l).to_owned());
         }
-        let _keep = if lines.is_empty() { Some(tx) } else { None };
+        // Non-empty input: close the channel so the loop sees EOF after the last line.
+        let _keep = if lines.is_empty() {
+            Some(tx)
+        } else {
+            drop(tx);
+            None
+        };
         let mut out = Vec::new();
         let port: Arc<dyn SessionPort> = fake;
         let result = attach_loop(port, session.map(SessionId::from_str), rx, &mut out).await;

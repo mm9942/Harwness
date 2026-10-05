@@ -40,8 +40,7 @@ use harw_protocol::approvals::ApprovalKind;
 use harw_protocol::{ApprovalRequest, SessionEvent, TurnEvent};
 use harw_session_host::HostError;
 use harw_session_host::driver::{
-    CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput,
-    TurnOutcome,
+    CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome,
 };
 use harw_session_store::{
     ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, SessionStoreError,
@@ -261,7 +260,9 @@ impl CoreTurnDriver {
         Self::with_runtime(config, Arc::new(runtime))
     }
 
-    fn controls(&self) -> Result<MutexGuard<'_, HashMap<SessionId, TurnControl>>, DriverBridgeError> {
+    fn controls(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<SessionId, TurnControl>>, DriverBridgeError> {
         self.controls
             .lock()
             .map_err(|_| DriverBridgeError::Runtime("turn control table poisoned".to_owned()))
@@ -448,9 +449,15 @@ impl CoreTurnDriver {
             Some(request) => request,
             // Host restart between park and resume: ask the core.
             None => {
-                let parked = self.runtime.parked_approval(session).await?.ok_or_else(|| {
-                    DriverBridgeError::Approval("session is not parked on an approval".to_owned())
-                })?;
+                let parked = self
+                    .runtime
+                    .parked_approval(session)
+                    .await?
+                    .ok_or_else(|| {
+                        DriverBridgeError::Approval(
+                            "session is not parked on an approval".to_owned(),
+                        )
+                    })?;
                 ItemId::from_str(parked.request.id.as_str())
             }
         };
@@ -538,10 +545,17 @@ impl TurnDriver for CoreTurnDriver {
                 // Host restart between park and resume: no live token.
                 None => CancelToken::new(),
             };
+            // The core only accepts the actor bound when it parked; the
+            // resolver (`record.actor`) stays in the durable record as audit.
+            // Who may resolve is decided by the host (caps), not here.
+            let bound = match self.runtime.parked_approval(&session_id).await? {
+                Some(parked) => parked.actor,
+                None => record.actor,
+            };
             let (tx, rx) = mpsc::unbounded_channel();
             let leg = self
                 .runtime
-                .resume_after_approval(&session_id, record.actor, resolution, tx);
+                .resume_after_approval(&session_id, bound, resolution, tx);
             let result = Self::pump(leg, rx, &mut cancel, &token, &sink).await;
             self.settle(&session_id, &sink, result)
                 .await
@@ -641,10 +655,7 @@ impl HarwCoreRuntime {
         }
     }
 
-    fn slots(
-        &self,
-    ) -> Result<MutexGuard<'_, SlotMap>, DriverBridgeError>
-    {
+    fn slots(&self) -> Result<MutexGuard<'_, SlotMap>, DriverBridgeError> {
         self.slots
             .lock()
             .map_err(|_| DriverBridgeError::Runtime("session table poisoned".to_owned()))
@@ -668,9 +679,9 @@ impl HarwCoreRuntime {
         }
         let (event_tx, session_events) = mpsc::unbounded_channel();
         let (turn_tx, turn_events) = mpsc::unbounded_channel();
-        let mut core = self
-            .factory
-            .build(session_id, title, SessionWiring { event_tx, turn_tx })?;
+        let mut core =
+            self.factory
+                .build(session_id, title, SessionWiring { event_tx, turn_tx })?;
         core.session
             .hydrate_from_store(core.store.as_ref())
             .await

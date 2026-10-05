@@ -72,6 +72,7 @@ pub mod config_agents;
 pub mod diary_tools;
 pub mod embedded_agents;
 pub mod kanban_tools;
+pub mod memory_tools;
 pub mod palace_tools;
 pub mod profile;
 pub mod research_web;
@@ -114,6 +115,7 @@ pub use config_agents::{AgentDefinitionMeta, ConfigAgents, discover_run_agent_de
 pub use diary_tools::DiaryToolProvider;
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use kanban_tools::KanbanReadToolProvider;
+pub use memory_tools::MemoryToolProvider;
 pub use palace_tools::PalaceToolProvider;
 pub use profile::{
     AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, JobWiring, RegistryProfile,
@@ -445,6 +447,10 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // Runde 5, Teil K: Abbruch eines eigenen Hintergrund-Agenten — nie
     // automatisch im Auto-Modus (im Voll-Modus fragt nichts).
     "agent.cancel",
+    // Starts a container (isolation is read back from the engine, but the
+    // image, command and workspace access are still the model's choice): an
+    // allow rule never skips the question.
+    "container.run",
     // R18 (D-B): die mutierenden `gateway.*`-Werkzeuge
     // (`profile::GATEWAY_MUTATION_TOOLS`, `model_tool(approval = "always")`)
     // — Widerruf, Draining, Listener, Werkzeug-Freigaben fragen unter
@@ -1138,6 +1144,9 @@ mod tests {
         read_only_surface.extend_from_slice(crate::palace_tools::PalaceToolProvider::TOOL_NAMES);
         // Runde 5, Teil H: `agent.result` liest nur eigene Kind-Ergebnisse.
         read_only_surface.extend_from_slice(crate::profile::CHILD_RESULT_TOOLS);
+        // harw-tool-tunnel-v1: `tunnel.status`/`tunnel.list` lesen nur den Zustand
+        // verwalteter Tunnels des Aufrufers (siehe `AUTO_APPROVED_TOOLS`).
+        read_only_surface.extend_from_slice(&["tunnel.status", "tunnel.list"]);
         // Runde 5, Teil F: `ask_user` liest nur die Antwort der Nutzerin.
         read_only_surface.push(harw_tool_plan::ASK_USER_TOOL);
         // Runde 5 (Integration): `plan.write` schreibt ausschließlich die

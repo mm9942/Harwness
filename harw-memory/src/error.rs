@@ -77,6 +77,17 @@ pub enum MemoryError {
         /// Der ungültige Rohwert.
         value: String,
     },
+    /// Eine konfigurierte Fakt-Obergrenze (`[memory] max_facts` /
+    /// `max_body_bytes`) wurde beim Schreiben überschritten; es wurde
+    /// nichts geschrieben.
+    LimitExceeded {
+        /// Welche Grenze (`"max_facts"`, `"max_body_bytes"`).
+        limit: &'static str,
+        /// Konfigurierter Höchstwert.
+        max: usize,
+        /// Beobachteter bzw. durch den Schreibvorgang entstehender Wert.
+        actual: usize,
+    },
 }
 
 impl fmt::Display for MemoryError {
@@ -115,6 +126,9 @@ impl fmt::Display for MemoryError {
             Self::InvalidEnumValue { field, value } => {
                 write!(f, "fact field {field:?} has invalid value: {value:?}")
             }
+            Self::LimitExceeded { limit, max, actual } => {
+                write!(f, "fact store limit {limit} exceeded: {actual} > {max}")
+            }
         }
     }
 }
@@ -135,7 +149,8 @@ impl std::error::Error for MemoryError {
             | Self::LockContention { .. }
             | Self::FrontmatterInvalid { .. }
             | Self::InvalidFactName { .. }
-            | Self::InvalidEnumValue { .. } => None,
+            | Self::InvalidEnumValue { .. }
+            | Self::LimitExceeded { .. } => None,
         }
     }
 }
