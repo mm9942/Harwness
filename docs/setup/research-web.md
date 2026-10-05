@@ -139,9 +139,11 @@ These are fixed in code and not configurable:
 
 - `https` only; at most 5 redirects, each one re-checked against the policy.
 - 20 s per request, 45 s total deadline per fetch.
-- HTML is reduced to visible text or Markdown (script, style and hidden
-  elements never reach the model); PDFs are extracted as text; output is
-  capped (64 KiB by default).
+- With the default `format` (`text`) or `markdown`, HTML is reduced to
+  visible content (script, style and hidden elements are dropped); PDFs are
+  extracted as text. `format = "raw"` is accepted from the tool arguments and
+  returns the body unchanged, so none of that reduction applies to it. Output
+  is capped (64 KiB by default) in every format.
 - Responses are cached under `<HARW_HOME>/cache/web/`, isolated per tenant and
   workspace scope; a cache hit counts only if its recorded redirect chain
   passes the policy check again.
@@ -178,4 +180,4 @@ not yet have:
   research.
 
 These are the subject of the planning compartment PL-92 (Web Research Fabric,
-draft pull request #104); nothing in it is implemented yet.
+a draft plan); nothing in it is implemented yet.
