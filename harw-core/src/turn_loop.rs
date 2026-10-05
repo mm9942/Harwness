@@ -6602,6 +6602,14 @@ fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError 
 mod tests {
     use super::*;
 
+    #[test]
+    fn delegation_is_async_by_default_and_inline_only_when_explicit() {
+        assert!(!delegation_runs_inline(&serde_json::json!({})));
+        assert!(!delegation_runs_inline(&serde_json::json!({"background": true})));
+        assert!(delegation_runs_inline(&serde_json::json!({"background": false})));
+        assert!(delegation_runs_inline(&serde_json::json!({"wait": true})));
+        assert!(!delegation_runs_inline(&serde_json::json!({"wait": false})));
+    }
     /// Ein Turn-Grenzen-Ende vermerkt die konkrete Grenze mit Wert (statt
     /// „Token-Budget oder Turn-Wächter"); der erste Grund gewinnt.
     #[test]
