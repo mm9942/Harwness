@@ -54,6 +54,7 @@ harw-model-catalog = { path = "../harw-model-catalog" }
 harw-observe = { path = "../harw-observe" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
+harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 harw-project-discovery = { path = "../harw-project-discovery" }

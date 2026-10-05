@@ -199,6 +199,7 @@ pub mod providers {
     provider!(EXPLORE, "explore", "harw-tool-explorer", "tool-explorer");
     provider!(DEPS, "deps", "harw-tool-deps", "tool-deps");
     provider!(LENS, "lens", "harw-tool-lens", "tool-lens");
+    provider!(OBSIDIAN, "obsidian", "harw-tool-obsidian", "tool-obsidian");
     provider!(WEB, "web", "harw-tool-web", "tool-web");
     provider!(BROWSER, "browser", "harw-tool-browser", "tool-browser");
     provider!(SHELL, "shell", "harw-tool-shell", "tool-shell");
@@ -240,6 +241,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "tool-job",
     "tool-latex",
     "tool-lens",
+    "tool-obsidian",
     "tool-plan",
     "tool-process",
     "tool-shell",
@@ -309,6 +311,12 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("deps.source_list", DEPS, Read),
     // lens
     row!("lens.ask", LENS, Read),
+    // obsidian
+    row!("obsidian.map", OBSIDIAN, Read),
+    row!("obsidian.read", OBSIDIAN, Read),
+    row!("obsidian.search", OBSIDIAN, Read),
+    row!("obsidian.links", OBSIDIAN, Read),
+    row!("obsidian.write", OBSIDIAN, Write),
     // web
     row!("web.fetch", WEB, Network),
     row!("web.docs_rs", WEB, Network),
@@ -548,7 +556,7 @@ mod tests {
     /// (agents, authoring, sudo, latex, matrix, ...) are not listed here.
     #[test]
     fn test_catalog_rows_match_provider_tool_names() -> Result<(), String> {
-        let parity: [(&ToolProvider, &[&[&str]]); 10] = [
+        let parity: [(&ToolProvider, &[&[&str]]); 11] = [
             (
                 &providers::DOC,
                 &[harw_tool_doc::DocToolProvider::TOOL_NAMES],
@@ -564,6 +572,10 @@ mod tests {
             (
                 &providers::LENS,
                 &[harw_tool_lens::LensToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::OBSIDIAN,
+                &[harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES],
             ),
             (
                 &providers::WEB,

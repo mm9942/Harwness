@@ -78,7 +78,8 @@ use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
     BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
-    FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, OBSIDIAN_READ_TOOLS, PROCESS_TOOLS, SHELL_TOOLS,
+    WEB_TOOLS, role_names,
 };
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
@@ -654,6 +655,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
     if tool == "fs.write"
         || tool == "fs.edit"
+        // Obsidian vault writes: `obsidian.write` creates or replaces a note
+        // in the vault (`docs/planning` by default) — same file-level right
+        // as `fs.write`, enforced through the sandbox workspace binding.
+        || tool == harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES[4]
         // Runde 7, Teil T2: `latex.template` schreibt Vorlage und Gerüst in
         // den Workspace (kein Prozess) — vor dem `LATEX_TOOLS`-Zweig geprüft.
         || tool == crate::profile::LATEX_TEMPLATE_TOOL
@@ -690,6 +695,8 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(WorkbenchReadToolProvider::TOOL_NAMES)
         || listed(DiaryToolProvider::TOOL_NAMES)
         || listed(PalaceToolProvider::TOOL_NAMES)
+        // Obsidian vault reads (first four entries of the provider list).
+        || listed(OBSIDIAN_READ_TOOLS)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
         // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
         // Harness-Artefakt `.harw/plans/<slug>.md` und muss unter der
@@ -875,6 +882,16 @@ mod tests {
     fn test_tool_permission_matches_lens_provider_declarations() {
         let names = harw_tool_lens::LensToolProvider::TOOL_NAMES;
         let declared = harw_tool_lens::LensToolProvider::TOOL_PERMISSIONS;
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_tool_permission_matches_obsidian_provider_declarations() {
+        let names = harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES;
+        let declared = harw_tool_obsidian::ObsidianToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
         }
