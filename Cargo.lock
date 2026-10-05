@@ -1997,6 +1997,7 @@ dependencies = [
  "harw-agent-artifact",
  "harw-agent-compiler",
  "harw-agent-dsl",
+ "harw-command",
  "harw-core",
  "harw-home",
  "harw-job-runtime",
@@ -2007,14 +2008,15 @@ dependencies = [
  "harw-types",
  "harwness-sdk",
  "http-body-util",
- "hyper",
  "hyper-util",
- "serde",
+ "hyper",
  "serde_json",
+ "serde",
  "tempfile",
- "tokio",
  "tokio-stream",
+ "tokio",
  "tracing",
+
 ]
 
 [[package]]
@@ -2173,16 +2175,17 @@ name = "harw-cli"
 version = "0.9.1"
 dependencies = [
  "aws-lc-rs",
- "clap",
  "clap_complete",
+ "clap",
  "getrandom 0.4.3",
  "harw-agent-artifact",
  "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
- "harw-channel",
- "harw-channel-telegram",
  "harw-channel-telegram-transport",
+ "harw-channel-telegram",
+ "harw-channel",
+ "harw-command",
  "harw-completions",
  "harw-config",
  "harw-context",
@@ -2197,8 +2200,8 @@ dependencies = [
  "harw-job-store",
  "harw-killer",
  "harw-knowledge",
- "harw-lens",
  "harw-lens-types",
+ "harw-lens",
  "harw-macros",
  "harw-mcp-client",
  "harw-mcp-server",
@@ -2207,14 +2210,14 @@ dependencies = [
  "harw-node-listener",
  "harw-node-transport",
  "harw-oauth",
- "harw-observe",
  "harw-observe-file",
  "harw-observe-otlp",
  "harw-observe-prom",
+ "harw-observe",
  "harw-operations",
  "harw-ops",
- "harw-plan",
  "harw-plan-bridge",
+ "harw-plan",
  "harw-protocol",
  "harw-provider-http",
  "harw-registry-defaults",
@@ -2240,15 +2243,16 @@ dependencies = [
  "rustix 1.1.5",
  "secrecy 0.10.3",
  "secrecy 0.8.0",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit",
- "tracing",
  "tracing-subscriber",
+ "tracing",
+
 ]
 
 [[package]]
@@ -2260,6 +2264,18 @@ dependencies = [
  "harw-types",
  "serde",
  "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
+name = "harw-command"
+version = "0.9.1"
+dependencies = [
+ "harw-job",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3615,9 +3631,10 @@ dependencies = [
  "harw-authority",
  "harw-catalog",
  "harw-code-graph",
+ "harw-command",
  "harw-config",
- "harw-core",
  "harw-core-bridge",
+ "harw-core",
  "harw-explorer",
  "harw-extension-api",
  "harw-home",
@@ -3629,11 +3646,11 @@ dependencies = [
  "harw-memory",
  "harw-model-catalog",
  "harw-operations",
- "harw-plan",
  "harw-plan-bridge",
+ "harw-plan",
  "harw-protocol",
- "harw-provider",
  "harw-provider-http",
+ "harw-provider",
  "harw-registry-defaults",
  "harw-research",
  "harw-retention",
@@ -3647,14 +3664,15 @@ dependencies = [
  "harw-web",
  "jiff",
  "secrecy 0.8.0",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit",
  "tracing",
+
 ]
 
 [[package]]
@@ -3828,9 +3846,10 @@ dependencies = [
  "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
- "harw-browser",
  "harw-browser-thirtyfour",
+ "harw-browser",
  "harw-catalog",
+ "harw-command",
  "harw-config",
  "harw-egress",
  "harw-extension-api",
@@ -3856,13 +3875,14 @@ dependencies = [
  "harw-types",
  "include_dir",
  "jiff",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+
 ]
 
 [[package]]
@@ -3904,11 +3924,12 @@ dependencies = [
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
+ "harw-command",
  "harw-config",
- "harw-context",
  "harw-context-ledger",
- "harw-core",
+ "harw-context",
  "harw-core-bridge",
+ "harw-core",
  "harw-explorer",
  "harw-extension-api",
  "harw-fsutil",
@@ -3924,8 +3945,8 @@ dependencies = [
  "harw-observe",
  "harw-operations",
  "harw-ops",
- "harw-plan",
  "harw-plan-bridge",
+ "harw-plan",
  "harw-project-discovery",
  "harw-protocol",
  "harw-provider-http",
@@ -3933,8 +3954,8 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
- "harw-tool-container",
  "harw-tool-container-run",
+ "harw-tool-container",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-remote",
@@ -3943,13 +3964,14 @@ dependencies = [
  "harw-types",
  "jiff",
  "secrecy 0.10.3",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+
 ]
 
 [[package]]
@@ -4342,6 +4364,7 @@ name = "harw-tool-job"
 version = "0.9.1"
 dependencies = [
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
  "harw-job-core",
  "harw-job-linux",
@@ -4352,11 +4375,12 @@ dependencies = [
  "harw-types",
  "jiff",
  "rustix 1.1.5",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",
+
 ]
 
 [[package]]
@@ -4436,6 +4460,7 @@ version = "0.9.1"
 dependencies = [
  "blake3",
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
  "harw-macros",
  "harw-observe",
@@ -4444,12 +4469,13 @@ dependencies = [
  "harw-tools",
  "harw-types",
  "jiff",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",
  "zeroize",
+
 ]
 
 [[package]]
@@ -4506,6 +4532,7 @@ dependencies = [
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
+ "harw-command",
  "harw-config",
  "harw-context",
  "harw-core",
@@ -4546,6 +4573,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.0",
  "zeroize",
+
 ]
 
 [[package]]

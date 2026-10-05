@@ -25,6 +25,79 @@ use tokio::sync::mpsc;
 
 use super::error::RuntimeError;
 
+/// Files the attempt's standard output and error are appended to instead of
+/// pipes (no frames, no captured head/tail). For jobs whose output outlives
+/// the submitting process, such as a background job's `stdout.log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputFiles {
+    /// Standard output is appended here.
+    pub stdout: PathBuf,
+    /// Standard error is appended here.
+    pub stderr: PathBuf,
+}
+
+/// Standard streams the submitter takes over instead of the runtime reading
+/// or closing them (an interactive child, a password written once).
+#[derive(Debug, Default)]
+pub struct HandedStdio {
+    /// The child's stdin, when it was asked for.
+    pub stdin: Option<std::process::ChildStdin>,
+    /// The child's stdout, when it was asked for (the runtime then neither
+    /// reads nor captures it).
+    pub stdout: Option<std::process::ChildStdout>,
+}
+
+type HandoffSlot = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<HandedStdio>>>>;
+
+/// A request to hand pipes of the first attempt to the submitter. Nothing of
+/// what flows through them is part of the [`JobSpec`]: secrets stay out of the
+/// spec and the job record.
+#[derive(Debug, Clone)]
+pub struct StdioHandoff {
+    /// Pipe the child's stdin.
+    pub stdin: bool,
+    /// Pipe the child's stdout.
+    pub stdout: bool,
+    slot: HandoffSlot,
+}
+
+impl StdioHandoff {
+    /// A handoff and the receiver of the handed streams. The receiver fails
+    /// when the attempt never starts.
+    #[must_use]
+    pub fn new(stdin: bool, stdout: bool) -> (Self, tokio::sync::oneshot::Receiver<HandedStdio>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                stdin,
+                stdout,
+                slot: Arc::new(std::sync::Mutex::new(Some(sender))),
+            },
+            receiver,
+        )
+    }
+
+    /// Delivers the streams once; later attempts get nothing.
+    pub fn deliver(&self, streams: HandedStdio) {
+        let sender = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(streams);
+        }
+    }
+}
+
+impl PartialEq for StdioHandoff {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.slot, &other.slot)
+    }
+}
+
+impl Eq for StdioHandoff {}
+
 /// Everything an executor needs to know about the attempt besides the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptContext {
@@ -40,6 +113,10 @@ pub struct AttemptContext {
     pub lease_epoch: u64,
     /// Absolute workspace root; `JobSpec::working_dir` is relative to it.
     pub workspace_root: PathBuf,
+    /// Where output goes instead of pipes, when the submitter asked for files.
+    pub output_files: Option<OutputFiles>,
+    /// Pipes to hand to the submitter, when it asked for them.
+    pub stdio_handoff: Option<StdioHandoff>,
 }
 
 /// What happened to a running attempt.

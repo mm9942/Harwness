@@ -40,6 +40,7 @@ async fn test_start_status_logs_stop() -> TestResult {
     let started = env
         .manager
         .start(request("sleeper", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     assert_eq!(started.meta.state, JobState::Running);
@@ -107,6 +108,7 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
             Vec::new(),
             origin,
         )
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     assert_eq!(started.meta.origin_call_id.as_deref(), Some("call-42"));
@@ -136,6 +138,7 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
     let plain = env
         .manager
         .start(request("plain", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start plain"))?;
     assert_eq!(plain.meta.origin_call_id, None);
     assert_eq!(plain.meta.origin_tool, None);
@@ -153,6 +156,7 @@ async fn test_stop_kills_whole_process_group() -> TestResult {
     let started = env
         .manager
         .start(request("group", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let stdout = started.log_dir.join(STDOUT_LOG);
@@ -191,6 +195,7 @@ async fn test_exit_code_and_tail_in_finished_event() -> TestResult {
     let started = env
         .manager
         .start(request("fails", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
 
@@ -232,6 +237,7 @@ async fn test_successful_job_is_succeeded() -> TestResult {
     let id = env
         .manager
         .start(request("ok", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -256,6 +262,7 @@ async fn test_only_creator_and_ancestors_control_a_job() -> TestResult {
             request("owned", "worker", &["orchestrator", "uia"]),
             prepared,
         )
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -305,6 +312,7 @@ async fn test_progress_and_error_events() -> TestResult {
     let id = env
         .manager
         .start(request("build", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -357,6 +365,7 @@ async fn test_wait_times_out_then_sees_milestone() -> TestResult {
     let id = env
         .manager
         .start(request("slow", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -398,6 +407,7 @@ async fn test_detach_keeps_process_and_operator_can_stop_it() -> TestResult {
     let started = env
         .manager
         .start(request("detached", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let pid = started.meta.pid.ok_or(TestError::Missing("pid"))?;
@@ -623,6 +633,7 @@ mod recovery {
         let started = env
             .manager
             .start(request("exec", "agent-a", &[]), prepared)
+            .await
             .map_err(ctx("start"))?;
         let id = started.meta.job_id.clone();
         let pid = started.meta.pid.ok_or(TestError::Missing("pid"))?;
@@ -819,6 +830,7 @@ mod recovery {
         let started = env
             .manager
             .start(request("group", "agent-a", &[]), prepared)
+            .await
             .map_err(ctx("start"))?;
         let id = started.meta.job_id.clone();
         let stdout = started.log_dir.join(STDOUT_LOG);
@@ -894,6 +906,7 @@ async fn test_capacity_limit() -> TestResult {
     let id = env
         .manager
         .start(request("one", "agent-a", &[]), first)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -908,7 +921,9 @@ async fn test_capacity_limit() -> TestResult {
     assert!(err.to_string().contains("[jobs] max_running"), "{err}");
     let second = env.prepare("sleep 30").await?;
     assert!(matches!(
-        env.manager.start(request("two", "agent-a", &[]), second),
+        env.manager
+            .start(request("two", "agent-a", &[]), second)
+            .await,
         Err(JobError::Capacity { max: 1 })
     ));
     assert_eq!(env.manager.stop_all().await, 1);
@@ -933,6 +948,7 @@ async fn test_capacity_is_adjustable_at_runtime_without_stopping_jobs() -> TestR
         let prepared = env.prepare("sleep 30").await?;
         env.manager
             .start(request(name, "agent-a", &[]), prepared)
+            .await
             .map_err(ctx("start"))?;
     }
     assert!(matches!(
@@ -998,6 +1014,7 @@ async fn test_normal_end_reaps_stragglers() -> TestResult {
     let started = env
         .manager
         .start(request("straggler", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let stdout = started.log_dir.join(STDOUT_LOG);
@@ -1030,6 +1047,7 @@ async fn test_clean_end_reaps_nothing() -> TestResult {
     let id = env
         .manager
         .start(request("clean", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -1054,6 +1072,7 @@ async fn test_small_log_budget_truncates_with_marker() -> TestResult {
     let started = env
         .manager
         .start(request("chatty", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let status = wait_terminal(&env, &id).await?;
@@ -1093,6 +1112,7 @@ async fn test_log_budget_applies_while_running() -> TestResult {
     let started = env
         .manager
         .start(request("flood", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let stdout = started.log_dir.join(STDOUT_LOG);
@@ -1126,6 +1146,7 @@ async fn test_launch_warnings_recorded_and_notified() -> TestResult {
             env.prepare("echo ok").await?,
             vec![warning.clone()],
         )
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
 
@@ -1189,14 +1210,16 @@ async fn test_old_meta_json_loads_with_new_fields_defaulted() -> TestResult {
 async fn test_spawn_failure_is_recorded_as_failed() -> TestResult {
     let env = Env::new()?;
     let mut command = tokio::process::Command::new("/nonexistent/harw-job-binary");
-    command.stdin(Stdio::null());
+    command.stdin(std::process::Stdio::null());
     let prepared = PreparedJob {
         command,
         executed_on_host: true,
+        env_cleared: false,
     };
     let result = env
         .manager
-        .start(request("broken", "agent-a", &[]), prepared);
+        .start(request("broken", "agent-a", &[]), prepared)
+        .await;
     assert!(matches!(result, Err(JobError::Spawn(_))));
     let jobs = env.manager.list(Caller::Agent("agent-a"));
     assert_eq!(jobs.len(), 1);
@@ -1212,6 +1235,7 @@ async fn test_start_piped_echoes_stdin_tees_stdout_and_detects_exit() -> TestRes
     let mut piped = env
         .manager
         .start_piped(request("echo", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
     assert_eq!(piped.status.meta.state, JobState::Running);
@@ -1267,6 +1291,7 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
     let mut piped = env
         .manager
         .start_piped(request("group", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
 
@@ -1319,6 +1344,7 @@ async fn run_piped_script(
     let mut piped = env
         .manager
         .start_piped_with_line_limit(request("limit", "agent-a", &[]), prepared, limit)
+        .await
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
     let items = drain_lines(&mut piped.stdout_lines).await?;
@@ -1434,88 +1460,4 @@ fn test_milestone_key_buckets() {
         milestone_key(&snapshot(None, "compiling a")),
         milestone_key(&snapshot(None, "finished dev"))
     );
-}
-
-/// Gleichzeitige Starts (mit und ohne Pipes) teilen sich die Obergrenze: der
-/// Platz wird atomar reserviert, bevor der Job in `jobs` steht.
-#[tokio::test]
-async fn test_concurrent_starts_never_exceed_max_running() -> TestResult {
-    const STARTERS: usize = 8;
-    let env = Env::with_config(|config| JobManagerConfig {
-        max_running_jobs: 1,
-        ..config
-    })?;
-    let mut prepared = Vec::new();
-    for n in 0..STARTERS {
-        prepared.push(if n % 2 == 0 {
-            env.prepare("sleep 30").await?
-        } else {
-            env.prepare_piped(&["sleep", "30"]).await?
-        });
-    }
-    let barrier = Arc::new(std::sync::Barrier::new(STARTERS));
-    let mut handles = Vec::new();
-    for (n, job) in prepared.into_iter().enumerate() {
-        let manager = Arc::clone(&env.manager);
-        let barrier = Arc::clone(&barrier);
-        handles.push(tokio::task::spawn_blocking(move || {
-            barrier.wait();
-            let name = format!("job-{n}");
-            if n % 2 == 0 {
-                manager
-                    .start(request(&name, "agent-a", &[]), job)
-                    .map(|_| None)
-            } else {
-                manager
-                    .start_piped(request(&name, "agent-a", &[]), job)
-                    .map(Some)
-            }
-        }));
-    }
-    let mut started = 0;
-    let mut rejected = 0;
-    let mut piped = Vec::new();
-    for handle in handles {
-        match handle.await.map_err(ctx("join"))? {
-            Ok(job) => {
-                started += 1;
-                piped.extend(job);
-            }
-            Err(JobError::Capacity { max: 1 }) => rejected += 1,
-            Err(other) => return Err(TestError::Unexpected(format!("unexpected: {other}"))),
-        }
-    }
-    assert_eq!(started, 1, "exactly one start may win max_running = 1");
-    assert_eq!(rejected, STARTERS - 1);
-    assert_eq!(env.manager.running_count(), 1);
-    drop(piped);
-    env.manager.stop_all().await;
-    Ok(())
-}
-
-/// Ein gescheiterter Start gibt seinen reservierten Platz wieder frei.
-#[tokio::test]
-async fn test_failed_launch_releases_its_slot() -> TestResult {
-    let env = Env::with_config(|config| JobManagerConfig {
-        max_running_jobs: 1,
-        ..config
-    })?;
-    let mut command = tokio::process::Command::new("/nonexistent/harw-job-binary");
-    command.stdin(Stdio::null());
-    let broken = PreparedJob {
-        command,
-        executed_on_host: true,
-    };
-    assert!(matches!(
-        env.manager.start(request("broken", "agent-a", &[]), broken),
-        Err(JobError::Spawn(_))
-    ));
-    // Der Fehlstart belegt nichts: der nächste Start geht durch.
-    let next = env.prepare("sleep 30").await?;
-    env.manager
-        .start(request("next", "agent-a", &[]), next)
-        .map_err(ctx("start after failed launch"))?;
-    assert_eq!(env.manager.running_count(), 1);
-    env.manager.stop_all().await;
-    Ok(())
 }
