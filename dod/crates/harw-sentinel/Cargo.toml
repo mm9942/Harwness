@@ -11,6 +11,8 @@ rust-version.workspace = true
 [dependencies]
 harw-authority = { path = "../../../harw-authority" }
 harw-home = { path = "../../../harw-home" }
+# Retention-Klasse `telemetry_rotated` liefert die Vorgabe für `--telemetry-max-files`.
+harw-retention = { path = "../../../harw-retention" }
 # Die Sammelstelle selbst: `Sentinel`, `SentinelConfig`. Dieses Binary macht
 # sie zu einem laufenden Prozess (Knoten AW2-19) — siehe `src/main.rs`.
 harw-dod-sentinel = { path = "../harw-dod-sentinel" }
@@ -113,6 +115,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 tempfile = { workspace = true }
 
 [lints]

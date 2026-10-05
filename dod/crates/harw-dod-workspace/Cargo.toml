@@ -27,6 +27,7 @@ jiff = { workspace = true }
 semver = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

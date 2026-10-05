@@ -8,6 +8,7 @@
 pub mod approvals;
 pub mod events;
 pub mod items;
+pub mod media;
 pub mod methods;
 pub mod orchestration;
 pub mod session_port;
@@ -20,6 +21,7 @@ pub use items::{
     AssistantMessageItem, ContentPart, ErrorItem, OpaqueReasoning, ReasoningItem, ResultTrust,
     ToolCallItem, ToolCallResult, ToolPlacement, ToolResultItem, TurnItem, UserMessageItem,
 };
+pub use media::{ImageDetail, ImageFormat, MediaRef, MediaRefError};
 pub use orchestration::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 pub use session_port::{
     FrameSource, GatewayPort, PortError, PortFuture, SessionPort, ToolPort, ToolRefusal,

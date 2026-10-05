@@ -72,6 +72,7 @@ privileged = [
 ]
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # Kennungen (`SensorId`) für jedes Beispiel/jeden Test, die einen
 # `SensorHandle` bauen. Dieselbe Konvention wie in jeder Sensor-Crate selbst
 # (z. B. `harw-dod-cpu/src/sensor.rs`-Doctests): eine Fassade re-exportiert

@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
 harw-protocol = { path = "../harw-protocol" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
@@ -20,6 +21,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 harw-authority = { path = "../harw-authority" }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 

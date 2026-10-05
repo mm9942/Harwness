@@ -56,5 +56,8 @@ serde_json = { workspace = true }
 # Gewicht für das Warden-Abhängigkeitsbudget.
 blake3 = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+
 [lints]
 workspace = true

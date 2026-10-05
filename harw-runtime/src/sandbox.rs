@@ -82,6 +82,7 @@ const fn tenant_name(entry: EntryKind) -> &'static str {
         EntryKind::JobPrompt | EntryKind::JobPlanNode => "job",
         EntryKind::GatewayTelegram => "gateway-telegram",
         EntryKind::GatewayDream => "gateway-dream",
+        EntryKind::SessionHost => "session-host",
         // #22 Welle 3A: ein kompilierter Agent bindet seine Wurzel-Sandbox
         // wie die CLI (`OneShot`/`LocalEcho`/…) — derselbe lokale Mensch.
         EntryKind::CompiledAgent => "cli",

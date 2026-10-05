@@ -68,7 +68,7 @@ use harw_core::{
     resume_after_approval, run_turn,
 };
 use harw_extension_api::{ApprovalMode, ContextProvider};
-use harw_memory::facts::{FactScope, FactStore};
+use harw_memory::facts::FactStore;
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_registry_defaults::ConfigAgents;
 use harw_runtime::{
@@ -888,60 +888,9 @@ fn uia_agent_memory_root(config: &ResolvedConfig, agents: &ConfigAgents) -> Opti
 /// bleibt der Recall aus, unabhängig davon, ob hier Fakten-Stores geöffnet
 /// werden konnten).
 fn open_fact_stores(home: &Path, cwd: &Path) -> (Option<Arc<FactStore>>, Option<Arc<FactStore>>) {
-    let project = project_memories_root(cwd).and_then(|root| {
-        match FactStore::open(&root, FactScope::Project) {
-            Ok(store) => Some(Arc::new(store)),
-            Err(error) => {
-                tracing::warn!(
-                    path = %root.display(),
-                    %error,
-                    "harw-memory: konnte Projekt-Fakten-Wurzel nicht öffnen"
-                );
-                None
-            }
-        }
-    });
-
-    let global = match active_profile_memories_root(home) {
-        Ok(root) => match FactStore::open(&root, FactScope::Global) {
-            Ok(store) => Some(Arc::new(store)),
-            Err(error) => {
-                tracing::warn!(
-                    path = %root.display(),
-                    %error,
-                    "harw-memory: konnte globale Fakten-Wurzel nicht öffnen"
-                );
-                None
-            }
-        },
-        Err(error) => {
-            tracing::warn!(%error, "harw-memory: konnte Profilverzeichnis für Fakten nicht auflösen");
-            None
-        }
-    };
-
-    (project, global)
-}
-
-/// Ermittelt und stellt die projekt-lokale Fakten-Wurzel sicher.
-///
-/// `None` bei jedem Fehlschlag der Projekterkennung; ein Fehlschlag von
-/// `ProjectHome::ensure` wird nur gewarnt — `FactStore::open` legt `facts/`
-/// bei Bedarf ohnehin selbst an, `.harw/plans`/`.harw/goals` fehlen dann nur
-/// vorübergehend.
-fn project_memories_root(cwd: &Path) -> Option<PathBuf> {
-    let project = match harw_home::project::discover_project(cwd, &[]) {
-        Ok(project) => project,
-        Err(error) => {
-            tracing::warn!(%error, "harw-memory: konnte Projekt-Root nicht ermitteln");
-            return None;
-        }
-    };
-    let project_home = harw_home::project::ProjectHome::at(&project);
-    if let Err(error) = project_home.ensure() {
-        tracing::warn!(%error, "harw-memory: konnte Projekt-Home nicht anlegen");
-    }
-    Some(project_home.memories_dir())
+    // Geteilter Helfer: dieselbe Öffnungslogik nutzt die Montage als Vorgabe
+    // für jeden anderen Einstieg (siehe `harw_runtime::memory_wiring`).
+    harw_runtime::memory_wiring::open_fact_stores(home, cwd)
 }
 
 /// Ordnet jede lokale CLI-Session stabil ihrem Transcript-Thread zu.

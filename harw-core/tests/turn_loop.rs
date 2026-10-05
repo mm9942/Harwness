@@ -857,3 +857,78 @@ async fn durable_approval_is_written_then_consumed_once_before_resuming() -> Tes
     ));
     Ok(())
 }
+
+/// Liefert genau ein Kontextfragment (für den Ledger-Test).
+struct NoteProvider;
+
+impl harw_extension_api::contributors::ContextProvider for NoteProvider {
+    fn contribute<'a>(
+        &'a self,
+        _ctx: &'a harw_extension_api::TurnInputContext,
+    ) -> harw_extension_api::contributors::ExtFuture<'a, Vec<harw_extension_api::ContextFragment>>
+    {
+        Box::pin(async {
+            vec![harw_extension_api::ContextFragment {
+                label: "note".to_owned(),
+                content: "secret content that must never reach the ledger".to_owned(),
+            }]
+        })
+    }
+
+    fn namespace(&self) -> &'static str {
+        "ledger-test.note"
+    }
+}
+
+#[tokio::test]
+async fn context_ledger_records_offered_fragments_without_content() -> TestResult {
+    let registry = ExtensionRegistryBuilder::default()
+        .context_provider(Arc::new(NoteProvider))
+        .map_err(ctx("provider registers"))?
+        .build();
+    let (session, _rx) = new_session(registry)?;
+    let ledger = Arc::new(harw_context_ledger::MemoryLedger::new());
+    let mut session = session.with_context_ledger(Some(
+        Arc::clone(&ledger) as Arc<dyn harw_context_ledger::LedgerSink>
+    ));
+    let store = InMemoryStateStore::new();
+    let model = EchoModelProvider::new("ok");
+
+    run_turn(&mut session, &model, &store, TurnInput::user("hello"))
+        .await
+        .map_err(ctx("turn runs"))?;
+
+    let entries = ledger.entries();
+    let note = entries
+        .iter()
+        .find(|entry| entry.label == "note")
+        .ok_or_else(|| {
+            TestError::Unexpected(format!("no ledger entry for the note: {entries:?}"))
+        })?;
+    assert_eq!(note.kind, harw_context_ledger::LedgerKind::Offered);
+    assert_eq!(note.session_id, session.id().as_str());
+    assert!(note.bytes.is_some_and(|bytes| bytes > 0));
+    let dump = format!("{entries:?}");
+    assert!(
+        !dump.contains("secret content"),
+        "the ledger must never hold fragment content"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_a_ledger_nothing_is_recorded_and_the_turn_is_unchanged() -> TestResult {
+    let registry = ExtensionRegistryBuilder::default()
+        .context_provider(Arc::new(NoteProvider))
+        .map_err(ctx("provider registers"))?
+        .build();
+    let (mut session, _rx) = new_session(registry)?;
+    assert!(session.context_ledger().is_none());
+    let store = InMemoryStateStore::new();
+    let model = EchoModelProvider::new("ok");
+    let outcome = run_turn(&mut session, &model, &store, TurnInput::user("hello"))
+        .await
+        .map_err(ctx("turn runs"))?;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+    Ok(())
+}

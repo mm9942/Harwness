@@ -1,0 +1,9 @@
+error[E0080]: evaluation panicked: tool_provider!(DupProvider): zwei Tools deklarieren denselben NAME — tools() würde einen Namen bewerben, den executor()/parallel_safe() nicht eindeutig auflösen können
+  --> tests/compile_fail/37_provider_duplicate_names_unit_form.rs:26:1
+   |
+26 | / harw_tools::tool_provider_core! {
+27 | |     struct DupProvider { FirstTool, SecondTool }
+28 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `harw_tools::tool_provider_core` (in Nightly builds, run with -Z macro-backtrace for more info)

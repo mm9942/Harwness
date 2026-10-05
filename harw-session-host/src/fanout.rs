@@ -24,25 +24,14 @@ use harw_protocol::{FrameSource, PortFuture, TurnEvent};
 use harw_types::SessionId;
 use tokio::sync::Notify;
 
-/// Default frame limit of one attachment queue.
-pub const DEFAULT_MAX_FRAMES: usize = 1024;
-
-/// Default byte limit (serialized JSON) of one attachment queue.
-pub const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-/// Bounds of one attachment queue. Whichever limit is hit first overflows.
-#[derive(Clone, Copy, Debug)]
-pub struct QueueLimits {
-    pub max_frames: usize,
-    pub max_bytes: usize,
-}
-
-impl Default for QueueLimits {
-    fn default() -> Self {
-        Self {
-            max_frames: DEFAULT_MAX_FRAMES,
-            max_bytes: DEFAULT_MAX_BYTES,
-        }
+harw_types::limits_struct! {
+    /// Bounds of one attachment queue. Whichever limit is hit first overflows.
+    #[derive(Clone, Copy, Debug)]
+    pub struct QueueLimits {
+        /// Frame limit of one attachment queue.
+        pub max_frames: usize = DEFAULT_MAX_FRAMES = 1024,
+        /// Byte limit (serialized JSON) of one attachment queue.
+        pub max_bytes: usize = DEFAULT_MAX_BYTES = 4 * 1024 * 1024,
     }
 }
 

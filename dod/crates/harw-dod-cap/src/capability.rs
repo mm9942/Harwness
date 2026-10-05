@@ -2,8 +2,8 @@
 //! Berechtigungsklasse sie fällt.
 //!
 //! # Verantwortungsbereich
-//! [`Capability`] ist ein geschlossenes Enum mit den vierzehn Fähigkeiten aus
-//! Vertrag Abschnitt F. Eine neue Fähigkeit ist damit immer eine bewusste
+//! [`Capability`] ist ein geschlossenes Enum mit den fünfzehn Fähigkeiten (vierzehn aus
+//! Vertrag Abschnitt F, dazu `ReadContainerScopes`). Eine neue Fähigkeit ist damit immer eine bewusste
 //! Entscheidung mit Eintrag in der Rechtematrix, kein freier String, den eine
 //! Sensor-Crate sich selbst ausdenken könnte. [`CapabilityClass`] bestimmt,
 //! in welches Binary eine Crate anhand ihrer Fähigkeit gehören darf.
@@ -31,7 +31,7 @@
 ///
 /// # Description
 /// Geschlossen: eine neue Fähigkeit ist eine Entscheidung mit Eintrag in der
-/// Rechtematrix, kein freier String. Jede der vierzehn Varianten entspricht
+/// Rechtematrix, kein freier String. Jede der fünfzehn Varianten entspricht
 /// genau einer Sensor-Crate im AW0-Ausbauprogramm.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -62,6 +62,9 @@ pub enum Capability {
     ReadScanReports,
     /// Der Workspace-Abhängigkeitsgraph des Harness.
     ReadWorkspaceGraph,
+    /// Container-Scopes (cgroup) und die Härtungsfelder ihrer Prozesse
+    /// (`/proc/<pid>/status`), nur für erwartete Container.
+    ReadContainerScopes,
     /// Dateisystem-Änderungsereignisse (fanotify/inotify).
     WatchFilesystem,
     /// Laden eines BPF-Programms in den Kernel.
@@ -92,7 +95,7 @@ impl Capability {
     ///
     /// # Description
     /// Reine Zuordnungstabelle, siehe [`CapabilityClass`] für die Bedeutung
-    /// jeder Klasse. Elf der vierzehn Fähigkeiten sind
+    /// jeder Klasse. Zwölf der fünfzehn Fähigkeiten sind
     /// [`CapabilityClass::Unprivileged`]; je eine Fähigkeit fällt auf
     /// [`CapabilityClass::Netlink`], [`CapabilityClass::FileWatch`] und
     /// [`CapabilityClass::Bpf`].
@@ -121,7 +124,8 @@ impl Capability {
             | Self::ReadProcNet
             | Self::ReadJournal
             | Self::ReadScanReports
-            | Self::ReadWorkspaceGraph => CapabilityClass::Unprivileged,
+            | Self::ReadWorkspaceGraph
+            | Self::ReadContainerScopes => CapabilityClass::Unprivileged,
             Self::ReadAuditNetlink => CapabilityClass::Netlink,
             Self::WatchFilesystem => CapabilityClass::FileWatch,
             Self::LoadBpfProgram => CapabilityClass::Bpf,
@@ -164,6 +168,7 @@ impl Capability {
             Self::ReadAuditNetlink => "audit-netlink",
             Self::ReadScanReports => "workspace-scan-reports",
             Self::ReadWorkspaceGraph => "workspace-graph",
+            Self::ReadContainerScopes => "container-scopes",
             Self::WatchFilesystem => "fanotify",
             Self::LoadBpfProgram => "/sys/fs/bpf",
         }
@@ -272,6 +277,14 @@ mod tests {
     }
 
     #[test]
+    fn test_class_read_container_scopes_is_unprivileged() {
+        assert_eq!(
+            Capability::ReadContainerScopes.class(),
+            CapabilityClass::Unprivileged
+        );
+    }
+
+    #[test]
     fn test_class_watch_filesystem_is_file_watch() {
         assert_eq!(
             Capability::WatchFilesystem.class(),
@@ -299,6 +312,7 @@ mod tests {
             Capability::ReadAuditNetlink,
             Capability::ReadScanReports,
             Capability::ReadWorkspaceGraph,
+            Capability::ReadContainerScopes,
             Capability::WatchFilesystem,
             Capability::LoadBpfProgram,
         ];
