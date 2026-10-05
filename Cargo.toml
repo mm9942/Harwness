@@ -17,6 +17,8 @@ members = [
     "harw-tool-explorer",
     "harw-killer",
     "harw-tool-process",
+    # PL-93: typisierte Werkzeuge für häufige Kommandos.
+    "harw-tool-fsread",
     "harw-tool-container",
     "harw-config",
     "harw-home",
