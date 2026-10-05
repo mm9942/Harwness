@@ -168,7 +168,13 @@ impl JobCommandPort<harw_job::FsJobRecordStore, harw_job::LinuxExecutor> {
             .map_err(|error| format!("job store {}: {error}", state_dir.display()))?;
         let runtime = JobRuntime::builder()
             .store(store)
-            .executor(harw_job::LinuxExecutor::default())
+            .executor(
+                harw_job::LinuxExecutor::new(harw_job::LinuxExecutorOptions {
+                    new_session: true,
+                    ..harw_job::LinuxExecutorOptions::default()
+                })
+                .map_err(|error| format!("job executor: {error}"))?,
+            )
             .workspace_root("/")
             .build()
             .map_err(|error| format!("job runtime: {error}"))?;

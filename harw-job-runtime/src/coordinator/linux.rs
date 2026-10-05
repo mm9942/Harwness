@@ -143,6 +143,11 @@ pub struct LinuxExecutorOptions {
     pub termination: TerminationPolicy,
     /// How long output is drained after the primary exited.
     pub drain_timeout: Duration,
+    /// Start unsandboxed jobs in a new session (no controlling terminal, so
+    /// `open("/dev/tty")` fails instead of stopping the job) through
+    /// `setsid(1)` when one is available; otherwise they lead their own
+    /// process group as usual.
+    pub new_session: bool,
 }
 
 impl Default for LinuxExecutorOptions {
@@ -153,8 +158,26 @@ impl Default for LinuxExecutorOptions {
             exit_status_dir: None,
             termination: TerminationPolicy::default(),
             drain_timeout: Duration::from_secs(2),
+            new_session: false,
         }
     }
+}
+
+/// `setsid(1)` at a fixed path, else on `PATH` (once per process).
+fn resolve_setsid() -> Option<&'static Path> {
+    static SETSID: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SETSID
+        .get_or_init(|| {
+            let fixed = ["/usr/bin/setsid", "/bin/setsid", "/usr/local/bin/setsid"];
+            if let Some(found) = fixed.iter().map(Path::new).find(|p| p.is_file()) {
+                return Some(found.to_path_buf());
+            }
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("setsid"))
+                .find(|candidate| candidate.is_file())
+        })
+        .as_deref()
 }
 
 /// Linux [`Executor`] (see the module docs).
@@ -194,6 +217,19 @@ impl Launch {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
+    }
+
+    /// `setsid <program> <args>`: in place (same PID) when the caller is not a
+    /// group leader, which is why the spawn must not make it one.
+    fn wrap_in_session(self, setsid: &Path) -> Self {
+        let mut args: Vec<OsString> = vec!["--wait".into(), self.program];
+        args.extend(self.args);
+        Self {
+            program: setsid.as_os_str().to_owned(),
+            args,
+            env: self.env,
+            cwd: self.cwd,
+        }
     }
 
     fn wrap_in_shim(self, status: &Path) -> Self {
@@ -1082,21 +1118,37 @@ impl Executor for LinuxExecutor {
             }
             launch = launch.wrap_in_shim(status);
         }
+        // A new session only for plain (unsandboxed) launches: sandbox
+        // backends manage their own namespaces and terminals.
+        let session = if self.options.new_session && spec.sandbox == SandboxRequirement::None {
+            resolve_setsid()
+        } else {
+            None
+        };
+        if let Some(setsid) = session {
+            launch = launch.wrap_in_session(setsid);
+        }
         // 4. spawn → pidfd → cgroup attach
         let mut command = launch.command();
         let spawned = match cgroup {
             Some((backend, handle)) => {
                 let backend: Arc<dyn CgroupBackend> = backend;
-                LinuxJobGroup::spawn_in_cgroup(&mut command, JobCgroup::new(backend, handle))
-                    .map_err(|error| match error {
-                        LaunchError::Process(error) => process_error("spawn", &spec.program, error),
-                        LaunchError::Cgroup(error) => cgroup_error(error),
-                        other => RuntimeError::Os {
-                            operation: "spawn in cgroup",
-                            detail: other.to_string(),
-                        },
-                    })
+                LinuxJobGroup::spawn_in_cgroup_with(
+                    &mut command,
+                    JobCgroup::new(backend, handle),
+                    session.is_some(),
+                )
+                .map_err(|error| match error {
+                    LaunchError::Process(error) => process_error("spawn", &spec.program, error),
+                    LaunchError::Cgroup(error) => cgroup_error(error),
+                    other => RuntimeError::Os {
+                        operation: "spawn in cgroup",
+                        detail: other.to_string(),
+                    },
+                })
             }
+            None if session.is_some() => LinuxJobGroup::spawn_in_new_session(&mut command)
+                .map_err(|error| process_error("spawn", &spec.program, error)),
             None => LinuxJobGroup::spawn(&mut command)
                 .map_err(|error| process_error("spawn", &spec.program, error)),
         };

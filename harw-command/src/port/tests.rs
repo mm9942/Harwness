@@ -6,14 +6,7 @@ harw_test_support::define_test_error!(pub(crate));
 type Port = JobCommandPort<FsJobRecordStore, LinuxExecutor>;
 
 fn port(dir: &std::path::Path) -> TestResult<Port> {
-    let store = FsJobRecordStore::create_ambient(dir).map_err(ctx("store"))?;
-    let runtime = JobRuntime::builder()
-        .store(store)
-        .executor(LinuxExecutor::default())
-        .workspace_root("/")
-        .build()
-        .map_err(ctx("runtime"))?;
-    Ok(JobCommandPort::new(runtime))
+    JobCommandPort::host(dir).map_err(TestError::Unexpected)
 }
 
 fn sh(script: &str, timeout: Duration) -> CommandRequest {
@@ -140,7 +133,55 @@ async fn a_relative_directory_and_a_missing_program_fail_cleanly() -> TestResult
     assert!(matches!(outcome.end, CommandEnd::Failed(_)), "{outcome:?}");
     let missing = CommandRequest::new("/nonexistent/program", "/tmp", Duration::from_secs(5));
     let outcome = port.run(missing, CancelToken::new()).await;
-    assert!(matches!(outcome.end, CommandEnd::Failed(_)), "{outcome:?}");
+    // Through setsid the failure shows as exit 127 (as a shell reports it).
+    assert!(
+        matches!(outcome.end, CommandEnd::Failed(_)) || outcome.exit_code == 127,
+        "{outcome:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[tokio::test]
+async fn the_job_has_no_controlling_terminal_and_its_tree_dies_with_it() -> TestResult {
+    let root = dir("session")?;
+    let port = port(&root)?;
+    // A session without controlling terminal: opening /dev/tty must fail.
+    let outcome = port
+        .run(
+            sh(
+                "(echo x > /dev/tty) 2>/dev/null && echo tty || echo notty",
+                Duration::from_secs(20),
+            ),
+            CancelToken::new(),
+        )
+        .await;
+    assert_eq!(outcome.stdout, b"notty\n", "{outcome:?}");
+    // A grandchild must die with the deadline kill (no orphan in its own session).
+    let marker = root.join("grandchild.pid");
+    let script = format!("sleep 60 & echo $! > {}; wait", marker.display());
+    let outcome = port
+        .run(sh(&script, Duration::from_secs(1)), CancelToken::new())
+        .await;
+    assert_eq!(outcome.end, CommandEnd::TimedOut, "{outcome:?}");
+    let pid: i32 = std::fs::read_to_string(&marker)
+        .map_err(ctx("marker"))?
+        .trim()
+        .parse()
+        .map_err(|_| TestError::Missing("grandchild pid"))?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists() || is_zombie(pid),
+        "grandchild {pid} survived"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+fn is_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit(')')
+            .next()
+            .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+    })
 }
