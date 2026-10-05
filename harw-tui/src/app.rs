@@ -1049,6 +1049,8 @@ pub struct ChatApp {
     /// abgebrochen oder vermischt werden; diese FIFO wird ausschließlich an
     /// Turn-Grenzen abgearbeitet.
     pending_turns: std::collections::VecDeque<String>,
+    /// `/image`: vorgemerkte Bilder für die nächste Nachricht.
+    images: crate::image_attach::ImageAttachments,
     /// Befehle und Datenabrufe, die während eines laufenden Turns nebenläufig
     /// laufen (Runde 4, Teil H; siehe [`busy_queue`]).
     busy_jobs: BusyJobs,
@@ -1472,6 +1474,7 @@ impl ChatApp {
             input,
             deferred_input: std::collections::VecDeque::new(),
             pending_turns: std::collections::VecDeque::new(),
+            images: crate::image_attach::ImageAttachments::default(),
             busy_jobs: BusyJobs::new(),
             // Runde 5, Teil L.
             btw: btw::BtwState::new(),
@@ -3807,6 +3810,12 @@ fn apply_local_intercept(
                 "Sitzungstitel (Anzeige) gesetzt: „{title}“"
             ))]);
         }
+        LocalIntercept::AttachImage(args) => {
+            let home = harw_home::paths::home_dir().ok();
+            let base = std::path::PathBuf::from(&app.project_root);
+            let note = app.images.command(&args, home.as_deref(), &base);
+            app.push_system_text_exported(&note);
+        }
         LocalIntercept::Rewrite(line) => bus.send(HarwEvent::Command(line)),
         LocalIntercept::Chat(text) => {
             app.scroll.force_follow();
@@ -4691,6 +4700,10 @@ pub(crate) async fn run_loop(
     // die eine Verlaufszelle je Kind-Session.
     let mut turn_state = TurnEventState::default();
 
+    // Bilder früherer Nachrichten (fortgesetzte Sitzung) wieder auffindbar machen.
+    app.images
+        .attach_existing(harw_home::paths::home_dir().ok().as_deref());
+
     let mut spinner = Spinner::new();
     let mut provider_error_streak = 0_u32;
     // Ein fertiger Busy-Auftrag weckt die Schleife über einen Frame, auch
@@ -5315,6 +5328,10 @@ pub(crate) async fn run_loop(
         let turn_text = background_agents::attach_queued_notices(app, turn_text);
         let displayed_text = display_override.unwrap_or_else(|| text.clone());
         app.push_line(Role::User, displayed_text);
+        let attached_images = app.images.len();
+        if attached_images > 0 {
+            app.push_system_text_exported(&format!("({attached_images} Bild(er) angehängt)"));
+        }
         if let Some(note) = attachment_note {
             // Runde 6, Teil C: Anhang-Hinweis auch in den Export.
             app.push_system_text_exported(&note);
@@ -5338,12 +5355,14 @@ pub(crate) async fn run_loop(
         // Chat offen und der Fehler wird als System-Zeile angezeigt.
         // `TuiError::Io` bleibt fatal und propagiert weiterhin nach
         // oben, da er einen nicht behebbaren Terminalfehler anzeigt.
+        let turn_images = app.images.take();
         let turn_result = run_turn_streaming(
             guard,
             app,
             &mut spinner,
             gateway,
             &turn_text,
+            turn_images,
             approval_driver,
             approvals,
             host_permit_prompts,
@@ -7238,6 +7257,7 @@ async fn run_turn_streaming(
     spinner: &mut Spinner,
     gateway: &mut dyn crate::gateway::ChatGateway,
     text: &str,
+    images: Vec<harw_protocol::MediaRef>,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
     host_permit_prompts: &mut HostPermitPromptReceiver,
@@ -7316,7 +7336,9 @@ async fn run_turn_streaming(
         app,
         spinner,
         gateway,
-        TurnInput::user(text).with_control(TurnControl::new().with_cancel(cancel)),
+        TurnInput::user(text)
+            .with_images(images)
+            .with_control(TurnControl::new().with_cancel(cancel)),
         approval_driver,
         approvals,
         host_permit_prompts,
@@ -9085,6 +9107,7 @@ fn is_busy_safe_intercept(intercept: &LocalIntercept) -> bool {
             | LocalIntercept::ToggleVerbose
             | LocalIntercept::System(_)
             | LocalIntercept::RenameSession(_)
+            | LocalIntercept::AttachImage(_)
             // Runde 5, Teil I: reine Anzeige-Umschaltung, sofort wirksam.
             | LocalIntercept::ChildStream(_)
             // Runde 5, Teil L: `/btw` läuft neben dem Turn, ohne ihn zu berühren.

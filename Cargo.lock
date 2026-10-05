@@ -4516,6 +4516,7 @@ dependencies = [
  "harw-home",
  "harw-lens-types",
  "harw-macros",
+ "harw-media",
  "harw-memory",
  "harw-model-catalog",
  "harw-operations",

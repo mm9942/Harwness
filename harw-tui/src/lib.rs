@@ -28,6 +28,7 @@ pub(crate) mod command_catalog;
 pub(crate) mod command_data;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
+mod image_attach;
 // Gemeinsames Dialog-Layout: angeheftete Optionen, scrollbarer Körper.
 pub(crate) mod dialog_frame;
 mod error;
