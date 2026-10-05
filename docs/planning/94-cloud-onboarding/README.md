@@ -26,6 +26,31 @@ or `config.toml`, and without a way to end up half-open.
 | Tailscale helper | `harw-tailscale`, `harw tailscale` | exists |
 | Telegram pairing (one-time code bound to the sender id) | `harw-cli::connect` | the one pairing flow that exists; a good pattern |
 
+## 1b. Field evidence (two real harw sessions, 2026-10-02 and 2026-10-05)
+
+Two exported operator sessions (a gateway host, two Raspberry-class nodes, a
+second server, all on one tailnet) show what the missing tooling costs in
+practice. Names and addresses are left out here on purpose.
+
+| Observation | What it tells us |
+|---|---|
+| A hand-written systemd unit for a reverse SSH tunnel failed with `Permission denied (publickey)` and **restarted ~18,400 times in one day**; the fix was another round of `sed -i` on the unit file | No supervised, rate-limited connection unit; no `doctor` that says "this unit has failed N times and why" |
+| `harw serve` crash-looped because `default_provider = "openai"` named a provider that did not exist any more | Config that makes a listener die at start should be caught by `node doctor` before the service is enabled |
+| `harw web` over the tailnet refused connections from the machine's **own** tailnet address (`is this node's own address`); the operator's first probe failed for that reason alone | The refusal is correct but unexplained; `status` must say "test from another device" |
+| A node was to be attached "over mTLS/HTTPS, but it must **not compile or accumulate artifacts**" and had no `harw` installed | A **thin node** role is a requirement: install a prebuilt release binary (aarch64 included), run pods and workers, never build; builds happen elsewhere |
+| The operator tried several SSH users and keys by hand against two targets, then fell back to a Cloudflare tunnel that had no `cert.pem` | Onboarding by trial and error; one `join`/`enroll` path with a clear failure reason is needed |
+| Old SSH forwards on fixed ports were declared forbidden; the replacement is "the tunnel is the tailnet" | Reachability profile `tailnet` is the default recommendation, not an add-on |
+| A sentinel socket existed with a running process but accepted nothing | `doctor` should probe sockets, not only check that they exist |
+| A tailnet listed several machines offline for weeks next to active ones | `device list` needs `last seen`, and stale devices should be easy to revoke |
+| A read-only "writer" agent could not touch an absolute path outside its workspace and could not run git; the task (resolving merge conflicts in another repo) simply could not run | Remote work on a node needs an explicit, per-node workspace root and a worker role with a shell, chosen at enrollment, not discovered by failing |
+
+These turn into requirements: (R1) `node doctor` covers unit health, config
+that prevents start, own-address refusal and socket probes; (R2) a `thin`
+node role with `harw node install --from-mirror` (checksummed prebuilt
+binary, no compiler); (R3) a generated, supervised service unit with
+back-off instead of hand-edited units; (R4) enrollment fixes the node's
+workspace root and worker role; (R5) `last seen` on every device.
+
 ## 2. The gaps (why it is hard today)
 
 1. **No command to manage devices.** Enrolling or revoking means editing a
@@ -143,7 +168,7 @@ Two levels, in this order:
 | **N2** | `harw node init` (key bootstrap, config writer that edits `[session_listener]` through the config crate, not by string) and `harw node doctor` | no |
 | **N3** | Pairing: one-time secret store, `device pair|approve|join`, protocol tests | wire format of the pairing message (§5.2) |
 | **N4** | Reachability profiles incl. `tailnet` via `harw-tailscale`; address in the code | no |
-| **N5** | `harw node enroll <ssh-target>` and `peer add|list|remove` | SSH use is acceptable (§5.3) |
+| **N5** | `harw node enroll <ssh-target>` and `peer add|list|remove`; thin-node install from the release mirror (R2); generated supervised unit (R3) | SSH use is acceptable (§5.3) |
 | **N6** | Mobile/SDK side of `join` (scan the code, store the key) | mobile key storage |
 | **N7** | `HostProvisioner` trait + cloud-init template, dry-run only | providers (§5.1) |
 
