@@ -543,9 +543,10 @@ impl ExtensionRegistryBuilder {
         self
     }
 
-    /// Installs the durable agent-job submitter. Delegation uses this path by
-    /// default; an absent submitter makes async delegation fail closed instead
-    /// of silently falling back to an unmanaged task.
+    /// Installs the durable agent-job submitter. When mounted, delegation uses
+    /// this path by default. Runtimes without a durable job substrate retain
+    /// the explicit inline compatibility path; no unmanaged background task is
+    /// created by the core.
     pub fn agent_job_submitter(mut self, submitter: Arc<dyn AgentJobSubmitter>) -> Self {
         self.agent_job_submitter = Some(submitter);
         self
