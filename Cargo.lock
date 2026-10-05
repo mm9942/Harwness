@@ -4241,6 +4241,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tool-cargo"
+version = "0.9.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-macros",
+ "harw-test-support",
+ "harw-tool-fsread",
+ "harw-tools",
+ "harw-types",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-tool-container"
 version = "0.9.0"
 

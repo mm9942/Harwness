@@ -367,6 +367,8 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-doc"]
 layer = "A"
+[packages."harw-tool-cargo"]
+layer = "A"
 [packages."harw-tool-explorer"]
 layer = "A"
 [packages."harw-tool-fs"]

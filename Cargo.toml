@@ -20,6 +20,7 @@ members = [
     # PL-93: typisierte Werkzeuge für häufige Kommandos.
     "harw-tool-fsread",
     "harw-tool-sys",
+    "harw-tool-cargo",
     "harw-tool-container",
     "harw-config",
     "harw-home",
