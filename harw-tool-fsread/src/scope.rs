@@ -341,6 +341,27 @@ impl Scope {
         }
     }
 
+    /// Wie [`Scope::open_read`], aber **ohne** die Geheimnis-Sperre.
+    ///
+    /// Nur für Vergleiche und Hashes (z. B. „hat sich die getrackte Datei
+    /// geändert?“): der Aufrufer darf den Inhalt niemals ausgeben. Symlinks
+    /// und Ausbrüche bleiben ausgeschlossen.
+    ///
+    /// # Errors
+    /// [`ScopeError::Io`] (inkl. `EISDIR`, `ELOOP`).
+    pub fn open_read_for_comparison(&self, rel: &RelPath) -> Result<File, ScopeError> {
+        if rel.is_root() {
+            return Err(ScopeError::Io(io::Error::from(rustix::io::Errno::ISDIR)));
+        }
+        let file = open_beneath(self.root_fd.as_fd(), rel.as_path(), OpenMode::read_only())?;
+        let stat = rustix::fs::fstat(&file)?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => Ok(file),
+            FileType::Directory => Err(ScopeError::Io(io::Error::from(rustix::io::Errno::ISDIR))),
+            _ => Err(ScopeError::Io(io::Error::from(rustix::io::Errno::INVAL))),
+        }
+    }
+
     /// Führt `f` mit dem Deskriptor des Elternverzeichnisses und dem letzten
     /// Namen aus. Für die Wurzel selbst gibt es keinen Namen: dort `fstat`.
     fn with_parent<R>(
