@@ -39,7 +39,7 @@ pub fn install_host_default(state_dir: &std::path::Path) -> bool {
     if installed().is_some() {
         return true;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         match crate::JobCommandPort::host(state_dir) {
             Ok(port) => {
@@ -48,7 +48,7 @@ pub fn install_host_default(state_dir: &std::path::Path) -> bool {
             Err(error) => tracing::warn!(%error, "no job runtime for commands"),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = state_dir;
     installed().is_some()
 }

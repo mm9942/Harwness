@@ -131,5 +131,9 @@ managers), a *recipe* builder (`PreparedJob`, `BackgroundLaunch`, the child-agen
 job runtime starts what they build), or an interactive helper that needs the user's terminal
 (editor, clipboard). `/diff` runs its sandboxed git through the port.
 
-Open: macOS (`DarwinExecutor` behind the same port; nothing is installed there, the surfaces
-fail closed), and the stdio handoff is Linux only.
+macOS: `JobCommandPort::host` is wired to `DarwinExecutor`, which now reads stdout/stderr on
+reader threads (events), appends to output files and hands stdin/stdout pipes over, like the
+Linux executor; a job with `require_rlimits` is refused (Darwin enforces no rlimits).
+**Type-checked** for `aarch64-apple-darwin` (`harw-command`, `harw-job-runtime`,
+`harw-tool-shell`, `harw-tool-job`; the TLS crates need a real sysroot), **not executed** —
+no macOS host was available. Run the `harw-command` tests on a Mac before relying on it.

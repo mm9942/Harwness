@@ -298,6 +298,27 @@ impl JobCommandPort<harw_job::FsJobRecordStore, harw_job::LinuxExecutor> {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl JobCommandPort<harw_job::FsJobRecordStore, harw_job::DarwinExecutor> {
+    /// The host runtime on macOS: file-backed job records below `state_dir`
+    /// and the Darwin executor (own process group, output through the runtime;
+    /// no resource limits, see `DarwinExecutor`).
+    ///
+    /// # Errors
+    /// The store or the runtime cannot be created.
+    pub fn host(state_dir: &std::path::Path) -> Result<Self, String> {
+        let store = harw_job::FsJobRecordStore::create_ambient(state_dir)
+            .map_err(|error| format!("job store {}: {error}", state_dir.display()))?;
+        let runtime = JobRuntime::builder()
+            .store(store)
+            .executor(harw_job::DarwinExecutor::default())
+            .workspace_root("/")
+            .build()
+            .map_err(|error| format!("job runtime: {error}"))?;
+        Ok(Self::new(runtime))
+    }
+}
+
 impl<S: CoordinatorStore, E: Executor> JobCommandPort<S, E> {
     /// Wraps a runtime whose workspace root is `/` (commands name absolute
     /// working directories).
