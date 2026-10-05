@@ -1126,6 +1126,19 @@ impl Executor for LinuxExecutor {
             None
         };
         if let Some(setsid) = session {
+            // `setsid` would report a missing program as exit status 127;
+            // a path that does not exist is a failed spawn, as without it.
+            let program = Path::new(&launch.program);
+            if program.components().count() > 1 && !program.exists() {
+                if let Some(plan) = &prepared.trampoline_plan {
+                    let _ = std::fs::remove_file(plan);
+                }
+                release(cgroup);
+                return Err(RuntimeError::Spawn {
+                    program: spec.program.clone(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                });
+            }
             launch = launch.wrap_in_session(setsid);
         }
         // 4. spawn → pidfd → cgroup attach

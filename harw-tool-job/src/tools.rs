@@ -999,7 +999,10 @@ impl JobToolExecutor {
             tool: Some(call.name.as_str().to_owned()),
             owner_agent: None,
         };
-        match manager.start_with_origin(request, launch.job, launch.warnings, origin) {
+        match manager
+            .start_with_origin(request, launch.job, launch.warnings, origin)
+            .await
+        {
             Ok(status) => {
                 info!(job_id = %status.meta.job_id, "job.start");
                 let mut value = status_json(&status);

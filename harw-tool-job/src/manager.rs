@@ -342,6 +342,82 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What the monitor waits on: a child this process spawned (the legacy piped
+/// path) or a command the job runtime runs.
+enum Waiter {
+    Child(Child),
+    Runtime(harw_command::RunFuture<'static>),
+}
+
+impl Waiter {
+    /// The exit status; cancel-safe (polling again continues the wait).
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Child(child) => child.wait().await,
+            Self::Runtime(done) => {
+                let outcome = done.as_mut().await;
+                match outcome.end {
+                    harw_command::CommandEnd::Exited => {
+                        Ok(ExitStatus::from_raw(outcome.exit_code << 8))
+                    }
+                    harw_command::CommandEnd::Signaled(signal) => Ok(ExitStatus::from_raw(signal)),
+                    // The runtime killed it (cancel, deadline): a SIGKILL.
+                    harw_command::CommandEnd::Cancelled
+                    | harw_command::CommandEnd::TimedOut
+                    | harw_command::CommandEnd::OutputLimit => Ok(ExitStatus::from_raw(9)),
+                    harw_command::CommandEnd::Failed(message) => Err(io::Error::other(message)),
+                }
+            }
+        }
+    }
+}
+
+/// How long a background job may run before the runtime's deadline (jobs have
+/// no wall limit of their own; stop is explicit).
+const JOB_RUNTIME_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+/// Hands a prepared job to the installed command port: argv, working directory
+/// and environment from the prepared command, output appended to the job's
+/// log files.
+async fn start_on_runtime(
+    prepared: &PreparedJob,
+    dir: &Path,
+) -> Result<harw_command::StartedCommand, String> {
+    let Some(port) = harw_command::installed() else {
+        return Err("no job runtime is installed; jobs start only through it".to_owned());
+    };
+    let std = prepared.command.as_std();
+    let mut request = harw_command::CommandRequest::new(
+        std.get_program().to_string_lossy().into_owned(),
+        std.get_current_dir()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf),
+        JOB_RUNTIME_DEADLINE,
+    );
+    request.args = std
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    request.env = if prepared.env_cleared {
+        Vec::new()
+    } else {
+        std::env::vars().collect()
+    };
+    for (name, value) in std.get_envs() {
+        let name = name.to_string_lossy().into_owned();
+        request.env.retain(|(existing, _)| *existing != name);
+        if let Some(value) = value {
+            request
+                .env
+                .push((name, value.to_string_lossy().into_owned()));
+        }
+    }
+    request.output = harw_command::CommandOutput::Files {
+        stdout: dir.join(STDOUT_LOG),
+        stderr: dir.join(STDERR_LOG),
+    };
+    port.start(request).await
+}
+
 /// Veränderlicher Zustand eines Jobs.
 #[derive(Debug)]
 struct EntryState {
@@ -676,12 +752,13 @@ impl JobManager {
     /// [`JobError::Capacity`], [`JobError::Io`] (Verzeichnis/Logdateien) oder
     /// [`JobError::Spawn`]; ein gescheiterter Start bleibt als
     /// [`JobState::Failed`] mit `launch_error` sichtbar.
-    pub fn start(
+    pub async fn start(
         self: &Arc<Self>,
         request: StartRequest,
         prepared: PreparedJob,
     ) -> Result<JobStatus, JobError> {
         self.start_with_warnings(request, prepared, Vec::new())
+            .await
     }
 
     /// Wie [`JobManager::start`], zusätzlich mit Hinweisen des Startwegs
@@ -691,13 +768,14 @@ impl JobManager {
     ///
     /// # Errors
     /// Wie [`JobManager::start`].
-    pub fn start_with_warnings(
+    pub async fn start_with_warnings(
         self: &Arc<Self>,
         request: StartRequest,
         prepared: PreparedJob,
         warnings: Vec<String>,
     ) -> Result<JobStatus, JobError> {
         self.start_with_origin(request, prepared, warnings, JobOrigin::default())
+            .await
     }
 
     /// Wie [`JobManager::start_with_warnings`], zusätzlich mit der Herkunft
@@ -706,7 +784,7 @@ impl JobManager {
     ///
     /// # Errors
     /// Wie [`JobManager::start`].
-    pub fn start_with_origin(
+    pub async fn start_with_origin(
         self: &Arc<Self>,
         request: StartRequest,
         prepared: PreparedJob,
@@ -715,8 +793,10 @@ impl JobManager {
     ) -> Result<JobStatus, JobError> {
         self.check_capacity()?;
         let (id, dir) = self.allocate()?;
-        let stdout = create_log(&dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?;
-        let stderr = create_log(&dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
+        // The runtime appends the process output to these files (they outlive
+        // this process); created here for the `O_EXCL` guarantee and the mode.
+        drop(create_log(&dir.join(STDOUT_LOG)).map_err(io_err("create stdout.log"))?);
+        drop(create_log(&dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?);
 
         let mut meta = JobMeta {
             version: META_VERSION,
@@ -752,26 +832,24 @@ impl JobManager {
             owner_agent: origin.owner_agent,
         };
 
-        let mut command = prepared.command;
-        command
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .kill_on_drop(false);
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                warn!(job_id = %id, error = %err, "job spawn failed");
+        // The job runtime starts the process (PL-93): session, pidfd, cgroup and
+        // the output files are its business; this keeps ownership, logs,
+        // progress and notifications.
+        let started = match start_on_runtime(&prepared, &dir).await {
+            Ok(started) => started,
+            Err(message) => {
+                warn!(job_id = %id, error = %message, "job spawn failed");
                 meta.state = JobState::Failed;
                 meta.ended_at = Some(Timestamp::now());
-                meta.launch_error = Some(err.to_string());
+                meta.launch_error = Some(message.clone());
                 let entry = Arc::new(JobEntry::new(dir, meta, false, None));
                 entry.persist();
                 lock(&self.jobs).insert(id, entry);
-                return Err(JobError::Spawn(err.to_string()));
+                return Err(JobError::Spawn(message));
             }
         };
 
-        let pid = child.id();
+        let pid = started.pid;
         let leader = adopt_child(&mut meta, pid);
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
@@ -811,7 +889,7 @@ impl JobManager {
             config: self.config.clone(),
             notify_every: request.notify_every,
         };
-        let handle = tokio::spawn(monitor.run(child));
+        let handle = tokio::spawn(monitor.run(Waiter::Runtime(started.done)));
         *lock(&entry.monitor) = Some(handle);
         Ok(entry.status())
     }
@@ -1524,8 +1602,8 @@ struct MonitorState {
 }
 
 impl Monitor {
-    async fn run(self, child: Child) {
-        self.run_inner(child, None).await;
+    async fn run(self, waiter: Waiter) {
+        self.run_inner(waiter, None).await;
     }
 
     /// Wie [`Monitor::run`], aber wartet nach dem Prozessende zusätzlich auf
@@ -1533,10 +1611,10 @@ impl Monitor {
     /// letzte Ausgabe sicher in `STDOUT_LOG` steht, bevor der Ende-Bericht
     /// den Tail liest.
     async fn run_piped(self, child: Child, tee: JoinHandle<()>) {
-        self.run_inner(child, Some(tee)).await;
+        self.run_inner(Waiter::Child(child), Some(tee)).await;
     }
 
-    async fn run_inner(self, mut child: Child, tee: Option<JoinHandle<()>>) {
+    async fn run_inner(self, mut child: Waiter, tee: Option<JoinHandle<()>>) {
         let started = Instant::now();
         let mut run = MonitorState {
             stdout: LogFollower::new(self.entry.dir.join(STDOUT_LOG)),

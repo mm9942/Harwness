@@ -379,18 +379,31 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
             };
             // The first frame of the attempt names the PID; a job that never
             // starts ends the stream instead.
+            let mut began = false;
             let mut pid = None;
             let wait_for_start = async {
                 while let Some(event) = frames.next().await {
                     if let FrameEvent::Frame(JobFrame::AttemptStarted { pid: started, .. }) = event
                     {
                         pid = started;
+                        began = true;
                         break;
                     }
                 }
             };
             let _ = tokio::time::timeout(START_TIMEOUT, wait_for_start).await;
             drop(frames);
+            if !began {
+                // The attempt never started (spawn, sandbox or admission
+                // failed): that is a failed start, not a running command.
+                return match handle.wait().await {
+                    Ok(result) => match end_of(&result, false, false).0 {
+                        CommandEnd::Failed(message) => Err(message),
+                        _ => Err("the job ended before it started".to_owned()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+            }
             let done: RunFuture<'static> = Box::pin(async move {
                 match handle.wait().await {
                     Ok(result) => {

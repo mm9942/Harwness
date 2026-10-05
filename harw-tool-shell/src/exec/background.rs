@@ -109,6 +109,8 @@ const HOST_ENV_DENY: [&str; 6] = [
 pub struct BackgroundLaunch {
     command: TokioCommand,
     executed_on_host: bool,
+    /// The environment is exactly what is set on `command` (nothing inherited).
+    env_cleared: bool,
     warnings: Vec<String>,
 }
 
@@ -117,6 +119,13 @@ impl BackgroundLaunch {
     #[must_use]
     pub fn executed_on_host(&self) -> bool {
         self.executed_on_host
+    }
+
+    /// `true`, wenn die Umgebung genau die am Befehl gesetzten Variablen ist
+    /// (nichts wird geerbt).
+    #[must_use]
+    pub fn env_cleared(&self) -> bool {
+        self.env_cleared
     }
 
     /// Hinweise des Startwegs (z. B. ohne rlimits); nie Werte von Umgebungsvariablen.
@@ -279,6 +288,7 @@ impl ShellToolProvider {
         let warnings = rlimit_warnings(prlimit.as_deref());
         let limits = timeouts::limits_for(executor.limits, cpu_budget_secs);
 
+        let env_cleared = effective_host;
         let mut launched = if effective_host {
             let setsid = resolve_setsid();
             let shell = resolve_host_shell(executor.exec_platform);
@@ -341,6 +351,7 @@ impl ShellToolProvider {
         Ok(BackgroundLaunch {
             command: launched,
             executed_on_host: effective_host,
+            env_cleared,
             warnings,
         })
     }

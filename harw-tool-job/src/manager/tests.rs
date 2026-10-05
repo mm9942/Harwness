@@ -40,6 +40,7 @@ async fn test_start_status_logs_stop() -> TestResult {
     let started = env
         .manager
         .start(request("sleeper", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     assert_eq!(started.meta.state, JobState::Running);
@@ -107,6 +108,7 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
             Vec::new(),
             origin,
         )
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     assert_eq!(started.meta.origin_call_id.as_deref(), Some("call-42"));
@@ -136,6 +138,7 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
     let plain = env
         .manager
         .start(request("plain", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start plain"))?;
     assert_eq!(plain.meta.origin_call_id, None);
     assert_eq!(plain.meta.origin_tool, None);
@@ -153,6 +156,7 @@ async fn test_stop_kills_whole_process_group() -> TestResult {
     let started = env
         .manager
         .start(request("group", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let stdout = started.log_dir.join(STDOUT_LOG);
@@ -191,6 +195,7 @@ async fn test_exit_code_and_tail_in_finished_event() -> TestResult {
     let started = env
         .manager
         .start(request("fails", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
 
@@ -232,6 +237,7 @@ async fn test_successful_job_is_succeeded() -> TestResult {
     let id = env
         .manager
         .start(request("ok", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -256,6 +262,7 @@ async fn test_only_creator_and_ancestors_control_a_job() -> TestResult {
             request("owned", "worker", &["orchestrator", "uia"]),
             prepared,
         )
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -305,6 +312,7 @@ async fn test_progress_and_error_events() -> TestResult {
     let id = env
         .manager
         .start(request("build", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -357,6 +365,7 @@ async fn test_wait_times_out_then_sees_milestone() -> TestResult {
     let id = env
         .manager
         .start(request("slow", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -398,6 +407,7 @@ async fn test_detach_keeps_process_and_operator_can_stop_it() -> TestResult {
     let started = env
         .manager
         .start(request("detached", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let pid = started.meta.pid.ok_or(TestError::Missing("pid"))?;
@@ -623,6 +633,7 @@ mod recovery {
         let started = env
             .manager
             .start(request("exec", "agent-a", &[]), prepared)
+            .await
             .map_err(ctx("start"))?;
         let id = started.meta.job_id.clone();
         let pid = started.meta.pid.ok_or(TestError::Missing("pid"))?;
@@ -819,6 +830,7 @@ mod recovery {
         let started = env
             .manager
             .start(request("group", "agent-a", &[]), prepared)
+            .await
             .map_err(ctx("start"))?;
         let id = started.meta.job_id.clone();
         let stdout = started.log_dir.join(STDOUT_LOG);
@@ -894,6 +906,7 @@ async fn test_capacity_limit() -> TestResult {
     let id = env
         .manager
         .start(request("one", "agent-a", &[]), first)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -908,7 +921,9 @@ async fn test_capacity_limit() -> TestResult {
     assert!(err.to_string().contains("[jobs] max_running"), "{err}");
     let second = env.prepare("sleep 30").await?;
     assert!(matches!(
-        env.manager.start(request("two", "agent-a", &[]), second),
+        env.manager
+            .start(request("two", "agent-a", &[]), second)
+            .await,
         Err(JobError::Capacity { max: 1 })
     ));
     assert_eq!(env.manager.stop_all().await, 1);
@@ -933,6 +948,7 @@ async fn test_capacity_is_adjustable_at_runtime_without_stopping_jobs() -> TestR
         let prepared = env.prepare("sleep 30").await?;
         env.manager
             .start(request(name, "agent-a", &[]), prepared)
+            .await
             .map_err(ctx("start"))?;
     }
     assert!(matches!(
@@ -998,6 +1014,7 @@ async fn test_normal_end_reaps_stragglers() -> TestResult {
     let started = env
         .manager
         .start(request("straggler", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let stdout = started.log_dir.join(STDOUT_LOG);
@@ -1030,6 +1047,7 @@ async fn test_clean_end_reaps_nothing() -> TestResult {
     let id = env
         .manager
         .start(request("clean", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?
         .meta
         .job_id;
@@ -1054,6 +1072,7 @@ async fn test_small_log_budget_truncates_with_marker() -> TestResult {
     let started = env
         .manager
         .start(request("chatty", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let status = wait_terminal(&env, &id).await?;
@@ -1093,6 +1112,7 @@ async fn test_log_budget_applies_while_running() -> TestResult {
     let started = env
         .manager
         .start(request("flood", "agent-a", &[]), prepared)
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
     let stdout = started.log_dir.join(STDOUT_LOG);
@@ -1126,6 +1146,7 @@ async fn test_launch_warnings_recorded_and_notified() -> TestResult {
             env.prepare("echo ok").await?,
             vec![warning.clone()],
         )
+        .await
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
 
@@ -1193,10 +1214,12 @@ async fn test_spawn_failure_is_recorded_as_failed() -> TestResult {
     let prepared = PreparedJob {
         command,
         executed_on_host: true,
+        env_cleared: false,
     };
     let result = env
         .manager
-        .start(request("broken", "agent-a", &[]), prepared);
+        .start(request("broken", "agent-a", &[]), prepared)
+        .await;
     assert!(matches!(result, Err(JobError::Spawn(_))));
     let jobs = env.manager.list(Caller::Agent("agent-a"));
     assert_eq!(jobs.len(), 1);
