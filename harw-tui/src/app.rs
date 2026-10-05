@@ -6007,14 +6007,21 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             let surface_root_id = app.session_id().as_str().to_owned();
             app.agent_monitor
                 .finish_surface_root(&surface_root_id, false, true);
-            mark_incomplete_tool_exports(app, state, &turn_id, &format!("unvollständig ({reason})"))
+            let _ = mark_incomplete_tool_exports(
+                app,
+                state,
+                &turn_id,
+                &format!("unvollständig ({reason})"),
+            );
+            true
         }
         TurnEvent::TurnAborted { turn_id } => {
             let surface_root_id = app.session_id().as_str().to_owned();
             app.agent_monitor
                 .finish_surface_root(&surface_root_id, true, false);
             let label = turn_safety::aborted_label(app);
-            mark_incomplete_tool_exports(app, state, &turn_id, &label)
+            let _ = mark_incomplete_tool_exports(app, state, &turn_id, &label);
+            true
         }
         // TurnCompleted läuft exklusiv über den SessionEvent-Pfad, damit die
         // Token-Summary nicht doppelt erscheint. TurnStarted trägt keinen
@@ -7752,16 +7759,16 @@ async fn drive_turn_animated(
                     // bereits während des Turns statt erst nach seinem Ende.
                     maybe_turn_event = turn_event_rx.recv() => {
                         if let Some(event) = maybe_turn_event {
-                            if handle_turn_event(app, turn_state, event) {
-                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
-                            }
-                            // Register „CSI-Sicherheitsnetz und Paste-
-                            // Platzhalter", Punkt 7: ein abgeschlossener
-                            // `shell.exec`-Aufruf kann Terminal-Modi
-                            // beschädigt zurückgelassen haben (siehe
-                            // `handle_turn_event`).
+                            let redraw = handle_turn_event(app, turn_state, event);
+                            // Terminal-Ownership MUSS vor dem ersten Frame nach
+                            // Host-Ausführung wiederhergestellt sein. Andersherum
+                            // landet genau dieser Frame im normalen tmux-Scrollback
+                            // und bleibt dort als duplizierter Dock stehen.
                             if app.take_needs_terminal_reassert() {
                                 guard.reassert_terminal_modes();
+                            }
+                            if redraw {
+                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             }
                         }
                     }
@@ -9005,15 +9012,15 @@ async fn drive_pauses_to_completion(
             }
             maybe_turn_event = turn_event_rx.recv() => {
                 if let Some(event) = maybe_turn_event {
-                    if handle_turn_event(app, turn_state, event) {
-                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
-                    }
-                    // Register „CSI-Sicherheitsnetz und Paste-Platzhalter",
-                    // Punkt 7: ein abgeschlossener `shell.exec`-Aufruf kann
-                    // Terminal-Modi beschädigt zurückgelassen haben (siehe
-                    // `handle_turn_event`).
+                    let redraw = handle_turn_event(app, turn_state, event);
+                    // Wie im normalen Turn-Pfad: erst Alternate-Screen/Modi
+                    // reparieren, dann zeichnen. Kein Frame darf zwischen
+                    // Host-Rückkehr und Reassert in den Terminal-Scrollback.
                     if app.take_needs_terminal_reassert() {
                         guard.reassert_terminal_modes();
+                    }
+                    if redraw {
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                 }
             }
