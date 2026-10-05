@@ -1748,6 +1748,33 @@ fn child_question(arguments: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// Async is the delegation default. Callers must opt into the old inline
+/// parent-waits-for-child contract explicitly.
+fn delegation_runs_inline(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        || arguments
+            .get("wait")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+fn agent_job_started_result(
+    handle: &harw_extension_api::AgentJobHandle,
+    role: &str,
+) -> ToolCallResult {
+    ToolCallResult::success(serde_json::json!({
+        "work_id": handle.work_id.as_str(),
+        "child_id": handle.child.as_str(),
+        "role": role,
+        "status": "running",
+        "async": true,
+        "hint": "Work continues independently. Use job.status/job.wait with work_id or agent.result with child_id."
+    }))
+}
+
 /// Argumentfelder eines Handoff-Calls, die — in dieser Reihenfolge — als
 /// Arbeitsauftrag des Kindes gelesen werden. `"question"` ist die ältere
 /// Schreibweise (siehe [`child_question`]).
@@ -3912,7 +3939,6 @@ async fn resume_after_approval_with_store(
                             });
                         }
                     };
-                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
                     // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
                     // zurück). Ohne dieses Event bliebe ein solches Kind für jeden
@@ -3923,9 +3949,53 @@ async fn resume_after_approval_with_store(
                             turn_id: ctx.turn_id.clone(),
                             child: child.clone(),
                             role: role.clone(),
-                            question,
+                            question: question.clone(),
                         },
                     );
+
+                    if !delegation_runs_inline(&pending.call.arguments) {
+                        let submitter = session
+                            .registry()
+                            .agent_job_submitter()
+                            .cloned()
+                            .ok_or_else(|| CoreError::HandoffFailed {
+                                role: role.clone(),
+                                reason: "durable agent job submitter is not mounted".to_owned(),
+                            })?;
+                        let job = submitter
+                            .submit_child(&child, question.as_deref())
+                            .await
+                            .map_err(|error| CoreError::HandoffFailed {
+                                role: role.clone(),
+                                reason: error.to_string(),
+                            })?;
+                        let result = agent_job_started_result(&job, &role);
+                        notify_tool_outcome(
+                            session,
+                            pending.call.name.as_str(),
+                            &pending.call.arguments,
+                            &result,
+                        );
+                        notify_tool_progress(session);
+                        session
+                            .history_mut()
+                            .push_tool_result(pending.call.id.clone(), result.clone(), 0);
+                        persist_last(session, store).await?;
+                        emit(
+                            session,
+                            TurnEvent::ToolCallCompleted {
+                                turn_id: ctx.turn_id.clone(),
+                                call_id: pending.call.id,
+                                result,
+                                duration_ms: 0,
+                                placement: None,
+                            },
+                        );
+                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                            .await;
+                    }
+
+                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     Ok(TurnOutcome::AwaitingChild {
                         child,
                         call_id: pending.call.id,
@@ -5024,17 +5094,56 @@ async fn drive_turn(
                     role: role.clone(),
                     reason: e.to_string(),
                 })?;
-                // state ⇒ WaitingForChild; Loop pausiert.
-                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
+                let question = child_question(&handoff_arguments);
                 emit(
                     session,
                     TurnEvent::ChildSpawned {
                         turn_id: handle.turn_id.clone(),
                         child: child.clone(),
                         role: role.clone(),
-                        question: child_question(&handoff_arguments),
+                        question: question.clone(),
                     },
                 );
+
+                // Async-by-default: admission above establishes the child
+                // authority; the durable job runtime now owns its lifecycle.
+                // Only an explicit background=false / wait=true keeps the
+                // historical AwaitingChild contract.
+                if !delegation_runs_inline(&handoff_arguments) {
+                    let submitter = session
+                        .registry()
+                        .agent_job_submitter()
+                        .cloned()
+                        .ok_or_else(|| CoreError::HandoffFailed {
+                            role: role.clone(),
+                            reason: "durable agent job submitter is not mounted".to_owned(),
+                        })?;
+                    let job = submitter
+                        .submit_child(&child, question.as_deref())
+                        .await
+                        .map_err(|error| CoreError::HandoffFailed {
+                            role: role.clone(),
+                            reason: error.to_string(),
+                        })?;
+                    let result = agent_job_started_result(&job, &role);
+                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                    notify_tool_progress(session);
+                    session.history_mut().push_tool_result(call.id.clone(), result.clone(), 0);
+                    persist_last(session, store).await?;
+                    emit(
+                        session,
+                        TurnEvent::ToolCallCompleted {
+                            turn_id: handle.turn_id.clone(),
+                            call_id: call.id,
+                            result,
+                            duration_ms: 0,
+                            placement: None,
+                        },
+                    );
+                    continue;
+                }
+
+                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
                 return Ok(TurnOutcome::AwaitingChild {
                     child,
                     call_id: call.id,
