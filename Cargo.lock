@@ -4270,15 +4270,18 @@ name = "harw-tool-container-run"
 version = "0.9.1"
 dependencies = [
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
+ "harw-job",
  "harw-tool-container",
  "harw-tools",
  "harw-types",
- "serde",
  "serde_json",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",
+
 ]
 
 [[package]]
