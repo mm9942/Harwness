@@ -196,10 +196,20 @@ mod tests {
             json!("f.txt/"),
             json!("bin"),
         ];
-        let nasty_numbers = [json!(0), json!(1), json!(u64::MAX), json!(-1), json!("18446744073709551616"), json!(1.5), json!("x")];
+        let nasty_numbers = [
+            json!(0),
+            json!(1),
+            json!(u64::MAX),
+            json!(-1),
+            json!("18446744073709551616"),
+            json!(1.5),
+            json!("x"),
+        ];
         let mut calls = 0usize;
         for name in FSREAD_TOOL_NAMES {
-            let tool = provider.executor(&ToolName::new(*name)).ok_or(TestError::Missing("executor"))?;
+            let tool = provider
+                .executor(&ToolName::new(*name))
+                .ok_or(TestError::Missing("executor"))?;
             for text in &nasty_strings {
                 for number in &nasty_numbers {
                     let attempts = [
@@ -214,8 +224,15 @@ mod tests {
                         match run(tool.as_ref(), &read, name, arguments.clone()).await {
                             Ok(output) => {
                                 let rendered = serde_json::to_string(&output)?;
-                                assert!(!rendered.contains("internal error"), "{name} panicked on {arguments}");
-                                assert!(rendered.len() <= crate::budget::MAX_OUTPUT_BYTES + 4096, "{name}: output of {} bytes on {arguments}", rendered.len());
+                                assert!(
+                                    !rendered.contains("internal error"),
+                                    "{name} panicked on {arguments}"
+                                );
+                                assert!(
+                                    rendered.len() <= crate::budget::MAX_OUTPUT_BYTES + 4096,
+                                    "{name}: output of {} bytes on {arguments}",
+                                    rendered.len()
+                                );
                             }
                             Err(error) => assert!(!error.to_string().is_empty()),
                         }
