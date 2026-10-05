@@ -60,7 +60,7 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 # Version bewusst identisch zu harw-cli/Cargo.toml.
 tracing = "0.1.44"
 serde_json = "1"
-harw-home = { version = "0.9.0", path = "../harw-home" }
+harw-home = { version = "0.9.1", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
 # `PendingApproval::requested_at`/`timeout_at` (harw-core) sind `jiff::Timestamp`;
 # der Freigabe-/Wiederaufnahme-Treiber (`src/approval.rs`) liest den

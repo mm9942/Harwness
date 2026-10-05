@@ -6,6 +6,8 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+## [0.9.1] — Unreleased
+
 ### Fixed
 
 - Packaging metadata now states the workspace license (`MIT OR Apache-2.0`)
@@ -44,8 +46,12 @@ Semantic Versioning within the 0.x pre-release range.
   installed version.
 - The release `mirror` job also uploads `harwness-<version>-source.tar.gz`
   (listed in `SHA256SUMS`) and `Harwness-main.zip`.
-
-## [0.9.0] — Unreleased
+- Version alignment: workspace bumped from 0.8.0 to 0.9.1 to match the
+  internal 0.9.x state; path-dependency version pins updated
+  (`harw-tui` → harw-home, `harw-registry-defaults` → harw-tool-doc,
+  harw-tools).
+- `harw pr-review`: argument bridge fix in `harw-cli` dispatch (PrReviewArgs
+  rebuilt from CLI args).
 
 ### Added
 - Tool gateway, round R18a (contract
