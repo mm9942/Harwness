@@ -5263,9 +5263,9 @@ struct SpawnerInputs<'a> {
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
 ///
 /// # Rückgabe
-/// `(Option<Arc<ManagedAgentSpawner>>, Vec<String>)` — bei
-/// [`SpawnerPolicy::None`] `(None, vec![])`, sonst der Spawner und die
-/// registrierten Rollennamen.
+/// Spawner, registrierte Rollennamen und den weakly-bound Slot für den
+/// runtimeweiten [`harw_extension_api::AgentJobSubmitter`]. Bei
+/// [`SpawnerPolicy::None`] sind Spawner und Submitter-Slot `None`.
 fn build_spawner(
     policy: SpawnerPolicy,
     inputs: SpawnerInputs<'_>,
