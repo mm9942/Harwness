@@ -74,8 +74,9 @@ PL-93's conflict-free implementation was ported onto the current `dev` baseline 
 5. claims and drives it using `DurableJobRunner`;
 6. renews the lease while it runs;
 7. links job cancellation to the child cancellation token;
-8. commits success/failure/cancellation/blocked outcomes under the lease fence;
-9. keeps `BackgroundChildren` only as a result/notification projection.
+8. commits success/failure/cancellation under the job lease fence;
+9. only after that durable commit, completes the subordinate child lease;
+10. only after both durable transitions, updates `BackgroundChildren` as a result/notification projection.
 
 The runtime mounts the submitter once at the composition root and passes a weak deferred adapter into every child registry. This avoids a strong registry/spawner/runtime cycle while preserving async-by-default behavior for the full delegation tree.
 
@@ -96,6 +97,8 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 - Agent-job scope is the canonical resolved tenant/workspace plus authenticated submitter, not a session-ID surrogate.
 - Root and descendant registries share the same logical job contract.
 - Missing approval UI rejects-and-continues.
+- A nested explicit inline delegation that still pauses fails closed instead of writing a `Blocked` job with no resume owner.
+- Agent background completion is ordered `job commit -> child lease completion -> background projection`; `WorkId` is the lifecycle source of truth.
 - Grep is process-free.
 - Podman lifecycle commands use the job command port.
 - Direct workload spawn exceptions are ratcheted.
@@ -114,6 +117,7 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 - Run the full compiler/test/gate matrix on this exact branch SHA.
 - Add/extend surface presentation for `work_id` where the current UI still prioritizes child/session IDs.
 - Add crash/restart integration coverage for an in-flight durable agent job.
+- Add a first-class durable dependency/work-graph contract before allowing agent jobs to enter `Blocked` on nested child handoffs; `wait=true` remains compatibility-only until a resume owner exists.
 - Add explicit job-status/result lookup by `work_id` for agent jobs where only child-oriented result tooling currently exists.
 - Add startup reconciliation for agent-job records left `Pending` between durable admission and background ownership transfer; these records must never be auto-run unless the child session and authority can be reconstructed and proven.
 - Decide whether CLI/build/editor/MCP/service-manager direct process exceptions should later get dedicated ports; they are not model workload execution and are intentionally outside this wave.

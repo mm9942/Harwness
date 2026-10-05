@@ -253,6 +253,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                     lease_ttl: SignedDuration::from_secs(AGENT_JOB_LEASE_SECS),
                     now: Timestamp::now(),
                 };
+                let spawner_for_run = Arc::clone(&spawner);
                 let result = runner
                     .run_with_cancel(
                         &work_id_for_run,
@@ -261,12 +262,12 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                             let (completion_tx, completion_rx) = watch::channel(false);
                             let control: Arc<dyn ExecutionControl> =
                                 Arc::new(AgentExecutionControl {
-                                    spawner: Arc::clone(&spawner),
+                                    spawner: Arc::clone(&spawner_for_run),
                                     child: child_for_run.clone(),
                                     completion_rx,
                                 });
                             let future = async move {
-                                let run = spawner
+                                let run = spawner_for_run
                                     .run_child_with_declared_budget(
                                         &child_for_run,
                                         state_store.as_ref(),
@@ -275,17 +276,16 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                                     )
                                     .await;
 
+                                // This future returns only the durable job
+                                // outcome. Background projection and child
+                                // lease finalization happen *after* the runner
+                                // has fenced and committed that outcome.
                                 let outcome = match run {
                                     Ok(result) => match result.outcome {
                                         TurnOutcome::Completed => {
                                             let text = result
                                                 .full_text
                                                 .unwrap_or_else(|| "completed".to_owned());
-                                            let _ = spawner.finish_background_child(
-                                                &child_for_run,
-                                                BackgroundStatus::Completed,
-                                                text.clone(),
-                                            );
                                             JobOutcome::Succeeded {
                                                 result: serde_json::json!({
                                                     "child_id": child_for_run.as_str(),
@@ -295,37 +295,48 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                                             }
                                         }
                                         TurnOutcome::Cancelled { reason } => {
-                                            let text = format!("agent cancelled: {reason:?}");
-                                            let _ = spawner.finish_background_child(
-                                                &child_for_run,
-                                                BackgroundStatus::Cancelled,
-                                                text.clone(),
-                                            );
-                                            JobOutcome::Cancelled { reason: text }
+                                            JobOutcome::Cancelled {
+                                                reason: format!("agent cancelled: {reason:?}"),
+                                            }
                                         }
-                                        TurnOutcome::AwaitingApproval { .. }
-                                        | TurnOutcome::AwaitingChild { .. } => JobOutcome::Blocked {
-                                            reason: "agent paused on durable dependency".to_owned(),
+                                        TurnOutcome::AwaitingApproval { .. } => {
+                                            JobOutcome::Failed {
+                                                reason: "agent paused on an unresolved approval after the durable approval relay exhausted; no resumable agent-job dependency owner is installed"
+                                                    .to_owned(),
+                                            }
+                                        }
+                                        TurnOutcome::AwaitingChild {
+                                            child: nested_child,
+                                            role,
+                                            ..
+                                        } => {
+                                            // Synchronous nested delegation is
+                                            // an explicit compatibility mode.
+                                            // The durable agent-job driver has
+                                            // no dependency re-driver yet, so
+                                            // never publish a fake Blocked
+                                            // record that can be set Ready with
+                                            // nobody left to claim it.
+                                            let cleanup = spawner_for_run
+                                                .release_child(&nested_child)
+                                                .err()
+                                                .map(|error| format!("; nested child cleanup failed: {error}"))
+                                                .unwrap_or_default();
+                                            JobOutcome::Failed {
+                                                reason: format!(
+                                                    "agent paused on inline handoff to '{role}'; nested inline pauses do not yet have a durable resume owner—use async delegation or a durable work graph{cleanup}"
+                                                ),
+                                            }
+                                        }
+                                        other => JobOutcome::Failed {
+                                            reason: format!(
+                                                "agent ended without terminal completion: {other:?}"
+                                            ),
                                         },
-                                        other => {
-                                            let text = format!("agent ended without terminal completion: {other:?}");
-                                            let _ = spawner.finish_background_child(
-                                                &child_for_run,
-                                                BackgroundStatus::Failed,
-                                                text.clone(),
-                                            );
-                                            JobOutcome::Failed { reason: text }
-                                        }
                                     },
-                                    Err(error) => {
-                                        let text = error.to_string();
-                                        let _ = spawner.finish_background_child(
-                                            &child_for_run,
-                                            BackgroundStatus::Failed,
-                                            text.clone(),
-                                        );
-                                        JobOutcome::Failed { reason: text }
-                                    }
+                                    Err(error) => JobOutcome::Failed {
+                                        reason: error.to_string(),
+                                    },
                                 };
                                 completion_tx.send_replace(true);
                                 outcome
@@ -334,13 +345,65 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         },
                     )
                     .await;
-                if let Err(error) = result {
-                    tracing::error!(
-                        work_id = %work_id_for_run,
-                        child = %child,
-                        error = %error,
-                        "agent_job.runtime_failed"
-                    );
+
+                match result {
+                    Ok(completion) => {
+                        // WorkId is the source of truth. Only after its
+                        // terminal outcome is durable may the subordinate
+                        // child lease be completed and the in-memory
+                        // background projection emit its terminal notice.
+                        let projection = match &completion.outcome {
+                            JobOutcome::Succeeded { result } => Some((
+                                BackgroundStatus::Completed,
+                                result
+                                    .get("text")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("agent completed")
+                                    .to_owned(),
+                            )),
+                            JobOutcome::Failed { reason } => {
+                                Some((BackgroundStatus::Failed, reason.clone()))
+                            }
+                            JobOutcome::Cancelled { reason } => {
+                                Some((BackgroundStatus::Cancelled, reason.clone()))
+                            }
+                            JobOutcome::Blocked { reason } => {
+                                tracing::error!(
+                                    work_id = %work_id_for_run,
+                                    child = %child,
+                                    reason,
+                                    "agent_job.blocked_without_resume_owner"
+                                );
+                                None
+                            }
+                        };
+
+                        if let Some((status, text)) = projection {
+                            if let Err(error) =
+                                spawner.close_child_durable(&child, completion.completed_at)
+                            {
+                                tracing::error!(
+                                    work_id = %work_id_for_run,
+                                    child = %child,
+                                    error = %error,
+                                    "agent_job.child_lease_completion_failed"
+                                );
+                            } else {
+                                let _ = spawner.finish_background_child(&child, status, text);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // A failed runner may mean lease loss or a rejected
+                        // fenced commit. Do not synthesize a terminal child
+                        // projection here: recovery owns that decision.
+                        tracing::error!(
+                            work_id = %work_id_for_run,
+                            child = %child,
+                            error = %error,
+                            "agent_job.runtime_failed"
+                        );
+                    }
                 }
             });
 
