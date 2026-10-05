@@ -245,6 +245,7 @@ async fn run_job_managed<S: ChildProcessSpawner>(
     let prepared = PreparedJob {
         command,
         executed_on_host: true,
+        env_cleared: false,
     };
     let request = StartRequest {
         name: format!("agent-child-{}", spec.agent_id),

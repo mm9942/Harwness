@@ -170,19 +170,8 @@ pub(crate) struct ChatOptions {
 /// job runtime. Without a port (unsupported platform, store not creatable)
 /// they report "no job runtime" instead of spawning anything themselves.
 fn install_command_port(home: &std::path::Path) {
-    #[cfg(target_os = "linux")]
-    {
-        let dir = harw_home::paths::cache_dir(home).join("command-jobs");
-        match harw_command::JobCommandPort::host(&dir) {
-            Ok(port) => {
-                // First installer wins; a second `run_chat` keeps the first.
-                let _ = harw_command::install(std::sync::Arc::new(port));
-            }
-            Err(error) => tracing::warn!(%error, "no job runtime for user commands"),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = home;
+    // First installer wins; `SessionJobs::open` installs the same default.
+    harw_command::install_host_default(&harw_home::paths::cache_dir(home).join("command-jobs"));
 }
 
 /// Startet den Default-Chat-Pfad.

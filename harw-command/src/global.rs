@@ -19,6 +19,29 @@ pub fn install(port: Arc<dyn CommandPort>) -> Result<(), Arc<dyn CommandPort>> {
     PORT.set(port)
 }
 
+/// Installs the host job runtime (file-backed job records below `state_dir`,
+/// Linux executor in new-session mode) unless a port is already installed.
+/// Returns whether a port is installed afterwards. Without Linux support, or
+/// when the runtime cannot be created, nothing is installed and surfaces fail
+/// closed.
+pub fn install_host_default(state_dir: &std::path::Path) -> bool {
+    if PORT.get().is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match crate::JobCommandPort::host(state_dir) {
+            Ok(port) => {
+                let _ = install(Arc::new(port));
+            }
+            Err(error) => tracing::warn!(%error, "no job runtime for commands"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state_dir;
+    PORT.get().is_some()
+}
+
 /// The installed port, if the composition root installed one.
 #[must_use]
 pub fn installed() -> Option<Arc<dyn CommandPort>> {

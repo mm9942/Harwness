@@ -52,6 +52,7 @@ impl K8sExecutor {
             runner_id: RunnerId::new("harw-canary").map_err(|e| id_error("canary runner", e))?,
             lease_epoch: 0,
             workspace_root: PathBuf::from("/"),
+            output_files: None,
         };
         let prepared = self.create_and_readback(&spec, &ctx)?;
         self.delete_now(&prepared.name);

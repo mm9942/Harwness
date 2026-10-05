@@ -463,6 +463,7 @@ mod tests {
         PreparedJob {
             command,
             executed_on_host: true,
+            env_cleared: false,
         }
     }
 
@@ -518,6 +519,7 @@ mod tests {
                 },
                 sleeper(),
             )
+            .await
             .map_err(ctx("start"))?;
         let id = status.meta.job_id.to_string();
 

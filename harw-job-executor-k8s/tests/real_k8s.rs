@@ -47,6 +47,7 @@ fn ctx(job: &str, epoch: u64) -> R<AttemptContext> {
         runner_id: RunnerId::new("real-runner")?,
         lease_epoch: epoch,
         workspace_root: PathBuf::from("/"),
+        output_files: None,
     })
 }
 
