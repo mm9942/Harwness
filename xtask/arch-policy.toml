@@ -373,6 +373,8 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-fs"]
 layer = "A"
+[packages."harw-tool-gitread"]
+layer = "A"
 [packages."harw-tool-fsread"]
 layer = "A"
 [packages."harw-tool-job"]

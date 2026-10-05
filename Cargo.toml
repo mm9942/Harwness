@@ -21,6 +21,7 @@ members = [
     "harw-tool-fsread",
     "harw-tool-sys",
     "harw-tool-cargo",
+    "harw-tool-gitread",
     "harw-tool-container",
     "harw-config",
     "harw-home",
