@@ -49,7 +49,7 @@
 //! - Host-Ausführung ([`ShellExecutor::run_host_command`], Plan Teil B1) läuft, wenn
 //!   `setsid` (util-linux) auffindbar ist, zusätzlich über `setsid --wait /bin/sh -c
 //!   <command>` statt `/bin/sh -c <command>` direkt: das löst den Befehl aus harws
-//!   Sitzung und Controlling-Terminal ([`host_shell_argv`], [`resolve_setsid`]) —
+//!   Sitzung und Controlling-Terminal ([`host_shell_argv_with_shell`], [`resolve_setsid`]) —
 //!   ein Kind, das `/dev/tty` öffnet (git, Pager,
 //!   Fortschrittsbalken), kann dann nicht mehr die Terminalmodi der harw-TUI
 //!   (z. B. Maus-Reporting) verändern. Ohne `setsid` bleibt der bisherige Pfad
@@ -823,7 +823,7 @@ impl ShellExecutor {
     ///
     /// Builds `/bin/sh -c <command>` — or, if `setsid` (util-linux) is
     /// resolvable via [`resolve_setsid`], `setsid --wait /bin/sh -c <command>`
-    /// via [`host_shell_argv`] — with `current_dir` set to the sandbox's
+    /// via [`host_shell_argv_with_shell`] — with `current_dir` set to the sandbox's
     /// canonical workspace root, the harness's own environment fully
     /// inherited (no `env_clear`, unlike the `bwrap` path), and stdin
     /// `/dev/null`. Process-group/session isolation depends on whether
@@ -899,7 +899,7 @@ impl ShellExecutor {
         command.current_dir(sandbox.workspace().canonical_root());
         // Prozessgruppen-/Sitzungs-Isolation des Host-Befehls von harws eigenem
         // Terminal. Zwei Fälle, je nachdem ob `setsid` gefunden wurde
-        // (`host_shell_argv`):
+        // (`host_shell_argv_with_shell`):
         //
         // - MIT setsid: `process_group(0)` wird hier BEWUSST NICHT gesetzt. Das
         //   util-linux-`setsid` forkt nur dann einen Enkelprozess (und wartet
@@ -1236,31 +1236,9 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-/// Baut das argv für den Host-Shell-Start (Plan Teil B1, Sitzungs-Trennung).
-///
-/// # Description
-/// Mit `setsid`: `<setsid> --wait /bin/sh -c <command>` — `--wait` lässt
-/// `setsid` blockieren, bis das gestartete Programm beendet ist, und gibt
-/// dessen Exit-Status weiter, sodass [`ShellExecutor::spawn_and_collect`]
-/// Timing und Exit-Code unverändert erhält. Ohne `setsid`: `/bin/sh -c
-/// <command>`, byte-identisch zum bisherigen Verhalten.
-///
-/// Reine Funktion ohne Prozessstart — unit-testbar ohne Spawn.
-///
-/// # Returns
-/// `(program, args)`: absoluter Programmpfad und die vollständige
-/// Argumentliste (ohne `program` selbst), in der Reihenfolge, in der sie an
-/// `TokioCommand::args` übergeben werden.
-fn host_shell_argv(setsid: Option<&Path>, command: &str) -> (PathBuf, Vec<OsString>) {
-    host_shell_argv_with_shell(setsid, Path::new("/bin/sh"), command)
-}
-
-/// Wie [`host_shell_argv`], aber mit einem explizit aufgelösten Shell-Pfad
+/// Argv des Host-Pfads mit einem explizit aufgelösten Shell-Pfad
 /// statt des fest verdrahteten `/bin/sh` (Android-Anbindung, siehe
-/// [`resolve_host_shell`]). `host_shell_argv` bleibt für Aufrufer, die
-/// weiterhin ausschließlich `/bin/sh` meinen (z. B. `exec::operator`, dessen
-/// `!`-Befehle unverändert nur auf gewöhnlichem Linux/Host laufen), byte-
-/// identisch zu vorher.
+/// [`resolve_host_shell`]).
 fn host_shell_argv_with_shell(
     setsid: Option<&Path>,
     shell: &Path,
@@ -2147,7 +2125,8 @@ mod tests {
     fn test_host_shell_argv_with_setsid_wraps_wait_and_bin_sh() {
         let setsid = Path::new("/usr/bin/setsid");
 
-        let (program, args) = host_shell_argv(Some(setsid), "echo hi");
+        let (program, args) =
+            host_shell_argv_with_shell(Some(setsid), Path::new("/bin/sh"), "echo hi");
 
         assert_eq!(program, PathBuf::from("/usr/bin/setsid"));
         assert_eq!(
@@ -2165,7 +2144,7 @@ mod tests {
 
     #[test]
     fn test_host_shell_argv_without_setsid_is_unchanged_bin_sh_dash_c() {
-        let (program, args) = host_shell_argv(None, "echo hi");
+        let (program, args) = host_shell_argv_with_shell(None, Path::new("/bin/sh"), "echo hi");
 
         assert_eq!(program, PathBuf::from("/bin/sh"));
         assert_eq!(

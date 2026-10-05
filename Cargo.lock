@@ -2184,6 +2184,7 @@ dependencies = [
  "harw-channel",
  "harw-channel-telegram",
  "harw-channel-telegram-transport",
+ "harw-command",
  "harw-completions",
  "harw-config",
  "harw-context",
@@ -4389,6 +4390,7 @@ version = "0.9.0"
 dependencies = [
  "blake3",
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
  "harw-macros",
  "harw-observe",

@@ -33,7 +33,6 @@
 "harw-tool-job/src/launcher.rs" = "migrate: PL-93 (workload process must go through the job runtime)"
 "harw-tool-shell/src/exec.rs" = "migrate: PL-93 (workload process must go through the job runtime)"
 "harw-tool-shell/src/exec/background.rs" = "migrate: PL-93 (workload process must go through the job runtime)"
-"harw-tool-shell/src/exec/operator.rs" = "migrate: PL-93 (workload process must go through the job runtime)"
 "harw-tool-shell/src/latex.rs" = "migrate: PL-93 (workload process must go through the job runtime)"
 "harw-tool-shell/src/sudo.rs" = "migrate: PL-93 (workload process must go through the job runtime)"
 "harw-tui/src/app/plan_mode.rs" = "migrate: PL-93 (workload process must go through the job runtime)"

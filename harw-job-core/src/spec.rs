@@ -212,6 +212,10 @@ pub struct ResourceRequest {
     /// Open file descriptors per process (`RLIMIT_NOFILE`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_files_max: Option<u32>,
+    /// Refuse to start the attempt when the per-process rlimits cannot be
+    /// applied (no `prlimit`, no trampoline) instead of running without them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_rlimits: bool,
 }
 
 impl ResourceRequest {

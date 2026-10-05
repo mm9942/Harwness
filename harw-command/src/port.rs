@@ -139,15 +139,41 @@ impl CommandOutcome {
 pub type RunFuture<'a> = Pin<Box<dyn Future<Output = CommandOutcome> + Send + 'a>>;
 
 /// Runs commands. The only way application code starts a workload process.
-pub trait CommandPort: Send + Sync {
+pub trait CommandPort: std::fmt::Debug + Send + Sync {
     /// Runs `request` to completion or until `cancel` fires.
     fn run(&self, request: CommandRequest, cancel: CancelToken) -> RunFuture<'_>;
 }
 
 /// [`CommandPort`] over a [`JobRuntime`].
-#[derive(Debug)]
 pub struct JobCommandPort<S, E> {
     runtime: JobRuntime<S, E>,
+}
+
+impl<S, E> std::fmt::Debug for JobCommandPort<S, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JobCommandPort")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl JobCommandPort<harw_job::FsJobRecordStore, harw_job::LinuxExecutor> {
+    /// The host runtime: file-backed job records below `state_dir` and the
+    /// Linux executor (pidfd + process group, no sandbox backend; sandboxed
+    /// commands need a configured executor).
+    ///
+    /// # Errors
+    /// The store or the runtime cannot be created.
+    pub fn host(state_dir: &std::path::Path) -> Result<Self, String> {
+        let store = harw_job::FsJobRecordStore::create_ambient(state_dir)
+            .map_err(|error| format!("job store {}: {error}", state_dir.display()))?;
+        let runtime = JobRuntime::builder()
+            .store(store)
+            .executor(harw_job::LinuxExecutor::default())
+            .workspace_root("/")
+            .build()
+            .map_err(|error| format!("job runtime: {error}"))?;
+        Ok(Self::new(runtime))
+    }
 }
 
 impl<S: CoordinatorStore, E: Executor> JobCommandPort<S, E> {

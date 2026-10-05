@@ -790,6 +790,7 @@ impl LinuxExecutor {
                     cwd: Some(workdir),
                 };
                 let rlimits = apply_prlimit(&mut launch, spec);
+                require_rlimits(spec, rlimits)?;
                 Ok(Prepared {
                     launch,
                     report: Some(unsandboxed_report(worse(resource_limits, rlimits))),
@@ -875,6 +876,7 @@ impl LinuxExecutor {
                 // `prlimit` runs in front of bwrap; the limits are inherited
                 // by the sandboxed program.
                 let rlimits = apply_prlimit(&mut launch, spec);
+                require_rlimits(spec, rlimits)?;
                 let report = SandboxReport {
                     resource_limits: worse(resource_limits, rlimits),
                     ..plan.report()
@@ -953,6 +955,17 @@ fn worse(a: EnforcementState, b: EnforcementState) -> EnforcementState {
         _ => 3,
     };
     if rank(b) > rank(a) { b } else { a }
+}
+
+/// A job that demands its rlimits does not run without them.
+fn require_rlimits(spec: &JobSpec, state: EnforcementState) -> Result<(), RuntimeError> {
+    if spec.resources.require_rlimits && state != EnforcementState::Enforced {
+        return Err(RuntimeError::Unsupported {
+            operation: "rlimits",
+            detail: "the job requires per-process rlimits but no prlimit is available".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Starts the launch through `prlimit` so the limits hold for the program
