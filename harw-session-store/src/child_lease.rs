@@ -26,7 +26,7 @@ use crate::error::{SessionStoreError, SessionStoreResult};
 use crate::store::{persist_noclobber, quarantine_file};
 use fs4::FileExt;
 use harw_observe::TraceContext;
-use harw_types::{SessionId, ToolCallId};
+use harw_types::{SessionId, ToolCallId, WorkId};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -53,6 +53,10 @@ pub struct ChildLeaseRecord {
     /// never rewritten just by being read back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<TraceContext>,
+    /// Durable WorkId that owns restart recovery for this child. Absent for
+    /// synchronous/non-job children and for legacy lease records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_work_id: Option<WorkId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +143,7 @@ impl ChildLeaseStore {
                 };
                 if is_regular_file(&self.completed_path(&lease.child)?)?
                     || now < lease.lease_expires_at
+                    || lease.owner_work_id.is_some()
                 {
                     continue;
                 }
@@ -164,6 +169,77 @@ impl ChildLeaseStore {
                 sync_parent_directory(&self.root)?;
             }
             Ok(claimed)
+        })();
+        unlock(lock, result)
+    }
+
+    /// Transfers restart ownership of an active child lease to one durable
+    /// WorkId. Idempotent for the same WorkId; a different existing owner is a
+    /// hard correlation error.
+    pub fn bind_job_owner(
+        &self,
+        child: &SessionId,
+        work_id: &WorkId,
+    ) -> SessionStoreResult<()> {
+        self.ensure_root()?;
+        let lock = self.lock()?;
+        let result = (|| {
+            let active = self.active_path(child)?;
+            if !is_regular_file(&active)? {
+                return Err(SessionStoreError::ChildLeaseNotFound {
+                    child: child.clone(),
+                });
+            }
+            let mut record = read_lease(&active)?;
+            match record.owner_work_id.as_ref() {
+                Some(existing) if existing != work_id => {
+                    return Err(SessionStoreError::ChildLeaseRecoveryMismatch {
+                        child: child.clone(),
+                        detail: format!(
+                            "owner_work_id is {existing}, not requested {work_id}"
+                        ),
+                    });
+                }
+                Some(_) => return Ok(()),
+                None => {}
+            }
+            record.owner_work_id = Some(work_id.clone());
+            let bytes = serde_json::to_vec(&record)?;
+            let parent = active.parent().ok_or_else(|| {
+                SessionStoreError::Io(std::io::Error::other("child lease path has no parent"))
+            })?;
+            let mut temp = NamedTempFile::new_in(parent).map_err(SessionStoreError::Io)?;
+            temp.write_all(&bytes).map_err(SessionStoreError::Io)?;
+            temp.as_file().sync_all().map_err(SessionStoreError::Io)?;
+            temp.persist(&active)
+                .map_err(|error| SessionStoreError::Io(error.error))?;
+            Ok(())
+        })();
+        unlock(lock, result)
+    }
+
+    /// Returns whether this child lease is durably owned by exactly work_id.
+    pub fn is_owned_by(
+        &self,
+        child: &SessionId,
+        work_id: &WorkId,
+    ) -> SessionStoreResult<bool> {
+        self.ensure_root()?;
+        let lock = self.lock()?;
+        let result = (|| {
+            let active = self.active_path(child)?;
+            let expired = self.expired_path(child)?;
+            let source = if is_regular_file(&active)? {
+                Some(active)
+            } else if is_regular_file(&expired)? {
+                Some(expired)
+            } else {
+                None
+            };
+            let Some(source) = source else {
+                return Ok(false);
+            };
+            Ok(read_lease(&source)?.owner_work_id.as_ref() == Some(work_id))
         })();
         unlock(lock, result)
     }

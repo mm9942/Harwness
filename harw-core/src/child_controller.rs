@@ -1193,6 +1193,7 @@ impl ChildRecord {
             // die Kette SpawnContext.trace -> ChildRecord.trace ->
             // ChildLeaseRecord.trace bis auf Platte.
             trace: self.trace.clone(),
+            owner_work_id: None,
         }
     }
 }
@@ -3539,6 +3540,36 @@ impl ManagedAgentSpawner {
     pub fn with_lease_store(mut self, lease_store: Arc<ChildLeaseStore>) -> Self {
         self.lease_store = Some(lease_store);
         self
+    }
+
+    /// Transfers durable restart ownership for an admitted child to a WorkId.
+    pub fn bind_child_job_owner(
+        &self,
+        child: &SessionId,
+        work_id: &WorkId,
+    ) -> Result<(), AgentSpawnError> {
+        let store = self
+            .lease_store
+            .as_ref()
+            .ok_or_else(|| Self::reject("durable child lease store is not configured"))?;
+        store.bind_job_owner(child, work_id).map_err(|error| {
+            Self::reject(format!("could not bind child lease to job {work_id}: {error}"))
+        })
+    }
+
+    /// Confirms the durable child/job correlation before restart recovery.
+    pub fn child_lease_owned_by(
+        &self,
+        child: &SessionId,
+        work_id: &WorkId,
+    ) -> Result<bool, AgentSpawnError> {
+        let store = self
+            .lease_store
+            .as_ref()
+            .ok_or_else(|| Self::reject("durable child lease store is not configured"))?;
+        store.is_owned_by(child, work_id).map_err(|error| {
+            Self::reject(format!("could not verify child/job lease owner: {error}"))
+        })
     }
 
     /// Verlängert die Lease eines noch aktiven, nicht abgelaufenen Kindes auf

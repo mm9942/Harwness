@@ -220,9 +220,32 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 return Err(Self::rejection(reason));
             }
 
-            // Phase 3: Ready means both durable admission and background
-            // ownership are established. A worker can only claim after this
-            // transition.
+            // Once background ownership exists, transfer restart ownership of
+            // the child lease to this WorkId. From this point the generic child
+            // reaper must not race the job runtime for recovery.
+            if let Err(error) = self.spawner.bind_child_job_owner(&child, &work_id) {
+                let reason = format!("agent child/job ownership binding failed: {}", error.message);
+                let store = Arc::clone(&self.job_store);
+                let work_id_for_cancel = work_id.clone();
+                let cancelled_by = self.scope.submitter().clone();
+                let reason_for_cancel = reason.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.cancel(
+                        &work_id_for_cancel,
+                        &CancelRequest {
+                            cancelled_at: Timestamp::now(),
+                            cancelled_by,
+                            reason: reason_for_cancel,
+                        },
+                    )
+                })
+                .await;
+                let _ = self.spawner.release_child(&child);
+                return Err(Self::rejection(reason));
+            }
+
+            // Phase 3: Ready means durable admission, background ownership and
+            // durable child/job correlation are established.
             let store = Arc::clone(&self.job_store);
             let work_id_for_ready = work_id.clone();
             let activation = tokio::task::spawn_blocking(move || {
