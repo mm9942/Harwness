@@ -39,6 +39,7 @@ harw-tool-process = { path = "../harw-tool-process" }
 harw-tool-doc = { version = "0.9.1", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
+harw-tool-obsidian = { path = "../harw-tool-obsidian" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 # Plan R9, Teil F: `job.*` (Hintergrund-Jobs statt tmux) neben `shell.exec`,
 # mit geklontem `ShellToolProvider` (gleiche Rechte, Freigaben, Host-Lease).
