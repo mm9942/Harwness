@@ -194,6 +194,10 @@ deck
 └── running jobs: remaining height, full width
 ```
 
+When the running-jobs region has no active jobs it collapses to a single
+empty-state row and returns the spare height to the agents/terminal row, so
+"exactly three regions" holds without wasting space.
+
 Recommended typed result:
 
 ```rust
@@ -285,6 +289,45 @@ Rules:
 This allows the live deck to show one child in both useful live views without
 rendering it twice in terminal history.
 
+Edge cases that must be specified by W20-A tests:
+
+- **Race.** A job event may arrive before its `AgentEvent`. The job must not
+  count as its own terminal category in the meantime; keep a pending-link
+  table or count terminal state only from the agent run.
+- **Orphan.** A job tagged `AgentChild` whose agent run was evicted or never
+  seen is shown as "Agent child (untracked)", never silently dropped.
+  A count of unrelated later events is **not** a safe boundary: the current
+  `AgentEventHub` is a lossy broadcast (a slow receiver can observe
+  `Lagged`), and the agent stream and the job snapshot share no causal
+  sequence, so a matching `AgentEvent` can still arrive after any fixed N.
+  Promotion from pending to "untracked" therefore requires a boundary that
+  guarantees no earlier matching event can still arrive: either the session
+  completion watermark, or a persisted per-agent / per-job sequence watermark
+  that both sources advance (this needs a W20-A change and is a prerequisite,
+  not an assumption). Until such a watermark exists, a tagged child with no
+  agent run stays **pending** and is shown as "Agent child (pending)"; it is
+  never counted as its own category.
+  Reconciliation if a match appears after promotion: the agent run takes
+  ownership, the "untracked" row is retired, and the terminal count is derived
+  (recomputed from the owning run), so the child is never counted twice. Tests:
+  late-after-boundary arrival, `Lagged` receiver, and replay of the same stream
+  promoting at the same watermark.
+- **Diverging outcomes.** Agent run `Completed` but job `Failed` (exit != 0):
+  the agent run still owns the count, and the aggregate carries a
+  "job exit != 0" badge so the signal is not lost.
+- `JobOrigin.owner_agent` is a display name and is never used as provenance.
+  Prefer one serialized tagged enum in `meta.json` / `JobEvent::Started` over
+  additional `Option` fields, so contradictory combinations are
+  unrepresentable.
+- **Legacy compatibility.** Today `meta.json` and `JobEvent::Started` already
+  carry `origin_call_id` and `origin_tool`. They stay readable and are mapped:
+  when the new tagged `origin` is absent and `origin_tool` is present, the
+  record reads as `Tool { tool, call_id }`; when both are absent it reads as
+  `Unknown`. New records may write the tagged field in addition to the legacy
+  fields during a transition (or a version marker selects the reader), so
+  existing tool-origin categorization is not lost. Tests use pre-change
+  fixtures for both the stored meta and the `Started` event.
+
 ## 5. Active-agents pane
 
 The upper-left pane shows concrete active identities.
@@ -294,7 +337,8 @@ Include:
 - active/waiting agent rows;
 - role;
 - short task/current tool when it fits;
-- elapsed time;
+- elapsed time (a presentation field, see the time-input rule in the W20
+  contract, not part of the pure projection);
 - context gauge/percentage when space remains.
 
 Do not place terminal runs here.
@@ -344,6 +388,11 @@ Acknowledgement advances the aggregate's seen revision; it does not delete
 history.
 
 ### 6.2 Retention boundary
+
+Aggregate counters are kept separately from constituent records. A counter
+survives eviction of the constituents; the drill-down does not. The UI marks
+a row whose constituents were evicted ("12 total, 8 listed"). The retention
+bound (runs per category) is a named constant with a test.
 
 W20 only promises history for data the current sources actually retain.
 
@@ -461,6 +510,22 @@ TERM, then the existing job stop policy if it does not exit.
 ```
 
 The confirmation is a UI step only. Admission remains in the operation path.
+
+Current behavior, which W20 keeps: `JobManager::stop` returns `Ok(status)` for
+an already-terminal job and `JobsOperation` always reports it as a sent signal;
+`/jobs` is registered `busy = "immediate"`, so it is admitted while a turn runs.
+
+The panel cannot tell two cases apart from the state after a refresh: the job
+finished on its own just before dispatch, or it ended because of the requested
+signal. Both look like "running at confirmation, terminal afterwards". The
+panel therefore **does not claim** "already finished". After a stop it shows
+the neutral resulting state ("job is now <state>").
+If a distinct "already finished" label is wanted, W20-E needs a typed stop
+outcome from the operation (`AlreadyTerminal(status)` vs `Signalled(status)`) or
+an atomic terminal observation taken before the signal, which is a change to
+`JobManager::stop` / `JobsOperation` and a prerequisite, decided by the owner.
+Tests, if that outcome is added: terminal-just-before-dispatch versus
+termination-by-requested-signal.
 
 ## 10. Presentation state
 
