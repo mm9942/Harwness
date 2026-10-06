@@ -68,8 +68,11 @@ impl SessionManager {
         registry: ExtensionRegistry,
         spawn_context: SpawnContext,
     ) -> SessionId {
-        let id = SessionId::new();
-        self.create_governed_session_with_id(id.clone(), role, parent, registry, spawn_context);
+        let mut session = AgentSession::new(role, parent, registry, self.event_tx.clone())
+            .with_spawn_context(spawn_context);
+        self.attach_hub(&mut session);
+        let id = session.id().clone();
+        self.sessions.insert(id.as_str().to_owned(), session);
         id
     }
 
@@ -85,7 +88,12 @@ impl SessionManager {
         parent: Option<SessionId>,
         registry: ExtensionRegistry,
         spawn_context: SpawnContext,
-    ) {
+    ) -> CoreResult<()> {
+        if self.sessions.contains_key(id.as_str()) {
+            return Err(CoreError::TurnRejected(format!(
+                "cannot create duplicate governed session {id}"
+            )));
+        }
         let mut session = AgentSession::new_with_id(
             id.clone(),
             role,
@@ -96,6 +104,7 @@ impl SessionManager {
         .with_spawn_context(spawn_context);
         self.attach_hub(&mut session);
         self.sessions.insert(id.as_str().to_owned(), session);
+        Ok(())
     }
 
     /// Liefert eine Kopie des Event-Senders, mit dem dieser Manager Sessions anlegt.

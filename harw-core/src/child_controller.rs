@@ -933,6 +933,17 @@ impl From<AgentBudget> for ChildRecoveryBudget {
     }
 }
 
+impl From<ChildRecoveryBudget> for AgentBudget {
+    fn from(value: ChildRecoveryBudget) -> Self {
+        Self {
+            max_tokens: value.max_tokens,
+            max_tool_calls: value.max_tool_calls,
+            max_wall_time_ms: value.max_wall_time_ms,
+            reasoning_effort: value.reasoning_effort,
+        }
+    }
+}
+
 /// Nicht-autorisierender Verweis auf eine aktivierte Capability.
 ///
 /// Nur Name, Art und der beim Spawn berechnete Definition-Digest werden
@@ -4288,6 +4299,167 @@ impl ManagedAgentSpawner {
             activated_capabilities,
             trace: record.trace,
         })
+    }
+
+    /// Validates and narrows the currently frozen capability contract against
+    /// a persisted recovery envelope. Persisted capabilities can only remove
+    /// current activations; every persisted activation must still exist with
+    /// the same definition digest.
+    fn recovery_capability_snapshot(
+        mut current: Option<SpawnCapabilitySnapshot>,
+        recovery: &ChildRecoveryView,
+    ) -> Result<Option<SpawnCapabilitySnapshot>, AdmitRejection> {
+        let kind = |kind: &SuggestionKind| match kind {
+            SuggestionKind::Skill => "skill",
+            SuggestionKind::Plugin => "plugin",
+            SuggestionKind::Mcp => "mcp",
+        };
+        match (&mut current, recovery.capability_agent.as_deref()) {
+            (None, None) if recovery.activated_capabilities.is_empty() => Ok(None),
+            (Some(snapshot), None) if recovery.activated_capabilities.is_empty() => {
+                snapshot.activated.clear();
+                Ok(current)
+            }
+            (Some(snapshot), Some(agent)) if snapshot.agent == agent => {
+                for expected in &recovery.activated_capabilities {
+                    let present = snapshot.activated.iter().any(|capability| {
+                        kind(&capability.kind) == expected.kind
+                            && capability.name == expected.name
+                            && capability.definition_sha256 == expected.definition_sha256
+                    });
+                    if !present {
+                        return Err(AdmitRejection::Other(Self::reject(format!(
+                            "agent recovery capability '{}:{}' changed or disappeared",
+                            expected.kind, expected.name
+                        ))));
+                    }
+                }
+                snapshot.activated.retain(|capability| {
+                    recovery.activated_capabilities.iter().any(|expected| {
+                        kind(&capability.kind) == expected.kind
+                            && capability.name == expected.name
+                            && capability.definition_sha256 == expected.definition_sha256
+                    })
+                });
+                Ok(current)
+            }
+            _ => Err(AdmitRejection::Other(Self::reject(
+                "agent recovery capability contract no longer matches current trusted catalog",
+            ))),
+        }
+    }
+
+    /// Rehydrates an already-admitted direct child of the durable external
+    /// root under today's policy, retaining its stable child id and transcript.
+    ///
+    /// Nested recovery is intentionally fail-closed in this wave: descendant
+    /// aggregate budget accounting is not yet durable enough to prove that
+    /// reattaching a nested child cannot restore spent delegation budget.
+    pub async fn recover_root_child(
+        &self,
+        recovery: &ChildRecoveryView,
+        store: &dyn StateStore,
+    ) -> Result<SessionId, AgentSpawnError> {
+        let root = self
+            .external_root_parent
+            .as_ref()
+            .filter(|root| root.session_id == recovery.parent)
+            .ok_or_else(|| {
+                Self::reject(
+                    "agent recovery requires the same durable external root; nested recovery is not enabled",
+                )
+            })?;
+        if !recovery
+            .authority
+            .workspace()
+            .matches(root.spawn_context.sandbox.workspace())
+        {
+            return Err(Self::reject(
+                "agent recovery workspace does not match the current durable root",
+            ));
+        }
+
+        let mut context = serde_json::Map::new();
+        if let Some(complexity) = recovery.task_complexity.as_deref() {
+            context.insert(
+                "complexity".to_owned(),
+                serde_json::Value::String(complexity.to_owned()),
+            );
+        }
+        let input = SpawnInput {
+            parent_session_id: recovery.parent.clone(),
+            handoff_call_id: recovery.handoff_call_id.clone(),
+            instructions: None,
+            context: serde_json::Value::Object(context),
+            ceiling: recovery.context_ceiling.clone(),
+        };
+        let sandbox = root
+            .spawn_context
+            .sandbox
+            .restrict(recovery.authority.request());
+        let child = self
+            .admit_inner(&recovery.role, input, sandbox, None, Some(recovery))
+            .map_err(AdmitRejection::into_error)?;
+
+        let mut session = {
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+            manager.remove(&child).ok_or_else(|| {
+                Self::reject(format!(
+                    "recovered child {child} disappeared before transcript hydration"
+                ))
+            })?
+        };
+        if let Err(error) = session.hydrate_from_store(store).await {
+            let _ = self.release_child(&child);
+            return Err(Self::reject(format!(
+                "could not hydrate recovered child {child}: {error}"
+            )));
+        }
+        {
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+            manager.restore(session).map_err(|error| {
+                Self::reject(format!(
+                    "could not restore hydrated child {child}: {error}"
+                ))
+            })?;
+        }
+
+        // Restore the dimensions that can be proven from durable session
+        // state/history. Wall time of the interrupted process is not durable;
+        // exhaust a finite inherited wall budget rather than guessing low.
+        let tokens = self.child_token_usage(&child)?;
+        let tool_calls = self.child_tool_call_count(&child)?;
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| Self::reject("child registry lock is poisoned"))?;
+        let record = active.get_mut(child.as_str()).ok_or_else(|| {
+            Self::reject(format!(
+                "recovered child {child} disappeared before usage restoration"
+            ))
+        })?;
+        let restored_usage = ChildUsage {
+            tokens,
+            tool_calls,
+            wall_time_ms: record.budget.max_wall_time_ms.unwrap_or(0),
+        };
+        record.consumed = restored_usage;
+        record.charged_to_parent = restored_usage;
+        drop(active);
+
+        tracing::info!(
+            child = %child,
+            tokens,
+            tool_calls,
+            "agent_recovery.root_child_rehydrated"
+        );
+        Ok(child)
     }
 
     /// Deckelt die zulässige Fan-out-Parallelität für einen **registrierten
@@ -7737,7 +7909,7 @@ impl ManagedAgentSpawner {
         // `transfer_to_<rolle>`, Agent-Werkzeug).
         let seed = self.requested_continuation(role_name, &mut input)?;
         let child = self
-            .admit_inner(role_name, input, sandbox, suggestions)
+            .admit_inner(role_name, input, sandbox, suggestions, None)
             .map_err(AdmitRejection::into_error)?;
         self.bind_requested_continuation(child, seed.as_ref())
     }
@@ -7837,6 +8009,7 @@ impl ManagedAgentSpawner {
         input: SpawnInput,
         sandbox: SandboxSpec,
         suggestions: Option<AgentSuggestions>,
+        recovery: Option<&ChildRecoveryView>,
     ) -> Result<SessionId, AdmitRejection> {
         let definition = self
             .roles
@@ -7847,6 +8020,21 @@ impl ManagedAgentSpawner {
         // weiter unten feldweise in den `ChildRecord` verschoben wird.
         let task_complexity = TaskComplexity::from_spawn_context(&input.context);
 
+        // A recovery envelope is evidence, never authority. Identity fields
+        // must bind exactly to the fresh admission request before any mutable
+        // controller state is created.
+        if let Some(recovery) = recovery {
+            if recovery.child.as_str().is_empty()
+                || recovery.parent != input.parent_session_id
+                || recovery.handoff_call_id != input.handoff_call_id
+                || recovery.role != role_name
+            {
+                return Err(AdmitRejection::Other(Self::reject(
+                    "agent recovery identity does not match the current admission",
+                )));
+            }
+        }
+
         // W2-19: die Agent-IR dieser Rolle wird vor jeder Prüfung aufgelöst,
         // weil sie die Tiefengrenze verschärfen darf. Ein fehlerhaftes Budget
         // (unbekanntes Effort-Label) lehnt die Admission fail-closed ab, bevor
@@ -7856,6 +8044,26 @@ impl ManagedAgentSpawner {
             Some(spec) => Self::budget_from_spec(spec)?,
             None => AgentBudget::default(),
         };
+        let child_budget = recovery.map_or(child_budget, |recovery| {
+            tighten_agent_budget(child_budget, recovery.budget.into())
+        });
+        if let Some(recovery) = recovery {
+            if recovery.organizational_role != definition.organizational_role {
+                return Err(AdmitRejection::Other(Self::reject(
+                    "agent recovery role authority no longer matches the current definition",
+                )));
+            }
+            let ir_matches = match (recovery.executable_snapshot_id.as_ref(), executable_ir) {
+                (None, None) => true,
+                (Some(reference), Some(ir)) => reference.confirm(ir.snapshot_id()).is_some(),
+                _ => false,
+            };
+            if !ir_matches {
+                return Err(AdmitRejection::Other(Self::reject(
+                    "agent recovery executable snapshot is not the current trusted IR",
+                )));
+            }
+        }
         let allow_pause = executable_ir.is_some_and(|ir| ir.lifecycle_machine().allow_pause());
 
         // The manager lock is taken up front (rather than after the active/
@@ -7973,9 +8181,26 @@ impl ManagedAgentSpawner {
         // der Basis des Elternteils (Kind ⊆ Eltern-Basis), und die Werkzeuge
         // des Kindes begrenzt weiter seine eigene Rolle (Registry-Profil,
         // Agent-IR) — ein lesendes Kind bekommt dadurch kein Schreibwerkzeug.
-        let (sandbox, parent_sandbox_ceiling) = match parent_base_sandbox {
-            Some(base) if sandbox == parent_context.sandbox => (base.clone(), base),
-            _ => (sandbox, parent_context.sandbox.clone()),
+        let (sandbox, parent_sandbox_ceiling) = if let Some(recovery) = recovery {
+            if !recovery
+                .authority
+                .workspace()
+                .matches(parent_context.sandbox.workspace())
+            {
+                return Err(AdmitRejection::Other(Self::reject(
+                    "agent recovery workspace no longer matches the trusted parent",
+                )));
+            }
+            let parent = parent_base_sandbox.unwrap_or_else(|| parent_context.sandbox.clone());
+            (
+                parent.restrict(recovery.authority.request()),
+                parent,
+            )
+        } else {
+            match parent_base_sandbox {
+                Some(base) if sandbox == parent_context.sandbox => (base.clone(), base),
+                _ => (sandbox, parent_context.sandbox.clone()),
+            }
         };
         // Beide Prüfungen (geschlossene Rollenmatrix inkl. `uia-worker`,
         // Addendum J + exakte `ChildOrchestrator`-Freigabeliste) laufen über
@@ -8191,7 +8416,10 @@ impl ManagedAgentSpawner {
         let approval_actor = parent_context.approval_actor.clone();
         // AW1-01b: Trace wird vererbt, nie neu erzeugt — dieselbe `trace_id`,
         // eine frische `span_id` für das Kind, siehe `inherit_trace`.
-        let child_trace = inherit_trace(parent_context.trace.as_ref())?;
+        let child_trace = match recovery {
+            Some(recovery) => recovery.trace.clone(),
+            None => inherit_trace(parent_context.trace.as_ref())?,
+        };
         // AW2-02: Die Kontext-Decke wird im selben Schritt geschnitten wie die
         // Berechtigungen — unmittelbar neben der Sandbox-Eskalationsprüfung
         // oben und der Trace-Vererbung direkt darüber, nicht in einem
@@ -8243,15 +8471,29 @@ impl ManagedAgentSpawner {
         // Die Verschärfungsrichtung bleibt unverändert: die eigene IR schneidet
         // nur nach unten (`min`), sodass `self.limits.max_depth` über die ganze
         // Kette die harte Obergrenze bleibt und kein Rollenwert sie anhebt.
-        let child_depth_ceiling = executable_ir
+        let mut child_depth_ceiling = executable_ir
             .and_then(|ir| ir.spawn_contract().max_depth())
             .map_or(inherited_depth_ceiling, |ir_depth| {
                 inherited_depth_ceiling.min(depth.saturating_add(ir_depth))
             });
+        if let Some(recovery) = recovery {
+            if depth != recovery.depth {
+                return Err(AdmitRejection::Other(Self::reject(
+                    "agent recovery depth no longer matches the current parent lineage",
+                )));
+            }
+            child_depth_ceiling = child_depth_ceiling.min(recovery.depth_ceiling);
+        }
 
-        let capability_snapshot = definition
+        let mut capability_snapshot = definition
             .registry_factory
             .capability_snapshot(role_name, &input)?;
+        if let Some(recovery) = recovery {
+            capability_snapshot = Self::recovery_capability_snapshot(
+                capability_snapshot,
+                recovery,
+            )?;
+        }
         let child_suggestions = capability_snapshot
             .as_ref()
             .map(|snapshot| snapshot.suggestions.clone())
@@ -8321,14 +8563,15 @@ impl ManagedAgentSpawner {
         // absent IR/list is default-deny for its future child-orchestrator
         // delegation. Captured up front (Addendum F+G) so the effort-weight
         // lookup below can reuse it without a second IR read.
-        let child_allowed_child_orchestrators: Vec<String> = executable_ir
+        let mut child_allowed_child_orchestrators: Vec<String> = executable_ir
             .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
             .unwrap_or_default();
-        let child = manager.create_governed_session(
-            definition.role.clone(),
-            Some(input.parent_session_id.clone()),
-            registry,
-            SpawnContext {
+        if let Some(recovery) = recovery {
+            child_allowed_child_orchestrators.retain(|name| {
+                recovery.allowed_child_orchestrators.contains(name)
+            });
+        }
+        let spawn_context = SpawnContext {
                 sandbox,
                 suggestions: child_suggestions,
                 capability_snapshot,
@@ -8339,8 +8582,31 @@ impl ManagedAgentSpawner {
                 // AW2-02: dieselbe Decke, die soeben neben der Sandbox
                 // geschnitten wurde — kein zweiter, separater Zustand.
                 ceiling: Some(child_ceiling),
-            },
-        );
+            };
+        let child = if let Some(recovery) = recovery {
+            let child = recovery.child.clone();
+            manager
+                .create_governed_session_with_id(
+                    child.clone(),
+                    definition.role.clone(),
+                    Some(input.parent_session_id.clone()),
+                    registry,
+                    spawn_context,
+                )
+                .map_err(|error| {
+                    Self::reject(format!(
+                        "could not restore governed child identity {child}: {error}"
+                    ))
+                })?;
+            child
+        } else {
+            manager.create_governed_session(
+                definition.role.clone(),
+                Some(input.parent_session_id.clone()),
+                registry,
+                spawn_context,
+            )
+        };
         // W2-19: Tool-Aktivierung aus der Agent-IR. `with_executable_agent_ir`
         // ist ein verbrauchender Builder, deshalb wird die frisch angelegte
         // Session einmal entnommen und konfiguriert zurückgelegt — noch unter
@@ -8478,6 +8744,14 @@ impl ManagedAgentSpawner {
                 })
                 .or_else(|| child_main_provider.clone())
                 .or_else(|| parent_provider.clone());
+            if let Some(recovery) = recovery
+                && (recovery.model != child_model || recovery.provider != child_provider)
+            {
+                let _ = manager.remove(&child);
+                return Err(AdmitRejection::Other(Self::reject(
+                    "agent recovery model/provider routing changed since admission",
+                )));
+            }
             let window = self.context_window_for(model.as_deref());
             let window_known = self
                 .model_known_probe
@@ -8676,7 +8950,11 @@ impl ManagedAgentSpawner {
         // `context`. Der ungekürzte Text wird als `pending_task` für den
         // ersten Lauf mit leerem `TurnInput` hinterlegt, sein Kurzkopf
         // speist `AgentOrchestrationEvent::task`.
-        let mut pending_task = spawn_task_text(input.instructions.as_deref(), &input.context);
+        let mut pending_task = if recovery.is_some() {
+            None
+        } else {
+            spawn_task_text(input.instructions.as_deref(), &input.context)
+        };
         // Teil C: Auftragsdeckel. Ein übergroßer Auftrag wird in der Mitte
         // gekürzt (mit Markierung), statt das Kind später am Kontextlimit
         // scheitern zu lassen.
@@ -8732,10 +9010,15 @@ impl ManagedAgentSpawner {
             charged_to_parent: ChildUsage::default(),
         };
         if let Some(lease_store) = &self.lease_store {
-            if let Err(error) = lease_store.admit(&record.durable_lease()) {
+            let durable = record.durable_lease();
+            let persisted = match recovery {
+                Some(_) => lease_store.recover(&durable),
+                None => lease_store.admit(&durable),
+            };
+            if let Err(error) = persisted {
                 let _ = manager.remove(&child);
                 return Err(AdmitRejection::Other(Self::reject(format!(
-                    "could not durably admit child lease: {error}"
+                    "could not durably persist child lease: {error}"
                 ))));
             }
         }
@@ -8924,6 +9207,7 @@ impl ManagedAgentSpawner {
                 input.clone(),
                 sandbox.clone(),
                 suggestions.clone(),
+                None,
             ) {
                 Ok(child) => return Ok(child),
                 Err(AdmitRejection::Other(error)) => return Err(error),
