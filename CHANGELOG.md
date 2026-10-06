@@ -6,6 +6,33 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Added
+
+- **Fixed 2× Ctrl+C emergency stop** (`harw-tui`, `hard_kill`,
+  `process_tree`). Two Ctrl+C presses within 2 s now kill all agent work
+  *immediately*, in every UI state (open dialog, overlay, hung event loop):
+  the turn's `CancelToken` tree (all child agents) and all background agents
+  are cancelled with `CancelReason::Shutdown`, then the whole process tree
+  below harw is `SIGKILL`ed — frozen with `SIGSTOP` first so nothing can
+  fork away, signalled through a `pidfd` bound to the process identity so a
+  reused PID is never hit. Processes orphaned by the first press' cooperative
+  cancel (e.g. `cargo`/`rustc` under a cancelled `shell.exec`) are recorded
+  at the first press and killed too. The detector lives in the blocking
+  input-reader thread, not in the async loop. A watchdog restores the
+  terminal and `exit(130)`s if the orderly shutdown (session save) stalls
+  for 1.5 s. Background jobs the user can see (`job.start`) keep their
+  existing contract — they are detached and keep running; processes of
+  job-backed child agents are killed. While a turn runs, the armed hint now
+  reads "nochmal Ctrl+C: alles sofort beenden".
+- `JobManager::detachable_leader_pids` and `JobManager::detach_user_jobs`
+  (`harw-tool-job`): user background jobs are told apart from the processes
+  of job-backed child agents (`start_piped`).
+
+### Fixed
+
+- `Cargo.lock` carried 129 unresolved merge-conflict blocks from the
+  `release/0.9.1` merge, so no cargo command could parse the lockfile.
+
 ## [0.9.1] — Unreleased
 
 ### Fixed

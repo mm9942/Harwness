@@ -49,7 +49,8 @@
 //! einzelnes Zeichen (`ctrl++` ist `ctrl` + `+`). `shift+tab` wird wie
 //! `backtab` behandelt, weil Terminals diese Kombination so melden.
 //!
-//! Nicht umbelegbar sind bewusst: `Ctrl+C`/`Ctrl+D` (Notausstieg), `Esc`
+//! Nicht umbelegbar sind bewusst: `Ctrl+C`/`Ctrl+D` (Notausstieg; 2× `Ctrl+C`
+//! ist der feste Not-Aus, siehe `crate::hard_kill`), `Esc`
 //! (kontextabhängiges Schließen/Zurück), `Enter` samt `Shift/Alt+Enter`
 //! sowie Tasten innerhalb von Dialogen und Overlays.
 

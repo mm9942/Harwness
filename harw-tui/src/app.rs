@@ -154,6 +154,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::hard_kill::HardKill;
 use harw_authority::SandboxSpec;
 use harw_core::cancel::{CancelReason, CancelToken};
 use harw_core::turn_loop::TurnControl;
@@ -1310,6 +1311,11 @@ pub struct ChatApp {
     /// `handle_busy_event` selbst keinen Zugriff auf den Ereigniskanal hat
     /// (siehe Plan „Ctrl+C-Hard-Interrupt, UI-Teil", Punkt 6).
     hard_quit_requested: bool,
+    /// Fester Not-Aus (2× Ctrl+C, siehe [`crate::hard_kill`]). Der Eingabe-Thread
+    /// löst ihn aus; die Schleife führt hier nur Turn-Token und Sitzungsbindung
+    /// nach und beendet, sobald er ausgelöst ist. Ohne Composition-Root
+    /// wirkungslos ([`HardKill::inert`]).
+    hard_kill: HardKill,
     /// Plan R9, Teil F: Takt der Jobs-Gruppe und Wahl im Beenden-Dialog.
     jobs_ui: jobs_glue::JobsUi,
     /// Zuletzt in dieser Sitzung tatsächlich gestartete `!`-Befehl (ohne
@@ -1406,6 +1412,7 @@ impl std::fmt::Debug for ChatApp {
             .field("has_title_job_context", &self.title_job_context.is_some())
             .field("pending_quit_armed", &self.pending_quit.is_some())
             .field("hard_quit_requested", &self.hard_quit_requested)
+            .field("hard_kill_tripped", &self.hard_kill.is_tripped())
             .finish()
     }
 }
@@ -1545,6 +1552,7 @@ impl ChatApp {
             pending_export_format: ExportOutputFormat::Markdown,
             pending_quit: None,
             hard_quit_requested: false,
+            hard_kill: HardKill::inert(),
             jobs_ui: jobs_glue::JobsUi::default(),
             last_shell_command: None,
             pending_turn_user_cell_override: None,
@@ -1601,6 +1609,17 @@ impl ChatApp {
     /// geladen); gilt ab der nächsten Taste für Panels und Composer.
     pub(crate) fn set_key_bindings(&mut self, bindings: KeyBindings) {
         self.key_bindings = bindings;
+    }
+
+    /// Setzt den prozessweiten Not-Aus (2× Ctrl+C).
+    ///
+    /// # Beschreibung
+    /// Die Composition-Root ruft das nach **jedem** Anlegen oder Ersetzen der
+    /// `ChatApp` (Start, `/new`, `/resume`) mit demselben Griff auf, den auch der
+    /// Eingabe-Thread hält — sonst löste dieser einen Not-Aus aus, den die neue
+    /// App nie sieht.
+    pub(crate) fn set_hard_kill(&mut self, hard_kill: HardKill) {
+        self.hard_kill = hard_kill;
     }
 
     /// Rebinds persistent input history to the runtime-selected Harw home.
@@ -4589,7 +4608,11 @@ pub(crate) fn tui_error_from_approval_driver(error: ApprovalDriverError) -> TuiE
 }
 
 /// Zeitfenster, in dem ein zweites Ctrl+C/Ctrl+D den Chat beendet.
-const QUIT_HINT_WINDOW: Duration = Duration::from_secs(2);
+///
+/// Dasselbe Fenster nutzt der Not-Aus im Eingabe-Thread
+/// ([`crate::hard_kill::DOUBLE_PRESS_WINDOW`]); beide teilen sich die Konstante,
+/// damit Hinweis und Kill nie auseinanderlaufen.
+const QUIT_HINT_WINDOW: Duration = crate::hard_kill::DOUBLE_PRESS_WINDOW;
 
 /// Maximale Popup-Höhe in Zeilen (ohne Rahmen).
 const POPUP_MAX_ROWS: u16 = 8;
@@ -4700,6 +4723,14 @@ pub(crate) async fn run_loop(
     app.operator_shell.set_waker(frame_req.clone());
 
     loop {
+        // Not-Aus (2× Ctrl+C) im Leerlauf ausgelöst: keinen Turn aus der
+        // Warteschlange mehr starten, sondern sofort geordnet verlassen.
+        if app.hard_kill.is_tripped() {
+            if !app.hard_kill.jobs_settled() {
+                jobs_glue::detach_for_exit(app);
+            }
+            return Ok(TuiRunOutcome::Quit);
+        }
         // Runde 5, Teil B: außerhalb eines Turns darf kein sudo-Fenster offen
         // stehen (hier landen auch alle frühen Rückkehrwege eines Turns) —
         // sonst ginge Getipptes an den Composer, während das Fenster noch
@@ -4796,6 +4827,8 @@ pub(crate) async fn run_loop(
             // Laufzeit/Fortschritt, solange Jobs laufen.
             let jobs_wake = jobs_glue::waker(app);
             let jobs_tick = jobs_glue::has_running(app);
+            // Eigener Griff, damit der `select!`-Zweig `app` nicht mitleiht.
+            let hard_kill = app.hard_kill.clone();
             tokio::select! {
                 maybe_tev = async { match app.deferred_input.pop_front() { Some(event) => Some(event), None => tui_rx.recv().await } } => {
                     let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
@@ -5275,6 +5308,11 @@ pub(crate) async fn run_loop(
                     app.drain_agent_events();
                     frame_req.schedule_frame();
                 }
+                // Not-Aus (2× Ctrl+C) aus dem Eingabe-Thread: der Schleifenanfang
+                // verlässt die TUI.
+                () = hard_kill.tripped() => {
+                    frame_req.schedule_frame();
+                }
                 // Plan R9, Teil F: ein Job-Ereignis — der Schleifenanfang
                 // holt es ab (und startet beim Ende ggf. den Auto-Turn).
                 _ = jobs_glue::wait_for_event(jobs_wake) => {
@@ -5358,9 +5396,13 @@ pub(crate) async fn run_loop(
         // Loop beendet direkt hier, unabhängig davon, ob der Turn selbst
         // erfolgreich war oder mit einem Fehler zurückkam (derselbe Ausgang
         // wie `HarwEvent::Quit` im Idle-Pfad oben).
-        if app.hard_quit_requested {
-            // Plan R9, Teil F: harw endet sofort — laufende Jobs ablösen.
-            jobs_glue::detach_for_exit(app);
+        if app.hard_quit_requested || app.hard_kill.is_tripped() {
+            // Plan R9, Teil F: harw endet sofort — laufende Jobs ablösen. Beim
+            // Not-Aus hat `HardKill::trip` das schon erledigt, und zwar
+            // selektiv (Kind-Agent-Jobs sind tot, nicht „abgelöst").
+            if !app.hard_kill.jobs_settled() {
+                jobs_glue::detach_for_exit(app);
+            }
             return Ok(TuiRunOutcome::Quit);
         }
 
@@ -6904,6 +6946,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 ..
             })
         ) {
+            // Auch im Leerlauf beendet der Doppeldruck alles, was die KI noch
+            // gestartet hat (Hintergrund-Agenten, verwaiste Prozesse).
+            app.hard_kill.trip();
             bus.send(HarwEvent::Quit);
             return false;
         }
@@ -7260,6 +7305,16 @@ async fn run_turn_streaming(
     // cooperative checkpoints instead of merely queuing a character.
     let cancel = CancelToken::new();
     app.active_cancel = Some(cancel.clone());
+    // Not-Aus (2× Ctrl+C): der Eingabe-Thread bricht genau diesen Turn samt
+    // seinem Token-Baum ab und kennt Spawner und Jobs der aktuellen Sitzung —
+    // beides wird je Turn frisch gebunden, damit ein Sitzungswechsel
+    // (`/new`, `/resume`) nie veraltete Griffe hinterlässt.
+    app.hard_kill.set_turn_cancel(Some(cancel.clone()));
+    app.hard_kill.bind_runtime(
+        app.managed_spawner().cloned(),
+        app.session_id().clone(),
+        jobs_glue::manager(app),
+    );
     // Ein neuer Turn startet: ein evtl. noch angezeigter "Abbruch
     // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
     // gehört nicht mehr zum aktuellen Zustand. Derselbe Reset gilt für den
@@ -7327,12 +7382,19 @@ async fn run_turn_streaming(
     // Runde 5, Teil O: Abbruchgrund für spät verarbeitete `TurnAborted` merken.
     turn_safety::end_turn(app);
     app.active_cancel = None;
+    app.hard_kill.set_turn_cancel(None);
     // Turn ist beendet (egal ob normal, per Fehler oder per Abbruch) — der
     // transiente Abbruch-Hinweis hat damit ausgedient. Derselbe Reset gilt
     // für den "Warteschlange wird gesendet"-Hinweis.
     app.cancel_requested_at = None;
     app.queue_kept_at = None;
 
+    // Not-Aus ausgelöst: der Turn ist abgebrochen, die Schleife verlässt die
+    // TUI gleich — weder eine Antwort noch ein Fehler des abgebrochenen Turns
+    // wird mehr aufbereitet oder animiert.
+    if app.hard_kill.is_tripped() {
+        return Ok(());
+    }
     let reply = reply?;
 
     // Auto-Compact läuft jetzt in harw-core selbst (Turn-Loop nach
@@ -9350,6 +9412,10 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
                 })
             ) {
                 app.hard_quit_requested = true;
+                // Normalerweise hat der Eingabe-Thread den Not-Aus längst
+                // ausgelöst; das hier sichert Wege ab, auf denen der Druck nicht
+                // über ihn lief (eingereihte Ereignisse, Einbettungen).
+                app.hard_kill.trip();
                 return BusyKeyOutcome::Redraw;
             }
             if interrupt_turn(app) {
@@ -10065,7 +10131,14 @@ fn render_viewport(
     // `quit_hint` (z. B. "Ctrl+C"/"Ctrl+D") signalisiert die Scharfstellung
     // des zweistufigen Beenden-Hinweises (`QuitArm`) und wurde bisher
     // stillschweigend verworfen.
+    //
+    // Läuft ein Turn, endet der zweite Ctrl+C nicht nur die App, sondern
+    // beendet sofort alle KI-Arbeit samt Prozessen (Not-Aus, siehe
+    // [`crate::hard_kill`]) — das soll der Hinweis auch sagen.
     let quit_suffix = match quit_hint {
+        Some(label) if label == "Ctrl+C" && app.active_cancel.is_some() => {
+            format!(" · nochmal {label}: alles sofort beenden")
+        }
         Some(label) => format!(" · nochmal {label} zum Beenden"),
         None => String::new(),
     };
@@ -11629,6 +11702,73 @@ mod tests {
             app.hard_quit_requested,
             "zweiter Ctrl+C-Druck binnen des Fensters muss hart beenden"
         );
+        Ok(())
+    }
+
+    /// Not-Aus (2× Ctrl+C): der zweite Druck löst zusätzlich zu
+    /// `hard_quit_requested` den [`HardKill`] aus. Im Betrieb hat der
+    /// Eingabe-Thread das längst getan; dieser Pfad sichert Ereignisse ab, die
+    /// nicht über ihn kamen. Der erste Druck darf ihn nicht auslösen.
+    #[test]
+    fn second_ctrl_c_during_busy_trips_the_hard_kill() -> TestResult {
+        let mut app = test_chat_app()?;
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
+        app.hard_kill.set_turn_cancel(Some(cancel.clone()));
+        let ctrl_c = || TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        handle_busy_event(&mut app, ctrl_c());
+        assert!(
+            !app.hard_kill.is_tripped(),
+            "der erste Druck bricht nur kooperativ ab"
+        );
+
+        handle_busy_event(&mut app, ctrl_c());
+        assert!(
+            app.hard_kill.is_tripped(),
+            "der zweite Druck ist der Not-Aus"
+        );
+        assert!(app.hard_quit_requested);
+        Ok(())
+    }
+
+    /// Die Statuszeile nennt nach dem ersten Ctrl+C die tatsächliche Wirkung:
+    /// während eines Turns beendet der zweite Druck alles sofort, im Leerlauf
+    /// nur die App.
+    #[test]
+    fn armed_ctrl_c_hint_names_the_hard_kill_only_while_a_turn_runs() -> TestResult {
+        let mut app = test_chat_app()?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20))
+            .map_err(ctx("test terminal"))?;
+        let mut screen = |app: &ChatApp, hint: Option<&str>| -> TestResult<String> {
+            terminal
+                .draw(|frame| render_viewport(frame, app, &Spinner::new(), hint))
+                .map_err(ctx("draw"))?;
+            let buffer = terminal.backend().buffer();
+            Ok((0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+
+        let idle = screen(&app, Some("Ctrl+C"))?;
+        assert!(idle.contains("nochmal Ctrl+C zum Beenden"), "{idle}");
+        assert!(!idle.contains("alles sofort beenden"), "{idle}");
+
+        app.active_cancel = Some(CancelToken::new());
+        let busy = screen(&app, Some("Ctrl+C"))?;
+        assert!(
+            busy.contains("nochmal Ctrl+C: alles sofort beenden"),
+            "{busy}"
+        );
+
+        // Ctrl+D kennt keinen Not-Aus: sein Hinweis bleibt auch im Turn gleich.
+        let ctrl_d = screen(&app, Some("Ctrl+D"))?;
+        assert!(ctrl_d.contains("nochmal Ctrl+D zum Beenden"), "{ctrl_d}");
         Ok(())
     }
 

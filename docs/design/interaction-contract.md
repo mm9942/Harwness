@@ -704,6 +704,40 @@ signal. A cancel no longer discards already-sent messages.
   `hard_quit_requested`, which `run_loop` checks right after the running
   turn and then exits immediately — the same outcome as `HarwEvent::Quit` on
   the idle path.
+- **Fixed 2× Ctrl+C emergency stop (instant, all children):** the double
+  press is additionally detected in the blocking input-reader thread
+  (`harw-tui/src/input_reader.rs` → `hard_kill::screen_event`), *before* the
+  key reaches any dialog, overlay or the async loop, so it fires in every UI
+  state and even when the event loop is blocked. The same
+  `QUIT_HINT_WINDOW` (2 s) applies; any other key press, or a key *repeat*,
+  disarms/doesn't count; only `Press` counts. The reaction
+  (`HardKill::trip`, idempotent) is, in this order:
+  1. cancel the running turn's `CancelToken` with `CancelReason::Shutdown`
+     (inherited by all synchronous child agents) and call
+     `ManagedAgentSpawner::cancel_all_background` — every cancel-aware
+     `await` wakes at once;
+  2. `SIGKILL` the whole process tree below harw
+     (`harw-tui/src/process_tree.rs`): descendants are frozen (`SIGSTOP`)
+     until the set is stable, then killed; signals go through a `pidfd`
+     opened *before* the start-time identity check, so a recycled PID is
+     never hit (non-Linux unix: `ps` snapshot + `kill(2)`, no identity
+     check). Processes orphaned by the **first** press' cooperative cancel
+     (`shell.exec`'s `terminate()` kills only the shell PID) are recorded at
+     the first press (`Census`, PID + start time) and killed as extra roots;
+  3. wake the event loop, which returns `TuiRunOutcome::Quit` (no queued
+     turn is started), saves the session and leaves the TUI; a watchdog
+     thread restores the terminal and calls `exit(130)` after 1.5 s if that
+     orderly path stalls.
+
+  **Exempt:** the process subtrees of the user's *detachable* background
+  jobs (`JobManager::detachable_leader_pids`, i.e. `job.start` jobs). Quitting
+  with a double Ctrl+C has always detached running jobs so they survive
+  (`jobs_glue::detach_for_exit`); the emergency stop keeps that contract and
+  calls `detach_user_jobs`. The processes of job-backed **child agents**
+  (`JobManager::start_piped`) are not user jobs and are killed with the tree.
+  Limits: a process the unprivileged harw may not signal (e.g. started via
+  `sudo`) is counted as `denied`, not killed; a process daemonized *before*
+  the first press (its parent already gone) is no longer a descendant.
 
 ### 2.6.5 Reasoning-effort defaults (precedence)
 

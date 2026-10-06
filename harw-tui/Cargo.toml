@@ -69,6 +69,12 @@ time = { version = "0.3.53", features = ["formatting"] }
 # dieselbe Fassung wie im übrigen Baum (Cargo.lock: zeroize 1.8).
 zeroize = "1"
 
+# Harter Abbruch (doppeltes Ctrl+C, `src/process_tree.rs`): pidfd-gebundene
+# Signale an den Prozessbaum, ohne `unsafe`. Workspace-Version wie in
+# harw-killer/harw-tool-job; nur Unix, die TUI kennt dort sonst keine Signale.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [dev-dependencies]
 harw-tools = { path = "../harw-tools" }
 harw-operations = { path = "../harw-operations" }

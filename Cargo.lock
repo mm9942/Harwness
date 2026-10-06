@@ -4139,6 +4139,7 @@ dependencies = [
  "harw-types",
  "jiff",
  "ratatui",
+ "rustix 1.1.5",
  "secrecy 0.8.0",
  "serde_json",
  "tempfile",

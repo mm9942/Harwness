@@ -38,6 +38,7 @@ pub mod export;
 pub mod fixed_agent;
 pub(crate) mod frame_requester;
 pub mod gateway;
+pub(crate) mod hard_kill;
 pub(crate) mod help_overlay;
 pub(crate) mod history_cell;
 pub mod host_permit_dialog;
@@ -66,6 +67,7 @@ pub(crate) mod panes;
 pub mod permissions_view;
 // Runde 5, Teil F: Plan-Freigabe (`plan.exit`), Plan-Vorschlag (`plan.enter`), `/plan …`.
 pub(crate) mod plan_dialog;
+pub(crate) mod process_tree;
 // Runde 5, Teil P: Goal-Marke der Statuszeile und Goal-/Schritt-Verlaufszeilen.
 pub(crate) mod goal_marker;
 mod registry;

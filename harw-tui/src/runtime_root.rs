@@ -651,6 +651,11 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         None => (crate::keybindings::KeyBindings::default(), None),
     };
     app.set_key_bindings(key_bindings.clone());
+    // Fester Not-Aus (2× Ctrl+C): ein Griff für den Eingabe-Thread und jede
+    // `ChatApp` dieser Sitzungskette. Beendet im Ernstfall den Prozessbaum und
+    // erzwingt den Exit (siehe `crate::hard_kill`).
+    let hard_kill = crate::hard_kill::HardKill::live();
+    app.set_hard_kill(hard_kill.clone());
     let hydration =
         match runtime.block_on(session.hydrate_from_store(assembly.state_store().as_ref())) {
             Ok(hydration) => hydration,
@@ -741,7 +746,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         let (harw_tx, mut harw_rx) = harw_event_channel();
         let (frame_req, frame_rx) = frame_channel();
         tokio::spawn(frame_scheduler(frame_rx, tui_tx.clone()));
-        let _reader = spawn_input_reader(tui_tx);
+        let _reader = spawn_input_reader(tui_tx, hard_kill.clone());
         frame_req.schedule_frame();
 
         loop {
@@ -835,6 +840,9 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                             // Die neue App startet mit der Standardbelegung;
                             // die geladene Belegung gilt sitzungsübergreifend.
                             app.set_key_bindings(key_bindings.clone());
+                            // Der Eingabe-Thread hält weiter den alten Griff:
+                            // die neue App muss denselben benutzen.
+                            app.set_hard_kill(hard_kill.clone());
                             event_rx = next_runtime.event_rx;
                             turn_event_rx = next_runtime.turn_event_rx;
                             // Treiber und Fragekanal gehören zum Handler der
