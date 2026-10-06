@@ -60,7 +60,7 @@
 use crate::blocking::run_blocking;
 use crate::symlink::open_start;
 use crate::tree::{
-    HARD_MAX_RESULTS, MAX_LINE_BYTES, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason,
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason,
     WalkOptions, Workspace, normalize_relative, open_file_in, read_bounded, truncate_line,
     walk_tree,
 };
@@ -72,7 +72,7 @@ use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Standard-Obergrenze für `fs.grep`-Treffer.
 pub const DEFAULT_MAX_MATCHES: usize = 100;
@@ -412,8 +412,6 @@ fn grep_internal(root: &Path, args: &GrepArgs) -> ToolOutput {
             ));
         }
     };
-    let search_root = start.root().to_path_buf();
-    let root = search_root.as_path();
     let (workspace, start_rel) = (start.workspace, start.rel);
 
     let target = match resolve_target(&workspace, start_input, &start_rel) {
