@@ -2153,15 +2153,15 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// # Errors
     /// [`AgentSpawnError`], wenn `role` keine bekannte Rolle ist oder die
     /// Montage scheitert (dieselben Fälle wie [`Self::build_registry`]).
-    fn build_registry_with_capabilities_for_parent(
+    fn build_registry_from_capability_snapshot_for_parent(
         &self,
         role: &str,
         input: &SpawnInput,
-        suggestions: Option<&harw_catalog::AgentSuggestions>,
+        snapshot: Option<&harw_catalog::SpawnCapabilitySnapshot>,
         parent: &harw_core::ParentGrant,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
         if role != role_names::AGENT_STEWARD {
-            return self.build_registry(role, input, suggestions);
+            return self.build_registry_with_capabilities(role, input, snapshot);
         }
 
         let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {

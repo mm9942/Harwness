@@ -1964,6 +1964,24 @@ pub trait ChildRegistryFactory: Send + Sync {
         )
     }
 
+    /// Builds from an already frozen capability snapshot plus the trusted
+    /// immediate-parent grant.
+    ///
+    /// This is the single-snapshot seam: callers that already resolved a
+    /// capability contract (notably recovery) pass that exact immutable value
+    /// to registry construction instead of asking the factory to resolve live
+    /// catalog state a second time.
+    fn build_registry_from_capability_snapshot_for_parent(
+        &self,
+        role: &str,
+        input: &SpawnInput,
+        snapshot: Option<&SpawnCapabilitySnapshot>,
+        parent: &ParentGrant,
+    ) -> Result<ExtensionRegistry, AgentSpawnError> {
+        let _ = parent;
+        self.build_registry_with_capabilities(role, input, snapshot)
+    }
+
     /// Wie [`Self::build_registry_with_capabilities`], zusätzlich mit dem
     /// vertrauenswürdigen [`ParentGrant`] der admittierenden Elternsitzung
     /// (Welle FANIN-K).
@@ -2003,9 +2021,13 @@ pub trait ChildRegistryFactory: Send + Sync {
         parent: &ParentGrant,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
         let _ = suggestions;
-        let _ = parent;
         let snapshot = self.capability_snapshot(role, input)?;
-        self.build_registry_with_capabilities(role, input, snapshot.as_ref())
+        self.build_registry_from_capability_snapshot_for_parent(
+            role,
+            input,
+            snapshot.as_ref(),
+            parent,
+        )
     }
 
     /// Returns the model provider selected for an admitted child role. The
@@ -8280,10 +8302,10 @@ impl ManagedAgentSpawner {
         };
         let registry = definition
             .registry_factory
-            .build_registry_with_capabilities_for_parent(
+            .build_registry_from_capability_snapshot_for_parent(
                 role_name,
                 &input,
-                child_suggestions.as_ref(),
+                capability_snapshot.as_ref(),
                 &parent_grant,
             )?;
         if self.limits.lease_seconds <= 0 {
