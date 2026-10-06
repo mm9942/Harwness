@@ -14,8 +14,8 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 46 Ops): `help`, `status`, `quit`,
-//! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
+//! **Grundausstattung** ([`register_all`], 47 Ops): `help`, `status`, `quit`,
+//! `new`, `work`, `work.result`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
@@ -928,7 +928,7 @@ mod tests {
     fn register_all_adds_forty_six_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 46);
+        assert_eq!(reg.len(), 47);
     }
 
     #[test]
