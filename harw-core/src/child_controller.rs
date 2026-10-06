@@ -8819,6 +8819,15 @@ impl AgentSpawner for ManagedAgentSpawner {
         Box::pin(async move { self.admit(role, input, sandbox, suggestions) })
     }
 
+    fn role_allows_pause(&self, role: &str) -> Option<bool> {
+        self.roles.get(role).map(|definition| {
+            definition
+                .registry_factory
+                .executable_agent_ir(role)
+                .is_some_and(|ir| ir.lifecycle_machine().allow_pause())
+        })
+    }
+
     fn child_finished(&self, child: &SessionId) {
         // Runde 5, Teil K: ein abgekoppeltes Kind läuft weiter; es wird erst
         // von `finish_background_child` freigegeben.
@@ -10958,6 +10967,10 @@ allow_pause = true
 admitted = ["fs.read"]
 "#,
         )?)?;
+        assert_eq!(
+            harw_extension_api::AgentSpawner::role_allows_pause(&spawner, "worker"),
+            Some(true)
+        );
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
@@ -11013,6 +11026,10 @@ admitted = ["fs.read"]
                 SessionActivation::default(),
             )
             .map_err(ctx("trusted external root registers during construction"))?;
+        assert_eq!(
+            harw_extension_api::AgentSpawner::role_allows_pause(&spawner, "worker"),
+            Some(false)
+        );
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)

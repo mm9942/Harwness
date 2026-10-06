@@ -27,6 +27,16 @@ pub trait AgentSpawner: Send + Sync {
         suggestions: Option<AgentSuggestions>,
     ) -> SpawnFuture<'a>;
 
+    /// Whether a registered role's lifecycle allows the child to pause.
+    ///
+    /// `Some(false)` lets the core reject a blocking handoff before spawning;
+    /// `None` means the implementation cannot report the role's lifecycle.
+    /// The default preserves compatibility with spawners that do not expose
+    /// role definitions.
+    fn role_allows_pause(&self, _role: &str) -> Option<bool> {
+        None
+    }
+
     /// The core calls this only after it has correlated a child result to the
     /// parent handoff. Managed spawners use it to release concurrency slots.
     /// A no-op default keeps isolated test/dummy spawners lightweight; it does
