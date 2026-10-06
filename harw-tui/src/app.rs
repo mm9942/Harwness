@@ -1212,7 +1212,10 @@ pub struct ChatApp {
     /// Runde 5, Teil P: Goal-Marke und Übergänge (`crate::goal_marker`).
     goal_tracker: crate::goal_marker::GoalTracker,
     /// Detailgrad, mit dem Werkzeugzellen gerendert werden (Plan Schritt 2
-    /// „Verbosity"); gesetzt über [`Self::with_verbose_tools`].
+    /// „Verbosity"); gesetzt über [`Self::with_verbose_tools`]. B11c:
+    /// `Activity` ist der Default (einzeilige Aktivitätsdarstellung),
+    /// `Verbose` zeigt zusätzlich rohe Argumente, `Compact` bleibt nur
+    /// programmatisch (Streaming-/Historie-Pfade).
     tool_verbosity: ToolVerbosity,
     /// Alle bisher angehängten Top-Level-Werkzeugzellen (einzeln oder
     /// gruppiert), in Ankunftsreihenfolge — Grundlage für Ctrl+O „letzte bzw.
@@ -1521,7 +1524,7 @@ impl ChatApp {
             active_mode: InteractionMode::default(),
             plan_services: None,
             goal_tracker: crate::goal_marker::GoalTracker::default(),
-            tool_verbosity: ToolVerbosity::Compact,
+            tool_verbosity: ToolVerbosity::Activity,
             tool_cells: Vec::new(),
             open_tool_group: None,
             last_shown_plan: None,
@@ -1724,7 +1727,9 @@ impl ChatApp {
     /// einer öffentlichen Signatur erscheinen. Die CLI (ein anderer Slice)
     /// reicht `--verbose` als `bool` durch; `true` entspricht
     /// `ToolVerbosity::Verbose` (zusätzlich immer ausgeklappt, rohe Argumente
-    /// sichtbar), `false` dem Default `ToolVerbosity::Compact`.
+    /// sichtbar), `false` dem Default `ToolVerbosity::Activity`
+    /// (B11c: einzeilige Aktivitätsdarstellung; `Compact` bleibt nur
+    /// programmatisch, etwa für Streaming-/Historie-Pfade).
     ///
     /// # Argumente
     /// - `verbose` (`bool`): `true` aktiviert die ausführliche Darstellung.
@@ -1736,7 +1741,8 @@ impl ChatApp {
         self.tool_verbosity = if verbose {
             ToolVerbosity::Verbose
         } else {
-            ToolVerbosity::Compact
+            // B11c: Rückkehr zum Default `Activity`, nicht `Compact`.
+            ToolVerbosity::Activity
         };
         self
     }
@@ -3414,7 +3420,9 @@ impl ChatApp {
     ///
     /// # Beschreibung
     /// Neue Werkzeugzellen erhalten die neue [`ToolVerbosity`]; bestehende
-    /// Zellen werden passend auf- bzw. zugeklappt.
+    /// Zellen werden passend auf- bzw. zugeklappt. Der aus-Zustand ist der
+    /// Default `ToolVerbosity::Activity` (B11c: einzeilige
+    /// Aktivitätsdarstellung; `Compact` bleibt nur programmatisch).
     ///
     /// # Rückgabe
     /// `true`, wenn jetzt die ausführliche Anzeige aktiv ist.
@@ -3423,7 +3431,8 @@ impl ChatApp {
         self.tool_verbosity = if verbose {
             ToolVerbosity::Verbose
         } else {
-            ToolVerbosity::Compact
+            // B11c: aus → zurück auf den Default `Activity`.
+            ToolVerbosity::Activity
         };
         for handle in &self.tool_cells {
             handle.set_expanded(verbose);
@@ -13989,6 +13998,28 @@ forbidden = [{forbidden}]
         let verbose = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
         apply_local_intercept(&mut app, verbose, &bus);
         assert_ne!(app.tool_verbosity, before);
+        Ok(())
+    }
+
+    /// Toggle-Zyklus (B11c): `/verbose` zweimal bringt den Detailgrad vom
+    /// Default `Activity` über `Verbose` zurück zu `Activity`; einmal
+    /// ausgeklappt wären die Zellen beim Zurückschalten zugeklappt.
+    #[test]
+    fn verbose_toggle_cycles_activity_to_verbose_and_back() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        assert!(matches!(
+            app.tool_verbosity,
+            ToolVerbosity::Activity
+        ));
+
+        let first = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, first, &bus);
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Verbose));
+
+        let second = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, second, &bus);
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Activity));
         Ok(())
     }
 
