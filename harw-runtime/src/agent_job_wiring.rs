@@ -410,71 +410,79 @@ impl RuntimeAgentJobSubmitter {
                             Err(error) => JobOutcome::Failed {
                                 reason: format!("agent recovery rejected: {error}"),
                             },
-                            Ok(recovered) => match recovered.disposition {
-                                RecoveredChildDisposition::UnsafeInterruptedToolCalls { count } => {
+                            Ok(recovered) => {
+                                // Rebuild the background projection before
+                                // interpreting the recovered transcript so
+                                // every terminal disposition can emit the same
+                                // parent/UI notice as a non-restarted run.
+                                if let Err(error) = spawner_for_run
+                                    .detach_for_background(&recovered.child, None)
+                                {
                                     JobOutcome::Failed {
                                         reason: format!(
-                                            "agent recovery found {count} interrupted tool call(s); side effects are ambiguous, so automatic continuation is refused"
+                                            "agent recovery could not restore background ownership: {}",
+                                            error.message
                                         ),
                                     }
-                                }
-                                RecoveredChildDisposition::AlreadyCompleted { text } => {
-                                    JobOutcome::Succeeded {
-                                        result: serde_json::json!({
-                                            "child_id": recovered.child.as_str(),
-                                            "text": text,
-                                            "budget_exhausted": false,
-                                            "recovered_without_replay": true,
-                                        }),
-                                    }
-                                }
-                                RecoveredChildDisposition::Continue => {
-                                    if job_cancel.is_cancelled() {
-                                        JobOutcome::Cancelled {
-                                            reason: "agent recovery cancelled before continuation".to_owned(),
+                                } else {
+                                    match recovered.disposition {
+                                        RecoveredChildDisposition::UnsafeInterruptedToolCalls { count } => {
+                                            JobOutcome::Failed {
+                                                reason: format!(
+                                                    "agent recovery found {count} interrupted tool call(s); side effects are ambiguous, so automatic continuation is refused"
+                                                ),
+                                            }
                                         }
-                                    } else if let Err(error) = spawner_for_run
-                                        .detach_for_background(&recovered.child, None)
-                                    {
-                                        JobOutcome::Failed {
-                                            reason: format!(
-                                                "agent recovery could not restore background ownership: {}",
-                                                error.message
-                                            ),
+                                        RecoveredChildDisposition::AlreadyCompleted { text } => {
+                                            JobOutcome::Succeeded {
+                                                result: serde_json::json!({
+                                                    "child_id": recovered.child.as_str(),
+                                                    "text": text,
+                                                    "budget_exhausted": false,
+                                                    "recovered_without_replay": true,
+                                                }),
+                                            }
                                         }
-                                    } else {
-                                        match spawner_for_run
-                                            .run_child_with_declared_budget(
-                                                &recovered.child,
-                                                state_store.as_ref(),
-                                                approvals.as_deref(),
-                                                TurnInput::default(),
-                                            )
-                                            .await
-                                        {
-                                            Ok(run) => match run.outcome {
-                                                TurnOutcome::Completed => JobOutcome::Succeeded {
-                                                    result: serde_json::json!({
-                                                        "child_id": recovered.child.as_str(),
-                                                        "text": run.full_text.unwrap_or_else(|| "completed".to_owned()),
-                                                        "budget_exhausted": run.budget_exhausted,
-                                                        "recovered": true,
-                                                    }),
-                                                },
-                                                TurnOutcome::Cancelled { reason } => {
-                                                    JobOutcome::Cancelled {
-                                                        reason: format!("agent cancelled: {reason:?}"),
-                                                    }
+                                        RecoveredChildDisposition::Continue => {
+                                            if job_cancel.is_cancelled() {
+                                                JobOutcome::Cancelled {
+                                                    reason: "agent recovery cancelled before continuation".to_owned(),
                                                 }
-                                                other => JobOutcome::Failed {
-                                                    reason: format!(
-                                                        "recovered agent ended without terminal completion: {other:?}"
-                                                    ),
-                                                },
-                                            },
-                                            Err(error) => JobOutcome::Failed {
-                                                reason: error.to_string(),
-                                            },
+                                            } else {
+                                                match spawner_for_run
+                                                    .run_child_with_declared_budget(
+                                                        &recovered.child,
+                                                        state_store.as_ref(),
+                                                        approvals.as_deref(),
+                                                        TurnInput::default(),
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(run) => match run.outcome {
+                                                        TurnOutcome::Completed => JobOutcome::Succeeded {
+                                                            result: serde_json::json!({
+                                                                "child_id": recovered.child.as_str(),
+                                                                "text": run.full_text.unwrap_or_else(|| "completed".to_owned()),
+                                                                "budget_exhausted": run.budget_exhausted,
+                                                                "recovered": true,
+                                                            }),
+                                                        },
+                                                        TurnOutcome::Cancelled { reason } => {
+                                                            JobOutcome::Cancelled {
+                                                                reason: format!("agent cancelled: {reason:?}"),
+                                                            }
+                                                        }
+                                                        other => JobOutcome::Failed {
+                                                            reason: format!(
+                                                                "recovered agent ended without terminal completion: {other:?}"
+                                                            ),
+                                                        },
+                                                    },
+                                                    Err(error) => JobOutcome::Failed {
+                                                        reason: error.to_string(),
+                                                    },
+                                                }
+                                            }
                                         }
                                     }
                                 }
