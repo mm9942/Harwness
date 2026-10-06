@@ -1667,9 +1667,15 @@ mod tests {
     fn minimal_parts_register_only_the_mandatory_eight() {
         let services = RuntimeServices::new(minimal_parts());
         for surface in ServiceSurface::ALL {
+            let mut expected = always_present();
+            if matches!(surface, ServiceSurface::Slash | ServiceSurface::ModelTool) {
+                // Vom Kompositionswurzel gesetzte Herkunft für durable
+                // Job-Mutationen; kein optionaler Dienst.
+                expected.push(type_name::<JobMutationScope>());
+            }
             assert_eq!(
                 services.registered(surface),
-                sorted(always_present()),
+                sorted(expected),
                 "Fläche {} ohne optionale Dienste",
                 surface.as_str()
             );
@@ -1962,6 +1968,8 @@ mod tests {
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<AgentEventHub>>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",
@@ -1993,6 +2001,8 @@ mod tests {
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<KnowledgeStore>>(),
                     type_name::<Arc<dyn JobTransitions>>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",

@@ -1942,10 +1942,7 @@ fn handoff_properties() -> BTreeMap<String, JsonSchema> {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
-                "Optional; Vorgabe true. Startet den Agenten als durable Job und gibt sofort work_id/child_id zurück. \
-                 false wartet inline. Ein pausierverbotenes Ziel (`allow_pause = false`) darf nie \
-                 inline blockieren: dort bei der Vorgabe bleiben, weder `background=false` noch \
-                 `wait=true` setzen."
+                "Optional; Vorgabe true. Startet den Agenten als durable Job und gibt sofort work_id/child_id zurück. false wartet inline."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -11264,7 +11261,7 @@ mod tests {
         let writer = find_function(&tools, "transfer_to_uia-writer")?;
         let summary = writer
             .description
-            .split("Ergebnis. ")
+            .split("wartet inline. ")
             .nth(1)
             .ok_or(TestError::Missing("Einzeiler"))?;
         assert!(
