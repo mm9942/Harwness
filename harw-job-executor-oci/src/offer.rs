@@ -65,6 +65,8 @@ impl OciExecutor {
             })?,
             lease_epoch: 0,
             workspace_root: PathBuf::from("/"),
+            output_files: None,
+            stdio_handoff: None,
         };
         let prepared = self.create_and_readback(&spec, &ctx)?;
         self.discard_container(&prepared.id);

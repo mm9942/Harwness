@@ -102,6 +102,7 @@ browser = ["dep:harw-browser", "dep:harw-tool-browser", "dep:harw-browser-thirty
 workspace = true
 
 [dev-dependencies]
+harw-command = { path = "../harw-command" }
 harw-test-support = { path = "../harw-test-support" }
 # Nur für Tests: die Freigabe-Regeln in `DefaultApprovalPolicy::review`
 # bekommen ihre Werkzeug-Argumente als `serde_json::Value`.

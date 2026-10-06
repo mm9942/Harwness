@@ -1997,6 +1997,7 @@ dependencies = [
  "harw-agent-artifact",
  "harw-agent-compiler",
  "harw-agent-dsl",
+ "harw-command",
  "harw-core",
  "harw-home",
  "harw-job-runtime",
@@ -2188,6 +2189,7 @@ dependencies = [
  "harw-channel",
  "harw-channel-telegram",
  "harw-channel-telegram-transport",
+ "harw-command",
  "harw-completions",
  "harw-config",
  "harw-context",
@@ -2265,6 +2267,18 @@ dependencies = [
  "harw-types",
  "serde",
  "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
+name = "harw-command"
+version = "0.9.0"
+dependencies = [
+ "harw-job",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3631,6 +3645,7 @@ dependencies = [
  "harw-authority",
  "harw-catalog",
  "harw-code-graph",
+ "harw-command",
  "harw-config",
  "harw-core",
  "harw-core-bridge",
@@ -3847,6 +3862,7 @@ dependencies = [
  "harw-browser",
  "harw-browser-thirtyfour",
  "harw-catalog",
+ "harw-command",
  "harw-config",
  "harw-egress",
  "harw-extension-api",
@@ -3921,6 +3937,7 @@ dependencies = [
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
+ "harw-command",
  "harw-config",
  "harw-context",
  "harw-context-ledger",
@@ -4420,6 +4437,7 @@ name = "harw-tool-job"
 version = "0.9.1"
 dependencies = [
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
  "harw-job-core",
  "harw-job-linux",
@@ -4530,6 +4548,7 @@ version = "0.9.1"
 dependencies = [
  "blake3",
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
  "harw-macros",
  "harw-observe",
@@ -4619,6 +4638,7 @@ dependencies = [
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
+ "harw-command",
  "harw-config",
  "harw-context",
  "harw-core",
