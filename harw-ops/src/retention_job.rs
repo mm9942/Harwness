@@ -145,6 +145,7 @@ pub fn admit_retention_sweep(
             base_delay: SignedDuration::from_secs(30),
             factor: 2.0,
             max_delay: SignedDuration::from_secs(300),
+            jitter: 0.0,
         },
         now,
     );
