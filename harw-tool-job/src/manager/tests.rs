@@ -1261,6 +1261,65 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
     Ok(())
 }
 
+/// Harter Abbruch (doppeltes Ctrl+C): nur Hintergrund-Jobs der Nutzerin sind
+/// „ablösbar" und werden geschont; der Prozess eines Kind-Agenten
+/// (`start_piped`) ist es nicht.
+#[tokio::test]
+async fn test_detachable_pids_and_detach_user_jobs_skip_piped_children() -> TestResult {
+    let env = Env::new()?;
+    let user = env.prepare("sleep 30").await?;
+    let user = env
+        .manager
+        .start(request("user", "agent-a", &[]), user)
+        .map_err(ctx("start user job"))?;
+    let user_pid = user.meta.pid.ok_or(TestError::Missing("user pid"))?;
+    let user_id = user.meta.job_id.clone();
+
+    let prepared = env.prepare_piped(&["/bin/cat"]).await?;
+    let piped = env
+        .manager
+        .start_piped(request("child", "agent-a", &[]), prepared)
+        .map_err(ctx("start_piped"))?;
+    let piped_pid = piped
+        .status
+        .meta
+        .pid
+        .ok_or(TestError::Missing("piped pid"))?;
+    let piped_id = piped.job_id.clone();
+
+    assert_eq!(
+        env.manager.detachable_leader_pids(),
+        vec![user_pid],
+        "nur der Nutzer-Job ist ablösbar, nicht der Kind-Agent-Prozess ({piped_pid})"
+    );
+
+    let summary = env.manager.detach_user_jobs();
+    assert_eq!(summary.detached, 1);
+    let user_status = env
+        .manager
+        .status(&user_id, Caller::Operator)
+        .map_err(ctx("user status"))?;
+    assert_eq!(user_status.meta.state, JobState::Detached);
+    let piped_status = env
+        .manager
+        .status(&piped_id, Caller::Operator)
+        .map_err(ctx("piped status"))?;
+    assert_eq!(
+        piped_status.meta.state,
+        JobState::Running,
+        "der Kind-Agent-Job darf nicht als abgelöst gelten"
+    );
+    assert!(env.manager.detachable_leader_pids().is_empty());
+
+    // Aufräumen: den abgelösten Job stoppen, den Kind-Job per EOF beenden.
+    env.manager
+        .stop(&user_id, Caller::Operator, JobSignal::Kill)
+        .await
+        .map_err(ctx("stop user job"))?;
+    drop(piped.stdin);
+    Ok(())
+}
+
 /// Liest den Zeilenstrom eines `start_piped`-Jobs bis zu seinem Ende.
 async fn drain_lines(
     lines: &mut mpsc::UnboundedReceiver<Result<String, PipedLineError>>,

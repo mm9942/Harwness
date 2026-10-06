@@ -396,6 +396,12 @@ struct JobEntry {
     /// (pidfd, bleibt auch nach `detach_all` gültig); `None` für Jobs
     /// früherer Sitzungen — die werden nur nach Identitätsprüfung gesteuert.
     leader: Option<OwnLeader>,
+    /// `true` für einen über [`JobManager::start_piped`] gestarteten Job, also
+    /// den Prozess eines job-gebundenen Kind-Agenten. Er ist kein Hintergrund-
+    /// Job der Nutzerin: beim harten Abbruch (doppeltes Ctrl+C) wird er mit
+    /// dem Prozessbaum beendet, statt abgelöst zu werden. Nur im Speicher,
+    /// nie in `meta.json`.
+    piped: bool,
 }
 
 impl JobEntry {
@@ -403,6 +409,7 @@ impl JobEntry {
         let (changes, _receiver) = watch::channel(0);
         Self {
             leader,
+            piped: false,
             dir,
             state: Mutex::new(EntryState {
                 meta,
@@ -415,6 +422,12 @@ impl JobEntry {
             changes,
             monitor: Mutex::new(None),
         }
+    }
+
+    /// Markiert den Eintrag als Kind-Agent-Job (siehe [`JobEntry::piped`]).
+    fn into_piped(mut self) -> Self {
+        self.piped = true;
+        self
     }
 
     fn bump(&self) {
@@ -925,7 +938,7 @@ impl JobManager {
         let leader = adopt_child(&mut meta, pid);
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
-        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader).into_piped());
         entry.persist();
         lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "piped job started");
@@ -1215,9 +1228,46 @@ impl JobManager {
     /// sind nach dem nächsten Start über `meta.json` sichtbar; Sandbox-Jobs
     /// enden trotzdem mit harw (`bwrap --die-with-parent`).
     pub fn detach_all(&self) -> DetachSummary {
+        self.detach_matching(|_| true)
+    }
+
+    /// Wie [`JobManager::detach_all`], löst aber nur die Hintergrund-Jobs der
+    /// Nutzerin ab — nicht die Prozesse job-gebundener Kind-Agenten
+    /// ([`JobManager::start_piped`]). Der harte Abbruch (doppeltes Ctrl+C)
+    /// beendet diese zusammen mit dem Prozessbaum; sie als „abgelöst, läuft
+    /// weiter" zu führen wäre nach dem Kill falsch.
+    pub fn detach_user_jobs(&self) -> DetachSummary {
+        self.detach_matching(|entry| !entry.piped)
+    }
+
+    /// PIDs der Gruppenführer aller laufenden, beaufsichtigten Hintergrund-Jobs
+    /// der Nutzerin (ohne Kind-Agent-Jobs aus [`JobManager::start_piped`]).
+    ///
+    /// Der harte Abbruch schont genau diese Prozessbäume: sie sind durch den
+    /// Beenden-Vertrag (`detach_all`: „weiterlaufen lassen") bewusst
+    /// überlebensfähig. Reine Abfrage ohne Signal und ohne `await`.
+    #[must_use]
+    pub fn detachable_leader_pids(&self) -> Vec<u32> {
+        let entries: Vec<Arc<JobEntry>> = lock(&self.jobs).values().cloned().collect();
+        entries
+            .into_iter()
+            .filter(|entry| !entry.piped)
+            .filter_map(|entry| {
+                let state = lock(&entry.state);
+                (state.monitored && !state.meta.state.is_terminal())
+                    .then_some(state.meta.pid)
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// Gemeinsamer Rumpf von [`JobManager::detach_all`] und
+    /// [`JobManager::detach_user_jobs`]: löst jeden laufenden, beaufsichtigten
+    /// Eintrag ab, für den `select` `true` liefert.
+    fn detach_matching(&self, select: impl Fn(&JobEntry) -> bool) -> DetachSummary {
         let entries: Vec<Arc<JobEntry>> = lock(&self.jobs).values().cloned().collect();
         let mut summary = DetachSummary::default();
-        for entry in entries {
+        for entry in entries.into_iter().filter(|entry| select(entry)) {
             let detach = {
                 let mut state = lock(&entry.state);
                 let running = state.monitored && !state.meta.state.is_terminal();
