@@ -104,9 +104,11 @@ use crate::session::{AgentSession, LiveEmitter, SpawnContext};
 use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
-use harw_agent_dsl::executable::{BudgetSpec, ContextProgram, ExecutableAgentIr, SectionDetail};
-use harw_authority::SandboxSpec;
-use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot};
+use harw_agent_dsl::executable::{
+    BudgetSpec, ContextProgram, ExecutableAgentIr, SectionDetail, SnapshotId,
+};
+use harw_authority::{AuthoritySnapshot, SandboxSpec};
+use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot, SuggestionKind};
 use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName, TrustClass};
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
@@ -115,7 +117,9 @@ use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
 use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
-use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId};
+use harw_types::{
+    AgentRole, ApprovalActor, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId,
+};
 use jiff::{SignedDuration, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::future::Future;
@@ -902,6 +906,75 @@ pub struct ChildRecord {
     /// angerechnet wurde. Weitere Anrechnungen übertragen nur die Differenz,
     /// damit Lauf-Ende und Freigabe nichts doppelt verbuchen.
     pub charged_to_parent: ChildUsage,
+}
+
+/// Persistierbarer Budget-Snapshot eines bereits admittierten Kindes.
+///
+/// Dieser Typ ist reine Wiederanlauf-Metadaten. Er kann weder ein Budget
+/// erweitern noch eine Session starten; ein späterer Rehydrator muss ihn
+/// gegen die frisch geladene Agent-IR und die aktuelle Policy prüfen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ChildRecoveryBudget {
+    pub max_tokens: Option<u64>,
+    pub max_tool_calls: Option<u32>,
+    pub max_wall_time_ms: Option<u64>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl From<AgentBudget> for ChildRecoveryBudget {
+    fn from(value: AgentBudget) -> Self {
+        Self {
+            max_tokens: value.max_tokens,
+            max_tool_calls: value.max_tool_calls,
+            max_wall_time_ms: value.max_wall_time_ms,
+            reasoning_effort: value.reasoning_effort,
+        }
+    }
+}
+
+/// Nicht-autorisierender Verweis auf eine aktivierte Capability.
+///
+/// Nur Name, Art und der beim Spawn berechnete Definition-Digest werden
+/// persistiert. Credentials, laufende MCP-Verbindungen oder executable grants
+/// gehören ausdrücklich nicht in den Recovery-Vertrag.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChildRecoveryCapability {
+    pub kind: String,
+    pub name: String,
+    pub definition_sha256: String,
+}
+
+/// Rekonstruktionsinput für einen durablen Agent-Job.
+///
+/// Der Snapshot ist kein Grant. authority ist absichtlich nur ein
+/// AuthoritySnapshot; eine wiederhergestellte Session muss daraus über die
+/// aktuelle vertrauenswürdige Policy einen neuen Grant ausstellen lassen.
+/// Ebenso ist executable_snapshot_id nur der bei der Admission berechnete
+/// Digest: Recovery darf nur fortfahren, wenn die aktuell aufgelöste IR ihn
+/// bestätigt. Capability-Digests, Kontextdecke und Routing-Metadaten dürfen
+/// beim Wiederanlauf nur bestätigt oder verengt, nie still erweitert werden.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ChildRecoveryView {
+    pub child: SessionId,
+    pub parent: SessionId,
+    pub handoff_call_id: ToolCallId,
+    pub role: String,
+    pub depth: u32,
+    pub depth_ceiling: u32,
+    pub budget: ChildRecoveryBudget,
+    pub task_complexity: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub authority: AuthoritySnapshot,
+    pub approval_actor: Option<ApprovalActor>,
+    pub organizational_role: harw_agent_dsl::roles::AgentRoleId,
+    pub allowed_child_orchestrators: Vec<String>,
+    pub context_ceiling: Option<ContextCeiling>,
+    pub mode: String,
+    pub executable_snapshot_id: Option<SnapshotId>,
+    pub capability_agent: Option<String>,
+    pub activated_capabilities: Vec<ChildRecoveryCapability>,
+    pub trace: Option<TraceContext>,
 }
 
 /// Verbrauch eines Kindes in den drei durchgesetzten Budget-Dimensionen.
@@ -4113,6 +4186,79 @@ impl ManagedAgentSpawner {
             .lock()
             .ok()
             .and_then(|active| active.get(child.as_str()).cloned())
+    }
+
+    /// Friert die minimalen, nicht-autorisierenden Rekonstruktionsdaten eines
+    /// bereits admittierten Kindes ein.
+    ///
+    /// Der Aufruf ist für den kurzen Zeitraum zwischen Admission und Start des
+    /// Kind-Turns gedacht. Während eines laufenden Turns ist die Session aus
+    /// dem Manager ausgecheckt; dann liefert diese Methode bewusst None
+    /// statt aus teilweise sichtbarem Zustand einen Snapshot zu erfinden.
+    #[must_use]
+    pub fn child_recovery_view(&self, child: &SessionId) -> Option<ChildRecoveryView> {
+        let record = self.child_record(child)?;
+        let manager = self.manager.lock().ok()?;
+        let session = manager.get(child).ok()?;
+        let context = session.spawn_context()?;
+        let base_sandbox = session.base_sandbox().unwrap_or(&context.sandbox);
+
+        let (capability_agent, mut activated_capabilities) =
+            if let Some(snapshot) = context.capability_snapshot.as_ref() {
+                let activated = snapshot
+                    .activated
+                    .iter()
+                    .map(|capability| ChildRecoveryCapability {
+                        kind: match &capability.kind {
+                            SuggestionKind::Skill => "skill",
+                            SuggestionKind::Plugin => "plugin",
+                            SuggestionKind::Mcp => "mcp",
+                        }
+                        .to_owned(),
+                        name: capability.name.clone(),
+                        definition_sha256: capability.definition_sha256.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                (Some(snapshot.agent.clone()), activated)
+            } else {
+                (None, Vec::new())
+            };
+        activated_capabilities.sort_by(|left, right| {
+            (&left.kind, &left.name, &left.definition_sha256).cmp(&(
+                &right.kind,
+                &right.name,
+                &right.definition_sha256,
+            ))
+        });
+
+        let mut allowed_child_orchestrators = context.allowed_child_orchestrators.clone();
+        allowed_child_orchestrators.sort();
+
+        Some(ChildRecoveryView {
+            child: record.child,
+            parent: record.parent,
+            handoff_call_id: record.handoff_call_id,
+            role: record.role,
+            depth: record.depth,
+            depth_ceiling: record.depth_ceiling,
+            budget: record.budget.into(),
+            task_complexity: record.task_complexity.map(|complexity| match complexity {
+                TaskComplexity::Simple => "simple".to_owned(),
+                TaskComplexity::Complex => "complex".to_owned(),
+            }),
+            model: record.model,
+            provider: record.provider,
+            authority: base_sandbox.authority().snapshot(),
+            approval_actor: context.approval_actor.clone(),
+            organizational_role: context.organizational_role,
+            allowed_child_orchestrators,
+            context_ceiling: context.ceiling.clone(),
+            mode: session.mode().as_str().to_owned(),
+            executable_snapshot_id: session.executable_snapshot_id().cloned(),
+            capability_agent,
+            activated_capabilities,
+            trace: record.trace,
+        })
     }
 
     /// Deckelt die zulässige Fan-out-Parallelität für einen **registrierten

@@ -95,6 +95,8 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 - Workload command execution has one application-facing port.
 - Agent delegation has a durable job submission capability with a three-phase `Pending -> ownership transfer -> Ready` admission boundary.
 - Agent-job scope is the canonical resolved tenant/workspace plus authenticated submitter, not a session-ID surrogate.
+- Before a job becomes durable, the spawner emits a versioned `harw.agent-job.recovery/v1` envelope containing only non-authoritative reconstruction evidence: parent/handoff/role, effective budget and routing, an `AuthoritySnapshot`, context ceiling, mode, executable-IR snapshot ID, capability definition digests and trace linkage.
+- The recovery envelope is not a grant: restart must freshly resolve the workspace, reissue authority under current policy, confirm the IR snapshot, and revalidate every capability digest. Any mismatch narrows or rejects recovery; it never silently widens the old run.
 - Root and descendant registries share the same logical job contract.
 - Missing approval UI rejects-and-continues.
 - A nested explicit inline delegation that still pauses fails closed instead of writing a `Blocked` job with no resume owner.
@@ -116,10 +118,12 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 
 - Run the full compiler/test/gate matrix on this exact branch SHA.
 - Add/extend surface presentation for `work_id` where the current UI still prioritizes child/session IDs.
+- Add the actual agent-job rehydrator/worker: the generic CLI worker intentionally does not claim `Custom("agent")`, so persisted recovery evidence is present but no post-restart executor may consume it yet.
+- Add a startup reconciliation rule for pre-envelope or otherwise unreconstructable agent jobs; they must end visibly fail-closed rather than sit indefinitely in `Ready`.
 - Add crash/restart integration coverage for an in-flight durable agent job.
 - Add a first-class durable dependency/work-graph contract before allowing agent jobs to enter `Blocked` on nested child handoffs; `wait=true` remains compatibility-only until a resume owner exists.
 - Add explicit job-status/result lookup by `work_id` for agent jobs where only child-oriented result tooling currently exists.
-- Add startup reconciliation for agent-job records left `Pending` between durable admission and background ownership transfer; these records must never be auto-run unless the child session and authority can be reconstructed and proven.
+- Reconcile `Pending` agent records on startup: the envelope proves what would need reconstruction, but a record may become runnable only after its child session, authority, IR and capability contract are all freshly reconstructed and verified.
 - Decide whether CLI/build/editor/MCP/service-manager direct process exceptions should later get dedicated ports; they are not model workload execution and are intentionally outside this wave.
 
 ## Required validation before merge

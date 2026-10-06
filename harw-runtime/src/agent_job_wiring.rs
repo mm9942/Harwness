@@ -24,6 +24,7 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
 
 const AGENT_JOB_KIND: &str = "agent";
+const AGENT_RECOVERY_SCHEMA: &str = "harw.agent-job.recovery/v1";
 const AGENT_JOB_WORKER: &str = "harw-agent-runtime";
 const AGENT_JOB_LEASE_SECS: i64 = 30;
 
@@ -106,6 +107,24 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 .unwrap_or("Continue the delegated task.")
                 .to_owned();
 
+            let recovery = match self.spawner.child_recovery_view(&child) {
+                Some(recovery) => recovery,
+                None => {
+                    let reason = format!(
+                        "child {child} has no complete trusted recovery view before durable admission"
+                    );
+                    if let Err(error) = self.spawner.release_child(&child) {
+                        tracing::error!(
+                            child = %child,
+                            error = %error,
+                            "agent_job.recovery_snapshot_release_failed"
+                        );
+                    }
+                    return Err(Self::rejection(reason));
+                }
+            };
+            let trace = recovery.trace.clone();
+
             let work_id = WorkId::new();
             let now = Timestamp::now();
             let retry = RetryPolicy::try_new(
@@ -133,6 +152,10 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                     "kind": AGENT_JOB_KIND,
                     "child_id": child.as_str(),
                     "task": task,
+                    "recovery": {
+                        "schema": AGENT_RECOVERY_SCHEMA,
+                        "snapshot": recovery,
+                    },
                 }),
                 submitted_at: now,
                 not_before: now,
@@ -141,7 +164,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 completion: None,
                 cancellation: None,
                 revision: 0,
-                trace: None,
+                trace,
             };
 
             let store = Arc::clone(&self.job_store);
