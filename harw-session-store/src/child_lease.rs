@@ -670,6 +670,7 @@ mod tests {
                 .checked_add(jiff::SignedDuration::from_secs(expires_in_seconds))
                 .map_err(ctx("lease: admitted_at + expires_in_seconds"))?,
             trace: None,
+            owner_work_id: None,
         })
     }
 
@@ -909,4 +910,20 @@ mod tests {
         assert!(store.active_path(&record.child)?.exists());
         Ok(())
     }
+    #[test]
+    fn job_owned_expired_lease_is_not_claimed_by_generic_reaper() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = ChildLeaseStore::new(temp.path());
+        let admitted = lease("child-job-owned", -1)?;
+        let child = admitted.child.clone();
+        store.admit(&admitted)?;
+        let work_id = WorkId::from_str("work-owned");
+        store.bind_job_owner(&child, &work_id)?;
+
+        assert!(store.claim_expired(Timestamp::now())?.is_empty());
+        assert!(store.is_owned_by(&child, &work_id)?);
+        assert_eq!(store.active()?.len(), 1);
+        Ok(())
+    }
+
 }
