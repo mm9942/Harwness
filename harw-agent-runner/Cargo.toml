@@ -42,6 +42,7 @@ default = [
     "tool-job",
     "tool-latex",
     "tool-lens",
+    "tool-obsidian",
     "tool-plan",
     "tool-process",
     "tool-shell",
@@ -97,6 +98,7 @@ tool-fs = []
 tool-job = []
 tool-latex = []
 tool-lens = []
+tool-obsidian = []
 tool-plan = []
 tool-process = []
 tool-shell = []

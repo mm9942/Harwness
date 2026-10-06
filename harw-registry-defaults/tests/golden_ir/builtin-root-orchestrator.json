@@ -29,6 +29,10 @@
       "deps.source_search",
       "deps.source_list",
       "lens.ask",
+      "obsidian.map",
+      "obsidian.read",
+      "obsidian.search",
+      "obsidian.links",
       "explore.tree",
       "explore.projects",
       "explore.relations",
@@ -199,6 +203,10 @@
       "kanban.list",
       "kanban.show",
       "lens.ask",
+      "obsidian.links",
+      "obsidian.map",
+      "obsidian.read",
+      "obsidian.search",
       "palace.recall",
       "palace.search",
       "parent.message",
@@ -308,6 +316,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "2efcd986be1923b8d8ea6a8a6eebe0f7f2423dc423b9e3cff6dcbca449e69d4f"
+    "digest": "d97d97b743d9b136cf64eeccb701e5ef9c064a542a2248580e703ded6f75d24f"
   }
 }

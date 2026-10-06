@@ -64,7 +64,6 @@ members = [
     "harw-infra-client",
     "harw-netsec",
     "harw-node-transport",
-    "harw-reverse-proxy",
     "harw-session-daemon",
     "harw-session-com",
     "harw-security-hub",

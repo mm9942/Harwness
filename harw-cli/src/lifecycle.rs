@@ -1606,6 +1606,17 @@ mod tests {
             "diff",
             "stop",
             "cancel",
+            // `work.result` liefert Status und Ergebnis eines durablen
+            // Agentenjobs; seit der async-first Delegation (Vorgabe: jeder
+            // Handoff ist ein Job) Teil der Grundausstattung.
+            "work.result",
+            // Obsidian-Vault-Werkzeuge (`harw-tool-obsidian`): das Full-Profil
+            // bekommt alle fünf (harw-registry-defaults/src/profile.rs).
+            "obsidian.map",
+            "obsidian.read",
+            "obsidian.search",
+            "obsidian.links",
+            "obsidian.write",
             // Explorer-Werkzeuge (`explore.*`) gehören seit der Explorer-
             // Verdrahtung zum Full-Profil, `doc.read_pdf` seit dem PDF-Fetch
             // (harw-registry-defaults/src/profile.rs `DOC_TOOLS`).

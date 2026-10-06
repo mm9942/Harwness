@@ -85,6 +85,7 @@ fn enabled(feature: &str) -> bool {
         "tool-job" => cfg!(feature = "tool-job"),
         "tool-latex" => cfg!(feature = "tool-latex"),
         "tool-lens" => cfg!(feature = "tool-lens"),
+        "tool-obsidian" => cfg!(feature = "tool-obsidian"),
         "tool-plan" => cfg!(feature = "tool-plan"),
         "tool-process" => cfg!(feature = "tool-process"),
         "tool-shell" => cfg!(feature = "tool-shell"),
@@ -240,6 +241,7 @@ mod tests {
                         | "tool-job"
                         | "tool-latex"
                         | "tool-lens"
+                        | "tool-obsidian"
                         | "tool-plan"
                         | "tool-process"
                         | "tool-shell"
