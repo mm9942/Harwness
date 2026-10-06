@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "harw-command"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "harw-job",
  "harw-test-support",
@@ -4300,7 +4300,9 @@ name = "harw-tool-container-run"
 version = "0.9.1"
 dependencies = [
  "harw-authority",
+ "harw-command",
  "harw-extension-api",
+ "harw-job",
  "harw-tool-container",
  "harw-tools",
  "harw-types",

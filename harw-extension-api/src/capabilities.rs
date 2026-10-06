@@ -3,13 +3,42 @@
 use harw_authority::SandboxSpec;
 use harw_catalog::AgentSuggestions;
 use harw_context::ContextCeiling;
-use harw_types::{SessionId, ToolCallId};
+use harw_types::{SessionId, ToolCallId, WorkId};
 use jiff::Timestamp;
 use std::future::Future;
 use std::pin::Pin;
 
 pub type SpawnFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SessionId, AgentSpawnError>> + Send + 'a>>;
+
+/// Stable handle returned when an admitted child is submitted to Harw's job runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentJobHandle {
+    /// Durable job identity. This is the primary lifecycle handle.
+    pub work_id: WorkId,
+    /// Agent session driven by the job.
+    pub child: SessionId,
+}
+
+/// Future returned by [`AgentJobSubmitter`].
+pub type AgentJobFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AgentJobHandle, AgentSpawnError>> + Send + 'a>>;
+
+/// Submits an already-admitted child into the durable job runtime.
+///
+/// The submit call is intentionally non-blocking with respect to the child:
+/// success means the job has been durably admitted and its driver task has
+/// been scheduled. Callers use the returned [`WorkId`] for status, result,
+/// cancellation and waiting instead of holding the parent turn open.
+pub trait AgentJobSubmitter: Send + Sync {
+    /// Submit `child` as a durable agent job and return immediately after
+    /// admission/scheduling.
+    fn submit_child<'a>(
+        &'a self,
+        child: &'a SessionId,
+        task: Option<&'a str>,
+    ) -> AgentJobFuture<'a>;
+}
 
 /// Handoff: Sub-Agent starten.
 pub trait AgentSpawner: Send + Sync {

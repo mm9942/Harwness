@@ -56,6 +56,31 @@ pub(crate) fn get_visible_job(
     }
 }
 
+/// Loads a job only when it belongs to the exact trusted workspace binding of
+/// this operation context.
+///
+/// This is intentionally stricter than get_visible_job: model-readable result
+/// access is confined to both the bound tenant and workspace even when the
+/// caller has no separate tenant scope. A mismatch is indistinguishable from
+/// a missing WorkId.
+pub(crate) fn get_bound_workspace_job(
+    ctx: &OpContext,
+    store: &JobStore,
+    work_id: &WorkId,
+) -> SessionStoreResult<StoredJob> {
+    let record = get_visible_job(ctx, store, work_id)?;
+    let binding = ctx.sandbox().workspace();
+    if record.scope.tenant() == binding.tenant()
+        && record.scope.workspace() == binding.workspace()
+    {
+        Ok(record)
+    } else {
+        Err(SessionStoreError::JobNotFound {
+            work_id: work_id.clone(),
+        })
+    }
+}
+
 /// Wache vor einer Mutation: prüft für mandantengebundene Aufrufer, dass der
 /// Job existiert und zum eigenen Mandanten gehört.
 ///
@@ -118,6 +143,7 @@ pub(crate) fn list_visible_jobs(
 /// Test-Bausteine für die Mandanten-Tests der Job-Operationen.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use crate::job_authority::JobMutationScope;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
@@ -221,6 +247,7 @@ pub(crate) mod fixtures {
         );
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&jobs.store));
+        services.insert(JobMutationScope::TenantVisible);
         let op_ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
         Ok(match tenant {
             Some(tenant) => op_ctx.with_tenant(TenantId::from_str(tenant)),

@@ -73,7 +73,8 @@ use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
     AgentSession, ChildRegistryFactory, ContextBudget, DriftObserver, GuardPolicy, InteractionMode,
-    ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor, RoleEffortWeights,
+    JobExecutionRegistry, ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor,
+    RoleEffortWeights,
     SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
@@ -2735,7 +2736,7 @@ impl RuntimeAssemblyBuilder {
                 detail: error.to_string(),
             })?,
         );
-        let (spawner, spawner_roles) = build_spawner(
+        let (spawner, spawner_roles, agent_job_submitter_slot) = build_spawner(
             profile.spawner,
             SpawnerInputs {
                 config: &config,
@@ -2798,6 +2799,46 @@ impl RuntimeAssemblyBuilder {
             let spawner: Arc<dyn AgentSpawner> = managed_spawner;
             registry_builder = registry_builder.spawner(spawner);
         }
+        // Async-by-default agent delegation is mounted at the composition root.
+        // The submitter is available only when the runtime has all three trusted
+        // ingredients: managed spawner, durable job ledger and authenticated
+        // approval actor. There is deliberately no unmanaged tokio fallback.
+        //
+        // Composition owns the live execution registry. Durable cancellation
+        // fences the JobStore first, then may address a live execution only
+        // through the exact prior LeaseToken returned by that transition.
+        let mut agent_job_executions: Option<Arc<JobExecutionRegistry>> = None;
+        if let (Some(spawner), Some(job_store), Some(actor)) = (
+            spawner.as_ref(),
+            stores.job_store.as_ref(),
+            spawn_context.approval_actor.clone(),
+        ) {
+            let runtime_submitter = Arc::new(
+                crate::agent_job_wiring::RuntimeAgentJobSubmitter::new(
+                    Arc::clone(spawner),
+                    Arc::clone(&stores.state_store),
+                    stores.approval_store.clone(),
+                    Arc::clone(job_store),
+                    {
+                        let executions = Arc::new(JobExecutionRegistry::new());
+                        agent_job_executions = Some(Arc::clone(&executions));
+                        executions
+                    },
+                    actor,
+                    sandbox.workspace().tenant().clone(),
+                    sandbox.workspace().workspace().clone(),
+                ),
+            );
+            runtime_submitter.start_recovery_worker();
+            let submitter: Arc<dyn harw_extension_api::AgentJobSubmitter> = runtime_submitter;
+            if let Some(slot) = agent_job_submitter_slot.as_ref() {
+                slot.set(Arc::downgrade(&submitter)).map_err(|_| RuntimeError::Spawner {
+                    detail: "durable agent job submitter slot was initialized twice".to_owned(),
+                })?;
+            }
+            registry_builder = registry_builder.agent_job_submitter(submitter);
+        }
+
         // Addendum F+G ("Zombies"): der periodische Kind-Reaper braucht eine
         // laufende Tokio-Runtime — geprüft **hier**, nicht in
         // `guard_wiring::spawn_child_reaper` selbst (dessen `tokio::task::spawn`
@@ -2895,6 +2936,7 @@ impl RuntimeAssemblyBuilder {
             operations: Arc::clone(&operations),
             state_store: Arc::clone(&stores.state_store),
             job_store: stores.job_store.clone(),
+            job_executions: agent_job_executions,
             spawner: spawner.clone(),
             memory,
             config: Arc::clone(&config),
@@ -5236,19 +5278,23 @@ struct SpawnerInputs<'a> {
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
 ///
 /// # Rückgabe
-/// `(Option<Arc<ManagedAgentSpawner>>, Vec<String>)` — bei
-/// [`SpawnerPolicy::None`] `(None, vec![])`, sonst der Spawner und die
-/// registrierten Rollennamen.
+/// Spawner, registrierte Rollennamen und den weakly-bound Slot für den
+/// runtimeweiten [`harw_extension_api::AgentJobSubmitter`]. Bei
+/// [`SpawnerPolicy::None`] sind Spawner und Submitter-Slot `None`.
 fn build_spawner(
     policy: SpawnerPolicy,
     inputs: SpawnerInputs<'_>,
     session_events: Option<UnboundedSender<SessionEvent>>,
-) -> RuntimeResult<(Option<Arc<ManagedAgentSpawner>>, Vec<String>)> {
+) -> RuntimeResult<(
+    Option<Arc<ManagedAgentSpawner>>,
+    Vec<String>,
+    Option<Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>>,
+)> {
     // Erschöpfend statt `if policy == …`: eine künftige Variante (etwa
     // `ConfiguredRoles`) fiele sonst still in den `BuiltinRoles`-Zweig,
     // statt den Compiler zu brechen (Befund Z2c-03).
     match policy {
-        SpawnerPolicy::None => return Ok((None, Vec::new())),
+        SpawnerPolicy::None => return Ok((None, Vec::new(), None)),
         SpawnerPolicy::BuiltinRoles => {}
     }
 
@@ -5288,6 +5334,9 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
+    let agent_job_submitter_slot: Arc<
+        std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
+    > = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
     // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
@@ -5329,6 +5378,7 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir.clone())
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_agent_job_submitter_slot(Arc::clone(&agent_job_submitter_slot))
         .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
         // Teil B4: dasselbe Sandbox-Profil und dieselbe Host-Permit-
         // Verdrahtung wie die Root-Registry — ohne diesen Aufruf bliebe jede
@@ -5397,6 +5447,7 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir)
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_agent_job_submitter_slot(Arc::clone(&agent_job_submitter_slot))
         .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
         // Teil B4: dieselbe Verdrahtung wie `factory` — erreicht damit auch
         // `uia-shell-worker` und `host-process-worker` (beide Rollen der
@@ -5550,7 +5601,7 @@ fn build_spawner(
             detail: "managed child spawner slot was initialized twice".to_owned(),
         })?;
 
-    Ok((Some(spawner), roles))
+    Ok((Some(spawner), roles, Some(agent_job_submitter_slot)))
 }
 
 /// Plan R9, Teil C: die Katalogdaten eines Roster-Eintrags für

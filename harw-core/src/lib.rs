@@ -86,7 +86,9 @@ pub use child_comms::{
 };
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildContextOverload, ChildLimits, ChildRecord,
-    ChildRegistryFactory, ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
+    ChildRecoveryBudget, ChildRecoveryCapability, ChildRecoveryView, ChildRegistryFactory,
+    ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
+    RecoveredChildDisposition, RecoveredRootChild,
     ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
     JoinSemantics, ManagedAgentSpawner, ModelKnownProbe, OrchestrationObserver, ParentGrant,
     RoleEffortWeights, TRANSFER_BUDGET_NOTE, TaskComplexity,

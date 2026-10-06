@@ -121,8 +121,6 @@ layer = "I"
 layer = "I"
 [packages."harw-fsutil"]
 layer = "I"
-[packages."harw-media"]
-layer = "I"
 [packages."harw-retention"]
 layer = "I"
 [packages."harw-observe"]
@@ -365,8 +363,6 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-deps"]
 layer = "A"
-[packages."harw-tool-container"]
-layer = "A"
 [packages."harw-tool-doc"]
 layer = "A"
 [packages."harw-tool-cargo"]
@@ -406,8 +402,6 @@ layer = "A"
 [packages."harw-session-com"]
 layer = "A"
 [packages."harw-session-remote"]
-layer = "A"
-[packages."harw-session-client"]
 layer = "A"
 [packages."harw-session-driver"]
 layer = "A"
@@ -511,5 +505,7 @@ layer = "I"
 [packages."harw-container-model"]
 layer = "I"
 
+[packages."harw-tool-container"]
+layer = "A"
 [packages."harw-tool-container-run"]
 layer = "A"

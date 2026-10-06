@@ -1748,6 +1748,33 @@ fn child_question(arguments: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// Async is the delegation default. Callers must opt into the old inline
+/// parent-waits-for-child contract explicitly.
+fn delegation_runs_inline(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        || arguments
+            .get("wait")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+fn agent_job_started_result(
+    handle: &harw_extension_api::AgentJobHandle,
+    role: &str,
+) -> ToolCallResult {
+    ToolCallResult::success(serde_json::json!({
+        "work_id": handle.work_id.as_str(),
+        "child_id": handle.child.as_str(),
+        "role": role,
+        "status": "submitted",
+        "async": true,
+        "hint": "Work continues independently. work_id is the durable lifecycle handle; use work.result with work_id for durable status/result. child_id remains the live agent projection for agent.status/agent.result."
+    }))
+}
+
 /// Argumentfelder eines Handoff-Calls, die — in dieser Reihenfolge — als
 /// Arbeitsauftrag des Kindes gelesen werden. `"question"` ist die ältere
 /// Schreibweise (siehe [`child_question`]).
@@ -1874,7 +1901,7 @@ fn one_line(text: &str, max: usize) -> String {
 }
 
 /// Die gemeinsamen Felder von `transfer_to_<name>` und `agents.delegate`
-/// (`task`, `context`, `continue_from`, `background`, `user_approved`).
+/// (`task`, `context`, `continue_from`, `background`, `wait`, `user_approved`).
 ///
 /// # Beschreibung
 /// Plan R9, Teil C: die Beschreibungen sind bewusst knapp — sie stehen in
@@ -1908,18 +1935,28 @@ fn handoff_properties() -> BTreeMap<String, JsonSchema> {
         crate::user_approval::USER_APPROVED_FIELD.to_owned(),
         crate::user_approval::user_approved_schema(),
     );
-    // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
-    // Orchestrator-Ziele der UIA-Wurzel (Vorgabe dort `true`); jeder andere
-    // Einstieg und jedes Worker-Ziel läuft synchron.
+    // Async-by-default: every delegation enters the durable job runtime.
+    // background=false or wait=true is the explicit compatibility escape hatch.
     properties.insert(
         "background".to_owned(),
         JsonSchema {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
-                "Optional (nur UIA-Orchestratoren in der TUI, dort Vorgabe true): sofort \
-                 zurück, Ergebnis kommt als Benachrichtigung; false wartet. Bei einem \
-                 pausierverbotenen Ziel `background=true` setzen, damit der Elternlauf \
-                 nicht auf das Kind wartet."
+                "Optional; Vorgabe true. Startet den Agenten als durable Job und gibt sofort work_id/child_id zurück. \
+                 false wartet inline. Ein pausierverbotenes Ziel (`allow_pause = false`) darf nie \
+                 inline blockieren: dort bei der Vorgabe bleiben, weder `background=false` noch \
+                 `wait=true` setzen."
+                    .to_owned(),
+            ),
+            ..JsonSchema::default()
+        },
+    );
+    properties.insert(
+        "wait".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "Optional; Vorgabe false. true erzwingt den synchronen Legacy-Pfad und wartet auf das Kind."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -1964,7 +2001,7 @@ fn handoff_tool_spec(role: &str, description: Option<&str>) -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
-            "Delegiert an '{role}' und wartet auf das Ergebnis.{summary}{}",
+            "Delegiert an '{role}' als durable Job und gibt standardmäßig sofort einen Handle zurück; background=false oder wait=true wartet inline.{summary}{}",
             handoff_role_hint(role)
         ),
         parameters: closed_object(handoff_properties(), &["task"]),
@@ -1993,8 +2030,7 @@ fn agents_delegate_tool_spec(names: &[String]) -> ToolSpec {
     );
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(AGENTS_DELEGATE_TOOL),
-        description: "Delegiert an einen sichtbaren Agenten und wartet auf das Ergebnis \
-                      (wie transfer_to_<name>)."
+        description: "Delegiert an einen sichtbaren Agenten als durable Job und gibt standardmäßig sofort work_id/child_id zurück; background=false oder wait=true wartet inline."
             .to_owned(),
         parameters: closed_object(properties, &["agent", "task"]),
         strict: false,
@@ -2349,17 +2385,24 @@ fn delegation_call(call: &ToolCall) -> Option<(String, serde_json::Value)> {
     delegate_tool_role(call).and_then(Result::ok)
 }
 
+/// Lehnt einen blockierenden Handoff an ein pausierverbotenes Ziel ab.
+///
+/// Ein Handoff blockiert nur, wenn er inline läuft (`background=false` oder
+/// `wait=true`) oder wenn weder `background=true` gesetzt noch ein Job-Submitter
+/// verfügbar ist, der die Vorgabe „durable Job“ erfüllt.
 fn blocking_handoff_pause_rejection(
     spawner: &dyn harw_extension_api::AgentSpawner,
     role: &str,
     arguments: &serde_json::Value,
+    job_submitter_available: bool,
 ) -> Option<String> {
-    if arguments
+    let background_requested = arguments
         .get("background")
         .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || spawner.role_allows_pause(role) != Some(false)
-    {
+        == Some(true);
+    let runs_non_blocking = !delegation_runs_inline(arguments)
+        && (background_requested || job_submitter_available);
+    if runs_non_blocking || spawner.role_allows_pause(role) != Some(false) {
         return None;
     }
     Some(format!(
@@ -3909,6 +3952,7 @@ async fn resume_after_approval_with_store(
                         spawner.as_ref(),
                         &role,
                         &input.context,
+                        session.registry().agent_job_submitter().is_some(),
                     ) {
                         Some(message) => Err(harw_extension_api::AgentSpawnError { message }),
                         None => {
@@ -3947,7 +3991,6 @@ async fn resume_after_approval_with_store(
                             });
                         }
                     };
-                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
                     // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
                     // zurück). Ohne dieses Event bliebe ein solches Kind für jeden
@@ -3958,9 +4001,47 @@ async fn resume_after_approval_with_store(
                             turn_id: ctx.turn_id.clone(),
                             child: child.clone(),
                             role: role.clone(),
-                            question,
+                            question: question.clone(),
                         },
                     );
+
+                    if !delegation_runs_inline(&pending.call.arguments)
+                        && let Some(submitter) = session.registry().agent_job_submitter().cloned()
+                    {
+                        let job = submitter
+                            .submit_child(&child, question.as_deref())
+                            .await
+                            .map_err(|error| CoreError::HandoffFailed {
+                                role: role.clone(),
+                                reason: error.to_string(),
+                            })?;
+                        let result = agent_job_started_result(&job, &role);
+                        notify_tool_outcome(
+                            session,
+                            pending.call.name.as_str(),
+                            &pending.call.arguments,
+                            &result,
+                        );
+                        notify_tool_progress(session);
+                        session
+                            .history_mut()
+                            .push_tool_result(pending.call.id.clone(), result.clone(), 0);
+                        persist_last(session, store).await?;
+                        emit(
+                            session,
+                            TurnEvent::ToolCallCompleted {
+                                turn_id: ctx.turn_id.clone(),
+                                call_id: pending.call.id,
+                                result,
+                                duration_ms: 0,
+                                placement: None,
+                            },
+                        );
+                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                            .await;
+                    }
+
+                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     Ok(TurnOutcome::AwaitingChild {
                         child,
                         call_id: pending.call.id,
@@ -5014,6 +5095,7 @@ async fn drive_turn(
                     spawner.as_ref(),
                     &role,
                     &spawn_input.context,
+                    session.registry().agent_job_submitter().is_some(),
                 ) {
                     Some(message) => Err(harw_extension_api::AgentSpawnError { message }),
                     None => {
@@ -5069,17 +5151,50 @@ async fn drive_turn(
                     role: role.clone(),
                     reason: e.to_string(),
                 })?;
-                // state ⇒ WaitingForChild; Loop pausiert.
-                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
+                let question = child_question(&handoff_arguments);
                 emit(
                     session,
                     TurnEvent::ChildSpawned {
                         turn_id: handle.turn_id.clone(),
                         child: child.clone(),
                         role: role.clone(),
-                        question: child_question(&handoff_arguments),
+                        question: question.clone(),
                     },
                 );
+
+                // Async-by-default: admission above establishes the child
+                // authority; the durable job runtime now owns its lifecycle.
+                // Only an explicit background=false / wait=true keeps the
+                // historical AwaitingChild contract.
+                if !delegation_runs_inline(&handoff_arguments)
+                    && let Some(submitter) = session.registry().agent_job_submitter().cloned()
+                {
+                    let job = submitter
+                        .submit_child(&child, question.as_deref())
+                        .await
+                        .map_err(|error| CoreError::HandoffFailed {
+                            role: role.clone(),
+                            reason: error.to_string(),
+                        })?;
+                    let result = agent_job_started_result(&job, &role);
+                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                    notify_tool_progress(session);
+                    session.history_mut().push_tool_result(call.id.clone(), result.clone(), 0);
+                    persist_last(session, store).await?;
+                    emit(
+                        session,
+                        TurnEvent::ToolCallCompleted {
+                            turn_id: handle.turn_id.clone(),
+                            call_id: call.id,
+                            result,
+                            duration_ms: 0,
+                            placement: None,
+                        },
+                    );
+                    continue;
+                }
+
+                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
                 return Ok(TurnOutcome::AwaitingChild {
                     child,
                     call_id: call.id,
@@ -6542,6 +6657,14 @@ fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError 
 mod tests {
     use super::*;
 
+    #[test]
+    fn delegation_is_async_by_default_and_inline_only_when_explicit() {
+        assert!(!delegation_runs_inline(&serde_json::json!({})));
+        assert!(!delegation_runs_inline(&serde_json::json!({"background": true})));
+        assert!(delegation_runs_inline(&serde_json::json!({"background": false})));
+        assert!(delegation_runs_inline(&serde_json::json!({"wait": true})));
+        assert!(!delegation_runs_inline(&serde_json::json!({"wait": false})));
+    }
     /// Ein Turn-Grenzen-Ende vermerkt die konkrete Grenze mit Wert (statt
     /// „Token-Budget oder Turn-Wächter"); der erste Grund gewinnt.
     #[test]
@@ -11085,6 +11208,7 @@ mod tests {
             "context",
             "continue_from",
             "background",
+            "wait",
             "user_approved",
         ] {
             assert!(properties.contains_key(field), "{field}");
