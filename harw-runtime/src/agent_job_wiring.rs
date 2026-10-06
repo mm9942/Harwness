@@ -118,6 +118,7 @@ impl RuntimeAgentJobSubmitter {
 
     async fn recovery_pass(self: &Arc<Self>) -> Result<(), String> {
         self.reconcile_expired_jobs().await?;
+        self.cleanup_terminal_child_leases().await?;
         self.cleanup_stale_pending().await?;
         let ready = self.list_jobs_in_states(vec![JobState::Ready]).await?;
         let now = Timestamp::now();
@@ -136,6 +137,7 @@ impl RuntimeAgentJobSubmitter {
                         %error,
                         "agent_job.recovery_snapshot_invalid"
                     );
+                    self.fail_unrecoverable_ready(&record, &error).await?;
                     continue;
                 }
             };
@@ -150,11 +152,13 @@ impl RuntimeAgentJobSubmitter {
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    let reason = "durable child lease is not owned by this WorkId";
                     tracing::error!(
                         work_id = %record.job.id,
                         child = %snapshot.child,
                         "agent_job.recovery_owner_mismatch"
                     );
+                    self.fail_unrecoverable_ready(&record, reason).await?;
                     continue;
                 }
                 Err(error) => {
@@ -217,6 +221,37 @@ impl RuntimeAgentJobSubmitter {
         .map_err(|error| format!("list task failed: {error}"))?
     }
 
+    async fn cleanup_terminal_child_leases(&self) -> Result<(), String> {
+        let terminal = self
+            .list_jobs_in_states(vec![
+                JobState::Completed,
+                JobState::Failed,
+                JobState::Cancelled,
+            ])
+            .await?;
+        for record in terminal {
+            if !self.owns_record(&record) || !Self::is_agent_record(&record) {
+                continue;
+            }
+            let Some(child) = Self::stored_child_id(&record) else {
+                continue;
+            };
+            if self.spawner.child_record(&child).is_some() {
+                // The same-process runner has committed and still owns final
+                // projection/lease cleanup. Never race that finalizer.
+                continue;
+            }
+            if self
+                .spawner
+                .child_lease_owned_by(&child, &record.job.id)
+                .unwrap_or(false)
+            {
+                let _ = self.spawner.close_child_durable(&child, Timestamp::now());
+            }
+        }
+        Ok(())
+    }
+
     async fn cleanup_stale_pending(&self) -> Result<(), String> {
         let pending = self.list_jobs_in_states(vec![JobState::Pending]).await?;
         let now = Timestamp::now();
@@ -229,6 +264,11 @@ impl RuntimeAgentJobSubmitter {
                 .checked_add(SignedDuration::from_secs(AGENT_PENDING_STALE_SECS))
                 .is_ok_and(|deadline| deadline <= now);
             if !stale {
+                continue;
+            }
+            if let Some(child) = Self::stored_child_id(&record)
+                && self.spawner.child_record(&child).is_some()
+            {
                 continue;
             }
             let snapshot = Self::recovery_snapshot(&record).ok();
@@ -257,6 +297,49 @@ impl RuntimeAgentJobSubmitter {
         Ok(())
     }
 
+    async fn fail_unrecoverable_ready(
+        &self,
+        record: &StoredJob,
+        detail: &str,
+    ) -> Result<(), String> {
+        let store = Arc::clone(&self.job_store);
+        let work_id = record.job.id.clone();
+        let cancelled_by = self.scope.submitter().clone();
+        let reason = format!("unrecoverable durable agent job: {detail}");
+        tokio::task::spawn_blocking(move || {
+            store.cancel(
+                &work_id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by,
+                    reason,
+                },
+            )
+        })
+        .await
+        .map_err(|error| format!("unrecoverable cleanup task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+
+        if let Some(child) = Self::stored_child_id(record)
+            && self
+                .spawner
+                .child_lease_owned_by(&child, &record.job.id)
+                .unwrap_or(false)
+        {
+            let _ = self.spawner.close_child_durable(&child, Timestamp::now());
+        }
+        Ok(())
+    }
+
+    fn stored_child_id(record: &StoredJob) -> Option<SessionId> {
+        record
+            .input
+            .get("child_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| SessionId::from_str(value.to_owned()))
+    }
+
     fn owns_record(&self, record: &StoredJob) -> bool {
         record.scope.tenant() == self.scope.tenant()
             && record.scope.workspace() == self.scope.workspace()
@@ -283,8 +366,17 @@ impl RuntimeAgentJobSubmitter {
             .get("snapshot")
             .cloned()
             .ok_or_else(|| "stored agent job has no recovery snapshot".to_owned())?;
-        serde_json::from_value(value)
-            .map_err(|error| format!("invalid agent recovery snapshot: {error}"))
+        let snapshot: ChildRecoveryView = serde_json::from_value(value)
+            .map_err(|error| format!("invalid agent recovery snapshot: {error}"))?;
+        let child_id = record
+            .input
+            .get("child_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "stored agent job has no child_id".to_owned())?;
+        if snapshot.child.as_str() != child_id {
+            return Err("stored child_id does not match recovery snapshot child".to_owned());
+        }
+        Ok(snapshot)
     }
 
     fn spawn_recovery_run(self: &Arc<Self>, work_id: WorkId, snapshot: ChildRecoveryView) {
