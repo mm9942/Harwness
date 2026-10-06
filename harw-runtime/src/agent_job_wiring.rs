@@ -68,11 +68,11 @@ impl RuntimeAgentJobSubmitter {
         state_store: Arc<dyn StateStore>,
         approval_store: Option<Arc<ApprovalStore>>,
         job_store: Arc<JobStore>,
+        executions: Arc<JobExecutionRegistry>,
         actor: ApprovalActor,
         tenant: TenantId,
         workspace: WorkspaceId,
     ) -> Self {
-        let executions = Arc::new(JobExecutionRegistry::new());
         let runner = Arc::new(DurableJobRunner::new(
             Arc::clone(&job_store),
             executions,

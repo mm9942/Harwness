@@ -73,7 +73,8 @@ use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
     AgentSession, ChildRegistryFactory, ContextBudget, DriftObserver, GuardPolicy, InteractionMode,
-    ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor, RoleEffortWeights,
+    JobExecutionRegistry, ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor,
+    RoleEffortWeights,
     SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
@@ -2802,6 +2803,11 @@ impl RuntimeAssemblyBuilder {
         // The submitter is available only when the runtime has all three trusted
         // ingredients: managed spawner, durable job ledger and authenticated
         // approval actor. There is deliberately no unmanaged tokio fallback.
+        //
+        // Composition owns the live execution registry. Durable cancellation
+        // fences the JobStore first, then may address a live execution only
+        // through the exact prior LeaseToken returned by that transition.
+        let mut agent_job_executions: Option<Arc<JobExecutionRegistry>> = None;
         if let (Some(spawner), Some(job_store), Some(actor)) = (
             spawner.as_ref(),
             stores.job_store.as_ref(),
@@ -2813,6 +2819,11 @@ impl RuntimeAssemblyBuilder {
                     Arc::clone(&stores.state_store),
                     stores.approval_store.clone(),
                     Arc::clone(job_store),
+                    {
+                        let executions = Arc::new(JobExecutionRegistry::new());
+                        agent_job_executions = Some(Arc::clone(&executions));
+                        executions
+                    },
                     actor,
                     sandbox.workspace().tenant().clone(),
                     sandbox.workspace().workspace().clone(),
@@ -2923,6 +2934,7 @@ impl RuntimeAssemblyBuilder {
             operations: Arc::clone(&operations),
             state_store: Arc::clone(&stores.state_store),
             job_store: stores.job_store.clone(),
+            job_executions: agent_job_executions,
             spawner: spawner.clone(),
             memory,
             config: Arc::clone(&config),

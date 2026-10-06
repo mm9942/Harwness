@@ -29,14 +29,21 @@
 //! (`#[raw(join_from = 1)]`); fehlt er, greift derselbe feste Text wie bei
 //! `/stop` ("cancelled through …"), angepasst auf diesen Befehlsnamen.
 
+use harw_core::JobExecutionRegistry;
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_session_store::{CancelRequest, JobStore};
 use harw_types::{ApprovalActor, WorkId};
 use std::sync::Arc;
+use std::time::Duration;
+
+use crate::job_authority::JobMutationScope;
 
 /// Begründung, wenn `/cancel` ohne expliziten Freitext aufgerufen wird.
 const DEFAULT_REASON: &str = "cancelled through /cancel";
+
+/// Cooperative window before a fenced live execution is force-aborted.
+const LIVE_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 /// Eingabe-Argumente für die `cancel`-Operation.
 #[derive(Debug, Default, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
@@ -77,8 +84,18 @@ async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> 
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
 
     let work_id_typed = WorkId::from_str(work_id);
-    // H12: ein fremder Job wird wie ein unbekannter behandelt.
-    let transition = crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
+    // Surface provenance is injected by the composition root. A model may
+    // mutate only a job in its exact trusted workspace; a typed Slash command
+    // retains the historical tenant-visible operator reach.
+    let visible = match ctx.service::<JobMutationScope>().copied() {
+        Some(JobMutationScope::BoundWorkspace) => {
+            crate::job_tenant::get_bound_workspace_job(ctx, store, &work_id_typed).map(|_| ())
+        }
+        Some(JobMutationScope::TenantVisible) | None => {
+            crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
+        }
+    };
+    let transition = visible
         .and_then(|()| {
             store.cancel(
                 &work_id_typed,
@@ -95,6 +112,27 @@ async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> 
             OpError::Execution(format!("could not cancel durable job `{work_id}`: {error}"))
         })?;
 
+    // Persisted fencing happens first. Only the exact prior lease returned by
+    // that atomic transition is allowed to address the live execution.
+    if let (Some(prior_lease), Some(executions)) = (
+        transition.prior_lease.as_ref(),
+        ctx.service::<Arc<JobExecutionRegistry>>(),
+    ) {
+        let token = prior_lease.token();
+        if executions.contains(&token) {
+            let executions = Arc::clone(executions);
+            tokio::spawn(async move {
+                if let Err(error) = executions.cancel(&token, LIVE_CANCEL_GRACE).await {
+                    tracing::warn!(
+                        work_id = %token.work_id,
+                        %error,
+                        "durable cancel was fenced but live execution signalling failed"
+                    );
+                }
+            });
+        }
+    }
+
     Ok(OpOutput::from(format!(
         "Cancelled {} (was {:?}, revision {}).",
         transition.work_id, transition.previous_state, transition.revision
@@ -109,18 +147,30 @@ mod tests {
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
+    use harw_core::{ExecutionControl, JobExecutionRegistry};
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_session_store::JobStore;
+    use harw_session_store::{ClaimRequest, JobStore};
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::{SignedDuration, Timestamp};
     use std::sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
+    use tokio::sync::watch;
+
+    use crate::job_authority::JobMutationScope;
 
     fn make_test_ctx(
         with_store: bool,
+    ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
+        make_test_ctx_with_services(with_store, None, None)
+    }
+
+    fn make_test_ctx_with_services(
+        with_store: bool,
+        mutation_scope: Option<JobMutationScope>,
+        executions: Option<Arc<JobExecutionRegistry>>,
     ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -150,6 +200,12 @@ mod tests {
         let mut services = ServiceMap::new();
         if let Some(store) = &store {
             services.insert(Arc::clone(store));
+        }
+        if let Some(scope) = mutation_scope {
+            services.insert(scope);
+        }
+        if let Some(executions) = executions {
+            services.insert(executions);
         }
         Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
@@ -387,4 +443,128 @@ mod tests {
         );
         Ok(())
     }
+    struct FakeExecutionControl {
+        completion: watch::Sender<bool>,
+        receiver: watch::Receiver<bool>,
+        graceful: AtomicUsize,
+        forced: AtomicUsize,
+    }
+
+    impl FakeExecutionControl {
+        fn new() -> Arc<Self> {
+            let (completion, receiver) = watch::channel(false);
+            Arc::new(Self {
+                completion,
+                receiver,
+                graceful: AtomicUsize::new(0),
+                forced: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ExecutionControl for FakeExecutionControl {
+        fn request_graceful_cancel(&self) {
+            self.graceful.fetch_add(1, Ordering::SeqCst);
+            self.completion.send_replace(true);
+        }
+
+        fn force_abort(&self) {
+            self.forced.fetch_add(1, Ordering::SeqCst);
+            self.completion.send_replace(true);
+        }
+
+        fn completion(&self) -> watch::Receiver<bool> {
+            self.receiver.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn model_cancel_is_confined_to_the_bound_workspace() -> TestResult {
+        let (op_ctx, root, store) = make_test_ctx_with_services(
+            true,
+            Some(JobMutationScope::BoundWorkspace),
+            None,
+        )?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
+        let work_id = WorkId::from_str("work-other-workspace");
+        let mut record = admitted_job(work_id.as_str())?;
+        record.scope = JobScope::new(
+            TenantId::from_str("test-tenant"),
+            WorkspaceId::from_str("other-workspace"),
+            ApprovalActor::Operator {
+                id: "test-operator".to_owned(),
+            },
+        );
+        store.admit(&record).map_err(ctx("admit foreign workspace job"))?;
+
+        let result = cancel(
+            &op_ctx,
+            CancelArgs {
+                work_id: Some(work_id.as_str().to_owned()),
+                reason: None,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(OpError::Execution(_))));
+        assert_eq!(
+            store.get(&work_id).map_err(ctx("read untouched job"))?.job.state,
+            JobState::Ready
+        );
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_signals_the_exact_live_execution() -> TestResult {
+        let executions = Arc::new(JobExecutionRegistry::new());
+        let (op_ctx, root, store) =
+            make_test_ctx_with_services(true, None, Some(Arc::clone(&executions)))?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
+        let work_id = WorkId::from_str("work-live-cancel");
+        store
+            .admit(&admitted_job(work_id.as_str())?)
+            .map_err(ctx("admit live job"))?;
+        let claim = store
+            .claim(
+                &work_id,
+                &ClaimRequest {
+                    worker_id: "test-worker".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("claim live job"))?;
+        let control = FakeExecutionControl::new();
+        let bound: Arc<dyn ExecutionControl> = control.clone();
+        executions
+            .register(claim.token.clone(), bound)
+            .map_err(ctx("register live execution"))?;
+
+        cancel(
+            &op_ctx,
+            CancelArgs {
+                work_id: Some(work_id.as_str().to_owned()),
+                reason: Some("stop now".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("cancel live job"))?;
+
+        for _ in 0..32 {
+            if control.graceful.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
+        assert_eq!(control.forced.load(Ordering::SeqCst), 0);
+        assert!(executions.is_empty());
+        assert_eq!(
+            store.get(&work_id).map_err(ctx("read cancelled live job"))?.job.state,
+            JobState::Cancelled
+        );
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        Ok(())
+    }
+
 }

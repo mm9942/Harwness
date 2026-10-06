@@ -205,6 +205,8 @@ pub mod help;
 // Nicht Teil von `register_all`: registriert nur der
 // `InfrastructureContributor` der Runtime, wenn `[infrastructure]` gesetzt ist.
 pub mod infra;
+// Server-derived reach for durable job mutations (Slash vs model tool).
+pub mod job_authority;
 // H12: Mandanten-Sichtbarkeit durabler Jobs (gemeinsam für ps/work/attach/…).
 pub(crate) mod job_tenant;
 pub mod jobs;
