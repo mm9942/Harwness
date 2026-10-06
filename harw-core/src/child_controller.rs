@@ -105,7 +105,7 @@ use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
 use harw_agent_dsl::executable::{
-    BudgetSpec, ContextProgram, ExecutableAgentIr, SectionDetail, SnapshotId,
+    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail, SnapshotId,
 };
 use harw_authority::{AuthoritySnapshot, SandboxSpec};
 use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot, SuggestionKind};
@@ -913,7 +913,8 @@ pub struct ChildRecord {
 /// Dieser Typ ist reine Wiederanlauf-Metadaten. Er kann weder ein Budget
 /// erweitern noch eine Session starten; ein späterer Rehydrator muss ihn
 /// gegen die frisch geladene Agent-IR und die aktuelle Policy prüfen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChildRecoveryBudget {
     pub max_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
@@ -937,7 +938,8 @@ impl From<AgentBudget> for ChildRecoveryBudget {
 /// Nur Name, Art und der beim Spawn berechnete Definition-Digest werden
 /// persistiert. Credentials, laufende MCP-Verbindungen oder executable grants
 /// gehören ausdrücklich nicht in den Recovery-Vertrag.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChildRecoveryCapability {
     pub kind: String,
     pub name: String,
@@ -953,7 +955,8 @@ pub struct ChildRecoveryCapability {
 /// Digest: Recovery darf nur fortfahren, wenn die aktuell aufgelöste IR ihn
 /// bestätigt. Capability-Digests, Kontextdecke und Routing-Metadaten dürfen
 /// beim Wiederanlauf nur bestätigt oder verengt, nie still erweitert werden.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChildRecoveryView {
     pub child: SessionId,
     pub parent: SessionId,
@@ -971,7 +974,9 @@ pub struct ChildRecoveryView {
     pub allowed_child_orchestrators: Vec<String>,
     pub context_ceiling: Option<ContextCeiling>,
     pub mode: String,
-    pub executable_snapshot_id: Option<SnapshotId>,
+    /// Untrusted wire/reference form. Recovery must confirm this against the
+    /// freshly resolved current IR before the stored transcript may run.
+    pub executable_snapshot_id: Option<ReferencedSnapshotId>,
     pub capability_agent: Option<String>,
     pub activated_capabilities: Vec<ChildRecoveryCapability>,
     pub trace: Option<TraceContext>,
@@ -4254,7 +4259,9 @@ impl ManagedAgentSpawner {
             allowed_child_orchestrators,
             context_ceiling: context.ceiling.clone(),
             mode: session.mode().as_str().to_owned(),
-            executable_snapshot_id: session.executable_snapshot_id().cloned(),
+            executable_snapshot_id: session
+                .executable_snapshot_id()
+                .map(ReferencedSnapshotId::from_computed),
             capability_agent,
             activated_capabilities,
             trace: record.trace,
