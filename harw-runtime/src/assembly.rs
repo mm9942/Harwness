@@ -5280,6 +5280,14 @@ struct SpawnerInputs<'a> {
 type AgentJobSubmitterSlot =
     Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>;
 
+/// Ergebnis von [`build_spawner`]: Spawner, registrierte Rollennamen und der
+/// optionale Submitter-Slot.
+type BuiltSpawner = (
+    Option<Arc<ManagedAgentSpawner>>,
+    Vec<String>,
+    Option<AgentJobSubmitterSlot>,
+);
+
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
 ///
 /// # Rückgabe
@@ -5290,11 +5298,7 @@ fn build_spawner(
     policy: SpawnerPolicy,
     inputs: SpawnerInputs<'_>,
     session_events: Option<UnboundedSender<SessionEvent>>,
-) -> RuntimeResult<(
-    Option<Arc<ManagedAgentSpawner>>,
-    Vec<String>,
-    Option<AgentJobSubmitterSlot>,
-)> {
+) -> RuntimeResult<BuiltSpawner> {
     // Erschöpfend statt `if policy == …`: eine künftige Variante (etwa
     // `ConfiguredRoles`) fiele sonst still in den `BuiltinRoles`-Zweig,
     // statt den Compiler zu brechen (Befund Z2c-03).
