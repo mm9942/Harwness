@@ -143,6 +143,7 @@ pub(crate) fn list_visible_jobs(
 /// Test-Bausteine für die Mandanten-Tests der Job-Operationen.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use crate::job_authority::JobMutationScope;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
@@ -245,6 +246,7 @@ pub(crate) mod fixtures {
         );
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&jobs.store));
+        services.insert(JobMutationScope::TenantVisible);
         let op_ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
         Ok(match tenant {
             Some(tenant) => op_ctx.with_tenant(TenantId::from_str(tenant)),

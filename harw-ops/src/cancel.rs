@@ -87,11 +87,19 @@ async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> 
     // Surface provenance is injected by the composition root. A model may
     // mutate only a job in its exact trusted workspace; a typed Slash command
     // retains the historical tenant-visible operator reach.
-    let visible = match ctx.service::<JobMutationScope>().copied() {
-        Some(JobMutationScope::BoundWorkspace) => {
+    let mutation_scope = ctx
+        .service::<JobMutationScope>()
+        .copied()
+        .ok_or_else(|| {
+            OpError::NotAvailable(
+                "durable job mutation scope is not configured for this surface".to_owned(),
+            )
+        })?;
+    let visible = match mutation_scope {
+        JobMutationScope::BoundWorkspace => {
             crate::job_tenant::get_bound_workspace_job(ctx, store, &work_id_typed).map(|_| ())
         }
-        Some(JobMutationScope::TenantVisible) | None => {
+        JobMutationScope::TenantVisible => {
             crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
         }
     };
@@ -164,7 +172,11 @@ mod tests {
     fn make_test_ctx(
         with_store: bool,
     ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
-        make_test_ctx_with_services(with_store, None, None)
+        make_test_ctx_with_services(
+            with_store,
+            Some(JobMutationScope::TenantVisible),
+            None,
+        )
     }
 
     fn make_test_ctx_with_services(
@@ -517,8 +529,11 @@ mod tests {
     #[tokio::test]
     async fn durable_cancel_signals_the_exact_live_execution() -> TestResult {
         let executions = Arc::new(JobExecutionRegistry::new());
-        let (op_ctx, root, store) =
-            make_test_ctx_with_services(true, None, Some(Arc::clone(&executions)))?;
+        let (op_ctx, root, store) = make_test_ctx_with_services(
+            true,
+            Some(JobMutationScope::TenantVisible),
+            Some(Arc::clone(&executions)),
+        )?;
         let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-live-cancel");
         store
