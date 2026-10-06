@@ -12568,8 +12568,10 @@ forbidden = [{forbidden}]
             .map(|span| span.content.into_owned())
             .collect::<Vec<_>>()
             .join("\n");
+        // Aktivitätsmodus: eine Zeile je Aufruf, kein Ergebnis-Text; der
+        // Waisen-Marker bleibt sichtbar, der Text steckt im Export (unten).
         assert!(visible.contains("tool.result"));
-        assert!(visible.contains("orphan result"));
+        assert!(visible.contains("orphaned: true"));
         assert!(visible.contains("unvollständig (Resume-Abbruch)"));
         let tool_entries = app
             .export_entries
@@ -12586,7 +12588,10 @@ forbidden = [{forbidden}]
             tool_entries[0],
             ExportEntry::ToolCall { tool_name, .. } if tool_name == "tool.result"
         ));
-        assert!(matches!(tool_entries[1], ExportEntry::ToolResult { .. }));
+        assert!(matches!(
+            tool_entries[1],
+            ExportEntry::ToolResult { result, .. } if result.to_string().contains("orphan result")
+        ));
         assert!(matches!(
             tool_entries[2],
             ExportEntry::ToolCall { tool_name, .. } if tool_name == "shell.exec"

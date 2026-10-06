@@ -4836,7 +4836,8 @@ mod tests {
             "stdout": "eins\nzwei\n",
             "stderr": "",
         }));
-        cell.complete(&result, 2);
+        // `complete` nimmt Millisekunden; ab 1000 ms zeigt der Kopf Sekunden.
+        cell.complete(&result, 2000);
 
         let activity = lines_to_strings(&cell.display_lines_with(
             80,
