@@ -1771,7 +1771,7 @@ fn agent_job_started_result(
         "role": role,
         "status": "submitted",
         "async": true,
-        "hint": "Work continues independently. work_id is the durable lifecycle handle; child_id addresses the live agent projection. Durable job controls use work_id; agent.status/agent.result use child_id until the work-id result surface is unified."
+        "hint": "Work continues independently. work_id is the durable lifecycle handle; use work.result with work_id for durable status/result. child_id remains the live agent projection for agent.status/agent.result."
     }))
 }
 

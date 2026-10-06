@@ -56,6 +56,31 @@ pub(crate) fn get_visible_job(
     }
 }
 
+/// Loads a job only when it belongs to the exact trusted workspace binding of
+/// this operation context.
+///
+/// This is intentionally stricter than get_visible_job: model-readable result
+/// access is confined to both the bound tenant and workspace even when the
+/// caller has no separate tenant scope. A mismatch is indistinguishable from
+/// a missing WorkId.
+pub(crate) fn get_bound_workspace_job(
+    ctx: &OpContext,
+    store: &JobStore,
+    work_id: &WorkId,
+) -> SessionStoreResult<StoredJob> {
+    let record = get_visible_job(ctx, store, work_id)?;
+    let binding = ctx.sandbox().workspace();
+    if record.scope.tenant() == binding.tenant()
+        && record.scope.workspace() == binding.workspace()
+    {
+        Ok(record)
+    } else {
+        Err(SessionStoreError::JobNotFound {
+            work_id: work_id.clone(),
+        })
+    }
+}
+
 /// Wache vor einer Mutation: prüft für mandantengebundene Aufrufer, dass der
 /// Job existiert und zum eigenen Mandanten gehört.
 ///

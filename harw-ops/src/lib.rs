@@ -251,6 +251,7 @@ pub(crate) mod test_support;
 pub(crate) mod testutil;
 pub mod usage;
 pub mod work;
+pub mod work_result;
 // R14: `work_driver.*` (enqueue/status/stop) — nur Tool- und Web-Flächen,
 // registriert über `register_work_driver_tools` neben der Planungsfläche.
 pub mod work_driver;
@@ -325,12 +326,12 @@ macro_rules! register_ops {
     };
 }
 
-/// Registriert alle 46 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 47 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
 /// jeder konkreten Op-Struct hinzu — jeweils genau einmal, in fester Reihenfolge:
-/// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
+/// `help, status, quit, new, work, work.result, ps, attach, stop, diff, agent, skills,
 /// plugins, model, provider, uia-model, uia-provider, permissions, compact,
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
 /// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
@@ -355,8 +356,9 @@ macro_rules! register_ops {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 46);
+/// assert_eq!(registry.len(), 47);
 /// assert!(registry.find_by_name("help").is_some());
+/// assert!(registry.find_by_name("work.result").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
 /// assert!(registry.find_by_command("/uia-worker-model").is_some());
@@ -401,6 +403,7 @@ register_ops! {
         Arc::new(quit::QuitOperation),
         Arc::new(new::NewOperation),
         Arc::new(work::WorkOperation),
+        Arc::new(work_result::WorkResultOperation),
         Arc::new(ps::PsOperation),
         Arc::new(attach::AttachOperation),
         Arc::new(stop::StopOperation),
@@ -1118,6 +1121,7 @@ mod tests {
             "quit",
             "new",
             "work",
+            "work.result",
             "ps",
             "attach",
             "stop",
@@ -1226,8 +1230,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            46,
-            "first register_all must produce exactly 46 ops"
+            47,
+            "first register_all must produce exactly 47 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -1241,8 +1245,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            46,
-            "registry must stay at 46 after a rejected duplicate"
+            47,
+            "registry must stay at 47 after a rejected duplicate"
         );
     }
 }

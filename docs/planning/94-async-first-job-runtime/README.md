@@ -101,6 +101,7 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 - Missing approval UI rejects-and-continues.
 - A nested explicit inline delegation that still pauses fails closed instead of writing a `Blocked` job with no resume owner.
 - Agent background completion is ordered `job commit -> child lease completion -> background projection`; `WorkId` is the lifecycle source of truth.
+- `work.result` is a read-only model tool for durable status/result by `WorkId`; it is restricted to the caller's exact trusted tenant+workspace binding, caps returned result text, and never exposes `StoredJob::input` or the recovery envelope.
 - Grep is process-free.
 - Podman lifecycle commands use the job command port.
 - Direct workload spawn exceptions are ratcheted.
@@ -122,7 +123,6 @@ PL-93's `xtask gates spawn` policy is retained and tightened. The previous `fs.g
 - Add a startup reconciliation rule for pre-envelope or otherwise unreconstructable agent jobs; they must end visibly fail-closed rather than sit indefinitely in `Ready`.
 - Add crash/restart integration coverage for an in-flight durable agent job.
 - Add a first-class durable dependency/work-graph contract before allowing agent jobs to enter `Blocked` on nested child handoffs; `wait=true` remains compatibility-only until a resume owner exists.
-- Add explicit job-status/result lookup by `work_id` for agent jobs where only child-oriented result tooling currently exists.
 - Reconcile `Pending` agent records on startup: the envelope proves what would need reconstruction, but a record may become runnable only after its child session, authority, IR and capability contract are all freshly reconstructed and verified.
 - Decide whether CLI/build/editor/MCP/service-manager direct process exceptions should later get dedicated ports; they are not model workload execution and are intentionally outside this wave.
 
@@ -145,6 +145,7 @@ Additionally exercise:
 - async root -> child -> grandchild delegation returns handles without `AwaitingChild`;
 - explicit `wait=true` and `background=false` still use the inline path;
 - cancellation by `WorkId` reaches the child;
+- `work.result` returns the committed agent output by `WorkId`, hides foreign tenant/workspace records like missing IDs, and never returns the recovery input;
 - lease loss cancels the child and rejects stale completion;
 - approval-present and approval-unavailable paths;
 - `shell.exec`, `job.start`, sudo and operator shell all cross `CommandPort`;
