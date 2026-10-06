@@ -489,17 +489,16 @@ names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "ha
 packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
 
-[packages."harw-session-com"]
-layer = "A"
-
-[packages."harw-session-daemon"]
-layer = "A"
-
-[packages."harw-reverse-proxy"]
-layer = "A"
-
 [packages."harw-context-ledger"]
 layer = "I"
+[packages."harw-session-client"]
+layer = "A"
+[packages."harw-media"]
+layer = "I"
+[packages."harw-tool-obsidian"]
+layer = "A"
+[packages."harw-job-executor-podman"]
+layer = "J"
 [packages."harw-placement-model"]
 layer = "I"
 [packages."harw-container-model"]

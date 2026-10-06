@@ -1401,7 +1401,7 @@ impl HistoryCell for GoalCell {
 ///
 /// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_width::UnicodeWidthStr;
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();
 
@@ -3386,7 +3386,7 @@ mod tests {
     /// B14: Überlange Pfade/URLs brechen an weichen Trennpunkten (`/`, `·`,
     /// `_`), der Trenner bleibt am Segmentende; kein Einzelwort-Überhang.
     #[test]
-    fn test_wrap_plain_breaks_paths_at_soft_break_points() {
+    fn test_wrap_plain_breaks_paths_at_soft_break_points() -> TestResult {
         use unicode_width::UnicodeWidthStr;
         let text = "crates/harw-tui/src/history_cell.rs und a_very_long_section_name_here";
         let lines = lines_to_strings(&wrap_plain(text, 12));
@@ -3401,6 +3401,7 @@ mod tests {
             .find(|l| l.contains("crates/"))
             .ok_or(TestError::Missing("Pfadsegment"))?;
         assert!(path_line.ends_with('/'), "war: {path_line:?}");
+        Ok(())
     }
 
     /// Prüft, dass `AssistantHistoryCell` bei `width=10` mehr Zeilen liefert als bei `width=100`.
