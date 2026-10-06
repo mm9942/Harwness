@@ -44,6 +44,7 @@ harw-home = { path = "../harw-home" }
 # (`src/infrastructure.rs`), als Dienst auf Slash/Web (`services.rs`). Kein
 # Zyklus: `harw-infra-client` (Schicht I) hängt von keiner harw-Crate ab.
 harw-infra-client = { path = "../harw-infra-client" }
+harw-job-core = { path = "../harw-job-core" }
 harw-job-runtime = { path = "../harw-job-runtime" }
 # L6: `Arc<KnowledgeStore>` für Slash/Modell-Werkzeug (`services.rs`). Kein
 # Zyklus: `harw-knowledge` hängt nicht von `harw-runtime` ab.

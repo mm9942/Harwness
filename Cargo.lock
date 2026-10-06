@@ -3948,6 +3948,7 @@ dependencies = [
  "harw-fsutil",
  "harw-home",
  "harw-infra-client",
+ "harw-job-core",
  "harw-job-runtime",
  "harw-knowledge",
  "harw-lens-types",

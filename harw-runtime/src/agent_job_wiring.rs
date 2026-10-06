@@ -748,7 +748,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                     ),
                     Ok(Ok(completion)) => {
                         if let Err(release_error) =
-                            self.spawner.close_child_durable(&child, completion.completed_at)
+                            self.spawner.close_child_durable(&child, completion.completion.completed_at)
                         {
                             tracing::error!(
                                 work_id = %work_id,
@@ -774,6 +774,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
             let runner = Arc::clone(&self.runner);
             let work_id_for_run = work_id.clone();
             let child_for_run = child.clone();
+            let child_for_finalize = child.clone();
             let task_for_run = task.clone();
 
             tokio::spawn(async move {
@@ -899,7 +900,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                             JobOutcome::Blocked { reason } => {
                                 tracing::error!(
                                     work_id = %work_id_for_run,
-                                    child = %child,
+                                    child = %child_for_finalize,
                                     reason,
                                     "agent_job.blocked_without_resume_owner"
                                 );
@@ -909,16 +910,16 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
 
                         if let Some((status, text)) = projection {
                             if let Err(error) =
-                                spawner.close_child_durable(&child, completion.completed_at)
+                                spawner.close_child_durable(&child_for_finalize, completion.completed_at)
                             {
                                 tracing::error!(
                                     work_id = %work_id_for_run,
-                                    child = %child,
+                                    child = %child_for_finalize,
                                     error = %error,
                                     "agent_job.child_lease_completion_failed"
                                 );
                             } else {
-                                let _ = spawner.finish_background_child(&child, status, text);
+                                let _ = spawner.finish_background_child(&child_for_finalize, status, text);
                             }
                         }
                     }
@@ -928,7 +929,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         // projection here: recovery owns that decision.
                         tracing::error!(
                             work_id = %work_id_for_run,
-                            child = %child,
+                            child = %child_for_finalize,
                             error = %error,
                             "agent_job.runtime_failed"
                         );
