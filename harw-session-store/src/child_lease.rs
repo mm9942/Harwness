@@ -337,7 +337,7 @@ impl ChildLeaseStore {
                 .map_err(|error| SessionStoreError::Io(error.error))?;
             if was_expired && expired.exists() {
                 std::fs::remove_file(&expired)?;
-                sync_dir(parent)?;
+                File::open(parent)?.sync_all()?;
             }
             Ok(())
         })();
