@@ -3064,6 +3064,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-job-executor-podman"
+version = "0.9.1"
+dependencies = [
+ "harw-config",
+ "harw-job-core",
+ "harw-job-linux",
+]
+
+[[package]]
 name = "harw-job-linux"
 version = "0.9.1"
 dependencies = [

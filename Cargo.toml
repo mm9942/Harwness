@@ -75,6 +75,7 @@ members = [
     "harw-job-executor-k8s",
     "harw-container-model",
     "harw-placement-model",
+    "harw-job-executor-podman",
     "harw-job",
     "harw-knowledge",
     "harw-channel",

@@ -41,6 +41,7 @@ mod service;
 mod session;
 mod settings;
 mod uia;
+mod worker;
 pub mod values;
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ pub use service::*;
 pub use session::*;
 pub use settings::*;
 pub use uia::*;
+pub use worker::*;
 pub use values::*;
 
 /// Root-Parser des `harw`-Binaries.
@@ -226,6 +228,12 @@ pub enum Command {
         /// Frist des Auftrags in Sekunden (Vorgabe 60).
         #[arg(long, value_name = "SECS")]
         deadline_secs: Option<u64>,
+    },
+    /// Baut, testet und führt Befehle im Container-Worker aus (P2 Builder-API).
+    Worker {
+        /// Auszuführende Worker-Aktion.
+        #[command(subcommand)]
+        action: WorkerAction,
     },
     /// Holt einen GitHub-PR read-only, legt den Diff als Fixture ab und
     /// reviewt ihn mit dem Agenten `github-pr-reviewer`.

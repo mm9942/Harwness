@@ -12,6 +12,8 @@ pub mod agent_sources;
 pub mod agent_toml;
 pub mod auth_toml;
 pub mod browser_toml;
+// P2 Builder-API-Contract: `[builder]` — Container-Worker-Bau.
+pub mod builder_toml;
 pub mod channel_toml;
 pub mod discovery;
 pub mod dod_toml;
@@ -55,6 +57,12 @@ pub use agent_sources::{
 pub use agent_toml::{AgentSuggestionsToml, AgentToml};
 pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, SecretRef};
 pub use browser_toml::BrowserSection;
+// P2 Builder-API-Contract: `[builder]`.
+pub use builder_toml::{
+    BUILDER_JOBS_RANGE, BUILDER_RAM_MIB_RANGE, BuilderBuildToml, BuilderRemoteTlsToml,
+    BuilderRemoteToml, BuilderToml, DEFAULT_BUILDER_JOBS, DEFAULT_BUILDER_RAM_MIB, MountSpec,
+    WorkerTemplate,
+};
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
     HasName, ResolvedConfig, default_config_layers, default_config_layers_named, discover_config,
