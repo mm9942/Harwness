@@ -105,7 +105,7 @@ use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
 use harw_agent_dsl::executable::{
-    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail, SnapshotId,
+    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail,
 };
 use harw_authority::{AuthoritySnapshot, SandboxSpec};
 use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot, SuggestionKind};
@@ -118,7 +118,7 @@ use harw_protocol::items::{ContentPart, TurnItem};
 use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
 use harw_types::{
-    AgentRole, ApprovalActor, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId,
+    AgentRole, ApprovalActor, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId, WorkId,
 };
 use jiff::{SignedDuration, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -8141,7 +8141,7 @@ impl ManagedAgentSpawner {
             }
             let ir_matches = match (recovery.executable_snapshot_id.as_ref(), executable_ir) {
                 (None, None) => true,
-                (Some(reference), Some(ir)) => reference.confirm(ir.snapshot_id()).is_some(),
+                (Some(reference), Some(ir)) => reference.confirm(&ir.snapshot_id()).is_some(),
                 _ => false,
             };
             if !ir_matches {
