@@ -2813,7 +2813,7 @@ impl RuntimeAssemblyBuilder {
             stores.job_store.as_ref(),
             spawn_context.approval_actor.clone(),
         ) {
-            let submitter: Arc<dyn harw_extension_api::AgentJobSubmitter> = Arc::new(
+            let runtime_submitter = Arc::new(
                 crate::agent_job_wiring::RuntimeAgentJobSubmitter::new(
                     Arc::clone(spawner),
                     Arc::clone(&stores.state_store),
@@ -2829,6 +2829,8 @@ impl RuntimeAssemblyBuilder {
                     sandbox.workspace().workspace().clone(),
                 ),
             );
+            runtime_submitter.start_recovery_worker();
+            let submitter: Arc<dyn harw_extension_api::AgentJobSubmitter> = runtime_submitter;
             if let Some(slot) = agent_job_submitter_slot.as_ref() {
                 slot.set(Arc::downgrade(&submitter)).map_err(|_| RuntimeError::Spawner {
                     detail: "durable agent job submitter slot was initialized twice".to_owned(),
