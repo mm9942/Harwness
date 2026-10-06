@@ -183,7 +183,16 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         error = %cancel_error,
                         "agent_job.pending_cleanup_failed"
                     ),
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        if let Err(release_error) = self.spawner.release_child(&child) {
+                            tracing::error!(
+                                work_id = %work_id,
+                                child = %child,
+                                error = %release_error,
+                                "agent_job.pending_child_release_failed"
+                            );
+                        }
+                    }
                 }
                 return Err(Self::rejection(reason));
             }
@@ -203,11 +212,6 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                 Err(error) => Some(format!("agent job activation task failed: {error}")),
             };
             if let Some(reason) = activation_error {
-                let _ = self.spawner.finish_background_child(
-                    &child,
-                    BackgroundStatus::Failed,
-                    reason.clone(),
-                );
                 let store = Arc::clone(&self.job_store);
                 let work_id_for_cancel = work_id.clone();
                 let cancelled_by = self.scope.submitter().clone();
@@ -234,7 +238,24 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         error = %cancel_error,
                         "agent_job.activation_cleanup_failed"
                     ),
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(completion)) => {
+                        if let Err(release_error) =
+                            self.spawner.close_child_durable(&child, completion.completed_at)
+                        {
+                            tracing::error!(
+                                work_id = %work_id,
+                                child = %child,
+                                error = %release_error,
+                                "agent_job.activation_child_lease_completion_failed"
+                            );
+                        } else {
+                            let _ = self.spawner.finish_background_child(
+                                &child,
+                                BackgroundStatus::Failed,
+                                reason.clone(),
+                            );
+                        }
+                    }
                 }
                 return Err(Self::rejection(reason));
             }
