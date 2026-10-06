@@ -261,6 +261,89 @@ impl ChildLeaseStore {
     /// Nimmt denselben Verzeichnis-Lock wie [`Self::claim_expired`]/
     /// [`Self::complete`]; von beliebig vielen Threads/Prozessen aufrufbar,
     /// serialisiert über diesen Lock.
+    /// Reattaches a durable child lease after the owning WorkId has been
+    /// claimed by a recovery worker.
+    ///
+    /// Unlike [`Self::renew`], this trusted recovery seam may move an
+    /// already-expired record back to active. It never creates a lease from
+    /// nothing and never revives a completed child. Before writing it verifies
+    /// the immutable correlation fields against `expected`; the caller may
+    /// choose a fresh expiry but cannot substitute another child/parent/tool
+    /// handoff/role/depth/trace.
+    ///
+    /// The WorkId fence lives in JobStore and is intentionally not duplicated
+    /// here; callers MUST hold that job lease before invoking this method.
+    pub fn recover(
+        &self,
+        expected: &ChildLeaseRecord,
+    ) -> SessionStoreResult<()> {
+        self.ensure_root()?;
+        let lock = self.lock()?;
+        let result = (|| {
+            let completed = self.completed_path(&expected.child)?;
+            if is_regular_file(&completed)? {
+                return Err(SessionStoreError::ChildLeaseAlreadyCompleted {
+                    child: expected.child.clone(),
+                });
+            }
+            if path_exists(&completed)? {
+                return Err(non_regular_lease_path_error());
+            }
+
+            let active = self.active_path(&expected.child)?;
+            let expired = self.expired_path(&expected.child)?;
+            let (source, was_expired) = if is_regular_file(&active)? {
+                (active.clone(), false)
+            } else if is_regular_file(&expired)? {
+                (expired.clone(), true)
+            } else {
+                return Err(SessionStoreError::ChildLeaseNotFound {
+                    child: expected.child.clone(),
+                });
+            };
+            let stored = read_lease(&source)?;
+            let mismatch = if stored.child != expected.child {
+                Some("child")
+            } else if stored.parent != expected.parent {
+                Some("parent")
+            } else if stored.handoff_call_id != expected.handoff_call_id {
+                Some("handoff_call_id")
+            } else if stored.role != expected.role {
+                Some("role")
+            } else if stored.depth != expected.depth {
+                Some("depth")
+            } else if stored.trace != expected.trace {
+                Some("trace")
+            } else {
+                None
+            };
+            if let Some(field) = mismatch {
+                return Err(SessionStoreError::ChildLeaseRecoveryMismatch {
+                    child: expected.child.clone(),
+                    detail: format!("{field} does not match the persisted admission"),
+                });
+            }
+
+            let mut recovered = stored;
+            recovered.lease_expires_at = expected.lease_expires_at;
+            let bytes = serde_json::to_vec(&recovered)?;
+            let parent = active.parent().ok_or_else(|| {
+                SessionStoreError::Io(std::io::Error::other("child lease path has no parent"))
+            })?;
+            let mut temp = NamedTempFile::new_in(parent).map_err(SessionStoreError::Io)?;
+            temp.write_all(&bytes).map_err(SessionStoreError::Io)?;
+            temp.as_file().sync_all().map_err(SessionStoreError::Io)?;
+            temp.persist(&active)
+                .map_err(|error| SessionStoreError::Io(error.error))?;
+            if was_expired && expired.exists() {
+                std::fs::remove_file(&expired)?;
+                sync_dir(parent)?;
+            }
+            Ok(())
+        })();
+        unlock(lock, result)
+    }
+
     pub fn renew(
         &self,
         child: &SessionId,

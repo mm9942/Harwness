@@ -68,12 +68,34 @@ impl SessionManager {
         registry: ExtensionRegistry,
         spawn_context: SpawnContext,
     ) -> SessionId {
-        let mut session = AgentSession::new(role, parent, registry, self.event_tx.clone())
-            .with_spawn_context(spawn_context);
-        self.attach_hub(&mut session);
-        let id = session.id().clone();
-        self.sessions.insert(id.as_str().to_owned(), session);
+        let id = SessionId::new();
+        self.create_governed_session_with_id(id.clone(), role, parent, registry, spawn_context);
         id
+    }
+
+    /// Creates a governed session under a caller-supplied durable identity.
+    ///
+    /// This is the recovery seam for already-admitted child sessions. The
+    /// caller-supplied id is identity only: authority still comes exclusively
+    /// from the freshly resolved registry and SpawnContext passed here.
+    pub fn create_governed_session_with_id(
+        &mut self,
+        id: SessionId,
+        role: AgentRole,
+        parent: Option<SessionId>,
+        registry: ExtensionRegistry,
+        spawn_context: SpawnContext,
+    ) {
+        let mut session = AgentSession::new_with_id(
+            id.clone(),
+            role,
+            parent,
+            registry,
+            self.event_tx.clone(),
+        )
+        .with_spawn_context(spawn_context);
+        self.attach_hub(&mut session);
+        self.sessions.insert(id.as_str().to_owned(), session);
     }
 
     /// Liefert eine Kopie des Event-Senders, mit dem dieser Manager Sessions anlegt.
