@@ -4515,6 +4515,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tool-cargo"
+version = "0.9.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-macros",
+ "harw-test-support",
+ "harw-tool-fsread",
+ "harw-tools",
+ "harw-types",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "harw-tool-container"
 version = "0.9.1"
 
@@ -4610,6 +4628,49 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "harw-tool-fsread"
+version = "0.9.0"
+dependencies = [
+ "globset",
+ "harw-authority",
+ "harw-digest",
+ "harw-extension-api",
+ "harw-fsutil",
+ "harw-macros",
+ "harw-test-support",
+ "harw-tools",
+ "harw-types",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "harw-tool-gitread"
+version = "0.9.0"
+dependencies = [
+ "flate2",
+ "harw-authority",
+ "harw-extension-api",
+ "harw-macros",
+ "harw-test-support",
+ "harw-tool-fsread",
+ "harw-tools",
+ "harw-types",
+ "ignore",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4741,6 +4802,25 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "harw-tool-sys"
+version = "0.9.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-macros",
+ "harw-test-support",
+ "harw-tool-fsread",
+ "harw-tools",
+ "harw-types",
+ "regex",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

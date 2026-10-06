@@ -367,9 +367,15 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-doc"]
 layer = "A"
+[packages."harw-tool-cargo"]
+layer = "A"
 [packages."harw-tool-explorer"]
 layer = "A"
 [packages."harw-tool-fs"]
+layer = "A"
+[packages."harw-tool-gitread"]
+layer = "A"
+[packages."harw-tool-fsread"]
 layer = "A"
 [packages."harw-tool-job"]
 layer = "A"
@@ -380,6 +386,8 @@ layer = "A"
 [packages."harw-tool-process"]
 layer = "A"
 [packages."harw-tool-shell"]
+layer = "A"
+[packages."harw-tool-sys"]
 layer = "A"
 [packages."harw-tool-tunnel"]
 layer = "A"
