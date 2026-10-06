@@ -993,6 +993,27 @@ pub struct ChildRecoveryView {
     pub trace: Option<TraceContext>,
 }
 
+/// How a rehydrated durable child should be driven after its transcript was loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveredChildDisposition {
+    /// No ambiguous in-flight tool call and no terminal assistant answer was
+    /// persisted; start one continuation turn with no new user text.
+    Continue,
+    /// The prior turn had already produced its terminal assistant answer before
+    /// the process died. Commit this result without invoking the model again.
+    AlreadyCompleted { text: String },
+    /// One or more tool calls were open when the process died. Their side
+    /// effects may have happened even though no result was durably recorded.
+    UnsafeInterruptedToolCalls { count: usize },
+}
+
+/// Result of root-child rehydration under fresh current policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredRootChild {
+    pub child: SessionId,
+    pub disposition: RecoveredChildDisposition,
+}
+
 /// Verbrauch eines Kindes in den drei durchgesetzten Budget-Dimensionen.
 ///
 /// # Beschreibung
@@ -4390,7 +4411,7 @@ impl ManagedAgentSpawner {
         &self,
         recovery: &ChildRecoveryView,
         store: &dyn StateStore,
-    ) -> Result<SessionId, AgentSpawnError> {
+    ) -> Result<RecoveredRootChild, AgentSpawnError> {
         let root = self
             .external_root_parent
             .as_ref()
@@ -4443,12 +4464,46 @@ impl ManagedAgentSpawner {
                 ))
             })?
         };
-        if let Err(error) = session.hydrate_from_store(store).await {
-            let _ = self.release_child(&child);
-            return Err(Self::reject(format!(
-                "could not hydrate recovered child {child}: {error}"
-            )));
-        }
+        let hydration = match session.hydrate_from_store(store).await {
+            Ok(hydration) => hydration,
+            Err(error) => {
+                let _ = self.release_child(&child);
+                return Err(Self::reject(format!(
+                    "could not hydrate recovered child {child}: {error}"
+                )));
+            }
+        };
+        let terminal_assistant = if hydration.repaired_tool_calls.is_empty() {
+            match session.history().last() {
+                Some(TurnItem::AssistantMessage(message)) => {
+                    let text: String = message
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.as_str()),
+                            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
+                        })
+                        .collect();
+                    Some(if text.trim().is_empty() {
+                        "completed".to_owned()
+                    } else {
+                        text
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let disposition = if !hydration.repaired_tool_calls.is_empty() {
+            RecoveredChildDisposition::UnsafeInterruptedToolCalls {
+                count: hydration.repaired_tool_calls.len(),
+            }
+        } else if let Some(text) = terminal_assistant {
+            RecoveredChildDisposition::AlreadyCompleted { text }
+        } else {
+            RecoveredChildDisposition::Continue
+        };
         {
             let mut manager = self
                 .manager
@@ -4490,7 +4545,7 @@ impl ManagedAgentSpawner {
             tool_calls,
             "agent_recovery.root_child_rehydrated"
         );
-        Ok(child)
+        Ok(RecoveredRootChild { child, disposition })
     }
 
     /// Deckelt die zulässige Fan-out-Parallelität für einen **registrierten
