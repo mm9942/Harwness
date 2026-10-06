@@ -70,6 +70,7 @@ pub struct RuntimeAgentJobSubmitter {
 
 impl RuntimeAgentJobSubmitter {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         spawner: Arc<ManagedAgentSpawner>,
         state_store: Arc<dyn StateStore>,

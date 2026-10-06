@@ -5275,6 +5275,11 @@ struct SpawnerInputs<'a> {
     child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
 }
 
+/// Weakly-bound Slot für den runtimeweiten [`harw_extension_api::AgentJobSubmitter`];
+/// wird nach dem Bau des Submitters einmalig gesetzt.
+type AgentJobSubmitterSlot =
+    Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>;
+
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
 ///
 /// # Rückgabe
@@ -5288,7 +5293,7 @@ fn build_spawner(
 ) -> RuntimeResult<(
     Option<Arc<ManagedAgentSpawner>>,
     Vec<String>,
-    Option<Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>>,
+    Option<AgentJobSubmitterSlot>,
 )> {
     // Erschöpfend statt `if policy == …`: eine künftige Variante (etwa
     // `ConfiguredRoles`) fiele sonst still in den `BuiltinRoles`-Zweig,
@@ -5334,9 +5339,7 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
-    let agent_job_submitter_slot: Arc<
-        std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
-    > = Arc::new(std::sync::OnceLock::new());
+    let agent_job_submitter_slot: AgentJobSubmitterSlot = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
     // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
