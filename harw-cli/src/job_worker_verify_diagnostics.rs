@@ -28,8 +28,12 @@ const MAX_LINE_CHARS: usize = 300;
 /// Rückfall ohne erkannte Befunde: so viele letzte, nicht leere Zeilen.
 const FALLBACK_TAIL_LINES: usize = 5;
 
-/// Wie weit nach einer Diagnose-Kopfzeile nach `-->` gesucht wird.
-const LOCATION_LOOKAHEAD: usize = 6;
+/// Wie weit nach einer Diagnose-Kopfzeile nach `-->` und Notizen gesucht
+/// wird.
+const DIAGNOSTIC_LOOKAHEAD: usize = 8;
+
+/// Höchstzahl `note:`/`help:`-Zeilen je Diagnose ohne Ort.
+const MAX_NOTES: usize = 3;
 
 /// Zusammenfassungen von cargo/rustc ohne eigenen Befund.
 const SUMMARY_PREFIXES: &[&str] = &[
@@ -41,13 +45,27 @@ const SUMMARY_PREFIXES: &[&str] = &[
     "error: process didn't exit successfully",
 ];
 
+/// Ergebnis von [`failure_lines`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FailureLines {
+    /// Befundzeilen, bzw. ohne erkannte Befunde das Ende eines Stroms.
+    pub(super) lines: Vec<String>,
+    /// `true`, wenn `lines` erkannte Befunde sind (nicht der Rückfall).
+    /// Dann trägt eine pfadlose Sammelzeile („Exit-Code passt nicht")
+    /// nichts bei und würde nur jeden Worker wecken.
+    pub(super) recognized: bool,
+}
+
 /// Verdichtet stdout und stderr eines fehlgeschlagenen Schritts.
 ///
 /// # Returns
 /// Höchstens [`MAX_FINDINGS`] Zeilen, dedupliziert, in Fundreihenfolge
-/// (erst stderr, dann stdout); ohne erkannte Befunde die letzten Zeilen
-/// von stderr bzw. stdout. Leer nur, wenn beide Ströme leer sind.
-pub(super) fn failure_lines(stdout: &str, stderr: &str) -> Vec<String> {
+/// (erst stderr, dann stdout). Jede Zeile mit Ort beginnt mit
+/// `pfad:zeile:spalte: `, damit die Kappung auf [`MAX_LINE_CHARS`] den Ort
+/// nie abschneidet. Ohne erkannte Befunde die letzten Zeilen von stderr
+/// bzw. stdout (`recognized = false`). Leer nur, wenn beide Ströme leer
+/// sind.
+pub(super) fn failure_lines(stdout: &str, stderr: &str) -> FailureLines {
     let stdout = strip_ansi(stdout);
     let stderr = strip_ansi(stderr);
     let mut findings = Findings::default();
@@ -62,9 +80,15 @@ pub(super) fn failure_lines(stdout: &str, stderr: &str) -> Vec<String> {
         } else {
             &stderr
         };
-        return tail(source);
+        return FailureLines {
+            lines: tail(source),
+            recognized: false,
+        };
     }
-    findings.lines
+    FailureLines {
+        lines: findings.lines,
+        recognized: true,
+    }
 }
 
 /// Gesammelte Befunde, dedupliziert und gedeckelt.
@@ -86,7 +110,10 @@ impl Findings {
     }
 }
 
-/// `error[E…]: …` / `error: …` mit dem ersten folgenden `--> ort`.
+/// `error[E…]: …` / `error: …` mit dem ersten folgenden `--> ort` als
+/// `ort: kopfzeile`; ohne Ort (z. B. Linker) die Kopfzeile plus bis zu
+/// [`MAX_NOTES`] folgende `note:`/`help:`-Zeilen, die den eigentlichen
+/// Grund tragen (`cannot find -lssl`).
 fn compiler_diagnostics(lines: &[&str], findings: &mut Findings) {
     for (index, raw) in lines.iter().enumerate() {
         let line = raw.trim();
@@ -98,18 +125,33 @@ fn compiler_diagnostics(lines: &[&str], findings: &mut Findings) {
         {
             continue;
         }
-        let location = lines
+        let body: Vec<&str> = lines
             .iter()
             .skip(index.saturating_add(1))
-            .take(LOCATION_LOOKAHEAD)
+            .take(DIAGNOSTIC_LOOKAHEAD)
             .map(|next| next.trim())
-            .take_while(|next| !next.starts_with("error"))
-            .find_map(|next| next.strip_prefix("--> "));
-        match location {
-            Some(location) => findings.push(format!("{line} at {}", location.trim())),
-            None => findings.push(line.to_owned()),
+            .take_while(|next| !next.starts_with("error") && !next.starts_with("warning"))
+            .collect();
+        match body.iter().find_map(|next| next.strip_prefix("--> ")) {
+            Some(location) => findings.push(format!("{}: {line}", location.trim())),
+            None => {
+                findings.push(line.to_owned());
+                for note in body
+                    .iter()
+                    .filter_map(|next| note_text(next))
+                    .take(MAX_NOTES)
+                {
+                    findings.push(format!("  {note}"));
+                }
+            }
         }
     }
+}
+
+/// `= note: …`, `note: …`, `= help: …`, `help: …` ohne das führende `=`.
+fn note_text(line: &str) -> Option<&str> {
+    let text = line.trim_start_matches('=').trim_start();
+    (text.starts_with("note:") || text.starts_with("help:")).then_some(text)
 }
 
 /// Blöcke `---- <test> stdout ----` mit Panic-Ort und Meldung; ohne solche
@@ -150,7 +192,7 @@ fn test_failures(lines: &[&str], findings: &mut Findings) {
     }
 }
 
-/// `test <name> failed at <ort>: <meldung>` aus dem Rumpf eines Blocks.
+/// `<ort>: test <name> failed: <meldung>` aus dem Rumpf eines Blocks.
 fn describe_test_failure(name: &str, body: &[&str]) -> String {
     let panic = body
         .iter()
@@ -188,9 +230,9 @@ fn describe_test_failure(name: &str, body: &[&str]) -> String {
             .join(" | ")
     });
     if message.is_empty() {
-        format!("test {name} failed at {location}")
+        format!("{location}: test {name} failed")
     } else {
-        format!("test {name} failed at {location}: {message}")
+        format!("{location}: test {name} failed: {message}")
     }
 }
 
@@ -277,15 +319,25 @@ failures:
 test result: FAILED. 1 passed; 2 failed; 0 ignored
 ";
 
+    const LINKER_STDERR: &str = "\
+error: linking with `cc` failed: exit status: 1
+  |
+  = note: LC_ALL=\"C\" PATH=\"/usr/bin\" \"cc\" \"-m64\" \"/tmp/rustc/symbols.o\"
+  = note: /usr/bin/ld: cannot find -lssl: No such file or directory
+          collect2: error: ld returned 1 exit status
+
+error: could not compile `harw-net` (bin \"harw-net\") due to 1 previous error
+";
+
     #[test]
-    fn test_compiler_errors_carry_their_location_and_skip_summaries() {
-        let lines = failure_lines("", COMPILE_STDERR);
+    fn test_compiler_errors_lead_with_their_location_and_skip_summaries() {
+        let found = failure_lines("", COMPILE_STDERR);
+        assert!(found.recognized);
         assert_eq!(
-            lines,
+            found.lines,
             vec![
-                "error[E0308]: mismatched types at harw-parser/src/lexer.rs:42:13".to_owned(),
-                "error: cannot find value `y` in this scope at harw-parser/src/ast.rs:7:5"
-                    .to_owned(),
+                "harw-parser/src/lexer.rs:42:13: error[E0308]: mismatched types".to_owned(),
+                "harw-parser/src/ast.rs:7:5: error: cannot find value `y` in this scope".to_owned(),
             ]
         );
     }
@@ -293,16 +345,52 @@ test result: FAILED. 1 passed; 2 failed; 0 ignored
     #[test]
     fn test_test_failures_are_read_from_stdout_with_location_and_message() {
         let stderr = "error: test failed, to rerun pass `-p harw-parser --lib`\n";
-        let lines = failure_lines(TEST_STDOUT, stderr);
+        let found = failure_lines(TEST_STDOUT, stderr);
+        assert!(found.recognized);
         assert_eq!(
-            lines,
+            found.lines,
             vec![
-                "test lexer::tests::splits_words failed at harw-parser/src/lexer.rs:88:9: \
+                "harw-parser/src/lexer.rs:88:9: test lexer::tests::splits_words failed: \
                  assertion `left == right` failed | left: 2 | right: 3"
                     .to_owned(),
-                "test ast::tests::roundtrip failed at harw-parser/src/ast.rs:120:5: boom"
-                    .to_owned(),
+                "harw-parser/src/ast.rs:120:5: test ast::tests::roundtrip failed: boom".to_owned(),
             ]
+        );
+    }
+
+    /// Review #132: an over-long header must not clip away the location.
+    #[test]
+    fn test_the_location_survives_the_line_cap() {
+        let header = format!("error[E0277]: {}", "x".repeat(290));
+        let stderr = format!("{header}\n --> src/a.rs:1:1\n");
+        let found = failure_lines("", &stderr);
+        assert_eq!(found.lines.len(), 1);
+        assert!(found.lines[0].starts_with("src/a.rs:1:1: error[E0277]: "));
+        assert!(found.lines[0].chars().count() <= MAX_LINE_CHARS + 1);
+    }
+
+    /// Review #132: a locationless diagnostic keeps the notes with the cause.
+    #[test]
+    fn test_a_linker_failure_keeps_its_notes() {
+        let found = failure_lines("", LINKER_STDERR);
+        assert!(found.recognized);
+        assert_eq!(
+            found.lines[0],
+            "error: linking with `cc` failed: exit status: 1"
+        );
+        assert!(
+            found
+                .lines
+                .iter()
+                .any(|line| line.contains("cannot find -lssl")),
+            "{:?}",
+            found.lines
+        );
+        assert!(
+            !found
+                .lines
+                .iter()
+                .any(|line| line.contains("could not compile"))
         );
     }
 
@@ -310,7 +398,7 @@ test result: FAILED. 1 passed; 2 failed; 0 ignored
     fn test_failed_test_lines_are_used_without_detail_blocks() {
         let stdout = "test a::b ... FAILED\ntest a::c ... ok\n";
         assert_eq!(
-            failure_lines(stdout, ""),
+            failure_lines(stdout, "").lines,
             vec!["test a::b failed".to_owned()]
         );
     }
@@ -318,12 +406,14 @@ test result: FAILED. 1 passed; 2 failed; 0 ignored
     #[test]
     fn test_unknown_output_falls_back_to_the_stderr_tail() {
         let stderr = "1\n2\n\n3\n4\n5\n6\n";
+        let found = failure_lines("ignored", stderr);
+        assert!(!found.recognized);
+        assert_eq!(found.lines, vec!["2", "3", "4", "5", "6"]);
         assert_eq!(
-            failure_lines("ignored", stderr),
-            vec!["2", "3", "4", "5", "6"]
+            failure_lines("only stdout\n", "  \n").lines,
+            vec!["only stdout"]
         );
-        assert_eq!(failure_lines("only stdout\n", "  \n"), vec!["only stdout"]);
-        assert!(failure_lines("", "").is_empty());
+        assert!(failure_lines("", "").lines.is_empty());
     }
 
     #[test]
@@ -332,7 +422,7 @@ test result: FAILED. 1 passed; 2 failed; 0 ignored
         for i in 0..40 {
             stderr.push_str(&format!("\u{1b}[1m\u{1b}[31merror\u{1b}[0m: e{}\n", i % 30));
         }
-        let lines = failure_lines("", &stderr);
+        let lines = failure_lines("", &stderr).lines;
         assert_eq!(lines.len(), MAX_FINDINGS);
         assert_eq!(lines[0], "error: e0");
         assert_eq!(lines.iter().filter(|line| *line == "error: e0").count(), 1);
