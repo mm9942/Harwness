@@ -121,6 +121,8 @@ layer = "I"
 layer = "I"
 [packages."harw-fsutil"]
 layer = "I"
+[packages."harw-media"]
+layer = "I"
 [packages."harw-retention"]
 layer = "I"
 [packages."harw-observe"]
@@ -363,11 +365,19 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-deps"]
 layer = "A"
+[packages."harw-tool-container"]
+layer = "A"
 [packages."harw-tool-doc"]
+layer = "A"
+[packages."harw-tool-cargo"]
 layer = "A"
 [packages."harw-tool-explorer"]
 layer = "A"
 [packages."harw-tool-fs"]
+layer = "A"
+[packages."harw-tool-gitread"]
+layer = "A"
+[packages."harw-tool-fsread"]
 layer = "A"
 [packages."harw-tool-job"]
 layer = "A"
@@ -378,6 +388,8 @@ layer = "A"
 [packages."harw-tool-process"]
 layer = "A"
 [packages."harw-tool-shell"]
+layer = "A"
+[packages."harw-tool-sys"]
 layer = "A"
 [packages."harw-tool-tunnel"]
 layer = "A"
@@ -393,9 +405,15 @@ layer = "A"
 layer = "A"
 [packages."harw-session-remote"]
 layer = "A"
+[packages."harw-session-client"]
+layer = "A"
 [packages."harw-session-driver"]
 layer = "A"
 [packages."harw-node-listener"]
+layer = "A"
+[packages."harw-mobile-core"]
+layer = "A"
+[packages."harw-mobile-term"]
 layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
@@ -487,7 +505,5 @@ layer = "I"
 [packages."harw-container-model"]
 layer = "I"
 
-[packages."harw-tool-container"]
-layer = "A"
 [packages."harw-tool-container-run"]
 layer = "A"
