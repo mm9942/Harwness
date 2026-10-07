@@ -36,6 +36,13 @@
 //!   der Rolle); Ergebnis und Verlauf landen an der Karte. Ohne
 //!   [`JobWorkerContext::knowledge`] bleiben diese Jobs unberührt.
 //!
+//! * [`JobKind::Custom`] named `memory_maintenance`
+//!   (`harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND`) — Gedächtnis-Wartung
+//!   (Konsolidieren, Vergessen, Promotion nach Global, Startup-Sweep), Modul
+//!   [`memory_job`]. Läuft in der Lane der langen Läufe (`WorkDriverLane`),
+//!   in `spawn_blocking`, mit der Frist aus der Job-Payload; Fristablauf
+//!   endet als `Failed` mit Grund `timed_out: …`.
+//!
 //! * [`JobKind::Custom`] named `work_driver`
 //!   (`harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND`) — ein Lauf des
 //!   Arbeitstreibers (Modul [`work_driver_job`]): ein Claim fährt die Runden
@@ -85,7 +92,9 @@ use harw_core::{
     AgentSession, DurableJobRunner, ExecutionControl, JobExecutionRegistry, ModelMessage,
     ModelProvider, StateStore, TranscriptStateStore, TurnInput, TurnOutcome, run_turn,
 };
-use harw_job_runtime::{Budget, JobClaim, JobKind, JobOutcome, JobScope, JobState, RetryPolicy};
+use harw_job_runtime::{
+    Budget, JobClaim, JobKind, JobLanes, JobOutcome, JobScope, JobState, RetryPolicy,
+};
 use harw_plan::admission::{
     FileChange, MutationContract, PatchFile, PathRule, RepoRevision, ScopeViolation, UnifiedDiff,
     validate_patch,
@@ -113,6 +122,15 @@ mod work_driver_job;
 
 #[path = "job_worker_verify_diagnostics.rs"]
 mod verify_diagnostics;
+
+#[path = "job_worker_memory.rs"]
+mod memory_job;
+
+#[path = "job_worker_retention.rs"]
+mod retention_job;
+
+#[path = "job_worker_learning.rs"]
+mod learning_job;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -305,12 +323,15 @@ const MAX_CONCURRENT_WORK_DRIVER_RUNS: usize = 2;
 pub struct JobWorkerOptions {
     /// Upper bound of concurrent `work_driver` runs (`>= 1`).
     pub max_work_driver_runs: usize,
+    /// Upper bound of concurrent `memory_maintenance` runs (`>= 1`).
+    pub max_memory_runs: usize,
 }
 
 impl Default for JobWorkerOptions {
     fn default() -> Self {
         Self {
             max_work_driver_runs: MAX_CONCURRENT_WORK_DRIVER_RUNS,
+            max_memory_runs: harw_job_runtime::lanes::DEFAULT_MEMORY_LANE_LIMIT,
         }
     }
 }
@@ -330,6 +351,7 @@ impl JobWorkerOptions {
             .unwrap_or(MAX_CONCURRENT_WORK_DRIVER_RUNS);
         Self {
             max_work_driver_runs: MAX_CONCURRENT_WORK_DRIVER_RUNS.min(max_running).max(1),
+            max_memory_runs: harw_job_runtime::lanes::DEFAULT_MEMORY_LANE_LIMIT,
         }
     }
 
@@ -337,6 +359,11 @@ impl JobWorkerOptions {
     // start a run and leave every driver job `Ready` forever).
     fn lane_limit(self) -> usize {
         self.max_work_driver_runs.max(1)
+    }
+
+    // Size of the memory lane (never 0, same reasoning).
+    fn memory_limit(self) -> usize {
+        self.max_memory_runs.max(1)
     }
 }
 
@@ -465,7 +492,9 @@ impl WorkerServices {
 /// # Concurrency
 /// Owned by one worker loop; not shared.
 struct WorkDriverLane {
-    permits: Arc<tokio::sync::Semaphore>,
+    // Resizable per-kind permit pools (`work_driver`, `memory`); operators
+    // resize them at runtime through `lane-limits.json` in the store root.
+    lanes: JobLanes,
     runs: tokio::task::JoinSet<bool>,
     // Work IDs of spawned runs until their task ends, so a run that has not
     // claimed yet is never spawned a second time.
@@ -488,9 +517,17 @@ impl Drop for InFlightEntry {
 }
 
 impl WorkDriverLane {
+    #[cfg(test)]
     fn new(limit: usize) -> Self {
+        Self::with_lanes(JobLanes::new(
+            limit,
+            harw_job_runtime::lanes::DEFAULT_MEMORY_LANE_LIMIT,
+        ))
+    }
+
+    fn with_lanes(lanes: JobLanes) -> Self {
         Self {
-            permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            lanes,
             runs: tokio::task::JoinSet::new(),
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
         }
@@ -499,7 +536,7 @@ impl WorkDriverLane {
     // Spawns `run` for `work_id` if a permit is free and the job is not in
     // flight already. Without a permit nothing is spawned and nothing is
     // claimed.
-    fn try_spawn<F>(&mut self, work_id: &WorkId, run: F) -> bool
+    fn try_spawn<F>(&mut self, work_id: &WorkId, lane_name: &str, run: F) -> bool
     where
         F: Future<Output = bool> + Send + 'static,
     {
@@ -510,8 +547,12 @@ impl WorkDriverLane {
         if in_flight.contains(&key) {
             return false;
         }
-        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-            tracing::debug!(work_id = %key, "work-driver lane full; job stays ready");
+        let Some(permit) = self
+            .lanes
+            .lane(lane_name)
+            .and_then(harw_job_runtime::ResizablePermits::try_acquire)
+        else {
+            tracing::debug!(work_id = %key, lane = lane_name, "job lane full; job stays ready");
             return false;
         };
         in_flight.insert(key.clone());
@@ -641,11 +682,26 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
         }
         // Arbeitstreiber: eigene Lane, damit ein langer Lauf die übrigen
         // Arten nicht blockiert; ohne freien Platz bleibt der Job `Ready`.
-        if work_driver_job::is_work_driver_kind(&record.job.kind) {
+        // Gedächtnis-Wartung (`memory_maintenance`): ebenfalls in der Lane,
+        // weil sie bis zu ihrer Frist (30–120 s) blockierende Dateiarbeit
+        // leistet und die übrigen Arten nicht aufhalten darf.
+        if work_driver_job::is_work_driver_kind(&record.job.kind)
+            || memory_job::is_memory_kind(&record.job.kind)
+            || retention_job::is_retention_kind(&record.job.kind)
+            || learning_job::is_learning_kind(&record.job.kind)
+        {
             let run_services = services.clone();
             let work_id = record.job.id.clone();
             let input = record.input.clone();
-            lane.try_spawn(&record.job.id, async move {
+            let lane_name = if memory_job::is_memory_kind(&record.job.kind)
+                || retention_job::is_retention_kind(&record.job.kind)
+                || learning_job::is_learning_kind(&record.job.kind)
+            {
+                harw_job_runtime::lanes::LANE_MEMORY
+            } else {
+                harw_job_runtime::lanes::LANE_WORK_DRIVER
+            };
+            lane.try_spawn(&record.job.id, lane_name, async move {
                 run_services.run_one(work_id, input, None).await
             });
             continue;
@@ -721,12 +777,26 @@ async fn drive_worker_loop(
     mut shutdown: watch::Receiver<bool>,
     options: JobWorkerOptions,
 ) {
-    let mut lane = WorkDriverLane::new(options.lane_limit());
+    let mut lane =
+        WorkDriverLane::with_lanes(JobLanes::new(options.lane_limit(), options.memory_limit()));
+    let mut published: Vec<harw_job_runtime::LaneStatus> = Vec::new();
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // Operator overrides (`/jobs permits`) apply between polls: raising
+        // starts waiting jobs at once, lowering never stops a running one.
+        for changed in lane.lanes.apply_overrides(services.store.root()) {
+            tracing::info!(lane = changed, "job lane limit changed by operator");
+        }
         let _ = poll_ready_jobs(services, &mut lane).await;
+        let status = lane.lanes.status();
+        if status != published {
+            if let Err(error) = lane.lanes.publish_status(services.store.root()) {
+                tracing::debug!(%error, "job lane status not published");
+            }
+            published = status;
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -750,6 +820,9 @@ fn is_supported_kind(kind: &JobKind) -> bool {
                 || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
                 || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
                 || name == harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND
+                || name == harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND
+                || name == harw_ops::retention_job::RETENTION_SWEEP_JOB_KIND
+                || name == harw_ops::learning_job::LEARNING_EXTRACT_JOB_KIND
         }
     }
 }
@@ -792,6 +865,21 @@ async fn execute_claim(task: ClaimTask) -> JobOutcome {
             job_store,
             Arc::clone(&control),
             &context,
+        )
+        .await
+    } else if memory_job::is_memory_kind(&claim.job.kind) {
+        memory_job::execute_memory_maintenance_claim(claim, input, job_store, Arc::clone(&control))
+            .await
+    } else if retention_job::is_retention_kind(&claim.job.kind) {
+        retention_job::execute_retention_sweep_claim(claim, input, job_store, Arc::clone(&control))
+            .await
+    } else if learning_job::is_learning_kind(&claim.job.kind) {
+        learning_job::execute_learning_extract_claim(
+            claim,
+            input,
+            provider,
+            job_store,
+            Arc::clone(&control),
         )
         .await
     } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
@@ -4278,6 +4366,7 @@ mod tests {
             );
             let zero = JobWorkerOptions {
                 max_work_driver_runs: 0,
+                ..JobWorkerOptions::default()
             };
             assert_eq!(zero.lane_limit(), 1, "a zero-permit lane never runs");
         }
