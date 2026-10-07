@@ -198,7 +198,7 @@ See [docs/setup/dod.md](docs/setup/dod.md).
 ### Source installer
 
 ```bash
-curl -fsSL https://get.harw.dev/harw/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mm9942/Harwness/main/scripts/install.sh | bash
 ```
 
 The source-install path downloads the repository archive, installs required build tooling when needed, and runs the project installation target from a persistent source directory.

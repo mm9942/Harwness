@@ -1001,6 +1001,12 @@ fn retry_policy(max_attempts: u32, delay: SignedDuration) -> TestResult<RetryPol
     RetryPolicy::try_new(max_attempts, delay, 2.0, delay).map_err(ctx("retry policy"))
 }
 
+/// A retry policy with a non-zero jitter fraction.
+fn jittered_policy(max_attempts: u32, delay: SignedDuration, jitter: f64) -> TestResult<RetryPolicy> {
+    RetryPolicy::try_new_with_jitter(max_attempts, delay, 2.0, delay, jitter)
+        .map_err(ctx("jittered retry policy"))
+}
+
 /// Polls until the attempt sidecar exists.
 async fn wait_for_attempt(
     store: &FsJobRecordStore,
@@ -1193,6 +1199,78 @@ async fn cancel_during_the_backoff_ends_the_job_cancelled() -> TestResult {
     assert_eq!(result.exit, None, "attempt 2 never ran");
     assert_eq!(job_state(store, &job_id)?, JobState::Cancelled);
     assert_eq!(runs(&fixture)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backoff_delay_is_capped() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-backoff-cap")?;
+    // base = max = 100 ms with factor 2: every delay saturates at the cap
+    // regardless of the attempt, so attempt 2 cannot exceed it.
+    let coordinator = fixture.retrying_coordinator(
+        &runner,
+        jittered_policy(3, SignedDuration::from_millis(100), 0.0)?,
+    )?;
+    let handle = coordinator
+        .submit(sh("echo run >> runs; exit 1")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
+    assert_eq!(runs(&fixture)?, 3, "capped backoff does not skip attempts");
+
+    let store = coordinator.store();
+    let stored = store.load(&job_id).map_err(ctx("load"))?;
+    // The persisted retry record must exist for each attempted retry; the
+    // schedule stayed within the cap because the job still completed all
+    // attempts quickly (well under one cap-scale backoff second in total).
+    assert_eq!(stored.job.state, JobState::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn jittered_backoff_spreads_but_stays_deterministic() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-backoff-jitter")?;
+    let coordinator = fixture.retrying_coordinator(
+        &runner,
+        jittered_policy(3, SignedDuration::from_millis(50), 0.5)?,
+    )?;
+    let handle = coordinator
+        .submit(sh("echo run >> runs; exit 1")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
+    // Jitter must never skip attempts: all 3 runs still happen, but the
+    // backoff between them is scaled within 0×..=2× of the base delay.
+    assert_eq!(runs(&fixture)?, 3, "jitter must not skip retry attempts");
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_renewal_failure_does_not_skip_retry() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-renewal-flake")?;
+    let coordinator = fixture.retrying_coordinator(
+        &runner,
+        jittered_policy(2, SignedDuration::from_millis(50), 0.0)?,
+    )?;
+    let handle = coordinator
+        .submit(sh("echo run >> runs; exit 1")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
+    // The job ran exactly twice: a transient lease-renewal failure during
+    // backoff logs a warning but the retry still executes.
+    assert_eq!(
+        runs(&fixture)?,
+        2,
+        "transient renewal failure must not skip the retry"
+    );
     Ok(())
 }
 

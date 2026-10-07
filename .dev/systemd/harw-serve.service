@@ -1,0 +1,13 @@
+[Unit]
+Description=harw MCP listener on 127.0.0.1:1338 (/mcp)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.harw/bin/harw --home %h/.harw serve --log info
+WorkingDirectory=/srv/dev-shared/projects/rust/Harwness
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
