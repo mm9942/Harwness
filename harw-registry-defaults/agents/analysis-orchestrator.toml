@@ -62,6 +62,14 @@ admitted = [
   "deps.source_search",
   "deps.source_list",
   "lens.ask",
+  # Obsidian vault reads (registered by RegistryProfile::Planning): the
+  # project's long-form memory (`docs/planning` vault) is mapped and read
+  # alongside the workspace. Write (`obsidian.write`) stays out of planning
+  # roles — it is registered only for the Full (coding agent) profile.
+  "obsidian.map",
+  "obsidian.read",
+  "obsidian.search",
+  "obsidian.links",
   "explore.tree",
   "explore.projects",
   "explore.relations",

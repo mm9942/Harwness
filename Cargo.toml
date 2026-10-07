@@ -133,6 +133,12 @@ members = [
     "harw-lens-federation",
     "harw-lens",
     "harw-tool-lens",
+    "harw-cloud/harw-cloudctl",
+    "harw-cloud/harw-cloud-enroll",
+    "harw-cloud/harw-cloud-gateway",
+    "harw-cloud/harw-cloud-ops",
+    "harw-cloud",
+    "harw-tool-obsidian",
     "harw-web",
     # === Remediation (Plan P0–P3) ===
     "harw-egress",

@@ -144,6 +144,9 @@ pub trait AssemblyContributor: Send + Sync {
 /// - [`InfrastructureContributor`]: die `infra.*`-Operationen, wenn
 ///   `[infrastructure]` konfiguriert ist (No-op ohne die Sektion).
 /// - [`GatewayDiagnosticsContributor`][]: `gateway.health`/`gateway.logs`/
+/// - [`CloudOpsContributor`]: the `cloud.*` operations of the cloud home
+///   stack (`cloud.status`, `cloud.enrollments.list`, `cloudctl.*`) for the
+///   UIA root (no-op for any other root).
 ///   `gateway.channels.*` für eine UIA-Wurzel (No-op für jede andere Wurzel).
 /// - [`BrowserRootContributor`] (Feature `browser`): `browser.*` für die
 ///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
@@ -155,6 +158,7 @@ pub fn default_contributors() -> Vec<Arc<dyn AssemblyContributor>> {
         Arc::new(crate::mcp_wiring::McpContributor),
         Arc::new(InfrastructureContributor),
         Arc::new(GatewayDiagnosticsContributor),
+        Arc::new(CloudOpsContributor),
     ];
     #[cfg(feature = "browser")]
     contributors.push(Arc::new(BrowserRootContributor));
@@ -328,10 +332,52 @@ impl AssemblyContributor for GatewayDiagnosticsContributor {
     }
 }
 
-/// Hängt die Browser-Werkzeuge (Firefox/geckodriver, WebDriver BiDi) an die
-/// Wurzel-Registry, sofern `[browser].enabled` und `[browser].roles` die
-/// Rolle `root` enthält. Kinder bekommen sie rollenweise in
-/// `children.rs` über dieselbe Konfiguration.
+/// Attaches the browser tools (Firefox/geckodriver, WebDriver BiDi) to the
+/// root registry if `[browser].enabled` and `[browser].roles` contain the
+/// `root` role. Children get them per-role in `children.rs` through the same
+/// configuration.
+/// Registers the seven `cloud.*` operations of the cloud home stack
+/// (`harw-cloud-ops::register_cloud`) for the UIA root.
+///
+/// # Description
+/// Same pattern as [`GatewayDiagnosticsContributor`]: only the UIA root gets
+/// them (``[`gateway_ops_wanted`]``), because they answer "how is the cloud
+/// stack doing" (status, enrollments) and offer the controlled mutations
+/// (up/down/restart/enroll, each with `approval = "always"` in the op
+/// definition). The read operations are free model tools.
+///
+/// # Boundaries
+/// No gateway port needed: `cloud.status` probes loopback ports and the
+/// systemd unit locally; the mutations run through the `harw-cloudctl`
+/// binary. Without a cloud stack they answer `OpError::NotAvailable` —
+/// fail closed.
+#[derive(Debug, Default)]
+pub struct CloudOpsContributor;
+
+impl AssemblyContributor for CloudOpsContributor {
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()> {
+        if !gateway_ops_wanted(
+            inputs.spawn_context.organizational_role,
+            inputs.profile.operations,
+        ) {
+            return Ok(());
+        }
+        if let Err(error) = harw_cloud_ops::register_cloud(&mut parts.operations) {
+            tracing::warn!(%error, "runtime.cloud_operations_not_registered");
+        }
+        Ok(())
+    }
+}
+
+/// Attaches the browser tools (Firefox/geckodriver, WebDriver BiDi) to the
+/// root registry if `[browser].enabled` and `[browser].roles` contain the
+/// `root` role. Children get them per-role in `children.rs` through the same
+/// configuration.
+
 #[cfg(feature = "browser")]
 #[derive(Debug, Default)]
 pub struct BrowserRootContributor;
