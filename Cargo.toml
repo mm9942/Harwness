@@ -17,11 +17,10 @@ members = [
     "harw-tool-explorer",
     "harw-killer",
     "harw-tool-process",
-    # PL-93: typisierte Werkzeuge für häufige Kommandos.
-    "harw-tool-fsread",
-    "harw-tool-sys",
-    "harw-tool-cargo",
     "harw-tool-gitread",
+    "harw-tool-cargo",
+    "harw-tool-sys",
+    "harw-tool-fsread",
     "harw-tool-container",
     "harw-config",
     "harw-home",
@@ -195,7 +194,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 # Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
 # damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
 # ohne Versionsangabe erlaubt).
