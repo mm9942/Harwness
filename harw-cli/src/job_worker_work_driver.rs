@@ -181,9 +181,6 @@ const MAX_OUTCOME_REASON_CHARS: usize = 600;
 /// Höchstlänge einer Worker-Antwort in der Zusammenfassung.
 const WORKER_TEXT_CLIP_CHARS: usize = 2_000;
 
-/// Höchstzahl der `stderr`-Zeilen je fehlgeschlagenem Verifikationsbefehl.
-const FAILING_TAIL_LINES: usize = 5;
-
 /// Kennung des synthetischen Knotens, der Goal-Evidenz in `evaluate_goal` trägt.
 const GOAL_EVIDENCE_NODE: &str = "work-driver-goal-evidence";
 
@@ -1965,17 +1962,14 @@ pub(super) fn report_from_run(run: &VerifyRun) -> VerificationReport {
                 failed_steps = failed_steps.saturating_add(1);
                 failing.push(format!("{label}: {failure}"));
                 if let Some(trace) = &report.trace {
-                    let tail = String::from_utf8_lossy(&trace.stderr_tail);
-                    let lines: Vec<&str> = tail
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect();
-                    let skip = lines.len().saturating_sub(FAILING_TAIL_LINES);
+                    // Compiler-Diagnosen und Test-Fehlschläge aus beiden
+                    // Strömen, mit Pfad — sonst nur das stderr-Ende
+                    // (`super::verify_diagnostics`).
+                    let stdout = String::from_utf8_lossy(&trace.stdout_tail);
+                    let stderr = String::from_utf8_lossy(&trace.stderr_tail);
                     failing.extend(
-                        lines
+                        super::verify_diagnostics::failure_lines(&stdout, &stderr)
                             .into_iter()
-                            .skip(skip)
                             .map(|line| format!("{label}: {line}")),
                     );
                 }
@@ -5031,6 +5025,61 @@ mod tests {
         assert_eq!(report.verdict, VerifyVerdict::Passed);
         assert_eq!(report.evidence.len(), 1);
         assert_eq!(report.evidence[0].locator, cmd);
+    }
+
+    /// Der Panic-Ort steht bei `cargo test` auf stdout; er muss mit Pfad in
+    /// `failing` landen, damit `failing_lines_for` ihn dem Besitzer zuordnet.
+    #[test]
+    fn test_report_from_run_routes_test_failures_from_stdout_with_their_path() {
+        use harw_job_runtime::{EnforcementState, SandboxReport};
+        use harw_plan_bridge::verify_exec::{CommandExit, CommandTrace, StepFailure, StepReport};
+        let cmd = "cargo test -p parser";
+        let stdout = "---- lexer::tests::splits stdout ----\n\
+                      thread 'lexer::tests::splits' panicked at parser/src/lexer.rs:88:9:\n\
+                      assertion failed: ok\n";
+        let run = VerifyRun {
+            steps: vec![StepReport {
+                index: 0,
+                step: VerificationStep::Command {
+                    cmd: cmd.to_owned(),
+                    expect_exit: 0,
+                },
+                outcome: VerifyOutcome::Failed {
+                    failure: StepFailure::ExitMismatch {
+                        expected: 0,
+                        actual: 101,
+                    },
+                    evidence: None,
+                },
+                trace: Some(CommandTrace {
+                    exit: CommandExit::Exited(101),
+                    stdout_tail: stdout.as_bytes().to_vec(),
+                    stderr_tail: b"error: test failed, to rerun pass `-p parser --lib`\n".to_vec(),
+                    truncated: false,
+                    sandbox: SandboxReport::uniform(EnforcementState::Enforced),
+                    material: Vec::new(),
+                }),
+            }],
+            skipped: 0,
+        };
+        let report = report_from_run(&run);
+        assert_eq!(report.verdict, VerifyVerdict::Failed);
+        assert_eq!(report.failed_steps, 1);
+        assert!(
+            report.failing.iter().any(|line| line.contains(
+                "test lexer::tests::splits failed at parser/src/lexer.rs:88:9: assertion failed: ok"
+            )),
+            "{:?}",
+            report.failing
+        );
+        assert!(
+            !report
+                .failing
+                .iter()
+                .any(|line| line.contains("to rerun pass")),
+            "summary lines carry no finding: {:?}",
+            report.failing
+        );
     }
 
     #[test]

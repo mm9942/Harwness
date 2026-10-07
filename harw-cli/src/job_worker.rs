@@ -111,6 +111,9 @@ mod kanban_card;
 #[path = "job_worker_work_driver.rs"]
 mod work_driver_job;
 
+#[path = "job_worker_verify_diagnostics.rs"]
+mod verify_diagnostics;
+
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
 const MAX_REASON_BYTES: usize = 160;
