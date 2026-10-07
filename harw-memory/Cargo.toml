@@ -10,16 +10,16 @@ rust-version.workspace = true
 
 [dependencies]
 harw-types = { path = "../harw-types" }
-# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
+# F-006: symlink-safe opening (correct O_NOFOLLOW per architecture, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tracing = "0.1.44"
 time = { version = "0.3.44", features = ["serde", "formatting", "parsing", "macros"] }
-# AW3-03: Quellenbindung `MemoryContextProvider` liefert `harw_context::Fragment`
-# statt des alten `ContextFragment` (nur label+content). Kein Zyklus:
-# `harw-context` und `harw-extension-api` hängen beide nicht (auch nicht
-# transitiv) von harw-memory ab — geprüft an ihren jeweiligen Cargo.toml.
+# AW3-03: source binding `MemoryContextProvider` delivers `harw_context::Fragment`
+# instead of the old `ContextFragment` (label+content only). No cycle:
+# `harw-context` and `harw-extension-api` both do not depend (not even
+# transitively) on harw-memory — verified in their respective Cargo.toml.
 harw-context = { path = "../harw-context" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-lens-types = { path = "../harw-lens-types" }

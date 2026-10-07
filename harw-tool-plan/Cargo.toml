@@ -8,21 +8,21 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Runde 5, Teil F: Plan-Modus wie in Claude Code — `plan.write`, `plan.exit`,
-# `plan.enter`, `ask_user`, die sofortige Plan-Sperre (`PlanModeGate`) und der
-# angeheftete Plan als Kontextbeitrag. Kein Zyklus: die Crate hängt weder an
-# `harw-core` noch an `harw-runtime`/`harw-tui`; beide hängen an ihr.
+# Round 5, part F: plan mode as in Claude Code — `plan.write`, `plan.exit`,
+# `plan.enter`, `ask_user`, the immediate plan lock (`PlanModeGate`) and the
+# pinned plan as a context contribution. No cycle: the crate depends neither on
+# `harw-core` nor on `harw-runtime`/`harw-tui`; both depend on it.
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
-# Symlinkfestes Öffnen der Plan-Dateien über Verzeichnis-Deskriptoren (O_NOFOLLOW/openat2).
+# Symlink-safe opening of the plan files via directory descriptors (O_NOFOLLOW/openat2).
 harw-fsutil = { path = "../harw-fsutil" }
 harw-home = { path = "../harw-home" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-# Fragekanal zur TUI (mpsc/oneshot) und Wartezeit auf die Entscheidung.
+# Question channel to the TUI (mpsc/oneshot) and wait time for the decision.
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 tracing.workspace = true
 

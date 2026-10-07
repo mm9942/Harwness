@@ -15,37 +15,37 @@ browser = ["harw-registry-defaults/browser"]
 [dependencies]
 harw-explorer = { path = "../harw-explorer" }
 harw-authority = { path = "../harw-authority" }
-# #22 Welle 3A: eingebettete Agenten-Artefakte (`EntryKind::CompiledAgent`,
-# `embedded.rs`) — Bundle, Artifact und ArtifactDigest.
+# #22 Wave 3A: embedded agent artifacts (`EntryKind::CompiledAgent`,
+# `embedded.rs`) — Bundle, Artifact, and ArtifactDigest.
 harw-agent-artifact = { path = "../harw-agent-artifact" }
-# Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
-# genutzt werden, sonst entsteht ein Zyklus.
+# Shared runtime assembly (L12): may only be used by `harw-tui` and `harw-cli`,
+# otherwise a cycle arises.
 harw-agent-dsl = { path = "../harw-agent-dsl" }
-# `AgentSuggestions` steht in der Signatur von `ChildRegistryFactory::build_registry`
-# (harw-core/src/child_controller.rs:393-398); harw-extension-api re-exportiert den
-# Typ nicht (harw-extension-api/src/capabilities.rs:3).
+# `AgentSuggestions` appears in the signature of `ChildRegistryFactory::build_registry`
+# (harw-core/src/child_controller.rs:393-398); harw-extension-api does not re-export
+# the type (harw-extension-api/src/capabilities.rs:3).
 harw-catalog = { path = "../harw-catalog" }
 harw-config = { path = "../harw-config" }
 harw-context = { path = "../harw-context" }
 harw-core = { path = "../harw-core" }
-# `delegate_wave` (Operation + Politik) für die Registries der
-# Orchestrator-Kinder (`children.rs`). Kein Zyklus: `harw-core-bridge` hängt
-# nicht von `harw-runtime` ab (nur harw-authority/-types/-sandbox/-operations/
-# -core/-extension-api/-research und `harw-dod-signals`).
+# `delegate_wave` (operation + policy) for the registries of the
+# orchestrator children (`children.rs`). No cycle: `harw-core-bridge` does not
+# depend on `harw-runtime` (only on harw-authority/-types/-sandbox/-operations/
+# -core/-extension-api/-research and `harw-dod-signals`).
 harw-core-bridge = { path = "../harw-core-bridge" }
 harw-extension-api = { path = "../harw-extension-api" }
-# `handoff.rs` (Agent OPS): symlinkfestes, atomares Schreiben der
-# `handoff.json` (Tempdatei im Zielverzeichnis + `rename`), analog zu
+# `handoff.rs` (Agent OPS): symlink-safe, atomic writing of
+# `handoff.json` (temp file in the target directory + `rename`), analogous to
 # `harw-session-store/src/meta.rs`.
 harw-fsutil = { path = "../harw-fsutil" }
 harw-home = { path = "../harw-home" }
-# Crypto-Infrastruktur H4: `InfrastructureAvailability` aus `[infrastructure]`
-# (`src/infrastructure.rs`), als Dienst auf Slash/Web (`services.rs`). Kein
-# Zyklus: `harw-infra-client` (Schicht I) hängt von keiner harw-Crate ab.
+# Crypto infrastructure H4: `InfrastructureAvailability` from `[infrastructure]`
+# (`src/infrastructure.rs`), as a service on Slash/Web (`services.rs`). No
+# cycle: `harw-infra-client` (layer I) depends on no harw crate.
 harw-infra-client = { path = "../harw-infra-client" }
 harw-job-runtime = { path = "../harw-job-runtime" }
-# L6: `Arc<KnowledgeStore>` für Slash/Modell-Werkzeug (`services.rs`). Kein
-# Zyklus: `harw-knowledge` hängt nicht von `harw-runtime` ab.
+# L6: `Arc<KnowledgeStore>` for the slash command/model tool (`services.rs`). No
+# cycle: `harw-knowledge` does not depend on `harw-runtime`.
 harw-knowledge = { path = "../harw-knowledge" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-macros = { path = "../harw-macros" }
@@ -57,52 +57,52 @@ harw-ops = { path = "../harw-ops" }
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 harw-project-discovery = { path = "../harw-project-discovery" }
-# `SessionEvent`/`TurnEvent` fuer `new_root_session`; harw-core re-exportiert beide
-# nicht (harw-core/src/session.rs:108-109 importiert sie selbst so).
+# `SessionEvent`/`TurnEvent` for `new_root_session`; harw-core re-exports neither
+# (harw-core/src/session.rs:108-109 imports them itself this way).
 harw-protocol = { path = "../harw-protocol" }
 harw-provider-http = { path = "../harw-provider-http" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-secrets = { path = "../harw-secrets" }
 harw-session-store = { path = "../harw-session-store" }
-# Geteilter Host-Permit-Fragekanal (`host_permit_prompt`): `RuntimeAssembly`
-# baut ihn hier, damit `harw-tui` ihn übernimmt statt einen eigenen zu bauen,
-# ohne dass `harw-tool-shell` selbst je von `harw-tui` abhängen müsste.
+# Shared host-permit question channel (`host_permit_prompt`): `RuntimeAssembly`
+# builds it here so that `harw-tui` adopts it instead of building its own,
+# without `harw-tool-shell` itself ever having to depend on `harw-tui`.
 harw-tool-shell = { path = "../harw-tool-shell" }
-# Runde 5, Teil F: Plan-Werkzeuge der Wurzel, Plan-Sperre und angehefteter Plan.
+# Round 5, part F: root plan tools, plan lock, and pinned plan.
 harw-tool-plan = { path = "../harw-tool-plan" }
-# Plan R9, Teil F: Job-Verwaltung je Sitzung (`job.*`), Freigabetext von
-# `job.start` und Zustellung der Job-Ereignisse.
+# Plan R9, part F: per-session job management (`job.*`), approval text of
+# `job.start`, and delivery of job events.
 harw-tool-job = { path = "../harw-tool-job" }
-# R18 D-A: der entfernte Werkzeug-Proxy eines an ein Gateway angebundenen
-# Laufs (`RuntimeAssemblyBuilder::remote_tools`). Kein Zyklus:
-# `harw-tool-remote` hängt nur an harw-protocol/-tools/-extension-api/-types.
+# R18 D-A: the remote tool proxy of a run attached to a gateway
+# (`RuntimeAssemblyBuilder::remote_tools`). No cycle:
+# `harw-tool-remote` depends only on harw-protocol/-tools/-extension-api/-types.
 harw-tool-remote = { path = "../harw-tool-remote" }
 harw-types = { path = "../harw-types" }
-# Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
+# No `[workspace.dependencies]` entry for tokio; version = Cargo.lock.
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time"] }
 harw-mcp-client = { path = "../harw-mcp-client" }
 tracing = { workspace = true }
-# secrecy 0.10 wie harw-provider-http/harw-model-catalog (Version = Cargo.lock)
+# secrecy 0.10 like harw-provider-http/harw-model-catalog (version = Cargo.lock)
 secrecy = "0.10.3"
 serde = { workspace = true }
-# `handoff.rs` (Agent OPS): `SessionHandoff::written_at` über
-# `jiff::Timestamp::now().to_string()` (RFC3339), wie `harw-session-store`.
+# `handoff.rs` (Agent OPS): `SessionHandoff::written_at` via
+# `jiff::Timestamp::now().to_string()` (RFC3339), like `harw-session-store`.
 jiff = { workspace = true }
-# `handoff.rs` (Agent OPS): (De-)Serialisierung von `SessionHandoff` als
-# `handoff.json`. War zuvor nur Dev-Dependency; jetzt auch für den
-# Produktivpfad benötigt.
+# `handoff.rs` (Agent OPS): (de)serialization of `SessionHandoff` as
+# `handoff.json`. Previously only a dev dependency; now also needed for the
+# production path.
 serde_json = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# `tests/remote_tools.rs`: `#[tokio::test]` über den entfernten Proxy und
-# `harw_tools::executor::ExecutionPlacement`/Spezifikationen der Test-Attrappen.
+# `tests/remote_tools.rs`: `#[tokio::test]` over the remote proxy and
+# `harw_tools::executor::ExecutionPlacement`/specifications of the test dummies.
 tokio = { version = "1.53.0", features = ["rt", "macros"] }
 harw-tools = { path = "../harw-tools" }
 # `embedded.rs` tests: `compile_agent(..., now: OffsetDateTime, ...)`
-# (`harw-agent-dsl`), Version wie dort (kein `[workspace.dependencies]`-Eintrag).
+# (`harw-agent-dsl`), version as there (no `[workspace.dependencies]` entry).
 time = "0.3.53"
 
 [lints]

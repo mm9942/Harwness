@@ -10,33 +10,33 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../../../harw-authority" }
-# `BpfLoader`-Trait, `RawBpfEvent`, die wiederverwendbaren Byte-Leser
-# (`read_u32_le`), `FixtureBpfLoader` für Tests ohne Kernel, sowie
-# `BpfProgramSpec`/`BpfProgramKind`/`BpfProgramSource` für die
-# Tracepoint-Entscheidung (siehe `src/lib.rs`).
+# `BpfLoader` trait, `RawBpfEvent`, the reusable byte readers
+# (`read_u32_le`), `FixtureBpfLoader` for tests without a kernel, and
+# `BpfProgramSpec`/`BpfProgramKind`/`BpfProgramSource` for the
+# tracepoint decision (see `src/lib.rs`).
 harw-dod-bpf = { path = "../harw-dod-bpf" }
-# `Capability::LoadBpfProgram` / `CapabilityClass::Bpf` — die eine Fähigkeit
-# dieser Crate.
+# `Capability::LoadBpfProgram` / `CapabilityClass::Bpf` — the one capability
+# of this crate.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# `EventKind::EgressFlow`, `SecurityEvent`, `Actor` — die Meldeform, in die
-# diese Crate ein geparstes `FlowEvent` übersetzt.
+# `EventKind::EgressFlow`, `SecurityEvent`, `Actor` — the reporting shape into
+# which this crate translates a parsed `FlowEvent`.
 harw-dod-signals = { path = "../harw-dod-signals" }
 # `SensorId`.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(HarwError)]` für `FlowError` — kein `anyhow`, kein `thiserror`.
+# `#[derive(HarwError)]` for `FlowError` — no `anyhow`, no `thiserror`.
 harw-macros = { path = "../../../harw-macros" }
-# `NetworkScope::allows_addr` trägt die Melderegel dieser Crate (siehe
-# `src/lib.rs`, Abschnitt „Die Melderegel"). Zulässige Kantenrichtung:
-# `harw-sandbox` hängt selbst an nichts aus dem `harw-dod-*`-Teilbaum (nur
-# `harw-types`, `ipnet`, `serde`) — diese Abhängigkeit schließt also keinen
-# Zyklus.
+# `NetworkScope::allows_addr` carries this crate's reporting rule (see
+# `src/lib.rs`, section "The reporting rule"). Permitted edge direction:
+# `harw-sandbox` itself depends on nothing from the `harw-dod-*` subtree (only
+# `harw-types`, `ipnet`, `serde`) — so this dependency does not close a
+# cycle.
 harw-sandbox = { path = "../../../harw-sandbox" }
-# Zeitachse für den injizierten Beobachtungszeitpunkt.
+# Time axis for the injected observation timestamp.
 jiff = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Zum Bauen von `EgressTarget::Cidr`-Werten in den Tests der Melderegel.
+# For building `EgressTarget::Cidr` values in the reporting-rule tests.
 ipnet = { workspace = true }
 serde_json = { workspace = true }
 

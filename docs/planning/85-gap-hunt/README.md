@@ -1,6 +1,6 @@
 ---
 id: GAP-HUNT
-title: Lückenjagd — wiederverwendbares Kit
+title: Gap hunt — reusable kit
 status: living
 date: 2026-09-27
 tags: [gap-hunt, workflow, reuse, patterns]
@@ -12,66 +12,66 @@ related:
   - ../90-migration-ledger/MIGRATION_LEDGER.md
 ---
 
-# Lückenjagd
+# Gap hunt
 
-Die Lückenjagd ist ein wiederverwendbares Verfahren, mit dem viele kurzlebige
-Agenten Lücken im ganzen Workspace finden, prüfen und beheben, ohne dass ein
-Agent baut. Sie ist aus der Runde R15 entstanden.
+The gap hunt is a reusable procedure in which many short-lived agents find,
+verify and fix gaps across the whole workspace, without any agent building.
+It emerged from round R15.
 
-| Datei | Zweck |
+| File | Purpose |
 |---|---|
-| [patterns.md](patterns.md) | Muster-Katalog (M1–M10, P1–P18). Die Finder taggen Funde damit. |
-| [R15-patterns.md](R15-patterns.md) | Lauf-Protokoll R15: Zahlen, Beobachtungen, Lehren |
-| [kit/workflows/gap-hunt-area.js](kit/workflows/gap-hunt-area.js) | Suchen und Prüfen für einen Bereich, nur lesend |
-| [kit/workflows/gap-fix.js](kit/workflows/gap-fix.js) | Fixen, Reviewen und Reparieren für eine disjunkte Dateimenge, dazu der Cross-File-Check |
-| [kit/workflows/gap-verify.js](kit/workflows/gap-verify.js) | Nachprüfen vorhandener Funde (gestaffelt), optional mit Vollständigkeits-Kritiker; auch für Feldberichte |
-| [kit/workflows/contract-wave.js](kit/workflows/contract-wave.js) | Mehrdatei-Funde je Cluster: Opus-Vertrag, ein Coder pro Datei, Opus-Cluster-Review, Reparatur |
-| [kit/skills/gap-hunt/SKILL.md](kit/skills/gap-hunt/SKILL.md) | Ablauf für die orchestrierende Session |
-| [kit/wave_manifest.py](kit/wave_manifest.py) | Schreibt das unveränderliche Manifest einer Welle nach [waves/](waves/) |
-| [kit/tests/workflow-gates.test.js](kit/tests/workflow-gates.test.js) | Tests der Abschluss-Gates (`node …`, ohne Abhängigkeiten) |
-| [kit/agents/](kit/agents/) | `focused-explorer` (nur lesen) und `focused-coder` (eine Datei, baut nie) |
+| [patterns.md](patterns.md) | Pattern catalog (M1–M10, P1–P18). The finders tag findings with it. |
+| [R15-patterns.md](R15-patterns.md) | Run log R15: numbers, observations, lessons |
+| [kit/workflows/gap-hunt-area.js](kit/workflows/gap-hunt-area.js) | Search and verify for one area, read-only |
+| [kit/workflows/gap-fix.js](kit/workflows/gap-fix.js) | Fix, review and repair for a disjoint set of files, plus the cross-file check |
+| [kit/workflows/gap-verify.js](kit/workflows/gap-verify.js) | Re-verification of existing findings (staged), optionally with a completeness critic; also for field reports |
+| [kit/workflows/contract-wave.js](kit/workflows/contract-wave.js) | Multi-file findings per cluster: Opus contract, one coder per file, Opus cluster review, repair |
+| [kit/skills/gap-hunt/SKILL.md](kit/skills/gap-hunt/SKILL.md) | Procedure for the orchestrating session |
+| [kit/wave_manifest.py](kit/wave_manifest.py) | Writes a wave's immutable manifest to [waves/](waves/) |
+| [kit/tests/workflow-gates.test.js](kit/tests/workflow-gates.test.js) | Tests of the completion gates (`node …`, no dependencies) |
+| [kit/agents/](kit/agents/) | `focused-explorer` (read-only) and `focused-coder` (one file, never builds) |
 
-## Warum dieses Verfahren (Entscheidungen)
-- **Ein Agent pro Datei, niemand baut:**
-  - Parallele Builds füllen die Platte und prüfen Zustände, die es nie gibt.
-  - Siehe die Build-Regel in `CLAUDE.md`.
-- **Nur lesendes Suchen getrennt vom Fixen:** Viele Such-Workflows können
-  gleichzeitig laufen, ohne sich in die Quere zu kommen. Geschrieben wird erst
-  auf disjunkten Dateimengen.
-- **Gestaffelte Prüfung nach Muster und Schwere (P9/P10), Stichentscheid nur
-  bei Uneinigkeit:**
-  - M3 (Doku-Drift): nur intent, der per grep bestätigt.
-  - critical/high: intent und scope; bei M1 zusätzlich „exploit“
-    (Ausnutzbarkeit).
-  - Alles andere: intent und reproduce, scope als Stichentscheid.
-  - `args.verify = 'classic'` schaltet zurück auf reproduce und intent für
-    jeden Fund.
-  - Weil der Host die Parallelität begrenzt (P6), spart das Prüfungen genau
-    dort, wo fast nie verworfen wird.
-  - Jeder Fund trägt `votes` mit Blickwinkel und Urteil, damit P9 weiter
-    gemessen werden kann.
-- **Opus zum Suchen und für kritische Fixes, Sonnet zum Prüfen und für kleine
-  Fixes:**
-  - Die Suche braucht Tiefe.
-  - Das gestaffelte Gegenprüfen fängt Fehlalarme günstig ab.
-- **Parallelschnitt:**
-  - Die Grenze gleichzeitiger Agenten gilt pro Workflow, bei CPUs − 2.
-  - Mehrere Top-Level-Läufe auf getrennten Bereichen nutzen das Kontingent aus,
-    ein einzelner großer Lauf nicht.
-- **Ein Workflow, eine Branch (P11):** Jede Welle arbeitet in einem eigenen
-  git-Worktree auf eigener Branch (`root`-Argument) und committet sofort nach
-  ihrem Review. Eine Integrations-Branch sammelt die Wellen per Merge; nur dort
-  läuft der zentrale Build. Der Haupt-Arbeitsbaum bleibt sauber.
-- **Mehrdatei-Funde als Vertragswelle:** Einzel-Fixer erzeugen sonst
-  Halb-Infrastruktur (P2).
-- **Abschluss nur über harte Gates:** `complete` kommt aus festem Code, nicht
-  aus einem Modellbericht. Ein Ripple-Befund blockiert die Welle, ein Vertrag
-  muss genau die deklarierten Dateien abdecken, und jede gemergte Welle hat
-  ein unveränderliches Manifest in [waves/](waves/).
+## Why this procedure (decisions)
+- **One agent per file, nobody builds:**
+  - Parallel builds fill the disk and check states that never exist.
+  - See the build rule in `CLAUDE.md`.
+- **Read-only search kept separate from fixing:** Many search workflows can
+  run at the same time without getting in each other's way. Writing happens
+  only on disjoint sets of files.
+- **Staged verification by pattern and severity (P9/P10), tie-break only
+  on disagreement:**
+  - M3 (doc drift): intent only, confirmed by grep.
+  - critical/high: intent and scope; for M1 additionally "exploit"
+    (exploitability).
+  - Everything else: intent and reproduce, scope as the tie-break.
+  - `args.verify = 'classic'` switches back to reproduce and intent for
+    every finding.
+  - Because the host limits parallelism (P6), this saves verifications exactly
+    where findings are almost never rejected.
+  - Every finding carries `votes` with perspective and verdict, so that P9 can
+    keep being measured.
+- **Opus for searching and critical fixes, Sonnet for verifying and small
+  fixes:**
+  - The search needs depth.
+  - Staged cross-checking catches false alarms cheaply.
+- **Parallel partitioning:**
+  - The limit on concurrent agents applies per workflow, at CPUs − 2.
+  - Several top-level runs on separate areas use up the quota,
+    a single large run does not.
+- **One workflow, one branch (P11):** Each wave works in its own
+  git worktree on its own branch (`root` argument) and commits right after
+  its review. An integration branch collects the waves by merge; only there
+  does the central build run. The main working tree stays clean.
+- **Multi-file findings as a contract wave:** Individual fixers otherwise
+  produce half-built infrastructure (P2).
+- **Completion only through hard gates:** `complete` comes from fixed code, not
+  from a model report. A ripple finding blocks the wave, a contract
+  must cover exactly the declared files, and every merged wave has
+  an immutable manifest in [waves/](waves/).
 
-## Installation (lokal, nicht versioniert)
-`.claude/` ist per `.gitignore` bewusst nicht Teil des Projekts. Das Kit liegt
-deshalb hier und wird lokal verlinkt:
+## Installation (local, not versioned)
+`.claude/` is deliberately not part of the project, via `.gitignore`. The kit
+therefore lives here and is linked locally:
 
 ```sh
 mkdir -p .claude/workflows .claude/skills .claude/agents
@@ -82,6 +82,6 @@ ln -sf ../../docs/planning/85-gap-hunt/kit/agents/focused-explorer.md .claude/ag
 ln -sf ../../docs/planning/85-gap-hunt/kit/agents/focused-coder.md    .claude/agents/
 ```
 
-Danach lassen sich die Workflows per Name starten, zum Beispiel
-`gap-hunt-area` mit `{key, area, crates, exclude}` oder `gap-fix` mit
+After that, the workflows can be started by name, for example
+`gap-hunt-area` with `{key, area, crates, exclude}` or `gap-fix` with
 `{key, findings}`.

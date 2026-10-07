@@ -9,31 +9,31 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# `ContentDigest`/`InvalidDigest` liegen in der Leaf-Crate `harw-digest`
-# (nur blake3 + serde) und werden hier re-exportiert — damit Crates, die nur
-# den Digest brauchen, nicht `jiff`/`uuid`/`tokio-util` erben (Regel L7).
+# `ContentDigest`/`InvalidDigest` live in the leaf crate `harw-digest`
+# (only blake3 + serde) and are re-exported here, so that crates which only
+# need the digest do not inherit `jiff`/`uuid`/`tokio-util` (rule L7).
 harw-digest = { path = "../harw-digest" }
-# C-APPR: `Clock::now() -> jiff::Timestamp` (Serveruhr, F-122).
+# C-APPR: `Clock::now() -> jiff::Timestamp` (server clock, F-122).
 jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-# `CancelToken` (verschoben aus harw-core, F-160/G-017) wickelt
-# `tokio_util::sync::CancellationToken` — die einzige async-Abhängigkeit
-# dieser sonst reinen Sync-/Datentyp-Crate, bewusst minimal (kein
-# tokio-Runtime-Feature, nur der Cancellation-Primitive).
+# `CancelToken` (moved from harw-core, F-160/G-017) wraps
+# `tokio_util::sync::CancellationToken` — the only async dependency of this
+# otherwise purely sync/data-type crate, deliberately minimal (no tokio
+# runtime feature, only the cancellation primitive).
 tokio-util = "0.7.18"
 
 [dev-dependencies]
-# BEFUND (dieser Auftrag): `harw-core/src/cancel.rs` enthält nicht nur den
-# `tokio_util`-Import, sondern auch `#[tokio::test]`-Funktionen (u. a.
-# `test_cancelled_future_completes_after_cancel`, die `tokio::spawn` nutzt)
-# sowie einen `#[tokio::main(flavor = "current_thread")]`-Doctest im
-# Moduldoc. Beides kompiliert nicht ohne `tokio` selbst — nur `tokio-util`
-# (oben) reicht nicht. Da beides ausschließlich in Tests/Doctests auftritt,
-# genügt `tokio` als Dev-Dependency; Features `rt` + `macros` sind das
-# Minimum, das `#[tokio::test]`, `tokio::spawn` und `#[tokio::main]`
-# brauchen (kein `sync`/`time`, die harw-core nur für andere Module bindet).
+# FINDING (this task): `harw-core/src/cancel.rs` contains not only the
+# `tokio_util` import but also `#[tokio::test]` functions (among them
+# `test_cancelled_future_completes_after_cancel`, which uses `tokio::spawn`)
+# and a `#[tokio::main(flavor = "current_thread")]` doctest in the module
+# doc. Neither compiles without `tokio` itself — `tokio-util` alone (above)
+# is not enough. Since both occur only in tests/doctests, `tokio` as a
+# dev-dependency suffices; the features `rt` + `macros` are the minimum that
+# `#[tokio::test]`, `tokio::spawn`, and `#[tokio::main]` need (no
+# `sync`/`time`, which harw-core binds only for other modules).
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [lints]

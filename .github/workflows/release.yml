@@ -59,9 +59,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
 
-      # Gepinnte Toolchain aus rust-toolchain.toml (wie in ci.yml). Ein
-      # `dtolnay/rust-toolchain@stable` würde hier ins Leere laufen: rustup
-      # nimmt ohnehin die Datei, das Ziel landete dann in der falschen Toolchain.
+      # Pinned toolchain from rust-toolchain.toml (as in ci.yml). A
+      # `dtolnay/rust-toolchain@stable` would come to nothing here: rustup
+      # takes the file anyway, and the target would end up in the wrong toolchain.
       - name: Install pinned Rust (rust-toolchain.toml)
         run: |
           rustup toolchain install

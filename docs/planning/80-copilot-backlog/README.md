@@ -1,6 +1,6 @@
 ---
 id: COPILOT-BACKLOG
-title: Copilot-Backlog (GitHub Copilot Coding Agent, Sonnet)
+title: Copilot backlog (GitHub Copilot coding agent, Sonnet)
 status: open
 tags: [backlog, copilot]
 related:
@@ -9,31 +9,31 @@ related:
   - ../90-migration-ledger/MIGRATION_LEDGER.md
 ---
 
-# Copilot-Backlog
+# Copilot backlog
 
-Kleine, abgeschlossene Aufgaben, die der GitHub-Copilot-Coding-Agent (Modell
-Sonnet) selbständig erledigen kann. Jede Aufgabe wird ein eigenes Issue, das
-Copilot zugewiesen wird. Jedes Issue führt zu einem PR gegen **`dev`**.
+Small, self-contained tasks that the GitHub Copilot coding agent (model
+Sonnet) can complete on its own. Each task becomes its own issue, assigned to
+Copilot. Each issue leads to a PR against **`dev`**.
 
-Regeln für alle Aufgaben: [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md).
-Die Aufgabentexte unten sind auf Englisch und werden als Issue-Text genutzt.
+Rules for all tasks: [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md).
+The task texts below are in English and are used as the issue text.
 
-Reihenfolge: C-01 bis C-05 sind unabhängig voneinander. C-07 setzt voraus,
-dass R14 auf `dev` liegt; C-06 und C-09 sind in R15 erledigt. C-08 ist nur
-ein Vorschlag, kein Code.
+Order: C-01 to C-05 are independent of each other. C-07 requires
+R14 to be on `dev`; C-06 and C-09 are done in R15. C-08 is only
+a proposal, no code.
 
-## Schwerpunkt für Copilot: Branches und README
+## Focus for Copilot: branches and README
 
-Copilot kümmert sich vor allem um Branch-Pflege und die README. Code-Runden
-laufen weiter über den lokalen Orchestrator mit einem zentralen Build.
+Copilot mainly takes care of branch maintenance and the README. Code rounds
+continue to run through the local orchestrator with a single central build.
 
-| ID | Aufgabe |
+| ID | Task |
 | --- | --- |
-| G-01 | `dev` als stabilen Integrationsbranch pflegen: PRs aus Runden gegen `dev`, nur grüne Stände |
-| G-02 | Überholte Stapel-PRs (#25, #26) schließen, sobald ihr Inhalt in `dev` liegt, mit Hinweis „aufgegangen in dev“ |
-| G-03 | Gemergte und verwaiste `claude/*`- und `copilot/*`-Branches auflisten und nach Rückfrage löschen |
-| G-04 | Root-`README.md` aktualisieren (siehe unten) |
-| G-05 | Release-PR `dev` → `main` vorbereiten, wenn ein Stand freigegeben werden soll |
+| G-01 | Maintain `dev` as the stable integration branch: PRs from rounds against `dev`, green states only |
+| G-02 | Close superseded stacked PRs (#25, #26) once their content is in `dev`, with the note "merged into dev" |
+| G-03 | List merged and orphaned `claude/*` and `copilot/*` branches and delete them after confirmation |
+| G-04 | Update the root `README.md` (see below) |
+| G-05 | Prepare the release PR `dev` → `main` when a state is to be released |
 
 ### G-04 — Update the root README.md
 
@@ -57,20 +57,20 @@ beyond what is wrong. No book titles, authors or quotes.
 
 **Done when:** every link resolves and no statement contradicts the code.
 
-## Code-Aufgaben (optional)
+## Code tasks (optional)
 
-| ID | Aufgabe | Umfang |
+| ID | Task | Size |
 | --- | --- | --- |
-| C-01 | Veraltete arch-Ausnahmen entfernen (session-store → job-store) | mittel |
-| C-02 | `webui/lib/generated/operations.ts` neu generieren | klein |
-| C-03 | Architektur-Docs nach R14 nachziehen | klein |
-| C-04 | `HARW-DRIVER-006`: WorkDriver-Werkzeug ohne `[work_driver]` | klein |
-| C-05 | Beispiel `driven-orchestrator` als Test absichern | klein |
-| C-06 | Provider-Pacing-Hook für TPM-Grenzen — erledigt (R15) | mittel |
-| C-07 | Auth-Hub: Test für Verbindungs-Lebensdauer | klein |
-| C-08 | Vorschlag DEC-009: Schreibrechte pro Pfad in der Sandbox | nur Text |
-| C-09 | Sandbox-Verify-Runner für den work driver verdrahten — erledigt (R15) | mittel |
-| C-10 | Vorschlag DEC-010: „Cloud Home“ für flüchtige Container | nur Text |
+| C-01 | Remove expired arch exceptions (session-store → job-store) | medium |
+| C-02 | `webui/lib/generated/operations.ts` regenerate | small |
+| C-03 | Update architecture docs after R14 | small |
+| C-04 | `HARW-DRIVER-006`: WorkDriver tool without `[work_driver]` | small |
+| C-05 | Guard the `driven-orchestrator` example with a test | small |
+| C-06 | Provider pacing hook for TPM limits — done (R15) | medium |
+| C-07 | Auth hub: connection lifetime test | small |
+| C-08 | Proposal DEC-009: path-level write rights in the sandbox | text only |
+| C-09 | Wire a sandboxed verify runner into the work driver — done (R15) | medium |
+| C-10 | Proposal DEC-010: "cloud home" for ephemeral containers | text only |
 
 ---
 
@@ -155,7 +155,7 @@ roles.
 
 ## C-06 — Provider pacing hook for TPM limits (after R14 is on `dev`)
 
-**Status:** erledigt in R15 (`ModelProvider::pacing_wait`, HTTP-Provider über `ProviderRateLimiter`, Pause im Work Driver vor jedem Wellen-Chunk; siehe DEC-003).
+**Status:** done in R15 (`ModelProvider::pacing_wait`, HTTP providers via `ProviderRateLimiter`, pause in the work driver before each wave chunk; see DEC-003).
 
 **Why:** the work driver's job worker can't reach
 `ProviderRateLimiter::pending_wait` / `wait_for_slot`
@@ -206,7 +206,7 @@ links DEC-004, DEC-006 and DEC-007.
 
 ## C-09 — Wire a sandboxed verify runner into the job worker (after R14 is on `dev`)
 
-**Status:** erledigt in R15 (`harw-cli/src/verify_sandbox.rs`, sandboxed Verify-Runner im Work-Driver-Job; ohne Runner bleibt `fallback_verifier`).
+**Status:** done in R15 (`harw-cli/src/verify_sandbox.rs`, sandboxed verify runner in the work driver job; without a runner `fallback_verifier` remains).
 
 **Why:** the work driver job (`harw-cli/src/job_worker_work_driver.rs`) can't
 reach the sandboxed `CoordinatorVerifyRunner`

@@ -10,64 +10,64 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../../../harw-authority" }
-# eBPF-Vokabular: `BpfLoader`-Trait, `BpfProgramSpec`/`BpfProgramKind`/
+# eBPF vocabulary: `BpfLoader` trait, `BpfProgramSpec`/`BpfProgramKind`/
 # `BpfProgramSource`, `BpfHandle`, `RawBpfEvent`, `BpfError`,
-# `fixture::FixtureBpfLoader` (Teil der normalen API, für eigene Tests ohne
-# Kernel, ohne Berechtigung, ohne eBPF-Toolchain).
+# `fixture::FixtureBpfLoader` (part of the regular API, for own tests without
+# a kernel, without privileges, without an eBPF toolchain).
 harw-dod-bpf = { path = "../harw-dod-bpf" }
-# Der alleinige Systemvertrag fuer Profilwahl und Konfigurationsdigest.
-# Die Probe akzeptiert weder eine implizite Home-Suche noch eigene CIDR- oder
-# Scope-Flags; beides wird aus diesem Vertrag abgeleitet.
+# The sole system contract for profile selection and configuration digest.
+# The probe accepts neither an implicit home lookup nor its own CIDR or
+# scope flags; both are derived from this contract.
 harw-dod-config = { path = "../harw-dod-config" }
-# Prozessstart: `procmon_contracts` und der v1-Wire-Parser für Exec/Exit.
+# Process start: `procmon_contracts` and the v1 wire parser for exec/exit.
 harw-dod-procmon = { path = "../harw-dod-procmon" }
-# Verbindungen: `flow_contracts`, der v1-TCP-Parser und die Melderegel
+# Connections: `flow_contracts`, the v1 TCP parser and the reporting rule
 # `to_security_event`.
 harw-dod-flow = { path = "../harw-dod-flow" }
-# Zugriffsvokabular: `Capability`, `CapabilityClass`, `ReadScope`,
+# Access vocabulary: `Capability`, `CapabilityClass`, `ReadScope`,
 # `SensorHandle`, `SensorError`, `Permanence`.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Daten-/Trait-Vokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`.
-# Gebraucht für `sensors::UnavailableSensor` und `collect`.
+# Data/trait vocabulary: `trait Sensor`, `SensorReading`, `SecurityEvent`.
+# Needed for `sensors::UnavailableSensor` and `collect`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# `NetworkScope`/`EgressTarget` — die Melderegel-Eingabe, die
-# `harw_dod_flow::observe` verlangt. Zulässige Kantenrichtung: `harw-sandbox`
-# hängt selbst an nichts aus dem `harw-dod-*`-Teilbaum (nur `harw-types`,
-# `ipnet`, `serde`), diese Abhängigkeit schließt also keinen Zyklus — dieselbe
-# Prüfung, die `harw-dod-flow/Cargo.toml` bereits für sich selbst dokumentiert.
+# `NetworkScope`/`EgressTarget` — the reporting-rule input that
+# `harw_dod_flow::observe` requires. Permitted edge direction: `harw-sandbox`
+# itself depends on nothing from the `harw-dod-*` subtree (only `harw-types`,
+# `ipnet`, `serde`), so this dependency closes no cycle — the same check
+# that `harw-dod-flow/Cargo.toml` already documents for itself.
 harw-sandbox = { path = "../../../harw-sandbox" }
 # `SensorId`.
 harw-types = { path = "../../../harw-types" }
 jiff = { workspace = true }
 tracing = { workspace = true }
-# Version identisch zu `harw-sentinel`/`harw-probe-fs` — ein Sink für
-# `tracing`, keine Zweitwahl je Binary.
+# Version identical to `harw-sentinel`/`harw-probe-fs` — one sink for
+# `tracing`, no second choice per binary.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# `--log`-Grammatik; Version identisch zu `harw-sentinel`/`harw-probe-fs`.
+# `--log` grammar; version identical to `harw-sentinel`/`harw-probe-fs`.
 clap = { version = "4.6.1", features = ["derive"] }
-# `completions`-Unterbefehl (Skriptausgabe und verwaltete Installation).
+# `completions` subcommand (script output and managed installation).
 harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
-# Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature) — dieselbe
-# Fassung, die `harw-sentinel::ipc` für die Empfangsseite dieses exakten
-# Sockets nutzt und `harw-probe-fs::sink` für die Sendeseite ihres eigenen
-# Sockets zum selben Sentinel.
+# Safe `SOCK_SEQPACKET` Unix socket without `unsafe` (`net` feature) — the
+# same variant that `harw-sentinel::ipc` uses for the receiving side of this
+# exact socket and `harw-probe-fs::sink` uses for the sending side of its own
+# socket to the same sentinel.
 rustix = { workspace = true, features = ["net"] }
-# Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
-# verfügbar (dort bislang ungenutzt); direkte Versionsangabe wie bei den
-# anderen Einzel-/Mehrfachkonsumenten dieser Crate im Workspace (z. B.
-# `tikv-jemallocator` nur in `harw-cli/Cargo.toml`). Version 0.4.7 identisch
-# zu `harw-sentinel/Cargo.toml` und `harw-probe-fs/Cargo.toml` übernommen
-# (dort über `docs.rs/crate/landlock` nachgeschlagen) — `cargo add` konnte
-# hier nicht laufen, siehe `src/landlock.rs`-Moduldoku.
+# Safe Landlock binding. **Not** available via `[workspace.dependencies]`
+# (so far unused there); direct version spec like the other single/multiple
+# consumers of this crate in the workspace (e.g. `tikv-jemallocator` only in
+# `harw-cli/Cargo.toml`). Version 0.4.7 taken over identically from
+# `harw-sentinel/Cargo.toml` and `harw-probe-fs/Cargo.toml` (looked up there
+# via `docs.rs/crate/landlock`) — `cargo add` could not run here, see the
+# `src/landlock.rs` module docs.
 landlock = "0.4.7"
-# Wire-Kodierung für `harw_dod_signals::SecurityEvent` auf dem Sendeweg zum
-# Sentinel — derselbe Vertrag, den `harw-sentinel::ipc` auf der Empfangsseite
-# voraussetzt (`#[serde(deny_unknown_fields)]`, kebab-case `EventKind`-Tag).
+# Wire encoding for `harw_dod_signals::SecurityEvent` on the send path to the
+# sentinel — the same contract that `harw-sentinel::ipc` assumes on the
+# receiving side (`#[serde(deny_unknown_fields)]`, kebab-case `EventKind` tag).
 serde_json = { workspace = true }
 ipnet = { workspace = true }
-# Parsen von `--egress-allow-cidr` in `harw_sandbox::EgressTarget::Cidr`.
-# Dieselbe Fassung, die `harw-sandbox` selbst und `harw-dod-flow` (als
-# Dev-Dependency, für seine eigenen Testfixturen) verwenden.
+# Parsing of `--egress-allow-cidr` into `harw_sandbox::EgressTarget::Cidr`.
+# The same variant that `harw-sandbox` itself and `harw-dod-flow` (as a
+# dev-dependency, for its own test fixtures) use.
 
 [dev-dependencies]
 tempfile = { workspace = true }

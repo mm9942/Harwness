@@ -9,76 +9,76 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Der Durchsetzer selbst: `Warden`, `WardenOutcome`, `AuditSink`,
+# The enforcer itself: `Warden`, `WardenOutcome`, `AuditSink`,
 # `CgroupFreezer`/`CgroupReleaser`/`NetworkIsolator`/`ProcessTreeKiller`,
-# `CgroupV2Executor`. Dieses Binary macht die Bibliothek zu einem laufenden
-# Prozess (Knoten AW5-04b) — siehe `src/main.rs`-Moduldoku.
+# `CgroupV2Executor`. This binary turns the library into a running
+# process (node AW5-04b) — see the `src/main.rs` module docs.
 harw-dod-warden = { path = "../harw-dod-warden" }
-# Wire-Vokabular: `WardenActionRequest`, `WardenResponse`,
-# `AuthorizationProof`. `harw-dod-warden` re-exportiert diese Typen selbst
-# NICHT (siehe dessen `lib.rs`, `pub use`-Liste) — dieses Binary braucht sie
-# direkt, um eine empfangene Wire-Nachricht überhaupt zu deserialisieren und
-# an `Warden::handle` zu übergeben.
+# Wire vocabulary: `WardenActionRequest`, `WardenResponse`,
+# `AuthorizationProof`. `harw-dod-warden` does NOT re-export these types
+# itself (see its `lib.rs`, `pub use` list) — this binary needs them
+# directly in order to deserialize a received wire message at all and
+# pass it to `Warden::handle`.
 harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
-# `FindingId` für den eigenen Umschlag dieses Binaries (siehe
-# `src/protocol.rs`-Moduldoku): `WardenActionRequest` trägt bewusst kein
-# eigenes `finding`-Feld (siehe `harw_dod_warden::warden`-Moduldoku,
-# Abschnitt „Die K43-Falle") — dieses Binary muss es deshalb selbst
-# transportieren.
+# `FindingId` for this binary's own envelope (see the
+# `src/protocol.rs` module docs): `WardenActionRequest` deliberately carries no
+# `finding` field of its own (see the `harw_dod_warden::warden` module docs,
+# section "The K43 trap") — this binary must therefore transport it
+# itself.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.
+# `#[derive(harw_macros::HarwError)]` for `src/error.rs` and `src/ipc.rs`.
 harw-macros = { path = "../../../harw-macros" }
 # `harw-warden completions <shell> [--install|--uninstall]`.
 harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
-# Wire-Kodierung des eigenen Umschlags (`src/protocol.rs`) und von
-# `WardenResponse`. Bereits transitiv durch die obige Kette vorhanden
-# (`harw-dod-warden-proto` hängt selbst von `serde`/`serde_json` ab) — kein
-# neues Blatt-Crate.
+# Wire encoding of the own envelope (`src/protocol.rs`) and of
+# `WardenResponse`. Already present transitively through the chain above
+# (`harw-dod-warden-proto` itself depends on `serde`/`serde_json`) — no
+# new leaf crate.
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Version identisch zu `harw-sentinel`/`harw-probe-fs` — ein Sink für
-# `tracing`, keine Zweitwahl je Binary.
+# Version identical to `harw-sentinel`/`harw-probe-fs` — one sink for
+# `tracing`, no second choice per binary.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# `--log`-Grammatik; Version identisch zu den Geschwisterbinaries.
+# `--log` grammar; version identical to the sibling binaries.
 clap = { version = "4.6.1", features = ["derive"] }
-# `accept`, `sockopt::socket_peercred`, `recv`, `send` für den
-# SOCK_SEQPACKET-Empfang auf dem von systemd übergebenen Deskriptor —
-# dieselbe gepinnte Fassung wie `harw-sentinel`/`harw-probe-fs` (`net`-
-# Feature). Jeder hier verwendete Aufruf ist gegen die tatsächlich gepinnte
-# Quelle (`rustix-1.1.4/src/net/`) geprüft, nicht gegen docs.rs oder aus dem
-# Gedächtnis — siehe `src/ipc.rs`-Moduldoku.
+# `accept`, `sockopt::socket_peercred`, `recv`, `send` for
+# SOCK_SEQPACKET reception on the descriptor passed by systemd —
+# the same pinned version as `harw-sentinel`/`harw-probe-fs` (`net`
+# feature). Every call used here is checked against the actually pinned
+# source (`rustix-1.1.4/src/net/`), not against docs.rs or from
+# memory — see the `src/ipc.rs` module docs.
 rustix = { workspace = true, features = ["net"] }
-# Sichere Landlock-Bindung, identisch zu `harw-sentinel`/`harw-probe-fs`
-# (Version 0.4.7, dort über docs.rs/crate/landlock nachgeschlagen — `cargo
-# add` konnte auch hier nicht laufen, siehe Wurzel-Anweisung „Führe KEIN
-# cargo aus"). Anders als bei `harw-sentinel` ist der Ausgang hier hart wie
-# bei `harw-probe-fs` (siehe `src/landlock.rs`-Moduldoku, Abschnitt „Die
-# harte Entscheidung").
+# Safe Landlock binding, identical to `harw-sentinel`/`harw-probe-fs`
+# (version 0.4.7, looked up there via docs.rs/crate/landlock — `cargo
+# add` could not run here either, see the root instruction "Run NO
+# cargo"). Unlike `harw-sentinel`, the outcome here is hard, as with
+# `harw-probe-fs` (see the `src/landlock.rs` module docs, section "The
+# hard decision").
 landlock = "0.4.7"
-# Liest die systemd-Socket-Aktivierungsumgebung und wandelt den übergebenen
-# rohen Deskriptor in einen `std::os::fd::OwnedFd` um — **ohne** `unsafe`
-# auf dieser Seite. Diese Umwandlung (im Kern ein `mem::transmute` einer
-# Ganzzahl in einen Deskriptortyp) ist am eigentlichen FFI-Rand
-# unausweichlich unsicher; `#![forbid(unsafe_code)]` verbietet sie in dieser
-# Crate vollständig, `unsafe_code = "forbid"` im Workspace ebenso. Diese
-# Crate kapselt genau diesen einen `unsafe`-Block selbst (Quelle in
-# `src/systemd.rs`-Moduldoku zitiert) und hat laut eigener Beschreibung
-# **keine einzige** weitere Abhängigkeit — das kleinste denkbare Blatt für
-# dieses eine Problem, ein besserer Tausch als selbst `unsafe` zu schreiben
-# oder eine schwerere Mehrzweck-Crate (`listenfd`) zu ziehen. Version 0.2.0
-# über die crates.io/docs.rs-Seite nachgeschlagen (`cargo add`/`cargo
-# search` konnten hier nicht laufen). Diese Crate prüft `LISTEN_PID` bereits
-# selbst intern gegen die eigene Prozess-ID — `src/systemd.rs` verlässt sich
-# darauf trotzdem nicht allein, sondern führt dieselbe Prüfung zusätzlich
-# selbst, testbar, aus (siehe dortige Moduldoku).
+# Reads the systemd socket activation environment and converts the passed
+# raw descriptor into a `std::os::fd::OwnedFd` — **without** `unsafe`
+# on this side. This conversion (at its core a `mem::transmute` of an
+# integer into a descriptor type) is unavoidably unsafe at the actual FFI
+# boundary; `#![forbid(unsafe_code)]` forbids it entirely in this
+# crate, and `unsafe_code = "forbid"` in the workspace does too. That
+# crate encapsulates exactly this one `unsafe` block itself (source cited in
+# the `src/systemd.rs` module docs) and, by its own description, has
+# **no** further dependency at all — the smallest conceivable leaf for
+# this one problem, a better trade than writing `unsafe` ourselves
+# or pulling in a heavier general-purpose crate (`listenfd`). Version 0.2.0
+# looked up on the crates.io/docs.rs page (`cargo add`/`cargo
+# search` could not run here). That crate already checks `LISTEN_PID`
+# internally against its own process ID — `src/systemd.rs` nevertheless does
+# not rely on that alone, but additionally performs the same check
+# itself, testably (see the module docs there).
 sd-listen-fds = "0.2.0"
 
 [dev-dependencies]
-# Nur für Tests, die einen vollständigen `AuthorizationProof` bauen (verlangt
-# einen `jiff::Timestamp`) — derselbe Grund wie bei `harw-dod-warden`s
-# eigener Testsuite. Reine Dev-Dependency, zählt nicht gegen das
-# Laufzeit-Abhängigkeitsbudget (K53).
+# Only for tests that build a complete `AuthorizationProof` (requires
+# a `jiff::Timestamp`) — the same reason as in `harw-dod-warden`'s
+# own test suite. Pure dev-dependency, does not count against the
+# runtime dependency budget (K53).
 jiff = { workspace = true }
 
 [lints]

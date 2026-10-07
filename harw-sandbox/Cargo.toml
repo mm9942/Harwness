@@ -9,27 +9,27 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Drop-Guard `SandboxChild` (W5 N-SBX) protokolliert Kill/Wait-Fehler.
+# Drop guard `SandboxChild` (W5 N-SBX) logs kill/wait errors.
 tracing = { workspace = true }
 harw-authority = { path = "../harw-authority" }
-# W0B-04: WHATWG-URL-Parsing für `egress::EgressUrl` — derselbe Parser wie
-# in reqwest, damit geprüfter und verbundener Host nie auseinanderlaufen.
+# W0B-04: WHATWG URL parsing for `egress::EgressUrl` — the same parser as
+# in reqwest, so that the checked and the connected host never diverge.
 url = "2.5.8"
-# `SandboxChild::wait_or_cancel` racet nicht-blockierendes `try_wait`-Polling
-# gegen `harw_types::cancel::CancelToken` (Plan „Welle 3 — 3c“, Nachzieh-Task,
-# analog zu shell.exec in harw-tool-shell). Nur `CancelToken` selbst wird
-# gebraucht, nicht dessen Sync-Aufbau, daher weiterhin keine Authority-Typen
-# re-exportiert (siehe `harw-sandbox/src/lib.rs`-Doku).
+# `SandboxChild::wait_or_cancel` races non-blocking `try_wait` polling
+# against `harw_types::cancel::CancelToken` (plan "Wave 3 — 3c", follow-up task,
+# analogous to shell.exec in harw-tool-shell). Only `CancelToken` itself is
+# needed, not its sync machinery, hence still no authority types
+# re-exported (see the `harw-sandbox/src/lib.rs` docs).
 harw-types = { path = "../harw-types" }
-# Nur `time` für `tokio::time::sleep` im Poll-Intervall; `tokio::select!` ist
-# featurelos. `process`/`rt` werden hier nicht gebraucht, da `SandboxChild`
-# weiterhin `std::process::Child` (kein `tokio::process::Child`) hält.
-# Version/Feature-Stil wie in harw-tool-shell/Cargo.toml.
+# Only `time` for `tokio::time::sleep` in the poll interval; `tokio::select!` is
+# featureless. `process`/`rt` are not needed here, since `SandboxChild`
+# still holds `std::process::Child` (not `tokio::process::Child`).
+# Version/feature style as in harw-tool-shell/Cargo.toml.
 tokio = { version = "1", features = ["macros", "time"] }
 
 [dev-dependencies]
-# `#[tokio::test]` für die neuen `wait_or_cancel`-Tests braucht zusätzlich
-# `rt` + `macros` (identisch zu harw-tool-shell/Cargo.toml).
+# `#[tokio::test]` for the new `wait_or_cancel` tests additionally needs
+# `rt` + `macros` (identical to harw-tool-shell/Cargo.toml).
 tokio = { version = "1", features = ["time", "rt", "macros"] }
 
 [lints]

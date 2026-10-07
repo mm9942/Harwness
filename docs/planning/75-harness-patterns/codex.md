@@ -11,14 +11,14 @@ related:
   - ../70-decisions/DEC-003-provider-limits.md
 ---
 
-> Recherche-Workflow `codex-harw-research`, nur lesend:
-> - 3 Sonnet-Rechercheure mit 58 belegten Fakten; Quelle ist vor allem
->   `openai/codex` `main` (`codex-rs`), abgerufen am 2026-09-27, teils Commit
->   `88235f8`, dazu developers.openai.com.
-> - Danach ein Mapping-Agent, der gegen den harw-Code abgeglichen hat.
+> Research workflow `codex-harw-research`, read-only:
+> - 3 Sonnet researchers with 58 sourced facts; the source is mainly
+>   `openai/codex` `main` (`codex-rs`), fetched on 2026-09-27, partly commit
+>   `88235f8`, plus developers.openai.com.
+> - Then a mapping agent that cross-checked against the harw code.
 >
-> Codex erscheint fast täglich neu: Jede Aussage zu Wire-Details braucht einen
-> „geprüft gegen Commit X“-Vermerk und regelmäßige Nachprüfung.
+> Codex ships new releases almost daily: every statement about wire details needs a
+> "verified against commit X" note and regular re-verification.
 
 # Codex → harw Provider Mapping (synthesis)
 

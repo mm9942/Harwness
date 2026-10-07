@@ -9,61 +9,60 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Formungsteil, `FsEventSource`/`FixtureFsEventSource`, `FsMonSensor`.
+# Shaping part, `FsEventSource`/`FixtureFsEventSource`, `FsMonSensor`.
 harw-dod-fsmon = { path = "../harw-dod-fsmon" }
-# Zugriffsvokabular: `Capability`, `ReadScope`, `SensorHandle`.
+# Access vocabulary: `Capability`, `ReadScope`, `SensorHandle`.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular: `SecurityEvent`, `trait Sensor`.
+# Data vocabulary: `SecurityEvent`, `trait Sensor`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Kennungen: `SensorId`.
+# Identifiers: `SensorId`.
 harw-types = { path = "../../../harw-types" }
 jiff = { workspace = true }
 tracing = { workspace = true }
-# Version identisch zu `harw-cli`/`harw-sentinel` — ein Sink für `tracing`,
-# keine Zweitwahl je Binary.
+# Version identical to `harw-cli`/`harw-sentinel` — one sink for `tracing`,
+# no second choice per binary.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# `--log`-Grammatik; Version identisch zu `harw-cli`/`harw-sentinel`.
+# `--log` grammar; version identical to `harw-cli`/`harw-sentinel`.
 clap = { version = "4.6.1", features = ["derive"] }
-# `completions`-Unterbefehl (Skriptausgabe und verwaltete Installation).
+# `completions` subcommand (script output and managed installation).
 harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
-# Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature). Das
-# `event`-Feature liefert `rustix::event::poll`, mit dem `src/source.rs` den
-# `timeout`-Parameter von `FsEventSource::read_events` gegen den echten
-# fanotify-Deskriptor durchsetzt, statt ihn zu ignorieren.
+# Safe `SOCK_SEQPACKET` Unix socket without `unsafe` (`net` feature). The
+# `event` feature provides `rustix::event::poll`, with which `src/source.rs`
+# enforces the `timeout` parameter of `FsEventSource::read_events` against the
+# real fanotify descriptor instead of ignoring it.
 rustix = { workspace = true, features = ["net", "event"] }
-# Liefert `nix::sys::fanotify` — die sichere fanotify-Bindung, die `rustix`
-# 1.1.4 (siehe `[workspace.dependencies]`) nicht hat: dort stehen
-# `fanotify_init`/`fanotify_mark` in `src/not_implemented.rs` (Modul `yet`),
-# ohne jede Hülle. Fassung 0.31.3 laut `crates.io`-API zum Recherchezeitpunkt
-# dieses Knotens die aktuelle stabile Fassung (`max_stable_version` ==
-# `newest_version`); das `fanotify`-Modul selbst kam mit nix 0.28.0
+# Provides `nix::sys::fanotify` — the safe fanotify binding that `rustix`
+# 1.1.4 (see `[workspace.dependencies]`) lacks: there, `fanotify_init`/
+# `fanotify_mark` sit in `src/not_implemented.rs` (module `yet`), without any
+# wrapper. Version 0.31.3 was the current stable version according to the
+# `crates.io` API at the time this node was researched (`max_stable_version`
+# == `newest_version`); the `fanotify` module itself arrived with nix 0.28.0
 # (CHANGELOG.md: "Added new fanotify API: wrappers for `fanotify_init` and
-# `fanotify_mark`", #2194) und übernahm mit 0.30.0 I/O-Sicherheit
-# (`BorrowedFd`/`OwnedFd` statt roher `RawFd`, CHANGELOG.md #2443/#2575).
-# `default-features = false`, weil ausschließlich das `fanotify`-Modul
-# gebraucht wird — laut `Cargo.toml` der Crate ist `fanotify = []` eine
-# eigenständige Feature ohne weitere Abhängigkeiten (die von `fanotify.rs`
-# genutzten Module `errno`, `fcntl`, `unistd` sind in `nix` unbedingt
-# kompiliert, nicht hinter einem eigenen Feature). Jede Funktion, die dieser
-# Knoten aus `nix::sys::fanotify` aufruft (`Fanotify::init`, `Fanotify::mark`,
-# `Fanotify::read_events`, `FanotifyEvent::{mask,fd,pid,check_version}`), ist
-# laut dem auf GitHub (`nix-rust/nix`, Tag `v0.31.3`,
-# `src/sys/fanotify.rs`) nachgelesenen Quelltext eine gewöhnliche sichere
-# Funktion — jedes `unsafe` darin (z. B. `BorrowedFd::borrow_raw`) ist internes
-# Detail der `nix`-Crate, nicht dieser.
+# `fanotify_mark`", #2194) and adopted I/O safety with 0.30.0
+# (`BorrowedFd`/`OwnedFd` instead of raw `RawFd`, CHANGELOG.md #2443/#2575).
+# `default-features = false`, because only the `fanotify` module is needed —
+# according to the crate's `Cargo.toml`, `fanotify = []` is a standalone
+# feature with no further dependencies (the modules `errno`, `fcntl`, `unistd`
+# used by `fanotify.rs` are compiled unconditionally in `nix`, not behind a
+# feature of their own). Every function this node calls from
+# `nix::sys::fanotify` (`Fanotify::init`, `Fanotify::mark`,
+# `Fanotify::read_events`, `FanotifyEvent::{mask,fd,pid,check_version}`) is,
+# according to the source read on GitHub (`nix-rust/nix`, tag `v0.31.3`,
+# `src/sys/fanotify.rs`), an ordinary safe function — any `unsafe` in them
+# (e.g. `BorrowedFd::borrow_raw`) is an internal detail of the `nix` crate,
+# not of this one.
 nix = { version = "0.31", default-features = false, features = ["fanotify"] }
-# Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
-# verfügbar (dort bislang ungenutzt) und diese Crate ist eine von zwei
-# Konsumentinnen — direkte Versionsangabe statt Workspace-Umweg, wie es
-# dieser Workspace auch für andere Einzel-/Doppelkonsumenten hält (z. B.
-# `tikv-jemallocator` nur in `harw-cli/Cargo.toml`). Version 0.4.7 identisch
-# zu `harw-sentinel/Cargo.toml` übernommen (dort über `docs.rs/crate/landlock`
-# nachgeschlagen) — `cargo add` konnte hier nicht laufen, siehe
-# `src/landlock.rs`-Moduldoku.
+# Safe Landlock binding. **Not** available via `[workspace.dependencies]`
+# (so far unused there) and this crate is one of two consumers — a direct
+# version specification instead of a workspace detour, as this workspace also
+# does for other single/double consumers (e.g. `tikv-jemallocator` only in
+# `harw-cli/Cargo.toml`). Version 0.4.7 taken over identically from
+# `harw-sentinel/Cargo.toml` (looked up there via `docs.rs/crate/landlock`) —
+# `cargo add` could not run here, see the `src/landlock.rs` module docs.
 landlock = "0.4.7"
-# Wire-Kodierung für `harw_dod_signals::SecurityEvent` auf dem Sendeweg zum
-# Sentinel — derselbe Vertrag, den `harw-sentinel::ipc` auf der Empfangsseite
-# voraussetzt (`#[serde(deny_unknown_fields)]`, kebab-case `EventKind`-Tag).
+# Wire encoding for `harw_dod_signals::SecurityEvent` on the send path to the
+# sentinel — the same contract that `harw-sentinel::ipc` assumes on the
+# receiving side (`#[serde(deny_unknown_fields)]`, kebab-case `EventKind` tag).
 serde_json = { workspace = true }
 
 [dev-dependencies]

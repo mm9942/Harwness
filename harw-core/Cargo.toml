@@ -36,9 +36,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
-# Zufallsquelle für frische Span-IDs beim Trace-Handoff an ein Kind
-# (AW1-01b). Version/Feature-Zeile identisch zu `harw-types`, das dieselbe
-# Crate für seine ID-Newtypes bindet — keine neue, unabgestimmte Version.
+# Randomness source for fresh span IDs on trace handoff to a child
+# (AW1-01b). Version/feature line identical to `harw-types`, which binds the same
+# crate for its ID newtypes — no new, uncoordinated version.
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1.44"
 

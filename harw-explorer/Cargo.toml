@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Universeller, projektunabhängiger Explorer: durchsucht den gesamten Baum ab einer Wurzel und erkennt Projekte, Dateitypen und Relationen."
+description = "Universal, project-independent explorer: searches the whole tree from a root and detects projects, file types and relations."
 
 [dependencies]
 ignore = "0.4.32"

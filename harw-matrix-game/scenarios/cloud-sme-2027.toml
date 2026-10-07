@@ -1,5 +1,5 @@
-# Business-Beispielszenario aus docs/design/wargaming-and-analysis.md §1.9 (fiktiv).
-# Gamebooks (`gamebook/*.md`) sind Teil des Szenario-Pakets und hier nicht enthalten.
+# Business example scenario from docs/design/wargaming-and-analysis.md §1.9 (fictional).
+# Gamebooks (`gamebook/*.md`) are part of the scenario package and not included here.
 schema = "harwness.matrix-scenario/v1"
 id = "cloud-sme-2027"
 title = "KMU-Cloud: Markteintritt eines Hyperscalers"
@@ -9,9 +9,9 @@ language = "de"
 
 [game]
 moves = 3
-# simulierte Zeit je Zug (Zug 3 = Foresight)
+# simulated time per move (move 3 = foresight)
 move_labels = ["2027 – Markteintritt", "2028 – Positionierung", "2031 – Verfestigung"]
-phase_deadline_turns = 6          # max. Agenten-Turns je Phase und Team
+phase_deadline_turns = 6          # max. agent turns per phase and team
 max_channel_messages_per_move = 12
 
 [[game.key_questions]]
@@ -41,7 +41,7 @@ kpis = ["share", "revenue", "contribution_margin", "ebit", "cash"]
 [[business.segments]]
 id = "sme"
 name = "KMU (10–249 MA)"
-size_meur = [800, 950, 1300]      # je Zug
+size_meur = [800, 950, 1300]      # per move
 price_sensitivity = 0.8
 [[business.segments]]
 id = "enterprise"
@@ -103,8 +103,8 @@ played_by = "gamemaster"
 profile = "Sucht exklusiven Plattformpartner; verlangt 20 % Marge und Leadschutz."
 
 [channels]
-pairwise = "all_players"          # private Paarkanäle zwischen allen Teams
-observer = "gamemaster"           # GM liest jeden Kanal mit (cc Control)
+pairwise = "all_players"          # private pairwise channels between all teams
+observer = "gamemaster"           # GM reads every channel (cc Control)
 market_contact = "sales_call_only"
 
 [[business.disclosure]]
@@ -115,7 +115,7 @@ template = "{a} und {b} verkünden eine Partnerschaft: {summary}"
 [[business.disclosure]]
 on = "price_change"
 audience = "all"
-delay_phases = 1                  # Listenpreise sind nach einer Phase öffentlich
+delay_phases = 1                  # list prices become public after one phase
 
 [[injects]]
 id = "INJ-1"
@@ -149,9 +149,9 @@ counter_approach_taxonomy = true
 export_indicators = true
 endex_release = "public_aar_only"
 
-# Optional: Unterlagen, die Sitze lesend einsehen dürfen (relativ zu dieser
-# Datei, absolut oder mit ~). Layout unter dir: geteilt/ (alle Sitze),
-# <sitz-id>/ (nur dieser Sitz), paare/<a>+<b>/ (nur a und b, alphabetisch),
-# umpire/ (nur Schiedsrichter; er sieht alles).
+# Optional: materials that seats may view read-only (relative to this
+# file, absolute or with ~). Layout below dir: geteilt/ (all seats),
+# <sitz-id>/ (this seat only), paare/<a>+<b>/ (a and b only, alphabetical),
+# umpire/ (umpire only; sees everything).
 # [materials]
 # dir = "unterlagen"

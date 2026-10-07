@@ -9,30 +9,30 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: Capability, ReadScope, SensorError, SensorHandle<Bound>.
+# Access vocabulary: Capability, ReadScope, SensorError, SensorHandle<Bound>.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular (HostSample) und der eine `trait Sensor`, den diese Crate
-# implementiert.
+# Data vocabulary (HostSample) and the one `trait Sensor` that this crate
+# implements.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die einzige Dateisystem-Naht: `read_first_line`, `parse_i64`, `glob::glob`.
-# Kein `std::fs` in dieser Crate (siehe `src/sensor.rs`-Moduldoku).
+# The only filesystem seam: `read_first_line`, `parse_i64`, `glob::glob`.
+# No `std::fs` in this crate (see the `src/sensor.rs` module docs).
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# `SensorId` für den Sensor-Griff.
+# `SensorId` for the sensor handle.
 harw-types = { path = "../../../harw-types" }
-# Laut AW2-07-Brief verbindliche Abhängigkeit jeder Sensor-Crate. Aktuell
-# ungenutzt: `Sensor` ist von Hand implementiert statt über
-# `#[derive(harw_macros::SensorSource)]` (Begründung: `src/lib.rs`-Moduldoku,
-# Abschnitt „Warum kein `#[derive(SensorSource)]`"), und `metrics!` bräuchte
-# zusätzlich `harw-observe`, das nicht im Abhängigkeitsumfang dieses Knotens
-# liegt. Vorbild für dieses Muster (verbindliche, aktuell ungenutzte
-# Abhängigkeit mit Begründungskommentar): `harw-dod-signals/Cargo.toml`
+# Mandatory dependency of every sensor crate per the AW2-07 brief. Currently
+# unused: `Sensor` is implemented by hand instead of via
+# `#[derive(harw_macros::SensorSource)]` (rationale: `src/lib.rs` module docs,
+# section "Why no `#[derive(SensorSource)]`"), and `metrics!` would
+# additionally need `harw-observe`, which is not within the dependency scope
+# of this node. Model for this pattern (mandatory, currently unused
+# dependency with an explanatory comment): `harw-dod-signals/Cargo.toml`
 # (`harw-observe`).
 harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 
 [dev-dependencies]
-# `sensor_suite!` — die geerbte Fixture-Testsuite (sechs Pflichtprüfungen
-# plus optionale Adversarial-Prüfung).
+# `sensor_suite!` — the inherited fixture test suite (six mandatory checks
+# plus an optional adversarial check).
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
 

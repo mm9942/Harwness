@@ -10,29 +10,29 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
-# W5 N-WEB: HTTP-Client und Egress-Policy ausschließlich aus harw-egress
-# (Scoped-Resolver, Adressklassen, keine Auto-Redirects, kein Proxy).
+# W5 N-WEB: HTTP client and egress policy exclusively from harw-egress
+# (scoped resolver, address classes, no auto-redirects, no proxy).
 harw-egress = { path = "../harw-egress" }
-# Symlinkfestes Lesen/Schreiben des Antwort-Caches (0600, Eigentümerprüfung).
+# Symlink-safe reading/writing of the response cache (0600, owner check).
 harw-fsutil = { path = "../harw-fsutil" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-macros = { path = "../harw-macros" }
 harw-sandbox = { path = "../harw-sandbox" }
-# PDF-Antworten von `web.fetch` werden lokal zu Text extrahiert (oxidize-pdf).
+# PDF responses from `web.fetch` are extracted to text locally (oxidize-pdf).
 harw-tool-doc = { path = "../harw-tool-doc" }
 harw-tools = { path = "../harw-tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Cache-Schlüssel und Scope-Digest (Cargo.lock: blake3 1.8.7).
+# Cache key and scope digest (Cargo.lock: blake3 1.8.7).
 blake3 = { workspace = true }
-# Identischer Feature-Satz wie harw-egress/harw-core (Cargo.lock: reqwest 0.12.28);
-# eine abweichende Konfiguration ergäbe einen inkompatiblen `Client`-Typ.
+# Identical feature set as harw-egress/harw-core (Cargo.lock: reqwest 0.12.28);
+# a differing configuration would yield an incompatible `Client` type.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
-# `rt`: `spawn_blocking` für Parsen und Cache-I/O; `time`: Gesamt-Deadline.
+# `rt`: `spawn_blocking` for parsing and cache I/O; `time`: overall deadline.
 tokio = { version = "1", features = ["rt", "time"] }
 tracing = "0.1.44"
-# Versionen aus Cargo.lock (scraper 0.23.1, htmd 0.2.2); einzige Berührungspunkte
-# sind `crate::html` und `crate::docs_rs::extract_main_content`.
+# Versions from Cargo.lock (scraper 0.23.1, htmd 0.2.2); the only touchpoints
+# are `crate::html` and `crate::docs_rs::extract_main_content`.
 scraper = "0.23.1"
 htmd = "0.2.2"
 

@@ -1,6 +1,6 @@
 ---
 id: HP-GW
-title: Vertrag harw ↔ eigener Cloudflare-Worker vor Workers AI
+title: Contract between harw and a dedicated Cloudflare Worker in front of Workers AI
 status: draft
 date: 2026-09-27
 tags: [harness-patterns, gateway, workers-ai, cache, placement]
@@ -10,70 +10,70 @@ related:
   - ../70-decisions/DEC-003-provider-limits.md
 ---
 
-# Vertrag: harw ↔ eigener Cloudflare-Worker vor Workers AI
+# Contract: harw ↔ dedicated Cloudflare Worker in front of Workers AI
 
-## Voraussetzung
-Im Betrieb setzt harw einen **eigenen Cloudflare-Worker** vor Workers AI
-voraus. Er ist die untere Stufe des Placements:
-- Er hält eine oder mehrere Workers-AI-Bindings (Lanes).
-- Er verteilt die Anfragen darauf.
-- Er leitet die Session-Affinität selbst ab.
+## Prerequisite
+In production, harw requires a **dedicated Cloudflare Worker** in front of
+Workers AI. It is the lower tier of placement:
+- It holds one or more Workers AI bindings (lanes).
+- It distributes requests across them.
+- It derives session affinity itself.
 
-harw modelliert die einzelnen Bindings **nicht**. Für harw ist der Worker
-**ein** Provider mit Kapazität.
+harw does **not** model the individual bindings. To harw, the Worker is
+**one** provider with capacity.
 
-Konto-, Binding- und Worker-Namen stehen nicht im Repo.
+Account, binding, and Worker names are not kept in the repo.
 
-## Zweistufiges Placement
-1. **harw** (Placement-Engine) wählt:
-   - den Provider, also diesen Worker;
-   - Modell und Rolle;
-   - die Präfix-Gruppe.
-2. **Der Worker** wählt Binding bzw. Lane und Affinität, die „sticky“ bleibt,
-   und ruft Workers AI auf.
+## Two-tier placement
+1. **harw** (placement engine) chooses:
+   - the provider, i.e. this Worker;
+   - model and role;
+   - the prefix group.
+2. **The Worker** chooses the binding or lane and an affinity that stays
+   "sticky", and calls Workers AI.
 
-## Anfrage (harw → Worker)
-- **API:** OpenAI-Chat-kompatibel (`api = "openai-chat"`).
-- **Konfiguration:**
-  - `base_url` zeigt auf den Worker.
+## Request (harw → Worker)
+- **API:** OpenAI-chat-compatible (`api = "openai-chat"`).
+- **Configuration:**
+  - `base_url` points to the Worker.
   - `gateway_identity_headers = true`.
-- **Header**, gesetzt nur bei gesetzter `RequestIdentity`, auf sichtbares ASCII
-  gekürzt, maximal 64 Zeichen:
-  - `x-harw-session`: Wurzel-Session des Agentenbaums.
-  - `x-harw-agent`: ID des Agenten.
-  - `x-harw-role`: Rolle, z. B. `root-orchestrator` oder `worker`.
-- **`x-session-affinity`** setzt harw bewusst **nie**. Der Worker leitet ihn
-  selbst ab. Quelle: `harw-provider-http/src/lib.rs`, `identity_headers`.
-- **Kapazität auf harw-Seite (DEC-003):**
-  - `max_concurrency` begrenzt die Parallelität.
-  - `[rate_limit]` bildet RPM und TPM ab.
-  - Frontier-Modelle bei Workers AI: 20 Anfragen pro Minute pro Modell und
-    Konto mit Standard-Abrechnung, 50 mit AI-Gateway-Credits.
+- **Headers**, set only when a `RequestIdentity` is present, truncated to
+  visible ASCII, at most 64 characters:
+  - `x-harw-session`: root session of the agent tree.
+  - `x-harw-agent`: ID of the agent.
+  - `x-harw-role`: role, e.g. `root-orchestrator` or `worker`.
+- harw deliberately **never** sets **`x-session-affinity`**. The Worker
+  derives it itself. Source: `harw-provider-http/src/lib.rs`,
+  `identity_headers`.
+- **Capacity on the harw side (DEC-003):**
+  - `max_concurrency` limits parallelism.
+  - `[rate_limit]` models RPM and TPM.
+  - Frontier models on Workers AI: 20 requests per minute per model and
+    account with standard billing, 50 with AI Gateway credits.
 
-## Antwort (Worker → harw)
-- **Format:** OpenAI-Chat, mit `usage`.
-- **Cache-Tokens:** Gecachte Input-Tokens werden als eigene Zahl gemeldet.
-  Nur so kann harw die Kosten richtig rechnen, siehe Kostenmodell.
-- **429:** mit `Retry-After`. harw pausiert dann und zählt den Versuch nicht.
+## Response (Worker → harw)
+- **Format:** OpenAI chat, with `usage`.
+- **Cache tokens:** Cached input tokens are reported as a separate number.
+  Only then can harw compute costs correctly, see the cost model.
+- **429:** with `Retry-After`. harw then pauses and does not count the attempt.
 
-## Geplante Erweiterungen (optional, abwärtskompatibel)
-- **`x-harw-cache-affinity`** (Anfrage):
-  - Benennt die **Präfix-Gruppe**, z. B. `session/rolle/präfix-hash`.
-  - Kurzlebige Worker mit gleichem Präfix, also gleichem Systemprompt, gleichen
-    Tools und gleichem Repo-Kontext, landen dadurch auf derselben Instanz, und
-    der Cache bleibt warm.
-  - Ist der Header nicht gesetzt, fällt der Worker auf Session plus Agent zurück.
-  - Gesetzt wird er von der Placement-Engine bzw. vom Work-Driver.
-- **`x-harw-lane` und `x-harw-affinity`** (Antwort): Sie melden, welche Lane
-  und welcher Affinitätsschlüssel benutzt wurden. Das dient der Beobachtung,
-  weil Logpush nicht in jedem Konto verfügbar ist.
-- **Kapazitätssignale** (Antwort, optional): Restkontingent und Reset-Zeit, in
-  denselben Header-Familien, die `ProviderRateLimiter` schon liest.
+## Planned extensions (optional, backward-compatible)
+- **`x-harw-cache-affinity`** (request):
+  - Names the **prefix group**, e.g. `session/role/prefix-hash`.
+  - Short-lived workers with the same prefix, i.e. the same system prompt,
+    the same tools, and the same repo context, thereby land on the same
+    instance, and the cache stays warm.
+  - If the header is not set, the Worker falls back to session plus agent.
+  - It is set by the placement engine or the work driver.
+- **`x-harw-lane` and `x-harw-affinity`** (response): They report which lane
+  and which affinity key were used. This is for observability, since Logpush
+  is not available in every account.
+- **Capacity signals** (response, optional): remaining quota and reset time,
+  in the same header families that `ProviderRateLimiter` already reads.
 
-## Warum so (Muster)
-- **Die Cache-Affinität folgt dem Präfix, nicht der Identität.** Bei
-  cache-lastigen Workloads (etwa 98 % Cache-Reads) entscheidet der Preis für
-  Cache-Read über die Kosten. Einen kalten Start zahlt jeder Worker zum vollen
-  Input-Preis.
-- **Kosten und Usage kommen aus harw selbst** (Usage pro Antwort, Kosten-Status)
-  und nicht aus Logpush.
+## Why this way (patterns)
+- **Cache affinity follows the prefix, not the identity.** For cache-heavy
+  workloads (around 98% cache reads), the cache-read price determines the
+  cost. Every worker pays the full input price for a cold start.
+- **Costs and usage come from harw itself** (usage per response, cost status)
+  and not from Logpush.

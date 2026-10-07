@@ -64,7 +64,7 @@ HARW
 └── applications
 ```
 
-This is the primary meaning of "übergeordneter Workspace" in the design discussion.
+This is the primary meaning of "parent workspace" in the design discussion.
 
 ## 2.2 Cargo workspace
 

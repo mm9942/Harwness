@@ -9,41 +9,40 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError.
+# Access vocabulary: Capability, ReadScope, SensorHandle, SensorError.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular und der eine `trait Sensor`, den dieser Sensor implementiert.
+# Data vocabulary and the single `trait Sensor` that this sensor implements.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die eine Dateisystem-Naht: `read_line_fields` liest `/proc/net/dev`, nie
-# direktes `std::fs` (siehe src/lib.rs-Moduldoku).
+# The single filesystem seam: `read_line_fields` reads `/proc/net/dev`, never
+# `std::fs` directly (see the src/lib.rs module docs).
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# `SensorId` für `SensorHandle`.
+# `SensorId` for `SensorHandle`.
 harw-types = { path = "../../../harw-types" }
-# Verbindliche Abhängigkeit jeder Sensor-Crate laut Arbeitsauftrag AW2-11.
-# `#[derive(harw_macros::SensorSource)]` selbst trägt genau ein
-# glob-adressiertes Feld mit genau einem zur Kompilierzeit festen Metriknamen
-# für jeden Treffer (siehe `harw-macros/src/sensor_source.rs`,
-# `expand_sensor_source`: "SensorSource erlaubt genau ein Feld mit
-# `#[source(...)]`"). `/proc/net/dev` ist weder ein glob-adressierbares Muster
-# über mehrere Dateien (es ist eine einzige Datei) noch trägt es einen
-# einzigen Skalar je Treffer (jede Zeile trägt sechzehn Spalten, und jede
-# Schnittstelle braucht außerdem ein eigenes Label im Metriknamen, das der
-# Feld-Metrikname des Makros nicht ausdrücken kann) — dafür passt das Makro
-# nicht (siehe src/lib.rs-Moduldoku, Abschnitt „Warum kein
-# `#[derive(SensorSource)]`"). Aktuell ungenutzt, analog zur unbenutzten
-# `harw-observe`-Abhängigkeit in `harw-dod-signals/Cargo.toml` und zur
-# unbenutzten `harw-macros`-Abhängigkeit in `harw-dod-cpu/Cargo.toml`.
+# Mandatory dependency of every sensor crate per work order AW2-11.
+# `#[derive(harw_macros::SensorSource)]` itself carries exactly one
+# glob-addressed field with exactly one metric name fixed at compile time
+# for every match (see `harw-macros/src/sensor_source.rs`,
+# `expand_sensor_source`: "SensorSource allows exactly one field with
+# `#[source(...)]`"). `/proc/net/dev` is neither a glob-addressable pattern
+# over several files (it is a single file) nor does it carry a single scalar
+# per match (each line carries sixteen columns, and each interface also needs
+# its own label in the metric name, which the macro's field metric name
+# cannot express) — the macro does not fit here (see the src/lib.rs module
+# docs, section "Why no `#[derive(SensorSource)]`"). Currently unused, like
+# the unused `harw-observe` dependency in `harw-dod-signals/Cargo.toml` and
+# the unused `harw-macros` dependency in `harw-dod-cpu/Cargo.toml`.
 harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 
 [dev-dependencies]
-# `sensor_suite!` — die geerbte Fixture-Testsuite (sechs Pflichtprüfungen).
+# `sensor_suite!` — the inherited fixture test suite (six mandatory checks).
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
-# Ausschließlich für den Inhaltsfreiheits-Test „keine Adresse/kein Port im
-# serialisierten Ergebnis" (siehe `src/sensor.rs`-Tests): `HostSample`
-# implementiert `serde::Serialize`, aber `harw_dod_fixtures::sensor_suite!`
-# serialisiert nicht öffentlich — dieser eine zusätzliche, crate-eigene Test
-# serialisiert deshalb selbst.
+# Solely for the content-freedom test "no address/no port in the serialized
+# result" (see the `src/sensor.rs` tests): `HostSample` implements
+# `serde::Serialize`, but `harw_dod_fixtures::sensor_suite!` does not
+# serialize publicly — this one additional, crate-specific test therefore
+# serializes on its own.
 serde_json = { workspace = true }
 
 [lints]

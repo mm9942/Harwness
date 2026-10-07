@@ -30,13 +30,13 @@ tracing = "0.1.44"
 # AW5-07 tests build `harw_context::FragmentOrigin` values directly, which
 # carry a `jiff::Timestamp`.
 jiff = { workspace = true }
-# Nur für Tests: schaltet `harw_authority::SandboxSpec::from_resolved_for_test`
-# frei, das eine Sandbox mit einem echten, nicht-leeren `NetworkScope` baut —
-# die produktive API von `harw-authority` (bereits oben unter
-# `[dependencies]`) erlaubt das sonst nirgends. Nötig, damit
-# `sandbox_guard`-Tests eine Host-Allow-Liste tatsächlich gegen
-# `require_host_access` prüfen können. Wegen `resolver = "2"` nur im
-# Testbuild aktiv, nie im produktiven Build dieser Crate.
+# Tests only: unlocks `harw_authority::SandboxSpec::from_resolved_for_test`,
+# which builds a sandbox with a real, non-empty `NetworkScope` —
+# the production API of `harw-authority` (already above under
+# `[dependencies]`) does not allow that anywhere else. Needed so that
+# `sandbox_guard` tests can actually check a host allow list against
+# `require_host_access`. Because of `resolver = "2"` only active in the
+# test build, never in this crate's production build.
 harw-authority = { path = "../harw-authority", features = ["test-support"] }
 
 [lints]

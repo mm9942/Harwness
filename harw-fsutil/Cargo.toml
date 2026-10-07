@@ -9,9 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Einzige Abhängigkeit (`harw-fsutil`): `fs` liefert `openat`/`openat2`,
-# `OFlags::NOFOLLOW` plattformkorrekt (aarch64: 0o100000, nicht 0o400000),
-# `statat`/`fstat`/`Dir`/`renameat`; `process` liefert `geteuid`.
+# Sole dependency (`harw-fsutil`): `fs` provides `openat`/`openat2`,
+# `OFlags::NOFOLLOW` correct per platform (aarch64: 0o100000, not 0o400000),
+# `statat`/`fstat`/`Dir`/`renameat`; `process` provides `geteuid`.
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]

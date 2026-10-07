@@ -9,35 +9,35 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Wire-Vokabular und die bereits nachprüfbare Bindungs-/Zulässigkeitslogik
-# (`AuthorizationProof::verify`, `WardenAction::is_admissible_from`) — siehe
-# lib.rs-Moduldoku, Abschnitt „Abhängigkeitsbudget".
+# Wire vocabulary and the already verifiable binding/admissibility logic
+# (`AuthorizationProof::verify`, `WardenAction::is_admissible_from`) — see the
+# lib.rs module docs, section "Dependency budget".
 harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
-# `CgroupId`/`FindingId` direkt: der Warden liest cgroup-Kennungen aus
-# WardenAction-Varianten, um sie an Ausführungs-Traits zu reichen, und nimmt
-# `finding` als unabhängigen Kontextparameter entgegen (siehe warden.rs).
-# Bereits vollständig durch `harw-dod-warden-proto` transitiv mitgebracht —
-# kein einziges neues Blatt-Crate.
+# `CgroupId`/`FindingId` directly: the warden reads cgroup identifiers from
+# WardenAction variants in order to hand them to execution traits, and takes
+# `finding` as an independent context parameter (see warden.rs).
+# Already brought in transitively in full by `harw-dod-warden-proto` —
+# not a single new leaf crate.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `error.rs` — wie bei der
-# proto-Crate ausschließlich dafür, nie für `warden_actions!`. Ebenfalls
-# bereits transitiv vorhanden.
+# `#[derive(harw_macros::HarwError)]` for `error.rs` — as with the
+# proto crate, exclusively for that, never for `warden_actions!`. Likewise
+# already present transitively.
 harw-macros = { path = "../../../harw-macros" }
 
 [dev-dependencies]
-# Nur für den Test „unbekanntes Feld in der Anfrage -> abgelehnt" (Rundlauf
-# über die tatsächliche Wire-Deserialisierung von
-# `harw_dod_warden_proto::WardenActionRequest`) und für die
-# Antwort-Inhaltsfreiheits-Prüfung (serialisierten Text inspizieren). Reine
-# Dev-Dependency, zählt nicht gegen das Laufzeit-Abhängigkeitsbudget des
-# Warden-Binaries.
+# Only for the test "unknown field in the request -> rejected" (round trip
+# through the actual wire deserialization of
+# `harw_dod_warden_proto::WardenActionRequest`) and for the
+# response content-freeness check (inspecting the serialized text). Pure
+# dev dependency, does not count against the runtime dependency budget of the
+# warden binary.
 serde_json = { workspace = true }
-# Nur für die Dateisystem-Tests von `CgroupV2Executor` (Tempdir statt
-# echtem `/sys/fs/cgroup`). Reine Dev-Dependency.
+# Only for the filesystem tests of `CgroupV2Executor` (tempdir instead of
+# the real `/sys/fs/cgroup`). Pure dev dependency.
 tempfile = { workspace = true }
-# Nur für Tests/Doctests, die einen `AuthorizationProof` bauen (verlangt
-# einen `jiff::Timestamp`, siehe `harw-dod-warden-proto`). Reine
-# Dev-Dependency — Laufzeitcode dieser Crate liest ohnehin keine Zeit.
+# Only for tests/doctests that build an `AuthorizationProof` (requires
+# a `jiff::Timestamp`, see `harw-dod-warden-proto`). Pure
+# dev dependency — this crate's runtime code does not read the time anyway.
 jiff = { workspace = true }
 
 [lints]

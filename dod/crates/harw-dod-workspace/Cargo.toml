@@ -9,18 +9,17 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Liefert `WorkspaceGraph`/`parse_lockfile`: liest Cargo.toml/Cargo.lock ohne
-# Subprozess. Siehe Crate-Moduldoku (`src/lib.rs`) für die Arbeitsteilung.
+# Provides `WorkspaceGraph`/`parse_lockfile`: reads Cargo.toml/Cargo.lock without
+# a subprocess. See the crate module docs (`src/lib.rs`) for the division of labor.
 harw-code-graph = { path = "../../../harw-code-graph" }
-# Zugriffsvokabular: `ReadScope`, `SensorHandle<Bound>`, `Capability`,
-# `SensorError` (der von `harw_dod_signals::Sensor::poll` vorgeschriebene
-# Fehlertyp).
+# Access vocabulary: `ReadScope`, `SensorHandle<Bound>`, `Capability`,
+# `SensorError` (the error type mandated by `harw_dod_signals::Sensor::poll`).
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Daten-Vokabular: `trait Sensor`, `SensorReading`, `EventKind::StructureDrift`.
+# Data vocabulary: `trait Sensor`, `SensorReading`, `EventKind::StructureDrift`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# `SensorId` (siehe `sensor.rs`) und `#[derive(harw_macros::HarwError)]`-Basis.
+# `SensorId` (see `sensor.rs`) and the `#[derive(harw_macros::HarwError)]` base.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+# `#[derive(harw_macros::HarwError)]` for `error.rs`.
 harw-macros = { path = "../../../harw-macros" }
 serde = { workspace = true }
 jiff = { workspace = true }

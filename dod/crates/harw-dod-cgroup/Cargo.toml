@@ -9,38 +9,38 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError.
+# Access vocabulary: Capability, ReadScope, SensorHandle, SensorError.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular und der eine `trait Sensor`, den dieser Sensor implementiert.
+# Data vocabulary and the one `trait Sensor` that this sensor implements.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die eine Dateisystem-Naht: `parse_u64`, `read_first_line`, `read_key_values`
-# und `glob::glob` lesen die cgroup-v2-Kontrolldateien, nie direktes
-# `std::fs` (siehe src/lib.rs-Moduldoku).
+# The one filesystem seam: `parse_u64`, `read_first_line`, `read_key_values`
+# and `glob::glob` read the cgroup-v2 control files, never direct
+# `std::fs` (see the src/lib.rs module docs).
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# `SensorId` für `SensorHandle`.
+# `SensorId` for `SensorHandle`.
 harw-types = { path = "../../../harw-types" }
-# Verbindliche Abhängigkeit jeder Sensor-Crate laut Arbeitsauftrag AW2-13.
-# `#[derive(harw_macros::SensorSource)]` selbst trägt genau ein
-# glob-adressiertes Feld mit genau einem zur Kompilierzeit festen Metriknamen
-# je Treffer (siehe `harw-macros/src/sensor_source.rs`). Ein cgroup braucht
-# vier verschiedene Kontrolldateien mit vier verschiedenen Metriknamen je
-# Treffer und ein Label je Treffer (der cgroup-Name) — dafür passt das Makro
-# nicht (siehe src/lib.rs-Moduldoku, Abschnitt „Warum kein
-# `#[derive(SensorSource)]`"). Aktuell ungenutzt, analog zur unbenutzten
-# `harw-macros`-Abhängigkeit in `harw-dod-cpu/Cargo.toml` und
+# Mandatory dependency of every sensor crate per work order AW2-13.
+# `#[derive(harw_macros::SensorSource)]` itself supports exactly one
+# glob-addressed field with exactly one metric name fixed at compile time
+# per match (see `harw-macros/src/sensor_source.rs`). A cgroup needs
+# four different control files with four different metric names per
+# match and one label per match (the cgroup name) — the macro does not
+# fit that (see the src/lib.rs module docs, section "Why no
+# `#[derive(SensorSource)]`"). Currently unused, analogous to the unused
+# `harw-macros` dependency in `harw-dod-cpu/Cargo.toml` and
 # `harw-dod-netcounters/Cargo.toml`.
 harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 
 [dev-dependencies]
-# `sensor_suite!` — die geerbte Fixture-Testsuite (acht Prüfungen).
+# `sensor_suite!` — the inherited fixture test suite (eight checks).
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
-# Ausschließlich für den eigenen, zusätzlichen Test „kein Prozessname/keine
-# Kommandozeile im serialisierten Ergebnis" (siehe `src/sensor.rs`-Tests):
-# `HostSample` implementiert `serde::Serialize`, aber
-# `harw_dod_fixtures::sensor_suite!` serialisiert nicht öffentlich — dieser
-# eine zusätzliche, crate-eigene Test serialisiert deshalb selbst, analog zu
+# Exclusively for the crate's own additional test "no process name/no
+# command line in the serialized result" (see the `src/sensor.rs` tests):
+# `HostSample` implements `serde::Serialize`, but
+# `harw_dod_fixtures::sensor_suite!` does not serialize publicly — this
+# one additional, crate-specific test therefore serializes itself, analogous to
 # `harw-dod-netcounters/Cargo.toml`.
 serde_json = { workspace = true }
 

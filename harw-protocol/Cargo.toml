@@ -10,9 +10,9 @@ rust-version.workspace = true
 
 [dependencies]
 harw-types = { path = "../harw-types" }
-# `ApprovalRequest`/`ApprovalResponse` (src/approvals.rs) tragen
-# `requested_at`/`timeout_at`/`decided_at` als `jiff::Timestamp` — dieselbe
-# Wanduhr-Darstellung wie überall sonst im Harness (C-APPR, F-122).
+# `ApprovalRequest`/`ApprovalResponse` (src/approvals.rs) carry
+# `requested_at`/`timeout_at`/`decided_at` as `jiff::Timestamp` — the same
+# wall-clock representation as everywhere else in the harness (C-APPR, F-122).
 jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

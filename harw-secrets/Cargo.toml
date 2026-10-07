@@ -18,7 +18,7 @@ chacha20poly1305 = "0.11.0"
 # `tests/fixtures/records/` must keep passing unchanged on every upgrade.
 crypt_guard = { workspace = true }
 getrandom = { version = "0.4.2", features = ["std"] }
-# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
+# F-006: symlink-safe opening (correct O_NOFOLLOW per architecture, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }

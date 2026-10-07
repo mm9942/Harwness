@@ -61,7 +61,7 @@
    "line": 110,
    "severity": "low",
    "pattern": "NEW:book-author-reference",
-   "title": "Skill assets name an author ('nach Minto', 'Minto-Pyramide')"
+   "title": "Skill assets name an author ('after Minto', 'Minto pyramid')"
   },
   {
    "id": "F-84cf315f2fcc",
@@ -70,7 +70,7 @@
    "line": 806,
    "severity": "low",
    "pattern": "M1",
-   "title": "arch gate *-sys hull skips internal crates' [build-dependencies], yet the doc claims it 'übersieht nichts'"
+   "title": "arch gate *-sys hull skips internal crates' [build-dependencies], yet the doc claims it 'overlooks nothing'"
   },
   {
    "id": "F-85c7161d3f39",

@@ -505,12 +505,12 @@ idempotent.
 ```toml
 # tests/reviews-a-claim.toml
 name = "reviews a sourced claim"
-prompt = "Prüfe die Quelle in report.md"
+prompt = "Check the source in report.md"
 
 [expect]
 tools = ["fs.read"]            # must be in the manifest (checked now)
 not_tools = ["shell.exec"]     # must not be (checked now)
-contains = ["Behalten"]        # answer check: runs the located runner as a subprocess
+contains = ["Keep"]            # answer check: runs the located runner as a subprocess
 ```
 
 ## 10. Where things are found

@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# /analyze: projektneutraler Einheiten-Graph (Projekte + Relationen).
+# /analyze: project-neutral unit graph (projects + relations).
 harw-explorer = { path = "../harw-explorer" }
 harw-authority = { path = "../harw-authority" }
 harw-operations = { path = "../harw-operations" }
@@ -19,12 +19,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 harw-config = { path = "../harw-config" }
 harw-home = { path = "../harw-home" }
-# Auslastungskanal (`ProviderLoadStatus`/`ProviderLoadControl`/
-# `ProviderLoadRegistry`) für `/provider show`, `/status` und
-# `/provider-concurrency`. Kein Zyklus: harw-provider-http hängt nur von
+# Load channel (`ProviderLoadStatus`/`ProviderLoadControl`/
+# `ProviderLoadRegistry`) for `/provider show`, `/status` and
+# `/provider-concurrency`. No cycle: harw-provider-http depends only on
 # harw-config/harw-core/harw-oauth/harw-fsutil/harw-protocol/harw-provider/
-# harw-sandbox/harw-tools/harw-types ab, keiner davon zurück auf harw-ops
-# (geprüft, siehe Cargo.toml-Audit dieser Zeile).
+# harw-sandbox/harw-tools/harw-types, none of which depends back on harw-ops
+# (checked, see the Cargo.toml audit of this line).
 harw-provider-http = { path = "../harw-provider-http" }
 harw-memory = { path = "../harw-memory" }
 harw-model-catalog = { path = "../harw-model-catalog" }
@@ -34,95 +34,95 @@ harw-job-runtime = { path = "../harw-job-runtime" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 harw-tools = { path = "../harw-tools" }
-# `sandbox-lease` wartet mit
-# `tokio::time::timeout` auf die Antwort eines `HostPermitPrompt` (dieselbe
-# Frist wie `harw_tool_shell::HOST_PERMIT_PROMPT_TIMEOUT`). `tokio` stand
-# bislang nur unter `[dev-dependencies]` (für `#[tokio::test]`); das reicht
-# für Produktionscode nicht, weil ein Crate `tokio::...`-Pfade nur benutzen
-# darf, wenn es selbst als Abhängigkeit deklariert ist — auch wenn `tokio`
-# bereits transitiv über harw-tool-shell im Graphen liegt. Nur `time`
-# zusätzlich zur ohnehin vorhandenen dev-dependency-Featureliste, keine neue
-# externe Crate. `process`/`io-util`/`macros`: das `diff`-Werkzeug startet
-# `git` als rein lesenden Prozess in einer eigenen bwrap-Sandbox
-# (`src/diff.rs`), mit Zeitlimit und begrenzter Ausgabe.
-# `net`: `gateway.health` prüft je Socket unter dem harw-Home per
-# `tokio::net::UnixStream::connect` (mit Zeitlimit, ohne Nutzdaten), ob er
-# Verbindungen annimmt (R18, `src/gateway_ops/health.rs`).
+# `sandbox-lease` waits with
+# `tokio::time::timeout` for the answer to a `HostPermitPrompt` (the same
+# deadline as `harw_tool_shell::HOST_PERMIT_PROMPT_TIMEOUT`). `tokio` used to
+# appear only under `[dev-dependencies]` (for `#[tokio::test]`); that is not
+# enough for production code, because a crate may only use `tokio::...` paths
+# if it declares the dependency itself — even though `tokio` is already in
+# the graph transitively via harw-tool-shell. Only `time` in addition to the
+# existing dev-dependency feature list, no new external crate.
+# `process`/`io-util`/`macros`: the `diff` tool starts `git` as a read-only
+# process in its own bwrap sandbox (`src/diff.rs`), with a time limit and
+# bounded output.
+# `net`: `gateway.health` checks each socket under the harw home via
+# `tokio::net::UnixStream::connect` (with a time limit, no payload) to see
+# whether it accepts connections (R18, `src/gateway_ops/health.rs`).
 tokio = { version = "1.52.3", features = ["time", "process", "io-util", "macros", "net"] }
-# UIA-Delegationsrouting (`explore`/`research_web`): `AgentRoleId` wird
-# gebraucht, um die aufrufende `organizational_role` gegen `UserInterface`
-# zu prüfen. Vormals nur dev-dependency für Test-Fixtures — jetzt auch in
-# Produktionscode benötigt.
+# UIA delegation routing (`explore`/`research_web`): `AgentRoleId` is
+# needed to check the calling `organizational_role` against `UserInterface`.
+# Formerly only a dev-dependency for test fixtures — now also needed in
+# production code.
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 jiff = { workspace = true }
-# Wellen-Fortschritt des `analyze`-Fan-outs (Spans je Ebene, Events je Kind).
+# Wave progress of the `analyze` fan-out (spans per level, events per child).
 tracing = "0.1.44"
 harw-core = { path = "../harw-core" }
-# Planungs-Fläche (`/plan`, `/goal`): Kern-Typen und Store-Trait aus harw-plan,
-# die Kontext-Anbindung (`OpContextPlanExt`) und der Controller aus der Bridge.
+# Planning surface (`/plan`, `/goal`): core types and store trait from harw-plan,
+# the context binding (`OpContextPlanExt`) and the controller from the bridge.
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
-# Runde 5, Teil P: Bestätigungskanal (`PlanConfirmChannel`) der `plan`-Operation
-# zum Freigabefenster der TUI. Kein Zyklus: harw-tool-plan hängt nicht an harw-ops.
+# Round 5, part P: confirmation channel (`PlanConfirmChannel`) of the `plan`
+# operation to the TUI's approval window. No cycle: harw-tool-plan does not depend on harw-ops.
 harw-tool-plan = { path = "../harw-tool-plan" }
-# Strukturierte Kind-Rückgaben: `explore`/`research_*` parsen und validieren
-# `ResearchFinding`, `analyze` legt sie über den FindingStore ab.
+# Structured child returns: `explore`/`research_*` parse and validate
+# `ResearchFinding`; `analyze` stores them via the FindingStore.
 harw-research = { path = "../harw-research" }
-# `analyze` baut den Crate-Graphen des Workspaces (leaf-first Ebenen) ohne
-# cargo-Subprozess — read-only Kinder haben kein `ExecuteProcess`.
+# `analyze` builds the workspace's crate graph (leaf-first levels) without a
+# cargo subprocess — read-only children have no `ExecuteProcess`.
 harw-code-graph = { path = "../harw-code-graph" }
-# Rollennamen (`role_names::EXPLORER` …) als Single Source of Truth für
-# `Surface::AgentTool.child_name`; kein Zyklus, weil registry-defaults die
-# Tool-Provider zusammenbaut und keine Operationen kennt.
+# Role names (`role_names::EXPLORER` …) as the single source of truth for
+# `Surface::AgentTool.child_name`; no cycle, because registry-defaults
+# assembles the tool providers and knows no operations.
 harw-registry-defaults = { path = "../harw-registry-defaults" }
-# Fan-out aus einer Operation heraus (`analyze`): Kind-Kontext und
-# Return-Contract-Auflösung laufen über die Core-Bridge.
+# Fan-out from within an operation (`analyze`): child context and
+# return-contract resolution go through the core bridge.
 harw-core-bridge = { path = "../harw-core-bridge" }
-# Autoritätsreduktion für Kind-Sandboxes (`SandboxSpec::restrict`) — bislang
-# nur Testabhängigkeit, jetzt auf dem Produktivpfad von `explore`/`analyze`.
+# Authority reduction for child sandboxes (`SandboxSpec::restrict`) — so far
+# only a test dependency, now on the production path of `explore`/`analyze`.
 harw-sandbox = { path = "../harw-sandbox" }
-# `harw_plan::PlanNode`/`EvidenceRef`/`Goal` datieren in `time::OffsetDateTime`;
-# diese Crate muss dieselbe Zeitachse benutzen, damit die Typen identisch sind.
-# Version bewusst identisch zu harw-plan/harw-plan-bridge gepinnt.
+# `harw_plan::PlanNode`/`EvidenceRef`/`Goal` use `time::OffsetDateTime` for
+# timestamps; this crate must use the same time axis so the types are identical.
+# Version deliberately pinned identically to harw-plan/harw-plan-bridge.
 time = "0.3.53"
-# AW5-09: `/context-proposal`-Prüffläche (list/view/accept/reject) über
-# `ContextProposal` (AW5-09). Kein Zyklus: `harw-knowledge` hängt nicht von
-# `harw-ops` ab.
+# AW5-09: `/context-proposal` review surface (list/view/accept/reject) over
+# `ContextProposal` (AW5-09). No cycle: `harw-knowledge` does not depend on
+# `harw-ops`.
 harw-knowledge = { path = "../harw-knowledge" }
-# Bestätigungsfläche (`approval.pending`/`approval.resolve`, UI-06-Folgeknoten):
+# Approval surface (`approval.pending`/`approval.resolve`, UI-06 follow-up node):
 # `security::pending_approval`/`security::resolve_approval`, `PeerCredentials`
-# und `ApprovalActorResolver` stammen aus `harw-web`. Kein Zyklus: `harw-web`
-# hängt nicht von `harw-ops` ab (geprüft).
+# and `ApprovalActorResolver` come from `harw-web`. No cycle: `harw-web`
+# does not depend on `harw-ops` (checked).
 harw-web = { path = "../harw-web" }
-# Slice B4 (`/permissions`): liest `[permissions]` aus einer Projekt-/Global-
-# Datei zurück, um Herkunft und Löschziele einer Regel zu bestimmen —
-# `harw_config::ConfigWriter` selbst bietet dafür keine Enumerations-API.
+# Slice B4 (`/permissions`): reads `[permissions]` back from a project/global
+# file to determine the origin and deletion targets of a rule —
+# `harw_config::ConfigWriter` itself offers no enumeration API for this.
 toml = { workspace = true }
-# `/provider switch`/`/model switch` verankern die zuletzt gewählte
-# Auswahl bestes Bemühen als Profil-Default (`config_util::persist_default_selection`)
-# über denselben kommentarerhaltenden Editor wie `/permissions`.
-# Version bewusst identisch zu harw-config gepinnt (ein einziges resolvtes toml_edit).
+# `/provider switch`/`/model switch` persist the most recently chosen
+# selection on a best-effort basis as the profile default (`config_util::persist_default_selection`)
+# via the same comment-preserving editor as `/permissions`.
+# Version deliberately pinned identically to harw-config (a single resolved toml_edit).
 toml_edit = "0.25.13"
-# `/matrix` (Matrix Game live): deterministischer Spielkern (Szenario,
-# Journal, Sichtbarkeit, Phasen, Prompts, AAR). Kein Zyklus: `harw-matrix-game`
-# hat keine harw-Abhängigkeiten.
+# `/matrix` (Matrix Game live): deterministic game core (scenario,
+# journal, visibility, phases, prompts, AAR). No cycle: `harw-matrix-game`
+# has no harw dependencies.
 harw-matrix-game = { path = "../harw-matrix-game" }
-# Plan R9, Teil F: `/jobs` (Hintergrund-Jobs der Sitzung ansehen, stoppen,
-# Logs lesen). Kein Zyklus: `harw-tool-job` hängt nicht von `harw-ops` ab.
+# Plan R9, part F: `/jobs` (view, stop and read logs of the session's
+# background jobs). No cycle: `harw-tool-job` does not depend on `harw-ops`.
 harw-tool-job = { path = "../harw-tool-job" }
-# #22 Welle 2B: `/agent check|build|inspect|graph|explain|…` (dieselben
-# Befehle wie `harw agent …`; `build` läuft als Job).
+# #22 wave 2B: `/agent check|build|inspect|graph|explain|…` (the same
+# commands as `harw agent …`; `build` runs as a job).
 harw-agent-compiler = { path = "../harw-agent-compiler" }
-# Crypto-Infrastruktur H5: `infra.*`-Operationen (`src/infra.rs`) lesen
-# `Arc<InfrastructureAvailability>` aus dem `OpContext` und rufen die typisierten
-# Clients (AuthHub/NetSec/SecurityHub); keine Operation öffnet selbst einen
-# Socket. Kein Zyklus: `harw-infra-client` (Schicht I) hängt von keiner
-# harw-Crate ab.
+# Crypto infrastructure H5: `infra.*` operations (`src/infra.rs`) read
+# `Arc<InfrastructureAvailability>` from the `OpContext` and call the typed
+# clients (AuthHub/NetSec/SecurityHub); no operation opens a socket
+# itself. No cycle: `harw-infra-client` (layer I) depends on no
+# harw crate.
 harw-infra-client = { path = "../harw-infra-client" }
-# R18 (D-B): `gateway.*`-Operationen (`src/gateway_ops.rs`) lesen
-# `Arc<dyn harw_protocol::GatewayPort>` aus dem `OpContext` und zeigen die
-# Wire-Typen (`GatewayStatus`, `GatewayConnectionInfo`, …). Kein Zyklus:
-# `harw-protocol` (Schicht F) hängt nicht von `harw-ops` ab.
+# R18 (D-B): `gateway.*` operations (`src/gateway_ops.rs`) read
+# `Arc<dyn harw_protocol::GatewayPort>` from the `OpContext` and expose the
+# wire types (`GatewayStatus`, `GatewayConnectionInfo`, …). No cycle:
+# `harw-protocol` (layer F) does not depend on `harw-ops`.
 harw-protocol = { path = "../harw-protocol" }
 
 [features]
@@ -133,20 +133,20 @@ chatgpt-oauth = ["harw-provider/chatgpt-oauth"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 secrecy = "0.8"
-# Slice B4: Persistenz-Rundlauf-Tests (`/permissions`, `/add-workdir`,
-# `/memory`) gegen ein temporäres Verzeichnis statt echter `HARW_HOME`/`HOME`-
-# Env-Mutation (nicht thread-sicher, würde parallele Tests gefährden).
+# Slice B4: persistence round-trip tests (`/permissions`, `/add-workdir`,
+# `/memory`) against a temporary directory instead of mutating the real
+# `HARW_HOME`/`HOME` env (not thread-safe, would endanger parallel tests).
 tempfile = { workspace = true }
-# Runde 9, E7: `runner/tests/spawner_chain.rs` implementiert
-# `ChildRegistryFactory`, dessen Signatur `harw_catalog::AgentSuggestions`
-# nennt. Kein Zyklus: harw-catalog hängt nicht von harw-ops ab (liegt ohnehin
-# transitiv über harw-core im Graphen).
+# Round 9, E7: `runner/tests/spawner_chain.rs` implements
+# `ChildRegistryFactory`, whose signature names `harw_catalog::AgentSuggestions`.
+# No cycle: harw-catalog does not depend on harw-ops (it is in the graph
+# transitively via harw-core anyway).
 harw-catalog = { path = "../harw-catalog" }
-# AW5-09: `context_proposal.rs`-Tests bauen einen `DefinitionId`
-# (`harwness.context.base@1`) als Fixture. Kein Zyklus: `harw-agent-dsl`
-# hängt nicht von `harw-ops` ab (geprüft).
-# (harw-agent-dsl ist jetzt eine normale [dependencies]-Zeile oben, da es
-# auch in Produktionscode gebraucht wird — hier keine Dopplung nötig.)
+# AW5-09: `context_proposal.rs` tests build a `DefinitionId`
+# (`harwness.context.base@1`) as a fixture. No cycle: `harw-agent-dsl`
+# does not depend on `harw-ops` (checked).
+# (harw-agent-dsl is now a normal [dependencies] line above, since it is
+# also needed in production code — no duplicate needed here.)
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 ---
 id: STRUCTURED-OUTPUT
-title: Wire-Level Structured Output (ModelRequest.output_schema) und Codex-Deckel (DEC-003)
+title: Wire-level structured output (ModelRequest.output_schema) and Codex cap (DEC-003)
 status: accepted
 date: 2026-09-27
 tags: [provider, structured-output, codex, dec-003, contract]
@@ -11,17 +11,17 @@ related:
   - ../85-gap-hunt/patterns.md
 ---
 
-> **Auftrag (Mia):** Die Wire-Ebene fehlt für alle Provider, harw validiert nur
-> hinterher. `ModelRequest.output_schema` wird von jedem Adapter auf seinen
-> Mechanismus abgebildet (OpenAI `text.format`, Anthropic `output_config` bzw.
-> Tool-Forcing). Der bestehende Validator bleibt als fail-closed-Absicherung
-> dahinter. Auf der Codex-Route ist der konfigurierte Deckel (DEC-003) die
-> eigentliche Kontrolle, nicht das Header-Pacing.
+> **Assignment (Mia):** The wire level is missing for all providers; harw only validates
+> afterwards. `ModelRequest.output_schema` is mapped by every adapter onto its
+> mechanism (OpenAI `text.format`, Anthropic `output_config` or
+> tool forcing). The existing validator stays behind it as a fail-closed
+> safeguard. On the Codex route, the configured cap (DEC-003) is the
+> actual control, not header pacing.
 >
-> Dieses Blatt ist der Umsetzungsvertrag: feste Signaturen, ein Agent pro
-> Datei, danach ein zentraler Build.
+> This sheet is the implementation contract: fixed signatures, one agent per
+> file, then one central build.
 
-# Umsetzungsvertrag: Wire-Level `output_schema` und Codex-Deckel
+# Implementation contract: wire-level `output_schema` and Codex cap
 
 ## 0. Answer, and corrections to the mappings
 
@@ -174,7 +174,7 @@ Why the fallback is so tightly gated:
 - **Default:** `effective_max_concurrency()` is used at `lib.rs:2082` (OpenAI and Codex), `lib.rs:760` (Anthropic; no behaviour change there) and `job_worker_work_driver.rs:2269`. An explicit value always wins; to lift the cap, set a larger number.
 - **Why 2:** it is the smallest value where `parallel_ceiling` (:374-379) still gives one worker plus the reserved orchestrator/judge slot.
 - **Pacing:** `observe_headers` stays (lib.rs:4231). Add a comment and a codex.rs module doc saying header pacing is best-effort on this route and that `effective_max_concurrency` plus `[rate_limit]` budgets are the real control (DEC-003).
-- **Provenance marker:** `pub(crate) const WIRE_VERIFIED_AGAINST: &str` in `codex.rs`, and a private copy in `harw-oauth/src/codex_refresh.rs` (replacing the "in dieser Session … verifiziert" comment at :47-53). Its value is `"openai/codex@<40-hex sha> (YYYY-MM-DD)"` only if the agent actually checks against a fetched tree, otherwise `"unpinned"`. Do not invent a hash: the `../codex` tree is absent here, and the `88235f8` in codex.md:86 is a research-batch commit, not a verification. The `PROVISIONAL` comment (codex.rs:245-256) stays.
+- **Provenance marker:** `pub(crate) const WIRE_VERIFIED_AGAINST: &str` in `codex.rs`, and a private copy in `harw-oauth/src/codex_refresh.rs` (replacing the "verified in this session …" comment at :47-53). Its value is `"openai/codex@<40-hex sha> (YYYY-MM-DD)"` only if the agent actually checks against a fetched tree, otherwise `"unpinned"`. Do not invent a hash: the `../codex` tree is absent here, and the `88235f8` in codex.md:86 is a research-batch commit, not a verification. The `PROVISIONAL` comment (codex.rs:245-256) stays.
 
 ## 5. Files, edits, tests
 

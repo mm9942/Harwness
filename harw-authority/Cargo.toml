@@ -16,28 +16,28 @@ serde = { workspace = true }
 toml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# Nur `geteuid` für die Eigentümerprüfung der OperatorHome-Policy
-# (`process_euid` in `src/lib.rs`): sicherer Wrapper statt des Eigentümers
-# von `/proc/self`, der bei nicht-dumpbaren Prozessen root ist.
+# Only `geteuid` for the ownership check of the OperatorHome policy
+# (`process_euid` in `src/lib.rs`): a safe wrapper instead of the owner
+# of `/proc/self`, which is root for non-dumpable processes.
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
-# Private, per `Drop` aufgeräumte Scratch-Verzeichnisse für die
-# Dateisystem-Tests (`scratch_dir` in `src/lib.rs`).
+# Private scratch directories cleaned up via `Drop` for the
+# filesystem tests (`scratch_dir` in `src/lib.rs`).
 tempfile = { workspace = true }
 
 [features]
-# Nur für Testfixtures abhängiger Crates (`harw-tools`, `harw-core-bridge`):
-# schaltet `SandboxSpec::from_resolved_for_test` frei, das einen beliebigen
-# (auch nicht-leeren) `NetworkScope` in eine Sandbox einbettet — die reale API
-# erlaubt das sonst nirgends außerhalb dieser Crate (`SandboxSpec::from_resolved`
-# startet stets mit `NetworkScope::empty()`, `restrict` verengt nur per
-# Schnittmenge, und `PolicyBootstrap::issue`/`reissue` akzeptieren ausschließlich
-# die zwei fest verdrahteten Policy-Pfade). Wegen `resolver = "2"`
-# (Workspace-Root) nur aktiv, wenn eine Crate es unter `[dev-dependencies]`
-# anfordert — nie im Build eines produktiven Konsumenten. Siehe
-# `src/lib.rs`-Doku an `SandboxSpec::from_resolved_for_test` für die dadurch
-# unangetastete Invariante (`restrict` bleibt reines Schnittmengen-Verfahren).
+# Only for test fixtures of dependent crates (`harw-tools`, `harw-core-bridge`):
+# unlocks `SandboxSpec::from_resolved_for_test`, which embeds an arbitrary
+# (even non-empty) `NetworkScope` into a sandbox — the real API
+# otherwise allows this nowhere outside this crate (`SandboxSpec::from_resolved`
+# always starts with `NetworkScope::empty()`, `restrict` only narrows by
+# intersection, and `PolicyBootstrap::issue`/`reissue` accept only
+# the two hard-wired policy paths). Because of `resolver = "2"`
+# (workspace root), only active if a crate requests it under `[dev-dependencies]`
+# — never in the build of a production consumer. See the
+# `src/lib.rs` docs on `SandboxSpec::from_resolved_for_test` for the invariant
+# this leaves untouched (`restrict` remains a pure intersection procedure).
 test-support = []
 
 [lints]

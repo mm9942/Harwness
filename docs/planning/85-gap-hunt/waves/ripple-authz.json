@@ -61,7 +61,7 @@
    "line": 2170,
    "severity": "low",
    "pattern": "P1",
-   "title": "Dangling cross-reference: \"siehe Bericht des Fixer-Agents\" points to an agent report that does not exist in the repo. harw-authority/Cargo.t"
+   "title": "Dangling cross-reference: \"see the fixer agent's report\" points to an agent report that does not exist in the repo. harw-authority/Cargo.t"
   },
   {
    "id": "F-ae9d10112266",

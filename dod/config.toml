@@ -1,8 +1,8 @@
 schema_version = 1
 mode = "observe"
 
-# Monitoriert den kompletten Host (Prozess-Starts und ausgehende TCP-Verbindungen).
-# Achtung: produziert viele Events. Fuer Tests ohne konkrete Cgroups geeignet.
+# Monitors the entire host (process starts and outbound TCP connections).
+# Caution: produces many events. Suitable for tests without concrete cgroups.
 active_profile = "host"
 
 [profiles.host]

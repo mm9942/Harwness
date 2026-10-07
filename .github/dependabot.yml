@@ -1,13 +1,13 @@
-# Dependabot: monatliche Update-Vorschläge für alle Paket-Ökosysteme im Repo.
+# Dependabot: monthly update proposals for all package ecosystems in the repo.
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 #
-# Je Ökosystem höchstens 3 offene PRs, damit die CI nicht mit Einzel-PRs
-# überflutet wird.
+# At most 3 open PRs per ecosystem, so that CI is not flooded
+# with individual PRs.
 
 version: 2
 updates:
-  # Rust-Workspace (Cargo.toml im Wurzelverzeichnis, inkl. aller Mitglieder;
-  # seit PL-60 auch die DoD-Crates unter dod/crates — ein Lockfile).
+  # Rust workspace (Cargo.toml in the root directory, including all members;
+  # since PL-60 also the DoD crates under dod/crates — one lockfile).
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -27,8 +27,8 @@ updates:
       webui-minor-patch:
         update-types: ["minor", "patch"]
 
-  # GitHub-Actions-Workflows unter .github/workflows. Alle Updates (auch
-  # Major) in einem gebündelten PR pro Monat.
+  # GitHub Actions workflows under .github/workflows. All updates (including
+  # major) in one bundled PR per month.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -38,8 +38,8 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Gepinnte Rust-Toolchain (rust-toolchain.toml im Wurzelverzeichnis, gilt
-  # für das ganze Repo einschließlich dod/). Ein Update ändert lokal und in der CI zugleich die Version.
+  # Pinned Rust toolchain (rust-toolchain.toml in the root directory, applies to
+  # the whole repo including dod/). An update changes the version locally and in CI at the same time.
   - package-ecosystem: "rust-toolchain"
     directory: "/"
     schedule:

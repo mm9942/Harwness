@@ -11,18 +11,18 @@ related:
   - ../70-decisions/DEC-003-provider-limits.md
 ---
 
-> Workflow `cost-model-research`: 2 Sonnet-Sammler lasen über das Cloudflare-MCP
-> 52 Modellpreise und 13 Gateway-Funktionen aus, danach entwarf ein Opus-Agent
-> das Modell gegen den harw-Code.
+> Workflow `cost-model-research`: 2 Sonnet collectors read out
+> 52 model prices and 13 gateway features via the Cloudflare MCP, after which an Opus agent
+> designed the model against the harw code.
 >
-> **Die Preise ändern sich.** Sie gehören in Daten mit Quelle und Datum, nie in
-> Code. Stand der Preise: Dokumentabruf am 2026-09-27.
+> **Prices change.** They belong in data with a source and a date, never in
+> code. Price snapshot: document retrieval on 2026-09-27.
 >
-> **Warum GLM-5.3 Flash für große Aufträge passt:** Es ist am unempfindlichsten
-> gegen kalten Cache. Sinkt die Trefferquote von 98,6 % auf 90 %, steigen die
-> Kosten nur um den Faktor 1,33, bei Opus um 2,55 und bei Fable um 3,5. Dazu
-> kommt der günstigste Output unter den billigen Modellen: Ab etwa 1,3 % Output
-> bezogen auf die Input-Seite schlägt es Luna 5.6.
+> **Why GLM-5.3 Flash fits large jobs:** It is the least sensitive
+> to a cold cache. If the hit rate drops from 98.6 % to 90 %, costs rise
+> only by a factor of 1.33, versus 2.55 for Opus and 3.5 for Fable. On top of that
+> it has the cheapest output among the cheap models: from roughly 1.3 % output
+> relative to the input side, it beats Luna 5.6.
 
 # Cache-aware, tiered cost model for harw: design note (Luna, cache prices, Cloudflare AI Gateway)
 

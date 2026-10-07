@@ -9,28 +9,28 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: `Capability`, `ReadScope`, `SensorHandle`, `SensorError`.
+# Access vocabulary: `Capability`, `ReadScope`, `SensorHandle`, `SensorError`.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular: `SecurityEvent`, `EventKind`, `Actor`, `trait Sensor`.
+# Data vocabulary: `SecurityEvent`, `EventKind`, `Actor`, `trait Sensor`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die einzige Dateisystem-Naht für privilegienlose Lesezugriffe (loginuid).
+# The only filesystem seam for unprivileged reads (loginuid).
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# Kennungen: `SensorId`.
+# Identifiers: `SensorId`.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+# `#[derive(harw_macros::HarwError)]` for `error.rs`.
 harw-macros = { path = "../../../harw-macros" }
-# Zeitachse für `SecurityEvent::observed_at` (injiziert, nie selbst gelesen).
+# Time axis for `SecurityEvent::observed_at` (injected, never read itself).
 jiff = { workspace = true }
 
 [dev-dependencies]
-# Fixture-Harness für Sensor-Crates. Zum Zeitpunkt dieses Knotens (AW4-02a)
-# noch ein leeres Gerüst ohne `sensor_suite!` (Knoten AW2-05 folgt parallel):
-# diese Crate schreibt ihre Prüfungen deshalb von Hand, bleibt aber bereits
-# auf die künftige Abhängigkeit verdrahtet.
+# Fixture harness for sensor crates. At the time of this node (AW4-02a)
+# still an empty scaffold without `sensor_suite!` (node AW2-05 follows in parallel):
+# this crate therefore writes its checks by hand, but is already wired
+# to the future dependency.
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
-# Nur für den Inhaltsfreiheits-Test in `shape.rs` (serialisiert ein geformtes
-# `SecurityEvent` und prüft, dass kein Dateiinhalt darin auftaucht).
+# Only for the content-freedom test in `shape.rs` (serializes a shaped
+# `SecurityEvent` and checks that no file content appears in it).
 serde_json = { workspace = true }
 
 [lints]

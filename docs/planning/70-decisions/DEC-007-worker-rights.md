@@ -1,6 +1,6 @@
 ---
 id: DEC-007
-title: Worker-Rechte — Lesen überall, Schreiben nur im eigenen Scope
+title: Worker rights — read everywhere, write only within your own scope
 status: accepted
 date: 2026-09-27
 tags: [decision, rights, sandbox, work-driver]
@@ -12,83 +12,82 @@ related:
   - ../../../harw-cli/src/job_worker_work_driver.rs
 ---
 
-# DEC-007 — Worker-Rechte
+# DEC-007 — Worker rights
 
-## Entscheidung
-Jeder Worker liest den gesamten Workspace, schreibt aber nur innerhalb der
-`owned_paths` seines eigenen Scopes; ein leerer Scope bedeutet reines Lesen.
-Das wird von der Rechte-/Sandbox-Schicht erzwungen, nicht nur per Prompt.
-`work_driver.status` verlangt `ReadWorkspace`, `work_driver.enqueue`
-verlangt `ExecuteProcess`; Enqueue und Stop fragen immer nach Zustimmung
-(`approval = "always"`). Limit-Overrides eines Aufrufs dürfen die Grenzen
-der Spec nur verengen, nie erweitern.
+## Decision
+Every worker reads the entire workspace but writes only within the
+`owned_paths` of its own scope; an empty scope means read-only.
+This is enforced by the rights/sandbox layer, not just via the prompt.
+`work_driver.status` requires `ReadWorkspace`, `work_driver.enqueue`
+requires `ExecuteProcess`; enqueue and stop always ask for consent
+(`approval = "always"`). Limit overrides on a call may only narrow the
+spec's limits, never widen them.
 
-## Warum
-- Lesen über den ganzen Workspace ist nötig, damit ein Worker Kontext
-  außerhalb seines eigenen Scopes versteht (geteilte Typen, Aufrufer,
-  Konventionen), ohne dass er dort etwas verändern darf.
-- Schreibrecht pfadgenau nur über `owned_paths` zu vergeben würde die
-  Rechte-/Sandbox-Schicht überfordern; sie kennt nur `{ReadWorkspace}` bzw.
-  `{ReadWorkspace, WriteWorkspace}`. Die eigentliche Pfadgrenze prüft die
-  Wellen-Admission separat (`validate_patch` gegen `owned_paths`), ein
-  Verstoß blockiert die Übernahme des Patches.
-- Ein leerer Scope (`owned_paths.is_empty()`) ist die explizite
-  Read-only-Rolle: der Worker bekommt nur `{ReadWorkspace}` und den
-  Hinweistext „nur lesen und berichten, nichts ändern“.
-- `work_driver.enqueue` startet einen dauerhaften Hintergrund-Job — wie
-  `job.start` — und braucht deshalb `ExecuteProcess`; `work_driver.status`
-  und `work_driver.stop` lesen nur den Job und seine Historie, wie
-  `job.status`/`job.stop`, und brauchen deshalb nur `ReadWorkspace`.
-- Enqueue/Stop laufen als Operator-Aktion mit `approval = "always"`: die
-  Freigabe entscheidet ein Mensch, nicht der Modell-Aufruf selbst.
-- Overrides dürfen nur verengen (`narrow_spec`/`narrow_u32`/`narrow_budget`):
-  ein Aufrufer kann seine eigenen Limits nicht über die Grenzen der
-  Ausgangs-Spec hinaus erweitern; jeder Versuch, ein Limit zu erhöhen, wird
-  mit einem Fehler abgelehnt.
+## Why
+- Reading across the whole workspace is necessary so a worker can understand
+  context outside its own scope (shared types, callers, conventions)
+  without being allowed to change anything there.
+- Granting write permission per path via `owned_paths` alone would overburden
+  the rights/sandbox layer; it only knows `{ReadWorkspace}` and
+  `{ReadWorkspace, WriteWorkspace}`. The actual path boundary is checked
+  separately by wave admission (`validate_patch` against `owned_paths`); a
+  violation blocks acceptance of the patch.
+- An empty scope (`owned_paths.is_empty()`) is the explicit read-only role:
+  the worker gets only `{ReadWorkspace}` and the hint text "only read and
+  report, change nothing".
+- `work_driver.enqueue` starts a durable background job — like
+  `job.start` — and therefore needs `ExecuteProcess`; `work_driver.status`
+  and `work_driver.stop` only read the job and its history, like
+  `job.status`/`job.stop`, and therefore need only `ReadWorkspace`.
+- Enqueue/stop run as an operator action with `approval = "always"`: a human
+  decides on the approval, not the model call itself.
+- Overrides may only narrow (`narrow_spec`/`narrow_u32`/`narrow_budget`):
+  a caller cannot widen its own limits beyond the bounds of the original
+  spec; any attempt to raise a limit is rejected with an error.
 
-## Folgen
-- Worker mit `owned_paths` bekommen das Registry-Profil `WorkspaceEdit`
-  (Rechte `{Read, Write}`, nur `fs.*`/`doc.*`/`explore.*`/Workspace-`deps.*`),
-  Worker ohne `owned_paths` bekommen `ReadOnlyExplore` (`{Read}`); kein
-  Worker bekommt Prozess-Werkzeuge — die Sandbox trägt kein pfadgenaues
-  Schreibrecht.
-- Ehrlicher Stand: eine pfadgenaue `WriteWorkspace` gibt es in der
-  Rechte-/Sandbox-Schicht noch nicht. `owned_paths` werden deshalb
-  nachträglich erzwungen, nicht präventiv: ein Workspace-Snapshot vor und
-  nach jeder Welle (`snapshot_workspace`/`diff_snapshots`), geprüft mit
-  demselben `validate_patch`-Mechanismus wie bei Plan-Knoten. Ein Schreiben
-  außerhalb des Scopes wird dabei nicht verhindert und nicht automatisch
-  zurückgerollt — es blockiert die Welle und eskaliert an den Menschen.
-- Offener Folgeschritt: präventive, pfadgenaue Schreibrechte in der
-  Sandbox selbst (statt Snapshot-Diff nach der Tat), damit ein
-  Scope-Verstoß gar nicht erst aufs Dateisystem kommt.
-- Overrides sind eine reine Verengungs-API: neue Felder in
-  `WorkDriverOverrides` müssen ebenfalls über `narrow_*`-Helfer laufen,
-  sonst entsteht eine stille Rechteausweitung.
-- Trade-off: kein Worker kann versehentlich fremden Code einsehen und
-  parallel dauerhaft verändern — der Verstoß wird aber erst nach dem
-  Schreiben entdeckt, nicht davor; das erzwingt kleine, vorab geplante
-  Scopes (siehe DEC-005) als zusätzliche Schadensbegrenzung.
+## Consequences
+- Workers with `owned_paths` get the registry profile `WorkspaceEdit`
+  (rights `{Read, Write}`, only `fs.*`/`doc.*`/`explore.*`/workspace `deps.*`),
+  workers without `owned_paths` get `ReadOnlyExplore` (`{Read}`); no
+  worker gets process tools — the sandbox does not support path-granular
+  write permission.
+- Honest status: the rights/sandbox layer does not yet have a path-granular
+  `WriteWorkspace`. `owned_paths` are therefore enforced after the fact,
+  not preventively: a workspace snapshot before and after each wave
+  (`snapshot_workspace`/`diff_snapshots`), checked with the same
+  `validate_patch` mechanism as for plan nodes. A write outside the scope is
+  neither prevented nor automatically rolled back — it blocks the wave and
+  escalates to a human.
+- Open follow-up: preventive, path-granular write permissions in the
+  sandbox itself (instead of a snapshot diff after the fact), so that a
+  scope violation never reaches the filesystem in the first place.
+- Overrides are a pure narrowing API: new fields in
+  `WorkDriverOverrides` must likewise go through the `narrow_*` helpers,
+  otherwise a silent rights escalation results.
+- Trade-off: no worker can accidentally inspect foreign code and
+  modify it in parallel for good — but the violation is only detected after
+  the write, not before; this calls for small, pre-planned scopes
+  (see DEC-005) as additional damage limitation.
 
-## Wo im Code
-- `harw-registry-defaults/src/authority.rs` — `tool_permission` für
+## Where in the code
+- `harw-registry-defaults/src/authority.rs` — `tool_permission` for
   `work_driver.status` → `Permission::ReadWorkspace`, `work_driver.enqueue`
-  → `Permission::ExecuteProcess`; `AuthorityReducer`-Obergrenzen.
+  → `Permission::ExecuteProcess`; `AuthorityReducer` upper bounds.
 - `harw-ops/src/work_driver.rs` — `work_driver_enqueue`,
   `WorkDriverOverrides`, `narrow_spec`/`narrow_u32`/`narrow_budget`
-  (Overrides verengen nur); `approval = "always"` an der
-  `#[harw_macros::tool(...)]`-Deklaration von `work_driver.enqueue`.
+  (overrides only narrow); `approval = "always"` on the
+  `#[harw_macros::tool(...)]` declaration of `work_driver.enqueue`.
 - `harw-plan-bridge/src/work_driver.rs` — `WorkScope::owned_paths`;
-  `render_task` mit dem Read-only-Hinweis „nur lesen und berichten,
-  nichts ändern“ bei leerem Scope.
-- `harw-cli/src/job_worker_work_driver.rs` — Modulkommentar: Worker mit
-  `owned_paths` → `RegistryProfile::WorkspaceEdit` (`{Read, Write}`), ohne
-  → `RegistryProfile::ReadOnlyExplore` (`{Read}`); `owned_rules` und die
-  nachträgliche `validate_patch`-Admission (`snapshot_workspace`/
-  `diff_snapshots` vor/nach der Welle) gegen die `owned_paths`.
+  `render_task` with the read-only hint "only read and report,
+  change nothing" for an empty scope.
+- `harw-cli/src/job_worker_work_driver.rs` — module comment: workers with
+  `owned_paths` → `RegistryProfile::WorkspaceEdit` (`{Read, Write}`), without
+  → `RegistryProfile::ReadOnlyExplore` (`{Read}`); `owned_rules` and the
+  after-the-fact `validate_patch` admission (`snapshot_workspace`/
+  `diff_snapshots` before/after the wave) against the `owned_paths`.
 
-## Verwandt
-- [DEC-004 Keine parallelen Builds](DEC-004-no-parallel-builds.md)
-- [DEC-005 Kleine Scopes, viele Wellen](DEC-005-small-scopes-waves.md)
-- [DEC-006 Modell-agnostischer Treiber](DEC-006-model-agnostic.md)
-- [DEC-008 Kein TUI](DEC-008-no-tui.md)
+## Related
+- [DEC-004 No parallel builds](DEC-004-no-parallel-builds.md)
+- [DEC-005 Small scopes, many waves](DEC-005-small-scopes-waves.md)
+- [DEC-006 Model-agnostic driver](DEC-006-model-agnostic.md)
+- [DEC-008 No TUI](DEC-008-no-tui.md)

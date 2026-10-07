@@ -18,19 +18,19 @@ harw-macros = { path = "../harw-macros" }
 harw-tools = { path = "../harw-tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# `ask_embedder()` (siehe `src/provenance.rs`) baut bei konfiguriertem
-# Endpunkt ein `harw_lens::HttpEmbedBackend`, das einen `secrecy::SecretString`
-# als API-Key entgegennimmt -- dieselbe Version, die `harw-lens-embed` bereits
-# gegen `Cargo.lock` aufgelöst hat (0.10.3), keine zweite Auflösung.
+# `ask_embedder()` (see `src/provenance.rs`) builds a `harw_lens::HttpEmbedBackend`
+# when an endpoint is configured, which takes a `secrecy::SecretString`
+# as API key -- the same version `harw-lens-embed` has already resolved
+# against `Cargo.lock` (0.10.3), no second resolution.
 secrecy = "0.10.3"
-# `lens_ask` (siehe `src/ask_tool.rs`) ruft `ask_with_home` -- eine
-# synchrone Funktion, die bei konfiguriertem entfernten Einbetter
-# `reqwest::blocking` durchläuft -- über `tokio::task::spawn_blocking` auf,
-# damit ein Aufruf aus dieser async fn heraus nicht mit "Cannot start a
-# runtime from within a runtime" abbricht (siehe
-# `harw_lens_embed::http_backend`s Moduldoku und `provenance.rs`s
-# `//!`-Block). Bisher nur `dev-dependencies`; jetzt Laufzeitabhängigkeit,
-# weil der Aufruf im produktiven Pfad liegt, nicht nur in Tests.
+# `lens_ask` (see `src/ask_tool.rs`) calls `ask_with_home` -- a
+# synchronous function that goes through `reqwest::blocking` when a remote
+# embedder is configured -- via `tokio::task::spawn_blocking`,
+# so that a call from within this async fn does not abort with "Cannot start a
+# runtime from within a runtime" (see the module docs of
+# `harw_lens_embed::http_backend` and the `//!` block in `provenance.rs`).
+# Previously only `dev-dependencies`; now a runtime dependency,
+# because the call is on the production path, not just in tests.
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]

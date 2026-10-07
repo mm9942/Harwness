@@ -1,53 +1,51 @@
-# Architektur-Richtlinie für das Gate `arch` (`cargo run -q -p xtask -- gates arch`).
+# Architecture policy for the `arch` gate (`cargo run -q -p xtask -- gates arch`).
 #
-# Umsetzung von docs/planning/10-ecosystem-workspace/
-# HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md, §6 (Abhängigkeitsrichtung),
-# §23 (TCB-Budgets), §40–§43 (native Abhängigkeiten, Klassen),
-# §47 (Klassifikation F/I/C/J/D/A + T) und §55–§56 (Architekturtests,
-# Richtliniendatei).
+# Implements docs/planning/10-ecosystem-workspace/
+# HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md, §6 (dependency direction),
+# §23 (TCB budgets), §40–§43 (native dependencies, classes),
+# §47 (classification F/I/C/J/D/A + T) and §55–§56 (architecture tests,
+# policy file).
 #
-# Grundsatz (§41): Mitgliedschaft im selben Cargo-Workspace ist KEINE
-# Erlaubnis, voneinander abzuhängen. Die Erlaubnis kommt allein aus dieser
-# Datei.
+# Principle (§41): Membership in the same Cargo workspace is NOT permission
+# to depend on one another. Permission comes from this file alone.
 #
-# Was das Gate prüft (Details in xtask/src/gate_arch.rs):
-# - Jedes Paket im Graphen (seit PL-60 ein Workspace, `dod/crates/*`
-#   eingeschlossen) steht unter `[packages]`. Ein neues, nicht
-#   klassifiziertes Paket ist ein Verstoß.
-#   Hier gelistete, aber (noch) nicht existierende Pakete sind zulässig.
-# - Jede interne normale Kante (`[dependencies]`, nicht dev/build) folgt
-#   `[rules]` — oder steht als `[[exceptions]]`-Eintrag da.
-# - Ratsche: eine Ausnahme ohne passende Kante oder für eine ohnehin
-#   erlaubte Kante ist ein Verstoß ("veraltet"). Die Liste kann nur
-#   schrumpfen.
-# - TCB-Pakete (`tcb = true`) dürfen direkt nur auf die in
-#   `[tcb."<name>"].allowed_internal` genannten internen Crates zeigen.
-#   Eine nicht mehr genutzte Allowlist-Zeile ist ebenfalls veraltet.
-# - Schichten mit `forbid_sys_crates = true` und alle TCB-Pakete dürfen in
-#   ihrer transitiven Hülle (über `[dependencies]` und
-#   `[build-dependencies]`) keine `*-sys`-Crate erreichen, außer den unter
-#   `[[sys_crates.allow]]` begründeten.
+# What the gate checks (details in xtask/src/gate_arch.rs):
+# - Every package in the graph (a single workspace since PL-60, including
+#   `dod/crates/*`) is listed under `[packages]`. A new, unclassified
+#   package is a violation.
+#   Packages listed here that do not (yet) exist are allowed.
+# - Every internal normal edge (`[dependencies]`, not dev/build) follows
+#   `[rules]` — or is present as an `[[exceptions]]` entry.
+# - Ratchet: an exception without a matching edge, or for an edge that is
+#   allowed anyway, is a violation ("stale"). The list can only shrink.
+# - TCB packages (`tcb = true`) may point directly only at the internal
+#   crates named in `[tcb."<name>"].allowed_internal`. An allowlist entry
+#   that is no longer used is likewise stale.
+# - Layers with `forbid_sys_crates = true` and all TCB packages must not
+#   reach any `*-sys` crate in their transitive closure (via
+#   `[dependencies]` and `[build-dependencies]`), except those justified
+#   under `[[sys_crates.allow]]`.
 
 # ---------------------------------------------------------------------------
 # Schichten
 # ---------------------------------------------------------------------------
 [layers]
-F = "foundation — breit konsumierbar, kaum Wissen nach außen (§7, §42)"
+F = "foundation — broadly consumable, little outward knowledge (§7, §42)"
 I = "shared infrastructure — wiederverwendbare Mechanismen (§13, §17, §42)"
 C = "compiler domain — DSL, Artefakt, Compiler (§11)"
-J = "job infrastructure — ohne Harwness- und DoD-Semantik (§14)"
+J = "job infrastructure — without Harwness or DoD semantics (§14)"
 D = "DoD domain — dod/crates/* (§18)"
 A = "application/composition — darf breit zusammensetzen (§24)"
 
-# Wer auf welche Schicht zeigen darf. Eine Schicht darf immer nur nach
-# innen (Richtung F) zeigen, nie nach außen (§6).
+# Who may point at which layer. A layer may only ever point inward
+# (towards F), never outward (§6).
 [rules]
 F.may_depend_on = ["F"]
 I.may_depend_on = ["F", "I"]
 C.may_depend_on = ["F", "I", "C"]
 J.may_depend_on = ["F", "I", "J"]
-# §14/§40: Job-Infrastruktur baut native Ausführungspfade; keine C-Bindings
-# per `*-sys` in der Hülle.
+# §14/§40: Job infrastructure builds native execution paths; no C bindings
+# via `*-sys` in the closure.
 J.forbid_sys_crates = true
 D.may_depend_on = ["F", "I", "D"]
 A.may_depend_on = ["*"]
@@ -55,32 +53,32 @@ A.may_depend_on = ["*"]
 # ---------------------------------------------------------------------------
 # `*-sys`-Crates (§40)
 # ---------------------------------------------------------------------------
-# Gilt für Schichten mit `forbid_sys_crates = true` und – über
-# `forbid_for_tcb` – für jedes Paket mit `tcb = true`. Die Hülle wird über
-# die `[dependencies]` und `[build-dependencies]` der Workspace-Crates und
-# danach über die Kanten in `Cargo.lock` gebildet (seit PL-60 die einzige
-# Lock-Datei). `Cargo.lock` kennt keine Plattform- oder Feature-Filter; die
-# Hülle ist also eine Überschätzung. Deshalb stehen hier die Crates, deren
-# Name auf `-sys` endet, die aber keinen C-Code bauen.
-# Grenze: Tabellen `[target.'cfg(..)'.…]` sieht die Hülle nicht. J-Crates,
-# die ihre plattformspezifischen Abhängigkeiten nur dort deklarieren
-# (z. B. harw-job-linux: rustix, landlock, …), prüft diese Regel damit
-# nicht wirksam (Grenze des Workspace-Graphen, siehe
+# Applies to layers with `forbid_sys_crates = true` and — via
+# `forbid_for_tcb` — to every package with `tcb = true`. The closure is built
+# from the `[dependencies]` and `[build-dependencies]` of the workspace crates
+# and then from the edges in `Cargo.lock` (the only lock file since PL-60).
+# `Cargo.lock` has no platform or feature filters, so the closure is an
+# overestimate. That is why the crates whose name ends in `-sys` but which
+# build no C code are listed here.
+# Limit: the closure does not see `[target.'cfg(..)'.…]` tables. J crates
+# that declare their platform-specific dependencies only there
+# (e.g. harw-job-linux: rustix, landlock, …) are therefore not effectively
+# checked by this rule (a limit of the workspace graph, see
 # xtask/src/gate_arch.rs).
 [sys_crates]
 forbid_for_tcb = true
 
 [[sys_crates.allow]]
 name = "linux-raw-sys"
-reason = "reines Rust: Linux-Syscall-ABI-Konstanten für rustix, kein C-Build, kein Linken gegen libc"
+reason = "pure Rust: Linux syscall ABI constants for rustix, no C build, no linking against libc"
 
 [[sys_crates.allow]]
 name = "windows-sys"
-reason = "nur für Windows-Ziele (tokio/mio/rustix/…); auf Linux nie gebaut, Bindings ohne C-Build"
+reason = "Windows targets only (tokio/mio/rustix/…); never built on Linux, bindings without a C build"
 
 [[sys_crates.allow]]
 name = "js-sys"
-reason = "nur für wasm32-Ziele (uuid/getrandom); auf Linux nie gebaut, kein C-Build"
+reason = "wasm32 targets only (uuid/getrandom); never built on Linux, no C build"
 
 # ---------------------------------------------------------------------------
 # Klassifikation (§43, §44: bottom-up aus den echten Kanten hergeleitet)
@@ -91,13 +89,13 @@ reason = "nur für wasm32-Ziele (uuid/getrandom); auf Linux nie gebaut, kein C-B
 layer = "F"
 [packages."harw-macros"]
 layer = "F"
-# Enthält derzeit auch Laufzeittypen (§10); vorerst F, Aufteilung folgt.
+# Currently also contains runtime types (§10); F for now, split to follow.
 [packages."harw-types"]
 layer = "F"
 [packages."harw-protocol"]
 layer = "F"
-# Reines Rang-/Retrieval-Vokabular (nur harw-digest + harw-macros);
-# von harw-context/harw-tools/harw-extension-api (I) gebraucht.
+# Pure ranking/retrieval vocabulary (only harw-digest + harw-macros);
+# needed by harw-context/harw-tools/harw-extension-api (I).
 [packages."harw-lens-types"]
 layer = "F"
 [packages."harw-tui-layout"]
@@ -144,7 +142,7 @@ layer = "I"
 layer = "I"
 [packages."harw-home"]
 layer = "I"
-# §33: Eigentümerschaft noch zu prüfen; von harw-dod-escalate (D) genutzt.
+# §33: ownership still to be reviewed; used by harw-dod-escalate (D).
 [packages."harw-session-store"]
 layer = "I"
 [packages."harw-code-graph"]
@@ -153,14 +151,14 @@ layer = "I"
 layer = "I"
 [packages."harw-completions"]
 layer = "I"
-# Blatt-Crate (pidfd + SIGKILL); Kandidat für harw-job-linux.
+# Leaf crate (pidfd + SIGKILL); candidate for harw-job-linux.
 [packages."harw-killer"]
 layer = "I"
 
 # --- J: job infrastructure -------------------------------------------------
 [packages."harw-job-runtime"]
 layer = "J"
-# Angekündigt (§52); dürfen hier stehen, bevor es sie gibt.
+# Announced (§52); may be listed here before they exist.
 [packages."harw-job-core"]
 layer = "J"
 [packages."harw-job-store"]
@@ -197,10 +195,10 @@ layer = "D"
 layer = "D"
 [packages."harw-dod-escalate"]
 layer = "D"
-# Crypto-Masterplan v2 §3/H2: Harw-Schlüsselzwecke, Nutzungsrichtlinie,
-# sichere Rahmen, Abbildung auf crypt_guard_service. Kein TCB; von der
-# Fassade `harw-dod`, Warden, Probes und Sensoren aus unerreichbar
-# (Gate `edges`, FORBIDDEN/FORBIDDEN_REACH).
+# Crypto master plan v2 §3/H2: Harw key purposes, usage policy,
+# secure frames, mapping onto crypt_guard_service. Not TCB; unreachable
+# from the `harw-dod` facade, Warden, probes and sensors
+# (gate `edges`, FORBIDDEN/FORBIDDEN_REACH).
 [packages."harw-auth-hub"]
 layer = "A"
 
@@ -273,7 +271,7 @@ tcb = true
 # --- A: application/composition -------------------------------------------
 [packages."harw"]
 layer = "A"
-# Setzt die Laufzeit zusammen (harw-runtime, harw-tui) — daher A, nicht C.
+# Composes the runtime (harw-runtime, harw-tui) — hence A, not C.
 [packages."harw-agent-runner"]
 layer = "A"
 [packages."harw-browser"]
@@ -388,9 +386,9 @@ layer = "A"
 layer = "A"
 
 # ---------------------------------------------------------------------------
-# TCB-Allowlisten (§22, §23, §51): direkte interne Abhängigkeiten.
-# Stand = die heutigen Kanten. Jede neue interne Kante ist ein Verstoß; eine
-# Zeile ohne Kante ist veraltet und muss gestrichen werden.
+# TCB allowlists (§22, §23, §51): direct internal dependencies.
+# State = today's edges. Every new internal edge is a violation; an entry
+# without an edge is stale and must be removed.
 # ---------------------------------------------------------------------------
 [tcb."harw-warden"]
 allowed_internal = [
@@ -414,39 +412,39 @@ allowed_internal = ["harw-dod-cap", "harw-macros"]
 allowed_internal = ["harw-dod-cap", "harw-macros", "harw-observe", "harw-types"]
 
 # ---------------------------------------------------------------------------
-# Ausnahmen: heute existierende Inversionen (§48). Jede trägt Grund und
-# Zieltermin. Ratsche: fällt die Kante weg, muss der Eintrag gehen.
+# Exceptions: inversions that exist today (§48). Each carries a reason and
+# a target date. Ratchet: if the edge goes away, the entry must go.
 # ---------------------------------------------------------------------------
 [[exceptions]]
 from = "harw-session-store"
 to = "harw-job-core"
-reason = "I → J: harw-session-store/src/job_store.rs persistiert Job-Modelltypen aus harw-job-core (Budget, JobState, StoredJob …); gehört nach harw-job-store (J, §33, §34)"
+reason = "I → J: harw-session-store/src/job_store.rs persists job model types from harw-job-core (Budget, JobState, StoredJob …); belongs in harw-job-store (J, §33, §34)"
 until = "R11 W2"
 
 [[exceptions]]
 from = "harw-session-store"
 to = "harw-job-store"
-reason = "I → J: harw-session-store::JobStore ist ein Adapter über die generische Speichermechanik in harw-job-store (§33); verschwindet, wenn die Job-Persistenz ganz in den J-Ring wandert"
+reason = "I → J: harw-session-store::JobStore is an adapter over the generic storage mechanism in harw-job-store (§33); goes away once job persistence moves entirely into the J ring"
 until = "R12"
 
 # ---------------------------------------------------------------------------
-# Verbotene externe Crates (transitiv, über [dependencies] und
+# Forbidden external crates (transitive, via [dependencies] and
 # [build-dependencies] plus Cargo.lock)
 # ---------------------------------------------------------------------------
-# W00 D10 / ARC-02: Die WebSocket-Bibliothek gehört allein dem Ring-A-Adapter
-# `harw-session-ws`. Jobs (J), DoD (D), die TCB und alles Innere erreichen sie
-# nicht.
+# W00 D10 / ARC-02: The WebSocket library belongs solely to the ring-A adapter
+# `harw-session-ws`. Jobs (J), DoD (D), the TCB and everything inner do not
+# reach it.
 [[forbidden_crates]]
 names = ["tungstenite", "tokio-tungstenite"]
 layers = ["F", "I", "C", "J", "D"]
 tcb = true
 reason = "W00 D10/ARC-02: WebSocket transport is owned by ring A (harw-session-ws) only"
 
-# W00 §2.1 / ARC-01: Der Session-Vertrag bleibt ohne Netzwerk-Transport und
-# ohne Anwendungs-Crates. `tokio` steht bewusst nicht in der Liste: harw-types
-# erreicht es über `tokio-util` (nur `CancellationToken`, kein Runtime-Feature,
-# siehe harw-types/Cargo.toml). Die öffentliche `SessionPort`-API selbst nutzt
-# nur std-Futures; das sichert harw-protocol/tests/session_wire_compat.rs.
+# W00 §2.1 / ARC-01: The session contract stays free of network transport and
+# application crates. `tokio` is deliberately not in the list: harw-types
+# reaches it via `tokio-util` (only `CancellationToken`, no runtime feature,
+# see harw-types/Cargo.toml). The public `SessionPort` API itself uses
+# only std futures; harw-protocol/tests/session_wire_compat.rs guarantees that.
 [[forbidden_crates]]
 names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "harw-web", "harw-cli", "harw-tui", "harw-session-host", "harw-session-ws"]
 packages = ["harw-protocol"]

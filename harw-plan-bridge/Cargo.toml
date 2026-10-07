@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Prozessübergreifende Workspace-Sperre der Verifikation (`verify_exec.rs`).
+# Cross-process workspace lock for verification (`verify_exec.rs`).
 fs4 = { workspace = true }
 harw-authority = { path = "../harw-authority" }
 harw-plan = { path = "../harw-plan" }
@@ -25,38 +25,38 @@ harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-core = { path = "../harw-core" }
-# AW3-03: Quellenbindung `PlanContextProvider` (harw_context::Fragment) und
-# die Registry-Prüfung für v2-Fragment-Provider (fragment_registry). Kein
-# Zyklus: `harw-context` hängt nur von harw-types/harw-lens-types/harw-macros
-# ab, keines davon kennt harw-plan-bridge.
+# AW3-03: source binding `PlanContextProvider` (harw_context::Fragment) and
+# the registry check for v2 fragment providers (fragment_registry). No
+# cycle: `harw-context` depends only on harw-types/harw-lens-types/harw-macros,
+# none of which knows harw-plan-bridge.
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
-# AW6-04: Plan-Andockung für Sicherheitsbefunde. `harw-dod-escalate`
-# re-exportiert `Finding<Triaged>`/`Triaged`/`Ladder` — dieses Crate zieht
-# die Kante zu `harw-dod-escalate`, nie umgekehrt (dessen Moduldoku,
-# Abschnitt „Andockung für harw-plan-bridge"). `harw-dod-signals` liefert
-# `SecurityEvidence`, deren `digest`-Feld strukturell nie fehlt (siehe
-# `security_bridge`-Moduldoku).
+# AW6-04: plan docking for security findings. `harw-dod-escalate`
+# re-exports `Finding<Triaged>`/`Triaged`/`Ladder` — this crate pulls
+# the edge to `harw-dod-escalate`, never the reverse (its module docs,
+# section "Docking for harw-plan-bridge"). `harw-dod-signals` provides
+# `SecurityEvidence`, whose `digest` field is structurally never missing (see
+# the `security_bridge` module docs).
 harw-dod-escalate = { path = "../dod/crates/harw-dod-escalate" }
 harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# Zwei Zeitbibliotheken sind hier unvermeidbar, nicht versehentlich:
-# `harw-plan` (Plan/Goal/Evidence) rechnet in `time::OffsetDateTime`,
-# `harw-research` / `harw-job-runtime` (Findings, Jobs) in `jiff::Timestamp`.
-# Dieses Crate ist genau die Naht zwischen beiden und konvertiert an einer
-# einzigen Stelle (`finding_store::offset_from_timestamp`).
+# Two time libraries are unavoidable here, not accidental:
+# `harw-plan` (Plan/Goal/Evidence) computes in `time::OffsetDateTime`,
+# `harw-research` / `harw-job-runtime` (findings, jobs) in `jiff::Timestamp`.
+# This crate is exactly the seam between the two and converts in a
+# single place (`finding_store::offset_from_timestamp`).
 time = { version = "0.3.53", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 jiff = { workspace = true }
 tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-# Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
-# genau wie `harw-dod-escalate` selbst es in seinen eigenen Tests tut — statt
-# einen privaten Konstruktor zu umgehen. `harw-dod-rules` ist deshalb keine
-# normale Abhängigkeit dieses Crates: der produktive Code nennt nur
-# `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
+# Tests only: builds a real `Finding<Triaged>` via `EgressFlowRule`,
+# just as `harw-dod-escalate` itself does in its own tests — instead of
+# bypassing a private constructor. `harw-dod-rules` is therefore not a
+# normal dependency of this crate: the production code only names
+# `Finding<Triaged>`, re-exported from `harw-dod-escalate`.
 harw-dod-rules = { path = "../dod/crates/harw-dod-rules", features = ["test-support"] }
 harw-sandbox = { path = "../harw-sandbox" }
 

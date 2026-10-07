@@ -203,7 +203,7 @@
     {
      "topic": "harw-protocol wire.rs",
      "finding": "The module doc names WebSocket as a target transport. ProtocolVersion rejects any major other than 1. The Request, Response and Notification envelopes and WireMessage exist, but nothing outside the crate uses them. Envelope params are a plain serde_json Value with no size bound, so transports must enforce size limits. Dependencies are harw-types, jiff, serde and serde_json only; the crate must stay transport-free (ring F).",
-     "evidence": "harw-protocol/src/wire.rs:1-2, :12-45, :60, :75, :123, :147; methods.rs:3-10; lib.rs:3-4 'Keine Runtime-Abhängigkeiten'; Cargo.toml deps; arch-policy.toml:90-91 (F); grep for RequestEnvelope outside the crate found nothing"
+     "evidence": "harw-protocol/src/wire.rs:1-2, :12-45, :60, :75, :123, :147; methods.rs:3-10; lib.rs:3-4 'No runtime dependencies'; Cargo.toml deps; arch-policy.toml:90-91 (F); grep for RequestEnvelope outside the crate found nothing"
     },
     {
      "topic": "harw-node-transport identity and WS feasibility",

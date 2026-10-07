@@ -9,63 +9,62 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Daten-Vokabular der Beobachtungsseite: `HostSample`, `SecurityEvent`,
-# `EventKind`, `Severity`, `Hardness`. `Finding<S>` lebt bewusst in dieser
-# Crate und nicht dort — siehe `src/finding.rs` Moduldoku für die Begründung
-# (Contract-Master-Korrektur §G.1).
+# Data vocabulary of the observation side: `HostSample`, `SecurityEvent`,
+# `EventKind`, `Severity`, `Hardness`. `Finding<S>` deliberately lives in this
+# crate and not there — see the `src/finding.rs` module docs for the
+# rationale (contract-master correction §G.1).
 harw-dod-signals = { path = "../harw-dod-signals" }
-# `EgressFlow`-Regel: `NetworkScope::allows`/`allows_addr`, statt die
-# Bereichsprüfung ein zweites Mal zu schreiben.
+# `EgressFlow` rule: `NetworkScope::allows`/`allows_addr`, instead of writing
+# the scope check a second time.
 harw-authority = { path = "../../../harw-authority" }
-# `FindingId` (Identität ab `RuleChecked`) und `Confidence` (Zielskala von
-# `epistemic_confidence_for`).
+# `FindingId` (identity from `RuleChecked` onward) and `Confidence` (target
+# scale of `epistemic_confidence_for`).
 harw-types = { path = "../../../harw-types" }
-# `FindingRecord` (W3 C-FIND) ist serialisierbar.
+# `FindingRecord` (W3 C-FIND) is serializable.
 serde = { workspace = true }
-# Quelltyp der einzigen echten Konvertierung dieser Crate:
-# `epistemic_confidence_for`. Kein Zyklus: `harw-research` hängt nur auf
+# Source type of this crate's only real conversion:
+# `epistemic_confidence_for`. No cycle: `harw-research` depends only on
 # `harw-macros`/`harw-types`/serde/jiff.
 harw-research = { path = "../../../harw-research" }
 jiff = { workspace = true }
-# `LockedPackage`/`parse_lockfile`/`find_locked` (Knoten AW7-06, Intel-Scout):
-# der bereits gelandete, einzige `Cargo.lock`-Parser des Baums (siehe
-# `src/advisory.rs` Moduldoku) — kein zweiter Lockfile-Parser hier. Kein
-# Zyklus: `harw-code-graph` hängt nur auf `serde`, `toml`, `harw-macros`,
-# `harw-types` (dessen `Cargo.toml` geprüft) — keine Rückkante auf
+# `LockedPackage`/`parse_lockfile`/`find_locked` (node AW7-06, intel scout):
+# the already-landed, sole `Cargo.lock` parser of the tree (see the
+# `src/advisory.rs` module docs) — no second lockfile parser here. No cycle:
+# `harw-code-graph` depends only on `serde`, `toml`, `harw-macros`,
+# `harw-types` (whose `Cargo.toml` was checked) — no back edge to
 # `harw-dod-rules`.
 harw-code-graph = { path = "../../../harw-code-graph" }
-# `VersionReq`/`Version`: korrekte numerische Versionsbereichsprüfung statt
-# eines Zeichenkettenvergleichs (`1.10.0` < `1.9.0` als String, aber nicht als
-# Version) — siehe `src/advisory.rs` Moduldoku.
+# `VersionReq`/`Version`: correct numeric version-range checking instead of a
+# string comparison (`1.10.0` < `1.9.0` as a string, but not as a version) —
+# see the `src/advisory.rs` module docs.
 semver = { workspace = true }
 rayon = "1.12.0"
 
 [dev-dependencies]
-# Nur für Tests: baut einen `NetworkScope` mit einem `Cidr`-Ziel über dessen
-# öffentliche `Deserialize`-Implementierung (`harw_authority::NetworkScope`
-# bietet keinen anderen öffentlichen Konstruktor für ein `Cidr`-Ziel).
+# Tests only: builds a `NetworkScope` with a `Cidr` target via its public
+# `Deserialize` implementation (`harw_authority::NetworkScope` offers no other
+# public constructor for a `Cidr` target).
 serde_json = { workspace = true }
-# Nur für Tests/Doctest: `crate::rules::baseline_deviation` konstruiert dort
-# bequem einen `harw_knowledge::artifact::ArtifactId`, um zu zeigen, dass er
-# `Baseline::new`s `impl std::fmt::Display`-Schranke erfüllt (siehe
-# `src/baseline.rs` Moduldoku, Abschnitt „Der gewählte Weg"). Bewusst
-# `[dev-dependencies]`, nicht `[dependencies]`: das hält die gesamte
-# `harw-knowledge`-Kette (inkl. `harw-model-catalog` → `reqwest`/`tokio`)
-# aus jedem produktiven Konsumenten dieser Crate heraus, namentlich
-# `harw-sentinel` — genau die Kante, die geschnitten wurde. Kein Zyklus:
-# `harw-knowledge` hängt seinerseits (produktiv) auf `harw-dod-rules`, aber
-# Dev-Dependency-Zyklen sind in Cargo ausdrücklich unterstützt — sie fließen
-# nie in den produktiven Abhängigkeitsgraphen ein.
+# Tests/doctests only: `crate::rules::baseline_deviation` conveniently
+# constructs a `harw_knowledge::artifact::ArtifactId` there to show that it
+# satisfies `Baseline::new`'s `impl std::fmt::Display` bound (see the
+# `src/baseline.rs` module docs, section "Der gewählte Weg"). Deliberately
+# `[dev-dependencies]`, not `[dependencies]`: this keeps the entire
+# `harw-knowledge` chain (incl. `harw-model-catalog` → `reqwest`/`tokio`) out
+# of every production consumer of this crate, namely `harw-sentinel` — exactly
+# the edge that was cut. No cycle: `harw-knowledge` in turn depends
+# (productively) on `harw-dod-rules`, but dev-dependency cycles are explicitly
+# supported in Cargo — they never flow into the production dependency graph.
 harw-knowledge = { path = "../../../harw-knowledge" }
 
 [features]
-# Nur für Testfixtures abhängiger Crates (z. B. `harw-dod-escalate`s
-# `Ladder`-Tests): schaltet `finding::triaged_finding_for_test` frei, das
-# beliebige `Severity`/`Hardness`-Kombinationen erzeugt, die keine echte Regel
-# liefert. Wegen `resolver = "2"` (Workspace-Root) nur aktiv, wenn eine Crate
-# es unter `[dev-dependencies]` anfordert — nie im Build eines produktiven
-# Konsumenten. Siehe `src/finding.rs`-Moduldoku, Abschnitt „Der Besitz des
-# Wertes ist die Berechtigung", für die dadurch unangetastete Invariante.
+# Only for test fixtures of dependent crates (e.g. `harw-dod-escalate`'s
+# `Ladder` tests): unlocks `finding::triaged_finding_for_test`, which produces
+# arbitrary `Severity`/`Hardness` combinations that no real rule yields.
+# Because of `resolver = "2"` (workspace root), only active when a crate
+# requests it under `[dev-dependencies]` — never in the build of a production
+# consumer. See the `src/finding.rs` module docs, section "Der Besitz des
+# Wertes ist die Berechtigung", for the invariant this leaves untouched.
 test-support = []
 
 [lints]

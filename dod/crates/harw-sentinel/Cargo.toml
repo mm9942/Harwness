@@ -11,105 +11,105 @@ rust-version.workspace = true
 [dependencies]
 harw-authority = { path = "../../../harw-authority" }
 harw-home = { path = "../../../harw-home" }
-# Die Sammelstelle selbst: `Sentinel`, `SentinelConfig`. Dieses Binary macht
-# sie zu einem laufenden Prozess (Knoten AW2-19) — siehe `src/main.rs`.
+# The collection point itself: `Sentinel`, `SentinelConfig`. This binary turns
+# it into a running process (node AW2-19) — see `src/main.rs`.
 harw-dod-sentinel = { path = "../harw-dod-sentinel" }
-# Sentinel und BPF-Probe lesen denselben vertrauenswürdigen DoD-Vertrag.
+# Sentinel and BPF probe read the same trusted DoD contract.
 harw-dod-config = { path = "../harw-dod-config" }
-# Daten-/Erzeugungsvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`,
-# `EventKind`, `SecurityEvidence`. Nötig, um die Sammelschleife und den
-# IPC-Empfangspfad gegen dieselben Typen zu schreiben, die `harw-dod-sentinel`
-# selbst verwendet.
+# Data/production vocabulary: `trait Sensor`, `SensorReading`, `SecurityEvent`,
+# `EventKind`, `SecurityEvidence`. Needed to write the collection loop and the
+# IPC receive path against the same types that `harw-dod-sentinel`
+# itself uses.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Zugriffsvokabular: `Capability`, `CapabilityClass`, `ReadScope`,
-# `SensorHandle`. Trägt die Abnahme dieses Knotens: jeder hier registrierte
-# Sensor muss `Capability::class() == CapabilityClass::Unprivileged` sein.
+# Access vocabulary: `Capability`, `CapabilityClass`, `ReadScope`,
+# `SensorHandle`. Carries the acceptance criterion of this node: every sensor
+# registered here must satisfy `Capability::class() == CapabilityClass::Unprivileged`.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# `TelemetrySink`-Trait für den Sink-Parameter von `Sentinel::new`.
+# `TelemetrySink` trait for the sink parameter of `Sentinel::new`.
 harw-observe = { path = "../../../harw-observe" }
-# `FileSink`, der einzige gelandete `TelemetrySink`-Implementierer — der
-# Standard-Sink dieses Binaries.
+# `FileSink`, the only landed `TelemetrySink` implementor — the
+# default sink of this binary.
 harw-observe-file = { path = "../../../harw-observe-file" }
-# `SensorId` für jeden hier gebauten `SensorHandle`.
+# `SensorId` for every `SensorHandle` built here.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.
+# `#[derive(harw_macros::HarwError)]` for `src/error.rs` and `src/ipc.rs`.
 harw-macros = { path = "../../../harw-macros" }
 # `harw-sentinel completions <shell> [--install|--uninstall]`.
 harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
-# Schließt Bruch 1 (Sensor -> Regelwerk): `run_rules`, `Rule`, `RuleContext`,
+# Closes break 1 (sensor -> rule set): `run_rules`, `Rule`, `RuleContext`,
 # `Finding`/`FindingKind`/`RuleChecked`, `EgressFlowRule`,
-# `StructureDriftRule`, `BaselineDeviationRule` — siehe `src/findings.rs`
-# Moduldoku für den Aufrufort im Poll-Zyklus und, nachgezählt statt
-# angenommen, wie viele weitere Einträge diese Kante dem Abhängigkeitsbaum
-# dieses unprivilegierten Binaries hinzufügt (Abschnitt „Das
-# Privilegienbudget dieser Kante").
+# `StructureDriftRule`, `BaselineDeviationRule` — see the `src/findings.rs`
+# module docs for the call site in the poll cycle and, counted rather than
+# assumed, how many further entries this edge adds to the dependency tree
+# of this unprivileged binary (section "The privilege budget of this
+# edge").
 harw-dod-rules = { path = "../harw-dod-rules" }
-# `NetworkScope` für den `network_scope`-Eintrag des `RuleContext`, den
-# `src/findings.rs` baut — siehe dortige Moduldoku, Abschnitt „Was dieser
-# Kontext (noch) nicht befüllt", für die Begründung von `NetworkScope::empty`.
+# `NetworkScope` for the `network_scope` entry of the `RuleContext` that
+# `src/findings.rs` builds — see the module docs there, section "What this
+# context does not (yet) populate", for the rationale for `NetworkScope::empty`.
 harw-sandbox = { path = "../../../harw-sandbox" }
 
-# --- Sensor-Crates: nur die tatsächlich gebauten (siehe src/sensors.rs für
-# die vollständige Registrierungs- und Auslassungsbegründung) ---
-# `ListenerSensor` (`Capability::ReadProcNet`, unprivilegiert).
+# --- Sensor crates: only those actually built (see src/sensors.rs for
+# the full registration and omission rationale) ---
+# `ListenerSensor` (`Capability::ReadProcNet`, unprivileged).
 harw-dod-listener = { path = "../harw-dod-listener" }
 # `WorkspaceDriftSensor`, `Inventory` (`Capability::ReadWorkspaceGraph`,
-# unprivilegiert).
+# unprivileged).
 harw-dod-workspace = { path = "../harw-dod-workspace" }
-# `CpuSensor` (`Capability::ReadProcStat`, unprivilegiert).
+# `CpuSensor` (`Capability::ReadProcStat`, unprivileged).
 harw-dod-cpu = { path = "../harw-dod-cpu" }
-# `ThermalSensor` (`Capability::ReadSysfsThermal`, unprivilegiert).
+# `ThermalSensor` (`Capability::ReadSysfsThermal`, unprivileged).
 harw-dod-thermal = { path = "../harw-dod-thermal" }
-# `MemorySensor` (`Capability::ReadProcMeminfo`, unprivilegiert).
+# `MemorySensor` (`Capability::ReadProcMeminfo`, unprivileged).
 harw-dod-memory = { path = "../harw-dod-memory" }
-# `BlockioSensor` (`Capability::ReadSysfsBlock`, unprivilegiert).
+# `BlockioSensor` (`Capability::ReadSysfsBlock`, unprivileged).
 harw-dod-blockio = { path = "../harw-dod-blockio" }
-# `NetCountersSensor` (`Capability::ReadProcNetDev`, unprivilegiert).
+# `NetCountersSensor` (`Capability::ReadProcNetDev`, unprivileged).
 harw-dod-netcounters = { path = "../harw-dod-netcounters" }
-# `GpuSensor` (`Capability::ReadSysfsDrm`, unprivilegiert).
+# `GpuSensor` (`Capability::ReadSysfsDrm`, unprivileged).
 harw-dod-gpu = { path = "../harw-dod-gpu" }
-# `CgroupSensor` (`Capability::ReadCgroupV2`, unprivilegiert).
+# `CgroupSensor` (`Capability::ReadCgroupV2`, unprivileged).
 harw-dod-cgroup = { path = "../harw-dod-cgroup" }
 harw-dod-scanreport = { path = "../harw-dod-scanreport" }
-# Bewusst NICHT aufgenommen: `harw-dod-authlog`. Sein einziges produktives
-# Backend (`AuditBackend`) trägt `Capability::ReadAuditNetlink`, Klasse
-# `CapabilityClass::Netlink` — nicht unprivilegiert. Ein Journal-Backend
-# (das unprivilegierte `Capability::ReadJournal` trüge) existiert laut
-# eigener Crate-Dokumentation bewusst nicht. Ebenso bewusst NICHT
-# aufgenommen: `harw-dod-fsmon` (`Capability::WatchFilesystem`, Klasse
-# `FileWatch`) und `harw-dod-procmon` (`Capability::LoadBpfProgram`, Klasse
-# `Bpf`) — beide gelandet, keine ihrer Fähigkeiten unprivilegiert. Siehe
-# `src/sensors.rs`-Moduldoku für die volle Begründung, warum diese Crates
-# hier fehlen, obwohl sie gebaut sind.
+# Deliberately NOT included: `harw-dod-authlog`. Its only production
+# backend (`AuditBackend`) carries `Capability::ReadAuditNetlink`, class
+# `CapabilityClass::Netlink` — not unprivileged. A journal backend
+# (which would carry the unprivileged `Capability::ReadJournal`) deliberately
+# does not exist, according to the crate's own documentation. Likewise
+# deliberately NOT included: `harw-dod-fsmon` (`Capability::WatchFilesystem`,
+# class `FileWatch`) and `harw-dod-procmon` (`Capability::LoadBpfProgram`,
+# class `Bpf`) — both landed, none of their capabilities unprivileged. See
+# the `src/sensors.rs` module docs for the full rationale for why these
+# crates are missing here even though they are built.
 
 jiff = { workspace = true }
 tracing = { workspace = true }
-# Version identisch zu `harw-cli`/`harw-browser-thirtyfour` — ein Sink für
-# `tracing`, keine Zweitwahl je Binary.
+# Version identical to `harw-cli`/`harw-browser-thirtyfour` — one sink for
+# `tracing`, no second choice per binary.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# `--log`-Grammatik; Version identisch zu `harw-cli`.
+# `--log` grammar; version identical to `harw-cli`.
 clap = { version = "4.6.1", features = ["derive"] }
-# Sicherer `SOCK_SEQPACKET`-Unix-Socket und `SO_PEERCRED` ohne `unsafe`
-# (`net`-Feature; Muster: `harw-dod-netlink/Cargo.toml`, dessen
-# `NetlinkAuditSource` denselben Feature-Zuschnitt für einen anderen
-# Sockettyp verwendet).
+# Safe `SOCK_SEQPACKET` Unix socket and `SO_PEERCRED` without `unsafe`
+# (`net` feature; pattern: `harw-dod-netlink/Cargo.toml`, whose
+# `NetlinkAuditSource` uses the same feature cut for a different
+# socket type).
 rustix = { workspace = true, features = ["net"] }
-# Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
-# verfügbar (dort bislang ungenutzt) und diese Crate ist die einzige
-# Konsumentin — direkte Versionsangabe statt Workspace-Umweg, wie es dieser
-# Workspace auch für andere Einzelkonsumenten hält (z. B.
-# `tikv-jemallocator` nur in `harw-cli/Cargo.toml`). Version 0.4.7 über
-# `docs.rs/crate/landlock` nachgeschlagen (Stand dieses Knotens) — `cargo
-# add` konnte hier nicht laufen, siehe `src/sandbox.rs`-Moduldoku.
+# Safe Landlock binding. **Not** available via `[workspace.dependencies]`
+# (unused there so far) and this crate is the only consumer —
+# direct version declaration instead of a workspace detour, as this
+# workspace also does for other single consumers (e.g.
+# `tikv-jemallocator` only in `harw-cli/Cargo.toml`). Version 0.4.7 looked up
+# via `docs.rs/crate/landlock` (as of this node) — `cargo
+# add` could not run here, see the `src/sandbox.rs` module docs.
 landlock = "0.4.7"
-# Wire-Kodierung für `harw_dod_signals::SecurityEvent` über den
-# IPC-Empfangspfad (siehe dortige Moduldoku: „Wire-Stabilität von
-# `EventKind`" — `#[serde(deny_unknown_fields)]`, kebab-case, bereits für
-# genau diesen Zweck vorgesehen).
+# Wire encoding for `harw_dod_signals::SecurityEvent` over the
+# IPC receive path (see the module docs there: "Wire stability of
+# `EventKind`" — `#[serde(deny_unknown_fields)]`, kebab-case, already provided
+# for exactly this purpose).
 serde_json = { workspace = true }
-# `#[derive(Serialize)]` für die JSON-Lines-Befundzeile in `src/export.rs`
-# (Vertrag mit `harw-security-hub/src/findings.rs`). Bereits transitiv im
-# Baum (u. a. über `harw-types`), keine neue Fremdcrate, keine Netzfähigkeit.
+# `#[derive(Serialize)]` for the JSON-Lines finding line in `src/export.rs`
+# (contract with `harw-security-hub/src/findings.rs`). Already transitively in
+# the tree (among others via `harw-types`), no new third-party crate, no network capability.
 serde = { workspace = true }
 
 [dev-dependencies]

@@ -1,6 +1,6 @@
 ---
 id: CONTAINERS-CELL
-title: "Mode B: harw-Zelle (harw im Container mit lokal kompilierten Worker-Agenten)"
+title: "Mode B: harw cell (harw in a container with locally compiled worker agents)"
 status: proposed
 date: 2026-09-27
 tags: [containers, cell, oci, placement, workers, dod]
@@ -12,17 +12,17 @@ related:
   - ../../design/agent-definition-dsl.md
 ---
 
-> **Idee (Mia):** Das Container-System übernimmt die Container-Verwaltung.
-> harw selbst läuft im Container als kleine Einheit mit einem Haufen lokal
-> sitzender, kompilierter Worker-Agenten, pro Auftrag erzeugt und danach
-> bereinigt. Zellen, Familien und Clans waren von Anfang an Teil der Planung.
+> **Idea (Mia):** The container system takes over container management.
+> harw itself runs in the container as a small unit with a bunch of locally
+> resident, compiled worker agents, created per job and cleaned up afterwards.
+> Cells, families and clans were part of the plan from the start.
 >
-> Dieses Blatt ergänzt Mode A aus `README.md` (Host verwaltet Container als
-> Job-Versuche) um Mode B (eine Zelle ist einer dieser Container). Der Abgleich
-> mit Familie/Clan/Zelle/Organisation aus `agent-definition-dsl.md` §14–15 und
-> Lücke G3 folgt als eigener Abschnitt.
+> This sheet extends Mode A from `README.md` (the host manages containers as
+> job attempts) with Mode B (a cell is one of those containers). The
+> reconciliation with family/clan/cell/organization from
+> `agent-definition-dsl.md` §14–15 and gap G3 follows as its own section.
 
-# Mode B: harw-Zelle
+# Mode B: harw cell
 
 **Answer.** The idea fits as a second mode on top of Mode A. In Mode A (67 §1–§8), the host harw starts, supervises and reaps containers as job attempts (`67-containers/README.md:44`). In Mode B, one of those ContainerInstances is a **cell**: a harw job worker and work driver, plus N compiled worker agents running as local processes. The cell is created for one job and removed once its results are exported. None of this exists yet:
 - The repo has no Containerfile or Dockerfile.
@@ -139,136 +139,136 @@ Two binding rules shape the design:
 - **DEC-040:** worker cells carry no toolchain. Native builds happen only in the image build stage or in a verify cell that holds the `BuildSlot`. Extends DEC-004.
 - **DEC-041:** cell state follows 65 §6; no `AutoRemove`; results go to `/out` or git. Requires DEC-010.
 
-## B.8 Abgleich mit Familie, Clan, Zelle, Organisation (DSL §14–15)
+## B.8 Reconciliation with family, clan, cell, organization (DSL §14–15)
 
 (`dsl.md` = `docs/design/agent-definition-dsl.md`)
 
-**Antwort.** Die DSL-Zelle und die Container-Zelle aus B.1 sind nicht dasselbe.
-- **DSL-Zelle (`[[cells]]`):** eine logische, run-lokale Fan-out-Welle über Plan-Knoten mit Schreibtrennung (`harw-agent-dsl/src/organization.rs:303-420`, Invariante 11 `dsl.md:1401`). Sie ist implementiert. Genutzt wird sie über `CellPlan::from_cell_nodes` (`harw-plan-bridge/src/cells.rs:176-229`), heute nur von `/analyze` (`harw-ops/src/analyze.rs:1642`).
-- **Container-Zelle aus B.1:** eine Laufzeit-Hülle, also eine `ContainerInstance` mit `harw.kind=cell`. Die Aussage in B.1, kein Code erwähne „cell“, stimmt nur in diesem Sinn.
+**Answer.** The DSL cell and the container cell from B.1 are not the same thing.
+- **DSL cell (`[[cells]]`):** a logical, run-local fan-out wave over plan nodes with separated write scopes (`harw-agent-dsl/src/organization.rs:303-420`, invariant 11 `dsl.md:1401`). It is implemented. It is used through `CellPlan::from_cell_nodes` (`harw-plan-bridge/src/cells.rs:176-229`), today only by `/analyze` (`harw-ops/src/analyze.rs:1642`).
+- **Container cell from B.1:** a runtime shell, that is, a `ContainerInstance` with `harw.kind=cell`. The statement in B.1 that no code mentions "cell" holds only in this sense.
 
-Vor B2b und B4 muss G3 geschlossen werden. Die heutige Disjunktheitsrelation erkennt keine Überlappungen mit Globs und ist bei ungültigen Pfaden fail-open. Außerdem liegt sie in Ring A, wo DSL (C) und Executor (J) sie nicht erreichen.
+G3 must be closed before B2b and B4. Today's disjointness relation does not detect overlaps involving globs and is fail-open on invalid paths. It also lives in ring A, where the DSL (C) and the executor (J) cannot reach it.
 
-### B.8.1 Ein Vokabular (DEC-042)
-- **Zelle** (ohne Zusatz) ist die DSL-Zelle. Sie legt fest, *wer* *gleichzeitig* an *welchen disjunkten* Schreibbereichen arbeitet.
-- **Zellhost** ist der Mode-B-Container. Er ist *eine mögliche Laufzeit-Platzierung* von Clan-Wellen und trägt `harw.kind=cellhost`.
-  - Das ändert nur die Wortwahl von DEC-036, nicht deren Inhalt.
-  - Die Dateinamen in B.7 folgen dieser Entscheidung.
+### B.8.1 One vocabulary (DEC-042)
+- **Cell** (without qualifier) is the DSL cell. It determines *who* works *concurrently* on *which disjoint* write scopes.
+- **Cell host** is the Mode B container. It is *one possible runtime placement* of clan waves and carries `harw.kind=cellhost`.
+  - This changes only the wording of DEC-036, not its content.
+  - The file names in B.7 follow this decision.
 
-| DSL | Placement-Einheit | Container | Ledger-Lease | Schreibpartition | Provider-Client (DEC-003/037) |
+| DSL | Placement unit | Container | Ledger lease | Write partition | Provider client (DEC-003/037) |
 |---|---|---|---|---|---|
-| Organisation (eine Root, `organization.rs:11`) | keine; verengt nur den `PlacementGrant` (`66:82,104-107`) | keiner; die Root bleibt auf dem Host (Inv. 13, `dsl.md:1403`) | Eltern-Lease des Laufs; Clans ziehen Kind-Leases (`66:203`) | Clan-Selektoren paarweise disjunkt | Host |
-| Familie (`family.rs`) | keine | Roster → Rollen-Binaries im Image (`dsl.md:913-923`, B.2) | – | Invariante `disjoint_write_sets` (`dsl.md:932`); heute ein freier String (`family.rs:131`), den kein Code auswertet | – |
-| Clan (`plan_scope`, Leader) | **ja**: Leader plus seine Wellen | standardmäßig 1 Zellhost je Clan | eine Lease je Zellhost mit k Slots (B.4) | Clan-`WriteScope` ⊆ Clan-Selektor | genau einer: der Leader im Zellhost |
-| Zelle | Teil der Clan-Einheit; die Breiteneinheit ist die `CellStage` (`cells.rs:320-325`) | läuft ganz in einem Zellhost | Stufenbreite ≤ k − Reserve | `DisjointSet` je Stufe | – |
-| Worker | nein | ein Prozess | teilt die Slots | eigener `WriteScope`, umgesetzt als Landlock-`read_write` | Relay |
+| Organization (one root, `organization.rs:11`) | none; only narrows the `PlacementGrant` (`66:82,104-107`) | none; the root stays on the host (inv. 13, `dsl.md:1403`) | parent lease of the run; clans draw child leases (`66:203`) | clan selectors pairwise disjoint | host |
+| Family (`family.rs`) | none | roster → role binaries in the image (`dsl.md:913-923`, B.2) | – | invariant `disjoint_write_sets` (`dsl.md:932`); today a free string (`family.rs:131`) that no code evaluates | – |
+| Clan (`plan_scope`, leader) | **yes**: the leader plus its waves | by default 1 cell host per clan | one lease per cell host with k slots (B.4) | clan `WriteScope` ⊆ clan selector | exactly one: the leader in the cell host |
+| Cell | part of the clan unit; the width unit is the `CellStage` (`cells.rs:320-325`) | runs entirely inside one cell host | stage width ≤ k − reserve | `DisjointSet` per stage | – |
+| Worker | no | one process | shares the slots | own `WriteScope`, applied as Landlock `read_write` | relay |
 
-### B.8.2 G3: Lücke, Besitz, Reihenfolge
+### B.8.2 G3: gap, ownership, order
 
-**Herkunft.**
-- G3 steht in `docs/design/hardening-gap-analysis.md:79-95` (Priorität P3, `:393`).
-- Die Idee zum „Borrow-Checker“ stammt aus `docs/design/agent-ir-v1.md:118-132`. Dort wird auch der Pass `PartitionWriteSets` vorgeschlagen (`:106`).
-- Der Beleg `ids.rs:163 PathOrSymbol(String)` in der Gap-Analyse ist veraltet. Heute ist es ein Enum mit `Path` und `Symbol` (`harw-plan/src/ids.rs:318-333`).
+**Origin.**
+- G3 is in `docs/design/hardening-gap-analysis.md:79-95` (priority P3, `:393`).
+- The "borrow checker" idea comes from `docs/design/agent-ir-v1.md:118-132`, which also proposes the `PartitionWriteSets` pass (`:106`).
+- The evidence `ids.rs:163 PathOrSymbol(String)` in the gap analysis is outdated. Today it is an enum with `Path` and `Symbol` (`harw-plan/src/ids.rs:318-333`).
 
-**Stand im Code:**
-- **Organisation:**
-  - `plan_scope` und `members_from_plan` sind Strings (`organization.rs:181,350`).
-  - `resolve_organization` prüft keine Überlappung (`:680-706`). Der Test `:973-986` löst `*-synthesis` und `security-*` fehlerfrei auf.
-  - Die Default-Organisation enthält genau dieses Paar (`harw-registry-defaults/agents/organization/default.toml:81,108`). Ein Knoten `security-synthesis` gehört damit zu zwei Clans.
+**State of the code:**
+- **Organization:**
+  - `plan_scope` and `members_from_plan` are strings (`organization.rs:181,350`).
+  - `resolve_organization` does not check for overlap (`:680-706`). The test at `:973-986` resolves `*-synthesis` and `security-*` without error.
+  - The default organization contains exactly this pair (`harw-registry-defaults/agents/organization/default.toml:81,108`). A node `security-synthesis` thus belongs to two clans.
 - **Partition:**
-  - Sie ist greedy (`harw-plan/src/graph.rs:332-351`) und entscheidet über `write_scopes_conflict`. Das ist eine reine Präfix-Relation (`harw-plan/src/admission.rs:791-803`).
-  - **Globs werden übersehen:** `src/*.rs` und `src/lib.rs` gelten als disjunkt. Die Admission macht aus `src/*.rs` aber eine Glob-Regel (`admission.rs:608-609`), die `src/lib.rs` zulässt.
-  - **Fail-open:** Ist ein Pfad nicht normalisierbar, lautet das Ergebnis „kein Konflikt“ (`:792-794`). Der Test `:1283` hält dieses Verhalten fest.
-- **Zweite, unabhängige Relation:** `paths_overlap` prüft `WorkScope.owned_paths: Vec<String>` (`harw-plan-bridge/src/work_driver.rs:170-180,1272-1294`). Auch `WorkerRequest.owned_paths` ist untypisiert (`harw-cli/src/job_worker_work_driver.rs:418`).
-- **Durchsetzung erst nachträglich:**
-  - Sie läuft über Schnappschuss und Diff; es gibt „keine pfadgenaue Sandbox“ (`job_worker_work_driver.rs:46-58`).
-  - Die Zuordnung erfolgt nach Besitz, nicht nach Schreiber (`:1961-1990`). Schreibt ein Worker in den Pfad eines Geschwisters, fällt das nicht auf.
-- **IR:** Sie kennt nur `filesystem_write: bool` (`ir_v2.rs:1074`). Für ORG gibt es keine Diagnosecodes (`diagnostics.rs:101`).
-- **Vorbild:** `AuthorityCeiling::is_disjoint_from` (`harw-agent-dsl/src/authority.rs:155`, genutzt in `family.rs:1536`).
+  - It is greedy (`harw-plan/src/graph.rs:332-351`) and decides via `write_scopes_conflict`. That is a pure prefix relation (`harw-plan/src/admission.rs:791-803`).
+  - **Globs are missed:** `src/*.rs` and `src/lib.rs` count as disjoint. Admission, however, turns `src/*.rs` into a glob rule (`admission.rs:608-609`) that permits `src/lib.rs`.
+  - **Fail-open:** if a path cannot be normalized, the result is "no conflict" (`:792-794`). The test at `:1283` pins this behavior.
+- **Second, independent relation:** `paths_overlap` checks `WorkScope.owned_paths: Vec<String>` (`harw-plan-bridge/src/work_driver.rs:170-180,1272-1294`). `WorkerRequest.owned_paths` is untyped as well (`harw-cli/src/job_worker_work_driver.rs:418`).
+- **Enforcement only after the fact:**
+  - It runs via snapshot and diff; there is "no path-precise sandbox" (`job_worker_work_driver.rs:46-58`).
+  - Attribution is by ownership, not by writer (`:1961-1990`). If a worker writes into a sibling's path, this goes unnoticed.
+- **IR:** it only knows `filesystem_write: bool` (`ir_v2.rs:1074`). There are no diagnostic codes for ORG (`diagnostics.rs:101`).
+- **Precedent:** `AuthorityCeiling::is_disjoint_from` (`harw-agent-dsl/src/authority.rs:155`, used in `family.rs:1536`).
 
-**Besitz.**
-- `harw-plan` liegt in Ring A (`xtask/arch-policy.toml:333-334`), `harw-agent-dsl` in C (`:105`), und C darf nur auf F, I und C zeigen (`:47`). Die Algebra gehört deshalb nach Ring I, als `harw-authority/src/write_scope.rs` (`:113-114`).
-- Dort liegt sie neben `NetworkScope`, das schon `intersection` und `is_subset_of` hat (`harw-authority/src/lib.rs:320-402`).
-- Die DSL erreicht `harw-authority` bereits über `harw-context` (`harw-agent-dsl/Cargo.toml:13`, `harw-context/Cargo.toml:12`). Die Ringe J, D und A dürfen I ohnehin nutzen (`:46,50,51`).
+**Ownership.**
+- `harw-plan` is in ring A (`xtask/arch-policy.toml:333-334`), `harw-agent-dsl` in C (`:105`), and C may only point to F, I and C (`:47`). The algebra therefore belongs in ring I, as `harw-authority/src/write_scope.rs` (`:113-114`).
+- There it sits next to `NetworkScope`, which already has `intersection` and `is_subset_of` (`harw-authority/src/lib.rs:320-402`).
+- The DSL already reaches `harw-authority` through `harw-context` (`harw-agent-dsl/Cargo.toml:13`, `harw-context/Cargo.toml:12`). Rings J, D and A may use I anyway (`:46,50,51`).
 
-**Warum vor B2b/B4.**
-- Im Zellhost teilen sich N Worker-Prozesse ein `/workspace` (B.5).
-- Die einzige harte Schranke ist Landlock je Prozess (B.3). Dessen Policy kennt nur Pfad-Hierarchien, keine Globs (`harw-job-linux/src/sandbox.rs:60-61`).
-- Die Disjunktheit muss also genau auf dieser Form entschieden werden. Sonst vergibt B2b unbemerkt überlappende Schreibrechte, und B4 exportiert einen vermischten Stand.
+**Why before B2b/B4.**
+- In the cell host, N worker processes share one `/workspace` (B.5).
+- The only hard barrier is Landlock per process (B.3). Its policy knows only path hierarchies, no globs (`harw-job-linux/src/sandbox.rs:60-61`).
+- Disjointness must therefore be decided on exactly this form. Otherwise B2b silently grants overlapping write permissions, and B4 exports a mixed-up state.
 
-**Typ-Skizze (DEC-043):**
+**Type sketch (DEC-043):**
 ```rust
 // harw-authority/src/write_scope.rs (Ring I)
-pub struct RepoPath(String);                             // normalisiert; `..`/absolut/leer ⇒ Err
-pub enum WriteRoot { File(RepoPath), Subtree(RepoPath) } // Landlock-fähig, keine Globs
-pub struct WriteScope(BTreeSet<WriteRoot>);              // leer = nur lesen
+pub struct RepoPath(String);                             // normalized; `..`/absolute/empty ⇒ Err
+pub enum WriteRoot { File(RepoPath), Subtree(RepoPath) } // Landlock-capable, no globs
+pub struct WriteScope(BTreeSet<WriteRoot>);              // empty = read-only
 impl WriteScope {
-    pub fn parse(e: &[&str]) -> Result<Self, ScopeError>;    // Glob ⇒ ScopeError::Glob
+    pub fn parse(e: &[&str]) -> Result<Self, ScopeError>;    // glob ⇒ ScopeError::Glob
     pub fn intersects(&self, o: &Self) -> bool;
     pub fn is_subset_of(&self, ceiling: &Self) -> bool;
     pub fn roots(&self) -> impl Iterator<Item = &WriteRoot>; // → FilesystemPolicy.read_write
 }
-pub struct DisjointSet<K>(Vec<(K, WriteScope)>);         // Beweis-Token, nur über prove
+pub struct DisjointSet<K>(Vec<(K, WriteScope)>);         // proof token, only via prove
 impl<K: Ord + Clone> DisjointSet<K> {
     pub fn prove(v: Vec<(K, WriteScope)>) -> Result<Self, Overlap<K>>;
 }
-pub enum PlanSelector { Exact(String), Prefix(String), Glob(String) } // Auswahl, kein Schreibrecht
-impl PlanSelector { pub fn may_overlap(&self, o: &Self) -> bool; }     // unentscheidbar ⇒ true
+pub enum PlanSelector { Exact(String), Prefix(String), Glob(String) } // selection, not a write permission
+impl PlanSelector { pub fn may_overlap(&self, o: &Self) -> bool; }     // undecidable ⇒ true
 ```
 
-**Prüfung an drei Stellen (DEC-044):**
-1. Beim DSL-Validate werden die Clan-Selektoren paarweise geprüft (neuer `HARW-ORG`-Code).
-2. Bei der Partition wird `CellPlan.batches` zu `Vec<DisjointSet<TaskId>>`.
-3. Bei der Zellhost-Admission wird vor jeder Stufe geprüft, gegen die Stufe und gegen die laufenden Worker (`work_driver.rs:1296`). Danach gilt `roots()` als Landlock-Regel.
+**Checked in three places (DEC-044):**
+1. DSL validation checks the clan selectors pairwise (new `HARW-ORG` code).
+2. In the partition, `CellPlan.batches` becomes `Vec<DisjointSet<TaskId>>`.
+3. Cell host admission checks before every stage, against the stage and against the running workers (`work_driver.rs:1296`). After that, `roots()` serves as the Landlock rule.
 
-### B.8.3 Konflikte zwischen B.1–B.7 und §14–15
-1. **Name:** siehe B.8.1.
-2. **Fan-out-Breite (DEC-046):**
-   - Heute berechnen drei Stellen die Breite unterschiedlich:
+### B.8.3 Conflicts between B.1–B.7 and §14–15
+1. **Name:** see B.8.1.
+2. **Fan-out width (DEC-046):**
+   - Today three places compute the width differently:
      - DSL: `min(Batch, max_parallel)` (`cells.rs:366-381`).
-     - Work-Driver: `min(spec, cap−1)` (`job_worker_work_driver.rs:374-380`).
-     - Zellhost: k aus der Lease (B.4).
-   - **Regel:** Breite = min(Partition-Batch, `max_parallel_workers`, k − `RESERVED_PROVIDER_SLOTS`).
-   - Die DSL begrenzt, *wer* zusammen läuft, der Ledger, *wie viele*. Keine Seite erweitert die andere.
-3. **Wo `required` gilt (DEC-044):**
-   - Heute nur in `cells.rs:200-209` und nur für `/analyze`. Der Work-Driver nutzt keine Org-Zellen.
-   - Fehlt die Organisation oder die Zelle, läuft die Welle ungeteilt (`cells.rs:51-55`, `analyze.rs:1561-1572`). Das ist fail-open.
-   - B.1–B.7 erwähnen `write_partition` nicht.
-   - **Regel:** Im Zellhost gilt `advisory`/`none` wie `required`, sobald mehr als ein Mitglied schreibt. Einen Rückfall auf die ungeteilte Welle gibt es dort nicht.
-4. **Clans und Zellhosts (DEC-045):**
-   - Die DSL sieht alle Clans in *einem* Root-Lauf (`dsl.md:1036-1038`). B.1 sieht einen Container je Job und sagt nichts zu Clans.
-   - **Regel:**
-     - Standard ist ein Zellhost je Clan.
-     - Der Leader, ein Child-Orchestrator (`default.toml:30-34`), ist dort der einzige Provider-Client.
-     - Ein Clan läuft nie über mehrere Zellhosts auf demselben Workspace.
-     - Die Rollen im Image kommen aus dem Familien-Roster.
-   - **Befund:** Bei der Security-Familie ist `[orchestrators].allowed` leer (`default.toml:97-99`).
-5. **Organisation und Placement-Policy (DEC-047):**
-   - Eine Organisation wird als „organization revision“ eingefroren (`dsl.md:1226`).
-   - Sie verengt den Grant nur (`meet`, Inv. 7 `dsl.md:1397`, DEC-022) und trägt keine Topologie (DEC-020). `child_depth_cost` ist schon so eine Verengung (`organization.rs:195-236`).
-   - Leases und Fencing gehören der Laufzeit (Inv. 24, `dsl.md:1414`). Das passt zu DEC-038.
+     - Work driver: `min(spec, cap−1)` (`job_worker_work_driver.rs:374-380`).
+     - Cell host: k from the lease (B.4).
+   - **Rule:** width = min(partition batch, `max_parallel_workers`, k − `RESERVED_PROVIDER_SLOTS`).
+   - The DSL limits *who* runs together, the ledger limits *how many*. Neither side widens the other.
+3. **Where `required` applies (DEC-044):**
+   - Today only in `cells.rs:200-209` and only for `/analyze`. The work driver uses no org cells.
+   - If the organization or the cell is missing, the wave runs undivided (`cells.rs:51-55`, `analyze.rs:1561-1572`). This is fail-open.
+   - B.1–B.7 do not mention `write_partition`.
+   - **Rule:** in the cell host, `advisory`/`none` count as `required` as soon as more than one member writes. There is no fallback to the undivided wave there.
+4. **Clans and cell hosts (DEC-045):**
+   - The DSL sees all clans in *one* root run (`dsl.md:1036-1038`). B.1 sees one container per job and says nothing about clans.
+   - **Rule:**
+     - The default is one cell host per clan.
+     - The leader, a child orchestrator (`default.toml:30-34`), is the only provider client there.
+     - A clan never runs across several cell hosts on the same workspace.
+     - The roles in the image come from the family roster.
+   - **Finding:** for the security family, `[orchestrators].allowed` is empty (`default.toml:97-99`).
+5. **Organization and placement policy (DEC-047):**
+   - An organization is frozen as an "organization revision" (`dsl.md:1226`).
+   - It only narrows the grant (`meet`, inv. 7 `dsl.md:1397`, DEC-022) and carries no topology (DEC-020). `child_depth_cost` is already such a narrowing (`organization.rs:195-236`).
+   - Leases and fencing belong to the runtime (inv. 24, `dsl.md:1414`). This fits DEC-038.
 
-### B.8.4 Gemeinsame Roadmap (eine Datei je Schritt)
+### B.8.4 Joint roadmap (one file per step)
 
-| Schritt | Datei (Ring) | Hängt ab | Test |
+| Step | File (ring) | Depends | Test |
 |---|---|---|---|
-| G0 | dieser Abschnitt, DEC-042–047 | – | – |
-| G1 | `harw-authority/src/write_scope.rs` (I) | – | Property: `prove` ok ⇒ jeder Pfad in ≤1 Scope; Glob/`..`/absolut abgelehnt; Serde |
-| G2 | `harw-plan/src/admission.rs` (A): `conflicts` delegiert an `WriteScope`; Glob oder ungültiger Pfad ⇒ Konflikt | G1 | `src/*.rs` gegen `src/lib.rs` ⇒ Konflikt; `admission.rs:1283` umdrehen |
-| G3 | `harw-plan-bridge/src/work_driver.rs` (A) | G1 | Fälle `:2036-2041` bleiben grün |
-| G4 | `harw-agent-dsl/src/organization.rs` (C) + ORG-Code | G1 | überlappende Clans ⇒ Fehler |
-| G5 | `harw-registry-defaults/agents/organization/default.toml` (A), in derselben Runde wie G4 | G4 | Default-Organisation löst auf |
-| G6 | `harw-plan-bridge/src/cells.rs` (A) | G2 | Glob-Knoten teilen nie einen Batch; kein ungeteilter Rückfall bei Schreibern |
-| B1 | `harw-container-model/src/cell.rs` (I) + `write_scope` | C1, G1 | Scope ⊆ Clan-Selektor |
-| B2b | `harw-cli/src/cell_spawner.rs` (A) | B2a, G6 | Fake-Binary kann nicht in den Pfad des Geschwisters schreiben |
-| B4 | `harw-cli/src/cell.rs` (A) | B2b, B3, G6 | überlappende Stufe wird vor dem Spawn abgelehnt |
-| B5 | `harw-job-executor-oci/src/cell.rs` (J) | C2, C3, B1 | Read-back: nur Scope-Wurzeln sind `rw` |
-| P1 | `harw-placement-model/src/requirements.rs` (I): `WriteNeed` trägt `WriteScope` (66) | G1 | `meet` weitet nie |
-| P4 | `harw-placement/src/lease.rs` (A): überlappende Workspace-Claims ⇒ `CapacityShort` | P2, P3, G1 | zwei Claims |
+| G0 | this section, DEC-042–047 | – | – |
+| G1 | `harw-authority/src/write_scope.rs` (I) | – | property: `prove` ok ⇒ every path in ≤1 scope; glob/`..`/absolute rejected; serde |
+| G2 | `harw-plan/src/admission.rs` (A): `conflicts` delegates to `WriteScope`; glob or invalid path ⇒ conflict | G1 | `src/*.rs` against `src/lib.rs` ⇒ conflict; flip `admission.rs:1283` |
+| G3 | `harw-plan-bridge/src/work_driver.rs` (A) | G1 | cases `:2036-2041` stay green |
+| G4 | `harw-agent-dsl/src/organization.rs` (C) + ORG code | G1 | overlapping clans ⇒ error |
+| G5 | `harw-registry-defaults/agents/organization/default.toml` (A), in the same round as G4 | G4 | default organization resolves |
+| G6 | `harw-plan-bridge/src/cells.rs` (A) | G2 | glob nodes never share a batch; no undivided fallback for writers |
+| B1 | `harw-container-model/src/cell.rs` (I) + `write_scope` | C1, G1 | scope ⊆ clan selector |
+| B2b | `harw-cli/src/cell_spawner.rs` (A) | B2a, G6 | fake binary cannot write into a sibling's path |
+| B4 | `harw-cli/src/cell.rs` (A) | B2b, B3, G6 | overlapping stage is rejected before the spawn |
+| B5 | `harw-job-executor-oci/src/cell.rs` (J) | C2, C3, B1 | read-back: only scope roots are `rw` |
+| P1 | `harw-placement-model/src/requirements.rs` (I): `WriteNeed` carries `WriteScope` (66) | G1 | `meet` never widens |
+| P4 | `harw-placement/src/lease.rs` (A): overlapping workspace claims ⇒ `CapacityShort` | P2, P3, G1 | two claims |
 
-**Unabhängig von G3:** C0–C6, P0, P2, P3, P5–P7, B0, B2a und B3. B6 hängt nur transitiv davon ab.
+**Independent of G3:** C0–C6, P0, P2, P3, P5–P7, B0, B2a and B3. B6 depends on it only transitively.
 
-**Wellen:**
+**Waves:**
 - W0: G0, C0, P0, B0
 - W1: G1, C1, B2a, B3
 - W2: G2, G3, G4, G5, P1, B1, C2, C4, C5
@@ -278,12 +278,12 @@ impl PlanSelector { pub fn may_overlap(&self, o: &Self) -> bool; }     // unents
 - W6: B5, P6
 - W7: B6, P7
 
-**Kritischer Pfad:** G1→G2→G6→B2b→B4→B6, parallel dazu C1→C2→C3→B5.
+**Critical path:** G1→G2→G6→B2b→B4→B6, in parallel C1→C2→C3→B5.
 
-### Offene Entscheidungen (B.8)
-- **DEC-042:** Heißt es „Zellhost“ (`harw.kind=cellhost`), oder bleibt es bei „Container-Zelle“ als Pflichtzusatz?
-- **DEC-043:** Kommt die Algebra als Modul in `harw-authority` oder in ein eigenes I-Crate `harw-scope`? Werden Globs in `write_scope` verboten oder konservativ als Konflikt gewertet?
-- **DEC-044:** Symbol-Scopes bleiben dateiweit (`ids.rs:283-286`). Wenn Landlock im Zellhost fehlt: nur noch ein Schreiber je Stufe?
-- **DEC-045:** Mehrere Zellhosts auf einem Workspace: disjunkte `rw`-Mounts auf einem Volume oder ein Klon je Zellhost mit Merge-Barriere? Für die Default-Organisation: `*-synthesis` in `synthesis-*` umbenennen (das betrifft die Knotennamen in `/analyze`, `default.toml:19-20`) oder eine Vorrangregel einführen?
-- **DEC-046:** Zählt der Leader-Turn gegen k, oder bekommt er einen eigenen Slot?
-- **DEC-047:** Kommen `[clans.placement]`-Hinweise (nur verengend, ⊆ Grant) zusammen mit P6 oder später?
+### Open decisions (B.8)
+- **DEC-042:** Is it called "cell host" (`harw.kind=cellhost`), or does it stay "container cell" with a mandatory qualifier?
+- **DEC-043:** Does the algebra go as a module into `harw-authority` or into its own I crate `harw-scope`? Are globs in `write_scope` forbidden, or conservatively treated as a conflict?
+- **DEC-044:** Symbol scopes stay file-wide (`ids.rs:283-286`). If Landlock is missing in the cell host: only one writer per stage?
+- **DEC-045:** Several cell hosts on one workspace: disjoint `rw` mounts on one volume, or one clone per cell host with a merge barrier? For the default organization: rename `*-synthesis` to `synthesis-*` (this affects the node names in `/analyze`, `default.toml:19-20`) or introduce a precedence rule?
+- **DEC-046:** Does the leader turn count against k, or does it get its own slot?
+- **DEC-047:** Do `[clans.placement]` hints (narrowing only, ⊆ grant) arrive together with P6 or later?

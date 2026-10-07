@@ -22,13 +22,13 @@
 | File:line | Stale statement | Correct statement |
 |---|---|---|
 | `harw-secrets/src/error.rs:46` | "`crypt_guard` 3.0.1 derives deterministic recipient keys only for hybrid KEMs" | Verified: 3.0.2 `derive_recipient_key_pair(kem, seed)` (`src/hpke_pq/mod.rs:2677`) also covers `MlKem512/768/1024`, after a SHAKE256 domain-separated seed expansion. `UnsupportedLegacyKem` is a **Harwness policy** (legacy pure ML-KEM records are read-only), not a library limit. |
-| `harw-secrets/src/policy.rs:7` | module doc: 3.0.1 derives seeds "nur noch" for hybrid KEMs | same correction (hybrid-only claim) |
-| `harw-secrets/src/policy.rs:76` | 3.0.1 "keine deterministische Seed-Ableitung mehr" for pure ML-KEM | same correction |
+| `harw-secrets/src/policy.rs:7` | module doc: 3.0.1 derives seeds "only" for hybrid KEMs | same correction (hybrid-only claim) |
+| `harw-secrets/src/policy.rs:76` | 3.0.1 "no deterministic seed derivation any more" for pure ML-KEM | same correction |
 | `harw-secrets/src/envelope.rs:106` | legacy pure ML-KEM envelopes "unreadable with `crypt_guard` 3.0.1" | "rejected by `harw-secrets` policy" |
-| `harw-secrets/src/envelope.rs:775` | test comment: envelope "mit crypt_guard 3.0.1 erzeugt" | historical fact, OK if it says "fixture produced with 3.0.1" |
+| `harw-secrets/src/envelope.rs:775` | test comment: envelope "produced with crypt_guard 3.0.1" | historical fact, OK if it says "fixture produced with 3.0.1" |
 | `harw-secrets/src/kek.rs:31` | cites `crypt_guard-3.0.1/src/hpke_pq/mod.rs:1698` | re-point to the 3.0.2 source line |
 | `harw-secrets/src/kek.rs:318`, `:701` | "without this step crypt_guard 3.0.1 would expand the same root seed" | verify against 3.0.2, then update the version |
-| `deny.toml:28`, `:32`–`:34` | "blockiert durch `crypt_guard = "=3.0.1"` (auch 3.0.2)" and reason strings "über crypt_guard =3.0.1" | pin is `=3.0.2`. The reason strings must name 3.0.2. |
+| `deny.toml:28`, `:32`–`:34` | "blocked by `crypt_guard = "=3.0.1"` (also 3.0.2)" and reason strings "via crypt_guard =3.0.1" | pin is `=3.0.2`. The reason strings must name 3.0.2. |
 | `docs/setup/build-prerequisites.md:33`–`36` | heading and text: "`crypt_guard` `3.0.1` (crates.io, hybrid KEM)" | 3.0.2 |
 
 Rule (§17): update comments and docs only. Do **not** reinterpret persisted records. Keep the exact pin until the move is re-blessed.

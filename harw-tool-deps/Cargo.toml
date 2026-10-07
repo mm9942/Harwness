@@ -15,10 +15,10 @@ harw-extension-api = { path = "../harw-extension-api" }
 harw-macros = { path = "../harw-macros" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tools = { path = "../harw-tools" }
-# `serde`/`serde_json` sind Pflicht-Dependencies für `#[harw_macros::tool]`:
-# der generierte Executor-Prolog ruft `::serde_json::from_value` auf.
-# Versionsangabe bewusst identisch zu harw-tool-fs (Workspace-Konvention);
-# die exakte Auflösung übernimmt das Workspace-Cargo.lock.
+# `serde`/`serde_json` are mandatory dependencies for `#[harw_macros::tool]`:
+# the generated executor prologue calls `::serde_json::from_value`.
+# Version specification deliberately identical to harw-tool-fs (workspace convention);
+# the exact resolution is taken care of by the workspace Cargo.lock.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

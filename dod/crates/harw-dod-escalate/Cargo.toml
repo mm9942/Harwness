@@ -10,54 +10,54 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../../../harw-authority" }
-# `ApprovalActor` (wer autorisiert hat) — dieselbe Kennung, die
-# `AuthorizationProof::authorized_by` bereits verlangt, statt eine zweite
-# Identitätsdarstellung zu erfinden.
+# `ApprovalActor` (who authorized) — the same identifier that
+# `AuthorizationProof::authorized_by` already requires, instead of inventing
+# a second identity representation.
 harw-types = { path = "../../../harw-types" }
-# `TriageSubmission` (W3 C-WPROTO) ist serialisierbar.
+# `TriageSubmission` (W3 C-WPROTO) is serializable.
 serde = { workspace = true }
-# `#[derive(harw_macros::HarwError)]` für `error.rs`. Kein `warden_actions!` —
-# diese Crate erzeugt keine Aktionstypen, sie autorisiert nur bereits von
-# `harw-dod-warden-proto` deklarierte.
+# `#[derive(harw_macros::HarwError)]` for `error.rs`. No `warden_actions!` —
+# this crate produces no action types; it only authorizes ones already
+# declared by `harw-dod-warden-proto`.
 harw-macros = { path = "../../../harw-macros" }
-# `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage` — die
-# Berechtigung, ein `Finding<Triaged>` zu besitzen, kann ausschließlich diese
-# Crate herstellen (siehe `lib.rs`-Moduldoku).
+# `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage` — only this
+# crate can establish the entitlement to hold a `Finding<Triaged>` (see the
+# `lib.rs` module docs).
 harw-dod-rules = { path = "../harw-dod-rules" }
-# `Severity`/`Hardness` — Felder von `Finding<S>`, auf denen `Ladder::stage_for`
-# die Aufstiegsregel auswertet. Keine zusätzliche Gewichtsklasse: `harw-dod-rules`
-# hängt bereits auf diese Crate.
+# `Severity`/`Hardness` — fields of `Finding<S>` on which `Ladder::stage_for`
+# evaluates the escalation rule. No additional weight class: `harw-dod-rules`
+# already depends on this crate.
 harw-dod-signals = { path = "../harw-dod-signals" }
 # `ProposedAction`/`WardenAction`/`AuthorizationProof`/`EscalationStage`/
-# `WardenActionRequest` — das Wire-Vokabular zum Warden. Von Hand geschrieben
-# dort, nicht über `warden_actions!` (siehe dessen `lib.rs`-Moduldoku,
-# Abschnitt „Prüfung 2: harw-tools") — diese Crate zieht deshalb kein
+# `WardenActionRequest` — the wire vocabulary to the warden. Written by hand
+# there, not via `warden_actions!` (see its `lib.rs` module docs, section
+# "Check 2: harw-tools") — this crate therefore does not pull in
 # `harw-tools`.
 harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
-# `FreezeStore`/`Freeze`/`FreezeResolution` (AW5-05) — diese Crate ist der
-# dokumentierte Aufrufer von `FreezeStore::reconcile_expired` beim Start
-# (siehe `harw-session-store/src/freeze.rs`-Moduldoku, Abschnitt „Expiry").
+# `FreezeStore`/`Freeze`/`FreezeResolution` (AW5-05) — this crate is the
+# documented caller of `FreezeStore::reconcile_expired` at startup (see the
+# `harw-session-store/src/freeze.rs` module docs, section "Expiry").
 harw-session-store = { path = "../../../harw-session-store" }
 jiff = { workspace = true }
 
 [dev-dependencies]
-# Nur für Tests: baut einen `serde_json::Error`, um den `#[from]`-Pfad von
-# `EscalateError::ActionEncoding` (wrappt `WardenProtoError`) ohne echte
-# Digestbildungspanne auszulösen.
+# Tests only: builds a `serde_json::Error` to trigger the `#[from]` path of
+# `EscalateError::ActionEncoding` (wraps `WardenProtoError`) without a real
+# digest-formation failure.
 serde_json = { workspace = true }
-# Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
-# statt einen privaten Konstruktor zu umgehen — `harw-dod-rules` selbst
-# verwendet dieselbe Crate für dasselbe Muster in seinen eigenen Doctests.
+# Tests only: builds a real `Finding<Triaged>` via `EgressFlowRule` instead
+# of bypassing a private constructor — `harw-dod-rules` itself uses the same
+# crate for the same pattern in its own doctests.
 harw-sandbox = { path = "../../../harw-sandbox" }
-# Nur für Tests: schaltet `triaged_finding_for_test` frei — die
-# `Ladder`-Testfixtures brauchen `Severity`/`Hardness`-Kombinationen (z. B.
-# `Severity::Critical`), die keine echte Regel erzeugt. Wegen `resolver = "2"`
-# (Workspace-Root) nur für Testziele dieser Crate aktiv, nie im produktiven
-# Build (siehe `harw-dod-rules`' `Cargo.toml` und `src/finding.rs`-Moduldoku).
+# Tests only: unlocks `triaged_finding_for_test` — the `Ladder` test fixtures
+# need `Severity`/`Hardness` combinations (e.g. `Severity::Critical`) that no
+# real rule produces. Because of `resolver = "2"` (workspace root) it is
+# active only for this crate's test targets, never in the production build
+# (see `harw-dod-rules`' `Cargo.toml` and the `src/finding.rs` module docs).
 harw-dod-rules = { path = "../harw-dod-rules", features = ["test-support"] }
-# Nur für Tests: ein `FreezeStore` braucht ein Wurzelverzeichnis; `tempfile`
-# ist dieselbe Crate, die `harw-session-store` selbst für seine `FreezeStore`-
-# Doctests/Tests verwendet.
+# Tests only: a `FreezeStore` needs a root directory; `tempfile` is the same
+# crate that `harw-session-store` itself uses for its `FreezeStore`
+# doctests/tests.
 tempfile = { workspace = true }
 
 [lints]
