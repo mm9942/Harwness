@@ -2101,6 +2101,10 @@ dependencies = [
 name = "harw-catalog"
 version = "0.9.1"
 dependencies = [
+ "jiff",
+ "harw-types",
+ "harw-lens-types",
+ "harw-context",
  "harw-config",
  "harw-home",
  "harw-test-support",
