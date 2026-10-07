@@ -2172,6 +2172,7 @@ dependencies = [
 name = "harw-cli"
 version = "0.9.1"
 dependencies = [
+ "blake3",
  "aws-lc-rs",
  "clap",
  "clap_complete",
