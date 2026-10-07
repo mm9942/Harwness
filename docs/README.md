@@ -100,6 +100,7 @@ Future architecture lives in [`planning/`](planning/README.md), not here. Planni
 
 ## Audits and research
 
+- [Harwness research paper — working draft](research/harwness-paper.md) — *artifact-grounded draft*
 - [Agent Capabilities Audit](audits/agent-capabilities-audit.md) — *partially implemented*
 - [Tool Inventory: Codex / Hermes / OpenClaw](research/tool-inventory.md) — *implemented*
 
