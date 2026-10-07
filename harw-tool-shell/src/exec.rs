@@ -55,10 +55,10 @@
 //!   (z. B. Maus-Reporting) verändern. Ohne `setsid` bleibt der bisherige Pfad
 //!   unverändert (`tracing::debug!` einmalig).
 
-use crate::capture::{BoundedCapture, DrainEnd};
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_authority::{Permission, SandboxSpec};
+use harw_command::{CommandEnd, CommandRequest, CommandSandbox, Persistence, ResourceRequest};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
@@ -78,11 +78,9 @@ use std::{
     io,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
-use tokio::process::{Child, Command as TokioCommand};
 use tracing::{debug, info, warn};
 
 // Runde 5, Teil N: Host-Mode-Anfrage (`request_host`) und Sandbox-Hinweis;
@@ -115,16 +113,6 @@ const TOOL_NAME: &str = "shell.exec";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const TRUNCATION_MARKER: &str = "\n[...truncated...]";
-/// Obergrenze für das Einsammeln des Exit-Status nach SIGKILL. `kill_on_drop` bleibt
-/// als Rückfallebene, falls der Kernel den Prozess nicht rechtzeitig freigibt.
-const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Feste Suchpfade für `setsid` (util-linux), geprüft vor der `PATH`-Suche in
-/// [`find_setsid`]. Anders als [`crate::limits::PRLIMIT_CANDIDATES`] fällt die
-/// Suche zusätzlich auf `PATH` zurück ([`std::env::split_paths`]): `setsid`
-/// dient nur der Sitzungs-Trennung des Host-Befehls von harws eigenem
-/// Terminal, nicht der Durchsetzung sicherheitskritischer Grenzen wie
-/// `bwrap`/`prlimit`, für die `PATH` bewusst nie ausgewertet wird.
-const SETSID_FIXED_CANDIDATES: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
 /// Einzige heute existierende Worker-Definition, die [`SandboxProfile::Host`]
 /// aktiviert (siehe `harw-registry-defaults/agents/host-process-worker.toml`).
 /// Sobald ein zweiter Host-fähiger Worker entsteht, muss dieser Konstante ein
@@ -797,12 +785,15 @@ impl ShellExecutor {
             launcher.executable(),
             plan.args(),
         );
-        let mut command = TokioCommand::new(&launch.program);
-        command.args(&launch.args);
 
-        self.spawn_and_collect(
-            &mut command,
-            "Bubblewrap",
+        self.run_on_port(
+            PortLaunch {
+                program: launch.program.as_os_str(),
+                args: &launch.args,
+                cwd: sandbox.workspace().canonical_root().to_path_buf(),
+                limits: ResourceRequest::default(),
+                context: "Bubblewrap",
+            },
             effective_timeout,
             session_id,
             cancel,
@@ -887,54 +878,24 @@ impl ShellExecutor {
             );
         }
 
-        let setsid = resolve_setsid();
+        // The job runtime starts the command in a new session (no controlling
+        // terminal) and owns the kill of its whole tree; the environment is the
+        // harness's own (no `env_clear`), unlike the hermetic bwrap path.
         let shell = resolve_host_shell(self.exec_platform);
-        let (program, shell_args) = host_shell_argv_with_shell(setsid, &shell, &args.command);
         // Runde 5, Teil N: RLIMIT_CPU wächst mit dem gewährten Zeitlimit.
         let limits = timeouts::limits_for(self.limits, effective_timeout);
-        let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
-
-        let mut command = TokioCommand::new(&launch.program);
-        command.args(&launch.args);
-        command.current_dir(sandbox.workspace().canonical_root());
-        // Prozessgruppen-/Sitzungs-Isolation des Host-Befehls von harws eigenem
-        // Terminal. Zwei Fälle, je nachdem ob `setsid` gefunden wurde
-        // (`host_shell_argv`):
-        //
-        // - MIT setsid: `process_group(0)` wird hier BEWUSST NICHT gesetzt. Das
-        //   util-linux-`setsid` forkt nur dann einen Enkelprozess (und wartet
-        //   dank `--wait` auf ihn), wenn es selbst bereits Prozessgruppenführer
-        //   ist (`getpgrp() == getpid()`). Ohne `process_group(0)` erbt der
-        //   direkte Kindprozess (der spätere `setsid`) harws Prozessgruppe
-        //   (deren pgid == harws eigene PID ist, nicht die des Kindes) — er ist
-        //   also KEIN Gruppenführer. `setsid` ruft daraufhin `setsid(2)` auf
-        //   sich selbst auf und `exec`t `/bin/sh` an derselben PID weiter, statt
-        //   zu forken: diese eine PID wird Sitzungs- UND Gruppenführer einer
-        //   neuen, von harws Terminal vollständig gelösten Sitzung (kein
-        //   Controlling-Terminal mehr — `open("/dev/tty")` scheitert dort mit
-        //   ENXIO, das eigentliche Ziel dieses Fixes). `terminate()` killt
-        //   unverändert genau diese eine PID (`child.start_kill()`), die damit
-        //   weiterhin die Spitze des gesamten Kommandobaums ist — kein Änderung
-        //   an `terminate()` nötig.
-        //   Würde hier stattdessen `process_group(0)` gesetzt, wäre der direkte
-        //   Kindprozess bereits Gruppenführer, `setsid` würde also forken und
-        //   (dank `--wait`) auf den Enkel warten; `terminate()` träfe dann nur
-        //   den wartenden Elternprozess, während `/bin/sh` in seiner eigenen,
-        //   neuen Sitzung als Waise weiterliefe — exakt das Leck, das dieser Fix
-        //   beheben soll. Deshalb bewusst vermieden.
-        // - OHNE setsid (Fallback, unverändertes Verhalten): `process_group(0)`
-        //   wie bisher, trennt den Host-Befehl zumindest von harws eigener
-        //   Prozessgruppe (keine Sitzungs-Trennung, `/dev/tty` bleibt erreichbar).
-        if setsid.is_none() {
-            command.process_group(0);
-        }
-        // Umgebung wird bewusst NICHT gecleart (kein `env_clear`): der Host-Pfad erbt
-        // den vollen zsh-Kontext des Nutzers (PATH/HOME/CARGO_HOME/…), im Unterschied
-        // zum hermetischen bwrap-Pfad.
-
-        self.spawn_and_collect(
-            &mut command,
-            "host shell",
+        let shell_args = [OsString::from("-c"), OsString::from(&args.command)];
+        self.run_on_port(
+            PortLaunch {
+                program: shell.as_os_str(),
+                args: &shell_args,
+                cwd: sandbox.workspace().canonical_root().to_path_buf(),
+                limits: rlimit_request(
+                    &limits,
+                    limits.require_rlimits && self.exec_platform == ExecPlatform::Sandboxed,
+                ),
+                context: "host shell",
+            },
             effective_timeout,
             session_id,
             cancel,
@@ -943,128 +904,89 @@ impl ShellExecutor {
         .await
     }
 
-    /// Spawns an already-configured, not-yet-started `TokioCommand`, drains
-    /// stdout/stderr together under one byte budget, applies the timeout and
-    /// optional cancel-race, and returns the finished `ToolOutput`. Shared
-    /// core for the sandboxed (`bwrap`) and host (`/bin/sh -c`, no `bwrap`)
-    /// paths (Plan Teil B1) — only the `command` construction differs
-    /// between [`Self::run_command`] and [`Self::run_host_command`].
+    /// Runs a prepared launch through the installed command port (PL-93):
+    /// the job runtime owns spawn, process group/session, deadline, output
+    /// budget and the kill; this only builds the request and shapes the
+    /// result for the model. Shared by the sandboxed (`bwrap`) and the host
+    /// (`/bin/sh -c`) path.
     ///
     /// # Errors
-    /// Returns `Ok(ToolOutput::error(...))` for spawn failure, missing
-    /// stdio pipes, I/O errors, or timeout. Returns
-    /// `Err(ToolsError::Cancelled)` when `cancel` fires before completion —
-    /// the process tree is killed via [`terminate`] before this is returned.
-    ///
-    /// # Concurrency
-    /// Timeout, cancellation, and output overflow all kill and reap the
-    /// child explicitly via [`terminate`]; `kill_on_drop(true)` still covers
-    /// a dropped future.
-    async fn spawn_and_collect(
+    /// `Ok(ToolOutput::error(...))` when no job runtime is installed, the job
+    /// cannot start, or the deadline elapses. `Err(ToolsError::Cancelled)` when
+    /// `cancel` fires — the runtime has killed the process tree by then.
+    async fn run_on_port(
         &self,
-        command: &mut TokioCommand,
-        spawn_error_context: &str,
+        launch: PortLaunch<'_>,
         effective_timeout: u64,
         session_id: &str,
         cancel: Option<&CancelToken>,
         executed_on_host: bool,
     ) -> Result<ToolOutput, ToolsError> {
-        let mut child = match configure_stdio(command).spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                warn!(error = %err, "shell.exec spawn failed");
-                return Ok(ToolOutput::error(format!(
-                    "shell.exec: failed to spawn {spawn_error_context}: {err}"
-                )));
-            }
-        };
-
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
-            terminate(&mut child).await;
+        let Some(port) = harw_command::installed() else {
             return Ok(ToolOutput::error(
-                "shell.exec: process I/O error: stdout/stderr pipes missing",
+                "shell.exec: no job runtime is installed; commands run only through the job runtime",
             ));
         };
+        let mut request = CommandRequest::new(
+            launch.program.to_string_lossy().into_owned(),
+            launch.cwd,
+            Duration::from_secs(effective_timeout),
+        );
+        request.args = launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        request.env = std::env::vars().collect();
+        request.max_output_bytes = self.max_output_bytes;
+        request.limits = launch.limits;
+        request.sandbox = CommandSandbox::Host;
+        request.persistence = Persistence::Ephemeral;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_timeout);
-        let mut capture = BoundedCapture::new(self.max_output_bytes);
-        let drained = match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    result = tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)) => result,
-                    () = cancel.cancelled() => {
-                        terminate(&mut child).await;
-                        info!(session_id, "shell.exec cancelled while draining output");
-                        return Err(ToolsError::Cancelled);
-                    }
-                }
+        let done = port.run(request, cancel.cloned().unwrap_or_default()).await;
+        match done.end {
+            CommandEnd::Failed(message) => {
+                warn!(error = %message, "shell.exec job failed to run");
+                Ok(ToolOutput::error(format!(
+                    "shell.exec: failed to spawn {}: {message}",
+                    launch.context
+                )))
             }
-            None => {
-                tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await
+            CommandEnd::Cancelled => {
+                info!(session_id, "shell.exec cancelled");
+                Err(ToolsError::Cancelled)
             }
-        };
-
-        let status = match drained {
-            Err(_elapsed) => {
-                terminate(&mut child).await;
+            CommandEnd::TimedOut => {
                 warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                return Ok(self.timeout_output(effective_timeout, &capture, executed_on_host));
+                Ok(self.timeout_output(
+                    effective_timeout,
+                    &done.stdout,
+                    &done.stderr,
+                    executed_on_host,
+                ))
             }
-            Ok(Err(err)) => {
-                terminate(&mut child).await;
-                warn!(error = %err, "shell.exec output read failed");
-                return Ok(ToolOutput::error(format!(
-                    "shell.exec: process I/O error: {err}"
-                )));
-            }
-            Ok(Ok(DrainEnd::LimitExceeded)) => {
-                // Niemand liest mehr: Prozessbaum sofort beenden statt bis zum Timeout
-                // weiterlaufen zu lassen (Pipe voll → Kind blockiert, CPU/Disk-Last bleibt).
-                let status = terminate(&mut child).await;
+            CommandEnd::OutputLimit => {
                 warn!(
                     max_output_bytes = self.max_output_bytes,
                     "shell.exec output limit exceeded; process tree killed"
                 );
-                return Ok(self.completed_output(status, &capture, true, executed_on_host));
+                Ok(self.completed_output(None, &done.stdout, &done.stderr, true, executed_on_host))
             }
-            Ok(Ok(DrainEnd::Eof)) => {
-                let waited = match cancel {
-                    Some(cancel) => {
-                        tokio::select! {
-                            result = tokio::time::timeout_at(deadline, child.wait()) => result,
-                            () = cancel.cancelled() => {
-                                terminate(&mut child).await;
-                                info!(session_id, "shell.exec cancelled while waiting for exit");
-                                return Err(ToolsError::Cancelled);
-                            }
-                        }
-                    }
-                    None => tokio::time::timeout_at(deadline, child.wait()).await,
-                };
-                match waited {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(err)) => {
-                        terminate(&mut child).await;
-                        warn!(error = %err, "shell.exec wait failed");
-                        return Ok(ToolOutput::error(format!(
-                            "shell.exec: process I/O error: {err}"
-                        )));
-                    }
-                    Err(_elapsed) => {
-                        terminate(&mut child).await;
-                        warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                        return Ok(self.timeout_output(
-                            effective_timeout,
-                            &capture,
-                            executed_on_host,
-                        ));
-                    }
-                }
-            }
-        };
-
-        Ok(self.completed_output(Some(status), &capture, false, executed_on_host))
+            CommandEnd::Exited => Ok(self.completed_output(
+                Some(done.exit_code),
+                &done.stdout,
+                &done.stderr,
+                done.truncated,
+                executed_on_host,
+            )),
+            CommandEnd::Signaled(_) => Ok(self.completed_output(
+                None,
+                &done.stdout,
+                &done.stderr,
+                done.truncated,
+                executed_on_host,
+            )),
+        }
     }
 
     /// Prüft die Limits und löst `prlimit` an den festen Pfaden auf.
@@ -1114,17 +1036,15 @@ impl ShellExecutor {
     /// byte-identisch zu vorher, ohne dieses Feld.
     fn completed_output(
         &self,
-        status: Option<ExitStatus>,
-        capture: &BoundedCapture,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
         killed_by_output_limit: bool,
         executed_on_host: bool,
     ) -> ToolOutput {
-        let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
-        let (stdout_str, stderr_str, truncated) = Self::truncate_combined_output(
-            capture.stdout(),
-            capture.stderr(),
-            self.max_output_bytes,
-        );
+        let exit_code = exit_code.unwrap_or(-1);
+        let (stdout_str, stderr_str, truncated) =
+            Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
         let truncated = truncated || killed_by_output_limit;
 
         info!(
@@ -1152,14 +1072,12 @@ impl ShellExecutor {
     fn timeout_output(
         &self,
         timeout_secs: u64,
-        capture: &BoundedCapture,
+        stdout: &[u8],
+        stderr: &[u8],
         executed_on_host: bool,
     ) -> ToolOutput {
-        let (stdout, stderr, truncated) = Self::truncate_combined_output(
-            capture.stdout(),
-            capture.stderr(),
-            self.max_output_bytes,
-        );
+        let (stdout, stderr, truncated) =
+            Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
         let prefix = if executed_on_host { "[host] " } else { "" };
         ToolOutput::error(format!(
             "{prefix}shell.exec timed out after {timeout_secs}s; process tree killed. \
@@ -1168,119 +1086,37 @@ impl ShellExecutor {
     }
 }
 
-/// Löst `setsid` (util-linux) einmalig pro Prozess auf und merkt das Ergebnis.
-///
-/// # Description
-/// Prüft zuerst [`SETSID_FIXED_CANDIDATES`], danach jeden Eintrag von `PATH`
-/// ([`find_setsid_in_path`]). `None` wird genau einmal mit
-/// [`tracing::debug!`] begründet — dank [`OnceLock`] läuft die Suche (und
-/// damit auch das Log) nur beim ersten Aufruf.
-///
-/// # Returns
-/// `Some(path)` zum ersten gefundenen ausführbaren `setsid`, sonst `None`.
-///
-/// # Concurrency
-/// `Send + Sync`; sicher von mehreren Tasks gleichzeitig aufrufbar, die
-/// zugrundeliegende Suche läuft dank `OnceLock` nur einmal.
-pub(crate) fn resolve_setsid() -> Option<&'static Path> {
-    static SETSID_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    SETSID_PATH.get_or_init(find_setsid).as_deref()
+/// What [`ShellExecutor::run_on_port`] runs.
+struct PortLaunch<'a> {
+    program: &'a std::ffi::OsStr,
+    args: &'a [OsString],
+    cwd: PathBuf,
+    limits: ResourceRequest,
+    context: &'static str,
 }
 
-/// Sucht `setsid` an [`SETSID_FIXED_CANDIDATES`], dann in `PATH`. Reine
-/// Auflösungslogik ohne `OnceLock`-Caching, damit [`resolve_setsid`] die
-/// Suche über `get_or_init` einmalig anstoßen kann.
-fn find_setsid() -> Option<PathBuf> {
-    let fixed = SETSID_FIXED_CANDIDATES.map(Path::new);
-    if let Some(found) = find_setsid_in(&fixed) {
-        return Some(found);
-    }
-    match find_setsid_in_path() {
-        Some(found) => Some(found),
-        None => {
-            debug!(
-                "shell.exec: setsid not found (fixed paths or PATH); host commands stay in \
-                 harw's own session (no /dev/tty isolation from this run)"
-            );
-            None
-        }
+/// [`ShellLimits`] as the job runtime's per-process rlimits. `RLIMIT_NPROC`
+/// has no counterpart there (a user-wide ceiling, see [`ShellLimits::nproc`]).
+/// A missing `prlimit` fails the start when the limits are required.
+fn rlimit_request(limits: &ShellLimits, require: bool) -> ResourceRequest {
+    ResourceRequest {
+        address_space_max: Some(limits.as_bytes),
+        cpu_time_max: Some(limits.cpu_secs),
+        file_size_max: Some(limits.fsize_bytes),
+        open_files_max: u32::try_from(limits.nofile).ok(),
+        require_rlimits: require,
+        ..ResourceRequest::default()
     }
 }
 
-/// Prüft `candidates` der Reihe nach und liefert den ersten, der eine
-/// ausführbare reguläre Datei ist. Kein `PATH`-Zugriff — reine
-/// Kandidatenliste, deshalb ohne Spawn unit-testbar (z. B. mit einem
-/// garantiert nicht existierenden Pfad).
-fn find_setsid_in(candidates: &[&Path]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|candidate| is_executable_file(candidate))
-        .map(|candidate| candidate.to_path_buf())
-}
-
-/// Durchsucht `PATH` (in Reihenfolge) nach einer ausführbaren `setsid`-Datei.
-/// Fehlt `PATH` oder ist es leer, liefert dies `None`.
-fn find_setsid_in_path() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join("setsid"))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-/// `true`, wenn `path` eine reguläre Datei mit mindestens einem
-/// Ausführ-Bit (owner/group/other) ist. Ein fehlender Pfad oder ein
-/// `stat`-Fehler zählt als `false`, nie als Panic.
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-/// Baut das argv für den Host-Shell-Start (Plan Teil B1, Sitzungs-Trennung).
-///
-/// # Description
-/// Mit `setsid`: `<setsid> --wait /bin/sh -c <command>` — `--wait` lässt
-/// `setsid` blockieren, bis das gestartete Programm beendet ist, und gibt
-/// dessen Exit-Status weiter, sodass [`ShellExecutor::spawn_and_collect`]
-/// Timing und Exit-Code unverändert erhält. Ohne `setsid`: `/bin/sh -c
-/// <command>`, byte-identisch zum bisherigen Verhalten.
-///
-/// Reine Funktion ohne Prozessstart — unit-testbar ohne Spawn.
-///
-/// # Returns
-/// `(program, args)`: absoluter Programmpfad und die vollständige
-/// Argumentliste (ohne `program` selbst), in der Reihenfolge, in der sie an
-/// `TokioCommand::args` übergeben werden.
-fn host_shell_argv(setsid: Option<&Path>, command: &str) -> (PathBuf, Vec<OsString>) {
-    host_shell_argv_with_shell(setsid, Path::new("/bin/sh"), command)
-}
-
-/// Wie [`host_shell_argv`], aber mit einem explizit aufgelösten Shell-Pfad
+/// Argv des Host-Pfads: `<shell> -c <command>`, mit dem aufgelösten Shell-Pfad
 /// statt des fest verdrahteten `/bin/sh` (Android-Anbindung, siehe
-/// [`resolve_host_shell`]). `host_shell_argv` bleibt für Aufrufer, die
-/// weiterhin ausschließlich `/bin/sh` meinen (z. B. `exec::operator`, dessen
-/// `!`-Befehle unverändert nur auf gewöhnlichem Linux/Host laufen), byte-
-/// identisch zu vorher.
-fn host_shell_argv_with_shell(
-    setsid: Option<&Path>,
-    shell: &Path,
-    command: &str,
-) -> (PathBuf, Vec<OsString>) {
-    match setsid {
-        Some(setsid) => (
-            setsid.to_path_buf(),
-            vec![
-                OsString::from("--wait"),
-                shell.as_os_str().to_owned(),
-                OsString::from("-c"),
-                OsString::from(command),
-            ],
-        ),
-        None => (
-            shell.to_path_buf(),
-            vec![OsString::from("-c"), OsString::from(command)],
-        ),
-    }
+/// [`resolve_host_shell`]). Die neue Sitzung legt die Job-Runtime an.
+fn host_shell_argv(shell: &Path, command: &str) -> (PathBuf, Vec<OsString>) {
+    (
+        shell.to_path_buf(),
+        vec![OsString::from("-c"), OsString::from(command)],
+    )
 }
 
 /// Löst den Host-Shell-Pfad auf.
@@ -1309,49 +1145,6 @@ fn resolve_host_shell(platform: ExecPlatform) -> PathBuf {
                 .into_iter()
                 .find(|candidate| candidate.is_file())
                 .unwrap_or_else(|| PathBuf::from("/bin/sh"))
-        }
-    }
-}
-
-/// Setzt die Standard-Streams für den Sandbox-Start: stdin `/dev/null` (nie das geerbte
-/// Terminal), stdout/stderr als Pipes, SIGKILL beim Drop des `Child`.
-pub(crate) fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-}
-
-/// Beendet den direkten Kindprozess (`prlimit` hat sich per `exec` durch `bwrap` bzw.
-/// `setsid`/`/bin/sh` ersetzt) per SIGKILL und sammelt den Exit-Status ein.
-///
-/// Im `bwrap`-Pfad beenden `--die-with-parent` und der PID-Namespace daraufhin den
-/// gesamten Sandbox-Prozessbaum, auch per `setsid`/`nohup` abgekoppelte Nachfahren. Im
-/// Host-Pfad ohne `bwrap` ([`ShellExecutor::run_host_command`]) ist die direkte
-/// Kind-PID durch die bewusste Wahl an der `process_group`-Aufrufstelle dort immer die
-/// Spitze des Kommandobaums — mit gefundenem `setsid` die `exec`te `/bin/sh`-PID der
-/// neuen Sitzung, ohne `setsid` die `process_group(0)`-Gruppenführer-PID von `/bin/sh`
-/// selbst — deshalb bleibt diese Funktion unverändert bei einem einzelnen SIGKILL statt
-/// einer Prozessgruppen-weiten Signalisierung.
-///
-/// Nur SIGKILL: Ein vorgelagertes SIGTERM (kurze Gnadenfrist vor SIGKILL) bräuchte eine
-/// Signalauswahl jenseits von [`tokio::process::Child::start_kill`] (immer SIGKILL) —
-/// dafür gibt es in diesem `forbid(unsafe_code)`-Crate ohne neue Abhängigkeit (kein
-/// `nix`/`libc`) keinen sicheren Weg, also bleibt es bei SIGKILL.
-pub(crate) async fn terminate(child: &mut Child) -> Option<ExitStatus> {
-    if let Err(err) = child.start_kill() {
-        warn!(error = %err, "shell.exec kill failed");
-    }
-    match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(err)) => {
-            warn!(error = %err, "shell.exec reap after kill failed");
-            None
-        }
-        Err(_elapsed) => {
-            warn!("shell.exec reap after kill timed out; relying on kill_on_drop");
-            None
         }
     }
 }
@@ -1867,15 +1660,14 @@ mod tests {
     use harw_tools::{ToolCall, ToolExecutionContext};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::io::AsyncWriteExt;
 
     // ── Test helpers ───────────────────────────────────────────────────────────
 
     fn make_temp_workspace() -> TestResult<TempDir> {
+        crate::test_support::install_host_port();
         tempfile::tempdir().map_err(ctx("tempdir creation must succeed in tests"))
     }
 
@@ -2141,122 +1933,17 @@ mod tests {
         );
     }
 
-    // ── setsid-Detach (Host-Pfad, Plan Teil B1 Ergänzung) ───────────────────────
+    // ── Host-Argv ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_host_shell_argv_with_setsid_wraps_wait_and_bin_sh() {
-        let setsid = Path::new("/usr/bin/setsid");
-
-        let (program, args) = host_shell_argv(Some(setsid), "echo hi");
-
-        assert_eq!(program, PathBuf::from("/usr/bin/setsid"));
-        assert_eq!(
-            args,
-            vec![
-                OsString::from("--wait"),
-                OsString::from("/bin/sh"),
-                OsString::from("-c"),
-                OsString::from("echo hi"),
-            ],
-            "with setsid the command must be wrapped in `setsid --wait /bin/sh -c <cmd>` \
-             so exit status/timing still propagate to spawn_and_collect"
-        );
-    }
-
-    #[test]
-    fn test_host_shell_argv_without_setsid_is_unchanged_bin_sh_dash_c() {
-        let (program, args) = host_shell_argv(None, "echo hi");
+    fn test_host_shell_argv_is_bin_sh_dash_c() {
+        let (program, args) = host_shell_argv(Path::new("/bin/sh"), "echo hi");
 
         assert_eq!(program, PathBuf::from("/bin/sh"));
-        assert_eq!(
-            args,
-            vec![OsString::from("-c"), OsString::from("echo hi")],
-            "without setsid the argv must stay byte-identical to the pre-fix host path"
-        );
-    }
-
-    #[test]
-    fn test_find_setsid_in_returns_none_for_nonexistent_explicit_path() {
-        let missing = Path::new("/nonexistent/definitely-not-here/setsid");
-
-        assert_eq!(
-            find_setsid_in(&[missing]),
-            None,
-            "a candidate path that does not exist must never resolve"
-        );
-    }
-
-    #[test]
-    fn test_find_setsid_in_finds_an_executable_regular_file() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let fake_setsid = dir.path().join("setsid");
-        fs::write(&fake_setsid, b"#!/bin/sh\nexec \"$@\"\n").map_err(ctx("write fake setsid"))?;
-        fs::set_permissions(&fake_setsid, std::fs::Permissions::from_mode(0o755))
-            .map_err(ctx("chmod fake setsid executable"))?;
-        let missing = dir.path().join("does-not-exist");
-
-        // Non-existent candidates before the real one must be skipped, not error.
-        assert_eq!(
-            find_setsid_in(&[missing.as_path(), fake_setsid.as_path()]),
-            Some(fake_setsid)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_setsid_in_skips_non_executable_file() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let not_executable = dir.path().join("setsid");
-        fs::write(&not_executable, b"not a program").map_err(ctx("write file"))?;
-        fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
-            .map_err(ctx("chmod without exec bits"))?;
-
-        assert_eq!(
-            find_setsid_in(&[not_executable.as_path()]),
-            None,
-            "a regular file without any execute bit must not resolve"
-        );
-        Ok(())
+        assert_eq!(args, vec![OsString::from("-c"), OsString::from("echo hi")]);
     }
 
     // ── Pure Tests ohne Sandbox (W1-03) ────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_configure_stdio_sets_stdin_to_dev_null() -> TestResult {
-        if !Path::new("/proc/self/fd/0").exists() || !Path::new("/bin/sh").exists() {
-            eprintln!("übersprungen: /proc oder /bin/sh fehlt, stdin-Ziel nicht beobachtbar");
-            return Ok(());
-        }
-        // Absichtlich ohne bwrap: prüft genau die Stream-Konfiguration, die der
-        // Sandbox-Start verwendet.
-        let mut command = TokioCommand::new("/bin/sh");
-        command.args(["-c", "readlink /proc/self/fd/0"]);
-        let mut child = configure_stdio(&mut command)
-            .spawn()
-            .map_err(ctx("spawn /bin/sh"))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or(TestError::Missing("stdout piped"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or(TestError::Missing("stderr piped"))?;
-        let mut capture = BoundedCapture::new(4096);
-        let end = capture
-            .drain(&mut stdout, &mut stderr)
-            .await
-            .map_err(ctx("read child output"))?;
-        let status = child.wait().await.map_err(ctx("wait child"))?;
-
-        assert_eq!(end, DrainEnd::Eof);
-        assert!(status.success(), "readlink must succeed: {status:?}");
-        assert_eq!(
-            String::from_utf8_lossy(capture.stdout()).trim(),
-            "/dev/null"
-        );
-        Ok(())
-    }
 
     #[test]
     fn test_completed_output_marks_output_limit_kill_as_truncated() -> TestResult {
@@ -2274,9 +1961,7 @@ mod tests {
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
         };
-        let capture = BoundedCapture::new(16);
-
-        match executor.completed_output(None, &capture, true, false) {
+        match executor.completed_output(None, b"", b"", true, false) {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], -1);
                 assert_eq!(content["truncated"], true);
@@ -2307,20 +1992,9 @@ mod tests {
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
         };
-        let (mut writer, mut stdout) = tokio::io::duplex(1024);
-        let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
-        writer
-            .write_all(b"partial-output-longer-than-budget")
-            .await
-            .map_err(ctx("write"))?;
-        let mut capture = BoundedCapture::new(executor.max_output_bytes);
-        let _ = tokio::time::timeout(
-            Duration::from_millis(50),
-            capture.drain(&mut stdout, &mut stderr),
-        )
-        .await;
+        let stdout = b"partial-output-longer-than-budget";
 
-        match executor.timeout_output(1, &capture, false) {
+        match executor.timeout_output(1, stdout, b"", false) {
             ToolOutput::Error { message } => {
                 assert!(message.contains("timed out after 1s"), "{message}");
                 assert!(message.contains("partial-"), "{message}");
@@ -2451,9 +2125,9 @@ mod tests {
             );
             std::process::Command::new(prlimit)
                 .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
                 .is_ok_and(|status| status.success())
         })
@@ -2873,7 +2547,7 @@ mod tests {
             .map_err(ctx("canceller task must not panic"))?;
 
         assert!(
-            started.elapsed() < KILL_REAP_TIMEOUT + Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(10),
             "cancel must kill the process tree (SIGKILL) well within the kill-reap \
              timeout, instead of waiting out `sleep 30`, took: {:?}",
             started.elapsed()

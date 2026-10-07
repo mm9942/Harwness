@@ -165,6 +165,15 @@ pub(crate) struct ChatOptions {
     pub(crate) add_dirs: Vec<PathBuf>,
 }
 
+/// Installs the process-wide command port (PL-93): `!`/`!!` and, as they
+/// migrate, `shell.exec` and `latex.*` start their processes only through the
+/// job runtime. Without a port (unsupported platform, store not creatable)
+/// they report "no job runtime" instead of spawning anything themselves.
+fn install_command_port(home: &std::path::Path) {
+    // First installer wins; `SessionJobs::open` installs the same default.
+    harw_command::install_host_default(&harw_home::paths::cache_dir(home).join("command-jobs"));
+}
+
 /// Startet den Default-Chat-Pfad.
 ///
 /// # Description
@@ -248,6 +257,8 @@ pub fn run_chat(
     if let Some(hint) = crate::onboarding::stale_pool_hint(&config) {
         eprintln!("{hint}");
     }
+
+    install_command_port(&home);
 
     match initial_prompt {
         Some(prompt) => {

@@ -87,6 +87,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 # production dependency, not test-only. It is already pulled in transitively via
 # harw-core / harw-mcp-server / harw-session-store.
 harw-job-runtime = { path = "../harw-job-runtime" }
+harw-command = { path = "../harw-command" }
 # Durable job records (`FsJobRecordStore`) for the sandboxed verify
 # coordinator of the work driver (`src/verify_sandbox.rs`).
 harw-job-store = { path = "../harw-job-store" }

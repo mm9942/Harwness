@@ -25,8 +25,9 @@
 //!    zustellbare Frage → `Reject`: das Kind bekommt einen Werkzeugfehler
 //!    und arbeitet weiter, statt abzustürzen.
 //!
-//! Ohne angebundenen Kanal (alle Nicht-TUI-Einstiege) bleibt alles beim
-//! bisherigen fail-closed-Verhalten.
+//! Ohne angebundenen Kanal wird die konkrete Freigabe fail-closed abgelehnt
+//! und der Kind-Turn weitergeführt. Damit blockiert ein asynchroner Agent-Job
+//! nicht nur deshalb, weil seine Oberfläche keine Approval-UI besitzt.
 //!
 //! # Nebenläufigkeit
 //! [`ChildApprovalRelay`] ist `Send + Sync`; die Sperre um den Broker wird
@@ -305,8 +306,8 @@ impl ManagedAgentSpawner {
 ///
 /// # Beschreibung
 /// Siehe Moduldoku. Kehrt mit dem unveränderten `outcome` zurück, wenn kein
-/// Kanal angebunden ist, der Ausgang keine Freigabepause ist, die Session
-/// keinen festgehaltenen Aufruf trägt oder [`CHILD_APPROVAL_MAX_ROUNDS`]
+/// Ausgang keine Freigabepause ist, die Session keinen festgehaltenen Aufruf
+/// trägt oder [`CHILD_APPROVAL_MAX_ROUNDS`]
 /// erreicht ist — der Aufrufer weist eine verbleibende Pause dann wie bisher
 /// fail-closed ab.
 ///
@@ -331,7 +332,7 @@ pub async fn relay_child_approvals(
     let relay = Arc::clone(spawner.child_approval_relay());
     let mut outcome = outcome;
     for _ in 0..CHILD_APPROVAL_MAX_ROUNDS {
-        if !matches!(outcome, TurnOutcome::AwaitingApproval { .. }) || !relay.is_available() {
+        if !matches!(outcome, TurnOutcome::AwaitingApproval { .. }) {
             return Ok(outcome);
         }
         let Some(pending) = session.pending_approval().cloned() else {
@@ -351,7 +352,7 @@ pub async fn relay_child_approvals(
                 "child_approval.tool_outside_role"
             );
             reject(REASON_TOOL_OUTSIDE_ROLE)
-        } else {
+        } else if relay.is_available() {
             relay
                 .resolve(ChildApprovalRequest {
                     child: child.clone(),
@@ -361,6 +362,14 @@ pub async fn relay_child_approvals(
                     timeout: relay.timeout(),
                 })
                 .await
+        } else {
+            tracing::warn!(
+                target: "harw::audit",
+                child = %child,
+                tool = %pending.call.name,
+                "child_approval.unavailable_rejected"
+            );
+            reject(REASON_CHILD_APPROVAL_UNDELIVERABLE)
         };
         let actor = pending.actor.clone();
         outcome = match approvals {

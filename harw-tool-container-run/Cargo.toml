@@ -9,6 +9,8 @@ rust-version.workspace = true
 description = "Agent tools container.images and container.run: run a validated, hardened rootless-Podman plan with bounded output, a runtime inspect read-back and kill-on-violation."
 
 [dependencies]
+harw-command = { path = "../harw-command" }
+harw-job = { path = "../harw-job" }
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-tool-container = { path = "../harw-tool-container" }

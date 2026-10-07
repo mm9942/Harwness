@@ -463,6 +463,7 @@ mod tests {
         PreparedJob {
             command,
             executed_on_host: true,
+            env_cleared: false,
         }
     }
 
@@ -491,6 +492,9 @@ mod tests {
     /// echten Job als Bedienerin (fremder Besitzer).
     #[tokio::test]
     async fn jobs_list_show_logs_and_stop() -> TestResult {
+        harw_command::install_host_default(
+            &std::env::temp_dir().join(format!("harw-ops-command-jobs-{}", std::process::id())),
+        );
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let manager = JobManager::new(
             harw_tool_job::JobManagerConfig::new(dir.path().join("state")),
@@ -518,6 +522,7 @@ mod tests {
                 },
                 sleeper(),
             )
+            .await
             .map_err(ctx("start"))?;
         let id = status.meta.job_id.to_string();
 

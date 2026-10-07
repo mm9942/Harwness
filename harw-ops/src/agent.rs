@@ -180,7 +180,7 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
         .as_deref()
         .is_some_and(|action| harw_agent_compiler::commands::COMPILER_ACTIONS.contains(&action))
     {
-        return agent_compiler(ctx, &args);
+        return agent_compiler(ctx, &args).await;
     }
     // Plan R9, Teil C: die startbaren Definitionen (Roster: eingebaut und
     // benutzerdefiniert) brauchen keinen Spawner.
@@ -342,7 +342,7 @@ fn run_compiler(
 /// eine Job-Verwaltung hat, als Job (`harw agent build … --json` als eigener
 /// Prozess; Fortschritt und Ergebnis im Job-Log, `/jobs`); ohne
 /// Job-Verwaltung synchron — mit [`FOREGROUND_BUILD_NOTE`] als erster Zeile.
-fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError> {
+async fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError> {
     let tokens = compiler_tokens(args);
     let command = harw_agent_compiler::parse_tokens(&tokens)
         .map_err(OpError::InvalidArguments)?
@@ -354,7 +354,7 @@ fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError
         return run_compiler(ctx, command);
     }
     if let Some(manager) = ctx.service::<std::sync::Arc<harw_tool_job::JobManager>>() {
-        return start_build_job(ctx, manager, &tokens);
+        return start_build_job(ctx, manager, &tokens).await;
     }
     tracing::info!("{FOREGROUND_BUILD_NOTE}");
     with_foreground_note(run_compiler(ctx, command))
@@ -380,7 +380,7 @@ fn with_foreground_note(result: Result<OpOutput, OpError>) -> Result<OpOutput, O
 }
 
 /// Startet `harw agent build … --json` als Job der Sitzung.
-fn start_build_job(
+async fn start_build_job(
     ctx: &OpContext,
     manager: &std::sync::Arc<harw_tool_job::JobManager>,
     tokens: &[String],
@@ -411,9 +411,11 @@ fn start_build_job(
     let prepared = harw_tool_job::PreparedJob {
         command,
         executed_on_host: true,
+        env_cleared: false,
     };
     let status = manager
         .start(request, prepared)
+        .await
         .map_err(|error| OpError::Execution(format!("build job could not start: {error}")))?;
     Ok(OpOutput::from(format!(
         "Build läuft als Job {} ({display}); Fortschritt und Ergebnis: /jobs show {}",

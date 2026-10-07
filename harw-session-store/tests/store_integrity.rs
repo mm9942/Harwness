@@ -316,6 +316,7 @@ fn stored_job(id: &str, now: Timestamp) -> TestResult<StoredJob> {
         cancellation: None,
         revision: 0,
         trace: None,
+        owner_work_id: None,
     })
 }
 

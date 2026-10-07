@@ -954,6 +954,90 @@ impl AgentMonitor {
         self.agents.values().filter(|a| a.phase.is_active()).count()
     }
 
+    /// Projiziert den direkt von der TUI getriebenen Root-Turn in denselben
+    /// Agenten-Monitor wie Kind-Agenten. Das ist reine Surface-Projektion:
+    /// Zähler bleiben beim AgentEvent-Bus, damit nichts doppelt gezählt wird.
+    pub(crate) fn begin_surface_root(&mut self, id: &str, role: &str) {
+        if !self.agents.contains_key(id) {
+            self.order.push(id.to_owned());
+        }
+        let live = self
+            .agents
+            .entry(id.to_owned())
+            .or_insert_with(|| AgentLive::new(id.to_owned(), None, role.to_owned()));
+        live.role = role.to_owned();
+        if live.finished.is_some() || !live.phase.is_active() {
+            live.begin_run();
+        }
+        live.phase = AgentPhase::Thinking;
+        live.finished = None;
+        live.current_tool = None;
+        live.preview.clear();
+        live.reasoning_preview.clear();
+    }
+
+    /// Spiegelt die sichtbaren Root-Streams in den Agenten-Dock, ohne
+    /// Token-/Tool-Zähler oder Trace-Einträge des AgentEvent-Busses zu duplizieren.
+    pub(crate) fn sync_surface_root_stream(
+        &mut self,
+        id: &str,
+        role: &str,
+        reasoning: &str,
+        answer: &str,
+    ) {
+        self.begin_surface_root_if_missing(id, role);
+        if let Some(live) = self.agents.get_mut(id) {
+            live.phase = AgentPhase::Thinking;
+            live.reasoning_preview.clear();
+            live.push_reasoning_preview(reasoning);
+            live.preview.clear();
+            live.push_preview(answer);
+        }
+    }
+
+    /// Markiert den Root-Turn als Werkzeugphase, ohne den Bus-Zähler zu verändern.
+    pub(crate) fn surface_root_tool(&mut self, id: &str, role: &str, tool: Option<&str>) {
+        self.begin_surface_root_if_missing(id, role);
+        if let Some(live) = self.agents.get_mut(id) {
+            match tool {
+                Some(tool) => {
+                    live.phase = AgentPhase::Tool;
+                    live.current_tool = Some(tool.to_owned());
+                }
+                None => {
+                    live.phase = AgentPhase::Thinking;
+                    live.current_tool = None;
+                }
+            }
+        }
+    }
+
+    /// Schließt die Root-Projektion konsistent mit dem Spinner/Turn-Lifecycle.
+    pub(crate) fn finish_surface_root(&mut self, id: &str, cancelled: bool, failed: bool) {
+        let Some(live) = self.agents.get_mut(id) else {
+            return;
+        };
+        if !live.phase.is_active() {
+            return;
+        }
+        live.phase = if cancelled {
+            AgentPhase::Cancelled
+        } else if failed {
+            AgentPhase::Failed
+        } else {
+            AgentPhase::Done
+        };
+        live.finished = Some(Instant::now());
+        live.current_tool = None;
+        live.trace.close_streams();
+    }
+
+    fn begin_surface_root_if_missing(&mut self, id: &str, role: &str) {
+        if !self.agents.contains_key(id) {
+            self.begin_surface_root(id, role);
+        }
+    }
+
     /// Kontextbelegung eines bestimmten Agenten.
     #[must_use]
     pub(crate) fn agent(&self, id: &str) -> Option<&AgentLive> {
@@ -2043,40 +2127,64 @@ fn panel_rows(
         }
         room = height.saturating_sub(rows.len());
     }
-    if focused
-        && room >= 3
-        && let Some(live) = monitor.selected_live()
+    let live_preview = if focused {
+        monitor.selected_live().filter(|live| live.phase.is_active())
+    } else {
+        monitor
+            .rows()
+            .into_iter()
+            .map(|(_, live)| live)
+            .find(|live| {
+                live.phase.is_active()
+                    && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
+            })
+    };
+    if let Some(live) = live_preview
         && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
     {
-        rows.push(PanelRow {
-            line: Line::default(),
-            entry: None,
-        });
-        rows.push(PanelRow {
-            line: Line::styled(
-                fit_width(
-                    &format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
-                    width,
+        // Fokus bekommt weiterhin den Trenner/Details-Hinweis. Ohne Fokus
+        // bleibt die Live-Projektion kompakt und nutzt nur tatsächlich freien
+        // Platz im Panel.
+        if focused && room >= 3 {
+            rows.push(PanelRow {
+                line: Line::default(),
+                entry: None,
+            });
+            rows.push(PanelRow {
+                line: Line::styled(
+                    fit_width(
+                        &format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
+                        width,
+                    ),
+                    style::dim_style(theme),
                 ),
-                style::dim_style(theme),
-            ),
-            entry: None,
-        });
-        let (text, line_style) = if live.preview.is_empty() {
-            (
-                format!("∴ {}", sanitize_inline(&live.reasoning_preview)),
-                style::dim_style(theme).add_modifier(Modifier::ITALIC),
-            )
-        } else {
-            (sanitize_inline(&live.preview), Style::default())
-        };
-        // Die Vorschau zeigt das Ende des Texts (neueste Zeichen).
-        let count = text.chars().count();
-        let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
-        rows.push(PanelRow {
-            line: Line::styled(fit_width(&tail, width), line_style),
-            entry: None,
-        });
+                entry: None,
+            });
+        }
+
+        let mut preview_room = height.saturating_sub(rows.len());
+        if preview_room > 0 && !live.reasoning_preview.is_empty() {
+            let text = format!("∴ {}", sanitize_inline(&live.reasoning_preview));
+            let count = text.chars().count();
+            let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
+            rows.push(PanelRow {
+                line: Line::styled(
+                    fit_width(&tail, width),
+                    style::dim_style(theme).add_modifier(Modifier::ITALIC),
+                ),
+                entry: None,
+            });
+            preview_room = preview_room.saturating_sub(1);
+        }
+        if preview_room > 0 && !live.preview.is_empty() {
+            let text = format!("» {}", sanitize_inline(&live.preview));
+            let count = text.chars().count();
+            let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
+            rows.push(PanelRow {
+                line: Line::styled(fit_width(&tail, width), Style::default()),
+                entry: None,
+            });
+        }
     }
     rows
 }
@@ -2341,6 +2449,60 @@ fn render_agents_only_panel(
             ),
             entry: None,
         });
+    }
+
+    // Split-Dock: Live-Reasoning gehört in die Agenten-Spalte und darf nicht
+    // vom Fokus abhängen. Pflicht-/Auswahlzeilen bleiben unverändert vorne;
+    // Preview-Zeilen werden ausschließlich in den noch freien Raum angehängt,
+    // sodass Selection- und Scroll-Indizes weiterhin auf den echten Agenten-
+    // Einträgen liegen.
+    let max_rows = usize::from(inner.height);
+    let mut preview_room = max_rows.saturating_sub(rows.len());
+    if preview_room > 0 {
+        let active: Vec<&AgentLive> = monitor
+            .rows()
+            .into_iter()
+            .map(|(_, live)| live)
+            .filter(|live| live.phase.is_active())
+            .collect();
+        let show_role = active.len() > 1;
+        for live in active {
+            if preview_room == 0 {
+                break;
+            }
+            if !live.reasoning_preview.is_empty() {
+                let body = sanitize_inline(&live.reasoning_preview);
+                let text = if show_role {
+                    format!("∴ {} · {body}", sanitize_inline(&live.role))
+                } else {
+                    format!("∴ {body}")
+                };
+                rows.push(PanelRow {
+                    line: Line::styled(
+                        fit_width(&text, inner_width),
+                        style::dim_style(theme).add_modifier(Modifier::ITALIC),
+                    ),
+                    entry: None,
+                });
+                preview_room -= 1;
+            }
+            if preview_room == 0 {
+                break;
+            }
+            if !live.preview.is_empty() {
+                let body = sanitize_inline(&live.preview);
+                let text = if show_role {
+                    format!("» {} · {body}", sanitize_inline(&live.role))
+                } else {
+                    format!("» {body}")
+                };
+                rows.push(PanelRow {
+                    line: Line::styled(fit_width(&text, inner_width), Style::default()),
+                    entry: None,
+                });
+                preview_room -= 1;
+            }
+        }
     }
     render_dock_rows(monitor, rows, inner, buf)
 }
@@ -3207,6 +3369,63 @@ mod tests {
     }
 
     #[test]
+    fn surface_root_projection_tracks_reasoning_and_closes_with_turn() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.begin_surface_root("root", "assistant");
+        assert_eq!(monitor.active_count(), 1);
+
+        monitor.sync_surface_root_stream(
+            "root",
+            "assistant",
+            "Prüfe die Konfiguration",
+            "Validator geprüft",
+        );
+        let live = monitor.agent("root").ok_or("root")?;
+        assert_eq!(live.reasoning_preview, "Prüfe die Konfiguration");
+        assert_eq!(live.preview, "Validator geprüft");
+
+        monitor.surface_root_tool("root", "assistant", Some("fs.read"));
+        assert_eq!(monitor.agent("root").map(|live| live.phase), Some(AgentPhase::Tool));
+        monitor.surface_root_tool("root", "assistant", None);
+        assert_eq!(monitor.agent("root").map(|live| live.phase), Some(AgentPhase::Thinking));
+
+        monitor.finish_surface_root("root", true, false);
+        assert_eq!(monitor.active_count(), 0);
+        assert_eq!(
+            monitor.agent("root").map(|live| live.phase),
+            Some(AgentPhase::Cancelled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn focused_agent_keeps_reasoning_visible_with_answer_text() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        let turn_id = TurnId::new();
+        monitor.apply(&ev(
+            "a",
+            None,
+            "root-orchestrator",
+            TurnEvent::ReasoningDelta {
+                turn_id: turn_id.clone(),
+                text: "Prüfe zuerst die Runtime".to_owned(),
+            },
+        )?);
+        monitor.apply(&ev(
+            "a",
+            None,
+            "root-orchestrator",
+            TurnEvent::AssistantDelta {
+                turn_id,
+                text: "Runtime sieht gut aus".to_owned(),
+            },
+        )?);
+        let shown = panel_screen(&monitor, 72, 12, true)?.join("\n");
+        assert!(shown.contains("∴ Prüfe zuerst die Runtime"), "{shown}");
+        assert!(shown.contains("Runtime sieht gut aus"), "{shown}");
+        Ok(())
+    }
+    #[test]
     fn finished_agents_collapse_into_one_summary_line() -> TestResult {
         let mut monitor = busy_monitor()?;
         let rows = panel_screen(&monitor, 44, 20, false)?;
@@ -3572,6 +3791,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn render_dock_split_shows_live_reasoning_without_focus() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        let turn = TurnId::new();
+        monitor.apply(&orch(
+            "a1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Running,
+        )?);
+        monitor.apply(&ev(
+            "a1",
+            None,
+            "root-orchestrator",
+            TurnEvent::ReasoningDelta {
+                turn_id: turn.clone(),
+                text: "Prüfe zuerst die DoD-Konfiguration".to_owned(),
+            },
+        )?);
+        monitor.apply(&ev(
+            "a1",
+            None,
+            "root-orchestrator",
+            TurnEvent::AssistantDelta {
+                turn_id: turn,
+                text: "Validator ist geprüft".to_owned(),
+            },
+        )?);
+        monitor.set_jobs(vec![job_row("job-1", "build", false, false)]);
+
+        let agents = Rect::new(0, 0, 40, 12);
+        let jobs = Rect::new(40, 0, 40, 12);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(area);
+        render_dock(
+            &monitor,
+            crate::panes::DockAreas::Split { agents, jobs },
+            &mut buf,
+            Theme::Dark,
+            false,
+        );
+        let rows = buffer_rows(&buf);
+        let left = rows
+            .iter()
+            .map(|row| row.chars().take(40).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let right = rows
+            .iter()
+            .map(|row| row.chars().skip(40).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(left.contains("∴ Prüfe zuerst die DoD"), "{left}");
+        assert!(left.contains("» Validator ist geprüft"), "{left}");
+        assert!(!right.contains("Prüfe zuerst die DoD"), "{right}");
+        Ok(())
+    }
     #[test]
     fn render_dock_split_truncates_long_names_with_ellipsis_and_keeps_row_count_fixed() -> TestResult
     {

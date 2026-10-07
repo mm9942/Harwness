@@ -61,8 +61,9 @@ pub use permits::{MAX_PERMITS, MIN_PERMITS, Permit, PermitStatus, ResizablePermi
 #[cfg(target_os = "macos")]
 pub use coordinator::DarwinExecutor;
 pub use coordinator::{
-    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, JobHandle, JobResult, RecoveredJob,
-    RecoveryDecision, RuntimeError,
+    Coordinator, CoordinatorConfig, CoordinatorStore, DEFAULT_FRAME_BUFFER, Executor, FrameEvent,
+    JobFrame, JobFrames, JobHandle, JobResult, Persistence, RecoveredJob, RecoveryDecision,
+    RuntimeError, SubmitOptions,
 };
 #[cfg(target_os = "linux")]
 pub use coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};

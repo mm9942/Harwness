@@ -163,6 +163,7 @@ name = "e2e_compiled_agent"
 required-features = ["cli", "repl", "mcp", "http"]
 
 [dev-dependencies]
+harw-command = { path = "../harw-command" }
 # `RunnerCapabilities::parse` — the fixture our `--capabilities` JSON must
 # satisfy exactly. No cycle: `harw-agent-compiler` does not depend on us.
 harw-agent-compiler = { path = "../harw-agent-compiler" }
