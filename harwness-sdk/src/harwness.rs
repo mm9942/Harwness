@@ -149,6 +149,7 @@ pub(crate) struct Inner {
     pub(crate) tool_names: Vec<String>,
     pub(crate) contexts: Vec<Arc<dyn harw_extension_api::ContextProvider>>,
     pub(crate) state_store: Arc<dyn StateStore>,
+    pub(crate) media: Arc<crate::media::MediaHandle>,
     #[cfg(feature = "unstable-internals")]
     pub(crate) raw_tools: Vec<Arc<dyn harw_extension_api::ToolProvider>>,
     #[cfg(feature = "unstable-internals")]
@@ -301,12 +302,16 @@ impl Harwness {
                 .enable_tool(harw_extension_api::ToolName::new(name.clone()));
         }
 
+        // A resumed session may hold images: attach an existing media store
+        // (creates nothing) so they can be sent again.
+        inner.media.attach_existing();
         Ok(Session::new(
             assembly,
             session,
             Arc::clone(&inner.approvals),
             turn_rx,
             event_rx,
+            Arc::clone(&inner.media),
         ))
     }
 }

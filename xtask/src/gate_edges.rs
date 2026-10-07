@@ -104,6 +104,7 @@ pub const SENSOR_CRATES: &[&str] = &[
     "harw-dod-netcounters",
     "harw-dod-gpu",
     "harw-dod-cgroup",
+    "harw-dod-container",
     "harw-dod-listener",
     "harw-dod-authlog",
     "harw-dod-scanreport",

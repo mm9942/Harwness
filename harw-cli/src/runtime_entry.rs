@@ -451,8 +451,20 @@ pub(crate) fn doctor_assembly(home: &Path, cwd: &Path) -> Result<RuntimeAssembly
         job_store: None,
         approval_store: None,
     };
-    build_assembly(spec, ModelSource::Echo("doctor".to_owned()), stores, None)
-        .map_err(|error| format!("doctor: {error}"))
+    // Ein Eintrag mit Kind-Spawner (z. B. eine aktive UIA) verlangt einen
+    // Sitzungs-Ereigniskanal. Doctor liest nur den Rechte-Schnappschuss und
+    // startet keine Sitzung; der Empfänger wird bewusst nicht gehalten, damit
+    // `harw doctor` (ein kurzlebiger Aufruf) ihn nicht durchreichen muss — der
+    // kleine Rest endet mit dem Prozess.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::mem::forget(event_rx);
+    build_assembly(
+        spec,
+        ModelSource::Echo("doctor".to_owned()),
+        stores,
+        Some(event_tx),
+    )
+    .map_err(|error| format!("doctor: {error}"))
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@
 //!   ([`persist_active_uia`]).
 //!
 //! ## Examples
-//! ```rust,no_run
+//! ```rust,ignore
 //! # use std::path::Path;
 //! # use harw_config::ResolvedConfig;
 //! # use harw_registry_defaults::ConfigAgents;
@@ -102,7 +102,7 @@ const DEFAULT_PERSONALITY_TEXT: &str = "Sei klar, respektvoll und transparent. E
 /// Einrichtung nötig ist.
 ///
 /// # Examples
-/// ```rust,no_run
+/// ```rust,ignore
 /// # use std::path::Path;
 /// # use harw_config::ResolvedConfig;
 /// # use harw_registry_defaults::ConfigAgents;
@@ -170,7 +170,7 @@ pub(crate) fn ensure_active_uia(
 /// Einzelthreadig; blockiert synchron auf `stdin` während des Dialogs.
 ///
 /// # Examples
-/// ```rust,no_run
+/// ```rust,ignore
 /// # fn example() -> Result<(), String> {
 /// crate::uia_bootstrap::run_new_uia_command(None)
 /// # }

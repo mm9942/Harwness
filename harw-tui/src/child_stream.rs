@@ -842,7 +842,7 @@ fn visible_text(content: &[ContentPart]) -> String {
     for part in content {
         match part {
             ContentPart::Text { text } => visible.push_str(text),
-            ContentPart::ImageUrl { .. } => visible.push_str("[Bild]"),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => visible.push_str("[Bild]"),
         }
     }
     visible

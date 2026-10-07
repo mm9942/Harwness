@@ -51,7 +51,8 @@ INSTALL_ENV = DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)' \
 PRIV_ESC := $(shell if [ "$$(id -u)" -ne 0 ] && [ -z "$(DESTDIR)" ]; then printf 'sudo -E'; fi)
 
 .PHONY: help doctor check-config ensure-bpf-toolchain build-bpf build check fmt clippy test verify \
-	install install-existing stage enable enable-warden disable restart status logs smoke uninstall stage-test
+	install install-existing stage enable enable-warden disable restart status logs smoke uninstall stage-test \
+	clean-ephemeral
 
 help:
 	@printf '%s\n' \
@@ -73,6 +74,8 @@ help:
 		'  smoke        explicit live smoke check (SMOKE_CONFIRM=1)' \
 		'  uninstall    remove only manifest-owned files; preserve data/config' \
 		'  stage-test   static packaging/placeholder checks (no Cargo invocation)' \
+		'  clean-ephemeral  list (default) or delete (APPLY=1) rotated telemetry older than' \
+		'               RETENTION_DAYS (default 7); never touches spool, findings or audit data' \
 		'' \
 		'Install variables: DESTDIR PREFIX LIBEXECDIR LIBDIR BPFDIR SYSCONFDIR' \
 		'LOCALSTATEDIR STATEDIR LOGDIR SYSTEMD_UNITDIR SYSUSERSDIR TMPFILESDIR.' \
@@ -80,6 +83,25 @@ help:
 
 doctor:
 	@exec scripts/doctor.sh
+
+# Ephemeral cleanup (retention class `telemetry_rotated`): rotated telemetry
+# files (`rotated-*.jsonl` and their `.blake3` digest sidecars, always removed
+# as a pair) older than RETENTION_DAYS under $(LOGDIR). A DRY RUN by default:
+# it only lists. APPLY=1 deletes. The finding spool, the findings export and
+# audit data are security-relevant and opt-in; this target never touches them
+# (deploy/tmpfiles.d/harw.conf deliberately sets no age on those directories).
+RETENTION_DAYS ?= 7
+APPLY ?=
+clean-ephemeral:
+	@dir='$(DESTDIR)$(LOGDIR)'; \
+	if [ ! -d "$$dir" ]; then printf 'clean-ephemeral: %s does not exist, nothing to do\n' "$$dir"; exit 0; fi; \
+	find "$$dir" -maxdepth 1 -type f -name 'rotated-*.jsonl' -mtime +$(RETENTION_DAYS) -print | while IFS= read -r f; do \
+		if [ -n '$(APPLY)' ]; then \
+			rm -f -- "$$f" "$$f.blake3" && printf 'removed %s (+ digest sidecar)\n' "$$f"; \
+		else \
+			printf 'would remove %s (+ digest sidecar)\n' "$$f"; \
+		fi; \
+	done
 
 check-config:
 	@exec scripts/check-config.sh $(if $(CONFIG),--config '$(CONFIG)',)

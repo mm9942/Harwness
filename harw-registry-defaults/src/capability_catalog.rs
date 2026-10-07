@@ -209,6 +209,12 @@ pub mod providers {
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
     provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
+        CONTAINER,
+        "container",
+        "harw-tool-container-run",
+        "tool-container"
+    );
+    provider!(
         KNOWLEDGE,
         "knowledge",
         "harw-registry-defaults",
@@ -233,6 +239,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "knowledge",
     "matrix",
     "tool-browser",
+    "tool-container",
     "tool-deps",
     "tool-doc",
     "tool-explorer",
@@ -374,6 +381,10 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("gateway.listeners.set", AGENTS, Host),
     row!("gateway.tools.grant", AGENTS, Host),
     row!("gateway.tools.narrow", AGENTS, Host),
+    // containers (`[tools.container]`, runtime-registered; `container.run`
+    // starts a container and always asks)
+    row!("container.images", CONTAINER, Meta),
+    row!("container.run", CONTAINER, Shell),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
@@ -391,6 +402,8 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("palace.recall", KNOWLEDGE, Knowledge),
     row!("kanban.list", KNOWLEDGE, Knowledge),
     row!("kanban.show", KNOWLEDGE, Knowledge),
+    row!("memory.recall", KNOWLEDGE, Knowledge),
+    row!("memory.record", KNOWLEDGE, WriteOther),
     // definition and skill authoring
     row!("agents.validate", AUTHORING, Meta),
     row!("agents.list_proposals", AUTHORING, Meta),
@@ -517,6 +530,7 @@ mod tests {
             DiaryToolProvider::TOOL_NAMES,
             PalaceToolProvider::TOOL_NAMES,
             KanbanReadToolProvider::TOOL_NAMES,
+            crate::memory_tools::MemoryToolProvider::TOOL_NAMES,
             harw_tool_plan::PlanToolProvider::TOOL_NAMES,
             ALWAYS_ASK_TOOLS,
         ] {
@@ -539,6 +553,99 @@ mod tests {
             missing.is_empty(),
             "tools without a catalog row: {missing:?}"
         );
+    }
+
+    /// Parity: for every catalog provider that is backed by a Rust tool
+    /// provider exposing `TOOL_NAMES`, the exact catalog rows of that provider
+    /// are the union of those names (no row without a tool, no tool without a
+    /// row). Providers whose tools are synthesized by the composition root
+    /// (agents, authoring, sudo, latex, matrix, ...) are not listed here.
+    #[test]
+    fn test_catalog_rows_match_provider_tool_names() -> Result<(), String> {
+        let parity: [(&ToolProvider, &[&[&str]]); 10] = [
+            (
+                &providers::DOC,
+                &[harw_tool_doc::DocToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::EXPLORE,
+                &[harw_tool_explorer::ExplorerToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::DEPS,
+                &[harw_tool_deps::DepsToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::LENS,
+                &[harw_tool_lens::LensToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::WEB,
+                &[harw_tool_web::WebToolProvider::TOOL_NAMES],
+            ),
+            (&providers::JOB, &[&harw_tool_job::JOB_TOOL_NAMES]),
+            (
+                &providers::PROCESS,
+                &[harw_tool_process::ProcessToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::PLAN,
+                &[harw_tool_plan::PlanToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::KNOWLEDGE,
+                &[
+                    WorkbenchToolProvider::TOOL_NAMES,
+                    WorkbenchReadToolProvider::TOOL_NAMES,
+                    DiaryToolProvider::TOOL_NAMES,
+                    PalaceToolProvider::TOOL_NAMES,
+                    KanbanReadToolProvider::TOOL_NAMES,
+                    crate::memory_tools::MemoryToolProvider::TOOL_NAMES,
+                ],
+            ),
+            (
+                &providers::SKILLS,
+                &[crate::SkillCatalogToolProvider::TOOL_NAMES],
+            ),
+        ];
+        // Rows that name a provider's feature but are synthesized by the
+        // composition root, not served by that provider's `TOOL_NAMES`.
+        // `agents.build` runs a build process, hence the `job` feature.
+        const SYNTHESIZED_ROWS: &[&str] = &["agents.build"];
+        let mut problems = Vec::new();
+        for tool in SYNTHESIZED_ROWS {
+            if lookup(tool).is_none() {
+                problems.push(format!("stale SYNTHESIZED_ROWS entry {tool}"));
+            }
+        }
+        for (provider, name_lists) in parity {
+            let expected: BTreeSet<&str> = name_lists
+                .iter()
+                .flat_map(|names| names.iter().copied())
+                .collect();
+            let rows: BTreeSet<&str> = CATALOG
+                .iter()
+                .filter(|entry| entry.provider.id == provider.id)
+                .filter_map(|entry| match entry.pattern {
+                    ToolPattern::Exact(name) if !SYNTHESIZED_ROWS.contains(&name) => Some(name),
+                    ToolPattern::Exact(_) | ToolPattern::Prefix(_) => None,
+                })
+                .collect();
+            let missing_row: Vec<&&str> = expected.difference(&rows).collect();
+            let missing_tool: Vec<&&str> = rows.difference(&expected).collect();
+            if !missing_row.is_empty() || !missing_tool.is_empty() {
+                problems.push(format!(
+                    "provider {}: tools without catalog row {missing_row:?}, \
+                     catalog rows without tool {missing_tool:?}",
+                    provider.id
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
     }
 
     #[test]

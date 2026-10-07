@@ -48,21 +48,14 @@ pub fn empty_body() -> NodeBody {
         .boxed()
 }
 
-/// Tunables of the dialling side.
-#[derive(Debug, Clone)]
-pub struct ClientOptions {
-    /// Deadline for TCP connect + TLS + node handshake.
-    pub handshake_timeout: Duration,
-    /// Freshness policy.
-    pub policy: HandshakePolicy,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            handshake_timeout: Duration::from_secs(10),
-            policy: HandshakePolicy::default(),
-        }
+harw_types::limits_struct! {
+    /// Tunables of the dialling side.
+    #[derive(Debug, Clone)]
+    pub struct ClientOptions {
+        /// Deadline for TCP connect + TLS + node handshake.
+        pub handshake_timeout: Duration = DEFAULT_CLIENT_HANDSHAKE_TIMEOUT = Duration::from_secs(10),
+        /// Freshness policy.
+        pub policy: HandshakePolicy = DEFAULT_CLIENT_POLICY = HandshakePolicy::DEFAULT,
     }
 }
 
@@ -133,7 +126,9 @@ impl NodeTransportClient {
         let (sender, connection) =
             hyper::client::conn::http1::handshake::<_, NodeBody>(TokioIo::new(stream)).await?;
         let connection = tokio::spawn(async move {
-            if let Err(err) = connection.await {
+            // `with_upgrades` is inert unless a request asks for an upgrade
+            // ([`NodeTransportClient::upgrade`]); plain requests behave as before.
+            if let Err(err) = connection.with_upgrades().await {
                 tracing::debug!(error = %err, "node transport client connection ended");
             }
         });
@@ -148,6 +143,19 @@ impl NodeTransportClient {
     #[must_use]
     pub fn peer(&self) -> &AuthenticatedPeer {
         &self.peer
+    }
+
+    /// Sends `request` and hands back the response plus the authenticated
+    /// peer without dropping (aborting) the connection task. Used by
+    /// `upgrade`, which must keep the connection alive until the upgraded
+    /// I/O has been taken over.
+    pub(crate) async fn send_for_upgrade(
+        &mut self,
+        request: Request<NodeBody>,
+    ) -> Result<(AuthenticatedPeer, Response<Incoming>), hyper::Error> {
+        self.sender.ready().await?;
+        let response = self.sender.send_request(request).await?;
+        Ok((self.peer.clone(), response))
     }
 
     /// Sends one request on the authenticated connection.

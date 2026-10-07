@@ -34,6 +34,10 @@ pub struct AttemptContext {
     pub attempt_id: AttemptId,
     /// The runner that holds the lease.
     pub runner_id: RunnerId,
+    /// The lease's fencing epoch the attempt runs under (executors that
+    /// leave artefacts behind label them with it so a stale runner's
+    /// leftovers are told apart from the current owner's).
+    pub lease_epoch: u64,
     /// Absolute workspace root; `JobSpec::working_dir` is relative to it.
     pub workspace_root: PathBuf,
 }

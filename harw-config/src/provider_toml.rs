@@ -1,3 +1,4 @@
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -398,10 +399,6 @@ pub struct OriginAllowlistToml {
     pub agents: Vec<String>,
     #[serde(default)]
     pub channels: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Default-Sicherheitsmarge für client-seitiges Rate-Limiting in Prozent.

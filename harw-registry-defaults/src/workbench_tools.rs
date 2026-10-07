@@ -45,7 +45,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::{ContextProvider, ExtFuture, ToolProvider};
+use harw_extension_api::contributors::{ContextProvider, ExtFuture};
 use harw_extension_api::types::{ContextFragment, TurnInputContext};
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
@@ -53,7 +53,9 @@ use harw_extension_api::{
 };
 use harw_knowledge::workbench::{self, DigestOptions, WorkbenchScope};
 use harw_knowledge::{AgentId, KnowledgeStore};
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::args::parse_args;
+use harw_tools::schema_helpers::{object_schema_all_required, string_property};
+use harw_tools::{FunctionToolSpec, Permission};
 use serde::Deserialize;
 
 /// Name des Notiz-Werkzeugs.
@@ -105,16 +107,6 @@ impl std::fmt::Debug for WorkbenchToolProvider {
 }
 
 impl WorkbenchToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[WORKBENCH_NOTE, WORKBENCH_HYPOTHESIS];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`]
-    /// (siehe Moduldoku „read-only-safe").
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider über dem Speicher der Montage.
     ///
     /// # Argumente
@@ -139,41 +131,29 @@ impl WorkbenchToolProvider {
     }
 }
 
-impl ToolProvider for WorkbenchToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![note_spec(), hypothesis_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            WORKBENCH_NOTE => WorkbenchTool::Note,
-            WORKBENCH_HYPOTHESIS => WorkbenchTool::Hypothesis,
-            _ => return None,
-        };
-        Some(Arc::new(WorkbenchExecutor {
-            store: Arc::clone(&self.store),
-            tool,
-            notifier: self.notifier.clone(),
-        }))
-    }
-}
-
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>) -> JsonSchema {
-    let required = props.keys().cloned().collect();
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
+// Notiz und Hypothese schreiben nur harness-eigene Workbench-Dateien
+// (`ReadWorkspace`, siehe Moduldoku „read-only-safe"); kein Werkzeug ist
+// parallelsicher (Standard `none`).
+harw_tools::tool_provider! {
+    impl for WorkbenchToolProvider as provider {
+        WORKBENCH_NOTE => {
+            spec: note_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: WorkbenchExecutor {
+                store: Arc::clone(&provider.store),
+                tool: WorkbenchTool::Note,
+                notifier: provider.notifier.clone(),
+            },
+        },
+        WORKBENCH_HYPOTHESIS => {
+            spec: hypothesis_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: WorkbenchExecutor {
+                store: Arc::clone(&provider.store),
+                tool: WorkbenchTool::Hypothesis,
+                notifier: provider.notifier.clone(),
+            },
+        },
     }
 }
 
@@ -189,7 +169,7 @@ fn note_spec() -> ToolSpec {
              Zwischenstände, Beobachtungen, nächste Schritte. Flüchtig per Design, \
              wird nicht ins Gedächtnis übernommen. Ändert keine Workspace-Datei."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -218,7 +198,7 @@ fn hypothesis_spec() -> ToolSpec {
              (hypotheses.md): offene Vermutungen festhalten und später bestätigen oder \
              verwerfen. Eine entschiedene Hypothese kann nicht erneut entschieden werden."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -301,11 +281,9 @@ fn execute_note(
     arguments: serde_json::Value,
     now: jiff::Timestamp,
 ) -> ToolOutput {
-    let args: NoteArgs = match serde_json::from_value(arguments) {
+    let args: NoteArgs = match parse_args(WORKBENCH_NOTE, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{WORKBENCH_NOTE}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     let scope = WorkbenchScope::Session(session_id.to_owned());
     match workbench::append_note(store, &scope, &model_author(session_id), &args.text, now) {
@@ -324,13 +302,9 @@ fn execute_hypothesis(
     arguments: serde_json::Value,
     now: jiff::Timestamp,
 ) -> ToolOutput {
-    let args: HypothesisArgs = match serde_json::from_value(arguments) {
+    let args: HypothesisArgs = match parse_args(WORKBENCH_HYPOTHESIS, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!(
-                "{WORKBENCH_HYPOTHESIS}: ungültige Argumente: {error}"
-            ));
-        }
+        Err(out) => return out,
     };
     let scope = WorkbenchScope::Session(session_id.to_owned());
     let author = model_author(session_id);
@@ -379,12 +353,6 @@ pub struct WorkbenchReadToolProvider {
 }
 
 impl WorkbenchReadToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[WORKBENCH_SHOW];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[Some(Permission::ReadWorkspace)];
-
     /// Baut den Provider; ohne [`Self::with_project`] kennt er nur die Sitzung.
     #[must_use]
     pub fn new(store: Arc<KnowledgeStore>) -> Self {
@@ -404,22 +372,17 @@ impl WorkbenchReadToolProvider {
     }
 }
 
-impl ToolProvider for WorkbenchReadToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![show_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == WORKBENCH_SHOW).then(|| {
-            Arc::new(WorkbenchShowExecutor {
-                store: Arc::clone(&self.store),
-                project: self.project.clone(),
-            }) as Arc<dyn ToolExecutor>
-        })
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        name.as_str() == WORKBENCH_SHOW
+// `workbench.show` liest nur (`ReadWorkspace`) und ist parallelsicher.
+harw_tools::tool_provider! {
+    impl for WorkbenchReadToolProvider as provider, parallel_safe: all {
+        WORKBENCH_SHOW => {
+            spec: show_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: WorkbenchShowExecutor {
+                store: Arc::clone(&provider.store),
+                project: provider.project.clone(),
+            },
+        },
     }
 }
 
@@ -440,7 +403,7 @@ fn show_spec() -> ToolSpec {
              kein Dateiinhalt), Hypothesen mit Nummer #<n> und das Ende der Notizen. \
              Gekürzt auf 4 KiB. Nur die eigene Sitzung bzw. das eigene Projekt."
             .to_owned(),
-        parameters: object_schema(props),
+        parameters: object_schema_all_required(props),
         strict: true,
     })
 }
@@ -482,11 +445,9 @@ fn execute_show(
     project: Option<&WorkbenchScope>,
     arguments: serde_json::Value,
 ) -> ToolOutput {
-    let args: ShowArgs = match serde_json::from_value(arguments) {
+    let args: ShowArgs = match parse_args(WORKBENCH_SHOW, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{WORKBENCH_SHOW}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     let scope = match args.scope.as_str() {
         "session" => WorkbenchScope::Session(session_id.to_owned()),
@@ -592,6 +553,7 @@ fn workbench_context_fragment(store: &KnowledgeStore, session_id: &str) -> Optio
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
 
     fn temporary_store(label: &str) -> TestResult<Arc<KnowledgeStore>> {
         let nonce = std::time::SystemTime::now()
