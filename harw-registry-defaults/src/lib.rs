@@ -213,6 +213,15 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Agenten. Die Sichtbarkeitsgrenze zieht `ReadScope`, nicht die
     // Genehmigung — der Aufrufer kann seinen Bereich nicht selbst wählen.
     "lens.ask",
+    // Lesende Obsidian-Vault-Werkzeuge (`harw-tool-obsidian`, siehe
+    // `profile::OBSIDIAN_READ_TOOLS`) — lesen nur Dateien aus dem Vault
+    // innerhalb des Workspace-Bindings, `Permission::ReadWorkspace` wie
+    // `fs.read`; `obsidian.write` bleibt bewusst ausgeschlossen (Dateien
+    // anlegen/überschreiben, nur `Full`).
+    "obsidian.map",
+    "obsidian.read",
+    "obsidian.search",
+    "obsidian.links",
     // Web-Recherche (`harw-tool-web`) — alle vier im Profil `Research` (Rolle
     // `researcher-web`, ohne `fs.*`/`deps.*`); `web.fetch`/`web.search`
     // zusätzlich in den Erkundungsprofilen (`explorer`, `uia-explorer`,
@@ -1048,6 +1057,13 @@ mod tests {
             // `process.kill` steht in `ALWAYS_ASK_TOOLS`, fragt also immer.
             "process.list".to_owned(),
             "process.kill".to_owned(),
+            // Obsidian vault tools (Full profile): read + write for coding
+            // agents maintaining the project's long-form memory.
+            "obsidian.map".to_owned(),
+            "obsidian.read".to_owned(),
+            "obsidian.search".to_owned(),
+            "obsidian.links".to_owned(),
+            "obsidian.write".to_owned(),
         ];
 
         let advertised_tools = registered_names(&ar);
@@ -1156,6 +1172,12 @@ mod tests {
         // WorkDriver-Worker (schreibt nur den eigenen Berichts-Slot).
         read_only_surface.extend_from_slice(crate::profile::GATEWAY_READ_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
+        // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge stehen in
+        // `AUTO_APPROVED_TOOLS` (Besitzprüfung im Tool selbst, `tunnel.stop`
+        // beendet nur einen eigenen Tunnel), aber kein read-only Profil
+        // registriert sie mehr — bis zur Montage bleiben sie die statische
+        // Vertrags-Obermenge (siehe `profile::TUNNEL_TOOLS`).
+        read_only_surface.extend_from_slice(&["tunnel.status", "tunnel.list"]);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }

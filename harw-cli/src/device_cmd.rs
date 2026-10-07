@@ -97,6 +97,8 @@ pub(crate) struct ListReport {
     path: String,
     records: Vec<DeviceRecord>,
     rejected: Vec<RejectedLine>,
+    /// Kurze Schlüssel-Fingerabdrücke aus `node-peers.conf`, je node_id.
+    fingerprints: std::collections::BTreeMap<String, String>,
 }
 
 /// Liest die Registry unter `remote_dir` samt verworfener Zeilen.
@@ -108,10 +110,16 @@ pub(crate) fn list(remote_dir: &Path) -> Result<ListReport, String> {
     let scan = registry
         .scan()
         .map_err(|error| format!("Geräte-Registry nicht lesbar: {error}"))?;
+    // Optional: eine fehlende oder unlesbare Peers-Datei ist hier kein Fehler.
+    let fingerprints =
+        std::fs::read_to_string(remote_dir.join(crate::session_listener::PEERS_FILE))
+            .map(|text| crate::session_listener::peer_fingerprints(&text))
+            .unwrap_or_default();
     Ok(ListReport {
         path: registry.path().display().to_string(),
         records: scan.records,
         rejected: scan.rejected,
+        fingerprints,
     })
 }
 
@@ -146,11 +154,23 @@ impl ListReport {
                     tier_name(r.tier).to_owned(),
                     status_name(r).to_owned(),
                     clean(&r.label),
+                    self.fingerprints
+                        .get(r.node_id.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_owned()),
                 ]
             })
             .collect();
         render_table(
-            &["DEVICE", "NODE_ID", "TENANT", "TIER", "STATUS", "LABEL"],
+            &[
+                "DEVICE",
+                "NODE_ID",
+                "TENANT",
+                "TIER",
+                "STATUS",
+                "LABEL",
+                "FINGERPRINT",
+            ],
             &rows,
         )
         .trim_end()
@@ -171,6 +191,7 @@ impl ListReport {
                     "status": status_name(r),
                     "label": r.label,
                     "approve_optin": r.approve_optin,
+                    "fingerprint": self.fingerprints.get(r.node_id.as_str()),
                 })
             })
             .collect();
@@ -408,6 +429,41 @@ mod tests {
         assert_eq!(json["devices"].as_array().map(Vec::len), Some(2));
         assert_eq!(json["devices"][1]["approve_optin"], json!(true));
         assert_eq!(json["rejected_lines"][0]["line"], json!(4));
+        Ok(())
+    }
+
+    #[test]
+    fn list_shows_a_key_fingerprint_when_the_peer_is_pinned() -> TestResult {
+        let (_home, dir) = fixture(FILE)?;
+        let key = "ab".repeat(1952);
+        std::fs::write(
+            dir.join("node-peers.conf"),
+            format!("node-a|{key}\nnode-b|zz\n"),
+        )
+        .map_err(ctx("peers"))?;
+        let report = list(&dir).map_err(TestError::Unexpected)?;
+        let expected = {
+            let bytes = vec![0xab_u8; 1952];
+            let hash = blake3::hash(&bytes);
+            let hex: String = hash.as_bytes()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("blake3:{hex}")
+        };
+        let json = report.json();
+        assert_eq!(json["devices"][0]["fingerprint"], json!(expected));
+        // node-b has an invalid key: no fingerprint, no error.
+        assert_eq!(json["devices"][1]["fingerprint"], json!(null));
+        let text = report.text();
+        assert!(
+            text.contains("FINGERPRINT") && text.contains(&expected),
+            "{text}"
+        );
+        // No peers file at all is fine.
+        std::fs::remove_file(dir.join("node-peers.conf")).map_err(ctx("rm"))?;
+        let none = list(&dir).map_err(TestError::Unexpected)?;
+        assert_eq!(none.json()["devices"][0]["fingerprint"], json!(null));
         Ok(())
     }
 

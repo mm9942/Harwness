@@ -52,6 +52,14 @@ admitted = [
   # Index abfragt; ohne ihn muesste der Planner dieselbe Frage nur noch per
   # `fs.grep`/`fs.search` erraten.
   "lens.ask",
+  # Obsidian vault reads (registered by RegistryProfile::Planning): the
+  # project's long-form memory (`docs/planning` vault) is mapped and read
+  # alongside the workspace. Write (`obsidian.write`) stays out of planning
+  # roles — it is registered only for the Full (coding agent) profile.
+  "obsidian.map",
+  "obsidian.read",
+  "obsidian.search",
+  "obsidian.links",
   # `explore.*` (harw-tool-explorer): rein lesender Ueberblick ueber den
   # Workspace-Baum, `RegistryProfile::Planning` registriert ihn.
   "explore.tree",

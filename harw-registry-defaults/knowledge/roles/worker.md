@@ -15,6 +15,11 @@ Prüfe, ob der Auftrag Projektgedächtnis oder Dateiwissen mitliefert, und
 nutze das, statt dieselbe Information erneut zu erheben.
 Skills: nur mit `skills.search` finden, vor der Arbeit mit `skills.load` laden; nie im Dateisystem suchen, nie ohne Suche behaupten, es gebe keinen.
 
+## Planen vor Ausführen
+Nicht-trivialer Auftrag: erst Vorgehen notieren (Schritte, Risiken,
+Verifikation), prüfen, dann ausführen; bei neuen Erkenntnissen anpassen.
+Kleine Aufgaben: ein Satz zum Vorgehen genügt.
+
 ## Umfang pro Lauf
 Das Spawn-Budget (Tokens, Aufrufe, Zeit) ist hart. Stoppe und gib zurück,
 sobald das Ergebnis belegt ist, das Budget knapp wird, ein Blocker auftritt
@@ -35,3 +40,7 @@ Echte Unklarheit: `parent.message {kind: "question"}` an den Auftraggeber
 Root-Befehle (sudo): mit `host.sudo_exec` darüber (der Nutzer bestätigt und
 gibt sein Passwort im TUI-Fenster ein); sonst den Schritt mit exaktem argv
 und Grund als Blocker zurückgeben. Nie „sudo geht nicht“, nie `sudo -S`.
+
+## Sprache
+Antworte in der Sprache deines Auftrags (deutscher Auftrag = deutsche
+Antwort); wechsle nie in eine dritte Sprache.

@@ -69,6 +69,7 @@ below; the merge semantics per section are in §3.
 ├── skills/
 │   ├── web-search/
 │   │   ├── skill.toml
+│   │   ├── triggers.toml        # optional, see 2.7
 │   │   └── instructions.md
 │   └── code-review/
 │       ├── skill.toml
@@ -293,6 +294,29 @@ skills = ["source-review", "web-research"]
 plugins = ["git-review"]
 mcps = ["docs"]
 ```
+
+An optional `skills/<name>/triggers.toml` next to `skill.toml` says *when* the
+skill text should be delivered to the model (PL-95). It is a separate file on
+purpose: `SkillToml` denies unknown fields and an older `harw` would drop a
+skill whose manifest gained new keys. Older builds never read `triggers.toml`.
+All fields are optional; invalid entries are discarded with a warning
+(`SkillIndex::warnings`) and never make the skill unloadable. Limits: 16
+entries per list, `when` at most 160 characters, error codes `[A-Za-z0-9_-]`.
+
+```toml
+# skills/rust-borrow-checker-e0505/triggers.toml
+when = "Rust borrow checker errors E0499/E0502/E0505"
+[triggers]
+keywords    = ["borrow checker", "cannot move out"]  # task text, word boundaries
+error_codes = ["E0505", "E0499"]                     # tool output, token match
+paths       = ["**/*.rs"]                            # touched files (glob)
+tools       = ["process.execute"]                    # first use of a tool
+commands    = ["cargo test"]                         # command prefix, argument boundary
+priority    = 50                                     # u8, higher first
+```
+
+Triggers never grant rights. S1 ships the parser, `TriggerIndex` and the pure
+`select` core in `harw-catalog`; runtime wiring follows in later cycles.
 
 `mcps/*.toml` contains declarative metadata (`name`, `description`,
 `transport`, endpoint or command metadata, tools, and `enabled`). Discovery
