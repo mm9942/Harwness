@@ -1,0 +1,23 @@
+[package]
+publish.workspace = true
+name = "harw-command"
+description = "The command port: one request/outcome vocabulary for running a process, and its adapter onto the job runtime (PL-93). Application code submits commands; it does not spawn them."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-job = { path = "../harw-job" }
+harw-types = { path = "../harw-types" }
+jiff = { workspace = true }
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process"] }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util"] }
+
+[lints]
+workspace = true

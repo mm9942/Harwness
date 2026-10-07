@@ -280,6 +280,8 @@ impl SessionJobs {
         // `[jobs] max_running` (1–256, beim Parsen geprüft); defensiv geklemmt.
         config.max_running_jobs = usize::try_from(max_running.clamp(1, 256)).unwrap_or(16);
         let manager = JobManager::new(config, Arc::new(notifier))?;
+        // Jobs start only through the job runtime (PL-93).
+        harw_command::install_host_default(&state_dir.join("runtime-jobs"));
         Ok((
             Self {
                 manager,

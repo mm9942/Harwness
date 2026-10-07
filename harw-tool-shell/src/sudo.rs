@@ -57,13 +57,13 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harw_authority::{Permission, SandboxSpec};
-use harw_extension_api::contributors::ToolProvider;
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
@@ -72,13 +72,12 @@ use harw_tools::{
 use harw_types::cancel::CancelToken;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command as TokioCommand};
+use tokio::io::AsyncWriteExt;
+use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::exec::{resolve_setsid, terminate};
 use crate::limits::{ShellLimits, launch_command};
 
 // ── Konstanten ────────────────────────────────────────────────────────────────
@@ -130,9 +129,6 @@ const MAX_ARG_BYTES: usize = 4096;
 
 /// Höchstlänge des Grundes in Zeichen.
 const MAX_REASON_CHARS: usize = 500;
-
-/// Lesepuffer je Pipe.
-const READ_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Programme, die Rechte erhöhen. `shell.exec` lehnt sie in Befehlsposition
 /// ab ([`escalation_program`]); `host.sudo_exec` lehnt sie als `argv[0]` ab.
@@ -194,28 +190,19 @@ fn default_sudo_limits() -> ShellLimits {
 
 /// Warum ein Passwort nicht als [`SudoSecret`] angenommen wurde. Trägt nie
 /// den Inhalt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, harw_macros::HarwError)]
 pub enum SudoSecretError {
     /// Das Passwort ist leer.
+    #[msg("Passwort ist leer")]
     Empty,
     /// Das Passwort ist länger als [`SUDO_MAX_SECRET_BYTES`].
+    #[msg("Passwort ist zu lang")]
     TooLong,
     /// Das Passwort enthält `\n`, `\r` oder `\0` (würde die Zeile für
     /// `sudo -S` verfälschen).
+    #[msg("Passwort enthält ein unzulässiges Steuerzeichen")]
     ForbiddenByte,
 }
-
-impl fmt::Display for SudoSecretError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("Passwort ist leer"),
-            Self::TooLong => f.write_str("Passwort ist zu lang"),
-            Self::ForbiddenByte => f.write_str("Passwort enthält ein unzulässiges Steuerzeichen"),
-        }
-    }
-}
-
-impl std::error::Error for SudoSecretError {}
 
 /// Ein sudo-Passwort im Speicher.
 ///
@@ -1179,6 +1166,23 @@ async fn send_password(stdin: ChildStdin, line: &Zeroizing<Vec<u8>>) -> bool {
     ok
 }
 
+/// Ein fertig geplanter `sudo`-Start.
+struct SudoLaunch {
+    program: PathBuf,
+    args: Vec<OsString>,
+    cwd: PathBuf,
+    /// Das Passwort kommt über stdin (sonst `/dev/null`).
+    password: bool,
+}
+
+/// Die feste, minimale Umgebung eines `sudo`-Prozesses.
+fn sudo_env() -> Vec<(String, String)> {
+    vec![
+        ("PATH".to_owned(), SUDO_ENV_PATH.to_owned()),
+        ("LANG".to_owned(), SUDO_ENV_LANG.to_owned()),
+    ]
+}
+
 /// Ausführer eines `host.sudo_exec`-Aufrufs.
 struct SudoExecExecutor {
     prompts: SudoPromptSender,
@@ -1238,29 +1242,21 @@ impl SudoExecExecutor {
 
     /// `sudo -n -k true`: gelingt es, läuft sudo ohne Passwort.
     async fn probe_passwordless(&self, sudo: &Path) -> bool {
-        let mut command = TokioCommand::new(sudo);
-        command
-            .args(["-n", "-k", "true"])
-            .env_clear()
-            .env("PATH", SUDO_ENV_PATH)
-            .env("LANG", SUDO_ENV_LANG)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let Ok(mut child) = command.spawn() else {
+        let Some(port) = harw_command::installed() else {
             return false;
         };
-        match tokio::time::timeout(PASSWORDLESS_PROBE_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => status.success(),
-            _ => {
-                terminate(&mut child).await;
-                false
-            }
-        }
+        let mut request = harw_command::CommandRequest::new(
+            sudo.to_string_lossy().into_owned(),
+            "/",
+            PASSWORDLESS_PROBE_TIMEOUT,
+        );
+        request.args = vec!["-n".to_owned(), "-k".to_owned(), "true".to_owned()];
+        request.env = sudo_env();
+        port.run(request, CancelToken::new()).await.is_success()
     }
 
-    /// Baut den vollständigen Start: `[prlimit … --] [setsid --wait] sudo …`.
+    /// Baut den vollständigen Start: `[prlimit … --] sudo …` (die neue Sitzung
+    /// legt die Job-Runtime an).
     fn build_command(
         &self,
         sudo: &Path,
@@ -1268,7 +1264,7 @@ impl SudoExecExecutor {
         marker: &str,
         argv: &[String],
         cwd: &Path,
-    ) -> Result<TokioCommand, String> {
+    ) -> Result<SudoLaunch, String> {
         self.limits
             .validate()
             .map_err(|err| format!("host.sudo_exec: Ressourcengrenzen: {err}"))?;
@@ -1285,120 +1281,102 @@ impl SudoExecExecutor {
         };
         sudo_args.push("--".into());
         sudo_args.extend(argv.iter().map(OsString::from));
-
-        let setsid = resolve_setsid();
-        let (program, args) = match setsid {
-            Some(setsid) => {
-                let mut args: Vec<OsString> = vec!["--wait".into(), sudo.as_os_str().to_owned()];
-                args.extend(sudo_args);
-                (setsid.to_path_buf(), args)
-            }
-            None => (sudo.to_path_buf(), sudo_args),
-        };
-        let launch = launch_command(prlimit.as_deref(), &self.limits, &program, &args);
-        let mut command = TokioCommand::new(&launch.program);
-        command
-            .args(&launch.args)
-            .current_dir(cwd)
-            .env_clear()
-            .env("PATH", SUDO_ENV_PATH)
-            .env("LANG", SUDO_ENV_LANG)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .stdin(match mode {
-                SudoMode::Passwordless => Stdio::null(),
-                SudoMode::Password => Stdio::piped(),
-            });
-        // Wie `run_host_command`: ohne setsid wenigstens eine eigene
-        // Prozessgruppe; mit setsid bewusst nicht (siehe dort).
-        if setsid.is_none() {
-            command.process_group(0);
-        }
-        Ok(command)
+        let launch = launch_command(prlimit.as_deref(), &self.limits, sudo, &sudo_args);
+        Ok(SudoLaunch {
+            program: launch.program,
+            args: launch.args,
+            cwd: cwd.to_path_buf(),
+            password: mode == SudoMode::Password,
+        })
     }
 
-    /// Startet, schreibt ggf. das Passwort nach der Einmal-Marke, sammelt
-    /// die Ausgabe gekappt und hält Zeitlimit und Abbruch ein.
+    /// Startet über die Job-Runtime, schreibt ggf. das Passwort nach der
+    /// Einmal-Marke (über die übergebene stdin-Pipe — das Passwort ist nie Teil
+    /// eines Job-Datensatzes), sammelt die Ausgabe gekappt (Frames) und hält
+    /// Zeitlimit und Abbruch ein.
     ///
     /// # Errors
     /// `Err(Some(msg))` bei Start-/I/O-Fehlern, `Err(None)` bei Abbruch.
     async fn run(
         &self,
-        mut command: TokioCommand,
+        launch: SudoLaunch,
         secret: Option<SudoSecret>,
         marker: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<RunReport, Option<String>> {
-        let mut child: Child = command.spawn().map_err(|err| {
-            warn!(error = %err, "host.sudo_exec spawn failed");
+        let Some(port) = harw_command::installed() else {
+            return Err(Some(
+                "host.sudo_exec: keine Job-Runtime montiert; Befehle laufen nur über die Job-Runtime"
+                    .to_owned(),
+            ));
+        };
+        let mut request = harw_command::CommandRequest::new(
+            launch.program.to_string_lossy().into_owned(),
+            &launch.cwd,
+            // Backstop; das eigentliche Zeitlimit hält die Schleife unten.
+            Duration::from_secs(self.timeout_secs.saturating_add(10)),
+        );
+        request.args = launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        request.env = sudo_env();
+        request.stdin = if launch.password {
+            harw_command::CommandStdin::Pipe
+        } else {
+            harw_command::CommandStdin::Null
+        };
+        request.stream = true;
+        let mut started = port.start(request).await.map_err(|err| {
+            warn!(error = %err, "host.sudo_exec start failed");
             Some(format!("host.sudo_exec: Start fehlgeschlagen: {err}"))
         })?;
         // Die Zeile wird einmal gebaut; das `SudoSecret` selbst wird sofort
         // genullt (Drop), die Zeile beim Verlassen dieser Funktion.
         let line: Option<Zeroizing<Vec<u8>>> = secret.as_ref().map(SudoSecret::line);
         drop(secret);
-        let mut stdin = child.stdin.take();
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
-            terminate(&mut child).await;
-            return Err(Some(
-                "host.sudo_exec: stdout/stderr-Pipes fehlen".to_owned(),
-            ));
+        let mut stdin = started.stdin.take();
+        let Some(mut frames) = started.frames.take() else {
+            drop(stdin);
+            (started.cancel)();
+            return Err(Some("host.sudo_exec: keine Ausgabe-Frames".to_owned()));
         };
 
-        let started = tokio::time::Instant::now();
-        let deadline = started + Duration::from_secs(self.timeout_secs);
-        let mut window = stdin.as_ref().map(|_| started + self.password_window);
+        let began = tokio::time::Instant::now();
+        let deadline = began + Duration::from_secs(self.timeout_secs);
+        let mut window = stdin.as_ref().map(|_| began + self.password_window);
         let marker_bytes = marker.as_bytes();
         let mut capture = SudoCapture::new(self.max_output_bytes);
         let mut tail: Vec<u8> = Vec::new();
         let mut prompts_seen = 0_u32;
         let mut password_sent = false;
-        let mut stdout_open = true;
-        let mut stderr_open = true;
-        let mut out_buf = [0_u8; READ_CHUNK_BYTES];
-        let mut err_buf = [0_u8; READ_CHUNK_BYTES];
         let mut timed_out = false;
+        let mut open = true;
 
-        while stdout_open || stderr_open {
+        while open {
             if capture.limit_exceeded() {
                 break;
             }
             tokio::select! {
-                read = stdout.read(&mut out_buf), if stdout_open => {
-                    match read {
-                        Ok(0) => stdout_open = false,
-                        Ok(count) => capture.push(true, &out_buf[..count]),
-                        Err(err) => {
-                            terminate(&mut child).await;
-                            return Err(Some(format!("host.sudo_exec: I/O-Fehler: {err}")));
-                        }
-                    }
-                }
-                read = stderr.read(&mut err_buf), if stderr_open => {
-                    match read {
-                        Ok(0) => stderr_open = false,
-                        Ok(count) => {
-                            let chunk = &err_buf[..count];
-                            capture.push(false, chunk);
-                            prompts_seen = prompts_seen
-                                .saturating_add(scan_for_marker(&mut tail, chunk, marker_bytes));
-                            // Genau ein Versuch: nur auf die erste echte
-                            // Passwortabfrage antworten, danach Pipe zu.
-                            if prompts_seen >= 1 && !password_sent {
-                                if let (Some(pipe), Some(line)) = (stdin.take(), line.as_ref()) {
-                                    password_sent = send_password(pipe, line).await;
-                                }
-                                window = None;
+                frame = frames.next() => match frame {
+                    None => open = false,
+                    Some(harw_command::CommandFrame::Stdout(chunk)) => capture.push(true, &chunk),
+                    Some(harw_command::CommandFrame::Stderr(chunk)) => {
+                        capture.push(false, &chunk);
+                        prompts_seen = prompts_seen
+                            .saturating_add(scan_for_marker(&mut tail, &chunk, marker_bytes));
+                        // Genau ein Versuch: nur auf die erste echte
+                        // Passwortabfrage antworten, danach Pipe zu.
+                        if prompts_seen >= 1 && !password_sent {
+                            if let (Some(pipe), Some(line)) = (stdin.take(), line.as_ref()) {
+                                password_sent = send_password(pipe, line).await;
                             }
-                        }
-                        Err(err) => {
-                            terminate(&mut child).await;
-                            return Err(Some(format!("host.sudo_exec: I/O-Fehler: {err}")));
+                            window = None;
                         }
                     }
-                }
+                    Some(harw_command::CommandFrame::Lagged(_)) => {}
+                },
                 () = sleep_until_opt(window) => {
                     // Keine Passwortabfrage in der Frist: Pipe ohne Passwort
                     // schließen (EOF für den Befehl bzw. Fehlschlag für sudo).
@@ -1411,7 +1389,8 @@ impl SudoExecExecutor {
                 }
                 () = cancelled(cancel) => {
                     drop(stdin.take());
-                    terminate(&mut child).await;
+                    (started.cancel)();
+                    let _ = started.done.await;
                     info!("host.sudo_exec cancelled");
                     return Err(None);
                 }
@@ -1421,26 +1400,33 @@ impl SudoExecExecutor {
         drop(line);
 
         let limit_exceeded = capture.limit_exceeded();
-        let status = if timed_out || limit_exceeded {
-            terminate(&mut child).await
+        let outcome = if timed_out || limit_exceeded {
+            (started.cancel)();
+            started.done.await
         } else {
             tokio::select! {
-                waited = tokio::time::timeout_at(deadline, child.wait()) => match waited {
-                    Ok(Ok(status)) => Some(status),
-                    Ok(Err(err)) => {
-                        terminate(&mut child).await;
-                        return Err(Some(format!("host.sudo_exec: Warten fehlgeschlagen: {err}")));
-                    }
-                    Err(_elapsed) => {
-                        timed_out = true;
-                        terminate(&mut child).await
-                    }
+                outcome = &mut started.done => outcome,
+                () = tokio::time::sleep_until(deadline) => {
+                    timed_out = true;
+                    (started.cancel)();
+                    started.done.await
                 },
                 () = cancelled(cancel) => {
-                    terminate(&mut child).await;
+                    (started.cancel)();
+                    let _ = started.done.await;
                     return Err(None);
                 }
             }
+        };
+        let status = match outcome.end {
+            harw_command::CommandEnd::Exited => Some(ExitStatus::from_raw(outcome.exit_code << 8)),
+            harw_command::CommandEnd::Signaled(signal) => Some(ExitStatus::from_raw(signal)),
+            harw_command::CommandEnd::Failed(message) => {
+                return Err(Some(format!(
+                    "host.sudo_exec: Lauf fehlgeschlagen: {message}"
+                )));
+            }
+            _ => None,
         };
         Ok(RunReport {
             status,
@@ -1769,6 +1755,10 @@ impl SudoToolProvider {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_sudo_path(mut self, path: PathBuf) -> Self {
+        // Commands run only through the job runtime; tests that fake `sudo`
+        // need a port.
+        #[cfg(test)]
+        crate::test_support::install_host_port();
         self.sudo_path = Some(path);
         self
     }
@@ -1821,11 +1811,15 @@ impl SudoToolProvider {
     }
 }
 
-impl ToolProvider for SudoToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::Function(FunctionToolSpec {
-            name: ToolName::new(SUDO_EXEC_TOOL),
-            description: "Run ONE command as root on the local host via sudo. sudo works: the \
+// `host.sudo_exec` ist das einzige Werkzeug; der Executor trägt Kanal, Worker,
+// Limits, Zeitfenster und Audit-Senke des Providers. `parallel_safe: none` —
+// ein Aufruf als root ist nie kommutativ.
+harw_tools::tool_provider! {
+    impl for SudoToolProvider as provider, parallel_safe: none {
+        SUDO_EXEC_TOOL => {
+            spec: ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new(SUDO_EXEC_TOOL),
+                description: "Run ONE command as root on the local host via sudo. sudo works: the \
                 user sees the exact argv and your reason in a TUI approval window, confirms and \
                 types their sudo password there if sudo asks (passwordless sudo works too). The \
                 password never reaches you — never ask for it in chat, put it into a command or \
@@ -1834,32 +1828,24 @@ impl ToolProvider for SudoToolProvider {
                 the user. Never call sudo via shell.exec; never say sudo is impossible while this \
                 tool is available."
                 .to_owned(),
-            parameters: Self::parameter_schema(),
-            strict: true,
-        })]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == SUDO_EXEC_TOOL).then(|| {
-            Arc::new(SudoExecExecutor {
-                prompts: self.prompts.clone(),
-                worker: self.worker.clone(),
-                timeout_secs: self.timeout_secs,
-                max_output_bytes: self.max_output_bytes,
-                limits: self.limits,
-                prompt_timeout: self.prompt_timeout,
-                password_window: self.password_window,
-                audit: Arc::clone(&self.audit),
+                parameters: SudoToolProvider::parameter_schema(),
+                strict: true,
+            }),
+            executor: SudoExecExecutor {
+                prompts: provider.prompts.clone(),
+                worker: provider.worker.clone(),
+                timeout_secs: provider.timeout_secs,
+                max_output_bytes: provider.max_output_bytes,
+                limits: provider.limits,
+                prompt_timeout: provider.prompt_timeout,
+                password_window: provider.password_window,
+                audit: Arc::clone(&provider.audit),
                 #[cfg(test)]
-                sudo_path: self.sudo_path.clone(),
+                sudo_path: provider.sudo_path.clone(),
                 #[cfg(not(test))]
                 sudo_path: None,
-            }) as Arc<dyn ToolExecutor>
-        })
-    }
-
-    fn parallel_safe(&self, _name: &ToolName) -> bool {
-        false
+            },
+        },
     }
 }
 
@@ -1870,6 +1856,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use serde_json::Value;
     use std::fs;
@@ -2668,5 +2655,20 @@ mod tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::SudoSecretError;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(SudoSecretError::Empty.to_string(), "Passwort ist leer");
+        assert_eq!(SudoSecretError::TooLong.to_string(), "Passwort ist zu lang");
+        assert_eq!(
+            SudoSecretError::ForbiddenByte.to_string(),
+            "Passwort enthält ein unzulässiges Steuerzeichen"
+        );
     }
 }

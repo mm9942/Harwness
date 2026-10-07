@@ -57,6 +57,7 @@
 //!
 //! # Features
 //! - `bwrap`: the Bubblewrap sandbox backend (`LinuxSandboxBackend::Bwrap`).
+//! - `oci`: the container backend (`OciExecutor`, `OciConfig`) for Podman/Docker.
 
 #![forbid(unsafe_code)]
 
@@ -68,11 +69,14 @@ pub use harw_job_core::{
     JobSpec, JobSpecBuilder, JobSpecEnvelope, LifecycleState, ResourceRequest, RunnerId,
     SandboxProfileName, SandboxReport, SandboxRequirement, SpecError, WorkspacePath,
 };
+#[cfg(all(feature = "oci", unix))]
+pub use harw_job_executor_oci::{OciConfig, OciError, OciExecutor, PeerPolicy};
 #[cfg(target_os = "macos")]
 pub use harw_job_runtime::coordinator::DarwinExecutor;
 pub use harw_job_runtime::coordinator::{
-    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, JobHandle, JobResult,
-    OutputCapture, RecoveredJob, RecoveryDecision, RuntimeError,
+    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, FrameEvent, HandedStdio, JobFrame,
+    JobFrames, JobHandle, JobResult, OutputCapture, OutputFiles, Persistence, RecoveredJob,
+    RecoveryDecision, RuntimeError, StdioHandoff, SubmitOptions,
 };
 #[cfg(target_os = "linux")]
 pub use harw_job_runtime::coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
@@ -259,6 +263,22 @@ impl<S: CoordinatorStore, E: Executor> JobRuntime<S, E> {
     /// claiming the job. Execution outcomes come from [`JobHandle::wait`].
     pub async fn submit(&self, spec: impl IntoJobSpec) -> Result<Job, RuntimeError> {
         self.coordinator.submit(spec.into_envelope()?).await
+    }
+
+    /// [`JobRuntime::submit`] with options: how much of the spec the job
+    /// record keeps ([`Persistence`]) and, with `stream: true`, a live
+    /// subscription ([`JobFrames`]) that sees the job from its first frame.
+    ///
+    /// # Errors
+    /// As [`JobRuntime::submit`].
+    pub async fn submit_with(
+        &self,
+        spec: impl IntoJobSpec,
+        options: SubmitOptions,
+    ) -> Result<(Job, Option<JobFrames>), RuntimeError> {
+        self.coordinator
+            .submit_with(spec.into_envelope()?, options)
+            .await
     }
 
     /// Recovers this runner's running jobs after a restart (see

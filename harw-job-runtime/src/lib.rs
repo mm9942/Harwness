@@ -50,14 +50,20 @@ pub use harw_job_core::JobRuntimeError as JobError;
 
 pub mod coordinator;
 pub mod host;
+pub mod lanes;
+pub mod offer;
+pub mod permits;
 
 pub use host::{HostFacts, HostLandlock, HostReport};
+pub use lanes::{JobLanes, LaneStatus};
+pub use permits::{MAX_PERMITS, MIN_PERMITS, Permit, PermitStatus, ResizablePermits};
 
 #[cfg(target_os = "macos")]
 pub use coordinator::DarwinExecutor;
 pub use coordinator::{
-    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, JobHandle, JobResult, RecoveredJob,
-    RecoveryDecision, RuntimeError,
+    Coordinator, CoordinatorConfig, CoordinatorStore, DEFAULT_FRAME_BUFFER, Executor, FrameEvent,
+    JobFrame, JobFrames, JobHandle, JobResult, Persistence, RecoveredJob, RecoveryDecision,
+    RuntimeError, SubmitOptions,
 };
 #[cfg(target_os = "linux")]
 pub use coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};

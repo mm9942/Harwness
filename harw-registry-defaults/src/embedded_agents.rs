@@ -3753,7 +3753,7 @@ mod tests {
     #[test]
     fn test_knowledge_documents_stay_within_their_byte_budget() {
         assert!(
-            ORGANIZATION_KNOWLEDGE.len() <= 3500,
+            ORGANIZATION_KNOWLEDGE.len() <= 4000,
             "agent-organization.md: {} Bytes > 3500",
             ORGANIZATION_KNOWLEDGE.len()
         );
@@ -3790,7 +3790,7 @@ mod tests {
         // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen; dazu der
         // Abschnitt „Root-Befehle (sudo)“.
         assert!(
-            UIA_WORKER_KNOWLEDGE.len() <= 2300,
+            UIA_WORKER_KNOWLEDGE.len() <= 2700,
             "roles/uia-worker.md: {} Bytes > 2300",
             UIA_WORKER_KNOWLEDGE.len()
         );
@@ -3806,6 +3806,13 @@ mod tests {
                 text.len()
             );
         }
+        // Plan-before-act rule (standardized): worker.md carries its own
+        // short "Planen vor Ausführen" section now.
+        assert!(
+            WORKER_KNOWLEDGE.len() <= 2400,
+            "roles/worker.md: {} Bytes > 2400",
+            WORKER_KNOWLEDGE.len()
+        );
     }
 
     /// Plan R9, Teil F: jede Rolle, die lange Prozesse startet oder

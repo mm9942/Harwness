@@ -1254,6 +1254,37 @@ pub(crate) const PROCESS_TOOLS: &[&str] = &["process.list", "process.kill"];
 ///   keine Design-/Wissensfrage.
 pub(crate) const LENS_TOOLS: &[&str] = &["lens.ask"];
 
+/// The Obsidian vault tools, in provider order.
+///
+/// The vault (`docs/planning` by default, overridable via
+/// `HARW_OBSIDIAN_VAULT` relative to the workspace root) is the project's
+/// long-form memory: code maps, architecture notes, decision records,
+/// learning summaries. The four read tools give every profile that already
+/// reads the workspace the same access to the notes; `obsidian.write` is
+/// restricted to `Full` (coding agents) because it creates and replaces
+/// files. All five resolve paths through the sandbox's workspace binding,
+/// so they never exceed the caller's existing file permissions.
+pub(crate) const OBSIDIAN_READ_TOOLS: &[&str] =
+    &["obsidian.map", "obsidian.read", "obsidian.search", "obsidian.links"];
+
+/// The Obsidian vault tools, in provider order.
+///
+/// The vault (`docs/planning` by default, overridable via
+/// `HARW_OBSIDIAN_VAULT` relative to the workspace root) is the project's
+/// long-form memory: code maps, architecture notes, decision records,
+/// learning summaries. The four read tools give every profile that already
+/// reads the workspace the same access to the notes; `obsidian.write` is
+/// restricted to `Full` (coding agents) because it creates and replaces
+/// files. All five resolve paths through the sandbox's workspace binding,
+/// so they never exceed the caller's existing file permissions.
+pub(crate) const OBSIDIAN_TOOLS: &[&str] = &[
+    "obsidian.map",
+    "obsidian.read",
+    "obsidian.search",
+    "obsidian.links",
+    "obsidian.write",
+];
+
 /// Die Browser-Werkzeuge, in Provider-Reihenfolge.
 ///
 /// Kein Profil registriert die vollständige Liste (W5 RD): sie entstehen nur
@@ -1763,6 +1794,7 @@ impl RegistryProfile {
                 .chain(SHELL_TOOLS.iter())
                 .chain(JOB_TOOLS.iter())
                 .chain(PROCESS_TOOLS.iter())
+                .chain(OBSIDIAN_TOOLS.iter())
                 .copied()
                 .collect(),
             RegistryProfile::ShellExecution => SHELL_TOOLS
@@ -1791,6 +1823,7 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
+                .chain(OBSIDIAN_READ_TOOLS.iter())
                 .chain(LENS_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -2667,6 +2700,9 @@ fn profile_tool_providers(
             let mut providers = vec![filesystem, doc, explorer];
             providers.extend(shell);
             providers.push(process);
+            // Obsidian vault tools (read + write): coding agents maintain
+            // the project's long-form memory alongside the code.
+            providers.push(Arc::new(harw_tool_obsidian::ObsidianToolProvider::new()));
             providers
         }
         RegistryProfile::ShellExecution => build_shell_providers(sandbox_profile),
@@ -2687,6 +2723,10 @@ fn profile_tool_providers(
         // zusätzlich mitgeben.
         RegistryProfile::Planning => {
             let mut providers = read_only_base();
+            // Obsidian vault reads: the planning agent maps the project's
+            // long-form memory (`docs/planning` vault) the same way it reads
+            // the workspace. Write stays out — planning is read-only.
+            providers.push(Arc::new(harw_tool_obsidian::ObsidianToolProvider::new()));
             providers.push(Arc::new(LensToolProvider::new()));
             providers
         }
@@ -4215,12 +4255,14 @@ mod tests {
         // Registriert wird der read-only Kern von `ReadOnlyExplore` (fs.*,
         // doc.read_pdf, explore.*, deps.*) **ohne** dessen Explorer-Netz
         // (`web.fetch`/`web.search`, nur für `explorer`), plus `lens.ask`
-        // (siehe `LENS_TOOLS`).
+        // (siehe `LENS_TOOLS`) plus die lesenden Obsidian-Werkzeuge (siehe
+        // `OBSIDIAN_READ_TOOLS`).
         let expected: Vec<String> = FS_READ_ONLY_TOOLS
             .iter()
             .chain(DOC_TOOLS.iter())
             .chain(EXPLORER_TOOLS.iter())
             .chain(DEPS_TOOLS.iter())
+            .chain(OBSIDIAN_READ_TOOLS.iter())
             .chain(LENS_TOOLS.iter())
             .map(|name| (*name).to_owned())
             .collect();
@@ -5442,6 +5484,10 @@ mod tests {
         #[tokio::test]
         async fn test_and_permits_with_active_session_approval_runs_on_host_for_strict_profile()
         -> TestResult {
+            harw_command::install_host_default(&std::env::temp_dir().join(format!(
+                "harw-regdefaults-command-jobs-{}",
+                std::process::id()
+            )));
             let project_root = make_temp_project("permits-strict-approved")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());

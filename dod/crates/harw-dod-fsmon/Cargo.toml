@@ -23,6 +23,7 @@ harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # Fixture-Harness für Sensor-Crates. Zum Zeitpunkt dieses Knotens (AW4-02a)
 # noch ein leeres Gerüst ohne `sensor_suite!` (Knoten AW2-05 folgt parallel):
 # diese Crate schreibt ihre Prüfungen deshalb von Hand, bleibt aber bereits

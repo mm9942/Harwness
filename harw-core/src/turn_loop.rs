@@ -1096,6 +1096,9 @@ impl TurnControl {
 pub struct TurnInput {
     /// Optionaler User-Text, der zu Beginn in den Verlauf gespielt wird.
     pub user_text: Option<String>,
+    /// Gespeicherte Bilder, die mit dem User-Text in dieselbe Nachricht gehen
+    /// (siehe `harw-media`). Leer = kein Bild.
+    pub user_images: Vec<harw_protocol::MediaRef>,
     /// Metadaten, die dem `TurnInputContext` mitgegeben werden.
     pub metadata: serde_json::Value,
     /// Steuerblock (Abbruch, Grenzwerte, Uhr, Zähler) dieses Turns.
@@ -1107,9 +1110,23 @@ impl TurnInput {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             user_text: Some(text.into()),
+            user_images: Vec::new(),
             metadata: serde_json::Value::Null,
             control: TurnControl::new(),
         }
+    }
+
+    /// Hängt gespeicherte Bilder an die User-Nachricht dieses Turns. Die
+    /// Bilder müssen im Medienspeicher liegen, den die Laufzeit mit
+    /// [`crate::install_media_source`] eingerichtet hat; sonst nennt der
+    /// Provider sie im Text als nicht gesendet.
+    #[must_use]
+    pub fn with_images(
+        mut self,
+        images: impl IntoIterator<Item = harw_protocol::MediaRef>,
+    ) -> Self {
+        self.user_images.extend(images);
+        self
     }
 
     /// Replaces the control block of this input.
@@ -1731,6 +1748,33 @@ fn child_question(arguments: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// Async is the delegation default. Callers must opt into the old inline
+/// parent-waits-for-child contract explicitly.
+fn delegation_runs_inline(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        || arguments
+            .get("wait")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+fn agent_job_started_result(
+    handle: &harw_extension_api::AgentJobHandle,
+    role: &str,
+) -> ToolCallResult {
+    ToolCallResult::success(serde_json::json!({
+        "work_id": handle.work_id.as_str(),
+        "child_id": handle.child.as_str(),
+        "role": role,
+        "status": "submitted",
+        "async": true,
+        "hint": "Work continues independently. work_id is the durable lifecycle handle; use work.result with work_id for durable status/result. child_id remains the live agent projection for agent.status/agent.result."
+    }))
+}
+
 /// Argumentfelder eines Handoff-Calls, die — in dieser Reihenfolge — als
 /// Arbeitsauftrag des Kindes gelesen werden. `"question"` ist die ältere
 /// Schreibweise (siehe [`child_question`]).
@@ -1857,7 +1901,7 @@ fn one_line(text: &str, max: usize) -> String {
 }
 
 /// Die gemeinsamen Felder von `transfer_to_<name>` und `agents.delegate`
-/// (`task`, `context`, `continue_from`, `background`, `user_approved`).
+/// (`task`, `context`, `continue_from`, `background`, `wait`, `user_approved`).
 ///
 /// # Beschreibung
 /// Plan R9, Teil C: die Beschreibungen sind bewusst knapp — sie stehen in
@@ -1891,16 +1935,25 @@ fn handoff_properties() -> BTreeMap<String, JsonSchema> {
         crate::user_approval::USER_APPROVED_FIELD.to_owned(),
         crate::user_approval::user_approved_schema(),
     );
-    // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
-    // Orchestrator-Ziele der UIA-Wurzel (Vorgabe dort `true`); jeder andere
-    // Einstieg und jedes Worker-Ziel läuft synchron.
+    // Async-by-default: every delegation enters the durable job runtime.
+    // background=false or wait=true is the explicit compatibility escape hatch.
     properties.insert(
         "background".to_owned(),
         JsonSchema {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
-                "Optional (nur UIA-Orchestratoren in der TUI, dort Vorgabe true): sofort \
-                 zurück, Ergebnis kommt als Benachrichtigung; false wartet."
+                "Optional; Vorgabe true. Startet den Agenten als durable Job und gibt sofort work_id/child_id zurück. false wartet inline."
+                    .to_owned(),
+            ),
+            ..JsonSchema::default()
+        },
+    );
+    properties.insert(
+        "wait".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "Optional; Vorgabe false. true erzwingt den synchronen Legacy-Pfad und wartet auf das Kind."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -1945,7 +1998,7 @@ fn handoff_tool_spec(role: &str, description: Option<&str>) -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
-            "Delegiert an '{role}' und wartet auf das Ergebnis.{summary}{}",
+            "Delegiert an '{role}' als durable Job und gibt standardmäßig sofort einen Handle zurück; background=false oder wait=true wartet inline.{summary}{}",
             handoff_role_hint(role)
         ),
         parameters: closed_object(handoff_properties(), &["task"]),
@@ -1974,8 +2027,7 @@ fn agents_delegate_tool_spec(names: &[String]) -> ToolSpec {
     );
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(AGENTS_DELEGATE_TOOL),
-        description: "Delegiert an einen sichtbaren Agenten und wartet auf das Ergebnis \
-                      (wie transfer_to_<name>)."
+        description: "Delegiert an einen sichtbaren Agenten als durable Job und gibt standardmäßig sofort work_id/child_id zurück; background=false oder wait=true wartet inline."
             .to_owned(),
         parameters: closed_object(properties, &["agent", "task"]),
         strict: false,
@@ -2995,7 +3047,7 @@ fn deliver_round_boundary(session: &mut AgentSession) {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ImageUrl { .. } => None,
+                ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
             })
             .collect();
         (!text.trim().is_empty()).then_some(text)
@@ -3420,7 +3472,8 @@ async fn run_turn_with_approvals(
     // Hydrate it before appending the new user item so the model sees the
     // complete transcript and the live session remains the single append
     // authority for the rest of this turn.
-    if input.user_text.is_some() && session.history().is_empty() {
+    let has_user_input = input.user_text.is_some() || !input.user_images.is_empty();
+    if has_user_input && session.history().is_empty() {
         let history = match store.load_history(session.id()).await {
             Ok(history) => history,
             Err(error) => {
@@ -3433,8 +3486,15 @@ async fn run_turn_with_approvals(
     }
 
     // User-Input in den Verlauf spielen und persistieren.
-    if let Some(text) = input.user_text {
-        session.history_mut().push_user_text(text);
+    if has_user_input {
+        let text = input.user_text.unwrap_or_default();
+        if input.user_images.is_empty() {
+            session.history_mut().push_user_text(text);
+        } else {
+            session
+                .history_mut()
+                .push_user_message(text, input.user_images);
+        }
         if let Err(error) = persist_last(session, store).await {
             transition_after_turn_failure(session, &ctx, &error);
             return Err(error);
@@ -3887,7 +3947,6 @@ async fn resume_after_approval_with_store(
                             });
                         }
                     };
-                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
                     // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
                     // zurück). Ohne dieses Event bliebe ein solches Kind für jeden
@@ -3898,9 +3957,47 @@ async fn resume_after_approval_with_store(
                             turn_id: ctx.turn_id.clone(),
                             child: child.clone(),
                             role: role.clone(),
-                            question,
+                            question: question.clone(),
                         },
                     );
+
+                    if !delegation_runs_inline(&pending.call.arguments)
+                        && let Some(submitter) = session.registry().agent_job_submitter().cloned()
+                    {
+                        let job = submitter
+                            .submit_child(&child, question.as_deref())
+                            .await
+                            .map_err(|error| CoreError::HandoffFailed {
+                                role: role.clone(),
+                                reason: error.to_string(),
+                            })?;
+                        let result = agent_job_started_result(&job, &role);
+                        notify_tool_outcome(
+                            session,
+                            pending.call.name.as_str(),
+                            &pending.call.arguments,
+                            &result,
+                        );
+                        notify_tool_progress(session);
+                        session
+                            .history_mut()
+                            .push_tool_result(pending.call.id.clone(), result.clone(), 0);
+                        persist_last(session, store).await?;
+                        emit(
+                            session,
+                            TurnEvent::ToolCallCompleted {
+                                turn_id: ctx.turn_id.clone(),
+                                call_id: pending.call.id,
+                                result,
+                                duration_ms: 0,
+                                placement: None,
+                            },
+                        );
+                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                            .await;
+                    }
+
+                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     Ok(TurnOutcome::AwaitingChild {
                         child,
                         call_id: pending.call.id,
@@ -4999,17 +5096,50 @@ async fn drive_turn(
                     role: role.clone(),
                     reason: e.to_string(),
                 })?;
-                // state ⇒ WaitingForChild; Loop pausiert.
-                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
+                let question = child_question(&handoff_arguments);
                 emit(
                     session,
                     TurnEvent::ChildSpawned {
                         turn_id: handle.turn_id.clone(),
                         child: child.clone(),
                         role: role.clone(),
-                        question: child_question(&handoff_arguments),
+                        question: question.clone(),
                     },
                 );
+
+                // Async-by-default: admission above establishes the child
+                // authority; the durable job runtime now owns its lifecycle.
+                // Only an explicit background=false / wait=true keeps the
+                // historical AwaitingChild contract.
+                if !delegation_runs_inline(&handoff_arguments)
+                    && let Some(submitter) = session.registry().agent_job_submitter().cloned()
+                {
+                    let job = submitter
+                        .submit_child(&child, question.as_deref())
+                        .await
+                        .map_err(|error| CoreError::HandoffFailed {
+                            role: role.clone(),
+                            reason: error.to_string(),
+                        })?;
+                    let result = agent_job_started_result(&job, &role);
+                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                    notify_tool_progress(session);
+                    session.history_mut().push_tool_result(call.id.clone(), result.clone(), 0);
+                    persist_last(session, store).await?;
+                    emit(
+                        session,
+                        TurnEvent::ToolCallCompleted {
+                            turn_id: handle.turn_id.clone(),
+                            call_id: call.id,
+                            result,
+                            duration_ms: 0,
+                            placement: None,
+                        },
+                    );
+                    continue;
+                }
+
+                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
                 return Ok(TurnOutcome::AwaitingChild {
                     child,
                     call_id: call.id,
@@ -5289,6 +5419,7 @@ async fn drive_turn(
     // Projektgedächtnis: alle Tool-Ergebnisse dieses Turns wurden bereits
     // über `notify_tool_outcome` gemeldet; hier, am erfolgreichen Turn-Ende,
     // erfährt der Beobachter, dass die Runde abgeschlossen ist.
+    crate::turn_feedback::notify_turn_texts(session);
     if let Some(observer) = session.tool_outcome_observer().cloned() {
         observer.on_turn_finished(session.id());
     }
@@ -5602,6 +5733,12 @@ async fn assemble_round_request(
         .or(session.max_output_tokens())
         .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
 
+    // Kontext-Ledger: die Fakten der gesammelten Fragmente festhalten, bevor
+    // die Montage sie verbraucht (nur wenn ein Ledger registriert ist).
+    let ledger_facts = session
+        .context_ledger()
+        .map(|_| crate::context_ledger_hook::snapshot(&fragments));
+
     // 4. Model-Call (provider-neutral).
     let request = ModelRequest::with_context_program(
         instructions,
@@ -5619,6 +5756,15 @@ async fn assemble_round_request(
     .with_max_output_tokens(max_output_tokens)
     .with_cancel_token(control.cancel_token().clone())
     .with_identity(request_identity(session));
+    if let (Some(ledger), Some(facts)) = (session.context_ledger(), ledger_facts.as_deref()) {
+        crate::context_ledger_hook::record_turn(
+            ledger.as_ref(),
+            session.id().as_str(),
+            turn_id.as_str(),
+            facts,
+            &request.context_assembly,
+        );
+    }
     Ok(match stream_sink_for_round(session, turn_id, total_usage) {
         Some(sink) => request.with_stream_sink(sink),
         None => request,
@@ -6456,6 +6602,14 @@ fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError 
 mod tests {
     use super::*;
 
+    #[test]
+    fn delegation_is_async_by_default_and_inline_only_when_explicit() {
+        assert!(!delegation_runs_inline(&serde_json::json!({})));
+        assert!(!delegation_runs_inline(&serde_json::json!({"background": true})));
+        assert!(delegation_runs_inline(&serde_json::json!({"background": false})));
+        assert!(delegation_runs_inline(&serde_json::json!({"wait": true})));
+        assert!(!delegation_runs_inline(&serde_json::json!({"wait": false})));
+    }
     /// Ein Turn-Grenzen-Ende vermerkt die konkrete Grenze mit Wert (statt
     /// „Token-Budget oder Turn-Wächter"); der erste Grund gewinnt.
     #[test]
@@ -10059,6 +10213,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_attached_image_reaches_the_model_request_with_its_bytes() -> TestResult {
+        use harw_media::MemorySource;
+        let source = std::sync::Arc::new(MemorySource::new());
+        crate::media::install_media_source(source.clone());
+        let png = {
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut out = u32::try_from(data.len())
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out
+            };
+            let mut ihdr = 12u32.to_be_bytes().to_vec();
+            ihdr.extend_from_slice(&9u32.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+            out.extend_from_slice(&chunk(b"IDAT", b"turn-loop-image"));
+            out.extend_from_slice(&chunk(b"IEND", b""));
+            out
+        };
+        let media = source
+            .put(&png)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("a small image")]);
+
+        run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("what is this?").with_images([media.clone()]),
+        )
+        .await
+        .map_err(ctx("turn with an image"))?;
+
+        let requests = model.take_requests();
+        let first = requests
+            .first()
+            .ok_or(TestError::Missing("model request"))?;
+        let Some(crate::ModelMessage::User { text, images }) = first.messages.first() else {
+            return Err(TestError::Unexpected(format!("{:?}", first.messages)));
+        };
+        assert_eq!(text, "what is this?");
+        assert_eq!(images.len(), 1);
+        let image = images.first().ok_or(TestError::Missing("image"))?;
+        assert_eq!(image.media, media);
+        assert!(image.bytes().is_some_and(|b| b.starts_with(b"\x89PNG")));
+        // The persisted transcript holds the reference, not the pixels.
+        let stored = serde_json::to_string(session.history())
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(stored.contains("\"type\":\"media\""));
+        assert!(!stored.contains("turn-loop-image"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_image_without_text_starts_a_turn_too() -> TestResult {
+        use harw_media::MemorySource;
+        let source = std::sync::Arc::new(MemorySource::new());
+        crate::media::install_media_source(source.clone());
+        let png = {
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut out = u32::try_from(data.len())
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out
+            };
+            let mut ihdr = 5u32.to_be_bytes().to_vec();
+            ihdr.extend_from_slice(&5u32.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+            out.extend_from_slice(&chunk(b"IDAT", b"image-only"));
+            out.extend_from_slice(&chunk(b"IEND", b""));
+            out
+        };
+        let media = source
+            .put(&png)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("ok")]);
+        let input = TurnInput {
+            user_images: vec![media],
+            ..TurnInput::default()
+        };
+        run_turn(&mut session, &model, &store, input)
+            .await
+            .map_err(ctx("image-only turn"))?;
+        let requests = model.take_requests();
+        let Some(crate::ModelMessage::User { text, images }) = requests
+            .first()
+            .and_then(|request| request.messages.first())
+        else {
+            return Err(TestError::Missing("user message"));
+        };
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn child_session_persists_reasoning_but_never_sends_it_to_the_model() -> TestResult {
         // Kind-Session (mit Parent): das Reasoning-Item landet in History und
         // Store, der nächste Modell-Request sieht es aber nicht als Nachricht.
@@ -10710,6 +10984,7 @@ mod tests {
             "context",
             "continue_from",
             "background",
+            "wait",
             "user_approved",
         ] {
             assert!(properties.contains_key(field), "{field}");

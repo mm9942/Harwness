@@ -412,17 +412,10 @@ pub(crate) fn map_turn_event(source: EventSource, event: TurnEvent) -> Option<Sd
     }
 }
 
-/// Verbindet die Textteile einer Assistenten-Nachricht (Bilder entfallen).
+/// Verbindet die Textteile einer Assistenten-Nachricht (Bilder entfallen);
+/// die Regel steht einmal in `harw-session-client`.
 pub(crate) fn assistant_text(message: &harw_protocol::AssistantMessageItem) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|part| match part {
-            harw_protocol::ContentPart::Text { text } => Some(text.as_str()),
-            harw_protocol::ContentPart::ImageUrl { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    harw_session_client::message_text(message)
 }
 
 /// Übersetzt ein internes Werkzeugergebnis.

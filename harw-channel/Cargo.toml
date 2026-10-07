@@ -21,5 +21,8 @@ tempfile = "3.27.0"
 
 # External deps — parent resolves exact versions via `cargo add` (no invented pins).
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

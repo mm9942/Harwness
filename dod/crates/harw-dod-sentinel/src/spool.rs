@@ -88,6 +88,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harw_dod_rules::finding::FindingRecord;
 use harw_fsutil::{
@@ -120,12 +121,32 @@ const SEQ_DIGITS: usize = 20;
 /// Hex-Stellen eines BLAKE3-Digests.
 const DIGEST_HEX_LEN: usize = 64;
 
+/// Zeitbudget eines einzelnen [`FindingSpool::sweep`]-Laufs.
+pub const SWEEP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Mindestabstand zwischen zwei Läufen von [`FindingSpool::maybe_sweep`].
+pub const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Grenzen eines [`FindingSpool`].
 ///
 /// # Description
-/// Beide Grenzen sind Sicherheitsentscheidungen: ohne Größenlimit kann ein
-/// übergroßer Record Leser und Triage-Kontext sprengen; ohne Eintragslimit
-/// wächst der Speicherbedarf eines Verzeichnisscans unbegrenzt.
+/// Die ersten beiden Grenzen sind Sicherheitsentscheidungen: ohne Größenlimit
+/// kann ein übergroßer Record Leser und Triage-Kontext sprengen; ohne
+/// Eintragslimit wächst der Speicherbedarf eines Verzeichnisscans unbegrenzt.
+///
+/// # Aufbewahrung (Opt-in, Standard: nie löschen)
+/// `max_age` und `max_total_bytes` begrenzen die Platten-Obergrenze (ohne sie
+/// im ungünstigsten Fall `max_entries` x `max_record_bytes` = 64 GiB). Der
+/// Spool enthält sicherheitsrelevante Daten, daher gilt:
+/// - `None` (Standard) = unbegrenzt = bisheriges Verhalten: es wird nie
+///   etwas gelöscht, [`FindingSpool::sweep`] tut nichts.
+/// - Auch mit gesetzten Grenzen löscht ein Sweep nur, wenn
+///   `retention_apply == true`; sonst ist er ein reiner Bericht (Trockenlauf).
+/// - Gelöscht werden nur **konsumierte** Records (Kennung <= Cursor, den der
+///   Aufrufer an den Sweep übergibt), älteste zuerst. Unkonsumierte Records
+///   werden nur mit `delete_unconsumed == true` angefasst.
+/// - Reihenfolge: Alter, dann Gesamtbytes. Eine Anzahlgrenze löscht nicht:
+///   `max_entries` weist weiterhin per [`SpoolError::SpoolFull`] ab.
 ///
 /// # Examples
 /// ```rust
@@ -139,6 +160,15 @@ pub struct SpoolLimits {
     pub max_record_bytes: u64,
     /// Maximale Anzahl Records im Spool; [`FindingSpool::put`] lehnt darüber ab.
     pub max_entries: usize,
+    /// Records, deren Datei älter ist, sind löschbar (Opt-in, siehe oben).
+    pub max_age: Option<Duration>,
+    /// Summe der Record-Bytes, über der die ältesten löschbaren Records
+    /// entfernt werden (Opt-in, siehe oben).
+    pub max_total_bytes: Option<u64>,
+    /// `false` (Standard): Sweep ist ein Trockenlauf und löscht nie.
+    pub retention_apply: bool,
+    /// `false` (Standard): unkonsumierte Records werden nie gelöscht.
+    pub delete_unconsumed: bool,
 }
 
 impl Default for SpoolLimits {
@@ -146,8 +176,47 @@ impl Default for SpoolLimits {
         Self {
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_entries: DEFAULT_MAX_ENTRIES,
+            max_age: None,
+            max_total_bytes: None,
+            retention_apply: false,
+            delete_unconsumed: false,
         }
     }
+}
+
+/// Ergebnis eines [`FindingSpool::sweep`].
+///
+/// # Description
+/// `removed*` zählt tatsächlich gelöschte Records (nur bei
+/// `applied == true`), `would_remove*` die im Trockenlauf löschbaren.
+/// `over_budget` ist `true`, wenn `max_total_bytes` trotz Sweep überschritten
+/// bleibt (z. B. weil der Rest unkonsumiert ist) — nichts wird dann
+/// zusätzlich gelöscht.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Ob gelöscht werden durfte (`SpoolLimits::retention_apply`).
+    pub applied: bool,
+    /// Gelöschte Records.
+    pub removed: usize,
+    /// Bytes der gelöschten Records.
+    pub removed_bytes: u64,
+    /// Im Trockenlauf löschbare Records.
+    pub would_remove: usize,
+    /// Bytes der im Trockenlauf löschbaren Records.
+    pub would_remove_bytes: u64,
+    /// Verbleibende Records.
+    pub kept: usize,
+    /// Bytes der verbleibenden Records.
+    pub kept_bytes: u64,
+    /// Davon unkonsumiert.
+    pub kept_unconsumed: usize,
+    /// Einträge, die keine reguläre Datei sind (nie angefasst).
+    pub skipped_non_regular: usize,
+    /// `max_total_bytes` bleibt überschritten.
+    pub over_budget: bool,
+    /// Das Zeitbudget war erschöpft; es wurde nichts oder nur teilweise
+    /// gelöscht.
+    pub deadline_hit: bool,
 }
 
 /// Kennung eines Records im Spool: Folgenummer plus Record-Digest.
@@ -462,6 +531,10 @@ impl std::error::Error for SpoolError {
     }
 }
 
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 // Baut einen `Io`-Fehler-Mapper für `map_err`.
 fn io_err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> SpoolError + 'a {
     move |source| SpoolError::Io {
@@ -489,6 +562,8 @@ pub struct FindingSpool {
     limits: SpoolLimits,
     next_seq: AtomicU64,
     count: AtomicUsize,
+    last_sweep_secs: AtomicU64,
+    open_report: SweepReport,
 }
 
 impl FindingSpool {
@@ -534,6 +609,29 @@ impl FindingSpool {
     /// Nicht synchronisiert mit anderen Prozessen; siehe Moduldoku
     /// („Ein Schreiber“).
     pub fn open_with_limits(dir: &Path, limits: SpoolLimits) -> SpoolResult<Self> {
+        Self::open_with_cursor(dir, limits, None)
+    }
+
+    /// Wie [`FindingSpool::open_with_limits`], mit Aufbewahrungs-Sweep gegen
+    /// den bekannten Konsum-Cursor.
+    ///
+    /// # Description
+    /// Sind `max_age`/`max_total_bytes` gesetzt, läuft direkt nach dem Öffnen
+    /// ein [`FindingSpool::sweep`] (Ergebnis: [`FindingSpool::open_report`]).
+    /// Ohne gesetzte Grenzen (Standard) geschieht nichts.
+    ///
+    /// # Arguments
+    /// - `consumed` (`Option<&SpoolCursor>`): alles bis einschließlich dieser
+    ///   Kennung gilt als konsumiert; `None` = nichts konsumiert.
+    ///
+    /// # Errors
+    /// Wie [`FindingSpool::open_with_limits`]; zusätzlich ein Fehler des
+    /// Sweeps (fail closed: der Spool wird dann nicht geöffnet).
+    pub fn open_with_cursor(
+        dir: &Path,
+        limits: SpoolLimits,
+        consumed: Option<&SpoolCursor>,
+    ) -> SpoolResult<Self> {
         match std::fs::symlink_metadata(dir) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(SpoolError::SymlinkRejected {
@@ -578,7 +676,10 @@ impl FindingSpool {
             limits,
             next_seq: AtomicU64::new(1),
             count: AtomicUsize::new(0),
+            last_sweep_secs: AtomicU64::new(0),
+            open_report: SweepReport::default(),
         };
+        let mut spool = spool;
         let ids = spool.list_ids()?;
         let next = match ids.iter().map(|(id, _)| id.seq).max() {
             Some(u64::MAX) => return Err(SpoolError::SequenceExhausted),
@@ -587,7 +688,193 @@ impl FindingSpool {
         };
         spool.next_seq.store(next, Ordering::SeqCst);
         spool.count.store(ids.len(), Ordering::SeqCst);
+        let now = SystemTime::now();
+        spool.open_report = spool.sweep(consumed, now)?;
+        spool
+            .last_sweep_secs
+            .store(unix_secs(now), Ordering::SeqCst);
         Ok(spool)
+    }
+
+    /// Bericht des Sweeps beim Öffnen (leer, wenn keine Grenzen gesetzt).
+    #[must_use]
+    pub fn open_report(&self) -> &SweepReport {
+        &self.open_report
+    }
+
+    /// Wendet `max_age` und `max_total_bytes` an (oder berichtet nur).
+    ///
+    /// # Description
+    /// Ohne gesetzte Grenzen: leerer Bericht, kein Scan. Sonst werden alle
+    /// Record-Dateien per `lstat` (ohne Symlink-Folge) vermessen; Nicht-Dateien
+    /// und fremde Namen (Tempdateien, `*.lock`, Punktdateien) werden nie
+    /// angefasst. Löschbar sind konsumierte Records (`<= consumed`), bei
+    /// `delete_unconsumed` alle. Reihenfolge: Alter, dann Bytes (älteste
+    /// zuerst, Neueste bleiben). Gelöscht wird nur mit `retention_apply`, und
+    /// nur per `unlink`.
+    ///
+    /// # Errors
+    /// Fail closed: jeder Fehler beim Vermessen bricht ab, **bevor**
+    /// irgendetwas gelöscht wurde; ein Fehler beim Löschen beendet den Lauf.
+    /// Ist das Zeitbudget ([`SWEEP_DEADLINE`]) beim Vermessen erschöpft,
+    /// wird nichts gelöscht (`deadline_hit`).
+    pub fn sweep(
+        &self,
+        consumed: Option<&SpoolCursor>,
+        now: SystemTime,
+    ) -> SpoolResult<SweepReport> {
+        let mut report = SweepReport {
+            applied: self.limits.retention_apply,
+            ..SweepReport::default()
+        };
+        if self.limits.max_age.is_none() && self.limits.max_total_bytes.is_none() {
+            return Ok(report);
+        }
+        let deadline = Instant::now() + SWEEP_DEADLINE;
+        let ids = self.list_ids()?;
+
+        struct Item {
+            id: SpoolId,
+            size: u64,
+            mtime: SystemTime,
+            consumed: bool,
+        }
+        let mut items: Vec<Item> = Vec::with_capacity(ids.len());
+        for (id, entry_type) in ids {
+            if Instant::now() >= deadline {
+                report.deadline_hit = true;
+                return Ok(report);
+            }
+            if entry_type != EntryType::File {
+                report.skipped_non_regular += 1;
+                continue;
+            }
+            let path = self.dir.join(id.file_name());
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_err("inspect spool record", &path)(err)),
+            };
+            if !meta.is_file() {
+                report.skipped_non_regular += 1;
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .map_err(io_err("read spool record mtime", &path))?;
+            let is_consumed = consumed.is_some_and(|c| id <= c.after);
+            items.push(Item {
+                id,
+                size: meta.len(),
+                mtime,
+                consumed: is_consumed,
+            });
+        }
+
+        let eligible = |item: &Item| item.consumed || self.limits.delete_unconsumed;
+        let mut doomed = vec![false; items.len()];
+        if let Some(max_age) = self.limits.max_age {
+            for (flag, item) in doomed.iter_mut().zip(&items) {
+                let aged = now
+                    .duration_since(item.mtime)
+                    .is_ok_and(|age| age > max_age);
+                *flag = aged && eligible(item);
+            }
+        }
+        if let Some(cap) = self.limits.max_total_bytes {
+            let mut total: u64 = items
+                .iter()
+                .zip(&doomed)
+                .filter(|(_, d)| !**d)
+                .fold(0u64, |acc, (item, _)| acc.saturating_add(item.size));
+            // `items` ist nach Folgenummer, also nach Schreibreihenfolge,
+            // sortiert: älteste zuerst.
+            for (flag, item) in doomed.iter_mut().zip(&items) {
+                if total <= cap {
+                    break;
+                }
+                if !*flag && eligible(item) {
+                    *flag = true;
+                    total = total.saturating_sub(item.size);
+                }
+            }
+            report.over_budget = total > cap;
+        }
+
+        let apply = self.limits.retention_apply;
+        if apply && doomed.iter().any(|d| *d) {
+            self.verified_dir()?;
+        }
+        for (item, doom) in items.iter().zip(&doomed) {
+            let keep = |report: &mut SweepReport| {
+                report.kept += 1;
+                report.kept_bytes = report.kept_bytes.saturating_add(item.size);
+                report.kept_unconsumed += usize::from(!item.consumed);
+            };
+            if !*doom {
+                keep(&mut report);
+                continue;
+            }
+            if !apply {
+                report.would_remove += 1;
+                report.would_remove_bytes = report.would_remove_bytes.saturating_add(item.size);
+                continue;
+            }
+            if Instant::now() >= deadline {
+                report.deadline_hit = true;
+                keep(&mut report);
+                continue;
+            }
+            let path = self.dir.join(item.id.file_name());
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    report.removed += 1;
+                    report.removed_bytes = report.removed_bytes.saturating_add(item.size);
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_err("remove spool record", &path)(err)),
+            }
+        }
+        if report.removed > 0 {
+            let mut current = self.count.load(Ordering::SeqCst);
+            loop {
+                let next = current.saturating_sub(report.removed);
+                match self
+                    .count
+                    .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Günstiger periodischer Aufruf: führt [`FindingSpool::sweep`] höchstens
+    /// alle [`SWEEP_MIN_INTERVAL`] aus.
+    ///
+    /// # Returns
+    /// `Ok(None)`, wenn noch nicht wieder dran (oder keine Grenzen gesetzt);
+    /// sonst den Bericht.
+    ///
+    /// # Errors
+    /// Wie [`FindingSpool::sweep`].
+    pub fn maybe_sweep(
+        &self,
+        consumed: Option<&SpoolCursor>,
+        now: SystemTime,
+    ) -> SpoolResult<Option<SweepReport>> {
+        if self.limits.max_age.is_none() && self.limits.max_total_bytes.is_none() {
+            return Ok(None);
+        }
+        let secs = unix_secs(now);
+        let last = self.last_sweep_secs.load(Ordering::SeqCst);
+        if last != 0 && secs.saturating_sub(last) < SWEEP_MIN_INTERVAL.as_secs() {
+            return Ok(None);
+        }
+        self.last_sweep_secs.store(secs, Ordering::SeqCst);
+        self.sweep(consumed, now).map(Some)
     }
 
     /// Der Pfad des Spool-Verzeichnisses.
@@ -1129,6 +1416,7 @@ mod tests {
         let limits = SpoolLimits {
             max_record_bytes: 64,
             max_entries: DEFAULT_MAX_ENTRIES,
+            ..SpoolLimits::default()
         };
         let spool =
             FindingSpool::open_with_limits(&spool_dir(&root), limits).map_err(ctx("opens"))?;
@@ -1152,6 +1440,7 @@ mod tests {
         let limits = SpoolLimits {
             max_record_bytes: 64,
             max_entries: DEFAULT_MAX_ENTRIES,
+            ..SpoolLimits::default()
         };
         let small = FindingSpool::open_with_limits(&dir, limits).map_err(ctx("reopens"))?;
         let Err(err) = small.get(&id) else {
@@ -1209,6 +1498,7 @@ mod tests {
         let limits = SpoolLimits {
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_entries: 1,
+            ..SpoolLimits::default()
         };
         let spool =
             FindingSpool::open_with_limits(&spool_dir(&root), limits).map_err(ctx("opens"))?;
@@ -1222,6 +1512,256 @@ mod tests {
             ));
         };
         assert!(matches!(err, SpoolError::SpoolFull { limit: 1 }));
+        Ok(())
+    }
+
+    // --- Aufbewahrung (Opt-in) -------------------------------------------
+
+    // Legt `n` Records ab, datiert Record `i` auf `now - (n - i) * 1h` zurück
+    // und liefert die Kennungen (älteste zuerst) samt `now`.
+    fn aged_spool(
+        root: &tempfile::TempDir,
+        limits: SpoolLimits,
+        n: usize,
+    ) -> TestResult<(FindingSpool, Vec<SpoolId>, SystemTime)> {
+        let spool =
+            FindingSpool::open_with_limits(&spool_dir(root), limits).map_err(ctx("opens"))?;
+        let now = SystemTime::now();
+        let mut ids = Vec::new();
+        for (i, record) in records(n, "retention")?.iter().enumerate() {
+            let id = spool.put(record).map_err(ctx("put"))?;
+            let age = Duration::from_secs(3600 * (n - i) as u64);
+            let when = now
+                .checked_sub(age)
+                .ok_or(TestError::Missing("time arithmetic"))?;
+            let path = spool.dir().join(id.file_name());
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(when))
+                .map_err(ctx("set mtime"))?;
+            ids.push(id);
+        }
+        Ok((spool, ids, now))
+    }
+
+    fn cursor_of(id: &SpoolId) -> TestResult<SpoolCursor> {
+        SpoolCursor::parse(&id.to_string()).ok_or(TestError::Missing("cursor parses"))
+    }
+
+    fn exists(spool: &FindingSpool, id: &SpoolId) -> bool {
+        spool.dir().join(id.file_name()).exists()
+    }
+
+    fn nth(ids: &[SpoolId], n: usize) -> TestResult<&SpoolId> {
+        ids.get(n).ok_or(TestError::Missing("spool id"))
+    }
+
+    #[test]
+    fn test_default_limits_never_delete_anything() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (spool, ids, now) = aged_spool(&root, SpoolLimits::default(), 3)?;
+        let last = nth(&ids, 2)?;
+        let far_future = now + Duration::from_secs(10 * 365 * 86_400);
+        let report = spool
+            .sweep(Some(&cursor_of(last)?), far_future)
+            .map_err(ctx("sweep"))?;
+        assert_eq!(report, SweepReport::default());
+        assert!(
+            spool
+                .maybe_sweep(None, far_future)
+                .map_err(ctx("maybe"))?
+                .is_none()
+        );
+        assert!(ids.iter().all(|id| exists(&spool, id)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_limits_without_apply_only_report() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_age: Some(Duration::from_secs(90 * 60)),
+            ..SpoolLimits::default()
+        };
+        let (spool, ids, now) = aged_spool(&root, limits, 3)?;
+        let last = nth(&ids, 2)?;
+        let report = spool
+            .sweep(Some(&cursor_of(last)?), now)
+            .map_err(ctx("sweep"))?;
+        // Alter 3h und 2h überschreiten 90 min, 1h nicht.
+        assert!(!report.applied);
+        assert_eq!(
+            (report.removed, report.would_remove, report.kept),
+            (0, 2, 1)
+        );
+        assert!(ids.iter().all(|id| exists(&spool, id)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_age_removes_only_consumed_records() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_age: Some(Duration::from_secs(90 * 60)),
+            retention_apply: true,
+            ..SpoolLimits::default()
+        };
+        let (spool, ids, now) = aged_spool(&root, limits, 3)?;
+        // Nur der älteste ist konsumiert; der zweite ist zu alt, aber
+        // unkonsumiert und bleibt.
+        let first = nth(&ids, 0)?;
+        let report = spool
+            .sweep(Some(&cursor_of(first)?), now)
+            .map_err(ctx("sweep"))?;
+        assert_eq!(
+            (report.removed, report.kept, report.kept_unconsumed),
+            (1, 2, 2)
+        );
+        assert!(!exists(&spool, first));
+        assert!(ids.iter().skip(1).all(|id| exists(&spool, id)));
+        // Ohne Cursor wird nichts gelöscht.
+        let report = spool.sweep(None, now).map_err(ctx("sweep"))?;
+        assert_eq!(report.removed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_bytes_removes_oldest_consumed_and_keeps_newest() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let probe_dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (probe, probe_ids, _) = aged_spool(&probe_dir, SpoolLimits::default(), 4)?;
+        let size = std::fs::metadata(probe.dir().join(nth(&probe_ids, 0)?.file_name()))
+            .map_err(ctx("stat"))?
+            .len();
+        let limits = SpoolLimits {
+            max_total_bytes: Some(size * 2 + size / 2),
+            retention_apply: true,
+            ..SpoolLimits::default()
+        };
+        let (spool, ids, now) = aged_spool(&root, limits, 4)?;
+        let third = nth(&ids, 2)?;
+        let report = spool
+            .sweep(Some(&cursor_of(third)?), now)
+            .map_err(ctx("sweep"))?;
+        assert_eq!(report.removed, 2, "two oldest consumed records go");
+        assert!(!report.over_budget);
+        assert!(!exists(&spool, nth(&ids, 0)?) && !exists(&spool, nth(&ids, 1)?));
+        assert!(exists(&spool, nth(&ids, 2)?) && exists(&spool, nth(&ids, 3)?));
+        Ok(())
+    }
+
+    #[test]
+    fn test_bytes_cap_reports_over_budget_when_nothing_is_consumed() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_total_bytes: Some(1),
+            retention_apply: true,
+            ..SpoolLimits::default()
+        };
+        let (spool, ids, now) = aged_spool(&root, limits, 2)?;
+        let report = spool.sweep(None, now).map_err(ctx("sweep"))?;
+        assert!(report.over_budget);
+        assert_eq!((report.removed, report.kept), (0, 2));
+        assert!(ids.iter().all(|id| exists(&spool, id)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_unconsumed_is_a_separate_opt_in() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_age: Some(Duration::from_secs(90 * 60)),
+            retention_apply: true,
+            delete_unconsumed: true,
+            ..SpoolLimits::default()
+        };
+        let (spool, _ids, now) = aged_spool(&root, limits, 3)?;
+        let report = spool.sweep(None, now).map_err(ctx("sweep"))?;
+        assert_eq!((report.removed, report.kept), (2, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sweep_never_touches_foreign_files_or_symlinks() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_age: Some(Duration::from_secs(1)),
+            retention_apply: true,
+            delete_unconsumed: true,
+            ..SpoolLimits::default()
+        };
+        let (spool, ids, now) = aged_spool(&root, limits, 1)?;
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, b"keep").map_err(ctx("write outside"))?;
+        let lock = spool.dir().join("spool.lock");
+        std::fs::write(&lock, b"x").map_err(ctx("write lock"))?;
+        let temp = spool.dir().join(".tmp-record");
+        std::fs::write(&temp, b"x").map_err(ctx("write temp"))?;
+        let link_id = SpoolId::parse(&format!("{:020}-{}", 99, "ab".repeat(32)))
+            .ok_or(TestError::Missing("link id"))?;
+        std::os::unix::fs::symlink(&outside, spool.dir().join(link_id.file_name()))
+            .map_err(ctx("symlink"))?;
+        let report = spool.sweep(None, now).map_err(ctx("sweep"))?;
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.skipped_non_regular, 1);
+        assert!(!exists(&spool, nth(&ids, 0)?));
+        assert!(lock.exists() && temp.exists() && outside.exists());
+        assert!(
+            std::fs::symlink_metadata(spool.dir().join(link_id.file_name())).is_ok(),
+            "symlink entry left alone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_spool_full_unchanged_when_retention_is_not_applied() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_entries: 1,
+            max_age: Some(Duration::from_secs(1)),
+            ..SpoolLimits::default()
+        };
+        let (spool, _ids, _now) = aged_spool(&root, limits, 1)?;
+        let record = records(2, "again")?
+            .into_iter()
+            .nth(1)
+            .ok_or(TestError::Missing("record"))?;
+        let Err(err) = spool.put(&record) else {
+            return Err(TestError::Unexpected("expected SpoolFull".into()));
+        };
+        assert!(matches!(err, SpoolError::SpoolFull { limit: 1 }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_sweeps_and_reports_and_maybe_sweep_is_rate_limited() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let limits = SpoolLimits {
+            max_age: Some(Duration::from_secs(90 * 60)),
+            retention_apply: true,
+            delete_unconsumed: true,
+            ..SpoolLimits::default()
+        };
+        let (spool, _ids, _now) = aged_spool(&root, limits, 3)?;
+        drop(spool);
+        let reopened =
+            FindingSpool::open_with_limits(&spool_dir(&root), limits).map_err(ctx("reopen"))?;
+        assert_eq!(reopened.open_report().removed, 2);
+        let now = SystemTime::now();
+        assert!(
+            reopened
+                .maybe_sweep(None, now)
+                .map_err(ctx("maybe"))?
+                .is_none()
+        );
+        let later = now + SWEEP_MIN_INTERVAL + Duration::from_secs(1);
+        assert!(
+            reopened
+                .maybe_sweep(None, later)
+                .map_err(ctx("maybe"))?
+                .is_some()
+        );
         Ok(())
     }
 

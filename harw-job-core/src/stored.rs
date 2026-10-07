@@ -97,6 +97,110 @@ pub enum JobOutcome {
     Blocked { reason: String },
 }
 
+/// Prefix of a [`JobOutcome::Failed`] reason that marks a deadline expiry.
+///
+/// # Why a typed reason and not a `TimedOut` state
+/// `JobState` and `JobOutcome` are serialized into `records/<id>.json`, matched
+/// exhaustively by the store, the MCP wire, the kanban bridge and the TUI, and
+/// old binaries cannot deserialize a variant they do not know. Expiry is
+/// therefore a *typed reason* on the existing `Failed` terminal state: the wire
+/// shape (`{"kind":"failed","detail":{"reason":"timed_out: …"}}`) is unchanged,
+/// old records and old readers keep working, and every consumer asks
+/// [`JobOutcome::is_timed_out`] / [`StoredJob::disposition`] instead of
+/// string-matching. The coordinator path (`LifecycleState::TimedOut`) is
+/// unaffected.
+pub const TIMED_OUT_REASON_PREFIX: &str = "timed_out";
+
+/// First-class terminal disposition of a job, derived from the durable record.
+///
+/// Unlike [`JobState`] it distinguishes a deadline expiry from every other
+/// failure, and a user cancellation from both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobDisposition {
+    /// Not terminal yet (pending, ready or running).
+    Active,
+    /// Finished successfully.
+    Succeeded,
+    /// Failed for any reason other than a deadline.
+    Failed,
+    /// The deadline elapsed before the job finished.
+    TimedOut,
+    /// Cancelled by a supervisor or operator.
+    Cancelled,
+    /// Parked behind an approval or other external unblock.
+    Blocked,
+}
+
+impl JobDisposition {
+    /// Stable lowercase label (`timed_out`, `cancelled`, …).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    /// Whether the job reached a final disposition (`Blocked` can still be
+    /// unblocked and `Active` still runs, so neither is final).
+    #[must_use]
+    pub const fn is_final(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::TimedOut | Self::Cancelled
+        )
+    }
+}
+
+impl std::fmt::Display for JobDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl JobOutcome {
+    /// A failure caused by an elapsed deadline; the reason starts with
+    /// [`TIMED_OUT_REASON_PREFIX`].
+    #[must_use]
+    pub fn timed_out(detail: impl std::fmt::Display) -> Self {
+        Self::Failed {
+            reason: format!("{TIMED_OUT_REASON_PREFIX}: {detail}"),
+        }
+    }
+
+    /// Whether this is a deadline-expiry failure (see [`Self::timed_out`]).
+    #[must_use]
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, Self::Failed { reason } if reason_is_timed_out(reason))
+    }
+
+    /// The disposition this outcome leads to.
+    #[must_use]
+    pub fn disposition(&self) -> JobDisposition {
+        match self {
+            Self::Succeeded { .. } => JobDisposition::Succeeded,
+            Self::Failed { .. } if self.is_timed_out() => JobDisposition::TimedOut,
+            Self::Failed { .. } => JobDisposition::Failed,
+            Self::Cancelled { .. } => JobDisposition::Cancelled,
+            Self::Blocked { .. } => JobDisposition::Blocked,
+        }
+    }
+}
+
+/// Whether a failure `reason` marks a deadline expiry.
+#[must_use]
+pub fn reason_is_timed_out(reason: &str) -> bool {
+    reason == TIMED_OUT_REASON_PREFIX
+        || reason
+            .strip_prefix(TIMED_OUT_REASON_PREFIX)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
 /// Canonical persistence record for one governed job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredJob {
@@ -148,6 +252,23 @@ pub enum ReclaimOutcome {
 }
 
 impl StoredJob {
+    /// The first-class disposition of this record: the terminal outcome when
+    /// one is recorded (deadline expiry reads as
+    /// [`JobDisposition::TimedOut`]), otherwise derived from the state.
+    #[must_use]
+    pub fn disposition(&self) -> JobDisposition {
+        if let Some(completion) = &self.completion {
+            return completion.outcome.disposition();
+        }
+        match self.job.state {
+            JobState::Pending | JobState::Ready | JobState::Running => JobDisposition::Active,
+            JobState::Completed => JobDisposition::Succeeded,
+            JobState::Blocked => JobDisposition::Blocked,
+            JobState::Failed => JobDisposition::Failed,
+            JobState::Cancelled => JobDisposition::Cancelled,
+        }
+    }
+
     /// Reclaimt eine abgelaufene Lease, deren Halter nicht mehr lebt.
     ///
     /// # Beschreibung
@@ -479,6 +600,61 @@ mod tests {
         )
         .map_err(ctx("a fresh lease can be issued after reclaim"))?;
         assert!(!next_lease.matches_token(&stale_token));
+        Ok(())
+    }
+
+    #[test]
+    fn timed_out_outcome_keeps_the_failed_wire_shape_and_round_trips() -> TestResult {
+        let outcome = JobOutcome::timed_out("phase 'x'");
+        assert!(outcome.is_timed_out());
+        assert_eq!(outcome.disposition(), JobDisposition::TimedOut);
+        let json = serde_json::to_value(&outcome).map_err(ctx("serialize"))?;
+        assert_eq!(json["kind"], "failed", "wire shape stays `failed`");
+        assert_eq!(json["detail"]["reason"], "timed_out: phase 'x'");
+        let back: JobOutcome = serde_json::from_value(json).map_err(ctx("deserialize"))?;
+        assert_eq!(back, outcome);
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_exact_prefix_counts_as_timed_out() {
+        assert!(reason_is_timed_out("timed_out"));
+        assert!(reason_is_timed_out("timed_out: deadline"));
+        assert!(!reason_is_timed_out("timed_outside"));
+        assert!(!reason_is_timed_out("it timed_out: later"));
+        let plain = JobOutcome::Failed {
+            reason: "disk full".to_owned(),
+        };
+        assert_eq!(plain.disposition(), JobDisposition::Failed);
+        let cancelled = JobOutcome::Cancelled {
+            reason: "timed_out: user wording".to_owned(),
+        };
+        assert_eq!(cancelled.disposition(), JobDisposition::Cancelled);
+    }
+
+    #[test]
+    fn disposition_of_a_record_follows_completion_then_state() -> TestResult {
+        let mut record = record(None)?;
+        assert_eq!(record.disposition(), JobDisposition::Active);
+        record.job.state = JobState::Failed;
+        // An old record without a completion still reads as plain failed.
+        assert_eq!(record.disposition(), JobDisposition::Failed);
+        record.completion = Some(JobCompletion {
+            completed_at: Timestamp::now(),
+            outcome: JobOutcome::timed_out("deadline"),
+        });
+        assert_eq!(record.disposition(), JobDisposition::TimedOut);
+        assert!(record.disposition().is_final());
+        assert_eq!(record.disposition().as_str(), "timed_out");
+        Ok(())
+    }
+
+    #[test]
+    fn a_legacy_failed_record_with_a_timed_out_reason_reads_as_timed_out() -> TestResult {
+        // Records written by G5 carry `failed` + `timed_out: …`.
+        let json = serde_json::json!({"kind": "failed", "detail": {"reason": "timed_out: old"}});
+        let outcome: JobOutcome = serde_json::from_value(json).map_err(ctx("legacy"))?;
+        assert_eq!(outcome.disposition(), JobDisposition::TimedOut);
         Ok(())
     }
 

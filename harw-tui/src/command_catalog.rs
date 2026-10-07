@@ -743,6 +743,15 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "Nebenfrage zum Gespräch, ohne den Agenten zu unterbrechen (nicht im Verlauf)",
             "/btw <frage>",
         ),
+        // Bilder: der Agent sieht sie mit der nächsten Nachricht.
+        local_spec(
+            "image",
+            Misc,
+            Operator,
+            Immediate,
+            "Bild für die nächste Nachricht vormerken (PNG, JPEG, GIF, WebP)",
+            "/image <pfad>",
+        ),
         // ── Ersatz, solange die Operation fehlt ───────────────────────────
         local_spec(
             "mode",
@@ -789,7 +798,7 @@ mod tests {
     const REAL_LOCAL: &[&str] = &[
         "tools", "resume", "sessions", "exit", "clear", "verbose", "keys", "whoami", "rename",
         // Runde 5, Teil L:
-        "btw",
+        "btw", "image",
     ];
 
     /// Befehle, deren Operation fehlen darf. `matrix` behält nur seine

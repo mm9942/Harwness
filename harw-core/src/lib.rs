@@ -14,6 +14,8 @@ pub mod activation;
 pub mod admission;
 pub mod agent_events;
 pub mod auto_compact;
+mod context_ledger_hook;
+mod turn_feedback;
 // Runde 5, Teil K: Hintergrund-Kinder und Orchestrierungsgrenzen.
 pub mod background_children;
 pub mod cancel;
@@ -41,6 +43,7 @@ pub mod guard;
 pub mod history;
 pub mod history_tail;
 pub mod live_mode;
+pub mod media;
 pub mod mode;
 pub mod model;
 pub mod one_shot;
@@ -83,7 +86,9 @@ pub use child_comms::{
 };
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildContextOverload, ChildLimits, ChildRecord,
-    ChildRegistryFactory, ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
+    ChildRecoveryBudget, ChildRecoveryCapability, ChildRecoveryView, ChildRegistryFactory,
+    ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
+    RecoveredChildDisposition, RecoveredRootChild,
     ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
     JoinSemantics, ManagedAgentSpawner, ModelKnownProbe, OrchestrationObserver, ParentGrant,
     RoleEffortWeights, TRANSFER_BUDGET_NOTE, TaskComplexity,
@@ -113,6 +118,7 @@ pub use history::{ConversationHistory, ModelMessage};
 pub use history_tail::{
     HISTORY_TAIL_GUARANTEED_GROUPS, HISTORY_TAIL_SECTION, HistoryTailRender, render_history_tail,
 };
+pub use media::{ModelImage, install_media_source, resolve_media, resolve_media_with};
 pub use mode::InteractionMode;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,

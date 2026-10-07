@@ -1049,6 +1049,8 @@ pub struct ChatApp {
     /// abgebrochen oder vermischt werden; diese FIFO wird ausschließlich an
     /// Turn-Grenzen abgearbeitet.
     pending_turns: std::collections::VecDeque<String>,
+    /// `/image`: vorgemerkte Bilder für die nächste Nachricht.
+    images: crate::image_attach::ImageAttachments,
     /// Befehle und Datenabrufe, die während eines laufenden Turns nebenläufig
     /// laufen (Runde 4, Teil H; siehe [`busy_queue`]).
     busy_jobs: BusyJobs,
@@ -1331,7 +1333,7 @@ pub struct ChatApp {
     pending_turn_user_cell_override: Option<String>,
     /// Vormerkung für [`TerminalGuard::reassert_terminal_modes`] (Register
     /// "CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7): `true`, sobald
-    /// ein Ereignis eingetreten ist, nach dem Raw-Mode/Bracketed-Paste/
+    /// ein Ereignis eingetreten ist, nach dem Raw-Mode/Alternate-Screen/Bracketed-Paste/
     /// Maus-Capture beschädigt zurückgekommen sein könnten (Ctrl+H beendet
     /// eine Host-Arbeitsphase, siehe [`Self::end_host_mode`], oder ein
     /// `shell.exec`-Werkzeugaufruf endet, siehe `handle_turn_event`).
@@ -1472,6 +1474,7 @@ impl ChatApp {
             input,
             deferred_input: std::collections::VecDeque::new(),
             pending_turns: std::collections::VecDeque::new(),
+            images: crate::image_attach::ImageAttachments::default(),
             busy_jobs: BusyJobs::new(),
             // Runde 5, Teil L.
             btw: btw::BtwState::new(),
@@ -3008,7 +3011,7 @@ impl ChatApp {
         let _ = runtime.host_permit_ledger().revoke_session(&session);
         self.push_line(Role::System, "Host-Modus beendet — Isolation wieder aktiv.");
         // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7: die
-        // beendete Host-Arbeitsphase kann Terminal-Modi (Raw-Mode/Bracketed-
+        // beendete Host-Arbeitsphase kann Terminal-Modi (Raw-Mode/Alternate-Screen/Bracketed-
         // Paste/Maus-Capture) beschädigt zurückgelassen haben — der Aufrufer
         // mit Zugriff auf den `TerminalGuard` reasserted sie best-effort.
         self.request_terminal_reassert();
@@ -3602,27 +3605,30 @@ impl TerminalGuard {
         &mut self.terminal
     }
 
-    /// Reassertiert Raw-Mode, Bracketed-Paste und Maus-Capture best-effort
-    /// (Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7).
+    /// Stellt die vollständige TUI-Terminal-Ownership best-effort wieder her.
     ///
     /// # Beschreibung
-    /// Ein Host-`shell.exec`/`!`-Lauf oder das Ende einer Host-Arbeitsphase
-    /// (Ctrl+H) kann diese Terminal-Modi beschädigt zurücklassen — z. B.
-    /// wenn eine ausgeführte Fremd-Anwendung sie selbst geändert hat. Diese
-    /// Funktion stellt sie erneut her, ohne den Bildschirm zu löschen oder
-    /// den Alternate-Screen zu verlassen/erneut zu betreten. Fehler werden
-    /// protokolliert, aber nicht propagiert — ein fehlgeschlagenes
-    /// Selbstheilen darf die TUI niemals abstürzen lassen.
+    /// Host-Arbeit kann nicht nur Raw-Mode/Paste/Mouse-Capture verändern,
+    /// sondern auch den Alternate-Screen verlassen. Passiert das, würde der
+    /// nächste ratatui-Frame in den normalen tmux-Scrollback zeichnen und
+    /// frühere Agenten-/Jobs-Docks als scheinbare Duplikate stehen lassen.
+    /// Deshalb wird die komplette Terminal-Sequenz reassertiert und das
+    /// ratatui-Terminal anschließend zu einem vollständigen Redraw gezwungen.
+    /// Fehler bleiben best-effort: Self-Healing darf die TUI nicht beenden.
     pub(crate) fn reassert_terminal_modes(&mut self) {
         if let Err(error) = enable_raw_mode() {
             tracing::warn!(%error, "tui.terminal.reassert_raw_mode_failed");
         }
         if let Err(error) = crossterm::execute!(
             self.terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
         ) {
             tracing::warn!(%error, "tui.terminal.reassert_modes_failed");
+        }
+        if let Err(error) = self.terminal.clear() {
+            tracing::warn!(%error, "tui.terminal.reassert_clear_failed");
         }
     }
 }
@@ -3806,6 +3812,12 @@ fn apply_local_intercept(
             app.push_lines(vec![Line::from(format!(
                 "Sitzungstitel (Anzeige) gesetzt: „{title}“"
             ))]);
+        }
+        LocalIntercept::AttachImage(args) => {
+            let home = harw_home::paths::home_dir().ok();
+            let base = std::path::PathBuf::from(&app.project_root);
+            let note = app.images.command(&args, home.as_deref(), &base);
+            app.push_system_text_exported(&note);
         }
         LocalIntercept::Rewrite(line) => bus.send(HarwEvent::Command(line)),
         LocalIntercept::Chat(text) => {
@@ -4206,7 +4218,9 @@ fn visible_message_text(content: &[ContentPart]) -> String {
     for part in content {
         match part {
             ContentPart::Text { text } => visible.push_str(text),
-            ContentPart::ImageUrl { .. } => visible.push_str(NON_TEXT_CONTENT_PLACEHOLDER),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => {
+                visible.push_str(NON_TEXT_CONTENT_PLACEHOLDER);
+            }
         }
     }
     visible
@@ -4688,6 +4702,10 @@ pub(crate) async fn run_loop(
     // Seitenkanäle der Turn-Ereignisverarbeitung: Werkzeugnamen-Korrelation und
     // die eine Verlaufszelle je Kind-Session.
     let mut turn_state = TurnEventState::default();
+
+    // Bilder früherer Nachrichten (fortgesetzte Sitzung) wieder auffindbar machen.
+    app.images
+        .attach_existing(harw_home::paths::home_dir().ok().as_deref());
 
     let mut spinner = Spinner::new();
     let mut provider_error_streak = 0_u32;
@@ -5313,6 +5331,10 @@ pub(crate) async fn run_loop(
         let turn_text = background_agents::attach_queued_notices(app, turn_text);
         let displayed_text = display_override.unwrap_or_else(|| text.clone());
         app.push_line(Role::User, displayed_text);
+        let attached_images = app.images.len();
+        if attached_images > 0 {
+            app.push_system_text_exported(&format!("({attached_images} Bild(er) angehängt)"));
+        }
         if let Some(note) = attachment_note {
             // Runde 6, Teil C: Anhang-Hinweis auch in den Export.
             app.push_system_text_exported(&note);
@@ -5336,12 +5358,14 @@ pub(crate) async fn run_loop(
         // Chat offen und der Fehler wird als System-Zeile angezeigt.
         // `TuiError::Io` bleibt fatal und propagiert weiterhin nach
         // oben, da er einen nicht behebbaren Terminalfehler anzeigt.
+        let turn_images = app.images.take();
         let turn_result = run_turn_streaming(
             guard,
             app,
             &mut spinner,
             gateway,
             &turn_text,
+            turn_images,
             approval_driver,
             approvals,
             host_permit_prompts,
@@ -5531,6 +5555,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             ..
         } => {
             app.clear_live_stream();
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .surface_root_tool(&surface_root_id, "assistant", Some(&tool_name));
             // Runde 5, Teil O: Turn des Aufrufs für die Abbruch-Markierung.
             state.tool_call_turns.insert(call_id.clone(), turn_id);
             let already_known = state.pending_tool_cells.contains_key(&call_id);
@@ -5602,13 +5629,16 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 });
             // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7:
             // ein abgeschlossener `shell.exec`-Aufruf kann Terminal-Modi
-            // (Raw-Mode/Bracketed-Paste/Maus-Capture) beschädigt
+            // (Raw-Mode/Alternate-Screen/Bracketed-Paste/Maus-Capture) beschädigt
             // zurücklassen — der Aufrufer (mit Zugriff auf den
             // `TerminalGuard`) reasserted sie best-effort, sobald diese
             // Vormerkung ansteht (siehe `ChatApp::take_needs_terminal_reassert`).
             if tool_name.as_deref() == Some("shell.exec") {
                 app.request_terminal_reassert();
             }
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .surface_root_tool(&surface_root_id, "assistant", None);
             if !state.export_tool_calls.contains_key(&call_id) {
                 app.export_entries.push(export_tool_call_entry(
                     &call_id,
@@ -5682,6 +5712,13 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         }
         TurnEvent::AssistantDelta { text, .. } => {
             app.live_stream.push_str(&text);
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor.sync_surface_root_stream(
+                &surface_root_id,
+                "assistant",
+                &app.live_reasoning,
+                &app.live_stream,
+            );
             true
         }
         TurnEvent::ReasoningDelta { text, .. } => {
@@ -5696,6 +5733,13 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     .skip(count - LIVE_REASONING_MAX_CHARS)
                     .collect();
             }
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor.sync_surface_root_stream(
+                &surface_root_id,
+                "assistant",
+                &app.live_reasoning,
+                &app.live_stream,
+            );
             true
         }
         TurnEvent::CompactionApplied {
@@ -5960,11 +6004,24 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         TurnEvent::TurnFailed {
             turn_id, reason, ..
         } => {
-            mark_incomplete_tool_exports(app, state, &turn_id, &format!("unvollständig ({reason})"))
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .finish_surface_root(&surface_root_id, false, true);
+            let _ = mark_incomplete_tool_exports(
+                app,
+                state,
+                &turn_id,
+                &format!("unvollständig ({reason})"),
+            );
+            true
         }
         TurnEvent::TurnAborted { turn_id } => {
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor
+                .finish_surface_root(&surface_root_id, true, false);
             let label = turn_safety::aborted_label(app);
-            mark_incomplete_tool_exports(app, state, &turn_id, &label)
+            let _ = mark_incomplete_tool_exports(app, state, &turn_id, &label);
+            true
         }
         // TurnCompleted läuft exklusiv über den SessionEvent-Pfad, damit die
         // Token-Summary nicht doppelt erscheint. TurnStarted trägt keinen
@@ -7236,6 +7293,7 @@ async fn run_turn_streaming(
     spinner: &mut Spinner,
     gateway: &mut dyn crate::gateway::ChatGateway,
     text: &str,
+    images: Vec<harw_protocol::MediaRef>,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
     host_permit_prompts: &mut HostPermitPromptReceiver,
@@ -7260,6 +7318,12 @@ async fn run_turn_streaming(
     // cooperative checkpoints instead of merely queuing a character.
     let cancel = CancelToken::new();
     app.active_cancel = Some(cancel.clone());
+    // Die direkt von der TUI getriebene Root-Session ist ebenfalls ein
+    // sichtbarer Agentenlauf. Ohne diese Projektion konnte der Status unten
+    // "denkt…" zeigen, während der Agenten-Dock "0 aktiv" meldete.
+    let surface_root_id = app.session_id().as_str().to_owned();
+    app.agent_monitor
+        .begin_surface_root(&surface_root_id, "assistant");
     // Ein neuer Turn startet: ein evtl. noch angezeigter "Abbruch
     // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
     // gehört nicht mehr zum aktuellen Zustand. Derselbe Reset gilt für den
@@ -7314,7 +7378,9 @@ async fn run_turn_streaming(
         app,
         spinner,
         gateway,
-        TurnInput::user(text).with_control(TurnControl::new().with_cancel(cancel)),
+        TurnInput::user(text)
+            .with_images(images)
+            .with_control(TurnControl::new().with_cancel(cancel)),
         approval_driver,
         approvals,
         host_permit_prompts,
@@ -7324,6 +7390,13 @@ async fn run_turn_streaming(
     )
     .await;
     spinner.stop();
+    // Falls kein terminales TurnEvent angekommen ist, schließt der äußere
+    // Turn-Lifecycle die Surface-Projektion. Ein bereits verarbeitetes
+    // Failed/Aborted-Event gewinnt (finish_surface_root ist idempotent).
+    let surface_cancelled = app.cancel_requested_at.is_some();
+    let surface_failed = reply.is_err() && !surface_cancelled;
+    app.agent_monitor
+        .finish_surface_root(&surface_root_id, surface_cancelled, surface_failed);
     // Runde 5, Teil O: Abbruchgrund für spät verarbeitete `TurnAborted` merken.
     turn_safety::end_turn(app);
     app.active_cancel = None;
@@ -7686,16 +7759,16 @@ async fn drive_turn_animated(
                     // bereits während des Turns statt erst nach seinem Ende.
                     maybe_turn_event = turn_event_rx.recv() => {
                         if let Some(event) = maybe_turn_event {
-                            if handle_turn_event(app, turn_state, event) {
-                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
-                            }
-                            // Register „CSI-Sicherheitsnetz und Paste-
-                            // Platzhalter", Punkt 7: ein abgeschlossener
-                            // `shell.exec`-Aufruf kann Terminal-Modi
-                            // beschädigt zurückgelassen haben (siehe
-                            // `handle_turn_event`).
+                            let redraw = handle_turn_event(app, turn_state, event);
+                            // Terminal-Ownership MUSS vor dem ersten Frame nach
+                            // Host-Ausführung wiederhergestellt sein. Andersherum
+                            // landet genau dieser Frame im normalen tmux-Scrollback
+                            // und bleibt dort als duplizierter Dock stehen.
                             if app.take_needs_terminal_reassert() {
                                 guard.reassert_terminal_modes();
+                            }
+                            if redraw {
+                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             }
                         }
                     }
@@ -8939,15 +9012,15 @@ async fn drive_pauses_to_completion(
             }
             maybe_turn_event = turn_event_rx.recv() => {
                 if let Some(event) = maybe_turn_event {
-                    if handle_turn_event(app, turn_state, event) {
-                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
-                    }
-                    // Register „CSI-Sicherheitsnetz und Paste-Platzhalter",
-                    // Punkt 7: ein abgeschlossener `shell.exec`-Aufruf kann
-                    // Terminal-Modi beschädigt zurückgelassen haben (siehe
-                    // `handle_turn_event`).
+                    let redraw = handle_turn_event(app, turn_state, event);
+                    // Wie im normalen Turn-Pfad: erst Alternate-Screen/Modi
+                    // reparieren, dann zeichnen. Kein Frame darf zwischen
+                    // Host-Rückkehr und Reassert in den Terminal-Scrollback.
                     if app.take_needs_terminal_reassert() {
                         guard.reassert_terminal_modes();
+                    }
+                    if redraw {
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                 }
             }
@@ -9083,6 +9156,7 @@ fn is_busy_safe_intercept(intercept: &LocalIntercept) -> bool {
             | LocalIntercept::ToggleVerbose
             | LocalIntercept::System(_)
             | LocalIntercept::RenameSession(_)
+            | LocalIntercept::AttachImage(_)
             // Runde 5, Teil I: reine Anzeige-Umschaltung, sofort wirksam.
             | LocalIntercept::ChildStream(_)
             // Runde 5, Teil L: `/btw` läuft neben dem Turn, ohne ihn zu berühren.

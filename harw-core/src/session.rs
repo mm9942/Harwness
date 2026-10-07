@@ -288,6 +288,9 @@ pub struct AgentSession {
     /// siehe [`crate::capture::ToolOutcomeObserver`]). `None`: kein
     /// Beobachter registriert.
     tool_outcome_observer: Option<std::sync::Arc<dyn crate::capture::ToolOutcomeObserver>>,
+    /// Kontext-Ledger dieser Session: pro Turn je Fragment angeboten oder
+    /// ausgelassen (nur Labels und Größen, nie Inhalt). `None`: kein Ledger.
+    context_ledger: Option<std::sync::Arc<dyn harw_context_ledger::LedgerSink>>,
     /// Fest zugeordnetes Provider-/Modellpaar für den Compaction-
     /// Zusammenfassungs-Aufruf dieser Session (Addendum C: interne
     /// Modellstellen). `(None, None)`: kein Pin gesetzt — `maybe_compact`
@@ -616,6 +619,7 @@ impl AgentSession {
             output_reserve_resolver: None,
             compaction_observer: None,
             tool_outcome_observer: None,
+            context_ledger: None,
             compaction_summary_model: (None, None),
             guard_policy: crate::guard::GuardPolicy::default(),
             drift_observer: None,
@@ -1108,6 +1112,24 @@ impl AgentSession {
     ) -> Self {
         self.tool_outcome_observer = observer;
         self
+    }
+
+    /// Registriert den Kontext-Ledger (siehe `harw-context-ledger`): der
+    /// Turn-Loop schreibt je Turn, welche Fragmente angeboten und welche
+    /// ausgelassen wurden. `None` schaltet ihn ab.
+    #[must_use]
+    pub fn with_context_ledger(
+        mut self,
+        ledger: Option<std::sync::Arc<dyn harw_context_ledger::LedgerSink>>,
+    ) -> Self {
+        self.context_ledger = ledger;
+        self
+    }
+
+    /// Liefert den Kontext-Ledger, falls registriert.
+    #[must_use]
+    pub fn context_ledger(&self) -> Option<&std::sync::Arc<dyn harw_context_ledger::LedgerSink>> {
+        self.context_ledger.as_ref()
     }
 
     /// Liefert den aktuell registrierten Tool-Outcome-Beobachter, falls vorhanden.

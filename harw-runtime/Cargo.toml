@@ -14,6 +14,7 @@ browser = ["harw-registry-defaults/browser"]
 
 [dependencies]
 harw-explorer = { path = "../harw-explorer" }
+harw-command = { path = "../harw-command" }
 harw-authority = { path = "../harw-authority" }
 # #22 Welle 3A: eingebettete Agenten-Artefakte (`EntryKind::CompiledAgent`,
 # `embedded.rs`) — Bundle, Artifact und ArtifactDigest.
@@ -50,10 +51,12 @@ harw-knowledge = { path = "../harw-knowledge" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-macros = { path = "../harw-macros" }
 harw-memory = { path = "../harw-memory" }
+harw-context-ledger = { path = "../harw-context-ledger" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 harw-observe = { path = "../harw-observe" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
+harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 harw-project-discovery = { path = "../harw-project-discovery" }
@@ -74,6 +77,9 @@ harw-tool-plan = { path = "../harw-tool-plan" }
 # Plan R9, Teil F: Job-Verwaltung je Sitzung (`job.*`), Freigabetext von
 # `job.start` und Zustellung der Job-Ereignisse.
 harw-tool-job = { path = "../harw-tool-job" }
+# `[tools.container]`: `container.images` / `container.run` (`src/container_wiring.rs`).
+harw-tool-container = { path = "../harw-tool-container" }
+harw-tool-container-run = { path = "../harw-tool-container-run" }
 # R18 D-A: der entfernte Werkzeug-Proxy eines an ein Gateway angebundenen
 # Laufs (`RuntimeAssemblyBuilder::remote_tools`). Kein Zyklus:
 # `harw-tool-remote` hängt nur an harw-protocol/-tools/-extension-api/-types.
@@ -94,6 +100,8 @@ jiff = { workspace = true }
 # Produktivpfad benötigt.
 serde_json = { workspace = true }
 toml = { workspace = true }
+# `security_signals.rs`: RFC-3339-Zeitstempel des DoD-Exports.
+time = { version = "0.3.53", features = ["parsing"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -103,7 +111,6 @@ tokio = { version = "1.53.0", features = ["rt", "macros"] }
 harw-tools = { path = "../harw-tools" }
 # `embedded.rs` tests: `compile_agent(..., now: OffsetDateTime, ...)`
 # (`harw-agent-dsl`), Version wie dort (kein `[workspace.dependencies]`-Eintrag).
-time = "0.3.53"
 
 [lints]
 workspace = true

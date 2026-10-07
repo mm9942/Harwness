@@ -28,6 +28,7 @@
 //!     (Provider `"openrouter"`, Modell aus [`InternalModelPoint::openrouter_default_model`]);
 //! (e) sonst `MainModel` mit `provider`/`model` beide `None`.
 
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 
 /// Interne Stelle, an der die Harness ein eigenes (Hilfs-)Modell einsetzen
@@ -206,11 +207,6 @@ pub struct InternalModelChoice {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-}
-
-/// Default für [`InternalModelsToml::use_openrouter_defaults`].
-fn default_true() -> bool {
-    true
 }
 
 /// `[internal_models]` — Konfiguration der wählbaren internen Modellstellen.

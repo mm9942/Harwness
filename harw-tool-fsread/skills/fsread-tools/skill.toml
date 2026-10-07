@@ -1,0 +1,4 @@
+name = "fsread-tools"
+description = "Use the read-only fsread.* tools (ls, stat, find, du, df, wc, head, tail, cat, file, tree, readlink, realpath, hash, diff, json) instead of shell commands."
+instructions_file = "instructions.md"
+tools = ["fsread.ls", "fsread.stat", "fsread.find", "fsread.du", "fsread.df", "fsread.wc", "fsread.head", "fsread.tail", "fsread.cat", "fsread.file", "fsread.tree", "fsread.readlink", "fsread.realpath", "fsread.hash", "fsread.diff", "fsread.json"]

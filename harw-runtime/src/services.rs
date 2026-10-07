@@ -114,7 +114,7 @@ use std::any::{Any, type_name};
 use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
-use harw_core::{AgentEventHub, ManagedAgentSpawner, StateStore};
+use harw_core::{AgentEventHub, JobExecutionRegistry, ManagedAgentSpawner, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_infra_client::InfrastructureAvailability;
@@ -124,6 +124,7 @@ use harw_knowledge::kanban::lifecycle::JobTransitions;
 use harw_memory::Memory;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{ServiceMap, SharedSessionController};
+use harw_ops::job_authority::JobMutationScope;
 use harw_plan::{GoalStore, PlanStore, PlanToolConfig};
 use harw_plan_bridge::{FindingStore, register_plan_services};
 use harw_protocol::GatewayPort;
@@ -414,6 +415,10 @@ pub struct RuntimeServicesParts {
     pub state_store: Arc<dyn StateStore>,
     /// Durabler Job-Speicher; `None` ohne HARW-Home.
     pub job_store: Option<Arc<JobStore>>,
+    /// Live-Ausführungen durabler Agent-Jobs. Der Store bleibt Source of
+    /// Truth; dieses Handle darf nur eine bereits gefencete Cancellation über
+    /// den exakten alten LeaseToken an die laufende Execution zustellen.
+    pub job_executions: Option<Arc<JobExecutionRegistry>>,
     /// Spawner für Kind-Agenten; `None`, wenn der Einstieg keine Kinder erlaubt.
     pub spawner: Option<Arc<ManagedAgentSpawner>>,
     /// Gedächtnis; `None`, wenn nicht konfiguriert.
@@ -971,6 +976,23 @@ impl RuntimeServices {
         if let Some(job_store) = &self.parts.job_store {
             insert_service(&mut map, &mut names, Arc::clone(job_store));
         }
+        if matches!(surface, ServiceSurface::Slash | ServiceSurface::ModelTool)
+            && let Some(executions) = &self.parts.job_executions
+        {
+            insert_service(&mut map, &mut names, Arc::clone(executions));
+        }
+        // This provenance is built by the trusted composition root, never
+        // taken from operation arguments. Model mutations are workspace-bound;
+        // typed Slash commands retain the historical tenant-visible reach.
+        match surface {
+            ServiceSurface::Slash => {
+                insert_service(&mut map, &mut names, JobMutationScope::TenantVisible);
+            }
+            ServiceSurface::ModelTool => {
+                insert_service(&mut map, &mut names, JobMutationScope::BoundWorkspace);
+            }
+            ServiceSurface::Web | ServiceSurface::Job => {}
+        }
         if let Some(host_permit_handles) = &self.parts.host_permit_handles {
             insert_service(&mut map, &mut names, Arc::clone(host_permit_handles));
             // Nutzerentscheidung 2026-09-24: nur eine vom Nutzer getippte
@@ -1110,7 +1132,9 @@ impl RuntimeServices {
     /// `home` des gebundenen [`harw_home::ResolvedHomeContext`]; ohne Bindung
     /// `None` — nie ein Rückgriff auf `HARW_HOME` oder `harw_home::home_dir()`.
     fn connection_check_home(&self) -> Option<std::path::PathBuf> {
-        self.home_context.as_ref().map(|context| context.home.clone())
+        self.home_context
+            .as_ref()
+            .map(|context| context.home.clone())
     }
 
     /// Das Kanban-Job-Ledger einer Fläche.
@@ -1166,7 +1190,8 @@ mod tests {
     use crate::test_support::{TestError, TestResult};
     use harw_config::ResolvedConfig;
     use harw_core::{
-        AgentEventHub, ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager,
+        AgentEventHub, ChildLimits, InMemoryStateStore, JobExecutionRegistry,
+        ManagedAgentSpawner, SessionManager,
     };
     use harw_extension_api::allow_rules::AllowRuleSet;
     use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
@@ -1176,6 +1201,7 @@ mod tests {
     use harw_operations::registry::OperationRegistry;
     use harw_operations::session_control::NullSessionController;
     use harw_operations::{ServiceMap, SharedSessionController};
+    use harw_ops::job_authority::JobMutationScope;
     use harw_plan::{GoalStore, InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
     use harw_plan_bridge::FindingStore;
     use harw_provider_http::ProviderLoadRegistry;
@@ -1256,6 +1282,7 @@ mod tests {
             operations: Arc::new(OperationRegistry::new()),
             state_store: Arc::new(InMemoryStateStore::default()),
             job_store: Some(Arc::new(JobStore::new(Path::new("/nonexistent/w2b-04")))),
+            job_executions: Some(Arc::new(JobExecutionRegistry::new())),
             spawner: Some(test_spawner()),
             memory: Some(Arc::new(StubMemory)),
             config: Arc::new(ResolvedConfig::default()),
@@ -1278,6 +1305,7 @@ mod tests {
             operations: Arc::new(OperationRegistry::new()),
             state_store: Arc::new(InMemoryStateStore::default()),
             job_store: None,
+            job_executions: None,
             spawner: None,
             memory: None,
             config: Arc::new(ResolvedConfig::default()),
@@ -1337,6 +1365,10 @@ mod tests {
         names.push(type_name::<Arc<dyn GoalStore>>());
         names.push(type_name::<Arc<FindingStore>>());
         names.push(type_name::<PlanToolConfig>());
+        if matches!(surface, ServiceSurface::Slash | ServiceSurface::ModelTool) {
+            names.push(type_name::<Arc<JobExecutionRegistry>>());
+            names.push(type_name::<JobMutationScope>());
+        }
         if surface.allows_spawner() {
             names.push(type_name::<Arc<ManagedAgentSpawner>>());
         }
@@ -1399,10 +1431,12 @@ mod tests {
                 sorted(vec![
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
-                "Fläche {} darf sich nur um Spawner, Sitzungs-Controller und den \
-                 Host-Lease-Nutzer-Marker unterscheiden",
+                "Fläche {} darf sich nur um Spawner, Sitzungs-Controller, Live-Job-Registry, \
+                 Job-Mutations-Scope und den Host-Lease-Nutzer-Marker unterscheiden",
                 surface.as_str()
             );
             assert!(
@@ -2093,10 +2127,7 @@ mod tests {
         let context = test_home_context(home.path())?;
         let services =
             RuntimeServices::new(minimal_parts()).with_home_context(Arc::clone(&context));
-        assert_eq!(
-            services.connection_check_home(),
-            Some(context.home.clone())
-        );
+        assert_eq!(services.connection_check_home(), Some(context.home.clone()));
         Ok(())
     }
 
@@ -2120,7 +2151,9 @@ mod tests {
             );
             let map = bound.service_map(surface);
             let Some(found) = map.get::<Arc<harw_home::ResolvedHomeContext>>() else {
-                return Err(TestError::Missing("gebundener Home-Kontext fehlt in der Map"));
+                return Err(TestError::Missing(
+                    "gebundener Home-Kontext fehlt in der Map",
+                ));
             };
             assert!(
                 Arc::ptr_eq(found, &context),
