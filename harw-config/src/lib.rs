@@ -23,6 +23,7 @@ pub mod infrastructure_toml;
 pub mod internal_models;
 pub mod loader;
 pub mod mcp_toml;
+pub mod memory_toml;
 pub mod merge;
 pub mod mode_toml;
 pub mod model_toml;
@@ -34,6 +35,7 @@ pub mod provider_toml;
 pub mod research_toml;
 mod role_models;
 pub mod scope;
+mod serde_defaults;
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub mod shell_limits;
 pub mod skill_toml;
@@ -99,6 +101,7 @@ pub use provider_toml::{
     DEFAULT_REQUEST_TIMEOUT_SECS, MaxTokensField, OriginAllowlistToml, ProviderToml, RateLimitMode,
     RateLimitToml, host_is_private_lan,
 };
+pub use memory_toml::MemorySection;
 pub use research_toml::ResearchSection;
 pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};

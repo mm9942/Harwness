@@ -76,38 +76,23 @@ pub(crate) fn slash_service_map(services: &RuntimeServices) -> ServiceMap {
 /// # Description
 /// Jede Variante trägt den angefragten Tool-Namen, damit die TUI eine
 /// konkrete Meldung anzeigen kann.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, harw_macros::HarwError)]
 pub(crate) enum ToolToggleError {
     /// Der Name ist in der Session nicht registriert (z. B. Tippfehler).
+    #[msg("unbekanntes Werkzeug '{name}': in dieser Session nicht registriert")]
     UnknownTool {
         /// Angefragter Tool-Name.
         name: String,
     },
     /// Das Einschalten würde die Decke der Session (Basis ∩ Modus) erweitern.
+    #[msg(
+        "Werkzeug '{name}' kann nicht eingeschaltet werden: die Decke dieser Session (Basis ∩ Modus) erlaubt es nicht"
+    )]
     BeyondCeiling {
         /// Angefragter Tool-Name.
         name: String,
     },
 }
-
-impl std::fmt::Display for ToolToggleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownTool { name } => {
-                write!(
-                    f,
-                    "unbekanntes Werkzeug '{name}': in dieser Session nicht registriert"
-                )
-            }
-            Self::BeyondCeiling { name } => write!(
-                f,
-                "Werkzeug '{name}' kann nicht eingeschaltet werden: die Decke dieser Session (Basis ∩ Modus) erlaubt es nicht"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ToolToggleError {}
 
 /// Prüft, ob `/tools on|off <tool>` zulässig ist, bevor die Aktivierung
 /// verändert wird.
@@ -248,5 +233,28 @@ mod tests {
         assert!(unknown.to_string().contains("fs.raed"));
         assert!(beyond.to_string().contains("shell.exec"));
         assert_ne!(unknown.to_string(), beyond.to_string());
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::ToolToggleError;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(
+            ToolToggleError::UnknownTool {
+                name: "t".to_owned()
+            }
+            .to_string(),
+            "unbekanntes Werkzeug 't': in dieser Session nicht registriert"
+        );
+        assert!(
+            ToolToggleError::BeyondCeiling {
+                name: "t".to_owned()
+            }
+            .to_string()
+            .starts_with("Werkzeug 't' kann nicht eingeschaltet werden")
+        );
     }
 }

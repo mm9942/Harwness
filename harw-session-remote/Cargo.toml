@@ -1,0 +1,40 @@
+[package]
+publish.workspace = true
+name = "harw-session-remote"
+description = "Session control plane client: connects to a local UDS or own-cloud NodeTransport host over harw.session.v1, multiplexes requests, reconnects with cursors and implements SessionPort (W00 §2.5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+# Transport adapter (ring A): upgrade/codec/limits and the WebSocketStream
+# re-export. The client takes no direct tungstenite dependency (W00 D10).
+harw-session-ws = { path = "../harw-session-ws" }
+harw-node-transport = { path = "../harw-node-transport" }
+harw-fsutil = { path = "../harw-fsutil" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-util"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+# Stream/Sink traits of the WebSocketStream (the client needs them to read and
+# write the upgraded socket; same spec as harw-session-ws, already in the lock).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+thiserror = "2"
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Client tests run against the real host through the real server transport.
+harw-session-host = { path = "../harw-session-host" }
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros", "io-util", "test-util"] }
+
+[lints]
+workspace = true

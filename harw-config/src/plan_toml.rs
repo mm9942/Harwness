@@ -23,6 +23,7 @@
 //! (`off`/`ask`/`on`, Default `ask`). Auswertung in `harw-cli`
 //! (`doc_ocr::install_doc_ocr`) und in der Freigabe-Politik.
 
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 
 /// `[tools]` — Container-Sektion für werkzeugspezifische Konfigurationen.
@@ -196,9 +197,6 @@ impl PlanSection {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_max_nodes() -> usize {
     256
 }

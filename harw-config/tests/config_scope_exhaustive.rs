@@ -89,6 +89,8 @@ fn test_field_table_exhaustive_harness_config() {
         shell: _,
         // `[jobs]`, eigener Abschnittstest unten.
         jobs: _,
+        // `[memory]`, eigener Abschnittstest unten.
+        memory: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -751,6 +753,52 @@ fn test_field_table_exhaustive_jobs_toml() {
         harw_config::harness_config::JobsToml::default();
     let _ = max_running;
     assert_path_in_field_table_exactly_once("jobs.max_running");
+}
+
+// ---------------------------------------------------------------------
+// [memory] (10 Felder) — Projektgedächtnis
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_memory_section() {
+    let harw_config::MemorySection {
+        enabled,
+        global_enabled,
+        token_budget,
+        max_facts,
+        max_body_bytes,
+        max_unused_days,
+        consolidate_deadline_secs,
+        forget_deadline_secs,
+        promote_deadline_secs,
+        sweep_deadline_secs,
+    } = harw_config::MemorySection::default();
+    let _ = (
+        enabled,
+        global_enabled,
+        token_budget,
+        max_facts,
+        max_body_bytes,
+        max_unused_days,
+        consolidate_deadline_secs,
+        forget_deadline_secs,
+        promote_deadline_secs,
+        sweep_deadline_secs,
+    );
+    for path in [
+        "memory.enabled",
+        "memory.global_enabled",
+        "memory.token_budget",
+        "memory.max_facts",
+        "memory.max_body_bytes",
+        "memory.max_unused_days",
+        "memory.consolidate_deadline_secs",
+        "memory.forget_deadline_secs",
+        "memory.promote_deadline_secs",
+        "memory.sweep_deadline_secs",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
 }
 
 // ---------------------------------------------------------------------

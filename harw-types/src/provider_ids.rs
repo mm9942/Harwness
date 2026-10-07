@@ -679,7 +679,7 @@ arc_str_id!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestResult;
+    use crate::test_support::{TestResult, assert_blank_id_apis_rejected};
     use std::collections::{BTreeMap, HashMap};
 
     // ── helper ──────────────────────────────────────────────────────────────
@@ -689,22 +689,14 @@ mod tests {
         s.len()
     }
 
-    macro_rules! assert_fallible_apis_reject_blank_ids {
-        ($id_type:ty) => {
-            assert!(<$id_type>::try_from_str("").is_err());
-            assert!(<$id_type>::parse(" \t\n").is_err());
-            assert!("".parse::<$id_type>().is_err());
-        };
-    }
-
     #[test]
     fn every_identifier_type_rejects_blank_values_from_fallible_apis() -> TestResult {
-        assert_fallible_apis_reject_blank_ids!(ProviderId);
-        assert_fallible_apis_reject_blank_ids!(ProviderName);
-        assert_fallible_apis_reject_blank_ids!(ModelId);
-        assert_fallible_apis_reject_blank_ids!(ModelName);
-        assert_fallible_apis_reject_blank_ids!(AgentName);
-        assert_fallible_apis_reject_blank_ids!(CustomerId);
+        assert_blank_id_apis_rejected!(ProviderId);
+        assert_blank_id_apis_rejected!(ProviderName);
+        assert_blank_id_apis_rejected!(ModelId);
+        assert_blank_id_apis_rejected!(ModelName);
+        assert_blank_id_apis_rejected!(AgentName);
+        assert_blank_id_apis_rejected!(CustomerId);
 
         assert_eq!(ProviderId::try_from_str(" openai ")?.as_str(), " openai ");
         Ok(())

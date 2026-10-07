@@ -87,6 +87,7 @@ use crate::internal_models::InternalModelsToml;
 use crate::mode_toml::ModeSection;
 use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
+use crate::memory_toml::MemorySection;
 use crate::research_toml::ResearchSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
 use crate::uia_worker_models::UiaWorkerModelsToml;
@@ -1329,6 +1330,99 @@ fn merge_research(
     );
 }
 
+// `[memory]` — alle zehn Felder `ProfileReplaces`: Home und Profil ersetzen,
+// ein nicht vertrautes Projekt darf keines setzen (wird gemeldet und
+// verworfen).
+fn merge_memory(
+    trusted: &mut HarnessConfig,
+    incoming: MemorySection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    let present = |field: &str| field_present(raw, &["memory", field]);
+    profile_replaces(
+        &mut trusted.memory.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "memory.enabled",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.global_enabled,
+        incoming.global_enabled,
+        present("global_enabled"),
+        role,
+        "memory.global_enabled",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.token_budget,
+        incoming.token_budget,
+        present("token_budget"),
+        role,
+        "memory.token_budget",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.max_facts,
+        incoming.max_facts,
+        present("max_facts"),
+        role,
+        "memory.max_facts",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.max_body_bytes,
+        incoming.max_body_bytes,
+        present("max_body_bytes"),
+        role,
+        "memory.max_body_bytes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.max_unused_days,
+        incoming.max_unused_days,
+        present("max_unused_days"),
+        role,
+        "memory.max_unused_days",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.consolidate_deadline_secs,
+        incoming.consolidate_deadline_secs,
+        present("consolidate_deadline_secs"),
+        role,
+        "memory.consolidate_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.forget_deadline_secs,
+        incoming.forget_deadline_secs,
+        present("forget_deadline_secs"),
+        role,
+        "memory.forget_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.promote_deadline_secs,
+        incoming.promote_deadline_secs,
+        present("promote_deadline_secs"),
+        role,
+        "memory.promote_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.sweep_deadline_secs,
+        incoming.sweep_deadline_secs,
+        present("sweep_deadline_secs"),
+        role,
+        "memory.sweep_deadline_secs",
+        layer_path,
+    );
+}
+
 // `[permissions]` (Abschnitt 1.11) — alle fuenf direkten Felder sowie
 // `RuleToml.tool`/`.pattern` sicherheitskritisch (🔒).
 fn merge_permissions(
@@ -2035,6 +2129,7 @@ pub(crate) fn merge_layer_into(
     merge_tools_plan(trusted, incoming.tools, raw, role, layer_path, &mut out);
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
+    merge_memory(trusted, incoming.memory, raw, role, layer_path);
     merge_permissions(
         trusted,
         incoming.permissions,
@@ -2507,6 +2602,49 @@ mod tests {
         );
         assert_eq!(fresh.shell.max_timeout_secs, None);
         assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_trusted_layers_replace_untrusted_project_is_ignored() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(trusted.memory.global_enabled);
+        assert_eq!(trusted.memory.max_facts, None);
+
+        let home = "[memory]\nglobal_enabled = false\nmax_facts = 100";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(!trusted.memory.global_enabled);
+        assert_eq!(trusted.memory.max_facts, Some(100));
+
+        // Ein nicht vertrauter Projekt-Layer darf nichts davon ändern.
+        let project = "[memory]\nglobal_enabled = true\nmax_facts = 5000\ntoken_budget = 9";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert!(!trusted.memory.global_enabled);
+        assert_eq!(trusted.memory.max_facts, Some(100));
+        assert_eq!(trusted.memory.token_budget, None);
+
+        // Ein Layer ohne `[memory]` lässt den Stand unberührt.
+        let other = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(other).map_err(ctx("parse other"))?,
+            &raw_from(other)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.memory.max_facts, Some(100));
         Ok(())
     }
 
