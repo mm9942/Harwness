@@ -35,7 +35,8 @@ use hyper::body::Incoming;
 use tokio::net::TcpListener;
 
 pub use identity::{
-    DeviceRecord, DeviceRegistry, IdentityMapper, MapFuture, RegistryIdentityMapper,
+    DeviceRecord, DeviceRegistry, IdentityMapper, MapFuture, RegistryIdentityMapper, RegistryScan,
+    RejectedLine, TierChange, TierChangeError,
 };
 pub use revoke::{HostRevoker, LiveConnections, RevocationReport, RevocationSink};
 

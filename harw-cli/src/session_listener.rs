@@ -117,6 +117,38 @@ pub fn parse_peers(text: &str) -> (PinnedPeers, usize) {
     (peers, skipped)
 }
 
+/// Short fingerprints of the pinned node keys in `node-peers.conf` text, by
+/// node id: `blake3:` + the first 8 bytes of the BLAKE3 hash of the public
+/// key, hex. Only lines that [`parse_peers`] would pin are included; the
+/// key itself is public, nothing secret is read.
+#[must_use]
+pub(crate) fn peer_fingerprints(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((node, key)) = line.split_once('|') else {
+            continue;
+        };
+        let (Ok(id), Some(bytes)) = (NodeId::try_from_str(node.trim()), decode_hex(key.trim()))
+        else {
+            continue;
+        };
+        if PinnedPeers::new().pin(id, bytes.clone()).is_err() {
+            continue;
+        }
+        let hash = blake3::hash(&bytes);
+        let short: String = hash.as_bytes()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        out.insert(node.trim().to_owned(), format!("blake3:{short}"));
+    }
+    out
+}
+
 /// Resolves the listen address; a non-loopback bind needs the explicit
 /// opt-in.
 ///
@@ -135,7 +167,7 @@ pub fn resolve_listen(section: &SessionListenerSection) -> Result<SocketAddr, St
     Ok(addr)
 }
 
-fn parse_tier(raw: &str) -> Result<PermissionTier, String> {
+pub(crate) fn parse_tier(raw: &str) -> Result<PermissionTier, String> {
     match raw {
         "observer" => Ok(PermissionTier::Observer),
         "operator" => Ok(PermissionTier::Operator),
