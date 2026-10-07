@@ -21,7 +21,7 @@ members = [
     "harw-home",
     "harw-plan",
     "harw-types",
-    # Leaf-Crate für ContentDigest (nur blake3 + serde), re-exportiert von harw-types.
+    # Leaf crate for ContentDigest (only blake3 + serde), re-exported by harw-types.
     "harw-digest",
     "harw-protocol",
     "harw-research",
@@ -73,13 +73,13 @@ members = [
     "harw-tool-web",
     "harw-tool-doc",
     "harw-tool-shell",
-    # Plan R9, Teil F: eingebautes Job-System (job.start/status/logs/stop/
-    # list/wait) für lang laufende Prozesse statt tmux.
+    # Plan R9, part F: built-in job system (job.start/status/logs/stop/
+    # list/wait) for long-running processes instead of tmux.
     "harw-tool-job",
-    # Runde 5, Teil F: Plan-Modus (plan.write/plan.exit/plan.enter/ask_user).
+    # Round 5, part F: plan mode (plan.write/plan.exit/plan.enter/ask_user).
     "harw-tool-plan",
-    # harw-tool-tunnel-v1: verwaltete SSH-Portforwards (v1 lokal -L,
-    # Loopback-only, Ziel-Allowlist, Approval, Keyfile-Referenz; Vertrag:
+    # harw-tool-tunnel-v1: managed SSH port forwards (v1 local -L,
+    # loopback-only, target allowlist, approval, key file reference; contract:
     # docs/design/tunnel-policy-v1.md).
     "harw-tool-tunnel",
     "harw-browser",
@@ -94,8 +94,8 @@ members = [
     "harw-cli",
     "harw-completions",
     "harw",
-    # === Ausbauprogramm AW0–AW7: Telemetrie, Kontext, Lens, Control Plane ===
-    # (DoD liegt unter `dod/crates/` — eigener Block am Ende der Liste.)
+    # === Expansion program AW0–AW7: telemetry, context, lens, control plane ===
+    # (DoD lives under `dod/crates/` — its own block at the end of the list.)
     "harw-observe",
     "harw-observe-file",
     "harw-observe-prom",
@@ -113,21 +113,21 @@ members = [
     "harw-lens",
     "harw-tool-lens",
     "harw-web",
-    # === Remediation (Plan P0–P3) ===
+    # === Remediation (plan P0–P3) ===
     "harw-egress",
     "harw-fsutil",
     "harw-runtime",
     "harwness-sdk",
     "xtask",
     # DoD domain (peer security domain, see docs/planning/50-dod-integration).
-    # Bis PL-60 ein eigener, verschachtelter Cargo-Workspace unter `dod/`
-    # (eigenes Lockfile, `exclude = ["dod"]` hier). Seit PL-60 gewöhnliche
-    # Members dieses Workspace: ein Lockfile, eine `[workspace.package]`-,
-    # `[workspace.dependencies]`- und Lint-Vorgabe. Membership ist
-    # Build-Governance, keine Abhängigkeitserlaubnis: die TCB-Grenzen von
-    # Warden/Sentinel/Probes erzwingen die `xtask`-Gates (`edges`,
-    # `privileges`, `warden-*`), nicht die Workspace-Grenze. Explizit
-    # aufgezählt, kein Glob (Architektur §19). Siehe
+    # Until PL-60 a separate, nested Cargo workspace under `dod/`
+    # (own lockfile, `exclude = ["dod"]` here). Since PL-60 ordinary
+    # members of this workspace: one lockfile, one `[workspace.package]`,
+    # `[workspace.dependencies]` and lint setting. Membership is
+    # build governance, not dependency permission: the TCB boundaries of
+    # Warden/Sentinel/Probes are enforced by the `xtask` gates (`edges`,
+    # `privileges`, `warden-*`), not by the workspace boundary. Listed
+    # explicitly, no glob (architecture §19). See
     # `docs/architecture/dod-workspace-merge-plan.md`.
     "dod/crates/harw-dod",
     "dod/crates/harw-dod-authlog",
@@ -166,43 +166,43 @@ members = [
 
 [workspace.package]
 version = "0.9.1"
-# Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
-# damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
-# ohne Versionsangabe erlaubt).
+# No crate is published to crates.io; `cargo deny` therefore treats them
+# as private (no license obligation without a decision, path dependencies
+# without a version allowed).
 publish = false
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mm9942/harwness"
 
-# Genau eine Fassung je geteilter Abhängigkeit. Ohne diesen Abschnitt stand
-# `jiff` in fünf Schreibweisen und drei Fassungen im Baum (0.2 / 0.2.28 /
-# 0.2.32); bei rund fünfzig neuen Crates, die ausnahmslos `jiff` benutzen
-# sollen, ist das ein Multiplikator statt einer Nachlässigkeit.
+# Exactly one version per shared dependency. Without this section `jiff`
+# appeared in five spellings and three versions in the tree (0.2 / 0.2.28 /
+# 0.2.32); with around fifty new crates that are all supposed to use `jiff`,
+# that is a multiplier rather than an oversight.
 [workspace.dependencies]
-# Zeitachse. Die eine erlaubte Pre-1.0-Abhängigkeit in öffentlichen Signaturen
-# (Doktrin D5, präzisiert): kleine Typfläche, ein relevanter Typ.
+# Time axis. The one allowed pre-1.0 dependency in public signatures
+# (doctrine D5, clarified): small type surface, one relevant type.
 jiff = { version = "0.2.32", features = ["serde"] }
 
-# Serialisierung.
+# Serialization.
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1.3"
 
-# Inhaltsadressierung: ContentDigest, ChunkDigest, SecurityEvidence.
+# Content addressing: ContentDigest, ChunkDigest, SecurityEvidence.
 blake3 = "1.8.7"
 
-# Netzmengen. Trägt den Cidr-Zweig von NetworkScope::EgressTarget.
+# Network sets. Carries the Cidr branch of NetworkScope::EgressTarget.
 ipnet = { version = "2.12.1", features = ["serde"] }
 
-# Dateien und Nebenläufigkeit — Store-Mechanik nach dem ChildLeaseStore-Muster.
+# Files and concurrency — store mechanics following the ChildLeaseStore pattern.
 fs4 = "1.1.0"
 tempfile = "3.27.0"
 
-# Beobachtung.
+# Observation.
 tracing = "0.1.44"
 
-# Syscalls ohne libc: fanotify im Dateisystem-Wächter.
+# Syscalls without libc: fanotify in the filesystem watcher.
 rustix = "1.1.4"
 # CryptGuard 3.1.0 is published on crates.io as of R15 (see
 # docs/planning/90-migration-ledger/MIGRATION_LEDGER.md, MIG-015); no git source needed anymore.
@@ -213,18 +213,18 @@ procfs = { version = "0.18.0", default-features = false }
 landlock = "0.4.7"
 cap-std = "4.0.3"
 
-# Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.
+# Directory embedding: registry definitions as files instead of a Rust list.
 include_dir = "0.7.4"
 
-# Versionsvergleich (Security-Signal, kein Stringvergleich). Aus dem
-# früheren `dod/Cargo.toml` übernommen (PL-60); Konsumenten:
+# Version comparison (security signal, not a string comparison). Taken over
+# from the former `dod/Cargo.toml` (PL-60); consumers:
 # `harw-dod-rules`, `harw-dod-sentinel`, `harw-dod-workspace`.
 semver = { version = "1.0.28", features = ["serde"] }
 
-# `forbid` statt `deny`: nicht per `#[allow]` überstimmbar. Die Regel stand
-# vorher als Attribut in jeder Crate einzeln und fehlte deshalb in acht von
-# fünfundvierzig. Eine Regel, die pro Crate wiederholt werden muss, wird pro
-# Crate vergessen.
+# `forbid` instead of `deny`: cannot be overridden with `#[allow]`. The rule
+# used to be an attribute in each crate individually and was therefore missing
+# in eight of forty-five. A rule that has to be repeated per crate gets
+# forgotten per crate.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

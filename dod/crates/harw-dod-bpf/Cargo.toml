@@ -9,33 +9,33 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# ID-Vokabular: `BpfProgramSpec`/`BpfHandle` tragen eine `SensorId`, damit ein
-# geladenes Programm auf den Sensor zurückführbar bleibt, der es besitzt.
+# ID vocabulary: `BpfProgramSpec`/`BpfHandle` carry a `SensorId` so a loaded
+# program remains traceable to the sensor that owns it.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(HarwError)]` für `BpfError` — kein `anyhow`, kein `thiserror`.
+# `#[derive(HarwError)]` for `BpfError` — no `anyhow`, no `thiserror`.
 harw-macros = { path = "../../../harw-macros" }
-# `Capability::LoadBpfProgram` / `CapabilityClass::Bpf`: diese Crate benennt
-# die Fähigkeit, die ein echter (Nicht-Fixture-)Lader braucht, ohne sie selbst
-# durchzusetzen — siehe `src/lib.rs` für die Abgrenzung.
+# `Capability::LoadBpfProgram` / `CapabilityClass::Bpf`: this crate names the
+# capability a real (non-fixture) loader needs, without enforcing it itself —
+# see `src/lib.rs` for the delimitation.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Zeitachse für den dekodierten Ereignis-Zeitstempel (Formungsteil).
+# Time axis for the decoded event timestamp (shaping part).
 jiff = { workspace = true }
 # `CLOCK_MONOTONIC` and `CLOCK_REALTIME` are sampled together by the loader;
 # no `ktime` value is treated as Unix epoch time.
 rustix = { workspace = true, features = ["time"] }
-# Reale eBPF-Ladeschicht (`src/real.rs`, Nachtrag zu AW7-01a/AW7-01d): der
-# `harw-dod-flow`-Konsument hängt inzwischen an einem Tracepoint statt an
-# `SocketFilter`, was das zuvor dokumentierte Hindernis (ein generischer
-# Lader dürfte keinen bereits offenen Socket besitzen) auflöst. Die hier
-# genutzte Teilmenge (`Ebpf::load`, `TracePoint`/`KProbe` `load`/`attach`,
-# `RingBuf::next`) ist laut gepinnter Quelle (siehe `src/real.rs`-Moduldoku)
-# durchweg `unsafe`-frei; kein `build.rs`, keine `libbpf`-/`clang`-Abhängigkeit
-# in diesem Crate. Version 0.14.0 über die crates.io-API verifiziert
-# (`GET /api/v1/crates/aya/versions`, neuester, nicht zurückgezogener
-# Eintrag zum Berichtszeitpunkt dieses Knotens) — nicht geraten. `cargo add`
-# konnte in dieser Aufgabenform nicht laufen (Hauptregel: kein `cargo`), die
-# Versionsnummer stammt deshalb aus der Registry-API, nicht aus dem
-# lokalen `~/.cargo`-Zwischenspeicher (dort war `aya` nicht gepinnt).
+# Real eBPF loading layer (`src/real.rs`, addendum to AW7-01a/AW7-01d): the
+# `harw-dod-flow` consumer now attaches to a tracepoint instead of
+# `SocketFilter`, which resolves the previously documented obstacle (a
+# generic loader must not own an already open socket). The subset used here
+# (`Ebpf::load`, `TracePoint`/`KProbe` `load`/`attach`, `RingBuf::next`) is,
+# according to the pinned source (see the `src/real.rs` module docs),
+# `unsafe`-free throughout; no `build.rs`, no `libbpf`/`clang` dependency in
+# this crate. Version 0.14.0 verified via the crates.io API
+# (`GET /api/v1/crates/aya/versions`, latest non-yanked entry at the time of
+# this node's report) — not guessed. `cargo add` could not run in this task
+# form (main rule: no `cargo`), so the version number comes from the
+# registry API, not from the local `~/.cargo` cache (where `aya` was not
+# pinned).
 aya = "0.14.0"
 
 [dev-dependencies]

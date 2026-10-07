@@ -1,5 +1,5 @@
-# `cargo xtask <befehl>` statt `cargo run -p xtask --`. Der Aufruf steht so in
-# jedem CI-Schritt und im Makefile; ohne den Alias müsste die längere Form an
-# jeder dieser Stellen wiederholt werden.
+# `cargo xtask <command>` instead of `cargo run -p xtask --`. The invocation appears so in
+# every CI step and in the Makefile; without the alias the longer form would have to be
+# repeated at each of those places.
 [alias]
 xtask = "run --package xtask --quiet --"

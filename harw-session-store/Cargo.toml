@@ -15,7 +15,7 @@ harw-job-core = { path = "../harw-job-core" }
 # Eco-Doc §33: generic job store mechanics (records/locks layout, fs4 locks,
 # atomic persist, fencing). `job_store.rs` is a thin adapter over it.
 harw-job-store = { path = "../harw-job-store" }
-# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
+# F-006: symlink-safe opening (correct O_NOFOLLOW per architecture, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }
 # AW1-01: ChildLeaseRecord carries a TraceContext (frozen wire form,
 # docs/design/build-history.md §A.4). Path dependency only — no version pin.
@@ -23,7 +23,7 @@ harw-observe = { path = "../harw-observe" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = { workspace = true }
-# C-APPR: defekte Approval-Einträge werden in `pending_all` mit `warn!` übersprungen.
+# C-APPR: defective approval entries are skipped with `warn!` in `pending_all`.
 tracing = { workspace = true }
 fs4 = "1.1.0"
 tempfile = "3.27.0"

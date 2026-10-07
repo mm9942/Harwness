@@ -9,9 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Baseline jeder Crate für den einen Fehlertyp (Kopfteil "Fehler":
-# `#[derive(harw_macros::HarwError)]`); ohne sie gäbe es keinen Weg,
-# `PromError` ohne anyhow/thiserror zu bauen.
+# Baseline of every crate for the single error type (header section "Errors":
+# `#[derive(harw_macros::HarwError)]`); without it there would be no way to build
+# `PromError` without anyhow/thiserror.
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 

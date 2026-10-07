@@ -12,14 +12,14 @@ related:
   - ../85-gap-hunt/patterns.md
 ---
 
-> Recherche-Workflow `openclaw-harw-research`, nur lesend:
-> - 3 Sonnet-Rechercheure mit 63 belegten Fakten; Quellen sind das offizielle
->   Repo `github.com/openclaw/openclaw` (Commit vom 2026-09-27), docs.openclaw.ai
->   sowie Advisories und Presse.
-> - Danach ein Muster-Extraktor, der gegen den harw-Code abgeglichen hat.
+> Research workflow `openclaw-harw-research`, read-only:
+> - 3 Sonnet researchers with 63 sourced facts; sources are the official
+>   repo `github.com/openclaw/openclaw` (commit of 2026-09-27), docs.openclaw.ai,
+>   as well as advisories and press.
+> - Then a pattern extractor that cross-checked against the harw code.
 >
-> Zahlen zu Reichweite und Menge (Sterne, CVE-Anzahl, exponierte Instanzen)
-> sind nicht verifiziert und werden nirgends als Beleg benutzt.
+> Figures on reach and volume (stars, CVE count, exposed instances)
+> are not verified and are not used anywhere as evidence.
 
 # OpenClaw → harw: Pattern Catalog
 
@@ -75,7 +75,7 @@ Recommendation: **Adopt/keep as-is.** One gap noted in PL-65 §4.5: "(verify) wh
 **7. Veto-chain tool policy — deny always wins, fail-closed**
 Problem: multiple independent gates (plugins, hooks) deciding on one tool call must not let a later "allow" silently override an earlier "deny."
 OpenClaw: `before_tool_call` hooks are terminal-veto: `{block:true}` stops lower-priority handlers; `{block:false}` is a no-op, never un-blocks (docs/concepts/agent-loop.md).
-harw today: **Present, stronger.** `harw-extension-api/src/allow_rules.rs`: "`Deny` gewinnt immer über `Allow`, auch wenn eine andere passende Regel..."; a poisoned lock fails closed to `Deny` (tested: `a poisoned lock must fail closed to Deny`).
+harw today: **Present, stronger.** `harw-extension-api/src/allow_rules.rs`: "`Deny` always wins over `Allow`, even if another matching rule..."; a poisoned lock fails closed to `Deny` (tested: `a poisoned lock must fail closed to Deny`).
 Recommendation: **Adopt pattern, already present and test-enforced** — no action needed beyond keeping the invariant test in the gate suite.
 
 **8. Capability/context ceiling — monotone reduction, structurally un-widenable**
@@ -135,13 +135,13 @@ Recommendation: **Adopt** (already scoped as PL-65's RS9 goal) — no new design
 **17. Local supply-chain trust pinning for config/agent layers**
 Problem: a repo-local or synced config/agent layer can silently change and gain authority it was never re-approved for.
 OpenClaw: ClawHub cross-checks a skill's declared frontmatter capabilities against what its code actually references, at publish time (docs.openclaw.ai/clawhub/skill-format).
-harw today: **Different but present — content-digest trust, not behavior-drift detection.** `harw-home/src/trust.rs`: a repo-local `.harw` gets full authority only after explicit user approval bound to canonical root + owner UID + a BLAKE3 digest over security-relevant files; any change flips status to `Changed` and the layer falls back to restricted authority until re-approved. `harw-agent-dsl/src/skills.rs` documents that harw skills are **explicitly authority-free instruction fragments** — "Vereinigung kann keine Rechte ausweiten" (union can never widen rights) — so the specific risk ClawHub's check targets (a skill secretly needing an undeclared tool/env var) is largely foreclosed by design, not by a runtime scanner.
+harw today: **Different but present — content-digest trust, not behavior-drift detection.** `harw-home/src/trust.rs`: a repo-local `.harw` gets full authority only after explicit user approval bound to canonical root + owner UID + a BLAKE3 digest over security-relevant files; any change flips status to `Changed` and the layer falls back to restricted authority until re-approved. `harw-agent-dsl/src/skills.rs` documents that harw skills are **explicitly authority-free instruction fragments** — "a union therefore cannot widen any rights" (union can never widen rights) — so the specific risk ClawHub's check targets (a skill secretly needing an undeclared tool/env var) is largely foreclosed by design, not by a runtime scanner.
 Recommendation: **Adapt, don't copy verbatim.** harw's digest-pinning model is a good fit for config/agent-definition layers (already present); a ClawHub-style manifest-vs-code drift scanner would only become relevant if harw's "skills" concept ever grows executable content beyond instruction fragments — not needed today.
 
 **18. Durable scheduled jobs / proactive heartbeat (missing, corroborated)**
 Problem: "remind me to do X" or periodic proactive checks need a deterministic scheduler, not free-text the model has to re-notice.
 OpenClaw: time-based intents compile to cron jobs; event-based intents compile to a matcher table; a cheap periodic heartbeat lets an agent act without a human message, short-circuiting almost for free when there's nothing to do (docs/automation/cron-jobs.md).
-harw today: **Missing at the agent/session level.** No cron/scheduler subsystem was found (`grep` across `harw-cli`, `harw-job-*` found no scheduler, only incidental "cron" substring hits). `harw-memory/src/heartbeat.rs` exists but is a *memory-maintenance* tick (HOT/WARM/COLD demotion, fact decay), not a proactive conversational heartbeat. This corroborates the same finding already flagged independently by the parallel Claude Code research sheet (`docs/planning/75-harness-patterns/claude-code.md`, item 4: "`/loop` und Cron: **fehlt**").
+harw today: **Missing at the agent/session level.** No cron/scheduler subsystem was found (`grep` across `harw-cli`, `harw-job-*` found no scheduler, only incidental "cron" substring hits). `harw-memory/src/heartbeat.rs` exists but is a *memory-maintenance* tick (HOT/WARM/COLD demotion, fact decay), not a proactive conversational heartbeat. This corroborates the same finding already flagged independently by the parallel Claude Code research sheet (`docs/planning/75-harness-patterns/claude-code.md`, item 4: "`/loop` and cron: **missing**").
 Recommendation: **Adopt**, but treat as one shared roadmap item across both sibling research sheets rather than duplicating design work — see also that sheet's proposed `schedule` operation.
 
 ## C. Anti-patterns / incidents to avoid
@@ -156,7 +156,7 @@ All items below are OpenClaw's own disclosed incidents (upstream researcher conf
 
 4. **"Localhost is trusted" (ClawJacked, no CVE id in sources found).** A malicious webpage opened a cross-origin WebSocket to `ws://localhost:<port>` (same-origin policy doesn't cover WS) and brute-forced the local Gateway password with no rate limit, auto-registering as a trusted device. *Source: thehackernews.com, Feb 2026.* Lesson: a loopback bind is not identity; it still needs auth + rate limiting, or better, a transport a browser can't address at all. harw note: `harw-web`'s local surface binds a **Unix domain socket** authenticated via `SO_PEERCRED` (`harw-web/src/peer.rs`) — a browser physically cannot open this transport, so harw is structurally immune to this exact attack class today. This is a design invariant worth preserving explicitly (never swap the local control socket for a loopback TCP port without re-deriving this guarantee).
 
-5. **"Claw Chain" — four chained CVEs, none alarming alone (TOCTOU sandbox-mount race → credential exposure → priv-esc → persistence; CVSS up to 9.6).** *Source: thehackernews.com/2026/05, cyera.com.* Lesson: audit sandbox mount/check-then-use sequences as an end-to-end kill chain, not as isolated findings — each step alone looks like normal agent behavior. harw note: this is precisely what `docs/planning/85-gap-hunt/patterns.md` M1 already describes ("Erst prüfen, dann benutzen (TOCTOU)"). Recommend running a **named, TOCTOU-focused gap-hunt-area pass** specifically over `harw-sandbox`/`harw-job-executor-bwrap`/`harw-job-linux` rather than relying on it surfacing in a general sweep — the withheld-`/run`/`/sys` comment in `executor.rs` shows the team already thinks this way; make it a recurring, explicitly-named review, not a one-off.
+5. **"Claw Chain" — four chained CVEs, none alarming alone (TOCTOU sandbox-mount race → credential exposure → priv-esc → persistence; CVSS up to 9.6).** *Source: thehackernews.com/2026/05, cyera.com.* Lesson: audit sandbox mount/check-then-use sequences as an end-to-end kill chain, not as isolated findings — each step alone looks like normal agent behavior. harw note: this is precisely what `docs/planning/85-gap-hunt/patterns.md` M1 already describes ("Check first, then use (TOCTOU)"). Recommend running a **named, TOCTOU-focused gap-hunt-area pass** specifically over `harw-sandbox`/`harw-job-executor-bwrap`/`harw-job-linux` rather than relying on it surfacing in a general sweep — the withheld-`/run`/`/sys` comment in `executor.rs` shows the team already thinks this way; make it a recurring, explicitly-named review, not a one-off.
 
 6. **Naming/scale claims — unconfirmed.** The upstream researcher's own open-questions list flags several numeric claims (star counts, "543 CVEs," "13K skills," "245,000 exposed instances") as SEO-farm-sourced or unverified against primary GHSA/NVD records. None of these are used as load-bearing facts above; flagged here only so this catalog doesn't get cited as having verified them.
 
@@ -164,7 +164,7 @@ All items below are OpenClaw's own disclosed incidents (upstream researcher conf
 
 1. **Config/security self-audit check.** OpenClaw's `openclaw security audit` checks drift from safe defaults (loopback bind, token auth, pairing enabled, allowlists) in one command (docs.openclaw.ai/gateway/security). harw already has a `DoctorCheck` trait and `health_checks()` in `harw-cli/src/lifecycle.rs`. *Effort: low — add one new `DoctorCheck` implementation.* *Value: high — catches an accidentally-unsafe config before it ships, one command, no new subsystem.*
 
-2. **Prove (and if needed close) that MCP-sourced tools cannot bypass the native tool-policy gate.** OpenClaw's explicit design lesson: "tools obtained from a connected MCP server are NOT a policy bypass — they pass through the exact same tool-profile/policy machinery as built-in tools" (docs.openclaw.ai/tools/mcp). `harw-mcp-client/src/tool_bridge.rs` and `harw-mcp-server/src/session.rs` were flagged as "ungeprüft" by the sibling Claude Code research sheet too. *Effort: low — add an explicit test asserting an MCP-sourced `ToolCall` is evaluated by `harw-extension-api::allow_rules` exactly like a native one; fix if the test fails.* *Value: high — closes an entire policy-bypass class, independently corroborated as worth checking by two parallel research tracks.*
+2. **Prove (and if needed close) that MCP-sourced tools cannot bypass the native tool-policy gate.** OpenClaw's explicit design lesson: "tools obtained from a connected MCP server are NOT a policy bypass — they pass through the exact same tool-profile/policy machinery as built-in tools" (docs.openclaw.ai/tools/mcp). `harw-mcp-client/src/tool_bridge.rs` and `harw-mcp-server/src/session.rs` were flagged as "unverified" by the sibling Claude Code research sheet too. *Effort: low — add an explicit test asserting an MCP-sourced `ToolCall` is evaluated by `harw-extension-api::allow_rules` exactly like a native one; fix if the test fails.* *Value: high — closes an entire policy-bypass class, independently corroborated as worth checking by two parallel research tracks.*
 
 3. **Structured fallback-decision observability event, separate from any user-facing notice.** OpenClaw logs `model_fallback_decision` (from/to model, failure reason, outcome) distinct from the chat-facing "Model Fallback" notice, and explicitly scopes exhaustion alerts to be model-aware so an unrelated model's rate limit doesn't trigger a false alarm (docs.openclaw.ai/concepts/model-failover). harw's `credential_pool.rs`/`retry.rs` already classify errors and cooldown per entry; they likely don't yet emit one dedicated, queryable observability event for the decision itself. *Effort: low-medium — one new `harw-observe` metric/event emitted from the existing decision points.* *Value: medium-high — pure debuggability win with no behavior change, low risk.*
 

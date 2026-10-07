@@ -18,69 +18,71 @@ harw-agent-dsl = { path = "../harw-agent-dsl" }
 # compiler depends on this crate only as a dev-dependency (its tests).
 harw-agent-compiler = { path = "../harw-agent-compiler" }
 harw-catalog = { path = "../harw-catalog" }
-# `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
-# Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5), dazu
-# die ungeparsten Agentendefinitionen (`ResolvedConfig::agent_sources`), die
-# `config_agents` parst und senkt (harw-config, Schicht I, kennt die DSL nicht).
+# `[network]` section (`NetworkSection::researcher_web_hosts`) as the single
+# source of the network scope of the `researcher-web` role (W5 RD, assumption
+# A5), plus the unparsed agent definitions (`ResolvedConfig::agent_sources`)
+# that `config_agents` parses and lowers (harw-config, layer I, does not know
+# the DSL).
 harw-config = { path = "../harw-config" }
-# `EgressPolicy` für die Web-Werkzeuge der Rolle `researcher-web` (W5 RD).
+# `EgressPolicy` for the web tools of the `researcher-web` role (W5 RD).
 harw-egress = { path = "../harw-egress" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-instructions = { path = "../harw-instructions" }
 harw-project-discovery = { path = "../harw-project-discovery" }
-# `Permission`/`PermissionSet`/`NetworkScope`: Rechte-Obergrenzen der
-# eingebauten Rollen und Werkzeugfilter nach gewährten Rechten (W5 RD).
+# `Permission`/`PermissionSet`/`NetworkScope`: permission ceilings of the
+# built-in roles and tool filtering by granted permissions (W5 RD).
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
 harw-tool-explorer = { path = "../harw-tool-explorer" }
 harw-tool-process = { path = "../harw-tool-process" }
-# `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
-# ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
+# `doc.read_pdf` (wiring W3): read-only PDF tool, appears everywhere a
+# read-only `FsToolProvider` is registered (see `profile::DOC_TOOLS`).
 harw-tool-doc = { version = "0.9.1", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 harw-tool-shell = { path = "../harw-tool-shell" }
-# Plan R9, Teil F: `job.*` (Hintergrund-Jobs statt tmux) neben `shell.exec`,
-# mit geklontem `ShellToolProvider` (gleiche Rechte, Freigaben, Host-Lease).
+# Plan R9, part F: `job.*` (background jobs instead of tmux) alongside
+# `shell.exec`, with a cloned `ShellToolProvider` (same permissions,
+# approvals, host lease).
 harw-tool-job = { path = "../harw-tool-job" }
-# Runde 5, Teil F: Namen und Rechteklasse der Plan-Werkzeuge (`plan.*`,
-# `ask_user`) für `authority::tool_permission` und die Standardpolitik.
-# Kein Zyklus: `harw-tool-plan` hängt nicht von dieser Crate ab.
+# Round 5, part F: names and permission class of the plan tools (`plan.*`,
+# `ask_user`) for `authority::tool_permission` and the default policy.
+# No cycle: `harw-tool-plan` does not depend on this crate.
 harw-tool-plan = { path = "../harw-tool-plan" }
 harw-tool-web = { path = "../harw-tool-web" }
 harw-browser = { path = "../harw-browser", optional = true }
 harw-browser-thirtyfour = { path = "../harw-browser-thirtyfour", optional = true }
 harw-tool-browser = { path = "../harw-tool-browser", optional = true }
-# Verzeichniseinbettung für `embedded_agents`: bettet den Baum unter `agents/`
-# zur Bauzeit ein, damit das Inventar der eingebauten Definitionen aus dem
-# Dateisystem folgt statt aus einer per Hand gepflegten `include_str!`-Liste
-# (AW6-00). Eine feste Liste hätte fünf spätere Knoten in drei Wellen auf
-# dieselbe Rust-Datei verwiesen, obwohl ihre Definitionen als TOML-Dateien
-# längst unabhängig nebeneinander liegen.
+# Directory embedding for `embedded_agents`: embeds the tree under `agents/`
+# at build time, so that the inventory of built-in definitions follows the
+# file system instead of a hand-maintained `include_str!` list (AW6-00). A
+# fixed list would have pointed five later nodes in three waves at the same
+# Rust file, even though their definitions already sit independently side by
+# side as TOML files.
 include_dir = { workspace = true }
-# Zeitstempel für die Auflösungs-Traces der eingebauten Agentendefinitionen:
-# `harw_agent_dsl::resolve::resolve_definition` verlangt eine
-# `time::OffsetDateTime`. Die Versionszeile ist bewusst identisch zu
-# harw-agent-dsl/Cargo.toml, damit im Workspace nur eine `time`-Auflösung
-# existiert.
+# Timestamps for the resolution traces of the built-in agent definitions:
+# `harw_agent_dsl::resolve::resolve_definition` requires a
+# `time::OffsetDateTime`. The version line is deliberately identical to
+# harw-agent-dsl/Cargo.toml, so that the workspace has only one `time`
+# resolution.
 time = "0.3.53"
-# Die eingebetteten Family- und Organisationsdefinitionen werden hier geparst:
-# `harw-agent-dsl` bietet mit `parse::parse_toml` nur einen Parser für
-# Agentendefinitionen und re-exportiert `toml` nicht. Die Versionszeile ist
-# bewusst identisch zu harw-agent-dsl/Cargo.toml, damit im Workspace nur eine
-# `toml`-Auflösung existiert.
+# The embedded family and organization definitions are parsed here:
+# `harw-agent-dsl` offers only a parser for agent definitions in
+# `parse::parse_toml` and does not re-export `toml`. The version line is
+# deliberately identical to harw-agent-dsl/Cargo.toml, so that the workspace
+# has only one `toml` resolution.
 toml = "1.1.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 harw-tools = { version = "0.9.1", path = "../harw-tools" }
-# `workbench.note`/`workbench.hypothesis` (`workbench_tools.rs`) schreiben über
-# `harw_knowledge::workbench` in den Sitzungs-Scope. Kein Zyklus:
-# `harw-knowledge` hängt (auch transitiv) nicht von `harw-registry-defaults` ab.
+# `workbench.note`/`workbench.hypothesis` (`workbench_tools.rs`) write through
+# `harw_knowledge::workbench` into the session scope. No cycle:
+# `harw-knowledge` does not depend (even transitively) on `harw-registry-defaults`.
 harw-knowledge = { path = "../harw-knowledge" }
-# Zeitstempel der Workbench-Einträge (`harw_knowledge::workbench` datiert in `jiff`).
+# Timestamps of the workbench entries (`harw_knowledge::workbench` dates in `jiff`).
 jiff = { workspace = true }
-# `agents.build` startet `harw agent build` als Job; `harw_tool_job::PreparedJob`
-# nimmt ein `tokio::process::Command`.
+# `agents.build` starts `harw agent build` as a job; `harw_tool_job::PreparedJob`
+# takes a `tokio::process::Command`.
 tokio = { version = "1", features = ["process"] }
 
 [features]
@@ -99,17 +101,17 @@ browser = ["dep:harw-browser", "dep:harw-tool-browser", "dep:harw-browser-thirty
 workspace = true
 
 [dev-dependencies]
-# Nur für Tests: die Freigabe-Regeln in `DefaultApprovalPolicy::review`
-# bekommen ihre Werkzeug-Argumente als `serde_json::Value`.
+# Tests only: the approval rules in `DefaultApprovalPolicy::review` receive
+# their tool arguments as `serde_json::Value`.
 serde_json = { workspace = true }
-# Nur für Tests: `SessionId`/`TurnId`/`TenantId`/`WorkspaceId` zum Bau eines
-# echten `harw_tools::ToolExecutionContext` in den End-to-End-Tests der
-# `_and_permits`-Montage (siehe `profile.rs::tests`).
+# Tests only: `SessionId`/`TurnId`/`TenantId`/`WorkspaceId` for building a
+# real `harw_tools::ToolExecutionContext` in the end-to-end tests of the
+# `_and_permits` assembly (see `profile.rs::tests`).
 harw-types = { path = "../harw-types" }
-# Nur für Tests: temporäre Workspace-Wurzeln für `WorkspaceRegistry::build`
-# in denselben Tests.
+# Tests only: temporary workspace roots for `WorkspaceRegistry::build` in the
+# same tests.
 tempfile = { workspace = true }
-# Nur für Tests: `ShellExecutor`s Bwrap-Ausführung läuft unter `tokio`. Die
-# Versionszeile ist bewusst identisch zu harw-tool-shell/Cargo.toml, damit im
-# Workspace nur eine `tokio`-Auflösung existiert.
+# Tests only: `ShellExecutor`'s bwrap execution runs under `tokio`. The
+# version line is deliberately identical to harw-tool-shell/Cargo.toml, so
+# that the workspace has only one `tokio` resolution.
 tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros"] }

@@ -1,8 +1,8 @@
 # Model lists refreshed from https://models.dev/api.json on 2026-09-11.
-# Eingebetteter Provider-Katalog (Basis, offline).
-# Wird von `embedded.rs::embedded_catalog()` via include_str! geladen.
-# Felder entsprechen `spec::ProviderSpec`; `auth` ist ein Array internally-tagged
-# `AuthMethod` (Feld `method` kebab-case, Struct-Felder `env_vars`/`sources`).
+# Embedded provider catalog (base, offline).
+# Loaded by `embedded.rs::embedded_catalog()` via include_str!.
+# Fields correspond to `spec::ProviderSpec`; `auth` is an array of internally-tagged
+# `AuthMethod` (field `method` kebab-case, struct fields `env_vars`/`sources`).
 
 [[provider]]
 id = "openai"
@@ -703,18 +703,18 @@ auth = [{ method = "api-key", env_vars = ["MOONSHOT_API_KEY", "KIMI_API_KEY"] }]
 models = ["kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k3"]
 
 [[provider]]
-# Eigener Cloudflare Worker vor Workers AI: OpenAI-Chat-kompatibles Gateway,
-# Auth per Bearer-Token gegen ein worker-seitiges Secret (kein Zusammenhang
-# mit dem offiziellen Moonshot-Provider oben). Discovery via
-# `{base_url}/models` funktioniert, sofern der Worker `GET /v1/models`
-# implementiert (wie unser Referenz-Worker es tut).
+# Own Cloudflare Worker in front of Workers AI: OpenAI-chat-compatible gateway,
+# auth via bearer token against a worker-side secret (unrelated
+# to the official Moonshot provider above). Discovery via
+# `{base_url}/models` works as long as the worker implements `GET /v1/models`
+# (as our reference worker does).
 #
-# `base_url` ist absichtlich ein Platzhalter: der Worker-Hostname ist pro
-# Cloudflare-Account individuell (Custom Domain oder *.workers.dev) und
-# gehört deshalb nicht fest in den eingebetteten Katalog — analog zu
-# `foundry` (Azure-Ressourcen-URL) und `custom`. Die konkrete URL und der
-# Secret-Verweis leben in der Profil-Provider-Datei, z. B.
-# `~/.harw/profiles/<profil>/providers/cf-worker.toml`.
+# `base_url` is intentionally a placeholder: the worker hostname is specific to each
+# Cloudflare account (custom domain or *.workers.dev) and
+# therefore does not belong hard-coded in the embedded catalog — analogous to
+# `foundry` (Azure resource URL) and `custom`. The concrete URL and the
+# secret reference live in the profile provider file, e.g.
+# `~/.harw/profiles/<profile>/providers/cf-worker.toml`.
 id = "cf-worker"
 name = "Cloudflare Worker (eigenes Gateway)"
 base_url = "https://<dein-worker>.example/v1"
@@ -849,12 +849,12 @@ base_url = "http://localhost:1234/v1"
 api = "openai-chat"
 auth = [{ method = "local-base-url" }]
 
-# Runde 7, Teil L2: vLLM (OpenAI-kompatibler Server, Standard-Port 8000).
-# Werkzeugaufrufe brauchen beim Serverstart
+# Round 7, part L2: vLLM (OpenAI-compatible server, default port 8000).
+# Tool calls require at server start
 #   --enable-auto-tool-choice --tool-call-parser <parser>
-# (z. B. `hermes` für Qwen2.5/Hermes, `qwen3_coder` für Qwen3-Coder,
-# `mistral`, `llama3_json`); das Kontextfenster setzt `--max-model-len`.
-# Siehe docs/setup/local-models.md.
+# (e.g. `hermes` for Qwen2.5/Hermes, `qwen3_coder` for Qwen3-Coder,
+# `mistral`, `llama3_json`); the context window is set by `--max-model-len`.
+# See docs/setup/local-models.md.
 [[provider]]
 id = "vllm"
 name = "vLLM (lokal)"

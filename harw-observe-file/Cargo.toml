@@ -9,10 +9,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# harw-macros ist Baseline jeder Crate für den einen Fehlertyp
-# (Kopfteil "Fehler": `#[derive(harw_macros::HarwError)]`), nicht Teil der
-# für harw-observe-file explizit aufgezählten Liste, aber ohne sie gäbe es
-# keinen Weg, `ObserveFileError` ohne anyhow/thiserror zu bauen.
+# harw-macros is the baseline of every crate for the single error type
+# (header section "Errors": `#[derive(harw_macros::HarwError)]`), not part of the
+# list explicitly enumerated for harw-observe-file, but without it there would be
+# no way to build `ObserveFileError` without anyhow/thiserror.
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 serde = { workspace = true }

@@ -9,16 +9,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Liest Cargo.toml und Cargo.lock ohne Subprozess und liefert den
-# Workspace-Graphen samt Ebenen. Grundlage von Gate 1 und Gate 2 — beide
-# müssten sonst `cargo metadata` aufrufen, also einen Subprozess starten.
+# Reads Cargo.toml and Cargo.lock without a subprocess and delivers the
+# workspace graph including layers. Basis of gate 1 and gate 2 — both
+# would otherwise have to call `cargo metadata`, i.e. start a subprocess.
 harw-code-graph = { path = "../harw-code-graph" }
-# Liest `xtask/arch-policy.toml` für das Gate `arch` (Schichtenregeln,
-# Ausnahmen, TCB-Allowlisten). Bereits über `harw-code-graph` im Baum —
-# keine neue Fassung, nur eine direkte Kante. Kein `serde`-Derive: die
-# Richtlinie wird als `toml::Table` gelesen und von Hand validiert, damit
-# jeder Formfehler eine lesbare Meldung statt eines Deserialisierungsfehlers
-# wird.
+# Reads `xtask/arch-policy.toml` for the `arch` gate (layer rules,
+# exceptions, TCB allowlists). Already in the tree via `harw-code-graph` —
+# no new version, only a direct edge. No `serde` derive: the
+# policy is read as a `toml::Table` and validated by hand, so that
+# every shape error becomes a readable message instead of a deserialization error.
 toml = { workspace = true }
 
 [lints]

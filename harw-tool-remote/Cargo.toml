@@ -14,8 +14,8 @@ harw-protocol = { path = "../harw-protocol" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 serde_json = { workspace = true }
-# `select!` (Aufruf gegen den Turn-`CancelToken`) und `Handle::try_current`
-# (`tool.cancel` beim Verwerfen eines laufenden Aufrufs).
+# `select!` (call against the turn `CancelToken`) and `Handle::try_current`
+# (`tool.cancel` when discarding a running call).
 tokio = { version = "1", features = ["rt", "macros"] }
 tracing = { workspace = true }
 

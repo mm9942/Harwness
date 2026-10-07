@@ -6,18 +6,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Eingebautes Job-System für lang laufende Prozesse (job.start/status/logs/stop/list/wait) statt tmux: Logs unter <state>/jobs/<id>/, Fortschrittserkennung und gedrosselte Meldungen an den besitzenden Agenten."
+description = "Built-in job system for long-running processes (job.start/status/logs/stop/list/wait) instead of tmux: logs under <state>/jobs/<id>/, progress detection and throttled notifications to the owning agent."
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
-# Derselbe Rechte-/Freigabeweg wie `shell.exec` (Sandbox/Host-Lease/Permit,
-# sudo-Verbot, rlimits): `ShellToolProvider::prepare_background_launch`.
+# The same rights/approval path as `shell.exec` (sandbox/host lease/permit,
+# sudo ban, rlimits): `ShellToolProvider::prepare_background_launch`.
 harw-tool-shell = { path = "../harw-tool-shell" }
 jiff = { workspace = true }
-# Signale an die ganze Prozessgruppe (`kill(-pgid, …)`) ohne `unsafe`/libc.
+# Signals to the whole process group (`kill(-pgid, …)`) without `unsafe`/libc.
 rustix = { workspace = true, features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

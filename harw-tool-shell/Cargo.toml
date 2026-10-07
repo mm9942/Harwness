@@ -14,13 +14,13 @@ harw-extension-api = { path = "../harw-extension-api" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
-# Runde 5, Teil B (`host.sudo_exec`): `#[derive(Redact)]` für den Audit-Datensatz,
-# argv-Hash und genullte Passwortpuffer (alle bereits im Cargo.lock).
+# Round 5, part B (`host.sudo_exec`): `#[derive(Redact)]` for the audit record,
+# argv hash and zeroed password buffers (all already in Cargo.lock).
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 blake3 = { workspace = true }
-# Runde 7, Teil T2 (`latex.template`): heutiges Datum in lokaler Zeitzone
-# (bereits im Cargo.lock, Workspace-Abhängigkeit).
+# Round 7, part T2 (`latex.template`): today's date in the local time zone
+# (already in Cargo.lock, workspace dependency).
 jiff = { workspace = true }
 zeroize = "1"
 serde = { version = "1", features = ["derive"] }

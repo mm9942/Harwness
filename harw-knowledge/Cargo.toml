@@ -27,33 +27,33 @@ harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
 # explicitly supports dev-dependency cycles since they never enter the
 # production dependency graph.
 harw-dod-rules = { path = "../dod/crates/harw-dod-rules" }
-# AW3-03: Quellenbindung `KnowledgeContextProvider` liefert `harw_context::Fragment`.
-# Kein Zyklus: `harw-context` hängt nur von harw-types/harw-lens-types/harw-macros
-# ab, keines davon kennt harw-knowledge.
+# AW3-03: source binding; `KnowledgeContextProvider` yields `harw_context::Fragment`.
+# No cycle: `harw-context` depends only on harw-types/harw-lens-types/harw-macros,
+# none of which knows harw-knowledge.
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
-# AW5-09: `ContextProposal::target_program` referenziert die `DefinitionId`
-# eines Kontextprogramms (`harwness.context.<name>@<major>`, siehe
-# `context_program.rs` §Grammatik) und `ProposedChange` bettet
-# `RawContextSectionSpec`/`SectionStrength` ein, statt sie zu duplizieren.
-# Kein Zyklus: `harw-agent-dsl` hängt nur von `harw-context` (das
-# `harw-knowledge` bereits kennt), `semver`, `serde`, `time`, `toml`, `blake3`
-# ab — keines davon kennt `harw-knowledge` (geprüft zum Zeitpunkt AW5-09).
+# AW5-09: `ContextProposal::target_program` references the `DefinitionId`
+# of a context program (`harwness.context.<name>@<major>`, see
+# `context_program.rs` §grammar) and `ProposedChange` embeds
+# `RawContextSectionSpec`/`SectionStrength` instead of duplicating them.
+# No cycle: `harw-agent-dsl` depends only on `harw-context` (which
+# `harw-knowledge` already knows), `semver`, `serde`, `time`, `toml`, `blake3`
+# — none of which knows `harw-knowledge` (checked at AW5-09 time).
 harw-agent-dsl = { path = "../harw-agent-dsl" }
-# AW5-09: `ContextProposal::evidence: Vec<EvidenceRef>` — dieselbe Belegkette,
-# die `harw-plan`-Knoten trägt (inkl. `digest: Option<ContentDigest>`, AW4-04).
-# Kein Zyklus: `harw-plan` hängt nur von `harw-macros`/`harw-types`/`serde`/
-# `serde_json`/`time`/`tracing` ab, keines davon kennt `harw-knowledge`. Auf
-# `harw-plan-bridge` (das umgekehrt bereits von `harw-knowledge` abhängt, siehe
-# `fragment_registry.rs`) wird bewusst NICHT zugegriffen — das wäre der Zyklus.
+# AW5-09: `ContextProposal::evidence: Vec<EvidenceRef>` — the same chain of
+# evidence that `harw-plan` nodes carry (incl. `digest: Option<ContentDigest>`, AW4-04).
+# No cycle: `harw-plan` depends only on `harw-macros`/`harw-types`/`serde`/
+# `serde_json`/`time`/`tracing`, none of which knows `harw-knowledge`.
+# `harw-plan-bridge` (which conversely already depends on `harw-knowledge`, see
+# `fragment_registry.rs`) is deliberately NOT accessed — that would be the cycle.
 # AW6-06: `ModelBehaviorProposal` embeds `harw_model_catalog::descriptor`'s
 # `ToolCallingSupport`/`TokenCount` and `harw_model_catalog::observed::Score`
-# read-only, instead of duplicating that vocabulary. Kein Zyklus: geprüft zum
-# Zeitpunkt AW6-06 hängt `harw-model-catalog` nur von `harw-config`,
-# `harw-context`, `harw-lens-types`, `harw-types` (path) und externen Crates
-# (reqwest/secrecy/serde/serde_json/tokio/time/toml) ab — keine dieser
-# Path-Abhängigkeiten kennt `harw-knowledge` (dieselbe Prüfung, die AW5-09
-# bereits für `harw-agent-dsl`/`harw-context` durchgeführt hat).
+# read-only, instead of duplicating that vocabulary. No cycle: as checked at
+# AW6-06 time, `harw-model-catalog` depends only on `harw-config`,
+# `harw-context`, `harw-lens-types`, `harw-types` (path) and external crates
+# (reqwest/secrecy/serde/serde_json/tokio/time/toml) — none of these
+# path dependencies knows `harw-knowledge` (the same check that AW5-09
+# already performed for `harw-agent-dsl`/`harw-context`).
 harw-model-catalog = { path = "../harw-model-catalog" }
 harw-plan = { path = "../harw-plan" }
 # AW6-08: the Context Steward's three null counters (`context_steward.rs`)
@@ -61,9 +61,9 @@ harw-plan = { path = "../harw-plan" }
 # TelemetrySink, Cardinality, MetricKey, MetricKind, Unit}` to make the
 # invariants it hangs a counter on observable, per the mechanic `harw-observe`
 # built in AW1-07 (deliberately without any concrete counters of its own).
-# Kein Zyklus: `harw-observe` hängt nur von `harw-macros` und `serde` ab
-# (siehe `harw-observe/Cargo.toml`), keines davon kennt `harw-knowledge` —
-# geprüft zum Zeitpunkt AW6-08.
+# No cycle: `harw-observe` depends only on `harw-macros` and `serde`
+# (see `harw-observe/Cargo.toml`), none of which knows `harw-knowledge` —
+# checked at AW6-08 time.
 harw-observe = { path = "../harw-observe" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
@@ -73,8 +73,8 @@ serde_norway = "0.9.42"
 # workspace default (`[workspace.dependencies] toml`, root `Cargo.toml`), same
 # as `harw-home`/`harw-authority`/`harw-lens-embed`.
 toml = { workspace = true }
-# Prozessübergreifende Dateisperren (`src/lock.rs`, Runde 4 D0) — dieselbe
-# Workspace-Fassung, die `harw-session-store` für Transcript-/Job-Sperren nutzt.
+# Cross-process file locks (`src/lock.rs`, round 4 D0) — the same
+# workspace version that `harw-session-store` uses for transcript/job locks.
 fs4 = { workspace = true }
 # External crates are LISTED here for the parent build to `cargo add` (this
 # worker never runs cargo); no version is invented for them.

@@ -20,10 +20,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1.53.0", features = ["rt", "macros", "time", "net"] }
 secrecy = "0.10"
 axum = "0.8.9"
-# Ohne Versionspin, wie alle anderen Workspace-internen Pfad-Deps: eine Version
-# neben `path` ist für den lokalen Build redundant und wird bei einem
-# Versionsbump zur zweiten Stelle, die man vergessen kann.
-# `harw/tests/version_coherence.rs` prüft genau das.
+# Without a version pin, like all other workspace-internal path deps: a version
+# next to `path` is redundant for the local build and becomes a second
+# place to forget on a version bump.
+# `harw/tests/version_coherence.rs` checks exactly that.
 harw-config = { path = "../harw-config" }
 infer = "0.22.0"
 fs4 = "1.1.0"

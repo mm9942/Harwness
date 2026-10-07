@@ -1,6 +1,6 @@
 ---
 id: HP-CATALOG
-title: Harness-Muster — Claude Code × Codex × OpenClaw × harw
+title: Harness patterns — Claude Code × Codex × OpenClaw × harw
 status: living
 date: 2026-09-27
 tags: [harness-patterns, catalog, roadmap, multi-provider]
@@ -15,9 +15,9 @@ related:
   - ../85-gap-hunt/patterns.md
 ---
 
-> Opus-Synthese der Rechercheblätter, danach ein gegnerischer Opus-Kritiker.
-> Seine Korrekturen sind im Text eingearbeitet (Abschnitt „Kritiker-Korrekturen“
-> am Ende). Wo Katalog und Korrektur sich widersprechen, **gilt die Korrektur**.
+> Opus synthesis of the research sheets, followed by an adversarial Opus critic.
+> Its corrections are incorporated into the text (section "Critic corrections"
+> at the end). Where the catalog and a correction contradict each other, **the correction wins**.
 
 # Cross-harness pattern catalog: Claude Code, Codex, OpenClaw → harw
 
@@ -29,7 +29,7 @@ Every harw claim below was checked against HEAD. The sources are the five sheets
 
 **2. Goal loops are stop gates, and harw's goal loop is already stricter than both.** Claude Code's `/goal` is a prompt-based Stop hook where a small model judges `met`, `not yet met` or `impossible`. Codex's `ext/goal` gives the model an `update_goal` tool. In harw the model can never declare a goal achieved or abandoned (`harw-ops/src/goal.rs:10-20`). The judge verdict is `passed: bool` and fails closed (DEC-001), and judge output is capped at 256 tokens (DEC-002). The missing piece is only a way to use this gate from chat sessions.
 
-**3. Per-run caps are the wrong unit; harw needs one ledger.** Claude Code workflows cap concurrency per run (default 16, depends on CPU count). The gap-hunt kit states the cap as CPUs − 2 per workflow and starts one top-level run per area *in order to* multiply it (`85-gap-hunt/kit/skills/gap-hunt/SKILL.md:24-27`); that parallel cut is P6's remedy. harw already has one provider authority (DEC-003: `ProviderRateLimiter`, `pacing_wait` at `harw-core/src/model.rs:647`). But the work driver keeps its own `parallel_ceiling` with `RESERVED_PROVIDER_SLOTS = 1` (`harw-cli/src/job_worker_work_driver.rs:164,374`), and subagents have their own `ChildLimits` (conservative defaults depth 4, 8 per parent in `harw-core/src/child_controller.rs:686-691`; the production values are set in `harw-runtime/src/budget.rs:268-277`, where depth is configurable from 1 to 6). The ledger holds provider slots (DEC-003/023) *and* node capacity (CPUs − 2, plus a `BuildSlot` of 1 per workspace, DEC-004; placement §6 and "Ergänzungen"). Per-run caps go away, so the parallel cut stops being a workaround and becomes a placement decision (pattern M2).
+**3. Per-run caps are the wrong unit; harw needs one ledger.** Claude Code workflows cap concurrency per run (default 16, depends on CPU count). The gap-hunt kit states the cap as CPUs − 2 per workflow and starts one top-level run per area *in order to* multiply it (`85-gap-hunt/kit/skills/gap-hunt/SKILL.md:24-27`); that parallel cut is P6's remedy. harw already has one provider authority (DEC-003: `ProviderRateLimiter`, `pacing_wait` at `harw-core/src/model.rs:647`). But the work driver keeps its own `parallel_ceiling` with `RESERVED_PROVIDER_SLOTS = 1` (`harw-cli/src/job_worker_work_driver.rs:164,374`), and subagents have their own `ChildLimits` (conservative defaults depth 4, 8 per parent in `harw-core/src/child_controller.rs:686-691`; the production values are set in `harw-runtime/src/budget.rs:268-277`, where depth is configurable from 1 to 6). The ledger holds provider slots (DEC-003/023) *and* node capacity (CPUs − 2, plus a `BuildSlot` of 1 per workspace, DEC-004; placement §6 and "Additions from the session"). Per-run caps go away, so the parallel cut stops being a workaround and becomes a placement decision (pattern M2).
 
 **4. Cost must be cache-aware, computed from data, and computed by harw.** Claude Code reports `total_cost_usd` and survives resume. Codex reports tokens only. OpenClaw treats the provider's usage API as primary; harw's own sheets decide the opposite (D10). The usage fields are right: `TokenUsage` has `cache_separate` (`harw-types/src/usage.rs:8-22`) and `UsageRound` records usage per provider and model (`harw-core/src/state_store.rs:287`). But mixed-provider sums double-count (`cache_separate |=`, `harw-types/src/usage.rs:85`), and the Anthropic hit rate prints about 7000 % (`harw-ops/src/usage.rs:113`). harw computes no dollar amount anywhere. The catalog's `Pricing` type is `f32` and has no cache-write price (`harw-model-catalog/src/descriptor.rs:282-288`). With about 98 % cache reads, the cache-read price decides cost (GLM-5.3 Flash on Workers AI: $0.03 vs $0.15 input; its cache-write price is unpublished, `cost-model.md:72`). So prices live in a route-keyed `prices.toml`, never in code, with exact integer types (`RatePerMTok`, `PicoUsd`, `MicroUsd`) in a new ring-I crate `harw-cost` (`cost-model.md` §2.2, §2.5, §2.6). Cache affinity follows the prefix group (`x-harw-cache-affinity`), not the identity.
 
@@ -44,7 +44,7 @@ Every harw claim below was checked against HEAD. The sources are the five sheets
 - **D6, schema type.** The Codex sheet proposes `serde_json::Value` on `ModelRequest`. Placement §5 bans `serde_json::Value` from its public APIs. A harw-owned `JsonSchema` exists (`harw-tools/src/schema.rs:24`) and should be used.
 - **D7, DEC numbers.** Placement says DEC-001 to DEC-019 are "taken". Only DEC-001 to DEC-008 are written. DEC-009 and DEC-010 are proposals (Copilot tasks C-08 and C-10), and DEC-011 to DEC-019 are reserved by PL-65 (`65-cloud-sessions/README.md:758-766`).
 - **D8, file location.** `SandboxRequirement` is defined in `harw-job-core/src/spec.rs:249`, not in `harw-job-exec/src/plan.rs` as the Codex sheet says; `plan.rs` only uses it (`:13,62`).
-- **D9, workflow cap figure: not a real disagreement.** "Standard 16, CPU-abhängig" (`claude-code.md:81`) is compatible with P6's CPUs − 2 per workflow. Both are per-run caps.
+- **D9, workflow cap figure: not a real disagreement.** "default 16, CPU-dependent" (`claude-code.md:81`) is compatible with P6's CPUs − 2 per workflow. Both are per-run caps.
 - **D10, cost authority.** OpenClaw treats the provider's usage API as primary and its own estimate as fallback (`openclaw.md:173`). `cost-model.md` §3 and `gateway-contract.md:78-79` make harw's own computation authoritative. Resolved in DEC 5 (§6).
 
 ## 2. Pattern table
@@ -168,7 +168,7 @@ Proposed titles without final numbers. They would start at DEC-028 or later, and
 13. Code that encodes another tool's wire details carries a "verified against commit X" marker and a recheck cadence.
 14. MCP tools are ordinary tools under the same policy fold, and starting an MCP server is a trust decision made in config.
 
-## Kritiker-Korrekturen (eingearbeitet)
+## Critic corrections (incorporated)
 
 - **S1** applied: §3 control-surface row, §4 ClawJacked, DEC 11, R11 (runner token on loopback).
 - **S2** applied: H12, §3 headless row, DEC 4.

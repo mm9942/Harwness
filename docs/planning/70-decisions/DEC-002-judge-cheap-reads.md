@@ -1,6 +1,6 @@
 ---
 id: DEC-002
-title: Richter — billige Lesevorgänge, teure Ausgabe gedeckelt
+title: Judge — cheap reads, capped expensive output
 status: accepted
 date: 2026-09-27
 tags: [decision, work-driver, cost, judge]
@@ -9,76 +9,75 @@ related:
   - ../../guides/work-driver.md
 ---
 
-# DEC-002 — Richter — billige Lesevorgänge, teure Ausgabe gedeckelt
+# DEC-002 — Judge — cheap reads, capped expensive output
 
-## Entscheidung
-Der Bewerter (Judge) im Work-Driver läuft als eigener interner Worker
-(`InternalModelPoint::WorkDriverJudge`) mit eigener Provider-/Modell-Wahl,
-ohne Werkzeuge. Er darf im Hintergrund viel lesen (Goal, Kriterien,
-Nachweise), weil das über Runden hinweg größtenteils aus dem Provider-Cache
-kommt; kostenrelevant ist nur die Ausgabe, und die ist auf minimale Antworten
-(`{"passed": false}` im Zweifel) sowie eine feste Obergrenze von 256
-Ausgabe-Token gedeckelt. Aktuell läuft der Richter einmal je abgeschlossener
-Welle, nach der zentralen Verifikation (`decide` hat keine Eingabe für
-Einzel-Worker-Verdikte innerhalb einer Welle); ein Aufruf nach jedem
-Worker-Ergebnis ist durch die Kostenlogik gedeckt und günstig, aber erst
-sinnvoll, sobald `decide` Verdikte pro Worker konsumiert — das ist möglich,
-aber noch nicht aktiv.
+## Decision
+The judge in the work driver runs as its own internal worker
+(`InternalModelPoint::WorkDriverJudge`) with its own provider/model choice,
+without tools. It may read a lot in the background (goal, criteria,
+evidence), because across rounds most of that comes from the provider cache;
+only the output is cost-relevant, and it is capped at minimal answers
+(`{"passed": false}` in case of doubt) as well as a fixed upper limit of 256
+output tokens. Currently the judge runs once per completed wave, after the
+central verification (`decide` has no input for individual worker verdicts
+within a wave); a call after every worker result is covered by the cost logic
+and cheap, but only makes sense once `decide` consumes per-worker verdicts —
+that is possible, but not yet active.
 
-## Warum
-- Getrennte `InternalModelPoint`-Stelle statt Wiederverwendung des
-  Hauptmodells: eigenes, günstigeres Modell/Provider für eine reine
-  Klassifikationsaufgabe, unabhängig von der Wahl des Hauptworkers.
-- Keine Werkzeuge: der Richter urteilt einmalig aus der vorliegenden Evidenz,
-  keine Rückfragen, kein Tool-Overhead, kein zusätzlicher Runden-Ping-Pong.
-- Stabiler Prompt-Präfix (`JUDGE_INSTRUCTION` + Kriterien) über eine
-  fortgeführte Session statt Neuaufbau je Runde: der wiederholte Anteil trifft
-  den Provider-Cache, nur der variable Teil (neue Evidenz) ist ein echter
-  Treffer gegen den Cache-Rabatt — Lesen ist dadurch faktisch billig.
-- Ausgabe ist der teure Teil bei den meisten Anbietern (Output-Token kosten
-  mehr als Cache-Reads), deshalb die harte Grenze `JUDGE_MAX_OUTPUT_TOKENS =
-  256` und eine minimale Antwortform: `{"passed": bool}` reicht, `comment`/
-  `missing` sind optional und knapp.
-- Fail-closed passt zur Kostenlogik: unklare/unlesbare Antwort → `passed:
-  false` (siehe DEC-001) statt einer teuren Nachfrage oder einem zweiten
-  Versuch.
-- Ein Aufruf nach jedem Worker-Ergebnis statt nur je Welle wäre durch die
-  Kostenlogik gedeckt (Lesen bleibt Cache-Read, nur die Ausgabe zählt), muss
-  aber ebenso günstig bleiben — sonst skaliert die Richter-Kostenlast linear
-  mit der Anzahl Worker-Runden statt mit der Anzahl Wellen.
+## Why
+- A separate `InternalModelPoint` slot instead of reusing the main model: its
+  own, cheaper model/provider for a pure classification task, independent of
+  the choice of the main worker.
+- No tools: the judge rules once from the evidence at hand, with
+  no follow-up questions, no tool overhead, and no additional round ping-pong.
+- A stable prompt prefix (`JUDGE_INSTRUCTION` + criteria) over a
+  continued session instead of rebuilding each round: the repeated portion hits
+  the provider cache, and only the variable part (new evidence) is a real
+  miss against the cache discount — reading is therefore effectively cheap.
+- Output is the expensive part at most providers (output tokens cost
+  more than cache reads), hence the hard limit `JUDGE_MAX_OUTPUT_TOKENS =
+  256` and a minimal answer form: `{"passed": bool}` suffices, `comment`/
+  `missing` are optional and terse.
+- Fail-closed fits the cost logic: unclear/unreadable answer → `passed:
+  false` (see DEC-001) instead of an expensive follow-up or a second
+  attempt.
+- A call after every worker result instead of only per wave would be covered by
+  the cost logic (reading stays a cache read, only the output counts), but
+  would have to stay equally cheap — otherwise the judge's cost load scales
+  linearly with the number of worker rounds instead of the number of waves.
 
-## Folgen
-- Der Richter braucht eine eigene Konfigurationsstelle
-  (`work_driver_judge` in `harw-config`) mit eigenem Fallback (schnelles
-  Modell des aktiven Providers, kein OpenRouter-Standard ohne explizite
-  Wahl) — analog zu `AutoClassifier`.
-- Trade-off: die 256-Token-Grenze zwingt zu knappen `comment`/`missing`-
-  Feldern; ein Richter, der ausführlich begründen soll, passt nicht in dieses
-  Budget und bräuchte eine andere Stelle.
-- Trade-off: selbst im aktuellen Zuschnitt (einmal je Welle, nach der
-  Verifikation) bedeuten Cache-Reads plus gedeckelte Ausgabe weiterhin
-  nicht-null Kosten pro Welle; die Entscheidung verlagert die Kosten nur auf
-  die günstigere Seite (Lesen statt Schreiben), sie eliminiert sie nicht.
-- Ein Wechsel auf „nach jedem Worker-Ergebnis" setzt voraus, dass `decide`
-  Verdikte pro Worker als Eingabe bekommt — das ist eine spätere Erweiterung,
-  keine heutige.
-- Zukünftige Änderungen an der Judge-Instruktion (`JUDGE_INSTRUCTION`)
-  müssen die Cache-Präfix-Stabilität erhalten, sonst verfällt der
-  Kostenvorteil aus dem wiederverwendeten Präfix.
+## Consequences
+- The judge needs its own configuration slot
+  (`work_driver_judge` in `harw-config`) with its own fallback (fast
+  model of the active provider, no OpenRouter default without an explicit
+  choice) — analogous to `AutoClassifier`.
+- Trade-off: the 256-token limit forces terse `comment`/`missing`
+  fields; a judge that is supposed to give detailed reasoning does not fit this
+  budget and would need a different slot.
+- Trade-off: even in the current shape (once per wave, after
+  verification), cache reads plus capped output still mean
+  non-zero cost per wave; the decision only shifts the cost to
+  the cheaper side (reading instead of writing), it does not eliminate it.
+- A switch to "after every worker result" requires that `decide`
+  receives per-worker verdicts as input — that is a later extension,
+  not a present one.
+- Future changes to the judge instruction (`JUDGE_INSTRUCTION`)
+  must preserve cache-prefix stability, otherwise the cost advantage from the
+  reused prefix is lost.
 
-## Wo im Code
+## Where in the code
 - [harw-config/src/internal_models.rs](../../../harw-config/src/internal_models.rs) —
   `InternalModelPoint::WorkDriverJudge`, `key()` (`"work_driver_judge"`),
   `description()`, `uses_openrouter_default()`, `openrouter_default_model()`.
 - [harw-cli/src/job_worker_work_driver.rs](../../../harw-cli/src/job_worker_work_driver.rs) —
-  `JUDGE_MAX_OUTPUT_TOKENS: u32 = 256`, `load_run_config` (löst
-  `InternalModelPoint::WorkDriverJudge` über `resolve_internal_model` auf,
-  liefert `RunConfig.judge`).
+  `JUDGE_MAX_OUTPUT_TOKENS: u32 = 256`, `load_run_config` (resolves
+  `InternalModelPoint::WorkDriverJudge` via `resolve_internal_model`,
+  yields `RunConfig.judge`).
 - [harw-plan-bridge/src/work_driver.rs](../../../harw-plan-bridge/src/work_driver.rs) —
-  `JudgeVerdict`, `JUDGE_INSTRUCTION` (stabiler Präfix, keine Tools, keine
-  Rückfragen).
+  `JudgeVerdict`, `JUDGE_INSTRUCTION` (stable prefix, no tools, no
+  follow-up questions).
 
-## Verwandt
-- [DEC-001 Judge-Verdikt `passed: bool`](DEC-001-passed-true.md)
-- [DEC-003 Provider-Limits](DEC-003-provider-limits.md)
-- [DEC-005 Kleine Scopes, viele Wellen](DEC-005-small-scopes-waves.md)
+## Related
+- [DEC-001 Judge verdict `passed: bool`](DEC-001-passed-true.md)
+- [DEC-003 Provider limits](DEC-003-provider-limits.md)
+- [DEC-005 Small scopes, many waves](DEC-005-small-scopes-waves.md)

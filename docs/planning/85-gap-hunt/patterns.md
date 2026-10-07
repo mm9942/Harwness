@@ -1,6 +1,6 @@
 ---
 id: GAP-PATTERNS
-title: Muster-Katalog für Lückenjagden
+title: Pattern catalog for gap hunts
 status: living
 date: 2026-09-27
 tags: [gap-hunt, patterns, review, catalog]
@@ -11,124 +11,121 @@ related:
   - ../70-decisions/DEC-007-worker-rights.md
 ---
 
-# Muster-Katalog
+# Pattern catalog
 
-Wiederverwendbarer Katalog für jede Lückenjagd:
-- Die Finder taggen jeden Fund mit einem Muster-Kürzel.
-- Neue Muster kommen erst als `NEW:<name>` herein und werden hier
-  aufgenommen, sobald sie in mehr als einem Bereich auftauchen.
+A reusable catalog for every gap hunt:
+- Finders tag each finding with a pattern code.
+- New patterns first come in as `NEW:<name>` and are added here as soon as
+  they show up in more than one area.
 
-Jeder Eintrag hat die gleichen Teile:
-- **Erkennen:** woran ein Finder es sieht.
-- **Regel:** wie der Code es richtig macht.
-- **Werkzeug:** ob ein Gate es dauerhaft abfangen kann.
+Every entry has the same parts:
+- **Recognize:** how a finder spots it.
+- **Rule:** how the code does it correctly.
+- **Tooling:** whether a gate can catch it permanently.
 
-## Muster im Code
+## Patterns in code
 
-### M1 — Prüfung nach dem Erfolgspfad (fail-open)
-- **Erkennen:**
-  - Die Prüfung steht im `else`/Fehlerzweig oder im Fallback. Beispiel:
-    `if ok { return Succeed }` steht vor dem Policy-Check.
-  - Lockere Fallbacks: ein Freitext-Parser liest „passed“ auch in
-    verneinter Form.
-  - Die Default-Erlaubnis gewinnt.
-  - Eine nicht vertrauenswürdige Konfigurationsschicht kann Guards
-    abschalten.
-  - Dateirechte werden der umask überlassen.
-  - Erst prüfen, dann benutzen (TOCTOU).
-  - Fehler werden nur geloggt, wo sie den Ablauf stoppen müssten.
-- **Regel:**
-  - Der Guard steht vor dem Erfolgspfad.
-  - Default ist Verweigern.
-  - Die Vertrauensschicht ist explizit.
-  - Rechte werden explizit gesetzt.
-  - Check-then-use wird zu Open-then-check.
-- **Werkzeug:** Das ist ein Review-Punkt. Ein eigener Finder mit dieser Brille
-  lohnt sich in jedem Bereich.
+### M1 — Check after the success path (fail-open)
+- **Recognize:**
+  - The check sits in the `else`/error branch or in the fallback. Example:
+    `if ok { return Succeed }` comes before the policy check.
+  - Loose fallbacks: a free-text parser also reads "passed" in negated form.
+  - The default permission wins.
+  - An untrusted configuration layer can switch guards off.
+  - File permissions are left to the umask.
+  - Check first, use later (TOCTOU).
+  - Errors are only logged where they should stop the flow.
+- **Rule:**
+  - The guard comes before the success path.
+  - The default is deny.
+  - The trust layer is explicit.
+  - Permissions are set explicitly.
+  - Check-then-use becomes open-then-check.
+- **Tooling:** This is a review item. A dedicated finder with this lens
+  pays off in every area.
 
-### M2 — Limit- und Zähl-Logik über Schichten verteilt
-- **Erkennen:** Provider, Retry und Worker haben je eigene Deckel und Zähler.
-  - Eine Wartezeit wird gekürzt.
-  - Ein Slot bleibt während einer Wartezeit belegt.
-  - Die Zählung geht bei einem Neustart verloren.
-- **Regel:**
-  - Invarianten stehen zentral, siehe DEC-003.
-  - Jede Schicht leitet die Werte nur weiter.
-  - Zustände, die einen Neustart überleben müssen, werden persistiert.
-- **Werkzeug:** eine Invarianten-Testsuite über alle Schichten.
+### M2 — Limit and counting logic spread across layers
+- **Recognize:** Provider, retry, and worker each have their own caps and
+  counters.
+  - A wait time is shortened.
+  - A slot stays occupied during a wait.
+  - The count is lost on restart.
+- **Rule:**
+  - Invariants live in one central place, see DEC-003.
+  - Each layer only passes the values through.
+  - State that must survive a restart is persisted.
+- **Tooling:** an invariant test suite across all layers.
 
-### M3 — Doku driftet vom Code
-- **Erkennen:**
-  - Kommentare, Guides, das Ledger oder Architektur-Dokumente beschreiben
-    den alten Zustand.
-  - Besonders nach dem Wechsel von Quellen oder Abhängigkeiten.
-  - Status-Behauptungen kommen vor dem Merge („LANDED“).
-- **Regel:**
-  - Wer Verhalten ändert, grept nach dem alten Begriff im ganzen Repo.
-  - Ein Status steht erst nach dem Merge im Ledger.
-- **Werkzeug:** ein abschließender Cross-File-Check (Opus) über den ganzen
-  Diff.
+### M3 — Docs drift from the code
+- **Recognize:**
+  - Comments, guides, the ledger, or architecture documents describe the old
+    state.
+  - Especially after switching sources or dependencies.
+  - Status claims arrive before the merge ("LANDED").
+- **Rule:**
+  - Whoever changes behavior greps the whole repo for the old term.
+  - A status goes into the ledger only after the merge.
+- **Tooling:** a final cross-file check (Opus) over the whole diff.
 
-### M4 — Hotspot-Datei
-- **Erkennen:** Eine Datei vereint mehrere Zuständigkeiten und sammelt
-  überproportional viele Funde.
-- **Regel:** In Module teilen. Bei „ein Agent pro Datei“ entscheidet die
-  Dateigröße über die Parallelität.
-- **Werkzeug:** Funde pro Datei zählen, die fünf größten zuerst teilen.
+### M4 — Hotspot file
+- **Recognize:** One file combines several responsibilities and collects a
+  disproportionate number of findings.
+- **Rule:** Split into modules. With "one agent per file", file size decides
+  the parallelism.
+- **Tooling:** Count findings per file and split the five largest first.
 
-### M5 — Unbegrenzte Eingaben an Vertrauensgrenzen
-- **Erkennen:** `read_to_end`, Zeilen lesen, Event-Puffer oder `await` ohne
-  Obergrenze bzw. Timeout, besonders bei MCP, SSE, Kanälen und Netz.
-- **Regel:** Gemeinsame Helfer für begrenztes Lesen und Timeouts statt Lösungen
-  pro Stelle.
+### M5 — Unbounded input at trust boundaries
+- **Recognize:** `read_to_end`, line reads, event buffers, or `await` without
+  an upper bound or timeout, especially in MCP, SSE, channels, and network
+  code.
+- **Rule:** Shared helpers for bounded reads and timeouts instead of
+  per-site solutions.
 
-### M6 — Unstrukturierte Nebenläufigkeit
-- **Erkennen:**
-  - losgelöste `spawn`s pro Event oder Pumpe;
-  - Abbruch wird nicht weitergereicht, Future-Zustand geht verloren;
-  - Tasks sterben unbeaufsichtigt;
-  - ein Accept-Fehler beendet den Listener;
-  - ein Lock wird über `sleep`/`await` gehalten.
-- **Regel:** Beaufsichtigte Tasks (JoinSet/Handle mit Owner), Abbruch fließt
-  durch, Listener überleben Fehler einzelner Verbindungen.
+### M6 — Unstructured concurrency
+- **Recognize:**
+  - detached `spawn`s per event or pump;
+  - cancellation is not propagated, future state is lost;
+  - tasks die unsupervised;
+  - an accept error ends the listener;
+  - a lock is held across `sleep`/`await`.
+- **Rule:** Supervised tasks (JoinSet/handle with an owner), cancellation
+  flows through, listeners survive errors on individual connections.
 
-### M7 — Temp-Dateien
-- **Erkennen:** Vorhersagbare oder unsichere Temp-Pfade, besonders für
-  Ausführbares.
-- **Regel:** `tempfile` mit privaten Rechten, nichts Ausführbares in
-  gemeinsamen Temp-Verzeichnissen.
+### M7 — Temp files
+- **Recognize:** Predictable or insecure temp paths, especially for
+  executables.
+- **Rule:** `tempfile` with private permissions, nothing executable in shared
+  temp directories.
 
-### M8 — Dateien mehrerer Prozesse
-- **Erkennen:** Veraltete Locks werden übernommen, Schreiber arbeiten ohne
-  Lock, Verlauf wird nicht persistiert.
-- **Regel:** fs4-Locks mit klarer Übernahme-Regel, atomares Schreiben
+### M8 — Files shared by several processes
+- **Recognize:** Stale locks are taken over, writers work without a lock,
+  history is not persisted.
+- **Rule:** fs4 locks with a clear takeover rule, atomic writes
   (temp + rename).
 
-### M9 — Zustand ohne Endübergang
-- **Erkennen:** Ein Zustand hat einen Eingang, aber keinen sicheren Ausgang.
-  Ein Job bleibt für immer `Running`, ein fertiger Worker gibt seinen Slot nie
-  frei, eine Zielschleife dreht ohne Abbruch, ein abgelaufener Lease wird nie
-  bereinigt.
-- **Regel:** Jede Zustandsmaschine nennt ihre Endzustände. Jeder Pfad, auch
-  Fehler, Abbruch und Neustart, führt in einen davon. Beim Start werden
-  verwaiste Zustände abgeglichen (reconcile).
-- **Werkzeug:** Tests pro Endübergang, dazu ein Neustart-Test mit einem
-  Zustand, der mitten im Lauf liegen geblieben ist.
+### M9 — State without a terminal transition
+- **Recognize:** A state has an entry but no safe exit. A job stays `Running`
+  forever, a finished worker never releases its slot, a goal loop spins
+  without a stop condition, an expired lease is never cleaned up.
+- **Rule:** Every state machine names its terminal states. Every path,
+  including failure, cancellation, and restart, leads into one of them. At
+  startup, orphaned states are reconciled.
+- **Tooling:** Tests per terminal transition, plus a restart test with a state
+  that was left behind mid-run.
 
-### M10 — Erst sichtbar, dann persistiert
-- **Erkennen:** Ein Prozess macht einen Zustand sichtbar (Speicher, Event,
-  Antwort), bevor er dauerhaft geschrieben ist. Nach Absturz oder Neustart
-  fehlt, was Clients schon gesehen haben. Beispiele: Speicher vor dem fsync
-  des Verzeichnisses, eine Session-ID nur im Speicher, ein Event-Bus ohne
-  dauerhaften Replay.
-- **Abgrenzung:** M8 betrifft mehrere Prozesse an einer Datei, M10 die
-  Reihenfolge in einem Prozess.
-- **Regel:** Erst schreiben, dann sichtbar machen. Wo das nicht geht, ist
-  „bestätigt, aber nicht dauerhaft“ ein eigener Fehlerfall, den Aufrufer
-  unterscheiden können.
+### M10 — Visible first, persisted later
+- **Recognize:** A process makes a state visible (memory, event, response)
+  before it is durably written. After a crash or restart, what clients have
+  already seen is missing. Examples: memory before the directory fsync, a
+  session ID held only in memory, an event bus without durable replay.
+- **Distinction:** M8 concerns several processes on one file, M10 the order
+  within one process.
+- **Rule:** Write first, then make visible. Where that is not possible,
+  "acknowledged but not durable" is its own error case that callers can tell
+  apart.
 
-### Zuordnen statt NEW
-Finder taggen viele Funde als `NEW:<name>`, die schon ein Muster haben:
+### Map to a pattern instead of NEW
+Finders tag many findings as `NEW:<name>` that already have a pattern:
 - `unbounded-read`, `unbounded-line-read`, `unbounded-connections`,
   `unbounded-event-buffer`, `unbounded-cache-growth`, `unbounded-await`,
   `no-timeout`: **M5**.
@@ -142,270 +139,271 @@ Finder taggen viele Funde als `NEW:<name>`, die schon ein Muster haben:
 - `let-chain`, `third-party-type-in-public-api`, `unused-dependency`,
   `dead-feature-flag`: **P8**. `pub-without-caller`: **P1**.
 
-Der Finder-Prompt nennt deshalb alle Kürzel mit je einem Erkennungssatz.
+The finder prompt therefore lists all codes with one recognition sentence
+each.
 
-## Muster im Prozess
+## Patterns in process
 
-### P1 — Fixes erzeugen Folgefunde
-Fixer lösen den Fund, räumen aber den Rand nicht auf:
-- Doku in derselben Datei,
-- `expect` in neuen Tests,
-- API ohne Aufrufer,
-- Performance-Regressionen.
+### P1 — Fixes create follow-up findings
+Fixers resolve the finding but do not clean up the edges:
+- docs in the same file,
+- `expect` in new tests,
+- API without callers,
+- performance regressions.
 
-**Gegenmittel:** eine Checkliste für Fixer und Reviewer (siehe Kit).
+**Countermeasure:** a checklist for fixers and reviewers (see the kit).
 
-### P2 — Die Ein-Datei-Regel erzeugt Halb-Infrastruktur
-Braucht ein Fix zwei Dateien, entsteht toter oder unverdrahteter Code oder ein
-Umweg in der Datei.
+### P2 — The one-file rule creates half-built infrastructure
+If a fix needs two files, the result is dead or unwired code, or a detour
+within the file.
 
-**Gegenmittel:** Mehrdatei-Funde gehen in eine Vertragswelle (ein Vertrag,
-dann ein Agent pro Datei), nicht in Einzel-Fixer. Diff-Grenze etwa 150 Zeilen.
+**Countermeasure:** Multi-file findings go into a contract wave (one
+contract, then one agent per file), not to individual fixers. Diff limit
+around 150 lines.
 
-### P3 — Testanteil
-Gesunde Fixes bestehen zu 60–75 % aus Tests. Ausreißer beim Produktivcode
-deuten auf P2.
+### P3 — Test share
+Healthy fixes consist of 60–75 % tests. Outliers in production code point to
+P2.
 
-### P4 — Der Intent-Blickwinkel
-Stimmt „intent“ dagegen, ist der Fund meist eine Absicherung in der Tiefe und
-kein akuter Bug. Das hilft beim Priorisieren.
+### P4 — The intent angle
+When "intent" votes against, the finding is usually defense in depth rather
+than an acute bug. This helps with prioritizing.
 
-### P5 — Regelbruch in Tests und Doctests
-`.unwrap(`, `.expect(` und `panic!(` in Tests und Doctests. Clippy prüft
-Doctests nicht.
+### P5 — Rule violations in tests and doctests
+`.unwrap(`, `.expect(`, and `panic!(` in tests and doctests. Clippy does not
+check doctests.
 
-**Werkzeug:** ein `xtask`-Gate.
+**Tooling:** an `xtask` gate.
 
-### P6 — Durchsatz hängt am Host
-Der Workflow lässt höchstens CPUs − 2 Agenten gleichzeitig laufen, **pro
-Workflow**.
+### P6 — Throughput depends on the host
+The workflow runs at most CPUs − 2 agents at the same time, **per
+workflow**.
 
-**Gegenmittel:** Parallelschnitt, also ein Workflow pro Bereich auf disjunkten
-Dateien.
+**Countermeasure:** a parallel split, that is, one workflow per area on
+disjoint files.
 
-### P7 — Pfade kanonisch halten
-Absolute und relative Pfade gemischt ergeben doppelte Gruppen und zwei Fixer
-an einer Datei.
+### P7 — Keep paths canonical
+Mixed absolute and relative paths produce duplicate groups and two fixers on
+one file.
 
-**Gegenmittel:** Pfade repo-relativ normalisieren, bevor gruppiert wird.
+**Countermeasure:** Normalize paths to repo-relative before grouping.
 
-### P8 — Regeln ohne Werkzeug, Teil 2
-- öffentliche Fremdtypen;
-- let-chains trotz MSRV;
-- ungenutzte Abhängigkeiten, tote Feature-Flags;
-- Buch- oder Autorbezüge.
+### P8 — Rules without tooling, part 2
+- public third-party types;
+- let-chains despite the MSRV;
+- unused dependencies, dead feature flags;
+- book or author references.
 
-**Werkzeug:** ein `xtask`-Gate, `cargo-machete`/`udeps` und ein MSRV-Check.
+**Tooling:** an `xtask` gate, `cargo-machete`/`udeps`, and an MSRV check.
 
-### P9 — Trennschärfe der Prüf-Blickwinkel messen
-Stand der Workspace-Jagd mit 8 Bereichen, rund 260 geprüften Funden von
-Opus-Findern:
-- **reproduce** sagt in 98,5 % der Fälle „echt“ (257 zu 4). Bei präzisen
-  Findern trennt dieser Blickwinkel kaum.
-- **intent** verwirft 10 % (230 zu 25). Er ist praktisch der einzige
-  Blickwinkel, der trennt (siehe P4).
-- **scope** wird als Stichentscheid selten gebraucht (13 Mal) und stimmt immer
-  mit „echt“.
+### P9 — Measure the discriminating power of the verification angles
+State of the workspace hunt with 8 areas, around 260 verified findings from
+Opus finders:
+- **reproduce** says "real" in 98.5 % of cases (257 to 4). With precise
+  finders, this angle hardly discriminates.
+- **intent** rejects 10 % (230 to 25). It is practically the only angle that
+  discriminates (see P4).
+- **scope** is rarely needed as a tie-breaker (13 times) and always agrees
+  with "real".
 
-**Gegenmittel:** Die Ausbeute pro Blickwinkel laufend messen. Einen
-Blickwinkel, der nie widerspricht, ersetzen oder nur bei hoher Schwere
-einsetzen. Beispiel: intent zuerst, reproduce nur bei `critical`/`high`.
-Zusätzlich einen gegnerischen Blickwinkel „Ausnutzbarkeit“ für M1-Funde.
+**Countermeasure:** Keep measuring the yield per angle. Replace an angle that
+never disagrees, or use it only for high severity. Example: intent first,
+reproduce only for `critical`/`high`. In addition, add an adversarial
+"exploitability" angle for M1 findings.
 
-### P10 — Vertrauen je Kategorie
-Anteil der Funde, die die Prüfung überstehen:
+### P10 — Confidence per category
+Share of findings that survive verification:
 
-| Kategorie | übersteht |
+| Category | survives |
 |---|---:|
-| M3 Doku-Drift | 98 % |
+| M3 doc drift | 98 % |
 | M1 | 91 % |
 | M2 | 91 % |
 | P5 | 90 % |
 | NEW | 91 % |
-| hohe und kritische Funde | 100 % |
-| niedrige Funde | 89 % |
+| high and critical findings | 100 % |
+| low findings | 89 % |
 
-**Gegenmittel:**
-- Prüfaufwand dorthin lenken, wo verworfen wird, also auf niedrige Funde und
-  auf NEW.
-- M3 lässt sich günstig per grep bestätigen statt mit drei Modell-Prüfern.
-- `critical`/`high` von Opus-Findern brauchen einen Prüfer für Umfang und
-  Risiko (scope), aber keinen Existenzbeweis.
+**Countermeasure:**
+- Direct verification effort to where findings get rejected, that is, low
+  findings and NEW.
+- M3 can be confirmed cheaply by grep instead of with three model verifiers.
+- `critical`/`high` from Opus finders need a verifier for scope and risk
+  (scope), but no existence proof.
 
-### P11 — Ein Workflow, eine Branch
-Alle Fixer im selben Arbeitsbaum heißt: Niemand darf committen, solange
-irgendein Fixer schreibt, der Baum ist stundenlang schmutzig, und ein Abbruch
-am Session-Limit hinterlässt halbe Edits mitten zwischen fertigen.
+### P11 — One workflow, one branch
+With all fixers in the same working tree, nobody may commit while any fixer
+is writing, the tree stays dirty for hours, and an abort at the session limit
+leaves half edits sitting between finished ones.
 
-**Gegenmittel:**
-- Jede schreibende Welle bekommt einen eigenen git-Worktree auf eigener Branch
-  und committet sofort nach ihrem Review.
-- Eine Integrations-Branch sammelt die Wellen per Merge; nur dort läuft der
-  zentrale Build.
-- Wellen bleiben dateidisjunkt. Wer Dateien einer früheren Welle berührt,
-  startet erst nach deren Merge.
-- Nach einem Abbruch die Welle mit **unverändertem** Skript fortsetzen
-  (resume): Fertige Agenten kommen aus dem Journal, fehlgeschlagene laufen
-  neu. Mit geändertem Skript gilt P12.
+**Countermeasure:**
+- Every writing wave gets its own git worktree on its own branch and commits
+  immediately after its review.
+- An integration branch collects the waves by merge; the central build runs
+  only there.
+- Waves stay file-disjoint. A wave that touches files of an earlier wave
+  starts only after that wave's merge.
+- After an abort, continue the wave with the **unchanged** script (resume):
+  finished agents come from the journal, failed ones run again. With a
+  changed script, P12 applies.
 
-Dasselbe Prinzip steckt in DEC-045 für harw selbst: ein Klon je Zellhost mit
-Merge-Barriere statt vieler Schreiber auf einem Workspace.
+The same principle underlies DEC-045 for harw itself: one clone per cell host
+with a merge barrier instead of many writers on one workspace.
 
-### P12 — Resume trifft nur den unveränderten Präfix
-Ein Resume liefert nur den **längsten unveränderten Präfix** der Agent-Aufrufe
-aus dem Cache. Ab dem ersten geänderten oder neuen Aufruf läuft alles live,
-auch Fixer und Coder, die schon fertig waren. Beispiel: Eine Welle bekommt
-nachträglich einen Re-Review-Schritt, dann laufen nach dem ersten neuen
-Re-Review alle späteren Fixer ein zweites Mal. Die Edits landen dann doppelt
-oder werden überschrieben, und die Tokens sind verloren.
+### P12 — Resume only hits the unchanged prefix
+A resume serves only the **longest unchanged prefix** of agent calls from the
+cache. From the first changed or new call onward, everything runs live, even
+fixers and coders that were already done. Example: a wave is retrofitted with
+a re-review step, and after the first new re-review all later fixers run a
+second time. The edits then land twice or overwrite each other, and the
+tokens are lost.
 
-**Gegenmittel:**
-- Schreibende Wellen nie auf geänderte Logik fortsetzen.
-- Einen fehlenden Schritt (etwa den Re-Review einer Reparatur) als eigenen
-  Agenten nachholen, mit Vertrag, Befund und Reparaturbericht aus dem Journal.
-- Prüfen, ob schon doppelt geschrieben wurde: die mtimes der Dateien mit dem
-  Resume-Zeitpunkt vergleichen.
+**Countermeasure:**
+- Never resume writing waves on changed logic.
+- Make up a missing step (such as the re-review of a repair) as a separate
+  agent, with the contract, finding, and repair report from the journal.
+- Check whether double writes have already happened: compare the files'
+  mtimes with the resume time.
 
-### P13 — Gegen die Basis prüfen, nicht gegen den gefixten Baum
-Werden Funde nachträglich geprüft, während ihre Fixes schon im Arbeitsbaum
-liegen, lesen die Prüfer den gefixten Code. Dann verwerfen sie echte Funde
-mit „ist schon behoben“. In R16 traf das drei von sechs nachgeprüften Funden.
-Alle drei waren auf HEAD echt.
+### P13 — Verify against the base, not against the fixed tree
+If findings are verified after the fact while their fixes are already in the
+working tree, the verifiers read the fixed code. They then reject genuine
+findings with "already fixed". In R16 this hit three of six re-verified
+findings. All three were real on HEAD.
 
-**Gegenmittel:** `gap-verify` bekommt `base`, den Commit, gegen den gefunden
-wurde. Die Prüfer lesen `git show <base>:<datei>`. „Im Arbeitsbaum schon
-behoben“ zählt als echt und wird als `fixed_in_tree` gemeldet.
+**Countermeasure:** `gap-verify` receives `base`, the commit the findings
+were made against. Verifiers read `git show <base>:<file>`. "Already fixed in
+the working tree" counts as real and is reported as `fixed_in_tree`.
 
-### P14 — Das Arbeitsverzeichnis wandert mit
-Wechselt die Hauptsession per `cd` in einen Worktree, wandert ihr
-Arbeitsverzeichnis mit. Jeder Agent, der danach startet und nur „das aktuelle
-Verzeichnis“ kennt, arbeitet im falschen Checkout:
-- Fixer schreiben in den fremden Worktree.
-- Reviewer sehen dort einen leeren Diff und melden „Fix fehlt“.
-- Die Reparatur folgt dem Pfad aus dem Review-Text und schreibt den Fix ein
-  zweites Mal, wieder im falschen Baum, auch wenn sie selbst im richtigen
-  Verzeichnis startet.
+### P14 — The working directory travels along
+When the main session switches into a worktree with `cd`, its working
+directory travels with it. Every agent that starts afterward and knows only
+"the current directory" works in the wrong checkout:
+- Fixers write into the foreign worktree.
+- Reviewers see an empty diff there and report "fix missing".
+- The repair follows the path from the review text and writes the fix a
+  second time, again in the wrong tree, even if it starts in the right
+  directory itself.
 
-In R16 traf das zwei kurze `cd`-Fenster. Betroffen waren etwa 15 Dateien aus
-sieben Wellen, darunter ein doppelter, byte-gleicher Fix und zwei
-verschiedene Fixes für denselben Fund.
+In R16 this hit two short `cd` windows. About 15 files from seven waves were
+affected, including a duplicate, byte-identical fix and two different fixes
+for the same finding.
 
-**Gegenmittel:**
-- Die Hauptsession wechselt nie per `cd` in einen Worktree, sondern nutzt
-  `git -C <pfad>` und absolute Pfade.
-- Schreibende Workflows verlangen `root`, auch für den Hauptbaum. Ohne
-  `root` brechen `gap-fix` und `contract-wave` ab.
-- Ein Wellen-Commit nimmt nur die benannten Dateien der Welle. Fremde
-  Änderungen im Worktree werden gemeldet und nach dem Ende aller Wellen
-  abgeglichen: Hat der Hauptbaum keinen Fix, wird verschoben; ist er gleich,
-  wird verworfen; sind beide verschieden, entscheidet ein Review.
+**Countermeasure:**
+- The main session never switches into a worktree with `cd`, but uses
+  `git -C <path>` and absolute paths.
+- Writing workflows require `root`, even for the main tree. Without `root`,
+  `gap-fix` and `contract-wave` abort.
+- A wave commit takes only the wave's named files. Foreign changes in the
+  worktree are reported and reconciled after all waves have ended: if the
+  main tree has no fix, it is moved over; if it is identical, it is
+  discarded; if the two differ, a review decides.
 
-### P15 — Agenten schreiben ihren Auftrag in den Code
-Fixer übernehmen Wörter aus ihrem Auftrag in Kommentare: „Covers the brief's
-three cases“ oder „siehe Bericht des Fixer-Agents“. Der Leser findet weder den
-Auftrag noch den Bericht, und die Zahl im Satz stimmt oft nicht einmal.
+### P15 — Agents write their assignment into the code
+Fixers carry words from their assignment into comments: "Covers the brief's
+three cases" or "see the fixer agent's report". The reader finds neither the
+assignment nor the report, and the number in the sentence is often not even
+correct.
 
-**Gegenmittel:** Die Fixer-Regeln verbieten Verweise auf Auftrag, Vertrag,
-Bericht, Welle oder Agent in Code und Doku. Ein `xtask`-Gate sucht nach
-diesen Wörtern.
+**Countermeasure:** The fixer rules forbid references to assignment,
+contract, report, wave, or agent in code and docs. An `xtask` gate searches
+for these words.
 
-### P16 — Ripple konvergiert, aber nicht auf null
-Jede Ripple-Runde findet weniger, fast nur Doku. Ab und zu steckt aber ein
-echter Fehler darin, den der Ripple-Fix selbst eingeführt hat. In R16 fand
-die erste Runde nach `wa-egress` 11 Punkte, die zweite 9 und darin einen
-neuen Verhaltensfehler (ein Leerlaufzähler zählte ab Verbindungsbeginn). Nach
-`r16-w4` waren es 14 Punkte, zwei davon HIGH.
+### P16 — Ripple converges, but not to zero
+Each ripple round finds less, almost only docs. Now and then, though, there
+is a real error in it that the ripple fix itself introduced. In R16 the first
+round after `wa-egress` found 11 items, the second 9, including a new
+behavioral error (an idle counter counted from connection start). After
+`r16-w4` there were 14 items, two of them HIGH.
 
-**Gegenmittel:**
-- Ein Ripple-Befund blockiert die Welle (`rippleStatus = findings`).
-- Die zweite Runde läuft als Vertragswelle, deren Opus-Nachprüfung die
-  Querprüfung übernimmt. Danach folgt kein weiterer Ripple-Lauf.
-- Reine Doku-Punkte werden gesammelt statt einzeln gejagt.
+**Countermeasure:**
+- A ripple finding blocks the wave (`rippleStatus = findings`).
+- The second round runs as a contract wave whose Opus verification takes
+  over the cross-check. No further ripple run follows.
+- Pure doc items are collected rather than hunted one by one.
 
-### P17 — Dieselbe Lösung dreimal
-Sicheres Öffnen einer Datei (kein Symlink, kein FIFO, Größe, Besitzer) haben
-`harw-authority`, `harw-security-hub` und `harw-tool-plan` je selbst gebaut,
-obwohl `harw_fsutil` es anbietet. Denselben Fehler (die euid als Besitzer von
-`/proc/self` lesen) hatten drei Crates. Die Ursache ist die Ein-Datei-Regel:
-Der Fixer darf `Cargo.toml` nicht ändern und baut deshalb lokal nach.
+### P17 — The same solution three times
+`harw-authority`, `harw-security-hub`, and `harw-tool-plan` each built safe
+file opening (no symlink, no FIFO, size, owner) themselves, although
+`harw_fsutil` offers it. Three crates had the same bug (reading the euid as
+the owner of `/proc/self`). The cause is the one-file rule: the fixer may not
+change `Cargo.toml` and therefore rebuilds it locally.
 
-**Gegenmittel:**
-- Finder- und Fixer-Prompts nennen die Workspace-Helfer.
-- Braucht ein Fix eine neue Abhängigkeit, geht er in eine Vertragswelle.
+**Countermeasure:**
+- Finder and fixer prompts name the workspace helpers.
+- If a fix needs a new dependency, it goes into a contract wave.
 
-### P18 — Reparatur ohne blockierenden Befund
-`contract-wave` startete für jedes Problem, das der Reviewer nannte, einen
-Reparatur-Agenten. Das galt auch nach `ok=true` und auch für Dateien außerhalb
-des Clusters, die der Reviewer ausdrücklich als „nur zur Info“ markiert hatte.
-Diese Änderungen hat nie jemand nachgeprüft: In `ripple-authz` traf es drei
-fremde Dateien, darunter 69 Zeilen Code.
+### P18 — Repair without a blocking finding
+`contract-wave` started a repair agent for every problem the reviewer named.
+This also applied after `ok=true` and to files outside the cluster that the
+reviewer had expressly marked as "for information only". Nobody ever
+re-verified these changes: in `ripple-authz` it hit three foreign files,
+including 69 lines of code.
 
-**Gegenmittel:**
-- Reparaturen laufen nur nach `ok=false` und nur an deklarierten Dateien.
-- Hinweise gehören in ein eigenes Feld `notes`.
-- Ein blockierendes Problem außerhalb des Clusters beendet den Cluster als
-  `unresolved`.
+**Countermeasure:**
+- Repairs run only after `ok=false` and only on declared files.
+- Hints belong in a separate `notes` field.
+- A blocking problem outside the cluster ends the cluster as `unresolved`.
 
-### P19 — Das Session-Limit ist ein gemeinsamer Ausfallpunkt
-Ein einziger Fächer aus vielen parallelen Wellen (w1–w8, w4-2, w8-2,
-ripple-web, pr-baseline, Blocker-Karten, Feldbericht) lief gleichzeitig in das
-Session-Limit des Kontos. Die Fixer waren meist fertig, die späten Stufen
-(Review, Reparatur, Ripple) starben. Übrig blieben viele Änderungen im Baum,
-denen genau die Prüfung fehlte.
+### P19 — The session limit is a shared point of failure
+A single fan-out of many parallel waves (w1–w8, w4-2, w8-2, ripple-web,
+pr-baseline, blocker cards, field report) ran into the account's session
+limit at the same time. The fixers were mostly done, while the late stages
+(review, repair, ripple) died. What remained were many changes in the tree
+that lacked exactly the verification.
 
-**Gegenmittel:**
-- Die Parallelität richtet sich nach dem Token-Budget, nicht nach den CPUs:
-  `maxParallel` (Standard 3) begrenzt Dateien bzw. Cluster im Flug.
-- Eine Welle wird ganz abgeschlossen (Review, Commit, Manifest), bevor die
-  nächste startet.
-- Eine Stufe ohne Antwort zählt nie als bestanden.
+**Countermeasure:**
+- Parallelism is set by the token budget, not by CPUs: `maxParallel`
+  (default 3) limits files or clusters in flight.
+- A wave is completed in full (review, commit, manifest) before the next one
+  starts.
+- A stage without an answer never counts as passed.
 
-### P20 — Mehr Agenten sind nicht mehr Durchsatz
-Jeder Folge-Workflow (`-2`, Ripple, `contract-c-2`) entstand, weil sein
-Vorgänger unvollständig war. Die Koordinationskosten wuchsen schneller als
-der Fortschritt. Fast jeder Fehler aus P12–P19 sitzt an einer Übergabe
-zwischen Agenten, nicht in der Programmlogik.
+### P20 — More agents do not mean more throughput
+Every follow-up workflow (`-2`, ripple, `contract-c-2`) existed because its
+predecessor was incomplete. Coordination costs grew faster than progress.
+Almost every error from P12–P19 sits at a handoff between agents, not in the
+program logic.
 
-**Gegenmittel (Arbeitsweise aus Harws Goal-/Plan-Modell):**
-- Jede schreibende Welle dient **einem** Goal mit Acceptance Criteria und
-  Invarianten und läuft gegen **eine** gepinnte Basis.
-- Eine Welle ist erst `complete`, wenn eine Goal-Prüfung für jedes Kriterium
-  `met` mit Beleg (Datei:Zeile oder Testname) meldet. Widersprüche zwischen
-  Code und Planungsdokumenten werden als `deltas` gemeldet, nie still
-  aufgelöst.
-- Ein kritischer oder hoher Befund zählt erst mit einem Regressionstest, den
-  das (Re-)Review benennt.
-- Die Welle erklärt ihr Goal nie für erreicht; `achieve` bleibt beim Menschen.
-- Der zentrale Build läuft über einen eingefrorenen SHA und wird dafür
-  protokolliert (`kit/gate_record.py`). Jede Änderung danach macht den Lauf
-  ungültig.
+**Countermeasure (working method from harw's goal/plan model):**
+- Every writing wave serves **one** goal with acceptance criteria and
+  invariants and runs against **one** pinned base.
+- A wave is `complete` only when a goal check reports `met` for every
+  criterion, with evidence (file:line or test name). Contradictions between
+  code and planning documents are reported as `deltas`, never resolved
+  silently.
+- A critical or high finding counts only with a regression test that the
+  (re-)review names.
+- The wave never declares its goal achieved; `achieve` stays with the human.
+- The central build runs against a frozen SHA and is recorded for that
+  (`kit/gate_record.py`). Any change afterward invalidates the run.
 
-### P21 — Entschiedene Fragen kommen als Frage zurück
-Die Secrets-Welle hielt zweimal vor dem Coden an. Beim zweiten Mal waren fünf
-Entscheidungen der Nutzerin schon getroffen, standen aber nur als Fließtext in
-Goal und Befund. Der Planer las sie als offene Punkte, stellte teils dieselben
-Fragen neu und setzte `feasible=false`.
+### P21 — Decided questions come back as questions
+The secrets wave stopped twice before coding. The second time, five
+decisions by the user had already been made, but they appeared only as prose
+in the goal and finding. The planner read them as open points, partly asked
+the same questions again, and set `feasible=false`.
 
-**Gegenmittel:**
-- Getroffene Entscheidungen gehen als eigenes Feld `decided` in die Welle und
-  stehen im Vertragsprompt ausdrücklich als erledigt.
-- Nur eine neue, unvorhergesehene Blockade darf `feasible=false` auslösen.
+**Countermeasure:**
+- Decisions already made go into the wave as a separate `decided` field and
+  appear in the contract prompt expressly as settled.
+- Only a new, unforeseen blocker may trigger `feasible=false`.
 
-### P22 — Ein Agent liefert eine Attrappe
-Beim Fortsetzen der Mobile-TUI-Welle gab ein neu gestarteter Vertragsagent
-statt eines Vertrags eine Attrappe zurück: die Datei `a` und die
-Zusammenfassung `test`. Das Schema war formal erfüllt.
+### P22 — An agent delivers a dummy
+When resuming the mobile TUI wave, a freshly started contract agent returned
+a dummy instead of a contract: the file `a` and the summary `test`. The
+schema was formally satisfied.
 
-**Gegenmittel:** Die harten Tore vor jedem Coder. Die deklarierte
-Dateimenge gegen die Vertragsmenge fing die Attrappe als `contract-mismatch`
-ab, bevor eine Zeile geschrieben wurde. Tore prüfen Inhalte gegen
-Vorgaben, nicht nur die Form.
+**Countermeasure:** The hard gates before every coder. The declared file set
+checked against the contract set caught the dummy as `contract-mismatch`
+before a single line was written. Gates check contents against requirements,
+not just the form.
 
-### P23 — Neue Dateien sind für `git diff` unsichtbar
-Reviews und Goal-Prüfungen lasen `git diff <base> -- <dateien>`. Neu
-angelegte, noch ungetrackte Dateien (`auth_migrate.rs`, die ganze neue
-Crate `harw-tui-layout`) erscheinen dort nicht; ein Review hätte sie
-übersehen und ein Goal-Prüfer hielt eine fertige Crate für leer.
+### P23 — New files are invisible to `git diff`
+Reviews and goal checks read `git diff <base> -- <files>`. Newly created,
+still untracked files (`auth_migrate.rs`, the whole new crate
+`harw-tui-layout`) do not appear there; a review would have missed them, and
+a goal checker took a finished crate for empty.
 
-**Gegenmittel:** Review-, Re-Review- und Goal-Prompts listen neue Dateien
-über `git status --short --untracked-files=all` und lesen sie direkt.
+**Countermeasure:** Review, re-review, and goal prompts list new files via
+`git status --short --untracked-files=all` and read them directly.

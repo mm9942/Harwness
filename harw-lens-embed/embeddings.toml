@@ -1,30 +1,30 @@
-# Embedding-Katalog für `harw-lens-embed` (Knoten AW4-07).
+# Embedding catalog for `harw-lens-embed` (node AW4-07).
 #
-# Wird über `include_str!` zur Kompilierzeit in `EmbeddingCatalog::load_default`
-# eingebettet -- kein Dateisystemzugriff zur Laufzeit.
+# Embedded at compile time via `include_str!` in `EmbeddingCatalog::load_default`
+# -- no filesystem access at runtime.
 #
-# Jeder `[[model]]`-Eintrag trägt drei getrennte statische Schichten:
-#   - `model.spec`       -- was das Modell IST (unveränderlich)
-#   - `model.descriptor` -- wie man es BENUTZT (Präfixe, Normalisierung)
-#   - `model.runtime`    -- was zur Laufzeit GILT (Backend, Ort, Stapelgröße)
-# Die vierte Schicht, `ObservedBehavior` (was gemessen wurde), steht
-# absichtlich nicht in dieser Datei -- sie ist anfangs leer und wird zur
-# Laufzeit befüllt, nie statisch vorgegeben.
+# Each `[[model]]` entry carries three separate static layers:
+#   - `model.spec`       -- what the model IS (immutable)
+#   - `model.descriptor` -- how to USE it (prefixes, normalization)
+#   - `model.runtime`    -- what APPLIES at runtime (backend, location, batch size)
+# The fourth layer, `ObservedBehavior` (what was measured), is intentionally
+# not in this file -- it starts out empty and is filled at runtime, never
+# prescribed statically.
 #
-# `roles` bindet ein Modell an die `EmbeddingRole`-Werte, für die `route` es
-# in Betracht zieht.
+# `roles` binds a model to the `EmbeddingRole` values for which `route`
+# considers it.
 #
-# Das zweite `[[model]]` unten trägt seit Knoten AW7-06 den echten Modellnamen
-# eines existierenden OpenAI-kompatiblen Einbettungsmodells
-# (`text-embedding-3-large`, 3072 Dimensionen) statt eines generischen
-# Platzhalters -- sein `model.runtime.backend`-Wert
-# (`http-embed-openai-compatible`) beschreibt den Transport, den
-# `src/http_backend.rs::HttpEmbedBackend` implementiert. Der Katalogeintrag
-# beschreibt nur, WAS das Modell ist und WOFÜR es zuständig ist; er
-# konstruiert selbst keinen `Embedder` -- das bleibt Sache des Aufrufers
-# (siehe `HttpEmbedBackend::new`, das Basis-URL und API-Key entgegennimmt,
-# die kein `embeddings.toml`-Feld tragen kann, ohne ein Geheimnis in eine
-# eingebettete Datei zu schreiben).
+# Since node AW7-06 the second `[[model]]` below carries the real model name
+# of an existing OpenAI-compatible embedding model
+# (`text-embedding-3-large`, 3072 dimensions) instead of a generic
+# placeholder -- its `model.runtime.backend` value
+# (`http-embed-openai-compatible`) describes the transport that
+# `src/http_backend.rs::HttpEmbedBackend` implements. The catalog entry only
+# describes WHAT the model is and WHAT it is responsible for; it does not
+# construct an `Embedder` itself -- that remains the caller's job
+# (see `HttpEmbedBackend::new`, which takes a base URL and API key that no
+# `embeddings.toml` field can carry without putting a secret into an
+# embedded file).
 
 [[model]]
 roles = ["code", "confidential"]

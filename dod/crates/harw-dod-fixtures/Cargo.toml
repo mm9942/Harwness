@@ -9,24 +9,24 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: Capability, ReadScope, SensorError, SensorHandle.
+# Access vocabulary: Capability, ReadScope, SensorError, SensorHandle.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular und der eine `trait Sensor`, den jede Prüfung aufruft.
+# Data vocabulary and the one `trait Sensor` that every check calls.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die eine Dateisystem-Naht: `capture()` liest den Quellbaum eines Sensors
-# ausschließlich darüber, nie über direktes `std::fs` (siehe capture.rs).
+# The one filesystem seam: `capture()` reads a sensor's source tree
+# exclusively through it, never through direct `std::fs` (see capture.rs).
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# `SensorId` für den festen Testgriff (siehe `FIXTURE_SENSOR_ID`).
+# `SensorId` for the fixed test handle (see `FIXTURE_SENSOR_ID`).
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+# `#[derive(harw_macros::HarwError)]` for `error.rs`.
 harw-macros = { path = "../../../harw-macros" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jiff = { workspace = true }
-# Nicht nur für Tests: `harness::assert_content_freedom` und
-# `harness::assert_scope_tightness` bauen bei jedem Aufruf ein frisches
-# temporäres Verzeichnis, in gewöhnlichem (nicht `#[cfg(test)]`-gebundenem)
-# Bibliothekscode — deshalb reguläre Abhängigkeit, keine Dev-Dependency.
+# Not only for tests: `harness::assert_content_freedom` and
+# `harness::assert_scope_tightness` build a fresh temporary directory on
+# every call, in ordinary (not `#[cfg(test)]`-gated) library code —
+# hence a regular dependency, not a dev-dependency.
 tempfile = { workspace = true }
 
 [lints]

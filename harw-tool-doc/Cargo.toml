@@ -6,20 +6,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-# Höher als workspace.package.rust-version (1.85): oxidize-pdf >=5 (die von
-# doc.read_pdf/native.rs verwendete API-Generation, siehe design-doc
-# doc_read_pdf_design.md) deklariert selbst rust-version 1.88. Mit dem
-# geerbten Workspace-Default löst `cargo add`/der MSRV-Resolver still auf die
-# inkompatible 2.x-Reihe zurück. Der installierte Compiler (1.98.1) erfüllt
-# 1.88 problemlos; nur diese Crate braucht die höhere deklarierte MSRV.
+# Higher than workspace.package.rust-version (1.85): oxidize-pdf >=5 (the API
+# generation used by doc.read_pdf/native.rs, see design doc
+# doc_read_pdf_design.md) itself declares rust-version 1.88. With the
+# inherited workspace default, `cargo add`/the MSRV resolver silently falls back to the
+# incompatible 2.x series. The installed compiler (1.98.1) satisfies
+# 1.88 without trouble; only this crate needs the higher declared MSRV.
 rust-version = "1.88"
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
-# W5 N-DOC: HTTP-Client und Egress-Policy für Mistral OCR ausschließlich aus
-# harw-egress (Scoped-Resolver, Adressklassen, keine Auto-Redirects, kein Proxy).
+# W5 N-DOC: HTTP client and egress policy for Mistral OCR exclusively from
+# harw-egress (scoped resolver, address classes, no auto-redirects, no proxy).
 harw-egress = { path = "../harw-egress" }
-# Symlinkfestes, ELOOP-strenges Öffnen der PDF-Datei unterhalb der Workspace-Wurzel.
+# Symlink-safe, ELOOP-strict opening of the PDF file below the workspace root.
 harw-fsutil = { path = "../harw-fsutil" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-macros = { path = "../harw-macros" }

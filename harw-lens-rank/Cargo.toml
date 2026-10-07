@@ -11,13 +11,13 @@ rust-version.workspace = true
 [dependencies]
 harw-lens-types = { path = "../harw-lens-types" }
 
-# Nur für Tests und Dokumentationsbeispiele: baut ChunkDigest-Fixtures über
-# ContentDigest::of. Fließt nie in ein ausgeliefertes Binary — cargo schließt
-# dev-dependencies aus `cargo build --release` aus. Die harte Vorgabe
-# "keine Abhängigkeit, die I/O, Systemzeit oder Zufall kann" gilt der
-# produktiven Abhängigkeitsfläche dieser Crate; blake3 (über ContentDigest)
-# ist ohnehin rein und deterministisch, taucht hier aber ausschließlich in
-# #[cfg(test)]-Code und Doctests auf.
+# Only for tests and documentation examples: builds ChunkDigest fixtures via
+# ContentDigest::of. Never flows into a shipped binary — cargo excludes
+# dev-dependencies from `cargo build --release`. The hard requirement
+# "no dependency that can do I/O, system time or randomness" applies to the
+# production dependency surface of this crate; blake3 (via ContentDigest)
+# is pure and deterministic anyway, but appears here exclusively in
+# #[cfg(test)] code and doctests.
 [dev-dependencies]
 harw-types = { path = "../harw-types" }
 

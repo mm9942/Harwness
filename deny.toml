@@ -1,30 +1,29 @@
-# Lieferketten-Prüfung für `cargo deny check`.
+# Supply-chain check for `cargo deny check`.
 #
-# Aufgenommen im Knoten AW0-00. Begründung für den Zeitpunkt: das
-# Ausbauprogramm legt rund fünfzig neue Crates an, und jede neue
-# Abhängigkeit, die nach dieser Prüfung hereinkommt, muss einzeln
-# nachgeholt werden. Ein Lauf zu Beginn kostet nichts, ein Nachziehen über
-# fünfzig Crates schon.
+# Introduced in node AW0-00. Reason for the timing: the expansion program
+# creates around fifty new crates, and every new dependency that arrives after
+# this check has to be backfilled individually. A run at the start costs
+# nothing; catching up across fifty crates does.
 #
-# `cargo-vet` folgt erst ab Welle AW5 und nur im DoD-Teilbaum: es verlangt
-# Audit-Einträge je Abhängigkeit und ist dort begründet, wo ein Binary mit
-# erhöhten Berechtigungen läuft — nicht workspaceweit.
+# `cargo-vet` follows only from wave AW5 and only in the DoD subtree: it
+# requires audit entries per dependency and is justified where a binary runs
+# with elevated privileges — not workspace-wide.
 
 [graph]
 all-features = true
 
 [advisories]
 version = 2
-# Bekannte, bewusst getragene Meldungen kommen hierher — jede mit einem
-# Kommentar, der sagt, warum sie getragen wird. Leer heißt: es gibt keine.
+# Known advisories that are knowingly tolerated go here — each with a
+# comment saying why it is tolerated. Empty means: there are none.
 ignore = [
-    # Nicht mehr gepflegt, kein sicheres Upgrade: kommt nur transitiv über
-    # `scraper` → `selectors` (HTML-Parsing in `harw-tool-web`).
-    { id = "RUSTSEC-2025-0057", reason = "fxhash transitiv über scraper/selectors; kein Upgrade verfügbar" },
-    # Nicht mehr gepflegt, reines Proc-Macro zur Übersetzungszeit über `ratatui`.
-    { id = "RUSTSEC-2024-0436", reason = "paste transitiv über ratatui (nur Compile-Zeit)" },
-    # Nicht mehr gepflegt, Proc-Macro über `hax-lib-macros` (libcrux-Kette).
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 transitiv über hax-lib-macros (nur Compile-Zeit)" },
+    # Unmaintained, no safe upgrade: only comes in transitively via
+    # `scraper` → `selectors` (HTML parsing in `harw-tool-web`).
+    { id = "RUSTSEC-2025-0057", reason = "fxhash transitively via scraper/selectors; no upgrade available" },
+    # Unmaintained, pure compile-time proc macro via `ratatui`.
+    { id = "RUSTSEC-2024-0436", reason = "paste transitively via ratatui (compile time only)" },
+    # Unmaintained, proc macro via `hax-lib-macros` (libcrux chain).
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 transitively via hax-lib-macros (compile time only)" },
 ]
 
 [licenses]
@@ -40,7 +39,7 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
-    # Mozillas Root-Zertifikatsdaten in `webpki-roots`/`webpki-root-certs`.
+    # Mozilla's root certificate data in `webpki-roots`/`webpki-root-certs`.
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
@@ -52,23 +51,23 @@ confidence-threshold = 0.9
 ignore = true
 
 [bans]
-# Mehrfach vorhandene Fassungen derselben Crate sind eine Warnung, kein
-# Fehler: der Baum zieht sie über fremde Abhängigkeiten, nicht über eigene
-# Entscheidungen. Was wir selbst wählen, steht in [workspace.dependencies].
+# Multiple versions of the same crate are a warning, not an error: the tree
+# pulls them in through third-party dependencies, not through our own
+# decisions. What we choose ourselves is listed in [workspace.dependencies].
 multiple-versions = "warn"
-# Seit PL-60 (DoD im Wurzel-Workspace, ein Lockfile) erwartet und bewusst
-# getragen: `nix` 0.29 (transitiv über `zbus`, OS-Keyring in `harw-secrets`)
-# neben `nix` 0.31 (direkt, `harw-probe-fs`, Feature `fanotify`). Zwei
-# Major-Fassungen, keine gemeinsame Wahl möglich; `warn` genügt, kein `skip`.
+# Expected and knowingly tolerated since PL-60 (DoD in the root workspace, one
+# lockfile): `nix` 0.29 (transitively via `zbus`, OS keyring in `harw-secrets`)
+# alongside `nix` 0.31 (direct, `harw-probe-fs`, feature `fanotify`). Two
+# major versions, no common choice possible; `warn` suffices, no `skip`.
 wildcards = "deny"
-# Pfad-Abhängigkeiten zwischen eigenen, unveröffentlichten Crates tragen
-# keine Versionsangabe.
+# Path dependencies between our own, unpublished crates carry no version
+# specification.
 allow-wildcard-paths = true
-# Die Zeitachse ist eine bewusste Festlegung: `jiff` für Neues. `time` liegt
-# noch in Bestandscrates und wird nicht im Rahmen dieses Programms migriert.
+# The time library is a deliberate choice: `jiff` for new code. `time` still
+# lives in existing crates and is not migrated as part of this program.
 skip = []
-# Tier C (docs/architecture/dependency-review.md): kein OpenSSL im Baum.
-# TLS läuft ausschließlich über rustls + aws-lc-rs (Ring A).
+# Tier C (docs/architecture/dependency-review.md): no OpenSSL in the tree.
+# TLS runs exclusively via rustls + aws-lc-rs (Ring A).
 deny = [
     { crate = "openssl-sys" },
     { crate = "openssl" },

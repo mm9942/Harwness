@@ -9,22 +9,22 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError.
+# Access vocabulary: Capability, ReadScope, SensorHandle, SensorError.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular und der eine `trait Sensor`, den dieser Sensor implementiert.
+# Data vocabulary and the one `trait Sensor` this sensor implements.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die eine Dateisystem-Naht: `glob::glob` und `read_line_fields` lesen jedes
-# `<gerät>/stat`, nie direktes `std::fs` (siehe src/lib.rs-Moduldoku).
+# The one filesystem seam: `glob::glob` and `read_line_fields` read each
+# `<device>/stat`, never `std::fs` directly (see the src/lib.rs module docs).
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# `SensorId` für `SensorHandle`.
+# `SensorId` for `SensorHandle`.
 harw-types = { path = "../../../harw-types" }
-# Verbindliche Abhängigkeit jeder Sensor-Crate laut Arbeitsauftrag AW2-10.
-# `#[derive(harw_macros::SensorSource)]` selbst trägt genau ein Feld über
-# genau eine glob-adressierte Quelle mit genau einem Skalarwert je Treffer —
-# `<gerät>/stat` ist eine Datei mit vielen Werten in Spalten, dafür passt das
-# Makro nicht (siehe src/lib.rs-Moduldoku, Abschnitt „Warum kein
-# `#[derive(SensorSource)]`"). Aktuell ungenutzt, analog zur unbenutzten
-# `harw-macros`-Abhängigkeit in `harw-dod-cpu/Cargo.toml`.
+# Mandatory dependency of every sensor crate per work order AW2-10.
+# However, `#[derive(harw_macros::SensorSource)]` itself carries exactly one
+# field via exactly one glob-addressed source with exactly one scalar value
+# per match — `<device>/stat` is a file with many values in columns, so the
+# macro does not fit (see the src/lib.rs module docs, section "Why no
+# `#[derive(SensorSource)]`"). Currently unused, analogous to the unused
+# `harw-macros` dependency in `harw-dod-cpu/Cargo.toml`.
 harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 

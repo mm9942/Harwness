@@ -1,30 +1,29 @@
 name: CI
 
 on:
-  # Gesteuerte CI: keine automatischen Push-/PR-Läufe. Jeder Lauf wird gezielt
-  # per workflow_dispatch auf einem gepushten Stand gestartet — nach dem
-  # zentralen lokalen Build aus CLAUDE.md, von der Sitzung, die den Stand
-  # gepusht hat. Ein roter Lauf wird behoben und neu gestartet, nie
-  # übersprungen. Zum Wiedereinschalten der automatischen Trigger die
-  # beiden Blöcke einkommentieren; die Job-Bedingungen unten behandeln
-  # `push` und `pull_request` weiterhin.
+  # Controlled CI: no automatic push/PR runs. Every run is started deliberately
+  # via workflow_dispatch on a pushed state — after the central local build
+  # from CLAUDE.md, by the session that pushed that state. A red run is fixed
+  # and restarted, never skipped. To re-enable the automatic triggers,
+  # uncomment the two blocks; the job conditions below still handle
+  # `push` and `pull_request`.
   #
   # push:
-  #   # `dev` ist der Integrationsbranch, `main` die stabile Linie. Beide
-  #   # bekommen dieselbe volle CI, damit nichts ungeprüft auf `dev` liegt.
+  #   # `dev` is the integration branch, `main` the stable line. Both
+  #   # get the same full CI so that nothing sits unchecked on `dev`.
   #   branches: [main, dev]
-  # # Alle PRs, auch gestapelte (Basis ist ein anderer Feature-Branch).
+  # # All PRs, including stacked ones (base is another feature branch).
   # pull_request:
   #   types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
-# Ein neuer Push auf denselben Branch/PR bricht den noch laufenden alten Lauf ab.
+# A new push to the same branch/PR cancels the still-running old run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# `pull-requests: read` braucht dorny/paths-filter, um bei PRs die geänderten
-# Dateien über die API zu lesen (ohne Checkout).
+# dorny/paths-filter needs `pull-requests: read` to read the changed files
+# of PRs via the API (without a checkout).
 permissions:
   contents: read
   pull-requests: read
@@ -37,18 +36,18 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
-# Toolchain: Alle Jobs installieren die in `rust-toolchain.toml` gepinnte
-# Version per `rustup toolchain install` (ohne Argument liest rustup >= 1.28
-# die Datei inkl. Komponenten). rustup ist auf den GitHub-Runnern
-# vorinstalliert; so gibt es genau eine Quelle der Wahrheit, die Dependabot
-# (Ökosystem `rust-toolchain`) aktualisiert – keine zweite Versionsangabe im
-# Workflow, die auseinanderlaufen könnte, und keine Dritt-Action.
+# Toolchain: all jobs install the version pinned in `rust-toolchain.toml`
+# via `rustup toolchain install` (without an argument, rustup >= 1.28 reads
+# the file, including components). rustup is preinstalled on the GitHub
+# runners; this gives exactly one source of truth, which Dependabot
+# (ecosystem `rust-toolchain`) updates – no second version declaration in the
+# workflow that could drift apart, and no third-party action.
 #
-# Pfadfilter: Die Filter greifen nur bei `pull_request`. Bei Push (solange
-# aktiviert) und bei workflow_dispatch laufen immer alle Jobs. Scheitert der Filter-Job selbst, laufen ebenfalls
-# alle Jobs (fail-open), damit nie ein Job ungeprüft „grün“ übersprungen wird.
-# Übersprungene Jobs zählen bei GitHub als erfolgreich und blockieren
-# erforderliche Checks nicht.
+# Path filters: the filters apply only on `pull_request`. On push (while
+# enabled) and on workflow_dispatch, all jobs always run. If the filter job
+# itself fails, all jobs run as well (fail-open), so that no job is ever
+# skipped as an unchecked "green". Skipped jobs count as successful on
+# GitHub and do not block required checks.
 
 jobs:
   changes:
@@ -65,10 +64,10 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@v4
         with:
-          # Alle Muster eines Filters müssen zutreffen: `rust` ist damit
-          # „alles außer“ den klar Rust-fremden Pfaden. Bewusst so breit, weil
-          # Crates Nicht-`.rs`-Dateien per include_str! einbetten (assets/*.md,
-          # deploy/, packaging/, harw-registry-defaults/ …).
+          # All patterns of a filter must match: `rust` is thus
+          # "everything except" the clearly non-Rust paths. Deliberately this
+          # broad, because crates embed non-`.rs` files via include_str!
+          # (assets/*.md, deploy/, packaging/, harw-registry-defaults/ …).
           predicate-quantifier: every
           filters: |
             rust:
@@ -89,18 +88,18 @@ jobs:
   check:
     name: fmt, clippy, test (root workspace, ${{ matrix.arch }})
     needs: changes
-    # Auch bei `dod`-Änderungen: seit PL-60 sind die DoD-Crates Members des
-    # Wurzel-Workspace, `--workspace` baut/testet sie mit, und die
-    # Struktur-Gates (`xtask gates`) prüfen die DoD-Binaries.
+    # Also on `dod` changes: since PL-60 the DoD crates are members of the
+    # root workspace, `--workspace` builds/tests them too, and the
+    # structure gates (`xtask gates`) check the DoD binaries.
     if: >-
       ${{ !cancelled() && (github.event_name != 'pull_request'
       || needs.changes.result != 'success'
       || needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.dod == 'true'
       || needs.changes.outputs.workflows == 'true') }}
-    # Jede Änderung wird auf x64 und Linux-arm64 geprüft (seit R19): arm64
-    # nativ auf dem GitHub-arm64-Runner, nicht per Cross-Compile — so laufen
-    # auch die Tests (bubblewrap, Sandbox) auf der Zielarchitektur.
+    # Every change is checked on x64 and Linux arm64 (since R19): arm64
+    # natively on the GitHub arm64 runner, not via cross-compile — so the
+    # tests (bubblewrap, sandbox) also run on the target architecture.
     strategy:
       fail-fast: false
       matrix:
@@ -155,14 +154,14 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --tests -- -D warnings
 
-      # Verbotene Kanten, Privilegienbudget je DoD-Binary, Warden-Hülle und
-      # kein C-Build im Warden-Teilbaum. Ein Gate, das nichts geprüft hat,
-      # ist rot (siehe xtask/src/gates.rs).
+      # Forbidden edges, privilege budget per DoD binary, warden shell, and
+      # no C build in the warden subtree. A gate that checked nothing
+      # is red (see xtask/src/gates.rs).
       - name: xtask gates
         run: cargo run -q -p xtask -- gates
 
-      # nextest führt jeden Test in einem eigenen Prozess parallel aus; Doc-Tests
-      # unterstützt nextest nicht, die laufen separat über `cargo test --doc`.
+      # nextest runs each test in its own process in parallel; nextest does not
+      # support doc tests, which run separately via `cargo test --doc`.
       - name: cargo nextest run
         run: cargo nextest run --workspace
 
@@ -172,16 +171,16 @@ jobs:
   dod:
     name: test (dod domain, package-scoped)
     needs: changes
-    # Seit PL-60 ist `dod/` kein eigener Workspace mehr; der `check`-Job baut
-    # und testet die DoD-Crates bereits mit `--workspace`. Dieser Job prüft
-    # die zweite, sicherheitsrelevante Konfiguration: DoD-Crates und die vier
-    # DoD-Binaries **nur mit `-p`-Auswahl** gebaut und getestet. Resolver 2
-    # vereinigt Features nur über die ausgewählten Pakete; so sieht der
-    # Job, was die Binaries ohne die Feature-Vereinigung mit Produkt-Crates
-    # (z. B. `serde_json/preserve_order`, weitere `rustix`-Features)
-    # tatsächlich tun — derselbe Zuschnitt wie `dod/Makefile` (`build`).
-    # dod hängt per Pfad an Root-Crates (harw-types, harw-macros …), daher
-    # auch bei `rust`-Änderungen.
+    # Since PL-60, `dod/` is no longer a separate workspace; the `check` job
+    # already builds and tests the DoD crates with `--workspace`. This job
+    # covers the second, security-relevant configuration: DoD crates and the
+    # four DoD binaries built and tested **with `-p` selection only**.
+    # Resolver 2 unifies features only across the selected packages; this way
+    # the job sees what the binaries actually do without feature unification
+    # with product crates (e.g. `serde_json/preserve_order`, further `rustix`
+    # features) — the same cut as `dod/Makefile` (`build`).
+    # dod depends on root crates by path (harw-types, harw-macros …), hence
+    # also on `rust` changes.
     if: >-
       ${{ !cancelled() && (github.event_name != 'pull_request'
       || needs.changes.result != 'success'
@@ -199,8 +198,8 @@ jobs:
           rustup show active-toolchain
           rustc --version
 
-      # Eigener Cache-Schlüssel: andere Feature-Auflösung als der
-      # `--workspace`-Lauf im `check`-Job, also andere Artefakte.
+      # Separate cache key: different feature resolution than the
+      # `--workspace` run in the `check` job, hence different artifacts.
       - name: Cache cargo (dod domain)
         uses: Swatinem/rust-cache@v2
         with:
@@ -214,18 +213,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
-      # Die vier DoD-Binaries gemeinsam, wie `dod/Makefile` (`build`) sie
-      # baut — ohne Produkt-Binaries im selben Feature-Graphen.
+      # The four DoD binaries together, as `dod/Makefile` (`build`) builds
+      # them — without product binaries in the same feature graph.
       - name: Build DoD binaries (package-scoped)
         run: cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden
 
-      # Warden-TCB fürs Log: die Laufzeit-Hülle, die `xtask gates`
-      # (warden-dependency-budget) gegen `MAX_WARDEN_RUNTIME_DEPS` zählt.
+      # Warden TCB for the log: the runtime shell that `xtask gates`
+      # (warden-dependency-budget) counts against `MAX_WARDEN_RUNTIME_DEPS`.
       - name: Warden runtime dependency tree
         run: cargo tree --locked -p harw-warden -e normal
 
-      # Jedes Verzeichnis unter dod/crates ist genau ein Paket gleichen
-      # Namens (geprüft von xtask: test_dod_crates_are_root_workspace_members).
+      # Each directory under dod/crates is exactly one package of the same
+      # name (checked by xtask: test_dod_crates_are_root_workspace_members).
       - name: cargo test (dod crates, -p selection)
         run: |
           packages=()
@@ -248,8 +247,8 @@ jobs:
         uses: actions/checkout@v7
 
       # Uses the repo's existing deny.toml (root of the checkout) — no
-      # separate config needed. Die Action bringt ihre eigene Toolchain im
-      # Container mit; rust-toolchain.toml spielt hier keine Rolle.
+      # separate config needed. The action brings its own toolchain in its
+      # container; rust-toolchain.toml plays no role here.
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -267,8 +266,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Offizielles Image des actionlint-Autors (rhysd); prüft alle Workflows
-      # unter .github/workflows inkl. shellcheck für `run:`-Blöcke.
+      # Official image from the actionlint author (rhysd); checks all workflows
+      # under .github/workflows, including shellcheck for `run:` blocks.
       - name: actionlint
         uses: docker://rhysd/actionlint:1.7.7
         with:
@@ -280,8 +279,8 @@ jobs:
     # Darwin-native job mechanics (harw-job-darwin) only run on macOS; the
     # Linux jobs above compile its pure parts only. harw-job-linux must still
     # compile (empty) on macOS.
-    # macOS-Minuten kosten das Zehnfache: nur auf main, per Hand
-    # (workflow_dispatch) oder auf PRs mit dem Label `macos`.
+    # macOS minutes cost ten times as much: only on main, by hand
+    # (workflow_dispatch), or on PRs with the `macos` label.
     if: >-
       ${{ !cancelled() && (github.event_name == 'push'
       || github.event_name == 'workflow_dispatch'
@@ -316,7 +315,7 @@ jobs:
     # otherwise only covered by golden tests of the generated crate; this job
     # runs a real `cargo build --release` of it and executes the result
     # (scripts/native-e2e.sh). A release build of the runner crates takes
-    # minutes: only on main and per Hand (workflow_dispatch), never on PRs.
+    # minutes: only on main and by hand (workflow_dispatch), never on PRs.
     if: >-
       ${{ !cancelled() && (github.event_name == 'push'
       || github.event_name == 'workflow_dispatch') }}

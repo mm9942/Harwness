@@ -19,19 +19,19 @@ proc-macro2 = "1"
 [dev-dependencies]
 harw-operations = { path = "../harw-operations" }
 harw-observe = { path = "../harw-observe" }
-# AW2-06 (`#[derive(SensorSource)]`): Zieltypen für Positivtests und trybuild.
-# Zyklisch mit den normalen Abhängigkeiten dieser Crates auf `harw-macros`
-# zurück (dieselbe Cargo-Dev-Dependency-Ausnahme wie bei `harw-observe`
-# oben) — Cargo erlaubt das, weil Dev-Dependencies nicht Teil des
-# Graphen sind, den ein Abnehmer dieser Crate als Bibliothek sieht.
+# AW2-06 (`#[derive(SensorSource)]`): target types for positive tests and trybuild.
+# Cyclic with these crates' normal dependencies on `harw-macros`
+# (the same Cargo dev-dependency exception as for `harw-observe`
+# above) — Cargo allows this because dev-dependencies are not part of the
+# graph that a consumer of this crate sees as a library.
 harw-dod-cap = { path = "../dod/crates/harw-dod-cap" }
 harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
 harw-dod-readfs = { path = "../dod/crates/harw-dod-readfs" }
 harw-types = { path = "../harw-types" }
 # AW5-01 (`warden_actions!`): `ProposedAction::tool_schema()` returns a
-# `harw_tools::ToolSpec`; needed for Positivtests und trybuild. Ebenfalls
-# zyklisch mit `harw-tools`' normaler Abhängigkeit auf `harw-macros` zurück
-# (dieselbe Dev-Dependency-Ausnahme wie oben bei `harw-observe`).
+# `harw_tools::ToolSpec`; needed for positive tests and trybuild. Likewise
+# cyclic with `harw-tools`' normal dependency on `harw-macros`
+# (the same dev-dependency exception as above for `harw-observe`).
 harw-tools = { path = "../harw-tools" }
 blake3 = { workspace = true }
 serde = { version = "1", features = ["derive"] }

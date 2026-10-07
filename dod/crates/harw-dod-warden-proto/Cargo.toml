@@ -9,51 +9,49 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Vokabular-Grundlage: `FindingId`, `CgroupId`, `ApprovalActor`,
-# `ContentDigest` (siehe lib.rs-Moduldoku, Abschnitt „Prüfung 2").
+# Vocabulary foundation: `FindingId`, `CgroupId`, `ApprovalActor`,
+# `ContentDigest` (see lib.rs module docs, section "Prüfung 2").
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `error.rs`. Bewusst NICHT
-# `harw_macros::warden_actions!` — siehe lib.rs-Moduldoku, Abschnitt
-# „Prüfung 2: harw-tools".
+# `#[derive(harw_macros::HarwError)]` for `error.rs`. Deliberately NOT
+# `harw_macros::warden_actions!` — see lib.rs module docs, section
+# "Prüfung 2: harw-tools".
 harw-macros = { path = "../../../harw-macros" }
 serde = { workspace = true }
-# BEFUND (Gate-Lauf, `warden-no-c-build`/`warden-dependency-budget`): `jiff`
-# zieht in `Cargo.lock` transitiv `defmt` (samt `defmt-macros`,
-# `defmt-parser`) in die Laufzeit-Hülle von `harw-warden` — `defmt` ist bei
-# `jiff` 0.2.32 ein rein optionales `dep:defmt` hinter dem Feature `defmt`
-# (siehe `[features] defmt = ["dep:defmt"]` in der gepinnten Quelle unter
-# `~/.cargo/registry/src/.../jiff-0.2.32/Cargo.toml`), und ebenso `log`
-# (Feature `logging = ["dep:log"]`) sowie `jiff-static` (Feature `static`).
-# Geprüft, kein Merkmal abgeschaltet: **keine** einzige `Cargo.toml` in
-# diesem Workspace — weder hier noch in einer der rund fünfzig anderen
-# `jiff = { workspace = true }`-Stellen, weder unter `[dependencies]` noch
-# unter `[dev-dependencies]` — fordert `defmt`, `logging` oder `static` an;
-# die Workspace-Wurzel setzt für `jiff` ausschließlich `features = ["serde"]`
-# (siehe Root-`Cargo.toml`, `[workspace.dependencies]`). `jiff`s eigener
-# `default`-Featuresatz enthält keines der drei. Damit lässt sich dieser
-# Fund **nicht** durch ein abzuwählendes Feature beseitigen — es gibt keins,
-# das hier aktiv ist. Der wahrscheinlichste Grund: `Cargo.lock` ist an dieser
-# Stelle veraltet — die Root-`Cargo.toml` dokumentiert selbst den
-# vorausgegangenen Umbau („`jiff` in fünf Schreibweisen und drei Fassungen im
-# Baum“ vor der Konsolidierung auf `workspace = true`); vermutlich forderte
-# eine der alten Schreibweisen `logging`/`defmt`/`static` an, und die
-# Konsolidierung hat diese Feature-Zeilen entfernt, ohne dass seither ein
-# `cargo`-Lauf `Cargo.lock` neu aufgelöst hätte. Diese Datei darf laut
-# Auftrag kein `cargo` ausführen und `Cargo.lock` nicht schreiben — die
-# Behebung ist ein `cargo update -p jiff --precise 0.2.32` (oder ein voller
-# `cargo build --workspace --all-targets`), danach beide Gates erneut
-# laufen lassen.
+# FINDING (gate run, `warden-no-c-build`/`warden-dependency-budget`): `jiff`
+# pulls `defmt` (along with `defmt-macros`, `defmt-parser`) transitively in
+# `Cargo.lock` into the runtime closure of `harw-warden` — with `jiff` 0.2.32,
+# `defmt` is a purely optional `dep:defmt` behind the feature `defmt`
+# (see `[features] defmt = ["dep:defmt"]` in the pinned source under
+# `~/.cargo/registry/src/.../jiff-0.2.32/Cargo.toml`), and likewise `log`
+# (feature `logging = ["dep:log"]`) and `jiff-static` (feature `static`).
+# Checked, no feature disabled: **not a single** `Cargo.toml` in this
+# workspace — neither here nor in any of the roughly fifty other
+# `jiff = { workspace = true }` sites, neither under `[dependencies]` nor
+# under `[dev-dependencies]` — requests `defmt`, `logging`, or `static`;
+# the workspace root sets only `features = ["serde"]` for `jiff` (see the root
+# `Cargo.toml`, `[workspace.dependencies]`). `jiff`'s own `default` feature
+# set contains none of the three. So this finding **cannot** be eliminated by
+# deselecting a feature — there is none active here. The most likely reason:
+# `Cargo.lock` is stale at this point — the root `Cargo.toml` itself documents
+# the preceding refactoring ("`jiff` in five spellings and three versions in
+# the tree" before the consolidation to `workspace = true`); presumably one of
+# the old spellings requested `logging`/`defmt`/`static`, and the
+# consolidation removed those feature lines without any `cargo` run having
+# re-resolved `Cargo.lock` since. Per the assignment, this file may not run
+# `cargo` and may not write `Cargo.lock` — the fix is
+# `cargo update -p jiff --precise 0.2.32` (or a full
+# `cargo build --workspace --all-targets`), then re-run both gates.
 jiff = { workspace = true }
-# Trägt die Bindungsregel für `AuthorizationProof::bound_action`
-# (kanonische Serialisierung von `WardenAction` vor dem Digest, siehe
-# `action.rs`). Deshalb ein regulärer Abhängigkeitseintrag und keine reine
-# Dev-Dependency: die Digestbildung läuft zur Laufzeit, nicht nur in Tests.
-# Kein zusätzliches Gewicht für das Warden-Abhängigkeitsbudget (Prüfung 2):
-# `harw-types` zieht `serde_json` bereits ein.
+# Carries the binding rule for `AuthorizationProof::bound_action`
+# (canonical serialization of `WardenAction` before the digest, see
+# `action.rs`). Hence a regular dependency entry and not a mere
+# dev-dependency: digest construction runs at runtime, not only in tests.
+# No additional weight for the warden dependency budget (check 2):
+# `harw-types` already pulls in `serde_json`.
 serde_json = { workspace = true }
-# Proof v2 (C-WPROTO): keyed BLAKE3 für den MAC, `blake3::Hash`-Vergleich in
-# konstanter Zeit. Bereits über `harw-types` im Baum — kein zusätzliches
-# Gewicht für das Warden-Abhängigkeitsbudget.
+# Proof v2 (C-WPROTO): keyed BLAKE3 for the MAC, constant-time `blake3::Hash`
+# comparison. Already in the tree via `harw-types` — no additional weight for
+# the warden dependency budget.
 blake3 = { workspace = true }
 
 [lints]

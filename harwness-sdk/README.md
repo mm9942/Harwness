@@ -1,12 +1,12 @@
 # harwness-sdk
 
-Stabile, dokumentierte API, um Harwness in eigene Programme einzubetten.
+A stable, documented API for embedding Harwness in your own programs.
 
-Die SDK ist die **semver-Grenze** vor den internen `harw-*`-Crates: keine
-öffentliche Signatur nennt einen internen Typ. JSON-Nutzdaten laufen über
-`serde_json::Value` (re-exportiert als `harwness_sdk::serde_json`).
+The SDK is the **semver boundary** in front of the internal `harw-*` crates:
+no public signature names an internal type. JSON payloads travel as
+`serde_json::Value` (re-exported as `harwness_sdk::serde_json`).
 
-## Schnellstart
+## Quick start
 
 ```rust,no_run
 use harwness_sdk::prelude::*;
@@ -15,65 +15,65 @@ use harwness_sdk::prelude::*;
 async fn main() -> Result<(), SdkError> {
     let harwness = Harwness::builder().cwd(".").build()?;
     let mut session = harwness.session()?;
-    let report = session.send("Welche Tests gibt es hier?").await?;
+    let report = session.send("Which tests are there?").await?;
     println!("{}", report.text.unwrap_or_default());
     Ok(())
 }
 ```
 
-Voraussetzungen: eine Tokio-Runtime und ein eingerichteter Root-Space
-(`~/.harw` bzw. `HARW_HOME`) mit aktiver UIA und konfiguriertem Provider —
-`harw` richtet beides beim ersten Start ein. Für Tests ohne Netz:
+Prerequisites: a Tokio runtime and a set-up root space
+(`~/.harw` or `HARW_HOME`) with an active UIA and a configured provider —
+`harw` sets up both on first start. For tests without network:
 `HarwnessBuilder::offline_echo("…")`.
 
-## API-Überblick
+## API overview
 
-| Baustein | Zweck |
+| Component | Purpose |
 |---|---|
 | `Harwness::builder()` → `HarwnessBuilder` | `home`, `cwd`, `model`, `provider`, `mode`, `reasoning_effort`, `agent`, `approval_policy`, `approval_handler`, `tool`, `context_source`, `ephemeral`, `scaffold_home`, `offline_echo` |
-| `HarwnessBuilder::build()` | prüft Eingaben, lädt Konfiguration (mit Repo-Vertrauensprüfung), prüft UIA/Provider, öffnet den Verlaufsspeicher |
-| `Harwness::session()` / `Harwness::resume(&id)` | neue bzw. gespeicherte Sitzung |
-| `Session::send(text)` → `TurnReport` | fährt einen Turn inkl. Freigaben und Kind-Agenten zu Ende |
+| `HarwnessBuilder::build()` | validates inputs, loads configuration (with repo trust check), checks UIA/provider, opens the history store |
+| `Harwness::session()` / `Harwness::resume(&id)` | new or saved session |
+| `Session::send(text)` → `TurnReport` | runs a turn to completion, including approvals and child agents |
 | `Session::events()` → `EventStream` | `SdkEvent`s: `TurnStarted`, `TextDelta`, `ReasoningDelta`, `Message`, `ToolCall`, `ToolResult`, `ChildSpawned`, `ChildCompleted`, `Usage`, `Context`, `Error`, `Finished`, `Lagged` |
-| `Session::cancel_handle()` → `CancelHandle` | laufenden Turn von außen abbrechen |
-| `Session::history()`, `Session::total_usage()` | Verlauf und Nutzung |
-| `Tool`, `FnTool`, `ToolContext`, `ToolError` | eigene Werkzeuge (JSON rein, JSON raus) |
-| `ContextSource`, `ContextItem` | eigener Kontext je Turn (Vertrauensklasse „Daten“) |
-| `ApprovalHandler`, `approval_fn`, `AutoDeny`, `Decision`, `ApprovalPolicy` | Freigaben; Vorgabe `AutoDeny` + `Delegated` |
-| `SdkError` | ein Fehlertyp, `#[non_exhaustive]` |
+| `Session::cancel_handle()` → `CancelHandle` | cancel a running turn from outside |
+| `Session::history()`, `Session::total_usage()` | history and usage |
+| `Tool`, `FnTool`, `ToolContext`, `ToolError` | custom tools (JSON in, JSON out) |
+| `ContextSource`, `ContextItem` | custom context per turn (trust class "data") |
+| `ApprovalHandler`, `approval_fn`, `AutoDeny`, `Decision`, `ApprovalPolicy` | approvals; default `AutoDeny` + `Delegated` |
+| `SdkError` | a single error type, `#[non_exhaustive]` |
 
-## Freigaben
+## Approvals
 
-Die Runtime hält Werkzeugaufrufe an, die ihre Politik nicht ohne Rückfrage
-durchlässt (`ApprovalPolicy::Delegated`: Veränderndes und Ausführendes;
-`AlwaysAsk`: alles; `FullAccess`: nichts). `Session::send` legt jede solche
-Anfrage dem `ApprovalHandler` vor. Ohne eigenen Handler lehnt `AutoDeny`
-ab; ohne Antwort innerhalb des konfigurierten Freigabe-Timeouts und bei
-Abbruch des Turns wird ebenfalls abgelehnt.
+The runtime pauses tool calls that its policy does not let through without
+asking (`ApprovalPolicy::Delegated`: anything that modifies or executes;
+`AlwaysAsk`: everything; `FullAccess`: nothing). `Session::send` presents
+each such request to the `ApprovalHandler`. Without a handler of your own,
+`AutoDeny` denies; a request is also denied if no answer arrives within the
+configured approval timeout or if the turn is cancelled.
 
-## Beispiele
+## Examples
 
 ```text
-cargo run -p harwness-sdk --example minimal_chat -- "Was liegt hier?"
-cargo run -p harwness-sdk --example streaming_events -- "Analysiere src/"
+cargo run -p harwness-sdk --example minimal_chat -- "What is in here?"
+cargo run -p harwness-sdk --example streaming_events -- "Analyze src/"
 cargo run -p harwness-sdk --example custom_tool
 ```
 
 ## Features
 
-- `browser` (Vorgabe): Browser-Werkzeuge der Wurzelsitzung, falls konfiguriert.
-- `unstable-internals`: rohe Erweiterungspunkte (`raw_tool_provider`,
+- `browser` (default): browser tools of the root session, if configured.
+- `unstable-internals`: raw extension points (`raw_tool_provider`,
   `raw_context_provider`, `raw_model_provider`, `raw_secret_resolver`) —
-  **ohne** semver-Zusage.
+  **without** a semver guarantee.
 
-## Grenzen (Stand dieser Fassung)
+## Limits (as of this version)
 
-- Der Einstieg nutzt das interaktive Runtime-Profil (`EntryKind::Tui`); eine
-  aktive UIA ist deshalb Pflicht.
-- Konfiguration wird aus den Dateien des Root-Space und des Projekts geladen;
-  In-Memory-Overrides gibt es nur für Modell, Provider, Modus, Effort, Agent
-  und Freigabepolitik.
-- `auth = "secrets:…"` braucht einen Resolver (nur über
+- The entry point uses the interactive runtime profile (`EntryKind::Tui`);
+  an active UIA is therefore mandatory.
+- Configuration is loaded from the files of the root space and the project;
+  in-memory overrides exist only for model, provider, mode, effort, agent
+  and approval policy.
+- `auth = "secrets:…"` needs a resolver (only via
   `unstable-internals`).
-- Verschachtelte Pausen von Kind-Agenten (eigene Freigaben/Übergaben) treibt
-  die SDK nicht; das Kind endet dann mit einem Fehlerergebnis.
+- The SDK does not drive nested pauses of child agents (their own
+  approvals/handoffs); the child then ends with an error result.

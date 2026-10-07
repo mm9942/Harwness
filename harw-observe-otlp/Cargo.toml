@@ -9,30 +9,30 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# harw-macros ist Baseline jeder Crate für den einen Fehlertyp (Kopfteil
-# "Fehler": `#[derive(harw_macros::HarwError)]`); ohne sie gäbe es keinen
-# Weg, `OtlpError` ohne anyhow/thiserror zu bauen.
+# harw-macros is the baseline of every crate for the single error type (header
+# section "Errors": `#[derive(harw_macros::HarwError)]`); without it there
+# would be no way to build `OtlpError` without anyhow/thiserror.
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jiff = { workspace = true }
 
-# Echter HTTP-Transport (`crate::http_transport::HttpTransport`), AW7-02.
-# Dieselbe HTTP-Bibliothek und dieselben Versionsangaben wie
-# harw-mcp-server/Cargo.toml und harw-web/Cargo.toml (Serverseite: "server",
-# "http1") -- hier nur die Client-seitigen Feature-Flags derselben, bereits
-# im Baum aufgelösten Crates ("client"/"client-legacy"). `hyper`,
-# `hyper-util`, `http-body-util`, `bytes` und `tokio` stehen in genau diesen
-# Versionsangaben bereits im Workspace (harw-mcp-server, harw-web,
-# harw-provider-http via `reqwest`s eigenem `hyper`-Client) -- diese Zeilen
-# fügen dem Cargo.lock **keine neue Crate** hinzu, nur zusätzliche Features
-# auf bereits aufgelösten Paketen (siehe crate-doc, Abschnitt "Die
-# HTTP-Bibliothek"). Kein `reqwest` (zusätzliche, größere Fläche) und keine
-# TLS-Bibliothek (siehe crate-doc, Abschnitt "TLS").
-# "http1" ist nötig, damit `hyper_util::client::legacy::Client` auch beim
-# alleinigen Bau (`cargo test -p harw-observe-otlp`) existiert -- im
-# Workspace-Bau kam das Feature nur zufällig über die Feature-Vereinigung.
+# Real HTTP transport (`crate::http_transport::HttpTransport`), AW7-02.
+# Same HTTP library and same version specifications as
+# harw-mcp-server/Cargo.toml and harw-web/Cargo.toml (server side: "server",
+# "http1") -- here only the client-side feature flags of the same crates that
+# are already resolved in the tree ("client"/"client-legacy"). `hyper`,
+# `hyper-util`, `http-body-util`, `bytes` and `tokio` already appear in
+# exactly these version specifications in the workspace (harw-mcp-server,
+# harw-web, harw-provider-http via `reqwest`'s own `hyper` client) -- these
+# lines add **no new crate** to Cargo.lock, only additional features on
+# already resolved packages (see the crate docs, section "The HTTP
+# library"). No `reqwest` (additional, larger surface) and no TLS library
+# (see the crate docs, section "TLS").
+# "http1" is required so that `hyper_util::client::legacy::Client` also exists
+# when built on its own (`cargo test -p harw-observe-otlp`) -- in the
+# workspace build the feature only arrived by chance via feature unification.
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = { version = "0.1" }

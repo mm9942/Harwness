@@ -1,7 +1,7 @@
-# Build-Artefakte
+# Build artifacts
 /target/
 **/target/
-# Lokale/temporäre Dateien
+# Local/temporary files
 /.tmp/
 /.remember/
 /.claude/settings.local.json
@@ -16,7 +16,7 @@
 /webui/.next/
 /webui/out/
 
-# Agenten-/Assistenz-Dateien und Sitzungsprotokolle (nicht Teil des Projekts)
+# Agent/assistant files and session logs (not part of the project)
 AGENTS.md
 AGENT.md
 CLAUDE.md
@@ -28,30 +28,30 @@ docs/remediation/AGENT-BRIEF.md
 .env
 .env.*
 
-# Lokale Arbeitsnotizen (Analyse, Handoff, Planungsentwürfe) – nicht Teil des Projekts
+# Local working notes (analysis, handoff, planning drafts) – not part of the project
 /TELEGRAM_TRANSPORT_PLAN.md
 /project_handoff.md
 /goal.md
 /hardening-suggestive-inspiration.md
 
-# Exportierte Claude-Code-Gespräche
+# Exported Claude Code conversations
 /20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
 
-# Build- und Prüfprotokolle aus lokalen Läufen (make build/clippy > …)
+# Build and check logs from local runs (make build/clippy > …)
 *.log
 
-# Lokales Auslieferungsarchiv (zu gross fuer GitHub)
+# Local delivery archive (too large for GitHub)
 harw.zip
 .harw/
 harw-export-*
 
-# lokale/experimentelle Räume, nicht Teil des Projekts
+# local/experimental spaces, not part of the project
 /spaces/
 
-# Zu grosse Codex-Session-Transkripte (bleiben lokal in docs/sessions/, nie tracken)
+# Oversized Codex session transcripts (stay local in docs/sessions/, never track)
 /docs/sessions/codex-session-01a0afe0-*.md
 
-# Temporäre Arbeitsdateien im Root
+# Temporary working files in the root
 .tmp_*
 
 # Never publish session transcripts, exports or local credentials

@@ -13,24 +13,24 @@ harw-dod-cap = { path = "../harw-dod-cap" }
 harw-dod-netlink = { path = "../harw-dod-netlink" }
 harw-dod-signals = { path = "../harw-dod-signals" }
 harw-macros = { path = "../../../harw-macros" }
-# `SensorId` für `AuthlogSensor` (bildet `AuthRecord` auf `SecurityEvent` ab,
-# siehe src/sensor.rs) und für die Doku-Beispiele.
+# `SensorId` for `AuthlogSensor` (maps `AuthRecord` to `SecurityEvent`,
+# see src/sensor.rs) and for the doc examples.
 harw-types = { path = "../../../harw-types" }
 jiff = { workspace = true }
 
 [dev-dependencies]
-# `harw-dod-fixtures` ist inzwischen (Knoten AW2-05) eine echte Crate mit
-# `sensor_suite!`, nicht mehr das Gerüst, das bei Beginn dieses Knotens
-# vorlag. Sie greift für `AuthlogSensor` trotzdem nicht sinnvoll:
-# `sensor_suite!` verlangt `From<SensorHandle<Bound>>` (ein Griff hinein,
-# ein Sensor heraus) — `AuthlogSensor` braucht zusätzlich ein
-# `Box<dyn AuthBackend>`, das aus einem bloßen Griff nicht ableitbar ist.
-# Und selbst die zugrunde liegenden `harness::assert_*`-Funktionen, die
-# generisch über `F: Fn(SensorHandle<Bound>) -> S` sind, gehen von einem
-# `ReadScope`/`tree/`-Fixture-Modell aus, das `AuthlogSensor` nie berührt
-# (siehe src/sensor.rs für die volle Begründung). Als Pfadabhängigkeit
-# trotzdem aufgenommen, wie im Auftrag verlangt, und damit ein künftiger
-# Knoten sie ohne Cargo.toml-Änderung nutzen kann.
+# `harw-dod-fixtures` is now (node AW2-05) a real crate with
+# `sensor_suite!`, no longer the scaffold that existed at the start of this
+# node. It still does not apply meaningfully to `AuthlogSensor`:
+# `sensor_suite!` requires `From<SensorHandle<Bound>>` (a handle in,
+# a sensor out) — `AuthlogSensor` additionally needs a
+# `Box<dyn AuthBackend>`, which cannot be derived from a bare handle.
+# And even the underlying `harness::assert_*` functions, which are
+# generic over `F: Fn(SensorHandle<Bound>) -> S`, assume a
+# `ReadScope`/`tree/` fixture model that `AuthlogSensor` never touches
+# (see src/sensor.rs for the full rationale). Included as a path dependency
+# anyway, as the work order demands, so that a future node can use it without
+# a Cargo.toml change.
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
 

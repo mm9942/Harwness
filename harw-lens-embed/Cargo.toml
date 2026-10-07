@@ -16,19 +16,19 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 blake3 = { workspace = true }
-# Transport für `http_backend::HttpEmbedBackend` (Knoten AW7-06). Version und
-# Feature-Zuschnitt ("blocking", "json", "rustls-tls") folgen bewusst
-# `harw-provider-http`s bereits vorhandener, bereits geprüfter Wahl -- keine
-# zweite, abweichende reqwest-Konfiguration im Baum. "blocking" kommt hinzu,
-# weil `Embedder::embed` synchron ist (siehe `http_backend`s Moduldoku für die
-# daraus folgende Aufrufer-Pflicht in async-Kontexten).
+# Transport for `http_backend::HttpEmbedBackend` (node AW7-06). Version and
+# feature selection ("blocking", "json", "rustls-tls") deliberately follow
+# `harw-provider-http`'s already existing, already vetted choice -- no
+# second, divergent reqwest configuration in the tree. "blocking" is added
+# because `Embedder::embed` is synchronous (see the module docs of `http_backend` for the
+# resulting caller obligation in async contexts).
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
     "rustls-tls",
 ] }
-# Hält den API-Key außerhalb von Debug-Ausgaben -- dieselbe Crate, die
-# `harw-provider-http` bereits für denselben Zweck einsetzt.
+# Keeps the API key out of debug output -- the same crate that
+# `harw-provider-http` already uses for the same purpose.
 secrecy = "0.10.3"
 
 [lints]

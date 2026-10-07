@@ -9,27 +9,27 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# `ContentDigest::of` hasht mit blake3 (mit `ContentDigest` aus
-# `harw-types` hierher verschoben, samt Befund):
-# BEFUND (Gate-Lauf, `warden-no-c-build`): `blake3` 1.8.7 verlangt in seiner
-# eigenen, gepinnten Quelle (`~/.cargo/registry/src/.../blake3-1.8.7/Cargo.toml`)
-# `[build-dependencies.cc]` **ohne** `optional = true` — diese Kante ist
-# bedingungslos, für jede Feature-Kombination. Geprüft: das Feature `pure`
-# (`pure = []`) schaltet in `build.rs` nur die SIMD-Assembly-/C-Intrinsics-
-# Pfade ab (reine Rust-Intrinsics werden gebaut) — es hebt weder die
-# `cc`-Build-Dependency im Manifest auf, noch verhindert es den
-# C-Compiler-Sondierungsaufruf `c_compiler_support()` in `build.rs`, der auf
-# x86/x86_64-Targets unabhängig von `pure` ausgeführt wird (nur der
-# *Fehlschlag* dieser Sondierung ist bei `pure` unschädlich, siehe dortige
-# `main()`-Logik). Damit gibt es **kein** Merkmal, dessen Abwahl diesen Fund
-# beseitigt, ohne die Version zu wechseln (verboten laut Auftrag) — ein
-# echter, mit den erlaubten Mitteln nicht behebbarer Verstoß. `ContentDigest`
-# bleibt unverändert auf `blake3` mit Default-Features (`std`), da eine
-# Featureänderung hier keinen Nutzen hätte und ungeprüfte Abwahl verboten
-# ist.
-# Datierte Ausnahme dazu: `C_BUILD_EXCEPTIONS` in `xtask/src/gate_warden.rs`.
+# `ContentDigest::of` hashes with blake3 (moved here from `harw-types` along
+# with `ContentDigest`, including the finding):
+# FINDING (gate run, `warden-no-c-build`): `blake3` 1.8.7 requires in its
+# own pinned source (`~/.cargo/registry/src/.../blake3-1.8.7/Cargo.toml`)
+# `[build-dependencies.cc]` **without** `optional = true` — this edge is
+# unconditional, for every feature combination. Verified: the `pure` feature
+# (`pure = []`) only disables the SIMD assembly / C intrinsics paths in
+# `build.rs` (pure Rust intrinsics are built) — it neither removes the
+# `cc` build dependency from the manifest nor prevents the
+# C-compiler probe call `c_compiler_support()` in `build.rs`, which on
+# x86/x86_64 targets is executed regardless of `pure` (only the
+# *failure* of this probe is harmless with `pure`, see the `main()` logic
+# there). So there is **no** feature whose deselection eliminates this
+# finding without changing the version (forbidden by the task) — a
+# genuine violation that cannot be fixed with the permitted means.
+# `ContentDigest` stays unchanged on `blake3` with default features (`std`),
+# since a feature change would bring no benefit here and unverified
+# deselection is forbidden.
+# Dated exception for this: `C_BUILD_EXCEPTIONS` in `xtask/src/gate_warden.rs`.
 blake3 = { workspace = true }
-# Hex-Zeichenkette als Drahtformat (`Serialize`/`Deserialize` von Hand).
+# Hex string as wire format (`Serialize`/`Deserialize` by hand).
 serde = { workspace = true }
 
 [dev-dependencies]

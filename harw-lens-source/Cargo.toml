@@ -21,10 +21,10 @@ harw-home = { path = "../harw-home" }
 harw-knowledge = { path = "../harw-knowledge" }
 harw-types = { path = "../harw-types" }
 harw-macros = { path = "../harw-macros" }
-# Trägt den Nullzähler `lens_remote_embed_on_operator_only` (AW7-05):
-# `build_index` erhöht ihn über `NullCounter::violated`, wenn ein
-# `operator-only`-Sichtbarkeits-Bucket einem Embedder mit
-# `Locality::Remote` zugewiesen würde.
+# Carries the null counter `lens_remote_embed_on_operator_only` (AW7-05):
+# `build_index` increments it via `NullCounter::violated` when an
+# `operator-only` visibility bucket would be assigned to an embedder with
+# `Locality::Remote`.
 harw-observe = { path = "../harw-observe" }
 serde = { workspace = true }
 serde_json = { workspace = true }

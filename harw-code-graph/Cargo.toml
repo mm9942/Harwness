@@ -10,10 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
-# aktualisieren lassen — dieser Worker hat keine ExecuteProcess-Permission und
-# konnte `cargo` nicht ausführen. "1.1.3" entspricht der bereits im
-# Workspace-Cargo.lock aufgelösten Version (toml 1.1.3+spec-1.1.0), wie sie
-# u.a. auch harw-agent-dsl, harw-cli und harw-model-catalog verwenden.
+# update — this worker has no ExecuteProcess permission and
+# could not run `cargo`. "1.1.3" corresponds to the version already resolved in the
+# workspace Cargo.lock (toml 1.1.3+spec-1.1.0), as also used by
+# harw-agent-dsl, harw-cli and harw-model-catalog, among others.
 toml = "1.1.3"
 harw-macros = { path = "../harw-macros" }
 harw-types = { path = "../harw-types" }

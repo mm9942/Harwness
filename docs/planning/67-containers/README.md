@@ -1,6 +1,6 @@
 ---
 id: CONTAINERS
-title: Optionales Container-System (Podman/Docker/Kubernetes als verwaltete Instanzen) + DoD-Container-Sensor
+title: Optional container system (Podman/Docker/Kubernetes as managed instances) + DoD container sensor
 status: proposed
 date: 2026-09-27
 tags: [containers, oci, podman, docker, kubernetes, dod, placement, executor]
@@ -12,23 +12,23 @@ related:
   - ../../design/harw-dod-charter.md
 ---
 
-> **Idee (Mia):** Die Ausführung wird als Container-System betrachtet, als
-> optionales Feature:
-> - Kubernetes, Docker und Podman werden zu Runtimes bzw. Nodes, die harw als
->   Instanzen verwaltet.
-> - DoD bekommt ein eigenes Container-Crate.
+> **Idea (Mia):** Execution is treated as a container system, as an
+> optional feature:
+> - Kubernetes, Docker and Podman become runtimes or nodes that harw manages as
+>   instances.
+> - DoD gets its own container crate.
 >
-> Entstanden aus dem Workflow `container-runtime-design`:
-> - 3 Mapper haben den Code gelesen;
-> - 2 Rechercheure haben die offiziellen Doku-Seiten von Podman, Docker und
->   Kubernetes ausgewertet;
-> - ein Opus-Entwurf hat daraus diesen Vorschlag gemacht und dabei vier Fehler
->   aus den Vorlagen korrigiert.
+> Arose from the workflow `container-runtime-design`:
+> - 3 mappers read the code;
+> - 2 researchers evaluated the official documentation pages of Podman, Docker and
+>   Kubernetes;
+> - an Opus draft turned this into the present proposal and corrected four errors
+>   from the inputs along the way.
 >
-> Kernaussage: Die Idee passt, mit einer Änderung. DoD bekommt einen reinen
-> **Beobachter** (Ring D). Die Instanzverwaltung liegt in Executoren (OCI in
-> Ring J, Kubernetes in Ring A wegen des TLS-Stacks). Ein gemeinsames
-> Vokabular in Ring I verbindet beide.
+> Key takeaway: The idea fits, with one change. DoD gets a pure
+> **observer** (ring D). Instance management lives in executors (OCI in
+> ring J, Kubernetes in ring A because of the TLS stack). A shared
+> vocabulary in ring I connects the two.
 
 # Design note: optional container system (Docker/Podman/Kubernetes as managed instances)
 
@@ -40,8 +40,8 @@ The mapping/research input has four errors that this note corrects:
 - `ResourceRequest` already has `memory_max`, `cpu_weight`, `pids_max` and `wall_timeout` (`harw-job-core/src/spec.rs:188-200`).
 - The proposed `LinuxSandboxBackend::Container` variant is the wrong shape (see §2).
 
-> **Mode B (harw-Zelle):** harw selbst als Container mit lokal kompilierten
-> Worker-Agenten, siehe [`cell.md`](cell.md).
+> **Mode B (harw cell):** harw itself as a container with locally compiled
+> worker agents, see [`cell.md`](cell.md).
 
 ## 1. Goal and non-goals
 - **Goal:** harw starts, supervises, reattaches to and cleans up containers as job attempts. It exposes them as `RuntimeOffer`/`NodeOffer` values. DoD observes them and can act on them.

@@ -1,6 +1,6 @@
 ---
 id: PLACEMENT
-title: Placement-Engine — Anforderungen → Node + Provider + Runtime
+title: Placement engine — requirements → node + provider + runtime
 status: proposed
 date: 2026-09-27
 tags: [placement, scheduling, providers, nodes, cost, cache]
@@ -12,9 +12,9 @@ related:
   - ../85-gap-hunt/patterns.md
 ---
 
-# Placement-Engine
+# Placement engine
 
-Ausgangsbild (Mia):
+Starting picture (Mia):
 
 ```
 Agent requirement
@@ -26,13 +26,13 @@ Agent requirement
 Node + Provider + Runtime
 ```
 
-Entstanden aus einem Workflow: Drei Mapper haben den Code gelesen (nur lesend,
-mit Belegen `datei:zeile`), danach hat ein Entwurfsagent die Engine entworfen.
-Die Ergänzungen aus der Sitzung stehen am Ende.
+This came out of a workflow: three mappers read the code (read-only,
+with `file:line` references), then a design agent designed the engine.
+The additions from the session are at the end.
 
-## Stand heute je Dimension
+## Status today per dimension
 
-| Dimension | Status | Wo heute entschieden |
+| Dimension | Status | Where decided today |
 |---|---|---|
 | Write access (filesystem) | partial | Compile time: DeriveRequirements pass (harw-agent-compiler/src/passes/requirements.rs:52-66) fixes the required sandbox level into the IR. Run time: harw-agent-… |
 | Network allowed | partial | Manifest requirement fixed at compile time (DeriveRequirements); process-level network confinement checked at admission time against the single local host; per-… |
@@ -254,50 +254,50 @@ Add to `arch-policy.toml`: `harw-placement-model` in layer I and `harw-placement
 
 This was a read-only pass: no files were edited, no tests were added, and no build commands were run. The central build has nothing new to run for this report.
 
-## Ergänzungen aus der Sitzung (2026-09-27)
+## Additions from the session (2026-09-27)
 
-### Zweistufiges Placement mit eigenem Gateway
-Im Betrieb steht ein **eigener Cloudflare-Worker** vor Workers AI, mit einem
-oder mehreren Bindings bzw. Lanes (siehe
-[gateway-contract](../75-harness-patterns/gateway-contract.md)). Die Engine
-wählt den *Provider*, also diesen Worker, dazu Rolle und Präfix-Gruppe. Lane
-und Affinität wählt der Worker. Für den `ProviderOffer` ist der Worker **ein**
-Provider mit Kapazität (`max_concurrency`, `[rate_limit]`), die Bindings
-modelliert harw nicht.
+### Two-stage placement with its own gateway
+In operation, a **dedicated Cloudflare Worker** sits in front of Workers AI,
+with one or more bindings or lanes (see
+[gateway-contract](../75-harness-patterns/gateway-contract.md)). The engine
+chooses the *provider*, that is this Worker, plus role and prefix group. The
+Worker chooses lane and affinity. For the `ProviderOffer`, the Worker is **one**
+provider with capacity (`max_concurrency`, `[rate_limit]`); harw does not
+model the bindings.
 
-### Cache-Affinität nach Präfix, nicht nach Identität
-Der Score-Faktor „Prompt-Cache warm“ bezieht sich auf **Präfix-Gruppen**:
-gleicher Systemprompt, gleiche Tools, gleicher Repo-Kontext, innerhalb eines
-Mandanten. Er bezieht sich nicht nur auf den letzten Turn des Eltern-Agenten.
-- Kurzlebige Worker mit gleichem Präfix teilen einen Affinitätsschlüssel
+### Cache affinity by prefix, not by identity
+The "prompt cache warm" score factor refers to **prefix groups**:
+same system prompt, same tools, same repo context, within one
+tenant. It does not refer only to the parent agent's last turn.
+- Short-lived workers with the same prefix share an affinity key
   (`x-harw-cache-affinity`).
-- Ein Wechsel des Modells oder Providers kostet einmal einen Cache-Write.
-- Bei rund 98 % Cache-Reads entscheidet der **Preis für Cache-Read** über die
-  Kosten, nicht der Listenpreis für Input.
+- Switching the model or provider costs one cache write.
+- At around 98% cache reads, the **cache-read price** determines the
+  cost, not the list price for input.
 
-### Kosten-Score
-Die erwarteten Kosten ergeben sich aus:
-- `cache_read_price × erwartete Trefferquote`;
-- `input_price` für frische Tokens;
-- `cache_write_price` bei kaltem Start;
-- `output_price × erwarteter Output`.
+### Cost score
+The expected cost is derived from:
+- `cache_read_price × expected hit rate`;
+- `input_price` for fresh tokens;
+- `cache_write_price` on a cold start;
+- `output_price × expected output`.
 
-Das Verhältnis Cache-Read zu Input schwankt je Modell zwischen 3 und 20 %,
-zum Beispiel DeepSeek v4 Flash 3 %, die Luna-Familie 10 %, GLM-5.3 Flash 20 %.
-Preise stehen in Daten, nicht im Code, und sind aktualisierbar. Für GLM-5.3 und
-5.3 Flash fehlen die Preisdaten im Katalog heute noch.
+The ratio of cache read to input varies between 3 and 20% depending on the model,
+for example DeepSeek v4 Flash 3%, the Luna family 10%, GLM-5.3 Flash 20%.
+Prices live in data, not in code, and can be updated. Price data for GLM-5.3 and
+5.3 Flash is still missing from the catalog today.
 
-### Referenz-Arbeitspferd
-Für große Aufträge ist **GLM-5.3 Flash über Workers AI** das Referenzmodell
-(Stand der Sitzung):
-- $0,15 Input, $0,03 Cache-Read, $0,50 Output pro 1 Mio Token;
-- 1,31 Mio Kontext, Function Calling, Reasoning, Vision.
+### Reference workhorse
+For large jobs, **GLM-5.3 Flash via Workers AI** is the reference model
+(as of the session):
+- $0.15 input, $0.03 cache read, $0.50 output per 1M tokens;
+- 1.31M context, function calling, reasoning, vision.
 
-Die Frontier-Modelle bei Workers AI haben 20 bzw. 50 Anfragen pro Minute pro
-Modell und Konto. Deshalb gehört die Lane-Kapazität des Gateways in den
-Ledger (DEC-023).
+The frontier models on Workers AI have 20 and 50 requests per minute per
+model and account, respectively. That is why the gateway's lane capacity belongs in the
+ledger (DEC-023).
 
-### Durchsatz der Workflows
-Die Grenze „CPUs − 2 pro Workflow“ (Lückenjagd, Muster P6) wird zur
-Node-Kapazität. Der Parallelschnitt, also mehrere Läufe auf getrennten
-Bereichen, ist eine Placement-Entscheidung.
+### Workflow throughput
+The "CPUs − 2 per workflow" limit (gap hunt, pattern P6) becomes
+node capacity. The parallel partitioning, that is several runs on separate
+areas, is a placement decision.

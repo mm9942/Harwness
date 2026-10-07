@@ -9,23 +9,23 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# eBPF-Ladeschicht: `BpfLoader`, `BpfProgramSpec`, `BpfHandle`, `RawBpfEvent`,
-# `BpfError`, `REQUIRED_CAPABILITY`, `FixtureBpfLoader` (für eigene Tests, Teil
-# der normalen API dieser Abhängigkeit).
+# eBPF loading layer: `BpfLoader`, `BpfProgramSpec`, `BpfHandle`, `RawBpfEvent`,
+# `BpfError`, `REQUIRED_CAPABILITY`, `FixtureBpfLoader` (for own tests, part
+# of the normal API of this dependency).
 harw-dod-bpf = { path = "../harw-dod-bpf" }
-# Zugriffsvokabular: `Capability`, `SensorHandle<Bound>`, `ReadScope`,
+# Access vocabulary: `Capability`, `SensorHandle<Bound>`, `ReadScope`,
 # `SensorError`.
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Daten-Vokabular und der eine `trait Sensor`: `Actor`, `EventKind::ProcessExec`,
+# Data vocabulary and the one `trait Sensor`: `Actor`, `EventKind::ProcessExec`,
 # `SecurityEvent`, `SensorReading`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# `SensorId` (indirekt über `SensorHandle`) und `ContentDigest` für
+# `SensorId` (indirectly via `SensorHandle`) and `ContentDigest` for
 # `ExecEvent::argv_digest`.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `ProcmonError` — kein `anyhow`,
-# kein `thiserror`.
+# `#[derive(harw_macros::HarwError)]` for `ProcmonError` — no `anyhow`,
+# no `thiserror`.
 harw-macros = { path = "../../../harw-macros" }
-# Zeitachse für `RawBpfEvent::observed_at` / `Sensor::poll`'s injiziertes `now`.
+# Time axis for `RawBpfEvent::observed_at` / the injected `now` of `Sensor::poll`.
 jiff = { workspace = true }
 
 [dev-dependencies]

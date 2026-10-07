@@ -10,29 +10,29 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
-# W3 C-EGRESS: URL-Parsing kommt ausschließlich aus `harw_sandbox::egress`
-# (EgressUrl, EgressHost); die Host-Suffix-Regel und die Public-DNS-Prüfung
-# kommen aus `harw_authority` (host_matches_suffix, is_public_dns_name) — keine
-# zweite Parser- oder Suffix-Implementierung (F-002, F-197).
+# W3 C-EGRESS: URL parsing comes exclusively from `harw_sandbox::egress`
+# (EgressUrl, EgressHost); the host-suffix rule and the public-DNS check
+# come from `harw_authority` (host_matches_suffix, is_public_dns_name) — no
+# second parser or suffix implementation (F-002, F-197).
 harw-sandbox = { path = "../harw-sandbox" }
-# Kanonischer Policy-Digest (`EgressPolicy::digest`).
+# Canonical policy digest (`EgressPolicy::digest`).
 blake3 = { workspace = true }
 tracing = { workspace = true }
-# Dieselbe Hauptversion und derselbe Feature-Satz wie harw-tool-web/harw-core
-# (Cargo.lock: reqwest 0.12.28). N-WEB bekommt den Client aus diesem Crate;
-# eine abweichende Hauptversion (0.13) ergäbe inkompatible `Client`-Typen.
+# Same major version and same feature set as harw-tool-web/harw-core
+# (Cargo.lock: reqwest 0.12.28). N-WEB gets the client from this crate;
+# a differing major version (0.13) would yield incompatible `Client` types.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
-# `tokio::net::lookup_host` im Scoped-Resolver (Cargo.lock: tokio 1.53.0).
-# W5 N-EGRESS (SOCKS5-Proxy): `rt` (JoinSet/spawn), `io-util` (read_exact,
+# `tokio::net::lookup_host` in the scoped resolver (Cargo.lock: tokio 1.53.0).
+# W5 N-EGRESS (SOCKS5 proxy): `rt` (JoinSet/spawn), `io-util` (read_exact,
 # write_all), `time` (timeout, sleep), `macros` (select!).
 tokio = { version = "1.53.0", features = ["net", "rt", "io-util", "time", "macros"] }
-# `url::Host::parse` normalisiert Allowlist-Einträge mit demselben WHATWG-
-# Host-Parser, den `EgressUrl::parse` für URLs nutzt (Cargo.lock: url 2.5.8).
+# `url::Host::parse` normalizes allowlist entries with the same WHATWG
+# host parser that `EgressUrl::parse` uses for URLs (Cargo.lock: url 2.5.8).
 url = "2.5.8"
 
 [dev-dependencies]
-# `sync` (oneshot) nur für Proxy-Tests; `tempfile` für Unix-Socket-Tempdirs
-# (Workspace-Dep, Cargo.lock: tempfile 3.27.0).
+# `sync` (oneshot) only for proxy tests; `tempfile` for Unix-socket tempdirs
+# (workspace dep, Cargo.lock: tempfile 3.27.0).
 tokio = { version = "1.53.0", features = ["rt", "macros", "net", "io-util", "time", "sync"] }
 tempfile = { workspace = true }
 

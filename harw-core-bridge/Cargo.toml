@@ -14,33 +14,33 @@ harw-types = { path = "../harw-types" }
 harw-operations = { path = "../harw-operations" }
 harw-core = { path = "../harw-core" }
 harw-extension-api = { path = "../harw-extension-api" }
-# Return-Contract-Validierung der Kind-Ergebnisse (ResearchFinding, ReturnEnvelope).
+# Return-contract validation of child results (ResearchFinding, ReturnEnvelope).
 harw-research = { path = "../harw-research" }
-# Return-Contract-Validierung des vierten Arms: `SecurityVerdict`
-# (`harwness.security-verdict/v1`, AW6-02). Bewusst NICHT
-# `harw-dod-warden-proto`: dieser Adapter darf aus einem Verdikt keine
-# `WardenAction` bauen können (siehe `agent_tool.rs`, `ChildReturnContract`).
+# Return-contract validation of the fourth arm: `SecurityVerdict`
+# (`harwness.security-verdict/v1`, AW6-02). Deliberately NOT
+# `harw-dod-warden-proto`: this adapter must not be able to build a
+# `WardenAction` from a verdict (see `agent_tool.rs`, `ChildReturnContract`).
 harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
-# #22 Welle 1B: das geschlossene Vokabular der Return-Contracts und
-# -Validatoren der Agent-IR v2 (`ChildReturnContract::parse` ist strikt).
+# #22 wave 1B: the closed vocabulary of the return contracts and
+# validators of agent IR v2 (`ChildReturnContract::parse` is strict).
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 serde_json = "1.0.150"
 tracing = "0.1.44"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
-# Nur für Tests: eine ChildRegistryFactory implementieren, um die
-# Contract-Auflösung über den OpContext zu prüfen (`harw-agent-dsl` ist seit
-# #22 Welle 1B eine reguläre Abhängigkeit, siehe oben).
+# Tests only: implement a ChildRegistryFactory to check contract resolution
+# via the OpContext (`harw-agent-dsl` has been a regular dependency since
+# #22 wave 1B, see above).
 harw-catalog = { path = "../harw-catalog" }
-# Nur für Tests: schaltet `harw_authority::SandboxSpec::from_resolved_for_test`
-# frei, das eine Sandbox mit einem echten, nicht-leeren `NetworkScope` baut —
-# die produktive API von `harw-authority` (bereits oben unter
-# `[dependencies]`) erlaubt das sonst nirgends. Nötig, damit die
-# Authority-Reduzierer-Tests belegen, dass `reduce_to_read_network` die
-# Parent-Hosts tatsächlich durchreicht, während die anderen Reduzierer sie
-# löschen. Wegen `resolver = "2"` nur im Testbuild aktiv, nie im produktiven
-# Build dieser Crate.
+# Tests only: unlocks `harw_authority::SandboxSpec::from_resolved_for_test`,
+# which builds a sandbox with a real, non-empty `NetworkScope` — the
+# production API of `harw-authority` (already listed above under
+# `[dependencies]`) allows this nowhere else. Needed so the authority-reducer
+# tests can show that `reduce_to_read_network` actually passes the parent
+# hosts through while the other reducers clear them. Because of
+# `resolver = "2"`, only active in the test build, never in this crate's
+# production build.
 harw-authority = { path = "../harw-authority", features = ["test-support"] }
 
 [lints]

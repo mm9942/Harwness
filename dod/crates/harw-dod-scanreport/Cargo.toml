@@ -9,37 +9,36 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError (der
-# einzige Fehlertyp, den diese Crate zurückgibt — siehe `src/lib.rs`).
+# Access vocabulary: Capability, ReadScope, SensorHandle, SensorError (the
+# only error type this crate returns — see `src/lib.rs`).
 harw-dod-cap = { path = "../harw-dod-cap" }
-# Datenvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`,
+# Data vocabulary: `trait Sensor`, `SensorReading`, `SecurityEvent`,
 # `EventKind`, `Hardness`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die einzige Dateisystem-Naht dieser Crate: `read_to_string`, `glob::glob`.
+# The only filesystem seam of this crate: `read_to_string`, `glob::glob`.
 harw-dod-readfs = { path = "../harw-dod-readfs" }
-# Benennt `scan_reports_dir(home)` — nur Pfadauflösung, kein Anlegen.
+# Names `scan_reports_dir(home)` — path resolution only, no creation.
 harw-home = { path = "../../../harw-home" }
 # `SensorId`.
 harw-types = { path = "../../../harw-types" }
-# Vorgegebene Pfadabhängigkeit dieses Knotens (Vertrag). Diese Crate deckt
-# ihre Fehlerfläche vollständig über das bereits inhaltsfreie
-# `harw_dod_cap::SensorError` ab und erfindet keine eigene Fehlermenge —
-# siehe `src/lib.rs`, Abschnitt „Fehler" — deshalb bleibt der Import
-# ungenutzt.
+# Path dependency prescribed for this node (contract). This crate covers its
+# entire error surface via the already content-free
+# `harw_dod_cap::SensorError` and invents no error set of its own —
+# see `src/lib.rs`, section "Fehler" — so the import remains unused.
 harw-macros = { path = "../../../harw-macros" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jiff = { workspace = true }
 
 [dev-dependencies]
-# Fixture-Harness (`sensor_suite!`, vollständig implementiert in
-# `harw-dod-fixtures/src/macros.rs`). Es greift hier trotzdem nicht: es
-# verlangt `From<harw_dod_cap::SensorHandle<harw_dod_cap::Bound>>` als
-# einzigen Konstruktionsweg, aber `ScanReportSensor` konstruiert sich über
-# `ScanReportSensor::for_home(id, &roots.home)` (Bequemlichkeitskonstruktor
-# über `harw_home::paths::scan_reports_dir`, siehe `src/sensor.rs`) statt
-# über `From` — die sechs Prüfungen sind deshalb unten von Hand geschrieben
-# (siehe `src/sensor.rs`, Testmodul).
+# Fixture harness (`sensor_suite!`, fully implemented in
+# `harw-dod-fixtures/src/macros.rs`). It still does not apply here: it
+# requires `From<harw_dod_cap::SensorHandle<harw_dod_cap::Bound>>` as the
+# only construction path, but `ScanReportSensor` is constructed via
+# `ScanReportSensor::for_home(id, &roots.home)` (convenience constructor
+# over `harw_home::paths::scan_reports_dir`, see `src/sensor.rs`) rather than
+# via `From` — the six checks are therefore written by hand below
+# (see `src/sensor.rs`, test module).
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
 

@@ -9,19 +9,19 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Zugriffsvokabular: `Capability::ReadProcNet`, `ReadScope`, `SensorError`,
-# `SensorHandle<Bound>`. Genau eine Fähigkeit (`ReadProcNet`) — siehe Modul-
-# Dokumentation für die Begründung, warum das eine Invariante ist.
+# Access vocabulary: `Capability::ReadProcNet`, `ReadScope`, `SensorError`,
+# `SensorHandle<Bound>`. Exactly one capability (`ReadProcNet`) — see the module
+# docs for the rationale on why that is an invariant.
 harw-dod-cap = { path = "../harw-dod-cap" }
 # `trait Sensor`, `SensorReading`, `SecurityEvent`, `EventKind::ListenerOpened`,
 # `Actor`.
 harw-dod-signals = { path = "../harw-dod-signals" }
-# Die einzige Dateisystem-Naht: `read_lines`, `read_to_string`,
-# `read_first_line`. Kein Sensor ruft `std::fs` für Dateiinhalte direkt auf.
+# The only filesystem seam: `read_lines`, `read_to_string`,
+# `read_first_line`. No sensor calls `std::fs` directly for file contents.
 harw-dod-readfs = { path = "../harw-dod-readfs" }
 # `CgroupId`.
 harw-types = { path = "../../../harw-types" }
-# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+# `#[derive(harw_macros::HarwError)]` for `error.rs`.
 harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 

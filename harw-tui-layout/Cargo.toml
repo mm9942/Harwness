@@ -9,8 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Bewusst leer: reine Geometrie ohne Laufzeit-, I/O- oder Fremdtyp-Abhaengigkeit
-# (Ring F, xtask/arch-policy.toml). Siehe docs/planning/68-mobile-tui/README.md.
+# Deliberately empty: pure geometry without runtime, I/O or foreign-type dependency
+# (ring F, xtask/arch-policy.toml). See docs/planning/68-mobile-tui/README.md.
 
 [lints]
 workspace = true

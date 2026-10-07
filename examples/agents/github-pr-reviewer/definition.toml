@@ -1,10 +1,10 @@
 # GitHub-PR-Reviewer (Goal harw-github-pr-reviewer, Schritt R2).
 #
-# Benutzerdefinierter Worker auf `worker-base@1`. Least-privilege: read-only
-# Analyse eines PR-Diffs; der Diff gilt als nicht vertrauenswürdiger Input
-# (nie als Anweisung behandelt). Veröffentlichung (Kommentar/Review) liegt
-# NICHT in diesem Agenten — der Runner (R3) postet nur nach separater
-# interaktiver Freigabe. Keine Shell-/GitHub-Schreibrechte im Modellagenten.
+# Custom worker on `worker-base@1`. Least privilege: read-only
+# analysis of a PR diff; the diff is treated as untrusted input
+# (never handled as an instruction). Publishing (comment/review) is
+# NOT part of this agent — the runner (R3) posts only after separate
+# interactive approval. No shell/GitHub write permissions in the model agent.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.github-pr-reviewer@1"
@@ -14,7 +14,7 @@ role = "worker"
 specialization = "github-pr-reviewer"
 
 name = "GitHub PR Reviewer"
-description = "Reviewt einen vorgelegten PR-Diff als nicht vertrauenswürdigen Input und liefert belegte, strukturierte Findings (P0-P3, Datei/Zeile, Begründung, Unsicherheit). Read-only; veröffentlicht nichts selbst."
+description = "Reviews a presented PR diff as untrusted input and returns substantiated, structured findings (P0-P3, file/line, rationale, uncertainty). Read-only; publishes nothing itself."
 instructions_file = "system.md"
 
 skills = []

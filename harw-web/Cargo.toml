@@ -9,47 +9,48 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Einzige Autoritätsquelle: die Registry, `Surface`, `WebAdapter`,
-# `OpContext`, `PermissionTier`, `ApprovalPolicy`. harw-web definiert selbst
-# keine Operation — siehe lib.rs-Moduldoku „kein zweiter Autoritätspfad".
+# Sole source of authority: the registry, `Surface`, `WebAdapter`,
+# `OpContext`, `PermissionTier`, `ApprovalPolicy`. harw-web itself defines
+# no operation — see the lib.rs module docs "no second authority path".
 harw-operations = { path = "../harw-operations" }
-# `TrustClass` — die Vertrauensklasse, die die Oberfläche braucht, um AW4-01s
-# Zwei-Block-Trennung sichtbar zu machen (siehe events.rs-Moduldoku „Woher
-# die Klasse kommt — und wo sie verloren geht").
+# `TrustClass` — the trust class the surface needs to make AW4-01's
+# two-block separation visible (see the events.rs module docs "Where the
+# class comes from — and where it gets lost").
 harw-context = { path = "../harw-context" }
-# `#[derive(HarwError)]` für `src/error.rs` — dieselbe hausinterne
-# Fehler-Ableitung wie in harw-sentinel/src/ipc.rs, kein thiserror/anyhow.
+# `#[derive(HarwError)]` for `src/error.rs` — the same in-house error
+# derive as in harw-sentinel/src/ipc.rs, no thiserror/anyhow.
 harw-macros = { path = "../harw-macros" }
 
-# Peer-Identifikation über SO_PEERCRED ohne unsafe — dieselbe Crate und
-# dasselbe Feature wie in harw-sentinel/Cargo.toml, dessen ipc.rs das Muster
-# vormacht (rustix::net::sockopt::socket_peercred).
+# Peer identification via SO_PEERCRED without unsafe — the same crate and
+# feature as in harw-sentinel/Cargo.toml, whose ipc.rs sets the pattern
+# (rustix::net::sockopt::socket_peercred).
 rustix = { workspace = true, features = ["net"] }
 
-# HTTP-Stack: identisch zu harw-mcp-server/Cargo.toml (Streamable-HTTP-
-# Vorbild dieses Knotens) — dieselben Versionsangaben, damit im Workspace
-# keine zweite HTTP-Bibliothek und keine zweite Versionsauflösung entsteht.
+# HTTP stack: identical to harw-mcp-server/Cargo.toml (the Streamable-HTTP
+# model for this node) — same version specs, so the workspace gets no second
+# HTTP library and no second version resolution.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 http-body-util = { version = "0.1", features = ["channel"] }
 bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "sync", "macros", "io-util", "time"] }
-# systemd-Socket-Aktivierung (`--systemd-socket`, Crypto-Masterplan v2 H9):
-# dieselbe Crate und Version wie harw-auth-hub/harw-netsec/harw-warden, damit
-# `src/systemd.rs` ohne eigenes `unsafe` den übergebenen Deskriptor übernimmt.
+# systemd socket activation (`--systemd-socket`, crypto master plan v2 H9):
+# the same crate and version as harw-auth-hub/harw-netsec/harw-warden, so
+# `src/systemd.rs` can take over the passed descriptor without its own
+# `unsafe`.
 sd-listen-fds = "0.2.0"
 
-# Der Genehmigungsbegriff ist durabel und existiert bereits: `ApprovalRecord`,
-# `ApprovalStore`, die Zustandsübergänge im Dateisuffix. `src/security.rs`
-# löst einen Datensatz auf, es erfindet keinen zweiten Speicher.
+# The approval concept is durable and already exists: `ApprovalRecord`,
+# `ApprovalStore`, the state transitions in the file suffix. `src/security.rs`
+# resolves a record; it does not invent a second store.
 harw-session-store = { path = "../harw-session-store" }
-# `ApprovalActor` -- wer entschieden hat. Wird aus den Peer-Credentials
-# abgeleitet, nie aus dem Anfragerumpf.
+# `ApprovalActor` -- who decided. Derived from the peer credentials, never
+# from the request body.
 harw-types = { path = "../harw-types" }
 jiff = { workspace = true }
-# H12: `SecurityHubClient::verify_context` — der einzige Weg, auf dem
-# `harw-web` einen vom Client vorgelegten Kontextverweis gegen den
-# SecurityHub prüft (`src/identity.rs`). Kein eigener Socket-Code.
+# H12: `SecurityHubClient::verify_context` — the only way `harw-web`
+# checks a context reference presented by the client against the
+# SecurityHub (`src/identity.rs`). No socket code of its own.
 harw-infra-client = { path = "../harw-infra-client" }
 
 serde = { workspace = true }
@@ -58,13 +59,13 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# `tests/identity_routes.rs` führt eine echte `Execute`-Route aus und braucht
-# dafür einen echten `OpContext` — also eine `SandboxSpec` über einer realen
-# `WorkspaceBinding` (`SandboxSpec::from_resolved`). Nur Testabhängigkeit;
-# `harw-authority` ist über `harw-operations` ohnehin im Graphen.
+# `tests/identity_routes.rs` runs a real `Execute` route and therefore needs
+# a real `OpContext` — that is, a `SandboxSpec` over a real
+# `WorkspaceBinding` (`SandboxSpec::from_resolved`). Test dependency only;
+# `harw-authority` is in the graph anyway via `harw-operations`.
 harw-authority = { path = "../harw-authority" }
-# `[web.identity]`-Beispiele in Tests exakt so parsen, wie sie in der
-# TOML-Konfiguration stehen (Schlüssel `"1000"` usw.).
+# Parse `[web.identity]` examples in tests exactly as they appear in the
+# TOML configuration (key `"1000"` etc.).
 toml = { workspace = true }
 
 [lints]

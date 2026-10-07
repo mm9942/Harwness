@@ -24,17 +24,17 @@ path = "src/main.rs"
 
 [features]
 default = []
-# jemalloc als globaler Allokator nur auf ausdrücklichen Wunsch (G-067): auf
-# Kerneln mit 16K-Seiten (RPi 5, `PAGESIZE=16384`) kann ein auf 4K-Systemen
-# gebautes jemalloc abstürzen. Ohne Feature gilt der System-Allokator.
+# jemalloc as the global allocator only on explicit request (G-067): on
+# kernels with 16K pages (RPi 5, `PAGESIZE=16384`), a jemalloc built on
+# 4K systems can crash. Without the feature, the system allocator applies.
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
-# #22 Welle 2B: `harw agent check|build|inspect|…` (der Agenten-Compiler) und
-# das eingebettete Artefakt einer personalisierten harw.
+# #22 wave 2B: `harw agent check|build|inspect|…` (the agent compiler) and
+# the embedded artifact of a personalized harw.
 harw-agent-compiler = { path = "../harw-agent-compiler" }
 harw-agent-artifact = { path = "../harw-agent-artifact" }
 harw-channel = { path = "../harw-channel" }
@@ -43,25 +43,25 @@ harw-channel-telegram-transport = { path = "../harw-channel-telegram-transport" 
 harw-core = { path = "../harw-core" }
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
-# `harw lens build`/`harw lens status` (src/lens.rs): der einzige
-# Produktionsaufrufer von `harw_lens::build`/`harw_lens::index_status`
-# außerhalb der Lens-Crates selbst -- siehe `harw-lens-source`s Moduldoku
-# ("Der Build ist ein Job auf der vorhandenen Job-Bridge... aufgerufen von
-# einer Bau-Pipeline außerhalb der Werkzeugoberfläche eines Agenten").
+# `harw lens build`/`harw lens status` (src/lens.rs): the only production
+# caller of `harw_lens::build`/`harw_lens::index_status` outside the lens
+# crates themselves -- see the module docs of `harw-lens-source`
+# ("The build is a job on the existing job bridge... invoked by a build
+# pipeline outside an agent's tool surface").
 harw-lens = { path = "../harw-lens" }
-# `harw lens build` baut mit exakt demselben Embedder/Deskriptor/Modellnamen,
-# den `lens.ask` (harw-tool-lens) zum Abfragen verwendet
+# `harw lens build` builds with exactly the same embedder/descriptor/model
+# name that `lens.ask` (harw-tool-lens) uses for querying
 # (`harw_tool_lens::provenance::{ask_embedder, ask_descriptor,
-# ask_provenance}`) und mit denselben (index_name, visibility)-Paaren, die
-# `lens.ask` tatsächlich befragt (`harw_tool_lens::scope::KNOWN_SELECTORS`)
-# -- sonst baute dieser Befehl einen Index, den `lens.ask` mangels
-# passendem Modell/passender Chunker-Fassung (K43) doch wieder ablehnt.
+# ask_provenance}`) and with the same (index_name, visibility) pairs that
+# `lens.ask` actually queries (`harw_tool_lens::scope::KNOWN_SELECTORS`)
+# -- otherwise this command would build an index that `lens.ask` rejects
+# anyway for lack of a matching model/chunker version (K43).
 harw-tool-lens = { path = "../harw-tool-lens" }
-# `doc.read_pdf` (Design docs/design/doc_read_pdf_design.md): `src/doc_ocr.rs`
-# installiert deren Mistral-OCR-Backend beim Boot eines Laufzeitpfads
-# (`serve`, `chat`/`analyze`, `gateway`), wenn ein Mistral-Provider
-# konfiguriert ist; ohne Installation fällt das Tool selbst auf die lokale
-# `oxidize-pdf`-Extraktion zurück.
+# `doc.read_pdf` (design docs/design/doc_read_pdf_design.md): `src/doc_ocr.rs`
+# installs its Mistral OCR backend at boot of a runtime path
+# (`serve`, `chat`/`analyze`, `gateway`) when a Mistral provider is
+# configured; without the installation, the tool itself falls back to local
+# `oxidize-pdf` extraction.
 harw-tool-doc = { path = "../harw-tool-doc" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
@@ -75,9 +75,9 @@ harw-mcp-server = { path = "../harw-mcp-server" }
 harw-mcp-client = { path = "../harw-mcp-client" }
 harw-session-store = { path = "../harw-session-store" }
 harw-secrets = { path = "../harw-secrets", features = ["keyring"] }
-# KEK-Bootstrap (`src/secret_store.rs`): 32 Zufallsbytes für `<home>/keys/secrets.kek`.
+# KEK bootstrap (`src/secret_store.rs`): 32 random bytes for `<home>/keys/secrets.kek`.
 getrandom = "0.4.3"
-# AuthHub-DEK-Wrapper (V3) für den SecretStore (`src/secret_store.rs`); Ring I, von Ring A erlaubt.
+# AuthHub DEK wrapper (V3) for the SecretStore (`src/secret_store.rs`); ring I, allowed by ring A.
 harw-infra-client = { path = "../harw-infra-client" }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 # `Lease` appears in the `WorkerCancellationSink` trait signature the CLI
@@ -88,28 +88,28 @@ harw-job-runtime = { path = "../harw-job-runtime" }
 # Durable job records (`FsJobRecordStore`) for the sandboxed verify
 # coordinator of the work driver (`src/verify_sandbox.rs`).
 harw-job-store = { path = "../harw-job-store" }
-# Planungsfläche — von drei Stellen im Binary benutzt:
-#  * `src/job_worker.rs` (W4-08): parst den Mutationsvertrag eines Plan-Knotens
-#    und meldet den Job-Ausgang über `PlanJobBridge` zurück in den Plan.
-#  * `src/main.rs` (W5-08): Composition-Root — Plan-/Goal-Store, `PlanToolConfig`,
+# Planning surface — used in three places in the binary:
+#  * `src/job_worker.rs` (W4-08): parses the mutation contract of a plan node
+#    and reports the job outcome back into the plan via `PlanJobBridge`.
+#  * `src/main.rs` (W5-08): composition root — plan/goal store, `PlanToolConfig`,
 #    `register_plan_services`, `FindingStore`, `GoalContextProvider`.
-#  * `src/chat.rs`: reicht dieselben Stores an die RuntimeAssembly.
-# Produktions-, nicht Test-Abhängigkeiten.
+#  * `src/chat.rs`: passes the same stores to the RuntimeAssembly.
+# Production dependencies, not test dependencies.
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
-# `sync`: watch/oneshot für den geordneten Shutdown von `harw serve`
+# `sync`: watch/oneshot for the orderly shutdown of `harw serve`
 # (`main.rs::serve_until`); `signal`: SIGTERM/SIGINT (`lifecycle::ShutdownSignals`).
 tokio = { version = "1", features = ["rt", "net", "macros", "time", "signal", "sync"] }
 jiff = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
 harw-home = { path = "../harw-home" }
 toml = "1.1.3"
-# Für `harw settings` (ConfigWriter::set_value braucht ein `toml_edit::Item`):
-# Version wie im Schwester-Crate `harw-config` gepinnt.
+# For `harw settings` (ConfigWriter::set_value needs a `toml_edit::Item`):
+# version pinned as in the sibling crate `harw-config`.
 toml_edit = "0.25.13"
-# Für `harw settings`: liest `[permissions]` aus einer beliebigen Config-Datei
-# in ein lokales `#[derive(Deserialize)]`-Hilfsdokument (siehe
-# `settings::load_permissions_section`). Workspace-Version, wie überall sonst.
+# For `harw settings`: reads `[permissions]` from an arbitrary config file
+# into a local `#[derive(Deserialize)]` helper document (see
+# `settings::load_permissions_section`). Workspace version, as everywhere else.
 serde = { workspace = true }
 harw-provider-http = { path = "../harw-provider-http" }
 harw-oauth = { path = "../harw-oauth" }
@@ -125,31 +125,31 @@ harw-completions = { path = "../harw-completions", features = ["clap-args"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 tikv-jemallocator = { version = "0.7.0", optional = true }
-# Telemetrie-Senken für Gateway und `src/observe.rs`.
+# Telemetry sinks for the gateway and `src/observe.rs`.
 harw-observe = { path = "../harw-observe" }
-# Bottom-up-Befund: `harw-web` hatte null Produktionskonsumenten. `src/web.rs`
-# ist die Komposition, die den Unix-Socket-Server aus derselben
-# `harw-operations`-Registry baut, die auch `harw-cli` sonst zusammenstellt.
+# Bottom-up finding: `harw-web` had zero production consumers. `src/web.rs`
+# is the composition that builds the Unix socket server from the same
+# `harw-operations` registry that `harw-cli` otherwise assembles.
 harw-tailscale = { path = "../harw-tailscale" }
 harw-web = { path = "../harw-web" }
-# Ermittelt die eigene UID für `harw_web::authz::StaticUidTierMap` — dieselbe
-# Crate wie `harw-web`s eigenes `SO_PEERCRED`, hier nur das `process`-Feature
-# für `rustix::process::getuid` statt `net`.
+# Determines the own UID for `harw_web::authz::StaticUidTierMap` — the same
+# crate as `harw-web`'s own `SO_PEERCRED`, here only the `process` feature
+# for `rustix::process::getuid` instead of `net`.
 rustix = { workspace = true, features = ["process"] }
-# Bottom-up-Befund: `harw-observe-prom`/`harw-observe-otlp` hatten null
-# Produktionskonsumenten. `src/observe.rs` ist die eine Kompositionsstelle,
-# die einen `RoutingSink` (Vorgabe: nur der immer aktive File-Sink) um sie
-# ergänzt, wenn `harw gateway --metrics-prometheus-port`/`--metrics-otlp-endpoint`
-# das ausdrücklich verlangen.
+# Bottom-up finding: `harw-observe-prom`/`harw-observe-otlp` had zero
+# production consumers. `src/observe.rs` is the one composition point that
+# extends a `RoutingSink` (default: only the always-on file sink) with them
+# when `harw gateway --metrics-prometheus-port`/`--metrics-otlp-endpoint`
+# explicitly request it.
 harw-observe-file = { path = "../harw-observe-file" }
 harw-observe-prom = { path = "../harw-observe-prom" }
 harw-observe-otlp = { path = "../harw-observe-otlp" }
 harw-runtime = { path = "../harw-runtime" }
 harw-protocol = { path = "../harw-protocol" }
 
-# `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
-# killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
-# `harw kill` einen Fehler (Exit-Code 2).
+# `harw kill` (src/main.rs::run_kill): passes all arguments through to killer.
+# killer needs pidfd and is therefore Linux-only; on other systems
+# `harw kill` reports an error (exit code 2).
 [target.'cfg(target_os = "linux")'.dependencies]
 harw-killer = { path = "../harw-killer" }
 # Sandboxed verify for the work driver (`src/verify_sandbox.rs`): bwrap as the
@@ -161,7 +161,7 @@ harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 tempfile = "3"
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
-# Nur Test: bindet den Hub-Namespace an `HarwKeyPurpose::SecretsKek` (Ring D nur als dev-dependency).
+# Test only: binds the hub namespace to `HarwKeyPurpose::SecretsKek` (ring D only as a dev-dependency).
 harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
 
 [lints]

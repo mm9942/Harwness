@@ -10,9 +10,9 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.23.1"
-# OS-Advisory-Lock (unter Unix flock) für den Codex-Refresh-Lock; ersetzt die
-# Nonce-/Stale-Heuristik (Gap-Hunt-Muster M8). std::fs::File::try_lock gibt es
-# erst ab Rust 1.89, MSRV ist 1.85.
+# OS advisory lock (flock on Unix) for the Codex refresh lock; replaces the
+# nonce/stale heuristic (gap-hunt pattern M8). std::fs::File::try_lock only exists
+# from Rust 1.89, MSRV is 1.85.
 fs4 = { workspace = true }
 harw-config = { path = "../harw-config" }
 rand = "0.10.2"
@@ -21,9 +21,9 @@ secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
-# Für den Datei-Lock-Retry-Backoff des Codex-Refresh-Flows (kein Blocking im
-# Async-Kontext); Version an bereits im Workspace verwendeter tokio-Version
-# ausgerichtet (siehe harw-provider-http/Cargo.toml).
+# For the file-lock retry backoff of the Codex refresh flow (no blocking in the
+# async context); version aligned with the tokio version already used in the workspace
+# (see harw-provider-http/Cargo.toml).
 tokio = { version = "1.52.3", features = ["time"] }
 
 [dev-dependencies]

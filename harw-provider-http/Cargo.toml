@@ -12,12 +12,12 @@ rust-version.workspace = true
 harw-config = { path = "../harw-config" }
 harw-core = { path = "../harw-core" }
 harw-oauth = { path = "../harw-oauth" }
-# W1-06b: `file:`/`file-json:`-Credentials nur symlinkfrei unter `<home>/secrets/`
+# W1-06b: `file:`/`file-json:` credentials only symlink-free under `<home>/secrets/`
 # (`open_dir_nofollow` + `open_beneath` + `ensure_private_regular`).
 harw-fsutil = { path = "../harw-fsutil" }
 harw-protocol = { path = "../harw-protocol" }
 harw-provider = { path = "../harw-provider" }
-# W1-06b: Endpoint-Prüfung über `EgressUrl` (https-Pflicht, http nur Loopback).
+# W1-06b: endpoint check via `EgressUrl` (https required, http only loopback).
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }

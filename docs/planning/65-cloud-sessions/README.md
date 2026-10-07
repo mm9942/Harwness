@@ -1,6 +1,6 @@
 ---
 id: PL-65
-title: Remote Sessions — Sessions über die Cloud auf verschiedenen TUIs (Programm RS)
+title: Remote Sessions — Sessions via the cloud on different TUIs (program RS)
 status: planned
 date: 2026-09-27
 tags: [planning, remote-sessions, cloud-home, tui, storage, network]
@@ -14,14 +14,14 @@ related:
 
 Planning only. No files were changed and no build was run. Every statement below is based on code I read at the current HEAD; where I was not sure, the item is marked **(verify)**.
 
-> **Transport-Profil W00:** Der ergänzende Entwurf
+> **Transport profile W00:** The supplementary draft
 > [Local / Own-Cloud Session Control Plane — WebSocket transport profile](local-own-cloud-websocket.md)
-> optimiert dieses Programm für die neuere WebSocket-Control-Plane-Richtung.
-> Er ändert keine bereits gelandete Transportfläche: `harw-web /events` bleibt
-> SSE und der DoD-Uplink bleibt NDJSON. Für die **noch nicht implementierte**
-> Session-Control-Plane ersetzt der Entwurf lediglich den hier geplanten
-> Zwischenweg `POST /v1/rpc` + NDJSON durch einen direkt versionierten,
-> multiplexen WebSocket-Transport. Der feste W00-Umsetzungsvertrag liegt unter
+> optimizes this program for the newer WebSocket control-plane direction.
+> It changes no transport surface that has already landed: `harw-web /events` stays
+> SSE and the DoD uplink stays NDJSON. For the **not yet implemented**
+> session control plane, the draft merely replaces the interim route planned here,
+> `POST /v1/rpc` + NDJSON, with a directly versioned,
+> multiplexed WebSocket transport. The fixed W00 implementation contract lives at
 > [`contracts/W00-websocket-control-plane.md`](contracts/W00-websocket-control-plane.md).
 
 Build rule (binding, verbatim, for every agent prompt): Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.
@@ -417,7 +417,7 @@ DEC-010 is **not written yet** (C-10 is text only). This plan assumes its outlin
 
 ---
 
-## 6a. Speicherkarte und synchronisiertes Home
+## 6a. Storage map and synchronized home
 
 ### 6a.1 Storage map (found with grep, not guessed)
 Legend: sensitivity S = secret, P = private, SH = shareable. "Sync?" = safe in Dropbox, OneDrive, Syncthing and similar.
@@ -599,7 +599,7 @@ Conventions:
 | ID | File | Content / interface | Acceptance | Model | Exec |
 |---|---|---|---|---|---|
 | RS0-01 | `docs/planning/70-decisions/DEC-010-cloud-home.md` | only if C-10 has not landed | follows the format of the existing notes | O | OR |
-| RS0-02…10 | `docs/planning/70-decisions/DEC-011…019-*.md` (one note per worker) | titles in §10 | format: Entscheidung → Warum → Folgen → Wo im Code | O (011, 012, 014, 017, 018), S (013, 015, 016, 019) | D |
+| RS0-02…10 | `docs/planning/70-decisions/DEC-011…019-*.md` (one note per worker) | titles in §10 | format: Decision → Why → Consequences → Where in the code | O (011, 012, 014, 017, 018), S (013, 015, 016, 019) | D |
 | RS0-11 | `docs/planning/70-decisions/README.md` | index rows | links resolve | H | D |
 | RS0-12 | `docs/planning/65-remote-sessions/README.md` | this plan as a planning compartment | – | H | D |
 | RS0-13 | `docs/architecture/remote-sessions.md` | architecture doc (§2–5) | – | S | D |
@@ -765,21 +765,21 @@ Separate plan later. Large: `app.rs` is 14,943 lines.
 - Q11 Knowledge in the sync root: accept last-writer-wins plus conflict copies?
 
 **Decision notes to write**
-- DEC-011 Session-Host im Daemon: eine Turn-Schleife je Sitzung, Clients hängen sich an
-- DEC-012 Session-Wire: JSON-RPC-Envelopes, NDJSON-Frames, Cursor = Transkript-Sequenz + Live-Ring, additive Versionierung
-- DEC-013 Mehrere Steuernde: FIFO mit Stale-View-Prüfung, Freigaben first-wins, Fähigkeiten observe/steer/approve/control
-- DEC-014 Geräteidentität: ML-DSA-65-Geräteschlüssel (DeviceIdentity/DeviceHandshake), Pairing-Code über server-authentisierten Enrollment-Kanal, Widerruf
-- DEC-015 Remote-TUI zuerst als schlanker Client; Konvergenz der lokalen TUI später
-- DEC-016 Geteiltes Home: `HARW_HOME` (synchronisierbar) / `HARW_STATE_DIR` / `HARW_RUNTIME_DIR`, Platzierungsprüfung
-- DEC-017 Synchronisierte Daten: nur verschlüsselt, Mehrempfänger-DEK, Mandantenordner, Konfliktkopien werden nie geladen
-- DEC-018 Privates Netz statt Nutzer-VPN; mTLS innen; IP ist nie Identität; Bedrohungsmodell
-- DEC-019 Drain und Wiederaufnahme nach Reclaim (setzt DEC-010 voraus)
+- DEC-011 Session host in the daemon: one turn loop per session, clients attach to it
+- DEC-012 Session wire: JSON-RPC envelopes, NDJSON frames, cursor = transcript sequence + live ring, additive versioning
+- DEC-013 Multiple steerers: FIFO with stale-view check, approvals first-wins, capabilities observe/steer/approve/control
+- DEC-014 Device identity: ML-DSA-65 device key (DeviceIdentity/DeviceHandshake), pairing code over a server-authenticated enrollment channel, revocation
+- DEC-015 Remote TUI first as a thin client; convergence of the local TUI later
+- DEC-016 Split home: `HARW_HOME` (syncable) / `HARW_STATE_DIR` / `HARW_RUNTIME_DIR`, placement check
+- DEC-017 Synchronized data: encrypted only, multi-recipient DEK, tenant folders, conflict copies are never loaded
+- DEC-018 Private network instead of user VPN; mTLS inside; IP is never identity; threat model
+- DEC-019 Drain and resume after reclaim (requires DEC-010)
 
 **Ledger:** at the landing of RS4 (host usable locally) write `MIG-014 — Remote sessions: host, wire, devices`, and `MIG-015 — Split home` at RS6, using the ledger template.
 
 ---
 
-## 11. Umsetzungsteam (local orchestrators, Harwness-internal agents)
+## 11. Implementation team (local orchestrators, Harwness-internal agents)
 
 ### 11.1 Roles
 - **Orchestrator (Opus), local.** The user's root TUI session with its main model set to Opus, plus the project-local child orchestrator `rs-orchestrator` (Opus).

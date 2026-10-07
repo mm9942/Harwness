@@ -10,9 +10,9 @@ rust-version.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-# Nur `ContentDigest` — aus der Leaf-Crate statt aus `harw-types`, das
-# `jiff`/`uuid`/`tokio-util` mitbrächte. Diese Crate liegt in der Hülle von
-# `harw-lens-rank`, die frei von Zeit, Zufall und I/O bleiben muss (L7,
+# Only `ContentDigest` — from the leaf crate instead of `harw-types`, which
+# would bring in `jiff`/`uuid`/`tokio-util`. This crate sits in the closure of
+# `harw-lens-rank`, which must stay free of time, randomness and I/O (L7,
 # `xtask gates` → `edges`).
 harw-digest = { path = "../harw-digest" }
 harw-macros = { path = "../harw-macros" }
