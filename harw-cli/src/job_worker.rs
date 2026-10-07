@@ -120,6 +120,9 @@ mod kanban_card;
 #[path = "job_worker_work_driver.rs"]
 mod work_driver_job;
 
+#[path = "job_worker_verify_diagnostics.rs"]
+mod verify_diagnostics;
+
 #[path = "job_worker_memory.rs"]
 mod memory_job;
 
