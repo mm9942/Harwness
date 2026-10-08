@@ -34,6 +34,17 @@ First end-to-end composed-agent recipe: `intent → candidate repo map → evide
 
 Proof: fake README versus source truth, surprise dependency boundary, symlink/out-of-scope denial, identical denied Egress not retried, reviewer can reproduce cited lines.
 
+### W03c/W03d — Durable error observations and independent agent runs (pre-W04 safety gates)
+
+Before widening orchestration, implement [05 — Error Learning & Agent Run Isolation](05-error-learning-and-run-isolation.md) as **two small separate waves**:
+
+- **W03c (PLANNED):** classify admission, executor, provider and reconciliation failures into typed non-secret run observations; atomically persist a bounded, epoch-fenced outbox **in the same CycleStore transaction as a committed checkpoint**. Do not write global memory from CycleDriver, do not count unverified fixes, and never retry an uncertain external effect blindly.
+- **W03d (PLANNED):** trusted run/agent/session principal through the job/child boundary; enforce per-session STM and independently assembled per-run context. A parent receives only an authorized bounded return, siblings receive no private history. Audit MemoryContextProvider session matching and bulk project/global fact injection; make child retrieval explicit and policy checked, with root compatibility governed separately.
+
+The existing W03 code and tests do **not** implement these subwaves. Cross-run learning consumption and promotion remain W09a–W09c.
+
+Proof: different agents cannot share STM/transcripts via provider reuse or the same trace; stale lease cannot append or ack learning; a crash between commit/delivery is idempotent; forbidden actions never become learned permissions; no context growth with sibling count. Keep current W01–W03 tests and arch gates green.
+
 ### W04 — Root and sub-orchestrator intent reconciliation
 
 Add the minimal intent contract and bounded DAG-change tool to Root/Sub. Detect material state delta, recompute frontier, cancel/supersede pending nodes, admit new specialist targets only through exact named grants and runtime capability snapshot. Do not inject every agent definition and every tool into context. Use compact top-k relevant role offers with capability and model readiness. Ensure `agents.delegate`, `delegate_wave`, generated transfer tools and execution/approval paths agree.
@@ -65,6 +76,9 @@ Adapt business-author/reviewer pipeline to approved versioned `PaperPackageV1` w
 Proof: independent reviewer rejects unsupported claim; non-pausing worker cannot receive synchronous handoff; LaTeX truncation resumes from checkpoint, not full regeneration; PDF visual render/QA; no fictitious citation; approved claims unchanged by typesetting.
 
 ### W09 — Knowledge feedback and intent lifecycle
+
+**Binding addendum:** [05 — Error Learning & Agent Run Isolation](05-error-learning-and-run-isolation.md) is mandatory. W09a consumes the W03c durable run observation outbox using existing learning/epistemic/outcome gates; W09b provides explicit authorized, versioned, top-k retrieval rather than shared agent contexts; W09c reviews project-to-global promotion and revocation. Global-home knowledge is not a global model prompt. Other agents' private conversations, tool transcripts, STM and diaries are never injected merely because they share project, trace, parent or role.
+
 
 Integrate context-ledger observation references, Diary/Dream/Palace/Maintenance as optional bounded segments; global promotion and embeddings require separate ownership/privacy policy. Link new sessions to stable intent/project while preventing child-context leaks. Journal corrections, confidence and source scope, not hidden provider reasoning text. Introduce replay and regression snapshots for learned policies.
 
@@ -119,7 +133,7 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 11. How intent-driven writes request expansion of path scope without silently violating original acceptance contract.
 12. Trace/event schema that makes graph evolution understandable in TUI/Web/Telegram while hiding secret material.
 
-## 7. Implementation status
+**Additional PL-90 status note (2026-10-08):** W03c, W03d and W09a–W09c are **PLANNED ONLY**; this PR currently contains no durable learning outbox or production cross-run memory consumer. The new [05 addendum](05-error-learning-and-run-isolation.md) introduces evidence-based gates, not a tested feature.\n\n## 7. Implementation status
 
 Status vocabulary as in the dossier: `CURRENT` = merged and checked, `IN PR` = code in this PR with locally green tests, `PLANNED` = design only.
 
