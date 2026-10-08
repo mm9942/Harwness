@@ -315,7 +315,6 @@ pub fn journal_only_entry(journal: &ChildJournal) -> Map<String, Value> {
     };
     entry.insert("status".to_owned(), json!(status));
     entry.insert("task".to_owned(), json!(journal.task));
-    entry.insert("background".to_owned(), json!(false));
     journal_status_fields(&mut entry, journal);
     entry
 }

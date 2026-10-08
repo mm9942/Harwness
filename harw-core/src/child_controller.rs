@@ -46,14 +46,11 @@
 //! (`JobAdmissionService::submit_queued_async` in `harw-core::admission`) zu
 //! wählen, statt bei Kapazitätsdruck hart abzulehnen.
 //!
-//! Für einen Fan-out innerhalb **dieses** Controllers (z. B. mehrere parallele
-//! `explore`-Kind-Aufrufe desselben Elternteils, deren Anzahl
-//! `max_active_children_per_parent` überschreiten kann) gibt es dasselbe
-//! Muster lokal: [`ManagedAgentSpawner::admit_or_wait`] /
-//! [`ManagedAgentSpawner::spawn_child_or_wait`] wiederholen nur eine
-//! [`AdmitRejection::Capacity`]-Ablehnung, gewickelt in `Notify` statt einer
-//! separaten Warteschlange — [`ManagedAgentSpawner::admit`] selbst lehnt
-//! Kapazitätsdruck unverändert sofort ab.
+//! Admission never waits: delegated work runs only in the background, and
+//! [`ManagedAgentSpawner::admit`] rejects capacity pressure immediately with
+//! a typed, detailed [`AgentSpawnError`] (`SpawnRejectionKind::CapacityExhausted`)
+//! that names the occupying children. Callers retry after a completion
+//! notification; nothing queues for a free slot.
 //!
 //! # Nebenläufigkeit
 //! `ManagedAgentSpawner` ist `Send + Sync`. Alle Sperren sind `std::sync::Mutex`
@@ -105,18 +102,20 @@ use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
 use harw_agent_dsl::executable::{
-    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail, SnapshotId,
+    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail,
 };
 use harw_authority::{AuthoritySnapshot, SandboxSpec};
 use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot, SuggestionKind};
 use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName, TrustClass};
 use harw_extension_api::{
-    AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
+    AgentSpawnError, AgentSpawner, ExtensionRegistry, FAIL_FAST_CONSEQUENCE, SpawnFuture,
+    SpawnInput, SpawnRejectionKind,
 };
 use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
 use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
+use harw_types::WorkId;
 use harw_types::{
     AgentRole, ApprovalActor, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId,
 };
@@ -1466,9 +1465,7 @@ impl From<ChildRunError> for AgentSpawnError {
     fn from(error: ChildRunError) -> Self {
         match error {
             ChildRunError::Spawn(error) => error,
-            ChildRunError::BudgetExhausted(exhausted) => Self {
-                message: exhausted.to_string(),
-            },
+            ChildRunError::BudgetExhausted(exhausted) => Self::new(exhausted.to_string()),
         }
     }
 }
@@ -2441,17 +2438,6 @@ pub struct ManagedAgentSpawner {
     /// [`TurnEvent::ChildProgress`]-Meldungen; geteilt mit dem
     /// [`Self::progress_observer`].
     progress_sinks: ProgressSinks,
-    /// Woken every time a slot in `active` is freed (`release_in_memory`,
-    /// `reap_expired`, `reap_expired_durable` — every path that removes an
-    /// entry from `active`). Lets [`Self::admit_or_wait`] wait for capacity
-    /// instead of failing outright when
-    /// `active_for_parent >= limits.max_active_children_per_parent` (four
-    /// parallel `explore` calls against a limit of two used to fail two of
-    /// them hard; see module docs). `notify_waiters` only wakes tasks already
-    /// waiting, so every waiter re-registers via `Notified::enable` before
-    /// re-checking admission, the same lost-wakeup-safe pattern as
-    /// `admission::SubmissionLimiter::freed`, plus a bounded fallback sleep.
-    freed: tokio::sync::Notify,
     /// Exakte Rollennamen, die ein `UserInterface`-Elternteil trotz
     /// `can_spawn(UserInterface, Worker) == false` als `Worker`-Kind
     /// admittieren darf ([`Self::with_uia_spawnable_roles`]). Leer, solange
@@ -2540,22 +2526,17 @@ const CHILD_OVER_BUDGET_COMPLEX_TOKENS: u64 = 250_000;
 /// admission, without either side parsing the other's message text.
 ///
 /// # Description
-/// [`ManagedAgentSpawner::admit_or_wait`] only ever retries a `Capacity`
-/// rejection (`active_for_parent >= limits.max_active_children_per_parent`);
-/// every `Other` rejection — unknown role, spawn-matrix denial, sandbox
-/// escalation, depth, lease/registry failure, poisoned lock, ... — is
-/// surfaced on the very first attempt, exactly as
-/// [`ManagedAgentSpawner::admit`] already did before this distinction
-/// existed. The wrapped [`AgentSpawnError`] carries the same message in both
-/// variants; [`ManagedAgentSpawner::admit`] discards the variant and returns
-/// it unchanged, so its public behavior is unaffected.
+/// Admission never waits: both variants are surfaced to the caller on the
+/// very first attempt as the wrapped, typed [`AgentSpawnError`]. The split
+/// only records whether the rejection was the active-child-per-parent limit
+/// (`active_for_parent >= limits.max_active_children_per_parent`) or any
+/// other rejection (unknown role, spawn-matrix denial, sandbox escalation,
+/// depth, lease/registry failure, poisoned lock, ...).
 enum AdmitRejection {
     /// The parent is already at
-    /// [`ChildLimits::max_active_children_per_parent`]. The only rejection
-    /// [`ManagedAgentSpawner::admit_or_wait`] waits out.
+    /// [`ChildLimits::max_active_children_per_parent`].
     Capacity(AgentSpawnError),
-    /// Any rejection other than the active-child-per-parent limit. Returned
-    /// immediately by [`ManagedAgentSpawner::admit_or_wait`], never retried.
+    /// Any rejection other than the active-child-per-parent limit.
     Other(AgentSpawnError),
 }
 
@@ -3227,7 +3208,6 @@ impl ManagedAgentSpawner {
             orchestration_observer: None,
             child_tasks: Mutex::new(BTreeMap::new()),
             progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
-            freed: tokio::sync::Notify::new(),
             uia_spawnable_roles: HashSet::new(),
             delegation_catalog: BTreeMap::new(),
             external_root_plan_mode: std::sync::atomic::AtomicBool::new(false),
@@ -3574,7 +3554,9 @@ impl ManagedAgentSpawner {
             .as_ref()
             .ok_or_else(|| Self::reject("durable child lease store is not configured"))?;
         store.bind_job_owner(child, work_id).map_err(|error| {
-            Self::reject(format!("could not bind child lease to job {work_id}: {error}"))
+            Self::reject(format!(
+                "could not bind child lease to job {work_id}: {error}"
+            ))
         })
     }
 
@@ -4189,15 +4171,6 @@ impl ManagedAgentSpawner {
                 "child_release.in_memory",
             );
         }
-        if record.is_some() {
-            // A parent's active-child slot only actually frees when an
-            // `active` entry is removed (a tombstone alone does not — it was
-            // already gone from `active`). Wakes every `admit_or_wait`
-            // waiter; each re-checks admission itself, so a wakeup that
-            // turns out to be for a different parent just costs one extra
-            // poll, never an incorrect admission.
-            self.freed.notify_waiters();
-        }
         Ok(record)
     }
 
@@ -4510,9 +4483,7 @@ impl ManagedAgentSpawner {
                 .lock()
                 .map_err(|_| Self::reject("session manager lock is poisoned"))?;
             manager.restore(session).map_err(|error| {
-                Self::reject(format!(
-                    "could not restore hydrated child {child}: {error}"
-                ))
+                Self::reject(format!("could not restore hydrated child {child}: {error}"))
             })?;
         }
 
@@ -4603,6 +4574,134 @@ impl ManagedAgentSpawner {
             Some(harw_agent_dsl::roles::AgentRoleId::UiaWorker) => 1,
             _ => usize::MAX,
         }
+    }
+
+    /// All-or-nothing admission pre-check for a wave of children that is
+    /// about to be started together.
+    ///
+    /// # Description
+    /// Delegated work never queues for a free slot. Before a wave or fan-out
+    /// starts anything, this checks that every entry of `roles` (one entry
+    /// per child to start, in start order) could be admitted *now*: the
+    /// per-role instance cap, the active-child limit of `parent` (counting
+    /// all requested children at once), the delegation depth ceiling and the
+    /// orchestration limits (simulated child by child). If any of these
+    /// would reject, nothing is started and the typed, detailed rejection is
+    /// returned.
+    ///
+    /// The check is a snapshot: a concurrent admission between this call and
+    /// the actual spawns can still make an individual spawn fail fast.
+    ///
+    /// # Errors
+    /// An [`AgentSpawnError`] with kind
+    /// [`SpawnRejectionKind::CapacityExhausted`],
+    /// [`SpawnRejectionKind::DepthExceeded`] or
+    /// [`SpawnRejectionKind::OrchestrationLimit`], or
+    /// [`SpawnRejectionKind::Other`] for an unregistered role / poisoned lock.
+    pub fn preflight_wave_admission(
+        &self,
+        parent: &SessionId,
+        roles: &[&str],
+    ) -> Result<(), AgentSpawnError> {
+        if roles.is_empty() {
+            return Ok(());
+        }
+        // Per-role instance cap (the `uia-worker` family runs one at a time).
+        let mut per_role: BTreeMap<&str, usize> = BTreeMap::new();
+        for role in roles {
+            if !self.roles.contains_key(*role) {
+                return Err(Self::reject(format!(
+                    "child role '{role}' is not registered"
+                )));
+            }
+            *per_role.entry(role).or_default() += 1;
+        }
+        for (role, count) in &per_role {
+            let cap = self.max_concurrent_instances_for_role(role);
+            if *count > cap {
+                return Err(AgentSpawnError::with_kind(
+                    SpawnRejectionKind::OrchestrationLimit {
+                        limit_name: format!("max_concurrent_instances[{role}]"),
+                        current: *count,
+                        max: cap,
+                    },
+                    format!(
+                        "{} {count} children of role '{role}' were requested at once, but at \
+                         most {cap} may run concurrently. Nothing was started. \
+                         {FAIL_FAST_CONSEQUENCE}",
+                        crate::background_children::DELEGATION_REJECTED_MARKER
+                    ),
+                ));
+            }
+        }
+        let parent_role = self.session_organizational_role(parent);
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| Self::reject("child registry lock is poisoned"))?;
+        // Capacity: all requested children must fit into the free slots.
+        let occupying: Vec<(String, String)> = active
+            .values()
+            .filter(|record| &record.parent == parent)
+            .map(|record| (record.child.to_string(), record.role.clone()))
+            .collect();
+        let limit = self.limits.max_active_children_per_parent;
+        if occupying.len().saturating_add(roles.len()) > limit {
+            return Err(Self::capacity_rejection(
+                parent,
+                occupying.len(),
+                limit,
+                roles.len(),
+                &occupying,
+            ));
+        }
+        // Depth: every child of the wave sits one level below the parent.
+        let (parent_depth, ceiling) = active
+            .get(parent.as_str())
+            .map_or((0, self.limits.max_depth), |record| {
+                (record.depth, record.depth_ceiling)
+            });
+        let depth = parent_depth.saturating_add(1);
+        if depth > ceiling {
+            return Err(Self::depth_rejection(depth, ceiling));
+        }
+        // Orchestration limits: simulate the admissions one after another.
+        if let Some(parent_role) = parent_role {
+            let synthetic_ids: Vec<String> = (0..roles.len())
+                .map(|index| format!("pending-wave-child-{index}"))
+                .collect();
+            let mut nodes: Vec<crate::background_children::AdmittedNode<'_>> = active
+                .values()
+                .map(|record| crate::background_children::AdmittedNode {
+                    child: record.child.as_str(),
+                    parent: record.parent.as_str(),
+                    role_name: record.role.as_str(),
+                    organizational_role: self
+                        .roles
+                        .get(&record.role)
+                        .map(|definition| definition.organizational_role),
+                })
+                .collect();
+            for (index, role) in roles.iter().enumerate() {
+                let Some(definition) = self.roles.get(*role) else {
+                    continue;
+                };
+                crate::background_children::check_orchestration_admission(
+                    &nodes,
+                    parent.as_str(),
+                    parent_role,
+                    definition.organizational_role,
+                    self.background.limits(),
+                )?;
+                nodes.push(crate::background_children::AdmittedNode {
+                    child: synthetic_ids[index].as_str(),
+                    parent: parent.as_str(),
+                    role_name: role,
+                    organizational_role: Some(definition.organizational_role),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Liefert die organisatorische Rolle (§3 DSL-Spawn-Matrix) der Session,
@@ -5133,13 +5232,6 @@ impl ManagedAgentSpawner {
             })
             .collect::<Vec<_>>();
         self.mark_expired(&expired);
-        if !expired.is_empty() {
-            // Each expired child freed its parent's active-child slot; see
-            // `release_in_memory`'s `self.freed.notify_waiters()` for why
-            // this wakes `admit_or_wait` waiters rather than requiring them
-            // to sleep out their full retry window.
-            self.freed.notify_waiters();
-        }
         expired
     }
 
@@ -5172,11 +5264,6 @@ impl ManagedAgentSpawner {
             }
         }
         self.mark_expired(&expired);
-        if !expired.is_empty() {
-            // See `reap_expired`: each claimed lease freed its parent's
-            // active-child slot.
-            self.freed.notify_waiters();
-        }
         Ok(expired)
     }
 
@@ -7536,9 +7623,51 @@ impl ManagedAgentSpawner {
     }
 
     fn reject(message: impl Into<String>) -> AgentSpawnError {
-        AgentSpawnError {
-            message: message.into(),
-        }
+        AgentSpawnError::new(message)
+    }
+
+    /// Builds the fail-fast capacity rejection: typed, with the occupying
+    /// children (bounded) and the explicit consequence for the caller.
+    fn capacity_rejection(
+        parent: &SessionId,
+        active: usize,
+        limit: usize,
+        requested: usize,
+        occupying: &[(String, String)],
+    ) -> AgentSpawnError {
+        let (described, listed) =
+            crate::background_children::describe_occupying_children(occupying);
+        let free = limit.saturating_sub(active);
+        AgentSpawnError::with_kind(
+            SpawnRejectionKind::CapacityExhausted {
+                active,
+                limit,
+                active_children: listed,
+            },
+            format!(
+                "{} active child limit reached for parent {parent}: {active} of {limit} child \
+                 slots are occupied by: {described}. {requested} new child(ren) requested, \
+                 {free} slot(s) free; nothing was started. {FAIL_FAST_CONSEQUENCE}",
+                crate::background_children::DELEGATION_REJECTED_MARKER
+            ),
+        )
+    }
+
+    /// Builds the fail-fast depth rejection.
+    fn depth_rejection(depth: u32, max: u32) -> AgentSpawnError {
+        AgentSpawnError::with_kind(
+            SpawnRejectionKind::DepthExceeded {
+                depth: usize::try_from(depth).unwrap_or(usize::MAX),
+                max: usize::try_from(max).unwrap_or(usize::MAX),
+            },
+            format!(
+                "{} child depth {depth} exceeds the maximum delegation depth {max}. A child at \
+                 this depth cannot be started now or later from this parent; do the work in \
+                 the current agent or delegate from a shallower one. Running children report \
+                 their results automatically when they finish.",
+                crate::background_children::DELEGATION_REJECTED_MARKER
+            ),
+        )
     }
 
     // ── Runde 9, E7: Eltern mit laufendem Turn ─────────────────────────────
@@ -7977,13 +8106,11 @@ impl ManagedAgentSpawner {
         false
     }
 
-    /// Admits a child. Unchanged public behavior and error messages — a thin
-    /// wrapper over [`Self::admit_inner`] that discards the
-    /// capacity-vs-other distinction [`Self::admit_or_wait`] needs.
+    /// Admits a child immediately or fails fast: a thin wrapper over
+    /// [`Self::admit_inner`] that discards the capacity-vs-other distinction.
     ///
     /// # Errors
-    /// See [`Self::admit_inner`]; the returned [`AgentSpawnError`] is
-    /// byte-identical either way.
+    /// See [`Self::admit_inner`]; the returned [`AgentSpawnError`] is typed.
     fn admit(
         &self,
         role_name: &str,
@@ -8075,14 +8202,9 @@ impl ManagedAgentSpawner {
     }
 
     /// Core admission logic (role, spawn-matrix, capacity, sandbox, depth,
-    /// registry, lease, cancellation wiring). Identical to what `admit` did
-    /// before [`Self::admit_or_wait`] was added, in every respect except its
-    /// error type, which distinguishes a
-    /// capacity rejection (`active_for_parent >=
-    /// limits.max_active_children_per_parent`) from every other rejection so
-    /// [`Self::admit_or_wait`] can retry only the former (development task:
-    /// four parallel `explore` calls against a per-parent limit of two used
-    /// to hard-fail two of them instead of queueing).
+    /// registry, lease, cancellation wiring). Never waits: a capacity
+    /// rejection (`active_for_parent >= limits.max_active_children_per_parent`)
+    /// is returned at once as a typed, detailed error.
     ///
     /// # Errors
     /// [`AdmitRejection::Capacity`] exactly when the active-child-per-parent
@@ -8141,7 +8263,7 @@ impl ManagedAgentSpawner {
             }
             let ir_matches = match (recovery.executable_snapshot_id.as_ref(), executable_ir) {
                 (None, None) => true,
-                (Some(reference), Some(ir)) => reference.confirm(ir.snapshot_id()).is_some(),
+                (Some(reference), Some(ir)) => reference.confirm(&ir.snapshot_id()).is_some(),
                 _ => false,
             };
             if !ir_matches {
@@ -8278,10 +8400,7 @@ impl ManagedAgentSpawner {
                 )));
             }
             let parent = parent_base_sandbox.unwrap_or_else(|| parent_context.sandbox.clone());
-            (
-                parent.restrict(recovery.authority.request()),
-                parent,
-            )
+            (parent.restrict(recovery.authority.request()), parent)
         } else {
             match parent_base_sandbox {
                 Some(base) if sandbox == parent_context.sandbox => (base.clone(), base),
@@ -8417,10 +8536,18 @@ impl ManagedAgentSpawner {
             .filter(|record| record.parent == input.parent_session_id)
             .count();
         if active_for_parent >= self.limits.max_active_children_per_parent {
-            return Err(AdmitRejection::Capacity(Self::reject(format!(
-                "parent {} reached its active child limit of {}",
-                input.parent_session_id, self.limits.max_active_children_per_parent
-            ))));
+            let occupying: Vec<(String, String)> = active
+                .values()
+                .filter(|record| record.parent == input.parent_session_id)
+                .map(|record| (record.child.to_string(), record.role.clone()))
+                .collect();
+            return Err(AdmitRejection::Capacity(Self::capacity_rejection(
+                &input.parent_session_id,
+                active_for_parent,
+                self.limits.max_active_children_per_parent,
+                1,
+                &occupying,
+            )));
         }
         // Runde 5, Teil K: Orchestrierungsgrenzen (`[agents]`), fail-closed
         // und mit einer Meldung, die das Modell lesen soll.
@@ -8444,7 +8571,7 @@ impl ManagedAgentSpawner {
                 definition.organizational_role,
                 self.background.limits(),
             )
-            .map_err(|message| AdmitRejection::Other(Self::reject(message)))?;
+            .map_err(AdmitRejection::Other)?;
         }
 
         // Budget-Anrechnung: ein Kind darf nie mehr bekommen, als seinem
@@ -8549,9 +8676,10 @@ impl ManagedAgentSpawner {
             .get(input.parent_session_id.as_str())
             .map_or(self.limits.max_depth, |parent| parent.depth_ceiling);
         if depth > inherited_depth_ceiling {
-            return Err(AdmitRejection::Other(Self::reject(format!(
-                "child depth {depth} exceeds maximum {inherited_depth_ceiling}"
-            ))));
+            return Err(AdmitRejection::Other(Self::depth_rejection(
+                depth,
+                inherited_depth_ceiling,
+            )));
         }
         // Die Decke, die dieses Kind seinerseits an seine Nachkommen weitergibt.
         // Die Verschärfungsrichtung bleibt unverändert: die eigene IR schneidet
@@ -8575,10 +8703,8 @@ impl ManagedAgentSpawner {
             .registry_factory
             .capability_snapshot(role_name, &input)?;
         if let Some(recovery) = recovery {
-            capability_snapshot = Self::recovery_capability_snapshot(
-                capability_snapshot,
-                recovery,
-            )?;
+            capability_snapshot =
+                Self::recovery_capability_snapshot(capability_snapshot, recovery)?;
         }
         let child_suggestions = capability_snapshot
             .as_ref()
@@ -8653,22 +8779,21 @@ impl ManagedAgentSpawner {
             .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
             .unwrap_or_default();
         if let Some(recovery) = recovery {
-            child_allowed_child_orchestrators.retain(|name| {
-                recovery.allowed_child_orchestrators.contains(name)
-            });
+            child_allowed_child_orchestrators
+                .retain(|name| recovery.allowed_child_orchestrators.contains(name));
         }
         let spawn_context = SpawnContext {
-                sandbox,
-                suggestions: child_suggestions,
-                capability_snapshot,
-                approval_actor,
-                organizational_role: definition.organizational_role,
-                allowed_child_orchestrators: child_allowed_child_orchestrators.clone(),
-                trace: child_trace.clone(),
-                // AW2-02: dieselbe Decke, die soeben neben der Sandbox
-                // geschnitten wurde — kein zweiter, separater Zustand.
-                ceiling: Some(child_ceiling),
-            };
+            sandbox,
+            suggestions: child_suggestions,
+            capability_snapshot,
+            approval_actor,
+            organizational_role: definition.organizational_role,
+            allowed_child_orchestrators: child_allowed_child_orchestrators.clone(),
+            trace: child_trace.clone(),
+            // AW2-02: dieselbe Decke, die soeben neben der Sandbox
+            // geschnitten wurde — kein zweiter, separater Zustand.
+            ceiling: Some(child_ceiling),
+        };
         let child = if let Some(recovery) = recovery {
             let child = recovery.child.clone();
             manager
@@ -9189,167 +9314,6 @@ impl ManagedAgentSpawner {
         );
         Ok(child)
     }
-
-    /// Admits a child, waiting for capacity instead of rejecting outright
-    /// when the parent is at [`ChildLimits::max_active_children_per_parent`].
-    ///
-    /// # Description
-    /// Fixes the four-parallel-`explore` regression: with a per-parent limit
-    /// of two, two of four concurrent [`Self::admit`] calls used to fail
-    /// hard with "reached its active child limit". This wraps
-    /// [`Self::admit_inner`] the way `admission::SubmissionLimiter`'s
-    /// `wait_before_retry` wraps `JobAdmissionService::submit` for the
-    /// analogous job-admission rate limiter: one attempt is made
-    /// immediately, and only [`AdmitRejection::Capacity`] is retried.
-    /// [`AdmitRejection::Other`] — unknown role, spawn-matrix denial,
-    /// sandbox escalation, depth, lease/registry failure, poisoned lock,
-    /// ... — is returned unchanged on the very first attempt, exactly as
-    /// [`Self::admit`] always has.
-    ///
-    /// Each retry creates and [enables](tokio::sync::Notify::notified) a
-    /// fresh [`Self::freed`] waiter *before* re-checking admission (the same
-    /// order [`Self::release_in_memory`] relies on to guarantee a release
-    /// landing between the failed check and the `.await` is still observed —
-    /// `notify_waiters` does not remember a notification for a waiter
-    /// created afterward). A bounded sleep (at most 500ms, less if `max_wait`
-    /// is about to elapse) races alongside that wait regardless, so even a
-    /// theoretically missed wakeup costs at most one extra poll, never a
-    /// hang.
-    ///
-    /// # Arguments
-    /// - `role_name`, `input`, `sandbox`, `suggestions`: identical to
-    ///   [`Self::admit`]; `input`/`sandbox`/`suggestions` are cloned once per
-    ///   retry attempt (the original caller's clone is never mutated).
-    /// - `max_wait` (`std::time::Duration`): upper bound on the total time
-    ///   spent waiting across every retry, starting from this call. Once it
-    ///   elapses while still at capacity, the exact
-    ///   [`AdmitRejection::Capacity`] error the next attempt would have
-    ///   produced is returned.
-    /// - `cancel` (`&CancelToken`): observed between attempts (not during
-    ///   `admit_inner` itself, which never awaits). A token cancelled while
-    ///   waiting ends the wait immediately with a distinct message — never
-    ///   confusable with the capacity message, so a caller can match on
-    ///   `error.message.contains(...)` to tell the two apart if it must.
-    ///
-    /// # Returns
-    /// `Ok(SessionId)` of the newly admitted child — identical in shape to
-    /// [`Self::admit`]'s success case.
-    ///
-    /// # Errors
-    /// - Any [`AdmitRejection::Other`] rejection from the first attempt,
-    ///   unchanged.
-    /// - The original capacity [`AgentSpawnError`] once `max_wait` elapses.
-    /// - An [`AgentSpawnError`] naming the cancellation if `cancel` is
-    ///   cancelled before a slot freed.
-    ///
-    /// # Concurrency
-    /// Requires a Tokio runtime (`tokio::select!`, `tokio::time::sleep`,
-    /// [`tokio::sync::Notify`]). Runs entirely on the calling task — unlike
-    /// `JobAdmissionService::submit_queued_async`, no background task is
-    /// spawned, because callers such as the parallel `explore` fan-out in
-    /// `harw-core-bridge::agent_tool` already run each spawn attempt on its
-    /// own task and want to `.await` this call directly rather than poll a
-    /// `oneshot::Receiver`.
-    pub async fn admit_or_wait(
-        &self,
-        role_name: &str,
-        input: SpawnInput,
-        sandbox: SandboxSpec,
-        suggestions: Option<AgentSuggestions>,
-        max_wait: Duration,
-        cancel: &CancelToken,
-    ) -> Result<SessionId, AgentSpawnError> {
-        // Runde 5, Teil J: `continue_from` einmal vor dem Warten prüfen,
-        // nach der Admission binden.
-        let mut input = input;
-        let seed = self.requested_continuation(role_name, &mut input)?;
-        let child = self
-            .admit_or_wait_inner(role_name, input, sandbox, suggestions, max_wait, cancel)
-            .await?;
-        self.bind_requested_continuation(child, seed.as_ref())
-    }
-
-    /// Kern von [`Self::admit_or_wait`] ohne Fortsetzungs-Behandlung.
-    async fn admit_or_wait_inner(
-        &self,
-        role_name: &str,
-        input: SpawnInput,
-        sandbox: SandboxSpec,
-        suggestions: Option<AgentSuggestions>,
-        max_wait: Duration,
-        cancel: &CancelToken,
-    ) -> Result<SessionId, AgentSpawnError> {
-        let deadline = tokio::time::Instant::now() + max_wait;
-        loop {
-            // Registered *before* the admission attempt below: if a release
-            // notifies between this attempt's capacity check and the
-            // `tokio::select!` awaiting `notified`, the notification is
-            // still observed (see the method doc and `Self::freed`).
-            let notified = self.freed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.admit_inner(
-                role_name,
-                input.clone(),
-                sandbox.clone(),
-                suggestions.clone(),
-                None,
-            ) {
-                Ok(child) => return Ok(child),
-                Err(AdmitRejection::Other(error)) => return Err(error),
-                Err(AdmitRejection::Capacity(error)) => {
-                    let now = tokio::time::Instant::now();
-                    if now >= deadline {
-                        return Err(error);
-                    }
-                    let sleep_for = deadline
-                        .saturating_duration_since(now)
-                        .min(Duration::from_millis(500));
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => {
-                            return Err(Self::reject(format!(
-                                "waiting for parent {}'s child capacity was cancelled before a slot freed",
-                                input.parent_session_id
-                            )));
-                        }
-                        () = notified.as_mut() => {}
-                        () = tokio::time::sleep(sleep_for) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// [`Self::admit_or_wait`] followed by [`Self::guard_child`] — the
-    /// capacity-waiting counterpart to [`Self::spawn_child_guarded`], for
-    /// callers that want a [`ChildGuard`] without an unguarded window
-    /// between admission and the guard taking ownership of the slot.
-    ///
-    /// # Arguments
-    /// See [`Self::admit_or_wait`].
-    ///
-    /// # Returns
-    /// The new child's [`ChildGuard`].
-    ///
-    /// # Errors
-    /// See [`Self::admit_or_wait`].
-    ///
-    /// # Concurrency
-    /// See [`Self::admit_or_wait`].
-    pub async fn spawn_child_or_wait(
-        &self,
-        role_name: &str,
-        input: SpawnInput,
-        sandbox: SandboxSpec,
-        suggestions: Option<AgentSuggestions>,
-        max_wait: Duration,
-        cancel: &CancelToken,
-    ) -> Result<ChildGuard<'_>, AgentSpawnError> {
-        self.admit_or_wait(role_name, input, sandbox, suggestions, max_wait, cancel)
-            .await
-            .map(|child| self.guard_child(child))
-    }
 }
 
 impl AgentSpawner for ManagedAgentSpawner {
@@ -9624,6 +9588,7 @@ mod tests {
 
         fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
             Err(AgentSpawnError {
+                kind: Default::default(),
                 message: "test registry does not run children".to_owned(),
             })
         }
@@ -9915,7 +9880,7 @@ specialization = "child-controller-test"
     }
 
     /// Wie [`worker_spawner`], aber mit frei wählbaren [`ChildLimits`] — für
-    /// die `admit_or_wait`-Tests, die einen engen
+    /// die Fail-fast-Admission-Tests, die einen engen
     /// `max_active_children_per_parent`-Deckel (typischerweise `1`) brauchen,
     /// um Kapazitätsdruck ohne acht parallele Kinder zu erzwingen.
     fn worker_spawner_with_limits(
@@ -10400,6 +10365,7 @@ specialization = "child-controller-test"
 
         fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
             Err(AgentSpawnError {
+                kind: Default::default(),
                 message: "test registry does not run children".to_owned(),
             })
         }
@@ -11328,6 +11294,7 @@ specialization = "child-controller-test"
 
             fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
                 let mut fast = self.fast.lock().map_err(|_| AgentSpawnError {
+                    kind: Default::default(),
                     message: "test registry lock is poisoned".to_owned(),
                 })?;
                 let model: Arc<dyn ModelProvider> = if *fast {
@@ -11718,7 +11685,17 @@ max_depth = 0
                 "a parent contract of max_depth = 0 forbids any grandchild".to_owned(),
             ));
         };
-        assert_eq!(error.message, "child depth 2 exceeds maximum 1");
+        assert!(
+            error
+                .message
+                .contains("child depth 2 exceeds the maximum delegation depth 1"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            error.kind,
+            SpawnRejectionKind::DepthExceeded { depth: 2, max: 1 }
+        );
 
         // Erweitern: `max_depth = 99` hebt nichts an — die geerbte Decke bleibt
         // `ChildLimits::conservative().max_depth`.
@@ -13273,7 +13250,7 @@ admitted = ["fs.read", "shell.exec"]
         Ok(())
     }
 
-    // ── admit_or_wait / spawn_child_or_wait ────────────────────────────────
+    // ── fail-fast admission ────────────────────────────────────────────────
 
     /// Baut einen [`ManagedAgentSpawner`] mit genau einem Kapazitäts-Slot je
     /// Elternteil (`max_active_children_per_parent = 1`) — der `explore`-
@@ -13302,155 +13279,188 @@ admitted = ["fs.read", "shell.exec"]
         Ok((Arc::new(spawner), parent, sandbox))
     }
 
-    #[tokio::test]
-    async fn test_admit_or_wait_waits_and_succeeds_after_release() -> TestResult {
+    #[test]
+    fn capacity_exhausted_fails_immediately_with_a_typed_detailed_error() -> TestResult {
         let (spawner, parent, sandbox) = single_slot_spawner()?;
         let first_child = spawner
             .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
             .map_err(ctx("the single slot admits the first child"))?;
 
-        let waiter_spawner = Arc::clone(&spawner);
-        let waiter_parent = parent.clone();
-        let waiter_sandbox = sandbox.clone();
-        let handle = tokio::spawn(async move {
-            let cancel = CancelToken::new();
-            waiter_spawner
-                .admit_or_wait(
-                    "worker",
-                    spawn_input(waiter_parent),
-                    waiter_sandbox,
-                    None,
-                    std::time::Duration::from_secs(5),
-                    &cancel,
-                )
-                .await
-        });
-
-        // Let the waiter make its first (rejected) attempt and reach the
-        // `tokio::select!` awaiting `freed.notified()` before the slot frees.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        spawner
-            .release_child(&first_child)
-            .map_err(ctx("releasing the first child frees the only slot"))?;
-
-        // Bounded well under the 500ms fallback sleep inside `admit_or_wait`:
-        // this only passes if `release_in_memory`'s `notify_waiters()`
-        // actually woke the waiter, not the periodic poll.
-        let second_child = tokio::time::timeout(std::time::Duration::from_millis(300), handle)
-            .await
-            .map_err(ctx(
-                "admit_or_wait must be woken by the release notification, not time out",
-            ))?
-            .map_err(ctx("waiter task must not panic"))?
-            .map_err(ctx(
-                "capacity frees, so the second admission must eventually succeed",
-            ))?;
-
-        assert_ne!(second_child, first_child);
-        assert!(spawner.child_record(&second_child).is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_admit_or_wait_times_out_with_unchanged_capacity_error() -> TestResult {
-        let (spawner, parent, sandbox) = single_slot_spawner()?;
-        let _first_child = spawner
-            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
-            .map_err(ctx("the single slot admits the first child"))?;
-
-        // The immediate rejection `admit` itself would give — `admit_or_wait`
-        // must return this exact message once it gives up, byte-identical.
-        let Err(direct_rejection) =
-            spawner.admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
-        else {
+        let started = std::time::Instant::now();
+        let Err(error) = spawner.admit("worker", spawn_input(parent.clone()), sandbox, None) else {
             return Err(TestError::Unexpected(
-                "admit itself must still reject immediately at capacity".to_owned(),
+                "the second child must not be admitted while the only slot is taken".to_owned(),
             ));
         };
-
-        let cancel = CancelToken::new();
-        let Err(waited_rejection) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            spawner.admit_or_wait(
-                "worker",
-                spawn_input(parent),
-                sandbox,
-                None,
-                std::time::Duration::from_millis(120),
-                &cancel,
-            ),
-        )
-        .await
-        .map_err(ctx(
-            "admit_or_wait must give up once max_wait elapses, not hang",
-        ))?
-        else {
-            return Err(TestError::Unexpected(
-                "capacity never frees in this test".to_owned(),
-            ));
-        };
-
-        assert_eq!(waited_rejection.message, direct_rejection.message);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_admit_or_wait_cancellation_returns_promptly() -> TestResult {
-        let (spawner, parent, sandbox) = single_slot_spawner()?;
-        let first_child = spawner
-            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
-            .map_err(ctx("the single slot admits the first child"))?;
-
-        let cancel = CancelToken::new();
-        let waiter_spawner = Arc::clone(&spawner);
-        let waiter_cancel = cancel.clone();
-        let waiter_parent = parent.clone();
-        let waiter_sandbox = sandbox.clone();
-        let handle = tokio::spawn(async move {
-            waiter_spawner
-                .admit_or_wait(
-                    "worker",
-                    spawn_input(waiter_parent),
-                    waiter_sandbox,
-                    None,
-                    std::time::Duration::from_secs(30),
-                    &waiter_cancel,
-                )
-                .await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        cancel.cancel(CancelReason::User);
-
-        let Err(rejection) = tokio::time::timeout(std::time::Duration::from_millis(300), handle)
-            .await
-            .map_err(ctx(
-                "cancellation must end the wait promptly, not time out at max_wait (30s)",
-            ))?
-            .map_err(ctx("waiter task must not panic"))?
-        else {
-            return Err(TestError::Unexpected(
-                "a cancelled wait must not admit a child".to_owned(),
-            ));
-        };
-
         assert!(
-            rejection.message.contains("cancelled"),
-            "cancellation rejection must name cancellation, not capacity: {}",
-            rejection.message
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "admission must fail fast, not wait"
         );
-        // The first child's own slot is untouched by the second caller's
-        // cancellation — cancellation only abandons the *waiting* attempt.
+
+        let SpawnRejectionKind::CapacityExhausted {
+            active,
+            limit,
+            active_children,
+        } = &error.kind
+        else {
+            return Err(TestError::Unexpected(format!(
+                "expected CapacityExhausted, got {:?}",
+                error.kind
+            )));
+        };
+        assert_eq!((*active, *limit), (1, 1));
+        assert_eq!(active_children, &vec![format!("{first_child} (worker)")]);
+        assert!(error.message.contains("active child limit reached"));
+        assert!(error.message.contains("1 of 1 child slots"));
+        assert!(error.message.contains(&format!("{first_child} (worker)")));
+        assert!(error.message.contains(FAIL_FAST_CONSEQUENCE));
+        assert!(
+            crate::background_children::is_orchestration_limit_rejection(&error.message),
+            "the model must be able to read the rejection instead of the turn aborting"
+        );
+        assert!(crate::background_children::is_orchestration_limit_error(
+            &error
+        ));
+        // The first child's slot is untouched by the rejected attempt.
         assert!(spawner.child_record(&first_child).is_some());
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_admit_or_wait_returns_non_capacity_rejection_immediately() -> TestResult {
+    #[test]
+    fn a_freed_slot_admits_the_next_child_without_any_waiting() -> TestResult {
+        let (spawner, parent, sandbox) = single_slot_spawner()?;
+        let first_child = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(ctx("the single slot admits the first child"))?;
+        assert!(
+            spawner
+                .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+                .is_err(),
+            "second admission fails while the slot is taken"
+        );
+        spawner
+            .release_child(&first_child)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let second = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("the freed slot admits the next child immediately"))?;
+        assert!(spawner.child_record(&second).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn wave_preflight_is_all_or_nothing_and_starts_nothing() -> TestResult {
+        let (spawner, parent, _sandbox) = single_slot_spawner()?;
+        spawner
+            .preflight_wave_admission(&parent, &["worker"])
+            .map_err(ctx("one child fits into the single free slot"))?;
+        let Err(error) = spawner.preflight_wave_admission(&parent, &["worker", "worker"]) else {
+            return Err(TestError::Unexpected(
+                "two children cannot fit into one slot".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            error.kind,
+            SpawnRejectionKind::CapacityExhausted {
+                active: 0,
+                limit: 1,
+                ..
+            }
+        ));
+        assert!(error.message.contains("2 new child(ren) requested"));
+        assert!(error.message.contains("1 slot(s) free"));
+        assert!(error.message.contains("nothing was started"));
+        assert!(error.message.contains(FAIL_FAST_CONSEQUENCE));
+        assert_eq!(
+            spawner.active_children_for(&parent),
+            0,
+            "the pre-check must not admit anything"
+        );
+        let Err(unknown) = spawner.preflight_wave_admission(&parent, &["worker", "nope"]) else {
+            return Err(TestError::Unexpected("unknown role admitted".to_owned()));
+        };
+        assert_eq!(unknown.kind, SpawnRejectionKind::Other);
+        Ok(())
+    }
+
+    #[test]
+    fn wave_preflight_names_the_occupying_children() -> TestResult {
+        let (spawner, parent, sandbox) = single_slot_spawner()?;
+        let first = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox, None)
+            .map_err(ctx("the single slot admits the first child"))?;
+        let Err(error) = spawner.preflight_wave_admission(&parent, &["worker"]) else {
+            return Err(TestError::Unexpected("the slot is taken".to_owned()));
+        };
+        assert!(error.message.contains(&format!("{first} (worker)")));
+        assert!(error.message.contains("0 slot(s) free"));
+        Ok(())
+    }
+
+    #[test]
+    fn wave_preflight_enforces_the_per_role_instance_cap() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
+            "uia-worker",
+            AgentRole::Agent {
+                name: "uia-worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::UiaWorker,
+            Arc::new(EmptyChildRegistry),
+        );
+        let parent = SessionId::new();
+        spawner
+            .preflight_wave_admission(&parent, &["uia-worker"])
+            .map_err(ctx("a single uia-worker is fine"))?;
+        let Err(error) = spawner.preflight_wave_admission(&parent, &["uia-worker", "uia-worker"])
+        else {
+            return Err(TestError::Unexpected(
+                "two concurrent uia-workers exceed the cap".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            error.kind,
+            SpawnRejectionKind::OrchestrationLimit {
+                current: 2,
+                max: 1,
+                ..
+            }
+        ));
+        assert!(error.message.contains("at most 1 may run concurrently"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_capacity_child_list_is_bounded() -> TestResult {
+        let children: Vec<(String, String)> = (0..20)
+            .map(|index| (format!("child-{index}"), "worker".to_owned()))
+            .collect();
+        let error =
+            ManagedAgentSpawner::capacity_rejection(&SessionId::new(), 20, 20, 1, &children);
+        let SpawnRejectionKind::CapacityExhausted {
+            active_children, ..
+        } = &error.kind
+        else {
+            return Err(TestError::Unexpected(
+                "expected CapacityExhausted".to_owned(),
+            ));
+        };
+        assert_eq!(
+            active_children.len(),
+            crate::background_children::REJECTION_CHILD_LIST_MAX + 1
+        );
+        assert!(error.message.contains("and 12 more"));
+        assert!(!error.message.contains("child-19"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_capacity_rejection_is_typed_and_immediate() -> TestResult {
         // Reuses the depth-limit fixture from
         // `the_agent_ir_can_only_tighten_the_depth_limit`: `max_depth = 0` on
-        // the admitted "manager" forbids any grandchild — a rejection that
-        // has nothing to do with capacity and so must never be retried.
+        // the admitted "manager" forbids any grandchild, a rejection that
+        // has nothing to do with capacity.
         let (spawner, root, sandbox) = two_hop_spawner(test_agent_ir(
             r#"
 [spawn]
@@ -13461,29 +13471,23 @@ max_depth = 0
             .admit("manager", spawn_input(root), sandbox.clone(), None)
             .map_err(ctx("the depth-0 role is itself admissible"))?;
 
-        let cancel = CancelToken::new();
-        let Err(rejection) = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            spawner.admit_or_wait(
-                "worker",
-                spawn_input(child),
-                sandbox,
-                None,
-                std::time::Duration::from_secs(30),
-                &cancel,
-            ),
-        )
-        .await
-        .map_err(ctx(
-            "a non-capacity rejection must return immediately, not wait out max_wait (30s)",
-        ))?
-        else {
+        let Err(rejection) = spawner.admit("worker", spawn_input(child), sandbox, None) else {
             return Err(TestError::Unexpected(
                 "a parent contract of max_depth = 0 forbids any grandchild".to_owned(),
             ));
         };
 
-        assert_eq!(rejection.message, "child depth 2 exceeds maximum 1");
+        assert_eq!(
+            rejection.kind,
+            SpawnRejectionKind::DepthExceeded { depth: 2, max: 1 }
+        );
+        assert!(
+            rejection
+                .message
+                .contains("child depth 2 exceeds the maximum delegation depth 1"),
+            "{}",
+            rejection.message
+        );
         Ok(())
     }
 
@@ -15293,17 +15297,14 @@ max_depth = 0
             .release_child(&second)
             .map_err(|error| TestError::Unexpected(error.message))?;
 
-        // Agent-Werkzeug (`AgentToolAdapter`): `spawn_child_or_wait`.
+        // Agent-Werkzeug (`AgentToolAdapter`): `spawn_child_guarded`.
         let guard = spawner
-            .spawn_child_or_wait(
+            .spawn_child_guarded(
                 "worker",
                 continuation_input(&parent, first.as_str(), "Rest prüfen"),
                 sandbox,
                 None,
-                Duration::from_secs(1),
-                &CancelToken::new(),
             )
-            .await
             .map_err(|error| TestError::Unexpected(error.message))?;
         let link = spawner
             .continuation_link(guard.child())

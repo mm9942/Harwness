@@ -34,6 +34,17 @@ First end-to-end composed-agent recipe: `intent → candidate repo map → evide
 
 Proof: fake README versus source truth, surprise dependency boundary, symlink/out-of-scope denial, identical denied Egress not retried, reviewer can reproduce cited lines.
 
+### W03c/W03d — Durable error observations and independent agent runs (pre-W04 safety gates)
+
+Before widening orchestration, implement [05 — Error Learning & Agent Run Isolation](05-error-learning-and-run-isolation.md) as **two small separate waves**:
+
+- **W03c (PLANNED):** classify admission, executor, provider and reconciliation failures into typed non-secret run observations; atomically persist a bounded, epoch-fenced outbox **in the same CycleStore transaction as a committed checkpoint**. Do not write global memory from CycleDriver, do not count unverified fixes, and never retry an uncertain external effect blindly.
+- **W03d (PLANNED):** trusted run/agent/session principal through the job/child boundary; enforce per-session STM and independently assembled per-run context. A parent receives only an authorized bounded return, siblings receive no private history. Audit MemoryContextProvider session matching and bulk project/global fact injection; make child retrieval explicit and policy checked, with root compatibility governed separately.
+
+The existing W03 code and tests do **not** implement these subwaves. Cross-run learning consumption and promotion remain W09a–W09c.
+
+Proof: different agents cannot share STM/transcripts via provider reuse or the same trace; stale lease cannot append or ack learning; a crash between commit/delivery is idempotent; forbidden actions never become learned permissions; no context growth with sibling count. Keep current W01–W03 tests and arch gates green.
+
 ### W04 — Root and sub-orchestrator intent reconciliation
 
 Add the minimal intent contract and bounded DAG-change tool to Root/Sub. Detect material state delta, recompute frontier, cancel/supersede pending nodes, admit new specialist targets only through exact named grants and runtime capability snapshot. Do not inject every agent definition and every tool into context. Use compact top-k relevant role offers with capability and model readiness. Ensure `agents.delegate`, `delegate_wave`, generated transfer tools and execution/approval paths agree.
@@ -65,6 +76,9 @@ Adapt business-author/reviewer pipeline to approved versioned `PaperPackageV1` w
 Proof: independent reviewer rejects unsupported claim; non-pausing worker cannot receive synchronous handoff; LaTeX truncation resumes from checkpoint, not full regeneration; PDF visual render/QA; no fictitious citation; approved claims unchanged by typesetting.
 
 ### W09 — Knowledge feedback and intent lifecycle
+
+**Binding addendum:** [05 — Error Learning & Agent Run Isolation](05-error-learning-and-run-isolation.md) is mandatory. W09a consumes the W03c durable run observation outbox using existing learning/epistemic/outcome gates; W09b provides explicit authorized, versioned, top-k retrieval rather than shared agent contexts; W09c reviews project-to-global promotion and revocation. Global-home knowledge is not a global model prompt. Other agents' private conversations, tool transcripts, STM and diaries are never injected merely because they share project, trace, parent or role.
+
 
 Integrate context-ledger observation references, Diary/Dream/Palace/Maintenance as optional bounded segments; global promotion and embeddings require separate ownership/privacy policy. Link new sessions to stable intent/project while preventing child-context leaks. Journal corrections, confidence and source scope, not hidden provider reasoning text. Introduce replay and regression snapshots for learned policies.
 
@@ -119,6 +133,70 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 11. How intent-driven writes request expansion of path scope without silently violating original acceptance contract.
 12. Trace/event schema that makes graph evolution understandable in TUI/Web/Telegram while hiding secret material.
 
-## 7. Implementation status
+**Additional PL-90 status note (2026-10-08):** W03c, W03d and W09a–W09c are **PLANNED ONLY**; this PR currently contains no durable learning outbox or production cross-run memory consumer. The new [05 addendum](05-error-learning-and-run-isolation.md) introduces evidence-based gates, not a tested feature.\n\n## 7. Implementation status
 
-This PR initially began as docs-only; **implementation wave W01 has now introduced `harw-plan-bridge/src/intent_cycle.rs` and exports in `lib.rs`**: a pure, fail-closed cycle proposal admission core and table/regression tests. This is NOT durable chain execution, provider integration, a write executor, model routing or completion of W02–W10. No Cargo build has been run in this environment (Rust toolchain unavailable). Source-grounding used connected GitHub at pinned dev and the Gap-Hunt kit; the comparison to Claude Code is limited to repository-visible workflows, **not a verified claim about Anthropic's internal proprietary implementation**. The first code action after design review should be the read-only transition core + adapter test harness, not enabling unrestricted write-capable agents.
+Status vocabulary as in the dossier: `CURRENT` = merged and checked, `IN PR` = code in this PR with locally green tests, `PLANNED` = design only.
+
+### 7.1 `harw-plan-bridge/src/intent_cycle.rs` — IN PR
+
+Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cycle` tests green) and `cargo clippy -p harw-plan-bridge --all-targets -- -D warnings` (clean). The original seven source-only tests had never been run; running them found one real defect: `{"kind":"complete","permission":"full_access"}` deserialized, because serde does not enforce `deny_unknown_fields` on unit variants of internally tagged enums. All proposal and join variants are now struct variants and the test covers four injection shapes.
+
+| Area | What the module now does | Review thread |
+|---|---|---|
+| Transition family | `Advance`, `Fork`+`JoinPolicy` (`All`/`Any`/`Quorum`), `Reorient`, `Revisit` (drops invalidated claims and the criteria built on the revisited evidence), `ProposePatch` (multi-file contract set, every target in scope), `Verify`, `RequestApproval` (a request, not an approval), `Complete`, `Wait`, `Escalate`, `Blocked`, `Failed` | — |
+| Bounds | separate chain-nesting and agent-spawn depth with distinct refusals (`nested()`/`child()` derive seeds), transition budget, stall budget, parallel width, duplicate segments; honest exits (`Escalate`/`Blocked`/`Failed`) stay admissible when exhausted or stalled; terminal checkpoints admit nothing more | — |
+| Trusted construction | `CycleAdmission` is not `Deserialize` and only built through `CycleAdmission::new` (rejects malformed intent, zero limits, blank targets); every serialized type is `deny_unknown_fields` | — |
+| Intent identity | `IntentBinding` carries `revision`, canonical `ContentDigest` and `predecessor`; `supersedes()` rejects other-intent, stale, forked, skipped and wrong-predecessor revisions; admission and resume reject any revision/digest mismatch | R02 |
+| Evidence & progress | `EvidenceRecord` with source kind, locator, digest and trust (`Reported < Observed < Verified`); `apply_observations` derives progress from new content digests, trust upgrades, newly covered criteria or invalidated claims — a known digest under a new id is false novelty; evidence ids cannot be rebound to other content | — |
+| Acceptance | `Complete` needs every acceptance criterion mapped to `Verified` evidence and yields `CycleTerminal::CompletionProposed`; goal acceptance stays with WorkDriver/human | R06 (partial: no WorkDriver wiring) |
+| Durable fence | `CycleCheckpoint` (schema v1) with `CheckpointFence { epoch, sequence }`; `check_commit` is the CAS rule: same epoch → sequence + 1, new epoch → never rewind, stale epoch refused, intent/authority/ceiling immutable across commits | — |
+| Resume | checkpoint stores the non-authorizing `AuthoritySnapshot` and `AdmissionCeiling`; `resume_admission` takes the context from `PolicyBootstrap::reissue`, refuses another workspace or any permission the snapshot never held, intersects stored ceiling × current admission × reissued permissions (write targets need `WriteWorkspace`, reads need `ReadWorkspace`), narrows limits, re-fences under the new epoch; test covers a policy + role upgrade between crash and resume | R01 |
+
+### 7.2 `harw-plan-bridge/src/cycle_runtime.rs` — IN PR (W02 runtime binding)
+
+Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycle_runtime`), clippy `-D warnings` clean, `xtask gates arch` without violations for `harw-plan-bridge` (new edges A → J `harw-job-core`/`harw-job-store` are permitted by `A.may_depend_on = ["*"]`).
+
+| Concern | Implementation | Reused mechanism |
+|---|---|---|
+| Persistence | `CycleStore` over `RecordStore<CycleRecord>`; every mutation is a fenced CAS under the record lock (`check_commit` for steps, new `check_rebind` for takeovers) | `harw-job-store::RecordStore` (lock, temp+rename+fsync, quarantine) |
+| Lease fencing | checkpoint epoch = `LeaseToken::epoch`; an older epoch is refused on every operation, a newer one must rebind first; `check_rebind` allows only a newer epoch at the same sequence, narrowing ceiling/permissions/network scope, nothing else changed (`StateTampered`) | job lease epochs from `JobStore` |
+| Resume | every claim (including the first, records start at epoch 0) reissues the persisted `AuthoritySnapshot` via `AuthorityReissuer` (`PolicyReissuer` → `PolicyBootstrap::reissue`), narrows via `resume_admission` (now also network scope) and rebinds | `harw-authority` |
+| Effect journal | `InFlightStep` with stable idempotency key `<cycle>-<sequence>` journaled before execution; on takeover `reconcile` → `NotStarted` (dropped), `Completed` (observations committed, never re-executed), `Uncertain` (cycle escalates) | — |
+| Driver | `CycleDriver`: proposer (model) and step executor (trusted) are separate traits; refusals are fed back to the proposer and escalate after `max_refusals_per_step` (default 3); proposer failure (e.g. provider 403) → `Blocked`; executor failure → stall → bounded escalation; cancellation between steps, in-flight step left for reconciliation | `CancelToken` |
+| Jobs | `cycle_job_operation` plugs the driver into `DurableJobRunner::run_with_cancel` (claim, heartbeat, lease-loss cancel, job commit); `job_outcome`: `CompletionProposed` → `Succeeded` with `requires_owner_acceptance: true`, `Escalated`/`Blocked` → `Blocked`, `Failed` → `Failed`, cancel → `Cancelled` | `harw-core::DurableJobRunner` |
+| Status | `CycleRecord::status()` — bounded projection (counts, covered criteria, in-flight key, terminal), no evidence bodies | — |
+
+Covered failure injections: stale epoch / zombie executor, foreign job, double journal, crash with completed / uncertain / not-started step, tampered or widened rebind, policy downgrade between submit and claim, unavailable proposer, executor capability failure, cancellation, end-to-end through a real `JobStore` + `DurableJobRunner`.
+
+### 7.3 `cycle_explorer.rs` / `cycle_proposer.rs` — IN PR (W03 building blocks)
+
+Intermediate state: the two halves of the W03 explorer exist as independently tested modules and are now merged together with one cross-module test (`cycle_w03_tests.rs`: `CycleDriver` + `ModelCycleProposer` over a scripted fake `ModelProvider` + `ReadOnlyExplorerExecutor` over a temp workspace; Advance(read) -> digest-bound `Observed` evidence -> Reorient on that evidence -> read -> Escalate; it also asserts the turn-2 prompt contains the evidence id and locator but no file content and no digest). Verified locally: `cargo test -p harw-plan-bridge` (271 lib + 20 `intent_cycle` tests green), clippy `-D warnings` clean, `rustfmt --edition 2024 --check` clean, `xtask gates arch` shows only the 6 pre-existing violations (`harw-cloud*`, `harw-tool-obsidian`). New edge: `harw-plan-bridge` -> `harw-tool-fsread`.
+
+| Module | What it does | Key decisions |
+|---|---|---|
+| `cycle_explorer.rs` (`ReadOnlyExplorerExecutor`) | First trusted `CycleStepExecutor`: turns admitted `Segment::Read` segments into `EvidenceRecord`s (source `Repository`, digest of the bytes, workspace-relative locator). Refuses child/nested segments and every non-read proposal. Reads go through `harw-tool-fsread` `Scope` (no symlink escape, regular files only, secret paths denied) and need `ReadWorkspace` | Target ids map to paths only via a trusted, non-`Deserialize` `ReadTargetMap`. All-or-nothing step: any failing read returns `Err(StepFailure)` (no partial evidence); the driver counts it as a stall. `reconcile` always returns `NotStarted` (reads are idempotent; a recovered digest could be stale). Oversized files are refused, never truncated or digested as a prefix. Optional bounded in-memory `ExplorerReadCache` (oldest-first eviction, filled only when the whole step succeeded, lost on restart). It only ever produces `Observed` evidence |
+| `cycle_proposer.rs` (`ModelCycleProposer`) | `CycleProposer` over a `ModelProvider`: pure `render_prompt` -> one JSON object -> `serde` parse (`deny_unknown_fields`) -> `CycleProposal`; admission and executor still decide everything | Route policy: deterministic default/escalation route chosen from refusal streak and `stall_transitions`, never by the model. One repair re-prompt with the bounded parse error, then `Err` -> `Blocked` (no synthesized `Escalate`). Retryable provider errors retried up to `max_retries` without sleeping. Auth circuit breaker: after `auth_trip_after` consecutive `Auth` failures a route is no longer used. Prompt exclusions: no authority snapshot, ceiling, permissions, digests, file contents or claim bodies; ids and locators are sanitized and capped |
+
+What is NOT done:
+
+- No runtime caller builds a `ReadTargetMap`, and there is no tool or registry entry that starts a cycle with these modules.
+- No real verifier: `Verify` is refused by the explorer, so `Complete` (which needs `Verified` evidence) is unreachable for a pure explorer cycle; the cross-module test therefore ends in `Escalate`, and the in-module `Verified` stand-in in `cycle_explorer` tests is a test double.
+- No `CancelToken` in the proposer (`CycleProposer::propose` does not receive one; requests carry `cancel: None`).
+- No retry backoff (the provider layer owns pacing and `Retry-After`).
+- No small-model benchmark (the W03 exit criterion in section 2 is still open).
+
+### 7.4 Not done (PLANNED)
+
+- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). W03 now has its building blocks (7.3) but no wiring or benchmark; W04 is open.
+- Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
+
+- W03 wiring and W04–W10: no wired explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
+- Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
+
+### 7.5 Base-branch notes found while verifying
+
+- `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
+- The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).
+- Two `harw-core` lib tests fail on the base once it compiles (`child_controller::tests::teil_o::without_a_relay_the_child_still_fails_closed`, `turn_loop::tests::uia_keeps_transfer_tools_with_one_line_descriptions`); unrelated to this PR and left for a separate fix.
+
+The comparison to Claude Code remains limited to repository-visible workflows (Gap-Hunt kit), **not a claim about Anthropic's internal implementation**.

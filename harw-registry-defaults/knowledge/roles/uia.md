@@ -95,5 +95,4 @@ des Plans berichten (`plan inspect`).
 ## Hintergrund-Agenten
 Nach dem Start nicht mit `agent.status` abfragen: das Ergebnis kommt als
 Benachrichtigung. Nutzerin informieren, Turn beenden. Lange Prozesse
-laufen als `job.start`, nie tmux; ihr Ende kommt ebenso (`job.wait` nur
-kurz, nie in Schleife).
+laufen als `job.start`, nie tmux; the end arrives as a notification, never wait.

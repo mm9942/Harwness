@@ -78,9 +78,9 @@ use crate::memory_tools::{MEMORY_RECALL, MEMORY_RECORD};
 use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
-    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
-    FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, OBSIDIAN_READ_TOOLS, PROCESS_TOOLS, SHELL_TOOLS,
-    WEB_TOOLS, role_names,
+    BROWSER_TOOLS, CARGO_TEST_ONE_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS,
+    EXPLORER_TOOLS, FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, OBSIDIAN_READ_TOOLS,
+    PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
@@ -682,6 +682,9 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // dieser Rechtefilter (der pro Werkzeug nur ein Recht liefert).
         || tool == WORK_DRIVER_ENQUEUE_TOOL
         || listed(PROCESS_TOOLS)
+        // `cargo.test_one` startet über `shell.exec` einen Testlauf; die
+        // übrigen `cargo.*` haben bewusst kein Recht (nie registriert).
+        || listed(CARGO_TEST_ONE_TOOLS)
         || listed(LATEX_TOOLS)
         || listed(crate::profile::SUDO_TOOLS)
     {
@@ -839,6 +842,21 @@ pub fn granted_for_capabilities(
     manifest_tools: Option<&[String]>,
 ) -> PermissionSet {
     let mut granted: Vec<Permission> = profile_rights.iter().collect();
+    // `cargo.test_one` braucht `ExecuteProcess`, das kein Profil trägt
+    // (`RegistryProfile::required_permissions`). Es wird nur vergeben, wenn
+    // ein Schreibprofil und ein Manifest zusammentreffen, das das Werkzeug
+    // führt; der Roster klemmt es für alle außer dem `test-engineer` heraus.
+    // Die Schnitte unten (Autorität, Manifest) gelten danach wie üblich.
+    if profile_rights.contains(Permission::WriteWorkspace)
+        && !granted.contains(&Permission::ExecuteProcess)
+        && manifest_tools.is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| crate::profile::CARGO_TEST_ONE_TOOLS.contains(&tool.as_str()))
+        })
+    {
+        granted.push(Permission::ExecuteProcess);
+    }
     if let Some(authority) = authority_permissions(capabilities) {
         granted.retain(|permission| authority.contains(*permission));
     }

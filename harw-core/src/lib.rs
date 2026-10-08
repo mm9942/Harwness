@@ -75,7 +75,8 @@ pub use auto_compact::{
 // Runde 5, Teil K.
 pub use background_children::{
     BackgroundChildren, BackgroundNotice, BackgroundProgress, BackgroundRun, BackgroundStatus,
-    ORCHESTRATION_LIMIT_MARKER, OrchestrationLimits, is_orchestration_limit_rejection,
+    DELEGATION_REJECTED_MARKER, ORCHESTRATION_LIMIT_MARKER, OrchestrationLimits,
+    describe_occupying_children, is_orchestration_limit_error, is_orchestration_limit_rejection,
 };
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 // Runde 5, Teil M.
@@ -111,7 +112,7 @@ pub use execution_registry::{
 };
 pub use guard::{
     DriftEvent, DriftKind, DriftObserver, GuardPolicy, GuardVerdict, PitfallAdvisor,
-    ProgressObserver, TurnGuard,
+    ProgressObserver, SessionResolvedSet, TurnGuard,
 };
 pub use harw_protocol::ToolCallResult;
 pub use history::{ConversationHistory, ModelMessage};

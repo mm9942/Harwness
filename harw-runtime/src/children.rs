@@ -1437,6 +1437,7 @@ impl RuntimeChildRegistryFactory {
                 return Ok(Vec::new());
             }
             return Err(AgentSpawnError {
+                kind: Default::default(),
                 message: format!(
                     "child role '{role}' requires the skills [{}] from its agent definition, \
                      but no skill catalog is wired: refusing to start it without them",
@@ -1456,6 +1457,7 @@ impl RuntimeChildRegistryFactory {
             &names,
         )
         .map_err(|detail| AgentSpawnError {
+            kind: Default::default(),
             message: format!("could not load the skills of child role '{role}': {detail}"),
         })?;
         for snapshot in &snapshots {
@@ -1677,6 +1679,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         let profile = self
             .registry_profile_for(role)
             .ok_or_else(|| AgentSpawnError {
+                kind: Default::default(),
                 message: format!(
                     "refusing to assemble a child registry for unknown role '{role}': \
                  no registry profile is declared for it"
@@ -1776,6 +1779,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 self.host_permit_wiring.clone(),
             )
             .map_err(|error| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`, nicht `install`:
@@ -1808,6 +1812,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             let browser_provider =
                 harw_registry_defaults::profile::browser_tool_provider_for_config(&self.browser)
                     .map_err(|error| AgentSpawnError {
+                        kind: Default::default(),
                         message: format!(
                             "could not assemble browser provider for role '{role}': {error}"
                         ),
@@ -1907,6 +1912,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .catalog
             .direct_skills_snapshot(role)
             .map_err(|error| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("could not freeze the capabilities of role '{role}': {error}"),
             })
     }
@@ -2165,6 +2171,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         }
 
         let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {
+            kind: Default::default(),
             message: format!(
                 "refusing to assemble a child registry for unknown role '{role}': \
                  no registry profile is declared for it"
@@ -2218,6 +2225,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 Some(access),
             )
             .map_err(|error| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`: siehe Begründung in `build_registry`.
@@ -2489,13 +2497,14 @@ impl AgentJobSubmitter for DeferredAgentJobSubmitter {
         task: Option<&'a str>,
     ) -> AgentJobFuture<'a> {
         Box::pin(async move {
-            let submitter = self
-                .slot
-                .get()
-                .and_then(Weak::upgrade)
-                .ok_or_else(|| AgentSpawnError {
-                    message: "durable agent job submitter is not available".to_owned(),
-                })?;
+            let submitter =
+                self.slot
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| AgentSpawnError {
+                        kind: Default::default(),
+                        message: "durable agent job submitter is not available".to_owned(),
+                    })?;
             submitter.submit_child(child, task).await
         })
     }
@@ -2515,6 +2524,7 @@ impl AgentSpawner for DeferredManagedSpawner {
                     .get()
                     .and_then(Weak::upgrade)
                     .ok_or_else(|| AgentSpawnError {
+                        kind: Default::default(),
                         message: "managed child spawner is not available".to_owned(),
                     })?;
             spawner.spawn_child(role, input, sandbox, suggestions).await
@@ -2537,6 +2547,7 @@ impl AgentSpawner for DeferredManagedSpawner {
             .get()
             .and_then(Weak::upgrade)
             .ok_or_else(|| AgentSpawnError {
+                kind: Default::default(),
                 message: "managed child spawner is not available".to_owned(),
             })?;
         spawner.child_completed(child, completed_at)

@@ -35,7 +35,8 @@
       "skills.search",
       "skills.load",
       "fs.write",
-      "fs.edit"
+      "fs.edit",
+      "cargo.test_one"
     ],
     "forbidden": [
       "shell.exec",
@@ -113,6 +114,7 @@
   },
   "permissions": {
     "tools": [
+      "cargo.test_one",
       "diary.read",
       "doc.read_pdf",
       "explore.find",
@@ -216,6 +218,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "6ba940050e2a7979fcc438319439dcc6d60fae53c0111a5bd51f985b5bd2a561"
+    "digest": "3566caf89d7077bc36efe00ea20fa4d3ed95982164597bcf0ae2f6e9b852e9ae"
   }
 }

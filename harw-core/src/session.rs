@@ -316,6 +316,9 @@ pub struct AgentSession {
     /// (< 64k) — `collect_tools` liefert dann kompakte Werkzeugschemas
     /// (gekürzte Beschreibungen).
     compact_tool_schemas: bool,
+    /// The host detaches `AwaitingChild` pauses into its own in-process
+    /// background launcher (TUI); counts as a background executor.
+    host_background_launcher: bool,
     /// Beobachter, der nach jeder Modellrunde und jedem Tool-Ergebnis dieser
     /// Session über Fortschritt benachrichtigt wird (Lease-Erneuerung durch
     /// `ManagedAgentSpawner`). `None`: kein Beobachter registriert.
@@ -626,6 +629,7 @@ impl AgentSession {
             pitfall_advisor: None,
             guard_state: crate::guard::SessionGuardState::default(),
             compact_tool_schemas: false,
+            host_background_launcher: false,
             progress_observer: None,
             token_calibration: crate::context_budget::TokenCalibration::default(),
             max_output_tokens: None,
@@ -1188,6 +1192,21 @@ impl AgentSession {
     #[must_use]
     pub fn pitfall_advisor(&self) -> Option<&std::sync::Arc<dyn crate::guard::PitfallAdvisor>> {
         self.pitfall_advisor.as_ref()
+    }
+
+    /// Declares that the host registered an in-process background launcher
+    /// that detaches `TurnOutcome::AwaitingChild` pauses (the TUI
+    /// `BackgroundLauncher`). Such a session counts as having a background
+    /// executor even without a durable agent job submitter; the child is
+    /// never driven inline by the turn loop.
+    pub fn set_host_background_launcher(&mut self, present: bool) {
+        self.host_background_launcher = present;
+    }
+
+    /// Whether the host detaches delegation pauses into the background.
+    #[must_use]
+    pub fn host_background_launcher(&self) -> bool {
+        self.host_background_launcher
     }
 
     /// Runde 7, Teil L9: schaltet kompakte Werkzeugschemas ein bzw. aus

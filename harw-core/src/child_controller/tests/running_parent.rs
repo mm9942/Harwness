@@ -134,21 +134,17 @@ impl ToolExecutor for SpawnExecutor {
                         .ok()
                 })
                 .unwrap_or_default();
-            let cancel = CancelToken::new();
             let outcome = match self.slot.get().and_then(Weak::upgrade) {
                 // Genau wie `SpawnerDriver` bzw. das Agent-Werkzeug: der
                 // aufrufende (laufende) Turn ist der Elternteil, die Sandbox
                 // ist die des Turns.
                 Some(spawner) => spawner
-                    .spawn_child_or_wait(
+                    .spawn_child_guarded(
                         "worker",
                         spawn_input(context.session_id().clone()),
                         context.sandbox().clone(),
                         None,
-                        Duration::from_millis(50),
-                        &cancel,
                     )
-                    .await
                     .map(ChildGuard::keep)
                     .map_err(|error| error.message),
                 None => Err("kein Spawner im Slot".to_owned()),

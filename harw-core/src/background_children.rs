@@ -33,22 +33,58 @@
 //! Wecken der Oberfläche).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use harw_agent_dsl::roles::AgentRoleId;
-use harw_extension_api::AgentSpawnError;
+use harw_extension_api::{AgentSpawnError, FAIL_FAST_CONSEQUENCE, SpawnRejectionKind};
 use harw_types::SessionId;
 use jiff::Timestamp;
 
 use crate::agent_events::{AgentEvent, AgentEventKind};
 use crate::child_controller::ManagedAgentSpawner;
 
-/// Anfang jeder Ablehnungsmeldung einer Orchestrierungsgrenze.
+/// Start of every orchestration-limit rejection message.
 ///
-/// Der Turn-Loop erkennt daran eine Ablehnung, die das Modell selbst lesen
-/// und beantworten soll (Werkzeugfehler statt Turn-Abbruch).
-pub const ORCHESTRATION_LIMIT_MARKER: &str = "Orchestrierungsgrenze:";
+/// The turn loop uses it to recognise a rejection that the model itself
+/// should read and react to (tool error instead of a turn abort).
+pub const ORCHESTRATION_LIMIT_MARKER: &str = "Orchestration limit:";
+
+/// Start of the capacity and depth rejection messages of the fail-fast
+/// admission. Treated like [`ORCHESTRATION_LIMIT_MARKER`]: an answer to the
+/// model, not a reason to abort the turn.
+pub const DELEGATION_REJECTED_MARKER: &str = "Delegation rejected:";
+
+/// Previous German marker. Rejection messages are never persisted, so this
+/// is only accepted for in-flight messages of an older build.
+const LEGACY_ORCHESTRATION_LIMIT_MARKER: &str = "Orchestrierungsgrenze:";
+
+/// Maximum number of children listed by name in a rejection message.
+pub const REJECTION_CHILD_LIST_MAX: usize = 8;
+
+/// Formats `id (role)` entries bounded to [`REJECTION_CHILD_LIST_MAX`]; the
+/// second value is the bounded list, the first the human-readable text.
+#[must_use]
+pub fn describe_occupying_children(children: &[(String, String)]) -> (String, Vec<String>) {
+    let mut listed: Vec<String> = children
+        .iter()
+        .take(REJECTION_CHILD_LIST_MAX)
+        .map(|(id, role)| format!("{id} ({role})"))
+        .collect();
+    let text = if listed.is_empty() {
+        "none".to_owned()
+    } else {
+        let mut text = listed.join(", ");
+        if children.len() > REJECTION_CHILD_LIST_MAX {
+            let more = children.len() - REJECTION_CHILD_LIST_MAX;
+            let _ = write!(text, ", and {more} more");
+            listed.push(format!("and {more} more"));
+        }
+        text
+    };
+    (text, listed)
+}
 
 /// Wie viele abgeschlossene Hintergrund-Läufe je Spawner zur Anzeige
 /// (`/agent bg`, `agent.status`) vorrätig bleiben.
@@ -57,10 +93,29 @@ pub const BACKGROUND_FINISHED_KEEP: usize = 16;
 /// Höchstlänge der Kurzfassung eines Ergebnisses in [`BackgroundRun::summary`].
 const SUMMARY_MAX_CHARS: usize = 240;
 
-/// `true`, wenn `message` eine Ablehnung durch eine Orchestrierungsgrenze ist.
+/// `true` if `message` is a fail-fast admission rejection (orchestration
+/// limit, child capacity or depth) that the model should read.
+///
+/// Prefer [`is_orchestration_limit_error`], which matches on the typed
+/// [`SpawnRejectionKind`]; this variant exists for call sites that only hold
+/// the message text.
 #[must_use]
 pub fn is_orchestration_limit_rejection(message: &str) -> bool {
     message.starts_with(ORCHESTRATION_LIMIT_MARKER)
+        || message.starts_with(DELEGATION_REJECTED_MARKER)
+        || message.starts_with(LEGACY_ORCHESTRATION_LIMIT_MARKER)
+}
+
+/// `true` if `error` is a typed fail-fast admission rejection (capacity,
+/// depth or orchestration limit).
+#[must_use]
+pub fn is_orchestration_limit_error(error: &AgentSpawnError) -> bool {
+    matches!(
+        error.kind,
+        SpawnRejectionKind::CapacityExhausted { .. }
+            | SpawnRejectionKind::DepthExceeded { .. }
+            | SpawnRejectionKind::OrchestrationLimit { .. }
+    )
 }
 
 /// `true` für Root- und Kind-Orchestratoren.
@@ -131,15 +186,16 @@ pub struct AdmittedNode<'a> {
 /// - `limits`: die wirksamen Grenzen.
 ///
 /// # Errors
-/// Eine Meldung für das Modell, beginnend mit
-/// [`ORCHESTRATION_LIMIT_MARKER`].
+/// A typed [`SpawnRejectionKind::OrchestrationLimit`] whose message starts
+/// with [`ORCHESTRATION_LIMIT_MARKER`] and ends with
+/// [`FAIL_FAST_CONSEQUENCE`].
 pub fn check_orchestration_admission(
     nodes: &[AdmittedNode<'_>],
     parent: &str,
     parent_role: AgentRoleId,
     target_role: AgentRoleId,
     limits: OrchestrationLimits,
-) -> Result<(), String> {
+) -> Result<(), AgentSpawnError> {
     if !is_orchestrator_role(target_role) {
         return Ok(());
     }
@@ -151,16 +207,25 @@ pub fn check_orchestration_admission(
             })
             .collect();
         if running.len() >= limits.max_root_orchestrators {
-            let described = running
+            let occupying: Vec<(String, String)> = running
                 .iter()
-                .map(|node| format!("{} ({})", node.role_name, node.child))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "{ORCHESTRATION_LIMIT_MARKER} Grenze max_root_orchestrators={} erreicht — es läuft \
-                 bereits: {described}. Nutze agent.status/agent.result oder warte auf seine \
-                 Benachrichtigung; für Nebenaufgaben stehen nur UIA-Worker zur Verfügung.",
-                limits.max_root_orchestrators
+                .map(|node| (node.child.to_owned(), node.role_name.to_owned()))
+                .collect();
+            let (described, _) = describe_occupying_children(&occupying);
+            return Err(AgentSpawnError::with_kind(
+                SpawnRejectionKind::OrchestrationLimit {
+                    limit_name: "max_root_orchestrators".to_owned(),
+                    current: running.len(),
+                    max: limits.max_root_orchestrators,
+                },
+                format!(
+                    "{ORCHESTRATION_LIMIT_MARKER} limit max_root_orchestrators is reached \
+                     (current {}, maximum {}). Occupying the slots: {described}. {FAIL_FAST_CONSEQUENCE} \
+                     Use agent.status / agent.result to inspect them; only UIA workers are \
+                     available for side tasks in the meantime.",
+                    running.len(),
+                    limits.max_root_orchestrators
+                ),
             ));
         }
         return Ok(());
@@ -203,10 +268,18 @@ pub fn check_orchestration_admission(
 
     let new_level = sub_levels.saturating_add(1);
     if new_level > limits.max_sub_orchestrator_depth {
-        return Err(format!(
-            "{ORCHESTRATION_LIMIT_MARKER} Grenze max_sub_orchestrator_depth={} erreicht — ein \
-             Sub-Orchestrator auf Ebene {new_level} ist nicht erlaubt; nutze Worker.",
-            limits.max_sub_orchestrator_depth
+        return Err(AgentSpawnError::with_kind(
+            SpawnRejectionKind::OrchestrationLimit {
+                limit_name: "max_sub_orchestrator_depth".to_owned(),
+                current: usize::try_from(new_level).unwrap_or(usize::MAX),
+                max: usize::try_from(limits.max_sub_orchestrator_depth).unwrap_or(usize::MAX),
+            },
+            format!(
+                "{ORCHESTRATION_LIMIT_MARKER} limit max_sub_orchestrator_depth is exceeded: a \
+                 sub-orchestrator at level {new_level} would be created, the maximum is {}. \
+                 This delegation is not admitted at any time; delegate to a worker instead.",
+                limits.max_sub_orchestrator_depth
+            ),
         ));
     }
 
@@ -233,10 +306,27 @@ pub fn check_orchestration_admission(
         })
         .count();
     if running_subs >= limits.max_sub_orchestrators {
-        return Err(format!(
-            "{ORCHESTRATION_LIMIT_MARKER} Grenze max_sub_orchestrators={} erreicht; nutze Worker \
-             oder warte auf ein laufendes Kind.",
-            limits.max_sub_orchestrators
+        let occupying: Vec<(String, String)> = nodes
+            .iter()
+            .filter(|node| {
+                node.organizational_role == Some(AgentRoleId::ChildOrchestrator)
+                    && in_tree(node.parent)
+            })
+            .map(|node| (node.child.to_owned(), node.role_name.to_owned()))
+            .collect();
+        let (described, _) = describe_occupying_children(&occupying);
+        return Err(AgentSpawnError::with_kind(
+            SpawnRejectionKind::OrchestrationLimit {
+                limit_name: "max_sub_orchestrators".to_owned(),
+                current: running_subs,
+                max: limits.max_sub_orchestrators,
+            },
+            format!(
+                "{ORCHESTRATION_LIMIT_MARKER} limit max_sub_orchestrators is reached (current \
+                 {running_subs}, maximum {}). Occupying the slots: {described}. \
+                 {FAIL_FAST_CONSEQUENCE} Delegate to a worker in the meantime.",
+                limits.max_sub_orchestrators
+            ),
         ));
     }
     Ok(())
@@ -720,6 +810,7 @@ impl ManagedAgentSpawner {
         task: Option<&str>,
     ) -> Result<BackgroundRun, AgentSpawnError> {
         let record = self.child_record(child).ok_or_else(|| AgentSpawnError {
+            kind: Default::default(),
             message: format!("child {child} is not admitted; it cannot run in the background"),
         })?;
         if !self
@@ -727,6 +818,7 @@ impl ManagedAgentSpawner {
             .register(child, &record.parent, &record.role, task)
         {
             return Err(AgentSpawnError {
+                kind: Default::default(),
                 message: format!("child {child} already runs in the background"),
             });
         }
@@ -746,6 +838,7 @@ impl ManagedAgentSpawner {
         self.background
             .run_for(&record.parent, child.as_str())
             .ok_or_else(|| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("background run of {child} vanished"),
             })
     }
@@ -794,6 +887,7 @@ impl ManagedAgentSpawner {
             .background
             .run_for(caller, child)
             .ok_or_else(|| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("kein eigener Hintergrund-Agent mit der ID {child}"),
             })?;
         if !run.is_running() {
@@ -860,7 +954,7 @@ mod tests {
             .is_ok()
         );
         let nodes = [node("root-1", UIA, AgentRoleId::RootOrchestrator)];
-        let Err(message) = check_orchestration_admission(
+        let Err(error) = check_orchestration_admission(
             &nodes,
             UIA,
             AgentRoleId::UserInterface,
@@ -868,13 +962,25 @@ mod tests {
             limits,
         ) else {
             return Err(TestError::Unexpected(
-                "zweiter Root-Orchestrator zugelassen".into(),
+                "second root orchestrator was admitted".into(),
             ));
         };
+        let message = error.message.clone();
         assert!(is_orchestration_limit_rejection(&message));
-        assert!(message.contains("root-orchestrator (root-1)"));
+        assert!(is_orchestration_limit_error(&error));
+        assert_eq!(
+            error.kind,
+            SpawnRejectionKind::OrchestrationLimit {
+                limit_name: "max_root_orchestrators".to_owned(),
+                current: 1,
+                max: 1,
+            }
+        );
+        assert!(message.contains("root-1 (root-orchestrator)"));
         assert!(message.contains("agent.status"));
-        assert!(message.contains("UIA-Worker"));
+        assert!(message.contains("UIA workers"));
+        assert!(message.contains("current 1, maximum 1"));
+        assert!(message.contains(FAIL_FAST_CONSEQUENCE));
         Ok(())
     }
 
@@ -996,7 +1102,7 @@ mod tests {
             node("sub-b", "sub-a", AgentRoleId::ChildOrchestrator),
             node("worker", "sub-b", AgentRoleId::Worker),
         ];
-        let Err(message) = check_orchestration_admission(
+        let Err(error) = check_orchestration_admission(
             &nodes,
             "root-1",
             AgentRoleId::RootOrchestrator,
@@ -1004,10 +1110,13 @@ mod tests {
             limits,
         ) else {
             return Err(TestError::Unexpected(
-                "Grenze max_sub_orchestrators hätte greifen müssen".into(),
+                "limit max_sub_orchestrators should have applied".into(),
             ));
         };
-        assert!(message.contains("max_sub_orchestrators=2"));
+        assert!(error.message.contains("max_sub_orchestrators is reached"));
+        assert!(error.message.contains("current 2, maximum 2"));
+        assert!(error.message.contains("sub-a (") && error.message.contains("sub-b ("));
+        assert!(error.message.contains(FAIL_FAST_CONSEQUENCE));
         // Ein anderer Baum ist unberührt.
         let other = [
             node("root-2", "other-uia", AgentRoleId::RootOrchestrator),
@@ -1059,9 +1168,18 @@ mod tests {
             limits,
         );
         assert!(
-            result
-                .as_ref()
-                .is_err_and(|message| message.contains("max_sub_orchestrator_depth=2")),
+            result.as_ref().is_err_and(|error| error
+                .message
+                .contains("max_sub_orchestrator_depth is exceeded")
+                && error.message.contains("level 3")
+                && matches!(
+                    error.kind,
+                    SpawnRejectionKind::OrchestrationLimit {
+                        current: 3,
+                        max: 2,
+                        ..
+                    }
+                )),
             "{result:?}"
         );
     }
