@@ -1,6 +1,6 @@
 //! Die Modell-Werkzeuge `job.start`, `job.status`, `job.logs`, `job.stop`,
 //! `job.list` ([`JobToolProvider`]). There is deliberately no blocking wait tool:
-//! delegated work is background-only and its progress and end arrive as
+//! job-managed work is background-only (the `transfer_to_*` handoff; inline agent tools are tracked as TODO(PL-90)) and its progress and end arrive as
 //! notifications.
 //!
 //! # Sicherheitskontrakt

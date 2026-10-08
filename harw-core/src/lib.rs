@@ -112,7 +112,7 @@ pub use execution_registry::{
 };
 pub use guard::{
     DriftEvent, DriftKind, DriftObserver, GuardPolicy, GuardVerdict, PitfallAdvisor,
-    ProgressObserver, TurnGuard,
+    ProgressObserver, SessionResolvedSet, TurnGuard,
 };
 pub use harw_protocol::ToolCallResult;
 pub use history::{ConversationHistory, ModelMessage};

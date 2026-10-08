@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use harw_config::ResolvedConfig;
 use harw_core::{
     DriftEvent, DriftObserver, GuardPolicy, ManagedAgentSpawner, PitfallAdvisor, RoleEffortWeights,
+    SessionResolvedSet,
 };
 use harw_memory::{Fact, FactStore, FactType};
 use harw_types::ReasoningEffort;
@@ -91,6 +92,10 @@ pub struct MemoryPitfallAdvisor {
     /// Aufrufs gelöst hat ([`PitfallAdvisor::resolved`]); sie melden sich
     /// nicht mehr.
     resolved: Mutex<Vec<String>>,
+    /// Session-getrennter, begrenzter Laufzustand für die Runtime-Aufrufer
+    /// ([`PitfallAdvisor::advise_in_session`] / `resolved_in_session`): ein
+    /// Erfolg in Session A löst den Hinweis nie in Session B auf.
+    resolved_by_session: SessionResolvedSet,
 }
 
 impl MemoryPitfallAdvisor {
@@ -101,11 +106,12 @@ impl MemoryPitfallAdvisor {
     ///   dieselbe wie [`crate::assembly::RuntimeAssemblyBuilder::fact_stores`]
     ///   (Projekt-Anteil).
     #[must_use]
-    pub const fn new(store: Arc<FactStore>) -> Self {
+    pub fn new(store: Arc<FactStore>) -> Self {
         Self {
             store,
             cache: OnceLock::new(),
             resolved: Mutex::new(Vec::new()),
+            resolved_by_session: SessionResolvedSet::new(),
         }
     }
 
@@ -149,8 +155,37 @@ impl PitfallAdvisor for MemoryPitfallAdvisor {
             .map(|fact| truncate_hint(&fact.description))
     }
 
+    /// Sessiongebunden: berücksichtigt nur die Auflösungen derselben Session
+    /// (nie den ungebundenen `resolved`-Zustand).
+    fn advise_in_session(
+        &self,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        self.pitfalls()
+            .iter()
+            .filter(|fact| !self.resolved_by_session.contains(session_id, &fact.name))
+            .find(|fact| pitfall_applies(fact, tool_name, arguments))
+            .map(|fact| truncate_hint(&fact.description))
+    }
+
+    /// Sessiongebunden: löst Treffer nur für `session_id` auf.
+    fn resolved_in_session(
+        &self,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) {
+        for fact in self.pitfalls() {
+            if pitfall_applies(fact, tool_name, arguments) {
+                self.resolved_by_session.insert(session_id, &fact.name);
+            }
+        }
+    }
+
     /// Runde 9, E3: ein erfolgreicher Aufruf löst jeden Pitfall, der auf ihn
-    /// passte.
+    /// passte (ungebundener Legacy-Pfad, nicht von der Runtime genutzt).
     fn resolved(&self, tool_name: &str, arguments: &serde_json::Value) {
         let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         for fact in self.pitfalls() {
@@ -687,6 +722,26 @@ mod pitfall_advisor_tests {
             advisor.advise("agent.message", &same).is_none(),
             "nach einem Erfolg kein veralteter Hinweis mehr"
         );
+        Ok(())
+    }
+
+    /// P1-a (PR #136): NICHT AUSFÜHRBAR, solange `harw-runtime` nicht
+    /// kompiliert; die ausführbare Entsprechung ist
+    /// `harw_core::guard::tests::test_resolution_in_session_a_does_not_hide_the_hint_in_session_b`.
+    #[test]
+    fn resolution_in_session_a_does_not_hide_pitfall_in_session_b() -> TestResult {
+        let (advisor, _dir) = advisor_with(&[(
+            "agent-message-stale",
+            "agent.message: kein eigenes, laufendes Kind mit der ID ffe02b1b child_id",
+            "agent.message",
+            0.9,
+        )])?;
+        let same = json!({ "child_id": "ffe02b1b", "text": "weiter" });
+        let a = harw_types::SessionId::new();
+        let b = harw_types::SessionId::new();
+        advisor.resolved_in_session(&a, "agent.message", &same);
+        assert!(advisor.advise_in_session(&a, "agent.message", &same).is_none());
+        assert!(advisor.advise_in_session(&b, "agent.message", &same).is_some());
         Ok(())
     }
 

@@ -6,6 +6,23 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Changed
+
+- Delegation through the turn-loop handoff (`transfer_to_<role>`, via the agent
+  job submitter or the host background launcher, e.g. the TUI) is now
+  background-only: it returns ids at once, results arrive as notifications,
+  and a missing executor is an immediate error. Not yet converted, still
+  inline (blocking join on the child): `AgentToolAdapter::invoke` (explore /
+  research tools), fan-out, and `delegate_wave`. Follow-up: `TODO(PL-90
+  background-only)`. See `docs/guides/background-agents.md`.
+
+### Fixed
+
+- The shared `MemoryPitfallAdvisor` keeps resolved pitfall hints per session
+  (`SessionResolvedSet`, bounded); a success in one session no longer hides
+  the hint in another. The default `PitfallAdvisor::resolved_in_session` no
+  longer forwards to the unbound `resolved`.
+
 ## [0.9.1] — Unreleased
 
 ### Fixed

@@ -38,6 +38,10 @@
 //!   fails immediately with a detailed error result; it never blocks the turn.
 //!   Completion arrives as a notice plus auto-turn; intermediate milestones
 //!   arrive through `parent.message` (`agent_messages`).
+//!   Scope: this covers the turn-loop `transfer_to_*` handoff only.
+//!   `AgentToolAdapter::invoke`, fan-out and `delegate_wave` in
+//!   `harw-core-bridge` still join the child inline (TODO(PL-90
+//!   background-only)); see `docs/guides/background-agents.md`.
 //! - Wie viele Orchestratoren gleichzeitig laufen, begrenzt der Spawner
 //!   (`[agents] max_root_orchestrators`), nicht diese Datei.
 //! - `/new`, `/resume` und Beenden brechen laufende Hintergrund-Kinder ab
