@@ -96,6 +96,7 @@ pub mod cells;
 pub mod context_ext;
 pub mod controller;
 pub mod cycle_explorer;
+pub mod cycle_proposer;
 pub mod cycle_runtime;
 pub mod error;
 pub mod finding_store;
@@ -118,6 +119,10 @@ pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
 pub use crate::cycle_explorer::{
     DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_STEP_BYTES, ExplorerReadCache,
     ReadOnlyExplorerExecutor, ReadTargetError, ReadTargetMap,
+};
+pub use crate::cycle_proposer::{
+    ModelCycleProposer, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy, RouteSlot,
+    refusal_hint, render_prompt, render_prompt_with,
 };
 pub use crate::cycle_runtime::{
     AuthorityReissuer, CYCLE_RECORD_SCHEMA, CycleDriver, CycleDriverConfig, CycleJobFuture,
