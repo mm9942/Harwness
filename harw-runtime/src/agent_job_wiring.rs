@@ -7,23 +7,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
-use std::time::Duration;
 use harw_core::{
     BackgroundStatus, ChildRecoveryView, DurableJobRunner, ExecutionControl, JobExecutionRegistry,
     ManagedAgentSpawner, RecoveredChildDisposition, StateStore, TurnInput, TurnOutcome,
 };
-use harw_extension_api::{
-    AgentJobFuture, AgentJobHandle, AgentJobSubmitter, AgentSpawnError,
-};
-use harw_job_core::{
-    Budget, Job, JobKind, JobOutcome, JobScope, JobState, RetryPolicy, StoredJob,
-};
-use harw_session_store::{
-    ApprovalStore, CancelRequest, ClaimRequest, JobListQuery, JobStore,
-};
+use harw_extension_api::{AgentJobFuture, AgentJobHandle, AgentJobSubmitter, AgentSpawnError};
+use harw_job_core::{Budget, Job, JobKind, JobOutcome, JobScope, JobState, RetryPolicy, StoredJob};
+use harw_session_store::{ApprovalStore, CancelRequest, ClaimRequest, JobListQuery, JobStore};
 use harw_types::{ApprovalActor, SessionId, TenantId, WorkId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 const AGENT_JOB_KIND: &str = "agent";
@@ -80,10 +74,7 @@ impl RuntimeAgentJobSubmitter {
         tenant: TenantId,
         workspace: WorkspaceId,
     ) -> Self {
-        let runner = Arc::new(DurableJobRunner::new(
-            Arc::clone(&job_store),
-            executions,
-        ));
+        let runner = Arc::new(DurableJobRunner::new(Arc::clone(&job_store), executions));
         Self {
             spawner,
             state_store,
@@ -357,8 +348,7 @@ impl RuntimeAgentJobSubmitter {
             .input
             .get("recovery")
             .ok_or_else(|| "stored agent job has no recovery envelope".to_owned())?;
-        if recovery.get("schema").and_then(serde_json::Value::as_str)
-            != Some(AGENT_RECOVERY_SCHEMA)
+        if recovery.get("schema").and_then(serde_json::Value::as_str) != Some(AGENT_RECOVERY_SCHEMA)
         {
             return Err("unsupported agent recovery schema".to_owned());
         }
@@ -551,6 +541,7 @@ impl RuntimeAgentJobSubmitter {
 
     fn rejection(detail: impl Into<String>) -> AgentSpawnError {
         AgentSpawnError {
+            kind: Default::default(),
             message: detail.into(),
         }
     }
@@ -633,15 +624,19 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
             let record_for_admit = record.clone();
             tokio::task::spawn_blocking(move || store.admit(&record_for_admit))
                 .await
-                .map_err(|error| Self::rejection(format!("agent job admission task failed: {error}")))?
+                .map_err(|error| {
+                    Self::rejection(format!("agent job admission task failed: {error}"))
+                })?
                 .map_err(|error| Self::rejection(format!("agent job admission failed: {error}")))?;
 
             // Phase 2: transfer the already-admitted child to the background
             // owner. Only after this succeeds may the durable record become
             // claimable.
             if let Err(error) = self.spawner.detach_for_background(&child, Some(&task)) {
-                let reason =
-                    format!("agent background ownership transfer failed: {}", error.message);
+                let reason = format!(
+                    "agent background ownership transfer failed: {}",
+                    error.message
+                );
                 let store = Arc::clone(&self.job_store);
                 let work_id_for_cancel = work_id.clone();
                 let cancelled_by = self.scope.submitter().clone();
@@ -686,7 +681,10 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
             // the child lease to this WorkId. From this point the generic child
             // reaper must not race the job runtime for recovery.
             if let Err(error) = self.spawner.bind_child_job_owner(&child, &work_id) {
-                let reason = format!("agent child/job ownership binding failed: {}", error.message);
+                let reason = format!(
+                    "agent child/job ownership binding failed: {}",
+                    error.message
+                );
                 let store = Arc::clone(&self.job_store);
                 let work_id_for_cancel = work_id.clone();
                 let cancelled_by = self.scope.submitter().clone();
@@ -747,8 +745,9 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         "agent_job.activation_cleanup_failed"
                     ),
                     Ok(Ok(completion)) => {
-                        if let Err(release_error) =
-                            self.spawner.close_child_durable(&child, completion.completed_at)
+                        if let Err(release_error) = self
+                            .spawner
+                            .close_child_durable(&child, completion.completed_at)
                         {
                             tracing::error!(
                                 work_id = %work_id,

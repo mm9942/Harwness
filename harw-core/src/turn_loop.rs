@@ -8563,6 +8563,7 @@ mod tests {
         ) -> SpawnFuture<'a> {
             Box::pin(async move {
                 Err(harw_extension_api::AgentSpawnError {
+                    kind: Default::default(),
                     message: format!(
                         "{} Grenze max_root_orchestrators=1 erreicht — es läuft bereits: \
                          root-orchestrator (r1).",

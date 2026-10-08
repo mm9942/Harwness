@@ -33,7 +33,7 @@ pub use approval_mode::ApprovalMode;
 pub use capabilities::{
     AgentJobFuture, AgentJobHandle, AgentJobSubmitter, AgentSpawnError, AgentSpawner,
     ChildBudgetExhausted, DelegationTargetInfo, DelegationTargets, DelegationUnavailable,
-    SpawnFuture, SpawnInput,
+    FAIL_FAST_CONSEQUENCE, SpawnFuture, SpawnInput, SpawnRejectionKind,
 };
 pub use contributors::{
     ApprovalDecision, ApprovalHandler, ContextProvider, ExtFuture, InstructionsProvider,
