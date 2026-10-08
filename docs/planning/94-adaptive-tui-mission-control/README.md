@@ -10,9 +10,12 @@ related:
   - ../90-intent-driven-composed-agents/README.md
   - ../../design/interaction-contract.md
   - contracts/W00-layout-progress-contract.md
+  - contracts/W02-chat-first-mini-live.md
 ---
 
 # PL-94 — Adaptive TUI Mission Control
+
+> **LATEST OPERATOR-APPROVED UX REVISION (2026-10-09): [W02 — Chat-first mini-live](contracts/W02-chat-first-mini-live.md) supersedes the *primary TUI* Progress Agent / portrait progress-bar / large second-output assumptions below. Preserve the three separately bordered status views but replace the portrait progress strip's **content** with a tiny, bounded **existing live-agent stream** (available displayable reasoning, current tool/status); keep main Chat much larger, full-width and the primary interaction. No new model, observer job or generated todo is a dependency of this UX. The older W00/README model-observer sections below are *historical alternatives, not the active implementation target*; see W02 for actual proposed behavior and acceptance. This is a planning revision; no Ratatui code was changed by W02.
 
 > PLANNING ONLY, not production implementation.
 > Code baseline: mm9942/Harwness dev@197a92e92d438bf6bf93b129bb964f4852686149 (2026-10-08).
