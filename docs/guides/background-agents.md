@@ -1,7 +1,6 @@
 # Background orchestrators: control, messaging, handoff
 
-This guide describes how the UIA in the TUI runs orchestrators in the
-background, how parents and children talk to each other, what remains
+This guide describes how delegated agents run in the background, how parents and children talk to each other, what remains
 when the budget runs out or a run is cancelled, and which limits apply.
 The code is authoritative; the sources are listed at the end.
 
@@ -9,7 +8,7 @@ The code is authoritative; the sources are listed at the end.
 
 ```text
 User ──► UIA (root, TUI)
-               │ transfer_to_<orchestrator> {task, background?}
+               │ transfer_to_<role> {task, context?, continue_from?}
                ▼
         Root orchestrator  ◄── agent.status / agent.result / agent.message / agent.cancel
                │ delegate_wave / transfer_to_*          ▲
@@ -17,19 +16,26 @@ User ──► UIA (root, TUI)
         Sub-orchestrators, workers ──────────────────────┘
 ```
 
-A background child is the same admitted child as in the synchronous case:
-the same sandbox, the same budget, the same approval chain. Running in the
-background only shifts **when** the UIA sees the result.
+Delegation is **background-only**: there is no synchronous mode and no
+`background` / `wait` parameter. A start is a one-time return with ids; the
+result and intermediate states are delivered to the caller automatically
+(notifications / auto-turn). A start that is not admissible fails
+immediately with a detailed error. The caller never blocks, so the user can
+keep chatting while children run. A legacy `background:false` / `wait:true`
+argument is answered with a tool error explaining this.
 
 ## 2. Orchestrators in the background
 
-- When the UIA in the TUI hands off to an orchestrator
-  (`transfer_to_<role>`), it runs in the background. The tool returns
-  immediately with `{child_id, status, hint}`, the UIA's turn ends, and
+- When the UIA in the TUI hands off to any agent (orchestrator or worker,
+  `transfer_to_<role>`), it runs in the background. The tool returns
+  immediately with `{child_id, role, status, hint}`, the UIA's turn ends, and
   the user can keep working.
-- `background: false` forces a synchronous run. Worker targets always run
-  synchronously, as does every entry point outside the TUI (`harw exec`,
-  Telegram, gateway).
+- Without a background executor (no launcher in the TUI, no agent job
+  submitter in `harw-core`) the call fails with an error; there is no
+  foreground fallback. `TurnOutcome::AwaitingChild` is no longer produced by
+  delegation tools; it remains only for resuming persisted sessions.
+- Milestones arrive through `parent.message`, the final result as a
+  completion notice; both start an auto-turn when the UIA is idle.
 - Once the orchestrator finishes, a UIA turn starts automatically with the
   result as soon as the UIA is idle. If a turn is already running, the
   result arrives as context in the next one.

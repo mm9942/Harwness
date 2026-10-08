@@ -151,13 +151,7 @@ fn fixture(hanging: bool) -> TestResult<Fixture> {
             .map_err(ctx("UIA-Wurzel registriert"))?,
     );
     let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
-    let launcher = BackgroundLauncher::new(
-        root.clone(),
-        Arc::clone(&spawner),
-        store,
-        None,
-        OrchestratorRoles::builtin(),
-    );
+    let launcher = BackgroundLauncher::new(root.clone(), Arc::clone(&spawner), store, None);
     let app = ChatApp::new(Vec::new(), sandbox.clone(), root)
         .with_managed_spawner(Some(Arc::clone(&spawner)));
     Ok(Fixture {
@@ -225,8 +219,7 @@ async fn a_uia_orchestrator_handoff_returns_immediately_with_running_status() ->
         .await?;
     let result = fx
         .launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Orchestrator läuft im Hintergrund"))?;
+        .try_launch(&fx.session, &child, &call_id, "root-orchestrator");
     match result {
         ToolCallResult::Success { value } => {
             assert_eq!(value["status"], json!("running"));
@@ -234,7 +227,7 @@ async fn a_uia_orchestrator_handoff_returns_immediately_with_running_status() ->
             assert!(
                 value["hint"]
                     .as_str()
-                    .is_some_and(|hint| hint.contains("agent.status"))
+                    .is_some_and(|hint| hint.contains("delivered to you automatically"))
             );
         }
         other => {
@@ -253,60 +246,91 @@ async fn a_uia_orchestrator_handoff_returns_immediately_with_running_status() ->
 }
 
 #[tokio::test]
-async fn workers_stay_synchronous_even_when_background_is_requested() -> TestResult {
-    let mut fx = fixture(false)?;
-    let (child, call_id) = fx
-        .handoff("uia-worker", json!({ "task": "kurz", "background": true }))
-        .await?;
-    assert!(
-        fx.launcher
-            .try_launch(&fx.session, &child, &call_id, "uia-worker")
-            .is_none()
-    );
-    assert!(!fx.spawner.background_children().is_detached(&child));
-    Ok(())
+async fn workers_also_start_in_the_background() -> TestResult {
+    let mut fx = fixture(true)?;
+    let (child, call_id) = fx.handoff("uia-worker", json!({ "task": "short" })).await?;
+    let result = fx
+        .launcher
+        .try_launch(&fx.session, &child, &call_id, "uia-worker");
+    let ToolCallResult::Success { value } = result else {
+        return Err(TestError::Unexpected(format!(
+            "a worker start must succeed immediately, got {result:?}"
+        )));
+    };
+    assert_eq!(value["child_id"], json!(child.as_str()));
+    assert_eq!(value["role"], json!("uia-worker"));
+    assert!(fx.spawner.background_children().is_detached(&child));
+    cancel_all(Some(&fx.spawner), fx.session.id(), "test");
+    wait_until_finished(&fx.spawner, fx.session.id()).await
 }
 
 #[tokio::test]
-async fn background_false_forces_a_synchronous_orchestrator() -> TestResult {
-    let mut fx = fixture(false)?;
+async fn legacy_background_false_no_longer_forces_a_synchronous_run() -> TestResult {
+    // The tool schema rejects `background:false` before it gets here; even if
+    // such an argument reaches the launcher it must not produce a blocking run.
+    let mut fx = fixture(true)?;
     let (child, call_id) = fx
         .handoff(
             "root-orchestrator",
             json!({ "task": "X", "background": false }),
         )
         .await?;
+    let result = fx
+        .launcher
+        .try_launch(&fx.session, &child, &call_id, "root-orchestrator");
+    assert!(result.is_success(), "{result:?}");
+    assert!(fx.spawner.background_children().is_detached(&child));
+    cancel_all(Some(&fx.spawner), fx.session.id(), "test");
+    wait_until_finished(&fx.spawner, fx.session.id()).await
+}
+
+#[tokio::test]
+async fn a_failed_detach_is_a_visible_error_result_not_a_silent_fallback() -> TestResult {
+    let mut fx = fixture(true)?;
+    let (child, call_id) = fx
+        .handoff("root-orchestrator", json!({ "task": "A" }))
+        .await?;
     assert!(
         fx.launcher
             .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-            .is_none()
+            .is_success()
     );
-    assert!(!fx.spawner.background_children().is_detached(&child));
-    Ok(())
+    // A second start of the same child cannot be detached again.
+    let again = fx
+        .launcher
+        .try_launch(&fx.session, &child, &call_id, "root-orchestrator");
+    let ToolCallResult::Error { message } = again else {
+        return Err(TestError::Unexpected(format!(
+            "a failed detach must be an error result, got {again:?}"
+        )));
+    };
+    assert!(message.contains("background-only"), "{message}");
+    assert!(
+        message.contains("could not be started in the background"),
+        "{message}"
+    );
+    cancel_all(Some(&fx.spawner), fx.session.id(), "test");
+    wait_until_finished(&fx.spawner, fx.session.id()).await
 }
 
-#[test]
-fn only_the_tui_root_and_orchestrator_targets_run_in_the_background() -> TestResult {
-    let fx = fixture(false)?;
+#[tokio::test]
+async fn a_finished_worker_reaches_the_parent_as_a_notice_with_an_auto_turn() -> TestResult {
+    let mut fx = fixture(false)?;
+    let (child, call_id) = fx.handoff("uia-worker", json!({ "task": "short" })).await?;
     assert!(
         fx.launcher
-            .wants_background(true, "root-orchestrator", None)
+            .try_launch(&fx.session, &child, &call_id, "uia-worker")
+            .is_success()
     );
+    wait_until_finished(&fx.spawner, fx.session.id()).await?;
     assert!(
-        fx.launcher
-            .wants_background(true, "root-orchestrator", Some(true))
+        collect_finished(&mut fx.app),
+        "the completion notice is collected"
     );
-    assert!(
-        !fx.launcher
-            .wants_background(true, "root-orchestrator", Some(false))
-    );
-    assert!(!fx.launcher.wants_background(true, "uia-worker", Some(true)));
-    // Nicht die Wurzel (z. B. ein Orchestrator, der selbst Kinder startet):
-    // synchron.
-    assert!(
-        !fx.launcher
-            .wants_background(false, "coding-orchestrator", None)
-    );
+    let turn = take_auto_turn(&mut fx.app).ok_or(TestError::Missing("auto-turn"))?;
+    assert_eq!(turn, AUTO_TURN_PROMPT);
+    let text = attach_queued_notices(&mut fx.app, turn);
+    assert!(text.contains(child.as_str()), "{text}");
     Ok(())
 }
 
@@ -316,9 +340,12 @@ async fn the_limit_applies_while_a_background_orchestrator_runs() -> TestResult 
     let (child, call_id) = fx
         .handoff("root-orchestrator", json!({ "task": "A" }))
         .await?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("erster läuft im Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "erster läuft im Hintergrund"
+    );
     let second = fx
         .handoff("root-orchestrator", json!({ "task": "B" }))
         .await;
@@ -339,9 +366,12 @@ async fn background_rights_equal_the_synchronous_admission() -> TestResult {
         .spawner
         .child_record(&child)
         .ok_or(TestError::Missing("admittiert"))?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "Hintergrund"
+    );
     let after = fx
         .spawner
         .child_record(&child)
@@ -366,9 +396,12 @@ async fn a_finished_background_agent_starts_an_auto_turn_when_idle() -> TestResu
     let (child, call_id) = fx
         .handoff("root-orchestrator", json!({ "task": "Baue X" }))
         .await?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "Hintergrund"
+    );
     wait_until_finished(&fx.spawner, fx.session.id()).await?;
     // Nach dem Ende ist die Admission freigegeben.
     assert!(fx.spawner.child_record(&child).is_none());
@@ -452,9 +485,12 @@ async fn agent_cancel_command_cancels_the_own_background_run() -> TestResult {
     let (child, call_id) = fx
         .handoff("root-orchestrator", json!({ "task": "A" }))
         .await?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "Hintergrund"
+    );
     // Die Task anlaufen lassen (das Modell hängt dann).
     for _ in 0..5 {
         tokio::task::yield_now().await;
@@ -483,9 +519,12 @@ async fn new_session_cancels_running_background_agents() -> TestResult {
     let (child, call_id) = fx
         .handoff("root-orchestrator", json!({ "task": "A" }))
         .await?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "Hintergrund"
+    );
     // `/new` und `/resume` rufen genau das für die alte Sitzung auf.
     assert_eq!(
         cancel_all(Some(&fx.spawner), fx.session.id(), "session switch"),
@@ -504,9 +543,12 @@ async fn quit_asks_once_while_background_agents_run() -> TestResult {
     let (child, call_id) = fx
         .handoff("root-orchestrator", json!({ "task": "A" }))
         .await?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "Hintergrund"
+    );
     assert!(!confirm_quit(&mut fx.app), "erstes /quit fragt nach");
     assert!(confirm_quit(&mut fx.app), "zweites /quit beendet");
     cancel_all(Some(&fx.spawner), fx.session.id(), "test");
@@ -613,9 +655,12 @@ async fn a_cancelled_background_agent_delivers_its_journal() -> TestResult {
     let (child, call_id) = fx
         .handoff("root-orchestrator", json!({ "task": "Baue X" }))
         .await?;
-    fx.launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Hintergrund"))?;
+    assert!(
+        fx.launcher
+            .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+            .is_success(),
+        "Hintergrund"
+    );
     for _ in 0..5 {
         tokio::task::yield_now().await;
     }
@@ -684,8 +729,7 @@ async fn a_turn_abort_during_the_start_does_not_end_the_background_transfer() ->
 
     let result = fx
         .launcher
-        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
-        .ok_or(TestError::Missing("Start im Hintergrund"))?;
+        .try_launch(&fx.session, &child, &call_id, "root-orchestrator");
     let ToolCallResult::Success { value } = result else {
         return Err(TestError::Unexpected(format!(
             "erwartet Erfolg, nicht {result:?}"
