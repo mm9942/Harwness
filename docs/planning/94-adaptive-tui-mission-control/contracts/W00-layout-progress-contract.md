@@ -26,12 +26,18 @@ parent: ../README.md
 
 - Compute from terminal cells `x=columns, y=rows`, not OS or model. `x>y` prefers landscape; `y>x` prefers portrait; `x==y` has a deterministic feasibility tie breaker.
 - A three-column landscape composition is feasible only after separately budgeting Chat, the **middle Status/WIP column** and the **outer-right Agents/Jobs column**, plus gutters and footer. Provisional targets: Chat >= 64 columns, Middle >= 38, Right >= 30 (a tested dense profile may be smaller); otherwise choose **ShallowLandscape** with distinct switchable windows. Never detect orientation by device identity.
-- In **PortraitStack**, Agents and Jobs sit in the pinned first row (two logical cards), **Finished/Failed** immediately underneath, then a taller separate **WIP** panel and the main chat. Composer/status remain at bottom.
+- In **PortraitStack**, Agents and Jobs sit in the pinned first row (two logical cards), **Finished/Failed** immediately underneath, then **only a compact, non-scrollable 2–3-row progress strip** and the main Chat. The Progress Agent still runs headlessly in portrait; no second output window, narrative, streaming text or expanded todo pane is shown by default. Composer/status remain at bottom.
 - In **LandscapeThreeColumns**, **Chat** is left, **Finished/Failed (Status)** is a separately bordered window at the **top-center**, **WIP** is the larger separate window directly below, and independently bordered **Active Agents** (top) and **Active Jobs** (bottom) are stacked at the **outer-right edge**. Never merge them into one oversized right-hand monitoring window.
 - In constrained `Summary`/compact mode, preserve **three individually addressable titled status window identities** as compact focusable counters/tabs with a detail switcher, plus a distinct WIP identity, even if all cannot render simultaneously. No blended status list, no zero-height rectangles.
 - Minimum chat, modal approvals and footer win capacity competition. Compress WIP first and status detail second; do not clip approval prompts. Each visible window has its own border, rectangle, scroll position, focus/selection and maximize/detail. The top-center 'Status' is Finished/Failed, not the bottom terminal status line.
 - Pure classifier; saturating arithmetic; no overlaps, out-of-bounds rectangles or unchecked conversion. A layout flip on resize does not modify agent/job execution, cancellation, history, plan or user input.
 - Preserve current F2/F3/F4/F5/F11/Esc semantics; WIP focus must not steal keystrokes from composer. Hit test by rectangles, not assumptions that AgentMonitor is always on the right.
+
+### 2.1 Portrait background observer / progress-only UI
+
+**Operator requirement (2026-10-08):** The observer continues to run in the background in portrait, with the same isolated session, progress-event cursor and bounded budget. The TUI renders ONLY concise progress fields (verified completed/total count when known, optional bar, current task/phase, critical blocked/stale indication). It does not render the observer's generated text, reasoning, private transcript, streamed tokens or a second agent-output pane. If a denominator is not evidence-backed, show an indeterminate progress indicator rather than inventing a percentage. Expanded WIP is a landscape/default-detail presentation only. Orientation changes alter rendering, not job lifecycle, agent rights or state.
+
+**Acceptance:** inject a multi-paragraph Progress Agent output in a portrait test; verify the agent/progress record updates but that rendered portrait includes only the derived compact status, never the generated prose. Assert no restart on portrait/landscape rotation and a useful fallback with the provider disabled.
 
 ## 3. Observer input/output contract
 
@@ -67,14 +73,14 @@ Model output is an **untrusted proposal**:
 ### Layout
 1. Geometry at `48x65`, `70x90`, `80x40`, `100x30`, `120x42`, `160x45`, `200x50`, `39x60`, `48x19`, `1x1` and `0x0`; x/y tie and crossing on resize. If full layout is feasible assert five individual window rectangles and exact anchor placement.
 2. Rectangles non-overlapping and within viewport; status/composer modal reserve, focus, F2/F3/F4/F5/F11/Esc, Unicode width, modal priority and independent wheel routing unchanged.
-3. Three distinct status views share source truth with existing monitor and JobRows; no duplicate lifecycle. In landscape assert Finished/Failed **top-center**, WIP **center below** and Agents/Jobs **separately stacked far-right**. Focus, borders, selection and scroll belong to each window; finished/failed reason visible.
+3. Three distinct status views share source truth with existing monitor and JobRows; no duplicate lifecycle. In landscape assert Finished/Failed **top-center**, expanded WIP **center below** and Agents/Jobs **separately stacked far-right**. In portrait assert a compact progress-only strip under the three separate status windows, with no separate observer-output pane; the main Chat remains full width. Focus, borders, selection and scroll belong to each window; finished/failed reason visible.
 4. No unbounded rendering or excessive main-chat area loss.
 
 ### Progress
 5. Exactly three newest committed **user** messages or fewer; no sibling/other session content; latest correction supersedes stale output.
 6. Untrusted model output cannot mutate PlanStore, JobManager, active agent turns, permissions or Goal achieved state.
 7. Job/agent failure remains visible even when a model writes a successful-sounding summary; verified evidence wins.
-8. Agent failure, provider outage or disabled feature leaves deterministic WIP visible, not an infinite spinner.
+8. Agent failure, provider outage or disabled feature leaves deterministic **progress** visible, not an infinite spinner: a compact verified count/current phase in portrait, expanded stale/deferred WIP in landscape.
 9. Same session resume restores cursor and chosen plan; switching session cannot reuse stale observer output.
 10. Multiple concurrent sessions keep separate observer states, jobs, budgets and output; no hidden reasoning leakage.
 11. Runtime output/text remains capped and redacted; all user/agent/tool content treated as lower-trust data.
@@ -83,9 +89,9 @@ Model output is an **untrusted proposal**:
 ## 5. Wave owner boundaries
 
 - M1: `harw-tui-layout` pure classifier, geometry tests.
-- M2: `harw-tui` status cards, focus/scroll, renderer tests.
+- M2: `harw-tui` independent status windows, portrait progress-only strip, focus/scroll, renderer tests.
 - M3: runtime-to-TUI typed progress projection without an LLM.
-- M4: optional separated progress agent job with strict minimal context.
+- M4: optional separated Progress Agent job with strict minimal context; portrait/landscape switching must never stop, reparent or restart its background run.
 - M5: validator for model todo drafts using existing PlanStore; retain human-only acceptance.
 - M6: reconcile PL-90 session index and job progress without sharing agent context.
 
