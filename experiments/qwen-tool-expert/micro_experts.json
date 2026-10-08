@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "experiment": "harwness-cycle-micro-experts",
+  "pinned_harwness_dev": "197a92e92d438bf6bf93b129bb964f4852686149",
+  "base_checkpoint": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "per_expert_parameters_approx": 134500000,
+  "target_student_checkpoint": "Qwen/Qwen3-1.7B",
+  "student_status": "untrained",
+  "composition_policy": {
+    "v0": "six micro-expert adapters and deterministic Harw state machine",
+    "v1": "up to twelve 135M expert roles, only 2-4 active per turn",
+    "shared_backbone": "same SmolLM2 base with separate LoRA adapters where supported",
+    "consolidation": "supervised knowledge distillation into Qwen3-1.7B from verified tool trajectories; do NOT concatenate or merge incompatible model weights",
+    "gate": "harw-core/src/turn_loop.rs keeps tool execution, permissions, approval, budgets, authorization and stopping conditions",
+    "dispatch": "select expert by current phase and confidence, skip unnecessary roles, fail closed on schema/rights errors",
+    "mobile": "compare Q4_K_M and Q5_K_M only after distillation; benchmark target GGUF with llama.cpp on device"
+  },
+  "experts": [
+    {
+      "id": "intent",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Interpret task and determine tool/no-tool branch; never assume authority",
+      "pilot": true,
+      "data_stage": "intent",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "tool_selection",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Select the best available and admitted native tool before shell",
+      "pilot": true,
+      "data_stage": "tool_selection",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "argument_builder",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Build exact typed arguments against supplied live JSON schema",
+      "pilot": true,
+      "data_stage": "argument_builder",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "observation",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Categorize tool results, truncation, failures and untrusted evidence",
+      "pilot": true,
+      "data_stage": "observation",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "continuation",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "After each tool response decide next tool or completion",
+      "pilot": true,
+      "data_stage": "continuation",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "verification",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Identify missing execution evidence and need to verify",
+      "pilot": true,
+      "data_stage": "verification",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "schema_repair",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Repair invalid JSON/schema arguments after validation errors",
+      "pilot": false,
+      "data_stage": "schema_repair",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "failure_recovery",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Decide bounded retry, alternate native tool, clarify or stop",
+      "pilot": false,
+      "data_stage": "failure_recovery",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "approval_advisory",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Suggest approval pause or rejection; runtime remains authoritative",
+      "pilot": false,
+      "data_stage": "approval_advisory",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "delegation_advisory",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Advise child delegation only if offered by runtime",
+      "pilot": false,
+      "data_stage": "delegation_advisory",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "context_budget",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Suggest compact task context to reduce input costs",
+      "pilot": false,
+      "data_stage": "context_budget",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    },
+    {
+      "id": "finalization",
+      "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "purpose": "Render concise evidence-backed outcome without invented execution",
+      "pilot": false,
+      "data_stage": "finalization",
+      "output": "strict_constrained_json",
+      "authority": "advisory_only",
+      "training": "not_started"
+    }
+  ]
+}
