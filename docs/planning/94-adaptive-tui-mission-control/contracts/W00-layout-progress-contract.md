@@ -22,6 +22,14 @@ parent: ../README.md
 
 **Status must never be inferred from free-form assistant output:** a claim that a test passed is still a claim until supported by an actual verified job/evidence result. WorkDriver/Goal owner acceptance is not delegated to the Progress Agent.
 
+### 1.1 Existing unblocked orchestrator behavior — preserve it
+
+**CURRENT at dev@197a92e (not a proposed PL-94 feature):** `harw-tui/src/app/background_agents.rs::BackgroundLauncher::wants_background` defaults TUI-root orchestrator handoffs to background execution unless the request explicitly uses `background: false`. Root/UIA chatting can proceed while that admitted child runs; results/notices use the current parent delivery queue. Existing tests cover detached launch and notice delivery. Do **not** add a second nonblocking executor, change this default or use window navigation to restart an agent.
+
+**Limits of the existing contract:** background-by-default applies to TUI-root **orchestrator** targets, not all worker/tool calls. `/new`, `/resume` and TUI shutdown currently cancel background children; the external `/plan edit` path is not busy-safe. PL-94 must not claim these other behaviors work without separate code changes and tests.
+
+**PL-94 enhancement:** navigating/scrolling to an authorized Root Orchestrator row or its existing live tree/details must be a **pure view/focus action**, preserving running jobs, UIA composer draft, conversation scroll, session/run identity and current plan. It cannot implicitly attach private child transcript/context, widen permissions, or change the human-approval and PlanMode gates. Tests should exercise continued UIA chat/plan review while a default-unblocked orchestrator works, focus/scroll to its detail projection, then return to the unmodified chat/composer.
+
 ## 2. Responsive rect contract
 
 - Compute from terminal cells `x=columns, y=rows`, not OS or model. `x>y` prefers landscape; `y>x` prefers portrait; `x==y` has a deterministic feasibility tie breaker.
