@@ -28,7 +28,7 @@ parent: ../README.md
 
 **Limits of the existing contract:** background-by-default applies to TUI-root **orchestrator** targets, not all worker/tool calls. `/new`, `/resume` and TUI shutdown currently cancel background children; the external `/plan edit` path is not busy-safe. PL-94 must not claim these other behaviors work without separate code changes and tests.
 
-**PL-94 enhancement:** navigating/scrolling to an authorized Root Orchestrator row or its existing live tree/details must be a **pure view/focus action**, preserving running jobs, UIA composer draft, conversation scroll, session/run identity and current plan. It cannot implicitly attach private child transcript/context, widen permissions, or change the human-approval and PlanMode gates. Tests should exercise continued UIA chat/plan review while a default-unblocked orchestrator works, focus/scroll to its detail projection, then return to the unmodified chat/composer.
+**PL-94 enhancement (revised operator intent):** the primary interaction is an **attached, live, dynamically repositioned Root/child agent message directly in the main Chat**, *not* navigating to a separate agent session. [W01 — activity-ranked inline chat](W01-activity-ranked-inline-chat.md) defines stable visual slots counted from the composer: root normally #2 while idle, behind the active foreground UIA exchange (typically #3) during a new turn, #2 again after the final reply. With multiple background runs, prioritize their **display** via trustworthy meaningful activity, recency and optional manual pin; do not change scheduling, contexts or history. Existing AgentTree/scroll can still open details. Every focus/visual move preserves running jobs, the UIA composer draft, session IDs, canonical chronological history, PlanMode and permissions. No private child transcript may be implicitly attached.
 
 ## 2. Responsive rect contract
 
@@ -76,6 +76,10 @@ Model output is an **untrusted proposal**:
 
 **Lifecycle:** event-triggered coalesced updates after trusted commits, plan changes, job progress or child return. Do not trigger an LLM on every rendered frame, output token, tool heartbeat or polling interval. One bounded pending model update/session; reject stale output after new user correction, plan revision or session move. If no provider, render deterministic status with explicit deferred/stale labels. Preserve a cursor/high-water mark for restart; lossy AgentEventHub notifications are only wakeups.
 
+### 3.1 Activity-ranked inline chat contract
+
+The separate [W01 contract](W01-activity-ranked-inline-chat.md) is mandatory for the main Chat: stable per-agent visual handles; foreground UIA/user answer always ahead of background; multiple background runs sorted by meaningful observed activity with dwell/hysteresis, not by token spam; no duplicate or rearranged canonical transcript cells; identity-preserving scrollback and after-the-fact result retrieval. This is presentation priority, **never** execution or authority priority. The chat remains the largest viewport in portrait AND landscape. A paused/quiet background run remains reachable even if another run is temporarily ranked higher.
+
 ## 4. First-pass test gates
 
 ### Layout
@@ -83,6 +87,13 @@ Model output is an **untrusted proposal**:
 2. Rectangles non-overlapping and within viewport; status/composer modal reserve, focus, F2/F3/F4/F5/F11/Esc, Unicode width, modal priority and independent wheel routing unchanged.
 3. Three distinct status views share source truth with existing monitor and JobRows; no duplicate lifecycle. In landscape assert Finished/Failed **top-center**, expanded WIP **center below** and Agents/Jobs **separately stacked far-right**. In portrait assert a compact progress-only strip under the three separate status windows, with no separate observer-output pane; the main Chat remains full width. Focus, borders, selection and scroll belong to each window; finished/failed reason visible.
 4. No unbounded rendering or excessive main-chat area loss.
+
+### Inline chat ranking
+
+- At least three concurrently running agents with disjoint session IDs: the highest legitimate activity moves to the foreground BACKGROUND slot while all agents keep executing with unchanged job scheduling.
+- During an active UIA user/assistant turn, background items move behind that pair and return closer after the assistant finalizes. No duplicate messages or export pollution.
+- Token spam/ReasoningDelta cannot steal rank from real milestones, unread operator questions or tool outcomes. Hysteresis prevents flicker.
+- Manual scroll/focus stays anchored to the same cell when ranking changes; manual pin is respected; no private sibling contents displayed.
 
 ### Progress
 5. Exactly three newest committed **user** messages or fewer; no sibling/other session content; latest correction supersedes stale output.
