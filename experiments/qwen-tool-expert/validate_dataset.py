@@ -41,7 +41,7 @@ def evaluate(folder):
                     call = calls[0]
                     name = call["function"]["name"]
                     if name not in available: raise AssertionError("Unadmitted tool "+name)
-                    validate_call(tools_by_name[name], json.loads(call["function"]["arguments"]))
+                    validate_call(tools_by_name[name], call["function"]["arguments"])
                     pending = (call["id"], name)
                 elif role == "tool":
                     if pending != (message.get("tool_call_id"),message.get("name")): raise AssertionError("Wrong tool reply")
