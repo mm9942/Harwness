@@ -25,7 +25,7 @@ The TUI should provide four *distinct projections* without requiring the operato
 1. **Active agents**, always the first status card.
 2. **Active jobs**, always the second status card.
 3. **Finished and failed agents/jobs**, the third **independently bordered** status window, below the first two in portrait and **top-center in landscape**.
-4. **Work in Progress**, the larger second live output, authored by a dedicated bounded progress agent. It tracks a current task, proposes concrete todos, highlights evidence-backed work states and narrates the latest verified progress.
+4. **Work in Progress** is backed by a separate bounded Progress Agent: **landscape** displays its own expanded live WIP window; **portrait displays only a compact derived progress strip**. The agent still runs in the background in portrait; its model-generated narration and separate output are hidden by default.
 
 All three status windows are always logically distinct, separately bordered, individually focusable and independently scrollable. Their pinned position follows the orientation; Chat scroll never moves them, and Progress output scroll is independent. The composer, main agent conversation, approvals and job authority retain their existing owners.
 
@@ -68,39 +68,33 @@ Suggested pure types, final naming Harw-owned:
     StatusRects = {agents, jobs, completed_failed}
     MissionRects = {status, wip, chat, footer}
 
-### 2.2 Portrait — two cards, a third card under them, then WIP and chat
+### 2.2 Portrait — three status windows, a progress-only strip and full-width chat
+
+**User clarification (2026-10-08):** The Progress Agent continues in the background in portrait, but the TUI should show **only its derived progress** — not a second agent chat, a streamed model answer, a verbose narrative, an expanded todo panel or a second live-output viewport.
 
     +------------------------------------------------+
     | ACTIVE AGENTS         | ACTIVE JOBS             |
     | root: thinking       | job-42: verify 65%       |
     | child: testing       | job-43: running          |
     +------------------------------------------------+
-    | FINISHED 3    FAILED 1   (open details)         |
+    | FINISHED 3    FAILED 1  (details on demand)    |
     +------------------------------------------------+
-    | WORK IN PROGRESS — dedicated progress agent    |
-    | Goal: restore secure session memory             |
-    | [x] inspect job/session boundaries (verified)   |
-    | [>] isolate guards per session (running)        |
-    | [ ] replay/visibility regression test           |
-    | Next: verify side index commit order            |
+    | PROGRESS   verified 2/4   [######------]      |
+    | Current task: isolate guards · running         |
     +------------------------------------------------+
-    | CHAT / ACTIVE MAIN AGENT OUTPUT                 |
-    | conversation and current tool results          |
+    | MAIN CHAT / ACTIVE ROOT OUTPUT                 |
+    | conversation, tool events and input history     |
+    |                                                |
     |                                                |
     +------------------------------------------------+
     | status, approvals, input/composer               |
     +------------------------------------------------+
 
-Three status cards stay pinned at the top. Agent and Job cards each have their own selection/scroll, even when text must clip. Completed/failed is a short horizontal strip immediately underneath, with failure-first detail and aggregate counts. **WIP is a separate larger pane**; it does not steal the entire transcript region or append its every update to the main chat.
+**Portrait progress strip:** a compact read-only, non-scrollable status projection, normally 2–3 rows, up to 4 only if a blocker/stale warning needs space. Render only the current task/phase, verified-completed vs total task counts, an optional progress bar (only with a trustworthy denominator), and critical blocked/stale state. When progress cannot be quantified, show an indeterminate marker rather than inventing a percentage. The main chat gets the remaining height.
 
-Suggested provisional geometry for a spacious portrait viewport (e.g. 48x65, footer = 4):
-- Status agents+jobs row: 5–7 rows.
-- Completed/failed row: 2–3 rows.
-- Progress pane: 8–14 rows, adjustable within a bounded budget.
-- Remaining chat: at least 18 rows (prefer 24+).
-- Footer fixed by current status/composer layout.
+The separate Progress Agent still retains its **own session/job/budget, event cursor and narrowly scoped inputs**. It may update structured progress/todo proposals on meaningful events, but the portrait renderer never displays its narrative or transcript by default. An explicitly selected detail view is optional and not part of the always-on portrait layout. All three existing status categories remain as distinct bordered windows with independent selection/scroll.
 
-If width is narrow (e.g. 40–49), show an ID, phase and count in each status card; clip detail and make Enter/fullscreen accessible. Do not merge three logical categories into the wrong source or force illegibly wrapped names.
+**Rotation preserves execution:** portrait/landscape switching changes projection only. Do not cancel, restart, reparent, share context or alter the background observer's tool/permission ceiling; moving to landscape exposes the larger WIP window, while returning to portrait collapses only presentation.
 
 ### 2.3 Landscape — three columns with five independent windows
 
@@ -135,14 +129,14 @@ Landscape is selected by x>y **as a preference**, then tested for available cell
 
 If x>y but there is not enough space, **ShallowLandscape still preserves separate window identities**. Prefer readable Chat plus tiled/individually switchable status windows and an expandable WIP view. Never silently merge all monitoring rows into one combined status canvas; when dimensions are tiny, only one independently titled panel may be expanded at a time, but the three categories remain navigable as distinct tabs/counters. A 0x0 terminal cannot render five boxes simultaneously.
 
-Portrait continues to render independent Agents/Jobs windows side by side, independent Finished/Failed directly below, then WIP and Chat. Rotation changes only geometry; it must not restart, cancel, share or reparent agent runs. Explorer/Workbench/F11 and modal approvals keep their existing precedence and ownership.
+Portrait retains separate Agents/Jobs windows side by side and Finished/Failed below, then shows only a **compact progress strip** above full-width Chat. Expanded Progress Agent narrative belongs to landscape or an explicitly opened detail view. Rotation must not restart, cancel, share or reparent agent runs. Explorer/Workbench/F11 and modal approvals keep their existing precedence and ownership.
 
 ### 2.4 Allocation and degradation order
 
 1. Reserve status line, composer, approval overlays and any immutable prompt affordances.
 2. Reserve minimum chat height/width and available space for focused detail.
 3. Allocate three independently bordered status windows at the layout-specific anchors: portrait (Agents/Jobs row, Finished/Failed below) or landscape (Finished/Failed center-top; Agents/Jobs stacked at outer right).
-4. Allocate WIP as its own independently scrollable window below Finished/Failed in the center for landscape, and below the top status group for portrait.
+4. Allocate the **expanded, independently scrollable WIP** below Finished/Failed in landscape. In portrait allocate **only a 2–3-row progress-only strip**, not a second output or scrolling WIP pane.
 5. In constrained terminals, shrink WIP first, then show compact independently titled status tiles or explicit tabs; never merge three windows into one undifferentiated monitoring canvas. If all cannot fit at once, allow one at a time with distinct focus/identity. Never clip composer or hide a blocking approval.
 6. When no progress agent/provider is available, the WIP pane uses deterministic typed status; it never disappears into an empty spinner.
 
@@ -182,12 +176,12 @@ If the model fails, is unavailable, over budget or the worker is down, show dete
 
 ### 3.3 Desired UX
 
-- WIP header: scoped goal/intent, current plan revision, last durable update time and source.
+- **Landscape WIP:** scoped goal/intent, current plan revision, last durable update time and source. **Portrait strip:** verified progress count/optional bar, current task/phase and essential blocked/stale state only.
 - At most 4–6 visible active todos by default; expandable list includes blocked/recently finished.
 - Each todo distinguishes Suggested, Ready, Running, Blocked, Verified Done, Superseded/Invalidated. Verified Done only with real PlanStore evidence or equivalent admitted verifier.
-- A concise live narration line: what is actually happening, what just changed, what blocks the next step.
+- Concise model-generated narration may appear in the **expanded landscape WIP** or an explicitly opened detail view. **Never show the agent's prose by default in portrait.**
 - Optional selection of a todo shows its source user message, related Job/Agent, file/PR evidence and verification state, subject to existing visibility.
-- WIP scroll is isolated from chat/Agent/Jobs. Focus and maximize follow existing keybindings and are not hardcoded to an already assigned key. It should be possible to pause/resume the Progress Agent without pausing the main turn.
+- The expanded **landscape WIP** scroll is isolated from Chat/Agents/Jobs; the **portrait progress strip is non-scrollable** and cannot steal keyboard input from Chat. Explicit detail/maximize uses existing keybindings. Pausing the Progress Agent never pauses the main turn.
 - Progress narration is a separate panel, never silently injected as a new user message or a new main-agent turn; it must not spam chat history.
 
 ### 3.4 Cost, reliability, and governance
@@ -218,7 +212,7 @@ Existing PL-68/mobile layout and PL-65/remote TUI contracts remain references. C
 
 - **M0 — contracts only (THIS PR):** pin source evidence, test matrix, portrait/landscape wireframes, security/authority contract, owner/file boundaries. No runtime behavior changed.
 - **M1 — pure geometry:** new placement/rect classification with x/y orientation and feasibility constraints; keep the existing placement as compatibility fallback. Unit/property tests across zero, tiny, boundary and wide terminal sizes.
-- **M2 — three status cards:** project existing monitor/job rows into three logical cards; independent focus + scroll; bottom status/composer, Workbench and overlays unchanged. Renderer/interaction tests.
+- **M2 — three status cards + compact portrait progress:** independently render status windows; add a read-only progress strip in portrait, not a second agent-output pane. Preserve Composer, Workbench, overlays, and maximize. Renderer/interaction tests.
 - **M3 — deterministic WIP:** 3 user message refs, current turn, typed Plan/Goal/Job status; display event-backed todo/progress projection; replay/resume tests. No model call yet.
 - **M4 — model-backed observer:** separate tool-free governed Progress Agent job, bounded input/output, dedup/stale result handling, costs/visibility, side-output styling. Test missing-model and stale-turn behavior.
 - **M5 — Plan/Goal integration:** auto-generated *draft* todos, admitted promotion/update, evidence-bound completion and conflict handling; owner acceptance preserved.
@@ -230,9 +224,9 @@ Parallelism policy: new PL-94 branch and separate Draft PR, own worktrees and fi
 
 | Screen x by y | Expected |
 | --- | --- |
-| 48x65 | PortraitStack: Agents/Jobs upper row, Completed/Failed underneath, WIP, readable chat |
-| 45x80 | PortraitStack with clipped narrow status cards |
-| 70x90 | PortraitStack, wider 2-card top row and independent WIP |
+| 48x65 | PortraitStack: separate Agents/Jobs, Finished/Failed; **progress-only strip**; full-width Chat, no expanded agent output |
+| 45x80 | PortraitStack with clipped narrow status cards and compact progress only; observer keeps running |
+| 70x90 | PortraitStack with compact progress-only strip, no second output/narration |
 | 60x60 | Balanced, chosen by feasible layout; deterministic |
 | 80x40 | ShallowLandscape: compact independently titled status windows/tabs; no combined monitoring panel |
 | 100x30 | ShallowLandscape, separate focusable status identities without overlapping; composer/chat usable |
@@ -244,7 +238,7 @@ Parallelism policy: new PL-94 branch and separate Draft PR, own worktrees and fi
 | 1x1 and 0x0 | No panic, no rectangle overflow or subtraction underflow |
 | x/y crossing on live resize | Reclassify and redraw immediately, preserve focus/selection and running jobs |
 
-Also test non-overlapping rects and **five independently bordered window identities**, exact landscape placement (center-top Finished/Failed, center-bottom WIP, far-right Agents over Jobs), no clipping of blocking approval, Unicode cell width, no leaked raw reasoning, independent scrolling, F2/F3/F4/F5/F11/Esc parity, and a mid-turn phone rotation that does not spawn/cancel agents.
+Also test non-overlapping rects and **five independently bordered windows in landscape**; in portrait only **three status windows + compact progress strip + Chat, no expanded second-output window**. Verify landscape anchors (center Status/WIP, right Agents/Jobs), modal priority, Unicode cell width, no leaked raw reasoning, independent scrolling and keybindings. Rotating mid-turn must not spawn/cancel the progress observer.
 
 **Observer tests:** exactly three most recent *user-authored* committed messages; correct session/turn/tenant; a background child with same trace never leaks private transcript; stale update is rejected; active agent turn advances; session resume rehydrates cursor; job failure is not called verified success; no raw agent reasoning; no side-effect tools; two concurrent sessions get independent WIP; missing provider uses deterministic fallback; no unbounded full-history re-scan.
 
@@ -252,7 +246,7 @@ Also test non-overlapping rects and **five independently bordered window identit
 
 ## 7. Definition of done and implementation status
 
-A real Harw TUI viewport in portrait or landscape visibly distinguishes **active agents**, **active jobs**, **completed/failed**, and **session-local live WIP**; its output is navigable and remains accurate during an ongoing root turn and independent background jobs. The WIP agent may propose todos from the last three user messages/current turn/progress signals but cannot share other agents' private context or treat proposals as verified outcomes.
+A real Harw TUI viewport in portrait or landscape distinguishes **active agents**, **active jobs** and **completed/failed**. **Landscape** additionally shows the expanded WIP/second-output window. **Portrait** keeps the Progress Agent running but renders **only a compact verified progress strip**, not a second agent output or narrative. Both stay accurate during active root turns and background jobs. The WIP agent may propose todos from the last three user messages/current turn/progress signals but cannot share other agents' private context or treat proposals as verified outcomes.
 
 **Current status: M0 design only.** The audited existing PL-68 dock, goal marker, AgentMonitor, JobRow and /btw are implemented foundations. M1–M6 are PROPOSED until independently tested code and corresponding hashes are attached in this Draft PR. No Cargo, TUI render test or real-device test has run as a result of this document.
 
