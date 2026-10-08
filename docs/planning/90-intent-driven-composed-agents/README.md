@@ -6,4 +6,4 @@ This dossier defines the composed-agent facade, adaptive model-turn chains, boun
 
 **Principle:** externally an agent is one accountable, intent-addressable unit; internally it is a dynamically evolving, evidence-directed execution graph composed of model turns, tools, child agents, nested chains, cells, checkpoints and jobs. Evidence changes its route, never silently its authority or agreed objective.
 
-**CURRENT:** agent DSL, roles, named delegation, WorkDriver, gap-hunt workflows, Matrix Game, writer/reviewer, LaTeX, context/learning infrastructure. **PLANNED:** generic durable model-turn chain and composed-agent runtime. **DELTA:** contracts, adapters, preflight and gates specified in this dossier.
+**CURRENT:** agent DSL, roles, named delegation, WorkDriver, gap-hunt workflows, Matrix Game, writer/reviewer, LaTeX, context/learning infrastructure. **PARTIAL IMPLEMENTATION (W01):** a pure `harw-plan-bridge::intent_cycle` transition admission module with regression tests; not yet integrated with job execution. **PLANNED:** generic durable model-turn chain and composed-agent runtime. **DELTA:** contracts, adapters, preflight and gates specified in this dossier.
