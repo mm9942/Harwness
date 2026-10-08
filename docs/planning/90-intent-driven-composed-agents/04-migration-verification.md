@@ -138,13 +138,31 @@ Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cyc
 | Durable fence | `CycleCheckpoint` (schema v1) with `CheckpointFence { epoch, sequence }`; `check_commit` is the CAS rule: same epoch → sequence + 1, new epoch → never rewind, stale epoch refused, intent/authority/ceiling immutable across commits | — |
 | Resume | checkpoint stores the non-authorizing `AuthoritySnapshot` and `AdmissionCeiling`; `resume_admission` takes the context from `PolicyBootstrap::reissue`, refuses another workspace or any permission the snapshot never held, intersects stored ceiling × current admission × reissued permissions (write targets need `WriteWorkspace`, reads need `ReadWorkspace`), narrows limits, re-fences under the new epoch; test covers a policy + role upgrade between crash and resume | R01 |
 
-### 7.2 Not done (PLANNED)
+### 7.2 `harw-plan-bridge/src/cycle_runtime.rs` — IN PR (W02 runtime binding)
 
-- W02 runtime: job claim/lease integration, actual persistence through `harw-job-store`, cancellation cascade, idempotent effect journal, model/provider route per turn.
+Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycle_runtime`), clippy `-D warnings` clean, `xtask gates arch` without violations for `harw-plan-bridge` (new edges A → J `harw-job-core`/`harw-job-store` are permitted by `A.may_depend_on = ["*"]`).
+
+| Concern | Implementation | Reused mechanism |
+|---|---|---|
+| Persistence | `CycleStore` over `RecordStore<CycleRecord>`; every mutation is a fenced CAS under the record lock (`check_commit` for steps, new `check_rebind` for takeovers) | `harw-job-store::RecordStore` (lock, temp+rename+fsync, quarantine) |
+| Lease fencing | checkpoint epoch = `LeaseToken::epoch`; an older epoch is refused on every operation, a newer one must rebind first; `check_rebind` allows only a newer epoch at the same sequence, narrowing ceiling/permissions/network scope, nothing else changed (`StateTampered`) | job lease epochs from `JobStore` |
+| Resume | every claim (including the first, records start at epoch 0) reissues the persisted `AuthoritySnapshot` via `AuthorityReissuer` (`PolicyReissuer` → `PolicyBootstrap::reissue`), narrows via `resume_admission` (now also network scope) and rebinds | `harw-authority` |
+| Effect journal | `InFlightStep` with stable idempotency key `<cycle>-<sequence>` journaled before execution; on takeover `reconcile` → `NotStarted` (dropped), `Completed` (observations committed, never re-executed), `Uncertain` (cycle escalates) | — |
+| Driver | `CycleDriver`: proposer (model) and step executor (trusted) are separate traits; refusals are fed back to the proposer and escalate after `max_refusals_per_step` (default 3); proposer failure (e.g. provider 403) → `Blocked`; executor failure → stall → bounded escalation; cancellation between steps, in-flight step left for reconciliation | `CancelToken` |
+| Jobs | `cycle_job_operation` plugs the driver into `DurableJobRunner::run_with_cancel` (claim, heartbeat, lease-loss cancel, job commit); `job_outcome`: `CompletionProposed` → `Succeeded` with `requires_owner_acceptance: true`, `Escalated`/`Blocked` → `Blocked`, `Failed` → `Failed`, cancel → `Cancelled` | `harw-core::DurableJobRunner` |
+| Status | `CycleRecord::status()` — bounded projection (counts, covered criteria, in-flight key, terminal), no evidence bodies | — |
+
+Covered failure injections: stale epoch / zombie executor, foreign job, double journal, crash with completed / uncertain / not-started step, tampered or widened rebind, policy downgrade between submit and claim, unavailable proposer, executor capability failure, cancellation, end-to-end through a real `JobStore` + `DurableJobRunner`.
+
+### 7.3 Not done (PLANNED)
+
+- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). These are W03 (read-only explorer as first real executor) and W04.
+- Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
+
 - W03–W10: no explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
-- Crate ownership: the module stays in `harw-plan-bridge` (already depends on `harw-authority` and `harw-types`; no new dependency edge). Moving it to a dedicated chain crate needs the ring analysis from W00.
+- Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
 
-### 7.3 Base-branch notes found while verifying
+### 7.4 Base-branch notes found while verifying
 
 - `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
 - The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).

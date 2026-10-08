@@ -95,6 +95,7 @@
 pub mod cells;
 pub mod context_ext;
 pub mod controller;
+pub mod cycle_runtime;
 pub mod error;
 pub mod finding_store;
 pub mod fragment_registry;
@@ -113,6 +114,12 @@ pub use crate::cells::{
 };
 pub use crate::context_ext::{OpContextPlanExt, register_plan_services};
 pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
+pub use crate::cycle_runtime::{
+    AuthorityReissuer, CYCLE_RECORD_SCHEMA, CycleDriver, CycleDriverConfig, CycleJobFuture,
+    CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome, CycleStatus, CycleStepExecutor,
+    CycleStore, CycleStoreError, InFlightStep, PolicyReissuer, StepFailure, StepReconciliation,
+    cycle_job_operation, job_outcome,
+};
 pub use crate::error::{PlanBridgeError, PlanBridgeResult};
 pub use crate::finding_store::{
     FindingStore, evidence_for_finding, finding_locator, offset_from_timestamp,

@@ -3705,7 +3705,9 @@ dependencies = [
  "harw-dod-signals",
  "harw-extension-api",
  "harw-home",
+ "harw-job-core",
  "harw-job-runtime",
+ "harw-job-store",
  "harw-knowledge",
  "harw-lens-types",
  "harw-macros",
@@ -3722,6 +3724,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "time",
+ "tokio",
  "tracing",
 ]
 

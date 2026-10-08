@@ -17,6 +17,10 @@ harw-research = { path = "../harw-research" }
 harw-operations = { path = "../harw-operations" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-job-runtime = { path = "../harw-job-runtime" }
+# PL-90 W02: durable intent-cycle records (`cycle_runtime.rs`) über die
+# generische, gefencte Speichermechanik und den Lease-Token des Job-Modells.
+harw-job-core = { path = "../harw-job-core" }
+harw-job-store = { path = "../harw-job-store" }
 harw-session-store = { path = "../harw-session-store" }
 harw-knowledge = { path = "../harw-knowledge" }
 harw-home = { path = "../harw-home" }
@@ -49,6 +53,9 @@ serde_json = "1.0.150"
 time = { version = "0.3.53", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 jiff = { workspace = true }
 tracing = "0.1.44"
+# PL-90 W02: blockierende Store-Zugriffe des Cycle-Drivers laufen über
+# `spawn_blocking`, Abschlusssignal für `ExecutionControl` über `watch`.
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
@@ -60,6 +67,7 @@ tempfile = "3.27.0"
 # `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
 harw-dod-rules = { path = "../dod/crates/harw-dod-rules", features = ["test-support"] }
 harw-sandbox = { path = "../harw-sandbox" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

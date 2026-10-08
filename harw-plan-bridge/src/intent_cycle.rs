@@ -337,6 +337,8 @@ pub struct CycleCheckpoint {
     pub evidence: BTreeMap<String, EvidenceRecord>,
     /// Acceptance criterion -> id of the verified evidence that covers it.
     pub criteria_met: BTreeMap<String, String>,
+    /// The last committed (admitted) decision, for status and audit.
+    pub last_decision: Option<CycleProposal>,
     pub terminal: Option<CycleTerminal>,
 }
 
@@ -359,6 +361,7 @@ impl CycleCheckpoint {
             claims: BTreeMap::new(),
             evidence: BTreeMap::new(),
             criteria_met: BTreeMap::new(),
+            last_decision: None,
             terminal: None,
         }
     }
@@ -391,6 +394,7 @@ impl CycleCheckpoint {
             stall_transitions: 0,
             claims: BTreeMap::new(),
             criteria_met: BTreeMap::new(),
+            last_decision: None,
             terminal: None,
             ..self.clone()
         }
@@ -515,9 +519,27 @@ pub struct AdmittedCycle {
 }
 
 impl AdmittedCycle {
+    /// Re-creates the admission of a step that was journaled as in flight
+    /// before a crash. Its effect may already have happened, so its outcome
+    /// must be recorded truthfully even if a narrowed admission would refuse
+    /// the same proposal today. Crate-internal: only the durable cycle
+    /// runtime may use it, and only for a journaled proposal.
+    pub(crate) fn recovered(proposal: CycleProposal, expected_sequence: u64) -> Self {
+        Self {
+            proposal,
+            expected_sequence,
+        }
+    }
+
     #[must_use]
     pub fn proposal(&self) -> &CycleProposal {
         &self.proposal
+    }
+
+    /// Checkpoint sequence this admission was decided against.
+    #[must_use]
+    pub fn expected_sequence(&self) -> u64 {
+        self.expected_sequence
     }
 
     /// The terminal state this transition leads to, if any.
@@ -860,6 +882,7 @@ pub fn apply_observations(
             .ok_or(ObservationError::Overflow)?
     };
     next.terminal = admitted.terminal();
+    next.last_decision = Some(admitted.proposal.clone());
     Ok(next)
 }
 
@@ -874,6 +897,8 @@ pub enum FenceRefusal {
     IntentMismatch,
     /// Tries to widen the recorded ceiling or swap the authority snapshot.
     CeilingWidened,
+    /// A rebind changed cycle state other than epoch, ceiling and authority.
+    StateTampered,
 }
 
 /// Compare-and-swap rule for persisting `candidate` over `stored`.
@@ -912,6 +937,64 @@ pub fn check_commit(
     } else {
         Err(FenceRefusal::OutOfOrder)
     }
+}
+
+/// Rule for replacing `stored` with the output of [`resume_admission`] when
+/// a new lease epoch takes over a cycle.
+///
+/// The candidate must be fenced under a strictly newer epoch at the *same*
+/// sequence, may only narrow the ceiling and the authority snapshot (same
+/// workspace, subset of permissions), and must leave every other field
+/// untouched.
+///
+/// # Errors
+/// [`FenceRefusal`] naming the violated rule.
+pub fn check_rebind(
+    stored: &CycleCheckpoint,
+    candidate: &CycleCheckpoint,
+) -> Result<(), FenceRefusal> {
+    if candidate.intent_id != stored.intent_id
+        || candidate.intent_revision != stored.intent_revision
+        || candidate.intent_digest != stored.intent_digest
+    {
+        return Err(FenceRefusal::IntentMismatch);
+    }
+    if candidate.fence.epoch <= stored.fence.epoch {
+        return Err(FenceRefusal::StaleEpoch);
+    }
+    if candidate.fence.sequence != stored.fence.sequence {
+        return Err(FenceRefusal::OutOfOrder);
+    }
+    let narrowed = candidate.ceiling.read.is_subset(&stored.ceiling.read)
+        && candidate.ceiling.write.is_subset(&stored.ceiling.write)
+        && candidate
+            .ceiling
+            .children
+            .is_subset(&stored.ceiling.children)
+        && candidate.ceiling.recipes.is_subset(&stored.ceiling.recipes)
+        && candidate.ceiling.limits.narrowed(&stored.ceiling.limits) == candidate.ceiling.limits
+        && candidate.authority.workspace() == stored.authority.workspace()
+        && candidate
+            .authority
+            .request()
+            .iter()
+            .all(|permission| stored.authority.request().contains(permission))
+        && candidate
+            .authority
+            .request()
+            .network_scope()
+            .is_subset_of(stored.authority.request().network_scope());
+    if !narrowed {
+        return Err(FenceRefusal::CeilingWidened);
+    }
+    let mut rest = candidate.clone();
+    rest.fence = stored.fence;
+    rest.ceiling = stored.ceiling.clone();
+    rest.authority = stored.authority.clone();
+    if &rest != stored {
+        return Err(FenceRefusal::StateTampered);
+    }
+    Ok(())
 }
 
 /// Why a cycle cannot be resumed.
@@ -970,6 +1053,9 @@ pub fn resume_admission(
         .permissions()
         .iter()
         .any(|permission| !recorded.contains(permission))
+        || !reissued
+            .network_scope()
+            .is_subset_of(recorded.network_scope())
     {
         return Err(ResumeRefusal::AuthorityWidened);
     }
