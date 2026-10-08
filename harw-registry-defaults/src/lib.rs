@@ -299,15 +299,14 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // `JOB_READ_TOOLS`): `job.status`/`job.logs`/`job.list` lesen nur
     // Zustand und Logdateien eigener Jobs bzw. der Jobs von Nachfahren
     // (Besitzprüfung über die Sitzung aus dem Ausführungskontext);
-    // `job.wait` ist ein kurzes Polling (höchstens 60 s; das Jobende kommt
-    // als Notiz, R18 F8). Keine
+    // there is no blocking wait tool (background-only rule): the job end
+    // arrives as a notification. Keine
     // Schreibwirkung, kein Prozessstart. `job.start` fragt wie `shell.exec`,
     // `job.stop` wie jedes andere Werkzeug mit Wirkung (nicht in
     // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift).
     "job.status",
     "job.logs",
     "job.list",
-    "job.wait",
     // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge (`TUNNEL_TOOLS`,
     // `profile::TUNNEL_TOOLS`): `tunnel.status`/`tunnel.list` lesen nur den
     // Zustand verwalteter Tunnels des Aufrufers, `tunnel.stop` beendet nur

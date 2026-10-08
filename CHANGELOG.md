@@ -106,8 +106,9 @@ Semantic Versioning within the 0.x pre-release range.
   `harw-web`). See `docs/setup/tailscale.md`.
 
 ### Changed
-- `job.wait` is a short poll: `timeout_secs` is limited to 1..=60 (larger
-  values are refused); job completion arrives as a notification.
+- Removed the blocking `job.wait` tool. Delegated work runs only in the
+  background: job progress and completion arrive as notifications, and
+  `job.status` gives a non-blocking snapshot.
 - `shell.exec` documents POSIX `/bin/sh` and steers file edits to `fs.*`.
 
 ### `harw update` installs updates

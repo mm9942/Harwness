@@ -351,7 +351,6 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("job.logs", JOB, Meta),
     row!("job.stop", JOB, Meta),
     row!("job.list", JOB, Meta),
-    row!("job.wait", JOB, Meta),
     // agent compiler (#22 wave 2B): compiles an agent definition as a
     // background job, same launch path as `job.start`/`shell.exec`. Never
     // granted to a built-in role by default (no `RegistryProfile` registers

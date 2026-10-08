@@ -4,21 +4,19 @@
     "job.logs": true,
     "job.start": true,
     "job.status": true,
-    "job.stop": true,
-    "job.wait": true
+    "job.stop": true
   },
   "parallel_safe": {
     "job.list": true,
     "job.logs": true,
     "job.start": false,
     "job.status": true,
-    "job.stop": false,
-    "job.wait": true
+    "job.stop": false
   },
   "permissions": null,
   "tools": [
     {
-      "description": "Start a long-running command as a background job and return its job_id at once. Use this instead of shell.exec (and never tmux) for anything that may take longer than about 2 minutes or that you want to follow: builds (cargo, cmake/ninja, make), package restores (vcpkg, npm, pip), test suites, servers. Same permissions and approval as shell.exec (sandbox or approved host mode; sudo only via host.sudo_exec). Give either `command` (shell text for /bin/sh -c) or `argv` (exact argument vector). stdout/stderr go to log files. You automatically get system notes: job start, progress every notify_every_secs (default 60, only when something changed; 0 = off), error lines as they appear, and the end with exit code, duration and the last 20 lines. Do not poll in a loop: continue other work or end your turn; the end note arrives on its own (job.wait is only a short poll, at most 60 s). On the host the job gets a filtered environment (PATH, HOME, locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); pass anything else explicitly via env.",
+      "description": "Start a long-running command as a background job and return its job_id at once. Use this instead of shell.exec (and never tmux) for anything that may take longer than about 2 minutes or that you want to follow: builds (cargo, cmake/ninja, make), package restores (vcpkg, npm, pip), test suites, servers. Same permissions and approval as shell.exec (sandbox or approved host mode; sudo only via host.sudo_exec). Give either `command` (shell text for /bin/sh -c) or `argv` (exact argument vector). stdout/stderr go to log files. You automatically get system notes: job start, progress every notify_every_secs (default 60, only when something changed; 0 = off), error lines as they appear, and the end with exit code, duration and the last 20 lines. Do not poll in a loop: continue other work or end your turn; the end note arrives on its own. For a non-blocking snapshot use job.status. On the host the job gets a filtered environment (PATH, HOME, locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); pass anything else explicitly via env.",
       "name": "job.start",
       "parameters": {
         "additionalProperties": false,
@@ -166,30 +164,6 @@
           }
         },
         "required": [],
-        "type": "object"
-      },
-      "strict": true,
-      "type": "function"
-    },
-    {
-      "description": "Short poll: wait at most timeout_secs (1-60) until the job ends or reaches the next milestone (new error lines, progress crossing a 10% step, or a phase change such as cargo `Finished`). Returns the outcome (finished/milestone/timeout) and the job status. You do not need job.wait to learn that a job ended: its end (exit code, duration, last lines) is delivered to you automatically as a note. Do not call job.wait in a loop; after a timeout, continue other work or end your turn and react to the job's end note.",
-      "name": "job.wait",
-      "parameters": {
-        "additionalProperties": false,
-        "properties": {
-          "job_id": {
-            "description": "Job id returned by job.start (e.g. job-20260924-101112-001).",
-            "type": "string"
-          },
-          "timeout_secs": {
-            "description": "Maximum seconds to wait: a short poll, 1-60. Larger values are rejected.",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "job_id",
-          "timeout_secs"
-        ],
         "type": "object"
       },
       "strict": true,
