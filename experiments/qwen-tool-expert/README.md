@@ -4,7 +4,7 @@ Status: **research pilot / draft**, 2026-10-08. No model has been trained, deplo
 
 ## Objective
 
-Fine-tune a small Qwen model to select and call **admitted Harwness tools** correctly, with strict argument schemas, tool-result continuation, rights awareness and minimal unnecessary shell use. Tool knowledge is a learned prior; the **runtime tool registry, admitted tools, sandbox and approval checks remain authoritative**.
+Train specialized ~135M models for distinct phases of the Harw agent cycle, then distill validated end-to-end tool trajectories into **Qwen3-1.7B**. The goal is correct admitted tools, strict argument schemas, tool-result continuation, rights awareness and minimal unnecessary shell use. Tool knowledge is a learned prior; the **runtime tool registry, admitted tools, sandbox and approval checks remain authoritative**.
 
 **Updated architecture:** start with several specialized **~135M cycle micro-models** based on [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct); distill their *validated complete tool trajectories* into [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B). Both base models are Apache-2.0. Read [CYCLE_ARCHITECTURE.md](CYCLE_ARCHITECTURE.md) for exact phase boundaries and what remains unimplemented. The 1.7B model is a **student target**, not a concatenation of tiny experts or a trained checkpoint.
 
@@ -18,6 +18,14 @@ python3 build_micro_dataset.py
 python3 validate_micro_dataset.py
 python3 -m unittest test_micro_dataset.py
 python3 train_micro.py --expert intent   # DRY RUN, no model download
+```
+
+To prepare an actual **student distillation dataset**, `distill_expert_runs.py` expects already-executed, externally reviewed and redacted micro-expert traces **plus a separate SHA256 allowlist of approved exact records**. It checks structural integrity, call/result pairs, and train/eval family separation; it **cannot itself prove execution, authorization or redaction**. No such verified traces exist in this pilot yet. Example invocation after externally producing those inputs:
+
+```sh
+python3 distill_expert_runs.py --trace-file reviewed_traces.jsonl \\
+  --reviewed-sha256-file reviewed_hashes.txt
+python3 -m unittest test_distillation_contract.py
 ```
 
 `train_micro.py --expert intent --train` is **opt-in** and refuses a tiny dataset by default. Likewise, `train_qlora.py` only starts the Qwen3-1.7B student training with `--train`. Neither script has been GPU-validated. **No ML training, deployment or Cloudflare billing operation has been started.**
