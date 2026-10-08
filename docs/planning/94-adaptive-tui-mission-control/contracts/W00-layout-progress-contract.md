@@ -8,6 +8,8 @@ parent: ../README.md
 
 # W00 — Adaptive Mission Control acceptance contract
 
+> **CURRENT UX DIRECTION (2026-10-09):** [W02 chat-first mini-live](W02-chat-first-mini-live.md) supersedes W00's model-backed Progress Agent, progress-only strip and expanded synthetic WIP as the primary TUI target. This W00 is kept for historical rationale and shared status/geometry invariants. New implementation must follow W02 for the compact real agent reasoning/tool preview and Chat-first capacity, without a second model invocation. No code was implemented by this documentation change.
+
 > **DESIGN ONLY**, rooted in dev@197a92e92d438bf6bf93b129bb964f4852686149. See the [parent design](../README.md). No renderer, agent or new runtime listener is claimed as implemented.
 
 ## 1. Exact UI state sources and authority
