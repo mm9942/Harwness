@@ -121,4 +121,33 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 
 ## 7. Implementation status
 
-This PR initially began as docs-only; **implementation wave W01 has now introduced `harw-plan-bridge/src/intent_cycle.rs` and exports in `lib.rs`**: a pure, fail-closed cycle proposal admission core and table/regression tests. This is NOT durable chain execution, provider integration, a write executor, model routing or completion of W02–W10. No Cargo build has been run in this environment (Rust toolchain unavailable). Source-grounding used connected GitHub at pinned dev and the Gap-Hunt kit; the comparison to Claude Code is limited to repository-visible workflows, **not a verified claim about Anthropic's internal proprietary implementation**. The first code action after design review should be the read-only transition core + adapter test harness, not enabling unrestricted write-capable agents.
+Status vocabulary as in the dossier: `CURRENT` = merged and checked, `IN PR` = code in this PR with locally green tests, `PLANNED` = design only.
+
+### 7.1 `harw-plan-bridge/src/intent_cycle.rs` — IN PR
+
+Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cycle` tests green) and `cargo clippy -p harw-plan-bridge --all-targets -- -D warnings` (clean). The original seven source-only tests had never been run; running them found one real defect: `{"kind":"complete","permission":"full_access"}` deserialized, because serde does not enforce `deny_unknown_fields` on unit variants of internally tagged enums. All proposal and join variants are now struct variants and the test covers four injection shapes.
+
+| Area | What the module now does | Review thread |
+|---|---|---|
+| Transition family | `Advance`, `Fork`+`JoinPolicy` (`All`/`Any`/`Quorum`), `Reorient`, `Revisit` (drops invalidated claims and the criteria built on the revisited evidence), `ProposePatch` (multi-file contract set, every target in scope), `Verify`, `RequestApproval` (a request, not an approval), `Complete`, `Wait`, `Escalate`, `Blocked`, `Failed` | — |
+| Bounds | separate chain-nesting and agent-spawn depth with distinct refusals (`nested()`/`child()` derive seeds), transition budget, stall budget, parallel width, duplicate segments; honest exits (`Escalate`/`Blocked`/`Failed`) stay admissible when exhausted or stalled; terminal checkpoints admit nothing more | — |
+| Trusted construction | `CycleAdmission` is not `Deserialize` and only built through `CycleAdmission::new` (rejects malformed intent, zero limits, blank targets); every serialized type is `deny_unknown_fields` | — |
+| Intent identity | `IntentBinding` carries `revision`, canonical `ContentDigest` and `predecessor`; `supersedes()` rejects other-intent, stale, forked, skipped and wrong-predecessor revisions; admission and resume reject any revision/digest mismatch | R02 |
+| Evidence & progress | `EvidenceRecord` with source kind, locator, digest and trust (`Reported < Observed < Verified`); `apply_observations` derives progress from new content digests, trust upgrades, newly covered criteria or invalidated claims — a known digest under a new id is false novelty; evidence ids cannot be rebound to other content | — |
+| Acceptance | `Complete` needs every acceptance criterion mapped to `Verified` evidence and yields `CycleTerminal::CompletionProposed`; goal acceptance stays with WorkDriver/human | R06 (partial: no WorkDriver wiring) |
+| Durable fence | `CycleCheckpoint` (schema v1) with `CheckpointFence { epoch, sequence }`; `check_commit` is the CAS rule: same epoch → sequence + 1, new epoch → never rewind, stale epoch refused, intent/authority/ceiling immutable across commits | — |
+| Resume | checkpoint stores the non-authorizing `AuthoritySnapshot` and `AdmissionCeiling`; `resume_admission` takes the context from `PolicyBootstrap::reissue`, refuses another workspace or any permission the snapshot never held, intersects stored ceiling × current admission × reissued permissions (write targets need `WriteWorkspace`, reads need `ReadWorkspace`), narrows limits, re-fences under the new epoch; test covers a policy + role upgrade between crash and resume | R01 |
+
+### 7.2 Not done (PLANNED)
+
+- W02 runtime: job claim/lease integration, actual persistence through `harw-job-store`, cancellation cascade, idempotent effect journal, model/provider route per turn.
+- W03–W10: no explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
+- Crate ownership: the module stays in `harw-plan-bridge` (already depends on `harw-authority` and `harw-types`; no new dependency edge). Moving it to a dedicated chain crate needs the ring analysis from W00.
+
+### 7.3 Base-branch notes found while verifying
+
+- `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
+- The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).
+- Two `harw-core` lib tests fail on the base once it compiles (`child_controller::tests::teil_o::without_a_relay_the_child_still_fails_closed`, `turn_loop::tests::uia_keeps_transfer_tools_with_one_line_descriptions`); unrelated to this PR and left for a separate fix.
+
+The comparison to Claude Code remains limited to repository-visible workflows (Gap-Hunt kit), **not a claim about Anthropic's internal implementation**.
