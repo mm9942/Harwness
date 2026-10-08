@@ -95,6 +95,7 @@
 pub mod cells;
 pub mod context_ext;
 pub mod controller;
+pub mod cycle_proposer;
 pub mod cycle_runtime;
 pub mod error;
 pub mod finding_store;
@@ -114,6 +115,10 @@ pub use crate::cells::{
 };
 pub use crate::context_ext::{OpContextPlanExt, register_plan_services};
 pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
+pub use crate::cycle_proposer::{
+    ModelCycleProposer, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy, RouteSlot,
+    refusal_hint, render_prompt, render_prompt_with,
+};
 pub use crate::cycle_runtime::{
     AuthorityReissuer, CYCLE_RECORD_SCHEMA, CycleDriver, CycleDriverConfig, CycleJobFuture,
     CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome, CycleStatus, CycleStepExecutor,
