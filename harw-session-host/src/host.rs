@@ -41,7 +41,10 @@ use tokio::sync::watch;
 use crate::agents::{AgentRegistry, rights_of};
 use crate::approvals::{ApprovalBackend, ResolveOutcome};
 use crate::arbiter::{Arbiter, ArbiterLimits};
-use crate::driver::{DriverEvent, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome};
+use crate::driver::{
+    DriverEvent, EventSink, MAX_NOTICE_CHARS, Setting, TurnDriver, TurnInput, TurnOutcome,
+    sanitize_notice,
+};
 use crate::error::HostError;
 use crate::fanout::{AttachmentQueue, QueueLimits, attachment};
 use crate::identity::{
@@ -834,6 +837,13 @@ fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
     });
 }
 
+/// Shown to a client that attaches to a session a host restart interrupted.
+const INTERRUPTED_NOTICE: &str = "session was interrupted by a host restart; the turn that was running is lost. \
+     Resume the session (session.resume) to continue, then submit your message again";
+
+/// Reason of a submit refused because the session is `Interrupted`.
+const INTERRUPTED_DENIED: &str = "session interrupted by a host restart; session.resume first";
+
 /// Apply a turn outcome. Returns `true` when the pump should continue with
 /// the next queued input.
 fn settle(host: &HostInner, slot: &Slot, outcome: &TurnOutcome) -> bool {
@@ -851,9 +861,29 @@ fn settle(host: &HostInner, slot: &Slot, outcome: &TurnOutcome) -> bool {
             host.save(&mut state);
             false
         }
-        TurnOutcome::Completed | TurnOutcome::Interrupted | TurnOutcome::Failed(_) => {
-            if let TurnOutcome::Failed(reason) = outcome {
+        TurnOutcome::Completed
+        | TurnOutcome::Interrupted
+        | TurnOutcome::Failed(_)
+        | TurnOutcome::FailedWith { .. } => {
+            // Liveness contract: a failed turn is reported as a visible
+            // `SessionError` frame with its cause, and the session returns
+            // to `Idle` below so the next submit works. `HostedState::Failed`
+            // is intentionally never produced (see `FailureCause`).
+            if let Some((cause, reason)) = outcome.failure() {
                 tracing::warn!(session = %slot.id.as_str(), %reason, "session host: turn failed");
+                let message = format!(
+                    "turn failed ({}): {}",
+                    cause.label(),
+                    sanitize_notice(reason, MAX_NOTICE_CHARS)
+                );
+                state.publish(
+                    &slot.id,
+                    SessionFrame::Session(SessionEvent::SessionError {
+                        session_id: slot.id.clone(),
+                        message,
+                        retryable: true,
+                    }),
+                );
             }
             state.parked = false;
             state.arbiter.finish();
@@ -1157,6 +1187,20 @@ impl HostConnection {
             }
         }
 
+        if state.record.state == HostedState::Interrupted {
+            // The host restarted while a turn was in flight: tell the
+            // attaching client why submits are refused and how to continue.
+            queue.push(FrameEnvelope {
+                session_id: slot.id.clone(),
+                cursor: state.head_cursor(),
+                frame: SessionFrame::Session(SessionEvent::SessionError {
+                    session_id: slot.id.clone(),
+                    message: INTERRUPTED_NOTICE.to_owned(),
+                    retryable: true,
+                }),
+            });
+        }
+
         let presence = PresenceEntry {
             label: self.identity.label.clone(),
             device: self.identity.device.clone(),
@@ -1264,7 +1308,7 @@ impl HostConnection {
             HostedState::Interrupted => {
                 return Ok((
                     SubmitResult::Denied {
-                        reason: "session interrupted; session.resume first".into(),
+                        reason: INTERRUPTED_DENIED.into(),
                     },
                     None,
                 ));
