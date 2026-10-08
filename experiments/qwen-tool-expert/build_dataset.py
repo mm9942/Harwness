@@ -106,7 +106,7 @@ def conversation(row,catalog):
         if name not in row["tools"]: raise ValueError("undeclared tool "+name)
         validate_call(catalog[name],args)
         tool_id=f"call_{i+1:02d}"
-        messages.append({"role":"assistant","tool_calls":[{"id":tool_id,"type":"function","function":{"name":name,"arguments":canonical(args)}}]})
+        messages.append({"role":"assistant","tool_calls":[{"id":tool_id,"type":"function","function":{"name":name,"arguments":args}}]})
         messages.append({"role":"tool","tool_call_id":tool_id,"name":name,"content":canonical(row["results"][i])})
     messages.append({"role":"assistant","content":row["final"]})
     return {"messages":messages,"tools":tools,"metadata":{"family":row["family"],"synthetic":True,"rights":"simulated availability only"}}
@@ -126,7 +126,7 @@ def main():
     for split,rows in buckets.items():
         with (output/f"{split}.jsonl").open("w") as f:
             for row in rows:f.write(json.dumps(row,ensure_ascii=False)+"\n")
-    manifest={"base_model":"Qwen/Qwen3-4B-Instruct-2507","data_kind":"synthetic_source_grounded_seed","ref":catalog_data["pinned_ref"],
+    manifest={"base_model":"Qwen/Qwen3-1.7B","data_kind":"synthetic_source_grounded_seed","ref":catalog_data["pinned_ref"],
         "train_families":[x["metadata"]["family"] for x in buckets["train"]],
         "eval_families":[x["metadata"]["family"] for x in buckets["eval"]],
         "counts":{k:len(v) for k,v in buckets.items()}}
