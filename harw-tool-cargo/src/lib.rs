@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod command;
+pub mod guard;
 pub mod parse;
 pub mod plan;
 pub mod report;
