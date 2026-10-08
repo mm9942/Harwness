@@ -3718,6 +3718,7 @@ dependencies = [
  "harw-sandbox",
  "harw-session-store",
  "harw-test-support",
+ "harw-tool-fsread",
  "harw-types",
  "jiff",
  "serde",

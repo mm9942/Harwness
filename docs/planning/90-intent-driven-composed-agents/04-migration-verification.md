@@ -154,15 +154,32 @@ Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycl
 
 Covered failure injections: stale epoch / zombie executor, foreign job, double journal, crash with completed / uncertain / not-started step, tampered or widened rebind, policy downgrade between submit and claim, unavailable proposer, executor capability failure, cancellation, end-to-end through a real `JobStore` + `DurableJobRunner`.
 
-### 7.3 Not done (PLANNED)
+### 7.3 `cycle_explorer.rs` / `cycle_proposer.rs` — IN PR (W03 building blocks)
 
-- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). These are W03 (read-only explorer as first real executor) and W04.
+Intermediate state: the two halves of the W03 explorer exist as independently tested modules and are now merged together with one cross-module test (`cycle_w03_tests.rs`: `CycleDriver` + `ModelCycleProposer` over a scripted fake `ModelProvider` + `ReadOnlyExplorerExecutor` over a temp workspace; Advance(read) -> digest-bound `Observed` evidence -> Reorient on that evidence -> read -> Escalate; it also asserts the turn-2 prompt contains the evidence id and locator but no file content and no digest). Verified locally: `cargo test -p harw-plan-bridge` (271 lib + 20 `intent_cycle` tests green), clippy `-D warnings` clean, `rustfmt --edition 2024 --check` clean, `xtask gates arch` shows only the 6 pre-existing violations (`harw-cloud*`, `harw-tool-obsidian`). New edge: `harw-plan-bridge` -> `harw-tool-fsread`.
+
+| Module | What it does | Key decisions |
+|---|---|---|
+| `cycle_explorer.rs` (`ReadOnlyExplorerExecutor`) | First trusted `CycleStepExecutor`: turns admitted `Segment::Read` segments into `EvidenceRecord`s (source `Repository`, digest of the bytes, workspace-relative locator). Refuses child/nested segments and every non-read proposal. Reads go through `harw-tool-fsread` `Scope` (no symlink escape, regular files only, secret paths denied) and need `ReadWorkspace` | Target ids map to paths only via a trusted, non-`Deserialize` `ReadTargetMap`. All-or-nothing step: any failing read returns `Err(StepFailure)` (no partial evidence); the driver counts it as a stall. `reconcile` always returns `NotStarted` (reads are idempotent; a recovered digest could be stale). Oversized files are refused, never truncated or digested as a prefix. Optional bounded in-memory `ExplorerReadCache` (oldest-first eviction, filled only when the whole step succeeded, lost on restart). It only ever produces `Observed` evidence |
+| `cycle_proposer.rs` (`ModelCycleProposer`) | `CycleProposer` over a `ModelProvider`: pure `render_prompt` -> one JSON object -> `serde` parse (`deny_unknown_fields`) -> `CycleProposal`; admission and executor still decide everything | Route policy: deterministic default/escalation route chosen from refusal streak and `stall_transitions`, never by the model. One repair re-prompt with the bounded parse error, then `Err` -> `Blocked` (no synthesized `Escalate`). Retryable provider errors retried up to `max_retries` without sleeping. Auth circuit breaker: after `auth_trip_after` consecutive `Auth` failures a route is no longer used. Prompt exclusions: no authority snapshot, ceiling, permissions, digests, file contents or claim bodies; ids and locators are sanitized and capped |
+
+What is NOT done:
+
+- No runtime caller builds a `ReadTargetMap`, and there is no tool or registry entry that starts a cycle with these modules.
+- No real verifier: `Verify` is refused by the explorer, so `Complete` (which needs `Verified` evidence) is unreachable for a pure explorer cycle; the cross-module test therefore ends in `Escalate`, and the in-module `Verified` stand-in in `cycle_explorer` tests is a test double.
+- No `CancelToken` in the proposer (`CycleProposer::propose` does not receive one; requests carry `cancel: None`).
+- No retry backoff (the provider layer owns pacing and `Retry-After`).
+- No small-model benchmark (the W03 exit criterion in section 2 is still open).
+
+### 7.4 Not done (PLANNED)
+
+- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). W03 now has its building blocks (7.3) but no wiring or benchmark; W04 is open.
 - Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
 
-- W03–W10: no explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
+- W03 wiring and W04–W10: no wired explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
 - Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
 
-### 7.4 Base-branch notes found while verifying
+### 7.5 Base-branch notes found while verifying
 
 - `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
 - The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).
