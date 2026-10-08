@@ -34,6 +34,9 @@ harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
 harw-tool-explorer = { path = "../harw-tool-explorer" }
 harw-tool-process = { path = "../harw-tool-process" }
+# `cargo.test_one` (Plan 93): der einzige registrierte `cargo.*`-Eintrag, nur
+# für `test-engineer` (siehe `profile::CARGO_TEST_ONE_TOOLS`).
+harw-tool-cargo = { path = "../harw-tool-cargo" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
 harw-tool-doc = { version = "0.9.1", path = "../harw-tool-doc" }

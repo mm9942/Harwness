@@ -3859,6 +3859,7 @@ dependencies = [
  "harw-sandbox",
  "harw-test-support",
  "harw-tool-browser",
+ "harw-tool-cargo",
  "harw-tool-deps",
  "harw-tool-doc",
  "harw-tool-explorer",

@@ -62,6 +62,7 @@ use harw_project_discovery::{
     DiscoveryConfig, ProjectContext, ProjectContextProvider, discover_project,
 };
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
+use harw_tool_cargo::{CargoToolProvider, ShellDelegate};
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_doc::DocToolProvider;
 use harw_tool_explorer::ExplorerToolProvider;
@@ -1210,6 +1211,16 @@ pub(crate) const LATEX_TEMPLATE_TOOL: &str = "latex.template";
 /// `Permission::ExecuteProcess`; nur unter Linux wirksam.
 pub(crate) const PROCESS_TOOLS: &[&str] = &["process.list", "process.kill"];
 
+/// Das einzige `cargo.*`-Werkzeug, das ein Profil registriert:
+/// `cargo.test_one` (genau ein Test hinter dem Rebuild-Wächter von
+/// `harw-tool-cargo`). Die übrigen acht `cargo.*`-Werkzeuge sind weder
+/// registriert noch haben sie ein Recht ([`crate::authority::tool_permission`]).
+/// Es läuft über den `shell.exec`-Ausführer des Profils (Sandbox, Freigabe,
+/// Host-Permit), braucht `Permission::ExecuteProcess` und steht nicht in
+/// [`crate::AUTO_APPROVED_TOOLS`]. Nur eine Definition, die es admittiert und
+/// die der Roster durchlässt (`roster::TEST_ENGINEER_EXTRA_TOOLS`), sieht es.
+pub const CARGO_TEST_ONE_TOOLS: &[&str] = &["cargo.test_one"];
+
 /// Das eine Werkzeug von `harw-tool-lens` (AW6-10): semantische Abfrage über
 /// `docs.design` und `knowledge.palace`.
 ///
@@ -1264,8 +1275,12 @@ pub(crate) const LENS_TOOLS: &[&str] = &["lens.ask"];
 /// restricted to `Full` (coding agents) because it creates and replaces
 /// files. All five resolve paths through the sandbox's workspace binding,
 /// so they never exceed the caller's existing file permissions.
-pub(crate) const OBSIDIAN_READ_TOOLS: &[&str] =
-    &["obsidian.map", "obsidian.read", "obsidian.search", "obsidian.links"];
+pub(crate) const OBSIDIAN_READ_TOOLS: &[&str] = &[
+    "obsidian.map",
+    "obsidian.read",
+    "obsidian.search",
+    "obsidian.links",
+];
 
 /// The Obsidian vault tools, in provider order.
 ///
@@ -1924,6 +1939,7 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_WORKSPACE_TOOLS.iter())
+                .chain(CARGO_TEST_ONE_TOOLS.iter())
                 .copied()
                 .collect(),
             // Nur lesende Unterlagen der Matrix-Sitze (siehe die Begründung
@@ -2907,7 +2923,18 @@ fn profile_tool_providers(
                 Arc::new(DepsToolProvider::new()),
                 DEPS_WORKSPACE_TOOLS,
             ));
-            vec![filesystem, doc, explorer, dependencies]
+            let mut providers = vec![filesystem, doc, explorer, dependencies];
+            // `cargo.test_one` läuft über den `shell.exec`-Ausführer dieses
+            // Profils; `shell.exec` selbst wird nicht registriert.
+            if let Some(executor) =
+                build_shell(sandbox_profile).executor(&ToolName::new("shell.exec"))
+            {
+                providers.push(Arc::new(RestrictedToolProvider::new(
+                    Arc::new(CargoToolProvider::new(ShellDelegate::new(executor))),
+                    CARGO_TEST_ONE_TOOLS,
+                )));
+            }
+            providers
         }
         // Nur lesende Unterlagen: gefilterter, lesender FS-Provider +
         // lesender Doc-Provider — kein Explorer-, Deps-, Web- oder
@@ -4034,7 +4061,14 @@ mod tests {
         );
         assert_eq!(
             RegistryProfile::WorkspaceEdit.required_permissions(),
-            set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
+            // `ExecuteProcess` nur wegen `cargo.test_one`; die Roster-Klemme und
+            // `granted_for_ir(.., narrow_to_manifest = true)` entziehen es
+            // jedem Worker, dessen Manifest das Werkzeug nicht führt.
+            set(&[
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess
+            ])
         );
         assert_eq!(
             RegistryProfile::MatrixReader.required_permissions(),
@@ -4063,8 +4097,8 @@ mod tests {
 
     /// `WorkspaceEdit` (Runde 3, Welle D): exakt `fs.*` inklusive
     /// `fs.write`, `doc.read_pdf`, `explore.*` und `deps.graph`/
-    /// `deps.locked` — nie `shell.*`, `process.*`, `web.*`, `lens.ask`,
-    /// `browser.*` oder `deps.source_*`; registriert wie beworben.
+    /// `deps.locked` plus `cargo.test_one` — nie `shell.*`, `process.*`, `web.*`,
+    /// `lens.ask`, `browser.*`, andere `cargo.*` oder `deps.source_*`; registriert wie beworben.
     #[test]
     fn test_workspace_edit_profile_exact_tool_surface() -> TestResult {
         let expected = vec![
@@ -4082,6 +4116,7 @@ mod tests {
             "explore.find",
             "deps.graph",
             "deps.locked",
+            "cargo.test_one",
         ];
         assert_eq!(RegistryProfile::WorkspaceEdit.tool_names(), expected);
         for tool in RegistryProfile::WorkspaceEdit.tool_names() {

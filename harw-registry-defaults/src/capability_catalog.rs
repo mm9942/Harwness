@@ -207,6 +207,7 @@ pub mod providers {
     provider!(SUDO, "sudo", "harw-tool-shell", "tool-sudo");
     provider!(JOB, "job", "harw-tool-job", "tool-job");
     provider!(PROCESS, "process", "harw-tool-process", "tool-process");
+    provider!(CARGO, "cargo", "harw-tool-cargo", "tool-cargo");
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
     provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
@@ -240,6 +241,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "knowledge",
     "matrix",
     "tool-browser",
+    "tool-cargo",
     "tool-container",
     "tool-deps",
     "tool-doc",
@@ -396,6 +398,19 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
+    // cargo: only `cargo.test_one` is registered (profile.rs) and carries a
+    // right (`authority::tool_permission`); the rows exist so the catalog
+    // matches `CargoToolProvider::TOOL_NAMES`. They run through the sandboxed
+    // `shell.exec` executor, hence the `Shell` class.
+    row!("cargo.check", CARGO, Shell),
+    row!("cargo.build", CARGO, Shell),
+    row!("cargo.clippy", CARGO, Shell),
+    row!("cargo.test", CARGO, Shell),
+    row!("cargo.fmt_check", CARGO, Shell),
+    row!("cargo.tree", CARGO, Shell),
+    row!("cargo.doc", CARGO, Shell),
+    row!("cargo.metadata", CARGO, Shell),
+    row!("cargo.test_one", CARGO, Shell),
     // plan mode
     row!("plan.write", PLAN, WriteOther),
     row!("plan.exit", PLAN, Interaction),
@@ -570,7 +585,7 @@ mod tests {
     /// (agents, authoring, sudo, latex, matrix, ...) are not listed here.
     #[test]
     fn test_catalog_rows_match_provider_tool_names() -> Result<(), String> {
-        let parity: [(&ToolProvider, &[&[&str]]); 11] = [
+        let parity: [(&ToolProvider, &[&[&str]]); 12] = [
             (
                 &providers::DOC,
                 &[harw_tool_doc::DocToolProvider::TOOL_NAMES],
@@ -599,6 +614,10 @@ mod tests {
             (
                 &providers::PROCESS,
                 &[harw_tool_process::ProcessToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::CARGO,
+                &[harw_tool_cargo::CargoToolProvider::TOOL_NAMES],
             ),
             (
                 &providers::PLAN,

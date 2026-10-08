@@ -1212,7 +1212,7 @@ mod tests {
     };
     use harw_extension_api::contributors::ToolProvider;
     use harw_tools::{ToolName, ToolSpec};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> TestResult<T> {
@@ -1606,6 +1606,177 @@ mod tests {
                 64
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    /// Skriptet die drei Phasen von `cargo.test_one`: Metadata-Zwischendatei,
+    /// `git status` und den eigentlichen `cargo test`-Lauf.
+    fn test_one_shell(ws: &std::path::Path, dirty: &'static str) -> Arc<ScriptedShell> {
+        let dep =
+            |name: &str| json!({"name": name, "source": null, "kind": null, "path": ws.join(name)});
+        let package = |name: &str, deps: Vec<Value>, targets: Value| {
+            json!({
+                "name": name,
+                "manifest_path": format!("{}/{name}/Cargo.toml", ws.display()),
+                "dependencies": deps,
+                "targets": targets
+            })
+        };
+        let lib = |name: &str| json!([{"name": name, "kind": ["lib"]}]);
+        let doc = json!({
+            "workspace_root": ws.to_string_lossy(),
+            "packages": [
+                package("low", vec![], lib("low")),
+                package("mid1", vec![dep("low")], lib("mid1")),
+                package("mid2", vec![dep("low")], lib("mid2")),
+                package("mid3", vec![dep("low")], lib("mid3")),
+                package(
+                    "app",
+                    vec![dep("mid1"), dep("mid2"), dep("mid3")],
+                    json!([{"name": "app", "kind": ["lib"]}, {"name": "it", "kind": ["test"]}])
+                ),
+            ]
+        });
+        let ws = ws.to_path_buf();
+        ScriptedShell::with(move |command| {
+            let ok = |stdout: &str| {
+                harw_tools::ToolOutput::json(
+                    json!({"exit_code": 0, "stdout": stdout, "stderr": "", "truncated": false}),
+                )
+            };
+            if command.starts_with("mkdir -p") {
+                let target = command
+                    .rsplit(" > ")
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('\'')
+                    .to_owned();
+                let path = ws.join(target);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, doc.to_string());
+                ok("")
+            } else if command.starts_with("git rev-parse") {
+                ok(dirty)
+            } else {
+                ok(
+                    "running 1 test\ntest tests::x ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+                )
+            }
+        })
+    }
+
+    fn cargo_test_calls(shell: &ScriptedShell) -> Vec<String> {
+        shell
+            .calls()
+            .into_iter()
+            .map(|(command, _)| command)
+            .filter(|command| command.starts_with("cargo test"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_one_refuses_dirty_low_level_crate_without_issuing_cargo_test() -> TestResult {
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let shell = test_one_shell(&fx.ws, "\n M low/src/lib.rs\0");
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let value = json_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "lib", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert_eq!(value["status"], "refused");
+        assert_eq!(value["reason"], "would_recompile");
+        assert_eq!(value["rebuild_count"], 5);
+        assert_eq!(value["threshold"], guard::MAX_REBUILD_PACKAGES);
+        assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_one_clean_tree_issues_exactly_one_exact_test_call() -> TestResult {
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let shell = test_one_shell(&fx.ws, "\n");
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let value = json_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "test:it", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(value["tests"]["passed"], 1);
+        assert_eq!(value["guard"]["rebuild_count"], 0);
+        let calls = cargo_test_calls(&shell);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let command = &calls[0];
+        assert!(
+            command.starts_with("cargo test -p app --test it "),
+            "{command}"
+        );
+        assert!(command.ends_with(" tests::x -- --exact"), "{command}");
+        assert!(!command.contains("--workspace"), "{command}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_one_rejects_unknown_package_and_target_before_running() -> TestResult {
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let shell = test_one_shell(&fx.ws, "\n");
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let unknown_package = error_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "nope", "target": "lib", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert!(
+            unknown_package.contains("not a workspace member"),
+            "{unknown_package}"
+        );
+        let unknown_test = error_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "test:missing", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert!(
+            unknown_test.contains("no integration test 'missing'"),
+            "{unknown_test}"
+        );
+        assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        assert!(
+            shell.calls().iter().all(|(c, _)| !c.starts_with("git ")),
+            "no change detection before the target is validated: {:?}",
+            shell.calls()
         );
         Ok(())
     }

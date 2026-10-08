@@ -102,6 +102,16 @@ pub const GENERIC_UIA_WORKER_BASE: &str = role_names::UIA_EXPLORER;
 /// seinen Auftrag). Keine Shell, kein Netz.
 pub const GENERIC_WORKER_WRITE_TOOLS: &[&str] = &["fs.write", "fs.edit"];
 
+/// Definitions-Id des mitgelieferten `test-engineer` (`harw-home`-Bundle).
+pub const TEST_ENGINEER_DEFINITION_ID: &str = "harwness.agent.test-engineer@1";
+
+/// Werkzeuge, die zusätzlich zu [`GENERIC_WORKER_WRITE_TOOLS`] **nur** der
+/// `test-engineer` über der generischen Worker-Decke behält: `cargo.test_one`
+/// (genau ein Test hinter dem Rebuild-Wächter; weder `shell.exec` noch andere
+/// `cargo.*`). Kein anderer generischer Worker bekommt es, auch wenn seine
+/// Definition es admittiert — die Klemme entfernt es dort.
+pub const TEST_ENGINEER_EXTRA_TOOLS: &[&str] = crate::profile::CARGO_TEST_ONE_TOOLS;
+
 /// Das Registry-Profil eines generischen schreibenden Workers:
 /// Workspace lesen und schreiben, ohne `shell.*` und ohne `web.*`.
 pub const GENERIC_WRITING_WORKER_PROFILE: RegistryProfile = RegistryProfile::WorkspaceEdit;
@@ -388,6 +398,9 @@ impl AgentRoster {
             } else {
                 Vec::new()
             };
+            if writes && id.as_str() == TEST_ENGINEER_DEFINITION_ID {
+                extra_allowed.extend_from_slice(TEST_ENGINEER_EXTRA_TOOLS);
+            }
             // A custom orchestrator with a `[work_driver]` section gets
             // `work_driver.enqueue/status/stop` from lowering; without this
             // they would be dropped again here because the base ceiling
@@ -963,6 +976,59 @@ max_tokens = 999999
             !RegistryProfile::WorkspaceEdit
                 .tool_names()
                 .contains(&"web.fetch")
+        );
+        Ok(())
+    }
+
+    /// `cargo.test_one` bleibt nur dem `test-engineer` (Definitions-Id
+    /// [`TEST_ENGINEER_DEFINITION_ID`]); ein anderer generischer Schreib-Worker
+    /// verliert es, und `shell.exec` fällt in beiden Fällen weg.
+    #[test]
+    fn only_the_test_engineer_keeps_cargo_test_one() -> TestResult {
+        let builtin = builtin()?;
+        let tools = r#""fs.read", "fs.write", "cargo.test_one", "cargo.test", "shell.exec""#;
+        let (_home, config) = discover(&[
+            (
+                "test-engineer",
+                worker(
+                    TEST_ENGINEER_DEFINITION_ID,
+                    "test-engineer",
+                    "harwness.agent.worker-base@1",
+                    tools,
+                )
+                .as_str(),
+            ),
+            (
+                "other-writer",
+                worker(
+                    "user.agent.other-writer@1",
+                    "other-writer",
+                    "harwness.agent.worker-base@1",
+                    tools,
+                )
+                .as_str(),
+            ),
+        ])?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let engineer = roster
+            .entry("test-engineer")
+            .ok_or(TestError::Missing("test-engineer"))?;
+        assert_eq!(
+            engineer.tools,
+            [
+                "fs.read",
+                "fs.write",
+                "cargo.test_one",
+                "skills.search",
+                "skills.load"
+            ]
+        );
+        let other = roster
+            .entry("other-writer")
+            .ok_or(TestError::Missing("other-writer"))?;
+        assert_eq!(
+            other.tools,
+            ["fs.read", "fs.write", "skills.search", "skills.load"]
         );
         Ok(())
     }
