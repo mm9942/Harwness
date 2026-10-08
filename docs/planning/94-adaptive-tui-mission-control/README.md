@@ -48,6 +48,16 @@ All three status windows are always logically distinct, separately bordered, ind
 
 PL-68 already shipped an initial PortraitDock; PL-94 is a **functional extension and aspect-aware redesign**, not a claim that the existing top dock is missing.
 
+### 1.1 CURRENT: default-unblocked orchestrator handoff (preserve, do not reimplement)
+
+**Operator correction (2026-10-08):** concurrent chat and running orchestrator work is an **existing behavior**, not a PL-94 future feature. At the verified dev baseline, `harw-tui/src/app/background_agents.rs::BackgroundLauncher::wants_background` chooses background execution for a TUI-root admission into an orchestrator role unless `background: false` is explicitly specified. It detaches the already-admitted child while the UIA/chat continues and delivers bounded status/results through the existing queue (`collect_finished`, `take_auto_turn`, `attach_queued_notices`). Unit tests in `harw-tui/src/app/background_agents/tests.rs` cover immediate handoff, running status, auto-turn and busy-turn queued notice.
+
+**Scope and exceptions:** this default applies to TUI-root orchestrator handoffs, not every model/tool action. Worker targets remain synchronous, and `/new`, `/resume` and TUI shutdown currently cancel running background children. The external plan editor (`/plan edit`) is also not busy-safe. Do not document universal interruption-free session switching until these limits have been separately reviewed.
+
+Existing `harw-tui/src/agent_tree.rs` provides an interactive agent tree (selection, folding, detail) and `harw-tui/src/agent_tree_live.rs` derives live counters and phases without execution authority. The current `scroll_routing.rs` separates agent-panel scrolling from chat; it does **not** establish a general-purpose root-child transcript jump or unrestricted access to a child's private context.
+
+**PL-94 UX DELTA is navigation and observation only:** keep the chat/composer usable while an orchestrator continues; preserve per-pane scroll and typed Plan/Goal progress; add a focus-preserving `Root Orchestrator` navigation target, anchored to its authorized agent-tree row and available bounded status/evidence/progress in the current UIA session. Returning to Chat must restore unsent composer text and the previous scroll position. **A visual jump is never `/new` or `/resume`, never a job restart and never implicit cross-agent transcript/context sharing.** Full child conversation content must remain behind existing explicit visibility and permission checks.
+
 ## 2. TARGET: adaptive layout based on terminal x/y
 
 ### 2.1 Orientation is derived from geometry, never an OS or device name
@@ -238,7 +248,7 @@ Parallelism policy: new PL-94 branch and separate Draft PR, own worktrees and fi
 | 1x1 and 0x0 | No panic, no rectangle overflow or subtraction underflow |
 | x/y crossing on live resize | Reclassify and redraw immediately, preserve focus/selection and running jobs |
 
-Also test non-overlapping rects and **five independently bordered windows in landscape**; in portrait only **three status windows + compact progress strip + Chat, no expanded second-output window**. Verify landscape anchors (center Status/WIP, right Agents/Jobs), modal priority, Unicode cell width, no leaked raw reasoning, independent scrolling and keybindings. Rotating mid-turn must not spawn/cancel the progress observer.
+Also test non-overlapping rects and **five independently bordered windows in landscape**; in portrait only **three status windows + compact progress strip + Chat, no expanded second-output window**. Verify landscape anchors (center Status/WIP, right Agents/Jobs), modal priority, Unicode cell width, no leaked raw reasoning, independent scrolling and keybindings. Rotating mid-turn must not spawn/cancel the progress observer. **Background UX regression:** start a root orchestrator with its default unblocked handoff, continue chatting and reviewing plans via UIA, select its live row/details, then return to the original chat draft and scroll position. No re-admission, context pooling, hidden reasoning exposure, or unintended cancellation. Record separately any existing busy-only plan-editor limitation.
 
 **Observer tests:** exactly three most recent *user-authored* committed messages; correct session/turn/tenant; a background child with same trace never leaks private transcript; stale update is rejected; active agent turn advances; session resume rehydrates cursor; job failure is not called verified success; no raw agent reasoning; no side-effect tools; two concurrent sessions get independent WIP; missing provider uses deterministic fallback; no unbounded full-history re-scan.
 
