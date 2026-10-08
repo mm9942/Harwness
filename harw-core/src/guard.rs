@@ -150,11 +150,34 @@ pub trait PitfallAdvisor: Send + Sync {
     /// Vertrag der Implementierung); sonst `None`.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String>;
 
-    /// Runde 9, E3: meldet einen **erfolgreichen** Aufruf. Ein Berater
-    /// verwirft daraufhin die Pitfalls, die auf genau diesen Aufruf passten —
-    /// ein gelöster Fehler hängt danach nicht mehr an späteren Ergebnissen.
-    /// Der Default tut nichts.
+    /// Sessiongebundene Variante. Ein gemeinsam montierter Advisor darf
+    /// den privaten Laufzustand einer anderen Session nicht beeinflussen.
+    /// Bestehende zustandslose Implementierungen bleiben kompatibel.
+    #[must_use]
+    fn advise_in_session(
+        &self,
+        _session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        self.advise(tool_name, arguments)
+    }
+
+    /// Legacy-Aufruf ohne Sessionbindung; neue Runtime-Aufrufer verwenden
+    /// resolved_in_session und dürfen diesen Aufruf nicht direkt benutzen.
     fn resolved(&self, _tool_name: &str, _arguments: &serde_json::Value) {}
+
+    /// Der Erfolg darf nur einen Hinweis in derselben Session auflösen.
+    /// Ein bestätigter, dauerhaft gültiger Fix gehört stattdessen durch
+    /// die separate Learning-/Verification-Gate in den Knowledge-Store.
+    fn resolved_in_session(
+        &self,
+        _session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) {
+        self.resolved(tool_name, arguments);
+    }
 }
 
 /// Wird nach jeder Modellrunde und jedem Tool-Ergebnis benachrichtigt, damit
