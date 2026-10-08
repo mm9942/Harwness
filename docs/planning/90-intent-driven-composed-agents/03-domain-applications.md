@@ -21,7 +21,7 @@ abstract composed agent (shared)
 
 A poor implementation dumps entire repository lists into model context. The good one indexes/searches deterministically and passes minimal candidates. Each result should include path:line, symbol, commit, why relevant and next uncertainty. A bounded explorer may choose whether to inspect `Cargo.lock`, a feature flag, a test fixture or a generated client after evidence, not before. No tool call is a sign of progress unless it advances coverage or narrows an unknown.
 
-**Suggested skills:** structural exploration, call-path tracing, dependency tracing, architecture map. Nested cognitive chains may perform recursive graph exploration without generating new OS processes/agents. Only an admitted ChildOrchestrator can spawn worker explorers.
+**Suggested skills:** structural exploration, call-path tracing, dependency tracing, architecture map. Nested cognitive chains may perform recursive graph exploration without generating new OS processes/agents. An admitted RootOrchestrator **or** ChildOrchestrator can spawn worker explorers under the sealed role matrix, named target admission, depth and effective rights (see `harw-agent-dsl/src/roles.rs` and Root `[delegation].targets`). A dedicated ChildOrchestrator is optional, not required for Root→explorer.
 
 **Acceptance:** answer coverage, cited path/line anchors, explicit unknowns, no read outside scope, no gigantic transcript; adversarial test with misleading README and conflicting implementation.
 
@@ -51,7 +51,7 @@ Represent competing hypotheses and evidence for/against each; keep links, observ
 
 ### 6. Matrix Game: retain game engine authority
 
-**CURRENT:** `matrix-game-master` is its own UIA-spawned RootOrchestrator, per `harw-registry-defaults/agents/matrix-game-master.toml`; `harw-ops/src/matrix/game_master.rs` and `docs/design/matrix-game.md` own deterministic game phases, dice, seats and approvals. `matrix.start/run/finish` remain approval-gated; the game master cannot acquire unrestricted network/shell or become arbitrary child of a different root.
+**CURRENT:** `matrix-game-master` is its own UIA-spawned RootOrchestrator, per `harw-registry-defaults/agents/matrix-game-master.toml`; `harw-matrix-game/src/{phases,dice,state,visibility}.rs` owns deterministic game phases, dice, seat state and replay. `harw-ops/src/matrix/runner.rs` manages seat execution; `harw-ops/src/matrix/game_master.rs` provides approval-gated operations. `docs/design/matrix-game.md` documents the boundary. `matrix.start/run/finish` remain approval-gated; the game master cannot acquire unrestricted network/shell or become arbitrary child of a different root.
 
 **TARGET v1 (compatible):** an intent-addressable Matrix Game facade from UIA, wrapping existing Master and engine. An optional `matrix-research-suborchestrator` prepares the evidence snapshot *before* UIA admission; because UIA cannot directly spawn arbitrary ChildOrchestrators and Master is root, orchestration must respect route ownership and perhaps run sequential handoffs with typed evidence package instead of pretending an illegal root-to-root hierarchy. A future `matrix-suborchestrator` may only exist after explicit role and authority design/test, not by relabeling the master.
 
@@ -59,7 +59,7 @@ Represent competing hypotheses and evidence for/against each; keep links, observ
 
 ### 7. Business writing: claims first, edits second
 
-**CURRENT:** `business-writing-pyramid` skill defines answer-first SCQ, logical grouping and evidence per claim. `author-review-pipeline` and `business-author` / `business-reviewer` separate draft, independent review and final approval. **TARGET:** `business-paper-composed-agent` accepts audience, decision, evidence set, narrative contract, scope and output. It builds a claim graph, asks for missing/rebutting evidence, drafts a bounded storyline, has an independent review, and reorients sections when evidence invalidates a claim.
+**CURRENT:** The `business-author` is a write-enabled Worker and `business-reviewer` a read-only Worker, while `author-review-pipeline` is a *skill/workflow contract*, not an implemented typed pipeline. `PaperPackageV1` is proposed. The `business-writing-pyramid` skill defines answer-first SCQ, logical grouping and evidence per claim. `author-review-pipeline` and `business-author` / `business-reviewer` separate draft, independent review and final approval. **TARGET:** `business-paper-composed-agent` accepts audience, decision, evidence set, narrative contract, scope and output. It builds a claim graph, asks for missing/rebutting evidence, drafts a bounded storyline, has an independent review, and reorients sections when evidence invalidates a claim.
 
 Writing-cycle states: `Researching` → `StorylineProposed` → `StorylineReviewed` → `DraftInProgress` → `EvidenceReviewed` → `Approved`. These are *milestones*, not an obligatory order of repeated generation; a late source conflict may return to research. The reviewer never self-writes the approved content and the author never silently marks its own unsupported assertion reviewed. Draft writes occur in small sections with stable IDs and immutable approved storyline revision.
 
@@ -67,7 +67,7 @@ Writing-cycle states: `Researching` → `StorylineProposed` → `StorylineReview
 
 ### 8. Scientific-business paper and LaTeX output
 
-**CURRENT:** `latex-report`, `latex-writing`, `xelatex-compile`, `uia-latex-writer`, `latex.template/check/build`, `harw-report.sty` and `business-paper.tex`. UIA spawns this specialized UiaWorker; Root and ChildOrchestrator cannot spawn it. **TARGET:** a paper generation recipe hands a *reviewed* package back to UIA and then to the LaTeX worker. A `research-paper` template would extend current template-kind catalogue without breaking Matrix's existing `business-paper` consumer.
+**CURRENT:** `harw-tool-shell/src/latex/template.rs::TemplateKind` currently supports exactly `Bericht`, `BusinessPaper`, and `Handbuch`; `ResearchPaper` would need a compatible enum/parser/template implementation. Only UIA can start the special `uia-latex-writer` role through the current role matrix. **CURRENT:** `latex-report`, `latex-writing`, `xelatex-compile`, `uia-latex-writer`, `latex.template/check/build`, `harw-report.sty` and `business-paper.tex`. UIA spawns this specialized UiaWorker; Root and ChildOrchestrator cannot spawn it. **TARGET:** a paper generation recipe hands a *reviewed* package back to UIA and then to the LaTeX worker. A `research-paper` template would extend current template-kind catalogue without breaking Matrix's existing `business-paper` consumer.
 
 Rendering algorithm: validate package → materialize semantic section sources → render bounded chapters → compile without shell escape → inspect diagnostics/page layout → fix only typography/source encoding → recompile up to explicit iteration cap → report PDF/TeX/Markdown provenance. Failed compilation cannot authorize rewriting business claims. Truncated LLM output is solved through sectional writing and checkpoints, not larger single tool responses. Every scientific claim retains citation; mock citations are not acceptable.
 
