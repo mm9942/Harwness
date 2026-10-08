@@ -423,6 +423,13 @@ pub trait CycleStepExecutor: Send {
         cancel: &CancelToken,
     ) -> impl Future<Output = Result<CycleObservations, StepFailure>> + Send;
 
+    /// Called by the driver with the freshly reissued authority whenever a
+    /// new lease epoch takes the cycle over, before any step of that lease
+    /// runs. Executors that keep their own [`AuthorityContext`] replace it
+    /// here so permission checks use the current lease's authority. The
+    /// default does nothing (for executors that hold no authority).
+    fn rebind_authority(&mut self, _authority: &AuthorityContext) {}
+
     /// Establishes what happened to a step journaled by an earlier lease,
     /// typically by looking up `step.idempotency_key`.
     fn reconcile(&mut self, step: &InFlightStep)
@@ -594,6 +601,7 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             record = self
                 .blocking(move |store| store.rebind(&id, &lease, &resumed))
                 .await?;
+            self.executor.rebind_authority(&reissued);
             admission
         };
         if let Some(step) = record.in_flight.clone() {
@@ -1062,6 +1070,7 @@ mod tests {
         results: VecDeque<Result<CycleObservations, StepFailure>>,
         reconciliation: StepReconciliation,
         executed: Arc<Mutex<Vec<String>>>,
+        rebinds: Arc<Mutex<u32>>,
     }
 
     impl Executor {
@@ -1070,11 +1079,18 @@ mod tests {
                 results: results.into(),
                 reconciliation: StepReconciliation::NotStarted,
                 executed: Arc::new(Mutex::new(Vec::new())),
+                rebinds: Arc::new(Mutex::new(0)),
             }
         }
     }
 
     impl CycleStepExecutor for Executor {
+        fn rebind_authority(&mut self, _authority: &AuthorityContext) {
+            if let Ok(mut rebinds) = self.rebinds.lock() {
+                *rebinds += 1;
+            }
+        }
+
         fn execute(
             &mut self,
             step: &InFlightStep,
@@ -1392,6 +1408,51 @@ mod tests {
             "the dropped step is not counted"
         );
         assert_eq!(checkpoint.fence.epoch, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn takeover_rebinds_the_executor_to_the_reissued_authority_once() -> TestResult {
+        let fx = fixture("cycle-rebind")?;
+        crash_mid_step(&fx, "cycle-rebind")?;
+        let proposer = Script::new(vec![Ok(CycleProposal::Failed {
+            reason: "stop".to_owned(),
+        })]);
+        let executor = Executor::new(vec![]);
+        let rebinds = Arc::clone(&executor.rebinds);
+        let mut driver = driver(&fx, proposer, executor, rights()?);
+        driver
+            .run(
+                "cycle-rebind",
+                &token(&fx.work_id, 2),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver resumes"))?;
+        assert_eq!(rebinds.lock().map(|n| *n).ok(), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuing_lease_does_not_rebind() -> TestResult {
+        let fx = fixture("cycle-norebind")?;
+        let proposer = Script::new(vec![Ok(CycleProposal::Failed {
+            reason: "stop".to_owned(),
+        })]);
+        let executor = Executor::new(vec![]);
+        let rebinds = Arc::clone(&executor.rebinds);
+        let mut driver = driver(&fx, proposer, executor, rights()?);
+        driver
+            .run(
+                "cycle-norebind",
+                &token(&fx.work_id, 0),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver runs"))?;
+        assert_eq!(rebinds.lock().map(|n| *n).ok(), Some(0));
         Ok(())
     }
 

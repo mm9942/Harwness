@@ -45,9 +45,16 @@
 //! `Auth`, `QuotaExceeded`, `ContextLength`, `Refusal`, `Cancelled` and all
 //! other non-retryable errors fail immediately. Retryable errors
 //! ([`ModelError::is_retryable`]) are retried up to
-//! [`ProposerConfig::max_retries`] times without sleeping: this crate has no
-//! timer dependency and the provider layer owns pacing and `Retry-After`
-//! handling (a documented deferral). After
+//! [`ProposerConfig::max_retries`] times with a bounded backoff
+//! ([`retry_wait`]): `RateLimited` waits `retry_after_secs`, `Transient`
+//! waits its `retry_after_secs` or else [`ProposerConfig::retry_base_delay`],
+//! and `Timeout` waits `retry_base_delay`. A provider-requested wait above
+//! [`ProposerConfig::retry_max_wait`] (default 5 s) is NOT slept: the call
+//! returns `Err` at once with a reason naming the requested and the maximum
+//! wait, so a cycle step never blocks for long inside the proposer (the
+//! provider layer's 30 s fallback for an unparsable `Retry-After` therefore
+//! fails fast). A zero delay skips the timer entirely, which is how tests stay
+//! deterministic. After
 //! [`ProposerConfig::auth_trip_after`] consecutive `Auth` failures a route
 //! is not used again by this proposer instance; the other configured route
 //! takes over if there is one, otherwise `propose` fails without calling the
@@ -60,6 +67,7 @@
 //! token through the trait is follow-up work.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use harw_core::{ConversationHistory, ModelError, ModelProvider, ModelRequest};
 use harw_extension_api::LoadedInstructions;
@@ -67,7 +75,8 @@ use harw_types::{ModelId, ReasoningEffort};
 
 use crate::cycle_runtime::{CycleProposer, StepFailure};
 use crate::intent_cycle::{
-    CycleAdmission, CycleCheckpoint, CycleProposal, CycleRefusal, EvidenceSourceKind, EvidenceTrust,
+    CycleAdmission, CycleCheckpoint, CycleProposal, CycleRefusal, EvidenceSourceKind,
+    EvidenceTrust, is_prompt_safe_char,
 };
 
 /// One `(model, effort, max output tokens)` choice.
@@ -228,6 +237,12 @@ pub struct ProposerConfig {
     pub prompt: PromptLimits,
     /// Retries per model call for retryable provider errors.
     pub max_retries: u32,
+    /// Wait before retrying a `Transient` (without `retry_after_secs`) or
+    /// `Timeout` error. Zero disables the wait.
+    pub retry_base_delay: Duration,
+    /// Longest wait the proposer sleeps for one retry. A provider-requested
+    /// wait above it makes the call fail immediately instead of sleeping.
+    pub retry_max_wait: Duration,
     /// Consecutive `Auth` failures after which a route is no longer used.
     pub auth_trip_after: u32,
     /// Model output longer than this is treated as unparseable.
@@ -239,6 +254,8 @@ impl Default for ProposerConfig {
         Self {
             prompt: PromptLimits::default(),
             max_retries: 2,
+            retry_base_delay: Duration::from_millis(250),
+            retry_max_wait: Duration::from_secs(5),
             auth_trip_after: 2,
             max_response_chars: 16_000,
         }
@@ -356,16 +373,16 @@ fn cap(text: &str, max: usize) -> String {
 
 /// Identifier-safe rendering: anything outside a small ASCII set becomes `?`
 /// (so whitespace, quotes and prose cannot carry instructions), then capped.
+///
+/// The set is [`is_prompt_safe_char`], the same one
+/// [`CycleAdmission::new`] enforces on every admitted target id, so for an
+/// admitted id this is the identity apart from the length cap. Only ids that
+/// do not come from admission (evidence locators, the intent id) can still be
+/// rewritten to `?`.
 fn clean_id(text: &str, max: usize) -> String {
     let safe: String = text
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@' | '#') {
-                c
-            } else {
-                '?'
-            }
-        })
+        .map(|c| if is_prompt_safe_char(c) { c } else { '?' })
         .collect();
     cap(&safe, max)
 }
@@ -565,6 +582,30 @@ fn error_kind(error: &ModelError) -> &'static str {
     }
 }
 
+/// How long to wait before retrying `error`, or the rejected over-long wait.
+///
+/// `Ok(wait)` is the delay to sleep (possibly zero); `Err(requested)` means
+/// the provider asked for more than [`ProposerConfig::retry_max_wait`].
+/// Non-retryable errors yield `Ok(Duration::ZERO)`; callers check
+/// [`ModelError::is_retryable`] first.
+fn retry_wait(error: &ModelError, config: &ProposerConfig) -> Result<Duration, Duration> {
+    let requested = match error {
+        ModelError::RateLimited {
+            retry_after_secs, ..
+        } => Duration::from_secs(*retry_after_secs),
+        ModelError::Transient {
+            retry_after_secs, ..
+        } => retry_after_secs.map_or(config.retry_base_delay, Duration::from_secs),
+        ModelError::Timeout { .. } => config.retry_base_delay,
+        _ => Duration::ZERO,
+    };
+    if requested > config.retry_max_wait {
+        Err(requested)
+    } else {
+        Ok(requested)
+    }
+}
+
 /// A [`CycleProposer`] backed by a [`ModelProvider`]. See the module docs.
 pub struct ModelCycleProposer {
     provider: Arc<dyn ModelProvider>,
@@ -618,7 +659,7 @@ impl ModelCycleProposer {
             })
     }
 
-    /// One logical model call with bounded, non-sleeping retries.
+    /// One logical model call with bounded retries with capped backoff.
     async fn call(
         &mut self,
         slot: RouteSlot,
@@ -650,7 +691,23 @@ impl ModelCycleProposer {
                     return Ok(String::new());
                 }
                 Err(error) if error.is_retryable() && attempt < self.config.max_retries => {
-                    attempt += 1;
+                    match retry_wait(&error, &self.config) {
+                        Ok(wait) => {
+                            attempt += 1;
+                            if !wait.is_zero() {
+                                tokio::time::sleep(wait).await;
+                            }
+                        }
+                        Err(requested) => {
+                            return Err(StepFailure::new(format!(
+                                "model route {}: {}; provider asked to wait {}s, over the {}s retry maximum",
+                                slot.name(),
+                                error_kind(&error),
+                                requested.as_secs(),
+                                self.config.retry_max_wait.as_secs()
+                            )));
+                        }
+                    }
                 }
                 Err(error) => {
                     if matches!(error, ModelError::Auth { .. }) {
@@ -856,7 +913,12 @@ mod tests {
 
     fn proposer(provider: &Arc<Scripted>) -> ModelCycleProposer {
         let provider: Arc<dyn ModelProvider> = Arc::clone(provider) as Arc<dyn ModelProvider>;
-        ModelCycleProposer::new(provider, policy())
+        // Zero retry delays keep the tests fast and deterministic.
+        let config = ProposerConfig {
+            retry_base_delay: Duration::ZERO,
+            ..ProposerConfig::default()
+        };
+        ModelCycleProposer::with_config(provider, policy(), config)
     }
 
     fn user_text(request: &ModelRequest) -> String {
@@ -1029,31 +1091,65 @@ mod tests {
         Ok(())
     }
 
+    /// Every [`CycleRefusal`] variant. The exhaustive `match` (no wildcard)
+    /// stops compiling when a variant is added, forcing this list, and thus
+    /// the hint test, to be extended.
+    fn all_refusals() -> Vec<CycleRefusal> {
+        use CycleRefusal::*;
+        let all = vec![
+            InvalidIntent,
+            InvalidLimits,
+            InvalidTarget,
+            UnsupportedSchema,
+            AlreadyTerminal,
+            Exhausted,
+            Stalled,
+            EmptyOrOversizedGraph,
+            DuplicateSegment,
+            InvalidJoin,
+            ReadNotAllowed,
+            WriteNotAllowed,
+            ChildNotAllowed,
+            RecipeNotAllowed,
+            ChainDepthExceeded,
+            SpawnDepthExceeded,
+            MissingEvidence,
+            UnknownClaim,
+            IncompleteAcceptance,
+            InvalidReason,
+            CeilingMismatch,
+        ];
+        for refusal in &all {
+            match refusal {
+                InvalidIntent
+                | InvalidLimits
+                | InvalidTarget
+                | UnsupportedSchema
+                | AlreadyTerminal
+                | Exhausted
+                | Stalled
+                | EmptyOrOversizedGraph
+                | DuplicateSegment
+                | InvalidJoin
+                | ReadNotAllowed
+                | WriteNotAllowed
+                | ChildNotAllowed
+                | RecipeNotAllowed
+                | ChainDepthExceeded
+                | SpawnDepthExceeded
+                | MissingEvidence
+                | UnknownClaim
+                | IncompleteAcceptance
+                | InvalidReason
+                | CeilingMismatch => {}
+            }
+        }
+        all
+    }
+
     #[test]
     fn refusal_hints_are_fixed_text_for_every_variant() {
-        let all = [
-            CycleRefusal::InvalidIntent,
-            CycleRefusal::InvalidLimits,
-            CycleRefusal::InvalidTarget,
-            CycleRefusal::UnsupportedSchema,
-            CycleRefusal::AlreadyTerminal,
-            CycleRefusal::Exhausted,
-            CycleRefusal::Stalled,
-            CycleRefusal::EmptyOrOversizedGraph,
-            CycleRefusal::DuplicateSegment,
-            CycleRefusal::InvalidJoin,
-            CycleRefusal::ReadNotAllowed,
-            CycleRefusal::WriteNotAllowed,
-            CycleRefusal::ChildNotAllowed,
-            CycleRefusal::RecipeNotAllowed,
-            CycleRefusal::ChainDepthExceeded,
-            CycleRefusal::SpawnDepthExceeded,
-            CycleRefusal::MissingEvidence,
-            CycleRefusal::UnknownClaim,
-            CycleRefusal::IncompleteAcceptance,
-            CycleRefusal::InvalidReason,
-            CycleRefusal::CeilingMismatch,
-        ];
+        let all = all_refusals();
         let hints: BTreeSet<&str> = all.iter().map(|r| refusal_hint(*r)).collect();
         assert_eq!(hints.len(), all.len(), "hints are distinct and non-empty");
         for hint in &hints {
@@ -1336,6 +1432,87 @@ mod tests {
             Ok(CycleProposal::Complete {})
         );
         assert_eq!(provider.calls(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn over_long_retry_after_fails_immediately_without_sleeping() -> TestResult {
+        let provider = Scripted::new(vec![
+            Err(ModelError::RateLimited {
+                retry_after_secs: 3_600,
+                message: "429".to_owned(),
+            }),
+            Ok("{\"kind\":\"complete\"}".to_owned()),
+        ]);
+        let mut p = proposer(&provider);
+        let failure = run_once(&mut p, None)
+            .await?
+            .err()
+            .ok_or(TestError::Missing("expected an immediate failure"))?;
+        assert!(
+            failure.reason.contains("asked to wait 3600s")
+                && failure.reason.contains("5s retry maximum"),
+            "{}",
+            failure.reason
+        );
+        assert_eq!(provider.calls(), 1, "no retry after an over-cap wait");
+        Ok(())
+    }
+
+    #[test]
+    fn retry_wait_honours_retry_after_and_caps_it() {
+        let config = ProposerConfig::default();
+        let rate = |secs| ModelError::RateLimited {
+            retry_after_secs: secs,
+            message: String::new(),
+        };
+        let transient = |after| ModelError::Transient {
+            status: None,
+            retry_after_secs: after,
+            message: String::new(),
+        };
+        let timeout = ModelError::Timeout {
+            message: String::new(),
+        };
+        assert_eq!(retry_wait(&rate(2), &config), Ok(Duration::from_secs(2)));
+        assert_eq!(retry_wait(&rate(5), &config), Ok(Duration::from_secs(5)));
+        assert_eq!(retry_wait(&rate(6), &config), Err(Duration::from_secs(6)));
+        assert_eq!(
+            retry_wait(&transient(None), &config),
+            Ok(config.retry_base_delay)
+        );
+        assert_eq!(
+            retry_wait(&transient(Some(1)), &config),
+            Ok(Duration::from_secs(1))
+        );
+        assert_eq!(retry_wait(&timeout, &config), Ok(config.retry_base_delay));
+        let zero = ProposerConfig {
+            retry_base_delay: Duration::ZERO,
+            ..config
+        };
+        assert_eq!(retry_wait(&timeout, &zero), Ok(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn short_retry_delay_is_actually_slept() -> TestResult {
+        let provider = Scripted::new(vec![
+            Err(ModelError::Timeout {
+                message: "slow".to_owned(),
+            }),
+            Ok("{\"kind\":\"complete\"}".to_owned()),
+        ]);
+        let provider: Arc<dyn ModelProvider> = provider;
+        let config = ProposerConfig {
+            retry_base_delay: Duration::from_millis(30),
+            ..ProposerConfig::default()
+        };
+        let mut p = ModelCycleProposer::with_config(provider, policy(), config);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_once(&mut p, None).await?,
+            Ok(CycleProposal::Complete {})
+        );
+        assert!(started.elapsed() >= Duration::from_millis(30));
         Ok(())
     }
 

@@ -165,13 +165,28 @@ pub struct CycleTargets {
     pub recipes: BTreeSet<String>,
 }
 
+/// `true` for a character that prompt rendering reproduces verbatim.
+///
+/// The model-facing prompt (`cycle_proposer::render_prompt`) shows target ids
+/// through `clean_id`, which replaces every other character with `?`. An id
+/// with such a character would be shown mangled and the model could never
+/// name it back, so [`CycleAdmission::new`] rejects those ids up front and
+/// both sides use this one definition: ASCII alphanumerics and
+/// `- _ . / : @ #`.
+#[must_use]
+pub fn is_prompt_safe_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@' | '#')
+}
+
 impl CycleAdmission {
     /// Builds an admission from trusted runtime inputs.
     ///
     /// # Errors
     /// [`CycleRefusal::InvalidIntent`] for a malformed intent,
     /// [`CycleRefusal::InvalidLimits`] for unusable limits and
-    /// [`CycleRefusal::InvalidTarget`] for blank target identifiers.
+    /// [`CycleRefusal::InvalidTarget`] for blank target identifiers or ids
+    /// with a character outside the prompt-safe set
+    /// ([`is_prompt_safe_char`]).
     pub fn new(
         intent: IntentBinding,
         limits: CycleLimits,
@@ -189,10 +204,10 @@ impl CycleAdmission {
             &targets.children,
             &targets.recipes,
         ];
-        if all
-            .iter()
-            .any(|set| set.iter().any(|t| t.trim().is_empty()))
-        {
+        if all.iter().any(|set| {
+            set.iter()
+                .any(|t| t.is_empty() || !t.chars().all(is_prompt_safe_char))
+        }) {
             return Err(CycleRefusal::InvalidTarget);
         }
         Ok(Self {
@@ -1694,6 +1709,27 @@ mod tests {
             CycleAdmission::new(intent(), limits(), blank),
             Err(CycleRefusal::InvalidTarget)
         );
+        // Ids the prompt could not reproduce are rejected in every set.
+        for bad in ["a b", "a\"b", "ä", "a\nb", "a,b", "a;b"] {
+            for slot in 0..4 {
+                let mut unsafe_targets = targets();
+                let set = match slot {
+                    0 => &mut unsafe_targets.read,
+                    1 => &mut unsafe_targets.write,
+                    2 => &mut unsafe_targets.children,
+                    _ => &mut unsafe_targets.recipes,
+                };
+                set.insert(bad.to_owned());
+                assert_eq!(
+                    CycleAdmission::new(intent(), limits(), unsafe_targets),
+                    Err(CycleRefusal::InvalidTarget),
+                    "id {bad:?} in set {slot}"
+                );
+            }
+        }
+        let mut safe = targets();
+        safe.read.insert("src/lib.rs:12@v2#a-b_c".to_owned());
+        assert!(CycleAdmission::new(intent(), limits(), safe).is_ok());
         let mut first_with_predecessor = intent();
         first_with_predecessor.revision = 1;
         assert_eq!(

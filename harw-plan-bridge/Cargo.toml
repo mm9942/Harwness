@@ -58,7 +58,8 @@ jiff = { workspace = true }
 tracing = "0.1.44"
 # PL-90 W02: blockierende Store-Zugriffe des Cycle-Drivers laufen über
 # `spawn_blocking`, Abschlusssignal für `ExecutionControl` über `watch`.
-tokio = { version = "1", features = ["rt", "sync"] }
+# PL-90 W03: `time` für den begrenzten Retry-Backoff des Modell-Proposers.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
