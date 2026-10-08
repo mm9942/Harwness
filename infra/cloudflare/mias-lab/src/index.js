@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { AdaptiveLane, concurrencyBoundsForModel } from "./adaptive.js";
 
 const CONTROL_GATEWAY_ID = "mias-lab";
 const GATEWAY_POOL = [
@@ -22,7 +23,6 @@ const GATEWAY_POOL = [
   "new-worker-of-the-universe",
   "new-worker-of-the-multiverse",
 ];
-const MAX_GATEWAY_ATTEMPTS = 3;
 const DEFAULT_MODEL = "@cf/moonshotai/kimi-k2.7-code";
 const DEFAULT_CACHE_TTL_SECONDS = 1800;
 const CACHE_KEY_VERSION = "v1";
@@ -100,21 +100,6 @@ function cleanHeader(request, name, max = 96) {
 function normalizeModel(model) {
   const value = String(model || DEFAULT_MODEL).trim();
   return MODEL_ALIASES[value] || value;
-}
-
-function concurrencyLimitForModel(model) {
-  if (
-    model.includes("kimi-k2.7") ||
-    model.includes("kimi-k2.6") ||
-    model.includes("glm-5.3") ||
-    model.includes("glm-5.2")
-  ) {
-    return 2;
-  }
-  if (model.includes("gpt-oss-120b") || model.includes("deepseek-v4")) {
-    return 3;
-  }
-  return 6;
 }
 
 function fnv1a32(value) {
@@ -340,6 +325,7 @@ export class ModelLane extends DurableObject {
     this.inflight = 0;
     this.waiters = [];
     this.coalesced = new Map();
+    this.adaptive = null;
     this.gatewayState = GATEWAY_POOL.map(() => ({
       cooldownUntil: 0,
       consecutiveLimits: 0,
@@ -385,15 +371,40 @@ export class ModelLane extends DurableObject {
     }
   }
 
-  async acquire(limit) {
-    if (this.inflight < limit) {
+  ensureAdaptive(model) {
+    if (!this.adaptive) this.adaptive = new AdaptiveLane(concurrencyBoundsForModel(model));
+    return this.adaptive;
+  }
+
+  wakeWaiters() {
+    if (!this.adaptive || this.adaptive.isCoolingDown()) return;
+    while (this.waiters.length && this.inflight < this.adaptive.limit) {
+      const waiter = this.waiters.shift();
+      clearTimeout(waiter.timer);
+      this.inflight += 1; // Reserve capacity before waking.
+      waiter.resolve();
+    }
+  }
+
+  onSharedCapacity() {
+    if (!this.adaptive) return;
+    this.adaptive.onSharedCapacity();
+    for (const waiter of this.waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error("capacity_cooldown"));
+    }
+  }
+
+  async acquire(model) {
+    const adaptive = this.ensureAdaptive(model);
+    adaptive.noteDemand(this.inflight + this.waiters.length + 1);
+    if (adaptive.isCoolingDown()) throw new Error("capacity_cooldown");
+    this.wakeWaiters();
+    if (!this.waiters.length && this.inflight < adaptive.limit) {
       this.inflight += 1;
       return;
     }
-    if (this.waiters.length >= MAX_QUEUED_PER_MODEL) {
-      throw new Error("queue_full");
-    }
-
+    if (this.waiters.length >= MAX_QUEUED_PER_MODEL) throw new Error("queue_full");
     await new Promise((resolve, reject) => {
       const waiter = { resolve, reject, timer: null };
       waiter.timer = setTimeout(() => {
@@ -407,14 +418,7 @@ export class ModelLane extends DurableObject {
 
   release() {
     this.inflight = Math.max(0, this.inflight - 1);
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      clearTimeout(waiter.timer);
-      // Reserve the released permit before waking the waiter so a newly
-      // arriving request cannot steal the slot between resolve() and resume.
-      this.inflight += 1;
-      waiter.resolve();
-    }
+    this.wakeWaiters();
   }
 
   trackedStream(stream) {
@@ -469,22 +473,23 @@ export class ModelLane extends DurableObject {
   }
 
   async execute(request, body, model, affinity, cacheKey, cacheTtl, stream) {
-    const limit = concurrencyLimitForModel(model);
+    const adaptive = this.ensureAdaptive(model);
     try {
-      await this.acquire(limit);
+      await this.acquire(model);
     } catch (error) {
       const kind = String(error?.message || error);
       return json(
         { error: { type: "rate_limit_error", code: kind, message: "mias-lab model lane is busy" } },
         429,
         {
-          "retry-after": kind === "queue_timeout" ? "5" : "2",
-          "x-harw-concurrency-limit": String(limit),
+          "retry-after": kind === "capacity_cooldown" ? String(adaptive.retryAfterSeconds()) : kind === "queue_timeout" ? "5" : "2",
+          "x-harw-concurrency-limit": String(adaptive.limit),
           "x-harw-queue-depth": String(this.waiters.length),
         },
       );
     }
 
+    const limit = adaptive.limit;
     let streamOwnsPermit = false;
     const cacheEnabled = shouldUseExactResponseCache(body);
     const metadata = modelMetadata(request, model, affinity);
@@ -496,7 +501,7 @@ export class ModelLane extends DurableObject {
       let lastError = null;
 
       for (
-        const gatewayIndex of candidates.slice(0, MAX_GATEWAY_ATTEMPTS)
+        const gatewayIndex of candidates.slice(0, adaptive.gatewayAttemptBudget())
       ) {
         const gatewayId = GATEWAY_POOL[gatewayIndex];
         attempted.push(gatewayId);
@@ -558,6 +563,7 @@ export class ModelLane extends DurableObject {
           const kind = gatewayErrorKind(error);
 
           if (kind === "shared_capacity") {
+            this.onSharedCapacity();
             return json(
               {
                 error: {
@@ -639,6 +645,7 @@ export class ModelLane extends DurableObject {
 
       const kind = gatewayErrorKind(lastError);
       const capacity = kind === "shared_capacity";
+      if (capacity) this.onSharedCapacity();
       return json(
         {
           error: {
