@@ -24,10 +24,10 @@ The TUI should provide four *distinct projections* without requiring the operato
 
 1. **Active agents**, always the first status card.
 2. **Active jobs**, always the second status card.
-3. **Finished and failed agents/jobs**, the third status card, directly below the first two within the dashboard cluster.
+3. **Finished and failed agents/jobs**, the third **independently bordered** status window, below the first two in portrait and **top-center in landscape**.
 4. **Work in Progress**, the larger second live output, authored by a dedicated bounded progress agent. It tracks a current task, proposes concrete todos, highlights evidence-backed work states and narrates the latest verified progress.
 
-The status cluster is pinned. Chat transcript scroll never moves it; Progress output scroll is independent. The composer, main agent conversation, approvals and job authority retain their existing owners.
+All three status windows are always logically distinct, separately bordered, individually focusable and independently scrollable. Their pinned position follows the orientation; Chat scroll never moves them, and Progress output scroll is independent. The composer, main agent conversation, approvals and job authority retain their existing owners.
 
 **Not shared agent context:** the progress agent is an independent, read-only *session-scoped* observer. It must not receive hidden reasoning, complete child transcripts, other session messages, unrestricted Dream/Diary/global memory, model credentials or extra tool rights. A child/worker result is available only through a bounded authorized return/progress envelope.
 
@@ -59,12 +59,12 @@ Use x = terminal columns; y = terminal rows. Compute the orientation after readi
 - x == y -> balanced; choose the feasible layout without discontinuity.
 - **Space checks outrank orientation preference.** Cells are not square pixels, so a 90x50 terminal may still lack width for a legible chat+rail. Use available grid dimensions and minimum usable rectangles; do not pretend x>y alone guarantees a side rail.
 - Do not identify Android, Termius, tmux, SSH, desktop, font size or hardware model.
-- Keep current Summary/Compact behavior when no layout can display all four panes legibly. The three status categories remain reachable as compact counters/fullscreen detail, not as zero-height clipped cards.
+- Keep current Summary/Compact behavior when no layout can display all four panes legibly. The three status windows remain independently addressable by title/tab and fullscreen detail, not merged into a shared monitoring panel or zero-height clipped cards.
 
 Suggested pure types, final naming Harw-owned:
 
     OrientationHint = Portrait | Landscape | Balanced
-    MissionPlacement = PortraitStack | LandscapeRail | ShallowLandscape | CompactSummary
+    MissionPlacement = PortraitStack | LandscapeThreeColumns | ShallowLandscape | CompactSummary
     StatusRects = {agents, jobs, completed_failed}
     MissionRects = {status, wip, chat, footer}
 
@@ -102,38 +102,48 @@ Suggested provisional geometry for a spacious portrait viewport (e.g. 48x65, foo
 
 If width is narrow (e.g. 40–49), show an ID, phase and count in each status card; clip detail and make Enter/fullscreen accessible. Do not merge three logical categories into the wrong source or force illegibly wrapped names.
 
-### 2.3 Landscape — chat on the left, Mission Control rail on the right
+### 2.3 Landscape — three columns with five independent windows
 
-    +--------------------------------------+-------------------------------+
-    | MAIN CHAT / LIVE TURN                | AGENTS         | JOBS         |
-    |                                      | ● root         | ● verify     |
-    |                                      +-------------------------------+
-    |                                      | DONE 3 · FAILED 1             |
-    |                                      +-------------------------------+
-    |                                      | WORK IN PROGRESS             |
-    |                                      | Goal  / next action           |
-    |                                      | Todo 1/4 verified             |
-    |                                      | Todo 2/4 running              |
-    |                                      | blockers / latest evidence    |
-    |                                      | progress-agent output        |
-    |                                      |                               |
-    +--------------------------------------+-------------------------------+
-    | status + composer (kept operable)                                    |
-    +----------------------------------------------------------------------+
+**User-approved placement (2026-10-08):** Chat is the left column. **FINISHED / FAILED (Status) is top-center**, with the larger **WORK IN PROGRESS** window directly beneath it. The **far-right edge** holds **ACTIVE AGENTS** above **ACTIVE JOBS**. Each labeled item is a *separate* TUI window, not merely a subsection of a single large monitoring panel.
 
-The status cards remain at the top **of the rail**; the third spans the rail underneath. Progress occupies the larger remainder. Keep chat readable; initial feasibility target: cols >= 112, body_rows >= 28, chat_width >= 68 and rail_width >= 44. Candidate rail width: clamp(floor(cols*0.34), 44, 60), then cap by available chat minimum. At 160 columns, a ~54-column rail leaves ~106 chat columns. At 120 columns, a 44-column rail leaves 76.
+    +--------------------------------+---------------------------+--------------------+
+    |                                | FINISHED / FAILED         | ACTIVE AGENTS      |
+    |                                | done 3 / failed 1         | root: thinking     |
+    |                                +---------------------------+ child: testing     |
+    | MAIN CHAT / ACTIVE TURN        |                           +--------------------+
+    |                                | WORK IN PROGRESS          | ACTIVE JOBS        |
+    | independent transcript         | current user intent       | build: running     |
+    | visible assistant/tool output  | [x] verified task         | test: pending      |
+    | and conversation               | [>] active task           |                    |
+    |                                | [ ] next task             |                    |
+    |                                | progress agent narration  |                    |
+    |                                | evidence / next step      |                    |
+    +--------------------------------+---------------------------+--------------------+
+    | status / goal / approvals / composer (pinned footer)                      |
+    +-------------------------------------------------------------------------+
 
-If x>y but width is insufficient, select **ShallowLandscape**: a compressed 3-card dashboard at top with a collapsible short WIP projection above chat, not a 44-column rail that crushes the transcript. A balanced orientation should use the same feasibility test.
+The word **status window** means FINISHED / FAILED, which is **not** the terminal's bottom status line. All five independently bordered windows have their own rectangle, focus state, scroll position, selection, title and optional maximize/detail view. Status data still comes from the existing AgentMonitor and JobManager: separate visual windows do not imply separate lifecycle stores.
 
-Workbench/Explorer/F11/approval UI still exist. WIP does not secretly replace Workbench or take control of its lifecycle; define an explicit panel-focus/presentation policy for cases when both are visible. Overlay and approval precedence always beat status and Progress surfaces.
+- **Left — Chat:** full available body height, separate history scrolling and input focus, never squeezed below a tested chat minimum.
+- **Center top — Finished/Failed:** normally 4–8 rows, newest failures with reasons plus finished aggregates/details; independently scrolled.
+- **Center below — Work in Progress:** the larger remaining center area for the dedicated session-bounded Progress Agent and verified todo/progress projection.
+- **Outer right top — Active Agents:** its own agent list/window, including phase and running task; never placed inside the Job window.
+- **Outer right below — Active Jobs:** its own jobs list/window, including progress and runtime; split right column vertically with enough rows for both.
+- **Bottom — status/composer:** remains usable; approval overlays always take precedence.
+
+Landscape is selected by x>y **as a preference**, then tested for available cell width/height. Provisional comfortable bounds: Chat >= 64 cols, Center >= 38 cols, OuterRight >= 30 cols, plus gutters; a denser tested three-column mode may use Chat >= 48, Center >= 34, OuterRight >= 26. Required vertical feasibility: independent Agents/Jobs windows >= 5 rows each, center Finished/Failed >= 3 rows, center WIP >= 7 rows. Treat these as initial test targets, not permanent hardcoded constants.
+
+If x>y but there is not enough space, **ShallowLandscape still preserves separate window identities**. Prefer readable Chat plus tiled/individually switchable status windows and an expandable WIP view. Never silently merge all monitoring rows into one combined status canvas; when dimensions are tiny, only one independently titled panel may be expanded at a time, but the three categories remain navigable as distinct tabs/counters. A 0x0 terminal cannot render five boxes simultaneously.
+
+Portrait continues to render independent Agents/Jobs windows side by side, independent Finished/Failed directly below, then WIP and Chat. Rotation changes only geometry; it must not restart, cancel, share or reparent agent runs. Explorer/Workbench/F11 and modal approvals keep their existing precedence and ownership.
 
 ### 2.4 Allocation and degradation order
 
 1. Reserve status line, composer, approval overlays and any immutable prompt affordances.
 2. Reserve minimum chat height/width and available space for focused detail.
-3. Allocate top Status three-card cluster with bounded heights.
-4. Allocate WIP to the *remaining discretionary capacity*, bounded and resizable.
-5. In constrained terminals, compress WIP first to a one/two-line verified summary, then status cards to compact counters; never clip composer or hide a blocking approval. When no three separate rectangles fit, provide a single composite header with all three labelled counts and a detail switcher (meaning still available, not falsely claimed as three windows).
+3. Allocate three independently bordered status windows at the layout-specific anchors: portrait (Agents/Jobs row, Finished/Failed below) or landscape (Finished/Failed center-top; Agents/Jobs stacked at outer right).
+4. Allocate WIP as its own independently scrollable window below Finished/Failed in the center for landscape, and below the top status group for portrait.
+5. In constrained terminals, shrink WIP first, then show compact independently titled status tiles or explicit tabs; never merge three windows into one undifferentiated monitoring canvas. If all cannot fit at once, allow one at a time with distinct focus/identity. Never clip composer or hide a blocking approval.
 6. When no progress agent/provider is available, the WIP pane uses deterministic typed status; it never disappears into an empty spinner.
 
 The goal is a predictable responsive projection, not a per-region font-size change (terminals have one cell font setting). All widths/heights are finite and pure functions of geometry and explicitly registered visibility/focus.
@@ -224,17 +234,17 @@ Parallelism policy: new PL-94 branch and separate Draft PR, own worktrees and fi
 | 45x80 | PortraitStack with clipped narrow status cards |
 | 70x90 | PortraitStack, wider 2-card top row and independent WIP |
 | 60x60 | Balanced, chosen by feasible layout; deterministic |
-| 80x40 | ShallowLandscape: no unsafe 44-column rail; three categories visible in compressed header |
-| 100x30 | ShallowLandscape, keep composer/chat usable |
-| 120x42 | LandscapeRail with >=68-column chat and full 3+WIP rail |
-| 160x45 | LandscapeRail, broad chat + responsive rail |
-| 200x50 | LandscapeRail, existing Explorer/Workbench supported |
+| 80x40 | ShallowLandscape: compact independently titled status windows/tabs; no combined monitoring panel |
+| 100x30 | ShallowLandscape, separate focusable status identities without overlapping; composer/chat usable |
+| 120x42 | Dense 3-column landscape if feasible, or ShallowLandscape; center Status above WIP, right Agents above Jobs |
+| 160x45 | Three columns: Chat left; center Status above WIP; Agents above Jobs at outer right |
+| 200x50 | Full five independently bordered windows in three columns; Explorer/Workbench preserved |
 | 39x60 | CompactSummary: all three categories reachable via labelled counts/detail |
 | 48x19 | CompactSummary, never crowd out composer/status |
 | 1x1 and 0x0 | No panic, no rectangle overflow or subtraction underflow |
 | x/y crossing on live resize | Reclassify and redraw immediately, preserve focus/selection and running jobs |
 
-Also test non-overlapping rects, no clipping of blocking approval, Unicode cell width, no leaked raw reasoning, independent scrolling, F2/F3/F4/F5/F11/Esc parity, and a mid-turn phone rotation that does not spawn/cancel agents.
+Also test non-overlapping rects and **five independently bordered window identities**, exact landscape placement (center-top Finished/Failed, center-bottom WIP, far-right Agents over Jobs), no clipping of blocking approval, Unicode cell width, no leaked raw reasoning, independent scrolling, F2/F3/F4/F5/F11/Esc parity, and a mid-turn phone rotation that does not spawn/cancel agents.
 
 **Observer tests:** exactly three most recent *user-authored* committed messages; correct session/turn/tenant; a background child with same trace never leaks private transcript; stale update is rejected; active agent turn advances; session resume rehydrates cursor; job failure is not called verified success; no raw agent reasoning; no side-effect tools; two concurrent sessions get independent WIP; missing provider uses deterministic fallback; no unbounded full-history re-scan.
 
