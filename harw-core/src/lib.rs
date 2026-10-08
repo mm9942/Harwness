@@ -88,10 +88,11 @@ pub use child_comms::{
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildContextOverload, ChildLimits, ChildRecord,
     ChildRecoveryBudget, ChildRecoveryCapability, ChildRecoveryView, ChildRegistryFactory,
-    ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage, ContextWindowResolver,
-    DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner,
-    ModelKnownProbe, OrchestrationObserver, ParentGrant, RecoveredChildDisposition,
-    RecoveredRootChild, RoleEffortWeights, TRANSFER_BUDGET_NOTE, TaskComplexity,
+    ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
+    RecoveredChildDisposition, RecoveredRootChild,
+    ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
+    JoinSemantics, ManagedAgentSpawner, ModelKnownProbe, OrchestrationObserver, ParentGrant,
+    RoleEffortWeights, TRANSFER_BUDGET_NOTE, TaskComplexity,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,

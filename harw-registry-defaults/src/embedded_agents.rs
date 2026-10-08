@@ -3837,10 +3837,7 @@ mod tests {
             ("uia-worker.md", UIA_WORKER_KNOWLEDGE),
             ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
         ] {
-            assert!(
-                text.contains("notification"),
-                "{name}: missing notification"
-            );
+            assert!(text.contains("notification"), "{name}: missing notification");
             assert!(!text.contains("job.wait"), "{name}: mentions job.wait");
         }
     }
