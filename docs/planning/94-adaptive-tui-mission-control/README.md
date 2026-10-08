@@ -56,7 +56,7 @@ PL-68 already shipped an initial PortraitDock; PL-94 is a **functional extension
 
 Existing `harw-tui/src/agent_tree.rs` provides an interactive agent tree (selection, folding, detail) and `harw-tui/src/agent_tree_live.rs` derives live counters and phases without execution authority. The current `scroll_routing.rs` separates agent-panel scrolling from chat; it does **not** establish a general-purpose root-child transcript jump or unrestricted access to a child's private context.
 
-**PL-94 UX DELTA is navigation and observation only:** keep the chat/composer usable while an orchestrator continues; preserve per-pane scroll and typed Plan/Goal progress; add a focus-preserving `Root Orchestrator` navigation target, anchored to its authorized agent-tree row and available bounded status/evidence/progress in the current UIA session. Returning to Chat must restore unsent composer text and the previous scroll position. **A visual jump is never `/new` or `/resume`, never a job restart and never implicit cross-agent transcript/context sharing.** Full child conversation content must remain behind existing explicit visibility and permission checks.
+**PL-94 UX DELTA is dynamic inline chat presentation, NOT a new executor:** keep the chat/composer usable while orchestrators continue. Per [W01 — activity-ranked live chat messages](contracts/W01-activity-ranked-inline-chat.md), show authorized background runs as **stable, attached live messages inside the same large Chat**, with visual positions computed relative to the latest user/UIA turn and activity of multiple background agents. An idle Root typically appears at visual slot #2; it shifts behind the foreground user/UIA pair while the UIA is working and returns to #2 after the answer. Among several background agents, **actual meaningful activity, stable recency and optional explicit user pin** determine which is shown nearest the composer. No status/priority choice changes actual job scheduling, run ownership, message storage or child context. Existing AgentTree navigation stays useful for details, but **scrolling to another run is not the primary interaction**. Never use `/new` or `/resume` just to change the visible agent.
 
 ## 2. TARGET: adaptive layout based on terminal x/y
 
@@ -152,6 +152,12 @@ Portrait retains separate Agents/Jobs windows side by side and Finished/Failed b
 
 The goal is a predictable responsive projection, not a per-region font-size change (terminals have one cell font setting). All widths/heights are finite and pure functions of geometry and explicitly registered visibility/focus.
 
+### 2.5 Active agents as moving **inline chat messages**
+
+The main Chat remains the dominant surface in **both** orientations. An independent, running root orchestrator contributes a live message projection that moves among the newest UIA/user message slots without editing canonical history. For one root, the useful default is **slot #2 (from composer upward)** when UIA is idle, **slot #3** behind an active user/UIA exchange, returning to #2 once the UIA reply completes. If multiple background agents run, the leading visible agent is chosen from **meaningful, scoped live activity**, not always the oldest/root, while the others remain accessible as compact items. Do not jump positions on every token. **Full state ordering, event priority, scroll anchoring, security and tests are specified in [W01](contracts/W01-activity-ranked-inline-chat.md).**
+
+This is a read-only TUI projection over current ChildStreamBlock/AgentMonitor and must not rearrange the stored transcript, duplicate outputs, merge run contexts or affect JobManager priority. The portrait progress strip remains compact; it does not become a second output window just because multiple agents are active.
+
 ## 3. TARGET: dedicated read-only Progress Agent
 
 The **Progress Agent is not the main assistant**, not a substitute root orchestrator, not the job manager and not a global memory consumer. It is a separate, bounded, optional model-backed observer session behind the existing Harw job/agent infrastructure. It yields a model-written second output and session-local todo proposal projection.
@@ -222,7 +228,7 @@ Existing PL-68/mobile layout and PL-65/remote TUI contracts remain references. C
 
 - **M0 — contracts only (THIS PR):** pin source evidence, test matrix, portrait/landscape wireframes, security/authority contract, owner/file boundaries. No runtime behavior changed.
 - **M1 — pure geometry:** new placement/rect classification with x/y orientation and feasibility constraints; keep the existing placement as compatibility fallback. Unit/property tests across zero, tiny, boundary and wide terminal sizes.
-- **M2 — three status cards + compact portrait progress:** independently render status windows; add a read-only progress strip in portrait, not a second agent-output pane. Preserve Composer, Workbench, overlays, and maximize. Renderer/interaction tests.
+- **M2 — three status cards + dynamic inline agent chat + compact portrait progress:** independently render status windows and a read-only portrait progress strip; M2a–M2c additionally implement [W01](contracts/W01-activity-ranked-inline-chat.md): virtual stable live-child cells, meaningful-activity priority among concurrent background runs, and semantic scroll anchoring with foreground UIA message slots. No second large output pane. Preserve Composer, Workbench, overlays, and maximize; renderer and interaction tests.
 - **M3 — deterministic WIP:** 3 user message refs, current turn, typed Plan/Goal/Job status; display event-backed todo/progress projection; replay/resume tests. No model call yet.
 - **M4 — model-backed observer:** separate tool-free governed Progress Agent job, bounded input/output, dedup/stale result handling, costs/visibility, side-output styling. Test missing-model and stale-turn behavior.
 - **M5 — Plan/Goal integration:** auto-generated *draft* todos, admitted promotion/update, evidence-bound completion and conflict handling; owner acceptance preserved.
@@ -249,6 +255,8 @@ Parallelism policy: new PL-94 branch and separate Draft PR, own worktrees and fi
 | x/y crossing on live resize | Reclassify and redraw immediately, preserve focus/selection and running jobs |
 
 Also test non-overlapping rects and **five independently bordered windows in landscape**; in portrait only **three status windows + compact progress strip + Chat, no expanded second-output window**. Verify landscape anchors (center Status/WIP, right Agents/Jobs), modal priority, Unicode cell width, no leaked raw reasoning, independent scrolling and keybindings. Rotating mid-turn must not spawn/cancel the progress observer. **Background UX regression:** start a root orchestrator with its default unblocked handoff, continue chatting and reviewing plans via UIA, select its live row/details, then return to the original chat draft and scroll position. No re-admission, context pooling, hidden reasoning exposure, or unintended cancellation. Record separately any existing busy-only plan-editor limitation.
+
+**Inline activity ranking tests:** see [W01](contracts/W01-activity-ranked-inline-chat.md): three concurrent children, meaningful-event preference over token spam, Root #2 idle / #3 while UIA busy / #2 after completion, identity-anchored scrollback, stable manual pin and zero changes to scheduler, history, context, authority or jobs.
 
 **Observer tests:** exactly three most recent *user-authored* committed messages; correct session/turn/tenant; a background child with same trace never leaks private transcript; stale update is rejected; active agent turn advances; session resume rehydrates cursor; job failure is not called verified success; no raw agent reasoning; no side-effect tools; two concurrent sessions get independent WIP; missing provider uses deterministic fallback; no unbounded full-history re-scan.
 
