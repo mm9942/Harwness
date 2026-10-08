@@ -1000,6 +1000,22 @@ async fn preflight_metadata(
     }
 }
 
+/// Refuses unless cargo's `workspace_root` is the shell's canonical working
+/// directory, so the rebuild guard compares paths from one common base.
+fn check_workspace_root(metadata: &Value, shell_root: &std::path::Path) -> Result<(), String> {
+    let reported = metadata
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .ok_or("cargo metadata has no workspace_root")?;
+    match std::fs::canonicalize(reported) {
+        Ok(root) if root == shell_root => Ok(()),
+        _ => Err(
+            "cargo's workspace root is not the sandbox working directory; the rebuild guard cannot map changed files onto packages, so no test was run. Run cargo.test_one from the workspace root."
+                .to_owned(),
+        ),
+    }
+}
+
 /// Lists changed paths (staged, unstaged, untracked) relative to the
 /// workspace root through `git status`.
 async fn preflight_changes(
@@ -1036,14 +1052,28 @@ async fn preflight_changes(
             "pre-flight `git status` output was truncated: far too many files changed for a focused test run; commit or stash the unrelated changes, or run the test as a background job (job.start). No test was run.",
         ));
     }
-    let (prefix, rest) = run.stdout.split_once('\n').unwrap_or(("", ""));
-    Ok(parse_porcelain_z(rest, prefix.trim()))
+    // Fail closed: without the `--show-prefix` line the status paths cannot
+    // be mapped onto the workspace, and the guard would see no rebuilds.
+    let Some((prefix, rest)) = run.stdout.split_once('\n') else {
+        return Err(fail(
+            tool,
+            "pre-flight `git status` output is malformed (no path prefix line); the rebuild guard cannot tell what changed, so no test was run.",
+        ));
+    };
+    let prefix = prefix.trim();
+    if !prefix.is_empty() && (!prefix.ends_with('/') || prefix.starts_with('/')) {
+        return Err(fail(
+            tool,
+            "pre-flight `git rev-parse --show-prefix` returned an unexpected prefix; the rebuild guard cannot tell what changed, so no test was run.",
+        ));
+    }
+    Ok(parse_porcelain_z(rest, prefix))
 }
 
 /// Runs exactly one test if the rebuild guard allows it.
 #[harw_macros::tool(
     name = "cargo.test_one",
-    description = "Runs exactly ONE Rust test (cargo test -p PACKAGE --lib|--test T --locked TEST -- --exact) and only when that will not recompile a large part of the workspace. Arguments: package (workspace member), target (\"lib\" or \"test:<integration test name>\"), test (exact test path), optional timeout_secs (default 300, max 600). A deterministic pre-flight check (no compilation) computes which workspace crates cargo would rebuild from the uncommitted changes and the dependency closure of the package; if more than 3 crates would rebuild, or Cargo.toml, Cargo.lock, rust-toolchain, .cargo/config.toml or a build.rs changed, nothing is run and the result is {status: \"refused\", reason: would_recompile|global_invalidation, rebuild_count, threshold, rebuild_set, changed_packages, changed_global_files, hint}. Otherwise returns the cargo.test result {status: ok|tests_failed|failed|no_test_matched, tests:{passed, failed, failures:[{name, location, message}]}, diagnostics, log} plus a guard summary. No --workspace, no free-form arguments. Runs through the sandboxed shell tool and needs execute permission.",
+    description = "Runs exactly ONE Rust test (cargo test -p PACKAGE --lib|--test T --locked TEST -- --exact) and only when that will not recompile a large part of the workspace. Arguments: package (workspace member), target (\"lib\" or \"test:<integration test name>\"), test (exact test path), optional timeout_secs (default 300, max 600). A deterministic pre-flight check (no compilation) computes which workspace crates cargo would rebuild from the uncommitted changes and the dependency closure of the package; if more than 3 crates would rebuild, or Cargo.toml, Cargo.lock, rust-toolchain, .cargo/config.toml or a build.rs changed, nothing is run and the result is {status: \"refused\", reason: would_recompile|global_invalidation, rebuild_count, threshold, rebuild_set, changed_packages, changed_global_files, hint}. Otherwise returns the cargo.test result {status: ok|tests_failed|failed|no_test_matched, tests:{passed, failed, failures:[{name, location, message}]}, diagnostics, log} plus a guard summary. No --workspace, no free-form arguments. Runs through the sandboxed shell tool and needs execute permission; because it executes workspace test code it always asks for approval (an allow rule or a remembered approval never covers it).",
     permission = "execute_process",
     state = ShellDelegate
 )]
@@ -1086,6 +1116,12 @@ async fn cargo_test_one(
         Ok(metadata) => metadata,
         Err(output) => return Ok(output),
     };
+    // The git status paths are relative to the shell's working directory;
+    // package directories are relative to cargo's workspace root. Only when
+    // both are the same directory do the two path sets line up.
+    if let Err(message) = check_workspace_root(&metadata, &workspace_root(context)) {
+        return Ok(fail(TOOL, message));
+    }
     let workspace = match Workspace::from_metadata(&metadata) {
         Ok(workspace) => workspace,
         Err(message) => return Ok(fail(TOOL, message)),
@@ -1613,6 +1649,16 @@ mod tests {
     /// Skriptet die drei Phasen von `cargo.test_one`: Metadata-Zwischendatei,
     /// `git status` und den eigentlichen `cargo test`-Lauf.
     fn test_one_shell(ws: &std::path::Path, dirty: &'static str) -> Arc<ScriptedShell> {
+        test_one_shell_rooted(ws, dirty, ws)
+    }
+
+    /// Like [`test_one_shell`], but cargo reports `reported_root` as its
+    /// `workspace_root`.
+    fn test_one_shell_rooted(
+        ws: &std::path::Path,
+        dirty: &'static str,
+        reported_root: &std::path::Path,
+    ) -> Arc<ScriptedShell> {
         let dep =
             |name: &str| json!({"name": name, "source": null, "kind": null, "path": ws.join(name)});
         let package = |name: &str, deps: Vec<Value>, targets: Value| {
@@ -1625,7 +1671,7 @@ mod tests {
         };
         let lib = |name: &str| json!([{"name": name, "kind": ["lib"]}]);
         let doc = json!({
-            "workspace_root": ws.to_string_lossy(),
+            "workspace_root": reported_root.to_string_lossy(),
             "packages": [
                 package("low", vec![], lib("low")),
                 package("mid1", vec![dep("low")], lib("mid1")),
@@ -1701,6 +1747,48 @@ mod tests {
         assert_eq!(value["rebuild_count"], 5);
         assert_eq!(value["threshold"], guard::MAX_REBUILD_PACKAGES);
         assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        Ok(())
+    }
+
+    async fn test_one_error(shell: Arc<ScriptedShell>, fx: &Fixture) -> TestResult<String> {
+        let ctx = fx.exec_ctx()?;
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let message = error_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "lib", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        Ok(message)
+    }
+
+    #[tokio::test]
+    async fn test_one_refuses_when_cargo_workspace_root_is_not_the_shell_root() -> TestResult {
+        let fx = Fixture::new()?;
+        let elsewhere = fx.ws.join("low");
+        std::fs::create_dir_all(&elsewhere)?;
+        let shell = test_one_shell_rooted(&fx.ws, "\n", &elsewhere);
+        let message = test_one_error(shell, &fx).await?;
+        assert!(message.contains("workspace root"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_one_refuses_malformed_git_status_output() -> TestResult {
+        let fx = Fixture::new()?;
+        let shell = test_one_shell(&fx.ws, "");
+        let message = test_one_error(shell, &fx).await?;
+        assert!(message.contains("malformed"), "{message}");
+        let shell = test_one_shell(&fx.ws, "/abs\n");
+        let message = test_one_error(shell, &fx).await?;
+        assert!(message.contains("unexpected prefix"), "{message}");
         Ok(())
     }
 

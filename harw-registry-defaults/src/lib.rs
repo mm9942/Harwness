@@ -450,6 +450,10 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // image, command and workspace access are still the model's choice): an
     // allow rule never skips the question.
     "container.run",
+    // `cargo.test_one` führt Testcode aus dem Workspace aus; zusammen mit
+    // `fs.write` ist das beliebige Codeausführung in der Sandbox. Eine
+    // sitzungsweite „merken“-Freigabe darf es daher nie abdecken.
+    "cargo.test_one",
     // R18 (D-B): die mutierenden `gateway.*`-Werkzeuge
     // (`profile::GATEWAY_MUTATION_TOOLS`, `model_tool(approval = "always")`)
     // — Widerruf, Draining, Listener, Werkzeug-Freigaben fragen unter
@@ -1292,6 +1296,7 @@ mod tests {
         )));
         assert!(!AUTO_APPROVED_TOOLS.contains(&"agent.cancel"));
         assert!(ALWAYS_ASK_TOOLS.contains(&"agent.cancel"));
+        assert!(ALWAYS_ASK_TOOLS.contains(&"cargo.test_one"));
         assert!(DefaultApprovalPolicy::requires_explicit_approval(&call(
             "agent.cancel"
         )));
