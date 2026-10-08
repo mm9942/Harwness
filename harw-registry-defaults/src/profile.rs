@@ -2013,7 +2013,17 @@ impl RegistryProfile {
     /// ```
     #[must_use]
     pub fn required_permissions(self) -> PermissionSet {
-        permissions_of(&self.registered_tool_names())
+        let mut names = self.registered_tool_names();
+        // `cargo.test_one` (`ExecuteProcess`) steht im Profil `WorkspaceEdit`,
+        // aber sein Recht gehört nicht zu den Profilrechten: sonst bekäme jeder
+        // Träger des Profils (Telegram-Wurzel, Job-Worker, jeder Schreib-Worker)
+        // `ExecuteProcess`. Das Recht vergibt allein
+        // `authority::granted_for_capabilities`, wenn das (geklemmte) Manifest
+        // das Werkzeug tatsächlich führt — nur der `test-engineer`.
+        if self == RegistryProfile::WorkspaceEdit {
+            names.retain(|name| !CARGO_TEST_ONE_TOOLS.contains(name));
+        }
+        permissions_of(&names)
     }
 
     /// Die Werkzeuge dieses Profils, deren Recht `granted` trägt.
@@ -3714,6 +3724,12 @@ mod tests {
             .collect()
     }
 
+    /// `cargo.test_one` gehört zu `WorkspaceEdit`, aber `ExecuteProcess` nicht
+    /// zu den eigenen Profilrechten: unter `assemble()` fehlt es bewusst.
+    fn lacks_default_right(profile: RegistryProfile, tool: &str) -> bool {
+        profile == RegistryProfile::WorkspaceEdit && CARGO_TEST_ONE_TOOLS.contains(&tool)
+    }
+
     fn assemble(profile: RegistryProfile) -> TestResult<AssembledRegistry> {
         let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
         assemble_registry(profile, cwd, IdentityOverrides::default()).map_err(ctx("assemble"))
@@ -3785,6 +3801,7 @@ mod tests {
                 .registered_tool_names()
                 .iter()
                 .filter(|name| !JOB_TOOLS.contains(name))
+                .filter(|name| !lacks_default_right(*profile, name))
                 .map(|name| (*name).to_owned())
                 .collect();
             assert_eq!(
@@ -4061,18 +4078,35 @@ mod tests {
         );
         assert_eq!(
             RegistryProfile::WorkspaceEdit.required_permissions(),
-            // `ExecuteProcess` nur wegen `cargo.test_one`; die Roster-Klemme und
-            // `granted_for_ir(.., narrow_to_manifest = true)` entziehen es
-            // jedem Worker, dessen Manifest das Werkzeug nicht führt.
-            set(&[
-                Permission::ReadWorkspace,
-                Permission::WriteWorkspace,
-                Permission::ExecuteProcess
-            ])
+            // Kein `ExecuteProcess` trotz `cargo.test_one` im Profil: das Recht
+            // vergibt nur `granted_for_capabilities` bei geführtem Werkzeug.
+            set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
         );
         assert_eq!(
             RegistryProfile::MatrixReader.required_permissions(),
             set(&[Permission::ReadWorkspace])
+        );
+    }
+
+    /// Das Profil `WorkspaceEdit` bewirbt mit seinen eigenen Rechten weder
+    /// `cargo.test_one` noch irgendein prozessfähiges Werkzeug.
+    #[test]
+    fn test_workspace_edit_own_rights_do_not_admit_cargo_test_one() {
+        use harw_authority::Permission;
+        let rights = RegistryProfile::WorkspaceEdit.required_permissions();
+        assert!(!rights.contains(Permission::ExecuteProcess));
+        let tools = RegistryProfile::WorkspaceEdit.tool_names_for(&rights);
+        assert!(!tools.contains(&"cargo.test_one"));
+        assert!(!tools.contains(&"shell.exec"));
+        let with_exec = PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ]);
+        assert!(
+            RegistryProfile::WorkspaceEdit
+                .tool_names_for(&with_exec)
+                .contains(&"cargo.test_one")
         );
     }
 
@@ -4130,7 +4164,37 @@ mod tests {
                 "WorkspaceEdit darf {tool} nicht registrieren"
             );
         }
+        // Unter den eigenen Profilrechten ({Read, Write}) fehlt `cargo.test_one`.
+        let default_expected: Vec<String> = expected
+            .iter()
+            .filter(|t| **t != "cargo.test_one")
+            .map(|t| (*t).to_owned())
+            .collect();
         let assembled = assemble(RegistryProfile::WorkspaceEdit)?;
+        assert_eq!(registered_names(&assembled), default_expected);
+        assert_eq!(assembled.identity.tools_available, default_expected);
+        // Mit ausdrücklich gewährtem `ExecuteProcess` (nur `test-engineer`,
+        // siehe `authority::granted_for_capabilities`) kommt es dazu.
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let project = harw_project_discovery::discover_project(
+            &cwd,
+            &harw_project_discovery::DiscoveryConfig::default(),
+        )
+        .map_err(ctx("discover"))?;
+        let granted = PermissionSet::from_policy([
+            harw_authority::Permission::ReadWorkspace,
+            harw_authority::Permission::WriteWorkspace,
+            harw_authority::Permission::ExecuteProcess,
+        ]);
+        let assembled = assemble_registry_for_sandbox_with_definition_access(
+            RegistryProfile::WorkspaceEdit,
+            &project,
+            IdentityOverrides::default(),
+            ApprovalModeCell::default(),
+            &granted,
+            None,
+        )
+        .map_err(ctx("assemble with exec"))?;
         let expected_owned: Vec<String> = expected.iter().map(|t| (*t).to_owned()).collect();
         assert_eq!(registered_names(&assembled), expected_owned);
         assert_eq!(assembled.identity.tools_available, expected_owned);
@@ -4225,7 +4289,11 @@ mod tests {
         for profile in RegistryProfile::ALL {
             assert_eq!(
                 profile.tool_names_for(&profile.required_permissions()),
-                profile.registered_tool_names(),
+                profile
+                    .registered_tool_names()
+                    .into_iter()
+                    .filter(|name| !lacks_default_right(*profile, name))
+                    .collect::<Vec<_>>(),
                 "{profile:?}: unter den eigenen Rechten fällt nichts heraus"
             );
             assert!(
@@ -4416,6 +4484,7 @@ mod tests {
                 .tool_names()
                 .iter()
                 .filter(|name| !JOB_TOOLS.contains(name))
+                .filter(|name| !lacks_default_right(*profile, name))
                 .map(|name| (*name).to_owned())
                 .collect();
             assert_eq!(

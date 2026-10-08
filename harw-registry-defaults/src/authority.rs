@@ -842,6 +842,21 @@ pub fn granted_for_capabilities(
     manifest_tools: Option<&[String]>,
 ) -> PermissionSet {
     let mut granted: Vec<Permission> = profile_rights.iter().collect();
+    // `cargo.test_one` braucht `ExecuteProcess`, das kein Profil trägt
+    // (`RegistryProfile::required_permissions`). Es wird nur vergeben, wenn
+    // ein Schreibprofil und ein Manifest zusammentreffen, das das Werkzeug
+    // führt; der Roster klemmt es für alle außer dem `test-engineer` heraus.
+    // Die Schnitte unten (Autorität, Manifest) gelten danach wie üblich.
+    if profile_rights.contains(Permission::WriteWorkspace)
+        && !granted.contains(&Permission::ExecuteProcess)
+        && manifest_tools.is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| crate::profile::CARGO_TEST_ONE_TOOLS.contains(&tool.as_str()))
+        })
+    {
+        granted.push(Permission::ExecuteProcess);
+    }
     if let Some(authority) = authority_permissions(capabilities) {
         granted.retain(|permission| authority.contains(*permission));
     }
