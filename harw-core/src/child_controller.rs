@@ -105,7 +105,7 @@ use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
 use harw_agent_dsl::executable::{
-    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail, SnapshotId,
+    BudgetSpec, ContextProgram, ExecutableAgentIr, ReferencedSnapshotId, SectionDetail,
 };
 use harw_authority::{AuthoritySnapshot, SandboxSpec};
 use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot, SuggestionKind};
@@ -117,6 +117,7 @@ use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
 use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
+use harw_types::WorkId;
 use harw_types::{
     AgentRole, ApprovalActor, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId,
 };
@@ -3574,7 +3575,9 @@ impl ManagedAgentSpawner {
             .as_ref()
             .ok_or_else(|| Self::reject("durable child lease store is not configured"))?;
         store.bind_job_owner(child, work_id).map_err(|error| {
-            Self::reject(format!("could not bind child lease to job {work_id}: {error}"))
+            Self::reject(format!(
+                "could not bind child lease to job {work_id}: {error}"
+            ))
         })
     }
 
@@ -4510,9 +4513,7 @@ impl ManagedAgentSpawner {
                 .lock()
                 .map_err(|_| Self::reject("session manager lock is poisoned"))?;
             manager.restore(session).map_err(|error| {
-                Self::reject(format!(
-                    "could not restore hydrated child {child}: {error}"
-                ))
+                Self::reject(format!("could not restore hydrated child {child}: {error}"))
             })?;
         }
 
@@ -8141,7 +8142,7 @@ impl ManagedAgentSpawner {
             }
             let ir_matches = match (recovery.executable_snapshot_id.as_ref(), executable_ir) {
                 (None, None) => true,
-                (Some(reference), Some(ir)) => reference.confirm(ir.snapshot_id()).is_some(),
+                (Some(reference), Some(ir)) => reference.confirm(&ir.snapshot_id()).is_some(),
                 _ => false,
             };
             if !ir_matches {
@@ -8278,10 +8279,7 @@ impl ManagedAgentSpawner {
                 )));
             }
             let parent = parent_base_sandbox.unwrap_or_else(|| parent_context.sandbox.clone());
-            (
-                parent.restrict(recovery.authority.request()),
-                parent,
-            )
+            (parent.restrict(recovery.authority.request()), parent)
         } else {
             match parent_base_sandbox {
                 Some(base) if sandbox == parent_context.sandbox => (base.clone(), base),
@@ -8575,10 +8573,8 @@ impl ManagedAgentSpawner {
             .registry_factory
             .capability_snapshot(role_name, &input)?;
         if let Some(recovery) = recovery {
-            capability_snapshot = Self::recovery_capability_snapshot(
-                capability_snapshot,
-                recovery,
-            )?;
+            capability_snapshot =
+                Self::recovery_capability_snapshot(capability_snapshot, recovery)?;
         }
         let child_suggestions = capability_snapshot
             .as_ref()
@@ -8653,22 +8649,21 @@ impl ManagedAgentSpawner {
             .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
             .unwrap_or_default();
         if let Some(recovery) = recovery {
-            child_allowed_child_orchestrators.retain(|name| {
-                recovery.allowed_child_orchestrators.contains(name)
-            });
+            child_allowed_child_orchestrators
+                .retain(|name| recovery.allowed_child_orchestrators.contains(name));
         }
         let spawn_context = SpawnContext {
-                sandbox,
-                suggestions: child_suggestions,
-                capability_snapshot,
-                approval_actor,
-                organizational_role: definition.organizational_role,
-                allowed_child_orchestrators: child_allowed_child_orchestrators.clone(),
-                trace: child_trace.clone(),
-                // AW2-02: dieselbe Decke, die soeben neben der Sandbox
-                // geschnitten wurde — kein zweiter, separater Zustand.
-                ceiling: Some(child_ceiling),
-            };
+            sandbox,
+            suggestions: child_suggestions,
+            capability_snapshot,
+            approval_actor,
+            organizational_role: definition.organizational_role,
+            allowed_child_orchestrators: child_allowed_child_orchestrators.clone(),
+            trace: child_trace.clone(),
+            // AW2-02: dieselbe Decke, die soeben neben der Sandbox
+            // geschnitten wurde — kein zweiter, separater Zustand.
+            ceiling: Some(child_ceiling),
+        };
         let child = if let Some(recovery) = recovery {
             let child = recovery.child.clone();
             manager
