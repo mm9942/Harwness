@@ -19,9 +19,9 @@ SYSTEM = (
 # Scenarios are deliberately synthetic, do not ingest private logs or credentials.
 # Each family holds a distinct task concept to prevent near-duplicate train/test leakage.
 SCENARIOS = [
-    {"family":"grep_then_read","user":"Find where acquire() is defined, then read the relevant lines without shell commands.",
-     "tools":["fs.search","fs.read"],"calls":[("fs.search",{"query":"acquire(","path":"harw-core/src"}),("fs.read",{"path":"harw-core/src/turn_loop.rs","line":1370,"limit":24})],
-     "results":[{"matches":[{"path":"harw-core/src/turn_loop.rs","line":1385,"text":"fn request_identity(..."}]},{"path":"harw-core/src/turn_loop.rs","line":1385,"text":"fn request_identity(session: &AgentSession) -> RequestIdentity"}],
+    {"family":"grep_then_read","user":"Find where request_identity() is defined, then read the relevant lines without shell commands.",
+     "tools":["fs.search","fs.read"],"calls":[("fs.search",{"query":"fn request_identity(","path":"harw-core/src"}),("fs.read",{"path":"harw-core/src/turn_loop.rs","line":1370,"limit":24})],
+     "results":[{"matches":[{"path":"harw-core/src/turn_loop.rs","line":1385,"text":"fn request_identity(session: &AgentSession) -> RequestIdentity {"}]},{"path":"harw-core/src/turn_loop.rs","line":1385,"text":"fn request_identity(session: &AgentSession) -> RequestIdentity"}],
      "final":"I searched first and then read the matching source range. The file contains the request-identity helper."},
     {"family":"list_directory","user":"Show entries in the tool crate directory, without launching a process.",
      "tools":["fs.list"],"calls":[("fs.list",{"path":"harw-tool-fs/src"})],
