@@ -127,7 +127,7 @@ impl PodmanEngine {
     fn port(&self) -> Result<std::sync::Arc<dyn CommandPort>, EngineError> {
         self.port
             .clone()
-            .or_else(harw_command::global::installed)
+            .or_else(harw_command::installed)
             .ok_or_else(|| EngineError::Spawn(
                 "no job-backed command runtime is installed for the container engine".to_owned(),
             ))

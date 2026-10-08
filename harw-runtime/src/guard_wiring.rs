@@ -108,7 +108,7 @@ impl MemoryPitfallAdvisor {
     ///   dieselbe wie [`crate::assembly::RuntimeAssemblyBuilder::fact_stores`]
     ///   (Projekt-Anteil).
     #[must_use]
-    pub const fn new(store: Arc<FactStore>) -> Self {
+    pub fn new(store: Arc<FactStore>) -> Self {
         Self {
             store,
             cache: OnceLock::new(),

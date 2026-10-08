@@ -747,8 +747,9 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         "agent_job.activation_cleanup_failed"
                     ),
                     Ok(Ok(completion)) => {
-                        if let Err(release_error) =
-                            self.spawner.close_child_durable(&child, completion.completed_at)
+                        if let Err(release_error) = self
+                            .spawner
+                            .close_child_durable(&child, completion.completion.completed_at)
                         {
                             tracing::error!(
                                 work_id = %work_id,
@@ -783,6 +784,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                     now: Timestamp::now(),
                 };
                 let spawner_for_run = Arc::clone(&spawner);
+                let child_for_cleanup = child_for_run.clone();
                 let result = runner
                     .run_with_cancel(
                         &work_id_for_run,
@@ -899,7 +901,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                             JobOutcome::Blocked { reason } => {
                                 tracing::error!(
                                     work_id = %work_id_for_run,
-                                    child = %child,
+                                    child = %child_for_cleanup,
                                     reason,
                                     "agent_job.blocked_without_resume_owner"
                                 );
@@ -908,17 +910,24 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         };
 
                         if let Some((status, text)) = projection {
-                            if let Err(error) =
-                                spawner.close_child_durable(&child, completion.completed_at)
+                            if let Err(error) = spawner
+                                .close_child_durable(
+                                    &child_for_cleanup,
+                                    completion.completed_at,
+                                )
                             {
                                 tracing::error!(
                                     work_id = %work_id_for_run,
-                                    child = %child,
+                                    child = %child_for_cleanup,
                                     error = %error,
                                     "agent_job.child_lease_completion_failed"
                                 );
                             } else {
-                                let _ = spawner.finish_background_child(&child, status, text);
+                                let _ = spawner.finish_background_child(
+                                    &child_for_cleanup,
+                                    status,
+                                    text,
+                                );
                             }
                         }
                     }
@@ -928,7 +937,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                         // projection here: recovery owns that decision.
                         tracing::error!(
                             work_id = %work_id_for_run,
-                            child = %child,
+                            child = %child_for_cleanup,
                             error = %error,
                             "agent_job.runtime_failed"
                         );
