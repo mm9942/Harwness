@@ -100,6 +100,7 @@ pub mod finding_store;
 pub mod fragment_registry;
 pub mod goal_context;
 pub mod job_bridge;
+pub mod intent_cycle;
 pub mod metrics;
 pub mod plan_context;
 pub mod security_bridge;
@@ -122,6 +123,10 @@ pub use crate::fragment_registry::{
 };
 pub use crate::goal_context::{DEFAULT_MAX_CHARS, GoalContextProvider};
 pub use crate::job_bridge::{JobAdmissionTemplate, PlanJobBridge};
+pub use crate::intent_cycle::{
+    AdmittedCycle, CycleAdmission, CycleCheckpoint, CycleLimits, CycleProposal,
+    CycleRefusal, IntentBinding, Segment, admit_cycle,
+};
 pub use crate::plan_context::{
     PLAN_CONTEXT_MAX_TRUST, PLAN_CONTEXT_MAY_CARRY_USER_CONTENT, PLAN_CONTEXT_NAMESPACE,
     PlanContextProvider,
