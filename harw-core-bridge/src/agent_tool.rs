@@ -2325,29 +2325,20 @@ pub(crate) async fn fanout_children_with(
     // `uia-worker` family; the rule belongs to the spawner).
     let slots = requested_slots.min(spawner.max_concurrent_instances_for_role(role));
     if total > slots {
-        let reason = if slots < requested_slots {
-            format!("the role '{role}' may run at most {slots} instance(s) concurrently")
-        } else {
-            format!("max_parallel is {requested_slots}")
-        };
+        // Not an error: the wave runs in sequential batches of `slots`
+        // children (each batch fully admissible *now*, never queued).
         tracing::info!(
             role,
             requested = total,
             allowed_concurrently = slots,
-            "agent_fanout.rejected_not_admissible"
+            "agent_fanout.batched"
         );
-        return Err(OpError::NotAvailable(format!(
-            "Agent spawn failed: {} {total} children of role '{role}' were requested at once, \
-             but only {slots} may run concurrently ({reason}). Nothing was started. {} \
-             Request at most {slots} child(ren) per call.",
-            harw_core::background_children::DELEGATION_REJECTED_MARKER,
-            harw_extension_api::FAIL_FAST_CONSEQUENCE,
-        )));
     }
     // All-or-nothing pre-check of capacity, depth and orchestration limits
-    // over the whole wave before the first child is started.
+    // over the first batch before the first child is started; later batches
+    // are pre-checked the same way right before they start.
     spawner
-        .preflight_wave_admission(ctx.session_id(), &vec![role; total])
+        .preflight_wave_admission(ctx.session_id(), &vec![role; total.min(slots)])
         .map_err(|error| OpError::NotAvailable(format!("Agent spawn failed: {error}")))?;
     let winner = AtomicBool::new(false);
     // Je Position die Session-ID, sobald das Kind admittiert ist — nur damit
@@ -2369,7 +2360,6 @@ pub(crate) async fn fanout_children_with(
     };
 
     let mut results: Vec<Option<Result<Value, String>>> = (0..total).map(|_| None).collect();
-    let mut pending = questions.iter().enumerate();
     let mut running = Vec::with_capacity(slots.min(total));
     let mut winner_decided = false;
     // Ein Event statt eines betretenen Spans: `span::Entered` ist `!Send` und
@@ -2381,60 +2371,81 @@ pub(crate) async fn fanout_children_with(
         "agent_fanout.start"
     );
 
-    loop {
-        while running.len() < slots {
-            let Some((position, question)) = pending.next() else {
-                break;
-            };
-            if winner_decided {
-                results[position] = Some(Err(CANCELLED_BY_SIBLING.to_owned()));
-                continue;
-            }
-            running.push((
-                position,
-                Box::pin(run_fanout_slot(
-                    &shared,
-                    position,
-                    question,
-                    &admitted[position],
-                )),
-            ));
-        }
-        if running.is_empty() {
-            break;
-        }
-
-        // TODO(PL-90 background-only): this is a blocking join. Delegated work
-        // must run only in the background and report back automatically;
-        // converting the synchronous fan-out join is a separate, later wave.
-        let (index, value) = std::future::poll_fn(|cx| {
-            for (index, (_, future)) in running.iter_mut().enumerate() {
-                if let Poll::Ready(value) = future.as_mut().poll(cx) {
-                    return Poll::Ready((index, value));
+    for (batch_index, batch) in questions.chunks(slots).enumerate() {
+        let base = batch_index * slots;
+        if batch_index > 0 && !winner_decided {
+            // Fail-fast per batch: if the next batch is not admissible now,
+            // none of its children start and each position reports why.
+            if let Err(error) =
+                spawner.preflight_wave_admission(ctx.session_id(), &vec![role; batch.len()])
+            {
+                let message = format!("Agent spawn failed: {error}");
+                tracing::warn!(role, batch = batch_index, error = %error, "agent_fanout.batch_rejected");
+                for slot in &mut results[base..] {
+                    *slot = Some(Err(message.clone()));
                 }
+                break;
             }
-            Poll::Pending
-        })
-        .await;
-        let (position, _finished) = running.remove(index);
+        }
+        let mut pending = batch
+            .iter()
+            .enumerate()
+            .map(|(offset, q)| (base + offset, q));
+        loop {
+            while running.len() < slots {
+                let Some((position, question)) = pending.next() else {
+                    break;
+                };
+                if winner_decided {
+                    results[position] = Some(Err(CANCELLED_BY_SIBLING.to_owned()));
+                    continue;
+                }
+                running.push((
+                    position,
+                    Box::pin(run_fanout_slot(
+                        &shared,
+                        position,
+                        question,
+                        &admitted[position],
+                    )),
+                ));
+            }
+            if running.is_empty() {
+                break;
+            }
 
-        let value = if winner_decided {
-            Err(CANCELLED_BY_SIBLING.to_owned())
-        } else {
-            value
-        };
-        if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && value.is_ok() {
-            winner_decided = true;
-            winner.store(true, Ordering::SeqCst);
-            for (sibling, _) in &running {
-                if let Some(child) = admitted[*sibling].get() {
-                    if !spawner.request_cancellation(child) {
-                        tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
+            // TODO(PL-90 background-only): this is a blocking join. Delegated work
+            // must run only in the background and report back automatically;
+            // converting the synchronous fan-out join is a separate, later wave.
+            let (index, value) = std::future::poll_fn(|cx| {
+                for (index, (_, future)) in running.iter_mut().enumerate() {
+                    if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                        return Poll::Ready((index, value));
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+            let (position, _finished) = running.remove(index);
+
+            let value = if winner_decided {
+                Err(CANCELLED_BY_SIBLING.to_owned())
+            } else {
+                value
+            };
+            if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && value.is_ok() {
+                winner_decided = true;
+                winner.store(true, Ordering::SeqCst);
+                for (sibling, _) in &running {
+                    if let Some(child) = admitted[*sibling].get() {
+                        if !spawner.request_cancellation(child) {
+                            tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
+                        }
                     }
                 }
             }
+            results[position] = Some(value);
         }
-        results[position] = Some(value);
     }
 
     let results: Vec<Result<Value, String>> = results
@@ -5020,20 +5031,43 @@ specialization = "bridge-contract-test"
         Ok(())
     }
 
-    /// Fail-fast: a fan-out with more questions than may run concurrently is
-    /// rejected as a whole; nothing is started and nothing is queued.
+    /// More questions than concurrent slots no longer fail: the wave runs in
+    /// sequential batches of `slots` and returns one result per position, in
+    /// question order (regression: `/analyze` levels with > max_parallel units).
     #[tokio::test]
-    async fn fanout_larger_than_max_parallel_is_rejected_without_starting_anything() -> TestResult {
-        let (services, _events) = services_with_runtime();
+    async fn fanout_larger_than_max_parallel_runs_in_batches_preserving_order() -> TestResult {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spawner = ManagedAgentSpawner::new(
+            Arc::new(Mutex::new(SessionManager::new(event_tx))),
+            ChildLimits::conservative(),
+        )
+        .with_role(
+            "worker",
+            harw_types::AgentRole::Agent {
+                name: "worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            Arc::new(IrRegistryFactory {
+                ir: ir_with_contract("harwness.return.coding-task@1")?,
+            }),
+        );
+        let mut services = ServiceMap::new();
+        <OpContext as OpContextCoreExt>::register_agent_tool_services(
+            &mut services,
+            Arc::new(spawner),
+            Arc::new(InMemoryStateStore::new()),
+        );
         let (ctx, tmp) = make_test_ctx_with(services)?;
         let questions = vec![
             serde_json::json!({ "question": { "id": "q1", "question": "a" } }),
             serde_json::json!({ "question": { "id": "q2", "question": "b" } }),
             serde_json::json!({ "question": { "id": "q3", "question": "c" } }),
+            serde_json::json!({ "question": { "id": "q4", "question": "d" } }),
+            serde_json::json!({ "question": { "id": "q5", "question": "e" } }),
         ];
         let result = super::fanout_children(
             &ctx,
-            "explorer",
+            "worker",
             &questions,
             "reduce_to_read_explore",
             harw_core::child_controller::AgentBudget::default(),
@@ -5043,21 +5077,18 @@ specialization = "bridge-contract-test"
         )
         .await;
         let _ = std::fs::remove_dir_all(tmp);
-        let Err(OpError::NotAvailable(message)) = result else {
-            return Err(TestError::Unexpected(format!(
-                "expected a whole-wave rejection, got {result:?}"
-            )));
-        };
-        assert!(
-            message.contains("3 children of role 'explorer' were requested at once"),
-            "{message}"
-        );
-        assert!(message.contains("only 2 may run concurrently"), "{message}");
-        assert!(message.contains("Nothing was started"), "{message}");
-        assert!(
-            message.contains(harw_extension_api::FAIL_FAST_CONSEQUENCE),
-            "{message}"
-        );
+        let results = result.map_err(|error| {
+            TestError::Unexpected(format!("batched wave must not be rejected: {error:?}"))
+        })?;
+        assert_eq!(results.len(), questions.len(), "one result per question");
+        for slot in &results {
+            if let Err(message) = slot {
+                assert!(
+                    !message.contains("Nothing was started"),
+                    "no position may report a whole-wave rejection: {message}"
+                );
+            }
+        }
         Ok(())
     }
 

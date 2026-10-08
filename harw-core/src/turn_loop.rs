@@ -1765,8 +1765,9 @@ other work.";
 
 /// Error text when the session has no background executor for delegation.
 const NO_BACKGROUND_EXECUTOR_ERROR: &str = "Delegation is background-only and no background \
-executor is configured in this session (no agent job submitter is registered), so the agent was \
-not started. There is no foreground fallback; delegation is unavailable here.";
+executor is configured in this session (no agent job submitter is registered and the host \
+declared no in-process background launcher), so the agent was not started. There is no \
+foreground fallback; delegation is unavailable here. Continue without delegating.";
 
 /// Delegation is always background. Returns the tool error for a start that is
 /// not admissible: a legacy inline request (`background:false` / `wait:true`)
@@ -1780,10 +1781,46 @@ fn background_only_refusal(
     if flag("background") == Some(false) || flag("wait") == Some(true) {
         return Some(ToolCallResult::error(LEGACY_INLINE_DELEGATION_ERROR));
     }
-    if session.registry().agent_job_submitter().is_none() {
+    if session.registry().agent_job_submitter().is_none() && !session.host_background_launcher() {
         return Some(ToolCallResult::error(NO_BACKGROUND_EXECUTOR_ERROR));
     }
     None
+}
+
+/// Hands a freshly admitted child to the background executor.
+///
+/// # Returns
+/// `Some(result)`: the tool result to record (the one-time start confirmation,
+/// or a detailed error after the child was released because the submit
+/// failed; never an `Err` that would abort the turn and leak the child).
+/// `None`: no durable submitter, but the host declared an in-process launcher;
+/// the caller yields `AwaitingChild` for the host to detach (never inline).
+async fn detach_admitted_child(
+    session: &AgentSession,
+    spawner: &Arc<dyn harw_extension_api::AgentSpawner>,
+    child: &SessionId,
+    role: &str,
+    question: Option<&str>,
+) -> Option<ToolCallResult> {
+    let Some(submitter) = session.registry().agent_job_submitter().cloned() else {
+        if session.host_background_launcher() {
+            return None;
+        }
+        spawner.child_finished(child);
+        return Some(ToolCallResult::error(NO_BACKGROUND_EXECUTOR_ERROR));
+    };
+    match submitter.submit_child(child, question).await {
+        Ok(job) => Some(agent_job_started_result(&job, role)),
+        Err(error) => {
+            tracing::warn!(child = %child, role, error = %error, "turn.delegation.submit_failed");
+            spawner.child_finished(child);
+            Some(ToolCallResult::error(format!(
+                "The '{role}' agent was admitted but could not be started in the background: \
+                 {error}. The child was released and nothing is running for it. Retry the \
+                 delegation, or continue without it."
+            )))
+        }
+    }
 }
 
 /// One-time confirmation returned to the model when a background agent started.
@@ -2941,7 +2978,7 @@ fn notify_tool_outcome(
     if matches!(result, ToolCallResult::Success { .. })
         && let Some(advisor) = session.pitfall_advisor()
     {
-        advisor.resolved(tool_name, arguments);
+        advisor.resolved_in_session(session.id(), tool_name, arguments);
     }
     let Some(observer) = session.tool_outcome_observer().cloned() else {
         return;
@@ -3116,7 +3153,7 @@ async fn apply_pitfall_advice(
     arguments: &serde_json::Value,
 ) -> Option<String> {
     let advisor = session.pitfall_advisor()?.clone();
-    let hint = advisor.advise(tool_name, arguments)?;
+    let hint = advisor.advise_in_session(session.id(), tool_name, arguments)?;
     let event = DriftEvent {
         kind: DriftKind::PitfallMatch,
         session_id: session.id().to_string(),
@@ -3983,20 +4020,17 @@ async fn resume_after_approval_with_store(
                         },
                     );
 
-                    let Some(submitter) = session.registry().agent_job_submitter().cloned() else {
-                        return Err(CoreError::HandoffFailed {
-                            role: role.clone(),
-                            reason: NO_BACKGROUND_EXECUTOR_ERROR.to_owned(),
+                    let Some(result) =
+                        detach_admitted_child(session, &spawner, &child, &role, question.as_deref())
+                            .await
+                    else {
+                        session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
+                        return Ok(TurnOutcome::AwaitingChild {
+                            child,
+                            call_id: pending.call.id,
+                            role,
                         });
                     };
-                    let job = submitter
-                        .submit_child(&child, question.as_deref())
-                        .await
-                        .map_err(|error| CoreError::HandoffFailed {
-                            role: role.clone(),
-                            reason: error.to_string(),
-                        })?;
-                    let result = agent_job_started_result(&job, &role);
                     notify_tool_outcome(
                         session,
                         pending.call.name.as_str(),
@@ -5127,20 +5161,17 @@ async fn drive_turn(
                 // authority; the durable job runtime owns its lifecycle. The
                 // start is a one-time return; there is no blocking fallback
                 // (a missing submitter was refused before the spawn).
-                let Some(submitter) = session.registry().agent_job_submitter().cloned() else {
-                    return Err(CoreError::HandoffFailed {
-                        role: role.clone(),
-                        reason: NO_BACKGROUND_EXECUTOR_ERROR.to_owned(),
+                let Some(result) =
+                    detach_admitted_child(session, &spawner, &child, &role, question.as_deref())
+                        .await
+                else {
+                    session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
+                    return Ok(TurnOutcome::AwaitingChild {
+                        child,
+                        call_id: call.id,
+                        role,
                     });
                 };
-                let job = submitter
-                    .submit_child(&child, question.as_deref())
-                    .await
-                    .map_err(|error| CoreError::HandoffFailed {
-                        role: role.clone(),
-                        reason: error.to_string(),
-                    })?;
-                let result = agent_job_started_result(&job, &role);
                 notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
                 notify_tool_progress(session);
                 session
@@ -6858,6 +6889,95 @@ mod tests {
         }
         Ok(())
     }
+    #[tokio::test]
+    async fn host_background_launcher_counts_as_executor_and_yields_awaiting_child() -> TestResult {
+        let child = SessionId::new();
+        let mut session = delegation_session_with(
+            Arc::new(FixedChildSpawner {
+                child: child.clone(),
+            }),
+            None,
+        )?;
+        session.set_host_background_launcher(true);
+        assert!(background_only_refusal(&session, &serde_json::json!({})).is_none());
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("transfer_to_worker"),
+            arguments: serde_json::json!({"task": "do it"}),
+        }])]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+            .await
+            .map_err(ctx("the host launcher detaches the pause"))?;
+        let TurnOutcome::AwaitingChild {
+            child: paused,
+            role,
+            ..
+        } = outcome
+        else {
+            return Err(TestError::Unexpected(format!(
+                "expected AwaitingChild, got {outcome:?}"
+            )));
+        };
+        assert_eq!(paused, child);
+        assert_eq!(role, "worker");
+        Ok(())
+    }
+
+    struct FailingJobSubmitter;
+
+    impl harw_extension_api::AgentJobSubmitter for FailingJobSubmitter {
+        fn submit_child<'a>(
+            &'a self,
+            _child: &'a SessionId,
+            _task: Option<&'a str>,
+        ) -> harw_extension_api::AgentJobFuture<'a> {
+            Box::pin(async {
+                Err(harw_extension_api::AgentSpawnError::new(
+                    "job store unavailable",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_submit_releases_the_child_and_returns_a_tool_error() -> TestResult {
+        let spawner = Arc::new(CompletionTrackingSpawner {
+            child_completed: AtomicUsize::new(0),
+            child_finished: AtomicUsize::new(0),
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(spawner.clone())
+            .agent_job_submitter(Arc::new(FailingJobSubmitter))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"task": "do it"}),
+            }]),
+            crate::model::ModelResponse::text("understood"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+            .await
+            .map_err(ctx("a failed submit is a tool error, not a turn abort"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            spawner.child_finished.load(Ordering::SeqCst),
+            1,
+            "the admitted child must be released"
+        );
+        expect_single_error(
+            &session,
+            "The 'worker' agent was admitted but could not be started",
+        )
+    }
+
     /// Ein Turn-Grenzen-Ende vermerkt die konkrete Grenze mit Wert (statt
     /// „Token-Budget oder Turn-Wächter"); der erste Grund gewinnt.
     #[test]
