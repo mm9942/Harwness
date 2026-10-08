@@ -472,6 +472,7 @@ fn classify_outcome_maps_success_failure_and_cancellation() {
     let (status, _) = classify_outcome(Ok(ToolCallResult::error("child agent failed: x")));
     assert_eq!(status, BackgroundStatus::Failed);
     let (status, text) = classify_outcome(Err(AgentSpawnError {
+        kind: Default::default(),
         message: "weg".to_owned(),
     }));
     assert_eq!((status, text.as_str()), (BackgroundStatus::Failed, "weg"));

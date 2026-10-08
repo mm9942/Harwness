@@ -75,7 +75,8 @@ pub use auto_compact::{
 // Runde 5, Teil K.
 pub use background_children::{
     BackgroundChildren, BackgroundNotice, BackgroundProgress, BackgroundRun, BackgroundStatus,
-    ORCHESTRATION_LIMIT_MARKER, OrchestrationLimits, is_orchestration_limit_rejection,
+    DELEGATION_REJECTED_MARKER, ORCHESTRATION_LIMIT_MARKER, OrchestrationLimits,
+    describe_occupying_children, is_orchestration_limit_error, is_orchestration_limit_rejection,
 };
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 // Runde 5, Teil M.
