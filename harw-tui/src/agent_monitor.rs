@@ -9,6 +9,30 @@
 //! Seitenpanel der TUI, [`AgentMonitor::render_agent_detail`] zeigt die
 //! Detailansicht eines einzelnen Agenten; die Statuszeile liest
 //! [`AgentMonitor::totals`].
+//!
+//! # Identität, Spur und semantische Projektion
+//!
+//! Der Monitor ist absichtlich **identitätsorientierter Laufzeitzustand**:
+//! ein Eintrag in `agents` beschreibt einen konkreten Agenten/Run. Schon
+//! heute werden einige wiederholte Updates in-place konsolidiert (Streaming-
+//! Deltas, doppelte Statusmeldungen, Tool-Call/Result-Deduplizierung), ohne
+//! die konkrete Agentenidentität aufzugeben.
+//!
+//! `docs/planning/71-semantic-activity-patterns/` plant darüber eine
+//! zusätzliche, abgeleitete Pattern-/Projection-Schicht. Beispielsweise
+//! könnten mehrere fehlgeschlagene `uia-writer`-Runs mit derselben
+//! normalisierten Fehlerklasse in einer kompakten Panel-Zeile erscheinen.
+//! Diese Projektion darf jedoch niemals die einzelnen `SessionId`s,
+//! Trace-Einträge oder Fehlerursachen aus dem Detailpfad entfernen.
+//!
+//! Deshalb bleibt die Trennung verbindlich:
+//!
+//! - `AgentLive` = konkreter Lauf / konkrete Identität;
+//! - PatternInstance = abgeleitete semantische Gruppe;
+//! - Projection = mutable Darstellung dieser Gruppe.
+//!
+//! Pattern-Aggregation ist reine Beobachtung/Darstellung und trägt keine
+//! Agent-, Tool- oder Host-Authority.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
