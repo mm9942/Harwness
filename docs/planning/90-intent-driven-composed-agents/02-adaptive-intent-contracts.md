@@ -33,6 +33,9 @@ Proposed strictly versioned, deny-unknown-fields contract (illustrative Rust, no
 struct AgentIntentV1 {
     schema_version: u32,
     intent_id: IntentId,
+    revision: u64,                  // trusted monotonic intent revision
+    predecessor_digest: Option<ContentDigest>,
+    canonical_digest: ContentDigest,
     issuer: PrincipalRef,
     objective: Objective,
     immutable_constraints: Vec<Constraint>,
@@ -149,6 +152,8 @@ central verification at pinned integration SHA
 verified proposal for commit / PR / human completion
 ```
 
+**Writer admission is separate from the pure transition core**. Revalidate actual canonical path/symlinks against the trusted workspace root, branch/worktree identity, index state, parent/child rights, lease ownership and preimage hashes at execution and merge time. A successful `ProposePatch` transition has no filesystem effect.
+
 A patch operation must carry: `intent_id`, `base_sha`, `repository_ref`, `allowed_paths`, `expected_preimage_digests`, `change_kind`, `owner_worker`, `risk_class`, `review_plan`, `rollback_strategy`, `approval_ref` if needed, and `idempotency_key`. Recheck base/preimages immediately before edit and again before merge; an unseen file modification is a conflict, not permission for `git add -A`. For multi-file changes, reserve the entire declared contract set and reject undeclared files; untouched declared entries can be `change=false`.
 
 Reversal is not always equivalent to `git reset`: before publication, prefer separate worktrees / clean revert of owned changes only; after publication, create explicit compensating commits; for irreversible external actions use a human-approved mitigation plan. A model can propose rollback, not erase someone else's changes without ownership proof.
@@ -171,7 +176,7 @@ Boundedness requires **independent** `max_agent_spawn_depth`, `max_chain_nesting
 
 ## H. Durable semantics and replay
 
-An `AgentCycleCheckpoint` should pin job work id, epoch/lease, parent intent revision, recipe version, branch frontier, decision proposal+admission verdict, model/provider/effort selection, evidence refs, owned artifact revisions, coverage, budget and next intent. Stale epoch cannot write. A crashed uncommitted action may be retried: external effects need idempotency identifiers, writes compare preimages and parent sees an explicit uncertain-effect state when success cannot be proven. A checkpoint stores *explicit argument/evidence summaries*, not private model chain-of-thought. Session compaction is not the checkpoint. Streaming partial tokens are not committed evidence.
+An `AgentCycleCheckpoint` should pin job work id, epoch/lease, parent intent revision and digest, recipe version, branch frontier, decision proposal+admission verdict, model/provider/effort selection, evidence refs, owned artifact revisions, coverage, budget and next intent. **Crucially**, it stores a non-authorizing `harw_authority::AuthoritySnapshot` reference plus its bound workspace/policy provenance; on resume the trusted runtime must reissue and intersect that snapshot under current trusted policy (`harw-authority/src/lib.rs::PolicyBootstrap::reissue`; `harw-core/src/child_controller.rs::ChildRecoveryView`). Serialized checkpoints cannot grant or widen rights. Stale epoch cannot write. A crashed uncommitted action may be retried: external effects need idempotency identifiers, writes compare preimages and parent sees an explicit uncertain-effect state when success cannot be proven. A checkpoint stores *explicit argument/evidence summaries*, not private model chain-of-thought. Session compaction is not the checkpoint. Streaming partial tokens are not committed evidence.
 
 ## I. Root and sub-orchestrator control policy
 
