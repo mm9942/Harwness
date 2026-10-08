@@ -24,12 +24,12 @@ parent: ../README.md
 
 ## 2. Responsive rect contract
 
-- Compute from terminal cells \`x=columns, y=rows\`, not OS or model. \`x>y\` prefers landscape; \`y>x\` prefers portrait; \`x==y\` has a deterministic feasibility tie breaker.
-- A side rail is only feasible if \`chat.width >= 68\`, \`rail.width >= 44\` and sufficient body height remains after footer; an otherwise landscape-oriented terminal falls back to **ShallowLandscape**. Never call portrait purely because it is a phone.
+- Compute from terminal cells `x=columns, y=rows`, not OS or model. `x>y` prefers landscape; `y>x` prefers portrait; `x==y` has a deterministic feasibility tie breaker.
+- A three-column landscape composition is feasible only after separately budgeting Chat, the **middle Status/WIP column** and the **outer-right Agents/Jobs column**, plus gutters and footer. Provisional targets: Chat >= 64 columns, Middle >= 38, Right >= 30 (a tested dense profile may be smaller); otherwise choose **ShallowLandscape** with distinct switchable windows. Never detect orientation by device identity.
 - In **PortraitStack**, Agents and Jobs sit in the pinned first row (two logical cards), **Finished/Failed** immediately underneath, then a taller separate **WIP** panel and the main chat. Composer/status remain at bottom.
-- In **LandscapeRail**, chat is left, right rail holds Agents/Jobs at top, Finished/Failed underneath, and WIP in the large remaining right region. Independently scrollable.
-- In constrained \`Summary\`/compact mode, label all 3 categories as distinct counters with a detail switcher and show the latest verified progress in one or two lines. Do not construct unreadable zero-height cards.
-- Minimum chat, modal approvals and footer win capacity competition. Compress WIP first, status detail second; do not clip approval prompts.
+- In **LandscapeThreeColumns**, **Chat** is left, **Finished/Failed (Status)** is a separately bordered window at the **top-center**, **WIP** is the larger separate window directly below, and independently bordered **Active Agents** (top) and **Active Jobs** (bottom) are stacked at the **outer-right edge**. Never merge them into one oversized right-hand monitoring window.
+- In constrained `Summary`/compact mode, preserve **three individually addressable titled status window identities** as compact focusable counters/tabs with a detail switcher, plus a distinct WIP identity, even if all cannot render simultaneously. No blended status list, no zero-height rectangles.
+- Minimum chat, modal approvals and footer win capacity competition. Compress WIP first and status detail second; do not clip approval prompts. Each visible window has its own border, rectangle, scroll position, focus/selection and maximize/detail. The top-center 'Status' is Finished/Failed, not the bottom terminal status line.
 - Pure classifier; saturating arithmetic; no overlaps, out-of-bounds rectangles or unchecked conversion. A layout flip on resize does not modify agent/job execution, cancellation, history, plan or user input.
 - Preserve current F2/F3/F4/F5/F11/Esc semantics; WIP focus must not steal keystrokes from composer. Hit test by rectangles, not assumptions that AgentMonitor is always on the right.
 
@@ -58,16 +58,16 @@ Model output is an **untrusted proposal**:
 
 **Hard authorization:** input principal is set by runtime; a model cannot choose the session, project, agent, worktree, source index, tool grants or read scope. A child/sibling result appears only through its already admissible bounded return envelope. Never include private reasoning, raw prompts, raw tool args, unrelated user messages or secret material. Model narration and proposals are escaped/redacted, output capped and are never executable commands.
 
-**Write and accuracy rules:** Progress Agent is read-only and tool-free in the MVP. The deterministic coordinator may hold session-local draft cards but may not mark a PlanNode Completed or Goal Achieved. Actual persisted changes require the existing validated PlanStore actions and approvals. \`Completed\` carries verified EvidenceRef; \`Failed\` and \`Blocked\` are never disguised as “almost done”.
+**Write and accuracy rules:** Progress Agent is read-only and tool-free in the MVP. The deterministic coordinator may hold session-local draft cards but may not mark a PlanNode Completed or Goal Achieved. Actual persisted changes require the existing validated PlanStore actions and approvals. `Completed` carries verified EvidenceRef; `Failed` and `Blocked` are never disguised as “almost done”.
 
 **Lifecycle:** event-triggered coalesced updates after trusted commits, plan changes, job progress or child return. Do not trigger an LLM on every rendered frame, output token, tool heartbeat or polling interval. One bounded pending model update/session; reject stale output after new user correction, plan revision or session move. If no provider, render deterministic status with explicit deferred/stale labels. Preserve a cursor/high-water mark for restart; lossy AgentEventHub notifications are only wakeups.
 
 ## 4. First-pass test gates
 
 ### Layout
-1. Geometry at \`48x65\`, \`70x90\`, \`80x40\`, \`100x30\`, \`120x42\`, \`160x45\`, \`39x60\`, \`48x19\`, \`1x1\` and \`0x0\`; x/y tie and crossing on resize.
+1. Geometry at `48x65`, `70x90`, `80x40`, `100x30`, `120x42`, `160x45`, `200x50`, `39x60`, `48x19`, `1x1` and `0x0`; x/y tie and crossing on resize. If full layout is feasible assert five individual window rectangles and exact anchor placement.
 2. Rectangles non-overlapping and within viewport; status/composer modal reserve, focus, F2/F3/F4/F5/F11/Esc, Unicode width, modal priority and independent wheel routing unchanged.
-3. Three distinct status views share source truth with existing monitor and JobRows; no duplicate lifecycle; finished/failed reason visible.
+3. Three distinct status views share source truth with existing monitor and JobRows; no duplicate lifecycle. In landscape assert Finished/Failed **top-center**, WIP **center below** and Agents/Jobs **separately stacked far-right**. Focus, borders, selection and scroll belong to each window; finished/failed reason visible.
 4. No unbounded rendering or excessive main-chat area loss.
 
 ### Progress
@@ -82,11 +82,11 @@ Model output is an **untrusted proposal**:
 
 ## 5. Wave owner boundaries
 
-- M1: \`harw-tui-layout\` pure classifier, geometry tests.
-- M2: \`harw-tui\` status cards, focus/scroll, renderer tests.
+- M1: `harw-tui-layout` pure classifier, geometry tests.
+- M2: `harw-tui` status cards, focus/scroll, renderer tests.
 - M3: runtime-to-TUI typed progress projection without an LLM.
 - M4: optional separated progress agent job with strict minimal context.
 - M5: validator for model todo drafts using existing PlanStore; retain human-only acceptance.
 - M6: reconcile PL-90 session index and job progress without sharing agent context.
 
-This W00 should not be used to justify touching Harw-owned code in PR #136 or moving runtime policy into \`harw-tui-layout\`. Record actual implementation SHAs and tests before any item is relabeled COMPLETE.
+This W00 should not be used to justify touching Harw-owned code in PR #136 or moving runtime policy into `harw-tui-layout`. Record actual implementation SHAs and tests before any item is relabeled COMPLETE.
