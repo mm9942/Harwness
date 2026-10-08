@@ -696,7 +696,10 @@ pub fn admit_cycle(
     })
 }
 
-fn check_state(policy: &CycleAdmission, state: &CycleCheckpoint) -> Result<(), CycleRefusal> {
+pub(crate) fn check_state(
+    policy: &CycleAdmission,
+    state: &CycleCheckpoint,
+) -> Result<(), CycleRefusal> {
     if state.schema_version != CYCLE_CHECKPOINT_SCHEMA {
         return Err(CycleRefusal::UnsupportedSchema);
     }
@@ -783,8 +786,11 @@ fn require_evidence(state: &CycleCheckpoint, evidence_id: &str) -> Result<(), Cy
     }
 }
 
+/// Upper bound (in characters) of a transition reason.
+pub const MAX_REASON_CHARS: usize = 512;
+
 fn check_reason(reason: &str) -> Result<(), CycleRefusal> {
-    if reason.trim().is_empty() {
+    if reason.trim().is_empty() || reason.chars().count() > MAX_REASON_CHARS {
         Err(CycleRefusal::InvalidReason)
     } else {
         Ok(())
@@ -1566,6 +1572,27 @@ mod tests {
                 }
             ),
             Err(CycleRefusal::InvalidReason)
+        );
+        let too_long = "x".repeat(MAX_REASON_CHARS + 1);
+        assert_eq!(
+            admit_cycle(
+                &policy,
+                &state,
+                CycleProposal::Failed {
+                    reason: too_long.clone()
+                }
+            ),
+            Err(CycleRefusal::InvalidReason)
+        );
+        assert!(
+            admit_cycle(
+                &policy,
+                &state,
+                CycleProposal::Failed {
+                    reason: "x".repeat(MAX_REASON_CHARS)
+                }
+            )
+            .is_ok()
         );
         Ok(())
     }

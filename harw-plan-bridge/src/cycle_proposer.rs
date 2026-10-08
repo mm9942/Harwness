@@ -699,7 +699,7 @@ impl ModelCycleProposer {
                             }
                         }
                         Err(requested) => {
-                            return Err(StepFailure::new(format!(
+                            return Err(StepFailure::retryable(format!(
                                 "model route {}: {}; provider asked to wait {}s, over the {}s retry maximum",
                                 slot.name(),
                                 error_kind(&error),
@@ -714,11 +714,12 @@ impl ModelCycleProposer {
                         let slot_failures = &mut self.auth_failures[slot.index()];
                         *slot_failures = slot_failures.saturating_add(1);
                     }
-                    return Err(StepFailure::new(format!(
-                        "model route {}: {}",
-                        slot.name(),
-                        error_kind(&error)
-                    )));
+                    let reason = format!("model route {}: {}", slot.name(), error_kind(&error));
+                    return Err(if error.is_retryable() {
+                        StepFailure::retryable(reason)
+                    } else {
+                        StepFailure::new(reason)
+                    });
                 }
             }
         }
@@ -1455,6 +1456,7 @@ mod tests {
             "{}",
             failure.reason
         );
+        assert!(failure.retryable, "an over-cap wait is a temporary outage");
         assert_eq!(provider.calls(), 1, "no retry after an over-cap wait");
         Ok(())
     }
@@ -1527,7 +1529,11 @@ mod tests {
         };
         let provider = Scripted::new(vec![transient(), transient(), transient(), transient()]);
         let mut p = proposer(&provider);
-        assert!(run_once(&mut p, None).await?.is_err());
+        let failure = run_once(&mut p, None)
+            .await?
+            .err()
+            .ok_or(TestError::Missing("expected failure"))?;
+        assert!(failure.retryable, "exhausted 5xx retries are temporary");
         assert_eq!(provider.calls(), 3, "1 try + max_retries(2)");
         Ok(())
     }
