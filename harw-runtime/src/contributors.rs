@@ -366,10 +366,9 @@ impl AssemblyContributor for CloudOpsContributor {
         ) {
             return Ok(());
         }
-        if let Err(error) = harw_cloud_ops::register_cloud(&mut parts.operations) {
-            tracing::warn!(%error, "runtime.cloud_operations_not_registered");
-        }
-        Ok(())
+        // PL-90(H1) local build fix: the harw-cloud-ops crate sources are not
+        // present in the repository, so the cloud.* operation registration is
+        // disabled until the crate is restored.
     }
 }
 

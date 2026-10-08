@@ -2935,7 +2935,7 @@ fn notify_tool_outcome(
     if matches!(result, ToolCallResult::Success { .. })
         && let Some(advisor) = session.pitfall_advisor()
     {
-        advisor.resolved(tool_name, arguments);
+        advisor.resolved_in_session(session.id(), tool_name, arguments);
     }
     let Some(observer) = session.tool_outcome_observer().cloned() else {
         return;
@@ -3110,7 +3110,7 @@ async fn apply_pitfall_advice(
     arguments: &serde_json::Value,
 ) -> Option<String> {
     let advisor = session.pitfall_advisor()?.clone();
-    let hint = advisor.advise(tool_name, arguments)?;
+    let hint = advisor.advise_in_session(session.id(), tool_name, arguments)?;
     let event = DriftEvent {
         kind: DriftKind::PitfallMatch,
         session_id: session.id().to_string(),
