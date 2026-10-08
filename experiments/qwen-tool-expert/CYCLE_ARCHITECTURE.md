@@ -108,6 +108,20 @@ Export only appropriately scrubbed and authorized records. Reject stale schemas,
 
 Use these trajectories as multi-turn conversational SFT for Qwen, with explicit tool-call/response boundaries; later preference optimization is optional and only if a reliable executable reward exists. Retain independent untouched evaluation tasks from newer Harw schema revisions.
 
+### Implemented offline distillation gate
+
+`distill_expert_runs.py` accepts an explicitly supplied, already redacted JSONL of micro-model runs **only after an operator separately allowlists the SHA256 of each exact record**. It structurally validates the conversation, registered tool names, matching call/result ids, expert annotations, and family-level holdout. The separate training command `train_qlora.py --data-dir student_verified_data --train` remains opt-in.
+
+This structural validator **cannot attest** real sandbox execution, license/secret redaction, or permission correctness: these require a trusted Harw runtime exporter and independent verification. There are presently **zero** such validated traces; its positive unit-test fixtures are explicitly synthetic and do not count as production proof.
+
+```sh
+python3 build_micro_dataset.py && python3 validate_micro_dataset.py
+python3 -m unittest test_micro_dataset.py test_distillation_contract.py
+# This command requires operator-prepared inputs; it is not a synthetic shortcut:
+python3 distill_expert_runs.py --trace-file reviewed_traces.jsonl \\
+  --reviewed-sha256-file reviewed_hashes.txt
+```
+
 ## Acceptance targets (to measure, not claims)
 
 1. At least as many **successful tool tasks per second** as untuned Qwen3-1.7B; compare costs, latency and total tokens, not only expert parameter counts.
