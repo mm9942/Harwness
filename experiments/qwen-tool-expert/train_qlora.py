@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-BASE = "Qwen/Qwen3-4B-Instruct-2507"
+BASE = "Qwen/Qwen3-1.7B"
 ROOT = Path(__file__).resolve().parent
 
 def main():
