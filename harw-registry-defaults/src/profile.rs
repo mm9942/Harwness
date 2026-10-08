@@ -1135,7 +1135,7 @@ pub const TUNNEL_TOOLS: &[&str] = &[
 ];
 
 /// Plan R9, Teil F: die sechs Werkzeuge von `harw-tool-job`
-/// (`job.start/status/logs/stop/list/wait`) in Registrierungsreihenfolge.
+/// (`job.start/status/logs/stop/list`) in Registrierungsreihenfolge.
 ///
 /// # Beschreibung
 /// Stehen in jedem Profil direkt hinter [`SHELL_TOOLS`]: `job.start` läuft
@@ -1148,7 +1148,7 @@ pub const TUNNEL_TOOLS: &[&str] = &[
 pub const JOB_TOOLS: &[&str] = &harw_tool_job::JOB_TOOL_NAMES;
 
 /// Plan R9, Teil F: die Job-Werkzeuge der Orchestratoren (ohne Shell):
-/// `job.status/logs/stop/list/wait` — kein `job.start`.
+/// `job.status/logs/stop/list` — kein `job.start`.
 ///
 /// # Warum nicht Teil eines [`RegistryProfile`]
 /// Wie [`SUDO_TOOLS`]: die Composition-Root hängt sie über
@@ -1164,7 +1164,7 @@ pub const JOB_CONTROL_TOOLS: &[&str] = &harw_tool_job::JOB_CONTROL_TOOLS;
 /// ```rust
 /// use harw_registry_defaults::profile::{job_control_tools_for_role, role_names};
 ///
-/// assert!(job_control_tools_for_role(role_names::ROOT_ORCHESTRATOR).contains(&"job.wait"));
+/// assert!(job_control_tools_for_role(role_names::ROOT_ORCHESTRATOR).contains(&"job.status"));
 /// assert!(!job_control_tools_for_role(role_names::CODING_ORCHESTRATOR).contains(&"job.start"));
 /// assert!(job_control_tools_for_role(role_names::EXECUTOR).is_empty());
 /// ```
@@ -2515,7 +2515,7 @@ impl JobWiring {
         )
     }
 
-    /// Nur [`JOB_CONTROL_TOOLS`] (lesen, warten, stoppen — kein
+    /// Nur [`JOB_CONTROL_TOOLS`] (lesen, stoppen — kein
     /// `job.start`) für Orchestratoren ohne Shell. Der Startweg ist ein
     /// Sandbox-Standard-Shell-Provider, aber über den Filter nie erreichbar.
     #[must_use]

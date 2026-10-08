@@ -199,12 +199,12 @@ async fn test_exit_code_and_tail_in_finished_event() -> TestResult {
         .map_err(ctx("start"))?;
     let id = started.meta.job_id.clone();
 
-    let (outcome, status) = env
+    let status = env
         .manager
-        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
+        .await_exit(&id, Caller::Agent("agent-a"), LIMIT)
         .await
-        .map_err(ctx("wait"))?;
-    assert_eq!(outcome, WaitOutcome::Finished);
+        .map_err(ctx("await_exit"))?;
+    assert!(status.meta.state.is_terminal());
     assert_eq!(status.meta.state, JobState::Failed);
     assert_eq!(status.meta.exit_code, Some(3));
 
@@ -241,12 +241,12 @@ async fn test_successful_job_is_succeeded() -> TestResult {
         .map_err(ctx("start"))?
         .meta
         .job_id;
-    let (outcome, status) = env
+    let status = env
         .manager
-        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
+        .await_exit(&id, Caller::Agent("agent-a"), LIMIT)
         .await
-        .map_err(ctx("wait"))?;
-    assert_eq!(outcome, WaitOutcome::Finished);
+        .map_err(ctx("await_exit"))?;
+    assert!(status.meta.state.is_terminal());
     assert_eq!(status.meta.state, JobState::Succeeded);
     assert_eq!(status.meta.exit_code, Some(0));
     Ok(())
@@ -316,15 +316,6 @@ async fn test_progress_and_error_events() -> TestResult {
         .map_err(ctx("start"))?
         .meta
         .job_id;
-    let (outcome, status) = env
-        .manager
-        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
-        .await
-        .map_err(ctx("wait"))?;
-    // Der erste Meilenstein kommt vor dem Ende.
-    assert_eq!(outcome, WaitOutcome::Milestone);
-    assert!(!status.meta.state.is_terminal());
-
     let finished = eventually(LIMIT, || {
         env.manager
             .status(&id, Caller::Agent("agent-a"))
@@ -357,11 +348,9 @@ async fn test_progress_and_error_events() -> TestResult {
 }
 
 #[tokio::test]
-async fn test_wait_times_out_then_sees_milestone() -> TestResult {
+async fn test_await_exit_times_out_while_the_job_runs() -> TestResult {
     let env = Env::new()?;
-    let prepared = env
-        .prepare("sleep 0.5; echo '[5/10] half'; sleep 30")
-        .await?;
+    let prepared = env.prepare("sleep 30").await?;
     let id = env
         .manager
         .start(request("slow", "agent-a", &[]), prepared)
@@ -370,33 +359,23 @@ async fn test_wait_times_out_then_sees_milestone() -> TestResult {
         .meta
         .job_id;
     let caller = Caller::Agent("agent-a");
-    let (outcome, _) = env
+    let status = env
         .manager
-        .wait(&id, caller, Duration::from_millis(100), None)
+        .await_exit(&id, caller, Duration::from_millis(100))
         .await
         .map_err(ctx("short wait"))?;
-    assert_eq!(outcome, WaitOutcome::Timeout);
-    let (outcome, status) = env
-        .manager
-        .wait(&id, caller, LIMIT, None)
-        .await
-        .map_err(ctx("long wait"))?;
-    assert_eq!(outcome, WaitOutcome::Milestone);
-    assert_eq!(status.meta.progress.and_then(|p| p.percent), Some(50));
-
-    let cancel = CancelToken::new();
-    cancel.cancel(harw_types::cancel::CancelReason::User);
-    let (outcome, _) = env
-        .manager
-        .wait(&id, caller, LIMIT, Some(&cancel))
-        .await
-        .map_err(ctx("cancelled wait"))?;
-    assert_eq!(outcome, WaitOutcome::Cancelled);
+    assert!(!status.meta.state.is_terminal());
 
     env.manager
         .stop(&id, caller, JobSignal::Kill)
         .await
         .map_err(ctx("stop"))?;
+    let status = env
+        .manager
+        .await_exit(&id, caller, LIMIT)
+        .await
+        .map_err(ctx("wait after stop"))?;
+    assert!(status.meta.state.is_terminal());
     Ok(())
 }
 
@@ -1257,12 +1236,12 @@ async fn test_start_piped_echoes_stdin_tees_stdout_and_detects_exit() -> TestRes
     // `cat` sees EOF on stdin and exits 0.
     drop(piped.stdin);
 
-    let (outcome, status) = env
+    let status = env
         .manager
-        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
+        .await_exit(&id, Caller::Agent("agent-a"), LIMIT)
         .await
-        .map_err(ctx("wait"))?;
-    assert_eq!(outcome, WaitOutcome::Finished);
+        .map_err(ctx("await_exit"))?;
+    assert!(status.meta.state.is_terminal());
     assert_eq!(status.meta.state, JobState::Succeeded);
     assert_eq!(status.meta.exit_code, Some(0));
 
@@ -1348,12 +1327,12 @@ async fn run_piped_script(
         .map_err(ctx("start_piped"))?;
     let id = piped.job_id.clone();
     let items = drain_lines(&mut piped.stdout_lines).await?;
-    let (outcome, _) = env
+    let status = env
         .manager
-        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
+        .await_exit(&id, Caller::Agent("agent-a"), LIMIT)
         .await
-        .map_err(ctx("wait"))?;
-    assert_eq!(outcome, WaitOutcome::Finished);
+        .map_err(ctx("await_exit"))?;
+    assert!(status.meta.state.is_terminal());
     let dir = env
         .manager
         .log_dir(&id, Caller::Agent("agent-a"))

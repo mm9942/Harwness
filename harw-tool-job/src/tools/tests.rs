@@ -9,6 +9,7 @@ use harw_extension_api::contributors::ToolProvider;
 use harw_tool_shell::ShellToolProvider;
 use harw_types::ToolCallId;
 use std::fs;
+use std::time::Duration;
 
 fn call(tool: &str, arguments: Value) -> ToolCall {
     ToolCall {
@@ -82,33 +83,25 @@ fn test_tool_specs_and_parallel_safety() -> TestResult {
     assert!(!provider.parallel_safe(&ToolName::new(JOB_START_TOOL)));
     assert!(!provider.parallel_safe(&ToolName::new(JOB_STOP_TOOL)));
     assert!(provider.parallel_safe(&ToolName::new(JOB_STATUS_TOOL)));
-    assert!(provider.parallel_safe(&ToolName::new(JOB_WAIT_TOOL)));
+    assert!(provider.parallel_safe(&ToolName::new(JOB_LOGS_TOOL)));
+    assert!(provider.parallel_safe(&ToolName::new(JOB_LIST_TOOL)));
     Ok(())
 }
 
-/// R18 F8 (EX-05): `job.wait` is a short poll (cap 60 s); the description
-/// and the rejection tell the model not to loop and that the end arrives as
-/// a note.
+/// Background-only rule: there is no blocking wait tool. The model observes
+/// jobs through notifications and the non-blocking `job.status` snapshot.
 #[test]
-fn test_job_wait_is_a_documented_short_poll() -> TestResult {
-    assert_eq!(MAX_WAIT_SECS, 60);
-    assert!(JOB_WAIT_DESCRIPTION.contains("Short poll"));
-    assert!(JOB_WAIT_DESCRIPTION.contains("1-60"));
-    assert!(JOB_WAIT_DESCRIPTION.contains("Do not call job.wait in a loop"));
-    assert!(JOB_WAIT_DESCRIPTION.contains("delivered to you automatically"));
-    assert_eq!(parse_wait_secs(Some(60)).map_err(ctx("60 s"))?, 60);
-    assert_eq!(parse_wait_secs(Some(1)).map_err(ctx("1 s"))?, 1);
-    match parse_wait_secs(Some(61)) {
-        Err(ToolsError::InvalidArguments { reason, .. }) => {
-            assert!(reason.contains("short poll"), "{reason}");
-            assert!(reason.contains("note"), "{reason}");
-        }
-        other => {
-            return Err(TestError::Unexpected(format!(
-                "61 s must be rejected, got {other:?}"
-            )));
-        }
-    }
+fn test_no_blocking_wait_tool_is_registered() -> TestResult {
+    let env = Env::new()?;
+    let provider = provider(&env, Arc::new(NoLineage));
+    let names: Vec<String> = provider
+        .tools()
+        .iter()
+        .map(|spec| spec.name().to_owned())
+        .collect();
+    assert!(!names.iter().any(|name| name.contains("wait")), "{names:?}");
+    assert!(provider.executor(&ToolName::new("job.wait")).is_none());
+    assert!(names.contains(&JOB_STATUS_TOOL.to_owned()));
     Ok(())
 }
 
@@ -208,7 +201,7 @@ async fn test_shell_launcher_applies_shell_exec_rules() -> TestResult {
 }
 
 #[tokio::test]
-async fn test_tool_flow_start_status_logs_wait_list_stop() -> TestResult {
+async fn test_tool_flow_start_status_logs_list_stop() -> TestResult {
     let env = Env::new()?;
     let lineage: Arc<dyn JobLineage> = Arc::new(FnLineage(|session: &SessionId| {
         if session.as_str() == "worker" {
@@ -283,18 +276,6 @@ async fn test_tool_flow_start_status_logs_wait_list_stop() -> TestResult {
     )?;
     assert_eq!(logs["stdout"]["lines"], json!(["1: hi there"]));
     assert_eq!(logs["stderr"]["total_lines"], json!(0));
-
-    let waited = json_of(
-        run(
-            &provider,
-            &worker,
-            JOB_WAIT_TOOL,
-            json!({ "job_id": job_id, "timeout_secs": 1 }),
-        )
-        .await
-        .map_err(ctx("wait"))?,
-    )?;
-    assert_eq!(waited["outcome"], json!("timeout"));
 
     let listed = json_of(
         run(&provider, &orchestrator, JOB_LIST_TOOL, json!({}))
@@ -388,19 +369,26 @@ async fn test_job_start_with_argv_and_cwd() -> TestResult {
         .to_owned();
     assert_eq!(started["command"], json!("sh -c 'pwd; exit 7'"));
 
-    let waited = json_of(
+    let id = JobId::parse(&job_id).ok_or(TestError::Missing("valid job id"))?;
+    let ended = eventually(Duration::from_secs(10), || {
+        env.manager
+            .status(&id, Caller::Agent("worker"))
+            .is_ok_and(|status| status.meta.state.is_terminal())
+    })
+    .await;
+    assert!(ended);
+    let status = json_of(
         run(
             &provider,
             &worker,
-            JOB_WAIT_TOOL,
-            json!({ "job_id": job_id, "timeout_secs": 10 }),
+            JOB_STATUS_TOOL,
+            json!({ "job_id": job_id }),
         )
         .await
-        .map_err(ctx("wait"))?,
+        .map_err(ctx("status"))?,
     )?;
-    assert_eq!(waited["outcome"], json!("finished"));
-    assert_eq!(waited["status"]["state"], json!("failed"));
-    assert_eq!(waited["status"]["exit_code"], json!(7));
+    assert_eq!(status["state"], json!("failed"));
+    assert_eq!(status["exit_code"], json!(7));
 
     let logs = json_of(
         run(
@@ -456,20 +444,6 @@ async fn test_invalid_arguments_are_rejected() -> TestResult {
             json!({ "job_id": "job-1", "signal": "STOP" }),
         ),
         (JOB_LIST_TOOL, json!({ "all": true })),
-        (
-            JOB_WAIT_TOOL,
-            json!({ "job_id": "job-1", "timeout_secs": 0 }),
-        ),
-        (JOB_WAIT_TOOL, json!({ "job_id": "job-1" })),
-        // R18 F8 (EX-05): above the short-poll cap → rejected, not clamped.
-        (
-            JOB_WAIT_TOOL,
-            json!({ "job_id": "job-1", "timeout_secs": MAX_WAIT_SECS + 1 }),
-        ),
-        (
-            JOB_WAIT_TOOL,
-            json!({ "job_id": "job-1", "timeout_secs": 600 }),
-        ),
     ];
     for (tool, arguments) in cases {
         let result = run(&provider, &worker, tool, arguments.clone()).await;

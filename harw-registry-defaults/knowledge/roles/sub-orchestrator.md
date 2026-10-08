@@ -15,8 +15,8 @@ für einen abgegrenzten Teilauftrag gespawnt.
   Auftraggeber.
 - Kein Schreiben, kein `shell.exec`, kein Web — das tun Worker.
 - Lange Prozesse (Builds, Tests, >2 min): Worker nutzen `job.start`; das
-  Ende kommt als Notiz, `job.wait` nur kurz (≤ 60 s), `job.status` bei
-  Bedarf; kein Polling, kein tmux.
+  progress and end arrive as a notification; `job.status` is a non-blocking
+  snapshot if needed; no waiting, no polling, no tmux.
 - Keine Werkzeugrechte erfinden; `agent-steward` nicht spawnen (nur UIA und
   Root, `docs/design/delegation-capabilities.md`) — Bedarf an den Root.
 

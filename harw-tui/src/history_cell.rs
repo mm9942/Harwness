@@ -1668,7 +1668,7 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 ///   Rumpf zu `… heredoc N Zeilen` eingeklappt (R18 F7), siehe
 ///   [`shell_label`].
 /// - `job.start` → `Job(<Name>)`; der Befehl erscheint nur ausgeklappt im
-///   Ergebnis. `job.wait` → `job.wait(<id>, ≤Ns)`, `job.status`/`job.logs`/
+///   Ergebnis. `job.status`/`job.logs`/
 ///   `job.stop` → `job.<aktion>(<id>)`, `job.list` → `job.list(<art>)`.
 /// - `plan {action: …}` → `plan(<aktion> <knoten> → <zustand>)`, siehe
 ///   [`plan_tool_label`].
@@ -1721,16 +1721,6 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
                 "Job(unbenannt)".to_owned()
             } else {
                 format!("Job({})", truncate_chars(name, 60))
-            }
-        }
-        "job.wait" => {
-            let id = str_arg("job_id").unwrap_or("?");
-            match object
-                .and_then(|entries| entries.get("timeout_secs"))
-                .and_then(|v| v.as_u64())
-            {
-                Some(secs) => format!("job.wait({id}, ≤{secs}s)"),
-                None => format!("job.wait({id})"),
             }
         }
         "job.status" | "job.logs" => format!("{tool_name}({})", str_arg("job_id").unwrap_or("?")),
@@ -1927,7 +1917,7 @@ pub(crate) fn placement_badge(placement: &ToolPlacement) -> String {
 }
 
 /// Ersatz-Ort aus dem Ergebnis: `executed_on` (`"host"`, `"sandbox"`,
-/// `"gateway"`) auf oberster Ebene oder unter `status` (`job.wait`).
+/// `"gateway"`) auf oberster Ebene oder unter `status`.
 /// Andere Werte ergeben `None` — geraten wird nicht.
 fn placement_from_result(result: &ToolCallResult) -> Option<ToolPlacement> {
     let ToolCallResult::Success { value } = result else {
@@ -2181,8 +2171,7 @@ impl ToolCell {
     ///   `summary`-Feld, außer bei `explore.projects`), `preview` je Eintrag
     ///   eine Zeile (`root (kind)`, `path (kind)`, `from → to (kind)`),
     ///   `full_output` das formatierte JSON ([`pretty_print_json`]).
-    /// - `job.start`/`job.status`/`job.wait`: `summary` aus Ausgang
-    ///   (`job.wait`), Job-ID, Zustand und Exit-Code; keine `preview`, der
+    /// - `job.start`/`job.status`: `summary` aus Job-ID, Zustand und Exit-Code; keine `preview`, der
     ///   Befehl (`Befehl: …`), `cwd` und die letzten Zeilen nur ausgeklappt.
     /// - alle anderen Werkzeuge: `summary = None`, `preview` die ersten drei
     ///   Zeilen einer kompakten Klartext-Darstellung (Zeichenketten
@@ -2205,7 +2194,7 @@ impl ToolCell {
     ///
     /// # Beschreibung
     /// `placement` hat Vorrang; fehlt es, gilt `executed_on` im Ergebnis
-    /// (`job.*` liefert `"host"`/`"sandbox"`, bei `job.wait` unter `status`).
+    /// (`job.*` liefert `"host"`/`"sandbox"`, teils unter `status`).
     /// Fehlt beides, bleibt der Ort unbekannt (`None`).
     ///
     /// # Argumente
@@ -2469,7 +2458,7 @@ impl ToolCell {
             // R18 D-D: `job.*` zeigt Job, Zustand und Ausgang; der Befehl
             // steht nur in der ausgeklappten Darstellung, nie in der
             // eingeklappten Zelle.
-            "job.start" | "job.status" | "job.wait" if value.is_object() => {
+            "job.start" | "job.status" if value.is_object() => {
                 let status = value
                     .get("status")
                     .filter(|status| status.is_object())
@@ -4118,11 +4107,6 @@ mod tests {
             harw_tools::serde_json::json!({ "command": "make" }),
         );
         assert_eq!(tool_label(&unnamed), "Job(unbenannt)");
-        let wait = make_tool_call(
-            "job.wait",
-            harw_tools::serde_json::json!({ "job_id": "job-1", "timeout_secs": 60 }),
-        );
-        assert_eq!(tool_label(&wait), "job.wait(job-1, ≤60s)");
         let status = make_tool_call(
             "job.status",
             harw_tools::serde_json::json!({ "job_id": "job-1" }),

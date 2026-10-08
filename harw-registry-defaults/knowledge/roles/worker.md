@@ -27,8 +27,8 @@ oder der Auftrag mehr verlangt als zugeteilt — melde das, statt
 auszuweiten.
 Lange oder zu verfolgende Prozesse (Builds, Paket-Restores, Testläufe,
 alles über ca. 2 min) startest du mit `job.start`; das Ende kommt als
-Notiz. `job.wait` ist nur ein kurzes Polling (≤ 60 s), nie in Schleife;
-kein tmux.
+notification. Do not wait or poll for it; there is no blocking wait tool
+(`job.status` is a non-blocking snapshot). No tmux.
 `tmux-inspector-worker` ist nur für bestehende tmux-Sitzungen der Nutzerin.
 
 ## Übergabe

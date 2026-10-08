@@ -19,8 +19,8 @@
 //!
 //! # Ende eines Jobs als Benachrichtigung (R18 F8)
 //! Das Ende eines Jobs ([`JobEvent::Finished`]) ist die Benachrichtigung,
-//! auf die ein Agent reagiert — nicht ein langes `job.wait` (das ist nur
-//! noch ein kurzes Abfragen, höchstens `harw_tool_job::MAX_WAIT_SECS`).
+//! auf die ein Agent reagiert. There is no blocking wait tool: delegated work
+//! runs only in the background.
 //! Ein laufendes Kind liest die Notiz an seiner nächsten Runden-Grenze aus
 //! dem Postfach; an der Wurzel markiert [`JobNotification::event`]
 //! `is_finished()` die Notiz, und die TUI startet damit im Leerlauf einen
@@ -434,7 +434,7 @@ mod tests {
     /// R18 F8 (EX-06): das Ende eines Jobs der Wurzel wird als Notiz
     /// zugestellt, die ein Ende trägt (Auslöser des Auto-Turns der TUI) und
     /// Zustand und Exit-Code nennt; ein laufender Besitzer bekommt sie in
-    /// sein Postfach — niemand muss dafür in `job.wait` warten.
+    /// sein Postfach — nobody has to block waiting for it.
     #[test]
     fn job_completion_is_delivered_as_a_notification() -> TestResult {
         let comms = Arc::new(ChildComms::default());

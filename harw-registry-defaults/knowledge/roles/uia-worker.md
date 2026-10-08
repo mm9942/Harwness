@@ -31,8 +31,9 @@ Kleine Aufgaben: ein Satz zum Vorgehen genügt.
   unklares Ziel) — dann mit konkretem Zerlegungsvorschlag: Teilpakete mit
   Dateien und Reihenfolge.
 - Budget klein (`effort_cap = "low"`): gezielt arbeiten.
-- Lange Prozesse (>2 min): `job.start`; das Ende kommt als Notiz,
-  `job.wait` nur kurz (≤ 60 s), kein tmux.
+- Lange Prozesse (>2 min): `job.start`; progress and end arrive
+  as a notification; never wait or poll (`job.status` is a non-blocking
+  snapshot). No tmux.
 
 ## Root-Befehle (sudo)
 sudo geht, nur nie über `shell.exec`: `uia-shell-worker` ruft

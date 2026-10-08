@@ -330,10 +330,10 @@ async fn run_job_managed<S: ChildProcessSpawner>(
     }
     if matches!(outcome.status, ChildRunStatus::Crashed { .. }) {
         let exit_code = match job_manager
-            .wait(&job_id, Caller::Agent(&caller_session), JOB_EXIT_WAIT, None)
+            .await_exit(&job_id, Caller::Agent(&caller_session), JOB_EXIT_WAIT)
             .await
         {
-            Ok((_, status)) => status.meta.exit_code,
+            Ok(status) => status.meta.exit_code,
             Err(_) => None,
         };
         let stderr_tail = job_managed_stderr_tail(job_manager, &job_id, &caller_session);
