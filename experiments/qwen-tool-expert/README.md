@@ -6,7 +6,21 @@ Status: **research pilot / draft**, 2026-10-08. No model has been trained, deplo
 
 Fine-tune a small Qwen model to select and call **admitted Harwness tools** correctly, with strict argument schemas, tool-result continuation, rights awareness and minimal unnecessary shell use. Tool knowledge is a learned prior; the **runtime tool registry, admitted tools, sandbox and approval checks remain authoritative**.
 
-Base checkpoint: [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) (Apache-2.0; model choice should be re-evaluated against Qwen3.5-4B only after tool-template, training and inference benchmarks). First technique: QLoRA SFT, not full pretraining or an experimental latent-state architecture.
+**Updated architecture:** start with several specialized **~135M cycle micro-models** based on [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct); distill their *validated complete tool trajectories* into [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B). Both base models are Apache-2.0. Read [CYCLE_ARCHITECTURE.md](CYCLE_ARCHITECTURE.md) for exact phase boundaries and what remains unimplemented. The 1.7B model is a **student target**, not a concatenation of tiny experts or a trained checkpoint.
+
+## Micro-expert cycle pilot (new)
+
+Six seeded phase-specialists: `intent`, `tool_selection`, `argument_builder`, `observation`, `continuation`, and `verification`. Six further roles are reserved in `micro_experts.json` pending real validated training samples. All 135M decisions remain **advisory**: Harw's Rust `turn_loop`, live registry, permissions and approvals are the only authoritative execution path. Prefer a shared 135M backbone with separate LoRA adapters or distill into the 1.7B student, rather than loading every expert independently on the phone.
+
+```sh
+cd experiments/qwen-tool-expert
+python3 build_micro_dataset.py
+python3 validate_micro_dataset.py
+python3 -m unittest test_micro_dataset.py
+python3 train_micro.py --expert intent   # DRY RUN, no model download
+```
+
+`train_micro.py --expert intent --train` is **opt-in** and refuses a tiny dataset by default. Likewise, `train_qlora.py` only starts the Qwen3-1.7B student training with `--train`. Neither script has been GPU-validated. **No ML training, deployment or Cloudflare billing operation has been started.**
 
 ## Source ground truth
 
@@ -70,6 +84,6 @@ Train/evaluate by repository, task template, tool family, and schema version to 
 
 ## Limitations and next wave
 
-This PR supplies a schema-verified seed, deterministic generator, validator, and **opt-in unverified training starter** only. It does not export full runtime tools, replace Harwness's tool registry, train a checkpoint, or charge for GPU compute.
+This PR supplies source-annotated seed tools, deterministic full-cycle and micro-stage generators, validators, tests, a 12-role manifest and **opt-in unverified LoRA / QLoRA starters** only. It does not export full runtime tools, replace Harwness's tool registry, train a checkpoint, or charge for GPU compute.
 
 Next separate waves: (A) Rust registry exporter, (B) curated 200–1,000 real/synthetic vetted trajectories with privacy scrubber, (C) LoRA pilot and baseline A/B, (D) conditional Harwness model integration when evaluations pass. No changes to Cloudflare billing or production model routes.
