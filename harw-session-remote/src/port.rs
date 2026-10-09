@@ -40,6 +40,26 @@ impl RemotePort {
     pub fn connection(&self) -> &RemoteConnection {
         &self.connection
     }
+
+    /// Attach with the recorded resume cursor (h19): presents the newest
+    /// cursor seen for the session as `AttachParams::from` and never
+    /// fabricates one. `None` means a fresh attach from the tail.
+    ///
+    /// The host enforces generation correctness on its own (a stale or
+    /// foreign-generation cursor triggers a resync, see `attach_sync`);
+    /// this helper only hands over what was actually observed.
+    #[must_use]
+    pub fn attach_with_resume(&self, params: AttachParams) -> AttachParams {
+        if params.from.is_none() {
+            if let Some(cursor) = self.connection.resume_cursor(&params.session_id) {
+                return AttachParams {
+                    from: Some(cursor),
+                    ..params
+                };
+            }
+        }
+        params
+    }
 }
 
 fn session_ref(session: SessionId) -> SessionRef {

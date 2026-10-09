@@ -1062,6 +1062,10 @@ impl HostConnection {
 
         // Durable replay, at most half a queue so the stream starts healthy;
         // the rest arrives through `Lagged` + re-attach from the cursor.
+        // h19: `params.from` comes from the client's recorded resume cursor
+        // (`ResumeCursors`, see harw-session-remote reconnect.rs) — the
+        // client never fabricates a cursor. A generation change forces a
+        // resync below instead of a stale-position resume.
         let budget = (self.host.config.queue.max_frames / 2).max(1);
         let (start, resync) = match params.from {
             Some(cursor) if cursor.generation == generation => (cursor.durable.min(head), false),
