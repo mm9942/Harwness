@@ -8,20 +8,20 @@ use harw_authority::{
 use harw_core::{
     AgentSession, ApprovalResolution, ConfigApprovalPolicy, EchoModelProvider, InMemoryStateStore,
     ModelFuture, ModelProvider, ModelRequest, ModelResponse, SessionState, SpawnContext, TurnInput,
-    TurnOutcome, resume_after_approval, resume_after_approval_durable, resume_after_child,
-    run_turn, run_turn_durable,
+    TurnOutcome, resume_after_approval, resume_after_approval_durable, run_turn, run_turn_durable,
 };
 use harw_extension_api::{
-    AgentSpawnError, AgentSpawner, ApprovalDecision, ApprovalHandler, ExtensionRegistry,
-    ExtensionRegistryBuilder, SpawnFuture, SpawnInput, ToolExecutor, ToolExecutorFuture, ToolName,
-    ToolOutput, ToolProvider, ToolSpec,
+    AgentJobFuture, AgentJobHandle, AgentJobSubmitter, AgentSpawnError, AgentSpawner,
+    ApprovalDecision, ApprovalHandler, ExtensionRegistry, ExtensionRegistryBuilder, SpawnFuture,
+    SpawnInput, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput, ToolProvider, ToolSpec,
 };
 use harw_session_store::ApprovalStore;
 use harw_tools::ToolCall;
 use harw_tools::schema::JsonSchema;
 use harw_tools::spec::FunctionToolSpec;
 use harw_types::{
-    AgentRole, ApprovalActor, ItemId, ReviewDecision, SessionId, TenantId, ToolCallId, WorkspaceId,
+    AgentRole, ApprovalActor, ItemId, ReviewDecision, SessionId, TenantId, ToolCallId, WorkId,
+    WorkspaceId,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -540,91 +540,95 @@ async fn explicitly_parallel_safe_tool_calls_are_joined_before_the_next_model_ru
     Ok(())
 }
 
-#[tokio::test]
-async fn handoff_pauses_then_resumes() -> TestResult {
-    let child_id = SessionId::new();
-    let spawns = Arc::new(AtomicUsize::new(0));
-    let finished = Arc::new(AtomicUsize::new(0));
-    let registry = ExtensionRegistryBuilder::default()
-        .spawner(Arc::new(StubSpawner {
-            child: child_id.clone(),
-            spawns: spawns.clone(),
-            finished: finished.clone(),
-        }))
-        .build();
-    let (mut session, _rx) = new_session(registry)?;
-    let store = InMemoryStateStore::new();
+/// Records submitted children and answers with a fresh durable work id.
+struct StubJobSubmitter {
+    submitted: Arc<AtomicUsize>,
+}
 
-    let handoff_call_id = ToolCallId::new();
-    let model = ScriptedModel::new(vec![
-        // first call: a handoff
+impl AgentJobSubmitter for StubJobSubmitter {
+    fn submit_child<'a>(
+        &'a self,
+        child: &'a SessionId,
+        _task: Option<&'a str>,
+    ) -> AgentJobFuture<'a> {
+        self.submitted.fetch_add(1, Ordering::SeqCst);
+        let child = child.clone();
+        Box::pin(async move {
+            Ok(AgentJobHandle {
+                work_id: WorkId::new(),
+                child,
+            })
+        })
+    }
+}
+
+fn handoff_model(handoff_call_id: &ToolCallId, arguments: serde_json::Value) -> ScriptedModel {
+    ScriptedModel::new(vec![
         ModelResponse {
             message: None,
             tool_calls: vec![ToolCall {
                 id: handoff_call_id.clone(),
                 name: ToolName::new("transfer_to_worker"),
-                arguments: serde_json::json!({"task": "sub"}),
+                arguments,
             }],
             usage: Default::default(),
             ..Default::default()
         },
-        // after resume: final answer
-        ModelResponse::text("child done, finishing"),
-    ]);
+        ModelResponse::text("started, continuing"),
+    ])
+}
+
+#[tokio::test]
+async fn handoff_starts_in_the_background_without_pausing_the_turn() -> TestResult {
+    let child_id = SessionId::new();
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let registry = ExtensionRegistryBuilder::default()
+        .spawner(Arc::new(StubSpawner {
+            child: child_id,
+            spawns: spawns.clone(),
+            finished,
+        }))
+        .agent_job_submitter(Arc::new(StubJobSubmitter {
+            submitted: submitted.clone(),
+        }))
+        .build();
+    let (mut session, _rx) = new_session(registry)?;
+    let store = InMemoryStateStore::new();
+    let model = handoff_model(&ToolCallId::new(), serde_json::json!({"task": "sub"}));
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegate"))
         .await
         .map_err(ctx("turn runs"))?;
 
-    match outcome {
-        TurnOutcome::AwaitingChild {
-            child,
-            call_id,
-            role,
-        } => {
-            assert_eq!(child, child_id);
-            assert_eq!(call_id, handoff_call_id);
-            assert_eq!(role, "worker");
-        }
-        other => {
-            return Err(TestError::Unexpected(format!(
-                "expected AwaitingChild, got {other:?}"
-            )));
-        }
-    }
+    assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
-    assert_eq!(*session.state(), SessionState::WaitingForChild);
+    assert_eq!(submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(*session.state(), SessionState::Idle);
+    Ok(())
+}
 
-    let wrong_child = SessionId::new();
-    let mismatch = resume_after_child(
-        &mut session,
-        &model,
-        &store,
-        wrong_child,
-        handoff_call_id.clone(),
-        harw_protocol::ToolCallResult::success(serde_json::json!({"result": "wrong child"})),
-    )
-    .await;
-    assert!(
-        mismatch.is_err(),
-        "a different child cannot resume the parent"
-    );
-    assert_eq!(*session.state(), SessionState::WaitingForChild);
+#[tokio::test]
+async fn handoff_without_a_background_executor_is_a_tool_error_and_spawns_nothing() -> TestResult {
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let registry = ExtensionRegistryBuilder::default()
+        .spawner(Arc::new(StubSpawner {
+            child: SessionId::new(),
+            spawns: spawns.clone(),
+            finished: Arc::new(AtomicUsize::new(0)),
+        }))
+        .build();
+    let (mut session, _rx) = new_session(registry)?;
+    let store = InMemoryStateStore::new();
+    let model = handoff_model(&ToolCallId::new(), serde_json::json!({"task": "sub"}));
 
-    // child reports back
-    let resumed = resume_after_child(
-        &mut session,
-        &model,
-        &store,
-        child_id,
-        handoff_call_id,
-        harw_protocol::ToolCallResult::success(serde_json::json!({"result": "ok"})),
-    )
-    .await
-    .map_err(ctx("resume runs"))?;
+    let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegate"))
+        .await
+        .map_err(ctx("turn runs"))?;
 
-    assert!(matches!(resumed, TurnOutcome::Completed));
-    assert_eq!(finished.load(Ordering::SeqCst), 1);
+    assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
     assert_eq!(*session.state(), SessionState::Idle);
     Ok(())
 }

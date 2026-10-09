@@ -1681,6 +1681,7 @@ impl ChildComms {
 /// Immer dieselbe Ablehnung für fremde, unbekannte und beendete Kinder.
 fn not_own_running_child(child: &str) -> AgentSpawnError {
     AgentSpawnError {
+        kind: Default::default(),
         message: format!("kein eigenes, laufendes Kind mit der ID {child}"),
     }
 }
@@ -1738,12 +1739,12 @@ impl ManagedAgentSpawner {
         if record.status.is_terminal() {
             return Err(not_own_running_child(child_id));
         }
-        let text = validate_message(text).map_err(|message| AgentSpawnError { message })?;
+        let text = validate_message(text).map_err(AgentSpawnError::new)?;
         let from = self.message_sender_role(caller);
         let delivery = self
             .comms
             .deliver_to_child(&child, &from, &text)
-            .map_err(|message| AgentSpawnError { message })?;
+            .map_err(AgentSpawnError::new)?;
         tracing::info!(
             child = %child,
             parent = %caller,
@@ -1766,12 +1767,13 @@ impl ManagedAgentSpawner {
         text: &str,
     ) -> Result<SessionId, AgentSpawnError> {
         let record = self.child_record(child).ok_or_else(|| AgentSpawnError {
+            kind: Default::default(),
             message: "parent.message: diese Sitzung hat keinen Elternteil".to_owned(),
         })?;
-        let text = validate_message(text).map_err(|message| AgentSpawnError { message })?;
+        let text = validate_message(text).map_err(AgentSpawnError::new)?;
         self.comms
             .post_info(child, &record.parent, &record.role, &text, Instant::now())
-            .map_err(|message| AgentSpawnError { message })?;
+            .map_err(AgentSpawnError::new)?;
         tracing::info!(child = %child, parent = %record.parent, "child_comms.info_to_parent");
         Ok(record.parent)
     }
@@ -1796,13 +1798,14 @@ impl ManagedAgentSpawner {
         timeout: Duration,
     ) -> Result<(String, bool), AgentSpawnError> {
         let record = self.child_record(child).ok_or_else(|| AgentSpawnError {
+            kind: Default::default(),
             message: "parent.message: diese Sitzung hat keinen Elternteil".to_owned(),
         })?;
-        let text = validate_message(text).map_err(|message| AgentSpawnError { message })?;
+        let text = validate_message(text).map_err(AgentSpawnError::new)?;
         let (id, receiver) = self
             .comms
             .ask_parent(child, &record.parent, &record.role, &text)
-            .map_err(|message| AgentSpawnError { message })?;
+            .map_err(AgentSpawnError::new)?;
         tracing::info!(child = %child, parent = %record.parent, "child_comms.question_to_parent");
         let cancel = self.child_cancel_token(child);
         let wait = tokio::time::timeout(timeout, receiver);

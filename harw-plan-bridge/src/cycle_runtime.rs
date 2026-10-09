@@ -49,7 +49,7 @@ use tokio::sync::watch;
 use crate::intent_cycle::{
     AdmittedCycle, CycleAdmission, CycleCheckpoint, CycleObservations, CycleProposal, CycleRefusal,
     CycleTerminal, FenceRefusal, ObservationError, ResumeRefusal, admit_cycle, apply_observations,
-    check_commit, check_rebind, resume_admission,
+    check_commit, check_rebind, check_state, resume_admission,
 };
 
 /// Schema version of [`CycleRecord`].
@@ -367,13 +367,27 @@ fn check_fenced(record: &CycleRecord, token: &LeaseToken) -> Result<(), CycleSto
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepFailure {
     pub reason: String,
+    /// `true` when the failure is temporary (provider overloaded, rate
+    /// limited): the cycle must stay non-terminal so a new lease can retry.
+    pub retryable: bool,
 }
 
 impl StepFailure {
+    /// A permanent failure (missing capability, auth, bad output).
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
+            retryable: false,
+        }
+    }
+
+    /// A temporary failure; the driver commits no terminal state for it.
+    #[must_use]
+    pub fn retryable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retryable: true,
         }
     }
 }
@@ -384,8 +398,11 @@ pub trait CycleProposer: Send {
     /// admission refusal of the previous proposal for the same step, so the
     /// model can correct course instead of repeating it.
     ///
-    /// Returning `Err` means the proposer itself is unavailable (provider
-    /// error, missing route); the driver ends the cycle as `Blocked`.
+    /// Returning `Err` means the proposer itself is unavailable. A permanent
+    /// failure (missing route, auth) ends the cycle as `Blocked`; a
+    /// [`StepFailure::retryable`] one leaves the cycle non-terminal and
+    /// surfaces as [`CycleRunError::ProposerUnavailable`], which the job
+    /// runner retries under a new lease.
     fn propose(
         &mut self,
         admission: &CycleAdmission,
@@ -422,6 +439,13 @@ pub trait CycleStepExecutor: Send {
         state: &CycleCheckpoint,
         cancel: &CancelToken,
     ) -> impl Future<Output = Result<CycleObservations, StepFailure>> + Send;
+
+    /// Called by the driver with the freshly reissued authority whenever a
+    /// new lease epoch takes the cycle over, before any step of that lease
+    /// runs. Executors that keep their own [`AuthorityContext`] replace it
+    /// here so permission checks use the current lease's authority. The
+    /// default does nothing (for executors that hold no authority).
+    fn rebind_authority(&mut self, _authority: &AuthorityContext) {}
 
     /// Establishes what happened to a step journaled by an earlier lease,
     /// typically by looking up `step.idempotency_key`.
@@ -482,6 +506,8 @@ pub enum CycleRunError {
     Admission(CycleRefusal),
     Observation(ObservationError),
     Join(String),
+    /// Temporary proposer outage; nothing terminal was committed.
+    ProposerUnavailable(String),
 }
 
 impl fmt::Display for CycleRunError {
@@ -493,6 +519,9 @@ impl fmt::Display for CycleRunError {
             Self::Admission(refusal) => write!(f, "cycle admission refused: {refusal:?}"),
             Self::Observation(error) => write!(f, "cycle observation rejected: {error:?}"),
             Self::Join(reason) => write!(f, "blocking store task failed: {reason}"),
+            Self::ProposerUnavailable(reason) => {
+                write!(f, "proposer temporarily unavailable (retryable): {reason}")
+            }
         }
     }
 }
@@ -594,6 +623,7 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             record = self
                 .blocking(move |store| store.rebind(&id, &lease, &resumed))
                 .await?;
+            self.executor.rebind_authority(&reissued);
             admission
         };
         if let Some(step) = record.in_flight.clone() {
@@ -609,20 +639,32 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             }
         }
         let mut checkpoint = record.checkpoint;
+        // A state the policy refuses outright (narrowed chain depth, ceiling
+        // mismatch) refuses every proposal: fail closed before any model call.
+        check_state(&admission, &checkpoint).map_err(CycleRunError::Admission)?;
         let mut last_refusal = None;
         let mut refusals: u8 = 0;
         loop {
             if cancel.is_cancelled() {
                 return Ok(CycleRunOutcome::Cancelled { checkpoint });
             }
-            let proposal = match self
-                .proposer
-                .propose(&admission, &checkpoint, last_refusal)
-                .await
-            {
+            let proposed = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Ok(CycleRunOutcome::Cancelled { checkpoint });
+                }
+                proposed = self.proposer.propose(&admission, &checkpoint, last_refusal) => proposed,
+            };
+            let proposal = match proposed {
                 Ok(proposal) => proposal,
+                Err(failure) if failure.retryable => {
+                    return Err(CycleRunError::ProposerUnavailable(failure.reason));
+                }
                 Err(failure) => CycleProposal::Blocked {
-                    reason: format!("proposer unavailable: {}", failure.reason),
+                    reason: format!(
+                        "proposer unavailable: {}",
+                        failure.reason.chars().take(400).collect::<String>()
+                    ),
                 },
             };
             let admitted = match admit_cycle(&admission, &checkpoint, proposal) {
@@ -1062,6 +1104,7 @@ mod tests {
         results: VecDeque<Result<CycleObservations, StepFailure>>,
         reconciliation: StepReconciliation,
         executed: Arc<Mutex<Vec<String>>>,
+        rebinds: Arc<Mutex<u32>>,
     }
 
     impl Executor {
@@ -1070,11 +1113,18 @@ mod tests {
                 results: results.into(),
                 reconciliation: StepReconciliation::NotStarted,
                 executed: Arc::new(Mutex::new(Vec::new())),
+                rebinds: Arc::new(Mutex::new(0)),
             }
         }
     }
 
     impl CycleStepExecutor for Executor {
+        fn rebind_authority(&mut self, _authority: &AuthorityContext) {
+            if let Ok(mut rebinds) = self.rebinds.lock() {
+                *rebinds += 1;
+            }
+        }
+
         fn execute(
             &mut self,
             step: &InFlightStep,
@@ -1231,6 +1281,119 @@ mod tests {
                     .to_owned()
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retryable_proposer_outage_commits_no_terminal_state() -> TestResult {
+        let fx = fixture("cycle-503")?;
+        let proposer = Script::new(vec![Err(StepFailure::retryable("model route: 503"))]);
+        let mut first = driver(&fx, proposer, Executor::new(vec![]), rights()?);
+        let result = first
+            .run(
+                "cycle-503",
+                &token(&fx.work_id, 1),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await;
+        let Err(error) = result else {
+            return Err(TestError::Missing("retryable outage must be an error"));
+        };
+        assert!(matches!(error, CycleRunError::ProposerUnavailable(_)));
+        assert!(matches!(
+            job_outcome("cycle-503", Err(error)),
+            JobOutcome::Failed { .. }
+        ));
+        let record = fx.store.load("cycle-503").map_err(ctx("record loads"))?;
+        assert_eq!(record.checkpoint.terminal, None, "cycle stays resumable");
+        // A later lease can still run the cycle to completion.
+        let proposer = Script::new(vec![Ok(CycleProposal::Complete {})]);
+        let mut again = driver(&fx, proposer, Executor::new(vec![]), rights()?);
+        let outcome = again
+            .run(
+                "cycle-503",
+                &token(&fx.work_id, 2),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("second lease runs"))?;
+        assert!(matches!(outcome, CycleRunOutcome::Terminal { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refused_state_fails_closed_before_any_model_call() -> TestResult {
+        let fx = fixture("cycle-deep")?;
+        let mut record = fx.store.load("cycle-deep").map_err(ctx("record loads"))?;
+        record.checkpoint.chain_depth = fx.admission.limits().max_chain_depth + 1;
+        fx.store.create(&CycleRecord::new(
+            "cycle-deep-2",
+            fx.work_id.clone(),
+            record.checkpoint,
+        )
+        .map_err(ctx("record builds"))?)
+        .map_err(ctx("record persists"))?;
+        let proposer = Script::new(vec![Ok(wait()), Ok(wait()), Ok(wait())]);
+        let seen = Arc::clone(&proposer.refusals);
+        let mut driver = driver(&fx, proposer, Executor::new(vec![]), rights()?);
+        let result = driver
+            .run(
+                "cycle-deep-2",
+                &token(&fx.work_id, 1),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CycleRunError::Admission(CycleRefusal::ChainDepthExceeded))
+        ));
+        assert!(
+            seen.lock().map_err(|_| TestError::Missing("lock"))?.is_empty(),
+            "the proposer must not be called"
+        );
+        Ok(())
+    }
+
+    /// A proposer whose model call never resolves.
+    struct Hung;
+
+    impl CycleProposer for Hung {
+        fn propose(
+            &mut self,
+            _admission: &CycleAdmission,
+            _state: &CycleCheckpoint,
+            _last_refusal: Option<CycleRefusal>,
+        ) -> impl Future<Output = Result<CycleProposal, StepFailure>> + Send {
+            std::future::pending()
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_hung_proposer() -> TestResult {
+        let fx = fixture("cycle-hung")?;
+        let mut driver = CycleDriver::new(
+            Arc::clone(&fx.store),
+            Hung,
+            Executor::new(vec![]),
+            Arc::new(FixedReissuer(rights()?)),
+        );
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel(CancelReason::User);
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            driver.run("cycle-hung", &token(&fx.work_id, 1), &fx.admission, &cancel),
+        )
+        .await
+        .map_err(|_| TestError::Missing("driver must not hang"))?
+        .map_err(ctx("driver runs"))?;
+        assert!(matches!(outcome, CycleRunOutcome::Cancelled { .. }));
         Ok(())
     }
 
@@ -1392,6 +1555,51 @@ mod tests {
             "the dropped step is not counted"
         );
         assert_eq!(checkpoint.fence.epoch, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn takeover_rebinds_the_executor_to_the_reissued_authority_once() -> TestResult {
+        let fx = fixture("cycle-rebind")?;
+        crash_mid_step(&fx, "cycle-rebind")?;
+        let proposer = Script::new(vec![Ok(CycleProposal::Failed {
+            reason: "stop".to_owned(),
+        })]);
+        let executor = Executor::new(vec![]);
+        let rebinds = Arc::clone(&executor.rebinds);
+        let mut driver = driver(&fx, proposer, executor, rights()?);
+        driver
+            .run(
+                "cycle-rebind",
+                &token(&fx.work_id, 2),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver resumes"))?;
+        assert_eq!(rebinds.lock().map(|n| *n).ok(), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuing_lease_does_not_rebind() -> TestResult {
+        let fx = fixture("cycle-norebind")?;
+        let proposer = Script::new(vec![Ok(CycleProposal::Failed {
+            reason: "stop".to_owned(),
+        })]);
+        let executor = Executor::new(vec![]);
+        let rebinds = Arc::clone(&executor.rebinds);
+        let mut driver = driver(&fx, proposer, executor, rights()?);
+        driver
+            .run(
+                "cycle-norebind",
+                &token(&fx.work_id, 0),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver runs"))?;
+        assert_eq!(rebinds.lock().map(|n| *n).ok(), Some(0));
         Ok(())
     }
 

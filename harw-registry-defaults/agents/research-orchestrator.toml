@@ -112,7 +112,6 @@ admitted = [
   "job.logs",
   "job.stop",
   "job.list",
-  "job.wait",
 ]
 forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 

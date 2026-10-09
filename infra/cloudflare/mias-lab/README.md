@@ -86,3 +86,11 @@ profile environment/secret layer.
 Keep client-side `max_concurrency` as a first line of defence. The Durable
 Object limit is the shared backstop across Harwness processes and Worker
 isolates, not a replacement for Harwness placement/rate-limit accounting.
+
+## Adaptive concurrency (draft implementation)
+
+The model-scoped Durable Object now starts with the existing conservative limits (frontier: 2, DeepSeek V4/GPT-OSS-120B: 3, others: 6). When requests overlap it expands the local admitted in-flight limit up to a bounded cap (10/12/16 respectively); quiet traffic settles back after a minute. A shared Workers AI capacity response cuts the limit and applies a 20-second admission cooldown instead of fanning out across Gateway IDs. This is **not** an increase in account/model quota: max values are deployment guardrails requiring measured production tuning.
+
+All 19 existing backend Gateway IDs remain eligible as sticky primaries; only transient route-local errors can use alternate Gateways, with a capped attempt budget (3, expanding to 6 under high demand). Full-response caching continues to be restricted to non-streaming, tool-free requests; prompt-prefix caching and `x-session-affinity` are unchanged. Billing remains **postpaid**.
+
+Run `npm run check && npm test` in `infra/cloudflare/mias-lab/` before deploying. Evaluate request success, 429/3040, first-token latency, queue waits, in-flight peak and `input_cached_tokens/input_tokens` against baseline. Roll back if failure rate or cache efficiency regresses; keep this change in a draft PR until production-like integration tests and versioned rollout are verified. File-level coding isolation belongs to Harwness job/worktree orchestration, not this model/Gateway limiter.

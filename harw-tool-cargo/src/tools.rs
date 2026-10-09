@@ -9,6 +9,7 @@
 //! großen Workspaces nicht die Meldungen verdrängt.
 
 use crate::command;
+use crate::guard::{self, Target, Workspace, parse_porcelain_z};
 use crate::plan::{Plan, RawSelection, RawTargets};
 use crate::report::{
     build_report, failed_report, fmt_report, metadata_report, test_report, tree_report,
@@ -351,6 +352,24 @@ pub struct TreeArgs {
     #[serde(default)]
     pub offline: Option<bool>,
     /// Time limit in seconds (1-3600, default 600).
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_u64"
+    )]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Argumente für `cargo.test_one`.
+#[derive(Debug, Deserialize, harw_macros::Tool)]
+#[serde(deny_unknown_fields)]
+pub struct TestOneArgs {
+    /// Workspace member to test (exact package name, validated against cargo metadata).
+    pub package: String,
+    /// Test target: "lib" or "test:<integration test name>".
+    pub target: String,
+    /// Exact test path as printed by the harness, for example "parse::tests::empty_input" (letters, digits and _ : . / -).
+    pub test: String,
+    /// Time limit in seconds (1-600, default 300).
     #[serde(
         default,
         deserialize_with = "harw_extension_api::lenient::lenient_opt_u64"
@@ -927,6 +946,278 @@ fn read_and_remove(
     result
 }
 
+/// Time limit of the two pre-flight commands (`cargo metadata`, `git status`).
+const PREFLIGHT_TIMEOUT_SECS: u64 = 60;
+
+/// Runs `cargo metadata --no-deps` through the delegate and returns the JSON.
+async fn preflight_metadata(
+    shell: &ShellDelegate,
+    context: &ToolExecutionContext,
+    tool: &str,
+) -> Result<Value, ToolOutput> {
+    let argv: Vec<String> = [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--no-deps",
+        "--locked",
+        COLOR[0],
+        COLOR[1],
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let name = format!(
+        "metadata-{}-{}.json",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let file = format!("{SCRATCH_DIR}/{name}");
+    let command = format!(
+        "{} && {} > {}",
+        command::join(&["mkdir".to_owned(), "-p".to_owned(), SCRATCH_DIR.to_owned()]),
+        command::join(&argv),
+        command::join(std::slice::from_ref(&file))
+    );
+    let run = execute(shell, context, tool, &command, PREFLIGHT_TIMEOUT_SECS).await?;
+    let root = workspace_root(context);
+    let read = blocking(move || read_and_remove(&root, &file, &name, MAX_METADATA_BYTES)).await;
+    if run.exit_code != 0 {
+        let tail: String = run.stderr.chars().take(1500).collect();
+        return Err(fail(
+            tool,
+            format!(
+                "pre-flight `cargo metadata --no-deps --locked` failed (exit {}); no test was run: {tail}",
+                run.exit_code
+            ),
+        ));
+    }
+    match read {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(message)) => Err(fail(tool, message)),
+        None => Err(fail(tool, "internal error while reading the metadata file")),
+    }
+}
+
+/// Refuses unless cargo's `workspace_root` is the shell's canonical working
+/// directory, so the rebuild guard compares paths from one common base.
+fn check_workspace_root(metadata: &Value, shell_root: &std::path::Path) -> Result<(), String> {
+    let reported = metadata
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .ok_or("cargo metadata has no workspace_root")?;
+    match std::fs::canonicalize(reported) {
+        Ok(root) if root == shell_root => Ok(()),
+        _ => Err(
+            "cargo's workspace root is not the sandbox working directory; the rebuild guard cannot map changed files onto packages, so no test was run. Run cargo.test_one from the workspace root."
+                .to_owned(),
+        ),
+    }
+}
+
+/// Lists changed paths (staged, unstaged, untracked) relative to the
+/// workspace root through `git status`.
+async fn preflight_changes(
+    shell: &ShellDelegate,
+    context: &ToolExecutionContext,
+    tool: &str,
+) -> Result<Vec<String>, ToolOutput> {
+    let words = |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_owned()).collect() };
+    let prefix_cmd = command::join(&words(&["git", "rev-parse", "--show-prefix"]));
+    let status_cmd = command::join(&words(&[
+        "git",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+        ".",
+    ]));
+    let command = format!("{prefix_cmd} && {status_cmd}");
+    let run = execute(shell, context, tool, &command, PREFLIGHT_TIMEOUT_SECS).await?;
+    if run.exit_code != 0 {
+        return Err(fail(
+            tool,
+            format!(
+                "pre-flight `git status` failed (exit {}); the rebuild guard cannot tell what changed, so no test was run: {}",
+                run.exit_code,
+                run.stderr.chars().take(500).collect::<String>()
+            ),
+        ));
+    }
+    if run.truncated {
+        return Err(fail(
+            tool,
+            "pre-flight `git status` output was truncated: far too many files changed for a focused test run; commit or stash the unrelated changes, or run the test as a background job (job.start). No test was run.",
+        ));
+    }
+    // Fail closed: without the `--show-prefix` line the status paths cannot
+    // be mapped onto the workspace, and the guard would see no rebuilds.
+    let Some((prefix, rest)) = run.stdout.split_once('\n') else {
+        return Err(fail(
+            tool,
+            "pre-flight `git status` output is malformed (no path prefix line); the rebuild guard cannot tell what changed, so no test was run.",
+        ));
+    };
+    let prefix = prefix.trim();
+    if !prefix.is_empty() && (!prefix.ends_with('/') || prefix.starts_with('/')) {
+        return Err(fail(
+            tool,
+            "pre-flight `git rev-parse --show-prefix` returned an unexpected prefix; the rebuild guard cannot tell what changed, so no test was run.",
+        ));
+    }
+    Ok(parse_porcelain_z(rest, prefix))
+}
+
+/// Runs exactly one test if the rebuild guard allows it.
+#[harw_macros::tool(
+    name = "cargo.test_one",
+    description = "Runs exactly ONE Rust test (cargo test -p PACKAGE --lib|--test T --locked TEST -- --exact) and only when that will not recompile a large part of the workspace. Arguments: package (workspace member), target (\"lib\" or \"test:<integration test name>\"), test (exact test path), optional timeout_secs (default 300, max 600). A deterministic pre-flight check (no compilation) computes which workspace crates cargo would rebuild from the uncommitted changes and the dependency closure of the package; if more than 3 crates would rebuild, or Cargo.toml, Cargo.lock, rust-toolchain, .cargo/config.toml or a build.rs changed, nothing is run and the result is {status: \"refused\", reason: would_recompile|global_invalidation, rebuild_count, threshold, rebuild_set, changed_packages, changed_global_files, hint}. Otherwise returns the cargo.test result {status: ok|tests_failed|failed|no_test_matched, tests:{passed, failed, failures:[{name, location, message}]}, diagnostics, log} plus a guard summary. No --workspace, no free-form arguments. Runs through the sandboxed shell tool and needs execute permission; because it executes workspace test code it always asks for approval (an allow rule or a remembered approval never covers it).",
+    permission = "execute_process",
+    state = ShellDelegate
+)]
+async fn cargo_test_one(
+    shell: &ShellDelegate,
+    context: &ToolExecutionContext,
+    args: TestOneArgs,
+) -> Result<ToolOutput, ToolsError> {
+    const TOOL: &str = "cargo.test_one";
+    let timeout = match args.timeout_secs {
+        None => guard::DEFAULT_TIMEOUT_SECS,
+        Some(n) if (1..=guard::MAX_TIMEOUT_SECS).contains(&n) => n,
+        Some(n) => {
+            return Ok(fail(
+                TOOL,
+                format!(
+                    "timeout_secs must be between 1 and {}, got {n}",
+                    guard::MAX_TIMEOUT_SECS
+                ),
+            ));
+        }
+    };
+    let target = match Target::parse(&args.target) {
+        Ok(target) => target,
+        Err(message) => return Ok(fail(TOOL, message)),
+    };
+    if let Err(message) = command::package(&args.package) {
+        return Ok(fail(TOOL, message));
+    }
+    if args.package.contains('@') {
+        return Ok(fail(
+            TOOL,
+            "package must be a plain package name without @version",
+        ));
+    }
+    if let Err(message) = command::test_filter(&args.test) {
+        return Ok(fail(TOOL, message.replace("test_filter", "test")));
+    }
+    let metadata = match preflight_metadata(shell, context, TOOL).await {
+        Ok(metadata) => metadata,
+        Err(output) => return Ok(output),
+    };
+    // The git status paths are relative to the shell's working directory;
+    // package directories are relative to cargo's workspace root. Only when
+    // both are the same directory do the two path sets line up.
+    if let Err(message) = check_workspace_root(&metadata, &workspace_root(context)) {
+        return Ok(fail(TOOL, message));
+    }
+    let workspace = match Workspace::from_metadata(&metadata) {
+        Ok(workspace) => workspace,
+        Err(message) => return Ok(fail(TOOL, message)),
+    };
+    let Some(info) = workspace.packages.get(&args.package) else {
+        let similar = workspace.similar(&args.package);
+        let hint = if similar.is_empty() {
+            String::new()
+        } else {
+            format!("; similar: {}", similar.join(", "))
+        };
+        return Ok(fail(
+            TOOL,
+            format!("'{}' is not a workspace member{hint}", args.package),
+        ));
+    };
+    match &target {
+        Target::Lib if !info.has_lib => {
+            return Ok(fail(
+                TOOL,
+                format!(
+                    "{} has no library target; use target \"test:<name>\"",
+                    args.package
+                ),
+            ));
+        }
+        Target::Test(name) if !info.test_targets.contains(name) => {
+            let available: Vec<&str> = info.test_targets.iter().map(String::as_str).collect();
+            return Ok(fail(
+                TOOL,
+                format!(
+                    "{} has no integration test '{name}' (available: {})",
+                    args.package,
+                    if available.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        available.join(", ")
+                    }
+                ),
+            ));
+        }
+        _ => {}
+    }
+    let changes = match preflight_changes(shell, context, TOOL).await {
+        Ok(changes) => changes,
+        Err(output) => return Ok(output),
+    };
+    let assessment = guard::assess(&workspace, &args.package, &changes);
+    if let Some(reason) = assessment.refusal() {
+        return Ok(ToolOutput::json(
+            assessment.refusal_json(reason, &target, &args.test),
+        ));
+    }
+    let argv = guard::test_one_argv(&args.package, &target, &args.test);
+    let command = command::join(&argv);
+    let run = match execute(shell, context, TOOL, &command, timeout).await {
+        Ok(run) => run,
+        Err(output) => return Ok(output),
+    };
+    let output = test_report(TOOL, &command, &run, 20, false);
+    Ok(shape_test_one(output, &args, &target, &assessment))
+}
+
+/// Adds the guard summary and detects "no test matched".
+fn shape_test_one(
+    output: ToolOutput,
+    args: &TestOneArgs,
+    target: &Target,
+    assessment: &guard::Assessment,
+) -> ToolOutput {
+    let ToolOutput::Json { mut content } = output else {
+        return output;
+    };
+    content["package"] = serde_json::json!(args.package);
+    content["target"] = serde_json::json!(target.label());
+    content["test"] = serde_json::json!(args.test);
+    content["guard"] = serde_json::json!({
+        "rebuild_count": assessment.rebuild_set.len(),
+        "threshold": guard::MAX_REBUILD_PACKAGES,
+        "rebuild_set": assessment.rebuild_set,
+    });
+    let count = |key: &str| content["tests"][key].as_u64().unwrap_or(0);
+    let ran = count("passed") + count("failed");
+    if content["status"] == "ok" && ran == 0 {
+        content["status"] = serde_json::json!(if count("ignored") > 0 {
+            "ignored"
+        } else {
+            "no_test_matched"
+        });
+        content["hint"] = serde_json::json!(
+            "No test ran: --exact needs the full path as printed by the harness (for example module::tests::name), and #[ignore]d tests are skipped."
+        );
+    }
+    ToolOutput::Json { content }
+}
+
 harw_tools::tool_provider! {
     /// Stellt die Cargo-Werkzeuge `cargo.check`, `cargo.build`, `cargo.clippy`,
     /// `cargo.test`, `cargo.fmt_check`, `cargo.tree`, `cargo.doc` und
@@ -942,6 +1233,7 @@ harw_tools::tool_provider! {
         CargoTreeTool => CargoTreeTool::new(shell.clone()),
         CargoDocTool => CargoDocTool::new(shell.clone()),
         CargoMetadataTool => CargoMetadataTool::new(shell.clone()),
+        CargoTestOneTool => CargoTestOneTool::new(shell.clone()),
     }
 }
 
@@ -956,7 +1248,7 @@ mod tests {
     };
     use harw_extension_api::contributors::ToolProvider;
     use harw_tools::{ToolName, ToolSpec};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> TestResult<T> {
@@ -1354,12 +1646,235 @@ mod tests {
         Ok(())
     }
 
+    /// Skriptet die drei Phasen von `cargo.test_one`: Metadata-Zwischendatei,
+    /// `git status` und den eigentlichen `cargo test`-Lauf.
+    fn test_one_shell(ws: &std::path::Path, dirty: &'static str) -> Arc<ScriptedShell> {
+        test_one_shell_rooted(ws, dirty, ws)
+    }
+
+    /// Like [`test_one_shell`], but cargo reports `reported_root` as its
+    /// `workspace_root`.
+    fn test_one_shell_rooted(
+        ws: &std::path::Path,
+        dirty: &'static str,
+        reported_root: &std::path::Path,
+    ) -> Arc<ScriptedShell> {
+        let dep =
+            |name: &str| json!({"name": name, "source": null, "kind": null, "path": ws.join(name)});
+        let package = |name: &str, deps: Vec<Value>, targets: Value| {
+            json!({
+                "name": name,
+                "manifest_path": format!("{}/{name}/Cargo.toml", ws.display()),
+                "dependencies": deps,
+                "targets": targets
+            })
+        };
+        let lib = |name: &str| json!([{"name": name, "kind": ["lib"]}]);
+        let doc = json!({
+            "workspace_root": reported_root.to_string_lossy(),
+            "packages": [
+                package("low", vec![], lib("low")),
+                package("mid1", vec![dep("low")], lib("mid1")),
+                package("mid2", vec![dep("low")], lib("mid2")),
+                package("mid3", vec![dep("low")], lib("mid3")),
+                package(
+                    "app",
+                    vec![dep("mid1"), dep("mid2"), dep("mid3")],
+                    json!([{"name": "app", "kind": ["lib"]}, {"name": "it", "kind": ["test"]}])
+                ),
+            ]
+        });
+        let ws = ws.to_path_buf();
+        ScriptedShell::with(move |command| {
+            let ok = |stdout: &str| {
+                harw_tools::ToolOutput::json(
+                    json!({"exit_code": 0, "stdout": stdout, "stderr": "", "truncated": false}),
+                )
+            };
+            if command.starts_with("mkdir -p") {
+                let target = command
+                    .rsplit(" > ")
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('\'')
+                    .to_owned();
+                let path = ws.join(target);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, doc.to_string());
+                ok("")
+            } else if command.starts_with("git rev-parse") {
+                ok(dirty)
+            } else {
+                ok(
+                    "running 1 test\ntest tests::x ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+                )
+            }
+        })
+    }
+
+    fn cargo_test_calls(shell: &ScriptedShell) -> Vec<String> {
+        shell
+            .calls()
+            .into_iter()
+            .map(|(command, _)| command)
+            .filter(|command| command.starts_with("cargo test"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_one_refuses_dirty_low_level_crate_without_issuing_cargo_test() -> TestResult {
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let shell = test_one_shell(&fx.ws, "\n M low/src/lib.rs\0");
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let value = json_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "lib", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert_eq!(value["status"], "refused");
+        assert_eq!(value["reason"], "would_recompile");
+        assert_eq!(value["rebuild_count"], 5);
+        assert_eq!(value["threshold"], guard::MAX_REBUILD_PACKAGES);
+        assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        Ok(())
+    }
+
+    async fn test_one_error(shell: Arc<ScriptedShell>, fx: &Fixture) -> TestResult<String> {
+        let ctx = fx.exec_ctx()?;
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let message = error_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "lib", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        Ok(message)
+    }
+
+    #[tokio::test]
+    async fn test_one_refuses_when_cargo_workspace_root_is_not_the_shell_root() -> TestResult {
+        let fx = Fixture::new()?;
+        let elsewhere = fx.ws.join("low");
+        std::fs::create_dir_all(&elsewhere)?;
+        let shell = test_one_shell_rooted(&fx.ws, "\n", &elsewhere);
+        let message = test_one_error(shell, &fx).await?;
+        assert!(message.contains("workspace root"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_one_refuses_malformed_git_status_output() -> TestResult {
+        let fx = Fixture::new()?;
+        let shell = test_one_shell(&fx.ws, "");
+        let message = test_one_error(shell, &fx).await?;
+        assert!(message.contains("malformed"), "{message}");
+        let shell = test_one_shell(&fx.ws, "/abs\n");
+        let message = test_one_error(shell, &fx).await?;
+        assert!(message.contains("unexpected prefix"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_one_clean_tree_issues_exactly_one_exact_test_call() -> TestResult {
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let shell = test_one_shell(&fx.ws, "\n");
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let value = json_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "test:it", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(value["tests"]["passed"], 1);
+        assert_eq!(value["guard"]["rebuild_count"], 0);
+        let calls = cargo_test_calls(&shell);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let command = &calls[0];
+        assert!(
+            command.starts_with("cargo test -p app --test it "),
+            "{command}"
+        );
+        assert!(command.ends_with(" tests::x -- --exact"), "{command}");
+        assert!(!command.contains("--workspace"), "{command}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_one_rejects_unknown_package_and_target_before_running() -> TestResult {
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let shell = test_one_shell(&fx.ws, "\n");
+        let provider = CargoToolProvider::new(ShellDelegate::new(shell.clone()));
+        let tool = provider
+            .executor(&ToolName::new("cargo.test_one"))
+            .ok_or(TestError::Missing("cargo.test_one"))?;
+        let unknown_package = error_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "nope", "target": "lib", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert!(
+            unknown_package.contains("not a workspace member"),
+            "{unknown_package}"
+        );
+        let unknown_test = error_of(
+            run(
+                tool.as_ref(),
+                &ctx,
+                "cargo.test_one",
+                json!({"package": "app", "target": "test:missing", "test": "tests::x"}),
+            )
+            .await?,
+        )?;
+        assert!(
+            unknown_test.contains("no integration test 'missing'"),
+            "{unknown_test}"
+        );
+        assert!(cargo_test_calls(&shell).is_empty(), "{:?}", shell.calls());
+        assert!(
+            shell.calls().iter().all(|(c, _)| !c.starts_with("git ")),
+            "no change detection before the target is validated: {:?}",
+            shell.calls()
+        );
+        Ok(())
+    }
+
     #[test]
-    fn provider_exposes_eight_tools_with_documented_schemas() -> TestResult {
+    fn provider_exposes_nine_tools_with_documented_schemas() -> TestResult {
         let shell: Arc<ScriptedShell> = ScriptedShell::json(json!({"exit_code": 0}));
         let provider = CargoToolProvider::new(ShellDelegate::new(shell));
         let specs = provider.tools();
-        assert_eq!(specs.len(), 8);
+        assert_eq!(specs.len(), 9);
         for name in CARGO_TOOL_NAMES {
             assert!(name.starts_with("cargo."), "{name}");
             assert!(provider.executor(&ToolName::new(*name)).is_some());
@@ -1373,6 +1888,7 @@ mod tests {
             "cargo.doc",
             "cargo.tree",
             "cargo.metadata",
+            "cargo.test_one",
         ] {
             assert!(!provider.parallel_safe(&ToolName::new(name)), "{name}");
         }

@@ -50,7 +50,6 @@ use crate::progress::{
     ProgressSnapshot, ProgressSource, ProgressTracker, Severity, detect_severity,
 };
 use crate::throttle::{NotifyThrottle, ProgressKey, ThrottleConfig};
-use harw_types::cancel::CancelToken;
 use jiff::Timestamp;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -260,33 +259,6 @@ pub enum PipedLineError {
     /// Eine Zeile war kein gültiges UTF-8.
     #[msg("job stdout line is not valid UTF-8")]
     InvalidUtf8,
-}
-
-/// Ausgang von [`JobManager::wait`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// Der Job ist beendet.
-    Finished,
-    /// Ein Meilenstein: neue Fehlermeldung, Fortschritt überschreitet eine
-    /// 10-%-Stufe oder die Phase wechselt (z. B. cargo `Finished`).
-    Milestone,
-    /// Die Wartezeit lief ab.
-    Timeout,
-    /// Der Aufruf wurde abgebrochen.
-    Cancelled,
-}
-
-impl WaitOutcome {
-    /// Kurzname.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Finished => "finished",
-            Self::Milestone => "milestone",
-            Self::Timeout => "timeout",
-            Self::Cancelled => "cancelled",
-        }
-    }
 }
 
 /// Ergebnis von [`JobManager::detach_all`].
@@ -1224,63 +1196,48 @@ impl JobManager {
         });
     }
 
-    /// Wartet begrenzt auf das Ende oder den nächsten Meilenstein.
+    /// Waits for a job to reach a terminal state, for at most `timeout`.
+    ///
+    /// # Description
+    /// Public for the runner crate but deliberately NOT a model-facing tool:
+    /// delegated work is background-only and the model never blocks on it
+    /// (results arrive as notifications). This exists solely for process
+    /// supervision in `harw-agent-runner`, which needs the exit code of a
+    /// crashed job-managed child within a few seconds. It returns the current
+    /// status either way; the caller inspects `status.meta.state` to see
+    /// whether the job ended.
     ///
     /// # Errors
-    /// [`JobError::NotFound`] für unbekannte oder fremde Jobs.
-    pub async fn wait(
+    /// [`JobError::NotFound`] for unknown or foreign jobs.
+    pub async fn await_exit(
         &self,
         id: &JobId,
         caller: Caller<'_>,
         timeout: Duration,
-        cancel: Option<&CancelToken>,
-    ) -> Result<(WaitOutcome, JobStatus), JobError> {
+    ) -> Result<JobStatus, JobError> {
         let entry = self.entry(id, caller)?;
         refresh_foreign(&entry);
         let deadline = tokio::time::Instant::now() + timeout;
         let mut receiver = entry.changes.subscribe();
-        let start_milestones = lock(&entry.state).milestones;
         let monitored = lock(&entry.state).monitored;
         loop {
-            let (state, milestones) = {
-                let state = lock(&entry.state);
-                (state.meta.state, state.milestones)
-            };
+            let state = lock(&entry.state).meta.state;
             if state.is_terminal() {
-                return Ok((WaitOutcome::Finished, entry.status()));
-            }
-            if milestones > start_milestones {
-                return Ok((WaitOutcome::Milestone, entry.status()));
+                return Ok(entry.status());
             }
             if !monitored && state != JobState::Queued {
-                // Kein Überwachungs-Task: Lebenszeichen abfragen.
+                // No monitor task: probe for signs of life.
                 let step = tokio::time::Instant::now() + FOREIGN_POLL;
-                let until = step.min(deadline);
-                tokio::select! {
-                    () = tokio::time::sleep_until(until) => {}
-                    () = cancelled(cancel) => return Ok((WaitOutcome::Cancelled, entry.status())),
-                }
+                tokio::time::sleep_until(step.min(deadline)).await;
                 refresh_foreign(&entry);
-                if tokio::time::Instant::now() >= deadline && !entry.state().is_terminal() {
-                    return Ok((WaitOutcome::Timeout, entry.status()));
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(entry.status());
                 }
                 continue;
             }
-            tokio::select! {
-                changed = tokio::time::timeout_at(deadline, receiver.changed()) => {
-                    match changed {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) | Err(_) => {
-                            let outcome = if entry.state().is_terminal() {
-                                WaitOutcome::Finished
-                            } else {
-                                WaitOutcome::Timeout
-                            };
-                            return Ok((outcome, entry.status()));
-                        }
-                    }
-                }
-                () = cancelled(cancel) => return Ok((WaitOutcome::Cancelled, entry.status())),
+            match tokio::time::timeout_at(deadline, receiver.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return Ok(entry.status()),
             }
         }
     }
@@ -1456,13 +1413,6 @@ async fn wait_detached_exit(entry: &JobEntry, meta: &JobMeta, limit: Duration) -
             return false;
         }
         tokio::time::sleep(FOREIGN_POLL).await;
-    }
-}
-
-async fn cancelled(cancel: Option<&CancelToken>) {
-    match cancel {
-        Some(cancel) => cancel.cancelled().await,
-        None => std::future::pending().await,
     }
 }
 
@@ -1879,7 +1829,7 @@ impl Monitor {
             run.last_persist = now;
             run.dirty = false;
         }
-        // Wartende (`job.wait`) nur bei einem neuen Meilenstein wecken.
+        // Wake subscribers only on a new milestone.
         if milestones != run.announced_milestones {
             run.announced_milestones = milestones;
             self.entry.bump();

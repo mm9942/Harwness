@@ -77,6 +77,7 @@ fn enabled(feature: &str) -> bool {
         "knowledge" => cfg!(feature = "knowledge"),
         "matrix" => cfg!(feature = "matrix"),
         "tool-browser" => cfg!(feature = "tool-browser"),
+        "tool-cargo" => cfg!(feature = "tool-cargo"),
         "tool-container" => cfg!(feature = "tool-container"),
         "tool-deps" => cfg!(feature = "tool-deps"),
         "tool-doc" => cfg!(feature = "tool-doc"),
@@ -232,6 +233,7 @@ mod tests {
                         | "knowledge"
                         | "matrix"
                         | "tool-browser"
+                        | "tool-cargo"
                         | "tool-container"
                         | "tool-deps"
                         | "tool-doc"

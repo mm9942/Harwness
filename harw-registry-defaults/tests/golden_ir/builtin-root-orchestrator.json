@@ -29,6 +29,10 @@
       "deps.source_search",
       "deps.source_list",
       "lens.ask",
+      "obsidian.map",
+      "obsidian.read",
+      "obsidian.search",
+      "obsidian.links",
       "explore.tree",
       "explore.projects",
       "explore.relations",
@@ -48,8 +52,7 @@
       "job.status",
       "job.logs",
       "job.stop",
-      "job.list",
-      "job.wait"
+      "job.list"
     ],
     "forbidden": [
       "fs.write",
@@ -195,10 +198,13 @@
       "job.logs",
       "job.status",
       "job.stop",
-      "job.wait",
       "kanban.list",
       "kanban.show",
       "lens.ask",
+      "obsidian.links",
+      "obsidian.map",
+      "obsidian.read",
+      "obsidian.search",
       "palace.recall",
       "palace.search",
       "parent.message",
@@ -308,6 +314,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "2efcd986be1923b8d8ea6a8a6eebe0f7f2423dc423b9e3cff6dcbca449e69d4f"
+    "digest": "89fabedfc99166bb6e5563c33eecea18f399226cf3241c93a65ba8e30e1ef08c"
   }
 }

@@ -58,7 +58,8 @@ jiff = { workspace = true }
 tracing = "0.1.44"
 # PL-90 W02: blockierende Store-Zugriffe des Cycle-Drivers laufen über
 # `spawn_blocking`, Abschlusssignal für `ExecutionControl` über `watch`.
-tokio = { version = "1", features = ["rt", "sync"] }
+# PL-90 W03: `time` für den begrenzten Retry-Backoff des Modell-Proposers.
+tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
@@ -70,7 +71,7 @@ tempfile = "3.27.0"
 # `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
 harw-dod-rules = { path = "../dod/crates/harw-dod-rules", features = ["test-support"] }
 harw-sandbox = { path = "../harw-sandbox" }
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["rt", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

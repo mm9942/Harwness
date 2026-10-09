@@ -1,5 +1,7 @@
 //! Die Modell-Werkzeuge `job.start`, `job.status`, `job.logs`, `job.stop`,
-//! `job.list`, `job.wait` ([`JobToolProvider`]).
+//! `job.list` ([`JobToolProvider`]). There is deliberately no blocking wait tool:
+//! job-managed work is background-only (the `transfer_to_*` handoff; inline agent tools are tracked as TODO(PL-90)) and its progress and end arrive as
+//! notifications.
 //!
 //! # Sicherheitskontrakt
 //! - `job.start`: [`Permission::ExecuteProcess`] (hier **und** im
@@ -28,12 +30,12 @@
 //!   --kind work` des Operators.
 //!
 //! # Nebenläufigkeit
-//! `job.status`, `job.logs`, `job.list` und `job.wait` sind `parallel_safe`
+//! `job.status`, `job.logs` und `job.list` sind `parallel_safe`
 //! (lesend), `job.start` und `job.stop` nicht.
 
 use crate::launcher::JobLauncher;
 use crate::logs::{LogQuery, LogSlice, read_log};
-use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest, WaitOutcome};
+use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest};
 use crate::model::{JobEndReason, JobId, JobOwner, JobStatus, STDERR_LOG, STDOUT_LOG};
 use crate::procfs::JobSignal;
 use harw_authority::Permission;
@@ -49,7 +51,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 
 /// Name des Startwerkzeugs.
@@ -62,31 +63,26 @@ pub const JOB_LOGS_TOOL: &str = "job.logs";
 pub const JOB_STOP_TOOL: &str = "job.stop";
 /// Name des Listenwerkzeugs.
 pub const JOB_LIST_TOOL: &str = "job.list";
-/// Name des Wartewerkzeugs.
-pub const JOB_WAIT_TOOL: &str = "job.wait";
 
 /// Alle Job-Werkzeuge in Registrierungsreihenfolge.
-pub const JOB_TOOL_NAMES: [&str; 6] = [
+pub const JOB_TOOL_NAMES: [&str; 5] = [
     JOB_START_TOOL,
     JOB_STATUS_TOOL,
     JOB_LOGS_TOOL,
     JOB_STOP_TOOL,
     JOB_LIST_TOOL,
-    JOB_WAIT_TOOL,
 ];
 
 /// Die rein lesenden Job-Werkzeuge (Kandidaten für `AUTO_APPROVED_TOOLS`).
-pub const JOB_READ_TOOLS: [&str; 4] =
-    [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL, JOB_WAIT_TOOL];
+pub const JOB_READ_TOOLS: [&str; 3] = [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL];
 
-/// Die Werkzeuge, die Orchestratoren ohne Shell tragen: lesen, warten und
-/// stoppen — kein `job.start`.
-pub const JOB_CONTROL_TOOLS: [&str; 5] = [
+/// Die Werkzeuge, die Orchestratoren ohne Shell tragen: lesen und stoppen —
+/// kein `job.start`, kein blockierendes Warten.
+pub const JOB_CONTROL_TOOLS: [&str; 4] = [
     JOB_STATUS_TOOL,
     JOB_LOGS_TOOL,
     JOB_STOP_TOOL,
     JOB_LIST_TOOL,
-    JOB_WAIT_TOOL,
 ];
 
 /// Der Befehlstext eines `job.start`-Aufrufs für Freigabe und Auto-Modus:
@@ -137,13 +133,6 @@ pub fn job_start_command_text(arguments: &Value) -> Option<String> {
     }
 }
 
-/// Höchste Wartezeit von `job.wait` in Sekunden.
-///
-/// R18 F8: `job.wait` ist ein kurzes Abfragen, kein langes Blockieren —
-/// Agenten haben mit `timeout_secs: 600` über eine Stunde in
-/// `job.wait`-Schleifen gehangen. Das Ende eines Jobs kommt ohnehin als
-/// Notiz; ein größerer Wert wird abgewiesen (kein stilles Klemmen).
-pub const MAX_WAIT_SECS: u64 = 60;
 /// Vorgabe für `job.logs` ohne `tail`/`since_line`.
 const DEFAULT_LOG_TAIL: usize = 100;
 /// Höchstzahl Zeilen je Stream in `job.logs`.
@@ -268,7 +257,6 @@ enum Kind {
     Logs,
     Stop,
     List,
-    Wait,
 }
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -324,16 +312,6 @@ fn spec(name: &str, description: &str, parameters: JsonSchema) -> ToolSpec {
     })
 }
 
-/// Modellbeschreibung von `job.wait` (R18 F8: kurzes Abfragen, das Ende
-/// kommt als Notiz, keine Warteschleifen).
-const JOB_WAIT_DESCRIPTION: &str = "Short poll: wait at most timeout_secs (1-60) until the job \
-     ends or reaches the next milestone (new error lines, progress crossing a 10% step, or a \
-     phase change such as cargo `Finished`). Returns the outcome (finished/milestone/timeout) \
-     and the job status. You do not need job.wait to learn that a job ended: its end (exit \
-     code, duration, last lines) is delivered to you automatically as a note. Do not call \
-     job.wait in a loop; after a timeout, continue other work or end your turn and react \
-     to the job's end note.";
-
 /// Spezifikation von `job.start`.
 fn job_start_spec() -> ToolSpec {
     spec(
@@ -348,8 +326,8 @@ fn job_start_spec() -> ToolSpec {
          system notes: job start, progress every notify_every_secs (default 60, only when \
          something changed; 0 = off), error lines as they appear, and the end with exit \
          code, duration and the last 20 lines. Do not poll in a loop: continue other work \
-         or end your turn; the end note arrives on its own (job.wait is only a short poll, \
-         at most 60 s). On the host the job gets a filtered environment (PATH, HOME, \
+         or end your turn; the end note arrives on its own. For a non-blocking snapshot \
+         use job.status. On the host the job gets a filtered environment (PATH, HOME, \
          locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; \
          names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); \
          pass anything else explicitly via env.",
@@ -519,28 +497,6 @@ fn job_list_spec() -> ToolSpec {
     )
 }
 
-/// Spezifikation von `job.wait`.
-fn job_wait_spec() -> ToolSpec {
-    spec(
-        JOB_WAIT_TOOL,
-        JOB_WAIT_DESCRIPTION,
-        object(
-            vec![
-                ("job_id", job_id_prop()),
-                (
-                    "timeout_secs",
-                    prop(
-                        JsonSchemaType::Integer,
-                        "Maximum seconds to wait: a short poll, 1-60. Larger values are \
-                         rejected.",
-                    ),
-                ),
-            ],
-            &["job_id", "timeout_secs"],
-        ),
-    )
-}
-
 // ── Argumente ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -621,30 +577,6 @@ fn parse_list_kind(raw: Option<&str>) -> Result<Option<ListKind>, ToolsError> {
         Some(other) => Err(invalid(
             JOB_LIST_TOOL,
             format!("kind must be work or process, got `{other}`"),
-        )),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WaitArgs {
-    job_id: String,
-    #[serde(deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
-    timeout_secs: Option<u64>,
-}
-
-/// Prüft `timeout_secs` von `job.wait` (R18 F8, EX-05): `1..=MAX_WAIT_SECS`,
-/// alles andere — auch ein zu großer Wert — ist `InvalidArguments` mit dem
-/// Hinweis, dass das Ende als Notiz kommt (kein stilles Klemmen).
-fn parse_wait_secs(raw: Option<u64>) -> Result<u64, ToolsError> {
-    match raw {
-        Some(secs) if (1..=MAX_WAIT_SECS).contains(&secs) => Ok(secs),
-        _ => Err(invalid(
-            JOB_WAIT_TOOL,
-            format!(
-                "timeout_secs must be between 1 and {MAX_WAIT_SECS}: job.wait is a short poll. \
-                 The job's end is delivered to you as a note; do not wait in a loop."
-            ),
         )),
     }
 }
@@ -1009,8 +941,9 @@ impl JobToolExecutor {
                 value["notify_every_secs"] = json!(notify_every.as_secs());
                 value["note"] = json!(
                     "Job runs in the background. You will receive progress/error/finish notes \
-                     automatically, so do not loop on job.wait (a short poll of at most 60 s); \
-                     use job.logs for output, job.stop to stop it."
+                     automatically, so do not poll; \
+                     use job.status for a non-blocking snapshot, job.logs for output, \
+                     job.stop to stop it."
                 );
                 Ok(ToolOutput::json(value))
             }
@@ -1112,31 +1045,6 @@ impl JobToolExecutor {
         }
     }
 
-    async fn wait(
-        &self,
-        context: &ToolExecutionContext,
-        call: &ToolCall,
-    ) -> Result<ToolOutput, ToolsError> {
-        let args: WaitArgs = parse_args(JOB_WAIT_TOOL, call)?;
-        let id = parse_job_id(JOB_WAIT_TOOL, &args.job_id)?;
-        let secs = parse_wait_secs(args.timeout_secs)?;
-        let caller = Caller::Agent(context.session_id().as_str());
-        match self
-            .shared
-            .manager
-            .wait(&id, caller, Duration::from_secs(secs), context.cancel())
-            .await
-        {
-            Ok((WaitOutcome::Cancelled, _)) => Err(ToolsError::Cancelled),
-            Ok((outcome, status)) => Ok(ToolOutput::json(json!({
-                "outcome": outcome.as_str(),
-                "waited_max_secs": secs,
-                "status": status_json(&status),
-            }))),
-            Err(err) => Ok(job_error(JOB_WAIT_TOOL, &err)),
-        }
-    }
-
     fn status(
         &self,
         context: &ToolExecutionContext,
@@ -1184,18 +1092,17 @@ impl ToolExecutor for JobToolExecutor {
                 Kind::Logs => self.logs(context, call).await,
                 Kind::Stop => self.stop(context, call).await,
                 Kind::List => self.list(context, call),
-                Kind::Wait => self.wait(context, call).await,
             }
         })
     }
 }
 
-// Die sechs Job-Werkzeuge. Alle teilen den Zustand [`Shared`] (Verwaltung,
-// Launcher, Elternkette); nur die vier lesenden/wartenden sind parallelsicher
+// Die fünf Job-Werkzeuge. Alle teilen den Zustand [`Shared`] (Verwaltung,
+// Launcher, Elternkette); nur die drei lesenden sind parallelsicher
 // (`JOB_READ_TOOLS`), `job.start` und `job.stop` nie.
 harw_tools::tool_provider! {
     impl for JobToolProvider as provider,
-    parallel_safe: [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL, JOB_WAIT_TOOL] {
+    parallel_safe: [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL] {
         JOB_START_TOOL => {
             spec: job_start_spec(),
             executor: JobToolExecutor { kind: Kind::Start, shared: Arc::clone(&provider.shared) },
@@ -1215,10 +1122,6 @@ harw_tools::tool_provider! {
         JOB_LIST_TOOL => {
             spec: job_list_spec(),
             executor: JobToolExecutor { kind: Kind::List, shared: Arc::clone(&provider.shared) },
-        },
-        JOB_WAIT_TOOL => {
-            spec: job_wait_spec(),
-            executor: JobToolExecutor { kind: Kind::Wait, shared: Arc::clone(&provider.shared) },
         },
     }
 }

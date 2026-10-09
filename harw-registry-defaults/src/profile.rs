@@ -62,6 +62,7 @@ use harw_project_discovery::{
     DiscoveryConfig, ProjectContext, ProjectContextProvider, discover_project,
 };
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
+use harw_tool_cargo::{CargoToolProvider, ShellDelegate};
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_doc::DocToolProvider;
 use harw_tool_explorer::ExplorerToolProvider;
@@ -1135,7 +1136,7 @@ pub const TUNNEL_TOOLS: &[&str] = &[
 ];
 
 /// Plan R9, Teil F: die sechs Werkzeuge von `harw-tool-job`
-/// (`job.start/status/logs/stop/list/wait`) in Registrierungsreihenfolge.
+/// (`job.start/status/logs/stop/list`) in Registrierungsreihenfolge.
 ///
 /// # Beschreibung
 /// Stehen in jedem Profil direkt hinter [`SHELL_TOOLS`]: `job.start` läuft
@@ -1148,7 +1149,7 @@ pub const TUNNEL_TOOLS: &[&str] = &[
 pub const JOB_TOOLS: &[&str] = &harw_tool_job::JOB_TOOL_NAMES;
 
 /// Plan R9, Teil F: die Job-Werkzeuge der Orchestratoren (ohne Shell):
-/// `job.status/logs/stop/list/wait` — kein `job.start`.
+/// `job.status/logs/stop/list` — kein `job.start`.
 ///
 /// # Warum nicht Teil eines [`RegistryProfile`]
 /// Wie [`SUDO_TOOLS`]: die Composition-Root hängt sie über
@@ -1164,7 +1165,7 @@ pub const JOB_CONTROL_TOOLS: &[&str] = &harw_tool_job::JOB_CONTROL_TOOLS;
 /// ```rust
 /// use harw_registry_defaults::profile::{job_control_tools_for_role, role_names};
 ///
-/// assert!(job_control_tools_for_role(role_names::ROOT_ORCHESTRATOR).contains(&"job.wait"));
+/// assert!(job_control_tools_for_role(role_names::ROOT_ORCHESTRATOR).contains(&"job.status"));
 /// assert!(!job_control_tools_for_role(role_names::CODING_ORCHESTRATOR).contains(&"job.start"));
 /// assert!(job_control_tools_for_role(role_names::EXECUTOR).is_empty());
 /// ```
@@ -1209,6 +1210,16 @@ pub(crate) const LATEX_TEMPLATE_TOOL: &str = "latex.template";
 /// über [`crate::ALWAYS_ASK_TOOLS`]). Beide verlangen
 /// `Permission::ExecuteProcess`; nur unter Linux wirksam.
 pub(crate) const PROCESS_TOOLS: &[&str] = &["process.list", "process.kill"];
+
+/// Das einzige `cargo.*`-Werkzeug, das ein Profil registriert:
+/// `cargo.test_one` (genau ein Test hinter dem Rebuild-Wächter von
+/// `harw-tool-cargo`). Die übrigen acht `cargo.*`-Werkzeuge sind weder
+/// registriert noch haben sie ein Recht ([`crate::authority::tool_permission`]).
+/// Es läuft über den `shell.exec`-Ausführer des Profils (Sandbox, Freigabe,
+/// Host-Permit), braucht `Permission::ExecuteProcess` und steht nicht in
+/// [`crate::AUTO_APPROVED_TOOLS`]. Nur eine Definition, die es admittiert und
+/// die der Roster durchlässt (`roster::TEST_ENGINEER_EXTRA_TOOLS`), sieht es.
+pub const CARGO_TEST_ONE_TOOLS: &[&str] = &["cargo.test_one"];
 
 /// Das eine Werkzeug von `harw-tool-lens` (AW6-10): semantische Abfrage über
 /// `docs.design` und `knowledge.palace`.
@@ -1264,8 +1275,12 @@ pub(crate) const LENS_TOOLS: &[&str] = &["lens.ask"];
 /// restricted to `Full` (coding agents) because it creates and replaces
 /// files. All five resolve paths through the sandbox's workspace binding,
 /// so they never exceed the caller's existing file permissions.
-pub(crate) const OBSIDIAN_READ_TOOLS: &[&str] =
-    &["obsidian.map", "obsidian.read", "obsidian.search", "obsidian.links"];
+pub(crate) const OBSIDIAN_READ_TOOLS: &[&str] = &[
+    "obsidian.map",
+    "obsidian.read",
+    "obsidian.search",
+    "obsidian.links",
+];
 
 /// The Obsidian vault tools, in provider order.
 ///
@@ -1924,6 +1939,7 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_WORKSPACE_TOOLS.iter())
+                .chain(CARGO_TEST_ONE_TOOLS.iter())
                 .copied()
                 .collect(),
             // Nur lesende Unterlagen der Matrix-Sitze (siehe die Begründung
@@ -1997,7 +2013,17 @@ impl RegistryProfile {
     /// ```
     #[must_use]
     pub fn required_permissions(self) -> PermissionSet {
-        permissions_of(&self.registered_tool_names())
+        let mut names = self.registered_tool_names();
+        // `cargo.test_one` (`ExecuteProcess`) steht im Profil `WorkspaceEdit`,
+        // aber sein Recht gehört nicht zu den Profilrechten: sonst bekäme jeder
+        // Träger des Profils (Telegram-Wurzel, Job-Worker, jeder Schreib-Worker)
+        // `ExecuteProcess`. Das Recht vergibt allein
+        // `authority::granted_for_capabilities`, wenn das (geklemmte) Manifest
+        // das Werkzeug tatsächlich führt — nur der `test-engineer`.
+        if self == RegistryProfile::WorkspaceEdit {
+            names.retain(|name| !CARGO_TEST_ONE_TOOLS.contains(name));
+        }
+        permissions_of(&names)
     }
 
     /// Die Werkzeuge dieses Profils, deren Recht `granted` trägt.
@@ -2515,7 +2541,7 @@ impl JobWiring {
         )
     }
 
-    /// Nur [`JOB_CONTROL_TOOLS`] (lesen, warten, stoppen — kein
+    /// Nur [`JOB_CONTROL_TOOLS`] (lesen, stoppen — kein
     /// `job.start`) für Orchestratoren ohne Shell. Der Startweg ist ein
     /// Sandbox-Standard-Shell-Provider, aber über den Filter nie erreichbar.
     #[must_use]
@@ -2907,7 +2933,18 @@ fn profile_tool_providers(
                 Arc::new(DepsToolProvider::new()),
                 DEPS_WORKSPACE_TOOLS,
             ));
-            vec![filesystem, doc, explorer, dependencies]
+            let mut providers = vec![filesystem, doc, explorer, dependencies];
+            // `cargo.test_one` läuft über den `shell.exec`-Ausführer dieses
+            // Profils; `shell.exec` selbst wird nicht registriert.
+            if let Some(executor) =
+                build_shell(sandbox_profile).executor(&ToolName::new("shell.exec"))
+            {
+                providers.push(Arc::new(RestrictedToolProvider::new(
+                    Arc::new(CargoToolProvider::new(ShellDelegate::new(executor))),
+                    CARGO_TEST_ONE_TOOLS,
+                )));
+            }
+            providers
         }
         // Nur lesende Unterlagen: gefilterter, lesender FS-Provider +
         // lesender Doc-Provider — kein Explorer-, Deps-, Web- oder
@@ -3687,6 +3724,12 @@ mod tests {
             .collect()
     }
 
+    /// `cargo.test_one` gehört zu `WorkspaceEdit`, aber `ExecuteProcess` nicht
+    /// zu den eigenen Profilrechten: unter `assemble()` fehlt es bewusst.
+    fn lacks_default_right(profile: RegistryProfile, tool: &str) -> bool {
+        profile == RegistryProfile::WorkspaceEdit && CARGO_TEST_ONE_TOOLS.contains(&tool)
+    }
+
     fn assemble(profile: RegistryProfile) -> TestResult<AssembledRegistry> {
         let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
         assemble_registry(profile, cwd, IdentityOverrides::default()).map_err(ctx("assemble"))
@@ -3758,6 +3801,7 @@ mod tests {
                 .registered_tool_names()
                 .iter()
                 .filter(|name| !JOB_TOOLS.contains(name))
+                .filter(|name| !lacks_default_right(*profile, name))
                 .map(|name| (*name).to_owned())
                 .collect();
             assert_eq!(
@@ -4034,11 +4078,35 @@ mod tests {
         );
         assert_eq!(
             RegistryProfile::WorkspaceEdit.required_permissions(),
+            // Kein `ExecuteProcess` trotz `cargo.test_one` im Profil: das Recht
+            // vergibt nur `granted_for_capabilities` bei geführtem Werkzeug.
             set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
         );
         assert_eq!(
             RegistryProfile::MatrixReader.required_permissions(),
             set(&[Permission::ReadWorkspace])
+        );
+    }
+
+    /// Das Profil `WorkspaceEdit` bewirbt mit seinen eigenen Rechten weder
+    /// `cargo.test_one` noch irgendein prozessfähiges Werkzeug.
+    #[test]
+    fn test_workspace_edit_own_rights_do_not_admit_cargo_test_one() {
+        use harw_authority::Permission;
+        let rights = RegistryProfile::WorkspaceEdit.required_permissions();
+        assert!(!rights.contains(Permission::ExecuteProcess));
+        let tools = RegistryProfile::WorkspaceEdit.tool_names_for(&rights);
+        assert!(!tools.contains(&"cargo.test_one"));
+        assert!(!tools.contains(&"shell.exec"));
+        let with_exec = PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ]);
+        assert!(
+            RegistryProfile::WorkspaceEdit
+                .tool_names_for(&with_exec)
+                .contains(&"cargo.test_one")
         );
     }
 
@@ -4063,8 +4131,8 @@ mod tests {
 
     /// `WorkspaceEdit` (Runde 3, Welle D): exakt `fs.*` inklusive
     /// `fs.write`, `doc.read_pdf`, `explore.*` und `deps.graph`/
-    /// `deps.locked` — nie `shell.*`, `process.*`, `web.*`, `lens.ask`,
-    /// `browser.*` oder `deps.source_*`; registriert wie beworben.
+    /// `deps.locked` plus `cargo.test_one` — nie `shell.*`, `process.*`, `web.*`,
+    /// `lens.ask`, `browser.*`, andere `cargo.*` oder `deps.source_*`; registriert wie beworben.
     #[test]
     fn test_workspace_edit_profile_exact_tool_surface() -> TestResult {
         let expected = vec![
@@ -4082,6 +4150,7 @@ mod tests {
             "explore.find",
             "deps.graph",
             "deps.locked",
+            "cargo.test_one",
         ];
         assert_eq!(RegistryProfile::WorkspaceEdit.tool_names(), expected);
         for tool in RegistryProfile::WorkspaceEdit.tool_names() {
@@ -4095,7 +4164,37 @@ mod tests {
                 "WorkspaceEdit darf {tool} nicht registrieren"
             );
         }
+        // Unter den eigenen Profilrechten ({Read, Write}) fehlt `cargo.test_one`.
+        let default_expected: Vec<String> = expected
+            .iter()
+            .filter(|t| **t != "cargo.test_one")
+            .map(|t| (*t).to_owned())
+            .collect();
         let assembled = assemble(RegistryProfile::WorkspaceEdit)?;
+        assert_eq!(registered_names(&assembled), default_expected);
+        assert_eq!(assembled.identity.tools_available, default_expected);
+        // Mit ausdrücklich gewährtem `ExecuteProcess` (nur `test-engineer`,
+        // siehe `authority::granted_for_capabilities`) kommt es dazu.
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let project = harw_project_discovery::discover_project(
+            &cwd,
+            &harw_project_discovery::DiscoveryConfig::default(),
+        )
+        .map_err(ctx("discover"))?;
+        let granted = PermissionSet::from_policy([
+            harw_authority::Permission::ReadWorkspace,
+            harw_authority::Permission::WriteWorkspace,
+            harw_authority::Permission::ExecuteProcess,
+        ]);
+        let assembled = assemble_registry_for_sandbox_with_definition_access(
+            RegistryProfile::WorkspaceEdit,
+            &project,
+            IdentityOverrides::default(),
+            ApprovalModeCell::default(),
+            &granted,
+            None,
+        )
+        .map_err(ctx("assemble with exec"))?;
         let expected_owned: Vec<String> = expected.iter().map(|t| (*t).to_owned()).collect();
         assert_eq!(registered_names(&assembled), expected_owned);
         assert_eq!(assembled.identity.tools_available, expected_owned);
@@ -4190,7 +4289,11 @@ mod tests {
         for profile in RegistryProfile::ALL {
             assert_eq!(
                 profile.tool_names_for(&profile.required_permissions()),
-                profile.registered_tool_names(),
+                profile
+                    .registered_tool_names()
+                    .into_iter()
+                    .filter(|name| !lacks_default_right(*profile, name))
+                    .collect::<Vec<_>>(),
                 "{profile:?}: unter den eigenen Rechten fällt nichts heraus"
             );
             assert!(
@@ -4381,6 +4484,7 @@ mod tests {
                 .tool_names()
                 .iter()
                 .filter(|name| !JOB_TOOLS.contains(name))
+                .filter(|name| !lacks_default_right(*profile, name))
                 .map(|name| (*name).to_owned())
                 .collect();
             assert_eq!(

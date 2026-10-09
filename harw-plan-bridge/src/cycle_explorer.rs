@@ -13,9 +13,15 @@
 //!   trusted runtime in a [`ReadTargetMap`]; an id the map does not know is
 //!   refused. The map is deliberately not `Deserialize`.
 //! - Every read needs [`Permission::ReadWorkspace`] on the executor's
-//!   [`AuthorityContext`] and goes through `harw_tool_fsread`'s `Scope`
+//!   [`AuthorityContext`] *and* must name a target in the step's
+//!   [`CycleAdmission::allowed_read_targets`] (defence in depth: the
+//!   admission the driver passes to `execute` is already narrowed by the
+//!   reissued authority, see below). Both checks run before any file is
+//!   touched. Reads go through `harw_tool_fsread`'s `Scope`
 //!   (RESOLVE_BENEATH-style `open_read`, regular files only, secret paths
-//!   such as `.env` or `*.pem` denied).
+//!   such as `.env` or `*.pem` denied). The `Scope` (one directory
+//!   descriptor, `Send + Sync`) is opened once per authority binding and
+//!   shared by all reads via `Arc`, not re-resolved per read.
 //! - A file larger than the per-read cap is refused *before* reading; a
 //!   truncated prefix is never digested, because a digest of a prefix would
 //!   look like evidence about the whole file.
@@ -23,6 +29,19 @@
 //!   File content never enters the durable record. A proposer that needs the
 //!   text can get it from an optional, bounded, in-memory
 //!   [`ExplorerReadCache`] that is lost on restart by design.
+//!
+//! # Authority per lease
+//!
+//! The driver reissues the authority whenever a new lease epoch takes a
+//! cycle over. The executor is constructed with one [`AuthorityContext`], so
+//! [`CycleStepExecutor::rebind_authority`] (a default no-op on the trait,
+//! overridden here) hands it the reissued context; the driver calls it right
+//! after reissuing and before the first step of that lease. This was chosen
+//! over rebuilding the executor per lease because the driver owns its
+//! executor by value and the hook is a few lines. Rebinding replaces the
+//! permission set and reopens the `Scope`. Within a single continuing lease
+//! there is no reissue, so the construction-time authority applies; the
+//! per-step admission check above still holds.
 //!
 //! # Partial failure: all or nothing
 //!
@@ -176,8 +195,13 @@ fn is_plain_relative(path: &str) -> bool {
 }
 
 /// Bounded, in-memory store of the text the explorer read, keyed by evidence
-/// id. Optional and lossy by design: it is a convenience for the proposer's
-/// next prompt, never part of a checkpoint, and does not survive a restart.
+/// id. Optional and lossy by design: never part of a checkpoint and not
+/// surviving a restart.
+///
+/// This is an optional building block that is **not yet wired to the
+/// proposer**: `cycle_proposer` renders ids and digests-free metadata only
+/// and never reads this cache. Wiring file content into prompts needs its own
+/// review of the prompt-injection and size limits.
 ///
 /// Content of a step is inserted only when the whole step succeeded. When the
 /// byte cap would be exceeded, older entries are evicted first (by insertion
@@ -248,6 +272,8 @@ impl ExplorerReadCache {
 #[derive(Debug)]
 pub struct ReadOnlyExplorerExecutor {
     authority: AuthorityContext,
+    /// Opened lazily on the first read of an authority binding, then shared.
+    scope: Option<Arc<Scope>>,
     targets: ReadTargetMap,
     max_read_bytes: usize,
     max_step_bytes: usize,
@@ -260,6 +286,7 @@ impl ReadOnlyExplorerExecutor {
     pub fn new(authority: AuthorityContext, targets: ReadTargetMap) -> Self {
         Self {
             authority,
+            scope: None,
             targets,
             max_read_bytes: DEFAULT_MAX_READ_BYTES,
             max_step_bytes: DEFAULT_MAX_STEP_BYTES,
@@ -317,40 +344,23 @@ struct ReadOutcome {
     bytes: usize,
 }
 
-/// Reads one file beneath `root`. Blocking; call from `spawn_blocking`.
+/// Reads one file through `scope`. Blocking; call from `spawn_blocking`.
 fn read_beneath(
-    root: &Path,
+    scope: &Scope,
     relative: &str,
     max_read: usize,
     remaining_step: usize,
 ) -> Result<ReadOutcome, String> {
-    let scope =
-        Scope::new(root).map_err(|error| format!("workspace root not readable: {error}"))?;
     let rel = scope
         .rel_readable(relative)
         .map_err(|error| error.to_string())?;
-    let mut file = scope.open_read(&rel).map_err(|error| error.to_string())?;
+    let file = scope.open_read(&rel).map_err(|error| error.to_string())?;
     let length = file
         .metadata()
         .map_err(|error| format!("metadata unreadable: {error}"))?
         .len();
     let limit = max_read.min(remaining_step);
-    if length > limit as u64 {
-        return Err(format!(
-            "'{relative}' is {length} bytes, over the {limit} byte read budget"
-        ));
-    }
-    let mut bytes = Vec::new();
-    // One byte beyond the limit detects a file that grew since `metadata`.
-    (&mut file)
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read failed: {error}"))?;
-    if bytes.len() > limit {
-        return Err(format!(
-            "'{relative}' grew past the {limit} byte read budget while reading"
-        ));
-    }
+    let bytes = read_bounded(file, length, limit, relative)?;
     Ok(ReadOutcome {
         locator: rel.display(),
         digest: ContentDigest::of(&bytes),
@@ -359,28 +369,65 @@ fn read_beneath(
     })
 }
 
+/// Reads at most `limit` bytes from `reader`, whose `length` was reported
+/// beforehand; refuses (never truncates) when either is over the limit.
+fn read_bounded(
+    reader: impl Read,
+    length: u64,
+    limit: usize,
+    relative: &str,
+) -> Result<Vec<u8>, String> {
+    if length > limit as u64 {
+        return Err(format!(
+            "'{relative}' is {length} bytes, over the {limit} byte read budget"
+        ));
+    }
+    let mut bytes = Vec::new();
+    // One byte beyond the limit detects a file that grew since `metadata`.
+    // Saturating: `limit` may be `usize::MAX` on 64-bit targets.
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read failed: {error}"))?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "'{relative}' grew past the {limit} byte read budget while reading"
+        ));
+    }
+    Ok(bytes)
+}
+
 impl CycleStepExecutor for ReadOnlyExplorerExecutor {
     fn execute(
         &mut self,
         step: &InFlightStep,
-        _admission: &CycleAdmission,
+        admission: &CycleAdmission,
         _state: &CycleCheckpoint,
         cancel: &CancelToken,
     ) -> impl Future<Output = Result<CycleObservations, StepFailure>> + Send {
+        let scope = &mut self.scope;
+        let authority = &self.authority;
         let plan = read_targets(&step.proposal).and_then(|targets| {
             if targets.is_empty() {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), None));
             }
-            if !self
-                .authority
-                .permissions()
-                .contains(Permission::ReadWorkspace)
-            {
+            if !authority.permissions().contains(Permission::ReadWorkspace) {
                 return Err(StepFailure::new("ReadWorkspace permission missing"));
             }
             // Deduplicate: one evidence record per target and step.
             let unique: BTreeSet<&str> = targets.into_iter().collect();
-            unique
+            // Defence in depth: the admission of this step must allow every
+            // target, independent of the executor's own mapping. Checked for
+            // all targets before any read.
+            if let Some(denied) = unique
+                .iter()
+                .find(|target| !admission.allowed_read_targets().contains(**target))
+            {
+                return Err(StepFailure::new(format!(
+                    "read target '{denied}' is not allowed by the step admission"
+                )));
+            }
+            let plan = unique
                 .into_iter()
                 .map(|target| {
                     self.targets
@@ -390,15 +437,24 @@ impl CycleStepExecutor for ReadOnlyExplorerExecutor {
                             StepFailure::new(format!("read target '{target}' is not mapped"))
                         })
                 })
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>, _>>()?;
+            // One directory descriptor per authority binding, shared by all
+            // reads (`Scope` is `Send + Sync`).
+            if scope.is_none() {
+                let opened =
+                    Scope::new(authority.workspace().canonical_root()).map_err(|error| {
+                        StepFailure::new(format!("workspace root not readable: {error}"))
+                    })?;
+                *scope = Some(Arc::new(opened));
+            }
+            Ok((plan, scope.clone()))
         });
-        let root = self.authority.workspace().canonical_root().to_path_buf();
         let key = step.idempotency_key.clone();
         let (max_read, max_step) = (self.max_read_bytes, self.max_step_bytes);
         let cache = self.cache.clone();
         let cancel = cancel.clone();
         async move {
-            let plan = plan?;
+            let (plan, scope) = plan?;
             let mut evidence = Vec::with_capacity(plan.len());
             let mut texts = Vec::with_capacity(plan.len());
             let mut used = 0usize;
@@ -406,9 +462,12 @@ impl CycleStepExecutor for ReadOnlyExplorerExecutor {
                 if cancel.is_cancelled() {
                     return Err(StepFailure::new("explorer step cancelled"));
                 }
-                let (root, remaining) = (root.clone(), max_step.saturating_sub(used));
+                let remaining = max_step.saturating_sub(used);
+                let Some(scope) = scope.clone() else {
+                    return Err(StepFailure::new("workspace scope unavailable"));
+                };
                 let outcome = tokio::task::spawn_blocking(move || {
-                    read_beneath(&root, &relative, max_read, remaining)
+                    read_beneath(&scope, &relative, max_read, remaining)
                 })
                 .await
                 .map_err(|error| StepFailure::new(format!("read task failed: {error}")))?
@@ -439,6 +498,12 @@ impl CycleStepExecutor for ReadOnlyExplorerExecutor {
 
     async fn reconcile(&mut self, _step: &InFlightStep) -> StepReconciliation {
         StepReconciliation::NotStarted
+    }
+
+    fn rebind_authority(&mut self, authority: &AuthorityContext) {
+        self.authority = authority.clone();
+        // Reopen against the (re)issued workspace binding on the next read.
+        self.scope = None;
     }
 }
 
@@ -523,6 +588,10 @@ mod tests {
     }
 
     fn admission() -> TestResult<CycleAdmission> {
+        admission_with(&["source", "other"])
+    }
+
+    fn admission_with(read_ids: &[&str]) -> TestResult<CycleAdmission> {
         CycleAdmission::new(
             IntentBinding {
                 id: "intent-w03".to_owned(),
@@ -539,7 +608,7 @@ mod tests {
                 max_stall_transitions: 3,
             },
             CycleTargets {
-                read: set(&["source", "other"]),
+                read: set(read_ids),
                 write: set(&[]),
                 children: set(&["explorer"]),
                 recipes: set(&["hypothesis"]),
@@ -587,6 +656,10 @@ mod tests {
 
     fn step_err(_failure: StepFailure) -> TestError {
         TestError::Missing("executor step failed")
+    }
+
+    fn step_err_text(_reason: String) -> TestError {
+        TestError::Missing("bounded read failed")
     }
 
     fn read_rights() -> [Permission; 1] {
@@ -735,7 +808,11 @@ mod tests {
         for target in ["source", "other"] {
             let result = run(&mut executor, advance(&[target]), &CancelToken::new()).await;
             let reason = failure_reason(result)?;
-            assert!(reason.contains("failed"), "{target}: {reason}");
+            assert!(
+                reason.contains(&format!("read '{target}' failed"))
+                    && reason.contains("symbolic link"),
+                "{target}: {reason}"
+            );
         }
         assert_eq!(cache.used_bytes(), 0, "no content leaked");
         Ok(())
@@ -801,21 +878,124 @@ mod tests {
         )?;
         assert!(reason.contains("read budget"), "{reason}");
         assert_eq!(cache.used_bytes(), 0, "failed step publishes no content");
-        // A missing file after a good one: whole step fails, no evidence.
+        // Good read first, failure second. Target ids are visited in
+        // `BTreeSet` (lexicographic) order, so "a-good" is read (and
+        // succeeds) before "b-gone" fails.
         ws.write("c.txt", b"c")?;
+        let two = |good: &str, bad: &str| -> TestResult<ReadOnlyExplorerExecutor> {
+            Ok(ReadOnlyExplorerExecutor::new(
+                ws.authority(&read_rights())?,
+                map(&[(good, "c.txt"), (bad, "gone.txt")])?,
+            )
+            .with_cache(cache.clone()))
+        };
+        let mut executor = two("a-good", "b-gone")?;
+        let admission = admission_with(&["a-good", "b-gone"])?;
+        let state = CycleCheckpoint::initial(&admission, &executor.authority, 0);
+        let result = executor
+            .execute(
+                &step(advance(&["b-gone", "a-good"])),
+                &admission,
+                &state,
+                &CancelToken::new(),
+            )
+            .await;
+        let reason = failure_reason(result)?;
+        assert!(reason.contains("read 'b-gone' failed"), "{reason}");
+        assert_eq!(cache.used_bytes(), 0, "good read is not published");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_outside_the_step_admission_is_refused_without_reading() -> TestResult {
+        let ws = Workspace::new()?;
+        ws.write("a.txt", b"a")?;
+        let cache = ExplorerReadCache::new(DEFAULT_CACHE_BYTES);
         let mut executor = ReadOnlyExplorerExecutor::new(
             ws.authority(&read_rights())?,
-            map(&[("source", "c.txt"), ("other", "gone.txt")])?,
+            map(&[("source", "a.txt"), ("extra", "a.txt")])?,
         )
         .with_cache(cache.clone());
+        // "extra" is mapped and permitted by the authority, but the
+        // admission of the test (source, other) does not list it; the
+        // allowed "source" must not be read either.
         let result = run(
             &mut executor,
-            advance(&["source", "other"]),
+            advance(&["source", "extra"]),
             &CancelToken::new(),
         )
         .await;
-        assert!(failure_reason(result)?.contains("'other' failed"));
-        assert_eq!(cache.used_bytes(), 0);
+        let reason = failure_reason(result)?;
+        assert!(
+            reason.contains("'extra' is not allowed by the step admission"),
+            "{reason}"
+        );
+        assert_eq!(cache.used_bytes(), 0, "no read happened");
+        assert!(executor.scope.is_none(), "scope was not even opened");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebinding_authority_changes_the_permission_check() -> TestResult {
+        let ws = Workspace::new()?;
+        ws.write("a.txt", b"a")?;
+        let mut executor = ReadOnlyExplorerExecutor::new(
+            ws.authority(&[Permission::WriteWorkspace])?,
+            map(&[("source", "a.txt")])?,
+        );
+        let cancel = CancelToken::new();
+        let reason = failure_reason(run(&mut executor, advance(&["source"]), &cancel).await)?;
+        assert!(reason.contains("ReadWorkspace"), "{reason}");
+        executor.rebind_authority(&ws.authority(&read_rights())?);
+        assert!(
+            run(&mut executor, advance(&["source"]), &cancel)
+                .await
+                .is_ok()
+        );
+        assert!(executor.scope.is_some(), "scope opened once and kept");
+        // Narrowing again takes effect immediately and drops the scope.
+        executor.rebind_authority(&ws.authority(&[Permission::WriteWorkspace])?);
+        assert!(executor.scope.is_none());
+        let reason = failure_reason(run(&mut executor, advance(&["source"]), &cancel).await)?;
+        assert!(reason.contains("ReadWorkspace"), "{reason}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_bounded_handles_huge_limits_and_growth() -> TestResult {
+        // LOW-1: `limit + 1` must not overflow for `usize::MAX`.
+        let bytes = read_bounded(&b"abc"[..], 3, usize::MAX, "f").map_err(step_err_text)?;
+        assert_eq!(bytes, b"abc");
+        // The "grew while reading" branch needs a file that is longer than
+        // its earlier `metadata` length; a reader that reports a small
+        // length but yields more bytes reproduces that deterministically.
+        let reason = read_bounded(&b"abcdef"[..], 3, 3, "f")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("grew past the 3 byte read budget while reading"),
+            "{reason}"
+        );
+        let reason = read_bounded(&b"ab"[..], 9, 3, "f")
+            .err()
+            .unwrap_or_default();
+        assert!(reason.contains("over the 3 byte read budget"), "{reason}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn huge_limits_do_not_overflow_a_real_read() -> TestResult {
+        let ws = Workspace::new()?;
+        ws.write("a.txt", b"hello")?;
+        let mut executor = ReadOnlyExplorerExecutor::new(
+            ws.authority(&read_rights())?,
+            map(&[("source", "a.txt")])?,
+        )
+        .with_limits(usize::MAX, usize::MAX);
+        let observed = run(&mut executor, advance(&["source"]), &CancelToken::new())
+            .await
+            .map_err(step_err)?;
+        assert_eq!(observed.evidence[0].digest, ContentDigest::of(b"hello"));
         Ok(())
     }
 
@@ -985,6 +1165,10 @@ mod tests {
                     None => read.await,
                 }
             }
+        }
+
+        fn rebind_authority(&mut self, authority: &AuthorityContext) {
+            self.0.rebind_authority(authority);
         }
 
         fn reconcile(

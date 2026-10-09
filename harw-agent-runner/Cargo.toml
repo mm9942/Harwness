@@ -35,6 +35,7 @@ default = [
     "knowledge",
     "matrix",
     "tool-browser",
+    "tool-cargo",
     "tool-deps",
     "tool-doc",
     "tool-explorer",
@@ -88,6 +89,7 @@ core = []
 knowledge = []
 matrix = []
 tool-browser = []
+tool-cargo = []
 # Not in the default set: the runner does not link the container tools yet.
 tool-container = []
 tool-deps = []

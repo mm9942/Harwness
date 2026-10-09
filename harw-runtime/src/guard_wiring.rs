@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use harw_config::ResolvedConfig;
 use harw_core::{
     DriftEvent, DriftObserver, GuardPolicy, ManagedAgentSpawner, PitfallAdvisor, RoleEffortWeights,
+    SessionResolvedSet,
 };
 use harw_memory::{Fact, FactStore, FactType};
 use harw_types::ReasoningEffort;
@@ -87,17 +88,14 @@ pub struct MemoryPitfallAdvisor {
     store: Arc<FactStore>,
     /// Einmalig gefüllter Cache der Pitfall-Fakten.
     cache: OnceLock<Vec<Fact>>,
-    /// PL-90 H1: per-session names of pitfalls that a later successful call
-    /// of the same invocation resolved ([`PitfallAdvisor::resolved_in_session`]);
-    /// keyed by `SessionId::as_str()`. Legacy callers without a session share
-    /// the [`legacy_session_id`] bucket (session-unsafe, kept for the
-    /// deprecated [`PitfallAdvisor::advise`]/[`PitfallAdvisor::resolved`]).
-    resolved: Mutex<std::collections::HashMap<String, Vec<String>>>,
-}
-
-/// Shared bucket for the deprecated session-less legacy API.
-fn legacy_session_id() -> harw_types::SessionId {
-    harw_types::SessionId::from_str("legacy")
+    /// Runde 9, E3: Namen der Pitfalls, die ein späterer Erfolg desselben
+    /// Aufrufs gelöst hat ([`PitfallAdvisor::resolved`]); sie melden sich
+    /// nicht mehr.
+    resolved: Mutex<Vec<String>>,
+    /// Session-getrennter, begrenzter Laufzustand für die Runtime-Aufrufer
+    /// ([`PitfallAdvisor::advise_in_session`] / `resolved_in_session`): ein
+    /// Erfolg in Session A löst den Hinweis nie in Session B auf.
+    resolved_by_session: SessionResolvedSet,
 }
 
 impl MemoryPitfallAdvisor {
@@ -112,7 +110,8 @@ impl MemoryPitfallAdvisor {
         Self {
             store,
             cache: OnceLock::new(),
-            resolved: Mutex::new(std::collections::HashMap::new()),
+            resolved: Mutex::new(Vec::new()),
+            resolved_by_session: SessionResolvedSet::new(),
         }
     }
 
@@ -137,34 +136,10 @@ impl MemoryPitfallAdvisor {
 }
 
 impl PitfallAdvisor for MemoryPitfallAdvisor {
-    /// Legacy session-less advise: reads the shared [`legacy_session_id`]
-    /// bucket. Session-unsafe (one session's resolutions may hide hints in
-    /// another) — prefer [`PitfallAdvisor::advise_in_session`].
+    /// Runde 9, E3: ungebundener Legacy-Pfad (nicht von der Runtime
+    /// genutzt): berücksichtigt den ungebundenen `resolved`-Zustand.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
-        self.advise_in_session(&legacy_session_id(), tool_name, arguments)
-    }
-
-    /// Prüft `tool_name`/`arguments` gegen die gecachten Pitfall-Fakten.
-    ///
-    /// # Argumente
-    /// - `tool_name` (`&str`): der Name des unmittelbar bevorstehenden
-    ///   Werkzeugaufrufs.
-    /// - `arguments` (`&serde_json::Value`): dessen Argumente.
-    ///
-    /// # Rückgabe
-    /// `Some(hint)` mit einem auf höchstens 300 Bytes gekürzten Hinweistext
-    /// beim ersten Treffer; sonst `None`.
-    /// PL-90 H1: session-scoped advice; the shared resolution set is keyed
-    /// per session so one session's successes never silence hints in another.
-    #[must_use]
-    fn advise_in_session(
-        &self,
-        session_id: &harw_types::SessionId,
-        tool_name: &str,
-        arguments: &serde_json::Value,
-    ) -> Option<String> {
         let resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = resolved.get(session_id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
         self.pitfalls()
             .iter()
             .filter(|fact| !resolved.contains(&fact.name))
@@ -172,30 +147,45 @@ impl PitfallAdvisor for MemoryPitfallAdvisor {
             .map(|fact| truncate_hint(&fact.description))
     }
 
-    /// PL-90 H1: a successful call resolves matching pitfalls only in the
-    /// calling session's bucket.
+    /// Sessiongebunden: berücksichtigt nur die Auflösungen derselben Session
+    /// (nie den ungebundenen `resolved`-Zustand).
+    #[must_use]
+    fn advise_in_session(
+        &self,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        self.pitfalls()
+            .iter()
+            .filter(|fact| !self.resolved_by_session.contains(session_id, &fact.name))
+            .find(|fact| pitfall_applies(fact, tool_name, arguments))
+            .map(|fact| truncate_hint(&fact.description))
+    }
+
+    /// Sessiongebunden: löst Treffer nur für `session_id` auf.
     fn resolved_in_session(
         &self,
         session_id: &harw_types::SessionId,
         tool_name: &str,
         arguments: &serde_json::Value,
     ) {
-        let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
-        let bucket = resolved
-            .entry(session_id.as_str().to_string())
-            .or_default();
         for fact in self.pitfalls() {
-            if pitfall_applies(fact, tool_name, arguments) && !bucket.contains(&fact.name) {
-                bucket.push(fact.name.clone());
+            if pitfall_applies(fact, tool_name, arguments) {
+                self.resolved_by_session.insert(session_id, &fact.name);
             }
         }
     }
 
-    /// Legacy session-less resolved: writes into the shared
-    /// [`legacy_session_id`] bucket. Session-unsafe — prefer
-    /// [`PitfallAdvisor::resolved_in_session`].
+    /// Runde 9, E3: ein erfolgreicher Aufruf löst jeden Pitfall, der auf ihn
+    /// passte (ungebundener Legacy-Pfad, nicht von der Runtime genutzt).
     fn resolved(&self, tool_name: &str, arguments: &serde_json::Value) {
-        self.resolved_in_session(&legacy_session_id(), tool_name, arguments);
+        let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
+        for fact in self.pitfalls() {
+            if pitfall_applies(fact, tool_name, arguments) && !resolved.contains(&fact.name) {
+                resolved.push(fact.name.clone());
+            }
+        }
     }
 }
 

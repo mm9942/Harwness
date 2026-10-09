@@ -196,6 +196,20 @@ const SECRET_NAMES: &[&str] = &[
     "secrets",
 ];
 
+/// Weitere Dateinamen mit Zugangsdaten (wie [`SECRET_NAMES`], an beliebiger
+/// Stelle im Pfad).
+const SECRET_FILE_NAMES: &[&str] = &[".npmrc", ".pypirc", ".htpasswd", "credentials.json"];
+
+/// Aufeinanderfolgende Pfadglieder `(Verzeichnis, Datei)`, die Zugangsdaten
+/// bezeichnen. Passt auf jede Stelle im Pfad (`home/.aws/credentials`), nicht
+/// nur am Anfang; `.aws/other` und ein loses `config` bleiben lesbar.
+const SECRET_PATH_PAIRS: &[(&str, &str)] = &[
+    (".aws", "credentials"),
+    (".aws", "config"),
+    (".kube", "config"),
+    (".docker", "config.json"),
+];
+
 /// Endungen von Schlüsselmaterial.
 const SECRET_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "kdbx", "jks", "keystore"];
 
@@ -206,12 +220,26 @@ const SECRET_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "kdbx", "jks", 
 /// und `.env.sample` nicht.
 #[must_use]
 pub fn is_secret_path(rel: &Path) -> bool {
+    let names: Vec<String> = rel
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    if names.windows(2).any(|pair| {
+        SECRET_PATH_PAIRS
+            .iter()
+            .any(|(dir, file)| pair[0] == *dir && pair[1] == *file)
+    }) {
+        return true;
+    }
     rel.components().any(|component| {
         let Component::Normal(name) = component else {
             return false;
         };
         let name = name.to_string_lossy().to_ascii_lowercase();
-        if SECRET_NAMES.contains(&name.as_str()) {
+        if SECRET_NAMES.contains(&name.as_str()) || SECRET_FILE_NAMES.contains(&name.as_str()) {
             return true;
         }
         if name.starts_with("id_rsa")
@@ -676,6 +704,54 @@ mod tests {
             scope.open_read(&denied),
             Err(ScopeError::Denied(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_files_are_denied_by_name_and_by_directory_pair() -> TestResult {
+        let fx = Fixture::new()?;
+        let scope = fx.scope()?;
+        for path in [
+            ".aws/credentials",
+            ".aws/config",
+            "home/user/.aws/credentials",
+            ".AWS/Credentials",
+            ".kube/config",
+            "h/.kube/config",
+            ".npmrc",
+            "pkg/.npmrc",
+            ".pypirc",
+            ".netrc",
+            "u/.netrc",
+            ".htpasswd",
+            "srv/.htpasswd",
+            ".docker/config.json",
+            "h/.docker/config.json",
+            "credentials.json",
+            "gcp/credentials.json",
+            ".git-credentials",
+            "h/.git-credentials",
+        ] {
+            assert!(
+                matches!(scope.rel_readable(path), Err(ScopeError::Denied(_))),
+                "{path} must be denied"
+            );
+        }
+        // Pair rules are not name rules: neighbours stay readable.
+        for path in [
+            "config",
+            "app/config",
+            "config.json",
+            ".aws/cli/cache.json",
+            ".kube/cache",
+            ".docker/daemon.json",
+            "docs/aws/credentials",
+            "credentials.json.md",
+            "npmrc",
+            "src/.aws-notes",
+        ] {
+            assert!(scope.rel_readable(path).is_ok(), "{path} must be readable");
+        }
         Ok(())
     }
 

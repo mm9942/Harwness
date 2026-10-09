@@ -79,6 +79,7 @@ pub mod research_web;
 pub mod roster;
 pub mod skill_proposal_tools;
 pub mod skill_tools;
+pub mod tool_index;
 pub mod workbench_tools;
 
 #[cfg(test)]
@@ -299,15 +300,14 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // `JOB_READ_TOOLS`): `job.status`/`job.logs`/`job.list` lesen nur
     // Zustand und Logdateien eigener Jobs bzw. der Jobs von Nachfahren
     // (Besitzprüfung über die Sitzung aus dem Ausführungskontext);
-    // `job.wait` ist ein kurzes Polling (höchstens 60 s; das Jobende kommt
-    // als Notiz, R18 F8). Keine
+    // there is no blocking wait tool (background-only rule): the job end
+    // arrives as a notification. Keine
     // Schreibwirkung, kein Prozessstart. `job.start` fragt wie `shell.exec`,
     // `job.stop` wie jedes andere Werkzeug mit Wirkung (nicht in
     // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift).
     "job.status",
     "job.logs",
     "job.list",
-    "job.wait",
     // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge (`TUNNEL_TOOLS`,
     // `profile::TUNNEL_TOOLS`): `tunnel.status`/`tunnel.list` lesen nur den
     // Zustand verwalteter Tunnels des Aufrufers, `tunnel.stop` beendet nur
@@ -451,6 +451,10 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // image, command and workspace access are still the model's choice): an
     // allow rule never skips the question.
     "container.run",
+    // `cargo.test_one` führt Testcode aus dem Workspace aus; zusammen mit
+    // `fs.write` ist das beliebige Codeausführung in der Sandbox. Eine
+    // sitzungsweite „merken“-Freigabe darf es daher nie abdecken.
+    "cargo.test_one",
     // R18 (D-B): die mutierenden `gateway.*`-Werkzeuge
     // (`profile::GATEWAY_MUTATION_TOOLS`, `model_tool(approval = "always")`)
     // — Widerruf, Draining, Listener, Werkzeug-Freigaben fragen unter
@@ -1293,6 +1297,7 @@ mod tests {
         )));
         assert!(!AUTO_APPROVED_TOOLS.contains(&"agent.cancel"));
         assert!(ALWAYS_ASK_TOOLS.contains(&"agent.cancel"));
+        assert!(ALWAYS_ASK_TOOLS.contains(&"cargo.test_one"));
         assert!(DefaultApprovalPolicy::requires_explicit_approval(&call(
             "agent.cancel"
         )));
