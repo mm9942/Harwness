@@ -89,8 +89,8 @@ pub use progress::{
 pub use throttle::{ErrorBatch, NotifyThrottle, ProgressKey, ThrottleConfig};
 pub use tools::{
     FnLineage, JOB_CONTROL_TOOLS, JOB_LIST_TOOL, JOB_LOGS_TOOL, JOB_READ_TOOLS, JOB_START_TOOL,
-    JOB_STATUS_TOOL, JOB_STOP_TOOL, JOB_TOOL_NAMES, JobLineage, JobToolProvider,
-    NoLineage, job_start_command_text, job_tools, shell_quote,
+    JOB_STATUS_TOOL, JOB_STOP_TOOL, JOB_TOOL_NAMES, JobLineage, JobToolProvider, NoLineage,
+    job_start_command_text, job_tools, shell_quote,
 };
 
 #[cfg(test)]

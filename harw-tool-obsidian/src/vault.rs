@@ -151,7 +151,9 @@ pub fn split_frontmatter(text: &str) -> (Option<String>, &str) {
         return (None, text);
     };
     let yaml = rest[..end].trim().to_owned();
-    let after = rest[end + 4..].strip_prefix('\n').unwrap_or(&rest[end + 4..]);
+    let after = rest[end + 4..]
+        .strip_prefix('\n')
+        .unwrap_or(&rest[end + 4..]);
     (Some(yaml), after)
 }
 
@@ -241,10 +243,7 @@ pub(crate) mod tests {
             .expect("test binding");
         SandboxSpec::from_resolved(
             binding,
-            PermissionSet::from_policy(vec![
-                Permission::ReadWorkspace,
-                Permission::WriteWorkspace,
-            ]),
+            PermissionSet::from_policy(vec![Permission::ReadWorkspace, Permission::WriteWorkspace]),
         )
     }
 }

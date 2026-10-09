@@ -1,9 +1,8 @@
-# This lock is intentionally fail-closed until it is populated by the first
-# target-host validation.  A guessed compiler or bpftool version would make a
-# manifest look reproducible without providing that guarantee.  `make` refuses
-# to build while either value is UNVALIDATED; the validated, exact first output
-# line of each command is then committed here before producing artifacts.
+# Exact first output lines of the tools validated on the target host by
+# building all four objects, checking their ELF contracts, and generating
+# the manifest. Revalidate the build before changing these pins; `make`
+# rejects mismatches and UNVALIDATED values.
 schema_version = 1
-clang_version = "Debian clang version 19.1.7 (3+b1)"
-bpftool_version = "bpftool v7.7.0"
-llvm_objdump_version = "Debian LLVM version 19.1.7"
+clang_version = "Ubuntu clang version 18.1.3 (1ubuntu1)"
+bpftool_version = "bpftool v7.4.0"
+llvm_objdump_version = "Ubuntu LLVM version 19.1.1"

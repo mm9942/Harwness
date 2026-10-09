@@ -136,16 +136,8 @@ impl MemoryPitfallAdvisor {
 }
 
 impl PitfallAdvisor for MemoryPitfallAdvisor {
-    /// Prüft `tool_name`/`arguments` gegen die gecachten Pitfall-Fakten.
-    ///
-    /// # Argumente
-    /// - `tool_name` (`&str`): der Name des unmittelbar bevorstehenden
-    ///   Werkzeugaufrufs.
-    /// - `arguments` (`&serde_json::Value`): dessen Argumente.
-    ///
-    /// # Rückgabe
-    /// `Some(hint)` mit einem auf höchstens 300 Bytes gekürzten Hinweistext
-    /// beim ersten Treffer; sonst `None`.
+    /// Runde 9, E3: ungebundener Legacy-Pfad (nicht von der Runtime
+    /// genutzt): berücksichtigt den ungebundenen `resolved`-Zustand.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
         let resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         self.pitfalls()
@@ -725,23 +717,52 @@ mod pitfall_advisor_tests {
         Ok(())
     }
 
-    /// P1-a (PR #136): NICHT AUSFÜHRBAR, solange `harw-runtime` nicht
-    /// kompiliert; die ausführbare Entsprechung ist
-    /// `harw_core::guard::tests::test_resolution_in_session_a_does_not_hide_the_hint_in_session_b`.
+    /// PL-90 H1: resolutions are scoped per session — a success in one
+    /// session must not silence hints in another.
     #[test]
-    fn resolution_in_session_a_does_not_hide_pitfall_in_session_b() -> TestResult {
+    fn resolve_in_session_a_does_not_suppress_the_pitfall_in_session_b() -> TestResult {
+        use harw_types::SessionId;
         let (advisor, _dir) = advisor_with(&[(
             "agent-message-stale",
             "agent.message: kein eigenes, laufendes Kind mit der ID ffe02b1b child_id",
             "agent.message",
             0.9,
         )])?;
+        let session_a = SessionId::from_str("a");
+        let session_b = SessionId::from_str("b");
         let same = json!({ "child_id": "ffe02b1b", "text": "weiter" });
-        let a = harw_types::SessionId::new();
-        let b = harw_types::SessionId::new();
-        advisor.resolved_in_session(&a, "agent.message", &same);
-        assert!(advisor.advise_in_session(&a, "agent.message", &same).is_none());
-        assert!(advisor.advise_in_session(&b, "agent.message", &same).is_some());
+        assert!(
+            advisor
+                .advise_in_session(&session_a, "agent.message", &same)
+                .is_some()
+        );
+        assert!(
+            advisor
+                .advise_in_session(&session_b, "agent.message", &same)
+                .is_some()
+        );
+        // Resolve in session A only.
+        advisor.resolved_in_session(&session_a, "agent.message", &same);
+        assert!(
+            advisor
+                .advise_in_session(&session_a, "agent.message", &same)
+                .is_none(),
+            "resolved in session A"
+        );
+        assert!(
+            advisor
+                .advise_in_session(&session_b, "agent.message", &same)
+                .is_some(),
+            "session B unaffected by session A's resolution"
+        );
+        // Both directions: resolving in B now must not resurrect A's hint,
+        // and a fresh session C still sees the hint.
+        let session_c = SessionId::from_str("c");
+        assert!(
+            advisor
+                .advise_in_session(&session_c, "agent.message", &same)
+                .is_some()
+        );
         Ok(())
     }
 

@@ -138,7 +138,9 @@ pub use crate::fragment_registry::{
     FragmentProviderDeclaration, FragmentProviderRegistry, FragmentRegistryError,
     FragmentRegistryResult,
 };
-pub use crate::goal_context::{DEFAULT_MAX_CHARS, GoalContextProvider};
+pub use crate::goal_context::{
+    DEFAULT_MAX_CHARS, GoalContextProvider, GoalModeScope, GoalModeView, SessionGoalBinding,
+};
 pub use crate::intent_cycle::{
     AdmissionCeiling, AdmittedCycle, CYCLE_CHECKPOINT_SCHEMA, CheckpointFence, CycleAdmission,
     CycleCheckpoint, CycleLimits, CycleObservations, CycleProposal, CycleRefusal, CycleTargets,

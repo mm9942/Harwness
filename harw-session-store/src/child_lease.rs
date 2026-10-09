@@ -176,11 +176,7 @@ impl ChildLeaseStore {
     /// Transfers restart ownership of an active child lease to one durable
     /// WorkId. Idempotent for the same WorkId; a different existing owner is a
     /// hard correlation error.
-    pub fn bind_job_owner(
-        &self,
-        child: &SessionId,
-        work_id: &WorkId,
-    ) -> SessionStoreResult<()> {
+    pub fn bind_job_owner(&self, child: &SessionId, work_id: &WorkId) -> SessionStoreResult<()> {
         self.ensure_root()?;
         let lock = self.lock()?;
         let result = (|| {
@@ -195,9 +191,7 @@ impl ChildLeaseStore {
                 Some(existing) if existing != work_id => {
                     return Err(SessionStoreError::ChildLeaseRecoveryMismatch {
                         child: child.clone(),
-                        detail: format!(
-                            "owner_work_id is {existing}, not requested {work_id}"
-                        ),
+                        detail: format!("owner_work_id is {existing}, not requested {work_id}"),
                     });
                 }
                 Some(_) => return Ok(()),
@@ -219,11 +213,7 @@ impl ChildLeaseStore {
     }
 
     /// Returns whether this child lease is durably owned by exactly work_id.
-    pub fn is_owned_by(
-        &self,
-        child: &SessionId,
-        work_id: &WorkId,
-    ) -> SessionStoreResult<bool> {
+    pub fn is_owned_by(&self, child: &SessionId, work_id: &WorkId) -> SessionStoreResult<bool> {
         self.ensure_root()?;
         let lock = self.lock()?;
         let result = (|| {
@@ -349,10 +339,7 @@ impl ChildLeaseStore {
     ///
     /// The WorkId fence lives in JobStore and is intentionally not duplicated
     /// here; callers MUST hold that job lease before invoking this method.
-    pub fn recover(
-        &self,
-        expected: &ChildLeaseRecord,
-    ) -> SessionStoreResult<()> {
+    pub fn recover(&self, expected: &ChildLeaseRecord) -> SessionStoreResult<()> {
         self.ensure_root()?;
         let lock = self.lock()?;
         let result = (|| {
@@ -925,5 +912,4 @@ mod tests {
         assert_eq!(store.active()?.len(), 1);
         Ok(())
     }
-
 }

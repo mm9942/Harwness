@@ -249,6 +249,11 @@ pub struct WorkDriverEnqueueArgs {
     /// Plan to drive against; defaults to the plan bound to the goal.
     #[serde(default)]
     pub plan_id: Option<String>,
+    /// Frozen, human-approved plan scope (h23 gap 1): when set, the frozen
+    /// `plan_revision` must match the current sealed plan revision, otherwise
+    /// the enqueue fails closed ("plan revision changed after approval").
+    #[serde(default)]
+    pub frozen_scope: Option<FrozenPlanScope>,
     /// Optional, narrowing-only limit overrides.
     #[serde(default)]
     pub overrides: Option<WorkDriverOverrides>,
@@ -292,6 +297,22 @@ impl harw_operations::OpArgsSchema for WorkDriverEnqueueArgs {
             ],
             &[],
         );
+        let frozen_scope = described_object_schema(
+            "Frozen, human-approved plan scope. The frozen plan_revision must \
+             match the current sealed plan revision, otherwise the enqueue \
+             fails closed.",
+            vec![
+                (
+                    "plan_revision",
+                    integer_schema("Sealed plan revision the scope was approved against."),
+                ),
+                (
+                    "scope_summary",
+                    string_schema("Free-text scope summary as approved."),
+                ),
+            ],
+            &["plan_revision", "scope_summary"],
+        );
         described_object_schema(
             "Starts a durable WorkDriver run on the current, active goal. Returns the job id.",
             vec![
@@ -300,6 +321,7 @@ impl harw_operations::OpArgsSchema for WorkDriverEnqueueArgs {
                     "plan_id",
                     string_schema("Plan to drive against; default: the goal's bound plan."),
                 ),
+                ("frozen_scope", frozen_scope),
                 ("overrides", overrides),
             ],
             &["goal_id"],
@@ -360,12 +382,23 @@ pub struct WorkDriverJobInput {
     pub goal_id: String,
     /// The plan to drive against, if any.
     pub plan_id: Option<String>,
+    /// Frozen plan revision at the time of the human approval: proves later
+    /// which scope was actually approved. Validated by `work_driver.enqueue`
+    /// against the current sealed revision when `frozen_scope` is set (h23
+    /// gap 1; mismatch fails closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u64>,
     /// Registry role of the orchestrator that enqueued the run.
     pub orchestrator_role: String,
     /// Principal id that requested the run.
     pub requested_by: String,
     /// Effective settings: the caller's spec narrowed by the overrides.
     pub spec: WorkDriverSpec,
+    /// Frozen plan/TODO scope confirmed at approval time (h23 gap 1): the
+    /// approved scope as an opaque snapshot; never silently changed after
+    /// enqueue. Absent for jobs admitted before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_scope: Option<FrozenPlanScope>,
     /// The enqueuing caller's tenant scope (H12), if any. Stamped by
     /// `work_driver.enqueue` from [`OpContext::tenant`]; absent for an
     /// unscoped (single-user) caller and for a job admitted before this
@@ -373,6 +406,18 @@ pub struct WorkDriverJobInput {
     /// `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<TenantId>,
+}
+
+/// Frozen, human-approved plan/TODO scope of a WorkDriver run (h23 gap 4,
+/// first variant: revision plus free-text summary; later refinements may
+/// sharpen this into typed step ids). Immutable after enqueue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenPlanScope {
+    /// Sealed plan revision the scope was approved against.
+    pub plan_revision: u64,
+    /// Free-text scope summary as approved (node ids/step list description).
+    pub scope_summary: String,
 }
 
 impl WorkDriverJobInput {
@@ -956,14 +1001,37 @@ async fn work_driver_enqueue(
         )));
     }
 
+    // ── Frozen scope validation (h23 gap 1) ──────────────────────────────────
+    // A caller-supplied frozen scope proves which revision the human approved.
+    // If the plan has moved on since the approval, the enqueue fails closed;
+    // the caller must re-approve against the current sealed revision.
+    let frozen_scope = args.frozen_scope.clone();
+    let plan_revision = frozen_scope.as_ref().map(|scope| scope.plan_revision);
+    if let Some(scope) = &frozen_scope {
+        let plans = ctx.plan_store();
+        let current_revision = plans
+            .as_ref()
+            .map(|store| store.revision().value())
+            .ok_or_else(|| OpError::NotAvailable("plan store is not configured".to_owned()))?;
+        if scope.plan_revision != current_revision {
+            return Err(OpError::InvalidArguments(format!(
+                "plan revision changed after approval: frozen scope is revision {}, but the \
+                 current sealed revision is {current_revision}; re-approve the scope",
+                scope.plan_revision
+            )));
+        }
+    }
+
     // ── Admission ────────────────────────────────────────────────────────────
     let input = WorkDriverJobInput {
         schema_version: WORK_DRIVER_INPUT_SCHEMA_VERSION,
         goal_id: goal_id.clone(),
         plan_id,
+        plan_revision,
         orchestrator_role: caller.role.clone(),
         requested_by: principal.id().to_owned(),
         spec,
+        frozen_scope,
         tenant: ctx.tenant().cloned(),
     };
     let record = admission_record(ctx, principal, &input)?;
@@ -1775,6 +1843,86 @@ judge_role = "critic"
             matches!(second, Err(OpError::Execution(ref message)) if message.contains(work_id.as_str())),
             "expected an active-run refusal, got {second:?}"
         );
+        Ok(())
+    }
+
+    /// h23 gap 1: without a plan store, a frozen scope cannot be validated
+    /// and the enqueue fails closed (NotAvailable, no job admitted).
+    #[tokio::test]
+    async fn enqueue_with_frozen_scope_requires_a_plan_store() -> TestResult {
+        let fx = fixture(true, GoalStatus::Active)?;
+        let result = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({
+                "goal_id": GOAL,
+                "frozen_scope": {
+                    "plan_revision": 1,
+                    "scope_summary": "h24 test scope"
+                }
+            }),
+        )
+        .await;
+        match result {
+            Err(OpError::NotAvailable(_)) => {}
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
+        }
+        let page = fx
+            .jobs
+            .list(&JobListQuery::default())
+            .map_err(ctx("list"))?;
+        assert!(page.jobs.is_empty(), "no job may be admitted");
+        Ok(())
+    }
+
+    /// h23 gap 1: the frozen scope is persisted unchanged on the admitted
+    /// job input, together with the mirrored `plan_revision`.
+    #[tokio::test]
+    async fn frozen_scope_fields_survive_roundtrip_via_serde() -> TestResult {
+        let scope = FrozenPlanScope {
+            plan_revision: 174,
+            scope_summary: "h7+h9 nodes".to_owned(),
+        };
+        let input = WorkDriverJobInput {
+            schema_version: WORK_DRIVER_INPUT_SCHEMA_VERSION,
+            goal_id: "g-1".to_owned(),
+            plan_id: None,
+            plan_revision: Some(scope.plan_revision),
+            orchestrator_role: "work-orchestrator".to_owned(),
+            requested_by: "model:orchestrator".to_owned(),
+            spec: spec(),
+            frozen_scope: Some(scope.clone()),
+            tenant: None,
+        };
+        // Old inputs without the new fields must still load (serde defaults).
+        let legacy = serde_json::to_value(WorkDriverJobInput {
+            schema_version: WORK_DRIVER_INPUT_SCHEMA_VERSION,
+            goal_id: "g-1".to_owned(),
+            plan_id: None,
+            plan_revision: None,
+            orchestrator_role: "work-orchestrator".to_owned(),
+            requested_by: "model:orchestrator".to_owned(),
+            spec: spec(),
+            frozen_scope: None,
+            tenant: None,
+        })
+        .map_err(ctx("encode legacy input"))?;
+        let legacy_input: WorkDriverJobInput =
+            serde_json::from_value(legacy).map_err(ctx("parse legacy input"))?;
+        assert_eq!(legacy_input.plan_revision, None);
+        assert_eq!(legacy_input.frozen_scope, None);
+        // New input roundtrips with both fields intact.
+        let encoded = serde_json::to_value(&input).map_err(ctx("encode input"))?;
+        assert_eq!(encoded["plan_revision"], 174);
+        assert_eq!(encoded["frozen_scope"]["scope_summary"], "h7+h9 nodes");
+        let decoded: WorkDriverJobInput =
+            serde_json::from_value(encoded).map_err(ctx("decode input"))?;
+        assert_eq!(decoded.frozen_scope, Some(scope));
+        assert_eq!(decoded.plan_revision, Some(174));
         Ok(())
     }
 

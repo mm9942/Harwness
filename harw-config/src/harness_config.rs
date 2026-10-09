@@ -583,6 +583,17 @@ impl Default for LoggingSection {
 
 /// `[tui]` — Theme, Verweis auf die Keybindings-Datei (relativ zum
 /// Layer-Verzeichnis dieser `config.toml`) und Live-Stream der Kind-Agenten.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusExpiryMode {
+    /// Abgelaufene Kind-Statusmeldungen nach 30 s je Kind kompakt zusammenfassen.
+    /// Dies gilt für Agenten- und Systemstatusmeldungen.
+    #[default]
+    Consolidate,
+    /// Abgelaufene Kind-Statusmeldungen nach 30 s ausblenden.
+    Hide,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuiSection {
@@ -596,6 +607,14 @@ pub struct TuiSection {
     /// [`ChildStreamModeToml::Orchestrators`]).
     #[serde(default)]
     pub child_stream: ChildStreamModeToml,
+    /// Verhalten abgelaufener Kind-Statusmeldungen nach dem 30s-Fenster:
+    /// "consolidate" fasst je Kind kompakt zusammen, "hide" blendet aus.
+    #[serde(default)]
+    pub status_expiry: StatusExpiryMode,
+    /// Read-only Zielmodus in der TUI (h9): blendet eine rein darstellende
+    /// Projektion des Goal-/Planstands ein (Vorgabe: aus).
+    #[serde(default)]
+    pub goal_mode: bool,
 }
 
 impl Default for TuiSection {
@@ -604,6 +623,8 @@ impl Default for TuiSection {
             theme: default_theme(),
             keybindings_file: default_keybindings_file(),
             child_stream: ChildStreamModeToml::default(),
+            status_expiry: StatusExpiryMode::default(),
+            goal_mode: false,
         }
     }
 }
@@ -803,6 +824,28 @@ mod tests {
         assert_eq!(cfg.session.retention_days, 90);
         assert_eq!(cfg.mcp_listener.listen_addr, "127.0.0.1:1337");
         assert_eq!(cfg.mcp_listener.path, "/mcp");
+        Ok(())
+    }
+
+    #[test]
+    fn test_status_expiry_defaults_to_consolidate() {
+        assert_eq!(
+            TuiSection::default().status_expiry,
+            StatusExpiryMode::Consolidate
+        );
+    }
+
+    #[test]
+    fn test_status_expiry_parses_hide() -> TestResult {
+        let src = r#"
+            default_provider = "anthropic"
+            default_model = "claude-sonnet"
+
+            [tui]
+            status_expiry = "hide"
+        "#;
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse status_expiry hide"))?;
+        assert_eq!(cfg.tui.status_expiry, StatusExpiryMode::Hide);
         Ok(())
     }
 

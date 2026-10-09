@@ -1,0 +1,13 @@
+[package]
+name = "harw-step-list"
+version = "0.9.1"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

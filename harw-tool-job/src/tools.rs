@@ -78,12 +78,8 @@ pub const JOB_READ_TOOLS: [&str; 3] = [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_
 
 /// Die Werkzeuge, die Orchestratoren ohne Shell tragen: lesen und stoppen —
 /// kein `job.start`, kein blockierendes Warten.
-pub const JOB_CONTROL_TOOLS: [&str; 4] = [
-    JOB_STATUS_TOOL,
-    JOB_LOGS_TOOL,
-    JOB_STOP_TOOL,
-    JOB_LIST_TOOL,
-];
+pub const JOB_CONTROL_TOOLS: [&str; 4] =
+    [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_STOP_TOOL, JOB_LIST_TOOL];
 
 /// Der Befehlstext eines `job.start`-Aufrufs für Freigabe und Auto-Modus:
 /// `command` bzw. `argv`, mit [`shell_quote`] zu einem Befehl verbunden.

@@ -26,6 +26,7 @@ harw-agent-dsl = { path = "../harw-agent-dsl" }
 # (harw-core/src/child_controller.rs:393-398); harw-extension-api re-exportiert den
 # Typ nicht (harw-extension-api/src/capabilities.rs:3).
 harw-catalog = { path = "../harw-catalog" }
+harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }
 harw-config = { path = "../harw-config" }
 harw-context = { path = "../harw-context" }
 harw-core = { path = "../harw-core" }
@@ -44,6 +45,7 @@ harw-home = { path = "../harw-home" }
 # (`src/infrastructure.rs`), als Dienst auf Slash/Web (`services.rs`). Kein
 # Zyklus: `harw-infra-client` (Schicht I) hängt von keiner harw-Crate ab.
 harw-infra-client = { path = "../harw-infra-client" }
+harw-job-core = { path = "../harw-job-core" }
 harw-job-runtime = { path = "../harw-job-runtime" }
 # L6: `Arc<KnowledgeStore>` für Slash/Modell-Werkzeug (`services.rs`). Kein
 # Zyklus: `harw-knowledge` hängt nicht von `harw-runtime` ab.
@@ -56,7 +58,9 @@ harw-model-catalog = { path = "../harw-model-catalog" }
 harw-observe = { path = "../harw-observe" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
-harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }
+# harw-cloud-ops is active again (PL-90 restore, commit d69615a7): the
+# harw-cloud/* sources are committed and the live dependency lives at
+# line 29 (harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }).
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 harw-project-discovery = { path = "../harw-project-discovery" }

@@ -148,6 +148,12 @@ pub trait PitfallAdvisor: Send + Sync {
     /// # Returns
     /// `Some(hinweis)`, falls ein Fakt zutrifft (Hinweistext ≤ 300 Bytes lt.
     /// Vertrag der Implementierung); sonst `None`.
+    /// Legacy session-less advise (PL-90 H1, deprecated for stateful
+    /// advisors): called with no session binding, so a shared advisor cannot
+    /// isolate per-session resolution state. Runtime callers must use
+    /// [`PitfallAdvisor::advise_in_session`] instead; stateless
+    /// implementations should keep delegating to this method from
+    /// `advise_in_session`.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String>;
 
     /// Sessiongebundene Variante. Ein gemeinsam montierter Advisor darf
@@ -165,6 +171,11 @@ pub trait PitfallAdvisor: Send + Sync {
 
     /// Legacy-Aufruf ohne Sessionbindung; neue Runtime-Aufrufer verwenden
     /// resolved_in_session und dürfen diesen Aufruf nicht direkt benutzen.
+    /// Legacy session-less resolution (PL-90 H1, deprecated for stateful
+    /// advisors): with no session binding, a shared advisor writes into a
+    /// global bucket, so one session's success can silence hints in another.
+    /// Runtime callers must use [`PitfallAdvisor::resolved_in_session`] and
+    /// must not call this directly.
     fn resolved(&self, _tool_name: &str, _arguments: &serde_json::Value) {}
 
     /// Der Erfolg darf nur einen Hinweis in derselben Session auflösen.

@@ -376,7 +376,7 @@ impl FromRawArgs for BugReportArgs {
 ///   `" :: <what happened>"`-Teil.
 /// - [`OpError::NotAvailable`]: an die Sitzung ist kein Root-Space gebunden
 ///   (kein Rückfall auf `HARW_HOME`).
-/// - [`OpError::Execution`]: Schreibfehler.
+/// - [`OpError::Execution`][]: Schreibfehler.
 #[operation(
     name = "bug-report",
     summary = "Speichert einen lokalen Bug-Report unter ~/.harw/bug-report/.",
