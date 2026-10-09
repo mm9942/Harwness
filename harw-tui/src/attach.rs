@@ -359,6 +359,17 @@ impl View<'_> {
                 });
             }
             SessionFrame::Revoked => return Err(AttachError::Revoked),
+            SessionFrame::Presence { attached } => {
+                writeln!(
+                    self.out,
+                    "-- presence: {}",
+                    attached
+                        .iter()
+                        .map(|e| e.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+            }
             _ => {}
         }
         Ok(Flow::Continue)
@@ -626,7 +637,21 @@ async fn pick_session(
     let sessions = port.list().await?;
     match sessions.as_slice() {
         [] => Ok(port.create(CreateParams::default()).await?.session_id),
-        [one] => Ok(one.session_id.clone()),
+        [one] => {
+            write!(
+                out,
+                "attach to {} ({})? [y/N] ",
+                one.session_id.as_str(),
+                one.title.as_deref().unwrap_or("untitled")
+            )?;
+            out.flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            match answer.trim().to_lowercase().as_str() {
+                "y" | "yes" => Ok(one.session_id.clone()),
+                _ => Err(AttachError::Ambiguous(one.session_id.as_str().to_owned())),
+            }
+        }
         many => {
             for s in many {
                 writeln!(

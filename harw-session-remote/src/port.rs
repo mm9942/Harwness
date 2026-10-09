@@ -98,6 +98,7 @@ impl SessionPort for RemotePort {
 
     fn attach(&self, params: AttachParams) -> PortFuture<'_, (AttachAck, Box<dyn FrameSource>)> {
         Box::pin(async move {
+            let params = self.attach_with_resume(params);
             // The subscription is registered by the reader in the same step
             // that resolves this response, so no frame can be missed.
             let sub = Subscription::new();

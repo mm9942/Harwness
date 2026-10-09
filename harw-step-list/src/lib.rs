@@ -50,7 +50,7 @@ impl StepStatus {
 }
 
 /// Übergangsregel: alles erlaubt, außer aus `Done`/`Cancelled` heraus.
-pub fn can_transition_to(from: StepStatus, to: StepStatus) -> bool {
+pub fn can_transition_to(from: StepStatus, _to: StepStatus) -> bool {
     !from.is_terminal()
 }
 
@@ -209,7 +209,7 @@ impl StepList {
     /// Seriell in Datei schreiben.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let f = std::fs::File::create(path)?;
-        serde_json::to_writer(&f, self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        serde_json::to_writer(&f, self).map_err(io::Error::other)
     }
 
     /// Aus Datei laden; unbekannte `schema_version` wird abgelehnt.
