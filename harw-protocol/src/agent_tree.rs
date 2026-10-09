@@ -143,6 +143,17 @@ pub struct AgentTreeNode {
     pub tool_calls: Option<u32>,
     /// Model the agent talks to.
     pub model: Option<String>,
+    /// Number of this node's direct children dropped from `nodes` by
+    /// truncation. Must be 0 unless the snapshot is `truncated`. For a
+    /// `WaitingOnChildren` node, every omitted child is covered by the
+    /// producer's guarantee that it is waiting or detached (see
+    /// [`AgentTreeSnapshot::bounded`]). Absent in older payloads (= 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted_children: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl AgentTreeNode {
@@ -215,6 +226,32 @@ pub enum AgentTreeError {
     },
     /// `WaitingOnChildren` with no children in a non-truncated snapshot.
     EmptyWaiting(String),
+    /// A `WaitingOnChildren` list names the same child twice.
+    DuplicateWaitingChild {
+        /// The waiting node.
+        id: String,
+        /// The repeated child reference.
+        child: String,
+    },
+    /// A live child present in the snapshot is missing from its parent's
+    /// `WaitingOnChildren` list.
+    UnlistedLiveChild {
+        /// The waiting node.
+        id: String,
+        /// The live child that is not listed.
+        child: String,
+    },
+    /// A foreground child of a `WaitingOnChildren` node is not itself waiting,
+    /// so somebody in the subtree is still working.
+    ForegroundChildNotWaiting {
+        /// The waiting node.
+        id: String,
+        /// The foreground child that is not waiting.
+        child: String,
+    },
+    /// `omitted_children` is inconsistent with `truncated` or with the
+    /// children the node's waiting list names but the snapshot lacks.
+    BadOmission(String),
 }
 
 impl fmt::Display for AgentTreeError {
@@ -234,6 +271,20 @@ impl fmt::Display for AgentTreeError {
                 write!(f, "node {id} waits on {child}, which is not a live child")
             }
             Self::EmptyWaiting(id) => write!(f, "node {id} is waiting on no children"),
+            Self::DuplicateWaitingChild { id, child } => {
+                write!(f, "node {id} lists waiting child {child} more than once")
+            }
+            Self::UnlistedLiveChild { id, child } => {
+                write!(
+                    f,
+                    "node {id} is waiting but does not list live child {child}"
+                )
+            }
+            Self::ForegroundChildNotWaiting { id, child } => write!(
+                f,
+                "node {id} is waiting but foreground child {child} is not waiting"
+            ),
+            Self::BadOmission(id) => write!(f, "node {id} has inconsistent omitted_children"),
         }
     }
 }
@@ -247,8 +298,11 @@ impl AgentTreeSnapshot {
     /// input order), nodes unreachable from the root are dropped, and at most
     /// `max_nodes` (at least 1) leading nodes are kept. A pre-order prefix is
     /// always connected, so parents stay before their children. Dropped nodes
-    /// are counted in `omitted` and `truncated` is set. Free-text fields are
-    /// bounded to [`MAX_TEXT_CHARS`].
+    /// are counted in `omitted` and `truncated` is set; each kept node records
+    /// how many of its direct children were dropped in `omitted_children`. A
+    /// `WaitingOnChildren` node with a dropped live foreground child that is not
+    /// itself waiting cannot be proven waiting, so it is demoted to `Working`.
+    /// Free-text fields are bounded to [`MAX_TEXT_CHARS`].
     #[must_use]
     pub fn bounded(
         generated_at: jiff::Timestamp,
@@ -277,10 +331,33 @@ impl AgentTreeSnapshot {
             }
         }
         order.truncate(max_nodes.max(1));
+        let kept: HashSet<usize> = order.iter().copied().collect();
+        let kept_ids: HashSet<&str> = order.iter().map(|&i| nodes[i].id.as_str()).collect();
+        let mut dropped: HashMap<String, (u32, bool)> = HashMap::new();
+        for (i, node) in nodes.iter().enumerate() {
+            let Some(parent) = node.parent.as_deref() else {
+                continue;
+            };
+            if kept.contains(&i) || !kept_ids.contains(parent) {
+                continue;
+            }
+            let entry = dropped.entry(parent.to_owned()).or_default();
+            entry.0 = entry.0.saturating_add(1);
+            let blocking = node.kind == AgentRunKind::Foreground
+                && !node.activity.is_terminal()
+                && !matches!(node.activity, AgentActivity::WaitingOnChildren { .. });
+            entry.1 |= blocking;
+        }
         let mut slots: Vec<Option<AgentTreeNode>> = nodes.into_iter().map(Some).collect();
         let mut out: Vec<AgentTreeNode> = order.iter().filter_map(|&i| slots[i].take()).collect();
         for node in &mut out {
             node.bound_texts();
+            if let Some(&(count, blocking)) = dropped.get(&node.id) {
+                node.omitted_children = count;
+                if blocking && matches!(node.activity, AgentActivity::WaitingOnChildren { .. }) {
+                    node.activity = AgentActivity::Working;
+                }
+            }
         }
         let omitted = total - out.len();
         Self {
@@ -296,8 +373,14 @@ impl AgentTreeSnapshot {
     /// Checks structural invariants: supported schema, unique ids, a single
     /// root (parentless, depth 0), existing parents, no cycles,
     /// `depth == parent depth + 1`, and that every `WaitingOnChildren` entry is
-    /// a live (non-terminal) child of that node. In a truncated snapshot,
-    /// waiting entries whose node was omitted are tolerated.
+    /// a live (non-terminal) child of that node.
+    ///
+    /// A `WaitingOnChildren` list must be exactly the node's live direct
+    /// children in the snapshot (no duplicates, none missing) and every
+    /// foreground live child must itself be waiting; background and durable
+    /// children are detached. `omitted_children` must be 0 in a non-truncated
+    /// snapshot. In a truncated snapshot, listed ids absent from `nodes` are
+    /// tolerated only up to the node's `omitted_children`.
     ///
     /// # Errors
     /// Returns the first violated invariant as an [`AgentTreeError`].
@@ -367,6 +450,17 @@ impl AgentTreeSnapshot {
                 });
             }
         }
+        let mut live_children: HashMap<&str, Vec<&AgentTreeNode>> = HashMap::new();
+        for node in &self.nodes {
+            if node.omitted_children > 0 && !self.truncated {
+                return Err(AgentTreeError::BadOmission(node.id.clone()));
+            }
+            if let Some(parent) = node.parent.as_deref()
+                && !node.activity.is_terminal()
+            {
+                live_children.entry(parent).or_default().push(node);
+            }
+        }
         for node in &self.nodes {
             let AgentActivity::WaitingOnChildren { children } = &node.activity else {
                 continue;
@@ -374,18 +468,45 @@ impl AgentTreeSnapshot {
             if children.is_empty() && !self.truncated {
                 return Err(AgentTreeError::EmptyWaiting(node.id.clone()));
             }
+            let mut listed: HashSet<&str> = HashSet::new();
+            let mut missing = 0u32;
             for child in children {
+                if !listed.insert(child.as_str()) {
+                    return Err(AgentTreeError::DuplicateWaitingChild {
+                        id: node.id.clone(),
+                        child: child.clone(),
+                    });
+                }
                 match index.get(child.as_str()) {
                     Some(c)
                         if c.parent.as_deref() == Some(node.id.as_str())
                             && !c.activity.is_terminal() => {}
-                    None if self.truncated => {}
+                    None if self.truncated => missing = missing.saturating_add(1),
                     _ => {
                         return Err(AgentTreeError::BadWaitingChild {
                             id: node.id.clone(),
                             child: child.clone(),
                         });
                     }
+                }
+            }
+            if missing > node.omitted_children {
+                return Err(AgentTreeError::BadOmission(node.id.clone()));
+            }
+            for live in live_children.get(node.id.as_str()).into_iter().flatten() {
+                if !listed.contains(live.id.as_str()) {
+                    return Err(AgentTreeError::UnlistedLiveChild {
+                        id: node.id.clone(),
+                        child: live.id.clone(),
+                    });
+                }
+                if live.kind == AgentRunKind::Foreground
+                    && !matches!(live.activity, AgentActivity::WaitingOnChildren { .. })
+                {
+                    return Err(AgentTreeError::ForegroundChildNotWaiting {
+                        id: node.id.clone(),
+                        child: live.id.clone(),
+                    });
                 }
             }
         }
@@ -706,6 +827,7 @@ mod tests {
             tokens: None,
             tool_calls: None,
             model: None,
+            omitted_children: 0,
         }
     }
 
@@ -729,9 +851,115 @@ mod tests {
     fn valid_nodes() -> Vec<AgentTreeNode> {
         vec![
             node("root", None, 0, waiting(&["a", "b"])),
-            node("a", Some("root"), 1, AgentActivity::Working),
-            node("b", Some("root"), 1, AgentActivity::Idle),
+            bg(node("a", Some("root"), 1, AgentActivity::Working)),
+            bg(node("b", Some("root"), 1, AgentActivity::Idle)),
         ]
+    }
+
+    fn bg(mut n: AgentTreeNode) -> AgentTreeNode {
+        n.kind = AgentRunKind::Background;
+        n
+    }
+
+    #[test]
+    fn validate_rejects_omitted_working_foreground_child() {
+        // root lists only the background child; foreground "fg" works.
+        let nodes = vec![
+            node("root", None, 0, waiting(&["bg"])),
+            bg(node("bg", Some("root"), 1, AgentActivity::Working)),
+            node("fg", Some("root"), 1, AgentActivity::Working),
+        ];
+        assert!(is_err_matching(snap(nodes).validate(), |e| matches!(
+            e,
+            AgentTreeError::UnlistedLiveChild { child, .. } if child == "fg"
+        )));
+        // Listed, but working foreground child.
+        let nodes = vec![
+            node("root", None, 0, waiting(&["bg", "fg"])),
+            bg(node("bg", Some("root"), 1, AgentActivity::Working)),
+            node("fg", Some("root"), 1, AgentActivity::Working),
+        ];
+        assert!(is_err_matching(snap(nodes).validate(), |e| matches!(
+            e,
+            AgentTreeError::ForegroundChildNotWaiting { child, .. } if child == "fg"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_waiting_child() {
+        let mut nodes = valid_nodes();
+        nodes[0].activity = waiting(&["a", "b", "a"]);
+        assert!(is_err_matching(snap(nodes).validate(), |e| matches!(
+            e,
+            AgentTreeError::DuplicateWaitingChild { child, .. } if child == "a"
+        )));
+    }
+
+    #[test]
+    fn validate_omission_semantics() {
+        // Non-truncated: omitted_children must be 0.
+        let mut nodes = valid_nodes();
+        nodes[0].omitted_children = 1;
+        assert!(is_err_matching(snap(nodes).validate(), |e| matches!(
+            e,
+            AgentTreeError::BadOmission(_)
+        )));
+        // Truncated: a listed-but-absent child needs omitted_children cover.
+        let mk = |omitted| {
+            let mut root = node("root", None, 0, waiting(&["a", "gone"]));
+            root.omitted_children = omitted;
+            let mut s = snap(vec![
+                root,
+                bg(node("a", Some("root"), 1, AgentActivity::Working)),
+            ]);
+            s.truncated = true;
+            s.omitted = 1;
+            s
+        };
+        assert!(mk(1).validate().is_ok());
+        assert!(is_err_matching(mk(0).validate(), |e| matches!(
+            e,
+            AgentTreeError::BadOmission(_)
+        )));
+    }
+
+    #[test]
+    fn bounded_demotes_waiting_when_foreground_child_omitted() -> TestResult {
+        let nodes = vec![
+            node("root", None, 0, waiting(&["fg", "bg"])),
+            bg(node("bg", Some("root"), 1, AgentActivity::Working)),
+            node("fg", Some("root"), 1, AgentActivity::Working),
+        ];
+        let s = AgentTreeSnapshot::bounded(ts(), "root".to_owned(), nodes, 2);
+        assert!(s.truncated);
+        assert_eq!(s.nodes[0].omitted_children, 1);
+        assert_eq!(s.nodes[0].activity, AgentActivity::Working);
+        s.validate().map_err(ctx("demoted snapshot"))?;
+        // Omitted background child keeps the waiting state.
+        let nodes = vec![
+            node("root", None, 0, waiting(&["fg", "bg"])),
+            node("fg", Some("root"), 1, waiting(&["x"])),
+            bg(node("x", Some("fg"), 2, AgentActivity::Working)),
+            bg(node("bg", Some("root"), 1, AgentActivity::Working)),
+        ];
+        let s = AgentTreeSnapshot::bounded(ts(), "root".to_owned(), nodes, 3);
+        assert_eq!(s.nodes[0].omitted_children, 1);
+        assert!(matches!(
+            s.nodes[0].activity,
+            AgentActivity::WaitingOnChildren { .. }
+        ));
+        s.validate().map_err(ctx("kept waiting"))
+    }
+
+    #[test]
+    fn node_without_omitted_children_deserializes_to_zero() -> TestResult {
+        let n = node("x", None, 0, AgentActivity::Idle);
+        let mut v = serde_json::to_value(&n).map_err(ctx("ser"))?;
+        assert!(v.get("omitted_children").is_none());
+        v.as_object_mut().map(|o| o.remove("omitted_children"));
+        let back: AgentTreeNode = serde_json::from_value(v).map_err(ctx("de"))?;
+        assert_eq!(back.omitted_children, 0);
+        Ok(())
     }
 
     fn is_err_matching(r: Result<(), AgentTreeError>, f: impl Fn(&AgentTreeError) -> bool) -> bool {
@@ -1048,7 +1276,7 @@ mod tests {
         let nodes = vec![
             node("root", None, 0, act(&derived, "root")?),
             node("a", Some("root"), 1, act(&derived, "a")?),
-            node("a1", Some("a"), 2, act(&derived, "a1")?),
+            bg(node("a1", Some("a"), 2, act(&derived, "a1")?)),
         ];
         snap(nodes).validate().map_err(ctx("derived snapshot"))
     }
