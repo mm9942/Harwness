@@ -15,6 +15,7 @@ harw-macros = { path = "../../../harw-macros" }
 serde = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 

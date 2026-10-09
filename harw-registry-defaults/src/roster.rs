@@ -102,6 +102,16 @@ pub const GENERIC_UIA_WORKER_BASE: &str = role_names::UIA_EXPLORER;
 /// seinen Auftrag). Keine Shell, kein Netz.
 pub const GENERIC_WORKER_WRITE_TOOLS: &[&str] = &["fs.write", "fs.edit"];
 
+/// Definitions-Id des mitgelieferten `test-engineer` (`harw-home`-Bundle).
+pub const TEST_ENGINEER_DEFINITION_ID: &str = "harwness.agent.test-engineer@1";
+
+/// Werkzeuge, die zusätzlich zu [`GENERIC_WORKER_WRITE_TOOLS`] **nur** der
+/// `test-engineer` über der generischen Worker-Decke behält: `cargo.test_one`
+/// (genau ein Test hinter dem Rebuild-Wächter; weder `shell.exec` noch andere
+/// `cargo.*`). Kein anderer generischer Worker bekommt es, auch wenn seine
+/// Definition es admittiert — die Klemme entfernt es dort.
+pub const TEST_ENGINEER_EXTRA_TOOLS: &[&str] = crate::profile::CARGO_TEST_ONE_TOOLS;
+
 /// Das Registry-Profil eines generischen schreibenden Workers:
 /// Workspace lesen und schreiben, ohne `shell.*` und ohne `web.*`.
 pub const GENERIC_WRITING_WORKER_PROFILE: RegistryProfile = RegistryProfile::WorkspaceEdit;
@@ -388,6 +398,9 @@ impl AgentRoster {
             } else {
                 Vec::new()
             };
+            if writes && id.as_str() == TEST_ENGINEER_DEFINITION_ID {
+                extra_allowed.extend_from_slice(TEST_ENGINEER_EXTRA_TOOLS);
+            }
             // A custom orchestrator with a `[work_driver]` section gets
             // `work_driver.enqueue/status/stop` from lowering; without this
             // they would be dropped again here because the base ceiling
@@ -963,6 +976,150 @@ max_tokens = 999999
             !RegistryProfile::WorkspaceEdit
                 .tool_names()
                 .contains(&"web.fetch")
+        );
+        Ok(())
+    }
+
+    /// `cargo.test_one` bleibt nur dem `test-engineer` (Definitions-Id
+    /// [`TEST_ENGINEER_DEFINITION_ID`]); ein anderer generischer Schreib-Worker
+    /// verliert es, und `shell.exec` fällt in beiden Fällen weg.
+    #[test]
+    fn only_the_test_engineer_keeps_cargo_test_one() -> TestResult {
+        let builtin = builtin()?;
+        let tools = r#""fs.read", "fs.write", "cargo.test_one", "cargo.test", "shell.exec""#;
+        let (_home, config) = discover(&[
+            (
+                "test-engineer",
+                worker(
+                    TEST_ENGINEER_DEFINITION_ID,
+                    "test-engineer",
+                    "harwness.agent.worker-base@1",
+                    tools,
+                )
+                .as_str(),
+            ),
+            (
+                "other-writer",
+                worker(
+                    "user.agent.other-writer@1",
+                    "other-writer",
+                    "harwness.agent.worker-base@1",
+                    tools,
+                )
+                .as_str(),
+            ),
+        ])?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let engineer = roster
+            .entry("test-engineer")
+            .ok_or(TestError::Missing("test-engineer"))?;
+        assert_eq!(
+            engineer.tools,
+            [
+                "fs.read",
+                "fs.write",
+                "cargo.test_one",
+                "skills.search",
+                "skills.load"
+            ]
+        );
+        let other = roster
+            .entry("other-writer")
+            .ok_or(TestError::Missing("other-writer"))?;
+        assert_eq!(
+            other.tools,
+            ["fs.read", "fs.write", "skills.search", "skills.load"]
+        );
+        Ok(())
+    }
+
+    /// Sicherheit: `ExecuteProcess` (wegen `cargo.test_one` im Profil
+    /// `WorkspaceEdit`) darf nie bei einem anderen Schreib-Worker ankommen —
+    /// weder als gewährtes Recht der Kind-Registry noch als prozessfähiges
+    /// Werkzeug. Der `test-engineer` bekommt das Recht und `cargo.test_one`,
+    /// aber nie `shell.exec`.
+    #[test]
+    fn execute_process_reaches_only_the_test_engineer() -> TestResult {
+        use crate::authority::granted_for_ir;
+        use harw_authority::Permission;
+
+        let builtin = builtin()?;
+        let all = r#""fs.read", "fs.write", "fs.edit", "cargo.test_one", "cargo.test", "shell.exec", "process.kill", "job.start""#;
+        let mut defs = vec![(
+            "test-engineer".to_owned(),
+            worker(
+                TEST_ENGINEER_DEFINITION_ID,
+                "test-engineer",
+                "harwness.agent.worker-base@1",
+                all,
+            ),
+        )];
+        for (name, tools) in [
+            ("other-writer", all),
+            ("plain-writer", r#""fs.read", "fs.write""#),
+            ("shell-wanter", r#""shell.exec", "fs.write""#),
+            ("reader", r#""fs.read""#),
+        ] {
+            defs.push((
+                name.to_owned(),
+                worker(
+                    &format!("user.agent.{name}@1"),
+                    name,
+                    "harwness.agent.worker-base@1",
+                    tools,
+                ),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = defs.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+        let (_home, config) = discover(&refs)?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let wiring = roster.custom_wiring();
+        assert_eq!(wiring.len(), 5);
+        for (name, wired) in &wiring {
+            let granted = granted_for_ir(&wired.profile.required_permissions(), &wired.ir, true);
+            let advertised = wired.profile.tool_names_for(&granted);
+            let admitted = &wired.ir.permissions.tools;
+            let effective: Vec<&str> = advertised
+                .iter()
+                .copied()
+                .filter(|tool| admitted.iter().any(|a| a == tool))
+                .collect();
+            let is_engineer = name == "test-engineer";
+            assert_eq!(
+                granted.contains(Permission::ExecuteProcess),
+                is_engineer,
+                "{name}: ExecuteProcess"
+            );
+            assert_eq!(effective.contains(&"cargo.test_one"), is_engineer, "{name}");
+            for tool in &effective {
+                assert!(
+                    !tool.starts_with("shell.")
+                        && !tool.starts_with("process.")
+                        && !tool.starts_with("job.")
+                        && (*tool == "cargo.test_one" && is_engineer
+                            || !tool.starts_with("cargo.")),
+                    "{name}: prozessfähiges Werkzeug {tool}"
+                );
+            }
+            // Auch ohne Manifest-Schnitt trägt das Profil das Recht nicht.
+            assert!(
+                !wired
+                    .profile
+                    .required_permissions()
+                    .contains(Permission::ExecuteProcess),
+                "{name}: Profilrechte"
+            );
+        }
+        let engineer = wiring
+            .get("test-engineer")
+            .ok_or(TestError::Missing("test-engineer"))?;
+        assert!(
+            !engineer
+                .ir
+                .permissions
+                .tools
+                .iter()
+                .any(|t| t == "shell.exec")
         );
         Ok(())
     }

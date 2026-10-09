@@ -44,7 +44,8 @@ use harw_core::{
     ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider, StateStore,
 };
 use harw_extension_api::{
-    AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
+    AgentJobFuture, AgentJobSubmitter, AgentSpawnError, AgentSpawner, ExtensionRegistry,
+    SpawnFuture, SpawnInput,
 };
 use harw_operations::OpContext;
 use harw_operations::adapter::ModelToolProvider;
@@ -334,6 +335,10 @@ pub struct RuntimeChildRegistryFactory {
     /// obwohl die Kind-Registry gebaut wird, bevor der Spawner selbst in der
     /// Assembly vollständig konstruiert ist.
     spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
+    /// Deferred weak reference to the runtime-wide durable agent-job submitter.
+    /// Child registries receive the same async-by-default scheduling contract
+    /// as the root without creating a strong registry/spawner/runtime cycle.
+    agent_job_submitter_slot: Arc<OnceLock<Weak<dyn AgentJobSubmitter>>>,
     /// Die aufgelöste Config des Elternlaufs, nur für
     /// [`ChildRegistryFactory::reasoning_effort_defaults_for_role_task`]
     /// (Welle 8: Rangfolge Provider > Modell > Agent > Rolle) — liefert die
@@ -520,6 +525,7 @@ impl RuntimeChildRegistryFactory {
             profile_agents_dir: None,
             browser: harw_config::BrowserSection::default(),
             spawner_slot: Arc::new(OnceLock::new()),
+            agent_job_submitter_slot: Arc::new(OnceLock::new()),
             reasoning_effort_config: None,
             main_model_selection: None,
             effective_main_model: None,
@@ -728,6 +734,15 @@ impl RuntimeChildRegistryFactory {
         spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
     ) -> Self {
         self.spawner_slot = spawner_slot;
+        self
+    }
+    /// Connects child registries to the runtime-wide durable agent-job submitter.
+    #[must_use]
+    pub fn with_agent_job_submitter_slot(
+        mut self,
+        slot: Arc<OnceLock<Weak<dyn AgentJobSubmitter>>>,
+    ) -> Self {
+        self.agent_job_submitter_slot = slot;
         self
     }
 
@@ -1422,6 +1437,7 @@ impl RuntimeChildRegistryFactory {
                 return Ok(Vec::new());
             }
             return Err(AgentSpawnError {
+                kind: Default::default(),
                 message: format!(
                     "child role '{role}' requires the skills [{}] from its agent definition, \
                      but no skill catalog is wired: refusing to start it without them",
@@ -1441,6 +1457,7 @@ impl RuntimeChildRegistryFactory {
             &names,
         )
         .map_err(|detail| AgentSpawnError {
+            kind: Default::default(),
             message: format!("could not load the skills of child role '{role}': {detail}"),
         })?;
         for snapshot in &snapshots {
@@ -1662,6 +1679,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         let profile = self
             .registry_profile_for(role)
             .ok_or_else(|| AgentSpawnError {
+                kind: Default::default(),
                 message: format!(
                     "refusing to assemble a child registry for unknown role '{role}': \
                  no registry profile is declared for it"
@@ -1761,6 +1779,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 self.host_permit_wiring.clone(),
             )
             .map_err(|error| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`, nicht `install`:
@@ -1773,6 +1792,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .install_over_default(assembled.registry)
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
+            }))
+            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
+                slot: Arc::clone(&self.agent_job_submitter_slot),
             }))
             // Plan R9, offenes Recherche-Netz (`[network].research_web =
             // "open"`): erste Anfrage je Domain fragt (unter `full` nicht),
@@ -1790,6 +1812,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             let browser_provider =
                 harw_registry_defaults::profile::browser_tool_provider_for_config(&self.browser)
                     .map_err(|error| AgentSpawnError {
+                        kind: Default::default(),
                         message: format!(
                             "could not assemble browser provider for role '{role}': {error}"
                         ),
@@ -1889,6 +1912,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .catalog
             .direct_skills_snapshot(role)
             .map_err(|error| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("could not freeze the capabilities of role '{role}': {error}"),
             })
     }
@@ -2135,18 +2159,19 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// # Errors
     /// [`AgentSpawnError`], wenn `role` keine bekannte Rolle ist oder die
     /// Montage scheitert (dieselben Fälle wie [`Self::build_registry`]).
-    fn build_registry_with_capabilities_for_parent(
+    fn build_registry_from_capability_snapshot_for_parent(
         &self,
         role: &str,
         input: &SpawnInput,
-        suggestions: Option<&harw_catalog::AgentSuggestions>,
+        snapshot: Option<&harw_catalog::SpawnCapabilitySnapshot>,
         parent: &harw_core::ParentGrant,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
         if role != role_names::AGENT_STEWARD {
-            return self.build_registry(role, input, suggestions);
+            return self.build_registry_with_capabilities(role, input, snapshot);
         }
 
         let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {
+            kind: Default::default(),
             message: format!(
                 "refusing to assemble a child registry for unknown role '{role}': \
                  no registry profile is declared for it"
@@ -2200,6 +2225,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 Some(access),
             )
             .map_err(|error| AgentSpawnError {
+                kind: Default::default(),
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`: siehe Begründung in `build_registry`.
@@ -2207,6 +2233,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .install_over_default(assembled.registry)
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
+            }))
+            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
+                slot: Arc::clone(&self.agent_job_submitter_slot),
             }));
         // Plan R9, Teil A: auch der Steward findet und lädt Skills.
         let registry = self
@@ -2455,6 +2484,32 @@ struct DeferredManagedSpawner {
     slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
 }
 
+/// Weak adapter that gives every child registry the same durable job submitter
+/// as the root while avoiding a strong reference cycle.
+struct DeferredAgentJobSubmitter {
+    slot: Arc<OnceLock<Weak<dyn AgentJobSubmitter>>>,
+}
+
+impl AgentJobSubmitter for DeferredAgentJobSubmitter {
+    fn submit_child<'a>(
+        &'a self,
+        child: &'a harw_types::SessionId,
+        task: Option<&'a str>,
+    ) -> AgentJobFuture<'a> {
+        Box::pin(async move {
+            let submitter =
+                self.slot
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| AgentSpawnError {
+                        kind: Default::default(),
+                        message: "durable agent job submitter is not available".to_owned(),
+                    })?;
+            submitter.submit_child(child, task).await
+        })
+    }
+}
+
 impl AgentSpawner for DeferredManagedSpawner {
     fn spawn_child<'a>(
         &'a self,
@@ -2469,6 +2524,7 @@ impl AgentSpawner for DeferredManagedSpawner {
                     .get()
                     .and_then(Weak::upgrade)
                     .ok_or_else(|| AgentSpawnError {
+                        kind: Default::default(),
                         message: "managed child spawner is not available".to_owned(),
                     })?;
             spawner.spawn_child(role, input, sandbox, suggestions).await
@@ -2491,6 +2547,7 @@ impl AgentSpawner for DeferredManagedSpawner {
             .get()
             .and_then(Weak::upgrade)
             .ok_or_else(|| AgentSpawnError {
+                kind: Default::default(),
                 message: "managed child spawner is not available".to_owned(),
             })?;
         spawner.child_completed(child, completed_at)
@@ -3991,7 +4048,9 @@ mod tests {
             factory.home_context.as_ref(),
         );
         assert!(
-            unbound.get::<Arc<harw_home::ResolvedHomeContext>>().is_none(),
+            unbound
+                .get::<Arc<harw_home::ResolvedHomeContext>>()
+                .is_none(),
             "ohne with_home_context kein Root-Space im OpContext"
         );
 

@@ -179,12 +179,6 @@ impl Workspace {
         open_beneath(self.dir.as_fd(), beneath_arg(rel), OpenMode::read_only())
     }
 
-    /// Kanonischer Pfad dieser Wurzel.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Metadaten des geöffneten Wurzel-Deskriptors (`fstat`).
     ///
     /// # Errors

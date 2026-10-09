@@ -191,6 +191,7 @@ pub struct Session {
     turn_rx: UnboundedReceiver<TurnEvent>,
     session_rx: UnboundedReceiver<SessionEvent>,
     cancel: CancelHandle,
+    media: Arc<crate::media::MediaHandle>,
 }
 
 impl std::fmt::Debug for Session {
@@ -208,6 +209,7 @@ impl Session {
         approvals: Arc<dyn ApprovalHandler>,
         turn_rx: UnboundedReceiver<TurnEvent>,
         session_rx: UnboundedReceiver<SessionEvent>,
+        media: Arc<crate::media::MediaHandle>,
     ) -> Self {
         Self {
             id: SessionId::from_core(root.id()),
@@ -217,6 +219,7 @@ impl Session {
             turn_rx,
             session_rx,
             cancel: CancelHandle::default(),
+            media,
         }
     }
 
@@ -273,7 +276,7 @@ impl Session {
             .to_model_messages()
             .into_iter()
             .filter_map(|message| match message {
-                ModelMessage::User { text } => Some(Message {
+                ModelMessage::User { text, .. } => Some(Message {
                     role: Role::User,
                     text,
                 }),
@@ -310,10 +313,34 @@ impl Session {
     /// Reguläre Ausgänge wie Abbruch, Ablehnung oder Abschneiden sind **kein**
     /// Fehler; sie stehen in [`TurnReport::status`].
     pub async fn send(&mut self, text: impl Into<String>) -> Result<TurnReport, SdkError> {
+        self.send_with_images(text, Vec::new()).await
+    }
+
+    /// Wie [`Self::send`], mit Bildern an der Nachricht.
+    ///
+    /// # Beschreibung
+    /// Die Bilder werden geprüft, von Metadaten befreit und im Medienspeicher
+    /// unter dem Home abgelegt (siehe [`crate::Image`]); das Modell erhält sie
+    /// vor dem Text. Versteht das gewählte Modell keine Bilder
+    /// (`image_input = false` in seiner Modelldatei), ersetzt der Provider sie
+    /// durch einen Hinweis mit den Maßen. Der Text darf leer sein, wenn
+    /// mindestens ein Bild da ist.
+    ///
+    /// # Fehler
+    /// - [`SdkError::InvalidInput`] bei leerem Text ohne Bild, mehr als
+    ///   [`crate::MAX_IMAGES_PER_MESSAGE`] Bildern oder einem Bild, das nicht
+    ///   PNG/JPEG/GIF/WebP, zu groß oder beschädigt ist.
+    /// - sonst wie [`Self::send`].
+    pub async fn send_with_images(
+        &mut self,
+        text: impl Into<String>,
+        images: Vec<crate::Image>,
+    ) -> Result<TurnReport, SdkError> {
         let text = text.into();
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && images.is_empty() {
             return Err(SdkError::invalid("text", "must not be empty"));
         }
+        let refs = self.media.ingest(&images)?;
         // Reste eines früheren (etwa abgebrochenen) Turns gehören nicht in
         // diesen Bericht.
         let _stale = self.drain();
@@ -321,8 +348,9 @@ impl Session {
         let usage_before = self.root.total_usage().clone();
         let token = CancelToken::new();
         self.cancel.arm(token.clone());
-        let input =
-            TurnInput::user(text).with_control(TurnControl::new().with_cancel(token.clone()));
+        let input = TurnInput::user(text)
+            .with_images(refs)
+            .with_control(TurnControl::new().with_cancel(token.clone()));
         let driven = drive(
             &self.assembly,
             &mut self.root,

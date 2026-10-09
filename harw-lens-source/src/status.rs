@@ -188,6 +188,8 @@ mod tests {
             },
             text: "# Intro\n\nEin Absatz Text.\n".to_owned(),
             visibility: DEFAULT_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         }];
         let embedder = DeterministicEmbedder::new(8);
         build_index(

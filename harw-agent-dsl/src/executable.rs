@@ -191,6 +191,19 @@ pub struct ReferencedSnapshotId {
 }
 
 impl ReferencedSnapshotId {
+    /// Builds the wire/reference form of a freshly computed snapshot.
+    ///
+    /// This conversion is one-way on purpose: deserializing a reference never
+    /// creates a trusted [`SnapshotId`]. A recovery consumer must still call
+    /// [`Self::confirm`] against the currently computed IR.
+    #[must_use]
+    pub fn from_computed(computed: &SnapshotId) -> Self {
+        Self {
+            domain: SNAPSHOT_HASH_DOMAIN.to_owned(),
+            digest: computed.to_string(),
+        }
+    }
+
     /// Prüft die Form eines eingelesenen Snapshot-Verweises und baut ihn.
     ///
     /// # Beschreibung

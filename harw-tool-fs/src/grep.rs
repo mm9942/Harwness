@@ -2,8 +2,8 @@
 //!
 //! Spec-Referenz: AP W2-01..03, Abschnitt "2. `grep.rs` — `fs.grep`";
 //! Sicherheits- und Grenzenüberarbeitung: W1-02 (F-059, F-118); Datei-Ziele
-//! und ripgrep-Integration: Nutzerentscheidung "ripgrep bevorzugt, interner
-//! Fallback" (siehe unten).
+//! Die Suche ist vollständig in-process; externe Suchprozesse sind kein
+//! Ausführungspfad eines Read-Tools.
 //!
 //! # Verantwortung
 //! Dieses Modul besitzt den `fs.grep`-Executor:
@@ -25,29 +25,11 @@
 //! denselben Fehler. Der Startpfad liegt damit immer unter einer erlaubten
 //! Wurzel — unabhängig vom Suchmotor.
 //!
-//! # ripgrep-Integration
-//! Ist ein `rg`-Binary in `PATH` auffindbar (einmal je Prozess ermittelt,
-//! siehe [`rg_binary`]; keine `which`-Crate — reine `PATH`-Suche über
-//! `std::env::split_paths`) und wurden keine Kontextzeilen angefordert, läuft
-//! `rg --json` synchron im bereits blockierenden Kontext (siehe
-//! [`crate::blocking::run_blocking`]) mit `current_dir` = Workspace-Wurzel
-//! und entferntem `RIPGREP_CONFIG_PATH`. Die `match`-Ereignisse der
-//! `--json`-Ausgabe werden zeilenweise geparst (siehe
-//! [`parse_rg_match_line`]) und in dieselbe Trefferstruktur überführt wie die
-//! interne Suche — identisches Ausgabeformat, identische Zeilenkürzung,
-//! identische Treffer-/Ausgabegrenzen. Der Kindprozess wird beim Erreichen
-//! einer Grenze vorzeitig beendet. Ein Regex-Fehler von `rg` (Exit-Code 2)
-//! ohne bereits gesammelte Treffer sowie jeder Spawn-Fehler fallen auf die
-//! interne Suche zurück; Exit-Code 1 (keine Treffer) liefert ein leeres
-//! Ergebnis. `rg` überspringt standardmäßig `.gitignore`-Einträge und
-//! versteckte Dateien — das deckt sich mit dem internen Fallback (der
-//! ebenfalls `.gitignore` beachtet) und ist akzeptiertes Verhalten.
-//! Kontextzeilen (`context_lines > 0`) werden ausschließlich intern bedient,
-//! da die verwendete `rg`-Argumentliste keine `-A`/`-B`/`-C`-Flags enthält.
-//! In Testbuilds liefert [`rg_binary`] stets `None`, damit Tests unabhängig
-//! vom Testrechner deterministisch bleiben; die ripgrep-Anbindung wird
-//! stattdessen gezielt über [`grep_with_engine`] mit einem injizierten Pfad
-//! getestet.
+//! # Prozessmodell
+//! `fs.grep` startet keine externen Programme. Die Suche läuft über den
+//! symlink-festen internen Walker und Rust-`regex`. Das hält Read-Tools aus
+//! der Prozess-/Job-Capability heraus; jede echte Prozessausführung bleibt
+//! ausschließlich beim Job-/Command-Runtime-Pfad.
 //!
 //! # Traversierung und Grenzen (W1-02, interne Suche)
 //! Im Verzeichnis-Modus wird über [`crate::tree::walk_tree`] gewalkt (Basis
@@ -78,9 +60,8 @@
 use crate::blocking::run_blocking;
 use crate::symlink::open_start;
 use crate::tree::{
-    HARD_MAX_RESULTS, MAX_LINE_BYTES, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason,
-    WalkOptions, Workspace, normalize_relative, open_file_in, read_bounded, truncate_line,
-    walk_tree,
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason, WalkOptions, Workspace,
+    normalize_relative, open_file_in, read_bounded, truncate_line, walk_tree,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use harw_fsutil::EntryType;
@@ -89,12 +70,8 @@ use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-#[cfg(not(test))]
-use std::sync::OnceLock;
+use std::path::Path;
 
 /// Standard-Obergrenze für `fs.grep`-Treffer.
 pub const DEFAULT_MAX_MATCHES: usize = 100;
@@ -127,7 +104,7 @@ const HARD_EXCLUDED_NAMES: &[&str] = &["target", ".git"];
 #[tool(
     name = "fs.grep",
     description = "Durchsucht eine Datei oder Dateien im Workspace mit einem regulären \
-                    Ausdruck; bevorzugt ripgrep, sonst interne Suche."
+                    Ausdruck über die interne symlink-feste Suche."
 )]
 pub struct GrepArgs {
     /// Rust-Regex (crate `regex`).
@@ -305,9 +282,8 @@ impl GrepRun<'_> {
 #[harw_macros::tool(
     name = "fs.grep",
     description = "Durchsucht eine Datei oder alle Dateien im Workspace mit einem regulären \
-                    Ausdruck und liefert Treffer im GNU-grep-Stil. Bevorzugt ripgrep, wenn \
-                    installiert (dann wird .gitignore beachtet); sonst interne symlinkfeste \
-                    Suche.",
+                    Ausdruck und liefert Treffer im GNU-grep-Stil. Die Suche ist intern, \
+                    symlink-fest und startet keine externen Prozesse.",
     permission = "read_workspace",
     parallel_safe
 )]
@@ -316,10 +292,9 @@ async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolO
     run_blocking("fs.grep", move || Ok(grep_blocking(&root, &args))).await
 }
 
-/// Synchroner Kern von [`fs_grep`]: ermittelt den prozessweiten `rg`-Pfad
-/// (siehe [`rg_binary`]) und delegiert an [`grep_with_engine`].
+/// Synchroner, vollständig in-process laufender Kern von [`fs_grep`].
 fn grep_blocking(root: &Path, args: &GrepArgs) -> ToolOutput {
-    grep_with_engine(root, args, rg_binary())
+    grep_internal(root, args)
 }
 
 /// Aufgelöstes Suchziel (Abschnitt "Ziel-Validierung"): eine einzelne,
@@ -382,207 +357,12 @@ fn finalize(hits: &[GrepHit], stop: Option<StopReason>, cap: usize, skipped: usi
     ToolOutput::text(out_lines.join("\n"))
 }
 
-/// Prozessweit gecachter Pfad zum `rg`-Binary (`None`, wenn nicht gefunden).
-/// Nur in Nicht-Testbuilds referenziert (siehe [`rg_binary`]).
-#[cfg(not(test))]
-static RG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-/// Sucht `rg` in `PATH` (manuelle Suche über [`std::env::split_paths`], keine
-/// `which`-Crate — siehe Workspace-Regel gegen neue Abhängigkeiten).
-fn find_rg() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var).find_map(|dir| {
-        let candidate = dir.join("rg");
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-/// Liefert den gecachten `rg`-Pfad, falls vorhanden (einmal je Prozess
-/// ermittelt). In Testbuilds wird `rg` nie automatisch verwendet, damit Tests
-/// unabhängig vom Testrechner deterministisch bleiben; die ripgrep-Anbindung
-/// wird stattdessen gezielt über [`grep_with_engine`] mit einem injizierten
-/// Pfad getestet (siehe Modul-Doku "ripgrep-Integration").
-#[cfg(not(test))]
-fn rg_binary() -> Option<&'static Path> {
-    RG_PATH.get_or_init(find_rg).as_deref()
-}
-
-/// Testvariante von [`rg_binary`]: liefert immer `None`.
-#[cfg(test)]
-fn rg_binary() -> Option<&'static Path> {
-    None
-}
-
-/// Ergebnis eines `rg`-Laufs.
-enum RgOutcome {
-    /// Fertige Trefferliste inklusive Abbruchgrund.
-    Hits(Vec<GrepHit>, Option<StopReason>),
-    /// `rg` konnte nicht sinnvoll verwendet werden — die interne Suche
-    /// übernimmt (Spawn-Fehler oder Regex-Fehler ohne bereits gesammelte
-    /// Treffer).
-    Fallback,
-}
-
-/// Eine aus einem `rg --json`-`match`-Ereignis extrahierte Rohtrefferzeile.
-struct RgMatchLine {
-    /// Pfad relativ zum `current_dir` des `rg`-Aufrufs (== Workspace-Wurzel).
-    path: String,
-    /// 1-basierte Zeilennummer.
-    line_number: usize,
-    /// Zeileninhalt inklusive Zeilenumbruch.
-    text: String,
-}
-
-/// Eine Zeile aus `rg --json` (`{"type": "...", "data": {...}}`).
-#[derive(Deserialize)]
-struct RgEvent {
-    /// `"begin"`, `"match"`, `"end"` oder `"summary"`.
-    #[serde(rename = "type")]
-    event_type: String,
-    /// Nutzlast; Form hängt von `event_type` ab (siehe [`RgEventData`]).
-    data: Option<RgEventData>,
-}
-
-/// Die für `match`-Ereignisse relevanten Felder von `data`. Andere
-/// Ereignistypen (`begin`, `end`, `summary`) haben ein abweichendes
-/// `data`-Objekt; dessen unbekannte Felder werden von `serde_json` ignoriert,
-/// die hier fehlenden Schlüssel landen einfach als `None`.
-#[derive(Deserialize)]
-struct RgEventData {
-    /// `{"text": "<pfad>"}`.
-    path: Option<RgText>,
-    /// `{"text": "<zeileninhalt inkl. Zeilenumbruch>"}`.
-    lines: Option<RgText>,
-    /// 1-basierte Zeilennummer des Treffers.
-    line_number: Option<usize>,
-}
-
-/// `{"text": "..."}` — von `rg --json` für Pfad- und Zeilenfelder verwendet.
-#[derive(Deserialize)]
-struct RgText {
-    /// Der UTF-8-Text (fehlt bei nicht-UTF-8-Inhalt, dann Base64 in `bytes`,
-    /// was hier nicht ausgewertet wird).
-    text: Option<String>,
-}
-
-/// Parst eine Zeile aus `rg --json`-Ausgabe. Liefert `None` für
-/// Nicht-`match`-Ereignisse (`begin`, `end`, `summary`) und für unparsebare
-/// oder unvollständige Zeilen.
-fn parse_rg_match_line(line: &str) -> Option<RgMatchLine> {
-    let event: RgEvent = serde_json::from_str(line).ok()?;
-    if event.event_type != "match" {
-        return None;
-    }
-    let data = event.data?;
-    Some(RgMatchLine {
-        path: data.path?.text?,
-        line_number: data.line_number?,
-        text: data.lines?.text?,
-    })
-}
-
-/// Führt `rg --json` im Verzeichnis `root` aus und übersetzt die
-/// `match`-Ereignisse in [`GrepHit`]s (Abschnitt "ripgrep-Integration").
-///
-/// Bricht beim Erreichen von `cap` Treffern oder [`MAX_OUTPUT_BYTES`] ab und
-/// beendet den Kindprozess vorzeitig (`StopReason::ResultLimit` /
-/// `OutputLimit`). Exit-Code 2 (z. B. Regex-Fehler) ohne bereits gesammelte
-/// Treffer sowie jeder Spawn-Fehler liefern [`RgOutcome::Fallback`];
-/// Exit-Code 1 (keine Treffer) liefert eine leere Trefferliste.
-fn run_rg(rg: &Path, root: &Path, args: &GrepArgs, start_rel: &Path, cap: usize) -> RgOutcome {
-    let target_arg = if start_rel.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        start_rel
-    };
-
-    let mut cmd = Command::new(rg);
-    cmd.current_dir(root)
-        .env_remove("RIPGREP_CONFIG_PATH")
-        .arg("--json")
-        .arg("--no-config")
-        .arg("--no-follow")
-        .arg("--no-messages")
-        .arg("--color")
-        .arg("never")
-        .arg("--max-columns")
-        .arg(MAX_LINE_BYTES.to_string());
-    if args.case_insensitive.unwrap_or(false) {
-        cmd.arg("--ignore-case");
-    }
-    if let Some(glob) = args.glob.as_deref().filter(|glob| !glob.is_empty()) {
-        cmd.arg("--glob").arg(glob);
-    }
-    cmd.arg("-e")
-        .arg(&args.pattern)
-        .arg("--")
-        .arg(target_arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(_) => return RgOutcome::Fallback,
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return RgOutcome::Fallback;
-    };
-
-    let mut hits: Vec<GrepHit> = Vec::new();
-    let mut output_bytes = 0usize;
-    let mut stop: Option<StopReason> = None;
-
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        let Some(matched) = parse_rg_match_line(&line) else {
-            continue;
-        };
-        if hits.len() >= cap {
-            stop = Some(StopReason::ResultLimit);
-            break;
-        }
-        let hit = GrepHit {
-            path: matched.path,
-            line: matched.line_number,
-            before: Vec::new(),
-            text: truncate_line(matched.text.trim_end_matches(['\n', '\r'])),
-            after: Vec::new(),
-        };
-        let cost = hit.output_cost();
-        if output_bytes + cost > MAX_OUTPUT_BYTES {
-            stop = Some(StopReason::OutputLimit);
-            break;
-        }
-        output_bytes += cost;
-        hits.push(hit);
-    }
-
-    let exit_code = if stop.is_some() {
-        let _ = child.kill();
-        let _ = child.wait();
-        None
-    } else {
-        child.wait().ok().and_then(|status| status.code())
-    };
-
-    if hits.is_empty() && exit_code == Some(2) {
-        return RgOutcome::Fallback;
-    }
-    RgOutcome::Hits(hits, stop)
-}
-
-/// Kern von [`grep_blocking`] mit injizierbarem `rg`-Pfad (siehe Modul-Doku
-/// "ripgrep-Integration"). `rg` wird nur ohne angeforderte Kontextzeilen
-/// versucht; bei `RgOutcome::Fallback` oder `rg.is_none()` übernimmt die
-/// interne, symlinkfeste Suche.
+/// Prozessfreier Kern von [`grep_blocking`].
 ///
 /// # Errors
 /// Liefert nie `Err`; Pfad-, Muster- oder I/O-Fehler werden als
 /// `Ok(ToolOutput::error(...))` zurückgegeben.
-fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutput {
+fn grep_internal(root: &Path, args: &GrepArgs) -> ToolOutput {
     // Strict-Schema: `null` und `""` gelten als „nicht gesetzt“ (Wurzel).
     let start_input = args
         .path
@@ -631,8 +411,6 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
             ));
         }
     };
-    let search_root = start.root().to_path_buf();
-    let root = search_root.as_path();
     let (workspace, start_rel) = (start.workspace, start.rel);
 
     let target = match resolve_target(&workspace, start_input, &start_rel) {
@@ -651,18 +429,6 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
         .filter(|&matches| matches > 0)
         .unwrap_or(DEFAULT_MAX_MATCHES)
         .clamp(1, HARD_MAX_RESULTS);
-
-    // ripgrep nur ohne Kontextzeilen versuchen: die dokumentierte
-    // rg-Argumentliste (Abschnitt "ripgrep-Integration") enthält keine
-    // -A/-B/-C-Flags, mit Kontextzeilen läuft ausschließlich die interne Suche.
-    if context_lines == 0 {
-        if let Some(rg) = rg {
-            match run_rg(rg, root, args, &start_rel, cap) {
-                RgOutcome::Hits(hits, stop) => return finalize(&hits, stop, cap, 0),
-                RgOutcome::Fallback => {}
-            }
-        }
-    }
 
     let mut run = GrepRun {
         regex: &regex,
@@ -1070,11 +836,10 @@ mod tests {
         Ok(())
     }
 
-    // -- Datei-Ziel und ripgrep-Integration (Abschnitte "Ziel-Validierung",
-    // "ripgrep-Integration") -------------------------------------------------
+    // -- Datei-Ziel / prozessfreie interne Suche ------------------------------
 
     #[test]
-    fn test_grep_with_engine_file_mode_uses_internal_engine_without_rg() -> TestResult {
+    fn test_grep_internal_file_mode() -> TestResult {
         let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
         fs::create_dir_all(&ws)?;
@@ -1083,72 +848,23 @@ mod tests {
 
         let mut args = grep_args("MATCHME");
         args.path = Some("a.txt".to_owned());
-        let text = text_of(grep_with_engine(&ws, &args, None))?;
+        let text = text_of(grep_internal(&ws, &args))?;
 
         assert_eq!(text, "a.txt:2: MATCHME here");
         Ok(())
     }
 
     #[test]
-    fn test_grep_with_engine_dir_mode_uses_internal_engine_without_rg() -> TestResult {
+    fn test_grep_internal_dir_mode() -> TestResult {
         let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
         fs::create_dir_all(ws.join("sub"))?;
         fs::write(ws.join("sub/a.txt"), "MATCHME\n")?;
 
         let args = grep_args("MATCHME");
-        let text = text_of(grep_with_engine(&ws, &args, None))?;
+        let text = text_of(grep_internal(&ws, &args))?;
 
         assert_eq!(text, "sub/a.txt:1: MATCHME");
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_rg_match_line_extracts_match_events_only() -> TestResult {
-        let match_line = r#"{"type":"match","data":{"path":{"text":"src/lib.rs"},"lines":{"text":"fn matchme() {}\n"},"line_number":42,"absolute_offset":100,"submatches":[{"match":{"text":"matchme"},"start":3,"end":10}]}}"#;
-        let begin_line = r#"{"type":"begin","data":{"path":{"text":"src/lib.rs"}}}"#;
-        let end_line = r#"{"type":"end","data":{"path":{"text":"src/lib.rs"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":100,"human":"0.000000s"},"searches":1,"searches_with_match":1,"bytes_searched":50,"bytes_printed":30,"matched_lines":1,"matches":1}}}"#;
-        let summary_line = r#"{"data":{"elapsed_total":{"human":"0.000100s","nanos":100000,"secs":0},"stats":{"bytes_printed":30,"bytes_searched":50,"elapsed":{"human":"0.000100s","nanos":100000,"secs":0},"matched_lines":1,"matches":1,"searches":1,"searches_with_match":1}},"type":"summary"}"#;
-
-        let matched = parse_rg_match_line(match_line).ok_or(TestError::Missing("match event"))?;
-        assert_eq!(matched.path, "src/lib.rs");
-        assert_eq!(matched.line_number, 42);
-        assert_eq!(matched.text, "fn matchme() {}\n");
-
-        assert!(
-            parse_rg_match_line(begin_line).is_none(),
-            "begin event must not parse as match"
-        );
-        assert!(
-            parse_rg_match_line(end_line).is_none(),
-            "end event must not parse as match"
-        );
-        assert!(
-            parse_rg_match_line(summary_line).is_none(),
-            "summary event must not parse as match"
-        );
-        assert!(
-            parse_rg_match_line("not json").is_none(),
-            "garbage line must not parse"
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "erfordert ein installiertes rg-Binary auf PATH; nicht Teil der Standard-Testsuite"]
-    fn test_grep_with_engine_spawns_real_ripgrep_when_present() -> TestResult {
-        let Some(rg) = find_rg() else {
-            return Ok(());
-        };
-        let dir = TempDir::new()?;
-        let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws)?;
-        fs::write(ws.join("a.txt"), "one\nMATCHME here\nthree\n")?;
-
-        let args = grep_args("MATCHME");
-        let text = text_of(grep_with_engine(&ws, &args, Some(&rg)))?;
-
-        assert!(text.contains("a.txt:2: MATCHME here"), "{text}");
         Ok(())
     }
 }

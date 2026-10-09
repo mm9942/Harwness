@@ -75,8 +75,105 @@ pub enum TurnOutcome {
     /// The turn parked on an approval; the host resumes it after the
     /// approval is resolved.
     AwaitingApproval,
-    /// The turn failed.
+    /// The turn failed for an untyped reason (shown to clients as
+    /// [`FailureCause::Internal`]).
     Failed(String),
+    /// The turn failed for a known cause (provider auth, quota, context
+    /// length, refusal, ...). Drivers should prefer this over
+    /// [`Self::Failed`] so clients can show an actionable category.
+    FailedWith {
+        cause: FailureCause,
+        /// Raw reason; the host bounds and sanitizes it before it reaches a
+        /// client.
+        reason: String,
+    },
+}
+
+/// Why a hosted turn failed, as shown to clients.
+///
+/// # Failure surfacing (liveness contract)
+/// A failed turn never leaves a session dead from the client's point of
+/// view. The host (1) publishes one visible `SessionError` frame per failed
+/// turn (`"turn failed (<label>): <bounded, sanitized message>"`) and (2)
+/// returns the hosted state to `Idle` (or `Queued` when more input waits), so
+/// the next submit is accepted. `HostedState::Failed` is deliberately not
+/// produced: it exists on the wire for compatibility, but a state the client
+/// cannot leave would contradict this contract, and the failure is already
+/// reported as an event carrying its cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureCause {
+    /// Provider rejected the credentials (HTTP 401/403, expired token).
+    ProviderAuth,
+    /// Provider quota or budget exhausted.
+    Quota,
+    /// The request exceeded the model's context window.
+    ContextLength,
+    /// The model refused the request or its output.
+    Refusal,
+    /// The model request failed (transport, rate limit, timeout, truncated or
+    /// empty response, context assembly).
+    RequestFailed,
+    /// Anything else: store errors, tool or invariant failures.
+    Internal,
+}
+
+impl FailureCause {
+    /// Human-readable category used in the client notice.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ProviderAuth => "provider authentication failed",
+            Self::Quota => "provider quota or budget exhausted",
+            Self::ContextLength => "context length exceeded",
+            Self::Refusal => "model refused",
+            Self::RequestFailed => "model request failed",
+            Self::Internal => "internal error",
+        }
+    }
+}
+
+/// Longest message (in characters) forwarded to clients.
+pub const MAX_NOTICE_CHARS: usize = 300;
+
+/// Make an untrusted provider/error message safe to show: control characters
+/// (including ANSI escape introducers) count as whitespace, whitespace runs
+/// collapse to one space, and the result is cut to `max_chars` characters
+/// plus an ellipsis.
+#[must_use]
+pub fn sanitize_notice(raw: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if count >= max_chars {
+            out.push('\u{2026}');
+            return out;
+        }
+        if pending_space {
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+impl TurnOutcome {
+    /// Cause and raw reason of a failed outcome; `None` for other outcomes.
+    #[must_use]
+    pub fn failure(&self) -> Option<(FailureCause, &str)> {
+        match self {
+            Self::Failed(reason) => Some((FailureCause::Internal, reason)),
+            Self::FailedWith { cause, reason } => Some((*cause, reason)),
+            _ => None,
+        }
+    }
 }
 
 /// A session setting change, applied at the turn boundary.

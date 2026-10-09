@@ -63,15 +63,17 @@ use crate::operation::{Operation, Surface, WebMethod};
 /// - [`Self::WebPathCollision`]: Two ops declare a `Surface::Web` with the identical
 ///   `(path, method)` pair — see that variant's own doc for why this check lives in
 ///   the registry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, harw_macros::HarwError)]
 pub enum RegistryError {
     /// An operation with this canonical name is already registered.
+    #[msg("duplicate operation name: '{name}'")]
     DuplicateName {
         /// The colliding name.
         name: String,
     },
     /// An alias claimed by `second_owner` collides with a name or alias already owned
     /// by `first_owner`.
+    #[msg("alias '{alias}' is claimed by both '{first_owner}' and '{second_owner}'")]
     AliasCollision {
         /// The alias string that collides.
         alias: String,
@@ -81,6 +83,7 @@ pub enum RegistryError {
         second_owner: String,
     },
     /// An operation contains an internal name/alias inconsistency.
+    #[msg("operation '{owner}' has a self-collision: {reason}")]
     SelfCollision {
         /// Name of the offending operation.
         owner: String,
@@ -112,6 +115,7 @@ pub enum RegistryError {
     /// to the same `(path, method)` pair would be indistinguishable to
     /// `harw-web` — a silent "first one wins" would hide the collision
     /// instead of failing loudly.
+    #[msg("web route '{method:?} {path}' is claimed by both '{first_owner}' and '{second_owner}'")]
     WebPathCollision {
         /// The colliding HTTP path.
         path: String,
@@ -123,42 +127,6 @@ pub enum RegistryError {
         second_owner: String,
     },
 }
-
-impl std::fmt::Display for RegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateName { name } => {
-                write!(f, "duplicate operation name: '{name}'")
-            }
-            Self::AliasCollision {
-                alias,
-                first_owner,
-                second_owner,
-            } => {
-                write!(
-                    f,
-                    "alias '{alias}' is claimed by both '{first_owner}' and '{second_owner}'"
-                )
-            }
-            Self::SelfCollision { owner, reason } => {
-                write!(f, "operation '{owner}' has a self-collision: {reason}")
-            }
-            Self::WebPathCollision {
-                path,
-                method,
-                first_owner,
-                second_owner,
-            } => {
-                write!(
-                    f,
-                    "web route '{method:?} {path}' is claimed by both '{first_owner}' and '{second_owner}'"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for RegistryError {}
 
 // ── InventoryOp ───────────────────────────────────────────────────────────────
 

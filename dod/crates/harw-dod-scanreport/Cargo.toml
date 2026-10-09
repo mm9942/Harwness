@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # Fixture-Harness (`sensor_suite!`, vollständig implementiert in
 # `harw-dod-fixtures/src/macros.rs`). Es greift hier trotzdem nicht: es
 # verlangt `From<harw_dod_cap::SensorHandle<harw_dod_cap::Bound>>` als

@@ -302,14 +302,6 @@ pub(crate) struct Start {
     pub(crate) rel: PathBuf,
 }
 
-impl Start {
-    /// Kanonischer Pfad der Wurzel von [`Self::workspace`].
-    #[must_use]
-    pub(crate) fn root(&self) -> &Path {
-        self.workspace.root()
-    }
-}
-
 /// Löst `rel` für ein lesendes Tool auf und öffnet die passende Wurzel.
 ///
 /// # Beschreibung

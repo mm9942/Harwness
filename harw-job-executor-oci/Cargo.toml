@@ -1,0 +1,31 @@
+[package]
+publish.workspace = true
+name = "harw-job-executor-oci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OCI container job executor backend: runs a JobSpec in a Podman/Docker container through the engine's Docker-compatible API on a Unix socket, reads the applied configuration back (inspect) into a per-dimension SandboxReport before the body starts. Digest-pinned images only; no C, no unsafe."
+
+# Unix sockets and SO_PEERCRED: Linux/macOS engines only.
+[target.'cfg(unix)'.dependencies]
+harw-job-core = { path = "../harw-job-core" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+harw-container-model = { path = "../harw-container-model" }
+harw-types = { path = "../harw-types" }
+harw-placement-model = { path = "../harw-placement-model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+rustix = { workspace = true, features = ["net", "process"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
+[lints]
+workspace = true

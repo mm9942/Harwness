@@ -23,6 +23,7 @@ pub mod infrastructure_toml;
 pub mod internal_models;
 pub mod loader;
 pub mod mcp_toml;
+pub mod memory_toml;
 pub mod merge;
 pub mod mode_toml;
 pub mod model_toml;
@@ -32,8 +33,11 @@ pub mod plan_toml;
 pub mod plugin_toml;
 pub mod provider_toml;
 pub mod research_toml;
+pub mod retention_toml;
 mod role_models;
 pub mod scope;
+mod serde_defaults;
+pub mod session_listener_toml;
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub mod shell_limits;
 pub mod skill_toml;
@@ -73,6 +77,8 @@ pub use harness_config::{
 pub use shell_limits::ShellToml;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`).
 pub use harness_config::ChildStreamModeToml;
+// h7: `[tui] status_expiry` — Verhalten abgelaufener Kind-Statusmeldungen.
+pub use harness_config::StatusExpiryMode;
 // Crypto-Infrastruktur H4: `[infrastructure]`.
 pub use infrastructure_toml::InfrastructureSection;
 // Runde 5, Teil E: `ANTHROPIC_FAST_MODEL`/`fast_model_for_active_provider`
@@ -87,12 +93,13 @@ pub use loader::{
     load_system_prompt, load_uia_personalization, load_uia_user_name,
 };
 pub use mcp_toml::{McpServerToml, McpTransportToml};
+pub use memory_toml::MemorySection;
 pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_toml_into};
 pub use mode_toml::ModeSection;
 pub use model_toml::{ModelCapabilitiesToml, ModelToml, PromptCachingMode};
 pub use network_toml::{NetworkSection, ResearchWebMode};
 pub use permissions_toml::{PermissionsSection, RuleToml};
-pub use plan_toml::{DocSection, PlanSection, RemoteOcrMode, ToolsSection};
+pub use plan_toml::{ContainerToolsSection, DocSection, PlanSection, RemoteOcrMode, ToolsSection};
 pub use plugin_toml::{PluginCapabilitiesToml, PluginToml};
 pub use provider_toml::{
     DEFAULT_LOCAL_REQUEST_TIMEOUT_SECS, DEFAULT_LOCAL_STREAM_IDLE_TIMEOUT_SECS,
@@ -100,8 +107,10 @@ pub use provider_toml::{
     RateLimitToml, host_is_private_lan,
 };
 pub use research_toml::ResearchSection;
+pub use retention_toml::{RetentionClassToml, RetentionSection};
 pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
+pub use session_listener_toml::SessionListenerSection;
 pub use skill_toml::SkillToml;
 pub use uia_worker_models::{
     FOLLOW_UIA_VALUE, ResolvedUiaWorkerModel, UIA_WORKER_ROLES, UiaWorkerModelChoice,

@@ -954,6 +954,9 @@ mod tests {
             kind: ProjectKind::Directory,
         };
         let home = ProjectHome::at(&project);
+        // A stray directory from an earlier run (or another tool) must not make
+        // this test depend on the host: only creation by `ensure` counts.
+        let existed_before = home.dir.exists();
 
         let result = home.ensure();
 
@@ -961,7 +964,10 @@ mod tests {
             result,
             Err(HomeError::UnsupportedProjectHomeRoot { .. })
         ));
-        assert!(!home.dir.exists(), "must never attempt to create /.harw");
+        assert!(
+            existed_before || !home.dir.exists(),
+            "must never attempt to create /.harw"
+        );
     }
 
     #[test]

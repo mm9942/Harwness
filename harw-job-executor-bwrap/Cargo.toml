@@ -29,5 +29,8 @@ harw-types = { path = "../harw-types" }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

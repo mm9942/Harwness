@@ -23,7 +23,6 @@
       "job.logs",
       "job.stop",
       "job.list",
-      "job.wait",
       "fs.read",
       "fs.list",
       "fs.search",
@@ -131,7 +130,6 @@
       "job.start",
       "job.status",
       "job.stop",
-      "job.wait",
       "parent.message",
       "shell.exec",
       "skills.load",
@@ -231,6 +229,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "e83fc6adacde085e482387fa8f13152c73e591f5817e12abaaeb9a26e9907a31"
+    "digest": "2cd9ef4dd550ac98ef4e15bab2af7a9e2d2b96c171815c284ab851279d6a85a4"
   }
 }

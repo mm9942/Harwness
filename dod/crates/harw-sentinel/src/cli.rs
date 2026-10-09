@@ -199,6 +199,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub once: bool,
 
+    /// Höchstzahl rotierter Telemetrie-Dateien (`rotated-*.jsonl` samt
+    /// `.blake3`-Beidatei) unter `<home>/telemetry`; die ältesten Paare
+    /// werden nach einer Rotation entfernt. Ohne Angabe gilt das Limit der
+    /// Retention-Klasse `telemetry_rotated` (`harw-retention`).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub telemetry_max_files: Option<u64>,
+
     /// Optionaler JSON-Lines-Export jedes zertifizierten Befundes für
     /// `harw-security-hub` (siehe `crate::export`), z. B.
     /// `/var/lib/harw-sentinel/findings.jsonl`. Muss absolut sein. Ohne
@@ -211,6 +218,13 @@ pub struct Cli {
     /// (`/proc/sys/kernel/hostname`). Nur mit `--findings-export` wirksam.
     #[arg(long, value_name = "ID", value_parser = parse_host_id)]
     pub findings_host: Option<HostId>,
+
+    /// Anzahl aufbewahrter rotierter Exportdateien (`<pfad>.1` … `<pfad>.N`).
+    /// Vorgabe 1. Der Export belegt höchstens `(N + 1) × 16 MiB`. Nur mit
+    /// `--findings-export` wirksam; passt zur Retention-Klasse
+    /// `sentinel_export` (`harw-retention`).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub findings_export_keep: u32,
 }
 
 /// `clap`-Wertparser für `--findings-export`: nur absolute Pfade.
@@ -392,6 +406,16 @@ mod tests {
             Some("host-a")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_findings_export_keep_defaults_to_one_and_is_bounded() {
+        let cli = Cli::try_parse_from(["harw-sentinel"]);
+        assert_eq!(cli.map(|c| c.findings_export_keep).ok(), Some(1));
+        assert!(Cli::try_parse_from(["harw-sentinel", "--findings-export-keep", "0"]).is_err());
+        assert!(Cli::try_parse_from(["harw-sentinel", "--findings-export-keep", "65"]).is_err());
+        let ok = Cli::try_parse_from(["harw-sentinel", "--findings-export-keep", "5"]);
+        assert_eq!(ok.map(|c| c.findings_export_keep).ok(), Some(5));
     }
 
     #[test]

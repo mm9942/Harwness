@@ -13,7 +13,7 @@
 //! `Arc<WebFetcher>` trägt, könnte diesen Zustand also gar nicht an die
 //! makro-generierten Executors weiterreichen, weil auch die von
 //! `#[harw_macros::tool]` erzeugten Wrapper Unit-Strukturen sind. Die
-//! Alternative wäre gewesen, alle drei Executors von Hand zu schreiben, um
+//! Alternative wäre gewesen, alle vier Executors von Hand zu schreiben, um
 //! ihnen ein `Arc<WebFetcher>`-Feld zu geben — um den Preis, dass die
 //! Sicherheits-Prologe (Permission vor Deserialisierung, fail-closed
 //! Host-Extraktion) ebenfalls handgeschrieben und damit pro Tool erneut

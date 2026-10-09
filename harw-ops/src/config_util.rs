@@ -61,7 +61,7 @@
 //! mehreren Threads aus aufrufbar.
 //!
 //! # Fehlertypen
-//! - [`harw_operations::OpError::NotAvailable`]: [`bound_home`]/
+//! - [`harw_operations::OpError::NotAvailable`][]: [`bound_home`]/
 //!   [`load_bound_config`], wenn an die Sitzung kein Root-Space gebunden ist.
 //! - [`harw_operations::OpError::Execution`]: wenn die Config-Discovery fehlschlägt.
 //! - [`persist_default_selection`]/[`persist_uia_selection`]/
@@ -629,6 +629,65 @@ fn try_persist_uia_reasoning_effort(
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Rollen-Reasoning-Gewicht bestes Bemühen in der Profil-`config.toml`
+/// verankern (`[reasoning.<feld>]`).
+///
+/// # Description
+/// Struktureller Zwilling von [`persist_uia_reasoning_effort`] für die
+/// Rollen-Gewichte aus `harw-config` (`resolve_effort` liest
+/// `reasoning.<feld>` zuerst). Das Mapping vom Rollenschlüssel zum
+/// TOML-Feld deckt genau die Rollen ab, für die `resolve_effort` ein
+/// Gewichtsfeld definiert; alle anderen Rollen (`uia-worker`, `explorer`,
+/// …) haben kein eigenes Gewicht und führen zu `None`.
+///
+/// # Arguments
+/// - `role_key` (`&str`): Rollenschlüssel wie in `ModelRole::key`
+///   (`"uia"`, `"root-orchestrator"`, `"sub-orchestrator"`,
+///   `"worker-simple"`, `"worker-complex"`).
+/// - `effort` (`Option<&str>`): `Some(level)` setzt das Gewicht, `None`
+///   entfernt es (zurück zum Modell-/Provider-Default).
+///
+/// # Returns
+/// `None` bei Erfolg oder wenn die Rolle kein Gewichtsfeld hat;
+/// `Some(note)` bei einem Persistenzfehler.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock, analog zu [`persist_uia_reasoning_effort`].
+pub(crate) fn persist_role_reasoning_effort(
+    profile_dir: &Path,
+    role_key: &str,
+    effort: Option<&str>,
+) -> Option<String> {
+    let field = match role_key {
+        "uia" => "reasoning.uia",
+        "root-orchestrator" => "reasoning.root_orchestrator",
+        "sub-orchestrator" => "reasoning.sub_orchestrator",
+        "worker-simple" => "reasoning.worker_simple",
+        "worker-complex" => "reasoning.worker_complex",
+        _ => return None,
+    };
+    let result = open_profile_config_writer(profile_dir).and_then(|mut writer| {
+        match effort {
+            Some(level) => writer
+                .set_value(field, toml_edit::value(level))
+                .map_err(|error| error.to_string())?,
+            None => {
+                writer.remove_value(field);
+            }
+        }
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte Reasoning-Gewicht für '{role_key}' nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
 /// Öffnet `<profile_dir>/config.toml` über [`harw_config::ConfigWriter`].
 ///
 /// # Errors
@@ -938,6 +997,10 @@ pub trait SelectionPersistence: Send + Sync {
     /// Siehe [`persist_uia_reasoning_effort`].
     fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String>;
 
+    /// Siehe [`persist_role_reasoning_effort`].
+    fn persist_role_reasoning_effort(&self, role_key: &str, effort: Option<&str>)
+    -> Option<String>;
+
     /// Siehe [`persist_internal_model`].
     fn persist_internal_model(
         &self,
@@ -1031,6 +1094,14 @@ impl SelectionPersistence for FileSelectionPersistence {
         persist_uia_reasoning_effort(&self.profile_dir, effort)
     }
 
+    fn persist_role_reasoning_effort(
+        &self,
+        role_key: &str,
+        effort: Option<&str>,
+    ) -> Option<String> {
+        persist_role_reasoning_effort(&self.profile_dir, role_key, effort)
+    }
+
     fn persist_internal_model(
         &self,
         point: harw_config::InternalModelPoint,
@@ -1070,7 +1141,9 @@ struct UnboundSelectionPersistence;
 impl UnboundSelectionPersistence {
     /// Die Notiz, die jede Methode zurückgibt.
     fn note() -> Option<String> {
-        Some(format!("Hinweis: nicht dauerhaft gespeichert ({UNBOUND_HOME})."))
+        Some(format!(
+            "Hinweis: nicht dauerhaft gespeichert ({UNBOUND_HOME})."
+        ))
     }
 }
 
@@ -1088,6 +1161,10 @@ impl SelectionPersistence for UnboundSelectionPersistence {
     }
 
     fn persist_uia_reasoning_effort(&self, _: Option<&str>) -> Option<String> {
+        Self::note()
+    }
+
+    fn persist_role_reasoning_effort(&self, _: &str, _: Option<&str>) -> Option<String> {
         Self::note()
     }
 
@@ -1139,6 +1216,10 @@ pub enum RecordedSelectionPersistCall {
     UiaWorkerModel { model: Option<String> },
     /// Aufzeichnung von [`SelectionPersistence::persist_uia_reasoning_effort`].
     UiaReasoningEffort { effort: Option<String> },
+    RoleReasoningEffort {
+        role_key: String,
+        effort: Option<String>,
+    },
     /// Aufzeichnung von [`SelectionPersistence::persist_internal_model`].
     InternalModel {
         point: harw_config::InternalModelPoint,
@@ -1239,6 +1320,18 @@ impl SelectionPersistence for RecordingSelectionPersistence {
         None
     }
 
+    fn persist_role_reasoning_effort(
+        &self,
+        role_key: &str,
+        effort: Option<&str>,
+    ) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::RoleReasoningEffort {
+            role_key: role_key.to_owned(),
+            effort: effort.map(str::to_owned),
+        });
+        None
+    }
+
     fn persist_internal_model(
         &self,
         point: harw_config::InternalModelPoint,
@@ -1308,8 +1401,9 @@ pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersist
         // does not reliably coerce `Arc<FileSelectionPersistence>` to
         // `Arc<dyn SelectionPersistence>` without them.
         None => match bound_home(ctx) {
-            Ok(home) => Arc::new(FileSelectionPersistence::for_home(home))
-                as Arc<dyn SelectionPersistence>,
+            Ok(home) => {
+                Arc::new(FileSelectionPersistence::for_home(home)) as Arc<dyn SelectionPersistence>
+            }
             Err(_) => Arc::new(UnboundSelectionPersistence) as Arc<dyn SelectionPersistence>,
         },
     };
@@ -1448,11 +1542,12 @@ mod tests {
             .ok_or(TestError::Missing("note from persist_default_selection"))?;
         assert!(note.contains("Root-Space"), "{note}");
 
-        let note = persistence
-            .persist_default_interaction_mode("plan")
-            .ok_or(TestError::Missing(
-                "note from persist_default_interaction_mode",
-            ))?;
+        let note =
+            persistence
+                .persist_default_interaction_mode("plan")
+                .ok_or(TestError::Missing(
+                    "note from persist_default_interaction_mode",
+                ))?;
         assert!(note.contains("Root-Space"), "{note}");
         Ok(())
     }
@@ -1516,8 +1611,11 @@ mod tests {
     #[test]
     fn load_bound_config_reads_the_bound_root_layer() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        std::fs::write(dir.path().join("config.toml"), "default_model = \"bound\"\n")
-            .map_err(ctx("seed root config"))?;
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_model = \"bound\"\n",
+        )
+        .map_err(ctx("seed root config"))?;
         let mut services = ServiceMap::new();
         services.insert(test_home_context(dir.path())?);
         let context = crate::knowledge_test_support::op_context(services)?;

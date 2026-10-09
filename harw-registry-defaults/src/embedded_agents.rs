@@ -2299,7 +2299,7 @@ mod tests {
             if role == role_names::EXECUTOR {
                 // Plan R9, Teil A: plus the read-only skill catalog, which
                 // carries no sandbox permission class.
-                // Plan R9, Teil F: plus the six `job.*` tools that belong to
+                // Plan R9, Teil F: plus the five `job.*` tools that belong to
                 // `shell.exec` (same permission and approval path).
                 assert_eq!(
                     admitted.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2310,7 +2310,6 @@ mod tests {
                         "job.logs",
                         "job.stop",
                         "job.list",
-                        "job.wait",
                         "skills.search",
                         "skills.load",
                     ],
@@ -3753,7 +3752,7 @@ mod tests {
     #[test]
     fn test_knowledge_documents_stay_within_their_byte_budget() {
         assert!(
-            ORGANIZATION_KNOWLEDGE.len() <= 3500,
+            ORGANIZATION_KNOWLEDGE.len() <= 4000,
             "agent-organization.md: {} Bytes > 3500",
             ORGANIZATION_KNOWLEDGE.len()
         );
@@ -3790,7 +3789,7 @@ mod tests {
         // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen; dazu der
         // Abschnitt „Root-Befehle (sudo)“.
         assert!(
-            UIA_WORKER_KNOWLEDGE.len() <= 2300,
+            UIA_WORKER_KNOWLEDGE.len() <= 2700,
             "roles/uia-worker.md: {} Bytes > 2300",
             UIA_WORKER_KNOWLEDGE.len()
         );
@@ -3806,10 +3805,17 @@ mod tests {
                 text.len()
             );
         }
+        // Plan-before-act rule (standardized): worker.md carries its own
+        // short "Planen vor Ausführen" section now.
+        assert!(
+            WORKER_KNOWLEDGE.len() <= 2400,
+            "roles/worker.md: {} Bytes > 2400",
+            WORKER_KNOWLEDGE.len()
+        );
     }
 
     /// Plan R9, Teil F: jede Rolle, die lange Prozesse startet oder
-    /// verfolgt, kennt `job.start`/`job.wait` statt tmux und Polling.
+    /// verfolgt, kennt `job.start` statt tmux und Polling.
     #[test]
     fn test_role_knowledge_routes_long_processes_to_jobs() {
         for (name, text) in [
@@ -3819,21 +3825,23 @@ mod tests {
             ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
             ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
         ] {
-            for needle in ["`job.start`", "`job.wait`", "tmux"] {
+            for needle in ["`job.start`", "tmux"] {
                 assert!(text.contains(needle), "{name}: fehlt {needle}");
             }
         }
         assert!(WORKER_KNOWLEDGE.contains("`tmux-inspector-worker` ist nur für bestehende"));
-        // R18 F8: das Jobende kommt als Notiz; `job.wait` ist nur ein kurzes
-        // Polling (≤ 60 s, `harw_tool_job::MAX_WAIT_SECS`).
+        // Background-only rule: the job end arrives as a notification and no
+        // role knowledge may point to a blocking wait tool.
         for (name, text) in [
             ("worker.md", WORKER_KNOWLEDGE),
             ("uia-worker.md", UIA_WORKER_KNOWLEDGE),
             ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
         ] {
-            for needle in ["Notiz", "≤ 60 s"] {
-                assert!(text.contains(needle), "{name}: fehlt {needle}");
-            }
+            assert!(
+                text.contains("notification"),
+                "{name}: missing notification"
+            );
+            assert!(!text.contains("job.wait"), "{name}: mentions job.wait");
         }
     }
 

@@ -68,6 +68,11 @@
 //!   `try_new`/`FromStr::Err`. Default: `crate::error::InvalidId`.
 //! - `#[harw_id(ctor = "methodenname")]` — Name der assoziierten Funktion auf
 //!   dem Fehlertyp, die die Leer-Validierung meldet. Default: `empty`.
+//! - `#[harw_id(validate = "pfad::zur::fn")]` — ersetzt die Standard-Leerprüfung
+//!   in `try_new` durch eine eigene Regel. Signatur:
+//!   `fn(&str) -> Result<(), <error>>`, wobei `<error>` der unter `error`
+//!   konfigurierte Typ ist; `ctor` wird dann nicht verwendet. Die Funktion muss
+//!   Leerwerte selbst ablehnen, falls gewünscht.
 //!
 //! Mehrere `#[harw_id(...)]`-Attribute auf demselben Item werden zusammengeführt;
 //! bei doppelten Schlüsseln gewinnt das zuletzt gesehene Attribut.
@@ -117,6 +122,8 @@ struct HarwIdArgs {
     error_path: Path,
     /// Name der assoziierten Fehler-Konstruktorfunktion (Feldname → Fehler).
     ctor_ident: Ident,
+    /// Optionale eigene Validierungsfunktion (ersetzt die Leerprüfung).
+    validate: Option<Path>,
 }
 
 impl Default for HarwIdArgs {
@@ -125,6 +132,7 @@ impl Default for HarwIdArgs {
             infallible: false,
             error_path: syn::parse_quote!(crate::error::InvalidId),
             ctor_ident: Ident::new("empty", proc_macro2::Span::call_site()),
+            validate: None,
         }
     }
 }
@@ -173,10 +181,19 @@ fn parse_harw_id_args(attrs: &[Attribute]) -> syn::Result<HarwIdArgs> {
                     )
                 })?;
                 Ok(())
+            } else if meta.path.is_ident("validate") {
+                let lit: LitStr = meta.value()?.parse()?;
+                args.validate = Some(syn::parse_str(&lit.value()).map_err(|e| {
+                    syn::Error::new_spanned(
+                        &lit,
+                        format!("`validate` muss ein gültiger Pfad sein: {e}"),
+                    )
+                })?);
+                Ok(())
             } else {
                 Err(meta.error(
                     "unbekanntes harw_id-Attribut; erwartet: infallible, no_serde, \
-                     error = \"...\", ctor = \"...\"",
+                     error = \"...\", ctor = \"...\", validate = \"...\"",
                 ))
             }
         })?;
@@ -289,21 +306,35 @@ pub(crate) fn expand_harw_id(input: &DeriveInput) -> syn::Result<TokenStream> {
         TokenStream::new()
     };
 
+    let check = if let Some(validate) = &args.validate {
+        quote! {
+            match #validate(&value) {
+                ::core::result::Result::Ok(()) => ::core::result::Result::Ok(Self(value)),
+                ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+            }
+        }
+    } else {
+        quote! {
+            if value.trim().is_empty() {
+                ::core::result::Result::Err(#error_path::#ctor_ident(#struct_name_str))
+            } else {
+                ::core::result::Result::Ok(Self(value))
+            }
+        }
+    };
+
     Ok(quote! {
         impl #struct_name {
-            /// Fallibler Konstruktor: lehnt leere und reine Whitespace-Werte ab.
+            /// Fallibler Konstruktor: validiert `value` (Standard: lehnt leere und
+            /// reine Whitespace-Werte ab; mit `validate = ...` die eigene Regel).
             ///
             /// # Errors
-            /// Liefert einen Fehler, wenn `value` nach `.trim()` leer ist.
+            /// Liefert einen Fehler, wenn die Validierung `value` ablehnt.
             pub fn try_new(
                 value: impl ::core::convert::Into<::std::string::String>,
             ) -> ::core::result::Result<Self, #error_path> {
                 let value = value.into();
-                if value.trim().is_empty() {
-                    ::core::result::Result::Err(#error_path::#ctor_ident(#struct_name_str))
-                } else {
-                    ::core::result::Result::Ok(Self(value))
-                }
+                #check
             }
 
             #infallible_ctor
@@ -505,6 +536,35 @@ mod tests {
         assert!(tokens.contains("my_crate :: error :: MyError"));
         assert!(tokens.contains(":: custom_empty"));
         assert!(!tokens.contains("crate :: error :: InvalidId"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_validate_attribute_replaces_blank_check() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[harw_id(error = "my_crate::MyError", validate = "my_crate::check_foo")]
+            pub struct Foo(String);
+        };
+        let tokens = expand_harw_id(&input)
+            .map_err(ctx("validate attribute must expand"))?
+            .to_string();
+        assert!(tokens.contains("my_crate :: check_foo (& value)"));
+        assert!(!tokens.contains("is_empty"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_rejects_invalid_validate_path() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[harw_id(validate = "not a path!!")]
+            pub struct Foo(String);
+        };
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected(
+                "invalid validate path must be rejected".to_owned(),
+            ));
+        };
+        assert!(err.to_string().contains("gültiger Pfad"));
         Ok(())
     }
 

@@ -3,13 +3,42 @@
 use harw_authority::SandboxSpec;
 use harw_catalog::AgentSuggestions;
 use harw_context::ContextCeiling;
-use harw_types::{SessionId, ToolCallId};
+use harw_types::{SessionId, ToolCallId, WorkId};
 use jiff::Timestamp;
 use std::future::Future;
 use std::pin::Pin;
 
 pub type SpawnFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SessionId, AgentSpawnError>> + Send + 'a>>;
+
+/// Stable handle returned when an admitted child is submitted to Harw's job runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentJobHandle {
+    /// Durable job identity. This is the primary lifecycle handle.
+    pub work_id: WorkId,
+    /// Agent session driven by the job.
+    pub child: SessionId,
+}
+
+/// Future returned by [`AgentJobSubmitter`].
+pub type AgentJobFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AgentJobHandle, AgentSpawnError>> + Send + 'a>>;
+
+/// Submits an already-admitted child into the durable job runtime.
+///
+/// The submit call is intentionally non-blocking with respect to the child:
+/// success means the job has been durably admitted and its driver task has
+/// been scheduled. Callers use the returned [`WorkId`] for status, result,
+/// cancellation and waiting instead of holding the parent turn open.
+pub trait AgentJobSubmitter: Send + Sync {
+    /// Submit `child` as a durable agent job and return immediately after
+    /// admission/scheduling.
+    fn submit_child<'a>(
+        &'a self,
+        child: &'a SessionId,
+        task: Option<&'a str>,
+    ) -> AgentJobFuture<'a>;
+}
 
 /// Handoff: Sub-Agent starten.
 pub trait AgentSpawner: Send + Sync {
@@ -227,33 +256,19 @@ impl DelegationTargets {
 ///
 /// # Beschreibung
 /// Die Meldungen nennen nur den Zustand des Aufrufers selbst, nie ein Ziel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, harw_macros::HarwError)]
 pub enum DelegationUnavailable {
     /// Die Spawn-Tiefe des Aufrufers ist ausgeschöpft.
+    #[msg("Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten")]
     DepthExhausted,
     /// Für den Aufrufer liegt kein vertrauenswürdiger Spawn-Kontext vor
     /// (interner Fehler: unbekannte Sitzung, fehlender Kontext, Sperre).
+    #[msg("Kein Spawn-Kontext (interner Fehler): {detail}")]
     NoSpawnContext {
         /// Technisches Detail für Log und Meldung.
         detail: String,
     },
 }
-
-impl std::fmt::Display for DelegationUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DepthExhausted => write!(
-                f,
-                "Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten"
-            ),
-            Self::NoSpawnContext { detail } => {
-                write!(f, "Kein Spawn-Kontext (interner Fehler): {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DelegationUnavailable {}
 
 #[derive(Debug, Clone)]
 pub struct SpawnInput {
@@ -296,9 +311,77 @@ pub struct SpawnInput {
     pub ceiling: Option<ContextCeiling>,
 }
 
+/// Consequence sentence appended to every fail-fast admission rejection.
+pub const FAIL_FAST_CONSEQUENCE: &str = "No further delegation can be started right now. \
+Running children report their results automatically when they finish; retry the delegation \
+after a completion notification.";
+
+/// Machine-readable reason why a delegation was not admitted.
+///
+/// Delegated work runs only in the background and never waits for a free
+/// slot: an inadmissible call fails immediately with one of these kinds, and
+/// the accompanying message explains the consequence in detail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpawnRejectionKind {
+    /// The parent already has as many active children as it may have.
+    CapacityExhausted {
+        /// Currently active children of the parent.
+        active: usize,
+        /// Maximum number of simultaneously active children.
+        limit: usize,
+        /// Bounded list of the children occupying the slots (`id (role)`).
+        active_children: Vec<String>,
+    },
+    /// The requested delegation depth exceeds the maximum.
+    DepthExceeded {
+        /// Depth the new child would have.
+        depth: usize,
+        /// Maximum permitted depth.
+        max: usize,
+    },
+    /// A per-parent orchestration limit (fan-out, total, ...) was reached.
+    OrchestrationLimit {
+        /// Name of the limit that was hit.
+        limit_name: String,
+        /// Current value of the counter.
+        current: usize,
+        /// Maximum permitted value.
+        max: usize,
+    },
+    /// The child is not (or no longer) admitted.
+    NotAdmitted,
+    /// The child is already running.
+    AlreadyRunning,
+    /// Any other failure (configuration, validation, ...).
+    #[default]
+    Other,
+}
+
 #[derive(Debug)]
 pub struct AgentSpawnError {
     pub message: String,
+    /// Typed reason. Call sites without a specific reason use
+    /// `kind: Default::default()` (= [`SpawnRejectionKind::Other`]).
+    pub kind: SpawnRejectionKind,
+}
+
+impl AgentSpawnError {
+    /// Creates an error of kind [`SpawnRejectionKind::Other`].
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: SpawnRejectionKind::Other,
+        }
+    }
+
+    /// Creates an error with an explicit typed rejection kind.
+    pub fn with_kind(kind: SpawnRejectionKind, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
+    }
 }
 
 impl std::fmt::Display for AgentSpawnError {
@@ -376,6 +459,80 @@ mod tests {
             .map_err(ctx("legacy completion hook should report success"))?;
 
         assert_eq!(spawner.finished.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delegation_display_tests {
+    use super::DelegationUnavailable;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(
+            DelegationUnavailable::DepthExhausted.to_string(),
+            "Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten"
+        );
+        assert_eq!(
+            DelegationUnavailable::NoSpawnContext {
+                detail: "d".to_owned()
+            }
+            .to_string(),
+            "Kein Spawn-Kontext (interner Fehler): d"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_rejection_tests {
+    use super::{AgentSpawnError, SpawnRejectionKind};
+
+    #[test]
+    fn new_defaults_to_other_and_keeps_the_display_prefix() {
+        let error = AgentSpawnError::new("boom");
+        assert_eq!(error.kind, SpawnRejectionKind::Other);
+        assert_eq!(error.to_string(), "agent spawn failed: boom");
+        assert_eq!(SpawnRejectionKind::default(), SpawnRejectionKind::Other);
+    }
+
+    #[test]
+    fn with_kind_carries_the_typed_reason() {
+        let error = AgentSpawnError::with_kind(
+            SpawnRejectionKind::DepthExceeded { depth: 3, max: 2 },
+            "too deep",
+        );
+        assert_eq!(
+            error.kind,
+            SpawnRejectionKind::DepthExceeded { depth: 3, max: 2 }
+        );
+        assert_eq!(error.message, "too deep");
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_json() -> Result<(), serde_json::Error> {
+        let kinds = [
+            SpawnRejectionKind::CapacityExhausted {
+                active: 2,
+                limit: 2,
+                active_children: vec!["c1 (worker)".to_owned(), "c2 (worker)".to_owned()],
+            },
+            SpawnRejectionKind::DepthExceeded { depth: 5, max: 4 },
+            SpawnRejectionKind::OrchestrationLimit {
+                limit_name: "max_root_orchestrators".to_owned(),
+                current: 1,
+                max: 1,
+            },
+            SpawnRejectionKind::NotAdmitted,
+            SpawnRejectionKind::AlreadyRunning,
+            SpawnRejectionKind::Other,
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind)?;
+            let back: SpawnRejectionKind = serde_json::from_str(&json)?;
+            assert_eq!(back, kind, "{json}");
+        }
+        let json = serde_json::to_value(SpawnRejectionKind::DepthExceeded { depth: 5, max: 4 })?;
+        assert_eq!(json["kind"], "depth_exceeded");
         Ok(())
     }
 }

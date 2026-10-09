@@ -46,8 +46,7 @@
       "job.status",
       "job.logs",
       "job.stop",
-      "job.list",
-      "job.wait"
+      "job.list"
     ],
     "forbidden": [
       "fs.write",
@@ -195,7 +194,6 @@
       "job.logs",
       "job.status",
       "job.stop",
-      "job.wait",
       "lens.ask",
       "palace.recall",
       "palace.search",
@@ -305,6 +303,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "cd11f24ae47998c1c55c669ee223155129c8efac2c0bfabb599b4c032bfbde01"
+    "digest": "682f9556f8fcab4cca7da6a9a45c4462de64c749b0fdad24c7ae6286e5410266"
   }
 }

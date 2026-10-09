@@ -128,6 +128,8 @@ pub(crate) enum LocalIntercept {
     ClearTranscript,
     /// Sitzung umbenennen.
     RenameSession(String),
+    /// `/image <pfad>`: ein Bild für die nächste Nachricht vormerken.
+    AttachImage(String),
     /// Zeile durch diese Befehlszeile ersetzen und erneut dispatchen.
     Rewrite(String),
     /// Diesen Text als Chat-Nachricht an die UIA senden.
@@ -313,6 +315,7 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
             "Bitte einen Namen angeben: /rename <titel>".to_owned(),
         )),
         "rename" => Some(LocalIntercept::RenameSession(args.to_owned())),
+        "image" => Some(LocalIntercept::AttachImage(args.to_owned())),
         // Runde 5, Teil L: `/btw` ohne Frage → Nutzungshinweis.
         "btw" if bare => Some(LocalIntercept::System(
             crate::app::btw::BTW_USAGE_HINT.to_owned(),
@@ -862,6 +865,10 @@ mod tests {
             other => return Err(TestError::Unexpected(format!("rename, got {other:?}"))),
         }
         assert!(system(fx.run("/rename"))?.contains("/rename"));
+        match fx.run("/image  foto.png ") {
+            Some(LocalIntercept::AttachImage(args)) => assert_eq!(args, "foto.png"),
+            other => return Err(TestError::Unexpected(format!("image, got {other:?}"))),
+        }
         assert_eq!(rewrite(fx.run("/sessions"))?, "/resume");
         Ok(())
     }

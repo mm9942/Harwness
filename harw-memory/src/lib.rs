@@ -60,11 +60,16 @@ pub mod detect;
 pub mod epistemic;
 pub mod error;
 pub mod extraction;
+pub mod fact_outcomes;
+pub mod fact_signals;
 pub mod facts;
+pub mod feedback;
 pub mod file_index;
 pub mod file_store;
 pub mod heartbeat;
 pub mod learning;
+pub mod learning_gate;
+pub mod llm_extract;
 pub mod outcome_tracker;
 pub mod promote;
 pub mod short_term;
@@ -84,7 +89,7 @@ pub use extraction::{
     EntryRole, ExtractionCandidate, ExtractionError, ExtractionPolicy, IncomingStore,
     TranscriptEntry, build_input, parse_response, select_sessions, system_prompt, user_prompt,
 };
-pub use facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
+pub use facts::{Fact, FactLimits, FactScope, FactStore, FactType, redact, slugify};
 pub use file_index::{FileKnowledge, FileKnowledgeIndex};
 pub use file_store::FileMemoryStore;
 pub use promote::{

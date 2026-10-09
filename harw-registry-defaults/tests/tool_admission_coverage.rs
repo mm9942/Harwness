@@ -573,8 +573,12 @@ fn workspace_edit_profile_never_includes_shell_or_web_tools() {
     }
     assert_eq!(
         RegistryProfile::WorkspaceEdit.required_permissions(),
+        // Kein `ExecuteProcess`: das Recht für `cargo.test_one` vergibt nur
+        // `granted_for_capabilities` (nur `test-engineer`).
         PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace])
     );
+    let cargo: Vec<&&str> = tools.iter().filter(|t| t.starts_with("cargo.")).collect();
+    assert_eq!(cargo, [&"cargo.test_one"], "{tools:?}");
     for role in role_names::ALL {
         assert_ne!(
             profile_for_role(role),

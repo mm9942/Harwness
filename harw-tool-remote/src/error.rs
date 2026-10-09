@@ -4,17 +4,18 @@
 //! Typs: er wird zu einer `ToolOutput::Error`, damit das Modell reagieren
 //! kann (Vertrag R18 §2.4/§4.2).
 
-use std::fmt;
-
+use harw_macros::HarwError;
 use harw_protocol::session_port::PortError;
 
 /// Warum der entfernte Werkzeugsatz nicht aufgebaut werden konnte.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, HarwError)]
 pub enum RemoteToolError {
     /// `tool.list` wurde abgelehnt oder die Verbindung schlug fehl.
-    List(PortError),
+    #[msg("gateway tool.list failed: {0}")]
+    List(#[source] PortError),
     /// Ein Deskriptor des Gateways ist unbrauchbar (fail closed: der ganze
     /// Satz wird verworfen statt still ein Werkzeug auszulassen).
+    #[msg("gateway tool descriptor '{tool}' is invalid: {reason}")]
     InvalidDescriptor {
         /// Name des Werkzeugs, wie das Gateway ihn meldete.
         tool: String,
@@ -23,22 +24,24 @@ pub enum RemoteToolError {
     },
 }
 
-impl fmt::Display for RemoteToolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::List(error) => write!(f, "gateway tool.list failed: {error}"),
-            Self::InvalidDescriptor { tool, reason } => {
-                write!(f, "gateway tool descriptor '{tool}' is invalid: {reason}")
-            }
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
 
-impl std::error::Error for RemoteToolError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::List(error) => Some(error),
-            Self::InvalidDescriptor { .. } => None,
-        }
+    #[test]
+    fn display_and_source_are_stable() {
+        let list = RemoteToolError::List(PortError::NotFound);
+        assert_eq!(
+            list.to_string(),
+            format!("gateway tool.list failed: {}", PortError::NotFound)
+        );
+        assert!(list.source().is_some());
+        let bad = RemoteToolError::InvalidDescriptor {
+            tool: "t".to_owned(),
+            reason: "r".to_owned(),
+        };
+        assert_eq!(bad.to_string(), "gateway tool descriptor 't' is invalid: r");
+        assert!(bad.source().is_none());
     }
 }

@@ -45,7 +45,6 @@ forbidden = [
   "job.logs",
   "job.stop",
   "job.list",
-  "job.wait",
   "fs.read",
   "fs.search",
   "fs.list",

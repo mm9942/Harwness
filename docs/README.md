@@ -13,6 +13,7 @@ code wins and the document is a bug.
 - [Local models: vLLM, LM Studio and Ollama](setup/local-models.md)
 - [DoD (Detect · Orient · Defend)](setup/dod.md) — *partially implemented*
 - [Control plane (`harw web`)](setup/web.md) — *implemented*
+- [Web research: network policy, search backend, limits](setup/research-web.md) — *implemented*
 - [`crypt_guard` integration in `harw-secrets`](setup/crypt-guard.md)
 
 ## Using Harwness
@@ -100,6 +101,7 @@ Future architecture lives in [`planning/`](planning/README.md), not here. Planni
 
 ## Audits and research
 
+- [Harwness research paper — working draft](research/harwness-paper.md) — *artifact-grounded draft*
 - [Agent Capabilities Audit](audits/agent-capabilities-audit.md) — *partially implemented*
 - [Tool Inventory: Codex / Hermes / OpenClaw](research/tool-inventory.md) — *implemented*
 

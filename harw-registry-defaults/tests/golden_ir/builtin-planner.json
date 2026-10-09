@@ -29,6 +29,10 @@
       "deps.source_search",
       "deps.source_list",
       "lens.ask",
+      "obsidian.map",
+      "obsidian.read",
+      "obsidian.search",
+      "obsidian.links",
       "explore.tree",
       "explore.projects",
       "explore.relations",
@@ -163,6 +167,10 @@
       "fs.read",
       "fs.search",
       "lens.ask",
+      "obsidian.links",
+      "obsidian.map",
+      "obsidian.read",
+      "obsidian.search",
       "palace.recall",
       "palace.search",
       "parent.message",
@@ -257,7 +265,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/planner.toml",
-          "line": 99,
+          "line": 107,
           "column": 11
         },
         "path": "context.program"
@@ -266,6 +274,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "5d62eb7e2d44c69f5572ea4b7dde1e092d33a324da8ba8df6c19dfd836f82625"
+    "digest": "39c78ff91df957565db29c82465aed38f61c608c44745ff00af53ec27bc53677"
   }
 }
