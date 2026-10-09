@@ -1045,6 +1045,17 @@ pub struct ChatApp {
     /// durch den normalen Editorpfad laufen. Dadurch bleibt der Composer auch
     /// bei Modellarbeit und Freigabefragen vollständig bedienbar.
     deferred_input: std::collections::VecDeque<TuiEvent>,
+    /// Konsolidierte `parent.message {kind: "info"}`-Zwischenstände je
+    /// Kind-Agent im 30s-Fenster (gespiegelt aus
+    /// `PARENT_INFO_MIN_INTERVAL` in `harw-core::child_comms`):
+    /// Kind-Name → (letzter Info-Text, Eingangszeitpunkt).
+    child_infos: std::collections::HashMap<String, (String, std::time::Instant)>,
+    /// Zwei zuletzt eingetroffene Agentenmeldungen als reine Anzeigekopie.
+    recency: recency::RecencySlots,
+    /// TOML-gesteuertes Verhalten abgelaufener Kind-Statusmeldungen
+    /// (nach dem 30s-Fenster): `[tui].status_expiry` — konsolidieren oder
+    /// ausblenden. Default: konsolidieren.
+    status_expiry: harw_config::StatusExpiryMode,
     /// Bereits abgeschickte Benutzertexte. Ein laufender Turn darf nie
     /// abgebrochen oder vermischt werden; diese FIFO wird ausschließlich an
     /// Turn-Grenzen abgearbeitet.
@@ -1473,6 +1484,9 @@ impl ChatApp {
             cells: Vec::new(),
             input,
             deferred_input: std::collections::VecDeque::new(),
+            child_infos: std::collections::HashMap::new(),
+            recency: recency::RecencySlots::new(),
+            status_expiry: harw_config::StatusExpiryMode::default(),
             pending_turns: std::collections::VecDeque::new(),
             images: crate::image_attach::ImageAttachments::default(),
             busy_jobs: BusyJobs::new(),
@@ -1562,6 +1576,25 @@ impl ChatApp {
             esc_confirm: turn_safety::EscConfirm::default(),
             child_approvals: child_approvals::ChildApprovalUi::default(),
         }
+    }
+
+    /// Merkt sich einen Info-Zwischenstand eines Kind-Agenten für die
+    /// Statuszeile.
+    ///
+    /// Der Zeitstempel ist `Instant::now()`; das Anzeigefenster (30 s,
+    /// passend zur Drossel `PARENT_INFO_MIN_INTERVAL` in `harw-core`)
+    /// prüft das Rendern über das verstrichene Alter. Ältere Einträge
+    /// bleiben in der Map, werden aber nicht mehr prominent gezeigt.
+    pub(crate) fn note_child_info(&mut self, child: String, info: String) {
+        self.note_child_info_at(child, info, std::time::Instant::now());
+    }
+
+    /// Testbare Variante von [`Self::note_child_info`] mit vorgegebenem
+    /// Zeitstempel, damit das 30s-Ausblendfenster (`PARENT_INFO_MIN_INTERVAL`
+    /// in `harw-core::child_comms`) ohne Echtzeit-Warten geprüft werden kann.
+    #[cfg(test)]
+    pub(crate) fn note_child_info_at(&mut self, child: String, info: String, at: std::time::Instant) {
+        self.child_infos.insert(child, (info, at));
     }
 
     /// Reuses a runtime-owned controller for both slash commands and model
@@ -9649,6 +9682,21 @@ const PLAN_MARK_SHORT: &str = " ⏸ plan ";
 /// # Rückgabe
 /// Die Spans und ihre Gesamtbreite in Spalten (nie über `width`, außer die
 /// Host-Warnung allein ist breiter — sie wird nie gekürzt).
+/// Sichtbarkeitsfenster für Info-Zwischenstände von Kind-Agenten in der
+/// Statuszeile: 30 s, passend zur Drossel `PARENT_INFO_MIN_INTERVAL` in
+/// `harw-core::child_comms`. Ältere Einträge bleiben in
+/// [`ChatApp::child_infos`], werden aber nicht prominent gezeigt.
+fn child_info_visible(age_secs: u64) -> bool {
+    age_secs < 30
+}
+
+/// Kompaktformat für abgelaufene Kind-Statusmeldungen im
+/// `consolidate`-Modus (`[tui].status_expiry = "consolidate"`):
+/// nur noch Name und Alter, niedrig priorisiert.
+fn child_info_expired_segment(child: &str, age_secs: u64) -> String {
+    format!("{child}: {age_secs}s")
+}
+
 fn status_mark_spans(
     host: Option<Span<'static>>,
     plan: Option<(Span<'static>, Span<'static>)>,
@@ -10224,7 +10272,7 @@ fn render_viewport(
         .title_override()
         .map(|title| format!(" {title} │"))
         .unwrap_or_default();
-    let segments = vec![
+    let mut segments = vec![
         Seg::optional(255, title_suffix),
         Seg::new(
             150,
@@ -10264,6 +10312,26 @@ fn render_viewport(
         Seg::new(15, vec![agents_hint, agents_hint_short, String::new()]),
         Seg::optional(220, pending_permission_suffix),
     ];
+    // Info-Zwischenstände der Kind-Agenten (30s-Fenster, passend zur Drossel
+    // `PARENT_INFO_MIN_INTERVAL`): Ältere Einträge werden nicht aufgenommen
+    // (nur ausgeblendet, nicht gelöscht).
+    for (child, (info, at)) in &app.child_infos {
+        let age = at.elapsed().as_secs();
+        if child_info_visible(age) {
+            segments.push(Seg::optional(
+                120,
+                status_line::child_info_segment(child, Some(info), age, 40),
+            ));
+        } else if app.status_expiry == harw_config::StatusExpiryMode::Consolidate {
+            // `[tui].status_expiry = "consolidate"` (Default): abgelaufene
+            // Meldungen nur noch kompakt (Name + Alter) und niedrig priorisiert.
+            segments.push(Seg::optional(
+                60,
+                child_info_expired_segment(child, age),
+            ));
+        }
+        // Modus "hide": abgelaufene Meldungen entfallen komplett.
+    }
     // Solange eine Host-Arbeitsphase läuft, muss die Statuszeile das gemäß
     // `docs/design/mediated-process-execution.md` („permanent und
     // unübersehbar `HOST-MODUS AKTIV`") in einer eigenen, hervorgehobenen
@@ -15911,5 +15979,60 @@ mod approval_arming_tests {
             .map(|span| span.content.as_ref())
             .collect::<String>()
             .contains(needle)
+    }
+}
+
+#[cfg(test)]
+mod child_info_render_tests {
+    use super::tests::test_chat_app;
+    use super::*;
+    use crate::test_support::TestResult;
+
+    /// `note_child_info_at` füllt `child_infos`; ein zurückliegender
+    /// Zeitstempel liegt außerhalb des 30s-Fensters und wird beim Rendern
+    /// nicht prominent aufgenommen (`child_info_visible` auf dem
+    /// verstrichenen Alter).
+    #[test]
+    fn note_child_info_at_fills_map_and_old_entries_are_not_visible() -> TestResult {
+        let mut app = test_chat_app()?;
+        let at = std::time::Instant::now();
+        app.note_child_info_at(
+            "uia-writer".to_owned(),
+            "schreibe Abschnitt".to_owned(),
+            at,
+        );
+        assert!(app.child_infos.contains_key("uia-writer"));
+        // Ein vor 60 s gestempelter Eintrag ist älter als das 30s-Fenster.
+        let age_old = 60_u64;
+        assert!(!child_info_visible(age_old));
+        Ok(())
+    }
+
+    /// Das 30s-Sichtbarkeitsfenster: frisch sichtbar, ab 30 s nicht mehr.
+    #[test]
+    fn child_info_visible_window() -> TestResult {
+        assert!(child_info_visible(0));
+        assert!(child_info_visible(29));
+        assert!(!child_info_visible(30));
+        assert!(!child_info_visible(120));
+        Ok(())
+    }
+
+    /// Kompaktformat abgelaufener Meldungen im `consolidate`-Modus:
+    /// nur Name und Alter.
+    #[test]
+    fn expired_consolidate_shows_compact_segment() {
+        assert_eq!(child_info_expired_segment("writer", 60), "writer: 60s");
+        assert_eq!(child_info_expired_segment("root", 123), "root: 123s");
+    }
+
+    /// Die beiden TOML-Modi sind unterscheidbar; `hide` erzeugt im
+    /// Renderzweig kein Segment (else-if greift nur bei `consolidate`).
+    #[test]
+    fn status_expiry_modes_distinct() {
+        assert_ne!(
+            harw_config::StatusExpiryMode::Hide,
+            harw_config::StatusExpiryMode::Consolidate
+        );
     }
 }

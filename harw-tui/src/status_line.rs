@@ -12,6 +12,80 @@ const UNKNOWN: &str = "–";
 /// Auslassungszeichen beim Kürzen.
 const ELLIPSIS: char = '…';
 
+/// Segment für den 30s-Zwischenstand eines Kind-Agenten.
+///
+/// Verdichtet die von einem Kind-Agenten gemeldeten `parent.message
+/// {kind: "info"}`-Zwischenstände (Drossel: `PARENT_INFO_MIN_INTERVAL`,
+/// 30 s) zu einem kurzen Statussegment. Der Info-Text wird auf
+/// Whitespace normalisiert und auf `max_chars` Zeichen gekürzt (Ellipsis);
+/// `None` meldet das Kind ohne aktuelle Meldung im 30s-Fenster.
+///
+/// # Argumente
+/// - `child`: Anzeigename des Kind-Agenten.
+/// - `latest_info`: letzter konsolidierter Info-Text oder `None`.
+/// - `age_secs`: Alter der Meldung in Sekunden (0 = gerade eben).
+/// - `max_chars`: Obergrenze für den erzeugten Text in Zeichen.
+#[must_use]
+pub(crate) fn child_info_segment(
+    child: &str,
+    latest_info: Option<&str>,
+    age_secs: u64,
+    max_chars: usize,
+) -> String {
+    let age = match age_secs {
+        0 => "jetzt".to_owned(),
+        secs => format!("{secs}s"),
+    };
+    let info = match latest_info.map(str::trim) {
+        None | Some("") => "keine Meldung".to_owned(),
+        Some(text) => {
+            let collapsed: String =
+                text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.chars().count() > max_chars {
+                let mut kept: String =
+                    collapsed.chars().take(max_chars.saturating_sub(1)).collect();
+                kept.push(ELLIPSIS);
+                kept
+            } else {
+                collapsed
+            }
+        }
+    };
+    format!("{child} · {info} · {age}")
+}
+
+#[cfg(test)]
+mod child_info_tests {
+    use super::child_info_segment;
+
+    #[test]
+    fn none_and_empty_info_show_no_message() {
+        assert_eq!(
+            child_info_segment("researcher", None, 12, 40),
+            "researcher · keine Meldung · 12s"
+        );
+        assert_eq!(
+            child_info_segment("researcher", Some("   "), 0, 40),
+            "researcher · keine Meldung · jetzt"
+        );
+    }
+
+    #[test]
+    fn long_info_is_truncated_with_ellipsis() {
+        let out = child_info_segment("writer", Some("uuuu vvvv wwww"), 5, 10);
+        assert_eq!(out, "writer · uuuu vvv… · 5s");
+        assert_eq!(out.chars().count(), 21);
+    }
+
+    #[test]
+    fn normal_info_is_collapsed_and_kept() {
+        assert_eq!(
+            child_info_segment("analyst", Some(" scanne  Dateien\nim Ordner "), 0, 40),
+            "analyst · scanne Dateien im Ordner · jetzt"
+        );
+    }
+}
+
 /// Segment `Modus: x · Freigabe: y` für die Statuszeile.
 ///
 /// # Argumente
