@@ -870,6 +870,4 @@ mod tests {
         assert_eq!(text, "sub/a.txt:1: MATCHME");
         Ok(())
     }
-
-
 }

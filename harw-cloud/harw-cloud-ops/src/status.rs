@@ -39,7 +39,9 @@ fn systemd_active() -> String {
         .args(["is-active", "harw.cloud.service"])
         .output()
         .map(|out| {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+            let text = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .to_ascii_lowercase();
             if text.is_empty() {
                 "unknown".into()
             } else {
@@ -88,7 +90,12 @@ async fn cloud_status(_ctx: &OpContext, _args: CloudStatusArgs) -> Result<OpOutp
             status
                 .ports
                 .iter()
-                .map(|p| format!("{}:{}={}", p.name, p.port, if p.listening { "up" } else { "down" }))
+                .map(|p| format!(
+                    "{}:{}={}",
+                    p.name,
+                    p.port,
+                    if p.listening { "up" } else { "down" }
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -106,7 +113,10 @@ mod tests {
         let config = GatewayConfig {
             listen_addr: "127.0.0.1:1".into(),
             tls: None,
-            ports: vec![PortMap { name: "api".into(), port: 1 }],
+            ports: vec![PortMap {
+                name: "api".into(),
+                port: 1,
+            }],
         };
         let status = gateway_status::probe(&config).await;
         assert!(!status.running);

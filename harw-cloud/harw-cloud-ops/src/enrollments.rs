@@ -60,13 +60,11 @@ impl EnrollmentRow {
 fn node_devices_path() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("HARW_HOME") {
         return Some(
-            PathBuf::from(home)
-                .join("profiles/default/session-host/remote/node-devices.conf"),
+            PathBuf::from(home).join("profiles/default/session-host/remote/node-devices.conf"),
         );
     }
     std::env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".harw/profiles/default/session-host/remote/node-devices.conf")
+        PathBuf::from(home).join(".harw/profiles/default/session-host/remote/node-devices.conf")
     })
 }
 

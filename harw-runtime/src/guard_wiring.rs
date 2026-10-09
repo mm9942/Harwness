@@ -732,22 +732,38 @@ mod pitfall_advisor_tests {
         let session_a = SessionId::from_str("a");
         let session_b = SessionId::from_str("b");
         let same = json!({ "child_id": "ffe02b1b", "text": "weiter" });
-        assert!(advisor.advise_in_session(&session_a, "agent.message", &same).is_some());
-        assert!(advisor.advise_in_session(&session_b, "agent.message", &same).is_some());
+        assert!(
+            advisor
+                .advise_in_session(&session_a, "agent.message", &same)
+                .is_some()
+        );
+        assert!(
+            advisor
+                .advise_in_session(&session_b, "agent.message", &same)
+                .is_some()
+        );
         // Resolve in session A only.
         advisor.resolved_in_session(&session_a, "agent.message", &same);
         assert!(
-            advisor.advise_in_session(&session_a, "agent.message", &same).is_none(),
+            advisor
+                .advise_in_session(&session_a, "agent.message", &same)
+                .is_none(),
             "resolved in session A"
         );
         assert!(
-            advisor.advise_in_session(&session_b, "agent.message", &same).is_some(),
+            advisor
+                .advise_in_session(&session_b, "agent.message", &same)
+                .is_some(),
             "session B unaffected by session A's resolution"
         );
         // Both directions: resolving in B now must not resurrect A's hint,
         // and a fresh session C still sees the hint.
         let session_c = SessionId::from_str("c");
-        assert!(advisor.advise_in_session(&session_c, "agent.message", &same).is_some());
+        assert!(
+            advisor
+                .advise_in_session(&session_c, "agent.message", &same)
+                .is_some()
+        );
         Ok(())
     }
 

@@ -56,10 +56,7 @@ pub const MAX_BODY_CHARS: usize = 8_000;
 pub const MEMORY_KEY: &str = "memory";
 
 /// Resolve the vault root for a call.
-fn vault_of(
-    context: &ToolExecutionContext,
-    tool: &str,
-) -> Result<VaultRoot, ToolOutput> {
+fn vault_of(context: &ToolExecutionContext, tool: &str) -> Result<VaultRoot, ToolOutput> {
     VaultRoot::resolve(context.sandbox()).map_err(|err| ToolOutput::error(format!("{tool}: {err}")))
 }
 
@@ -78,7 +75,10 @@ fn read_note_parts(
     let yaml_str = yaml.as_deref().unwrap_or("");
     let mut links = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    for target in scan_wikilinks(body).into_iter().chain(scan_wikilinks(yaml_str)) {
+    for target in scan_wikilinks(body)
+        .into_iter()
+        .chain(scan_wikilinks(yaml_str))
+    {
         if seen.insert(target.clone()) {
             links.push(target);
         }
@@ -111,7 +111,7 @@ fn resolve_memory(store: &KnowledgeStore, node_id: &str) -> serde_json::Value {
         None => {
             return serde_json::json!({
                 "error": format!("palace node '{node_id}' not found in the agent-readable view")
-            })
+            });
         }
     };
     if !is_agent_readable(artifact) {
@@ -144,7 +144,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "obsidian.map",
-    description = "Lists the vault structure: folders and markdown notes below the vault root, with each note's title (frontmatter or filename) and memory link if present. Use it to see what the project's long-form memory covers before reading or searching.",
+    description = "Lists the vault structure: folders and markdown notes below the vault root, with each note's title (frontmatter or filename) and memory link if present. Use it to see what the project's long-form memory covers before reading or searching."
 )]
 pub struct ObsidianMapArgs {
     /// Optional subdirectory (vault-relative) to map instead of the whole vault.
@@ -172,10 +172,7 @@ async fn obsidian_map(
 }
 
 /// Synchronous core of `obsidian.map`.
-fn obsidian_map_sync(
-    vault: &VaultRoot,
-    folder: Option<&str>,
-) -> Result<serde_json::Value, String> {
+fn obsidian_map_sync(vault: &VaultRoot, folder: Option<&str>) -> Result<serde_json::Value, String> {
     let start = vault.existing_dir(folder.unwrap_or("."))?;
     let mut notes = Vec::new();
     let mut folders = Vec::new();
@@ -239,7 +236,7 @@ fn first_heading(body: &str) -> Option<String> {
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "obsidian.read",
-    description = "Reads one vault note: path, frontmatter, body, wikilinks and — when the frontmatter carries `memory: <palace-node-id>` — the linked established palace node. Use `obsidian.map` or `obsidian.search` first to find the path.",
+    description = "Reads one vault note: path, frontmatter, body, wikilinks and — when the frontmatter carries `memory: <palace-node-id>` — the linked established palace node. Use `obsidian.map` or `obsidian.search` first to find the path."
 )]
 pub struct ObsidianReadArgs {
     /// Vault-relative path of the note, e.g. `70-decisions/README.md`.
@@ -288,7 +285,7 @@ fn obsidian_read_sync(
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "obsidian.search",
-    description = "Full-text search across all vault notes. Returns matching notes with line numbers and a snippet each. Case-insensitive; plain substring, not regex.",
+    description = "Full-text search across all vault notes. Returns matching notes with line numbers and a snippet each. Case-insensitive; plain substring, not regex."
 )]
 pub struct ObsidianSearchArgs {
     /// The text to find (case-insensitive substring).
@@ -334,7 +331,9 @@ fn obsidian_search_sync(
     if query.trim().is_empty() {
         return Err("'query' must not be empty".to_owned());
     }
-    let limit = limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
+    let limit = limit
+        .unwrap_or(SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SEARCH_MAX_LIMIT);
     let needle = query.to_lowercase();
     let mut matches = Vec::new();
     for path in markdown_files(vault, folder)? {
@@ -351,7 +350,9 @@ fn obsidian_search_sync(
                     "snippet": truncate(line.trim(), 240),
                 }));
                 if matches.len() >= limit {
-                    return Ok(serde_json::json!({ "matches": matches, "truncated": matches.len() >= limit }));
+                    return Ok(
+                        serde_json::json!({ "matches": matches, "truncated": matches.len() >= limit }),
+                    );
                 }
             }
         }
@@ -401,7 +402,7 @@ fn walk_markdown(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "obsidian.links",
-    description = "Shows the link neighbourhood of one note: outgoing wikilinks (with the note names they resolve to inside the vault) and backlinks (other notes linking to it). Use it to follow the knowledge graph.",
+    description = "Shows the link neighbourhood of one note: outgoing wikilinks (with the note names they resolve to inside the vault) and backlinks (other notes linking to it). Use it to follow the knowledge graph."
 )]
 pub struct ObsidianLinksArgs {
     /// Vault-relative path of the note.
@@ -483,7 +484,7 @@ fn obsidian_links_sync(
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "obsidian.write",
-    description = "Creates or fully replaces one vault note. The content must be complete markdown (frontmatter included when wanted); the tool never merges or rewrites. For small edits prefer reading the note and writing the full new text. Set `memory` to a palace node id (e.g. `palace/code-map`) to wire the note into the agent-readable knowledge graph.",
+    description = "Creates or fully replaces one vault note. The content must be complete markdown (frontmatter included when wanted); the tool never merges or rewrites. For small edits prefer reading the note and writing the full new text. Set `memory` to a palace node id (e.g. `palace/code-map`) to wire the note into the agent-readable knowledge graph."
 )]
 pub struct ObsidianWriteArgs {
     /// Vault-relative path of the note (`.md` recommended).
@@ -578,7 +579,13 @@ mod tests {
         let out = obsidian_map_sync(&vault, None).expect("map");
         let notes = out["notes"].as_array().expect("notes");
         assert_eq!(notes.len(), 2);
-        assert!(out["folders"].as_array().expect("folders").iter().any(|f| f.as_str().unwrap_or("").contains("sub")));
+        assert!(
+            out["folders"]
+                .as_array()
+                .expect("folders")
+                .iter()
+                .any(|f| f.as_str().unwrap_or("").contains("sub"))
+        );
         assert!(notes.iter().any(|n| n["title"] == "Code Map"));
     }
 
@@ -587,7 +594,10 @@ mod tests {
         let (_dir, vault) = test_vault();
         let note = vault.existing_note("code-map.md").expect("note");
         let out = obsidian_read_sync(&vault, &note, None).expect("read");
-        assert_eq!(out["wikilinks"].as_array().expect("links")[0], "architecture");
+        assert_eq!(
+            out["wikilinks"].as_array().expect("links")[0],
+            "architecture"
+        );
         let yaml = out["frontmatter"]["raw"].as_str().expect("yaml");
         assert!(yaml.contains("memory: palace/code-map"));
     }
@@ -600,7 +610,12 @@ mod tests {
         assert_eq!(matches.len(), 1);
         // "The system is layered." is the second line of architecture.md.
         assert_eq!(matches[0]["line"], 2);
-        assert!(matches[0]["path"].as_str().unwrap_or("").contains("architecture"));
+        assert!(
+            matches[0]["path"]
+                .as_str()
+                .unwrap_or("")
+                .contains("architecture")
+        );
     }
 
     #[test]
@@ -622,10 +637,13 @@ mod tests {
     fn write_creates_and_reports_memory() {
         let (_dir, vault) = test_vault();
         let note = vault.writable_note("sub/new-note.md").expect("writable");
-        let out = obsidian_write_sync(&vault, &note, "---\ntitle: New\n---\nBody\n").expect("write");
+        let out =
+            obsidian_write_sync(&vault, &note, "---\ntitle: New\n---\nBody\n").expect("write");
         assert_eq!(out["created"], true);
         assert_eq!(out["has_frontmatter"], true);
-        let written = std::fs::read_to_string(vault.existing_note("sub/new-note.md").expect("exists")).expect("read back");
+        let written =
+            std::fs::read_to_string(vault.existing_note("sub/new-note.md").expect("exists"))
+                .expect("read back");
         assert!(written.contains("# New") || written.contains("title: New"));
     }
 

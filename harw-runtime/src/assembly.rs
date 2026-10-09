@@ -73,9 +73,9 @@ use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
     AgentSession, ChildRegistryFactory, ContextBudget, DriftObserver, GuardPolicy, InteractionMode,
-    JobExecutionRegistry, ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor,
-    RoleEffortWeights,
-    SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
+    JobExecutionRegistry, ManagedAgentSpawner, ModelProvider, OrchestrationObserver,
+    PitfallAdvisor, RoleEffortWeights, SessionActivation, SessionManager, SpawnContext, StateStore,
+    ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
@@ -2827,8 +2827,8 @@ impl RuntimeAssemblyBuilder {
             stores.job_store.as_ref(),
             spawn_context.approval_actor.clone(),
         ) {
-            let runtime_submitter = Arc::new(
-                crate::agent_job_wiring::RuntimeAgentJobSubmitter::new(
+            let runtime_submitter =
+                Arc::new(crate::agent_job_wiring::RuntimeAgentJobSubmitter::new(
                     Arc::clone(spawner),
                     Arc::clone(&stores.state_store),
                     stores.approval_store.clone(),
@@ -2841,14 +2841,14 @@ impl RuntimeAssemblyBuilder {
                     actor,
                     sandbox.workspace().tenant().clone(),
                     sandbox.workspace().workspace().clone(),
-                ),
-            );
+                ));
             runtime_submitter.start_recovery_worker();
             let submitter: Arc<dyn harw_extension_api::AgentJobSubmitter> = runtime_submitter;
             if let Some(slot) = agent_job_submitter_slot.as_ref() {
-                slot.set(Arc::downgrade(&submitter)).map_err(|_| RuntimeError::Spawner {
-                    detail: "durable agent job submitter slot was initialized twice".to_owned(),
-                })?;
+                slot.set(Arc::downgrade(&submitter))
+                    .map_err(|_| RuntimeError::Spawner {
+                        detail: "durable agent job submitter slot was initialized twice".to_owned(),
+                    })?;
             }
             registry_builder = registry_builder.agent_job_submitter(submitter);
         }

@@ -1328,13 +1328,12 @@ mod tests {
         let fx = fixture("cycle-deep")?;
         let mut record = fx.store.load("cycle-deep").map_err(ctx("record loads"))?;
         record.checkpoint.chain_depth = fx.admission.limits().max_chain_depth + 1;
-        fx.store.create(&CycleRecord::new(
-            "cycle-deep-2",
-            fx.work_id.clone(),
-            record.checkpoint,
-        )
-        .map_err(ctx("record builds"))?)
-        .map_err(ctx("record persists"))?;
+        fx.store
+            .create(
+                &CycleRecord::new("cycle-deep-2", fx.work_id.clone(), record.checkpoint)
+                    .map_err(ctx("record builds"))?,
+            )
+            .map_err(ctx("record persists"))?;
         let proposer = Script::new(vec![Ok(wait()), Ok(wait()), Ok(wait())]);
         let seen = Arc::clone(&proposer.refusals);
         let mut driver = driver(&fx, proposer, Executor::new(vec![]), rights()?);
@@ -1351,7 +1350,9 @@ mod tests {
             Err(CycleRunError::Admission(CycleRefusal::ChainDepthExceeded))
         ));
         assert!(
-            seen.lock().map_err(|_| TestError::Missing("lock"))?.is_empty(),
+            seen.lock()
+                .map_err(|_| TestError::Missing("lock"))?
+                .is_empty(),
             "the proposer must not be called"
         );
         Ok(())

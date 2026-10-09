@@ -7,8 +7,8 @@ pub mod status;
 
 use std::sync::Arc;
 
-use harw_operations::registry::{OperationRegistry, RegistryError};
 use harw_operations::Operation;
+use harw_operations::registry::{OperationRegistry, RegistryError};
 
 /// Number of operations registered by [`register_cloud`]:
 /// 1 status + 1 enrollments + 5 cloudctl.

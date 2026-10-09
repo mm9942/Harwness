@@ -152,6 +152,17 @@ impl Shared {
         }
     }
 
+    /// h19: record the newest frame cursor seen for `session` (monotonic;
+    /// used by `RemoteConnection::resume_cursor` on a re-attach).
+    fn record_resume_cursor(&self, session: &SessionId, cursor: Cursor) {
+        let mut state = lock(&self.state);
+        state
+            .resume_cursors
+            .record(session, cursor)
+            .map_err(|error| tracing::warn!(%error, "resume cursor record failed"))
+            .ok();
+    }
+
     fn end_error(&self) -> PortError {
         lock(&self.state)
             .end
@@ -412,22 +423,9 @@ impl RemoteConnection {
         &self.hello
     }
 
-    /// Record the newest frame cursor seen for `session` (h19: connects
-    /// [`crate::reconnect::ResumeCursors`] to the attach/resume path).
-    ///
-    /// Called by the connection reader on every incoming frame; the client
-    /// later presents the recorded cursor as `AttachParams::from` on a
-    /// re-attach and never fabricates a cursor (see `reconnect.rs`).
-    pub fn record_resume_cursor(&self, session: &SessionId, cursor: Cursor) {
-        let mut state = lock(&self.shared.state);
-        state
-            .resume_cursors
-            .record(session, cursor)
-            .map_err(|error| tracing::warn!(%error, "resume cursor record failed"))
-            .ok();
-    }
-
-    /// Cursor to resume `session` from, if one was recorded (h19).
+    /// Cursor to resume `session` from, if one was recorded (h19: the
+    /// connection reader records every frame cursor; a re-attach presents
+    /// it as `AttachParams::from` and never fabricates a cursor).
     #[must_use]
     pub fn resume_cursor(&self, session: &SessionId) -> Option<Cursor> {
         lock(&self.shared.state)

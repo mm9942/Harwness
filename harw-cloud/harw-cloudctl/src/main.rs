@@ -119,7 +119,10 @@ mod tests {
         for sub in ["up", "down", "restart", "enroll", "revoke", "status"] {
             // Only exercise the verb mapping logic without side effects on the
             // host: unknown-free paths return an exit code, not a panic.
-            let known = matches!(sub, "up" | "down" | "restart" | "enroll" | "revoke" | "status");
+            let known = matches!(
+                sub,
+                "up" | "down" | "restart" | "enroll" | "revoke" | "status"
+            );
             assert!(known, "subcommand {sub} must be known");
         }
     }

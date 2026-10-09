@@ -909,10 +909,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
 
                         if let Some((status, text)) = projection {
                             if let Err(error) = spawner
-                                .close_child_durable(
-                                    &child_for_cleanup,
-                                    completion.completed_at,
-                                )
+                                .close_child_durable(&child_for_cleanup, completion.completed_at)
                             {
                                 tracing::error!(
                                     work_id = %work_id_for_run,

@@ -5,9 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use harw_command::{
-    CommandEnd, CommandOutput, CommandPort, CommandRequest, CommandSandbox,
-};
+use harw_command::{CommandEnd, CommandOutput, CommandPort, CommandRequest, CommandSandbox};
 use harw_job::Persistence;
 use harw_tool_container::{ContainerId, ContainerPlan, Readback, Stage, StartRefusal};
 use harw_types::cancel::CancelToken;
@@ -128,9 +126,12 @@ impl PodmanEngine {
         self.port
             .clone()
             .or_else(harw_command::installed)
-            .ok_or_else(|| EngineError::Spawn(
-                "no job-backed command runtime is installed for the container engine".to_owned(),
-            ))
+            .ok_or_else(|| {
+                EngineError::Spawn(
+                    "no job-backed command runtime is installed for the container engine"
+                        .to_owned(),
+                )
+            })
     }
 
     /// Extra wall time beyond the plan's timeout before the container is
@@ -292,7 +293,9 @@ impl ContainerEngine for PodmanEngine {
             let truncated = outcome.truncated || outcome.end == CommandEnd::OutputLimit;
             let exit_code = match outcome.end {
                 CommandEnd::Exited => Some(outcome.exit_code),
-                CommandEnd::Signaled(_) | CommandEnd::TimedOut | CommandEnd::OutputLimit
+                CommandEnd::Signaled(_)
+                | CommandEnd::TimedOut
+                | CommandEnd::OutputLimit
                 | CommandEnd::Cancelled => None,
                 CommandEnd::Failed(reason) => {
                     self.remove(plan, &id).await;

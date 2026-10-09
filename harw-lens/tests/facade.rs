@@ -317,7 +317,11 @@ fn test_index_verify_rebuild_updates_hits() -> TestResult {
     let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
-    let first = vec![document("Erster Stand: Katzen.", "a.md", DEFAULT_VISIBILITY)];
+    let first = vec![document(
+        "Erster Stand: Katzen.",
+        "a.md",
+        DEFAULT_VISIBILITY,
+    )];
     build(
         home.path(),
         DOCS_DESIGN_INDEX,
@@ -329,7 +333,11 @@ fn test_index_verify_rebuild_updates_hits() -> TestResult {
         &descriptor,
     )
     .map_err(ctx("build succeeds"))?;
-    let second = vec![document("Zweiter Stand: Roboter.", "b.md", DEFAULT_VISIBILITY)];
+    let second = vec![document(
+        "Zweiter Stand: Roboter.",
+        "b.md",
+        DEFAULT_VISIBILITY,
+    )];
     build(
         home.path(),
         DOCS_DESIGN_INDEX,
@@ -418,8 +426,16 @@ fn test_index_verify_parallel_queries_same_index() -> TestResult {
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![
-        document("Parallelchunk eins ueber Katzen.", "a.md", DEFAULT_VISIBILITY),
-        document("Parallelchunk zwei ueber Hunde.", "b.md", DEFAULT_VISIBILITY),
+        document(
+            "Parallelchunk eins ueber Katzen.",
+            "a.md",
+            DEFAULT_VISIBILITY,
+        ),
+        document(
+            "Parallelchunk zwei ueber Hunde.",
+            "b.md",
+            DEFAULT_VISIBILITY,
+        ),
     ];
     build(
         home.path(),
@@ -475,7 +491,11 @@ fn test_index_verify_parallel_query_out_of_scope_is_rejected() -> TestResult {
     let home = Arc::new(tempfile::tempdir().map_err(ctx("tempdir"))?);
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
-    let documents = vec![document("Scopechunk ueber Katzen.", "a.md", DEFAULT_VISIBILITY)];
+    let documents = vec![document(
+        "Scopechunk ueber Katzen.",
+        "a.md",
+        DEFAULT_VISIBILITY,
+    )];
     build(
         home.path(),
         DOCS_DESIGN_INDEX,
@@ -521,7 +541,10 @@ fn test_index_verify_parallel_query_out_of_scope_is_rejected() -> TestResult {
     let r1 = t1.join().map_err(|_| ctx("thread 1 panicked"))?;
     let r2 = t2.join().map_err(|_| ctx("thread 2 panicked"))?;
     assert!(
-        matches!(r1, Err(LensError::Query(QueryError::IndexNotVisible { .. }))),
+        matches!(
+            r1,
+            Err(LensError::Query(QueryError::IndexNotVisible { .. }))
+        ),
         "out-of-scope selector must stay rejected under parallelism: {r1:?}"
     );
     assert!(r2.is_ok(), "in-scope parallel query must succeed: {r2:?}");

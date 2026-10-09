@@ -38,7 +38,11 @@ pub struct CloudStatus {
 pub async fn probe(config: &GatewayConfig) -> CloudStatus {
     let mut ports = Vec::with_capacity(config.ports.len());
     for mapping in &config.ports {
-        let listening = match timeout(PROBE_TIMEOUT, TcpStream::connect(("127.0.0.1", mapping.port))).await
+        let listening = match timeout(
+            PROBE_TIMEOUT,
+            TcpStream::connect(("127.0.0.1", mapping.port)),
+        )
+        .await
         {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,

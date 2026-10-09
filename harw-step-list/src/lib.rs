@@ -11,9 +11,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Stabile, monoton steigende Identität eines Steps.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StepId(u64);
 
 impl fmt::Display for StepId {
@@ -211,8 +209,7 @@ impl StepList {
     /// Seriell in Datei schreiben.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let f = std::fs::File::create(path)?;
-        serde_json::to_writer(&f, self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        serde_json::to_writer(&f, self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
     /// Aus Datei laden; unbekannte `schema_version` wird abgelehnt.
@@ -298,9 +295,7 @@ mod tests {
         assert!(list.set_status(id, StepStatus::InProgress, 3).is_ok());
         assert!(list.set_status(id, StepStatus::Done, 4).is_ok());
         // Terminalzustände: kein Weg mehr heraus.
-        let err = list
-            .set_status(id, StepStatus::Open, 5)
-            .unwrap_err();
+        let err = list.set_status(id, StepStatus::Open, 5).unwrap_err();
         assert_eq!(
             err,
             StepListError::IllegalTransition {
@@ -308,9 +303,7 @@ mod tests {
                 to: StepStatus::Open
             }
         );
-        assert!(list
-            .set_status(id, StepStatus::InProgress, 5)
-            .is_err());
+        assert!(list.set_status(id, StepStatus::InProgress, 5).is_err());
     }
 
     #[test]
@@ -335,13 +328,14 @@ mod tests {
         let mut list = StepList::new();
         let id = list.add("s", 0);
         assert_eq!(list.done(id, "", 1), Err(StepListError::EvidenceRequired));
-        assert_eq!(list.done(id, "   ", 1), Err(StepListError::EvidenceRequired));
+        assert_eq!(
+            list.done(id, "   ", 1),
+            Err(StepListError::EvidenceRequired)
+        );
         assert!(list.done(id, "Testlauf grün", 2).is_ok());
         assert_eq!(list.steps()[0].evidence(), Some("Testlauf grün"));
         assert_eq!(list.steps()[0].status(), &StepStatus::Done);
-        assert!(list
-            .update_evidence(id, "erneut bestätigt", 3)
-            .is_ok());
+        assert!(list.update_evidence(id, "erneut bestätigt", 3).is_ok());
         assert_eq!(list.steps()[0].evidence(), Some("erneut bestätigt"));
     }
 

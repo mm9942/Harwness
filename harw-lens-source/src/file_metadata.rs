@@ -85,8 +85,7 @@ pub fn classify(path: &Path) -> Option<FileMetadata> {
     }
     let bytes = std::fs::read(path).ok()?;
     let size = bytes.len() as u64;
-    let is_binary = size > MAX_TEXT_BYTES
-        || std::str::from_utf8(&bytes).is_err();
+    let is_binary = size > MAX_TEXT_BYTES || std::str::from_utf8(&bytes).is_err();
     Some(FileMetadata {
         path: path.to_path_buf(),
         content_hash: fnv1a64_hex(&bytes),
@@ -179,7 +178,13 @@ mod tests {
 
     #[test]
     fn secret_paths_are_excluded_before_hashing() {
-        for name in [".env", "prod.env", "auth.toml", "server.key", "id_ed25519.key"] {
+        for name in [
+            ".env",
+            "prod.env",
+            "auth.toml",
+            "server.key",
+            "id_ed25519.key",
+        ] {
             let (dir, path) = temp_file(name, b"secret");
             assert!(
                 classify(&path).is_none(),
