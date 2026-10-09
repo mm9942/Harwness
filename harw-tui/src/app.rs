@@ -1051,11 +1051,15 @@ pub struct ChatApp {
     /// Kind-Name → (letzter Info-Text, Eingangszeitpunkt).
     child_infos: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Zwei zuletzt eingetroffene Agentenmeldungen als reine Anzeigekopie.
-    recency: recency::RecencySlots,
+    recency: crate::recency::RecencySlots,
     /// TOML-gesteuertes Verhalten abgelaufener Kind-Statusmeldungen
     /// (nach dem 30s-Fenster): `[tui].status_expiry` — konsolidieren oder
     /// ausblenden. Default: konsolidieren.
     status_expiry: harw_config::StatusExpiryMode,
+    /// Read-only Step-/TODO-Anzeige (h22): Bibliothekszustand der
+    /// `harw-step-list`; die Explorer-Ansicht rendert daraus nur Zeilen.
+    /// `None`, solange keine Liste geladen/gesetzt wurde.
+    step_list: Option<harw_step_list::StepList>,
     /// Bereits abgeschickte Benutzertexte. Ein laufender Turn darf nie
     /// abgebrochen oder vermischt werden; diese FIFO wird ausschließlich an
     /// Turn-Grenzen abgearbeitet.
@@ -1485,8 +1489,9 @@ impl ChatApp {
             input,
             deferred_input: std::collections::VecDeque::new(),
             child_infos: std::collections::HashMap::new(),
-            recency: recency::RecencySlots::new(),
+            recency: crate::recency::RecencySlots::new(),
             status_expiry: harw_config::StatusExpiryMode::default(),
+            step_list: None,
             pending_turns: std::collections::VecDeque::new(),
             images: crate::image_attach::ImageAttachments::default(),
             busy_jobs: BusyJobs::new(),
@@ -1592,7 +1597,6 @@ impl ChatApp {
     /// Testbare Variante von [`Self::note_child_info`] mit vorgegebenem
     /// Zeitstempel, damit das 30s-Ausblendfenster (`PARENT_INFO_MIN_INTERVAL`
     /// in `harw-core::child_comms`) ohne Echtzeit-Warten geprüft werden kann.
-    #[cfg(test)]
     pub(crate) fn note_child_info_at(
         &mut self,
         child: String,
@@ -2785,6 +2789,14 @@ impl ChatApp {
             self.queue_overlay_refresh();
         }
         true
+    }
+
+    /// Setzt die read-only Step-/TODO-Ansicht (h22). Der Aufrufer (Step-
+    /// Owner, z. B. ein Driver oder die `plan`-Brücke) publisht den
+    /// Bibliothekszustand; die TUI rendert nur. `None` blendet die Ansicht
+    /// aus.
+    pub(crate) fn set_step_list(&mut self, list: Option<harw_step_list::StepList>) {
+        self.step_list = list;
     }
 
     /// Legt das Explorer-Panel beim ersten Einblenden an und startet die
@@ -9631,7 +9643,9 @@ fn handle_explorer_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     }
 }
 
-/// Zeichnet das Explorer-Panel.
+/// Zeichnet das Explorer-Panel. h22: Darunter wird — wenn eine Step-Liste
+/// geladen ist — deren read-only Ansicht im unteren Bereich des Explorer-
+/// Fensters ergänzt (Layout-Split, Fokuslogik des Panels unverändert).
 fn render_explorer_panel(
     app: &ChatApp,
     area: Rect,
@@ -9639,13 +9653,61 @@ fn render_explorer_panel(
     theme: style::Theme,
 ) {
     if let Some(panel) = &app.explorer {
-        panel.render(
-            area,
-            buf,
-            theme,
-            app.panels.focus == crate::panes::PaneFocus::Explorer,
-        );
+        if let Some(list) = &app.step_list {
+            // Zwei Bereiche: Explorer oben, StepList unten (min. 3 Zeilen:
+            // Kopf + 2 Steps; bei knapper Höhe entfällt die Ansicht nicht,
+            // sondern teilt sich fair).
+            let rows = u16::try_from(1 + list.steps().len().min(8)).unwrap_or(1);
+            let split = ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Min(3),
+                ratatui::layout::Constraint::Length((rows + 1).max(3)),
+            ])
+            .split(area);
+            panel.render(
+                split[0],
+                buf,
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Explorer,
+            );
+            render_step_list(list, split[1], buf, theme);
+        } else {
+            panel.render(
+                area,
+                buf,
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Explorer,
+            );
+        }
     }
+}
+
+/// Zeichnet die read-only StepList-Ansicht (h22). Reine Projektion: keine
+/// Interaktion, keine Mutation — Änderungen laufen über den Step-Owner.
+fn render_step_list(
+    list: &harw_step_list::StepList,
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    _theme: style::Theme,
+) {
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Widget, Wrap};
+
+    let Some((lines, done, total)) = crate::step_list_view::step_lines(list) else {
+        return;
+    };
+    let mut rows = vec![Line::styled(
+        crate::step_list_view::progress_line(done, total),
+        ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::BOLD),
+    )];
+    for line in lines {
+        rows.push(Line::styled(
+            format!("{} {}", line.mark, line.title),
+            ratatui::style::Style::default(),
+        ));
+    }
+    Paragraph::new(rows)
+        .wrap(Wrap { trim: true })
+        .render(area, buf);
 }
 
 /// Unter dieser Breite bekommen Goal-, Plan- und Host-Marke eine eigene

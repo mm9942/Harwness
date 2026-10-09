@@ -18,6 +18,7 @@ harw-catalog = { path = "../harw-catalog" }
 harw-config = { path = "../harw-config" }
 harw-core = { path = "../harw-core" }
 harw-explorer = { path = "../harw-explorer" }
+harw-step-list = { path = "../harw-step-list" }
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-extension-api = { path = "../harw-extension-api" }

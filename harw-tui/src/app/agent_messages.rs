@@ -77,13 +77,13 @@ pub(crate) fn collect_parent_messages(app: &mut ChatApp) -> bool {
             enqueue_background_notice(app, message.to_model_text(), true);
         }
         app.recency.push(crate::recency::RecencyEntry {
-            child: message.child.clone(),
+            child: message.child.as_str().to_owned(),
             text: message.text.clone(),
         });
         // Info-Zwischenstände des Kindes zusätzlich für die Statuszeile
         // merken (30s-Fenster, siehe `ChatApp::note_child_info`).
         if matches!(message.kind, ParentMessageKind::Info) {
-            app.note_child_info(message.child.clone(), message.text.clone());
+            app.note_child_info(message.child.as_str().to_owned(), message.text.clone());
         }
     }
     any
