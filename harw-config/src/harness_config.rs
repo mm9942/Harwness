@@ -611,6 +611,10 @@ pub struct TuiSection {
     /// "consolidate" fasst je Kind kompakt zusammen, "hide" blendet aus.
     #[serde(default)]
     pub status_expiry: StatusExpiryMode,
+    /// Read-only Zielmodus in der TUI (h9): blendet eine rein darstellende
+    /// Projektion des Goal-/Planstands ein (Vorgabe: aus).
+    #[serde(default)]
+    pub goal_mode: bool,
 }
 
 impl Default for TuiSection {
@@ -620,6 +624,7 @@ impl Default for TuiSection {
             keybindings_file: default_keybindings_file(),
             child_stream: ChildStreamModeToml::default(),
             status_expiry: StatusExpiryMode::default(),
+            goal_mode: false,
         }
     }
 }
