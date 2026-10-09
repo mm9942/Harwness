@@ -138,10 +138,19 @@ Present foundations include `research-orchestrator`, `coding-orchestrator`,
 packs such as `intel-analysis-orchestrator`,
 `wargaming-orchestrator`, `dependency-research-orchestrator` and
 `evidence-review-orchestrator`. They do **not** all have Root permission
-to spawn as children today. The built-in Root's exact allowlist currently
-contains only coding/research/analysis orchestrators. The Matrix Game Master
-is a separate root in today's default design and must not be relabeled as
-a child without a scoped capability and game-engine review.
+to spawn as children of the general root orchestrator today. The built-in
+Root's exact allowlist (its three `child_orchestrators`) contains only the
+coding/research/analysis orchestrators.
+
+`matrix-game-master` needs two separate statements. *Organizational role:* it
+is a root-orchestrator-role specialist (`role = "root-orchestrator"`,
+`harw-registry-defaults/src/profile.rs`, `MATRIX_GAME_MASTER`), not one of the
+general Root's three child orchestrators. *Actual tree relation:* the UIA
+already starts it today via `transfer_to_matrix-game-master` as a background
+child (`harw-ops/src/matrix/mod.rs`, module doc, Round 7 part M). That UIA to
+game-master relation exists and is not future work. What is not in place is
+the general root orchestrator delegating to it; that would be new and needs a
+scoped capability and game-engine review.
 
 ### D. Default delegation-first planner
 
@@ -228,7 +237,13 @@ or compensation; validation and model critique are not authorization.
   cycles, evaluated against single-turn baselines with reproducible tasks.
 - **C6 (specialized orchestrators):** promote verified packs for Explore,
   Scenario, Matrix and Evidence Review through explicit Root allowlists;
-  extend organizations/families/cells, but preserve matrix game authority.
+  extend organizations/families/cells. Acceptance: the existing
+  UIA -> `matrix-game-master` background-child relation keeps working
+  unchanged, and the engine-owned dice, scenario approval and seat-approval
+  authority stay with the game master and the matrix engine. Any new
+  delegation edge from the general root orchestrator to it is added only with
+  a scoped capability and a game-engine review, and is not a relabeling of the
+  current relation.
 - **C7 (measurement):** compare grounded evidence coverage, success rate,
   tokens per accepted finding, tool/permission failures, latency, wasted
   calls, and recovery after restart. Do not claim a small model is better
