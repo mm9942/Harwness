@@ -380,7 +380,6 @@ impl AssemblyContributor for CloudOpsContributor {
 /// root registry if `[browser].enabled` and `[browser].roles` contain the
 /// `root` role. Children get them per-role in `children.rs` through the same
 /// configuration.
-
 #[cfg(feature = "browser")]
 #[derive(Debug, Default)]
 pub struct BrowserRootContributor;

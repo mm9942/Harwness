@@ -64,6 +64,7 @@ pub struct RuntimeAgentJobSubmitter {
 
 impl RuntimeAgentJobSubmitter {
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // explicit dependency injection boundary
     pub fn new(
         spawner: Arc<ManagedAgentSpawner>,
         state_store: Arc<dyn StateStore>,
@@ -747,7 +748,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                     Ok(Ok(completion)) => {
                         if let Err(release_error) = self
                             .spawner
-                            .close_child_durable(&child, completion.completed_at)
+                            .close_child_durable(&child, completion.completion.completed_at)
                         {
                             tracing::error!(
                                 work_id = %work_id,

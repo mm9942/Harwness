@@ -86,7 +86,7 @@ fn read_note_parts(
     let mut value = serde_json::json!({
         "path": vault.display_path(note),
         "frontmatter": yaml.as_ref().map(|y| serde_json::json!({"raw": y})),
-        "body": truncate(&body, MAX_BODY_CHARS),
+        "body": truncate(body, MAX_BODY_CHARS),
         "wikilinks": links,
     });
     if let (Some(yaml), Some(store)) = (yaml.as_deref(), memory) {
@@ -212,7 +212,7 @@ fn collect_entries(
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
             notes.push(serde_json::json!({
                 "path": note["path"],
-                "title": first_heading(&note["body"].as_str().unwrap_or_default())
+                "title": first_heading(note["body"].as_str().unwrap_or_default())
                     .unwrap_or_else(|| name.trim_end_matches(".md").to_owned()),
                 "memory": note.get("memory").cloned(),
             }));

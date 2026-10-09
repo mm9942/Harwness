@@ -321,7 +321,7 @@ impl SessionGoalBinding {
             },
             goal_id: goal.id.clone(),
             statement: goal.statement.clone(),
-            status: goal.status.clone(),
+            status: goal.status,
             acceptance_criteria: goal
                 .acceptance_criteria
                 .iter()

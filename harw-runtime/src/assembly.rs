@@ -5291,21 +5291,23 @@ struct SpawnerInputs<'a> {
     child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
 }
 
+/// Spawner, registrierte Rollennamen und den weakly-bound Slot für den
+/// runtimeweiten [`harw_extension_api::AgentJobSubmitter`].
+type BuiltSpawner = (
+    Option<Arc<ManagedAgentSpawner>>,
+    Vec<String>,
+    Option<Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>>,
+);
+
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
 ///
 /// # Rückgabe
-/// Spawner, registrierte Rollennamen und den weakly-bound Slot für den
-/// runtimeweiten [`harw_extension_api::AgentJobSubmitter`]. Bei
-/// [`SpawnerPolicy::None`] sind Spawner und Submitter-Slot `None`.
+/// Bei [`SpawnerPolicy::None`] sind Spawner und Submitter-Slot `None`.
 fn build_spawner(
     policy: SpawnerPolicy,
     inputs: SpawnerInputs<'_>,
     session_events: Option<UnboundedSender<SessionEvent>>,
-) -> RuntimeResult<(
-    Option<Arc<ManagedAgentSpawner>>,
-    Vec<String>,
-    Option<Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>>,
-)> {
+) -> RuntimeResult<BuiltSpawner> {
     // Erschöpfend statt `if policy == …`: eine künftige Variante (etwa
     // `ConfiguredRoles`) fiele sonst still in den `BuiltinRoles`-Zweig,
     // statt den Compiler zu brechen (Befund Z2c-03).
