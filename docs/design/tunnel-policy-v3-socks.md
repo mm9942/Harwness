@@ -33,9 +33,19 @@ HARW provides the SOCKS5 server, not OpenSSH:
    metadata targets are denied unless the policy names them (metadata is never
    allowable).
 3. **Only `CONNECT`.** `BIND` and `UDP ASSOCIATE` are refused.
-4. **Authentication method `NO AUTH` only on a private Unix socket,** where the
-   kernel peer credential is the authentication (as in `harw-egress`). On any
-   other listener `NO AUTH` is refused.
+4. **Authentication method `NO AUTH` only on a verified private Unix socket.**
+   The security boundary is filesystem permissions (DAC): the socket is `0600`
+   inside a `0700` directory owned by the expected UID, and the caller of
+   `harw-egress` must verify exactly this before serving it (the existing
+   `harw-egress` contract, see the `run` doc comment in `proxy.rs`).
+   `EgressProxy` itself performs **no** peer-credential check: it accepts the
+   `UnixStream` and starts `run_session` immediately, and the crate contains no
+   `peer_cred`/`SO_PEERCRED` use. An implementation must therefore not assume
+   the proxy verified the connecting UID. **Required follow-up before `NO AUTH`
+   may be offered on any socket whose path or permissions are not verified:**
+   an `SO_PEERCRED` check (the peer UID must equal the allowed owner, checked
+   before each session) in `harw-egress`, with tests for a foreign-UID peer and
+   a wrongly-permissioned socket. On any other listener `NO AUTH` is refused.
 5. **Domain-name targets** (`socks5h`) are resolved by the SSH server, which
    cannot be verified locally (the same gap as hostname targets in v1; see the
    `allow_remote_resolution` opt-in in `harw-tool-tunnel`). Default: literal
@@ -52,4 +62,5 @@ HARW provides the SOCKS5 server, not OpenSSH:
 ## 4. Not covered
 
 Remote dynamic forwarding, SOCKS over the Cloudflare path, UDP, authentication
-other than the local peer credential.
+other than verified socket permissions (peer-credential checks are the follow-up
+named in rule 4).
