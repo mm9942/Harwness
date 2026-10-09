@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use harw_config::ResolvedConfig;
 use harw_core::{
     DriftEvent, DriftObserver, GuardPolicy, ManagedAgentSpawner, PitfallAdvisor, RoleEffortWeights,
+    SessionResolvedSet,
 };
 use harw_memory::{Fact, FactStore, FactType};
 use harw_types::ReasoningEffort;
@@ -91,6 +92,10 @@ pub struct MemoryPitfallAdvisor {
     /// Aufrufs gelöst hat ([`PitfallAdvisor::resolved`]); sie melden sich
     /// nicht mehr.
     resolved: Mutex<Vec<String>>,
+    /// Session-getrennter, begrenzter Laufzustand für die Runtime-Aufrufer
+    /// ([`PitfallAdvisor::advise_in_session`] / `resolved_in_session`): ein
+    /// Erfolg in Session A löst den Hinweis nie in Session B auf.
+    resolved_by_session: SessionResolvedSet,
 }
 
 impl MemoryPitfallAdvisor {
@@ -101,11 +106,12 @@ impl MemoryPitfallAdvisor {
     ///   dieselbe wie [`crate::assembly::RuntimeAssemblyBuilder::fact_stores`]
     ///   (Projekt-Anteil).
     #[must_use]
-    pub const fn new(store: Arc<FactStore>) -> Self {
+    pub fn new(store: Arc<FactStore>) -> Self {
         Self {
             store,
             cache: OnceLock::new(),
             resolved: Mutex::new(Vec::new()),
+            resolved_by_session: SessionResolvedSet::new(),
         }
     }
 
@@ -130,16 +136,8 @@ impl MemoryPitfallAdvisor {
 }
 
 impl PitfallAdvisor for MemoryPitfallAdvisor {
-    /// Prüft `tool_name`/`arguments` gegen die gecachten Pitfall-Fakten.
-    ///
-    /// # Argumente
-    /// - `tool_name` (`&str`): der Name des unmittelbar bevorstehenden
-    ///   Werkzeugaufrufs.
-    /// - `arguments` (`&serde_json::Value`): dessen Argumente.
-    ///
-    /// # Rückgabe
-    /// `Some(hint)` mit einem auf höchstens 300 Bytes gekürzten Hinweistext
-    /// beim ersten Treffer; sonst `None`.
+    /// Runde 9, E3: ungebundener Legacy-Pfad (nicht von der Runtime
+    /// genutzt): berücksichtigt den ungebundenen `resolved`-Zustand.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
         let resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         self.pitfalls()
@@ -149,8 +147,37 @@ impl PitfallAdvisor for MemoryPitfallAdvisor {
             .map(|fact| truncate_hint(&fact.description))
     }
 
+    /// Sessiongebunden: berücksichtigt nur die Auflösungen derselben Session
+    /// (nie den ungebundenen `resolved`-Zustand).
+    fn advise_in_session(
+        &self,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        self.pitfalls()
+            .iter()
+            .filter(|fact| !self.resolved_by_session.contains(session_id, &fact.name))
+            .find(|fact| pitfall_applies(fact, tool_name, arguments))
+            .map(|fact| truncate_hint(&fact.description))
+    }
+
+    /// Sessiongebunden: löst Treffer nur für `session_id` auf.
+    fn resolved_in_session(
+        &self,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) {
+        for fact in self.pitfalls() {
+            if pitfall_applies(fact, tool_name, arguments) {
+                self.resolved_by_session.insert(session_id, &fact.name);
+            }
+        }
+    }
+
     /// Runde 9, E3: ein erfolgreicher Aufruf löst jeden Pitfall, der auf ihn
-    /// passte.
+    /// passte (ungebundener Legacy-Pfad, nicht von der Runtime genutzt).
     fn resolved(&self, tool_name: &str, arguments: &serde_json::Value) {
         let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         for fact in self.pitfalls() {
@@ -686,6 +713,55 @@ mod pitfall_advisor_tests {
         assert!(
             advisor.advise("agent.message", &same).is_none(),
             "nach einem Erfolg kein veralteter Hinweis mehr"
+        );
+        Ok(())
+    }
+
+    /// PL-90 H1: resolutions are scoped per session — a success in one
+    /// session must not silence hints in another.
+    #[test]
+    fn resolve_in_session_a_does_not_suppress_the_pitfall_in_session_b() -> TestResult {
+        use harw_types::SessionId;
+        let (advisor, _dir) = advisor_with(&[(
+            "agent-message-stale",
+            "agent.message: kein eigenes, laufendes Kind mit der ID ffe02b1b child_id",
+            "agent.message",
+            0.9,
+        )])?;
+        let session_a = SessionId::from_str("a");
+        let session_b = SessionId::from_str("b");
+        let same = json!({ "child_id": "ffe02b1b", "text": "weiter" });
+        assert!(
+            advisor
+                .advise_in_session(&session_a, "agent.message", &same)
+                .is_some()
+        );
+        assert!(
+            advisor
+                .advise_in_session(&session_b, "agent.message", &same)
+                .is_some()
+        );
+        // Resolve in session A only.
+        advisor.resolved_in_session(&session_a, "agent.message", &same);
+        assert!(
+            advisor
+                .advise_in_session(&session_a, "agent.message", &same)
+                .is_none(),
+            "resolved in session A"
+        );
+        assert!(
+            advisor
+                .advise_in_session(&session_b, "agent.message", &same)
+                .is_some(),
+            "session B unaffected by session A's resolution"
+        );
+        // Both directions: resolving in B now must not resurrect A's hint,
+        // and a fresh session C still sees the hint.
+        let session_c = SessionId::from_str("c");
+        assert!(
+            advisor
+                .advise_in_session(&session_c, "agent.message", &same)
+                .is_some()
         );
         Ok(())
     }

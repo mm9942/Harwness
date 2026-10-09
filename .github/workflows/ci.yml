@@ -306,6 +306,12 @@ jobs:
       - name: cargo test (job core + Darwin backend)
         run: cargo test --locked -p harw-job-core -p harw-job-darwin
 
+      # PL-93: every workload process starts through the job runtime. The
+      # Darwin executor delivers output, output files and the stdio handoff;
+      # these tests execute that on a real macOS host.
+      - name: cargo test (command port + job runtime on Darwin)
+        run: cargo test --locked -p harw-command -p harw-job-runtime
+
       - name: cargo check (Linux backend compiles empty on macOS)
         run: cargo check --locked -p harw-job-linux
 

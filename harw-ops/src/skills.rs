@@ -361,8 +361,10 @@ fn skill_state_persistence(ctx: &OpContext) -> Result<Arc<dyn SkillStatePersiste
         return Ok(Arc::clone(persistence));
     }
     let home = crate::config_util::bound_home(ctx)?;
-    Ok(Arc::new(LayeredSkillStatePersistence::from_home_context(home)?)
-        as Arc<dyn SkillStatePersistence>)
+    Ok(
+        Arc::new(LayeredSkillStatePersistence::from_home_context(home)?)
+            as Arc<dyn SkillStatePersistence>,
+    )
 }
 
 // ── Skill-Vorschläge ──────────────────────────────────────────────────────────
@@ -1248,11 +1250,8 @@ mod tests {
     async fn skills_deactivate_writes_the_manifest_of_the_bound_home() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         // Root-Layer statt Profil-Layer: unabhängig von `HARW_PROFILE`.
-        let manifest = write_manifest(
-            temp.path(),
-            "review",
-            "name = \"review\"\nenabled = true\n",
-        )?;
+        let manifest =
+            write_manifest(temp.path(), "review", "name = \"review\"\nenabled = true\n")?;
         let mut services = ServiceMap::new();
         services.insert(Arc::new(review_config()));
         services.insert(crate::config_util::test_home_context(temp.path())?);
@@ -1262,7 +1261,11 @@ mod tests {
         std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         let output = result.map_err(ctx("deactivate"))?;
-        assert!(output.text.contains("'review' deaktiviert"), "{}", output.text);
+        assert!(
+            output.text.contains("'review' deaktiviert"),
+            "{}",
+            output.text
+        );
         assert!(!read_enabled(&manifest)?);
         Ok(())
     }
@@ -1270,8 +1273,7 @@ mod tests {
     /// Ohne Persistenzdienst und ohne gebundenen Root-Space ist `deactivate`
     /// nicht verfügbar, statt auf den Prozess-Root-Space auszuweichen.
     #[tokio::test]
-    async fn skills_deactivate_without_persistence_or_bound_home_is_not_available() -> TestResult
-    {
+    async fn skills_deactivate_without_persistence_or_bound_home_is_not_available() -> TestResult {
         let (op_ctx, root) = context_with(None)?;
         let result = super::skills(&op_ctx, args("deactivate", Some("review"))).await;
         std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
@@ -1395,12 +1397,8 @@ mod tests {
     async fn skill_proposals_default_to_the_bound_profile() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = crate::config_util::test_home_context(temp.path())?;
-        let store = SkillProposalStore::new(
-            temp.path()
-                .join("profiles")
-                .join("default")
-                .join("skills"),
-        );
+        let store =
+            SkillProposalStore::new(temp.path().join("profiles").join("default").join("skills"));
         let id = propose_review_skill(&store)?;
         let mut services = ServiceMap::new();
         services.insert(home);

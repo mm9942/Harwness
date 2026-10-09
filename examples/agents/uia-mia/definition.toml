@@ -1,0 +1,13 @@
+# uia-mia: the smallest user-interface agent (UIA) for `harw agent build --native`.
+#
+# `role = "user-interface"` selects the Harw flavor of the native backend
+# (harw-agent-compiler/src/backend/native.rs): not a slim per-agent runner but a
+# complete, personalized `harw` with this agent baked in as the fixed root.
+# See docs/guides/agent-compiler.md and ./README.md for the commands.
+
+schema = "harwness.agent/v1"
+id = "user.agent.mia@1"
+version = "1.0.0"
+role = "user-interface"
+specialization = "terminal-ui"
+name = "Mia"

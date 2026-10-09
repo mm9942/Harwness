@@ -35,6 +35,7 @@ pub mod job_store;
 pub mod meta;
 pub mod reader;
 pub mod record;
+pub mod retention;
 pub mod store;
 
 pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL};

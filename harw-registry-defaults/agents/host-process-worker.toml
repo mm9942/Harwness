@@ -51,7 +51,6 @@ admitted = [
   "job.logs",
   "job.stop",
   "job.list",
-  "job.wait",
 ]
 forbidden = [
   "fs.read",

@@ -60,7 +60,7 @@ mod common;
 use common::{TestError, TestResult, ctx};
 
 /// Alle sieben Rechte in fester Reihenfolge (Bitposition = Index).
-const PERMISSIONS: [Permission; 7] = [
+const PERMISSIONS: [Permission; 8] = [
     Permission::ReadWorkspace,
     Permission::WriteWorkspace,
     Permission::ExecuteProcess,
@@ -68,6 +68,7 @@ const PERMISSIONS: [Permission; 7] = [
     Permission::ReadSecrets,
     Permission::ManagePlugins,
     Permission::ReadCargoRegistry,
+    Permission::ManageContainers,
 ];
 
 /// Die Browser-Werkzeuge, wie `harw-tool-browser` sie benennt.

@@ -84,10 +84,12 @@ use crate::harness_config::{
     SandboxSection, SessionSection, TuiSection,
 };
 use crate::internal_models::InternalModelsToml;
+use crate::memory_toml::MemorySection;
 use crate::mode_toml::ModeSection;
 use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
+use crate::retention_toml::RetentionSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
@@ -1253,6 +1255,122 @@ fn merge_tools_doc(
     }
 }
 
+// `[session_listener]` — alle sechs Felder `GlobalOnly` und
+// sicherheitskritisch: nur die Baseline (Home) setzt sie.
+fn merge_session_listener(
+    trusted: &mut HarnessConfig,
+    incoming: crate::session_listener_toml::SessionListenerSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["session_listener", field]);
+    global_only(
+        &mut trusted.session_listener.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "session_listener.enabled",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.listen,
+        incoming.listen,
+        present("listen"),
+        role,
+        "session_listener.listen",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.allow_non_loopback,
+        incoming.allow_non_loopback,
+        present("allow_non_loopback"),
+        role,
+        "session_listener.allow_non_loopback",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.node_id,
+        incoming.node_id,
+        present("node_id"),
+        role,
+        "session_listener.node_id",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.tier,
+        incoming.tier,
+        present("tier"),
+        role,
+        "session_listener.tier",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.approval_device,
+        incoming.approval_device,
+        present("approval_device"),
+        role,
+        "session_listener.approval_device",
+        layer_path,
+        out,
+    );
+}
+
+// `[tools.container]` — alle vier Felder `GlobalOnly` und sicherheitskritisch:
+// Home/Profil (Baseline) setzen sie, ein Projekt kann sie nie ändern.
+fn merge_tools_container(
+    trusted: &mut HarnessConfig,
+    incoming: crate::plan_toml::ContainerToolsSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["tools", "container", field]);
+    global_only(
+        &mut trusted.tools.container.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "tools.container.enabled",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.tools.container.engine,
+        incoming.engine,
+        present("engine"),
+        role,
+        "tools.container.engine",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.tools.container.connection,
+        incoming.connection,
+        present("connection"),
+        role,
+        "tools.container.connection",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.tools.container.images,
+        incoming.images,
+        present("images"),
+        role,
+        "tools.container.images",
+        layer_path,
+        out,
+    );
+}
+
 // `[mode]` (Abschnitt 1.9) — einziges Feld `ProfileReplaces`.
 fn merge_mode(
     trusted: &mut HarnessConfig,
@@ -1325,6 +1443,123 @@ fn merge_research(
         present("cache_ttl_secs"),
         role,
         "research.cache_ttl_secs",
+        layer_path,
+    );
+}
+
+// `[memory]` — alle zehn Felder `ProfileReplaces`: Home und Profil ersetzen,
+// ein nicht vertrautes Projekt darf keines setzen (wird gemeldet und
+// verworfen).
+fn merge_memory(
+    trusted: &mut HarnessConfig,
+    incoming: MemorySection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    let present = |field: &str| field_present(raw, &["memory", field]);
+    profile_replaces(
+        &mut trusted.memory.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "memory.enabled",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.global_enabled,
+        incoming.global_enabled,
+        present("global_enabled"),
+        role,
+        "memory.global_enabled",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.token_budget,
+        incoming.token_budget,
+        present("token_budget"),
+        role,
+        "memory.token_budget",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.max_facts,
+        incoming.max_facts,
+        present("max_facts"),
+        role,
+        "memory.max_facts",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.max_body_bytes,
+        incoming.max_body_bytes,
+        present("max_body_bytes"),
+        role,
+        "memory.max_body_bytes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.max_unused_days,
+        incoming.max_unused_days,
+        present("max_unused_days"),
+        role,
+        "memory.max_unused_days",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.consolidate_deadline_secs,
+        incoming.consolidate_deadline_secs,
+        present("consolidate_deadline_secs"),
+        role,
+        "memory.consolidate_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.forget_deadline_secs,
+        incoming.forget_deadline_secs,
+        present("forget_deadline_secs"),
+        role,
+        "memory.forget_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.promote_deadline_secs,
+        incoming.promote_deadline_secs,
+        present("promote_deadline_secs"),
+        role,
+        "memory.promote_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.sweep_deadline_secs,
+        incoming.sweep_deadline_secs,
+        present("sweep_deadline_secs"),
+        role,
+        "memory.sweep_deadline_secs",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.context_ledger,
+        incoming.context_ledger,
+        present("context_ledger"),
+        role,
+        "memory.context_ledger",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.security_signals,
+        incoming.security_signals,
+        present("security_signals"),
+        role,
+        "memory.security_signals",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.memory.llm_extraction,
+        incoming.llm_extraction,
+        present("llm_extraction"),
+        role,
+        "memory.llm_extraction",
         layer_path,
     );
 }
@@ -1777,6 +2012,82 @@ fn merge_jobs(
     }
 }
 
+// `[retention.<klasse>]` — je Klasse (aus `harw_retention::CLASSES`):
+// `enabled` und `keep_newest` sind `ProfileReplaces` (ein nicht vertrautes
+// Projekt kann also weder eine sicherheitsrelevante Löschung einschalten
+// noch Schutzdateien reduzieren); `max_age_secs`/`max_bytes`/`max_files`
+// sind `MinBound`: vertraute Layer (Home, Profil) setzen frei, ein nicht
+// vertrautes Projekt darf nur senken (Vergleichswert: der bisher gesetzte
+// Wert, sonst die Klassenvorgabe; `None` = unbegrenzt, jeder Wert senkt).
+fn merge_retention(
+    trusted: &mut HarnessConfig,
+    incoming: RetentionSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    for class in harw_retention::CLASSES {
+        let (Some(inc), Some(cur)) = (
+            incoming.class_config(class.id),
+            trusted.retention.class_config_mut(class.id),
+        ) else {
+            continue;
+        };
+        let present = |key: &str| field_present(raw, &["retention", class.id, key]);
+        profile_replaces(
+            &mut cur.enabled,
+            inc.enabled,
+            present("enabled"),
+            role,
+            &format!("retention.{}.enabled", class.id),
+            layer_path,
+        );
+        profile_replaces(
+            &mut cur.keep_newest,
+            inc.keep_newest,
+            present("keep_newest"),
+            role,
+            &format!("retention.{}.keep_newest", class.id),
+            layer_path,
+        );
+        let limits = [
+            (
+                "max_age_secs",
+                &mut cur.max_age_secs,
+                inc.max_age_secs,
+                class.defaults.max_age_secs,
+            ),
+            (
+                "max_bytes",
+                &mut cur.max_bytes,
+                inc.max_bytes,
+                class.defaults.max_bytes,
+            ),
+            (
+                "max_files",
+                &mut cur.max_files,
+                inc.max_files,
+                class.defaults.max_files,
+            ),
+        ];
+        for (key, slot, value, default) in limits {
+            let Some(value) = value else { continue };
+            if !present(key) {
+                continue;
+            }
+            let current = (*slot).or(default);
+            if role != LayerRole::UntrustedProject || current.is_none_or(|c| value <= c) {
+                *slot = Some(value);
+            } else {
+                let field = format!("retention.{}.{key}", class.id);
+                let diagnostic = ScopeDiagnostic::new(&field, layer_path, &value);
+                reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+            }
+        }
+    }
+}
+
 // `[agent_compiler]` (#22 Welle 2B) — alle drei Felder `ProfileReplaces`.
 fn merge_agent_compiler(
     trusted: &mut HarnessConfig,
@@ -2032,9 +2343,27 @@ pub(crate) fn merge_layer_into(
     );
     merge_onboarding(trusted, incoming.onboarding, raw, role, layer_path);
     merge_tools_doc(trusted, incoming.tools.doc, raw, role, layer_path, &mut out);
+    merge_tools_container(
+        trusted,
+        incoming.tools.container.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_tools_plan(trusted, incoming.tools, raw, role, layer_path, &mut out);
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
+    merge_memory(trusted, incoming.memory, raw, role, layer_path);
+    merge_session_listener(
+        trusted,
+        incoming.session_listener.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
+    merge_retention(trusted, incoming.retention, raw, role, layer_path, &mut out);
     merge_permissions(
         trusted,
         incoming.permissions,
@@ -2374,6 +2703,81 @@ mod tests {
         Ok(())
     }
 
+    // [tools.container]: nur die Baseline (Home) setzt; Profil und Projekt
+    // können weder aktivieren noch Images/Engine ändern.
+    #[test]
+    fn test_tools_container_is_global_only() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.tools.container.enabled);
+        let home = "[tools.container]\nenabled = true\nimages = [\"a=docker.io/x@sha256:00\"]";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(trusted.tools.container.enabled);
+        assert_eq!(trusted.tools.container.images.len(), 1);
+
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack =
+                "[tools.container]\nengine = \"/tmp/podman\"\nimages = [\"b=evil@sha256:11\"]";
+            merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(
+                trusted.tools.container.engine, "/usr/bin/podman",
+                "{role:?}"
+            );
+            assert_eq!(trusted.tools.container.images.len(), 1, "{role:?}");
+        }
+        Ok(())
+    }
+
+    // [session_listener]: nur die Baseline (Home) setzt; Profil und Projekt
+    // können weder aktivieren noch Adresse, Identität oder Tier ändern.
+    #[test]
+    fn test_session_listener_is_global_only() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.session_listener.enabled);
+        let home = "[session_listener]\nenabled = true\nnode_id = \"gw\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(trusted.session_listener.enabled);
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack =
+                "[session_listener]\nlisten = \"0.0.0.0:1\"\ntier = \"owner\"\nnode_id = \"evil\"";
+            merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(
+                trusted.session_listener.listen, "127.0.0.1:7443",
+                "{role:?}"
+            );
+            assert_eq!(trusted.session_listener.tier, "observer", "{role:?}");
+            assert_eq!(
+                trusted.session_listener.node_id.as_deref(),
+                Some("gw"),
+                "{role:?}"
+            );
+        }
+        Ok(())
+    }
+
     // [tools.doc] remote_ocr: Home/Profil setzen frei, ein nicht vertrautes
     // Projekt verschärft nur (`off` < `ask` < `on`).
     #[test]
@@ -2507,6 +2911,101 @@ mod tests {
         );
         assert_eq!(fresh.shell.max_timeout_secs, None);
         assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_retention_untrusted_project_can_only_tighten_and_never_opt_in() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        let home = "[retention.tui_log]\nmax_files = 10\n[retention.dod_spool]\nenabled = true";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.retention.tui_log.max_files, Some(10));
+        assert_eq!(trusted.retention.dod_spool.enabled, Some(true));
+
+        // Projekt: lockern (hoeher), Opt-in einer anderen Klasse, `enabled =
+        // false` und `keep_newest` werden verworfen; Senken wirkt.
+        let project = "[retention.tui_log]\nmax_files = 50\nmax_age_secs = 60\nkeep_newest = 0\n\
+                       [retention.dod_spool]\nenabled = false\n\
+                       [retention.freeze_resolved]\nenabled = true\nmax_files = 5";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.retention.tui_log.max_files, Some(10));
+        // Vorgabe 14 Tage; 60 s ist niedriger und damit erlaubt.
+        assert_eq!(trusted.retention.tui_log.max_age_secs, Some(60));
+        assert_eq!(trusted.retention.tui_log.keep_newest, None);
+        assert_eq!(trusted.retention.dod_spool.enabled, Some(true));
+        assert_eq!(trusted.retention.freeze_resolved.enabled, None);
+        // Unbegrenzte Vorgabe (`None`): jeder Wert senkt.
+        let fields: Vec<&str> = diagnostics.iter().map(|d| d.field.as_str()).collect();
+        assert!(
+            fields.contains(&"retention.tui_log.max_files"),
+            "{fields:?}"
+        );
+
+        // Ein vertrauter Profil-Layer darf auch lockern.
+        let profile = "[retention.tui_log]\nmax_files = 99";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.retention.tui_log.max_files, Some(99));
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_trusted_layers_replace_untrusted_project_is_ignored() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(trusted.memory.global_enabled);
+        assert_eq!(trusted.memory.max_facts, None);
+
+        let home = "[memory]\nglobal_enabled = false\nmax_facts = 100";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(!trusted.memory.global_enabled);
+        assert_eq!(trusted.memory.max_facts, Some(100));
+
+        // Ein nicht vertrauter Projekt-Layer darf nichts davon ändern.
+        let project = "[memory]\nglobal_enabled = true\nmax_facts = 5000\ntoken_budget = 9";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert!(!trusted.memory.global_enabled);
+        assert_eq!(trusted.memory.max_facts, Some(100));
+        assert_eq!(trusted.memory.token_budget, None);
+
+        // Ein Layer ohne `[memory]` lässt den Stand unberührt.
+        let other = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(other).map_err(ctx("parse other"))?,
+            &raw_from(other)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.memory.max_facts, Some(100));
         Ok(())
     }
 

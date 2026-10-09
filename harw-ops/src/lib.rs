@@ -14,8 +14,8 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 46 Ops): `help`, `status`, `quit`,
-//! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
+//! **Grundausstattung** ([`register_all`], 47 Ops): `help`, `status`, `quit`,
+//! `new`, `work`, `work.result`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
@@ -205,6 +205,8 @@ pub mod help;
 // Nicht Teil von `register_all`: registriert nur der
 // `InfrastructureContributor` der Runtime, wenn `[infrastructure]` gesetzt ist.
 pub mod infra;
+// Server-derived reach for durable job mutations (Slash vs model tool).
+pub mod job_authority;
 // H12: Mandanten-Sichtbarkeit durabler Jobs (gemeinsam für ps/work/attach/…).
 pub(crate) mod job_tenant;
 pub mod jobs;
@@ -217,9 +219,11 @@ pub mod learn;
 // Live-Stand der aufgelösten Konfiguration (Spiegel gelungener Persistenz).
 pub mod live_config;
 // Live-Übernahme von Modellwechseln (Provider-Neubau, Rollenwahl).
+pub mod learning_job;
 pub mod live_model;
 pub mod matrix;
 pub mod memory;
+pub mod memory_job;
 pub mod mode;
 pub mod model;
 pub mod models;
@@ -236,6 +240,7 @@ pub mod provider;
 pub mod ps;
 pub mod quit;
 pub mod research;
+pub mod retention_job;
 pub mod retry;
 pub mod review;
 pub mod sandbox_lease;
@@ -248,6 +253,7 @@ pub(crate) mod test_support;
 pub(crate) mod testutil;
 pub mod usage;
 pub mod work;
+pub mod work_result;
 // R14: `work_driver.*` (enqueue/status/stop) — nur Tool- und Web-Flächen,
 // registriert über `register_work_driver_tools` neben der Planungsfläche.
 pub mod work_driver;
@@ -300,12 +306,34 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 46 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Declares one operation list: a private constructor `fn $ops()` returning
+/// the operations as an array whose length is derived from the list itself,
+/// plus the matching `const $count` (the number of listed operations).
+///
+/// There is no hand-maintained array length or count constant: adding or
+/// removing a line changes both. The registering functions iterate
+/// `$ops()` and return `$count`.
+macro_rules! register_ops {
+    (
+        $(#[$meta:meta])*
+        $vis:vis const $count:ident;
+        fn $ops:ident = [ $($op:expr),+ $(,)? ];
+    ) => {
+        $(#[$meta])*
+        $vis const $count: usize = [$(stringify!($op)),+].len();
+
+        fn $ops() -> [Arc<dyn Operation>; $count] {
+            [ $($op),+ ]
+        }
+    };
+}
+
+/// Registriert alle 47 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
 /// jeder konkreten Op-Struct hinzu — jeweils genau einmal, in fester Reihenfolge:
-/// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
+/// `help, status, quit, new, work, work.result, ps, attach, stop, diff, agent, skills,
 /// plugins, model, provider, uia-model, uia-provider, permissions, compact,
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
 /// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
@@ -330,8 +358,9 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 46);
+/// assert_eq!(registry.len(), 47);
 /// assert!(registry.find_by_name("help").is_some());
+/// assert!(registry.find_by_name("work.result").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
 /// assert!(registry.find_by_command("/uia-worker-model").is_some());
@@ -360,12 +389,23 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/dream").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 46] = [
+    let ops = base_ops();
+    for op in ops {
+        registry.register(op);
+    }
+}
+
+register_ops! {
+    /// Anzahl der Operationen der Grundausstattung ([`register_all`]).
+    const BASE_OP_COUNT;
+    fn base_ops = [
+
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
         Arc::new(new::NewOperation),
         Arc::new(work::WorkOperation),
+        Arc::new(work_result::WorkResultOperation),
         Arc::new(ps::PsOperation),
         Arc::new(attach::AttachOperation),
         Arc::new(stop::StopOperation),
@@ -463,13 +503,7 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // handelt als Bedienerin; kein Modell-Werkzeug).
         Arc::new(jobs::JobsOperation),
     ];
-    for op in ops {
-        registry.register(op);
-    }
 }
-
-/// Anzahl der Operationen, die [`register_plan_tools`] bei aktivem Gate hinzufügt.
-pub const PLAN_TOOL_COUNT: usize = 7;
 
 /// Registriert die Planungs-, Explorations- und Recherche-Operationen — gegated.
 ///
@@ -529,7 +563,18 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
     if !config.enabled {
         return 0;
     }
-    let ops: [Arc<dyn Operation>; PLAN_TOOL_COUNT] = [
+    let ops = plan_ops();
+    for op in ops {
+        registry.register(op);
+    }
+    PLAN_TOOL_COUNT
+}
+
+register_ops! {
+    /// Anzahl der Operationen, die [`register_plan_tools`] bei aktivem Gate hinzufügt.
+    pub const PLAN_TOOL_COUNT;
+    fn plan_ops = [
+
         Arc::new(plan::PlanOperation),
         Arc::new(goal::GoalOperation),
         Arc::new(explore::ExploreOperation),
@@ -538,14 +583,7 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
         Arc::new(research::ResearchWebOperation),
         Arc::new(analyze::AnalyzeOperation),
     ];
-    for op in ops {
-        registry.register(op);
-    }
-    PLAN_TOOL_COUNT
 }
-
-/// Anzahl der Operationen, die [`register_work_driver_tools`] bei aktivem Gate hinzufügt.
-pub const WORK_DRIVER_TOOL_COUNT: usize = 3;
 
 /// Registriert die WorkDriver-Operationen — hinter demselben Gate wie die
 /// Planungsfläche.
@@ -595,15 +633,22 @@ pub fn register_work_driver_tools(
     if !config.enabled {
         return 0;
     }
-    let ops: [Arc<dyn Operation>; WORK_DRIVER_TOOL_COUNT] = [
-        Arc::new(work_driver::WorkDriverEnqueueOperation),
-        Arc::new(work_driver::WorkDriverStatusOperation),
-        Arc::new(work_driver::WorkDriverStopOperation),
-    ];
+    let ops = work_driver_ops();
     for op in ops {
         registry.register(op);
     }
     WORK_DRIVER_TOOL_COUNT
+}
+
+register_ops! {
+    /// Anzahl der Operationen, die [`register_work_driver_tools`] bei aktivem Gate hinzufügt.
+    pub const WORK_DRIVER_TOOL_COUNT;
+    fn work_driver_ops = [
+
+        Arc::new(work_driver::WorkDriverEnqueueOperation),
+        Arc::new(work_driver::WorkDriverStatusOperation),
+        Arc::new(work_driver::WorkDriverStopOperation),
+    ];
 }
 
 #[cfg(test)]
@@ -885,7 +930,7 @@ mod tests {
     fn register_all_adds_forty_six_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 46);
+        assert_eq!(reg.len(), 47);
     }
 
     #[test]
@@ -1078,6 +1123,7 @@ mod tests {
             "quit",
             "new",
             "work",
+            "work.result",
             "ps",
             "attach",
             "stop",
@@ -1186,8 +1232,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            46,
-            "first register_all must produce exactly 46 ops"
+            47,
+            "first register_all must produce exactly 47 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -1201,8 +1247,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            46,
-            "registry must stay at 46 after a rejected duplicate"
+            47,
+            "registry must stay at 47 after a rejected duplicate"
         );
     }
 }

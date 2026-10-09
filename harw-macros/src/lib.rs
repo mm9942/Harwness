@@ -56,6 +56,12 @@
 //! `harw-tools`, `harw-types` oder dem später gebauten
 //! `harw-dod-warden-proto` ab — alle erzeugten Pfade sind rein textuell.
 //!
+//! [`macro@retention_classes`] declares every class of ephemeral data (logs,
+//! caches, spools) once and derives the `[retention]` config struct, the
+//! `CLASSES` registry and `policy_for` (with the opt-in rule for
+//! security-relevant classes) from that single list. Generated paths are
+//! textual (`::harw_retention::..`).
+//!
 //! # Modulaufbau
 //!
 //! Proc-Macro-Crates dürfen `#[proc_macro*]`-Funktionen nur aus dem Crate-Root
@@ -94,6 +100,7 @@ mod op_args;
 mod operation;
 mod raw_args;
 mod redact;
+mod retention_classes;
 mod schema;
 mod sensor_source;
 mod tool;
@@ -110,11 +117,17 @@ mod test_support;
 /// - `#[msg("...")]` controls the `Display` output. `{0}`, `{1}`, ... refer to
 ///   tuple fields, `{name}` refers to named fields.
 /// - `#[from]` generates a `From<Inner>` impl and wires `source()` to the inner
-///   error. Only valid on single-field tuple variants.
+///   error. On a variant it is valid on single-field tuple variants; on the
+///   single field of a named (struct) variant it also generates `From` and,
+///   without `#[msg]`, displays the inner error.
+/// - `#[source]` on a field (named or tuple) wires `source()` to that field
+///   without generating `From`; use it for variants like
+///   `Read { path, #[source] source }`. At most one `#[source]`/`#[from]` field
+///   per variant; the field type must implement `std::error::Error + 'static`.
 ///
 /// When the enum name ends in `Error`, a `pub type <Prefix>Result<T> =
 /// Result<T, <Enum>>;` alias is also emitted (e.g. `CoreError` -> `CoreResult`).
-#[proc_macro_derive(HarwError, attributes(msg, from))]
+#[proc_macro_derive(HarwError, attributes(msg, from, source))]
 pub fn derive_harw_error(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match error::expand_harw_error(&input) {
@@ -174,6 +187,8 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// | `permission` | `= "..."` | none | sandbox permission checked before anything else |
 /// | `host_from` | `= "<field>"` | none | args field holding the URL whose host is checked |
 /// | `parallel_safe` | flag or `= true`/`= false` | `false` | whether concurrent calls are safe |
+/// | `state` | `= Type` | none | the executor carries a `Type`; the fn takes `&Type` as an extra first argument |
+/// | `schema_from` | `= path` | none | `path()` returns the `ToolSpec` (externally built schema) instead of `Args::tool_spec()` |
 ///
 /// Accepted `permission` values are `"read_workspace"`, `"write_workspace"`,
 /// `"execute_process"`, `"network_access"`, `"read_secrets"`,
@@ -182,11 +197,38 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// allowed set rather than a silent fallback onto a different permission; a
 /// typo must never resolve to a *different* (possibly weaker) permission.
 ///
+/// # Stateful tools and external schemas
+///
+/// ```ignore
+/// #[tool(
+///     name = "palace.search",
+///     permission = "read_workspace",
+///     state = Arc<KnowledgeStore>,
+///     schema_from = search_spec,
+///     parallel_safe,
+/// )]
+/// async fn palace_search(
+///     store: &Arc<KnowledgeStore>,
+///     context: &ToolExecutionContext,
+///     args: SearchArgs,
+/// ) -> Result<ToolOutput, ToolsError> { ... }
+/// ```
+///
+/// With `state = Type` the wrapper is `struct PalaceSearchTool { state: Type }`
+/// with `PalaceSearchTool::new(state)` (no `Default`, no `Copy`; `Type` must be
+/// `Debug + Clone`) and the function receives `&Type` as its first argument. A
+/// `tool_provider!` with `state` builds such tools from a constructor
+/// expression. With `schema_from = path`, `spec()` calls `path()` (which must
+/// return `::harw_tools::ToolSpec`) and the args type does not need
+/// `#[derive(Tool)]`; name and description are still overwritten from
+/// `NAME` / `DESCRIPTION`.
+///
 /// # What is generated
 ///
 /// 1. The original `async fn`, unchanged.
-/// 2. A unit wrapper struct (`FsGlobTool`) deriving `Debug`, `Clone`, `Copy`
-///    and `Default`.
+/// 2. A wrapper struct (`FsGlobTool`) — a unit struct deriving `Debug`,
+///    `Clone`, `Copy` and `Default`, or (with `state`) a one-field struct with
+///    `new(state)`.
 /// 3. Associated consts `NAME`, `DESCRIPTION`, `PARALLEL_SAFE: bool` and
 ///    `PERMISSION: Option<::harw_tools::Permission>`. `PERMISSION` is the
 ///    auditable declaration; the prologue below is the actual enforcement.
@@ -482,7 +524,9 @@ pub fn derive_op_args(input: TokenStream) -> TokenStream {
 ///
 /// Anwendbar auf `pub struct Foo(String);`. Der Fehlertyp wird über
 /// `#[harw_id(error = "…", ctor = "…")]` konfiguriert; `#[harw_id(infallible)]`
-/// erzeugt zusätzlich einen unvalidierten Kompatibilitätskonstruktor `new`.
+/// erzeugt zusätzlich einen unvalidierten Kompatibilitätskonstruktor `new`;
+/// `#[harw_id(validate = "pfad::fn")]` ersetzt die Leerprüfung durch eine eigene
+/// Regel `fn(&str) -> Result<(), Fehler>`.
 ///
 /// # Errors
 /// - Kein Tuple-Struct mit genau einem `String`-Feld → `syn::Error`.
@@ -496,9 +540,11 @@ pub fn derive_harw_id(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Leitet `ALL`, `as_str`, `Display` und `FromStr` in kebab-case für ein Enum
-/// aus reinen Unit-Varianten ab (`FromStr` akzeptiert kebab- und snake_case,
-/// case-insensitiv).
+/// Leitet `ALL`, `as_str`, `Display` und `FromStr` in kebab-case (oder mit
+/// `#[kebab_enum(case = "snake")]` in snake_case) für ein Enum aus reinen
+/// Unit-Varianten ab (`FromStr` akzeptiert kebab- und snake_case,
+/// case-insensitiv). Optional: `parse_option` (`parse -> Option<Self>`),
+/// `no_from_str`, `no_all`.
 ///
 /// # Errors
 /// - Nicht-Unit-Variante → `syn::Error`.
@@ -632,6 +678,44 @@ pub fn field(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn metrics(input: TokenStream) -> TokenStream {
     match metrics::expand_metrics(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Declares retention classes once and derives config, registry and policy
+/// resolution from the list.
+///
+/// # Description
+/// Expects `config = <Name>;` followed by one block per class:
+/// `id: ephemeral | security_relevant { dir = <fn path>, name = <matcher>,
+/// max_age_secs = <n|none>, max_bytes = <n|none>, max_files = <n|none>,
+/// keep_newest = <n> }`. `name` is `any`, `prefix("..")`, `suffix("..")`,
+/// `contains("..")` or `prefix_suffix("..", "..")`; `dir` is a `fn(&::harw_retention::Roots) ->
+/// Vec<PathBuf>`. Expands (in the calling module) to the config struct
+/// (`serde(default, deny_unknown_fields)`, one `ClassConfig` per class),
+/// `pub static CLASSES`, `policy_for` and `resolve_all`. Security-relevant
+/// classes resolve to `enabled = false` unless config says `enabled = true`.
+/// See the `retention_classes` module docs for the full grammar.
+///
+/// # Compile-Fehler bei
+/// - doppelter Klassen-ID, unbekannter Art/Matcher/Schlüssel;
+/// - fehlendem Pflichtschlüssel (`dir`, `name`, `max_age_secs`, `max_bytes`,
+///   `max_files`) oder einem Limit von `0`.
+///
+/// # Examples
+/// ```ignore
+/// harw_macros::retention_classes! {
+///     config = RetentionConfig;
+///     tui_log: ephemeral {
+///         dir = tui_log_dirs, name = prefix("tui"),
+///         max_age_secs = 1_209_600, max_bytes = none, max_files = 5,
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn retention_classes(input: TokenStream) -> TokenStream {
+    match retention_classes::expand_retention_classes(input.into()) {
         Ok(ts) => ts.into(),
         Err(err) => err.to_compile_error().into(),
     }

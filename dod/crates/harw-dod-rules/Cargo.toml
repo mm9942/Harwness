@@ -41,6 +41,7 @@ semver = { workspace = true }
 rayon = "1.12.0"
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 # Nur für Tests: baut einen `NetworkScope` mit einem `Cidr`-Ziel über dessen
 # öffentliche `Deserialize`-Implementierung (`harw_authority::NetworkScope`
 # bietet keinen anderen öffentlichen Konstruktor für ein `Cidr`-Ziel).

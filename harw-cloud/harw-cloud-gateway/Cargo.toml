@@ -1,0 +1,22 @@
+[package]
+name = "harw-cloud-gateway"
+version = "0.9.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Harwness cloud gateway configuration and status probing"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+tracing = "0.1"
+pingora = { version = "0.9", optional = true }
+
+[features]
+proxy = ["dep:pingora"]
+
+[lints]
+workspace = true

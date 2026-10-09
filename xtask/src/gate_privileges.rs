@@ -428,6 +428,7 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-dod-netcounters", RequiredPrivilege::Unprivileged),
     ("harw-dod-gpu", RequiredPrivilege::Unprivileged),
     ("harw-dod-cgroup", RequiredPrivilege::Unprivileged),
+    ("harw-dod-container", RequiredPrivilege::Unprivileged),
     ("harw-dod-listener", RequiredPrivilege::Unprivileged),
     ("harw-dod-scanreport", RequiredPrivilege::Unprivileged),
     ("harw-dod-workspace", RequiredPrivilege::Unprivileged),
@@ -499,6 +500,11 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     // Symlinkfeste Datei-Grundbausteine (`openat2`, atomares Schreiben,
     // Rechteprüfung über `geteuid`) — gewöhnliche Dateisystem-Syscalls.
     ("harw-fsutil", RequiredPrivilege::Unprivileged),
+    // Aufbewahrungs-Sweeps (`harw-retention`): lstat, `read_dir` und `unlink`
+    // regulärer Dateien unter einem übergebenen Verzeichnis mit
+    // `std::fs`, ohne Symlink-Folgen. Kein `Capability::`, kein Socket, keine
+    // Beobachtung, kein BPF, kein Mount — gewöhnliche Benutzer-I/O.
+    ("harw-retention", RequiredPrivilege::Unprivileged),
     // --- Netlink (Capability::class() == Netlink) ---
     // Konservativ: `AuditBackend` trägt `Capability::ReadAuditNetlink`; das
     // (laut eigener Moduldoku bewusst nicht existierende) Journal-Backend

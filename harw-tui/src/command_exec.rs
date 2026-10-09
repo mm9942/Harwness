@@ -1397,6 +1397,7 @@ mod tests {
     /// `ExecuteProcess` der Sandbox, und liefert ein strukturiertes Ergebnis.
     #[tokio::test]
     async fn dispatch_shell_repeat_with_previous_command_reruns_it() -> TestResult {
+        crate::test_support::install_host_port();
         let adapters = adapters();
         let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
@@ -2363,6 +2364,8 @@ mod tests {
         ("exit", "deferred", ""),
         ("export", "deferred", ""),
         ("help", "immediate", ""),
+        // `/image <pfad>` merkt nur ein Bild vor, auch im laufenden Turn.
+        ("image", "immediate", ""),
         // Plan R9, Teil F: `/jobs` (lesen, stoppen) läuft sofort.
         ("jobs", "immediate", ""),
         (

@@ -23,7 +23,6 @@
       "job.logs",
       "job.stop",
       "job.list",
-      "job.wait",
       "skills.search",
       "skills.load"
     ],
@@ -152,7 +151,6 @@
       "job.start",
       "job.status",
       "job.stop",
-      "job.wait",
       "shell.exec",
       "skills.load",
       "skills.search"
@@ -260,7 +258,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/executor.toml",
-          "line": 133,
+          "line": 132,
           "column": 11
         },
         "path": "context.program"
@@ -269,6 +267,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "e5415145ec955b9a94f43b3223def6dc18b993bd232c8ced3455ea0f2200e131"
+    "digest": "811c297851dae996199e83681c67b8fe643f59d554dd3df00c9e6aaf3532cd91"
   }
 }

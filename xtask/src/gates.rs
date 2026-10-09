@@ -47,6 +47,10 @@ pub mod warden;
 // Schichtenregeln aus `xtask/arch-policy.toml` (Architekturplan §47/§55/§56).
 #[path = "gate_arch.rs"]
 pub mod arch;
+// Regel PL-93: Anwendungscode startet keine Workload-Prozesse, er reicht Jobs
+// ein (Ratsche: neue Startstellen sind Verstöße, die Liste kann nur schrumpfen).
+#[path = "gate_spawn.rs"]
+pub mod spawn;
 
 /// Lädt den (einen) Wurzel-Workspace samt DoD-Domäne als Graphen.
 ///
@@ -158,6 +162,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "warden-deps",
             "warden-cbuild",
             "arch",
+            "spawn",
         ]
     } else {
         args.iter().map(String::as_str).collect()
@@ -171,6 +176,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "warden-deps" => warden::dependency_budget::run()?,
             "warden-cbuild" => warden::c_build::run()?,
             "arch" => arch::run()?,
+            "spawn" => spawn::run()?,
             other => return Err(format!("unbekanntes Gate '{other}'")),
         };
         println!("{}", report.summary());

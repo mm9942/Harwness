@@ -1,0 +1,325 @@
+{
+  "format_version": 1,
+  "pinned_ref": "197a92e92d438bf6bf93b129bb964f4852686149",
+  "generated": "manual-source-verified-seed-not-runtime-export",
+  "notes": "This source-derived seed is intentionally small. A runtime ToolSpec exporter is the required authority before large-scale training. Availability/permissions always come from Harwness runtime.",
+  "tools": [
+    {
+      "name": "fs.read",
+      "source": "harw-tool-fs/src/provider.rs#fs_read_spec",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "fs.read",
+          "description": "Read a UTF-8 text file with line numbers from the workspace. Use one mode: line/limit (default), tail, or offset/max_bytes; prefer fs.search for broad discovery.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "File relative to workspace root."
+              },
+              "line": {
+                "type": "integer",
+                "description": "First line, 1-based; default 1."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum lines, default 400, maximum 2000."
+              },
+              "tail": {
+                "type": "integer",
+                "description": "Last N lines (maximum 2000); cannot combine with byte mode."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Byte offset in byte mode only."
+              },
+              "max_bytes": {
+                "type": "integer",
+                "description": "Maximum bytes in byte mode; at most 65536."
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "fs.search",
+      "source": "harw-tool-fs/src/provider.rs#fs_search_spec",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "fs.search",
+          "description": "Recursively search workspace files for a case-sensitive substring. Returns matched paths and line numbers; skips .git/target/node_modules; no shell necessary.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Case-sensitive substring to find."
+              },
+              "path": {
+                "type": "string",
+                "description": "Search root relative to workspace, default '.'."
+              },
+              "max_matches": {
+                "type": "integer",
+                "description": "Maximum hits, default 100, maximum 1000."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "fs.list",
+      "source": "harw-tool-fs/src/provider.rs#fs_list_spec",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "fs.list",
+          "description": "List entries in one workspace directory, sorted by name; does not recursively search contents.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Directory relative to workspace root."
+              },
+              "max_entries": {
+                "type": "integer",
+                "description": "Maximum entries; default 200."
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "fs.edit",
+      "source": "harw-tool-fs/src/provider.rs#fs_edit_spec",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "fs.edit",
+          "description": "Replace unique literal text in an existing UTF-8 file atomically. Requires WriteWorkspace permission; reject ambiguous matches. Prefer over fs.write for existing files.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Existing file relative to workspace."
+              },
+              "old_string": {
+                "type": "string",
+                "description": "Exact nonempty text to replace, unique unless replace_all."
+              },
+              "new_string": {
+                "type": "string",
+                "description": "Replacement text, must differ from old_string."
+              },
+              "replace_all": {
+                "type": "boolean",
+                "description": "Replace all occurrences; default false."
+              }
+            },
+            "required": [
+              "path",
+              "old_string",
+              "new_string"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "lens.ask",
+      "source": "harw-tool-lens/src/ask_tool.rs#LensAskArgs",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "lens.ask",
+          "description": "Ask a question across all indexes visible to the caller. The tool selects scope; never pass index_name. Inspect placeholder_embeddings before trusting semantic similarity.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "question": {
+                "type": "string",
+                "description": "Unprefixed natural-language question."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum hits per index, default 10 and hard maximum 50."
+              }
+            },
+            "required": [
+              "question"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "skills.search",
+      "source": "harw-registry-defaults/src/skill_tools.rs#search_spec",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "skills.search",
+          "description": "Search the trusted skill catalog for relevant procedures; do not search private skill files via filesystem. Then load the chosen skill with skills.load.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search terms, optional."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum results, 1..30."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Result offset for paging."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "skills.load",
+      "source": "harw-registry-defaults/src/skill_tools.rs#load_spec",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "skills.load",
+          "description": "Load a named skill from the trusted skill catalog, optionally a specific section, before following it.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Exact skill name returned by skills.search."
+              },
+              "section": {
+                "type": "string",
+                "description": "Optional heading or substring of a section."
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_wave",
+      "source": "harw-core-bridge/src/delegate_wave.rs#DELEGATE_WAVE_ARGS_SCHEMA",
+      "scope": "verified-source-derived-snapshot",
+      "interface": {
+        "type": "function",
+        "function": {
+          "name": "delegate_wave",
+          "description": "Orchestrator-only bounded fan-out to visible child roles; this is a model tool, not an arbitrary worker privilege; returns collected results.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "targets": {
+                "type": "array",
+                "description": "One to sixteen scoped children; every role must be an admitted visible target.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Optional unique wave id."
+                    },
+                    "role": {
+                      "type": "string",
+                      "description": "Admitted child role."
+                    },
+                    "task": {
+                      "type": "string",
+                      "description": "Bounded task for child; may be empty only with continue_from."
+                    },
+                    "complexity": {
+                      "type": "string",
+                      "enum": [
+                        "simple",
+                        "complex"
+                      ],
+                      "description": "Model tier; never modifies rights."
+                    },
+                    "continue_from": {
+                      "type": "string",
+                      "description": "Own budget-ended child id to continue."
+                    },
+                    "user_approved": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "scenario",
+                          "plan"
+                        ]
+                      },
+                      "description": "Only if explicitly approved by the user; never a rights grant."
+                    }
+                  },
+                  "required": [
+                    "role"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "join": {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "any",
+                  "collect"
+                ],
+                "description": "Join semantics; default all."
+              },
+              "max_parallel": {
+                "type": "integer",
+                "description": "Max simultaneous children; default min(4, target count)."
+              }
+            },
+            "required": [
+              "targets"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    }
+  ]
+}

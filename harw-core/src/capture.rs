@@ -72,4 +72,20 @@ pub trait ToolOutcomeObserver: Send + Sync {
     fn on_turn_finished(&self, session_id: &SessionId) {
         let _ = session_id;
     }
+
+    /// Wird am erfolgreichen Ende eines Turns mit dem Text der letzten
+    /// Nutzernachricht aufgerufen (vor [`Self::on_turn_finished`]). Grundlage
+    /// der Rückmeldung zu gelieferten Gedächtnisfakten (hat der Nutzer
+    /// korrigiert?). Standardmäßig ein No-op.
+    fn on_user_message(&self, session_id: &SessionId, text: &str) {
+        let _ = (session_id, text);
+    }
+
+    /// Wird am erfolgreichen Ende eines Turns mit dem Text der letzten
+    /// Assistentenantwort aufgerufen (vor [`Self::on_turn_finished`]).
+    /// Grundlage der Rückmeldung zu gelieferten Gedächtnisfakten (wurde ein
+    /// Fakt genutzt?). Standardmäßig ein No-op.
+    fn on_assistant_message(&self, session_id: &SessionId, text: &str) {
+        let _ = (session_id, text);
+    }
 }

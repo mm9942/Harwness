@@ -31,6 +31,7 @@
 //!   nötig, fontspec bekommt den Namen unverändert).
 
 use harw_authority::Permission;
+use harw_tools::schema_helpers::string_property;
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
@@ -646,15 +647,6 @@ impl ToolExecutor for LatexTemplateExecutor {
 }
 
 // ── Schema ────────────────────────────────────────────────────────────────────
-
-/// Ein optionales String-Feld fürs Schema.
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
 
 /// Die Werkzeugbeschreibung für das Modell.
 pub(crate) fn tool_spec() -> ToolSpec {

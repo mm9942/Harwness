@@ -430,7 +430,9 @@ fn saved_scenarios(root: &Path) -> Vec<String> {
 /// # Errors
 /// [`OpError::NotAvailable`], wenn kein Root-Space gebunden ist.
 fn matrix_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
-    Ok(harw_home::matrix_dir(&crate::config_util::bound_home(ctx)?.profile_dir))
+    Ok(harw_home::matrix_dir(
+        &crate::config_util::bound_home(ctx)?.profile_dir,
+    ))
 }
 
 /// Dateisystemtauglicher Name (ASCII-Alphanumerik, `-`, `_`).
@@ -962,9 +964,13 @@ mod tests {
         let listed = list_output(&unbound)?.data.ok_or("list ohne Daten")?;
         assert_eq!(listed["saved"], json!([]));
 
-        let refused = start_run(&unbound, resolve_known_scenario("karst-islands", None)?, None)
-            .err()
-            .ok_or("Laufstart ohne gebundenen Root-Space muss scheitern")?;
+        let refused = start_run(
+            &unbound,
+            resolve_known_scenario("karst-islands", None)?,
+            None,
+        )
+        .err()
+        .ok_or("Laufstart ohne gebundenen Root-Space muss scheitern")?;
         assert!(matches!(refused, OpError::NotAvailable(_)), "{refused}");
 
         let resolved = resolve_known_scenario("karst-islands", None)?;

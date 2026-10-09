@@ -70,6 +70,7 @@ ipnet = { workspace = true }
 # Dev-Dependency, für seine eigenen Testfixturen) verwenden.
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 tempfile = { workspace = true }
 
 [lints]

@@ -288,6 +288,9 @@ pub struct AgentSession {
     /// siehe [`crate::capture::ToolOutcomeObserver`]). `None`: kein
     /// Beobachter registriert.
     tool_outcome_observer: Option<std::sync::Arc<dyn crate::capture::ToolOutcomeObserver>>,
+    /// Kontext-Ledger dieser Session: pro Turn je Fragment angeboten oder
+    /// ausgelassen (nur Labels und Größen, nie Inhalt). `None`: kein Ledger.
+    context_ledger: Option<std::sync::Arc<dyn harw_context_ledger::LedgerSink>>,
     /// Fest zugeordnetes Provider-/Modellpaar für den Compaction-
     /// Zusammenfassungs-Aufruf dieser Session (Addendum C: interne
     /// Modellstellen). `(None, None)`: kein Pin gesetzt — `maybe_compact`
@@ -313,6 +316,9 @@ pub struct AgentSession {
     /// (< 64k) — `collect_tools` liefert dann kompakte Werkzeugschemas
     /// (gekürzte Beschreibungen).
     compact_tool_schemas: bool,
+    /// The host detaches `AwaitingChild` pauses into its own in-process
+    /// background launcher (TUI); counts as a background executor.
+    host_background_launcher: bool,
     /// Beobachter, der nach jeder Modellrunde und jedem Tool-Ergebnis dieser
     /// Session über Fortschritt benachrichtigt wird (Lease-Erneuerung durch
     /// `ManagedAgentSpawner`). `None`: kein Beobachter registriert.
@@ -616,12 +622,14 @@ impl AgentSession {
             output_reserve_resolver: None,
             compaction_observer: None,
             tool_outcome_observer: None,
+            context_ledger: None,
             compaction_summary_model: (None, None),
             guard_policy: crate::guard::GuardPolicy::default(),
             drift_observer: None,
             pitfall_advisor: None,
             guard_state: crate::guard::SessionGuardState::default(),
             compact_tool_schemas: false,
+            host_background_launcher: false,
             progress_observer: None,
             token_calibration: crate::context_budget::TokenCalibration::default(),
             max_output_tokens: None,
@@ -1110,6 +1118,24 @@ impl AgentSession {
         self
     }
 
+    /// Registriert den Kontext-Ledger (siehe `harw-context-ledger`): der
+    /// Turn-Loop schreibt je Turn, welche Fragmente angeboten und welche
+    /// ausgelassen wurden. `None` schaltet ihn ab.
+    #[must_use]
+    pub fn with_context_ledger(
+        mut self,
+        ledger: Option<std::sync::Arc<dyn harw_context_ledger::LedgerSink>>,
+    ) -> Self {
+        self.context_ledger = ledger;
+        self
+    }
+
+    /// Liefert den Kontext-Ledger, falls registriert.
+    #[must_use]
+    pub fn context_ledger(&self) -> Option<&std::sync::Arc<dyn harw_context_ledger::LedgerSink>> {
+        self.context_ledger.as_ref()
+    }
+
     /// Liefert den aktuell registrierten Tool-Outcome-Beobachter, falls vorhanden.
     #[must_use]
     pub fn tool_outcome_observer(
@@ -1166,6 +1192,21 @@ impl AgentSession {
     #[must_use]
     pub fn pitfall_advisor(&self) -> Option<&std::sync::Arc<dyn crate::guard::PitfallAdvisor>> {
         self.pitfall_advisor.as_ref()
+    }
+
+    /// Declares that the host registered an in-process background launcher
+    /// that detaches `TurnOutcome::AwaitingChild` pauses (the TUI
+    /// `BackgroundLauncher`). Such a session counts as having a background
+    /// executor even without a durable agent job submitter; the child is
+    /// never driven inline by the turn loop.
+    pub fn set_host_background_launcher(&mut self, present: bool) {
+        self.host_background_launcher = present;
+    }
+
+    /// Whether the host detaches delegation pauses into the background.
+    #[must_use]
+    pub fn host_background_launcher(&self) -> bool {
+        self.host_background_launcher
     }
 
     /// Runde 7, Teil L9: schaltet kompakte Werkzeugschemas ein bzw. aus

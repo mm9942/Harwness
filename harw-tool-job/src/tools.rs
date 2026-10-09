@@ -1,5 +1,7 @@
 //! Die Modell-Werkzeuge `job.start`, `job.status`, `job.logs`, `job.stop`,
-//! `job.list`, `job.wait` ([`JobToolProvider`]).
+//! `job.list` ([`JobToolProvider`]). There is deliberately no blocking wait tool:
+//! job-managed work is background-only (the `transfer_to_*` handoff; inline agent tools are tracked as TODO(PL-90)) and its progress and end arrive as
+//! notifications.
 //!
 //! # Sicherheitskontrakt
 //! - `job.start`: [`Permission::ExecuteProcess`] (hier **und** im
@@ -28,16 +30,15 @@
 //!   --kind work` des Operators.
 //!
 //! # Nebenläufigkeit
-//! `job.status`, `job.logs`, `job.list` und `job.wait` sind `parallel_safe`
+//! `job.status`, `job.logs` und `job.list` sind `parallel_safe`
 //! (lesend), `job.start` und `job.stop` nicht.
 
 use crate::launcher::JobLauncher;
 use crate::logs::{LogQuery, LogSlice, read_log};
-use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest, WaitOutcome};
+use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest};
 use crate::model::{JobEndReason, JobId, JobOwner, JobStatus, STDERR_LOG, STDOUT_LOG};
 use crate::procfs::JobSignal;
 use harw_authority::Permission;
-use harw_extension_api::contributors::ToolProvider;
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
@@ -50,7 +51,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 
 /// Name des Startwerkzeugs.
@@ -63,32 +63,23 @@ pub const JOB_LOGS_TOOL: &str = "job.logs";
 pub const JOB_STOP_TOOL: &str = "job.stop";
 /// Name des Listenwerkzeugs.
 pub const JOB_LIST_TOOL: &str = "job.list";
-/// Name des Wartewerkzeugs.
-pub const JOB_WAIT_TOOL: &str = "job.wait";
 
 /// Alle Job-Werkzeuge in Registrierungsreihenfolge.
-pub const JOB_TOOL_NAMES: [&str; 6] = [
+pub const JOB_TOOL_NAMES: [&str; 5] = [
     JOB_START_TOOL,
     JOB_STATUS_TOOL,
     JOB_LOGS_TOOL,
     JOB_STOP_TOOL,
     JOB_LIST_TOOL,
-    JOB_WAIT_TOOL,
 ];
 
 /// Die rein lesenden Job-Werkzeuge (Kandidaten für `AUTO_APPROVED_TOOLS`).
-pub const JOB_READ_TOOLS: [&str; 4] =
-    [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL, JOB_WAIT_TOOL];
+pub const JOB_READ_TOOLS: [&str; 3] = [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL];
 
-/// Die Werkzeuge, die Orchestratoren ohne Shell tragen: lesen, warten und
-/// stoppen — kein `job.start`.
-pub const JOB_CONTROL_TOOLS: [&str; 5] = [
-    JOB_STATUS_TOOL,
-    JOB_LOGS_TOOL,
-    JOB_STOP_TOOL,
-    JOB_LIST_TOOL,
-    JOB_WAIT_TOOL,
-];
+/// Die Werkzeuge, die Orchestratoren ohne Shell tragen: lesen und stoppen —
+/// kein `job.start`, kein blockierendes Warten.
+pub const JOB_CONTROL_TOOLS: [&str; 4] =
+    [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_STOP_TOOL, JOB_LIST_TOOL];
 
 /// Der Befehlstext eines `job.start`-Aufrufs für Freigabe und Auto-Modus:
 /// `command` bzw. `argv`, mit [`shell_quote`] zu einem Befehl verbunden.
@@ -138,13 +129,6 @@ pub fn job_start_command_text(arguments: &Value) -> Option<String> {
     }
 }
 
-/// Höchste Wartezeit von `job.wait` in Sekunden.
-///
-/// R18 F8: `job.wait` ist ein kurzes Abfragen, kein langes Blockieren —
-/// Agenten haben mit `timeout_secs: 600` über eine Stunde in
-/// `job.wait`-Schleifen gehangen. Das Ende eines Jobs kommt ohnehin als
-/// Notiz; ein größerer Wert wird abgewiesen (kein stilles Klemmen).
-pub const MAX_WAIT_SECS: u64 = 60;
 /// Vorgabe für `job.logs` ohne `tail`/`since_line`.
 const DEFAULT_LOG_TAIL: usize = 100;
 /// Höchstzahl Zeilen je Stream in `job.logs`.
@@ -269,32 +253,6 @@ enum Kind {
     Logs,
     Stop,
     List,
-    Wait,
-}
-
-impl Kind {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            JOB_START_TOOL => Some(Self::Start),
-            JOB_STATUS_TOOL => Some(Self::Status),
-            JOB_LOGS_TOOL => Some(Self::Logs),
-            JOB_STOP_TOOL => Some(Self::Stop),
-            JOB_LIST_TOOL => Some(Self::List),
-            JOB_WAIT_TOOL => Some(Self::Wait),
-            _ => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Start => JOB_START_TOOL,
-            Self::Status => JOB_STATUS_TOOL,
-            Self::Logs => JOB_LOGS_TOOL,
-            Self::Stop => JOB_STOP_TOOL,
-            Self::List => JOB_LIST_TOOL,
-            Self::Wait => JOB_WAIT_TOOL,
-        }
-    }
 }
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -350,206 +308,189 @@ fn spec(name: &str, description: &str, parameters: JsonSchema) -> ToolSpec {
     })
 }
 
-/// Modellbeschreibung von `job.wait` (R18 F8: kurzes Abfragen, das Ende
-/// kommt als Notiz, keine Warteschleifen).
-const JOB_WAIT_DESCRIPTION: &str = "Short poll: wait at most timeout_secs (1-60) until the job \
-     ends or reaches the next milestone (new error lines, progress crossing a 10% step, or a \
-     phase change such as cargo `Finished`). Returns the outcome (finished/milestone/timeout) \
-     and the job status. You do not need job.wait to learn that a job ended: its end (exit \
-     code, duration, last lines) is delivered to you automatically as a note. Do not call \
-     job.wait in a loop; after a timeout, continue other work or end your turn and react \
-     to the job's end note.";
+/// Spezifikation von `job.start`.
+fn job_start_spec() -> ToolSpec {
+    spec(
+        JOB_START_TOOL,
+        "Start a long-running command as a background job and return its job_id at once. \
+         Use this instead of shell.exec (and never tmux) for anything that may take longer \
+         than about 2 minutes or that you want to follow: builds (cargo, cmake/ninja, make), \
+         package restores (vcpkg, npm, pip), test suites, servers. Same permissions and \
+         approval as shell.exec (sandbox or approved host mode; sudo only via \
+         host.sudo_exec). Give either `command` (shell text for /bin/sh -c) or `argv` \
+         (exact argument vector). stdout/stderr go to log files. You automatically get \
+         system notes: job start, progress every notify_every_secs (default 60, only when \
+         something changed; 0 = off), error lines as they appear, and the end with exit \
+         code, duration and the last 20 lines. Do not poll in a loop: continue other work \
+         or end your turn; the end note arrives on its own. For a non-blocking snapshot \
+         use job.status. On the host the job gets a filtered environment (PATH, HOME, \
+         locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; \
+         names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); \
+         pass anything else explicitly via env.",
+        object(
+            vec![
+                (
+                    "command",
+                    prop(
+                        JsonSchemaType::String,
+                        "Shell command for /bin/sh -c. Mutually exclusive with argv.",
+                    ),
+                ),
+                (
+                    "argv",
+                    string_array(
+                        "Exact argument vector, e.g. [\"cargo\", \"build\", \"--release\"]. \
+                         Mutually exclusive with command.",
+                    ),
+                ),
+                (
+                    "cwd",
+                    prop(
+                        JsonSchemaType::String,
+                        "Working directory inside the workspace (relative to the workspace \
+                         root or absolute). Default: workspace root.",
+                    ),
+                ),
+                (
+                    "name",
+                    prop(
+                        JsonSchemaType::String,
+                        "Short human-readable job name, e.g. \"ladybird build\".",
+                    ),
+                ),
+                (
+                    "env",
+                    string_array("Extra environment variables as \"NAME=value\" strings."),
+                ),
+                (
+                    "notify_every_secs",
+                    prop(
+                        JsonSchemaType::Integer,
+                        "Seconds between progress notes (default 60, min 10, max 3600; 0 \
+                         disables periodic notes, errors and the end are still reported).",
+                    ),
+                ),
+            ],
+            &["name"],
+        ),
+    )
+}
 
-fn tool_specs() -> Vec<ToolSpec> {
-    vec![
-        spec(
-            JOB_START_TOOL,
-            "Start a long-running command as a background job and return its job_id at once. \
-             Use this instead of shell.exec (and never tmux) for anything that may take longer \
-             than about 2 minutes or that you want to follow: builds (cargo, cmake/ninja, make), \
-             package restores (vcpkg, npm, pip), test suites, servers. Same permissions and \
-             approval as shell.exec (sandbox or approved host mode; sudo only via \
-             host.sudo_exec). Give either `command` (shell text for /bin/sh -c) or `argv` \
-             (exact argument vector). stdout/stderr go to log files. You automatically get \
-             system notes: job start, progress every notify_every_secs (default 60, only when \
-             something changed; 0 = off), error lines as they appear, and the end with exit \
-             code, duration and the last 20 lines. Do not poll in a loop: continue other work \
-             or end your turn; the end note arrives on its own (job.wait is only a short poll, \
-             at most 60 s). On the host the job gets a filtered environment (PATH, HOME, \
-             locale, build-tool variables such as CARGO_*/RUSTFLAGS/CC, SSH_AUTH_SOCK, XDG_*; \
-             names containing TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/API_KEY are removed); \
-             pass anything else explicitly via env.",
-            object(
-                vec![
-                    (
-                        "command",
-                        prop(
-                            JsonSchemaType::String,
-                            "Shell command for /bin/sh -c. Mutually exclusive with argv.",
-                        ),
-                    ),
-                    (
-                        "argv",
-                        string_array(
-                            "Exact argument vector, e.g. [\"cargo\", \"build\", \"--release\"]. \
-                             Mutually exclusive with command.",
-                        ),
-                    ),
-                    (
-                        "cwd",
-                        prop(
-                            JsonSchemaType::String,
-                            "Working directory inside the workspace (relative to the workspace \
-                             root or absolute). Default: workspace root.",
-                        ),
-                    ),
-                    (
-                        "name",
-                        prop(
-                            JsonSchemaType::String,
-                            "Short human-readable job name, e.g. \"ladybird build\".",
-                        ),
-                    ),
-                    (
-                        "env",
-                        string_array("Extra environment variables as \"NAME=value\" strings."),
-                    ),
-                    (
-                        "notify_every_secs",
-                        prop(
-                            JsonSchemaType::Integer,
-                            "Seconds between progress notes (default 60, min 10, max 3600; 0 \
-                             disables periodic notes, errors and the end are still reported).",
-                        ),
-                    ),
-                ],
-                &["name"],
-            ),
-        ),
-        spec(
-            JOB_STATUS_TOOL,
-            "Status of one of your jobs: state (queued/running/succeeded/failed/stopped/\
-             detached/unknown), pid, runtime, exit code, recognised progress, warning/error \
-             counts, the last output lines, sandbox profile (host/bwrap), end reason \
-             (exited/signal/stopped/timeout/launch-error/unknown), whether leftover processes \
-             were reaped, whether a log hit its size budget, launch warnings.",
-            object(vec![("job_id", job_id_prop())], &["job_id"]),
-        ),
-        spec(
-            JOB_LOGS_TOOL,
-            "Read a job's stdout/stderr log files. Default: the last 100 lines of both \
-             streams. `tail` returns the last N (matching) lines, `since_line` starts at a line \
-             number (1-based; use the numbers from a previous call to read only new output), \
-             `grep` keeps lines containing a plain substring. Output is capped (~48 KiB).",
-            object(
-                vec![
-                    ("job_id", job_id_prop()),
-                    (
-                        "stream",
-                        JsonSchema {
-                            enum_values: Some(vec![
-                                json!("both"),
-                                json!("stdout"),
-                                json!("stderr"),
-                            ]),
-                            ..prop(
-                                JsonSchemaType::String,
-                                "Which log to read: both (default), stdout or stderr.",
-                            )
-                        },
-                    ),
-                    (
-                        "tail",
-                        prop(
-                            JsonSchemaType::Integer,
-                            "Return only the last N matching lines (max 500).",
-                        ),
-                    ),
-                    (
-                        "since_line",
-                        prop(
-                            JsonSchemaType::Integer,
-                            "Start at this line number (1-based).",
-                        ),
-                    ),
-                    (
-                        "grep",
-                        prop(
-                            JsonSchemaType::String,
-                            "Plain substring filter (not a regex).",
-                        ),
-                    ),
-                ],
-                &["job_id"],
-            ),
-        ),
-        spec(
-            JOB_STOP_TOOL,
-            "Stop one of your jobs: sends `signal` (TERM default; INT, HUP or KILL) to the \
-             whole process group, then SIGKILL after a grace period. Also kills processes the \
-             job left behind in its process group.",
-            object(
-                vec![
-                    ("job_id", job_id_prop()),
-                    (
-                        "signal",
-                        JsonSchema {
-                            enum_values: Some(vec![
-                                json!("TERM"),
-                                json!("INT"),
-                                json!("HUP"),
-                                json!("KILL"),
-                            ]),
-                            ..prop(
-                                JsonSchemaType::String,
-                                "Signal to send first (default TERM).",
-                            )
-                        },
-                    ),
-                ],
-                &["job_id"],
-            ),
-        ),
-        spec(
-            JOB_LIST_TOOL,
-            "Without kind: a summary per category (process = your background jobs from \
-             job.start, work = durable work items) with counts per state. With \
-             kind=\"process\": the rows (state, owner, sandbox profile, end reason, runtime, \
-             progress). Use job.status for one job.",
-            object(
-                vec![(
-                    "kind",
+/// Spezifikation von `job.status`.
+fn job_status_spec() -> ToolSpec {
+    spec(
+        JOB_STATUS_TOOL,
+        "Status of one of your jobs: state (queued/running/succeeded/failed/stopped/\
+         detached/unknown), pid, runtime, exit code, recognised progress, warning/error \
+         counts, the last output lines, sandbox profile (host/bwrap), end reason \
+         (exited/signal/stopped/timeout/launch-error/unknown), whether leftover processes \
+         were reaped, whether a log hit its size budget, launch warnings.",
+        object(vec![("job_id", job_id_prop())], &["job_id"]),
+    )
+}
+
+/// Spezifikation von `job.logs`.
+fn job_logs_spec() -> ToolSpec {
+    spec(
+        JOB_LOGS_TOOL,
+        "Read a job's stdout/stderr log files. Default: the last 100 lines of both \
+         streams. `tail` returns the last N (matching) lines, `since_line` starts at a line \
+         number (1-based; use the numbers from a previous call to read only new output), \
+         `grep` keeps lines containing a plain substring. Output is capped (~48 KiB).",
+        object(
+            vec![
+                ("job_id", job_id_prop()),
+                (
+                    "stream",
                     JsonSchema {
-                        enum_values: Some(vec![json!("work"), json!("process")]),
+                        enum_values: Some(vec![json!("both"), json!("stdout"), json!("stderr")]),
                         ..prop(
                             JsonSchemaType::String,
-                            "Category whose rows to list: process or work. Omit for the \
-                             summary.",
+                            "Which log to read: both (default), stdout or stderr.",
                         )
                     },
-                )],
-                &[],
-            ),
-        ),
-        spec(
-            JOB_WAIT_TOOL,
-            JOB_WAIT_DESCRIPTION,
-            object(
-                vec![
-                    ("job_id", job_id_prop()),
-                    (
-                        "timeout_secs",
-                        prop(
-                            JsonSchemaType::Integer,
-                            "Maximum seconds to wait: a short poll, 1-60. Larger values are \
-                             rejected.",
-                        ),
+                ),
+                (
+                    "tail",
+                    prop(
+                        JsonSchemaType::Integer,
+                        "Return only the last N matching lines (max 500).",
                     ),
-                ],
-                &["job_id", "timeout_secs"],
-            ),
+                ),
+                (
+                    "since_line",
+                    prop(
+                        JsonSchemaType::Integer,
+                        "Start at this line number (1-based).",
+                    ),
+                ),
+                (
+                    "grep",
+                    prop(
+                        JsonSchemaType::String,
+                        "Plain substring filter (not a regex).",
+                    ),
+                ),
+            ],
+            &["job_id"],
         ),
-    ]
+    )
+}
+
+/// Spezifikation von `job.stop`.
+fn job_stop_spec() -> ToolSpec {
+    spec(
+        JOB_STOP_TOOL,
+        "Stop one of your jobs: sends `signal` (TERM default; INT, HUP or KILL) to the \
+         whole process group, then SIGKILL after a grace period. Also kills processes the \
+         job left behind in its process group.",
+        object(
+            vec![
+                ("job_id", job_id_prop()),
+                (
+                    "signal",
+                    JsonSchema {
+                        enum_values: Some(vec![
+                            json!("TERM"),
+                            json!("INT"),
+                            json!("HUP"),
+                            json!("KILL"),
+                        ]),
+                        ..prop(
+                            JsonSchemaType::String,
+                            "Signal to send first (default TERM).",
+                        )
+                    },
+                ),
+            ],
+            &["job_id"],
+        ),
+    )
+}
+
+/// Spezifikation von `job.list`.
+fn job_list_spec() -> ToolSpec {
+    spec(
+        JOB_LIST_TOOL,
+        "Without kind: a summary per category (process = your background jobs from \
+         job.start, work = durable work items) with counts per state. With \
+         kind=\"process\": the rows (state, owner, sandbox profile, end reason, runtime, \
+         progress). Use job.status for one job.",
+        object(
+            vec![(
+                "kind",
+                JsonSchema {
+                    enum_values: Some(vec![json!("work"), json!("process")]),
+                    ..prop(
+                        JsonSchemaType::String,
+                        "Category whose rows to list: process or work. Omit for the \
+                         summary.",
+                    )
+                },
+            )],
+            &[],
+        ),
+    )
 }
 
 // ── Argumente ─────────────────────────────────────────────────────────────────
@@ -632,30 +573,6 @@ fn parse_list_kind(raw: Option<&str>) -> Result<Option<ListKind>, ToolsError> {
         Some(other) => Err(invalid(
             JOB_LIST_TOOL,
             format!("kind must be work or process, got `{other}`"),
-        )),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WaitArgs {
-    job_id: String,
-    #[serde(deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
-    timeout_secs: Option<u64>,
-}
-
-/// Prüft `timeout_secs` von `job.wait` (R18 F8, EX-05): `1..=MAX_WAIT_SECS`,
-/// alles andere — auch ein zu großer Wert — ist `InvalidArguments` mit dem
-/// Hinweis, dass das Ende als Notiz kommt (kein stilles Klemmen).
-fn parse_wait_secs(raw: Option<u64>) -> Result<u64, ToolsError> {
-    match raw {
-        Some(secs) if (1..=MAX_WAIT_SECS).contains(&secs) => Ok(secs),
-        _ => Err(invalid(
-            JOB_WAIT_TOOL,
-            format!(
-                "timeout_secs must be between 1 and {MAX_WAIT_SECS}: job.wait is a short poll. \
-                 The job's end is delivered to you as a note; do not wait in a loop."
-            ),
         )),
     }
 }
@@ -869,7 +786,7 @@ fn status_json(status: &JobStatus) -> Value {
 
 /// Standardansicht von `job.list`: Zahlen je Kategorie und Zustand, keine
 /// Zeilen. `count` oben bleibt die Zahl der sichtbaren Prozess-Jobs.
-fn list_summary_json(jobs: &[JobStatus]) -> Value {
+fn list_summary_json(jobs: &[JobStatus], limit: usize, running: usize) -> Value {
     let mut by_state: BTreeMap<&str, u64> = BTreeMap::new();
     for status in jobs {
         *by_state.entry(status.meta.state.as_str()).or_insert(0) += 1;
@@ -878,7 +795,11 @@ fn list_summary_json(jobs: &[JobStatus]) -> Value {
         "view": "summary",
         "count": jobs.len(),
         "categories": {
-            "process": { "count": jobs.len(), "by_state": by_state },
+            "process": {
+                "count": jobs.len(),
+                "by_state": by_state,
+                "permits": { "limit": limit, "running": running },
+            },
             "work": { "visible": false, "note": WORK_NOT_VISIBLE },
         },
         "note": "Pass kind=\"process\" for the rows; job.status shows one job.",
@@ -1006,15 +927,19 @@ impl JobToolExecutor {
             tool: Some(call.name.as_str().to_owned()),
             owner_agent: None,
         };
-        match manager.start_with_origin(request, launch.job, launch.warnings, origin) {
+        match manager
+            .start_with_origin(request, launch.job, launch.warnings, origin)
+            .await
+        {
             Ok(status) => {
                 info!(job_id = %status.meta.job_id, "job.start");
                 let mut value = status_json(&status);
                 value["notify_every_secs"] = json!(notify_every.as_secs());
                 value["note"] = json!(
                     "Job runs in the background. You will receive progress/error/finish notes \
-                     automatically, so do not loop on job.wait (a short poll of at most 60 s); \
-                     use job.logs for output, job.stop to stop it."
+                     automatically, so do not poll; \
+                     use job.status for a non-blocking snapshot, job.logs for output, \
+                     job.stop to stop it."
                 );
                 Ok(ToolOutput::json(value))
             }
@@ -1116,31 +1041,6 @@ impl JobToolExecutor {
         }
     }
 
-    async fn wait(
-        &self,
-        context: &ToolExecutionContext,
-        call: &ToolCall,
-    ) -> Result<ToolOutput, ToolsError> {
-        let args: WaitArgs = parse_args(JOB_WAIT_TOOL, call)?;
-        let id = parse_job_id(JOB_WAIT_TOOL, &args.job_id)?;
-        let secs = parse_wait_secs(args.timeout_secs)?;
-        let caller = Caller::Agent(context.session_id().as_str());
-        match self
-            .shared
-            .manager
-            .wait(&id, caller, Duration::from_secs(secs), context.cancel())
-            .await
-        {
-            Ok((WaitOutcome::Cancelled, _)) => Err(ToolsError::Cancelled),
-            Ok((outcome, status)) => Ok(ToolOutput::json(json!({
-                "outcome": outcome.as_str(),
-                "waited_max_secs": secs,
-                "status": status_json(&status),
-            }))),
-            Err(err) => Ok(job_error(JOB_WAIT_TOOL, &err)),
-        }
-    }
-
     fn status(
         &self,
         context: &ToolExecutionContext,
@@ -1166,7 +1066,11 @@ impl JobToolExecutor {
         Ok(ToolOutput::json(match kind {
             Some(ListKind::Work) => list_work_rows_json(),
             Some(ListKind::Process) => list_process_rows_json(&self.shared.manager.list(caller)),
-            None => list_summary_json(&self.shared.manager.list(caller)),
+            None => list_summary_json(
+                &self.shared.manager.list(caller),
+                self.shared.manager.max_running(),
+                self.shared.manager.running_count(),
+            ),
         }))
     }
 }
@@ -1184,28 +1088,37 @@ impl ToolExecutor for JobToolExecutor {
                 Kind::Logs => self.logs(context, call).await,
                 Kind::Stop => self.stop(context, call).await,
                 Kind::List => self.list(context, call),
-                Kind::Wait => self.wait(context, call).await,
             }
         })
     }
 }
 
-impl ToolProvider for JobToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        tool_specs()
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let kind = Kind::from_name(name.as_str())?;
-        debug_assert_eq!(kind.name(), name.as_str());
-        Some(Arc::new(JobToolExecutor {
-            kind,
-            shared: Arc::clone(&self.shared),
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        JOB_READ_TOOLS.contains(&name.as_str())
+// Die fünf Job-Werkzeuge. Alle teilen den Zustand [`Shared`] (Verwaltung,
+// Launcher, Elternkette); nur die drei lesenden sind parallelsicher
+// (`JOB_READ_TOOLS`), `job.start` und `job.stop` nie.
+harw_tools::tool_provider! {
+    impl for JobToolProvider as provider,
+    parallel_safe: [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL] {
+        JOB_START_TOOL => {
+            spec: job_start_spec(),
+            executor: JobToolExecutor { kind: Kind::Start, shared: Arc::clone(&provider.shared) },
+        },
+        JOB_STATUS_TOOL => {
+            spec: job_status_spec(),
+            executor: JobToolExecutor { kind: Kind::Status, shared: Arc::clone(&provider.shared) },
+        },
+        JOB_LOGS_TOOL => {
+            spec: job_logs_spec(),
+            executor: JobToolExecutor { kind: Kind::Logs, shared: Arc::clone(&provider.shared) },
+        },
+        JOB_STOP_TOOL => {
+            spec: job_stop_spec(),
+            executor: JobToolExecutor { kind: Kind::Stop, shared: Arc::clone(&provider.shared) },
+        },
+        JOB_LIST_TOOL => {
+            spec: job_list_spec(),
+            executor: JobToolExecutor { kind: Kind::List, shared: Arc::clone(&provider.shared) },
+        },
     }
 }
 
@@ -1257,7 +1170,11 @@ mod list_view_tests {
             status_of("job-b", "running", json!({}))?,
             status_of("job-c", "failed", json!({"exit_code": 1}))?,
         ];
-        let value = list_summary_json(&jobs);
+        let value = list_summary_json(&jobs, 4, 2);
+        assert_eq!(
+            value["categories"]["process"]["permits"],
+            json!({"limit": 4, "running": 2})
+        );
         assert_eq!(value["view"], json!("summary"));
         assert_eq!(value["count"], json!(3));
         assert_eq!(value["categories"]["process"]["count"], json!(3));

@@ -21,5 +21,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true
