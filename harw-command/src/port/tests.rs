@@ -68,7 +68,10 @@ async fn the_environment_is_exactly_the_request_and_never_persisted() -> TestRes
         .env
         .push(("HARW_SECRET".into(), "s3cret-value".into()));
     let outcome = port(&root)?.run(request, CancelToken::new()).await;
-    assert_eq!(outcome.stdout, b"s3cret-value\n/tmp\n", "{outcome:?}");
+    // `/tmp` is a symlink on macOS (`/private/tmp`); the shell reports the real path.
+    let tmp = std::fs::canonicalize("/tmp").map_err(ctx("canonicalize /tmp"))?;
+    let expected = format!("s3cret-value\n{}\n", tmp.display());
+    assert_eq!(outcome.stdout, expected.as_bytes(), "{outcome:?}");
     for entry in walk(&root)? {
         let text = std::fs::read(&entry).map_err(ctx("read"))?;
         assert!(
