@@ -149,7 +149,6 @@ impl PitfallAdvisor for MemoryPitfallAdvisor {
 
     /// Sessiongebunden: berücksichtigt nur die Auflösungen derselben Session
     /// (nie den ungebundenen `resolved`-Zustand).
-    #[must_use]
     fn advise_in_session(
         &self,
         session_id: &harw_types::SessionId,
