@@ -1,6 +1,6 @@
 # H15 — Inkrementeller Datei-/Artefaktmetadaten-Index: Contract-Draft
 
-Status: Contract-Draft (Befunde verifiziert am Quellcode; offene Punkte am Ende).
+Status: Completed (Implementierung h16 verifiziert im Quellcode; Tests siehe harw-lens/tests/facade.rs, Plan-Knoten h17).
 
 ## Befundene Fakten (mit Belegen)
 

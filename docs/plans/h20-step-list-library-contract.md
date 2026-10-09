@@ -1,6 +1,6 @@
 # H20 — Step-/TODO-Listenbibliothek: Contract-Draft
 
-Status: Contract-Draft (Befunde verifiziert am Quellcode; offene Punkte am Ende).
+Status: Completed (Implementierung h21 abgeschlossen; harw-step-list Crate im Workspace, Tests grün).
 
 ## Befundene Fakten (mit Belegen)
 

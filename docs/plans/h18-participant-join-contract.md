@@ -1,6 +1,6 @@
 # H18 — Authentifizierter Participant-Beitritt: Contract-Draft
 
-Status: Contract-Draft (Befunde verifiziert am Quellcode; Lücken am Ende).
+Status: Completed (Vertrag abgeschlossen; Implementierung h19 offene Punkte am Ende).
 
 ## Befundene Fakten (mit Belegen)
 

@@ -109,7 +109,7 @@ use harw_registry_defaults::profile::{
     HostPermitWiring, IdentityOverrides, RegistryProfile, role_names,
 };
 use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
-use harw_session_store::{ApprovalStore, JobStore};
+use harw_session_store::{ApprovalStore, ChildLeaseStore, JobStore};
 use harw_tool_shell::host_permit_prompt::{
     HostPermitHandles, HostPermitPromptReceiver, HostPermitPromptSender, HostPermitVariant,
     host_permit_prompt_channel,
@@ -2736,6 +2736,19 @@ impl RuntimeAssemblyBuilder {
                 detail: error.to_string(),
             })?,
         );
+        // Child/job ownership must be durable before the submitter can make
+        // work Ready. Derive the lease root from the actual ledger, including
+        // caller-injected stores, rather than from the runtime's home path.
+        let child_lease_store = stores
+            .job_store
+            .as_ref()
+            .map(|store| {
+                let root = store.root().parent().ok_or_else(|| RuntimeError::Store {
+                    detail: "durable job store has no parent storage root".to_owned(),
+                })?;
+                Ok(Arc::new(ChildLeaseStore::new(root)))
+            })
+            .transpose()?;
         let (spawner, spawner_roles, agent_job_submitter_slot) = build_spawner(
             profile.spawner,
             SpawnerInputs {
@@ -2772,6 +2785,7 @@ impl RuntimeAssemblyBuilder {
                 sandbox_profile: &sandbox_profile,
                 host_permit_wiring: &host_permit_wiring_for_children,
                 state_store: Arc::clone(&stores.state_store),
+                child_lease_store,
                 agent_events: agent_events.clone(),
                 // Welle 4: die vertrauten Config-Layer, aus denen die
                 // Kind-Fabriken die Skill-Verzeichnisse auflösen.
@@ -5251,6 +5265,8 @@ struct SpawnerInputs<'a> {
     host_permit_wiring: &'a Option<HostPermitWiring>,
     /// Shared transcript/state store used by lifecycle observer records.
     state_store: Arc<dyn StateStore>,
+    /// Lease ledger sharing the configured job store's durable storage root.
+    child_lease_store: Option<Arc<ChildLeaseStore>>,
     /// Live-Bus des Laufs; jedes Kind bekommt ihn über den SessionManager.
     agent_events: harw_core::AgentEventHub,
     /// Die vertrauten Config-Layer in aufsteigender Präzedenz
@@ -5320,6 +5336,7 @@ fn build_spawner(
         sandbox_profile,
         host_permit_wiring,
         state_store,
+        child_lease_store,
         agent_events,
         skill_roots,
         knowledge,
@@ -5541,6 +5558,9 @@ fn build_spawner(
         // Skills, Rechte, Budget, Herkunft und die Lese-Eigenschaft, nach der
         // im Plan-Modus nur lesende Ziele delegierbar bleiben.
         .with_delegation_catalog(roster.entries().map(delegation_target_info));
+    if let Some(lease_store) = child_lease_store {
+        spawner = spawner.with_lease_store(lease_store);
+    }
     // Welle 3C: ein gesetztes `RuntimeSpec::child_backend` lässt jedes über
     // diesen Spawner admittierte Kind über dieses `ChildBackend` laufen
     // (z. B. `harw-agent-runner`s `JobChildBackend`) statt in-process.
@@ -7948,6 +7968,96 @@ mod tests {
                 job_store: None,
                 approval_store: None,
             })
+    }
+
+    #[tokio::test]
+    async fn test_agent_job_submission_persists_child_lease_in_the_job_store_scope() -> TestResult {
+        use harw_extension_api::{AgentSpawner, SpawnInput};
+        use harw_session_store::ChildLeaseStore;
+
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let fixture = build_fixture()?;
+            // Deliberately outside the profile home: injected stores must
+            // retain their own durable scope across a restart.
+            let ledger_root = fixture._dir.path().join("injected-ledger");
+            let jobs = Arc::new(JobStore::new(&ledger_root));
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let assembly = fixture_builder(entry, &fixture)
+                .session_events(events)
+                .stores(RuntimeStores {
+                    state_store: Arc::new(harw_core::InMemoryStateStore::new()),
+                    job_store: Some(Arc::clone(&jobs)),
+                    approval_store: None,
+                })
+                .build()?;
+            let submitter = assembly
+                .registry
+                .lock()
+                .map_err(ctx("root registry lock"))?
+                .as_ref()
+                .and_then(ExtensionRegistry::agent_job_submitter)
+                .cloned()
+                .ok_or(TestError::Missing("durable agent job submitter"))?;
+            let spawner = assembly
+                .spawner()
+                .ok_or(TestError::Missing("managed child spawner"))?;
+            let call_id = harw_types::ToolCallId::new();
+            let child = spawner
+                .spawn_child(
+                    role_names::ROOT_ORCHESTRATOR,
+                    SpawnInput {
+                        parent_session_id: assembly.root_session_id().clone(),
+                        handoff_call_id: call_id.clone(),
+                        instructions: None,
+                        context: serde_json::json!({"task": "lease wiring regression"}),
+                        ceiling: None,
+                    },
+                    assembly.sandbox().clone(),
+                    None,
+                )
+                .await
+                .map_err(ctx("child admission"))?;
+            let handle = submitter
+                .submit_child(&child, Some("lease wiring regression"))
+                .await
+                .map_err(ctx("durable agent job submission"))?;
+            assert_eq!(handle.child, child);
+
+            // Reopen from disk rather than inspecting the spawner's memory.
+            let leases = ChildLeaseStore::new(&ledger_root);
+            assert!(
+                leases
+                    .is_owned_by(&child, &handle.work_id)
+                    .map_err(ctx("durable child/job ownership"))?
+            );
+            let active = leases.active().map_err(ctx("active child leases"))?;
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].parent, *assembly.root_session_id());
+            assert_eq!(active[0].handoff_call_id, call_id);
+            let job = jobs.get(&handle.work_id).map_err(ctx("admitted job"))?;
+            assert_eq!(job.job.state, harw_job_core::JobState::Ready);
+            assert_eq!(job.input["child_id"], child.as_str());
+
+            // Drive the offline child through terminal commit as well.
+            let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let job = jobs.get(&handle.work_id).map_err(ctx("running job"))?;
+                    if matches!(
+                        job.job.state,
+                        harw_job_core::JobState::Completed
+                            | harw_job_core::JobState::Failed
+                            | harw_job_core::JobState::Cancelled
+                    ) {
+                        return Ok::<_, TestError>(job);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(ctx("agent job completion timeout"))??;
+            assert_eq!(terminal.job.state, harw_job_core::JobState::Completed);
+        }
+        Ok(())
     }
 
     /// Jede [`harw_authority::Permission`] — die weiteste denkbare Obergrenze.

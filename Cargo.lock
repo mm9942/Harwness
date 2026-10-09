@@ -4911,6 +4911,7 @@ dependencies = [
  "harw-runtime",
  "harw-sandbox",
  "harw-session-store",
+ "harw-step-list",
  "harw-test-support",
  "harw-tool-job",
  "harw-tool-plan",

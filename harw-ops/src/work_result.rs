@@ -59,9 +59,10 @@ async fn work_result(ctx: &OpContext, args: WorkResultArgs) -> Result<OpOutput, 
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
     let work_id = WorkId::from_str(raw_id);
-    let record = crate::job_tenant::get_bound_workspace_job(ctx, store, &work_id).map_err(
-        |error| OpError::Execution(format!("could not read durable job '{raw_id}': {error}")),
-    )?;
+    let record =
+        crate::job_tenant::get_bound_workspace_job(ctx, store, &work_id).map_err(|error| {
+            OpError::Execution(format!("could not read durable job '{raw_id}': {error}"))
+        })?;
 
     render_result(&record, max_chars)
 }
@@ -212,11 +213,7 @@ mod tests {
     use jiff::Timestamp;
     use std::sync::Arc;
 
-    fn result_jobs(
-        id: &str,
-        text: &str,
-        workspace: &str,
-    ) -> TestResult<TenantJobs> {
+    fn result_jobs(id: &str, text: &str, workspace: &str) -> TestResult<TenantJobs> {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(&dir.path().join("job-store")));
         let mut record = job(id, TENANT_A, JobState::Completed);
@@ -284,7 +281,10 @@ mod tests {
 
         assert!(output.text.contains("Result: not terminal yet"));
         assert_eq!(
-            output.data.as_ref().and_then(|data| data["outcome"]["kind"].as_str()),
+            output
+                .data
+                .as_ref()
+                .and_then(|data| data["outcome"]["kind"].as_str()),
             Some("active")
         );
         Ok(())
@@ -352,6 +352,9 @@ mod tests {
 
     #[test]
     fn work_id_parser_accepts_durable_ids_used_by_the_store() {
-        assert_eq!(WorkId::from_str("work-result-test").as_str(), "work-result-test");
+        assert_eq!(
+            WorkId::from_str("work-result-test").as_str(),
+            "work-result-test"
+        );
     }
 }

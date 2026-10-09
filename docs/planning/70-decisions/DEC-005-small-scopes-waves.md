@@ -64,6 +64,6 @@ Koordinators.
   `apply_chat_cache_control`, `apply_messages_cache_control`.
 
 ## Verwandt
-- [DEC-004 Kein paralleler Build](DEC-004-no-parallel-builds.md)
+- [DEC-004 Keine parallelen Builds](DEC-004-no-parallel-builds.md)
 - [DEC-007 Worker-Rechte](DEC-007-worker-rights.md)
 - [DEC-006 Modell-agnostisch](DEC-006-model-agnostic.md)

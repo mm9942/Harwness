@@ -58,10 +58,9 @@ harw-model-catalog = { path = "../harw-model-catalog" }
 harw-observe = { path = "../harw-observe" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
-# harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }
-# PL-90(H1) local build fix: the harw-cloud/* crates are listed as workspace
-# members but the directories were never committed to the repository, so the
-# path dependency cannot resolve. Commented out until the sources are restored.
+# harw-cloud-ops is active again (PL-90 restore, commit d69615a7): the
+# harw-cloud/* sources are committed and the live dependency lives at
+# line 29 (harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }).
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 harw-project-discovery = { path = "../harw-project-discovery" }

@@ -70,7 +70,7 @@ PL-93's conflict-free implementation was ported onto the current `dev` baseline 
 1. receives an already-admitted child;
 2. admits a canonical-scope `JobKind::Custom("agent")` record as `Pending`;
 3. transfers the child to background ownership;
-4. publishes `Pending -> Ready` only after that ownership transfer succeeds;
+4. binds the durable child lease to the `WorkId` and publishes `Pending -> Ready` only after both ownership transfers succeed;
 5. claims and drives it using `DurableJobRunner`;
 6. renews the lease while it runs;
 7. links job cancellation to the child cancellation token;
@@ -79,6 +79,8 @@ PL-93's conflict-free implementation was ported onto the current `dev` baseline 
 10. only after both durable transitions, updates `BackgroundChildren` as a result/notification projection.
 
 The runtime mounts the submitter once at the composition root and passes a weak deferred adapter into every child registry. This avoids a strong registry/spawner/runtime cycle while preserving async-by-default behavior for the full delegation tree.
+
+When a job ledger is configured, the managed spawner receives a `ChildLeaseStore` before it is exposed. The child leases and jobs share the same storage root, including when the caller injects a custom `JobStore`.
 
 ### Non-blocking approval behavior
 

@@ -1,6 +1,6 @@
 # h23 — Full Mode: Plan-/TODO-Umfang als langlebiger WorkDriver-Job
 
-Status: analysis / contract draft (Spec, kein Code)
+Status: Completed (Contract abgeschlossen; Implementierung h24 übernimmt die belegten Lücken).
 
 ## Ist-Zustand (belegt)
 

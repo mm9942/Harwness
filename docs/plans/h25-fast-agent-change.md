@@ -1,6 +1,6 @@
 # H25 — Schneller Agent-/Modellwechsel: UX-/Vertragsentwurf
 
-Status: Contract-Draft (Befunde verifiziert am Quellcode; offene Punkte am Ende). Wichtig: **KEIN Hot-Switch belegt** — siehe unten.
+Status: Completed (Spec abgeschlossen; KEIN Hot-Switch belegt — siehe unten).
 
 ## Befundene Fakten (mit Belegen)
 
