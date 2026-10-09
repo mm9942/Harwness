@@ -39,11 +39,12 @@ pub(crate) fn child_info_segment(
     let info = match latest_info.map(str::trim) {
         None | Some("") => "keine Meldung".to_owned(),
         Some(text) => {
-            let collapsed: String =
-                text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
             if collapsed.chars().count() > max_chars {
-                let mut kept: String =
-                    collapsed.chars().take(max_chars.saturating_sub(1)).collect();
+                let mut kept: String = collapsed
+                    .chars()
+                    .take(max_chars.saturating_sub(1))
+                    .collect();
                 kept.push(ELLIPSIS);
                 kept
             } else {

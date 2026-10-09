@@ -1593,7 +1593,12 @@ impl ChatApp {
     /// Zeitstempel, damit das 30s-Ausblendfenster (`PARENT_INFO_MIN_INTERVAL`
     /// in `harw-core::child_comms`) ohne Echtzeit-Warten geprüft werden kann.
     #[cfg(test)]
-    pub(crate) fn note_child_info_at(&mut self, child: String, info: String, at: std::time::Instant) {
+    pub(crate) fn note_child_info_at(
+        &mut self,
+        child: String,
+        info: String,
+        at: std::time::Instant,
+    ) {
         self.child_infos.insert(child, (info, at));
     }
 
@@ -10325,10 +10330,7 @@ fn render_viewport(
         } else if app.status_expiry == harw_config::StatusExpiryMode::Consolidate {
             // `[tui].status_expiry = "consolidate"` (Default): abgelaufene
             // Meldungen nur noch kompakt (Name + Alter) und niedrig priorisiert.
-            segments.push(Seg::optional(
-                60,
-                child_info_expired_segment(child, age),
-            ));
+            segments.push(Seg::optional(60, child_info_expired_segment(child, age)));
         }
         // Modus "hide": abgelaufene Meldungen entfallen komplett.
     }
@@ -15996,11 +15998,7 @@ mod child_info_render_tests {
     fn note_child_info_at_fills_map_and_old_entries_are_not_visible() -> TestResult {
         let mut app = test_chat_app()?;
         let at = std::time::Instant::now();
-        app.note_child_info_at(
-            "uia-writer".to_owned(),
-            "schreibe Abschnitt".to_owned(),
-            at,
-        );
+        app.note_child_info_at("uia-writer".to_owned(), "schreibe Abschnitt".to_owned(), at);
         assert!(app.child_infos.contains_key("uia-writer"));
         // Ein vor 60 s gestempelter Eintrag ist älter als das 30s-Fenster.
         let age_old = 60_u64;
