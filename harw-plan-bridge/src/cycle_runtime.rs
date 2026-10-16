@@ -34,6 +34,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -54,6 +55,15 @@ use crate::intent_cycle::{
 
 /// Schema version of [`CycleRecord`].
 pub const CYCLE_RECORD_SCHEMA: u32 = 1;
+
+/// `JobKind::Custom` discriminator of an intent-cycle job. Shared by
+/// `intent_cycle.start` (harw-ops), the job worker (harw-cli) and
+/// `harw_runtime::job_ledger`.
+pub const INTENT_CYCLE_JOB_KIND: &str = "intent_cycle";
+
+/// Directory of the [`CycleStore`] below the durable job root
+/// (`<job-root>/intent_cycle/`), next to the job store's own sidecars.
+pub const CYCLE_STORE_DIR: &str = "intent_cycle";
 
 /// Default number of consecutive admission refusals before escalation.
 pub const DEFAULT_MAX_REFUSALS_PER_STEP: u8 = 3;
@@ -217,6 +227,25 @@ impl CycleStore {
     #[must_use]
     pub fn new(records: RecordStore<CycleRecord>) -> Self {
         Self { records }
+    }
+
+    /// Opens (creating if needed) the store at `<job_root>/`[`CYCLE_STORE_DIR`].
+    ///
+    /// # Errors
+    /// The underlying store error.
+    pub fn open_in_job_root(job_root: &Path) -> Result<Self, CycleStoreError> {
+        Ok(Self::new(RecordStore::create_ambient(
+            &job_root.join(CYCLE_STORE_DIR),
+        )?))
+    }
+
+    /// Opens the store at `<job_root>/`[`CYCLE_STORE_DIR`] if it exists;
+    /// creates nothing (status reads must not create directories).
+    ///
+    /// # Errors
+    /// The underlying store error.
+    pub fn open_existing_in_job_root(job_root: &Path) -> Result<Option<Self>, CycleStoreError> {
+        Ok(RecordStore::open_existing_ambient(&job_root.join(CYCLE_STORE_DIR))?.map(Self::new))
     }
 
     /// Persists a new record; an existing id is never overwritten.
@@ -483,6 +512,32 @@ impl AuthorityReissuer for PolicyReissuer {
         self.bootstrap
             .reissue(self.workspace.clone(), snapshot)
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Reissuer for runtimes whose authority does not come from a
+/// [`PolicyBootstrap`] (job workers assembled from the runtime profile
+/// table): the persisted snapshot is cut against the *current* trusted
+/// context of the same workspace. The result is the intersection, so it can
+/// only keep or drop what the snapshot recorded — never add.
+#[derive(Debug, Clone)]
+pub struct CeilingReissuer {
+    ceiling: AuthorityContext,
+}
+
+impl CeilingReissuer {
+    #[must_use]
+    pub fn new(ceiling: AuthorityContext) -> Self {
+        Self { ceiling }
+    }
+}
+
+impl AuthorityReissuer for CeilingReissuer {
+    fn reissue(&self, snapshot: &AuthoritySnapshot) -> Result<AuthorityContext, String> {
+        if !snapshot.workspace().matches(self.ceiling.workspace()) {
+            return Err("snapshot belongs to another workspace".to_owned());
+        }
+        Ok(self.ceiling.restrict(snapshot.request()))
     }
 }
 
@@ -1328,13 +1383,12 @@ mod tests {
         let fx = fixture("cycle-deep")?;
         let mut record = fx.store.load("cycle-deep").map_err(ctx("record loads"))?;
         record.checkpoint.chain_depth = fx.admission.limits().max_chain_depth + 1;
-        fx.store.create(&CycleRecord::new(
-            "cycle-deep-2",
-            fx.work_id.clone(),
-            record.checkpoint,
-        )
-        .map_err(ctx("record builds"))?)
-        .map_err(ctx("record persists"))?;
+        fx.store
+            .create(
+                &CycleRecord::new("cycle-deep-2", fx.work_id.clone(), record.checkpoint)
+                    .map_err(ctx("record builds"))?,
+            )
+            .map_err(ctx("record persists"))?;
         let proposer = Script::new(vec![Ok(wait()), Ok(wait()), Ok(wait())]);
         let seen = Arc::clone(&proposer.refusals);
         let mut driver = driver(&fx, proposer, Executor::new(vec![]), rights()?);
@@ -1351,7 +1405,9 @@ mod tests {
             Err(CycleRunError::Admission(CycleRefusal::ChainDepthExceeded))
         ));
         assert!(
-            seen.lock().map_err(|_| TestError::Missing("lock"))?.is_empty(),
+            seen.lock()
+                .map_err(|_| TestError::Missing("lock"))?
+                .is_empty(),
             "the proposer must not be called"
         );
         Ok(())
@@ -1733,6 +1789,58 @@ mod tests {
                 .authority
                 .request()
                 .contains(Permission::WriteWorkspace)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ceiling_reissuer_never_widens_and_refuses_foreign_workspace() -> TestResult {
+        let read_only = authority(&[Permission::ReadWorkspace])?;
+        let read_write = authority(&[Permission::ReadWorkspace, Permission::WriteWorkspace])?;
+
+        // Snapshot wider than the ceiling: the ceiling bounds the result.
+        let capped = CeilingReissuer::new(read_only.clone())
+            .reissue(&read_write.snapshot())
+            .map_err(|_| TestError::Missing("same-workspace reissue succeeds"))?;
+        assert!(!capped.permissions().contains(Permission::WriteWorkspace));
+        assert!(capped.is_subset_of(&read_only));
+
+        // Ceiling wider than the snapshot: the snapshot bounds the result.
+        let narrowed = CeilingReissuer::new(read_write.clone())
+            .reissue(&read_only.snapshot())
+            .map_err(|_| TestError::Missing("same-workspace reissue succeeds"))?;
+        assert!(!narrowed.permissions().contains(Permission::WriteWorkspace));
+        assert!(narrowed.is_subset_of(&read_only));
+
+        // Same tenant, different workspace: refused, never rebound.
+        let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(TestError::Missing("harness root"))?
+            .to_path_buf();
+        let tenant = TenantId::from_str("cycle-tenant");
+        let other = WorkspaceId::from_str("cycle-runtime-other");
+        let foreign_binding = WorkspaceRegistry::build(
+            &harness_root,
+            [WorkspaceRegistration {
+                tenant: tenant.clone(),
+                workspace: other.clone(),
+                root: PathBuf::from("harw-plan-bridge"),
+            }],
+        )
+        .map_err(ctx("foreign workspace registers"))?
+        .resolve(&tenant, &other)
+        .map_err(ctx("foreign workspace resolves"))?;
+        let foreign = SandboxSpec::from_resolved(
+            foreign_binding,
+            PermissionSet::from_policy([Permission::ReadWorkspace]),
+        )
+        .authority()
+        .clone();
+        assert!(
+            CeilingReissuer::new(read_write)
+                .reissue(&foreign.snapshot())
+                .is_err(),
+            "a snapshot of another workspace must not be reissued"
         );
         Ok(())
     }

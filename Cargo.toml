@@ -25,6 +25,9 @@ members = [
     "harw-config",
     "harw-home",
     "harw-plan",
+    # H20 — Step-/TODO-Listenbibliothek (Contract:
+    # docs/plans/h20-step-list-library-contract.md); eigenständig, ohne TUI.
+    "harw-step-list",
     "harw-types",
     # Leaf-Crate für ContentDigest (nur blake3 + serde), re-exportiert von harw-types.
     "harw-digest",

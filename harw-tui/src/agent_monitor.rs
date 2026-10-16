@@ -2152,7 +2152,9 @@ fn panel_rows(
         room = height.saturating_sub(rows.len());
     }
     let live_preview = if focused {
-        monitor.selected_live().filter(|live| live.phase.is_active())
+        monitor
+            .selected_live()
+            .filter(|live| live.phase.is_active())
     } else {
         monitor
             .rows()
@@ -3409,9 +3411,15 @@ mod tests {
         assert_eq!(live.preview, "Validator geprüft");
 
         monitor.surface_root_tool("root", "assistant", Some("fs.read"));
-        assert_eq!(monitor.agent("root").map(|live| live.phase), Some(AgentPhase::Tool));
+        assert_eq!(
+            monitor.agent("root").map(|live| live.phase),
+            Some(AgentPhase::Tool)
+        );
         monitor.surface_root_tool("root", "assistant", None);
-        assert_eq!(monitor.agent("root").map(|live| live.phase), Some(AgentPhase::Thinking));
+        assert_eq!(
+            monitor.agent("root").map(|live| live.phase),
+            Some(AgentPhase::Thinking)
+        );
 
         monitor.finish_surface_root("root", true, false);
         assert_eq!(monitor.active_count(), 0);

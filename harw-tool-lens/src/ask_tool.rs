@@ -405,6 +405,8 @@ mod tests {
             },
             text: "Lens bindet zehn Crates unter einer Fassade.".to_owned(),
             visibility: DEFAULT_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         }];
         harw_lens::build(
             &home,

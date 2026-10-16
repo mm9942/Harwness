@@ -54,6 +54,12 @@
 //!   neben den übrigen Arten, statt sie für die ganze Laufdauer zu
 //!   blockieren.
 //!
+//! * [`JobKind::Custom`] named `intent_cycle`
+//!   (`harw_plan_bridge::INTENT_CYCLE_JOB_KIND`) — ein nur lesender
+//!   PL-90-Intent-Zyklus (Modul [`intent_cycle_job`]): `CycleDriver` mit
+//!   Modell-Proposer, Explorer und deterministischem Verifier; läuft in der
+//!   Lane der langen Läufe neben den Arbeitstreibern.
+//!
 //! # Runtime assembly (W2d-2 J1, docs/design/runtime-contracts.md §extension)
 //! Every executed job is assembled through
 //! `crate::runtime_jobs::job_assembly` and gets its root session from
@@ -119,6 +125,9 @@ mod kanban_card;
 
 #[path = "job_worker_work_driver.rs"]
 mod work_driver_job;
+
+#[path = "job_worker_intent_cycle.rs"]
+mod intent_cycle_job;
 
 #[path = "job_worker_verify_diagnostics.rs"]
 mod verify_diagnostics;
@@ -686,6 +695,7 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
         // weil sie bis zu ihrer Frist (30–120 s) blockierende Dateiarbeit
         // leistet und die übrigen Arten nicht aufhalten darf.
         if work_driver_job::is_work_driver_kind(&record.job.kind)
+            || intent_cycle_job::is_intent_cycle_kind(&record.job.kind)
             || memory_job::is_memory_kind(&record.job.kind)
             || retention_job::is_retention_kind(&record.job.kind)
             || learning_job::is_learning_kind(&record.job.kind)
@@ -820,6 +830,7 @@ fn is_supported_kind(kind: &JobKind) -> bool {
                 || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
                 || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
                 || name == harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND
+                || name == harw_runtime::job_ledger::INTENT_CYCLE_JOB_KIND
                 || name == harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND
                 || name == harw_ops::retention_job::RETENTION_SWEEP_JOB_KIND
                 || name == harw_ops::learning_job::LEARNING_EXTRACT_JOB_KIND
@@ -880,6 +891,16 @@ async fn execute_claim(task: ClaimTask) -> JobOutcome {
             provider,
             job_store,
             Arc::clone(&control),
+        )
+        .await
+    } else if intent_cycle_job::is_intent_cycle_kind(&claim.job.kind) {
+        intent_cycle_job::execute_intent_cycle_claim(
+            claim,
+            input,
+            provider,
+            job_store,
+            Arc::clone(&control),
+            &context,
         )
         .await
     } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
@@ -4190,6 +4211,148 @@ mod tests {
     }
 
     // ── Work-driver lane ──────────────────────────────────────────────────
+
+    mod intent_cycle_e2e {
+        use super::*;
+        use std::collections::{BTreeMap, VecDeque};
+
+        use harw_core::{ModelError, ModelFuture, ModelRequest, ModelResponse};
+        use harw_ops::intent_cycle::{INTENT_CYCLE_INPUT_SCHEMA_VERSION, IntentCycleJobInput};
+        use harw_plan_bridge::{
+            ContentCheck, CycleStore, CycleTerminal, INTENT_CYCLE_JOB_KIND, ReadOnlyCycleSpec,
+        };
+
+        /// Replays scripted proposals, one per model call.
+        struct Scripted(Mutex<VecDeque<String>>);
+
+        impl ModelProvider for Scripted {
+            fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+                let next = self
+                    .0
+                    .lock()
+                    .ok()
+                    .and_then(|mut queue| queue.pop_front())
+                    .ok_or_else(|| ModelError::RequestFailed("script exhausted".to_owned()));
+                Box::pin(async move { next.map(ModelResponse::text) })
+            }
+        }
+
+        fn cycle_record(id: &str, workspace_root: &Path) -> TestResult<StoredJob> {
+            let spec = ReadOnlyCycleSpec::new(
+                "does lib.rs define the marker?".to_owned(),
+                BTreeMap::from([("lib".to_owned(), "src/lib.rs".to_owned())]),
+                BTreeMap::from([(
+                    "marker-defined".to_owned(),
+                    ContentCheck {
+                        target: "lib".to_owned(),
+                        must_contain: vec!["fn cycle_marker".to_owned()],
+                        must_not_contain: Vec::new(),
+                    },
+                )]),
+                None,
+            );
+            let input = IntentCycleJobInput {
+                schema_version: INTENT_CYCLE_INPUT_SCHEMA_VERSION,
+                cycle_id: id.to_owned(),
+                intent_id: format!("intent-{id}"),
+                spec,
+                requested_by: "operator".to_owned(),
+                tenant: None,
+                workspace_root: Some(
+                    std::fs::canonicalize(workspace_root).map_err(ctx("canonical root"))?,
+                ),
+            };
+            ready_record_of_kind(
+                id,
+                JobKind::Custom(INTENT_CYCLE_JOB_KIND.to_owned()),
+                serde_json::to_value(input).map_err(ctx("input json"))?,
+            )
+        }
+
+        #[tokio::test]
+        async fn worker_drives_a_cycle_to_completion_proposed() -> TestResult {
+            let temp = temp_dir()?;
+            let context = job_context(temp.path())?;
+            let cwd = context
+                .runtime_root
+                .as_ref()
+                .map(|root| root.cwd.clone())
+                .ok_or(TestError::Missing("runtime cwd"))?;
+            std::fs::create_dir_all(cwd.join("src")).map_err(ctx("mkdir src"))?;
+            std::fs::write(cwd.join("src/lib.rs"), "pub fn cycle_marker() {}\n")
+                .map_err(ctx("write lib"))?;
+            let config = context
+                .runtime_root
+                .as_ref()
+                .map(|root| root.home.join("config.toml"))
+                .ok_or(TestError::Missing("runtime home"))?;
+            // Top-level keys must precede the first table.
+            let text = std::fs::read_to_string(&config).map_err(ctx("read config"))?;
+            std::fs::write(
+                &config,
+                format!("default_model = \"cycle-test-model\"\n{text}"),
+            )
+            .map_err(ctx("write config"))?;
+            let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
+            admit(&store, &cycle_record("cycle-e2e", &cwd)?)?;
+            let provider = Arc::new(Scripted(Mutex::new(VecDeque::from([
+                r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                r#"{"kind":"verify","evidence_id":"cycle-e2e-0:lib"}"#.to_owned(),
+                r#"{"kind":"complete"}"#.to_owned(),
+            ]))));
+            let completed = run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                provider as Arc<dyn ModelProvider>,
+                None,
+                context,
+            )
+            .await;
+            assert_eq!(completed, 1);
+            let outcome = completion_of(&store, "cycle-e2e")?;
+            let JobOutcome::Succeeded { result } = outcome else {
+                return Err(TestError::Unexpected(format!("{outcome:?}")));
+            };
+            assert_eq!(result["terminal"], "completion_proposed");
+            assert_eq!(result["requires_owner_acceptance"], true);
+            let cycles = CycleStore::open_existing_in_job_root(store.root())
+                .map_err(ctx("open cycle store"))?
+                .ok_or(TestError::Missing("cycle store"))?;
+            let status = cycles.load("cycle-e2e").map_err(ctx("cycle"))?.status();
+            assert_eq!(status.terminal, Some(CycleTerminal::CompletionProposed));
+            assert_eq!(status.criteria_covered, vec!["marker-defined".to_owned()]);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn malformed_cycle_input_fails_without_a_model_call() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
+            admit(
+                &store,
+                &ready_record_of_kind(
+                    "cycle-bad",
+                    JobKind::Custom(INTENT_CYCLE_JOB_KIND.to_owned()),
+                    serde_json::json!({"objective": "x"}),
+                )?,
+            )?;
+            let provider = Arc::new(RecordingModelProvider::new());
+            run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                None,
+                job_context(temp.path())?,
+            )
+            .await;
+            assert!(provider.recorded().is_empty());
+            assert!(matches!(
+                completion_of(&store, "cycle-bad")?,
+                JobOutcome::Failed { .. }
+            ));
+            Ok(())
+        }
+    }
 
     mod work_driver_lane {
         use super::*;

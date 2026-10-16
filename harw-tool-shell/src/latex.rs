@@ -867,6 +867,9 @@ impl SandboxRunner {
         cancel: Option<&CancelToken>,
         deadline: tokio::time::Instant,
     ) -> Result<(RunEnd, BoundedCapture), Option<ToolOutput>> {
+        // Tests run the programs through the job runtime as well.
+        #[cfg(test)]
+        crate::test_support::install_host_port();
         #[cfg(test)]
         let prepared = if self.launch_directly {
             Ok(PreparedLaunch {

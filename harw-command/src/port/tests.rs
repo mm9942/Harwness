@@ -68,7 +68,14 @@ async fn the_environment_is_exactly_the_request_and_never_persisted() -> TestRes
         .env
         .push(("HARW_SECRET".into(), "s3cret-value".into()));
     let outcome = port(&root)?.run(request, CancelToken::new()).await;
-    assert_eq!(outcome.stdout, b"s3cret-value\n/tmp\n", "{outcome:?}");
+    let output = String::from_utf8_lossy(&outcome.stdout);
+    let mut lines = output.lines();
+    assert_eq!(lines.next(), Some("s3cret-value"), "{outcome:?}");
+    // macOS resolves `/tmp` to `/private/tmp`; Linux reports `/tmp`.
+    assert!(
+        matches!(lines.next(), Some("/tmp" | "/private/tmp")),
+        "unexpected working directory: {outcome:?}"
+    );
     for entry in walk(&root)? {
         let text = std::fs::read(&entry).map_err(ctx("read"))?;
         assert!(

@@ -70,7 +70,7 @@
 use harw_authority::{Permission, PermissionSet};
 
 use crate::capability_catalog::{
-    WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
+    INTENT_CYCLE_TOOLS, WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
@@ -720,6 +720,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // `job.status`/`job.stop`.
         || tool == WORK_DRIVER_STATUS_TOOL
         || tool == WORK_DRIVER_STOP_TOOL
+        // PL-90: an intent cycle only reads the named workspace files
+        // (read-only explorer + deterministic verifier); start, status and
+        // stop therefore need exactly the read right.
+        || listed(INTENT_CYCLE_TOOLS)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(&CONTAINER_TOOLS) {
@@ -1009,6 +1013,19 @@ mod tests {
             Some(Permission::ExecuteProcess)
         );
         for tool in [WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL] {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
+    }
+
+    /// PL-90: alle drei Intent-Zyklus-Werkzeuge lesen nur den Workspace.
+    #[test]
+    fn test_tool_permission_maps_intent_cycle_tools_to_read_workspace() {
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        for tool in INTENT_CYCLE_TOOLS {
             assert_eq!(
                 tool_permission(tool),
                 Some(Permission::ReadWorkspace),

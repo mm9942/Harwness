@@ -70,8 +70,7 @@ pub(crate) fn get_bound_workspace_job(
 ) -> SessionStoreResult<StoredJob> {
     let record = get_visible_job(ctx, store, work_id)?;
     let binding = ctx.sandbox().workspace();
-    if record.scope.tenant() == binding.tenant()
-        && record.scope.workspace() == binding.workspace()
+    if record.scope.tenant() == binding.tenant() && record.scope.workspace() == binding.workspace()
     {
         Ok(record)
     } else {

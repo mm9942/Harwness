@@ -1190,8 +1190,8 @@ mod tests {
     use crate::test_support::{TestError, TestResult};
     use harw_config::ResolvedConfig;
     use harw_core::{
-        AgentEventHub, ChildLimits, InMemoryStateStore, JobExecutionRegistry,
-        ManagedAgentSpawner, SessionManager,
+        AgentEventHub, ChildLimits, InMemoryStateStore, JobExecutionRegistry, ManagedAgentSpawner,
+        SessionManager,
     };
     use harw_extension_api::allow_rules::AllowRuleSet;
     use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};

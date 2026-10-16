@@ -366,6 +366,9 @@ impl AssemblyContributor for CloudOpsContributor {
         ) {
             return Ok(());
         }
+        // Cloud operations are restricted to authorized UIA roots and their
+        // configured operation surface; mutating operations enforce approval
+        // in their operation definitions.
         if let Err(error) = harw_cloud_ops::register_cloud(&mut parts.operations) {
             tracing::warn!(%error, "runtime.cloud_operations_not_registered");
         }
@@ -377,7 +380,6 @@ impl AssemblyContributor for CloudOpsContributor {
 /// root registry if `[browser].enabled` and `[browser].roles` contain the
 /// `root` role. Children get them per-role in `children.rs` through the same
 /// configuration.
-
 #[cfg(feature = "browser")]
 #[derive(Debug, Default)]
 pub struct BrowserRootContributor;

@@ -264,3 +264,27 @@
 - Merge to `dev` once the central build above is green.
 - Preventive path-level write rights (DEC-009 proposal, C-08).
 - A cloud home proposal (DEC-010, C-10).
+
+---
+
+## MIG-PL90-W03w — Intent cycles wired end to end (read-only explorer recipe)
+
+**Planning compartment:** `docs/planning/90-intent-driven-composed-agents` (04 §7)
+**Baseline commit:** `dev@6e34f2e3` plus PR branches #141, #143, #144, #145/#146/#147 and the newest docs branches (provider lifecycle 2026-10-14, Linux user cloud control 2026-10-16), merged on the integration branch
+**Implementation commit / PR:** integration branch `ccr-c2654e2c-284ibb` → `dev`
+**Affected crates:** `harw-plan-bridge`, `harw-ops`, `harw-registry-defaults`, `harw-runtime`, `harw-cli`
+
+**Before:** W01–W03 building blocks existed (`intent_cycle`, `cycle_runtime`, `cycle_explorer`, `cycle_proposer`), but nothing called them: no tool, no job kind, no worker, no verifier. `Complete` was unreachable because nothing produced `Verified` evidence.
+**Target:** a durable, human-approved, read-only intent cycle that can be started, observed and stopped as a tool and runs as a fenced job.
+**Landed delta:**
+- `harw-plan-bridge::cycle_verifier` — deterministic `ContentCheck` per acceptance criterion; `Verify` re-reads the observed file, requires an unchanged digest, emits `Verified` evidence of source `Verification` or an `unmet:`/`stale:` claim. `ExplorerCycleExecutor` = explorer (read/wait) + verifier (verify).
+- `harw-plan-bridge::cycle_spec` — `ReadOnlyCycleSpec` (objective, read targets, checks, limits ≤ host ceiling) with one canonical intent digest; `plan()` is the single validation used by the operation and the worker.
+- `CeilingReissuer` — narrowing-only reissue of the persisted `AuthoritySnapshot` against the worker's current trusted ceiling; `INTENT_CYCLE_JOB_KIND`, `CycleStore::open_in_job_root`.
+- `harw-ops::intent_cycle` — `intent_cycle.start` (operator, `approval = "always"`), `intent_cycle.status` (observer, read-only), `intent_cycle.stop` (operator, `approval = "always"`); registered by `register_intent_cycle_tools` behind the `[tools.plan]` gate and mounted by the runtime assembly.
+- `harw-registry-defaults` — catalog rows (`start` = `Read`, `status`/`stop` = `Meta`) and `ReadWorkspace` as the tool right of all three.
+- `harw-cli` job worker — `intent_cycle` jobs run in the long-run lane: fence + scope check, spec re-validation, read-only explore sandbox as ceiling, record creation on first claim, `CycleDriver` with `ModelCycleProposer` (budgeted provider, `Explorer` internal model or default model), job cancel → driver cancel, wall budget.
+**Compatibility retained:** no existing tool, job kind or permission changed; the cycle is read-only (no write targets, children or recipes).
+**Tests added/changed:** verifier (pass, unmet, stale, permission, non-repository evidence, explorer contract), spec validation and digest, W03 cross-module test `spec_read_verify_complete_reaches_completion_proposed`, ops start/refusal/status/stop tests, worker e2e `worker_drives_a_cycle_to_completion_proposed` and malformed-input test; registry completeness lists updated.
+**Architecture gates changed:** none (no new crate edges: `harw-ops → harw-plan-bridge` and `harw-cli → harw-plan-bridge` already existed).
+**Documentation updated:** PL-90 README and 04 §7.
+**Remaining plan items:** W03c learning outbox, W03d run isolation, small-model benchmark, W04+ (orchestrator, write waves, research, Matrix, LaTeX, DoD).

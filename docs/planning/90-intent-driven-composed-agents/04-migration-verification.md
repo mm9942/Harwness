@@ -1,6 +1,6 @@
 # 04 — Implementation waves, review gates, metrics and migration ledger
 
-> Status: **proposal only**, documented on the pinned `dev@197a92e92d438bf6bf93b129bb964f4852686149` baseline. This documentation PR does not implement a runtime, does not widen admission rights, and must not be presented as a passed build.
+> Status: **proposal** (§§1–6), documented on the pinned `dev@197a92e92d438bf6bf93b129bb964f4852686149` baseline. §7 records what is implemented so far (partial W01–W03; the read-only recipe is wired). This PR does not widen admission rights and must not be presented as a passed build.
 
 ## 1. Implementation ownership principles
 
@@ -133,7 +133,9 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 11. How intent-driven writes request expansion of path scope without silently violating original acceptance contract.
 12. Trace/event schema that makes graph evolution understandable in TUI/Web/Telegram while hiding secret material.
 
-**Additional PL-90 status note (2026-10-08):** W03c, W03d and W09a–W09c are **PLANNED ONLY**; this PR currently contains no durable learning outbox or production cross-run memory consumer. The new [05 addendum](05-error-learning-and-run-isolation.md) introduces evidence-based gates, not a tested feature.\n\n## 7. Implementation status
+**Additional PL-90 status note (2026-10-08):** W03c, W03d and W09a–W09c are **PLANNED ONLY**; this PR currently contains no durable learning outbox or production cross-run memory consumer. The new [05 addendum](05-error-learning-and-run-isolation.md) introduces evidence-based gates, not a tested feature.
+
+## 7. Implementation status
 
 Status vocabulary as in the dossier: `CURRENT` = merged and checked, `IN PR` = code in this PR with locally green tests, `PLANNED` = design only.
 
@@ -175,25 +177,43 @@ Intermediate state: the two halves of the W03 explorer exist as independently te
 | Module | What it does | Key decisions |
 |---|---|---|
 | `cycle_explorer.rs` (`ReadOnlyExplorerExecutor`) | First trusted `CycleStepExecutor`: turns admitted `Segment::Read` segments into `EvidenceRecord`s (source `Repository`, digest of the bytes, workspace-relative locator). Refuses child/nested segments and every non-read proposal. Reads go through `harw-tool-fsread` `Scope` (no symlink escape, regular files only, secret paths denied) and need `ReadWorkspace` | Target ids map to paths only via a trusted, non-`Deserialize` `ReadTargetMap`. All-or-nothing step: any failing read returns `Err(StepFailure)` (no partial evidence); the driver counts it as a stall. `reconcile` always returns `NotStarted` (reads are idempotent; a recovered digest could be stale). Oversized files are refused, never truncated or digested as a prefix. Optional bounded in-memory `ExplorerReadCache` (oldest-first eviction, filled only when the whole step succeeded, lost on restart). It only ever produces `Observed` evidence |
-| `cycle_proposer.rs` (`ModelCycleProposer`) | `CycleProposer` over a `ModelProvider`: pure `render_prompt` -> one JSON object -> `serde` parse (`deny_unknown_fields`) -> `CycleProposal`; admission and executor still decide everything | Route policy: deterministic default/escalation route chosen from refusal streak and `stall_transitions`, never by the model. One repair re-prompt with the bounded parse error, then `Err` -> `Blocked` (no synthesized `Escalate`). Retryable provider errors retried up to `max_retries` without sleeping. Auth circuit breaker: after `auth_trip_after` consecutive `Auth` failures a route is no longer used. Prompt exclusions: no authority snapshot, ceiling, permissions, digests, file contents or claim bodies; ids and locators are sanitized and capped |
+| `cycle_proposer.rs` (`ModelCycleProposer`) | `CycleProposer` over a `ModelProvider`: pure `render_prompt` -> one JSON object -> `serde` parse (`deny_unknown_fields`) -> `CycleProposal`; admission and executor still decide everything | Route policy: deterministic default/escalation route chosen from refusal streak and `stall_transitions`, never by the model. One repair re-prompt with the bounded parse error, then `Err` -> `Blocked` (no synthesized `Escalate`). Retryable provider errors retried up to `max_retries` times with bounded waits (`retry_wait`; a provider wait above `retry_max_wait` fails at once). Auth circuit breaker: after `auth_trip_after` consecutive `Auth` failures a route is no longer used. Prompt exclusions: no authority snapshot, ceiling, permissions, digests, file contents or claim bodies; ids and locators are sanitized and capped |
 
 What is NOT done:
 
-- No runtime caller builds a `ReadTargetMap`, and there is no tool or registry entry that starts a cycle with these modules.
-- No real verifier: `Verify` is refused by the explorer, so `Complete` (which needs `Verified` evidence) is unreachable for a pure explorer cycle; the cross-module test therefore ends in `Escalate`, and the in-module `Verified` stand-in in `cycle_explorer` tests is a test double.
+- ~~No runtime caller builds a `ReadTargetMap`, and there is no tool or registry entry that starts a cycle with these modules.~~ Done in 7.4.
+- ~~No real verifier: `Verify` is refused by the explorer, so `Complete` is unreachable.~~ Done in 7.4 (`cycle_verifier`); the in-module `Verified` stand-in in `cycle_explorer` tests is still a test double.
 - No `CancelToken` in the proposer (`CycleProposer::propose` does not receive one; requests carry `cancel: None`).
-- No retry backoff (the provider layer owns pacing and `Retry-After`).
+- ~~No retry backoff.~~ The proposer now sleeps bounded waits (see the table above); the provider layer still owns pacing.
 - No small-model benchmark (the W03 exit criterion in section 2 is still open).
 
-### 7.4 Not done (PLANNED)
+### 7.4 Production wiring of the read-only recipe — IN PR (MIG-PL90-W03w)
 
-- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). W03 now has its building blocks (7.3) but no wiring or benchmark; W04 is open.
+The W03 building blocks are now reachable end to end:
+
+| Layer | What | Where |
+|---|---|---|
+| Verifier | `ContentCheck` per acceptance criterion; `Verify` re-reads the observed file, requires the same digest, yields `Verified` evidence (source `Verification`) or an `unmet:`/`stale:` claim. `Complete` is now reachable without trusting the model | `harw-plan-bridge/src/cycle_verifier.rs` |
+| Executor | `ExplorerCycleExecutor` = read-only explorer (read, wait) + verifier (verify); everything else refused | same |
+| Spec | `ReadOnlyCycleSpec` (objective, read targets, checks, limits ≤ `MAX_CYCLE_LIMITS`), one canonical intent digest, `plan()` = the single validation of operation and worker | `harw-plan-bridge/src/cycle_spec.rs` |
+| Reissue | `CeilingReissuer`: persisted snapshot ∩ current trusted ceiling of the same workspace (never widens) | `cycle_runtime.rs` |
+| Tools | `intent_cycle.start` (approval always), `.status` (read-only), `.stop` (approval always); behind `[tools.plan]`; `ReadWorkspace` right; catalog class `Read`/`Meta` | `harw-ops/src/intent_cycle.rs`, `harw-registry-defaults` |
+| Job | kind `intent_cycle`, long-run lane, claim fence, read-only explore sandbox as ceiling, record created on first claim (epoch 0 → first lease rebinds), budgeted proposer, job cancel → driver cancel, wall budget | `harw-cli/src/job_worker_intent_cycle.rs` |
+
+Verified locally: `cargo test -p harw-plan-bridge` (cycle tests incl. `spec_read_verify_complete_reaches_completion_proposed`), `cargo test -p harw-ops`, `cargo test -p harw-registry-defaults`, `cargo test -p harw-cli --lib intent_cycle` (worker e2e: admitted job → `Succeeded { terminal: completion_proposed, requires_owner_acceptance: true }`).
+
+Proposer cancellation: the driver races every `propose` against the job's cancel token (`tokio::select!`), so a stop or lease loss drops an in-flight model request; the trait itself still takes no token.
+
+### 7.5 Not done (PLANNED)
+
+- No concrete executor for tools beyond file reads, waits and the content verifier, child spawn or nested recipes; no write-capable adapter (W05). W04 is open.
+- No small-model benchmark (W03 exit criterion).
 - Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
 
-- W03 wiring and W04–W10: no wired explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
+- W04–W10: no wired orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
 - Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
 
-### 7.5 Base-branch notes found while verifying
+### 7.6 Base-branch notes found while verifying
 
 - `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
 - The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).

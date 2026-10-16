@@ -113,6 +113,11 @@ impl ResumeCursors {
         Ok(())
     }
 
+    /// Forget the cursor of `session` (detached or ended).
+    pub fn remove(&mut self, session: &SessionId) {
+        self.cursors.remove(session);
+    }
+
     /// Cursor to resume `session` from, if one was recorded.
     ///
     /// # Errors
@@ -125,6 +130,68 @@ impl ResumeCursors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// h19: the attach/resume path records every seen frame cursor
+    /// monotonically — the value a re-attach later presents as
+    /// `AttachParams::from` is always the newest actually observed cursor.
+    #[test]
+    fn resume_cursors_are_monotonic_for_the_attach_path() {
+        let session = SessionId::try_from_str("s-resume").expect("valid session id");
+        let mut cursors = ResumeCursors::new();
+        assert!(cursors.cursor(&session).ok().flatten().is_none());
+
+        let first = Cursor {
+            generation: 0,
+            durable: 3,
+            live: 1,
+        };
+        cursors.record(&session, first).expect("record first");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(first));
+
+        // Older or equal cursor: ignored.
+        let older = Cursor {
+            generation: 0,
+            durable: 2,
+            live: 9,
+        };
+        cursors.record(&session, older).expect("record older");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(first));
+
+        // Newer cursor replaces the stored one.
+        let newer = Cursor {
+            generation: 0,
+            durable: 3,
+            live: 5,
+        };
+        cursors.record(&session, newer).expect("record newer");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(newer));
+
+        // Higher generation replaces outright even with lower durable.
+        let regen = Cursor {
+            generation: 1,
+            durable: 0,
+            live: 0,
+        };
+        cursors.record(&session, regen).expect("record regen");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(regen));
+    }
+
+    #[test]
+    fn removed_session_has_no_resume_cursor() -> Result<(), String> {
+        let session = SessionId::try_from_str("s-rm").map_err(|error| error.to_string())?;
+        let mut cursors = ResumeCursors::new();
+        let cursor = Cursor {
+            generation: 0,
+            durable: 1,
+            live: 1,
+        };
+        cursors
+            .record(&session, cursor)
+            .map_err(|error| error.to_string())?;
+        cursors.remove(&session);
+        assert_eq!(cursors.cursor(&session).ok().flatten(), None);
+        Ok(())
+    }
 
     #[test]
     fn default_policy_first_delay_is_bounded() {

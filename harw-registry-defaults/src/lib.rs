@@ -1263,6 +1263,10 @@ mod tests {
             "matrix.start",
             "matrix.run",
             "matrix.finish",
+            // PL-90: Intent-Zyklen deklarieren `approval = "always"`
+            // (`harw-ops/src/intent_cycle.rs`).
+            "intent_cycle.start",
+            "intent_cycle.stop",
         ] {
             assert!(
                 DefaultApprovalPolicy::requires_explicit_approval(&call(name)),
