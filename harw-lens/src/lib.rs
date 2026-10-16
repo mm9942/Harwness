@@ -299,6 +299,8 @@
 //!     source: SourceRef::File { path: "intro.md".to_owned() },
 //!     text: "Harwness Fassaden binden zehn Crates unter einem Namen.".to_owned(),
 //!     visibility: DEFAULT_VISIBILITY.to_owned(),
+//!     is_binary: false,
+//!     content_hash: None,
 //! }];
 //!
 //! let reports = build(

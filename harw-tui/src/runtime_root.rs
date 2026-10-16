@@ -1041,7 +1041,7 @@ fn build_root_runtime(
     })?;
     let (turn_event_tx, turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
     let root_session_id = assembly.root_session_id().clone();
-    let RootSession { session, .. } = assembly
+    let RootSession { mut session, .. } = assembly
         .new_root_session(
             root_session_id.clone(),
             events_tx,
@@ -1135,6 +1135,10 @@ fn build_root_runtime(
     app.attach_agent_events(assembly.agent_events());
     // Runde 5, Teil K: Orchestratoren der UIA-Wurzel laufen im Hintergrund.
     let approval_driver = crate::app::background_agents::attach_launcher(approval_driver, assembly);
+    // The TUI has no durable job store (hence no agent job submitter), but its
+    // `BackgroundLauncher` detaches `AwaitingChild` pauses: tell the turn loop
+    // so delegation is not refused as "no background executor".
+    session.set_host_background_launcher(assembly.spawner().is_some());
     // Runde 5, Teil O: Freigabe-Fragen von Kindern gehen an die Nutzerin
     // (Freigabedialog mit Absender) statt sofort zu scheitern.
     crate::app::child_approvals::attach(&mut app, assembly.spawner(), assembly.auto_mode());

@@ -71,13 +71,12 @@ const EXPLORE_TOOLS: &[&str] = &[
     // Plan R9, Teil A: Skill-Katalog lesen (Host-Prozess, keine Rechteklasse).
     "skills.search",
     "skills.load",
-    // Plan R9, Teil F: laufende Jobs nur ansehen bzw. auf sie warten
+    // Plan R9, Teil F: laufende Jobs nur ansehen
     // (`harw-tool-job`, eigene Jobs und die der Nachfahren). `job.start`
     // und `job.stop` bleiben außerhalb.
     "job.status",
     "job.logs",
     "job.list",
-    "job.wait",
 ];
 
 /// Werkzeuge von [`InteractionMode::Plan`].
@@ -107,7 +106,6 @@ const PLAN_TOOLS: &[&str] = &[
     "job.status",
     "job.logs",
     "job.list",
-    "job.wait",
     // — Planungs- und Rechercheerweiterung —
     "plan",
     "goal",
@@ -653,7 +651,6 @@ mod tests {
             "job.status",
             "job.logs",
             "job.list",
-            "job.wait",
         ];
         assert_eq!(InteractionMode::Explore.allowed_tools(), Some(expected));
     }
@@ -680,7 +677,6 @@ mod tests {
             "job.status",
             "job.logs",
             "job.list",
-            "job.wait",
             "plan",
             "goal",
             "web.fetch",

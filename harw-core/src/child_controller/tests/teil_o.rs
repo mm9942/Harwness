@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use super::*;
 use crate::child_approval::{
     ChildApprovalAnswer, ChildApprovalBroker, ChildApprovalRequest, REASON_CHILD_APPROVAL_TIMEOUT,
-    REASON_TOOL_OUTSIDE_ROLE,
+    REASON_CHILD_APPROVAL_UNDELIVERABLE, REASON_TOOL_OUTSIDE_ROLE,
 };
 
 /// Name des schreibenden Test-Werkzeugs der Kind-Rolle.
@@ -342,27 +342,38 @@ async fn a_request_outside_the_role_is_rejected_without_asking() -> TestResult {
     Ok(())
 }
 
-/// Ohne angebundenen Kanal (Nicht-TUI) bleibt es beim fail-closed-Verhalten.
+/// Ohne angebundenen Kanal (Nicht-TUI) bleibt es beim fail-closed-Verhalten:
+/// seit 7b8578a wird die Freigabe nicht mehr per Turn-Abbruch
+/// (`awaiting_approval`) beantwortet, sondern das Kind bekommt einen
+/// ablehnenden Werkzeugfehler und läuft regulär weiter. Entscheidend bleibt:
+/// das freigabepflichtige Werkzeug läuft **nie** (0 Läufe), das Kind endet
+/// nicht pausiert und die Ablehnung steht als Werkzeugergebnis fest.
 #[tokio::test]
 async fn without_a_relay_the_child_still_fails_closed() -> TestResult {
     let runs = Arc::new(AtomicUsize::new(0));
     let (spawner, child) = asking_child(&runs)?;
     let store = InMemoryStateStore::new();
 
-    let Err(error) = spawner
+    let run = spawner
         .run_child(&child, &store, TurnInput::user("arbeite"))
         .await
-    else {
-        return Err(TestError::Unexpected(
-            "ohne Kanal darf das Kind nicht weiterlaufen".to_owned(),
-        ));
-    };
+        .map_err(ctx("das Kind endet regulär, ohne das Werkzeug zu starten"))?;
+
     assert!(
-        error.message.contains("awaiting_approval"),
-        "{}",
-        error.message
+        matches!(run.outcome, TurnOutcome::Completed),
+        "kein pausierter oder erfolgreicher Fremdausgang: {:?}",
+        run.outcome
     );
-    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "das freigabepflichtige Werkzeug darf ohne Kanal nie laufen"
+    );
+    let result = last_tool_result(&spawner, &child)?;
+    assert!(
+        format!("{result:?}").contains(REASON_CHILD_APPROVAL_UNDELIVERABLE),
+        "{result:?}"
+    );
     Ok(())
 }
 

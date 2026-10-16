@@ -359,6 +359,17 @@ impl View<'_> {
                 });
             }
             SessionFrame::Revoked => return Err(AttachError::Revoked),
+            SessionFrame::Presence { attached } => {
+                writeln!(
+                    self.out,
+                    "-- presence: {}",
+                    attached
+                        .iter()
+                        .map(|e| e.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+            }
             _ => {}
         }
         Ok(Flow::Continue)
@@ -838,6 +849,18 @@ mod tests {
         let (result, out) = drive(fake, None, &[]).await;
         assert!(matches!(result, Err(AttachError::Ambiguous(_))));
         assert!(out.contains('a') && out.contains('b'));
+    }
+
+    #[tokio::test]
+    async fn single_session_is_attached_without_prompt() {
+        let fake = Fake {
+            sessions: vec![summary("only")],
+            ..Fake::default()
+        };
+        let mut out = Vec::<u8>::new();
+        let picked = pick_session(&fake, &mut out).await;
+        assert_eq!(picked.map(|s| s.0).ok().as_deref(), Some("only"));
+        assert!(out.is_empty());
     }
 
     #[tokio::test]

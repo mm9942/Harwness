@@ -70,3 +70,185 @@ Unverändert in der Reihenfolge, aber geändert im Inhalt:
 
 - **PR #70** (`feat/models-reasoning-effort`): Persistenz-Schicht für `(model, effort)` pro Rolle — Grundlage dieses Designs.
 - **PL-71** (PR #68, semantic-activity-patterns): PatternInstances als strukturierte Beobachtungen für Chains — nachgelagert, nach dieser Revision gegenzulesen (Integrationsformulierung 06, diff 937–946).
+
+
+---
+
+## Addendum (2026-10-08): Cycle-composed agents and delegation-first organization
+
+> **Status: TARGET / design extension; NOT an implemented chain runtime.**
+> Verified reference: `dev@197a92e92d438bf6bf93b129bb964f4852686149`.
+> Evidence motivating this addendum: a 2026-10-08 local SGH-Flow session export
+> (not committed; it contains private environment configuration and must remain local).
+
+### A. Agent as composed executable behavior — not a seventh authority role
+
+For small open-weights models, including approximately 30B-parameter models without provider-native extended reasoning, the useful logical agent can be assembled from:
+
+```text
+ComposedAgent = AgentIdentity + AuthorityCeiling + ModelRoute
+              + ChainRecipe + Tools/Skills + ContextProgram
+              + ReturnContract + Budgets
+```
+
+`(model, effort)` remains the atomic model-turn route when effort is supported.
+For a model without native effort, the chain supplies *explicit structured reasoning
+operations*: orient, identify evidence gaps, retrieve targeted facts, compare
+hypotheses, verify, synthesize, decide and repeat. Chain iterations are not
+provider-private chain-of-thought and must not request hidden reasoning traces.
+
+A `cycle-as-agent` is the **composed agent behavior** exposed as a named, versioned,
+callable specialist. A cycle **does not gain a new `AgentRoleId`**: its owner retains
+one of the six existing sealed organizational roles. A cycle is a *workflow primitive*;
+a composed agent is the executable unit binding that primitive to a model, rights,
+tools and a return contract. It is legitimate to call the resulting unit an agent.
+
+### B. Three independent depth and budget dimensions
+
+```text
+authority/spawn depth  : can this caller admit another agent?
+chain nesting depth   : can this recipe execute a bounded nested chain?
+reasoning-round budget: how many structured model turns may occur?
+```
+
+One does not widen another. `max_depth=0` for a worker does not prohibit
+*internal sequential chain turns*, but prohibits creating durable child agents.
+Nested chains use the parent job/claim, authority ceiling, cancellation and
+provider pacing. A subchain's state can be checkpointed without minting a
+new privileged identity or role.
+
+### C. Proposed built-in composed specialists
+
+The following are **design targets**, not claims that each name is already a
+registered built-in role:
+
+| Target composition | Orchestrator scope | Bounded worker / chain recipes |
+|---|---|---|
+| Explore | repository inventory and scope assignment | tree/index scan, file-path discovery, graph edges, targeted source reading, evidence citations |
+| Directory/File Research | exact file ownership and code evidence | grep/search -> narrow read -> cross-reference -> evidence review |
+| Web Research | primary docs and changelogs, no workspace leakage | search -> fetch -> cross-source corroboration -> source freshness -> synthesis |
+| Dependencies | package manifest / lock resolution and provenance | ecosystem metadata, installed source and advisory lookup |
+| Evidence/Method Review | independent falsification | critic + method auditor, disputed claims returned to the owner |
+| Scenario Analysis | hypotheses, key drivers, competing futures | scenario-player + systems-modeller + pattern-analyst |
+| Matrix Games | game/adjudication workflow | matrix runner's existing controlled seat agents; preserve engine-owned dice and approvals |
+| Implementation | scoped edit ownership | explorer -> plan -> authorized code writer -> central verification -> critic |
+
+Present foundations include `research-orchestrator`, `coding-orchestrator`,
+`analysis-orchestrator`, `matrix-game-master` and project/profile agent
+packs such as `intel-analysis-orchestrator`,
+`wargaming-orchestrator`, `dependency-research-orchestrator` and
+`evidence-review-orchestrator`. They do **not** all have Root permission
+to spawn as children of the general root orchestrator today. The built-in
+Root's exact allowlist (its three `child_orchestrators`) contains only the
+coding/research/analysis orchestrators.
+
+`matrix-game-master` needs two separate statements. *Organizational role:* it
+is a root-orchestrator-role specialist (`role = "root-orchestrator"`,
+`harw-registry-defaults/src/profile.rs`, `MATRIX_GAME_MASTER`), not one of the
+general Root's three child orchestrators. *Actual tree relation:* the UIA
+already starts it today via `transfer_to_matrix-game-master` as a background
+child (`harw-ops/src/matrix/mod.rs`, module doc, Round 7 part M). That UIA to
+game-master relation exists and is not future work. What is not in place is
+the general root orchestrator delegating to it; that would be new and needs a
+scoped capability and game-engine review.
+
+### D. Default delegation-first planner
+
+For a multi-domain request Root should produce a typed task graph, with each node:
+
+```text
+TaskNode {
+  id, objective, dependency_ids[], scope, capability_requirements,
+  expected_return_schema, evidence_requirements, max_budget,
+  idempotency_key, owner_role_candidate, completion_predicate
+}
+```
+
+Do not expose a full toolbox to every model turn. Build a small discoverable
+capability index and materialize **only the authorized relevant** tool family
+per node (registry and admission stay authoritative). An explicit capability
+preflight should validate role visibility, child-orchestrator grants, model
+availability, network host allowlist, sandbox dimensions, output schema and
+remaining token/time/provider budget *before* enqueueing a wave.
+
+```text
+task -> classify -> break into independently verifiable nodes
+     -> capability/model preflight -> bounded parallel wave
+     -> evidence validation -> missing-fact directed next wave
+     -> one synthesis -> decision -> repeat/complete/blocked
+```
+
+The orchestrator should read only a bounded workspace overview.
+Full source inspection is performed by leaf workers with narrow scopes.
+A useful default is at most four independent fan-out targets at once, subject
+to the existing `MAX_WAVE_TARGETS=16`, provider pacing and admission limits;
+this is not an unconditional concurrency guarantee.
+
+### E. Error-directed chain behavior
+
+A failed child call is not a reason to replay the same expensive task.
+Classify failures deterministically:
+
+- `provider_unauthorized` / HTTP 403 / model absent: reject that route;
+  a retry must select an authorized known model or return `blocked`.
+- `egress_denied`: do not retry with another tool to circumvent policy;
+  request authorized scope or return `blocked`.
+- `delegation_denied`: refresh *visible* targets only; do not invent
+  permissions or child-orchestrator names.
+- `budget_exhausted`: compact factual evidence and use
+  `continue_from` where permitted; do not duplicate full transcripts.
+- `no_progress`: stop, refocus the question, or return an evidence gap.
+- `output_truncated`: break into small artifact units, persist versions,
+  and resume from checkpoints; no oversized single-call rewrite.
+
+A side-effecting segment requires idempotent admission and explicit rollback
+or compensation; validation and model critique are not authorization.
+
+### F. Durable contracts required before implementation
+
+1. `AgentCompositionRef` binding a versioned `AgentIr` snapshot to a
+   versioned `ChainRecipeRef`, model-route policy and return contract.
+2. Strict `ChainRecipe` schema with typed segment IDs, dependencies,
+   subchain bounds, per-segment model/effort, tool requests and outputs;
+   model-generated configs remain data until validated.
+3. Checkpoint: job/lease epoch, chain/segment/round IDs, per-segment durable
+   semantic state, artifact digest/provenance, usage, and terminal decision.
+4. Reducer for fan-in synthesis: join must retain missing/failed children
+   as explicit gaps, not silently convert partial results to success.
+5. Preflight and provider-compatible capability snapshots on composition,
+   including fail-closed model credential and egress checks.
+6. Unit and integration tests for auth/egress 403 loops, missing delegation,
+   no-progress exhaustion, checkpoint/restart/lease fencing, duplicate work,
+   truncated artifacts, privilege non-escalation and small-model performance.
+
+### G. Incremental implementation waves
+
+- **C0 (docs / landed separately):** refresh root/sub orchestration rulebooks,
+  add this PL-69 addendum, avoid secret-bearing session exports in Git.
+- **C1 (contract):** typed TaskNode, AgentCompositionRef, ChainRecipe schema,
+  tests that authority does not change with chain nesting.
+- **C2 (preflight):** role/model/network/tool-capability resolution and
+  understandable rejection reasons, without widening sandbox grants.
+- **C3 (adaptive discovery):** small authorized tool index,
+  discovery → activation, typed DAG → `delegate_wave` for existing roles.
+- **C4 (durable runner):** PL-69 W00 with atomic checkpoint, lease fencing,
+  provider pacing, bounded segment/chain nesting.
+- **C5 (small-model recipes):** File/Directory Explore and Web Research
+  cycles, evaluated against single-turn baselines with reproducible tasks.
+- **C6 (specialized orchestrators):** promote verified packs for Explore,
+  Scenario, Matrix and Evidence Review through explicit Root allowlists;
+  extend organizations/families/cells. Acceptance: the existing
+  UIA -> `matrix-game-master` background-child relation keeps working
+  unchanged, and the engine-owned dice, scenario approval and seat-approval
+  authority stay with the game master and the matrix engine. Any new
+  delegation edge from the general root orchestrator to it is added only with
+  a scoped capability and a game-engine review, and is not a relabeling of the
+  current relation.
+- **C7 (measurement):** compare grounded evidence coverage, success rate,
+  tokens per accepted finding, tool/permission failures, latency, wasted
+  calls, and recovery after restart. Do not claim a small model is better
+  until measurements demonstrate it.
+
+The source-of-truth remains current Rust source, tests and runtime rules.
+These additions are design targets rather than functionality provided by
+a TOML file or this documentation update.

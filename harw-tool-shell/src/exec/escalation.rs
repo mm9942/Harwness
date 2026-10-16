@@ -466,6 +466,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_sandbox(dir: &TempDir, permissions: Vec<Permission>) -> TestResult<SandboxSpec> {
+        crate::test_support::install_host_port();
         let ws = dir.path().join("project");
         std::fs::create_dir_all(&ws).map_err(ctx("project subdir"))?;
         let registry = WorkspaceRegistry::build(

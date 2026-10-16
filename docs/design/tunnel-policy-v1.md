@@ -22,6 +22,19 @@ Vor Start und vor jeder Wiederverbindung muss das Werkzeug Host und Port gegen d
 
 Ziele im privaten Adressraum (RFC 1918) sowie Loopback- bzw. localhost-Ziele, die vom Fernhost aus erreichbar sind, sind standardmäßig verboten. Sie dürfen nur verwendet werden, wenn die Policy sie für das konkrete Ziel ausdrücklich erlaubt. Eine allgemeine Freigabe des Tunnels oder des SSH-Servers hebt dieses Default-Verbot nicht auf.
 
+### 2.1 Auflösung von Hostnamen (Implementierungsstand)
+
+`ssh -L` löst einen Ziel-Hostnamen auf dem **SSH-Server** auf. Ob ein erlaubter
+Name dort auf eine private oder Loopback-Adresse zeigt (auch per DNS-Rebinding),
+ist lokal weder prüfbar noch festnagelbar. Deshalb gilt in der Umsetzung
+(`harw-tool-tunnel/src/policy.rs`): Literal-IP-Ziele werden gegen das
+Default-Verbot geprüft (inklusive IPv4-mapped IPv6); ein Hostname-Ziel ist nur
+mit ausdrücklicher Zustimmung `allow_remote_resolution` im Allowlist-Eintrag
+zulässig, und diese Zustimmung bedeutet ausdrücklich, dass das Default-Verbot für
+private Ziele für diesen Namen **nicht** durchgesetzt wird. Eine
+durchgesetzte Prüfung bräuchte ein vertrauenswürdiges Egress-Gate auf der
+Gegenseite.
+
 ## 3. Bindungs-Regel
 
 Der lokale Listen-Endpunkt eines Forwards muss ausschließlich an `127.0.0.1` oder `::1` gebunden sein. Jede andere Bind-Adresse ist unzulässig. Insbesondere darf der Listener niemals an `0.0.0.0`, `::` oder einer LAN-/öffentlichen Adresse lauschen. Eine fehlende Bind-Adresse darf nicht zu einer breiteren Bindung führen; sie muss auf eine der beiden Loopback-Adressen festgelegt oder abgelehnt werden.

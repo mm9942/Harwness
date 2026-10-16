@@ -6,7 +6,25 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
-- Die widersprüchlich wirkende Freigabe der Host-Lease wurde durch Mias eigenen Bestätigungsklick ausgelöst; ein ergänzender Wächterhinweis ist für sich genommen nicht als Ablehnung durch Mia zu werten.
+### Changed
+
+- Delegation through the turn-loop handoff (`transfer_to_<role>`, via the agent
+  job submitter or the host background launcher, e.g. the TUI) is now
+  background-only: it returns ids at once, results arrive as notifications,
+  and a missing executor is an immediate error. Not yet converted, still
+  inline (blocking join on the child): `AgentToolAdapter::invoke` (explore /
+  research tools), fan-out, and `delegate_wave`. Follow-up: `TODO(PL-90
+  background-only)`. See `docs/guides/background-agents.md`.
+
+### Fixed
+
+- The shared `MemoryPitfallAdvisor` keeps resolved pitfall hints per session
+  (`SessionResolvedSet`, bounded); a success in one session no longer hides
+  the hint in another. The default `PitfallAdvisor::resolved_in_session` no
+  longer forwards to the unbound `resolved`.
+- The seemingly contradictory host-lease approval was triggered by Mia's own
+  confirmation click; a supplementary guardian notice is not, by itself, to be
+  read as a rejection by Mia.
 
 ## [0.9.1] — Unreleased
 
@@ -108,8 +126,9 @@ Semantic Versioning within the 0.x pre-release range.
   `harw-web`). See `docs/setup/tailscale.md`.
 
 ### Changed
-- `job.wait` is a short poll: `timeout_secs` is limited to 1..=60 (larger
-  values are refused); job completion arrives as a notification.
+- Removed the blocking `job.wait` tool. Delegated work runs only in the
+  background: job progress and completion arrive as notifications, and
+  `job.status` gives a non-blocking snapshot.
 - `shell.exec` documents POSIX `/bin/sh` and steers file edits to `fs.*`.
 
 ### `harw update` installs updates

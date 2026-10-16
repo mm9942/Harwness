@@ -38,7 +38,7 @@ use harw_node_transport::{LocalNode, NodeTransportClient, NodeVerifier, UpgradeE
 use harw_protocol::methods::{METHOD_SESSION_HELLO, NOTIF_EVENT_FRAME};
 use harw_protocol::session_wire::{HelloAck, HelloParams, SESSION_WIRE_MINOR};
 use harw_protocol::{
-    ClientCaps, FrameEnvelope, FrameSource, PortError, PortFuture, ProtocolVersion,
+    ClientCaps, Cursor, FrameEnvelope, FrameSource, PortError, PortFuture, ProtocolVersion,
     RequestEnvelope, ResponseEnvelope, SessionFrame,
 };
 use harw_session_ws::codec::{Inbound, decode, decode_frame_notification, encode_request};
@@ -128,6 +128,9 @@ struct Pending {
 struct State {
     pending: HashMap<String, Pending>,
     subs: HashMap<SessionId, Arc<Subscription>>,
+    /// Newest seen frame cursor per session (h19: attach/resume path). The
+    /// client presents it as `AttachParams::from` on a re-attach.
+    resume_cursors: crate::reconnect::ResumeCursors,
     /// Set once; after that no request is accepted.
     end: Option<PortError>,
 }
@@ -147,6 +150,17 @@ impl Shared {
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    /// h19: record the newest frame cursor seen for `session` (monotonic;
+    /// used by `RemoteConnection::resume_cursor` on a re-attach).
+    fn record_resume_cursor(&self, session: &SessionId, cursor: Cursor) {
+        let mut state = lock(&self.state);
+        state
+            .resume_cursors
+            .record(session, cursor)
+            .map_err(|error| tracing::warn!(%error, "resume cursor record failed"))
+            .ok();
     }
 
     fn end_error(&self) -> PortError {
@@ -175,7 +189,10 @@ impl Shared {
                     Effect::Subscribe(session, sub) => {
                         replaced = state.subs.insert(session.clone(), Arc::clone(sub));
                     }
-                    Effect::Unsubscribe(session) => replaced = state.subs.remove(session),
+                    Effect::Unsubscribe(session) => {
+                        replaced = state.subs.remove(session);
+                        state.resume_cursors.remove(session);
+                    }
                     Effect::None => {}
                 }
             }
@@ -197,12 +214,17 @@ impl Shared {
     /// subscription (detached, never attached) are dropped.
     fn on_frame(&self, envelope: FrameEnvelope) {
         let session = envelope.session_id.clone();
+        let cursor = envelope.cursor;
         let sub = lock(&self.state).subs.get(&session).cloned();
         let Some(sub) = sub else {
             tracing::trace!(session = %session.as_str(), "frame for a session without attachment");
             return;
         };
-        if sub.push(envelope) == Push::Closed {
+        if sub.push(envelope) == Push::Open {
+            // h19: only a frame handed to a live subscription advances the
+            // resume cursor; dropped or lagged frames must be replayed.
+            self.record_resume_cursor(&session, cursor);
+        } else {
             let mut state = lock(&self.state);
             if state
                 .subs
@@ -210,6 +232,8 @@ impl Shared {
                 .is_some_and(|current| Arc::ptr_eq(current, &sub))
             {
                 state.subs.remove(&session);
+                // The attachment ended: do not keep its cursor around.
+                state.resume_cursors.remove(&session);
             }
         }
     }
@@ -405,6 +429,21 @@ impl RemoteConnection {
     #[must_use]
     pub fn hello_ack(&self) -> &HelloAck {
         &self.hello
+    }
+
+    /// Cursor to resume `session` from, if one was recorded (h19: the
+    /// connection reader records the cursor of every frame delivered to a
+    /// live attachment; only an explicit resume presents it as
+    /// `AttachParams::from`, see `RemotePort::attach_with_resume`, and a
+    /// cursor is never fabricated). Entries are dropped on detach or when
+    /// the attachment ends.
+    #[must_use]
+    pub fn resume_cursor(&self, session: &SessionId) -> Option<Cursor> {
+        lock(&self.shared.state)
+            .resume_cursors
+            .cursor(session)
+            .ok()
+            .flatten()
     }
 
     /// Send one request and await its response (correlated by id).
@@ -772,6 +811,45 @@ mod tests {
         );
         let second = sub.next().await;
         assert!(matches!(second, Ok(None)), "{second:?}");
+        Ok(())
+    }
+
+    /// The resume cursor only advances for frames handed to a live
+    /// subscription, and is dropped when the attachment ends.
+    #[test]
+    fn resume_cursor_tracks_delivered_frames_only() -> Result<(), String> {
+        let session = SessionId::try_from_str("s-rc").map_err(|error| error.to_string())?;
+        let cursor_of = |shared: &Shared| {
+            lock(&shared.state)
+                .resume_cursors
+                .cursor(&session)
+                .ok()
+                .flatten()
+        };
+        let shared = Shared::new();
+
+        // No subscription: dropped, nothing recorded.
+        shared.on_frame(heartbeat(&session, 1));
+        assert_eq!(cursor_of(&shared), None);
+
+        // Delivered frame: recorded.
+        let sub = Subscription::new();
+        lock(&shared.state)
+            .subs
+            .insert(session.clone(), Arc::clone(&sub));
+        shared.on_frame(heartbeat(&session, 2));
+        assert_eq!(cursor_of(&shared).map(|c| c.live), Some(2));
+
+        // Overflowing the queue: the lagging frame is not recorded and the
+        // ended attachment's entry is removed.
+        let total = u32::try_from(FRAME_QUEUE_CAP).map_err(|error| error.to_string())?;
+        for live in 3..=total + 1 {
+            shared.on_frame(heartbeat(&session, live));
+        }
+        assert_eq!(cursor_of(&shared).map(|c| c.live), Some(total + 1));
+        shared.on_frame(heartbeat(&session, total + 2));
+        assert!(lock(&shared.state).subs.is_empty());
+        assert_eq!(cursor_of(&shared), None);
         Ok(())
     }
 }

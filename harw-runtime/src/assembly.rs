@@ -73,8 +73,9 @@ use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
     AgentSession, ChildRegistryFactory, ContextBudget, DriftObserver, GuardPolicy, InteractionMode,
-    ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor, RoleEffortWeights,
-    SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
+    JobExecutionRegistry, ManagedAgentSpawner, ModelProvider, OrchestrationObserver,
+    PitfallAdvisor, RoleEffortWeights, SessionActivation, SessionManager, SpawnContext, StateStore,
+    ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
@@ -108,7 +109,7 @@ use harw_registry_defaults::profile::{
     HostPermitWiring, IdentityOverrides, RegistryProfile, role_names,
 };
 use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
-use harw_session_store::{ApprovalStore, JobStore};
+use harw_session_store::{ApprovalStore, ChildLeaseStore, JobStore};
 use harw_tool_shell::host_permit_prompt::{
     HostPermitHandles, HostPermitPromptReceiver, HostPermitPromptSender, HostPermitVariant,
     host_permit_prompt_channel,
@@ -2735,7 +2736,20 @@ impl RuntimeAssemblyBuilder {
                 detail: error.to_string(),
             })?,
         );
-        let (spawner, spawner_roles) = build_spawner(
+        // Child/job ownership must be durable before the submitter can make
+        // work Ready. Derive the lease root from the actual ledger, including
+        // caller-injected stores, rather than from the runtime's home path.
+        let child_lease_store = stores
+            .job_store
+            .as_ref()
+            .map(|store| {
+                let root = store.root().parent().ok_or_else(|| RuntimeError::Store {
+                    detail: "durable job store has no parent storage root".to_owned(),
+                })?;
+                Ok(Arc::new(ChildLeaseStore::new(root)))
+            })
+            .transpose()?;
+        let (spawner, spawner_roles, agent_job_submitter_slot) = build_spawner(
             profile.spawner,
             SpawnerInputs {
                 config: &config,
@@ -2771,6 +2785,7 @@ impl RuntimeAssemblyBuilder {
                 sandbox_profile: &sandbox_profile,
                 host_permit_wiring: &host_permit_wiring_for_children,
                 state_store: Arc::clone(&stores.state_store),
+                child_lease_store,
                 agent_events: agent_events.clone(),
                 // Welle 4: die vertrauten Config-Layer, aus denen die
                 // Kind-Fabriken die Skill-Verzeichnisse auflösen.
@@ -2798,6 +2813,46 @@ impl RuntimeAssemblyBuilder {
             let spawner: Arc<dyn AgentSpawner> = managed_spawner;
             registry_builder = registry_builder.spawner(spawner);
         }
+        // Async-by-default agent delegation is mounted at the composition root.
+        // The submitter is available only when the runtime has all three trusted
+        // ingredients: managed spawner, durable job ledger and authenticated
+        // approval actor. There is deliberately no unmanaged tokio fallback.
+        //
+        // Composition owns the live execution registry. Durable cancellation
+        // fences the JobStore first, then may address a live execution only
+        // through the exact prior LeaseToken returned by that transition.
+        let mut agent_job_executions: Option<Arc<JobExecutionRegistry>> = None;
+        if let (Some(spawner), Some(job_store), Some(actor)) = (
+            spawner.as_ref(),
+            stores.job_store.as_ref(),
+            spawn_context.approval_actor.clone(),
+        ) {
+            let runtime_submitter =
+                Arc::new(crate::agent_job_wiring::RuntimeAgentJobSubmitter::new(
+                    Arc::clone(spawner),
+                    Arc::clone(&stores.state_store),
+                    stores.approval_store.clone(),
+                    Arc::clone(job_store),
+                    {
+                        let executions = Arc::new(JobExecutionRegistry::new());
+                        agent_job_executions = Some(Arc::clone(&executions));
+                        executions
+                    },
+                    actor,
+                    sandbox.workspace().tenant().clone(),
+                    sandbox.workspace().workspace().clone(),
+                ));
+            runtime_submitter.start_recovery_worker();
+            let submitter: Arc<dyn harw_extension_api::AgentJobSubmitter> = runtime_submitter;
+            if let Some(slot) = agent_job_submitter_slot.as_ref() {
+                slot.set(Arc::downgrade(&submitter))
+                    .map_err(|_| RuntimeError::Spawner {
+                        detail: "durable agent job submitter slot was initialized twice".to_owned(),
+                    })?;
+            }
+            registry_builder = registry_builder.agent_job_submitter(submitter);
+        }
+
         // Addendum F+G ("Zombies"): der periodische Kind-Reaper braucht eine
         // laufende Tokio-Runtime — geprüft **hier**, nicht in
         // `guard_wiring::spawn_child_reaper` selbst (dessen `tokio::task::spawn`
@@ -2895,6 +2950,7 @@ impl RuntimeAssemblyBuilder {
             operations: Arc::clone(&operations),
             state_store: Arc::clone(&stores.state_store),
             job_store: stores.job_store.clone(),
+            job_executions: agent_job_executions,
             spawner: spawner.clone(),
             memory,
             config: Arc::clone(&config),
@@ -3860,6 +3916,11 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
             // `ServiceMap`.
             let _registered =
                 harw_ops::register_work_driver_tools(&mut registry, &plan.plan_config);
+            // PL-90: Intent-Zyklen hängen am selben Gate (siehe
+            // `harw_ops::register_intent_cycle_tools`); der Job-Worker in
+            // `harw-cli` führt die zugelassenen `intent_cycle`-Jobs aus.
+            let _registered =
+                harw_ops::register_intent_cycle_tools(&mut registry, &plan.plan_config);
         }
         registry
     }
@@ -5209,6 +5270,8 @@ struct SpawnerInputs<'a> {
     host_permit_wiring: &'a Option<HostPermitWiring>,
     /// Shared transcript/state store used by lifecycle observer records.
     state_store: Arc<dyn StateStore>,
+    /// Lease ledger sharing the configured job store's durable storage root.
+    child_lease_store: Option<Arc<ChildLeaseStore>>,
     /// Live-Bus des Laufs; jedes Kind bekommt ihn über den SessionManager.
     agent_events: harw_core::AgentEventHub,
     /// Die vertrauten Config-Layer in aufsteigender Präzedenz
@@ -5233,22 +5296,28 @@ struct SpawnerInputs<'a> {
     child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
 }
 
+/// Spawner, registrierte Rollennamen und den weakly-bound Slot für den
+/// runtimeweiten [`harw_extension_api::AgentJobSubmitter`].
+type BuiltSpawner = (
+    Option<Arc<ManagedAgentSpawner>>,
+    Vec<String>,
+    Option<Arc<std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>>>,
+);
+
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
 ///
 /// # Rückgabe
-/// `(Option<Arc<ManagedAgentSpawner>>, Vec<String>)` — bei
-/// [`SpawnerPolicy::None`] `(None, vec![])`, sonst der Spawner und die
-/// registrierten Rollennamen.
+/// Bei [`SpawnerPolicy::None`] sind Spawner und Submitter-Slot `None`.
 fn build_spawner(
     policy: SpawnerPolicy,
     inputs: SpawnerInputs<'_>,
     session_events: Option<UnboundedSender<SessionEvent>>,
-) -> RuntimeResult<(Option<Arc<ManagedAgentSpawner>>, Vec<String>)> {
+) -> RuntimeResult<BuiltSpawner> {
     // Erschöpfend statt `if policy == …`: eine künftige Variante (etwa
     // `ConfiguredRoles`) fiele sonst still in den `BuiltinRoles`-Zweig,
     // statt den Compiler zu brechen (Befund Z2c-03).
     match policy {
-        SpawnerPolicy::None => return Ok((None, Vec::new())),
+        SpawnerPolicy::None => return Ok((None, Vec::new(), None)),
         SpawnerPolicy::BuiltinRoles => {}
     }
 
@@ -5274,6 +5343,7 @@ fn build_spawner(
         sandbox_profile,
         host_permit_wiring,
         state_store,
+        child_lease_store,
         agent_events,
         skill_roots,
         knowledge,
@@ -5288,6 +5358,9 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
+    let agent_job_submitter_slot: Arc<
+        std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
+    > = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
     // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
@@ -5329,6 +5402,7 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir.clone())
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_agent_job_submitter_slot(Arc::clone(&agent_job_submitter_slot))
         .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
         // Teil B4: dasselbe Sandbox-Profil und dieselbe Host-Permit-
         // Verdrahtung wie die Root-Registry — ohne diesen Aufruf bliebe jede
@@ -5397,6 +5471,7 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir)
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_agent_job_submitter_slot(Arc::clone(&agent_job_submitter_slot))
         .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
         // Teil B4: dieselbe Verdrahtung wie `factory` — erreicht damit auch
         // `uia-shell-worker` und `host-process-worker` (beide Rollen der
@@ -5490,6 +5565,9 @@ fn build_spawner(
         // Skills, Rechte, Budget, Herkunft und die Lese-Eigenschaft, nach der
         // im Plan-Modus nur lesende Ziele delegierbar bleiben.
         .with_delegation_catalog(roster.entries().map(delegation_target_info));
+    if let Some(lease_store) = child_lease_store {
+        spawner = spawner.with_lease_store(lease_store);
+    }
     // Welle 3C: ein gesetztes `RuntimeSpec::child_backend` lässt jedes über
     // diesen Spawner admittierte Kind über dieses `ChildBackend` laufen
     // (z. B. `harw-agent-runner`s `JobChildBackend`) statt in-process.
@@ -5550,7 +5628,7 @@ fn build_spawner(
             detail: "managed child spawner slot was initialized twice".to_owned(),
         })?;
 
-    Ok((Some(spawner), roles))
+    Ok((Some(spawner), roles, Some(agent_job_submitter_slot)))
 }
 
 /// Plan R9, Teil C: die Katalogdaten eines Roster-Eintrags für
@@ -7897,6 +7975,96 @@ mod tests {
                 job_store: None,
                 approval_store: None,
             })
+    }
+
+    #[tokio::test]
+    async fn test_agent_job_submission_persists_child_lease_in_the_job_store_scope() -> TestResult {
+        use harw_extension_api::{AgentSpawner, SpawnInput};
+        use harw_session_store::ChildLeaseStore;
+
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let fixture = build_fixture()?;
+            // Deliberately outside the profile home: injected stores must
+            // retain their own durable scope across a restart.
+            let ledger_root = fixture._dir.path().join("injected-ledger");
+            let jobs = Arc::new(JobStore::new(&ledger_root));
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let assembly = fixture_builder(entry, &fixture)
+                .session_events(events)
+                .stores(RuntimeStores {
+                    state_store: Arc::new(harw_core::InMemoryStateStore::new()),
+                    job_store: Some(Arc::clone(&jobs)),
+                    approval_store: None,
+                })
+                .build()?;
+            let submitter = assembly
+                .registry
+                .lock()
+                .map_err(ctx("root registry lock"))?
+                .as_ref()
+                .and_then(ExtensionRegistry::agent_job_submitter)
+                .cloned()
+                .ok_or(TestError::Missing("durable agent job submitter"))?;
+            let spawner = assembly
+                .spawner()
+                .ok_or(TestError::Missing("managed child spawner"))?;
+            let call_id = harw_types::ToolCallId::new();
+            let child = spawner
+                .spawn_child(
+                    role_names::ROOT_ORCHESTRATOR,
+                    SpawnInput {
+                        parent_session_id: assembly.root_session_id().clone(),
+                        handoff_call_id: call_id.clone(),
+                        instructions: None,
+                        context: serde_json::json!({"task": "lease wiring regression"}),
+                        ceiling: None,
+                    },
+                    assembly.sandbox().clone(),
+                    None,
+                )
+                .await
+                .map_err(ctx("child admission"))?;
+            let handle = submitter
+                .submit_child(&child, Some("lease wiring regression"))
+                .await
+                .map_err(ctx("durable agent job submission"))?;
+            assert_eq!(handle.child, child);
+
+            // Reopen from disk rather than inspecting the spawner's memory.
+            let leases = ChildLeaseStore::new(&ledger_root);
+            assert!(
+                leases
+                    .is_owned_by(&child, &handle.work_id)
+                    .map_err(ctx("durable child/job ownership"))?
+            );
+            let active = leases.active().map_err(ctx("active child leases"))?;
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].parent, *assembly.root_session_id());
+            assert_eq!(active[0].handoff_call_id, call_id);
+            let job = jobs.get(&handle.work_id).map_err(ctx("admitted job"))?;
+            assert_eq!(job.job.state, harw_job_core::JobState::Ready);
+            assert_eq!(job.input["child_id"], child.as_str());
+
+            // Drive the offline child through terminal commit as well.
+            let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let job = jobs.get(&handle.work_id).map_err(ctx("running job"))?;
+                    if matches!(
+                        job.job.state,
+                        harw_job_core::JobState::Completed
+                            | harw_job_core::JobState::Failed
+                            | harw_job_core::JobState::Cancelled
+                    ) {
+                        return Ok::<_, TestError>(job);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(ctx("agent job completion timeout"))??;
+            assert_eq!(terminal.job.state, harw_job_core::JobState::Completed);
+        }
+        Ok(())
     }
 
     /// Jede [`harw_authority::Permission`] — die weiteste denkbare Obergrenze.

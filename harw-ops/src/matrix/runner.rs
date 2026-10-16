@@ -110,9 +110,6 @@ pub const AAR_FILE: &str = "aar.md";
 /// verschärfen.
 const SEAT_TURN_BUDGET: &str = "60k_tokens,16_tool_calls,300s";
 
-/// Höchstwartezeit auf einen freien Admission-Slot beim ersten Aufruf eines Sitzes.
-const SEAT_SLOT_WAIT: Duration = Duration::from_secs(120);
-
 /// Reparaturversuche nach einer ungültigen Antwort (danach `Forfeit`).
 const REPAIR_ATTEMPTS: u32 = 1;
 
@@ -141,8 +138,8 @@ const FAILED_CALL: &str = "Aufruf fehlgeschlagen";
 /// Mittelteil der `forfeit`-Notiz einer auch nach Reparatur ungültigen Antwort.
 const INVALID_ANSWER: &str = "Antwort auch nach Reparaturversuch ungültig";
 
-/// Hartes Zeitlimit eines Sitz-Aufrufs (Runde 7, Teil M): Admission-Warten
-/// ([`SEAT_SLOT_WAIT`]) plus Turn-Budget (300 s) plus Reserve. Danach gilt
+/// Hartes Zeitlimit eines Sitz-Aufrufs (Runde 7, Teil M): Admission (fail-fast, kein Warten)
+/// plus Turn-Budget (300 s) plus Reserve. Danach gilt
 /// der Sitz für diesen Aufruf als gepasst, sein Kind wird abgebrochen und
 /// freigegeben — ein hängender Sitz (z. B. eine nie beantwortete Freigabe)
 /// blockiert den Lauf nicht mehr.
@@ -533,7 +530,6 @@ pub struct SpawnerDriver {
     /// Sandbox ohne jede Berechtigung für Läufe ohne Unterlagen-Kopien.
     sandbox: SandboxSpec,
     parent: SessionId,
-    cancel: CancelToken,
     budget: AgentBudget,
     children: BTreeMap<String, SessionId>,
     /// Runde 9, E7: letzter Aufruf je gehaltenem Sitz (für die Verdrängung,
@@ -572,7 +568,6 @@ impl SpawnerDriver {
             parent_sandbox: ctx.sandbox().clone(),
             sandbox: ctx.sandbox().restrict(&PermissionRequest::empty()),
             parent: ctx.session_id().clone(),
-            cancel: ctx.cancel_token().cloned().unwrap_or_else(CancelToken::new),
             budget: parse_budget_hint(SEAT_TURN_BUDGET)?,
             children: BTreeMap::new(),
             last_used: BTreeMap::new(),
@@ -702,15 +697,10 @@ impl SeatDriver for SpawnerDriver {
                     };
                     let child = self
                         .spawner
-                        .spawn_child_or_wait(
-                            request.role,
-                            input,
-                            bound,
-                            None,
-                            SEAT_SLOT_WAIT,
-                            &self.cancel,
-                        )
-                        .await
+                        // Fail-fast: `make_room_for` hat den Fan-out-Deckel
+                        // bereits freigeräumt; eine Ablehnung hier ist eine
+                        // echte Grenze und verwirkt den Zug des Sitzes.
+                        .spawn_child_guarded(request.role, input, bound, None)
                         .map(harw_core::child_controller::ChildGuard::keep)
                         .map_err(|error| format!("Spawn fehlgeschlagen: {error}"))?;
                     // Der Sitz bleibt über alle Phasen zugelassen; die

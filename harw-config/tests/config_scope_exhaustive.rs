@@ -153,7 +153,7 @@ fn test_field_table_exhaustive_logging_section() {
 }
 
 // ---------------------------------------------------------------------
-// [tui] (Abschnitt 1.3, 3 Felder; Runde 5, Teil I: +`child_stream`)
+// [tui] (Abschnitt 1.3, 5 Felder; Runde 5, Teil I: +`child_stream`; h7/h9: +`status_expiry`, `goal_mode`)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -162,9 +162,23 @@ fn test_field_table_exhaustive_tui_section() {
         theme,
         keybindings_file,
         child_stream,
+        status_expiry,
+        goal_mode,
     } = TuiSection::default();
-    let _ = (theme, keybindings_file, child_stream);
-    for path in ["tui.theme", "tui.keybindings_file", "tui.child_stream"] {
+    let _ = (
+        theme,
+        keybindings_file,
+        child_stream,
+        status_expiry,
+        goal_mode,
+    );
+    for path in [
+        "tui.theme",
+        "tui.keybindings_file",
+        "tui.child_stream",
+        "tui.status_expiry",
+        "tui.goal_mode",
+    ] {
         assert_path_in_field_table_exactly_once(path);
     }
 }

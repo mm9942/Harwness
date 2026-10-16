@@ -4,11 +4,18 @@
 //! (optionally under `sandbox-exec`), watch its exit on a dedicated thread,
 //! terminate the group on cancel. What it does **not** do, honestly
 //! reported: no resource limits (`resource_limits` is `not_enforced` when
-//! any limit is requested), no stdout/stderr capture (the streams go to
-//! `/dev/null`), and no reattach after a restart — Darwin cannot verify a
+//! any limit is requested; a job that sets `require_rlimits` is refused), and
+//! no reattach after a restart — Darwin cannot verify a
 //! recovered process identity without `unsafe`, so a recovered attempt is
 //! always `Lost` and never signalled.
+//!
+//! Output: stdout and stderr are read on reader threads and delivered as
+//! attempt events, appended to files when the submitter asked for them
+//! ([`AttemptContext::output_files`]), or handed over as pipes together with
+//! stdin ([`AttemptContext::stdio_handoff`]) — the same contract as the Linux
+//! executor.
 
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,12 +29,58 @@ use harw_job_darwin::{
 
 use super::error::RuntimeError;
 use super::executor::{
-    AttemptContext, AttemptControl, AttemptEvent, AttemptEvents, AttemptRun, Executor, Probe,
-    StartedAttempt, check_requirement, requests_resource_limits, unsandboxed_report,
+    AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
+    Executor, HandedStdio, Probe, StartedAttempt, check_requirement, requests_resource_limits,
+    unsandboxed_report,
 };
 
 /// How often the watcher thread checks for a cancellation request.
 const POLL: Duration = Duration::from_millis(100);
+
+/// How long output is drained after the primary exited.
+const DRAIN: Duration = Duration::from_secs(2);
+
+/// Opens an output file for appending (created `0600`).
+fn open_append(path: &std::path::Path) -> Result<Stdio, RuntimeError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map(Stdio::from)
+        .map_err(|error| RuntimeError::Os {
+            operation: "open output file",
+            detail: format!("{}: {error}", path.display()),
+        })
+}
+
+/// Reads `source` on its own thread and delivers every chunk as an event.
+fn forward_output<R: Read + Send + 'static>(
+    mut source: R,
+    sender: AttemptEventSender,
+    wrap: fn(Vec<u8>) -> AttemptEvent,
+) -> Result<std::thread::JoinHandle<()>, RuntimeError> {
+    std::thread::Builder::new()
+        .name("harw-job-output".to_owned())
+        .spawn(move || {
+            let mut buffer = [0_u8; 8 * 1024];
+            loop {
+                match source.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if !sender.send_blocking(wrap(buffer[..count].to_vec())) {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|source| RuntimeError::Spawn {
+            program: "output reader".to_owned(),
+            source,
+        })
+}
 
 /// Darwin [`Executor`] (see the module docs).
 #[derive(Debug, Clone)]
@@ -103,6 +156,13 @@ impl Executor for DarwinExecutor {
             unsandboxed_report(resource_limits)
         };
         check_requirement(spec.sandbox, &report)?;
+        if spec.resources.require_rlimits && spec.resources.requests_rlimits() {
+            return Err(RuntimeError::Unsupported {
+                operation: "rlimits",
+                detail: "the job requires per-process rlimits, which Darwin does not enforce"
+                    .to_owned(),
+            });
+        }
 
         let mut base = Command::new(&spec.program);
         base.args(&spec.args)
@@ -120,16 +180,61 @@ impl Executor for DarwinExecutor {
         } else {
             base
         };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let (mut process, _stdio) = DarwinProcess::spawn(&mut command)
+        let handoff = ctx.stdio_handoff.as_ref();
+        command.stdin(if handoff.is_some_and(|handoff| handoff.stdin) {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        match &ctx.output_files {
+            Some(files) => {
+                command
+                    .stdout(open_append(&files.stdout)?)
+                    .stderr(open_append(&files.stderr)?);
+            }
+            None => {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+        }
+        if handoff.is_some_and(|handoff| handoff.stdout) {
+            command.stdout(Stdio::piped());
+        }
+        let (mut process, mut stdio) = DarwinProcess::spawn(&mut command)
             .map_err(|error| process_error(&spec.program, error))?;
         let identity = process.recovery_identity();
         let pid = process.pid();
+        if let Some(handoff) = handoff {
+            // The submitter owns these pipes from here on.
+            handoff.deliver(HandedStdio {
+                stdin: if handoff.stdin {
+                    stdio.stdin.take()
+                } else {
+                    None
+                },
+                stdout: if handoff.stdout {
+                    stdio.stdout.take()
+                } else {
+                    None
+                },
+            });
+        }
 
         let (sender, events) = AttemptEvents::channel(8);
+        let mut readers = Vec::new();
+        if let Some(stdout) = stdio.stdout.take() {
+            readers.push(forward_output(
+                stdout,
+                sender.clone(),
+                AttemptEvent::Stdout,
+            )?);
+        }
+        if let Some(stderr) = stdio.stderr.take() {
+            readers.push(forward_output(
+                stderr,
+                sender.clone(),
+                AttemptEvent::Stderr,
+            )?);
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let watcher_cancel = Arc::clone(&cancel);
         let policy = self.termination;
@@ -156,6 +261,14 @@ impl Executor for DarwinExecutor {
                         }
                     }
                 };
+                // Let the readers deliver what is left before the final event;
+                // a descendant that keeps a pipe open must not hold it back.
+                let drain_until = std::time::Instant::now() + DRAIN;
+                while readers.iter().any(|reader| !reader.is_finished())
+                    && std::time::Instant::now() < drain_until
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 let _ = sender.send_blocking(AttemptEvent::Exited {
                     outcome,
                     sandbox: None,

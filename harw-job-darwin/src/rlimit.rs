@@ -210,6 +210,7 @@ mod tests {
             cpu_weight: Some(100),
             pids_max: Some(64),
             wall_timeout: None,
+            ..ResourceRequest::default()
         };
         let plan = RlimitPlan::from_request(&request).map_err(ctx("plan"))?;
         assert_eq!(plan.resource_limits, EnforcementState::Partial);

@@ -124,7 +124,30 @@ impl LinuxJobGroup {
     /// # Errors
     /// As [`LinuxProcess::spawn`].
     pub fn spawn(command: &mut Command) -> Result<(Self, ChildStdio), ProcessError> {
-        command.process_group(0);
+        Self::spawn_with(command, false)
+    }
+
+    /// Like [`LinuxJobGroup::spawn`], but the child is **not** made a group
+    /// leader: it inherits the parent's group and is expected to start its own
+    /// session before anything else (`setsid(1)` without `--wait` execs in
+    /// place when it is not a group leader, so the PID stays the primary's and
+    /// becomes session and group leader). The group id is the child's PID once
+    /// that happened; signalling before it did hits no group (`ESRCH`), never
+    /// the parent's.
+    ///
+    /// # Errors
+    /// As [`LinuxProcess::spawn`].
+    pub fn spawn_in_new_session(command: &mut Command) -> Result<(Self, ChildStdio), ProcessError> {
+        Self::spawn_with(command, true)
+    }
+
+    fn spawn_with(
+        command: &mut Command,
+        new_session: bool,
+    ) -> Result<(Self, ChildStdio), ProcessError> {
+        if !new_session {
+            command.process_group(0);
+        }
         let (primary, stdio) = LinuxProcess::spawn(command)?;
         let pgid = primary.pid();
         Ok((
@@ -155,7 +178,21 @@ impl LinuxJobGroup {
         command: &mut Command,
         cgroup: JobCgroup,
     ) -> Result<(Self, ChildStdio), crate::error::LaunchError> {
-        let (mut group, stdio) = Self::spawn(command)?;
+        Self::spawn_in_cgroup_with(command, cgroup, false)
+    }
+
+    /// [`LinuxJobGroup::spawn_in_cgroup`] with the session mode of
+    /// [`LinuxJobGroup::spawn_in_new_session`] when `new_session` is set.
+    ///
+    /// # Errors
+    /// As [`LinuxJobGroup::spawn_in_cgroup`].
+    #[cfg(feature = "linux-cgroup-v2")]
+    pub fn spawn_in_cgroup_with(
+        command: &mut Command,
+        cgroup: JobCgroup,
+        new_session: bool,
+    ) -> Result<(Self, ChildStdio), crate::error::LaunchError> {
+        let (mut group, stdio) = Self::spawn_with(command, new_session)?;
         if let Err(error) = cgroup.backend.attach(&cgroup.handle, &group.primary) {
             let _ = group.primary.signal(SignalKind::Kill);
             let _ = group.primary.wait();

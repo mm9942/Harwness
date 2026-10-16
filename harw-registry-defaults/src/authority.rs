@@ -70,7 +70,7 @@
 use harw_authority::{Permission, PermissionSet};
 
 use crate::capability_catalog::{
-    WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
+    INTENT_CYCLE_TOOLS, WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
@@ -78,8 +78,9 @@ use crate::memory_tools::{MEMORY_RECALL, MEMORY_RECORD};
 use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
-    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
-    FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    BROWSER_TOOLS, CARGO_TEST_ONE_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS,
+    EXPLORER_TOOLS, FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, OBSIDIAN_READ_TOOLS,
+    PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
@@ -655,6 +656,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
     if tool == "fs.write"
         || tool == "fs.edit"
+        // Obsidian vault writes: `obsidian.write` creates or replaces a note
+        // in the vault (`docs/planning` by default) — same file-level right
+        // as `fs.write`, enforced through the sandbox workspace binding.
+        || tool == harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES[4]
         // Runde 7, Teil T2: `latex.template` schreibt Vorlage und Gerüst in
         // den Workspace (kein Prozess) — vor dem `LATEX_TOOLS`-Zweig geprüft.
         || tool == crate::profile::LATEX_TEMPLATE_TOOL
@@ -677,6 +682,9 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // dieser Rechtefilter (der pro Werkzeug nur ein Recht liefert).
         || tool == WORK_DRIVER_ENQUEUE_TOOL
         || listed(PROCESS_TOOLS)
+        // `cargo.test_one` startet über `shell.exec` einen Testlauf; die
+        // übrigen `cargo.*` haben bewusst kein Recht (nie registriert).
+        || listed(CARGO_TEST_ONE_TOOLS)
         || listed(LATEX_TOOLS)
         || listed(crate::profile::SUDO_TOOLS)
     {
@@ -693,6 +701,8 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(WorkbenchReadToolProvider::TOOL_NAMES)
         || listed(DiaryToolProvider::TOOL_NAMES)
         || listed(PalaceToolProvider::TOOL_NAMES)
+        // Obsidian vault reads (first four entries of the provider list).
+        || listed(OBSIDIAN_READ_TOOLS)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
         || tool == MEMORY_RECALL
         // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
@@ -710,6 +720,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // `job.status`/`job.stop`.
         || tool == WORK_DRIVER_STATUS_TOOL
         || tool == WORK_DRIVER_STOP_TOOL
+        // PL-90: an intent cycle only reads the named workspace files
+        // (read-only explorer + deterministic verifier); start, status and
+        // stop therefore need exactly the read right.
+        || listed(INTENT_CYCLE_TOOLS)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(&CONTAINER_TOOLS) {
@@ -832,6 +846,21 @@ pub fn granted_for_capabilities(
     manifest_tools: Option<&[String]>,
 ) -> PermissionSet {
     let mut granted: Vec<Permission> = profile_rights.iter().collect();
+    // `cargo.test_one` braucht `ExecuteProcess`, das kein Profil trägt
+    // (`RegistryProfile::required_permissions`). Es wird nur vergeben, wenn
+    // ein Schreibprofil und ein Manifest zusammentreffen, das das Werkzeug
+    // führt; der Roster klemmt es für alle außer dem `test-engineer` heraus.
+    // Die Schnitte unten (Autorität, Manifest) gelten danach wie üblich.
+    if profile_rights.contains(Permission::WriteWorkspace)
+        && !granted.contains(&Permission::ExecuteProcess)
+        && manifest_tools.is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| crate::profile::CARGO_TEST_ONE_TOOLS.contains(&tool.as_str()))
+        })
+    {
+        granted.push(Permission::ExecuteProcess);
+    }
     if let Some(authority) = authority_permissions(capabilities) {
         granted.retain(|permission| authority.contains(*permission));
     }
@@ -913,6 +942,16 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_permission_matches_obsidian_provider_declarations() {
+        let names = harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES;
+        let declared = harw_tool_obsidian::ObsidianToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
     fn test_tool_permission_covers_every_tool_of_every_profile() {
         for profile in RegistryProfile::ALL {
             for tool in profile.registered_tool_names() {
@@ -974,6 +1013,19 @@ mod tests {
             Some(Permission::ExecuteProcess)
         );
         for tool in [WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL] {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
+    }
+
+    /// PL-90: alle drei Intent-Zyklus-Werkzeuge lesen nur den Workspace.
+    #[test]
+    fn test_tool_permission_maps_intent_cycle_tools_to_read_workspace() {
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        for tool in INTENT_CYCLE_TOOLS {
             assert_eq!(
                 tool_permission(tool),
                 Some(Permission::ReadWorkspace),

@@ -32,18 +32,17 @@
 //! TUI) den Befehl ab: Der Prozessbaum wird beendet, die Teilausgabe bleibt
 //! erhalten ([`OperatorEnd::Cancelled`]).
 
-use super::{
-    DEFAULT_MAX_OUTPUT_BYTES, ShellExecutor, configure_stdio, host_shell_argv, resolve_setsid,
-    terminate, timeouts,
+use super::{DEFAULT_MAX_OUTPUT_BYTES, ShellExecutor, timeouts};
+use crate::limits::ShellLimits;
+use harw_command::{
+    CommandEnd, CommandOutcome, CommandPort, CommandRequest, CommandSandbox, Persistence,
+    ResourceRequest,
 };
-use crate::capture::{BoundedCapture, DrainEnd};
-use crate::limits::{ShellLimits, launch_command};
 use harw_types::cancel::CancelToken;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command as TokioCommand;
 use tracing::{info, warn};
 
 /// Vorgabe-Zeitlimit eines `!`-Befehls, solange der Aufrufer keine
@@ -152,6 +151,7 @@ pub struct OperatorCommand {
     max_output_bytes: usize,
     env_overrides: Vec<(OsString, OsString)>,
     cancel: Option<CancelToken>,
+    port: Option<Arc<dyn CommandPort>>,
 }
 
 impl OperatorCommand {
@@ -167,7 +167,15 @@ impl OperatorCommand {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             env_overrides: Vec::new(),
             cancel: None,
+            port: None,
         }
+    }
+
+    /// Runs through this port instead of the installed one (tests, embedders).
+    #[must_use]
+    pub fn with_port(mut self, port: Arc<dyn CommandPort>) -> Self {
+        self.port = Some(port);
+        self
     }
 
     /// Setzt die rlimits.
@@ -204,14 +212,6 @@ impl OperatorCommand {
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = Some(cancel);
         self
-    }
-
-    /// Wartet auf den Abbruch; ohne Token nie.
-    async fn cancelled(&self) {
-        match &self.cancel {
-            Some(cancel) => cancel.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
     }
 
     /// Der (zugeschnittene) Befehlstext.
@@ -254,121 +254,74 @@ impl OperatorCommand {
         if let Err(err) = self.limits.validate() {
             return self.failed(started, format!("rlimits ungültig: {err}"));
         }
-        let prlimit = match self.limits.resolve_prlimit() {
-            Ok(prlimit) => prlimit,
-            Err(err) => return self.failed(started, err.to_string()),
-        };
-        if prlimit.is_none() {
-            warn!(
-                "shell.operator_exec runs WITHOUT rlimits: prlimit missing and require_rlimits=false"
+        let Some(port) = self.port.clone().or_else(harw_command::installed) else {
+            return self.failed(
+                started,
+                "Keine Job-Runtime montiert: `!`-Befehle laufen nur über die Job-Runtime."
+                    .to_owned(),
             );
-        }
+        };
 
         let timeout_secs = self.timeout.as_secs().max(1);
         let limits = timeouts::limits_for(self.limits, timeout_secs);
-        let setsid = resolve_setsid();
-        let (program, shell_args) = host_shell_argv(setsid, command);
-        let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
-
-        let mut process = TokioCommand::new(&launch.program);
-        process.args(&launch.args);
-        process.current_dir(&self.cwd);
-        // Wie `run_host_command`: mit `setsid` bewusst KEIN
-        // `process_group(0)` (sonst forkt `setsid` und `terminate` träfe nur
-        // den wartenden Elternprozess), ohne `setsid` eigene Prozessgruppe.
-        if setsid.is_none() {
-            process.process_group(0);
-        }
+        let mut request = CommandRequest::new("/bin/sh", &self.cwd, self.timeout);
+        request.args = vec!["-c".to_owned(), command.to_owned()];
         // Geerbte Umgebung bleibt vollständig (echtes `HOME`, `PATH` …);
-        // nur ausdrücklich gesetzte Werte kommen hinzu.
+        // nur ausdrücklich gesetzte Werte kommen hinzu. Die Umgebung wird
+        // nie persistiert (`Persistence::Ephemeral`).
+        request.env = std::env::vars().collect();
         for (key, value) in &self.env_overrides {
-            process.env(key, value);
+            let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+                continue;
+            };
+            request.env.retain(|(name, _)| name != key);
+            request.env.push((key.to_owned(), value.to_owned()));
         }
+        request.max_output_bytes = self.max_output_bytes;
+        request.limits = ResourceRequest {
+            address_space_max: Some(limits.as_bytes),
+            cpu_time_max: Some(limits.cpu_secs),
+            file_size_max: Some(limits.fsize_bytes),
+            open_files_max: u32::try_from(limits.nofile).ok(),
+            require_rlimits: limits.require_rlimits,
+            ..ResourceRequest::default()
+        };
+        request.sandbox = CommandSandbox::Host;
+        request.persistence = Persistence::Ephemeral;
 
-        let outcome = self
-            .spawn_and_collect(&mut process, timeout_secs, started)
-            .await;
+        let cancel = self.cancel.clone().unwrap_or_default();
+        let done = port.run(request, cancel).await;
+        let outcome = self.outcome_of(done, timeout_secs, started);
         audit(&outcome);
         outcome
     }
 
-    /// Startet den Prozess, liest die Ausgabe gekappt und setzt das
-    /// Zeitlimit durch.
-    async fn spawn_and_collect(
+    /// Maps the port's outcome onto the operator vocabulary.
+    fn outcome_of(
         &self,
-        process: &mut TokioCommand,
+        done: CommandOutcome,
         timeout_secs: u64,
         started: Instant,
     ) -> OperatorOutcome {
-        let mut child = match configure_stdio(process).spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                return self.failed(started, format!("Start auf dem Host fehlgeschlagen: {err}"));
+        let end = match &done.end {
+            CommandEnd::Exited | CommandEnd::Signaled(_) => OperatorEnd::Exited,
+            CommandEnd::TimedOut => OperatorEnd::TimedOut { timeout_secs },
+            CommandEnd::OutputLimit => OperatorEnd::OutputLimit,
+            CommandEnd::Cancelled => OperatorEnd::Cancelled,
+            CommandEnd::Failed(message) => {
+                return self.failed(
+                    started,
+                    format!("Start auf dem Host fehlgeschlagen: {message}"),
+                );
             }
         };
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
-            terminate(&mut child).await;
-            return self.failed(started, "stdout/stderr-Pipes fehlen".to_owned());
-        };
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let mut capture = BoundedCapture::new(self.max_output_bytes);
-        let drained = tokio::select! {
-            biased;
-            () = self.cancelled() => None,
-            drained = tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)) => {
-                Some(drained)
-            }
-        };
-
-        let (status, end): (Option<ExitStatus>, OperatorEnd) = match drained {
-            None => (terminate(&mut child).await, OperatorEnd::Cancelled),
-            Some(Err(_elapsed)) => (
-                terminate(&mut child).await,
-                OperatorEnd::TimedOut { timeout_secs },
-            ),
-            Some(Ok(Err(err))) => (
-                terminate(&mut child).await,
-                OperatorEnd::Failed {
-                    message: format!("Ausgabe nicht lesbar: {err}"),
-                },
-            ),
-            Some(Ok(Ok(DrainEnd::LimitExceeded))) => {
-                (terminate(&mut child).await, OperatorEnd::OutputLimit)
-            }
-            Some(Ok(Ok(DrainEnd::Eof))) => {
-                let waited = tokio::select! {
-                    biased;
-                    () = self.cancelled() => None,
-                    waited = tokio::time::timeout_at(deadline, child.wait()) => Some(waited),
-                };
-                match waited {
-                    None => (terminate(&mut child).await, OperatorEnd::Cancelled),
-                    Some(Ok(Ok(status))) => (Some(status), OperatorEnd::Exited),
-                    Some(Ok(Err(err))) => (
-                        terminate(&mut child).await,
-                        OperatorEnd::Failed {
-                            message: format!("Warten auf den Prozess fehlgeschlagen: {err}"),
-                        },
-                    ),
-                    Some(Err(_elapsed)) => (
-                        terminate(&mut child).await,
-                        OperatorEnd::TimedOut { timeout_secs },
-                    ),
-                }
-            }
-        };
-
         let (stdout, stderr, truncated) = ShellExecutor::truncate_combined_output(
-            capture.stdout(),
-            capture.stderr(),
+            &done.stdout,
+            &done.stderr,
             self.max_output_bytes,
         );
-        let exit_code = match end {
-            OperatorEnd::Exited => status
-                .and_then(|status| status.code())
-                .map_or(-1, i64::from),
+        let exit_code = match done.end {
+            CommandEnd::Exited => i64::from(done.exit_code),
             _ => -1,
         };
         OperatorOutcome {
@@ -377,7 +330,7 @@ impl OperatorCommand {
             exit_code,
             stdout,
             stderr,
-            truncated: truncated || end == OperatorEnd::OutputLimit,
+            truncated: truncated || done.truncated || end == OperatorEnd::OutputLimit,
             executed_on_host: true,
             duration: started.elapsed(),
             end,
@@ -479,6 +432,29 @@ fn audit(outcome: &OperatorOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_port() -> Arc<dyn CommandPort> {
+        let dir = harw_test_support::unique_tmp("harw-operator", "jobs");
+        let port = harw_command::JobCommandPort::host(&dir).expect("host job runtime");
+        Arc::new(port)
+    }
+
+    fn test_command(command: impl Into<String>, cwd: impl Into<PathBuf>) -> OperatorCommand {
+        OperatorCommand::new(command, cwd).with_port(test_port())
+    }
+
+    async fn run_with_test_port(
+        command: &str,
+        cwd: &Path,
+        limits: ShellLimits,
+        timeout: Duration,
+    ) -> OperatorOutcome {
+        test_command(command, cwd)
+            .with_limits(limits)
+            .with_timeout(timeout)
+            .run()
+            .await
+    }
     use crate::test_support::{TestError, TestResult, ctx};
     use tempfile::TempDir;
 
@@ -495,7 +471,7 @@ mod tests {
     async fn operator_command_writes_into_real_home() -> TestResult {
         let home = TempDir::new().map_err(ctx("temp home"))?;
         let workspace = TempDir::new().map_err(ctx("temp workspace"))?;
-        let outcome = OperatorCommand::new(
+        let outcome = test_command(
             "echo hallo > \"$HOME/operator-marker.txt\"",
             workspace.path(),
         )
@@ -521,7 +497,7 @@ mod tests {
             .canonicalize()
             .map_err(ctx("workspace kanonisieren"))?;
         let outcome =
-            run_operator_command("pwd -P", &expected, test_limits(), Duration::from_secs(30)).await;
+            run_with_test_port("pwd -P", &expected, test_limits(), Duration::from_secs(30)).await;
         assert_eq!(outcome.exit_code, 0, "{outcome:?}");
         assert_eq!(Path::new(outcome.stdout.trim()), expected.as_path());
         Ok(())
@@ -536,7 +512,7 @@ mod tests {
             "pkexec ls",
             "echo x && sudo rm -rf /tmp/x",
         ] {
-            let outcome = run_operator_command(
+            let outcome = run_with_test_port(
                 command,
                 workspace.path(),
                 test_limits(),
@@ -558,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn operator_command_rejects_blank_command() -> TestResult {
         let workspace = TempDir::new().map_err(ctx("temp workspace"))?;
-        let outcome = run_operator_command(
+        let outcome = run_with_test_port(
             "   ",
             workspace.path(),
             test_limits(),
@@ -576,7 +552,7 @@ mod tests {
     async fn operator_command_times_out_and_keeps_partial_output() -> TestResult {
         let workspace = TempDir::new().map_err(ctx("temp workspace"))?;
         let started = Instant::now();
-        let outcome = run_operator_command(
+        let outcome = run_with_test_port(
             "echo vorher; sleep 30",
             workspace.path(),
             test_limits(),
@@ -601,7 +577,7 @@ mod tests {
     async fn operator_command_cancel_stops_the_process_and_keeps_partial_output() -> TestResult {
         let workspace = TempDir::new().map_err(ctx("temp workspace"))?;
         let cancel = CancelToken::new();
-        let command = OperatorCommand::new("echo vorher; sleep 30", workspace.path())
+        let command = test_command("echo vorher; sleep 30", workspace.path())
             .with_limits(test_limits())
             .with_timeout(Duration::from_secs(60))
             .with_cancel(cancel.clone());
@@ -625,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn operator_command_reports_nonzero_exit_and_stderr() -> TestResult {
         let workspace = TempDir::new().map_err(ctx("temp workspace"))?;
-        let outcome = run_operator_command(
+        let outcome = run_with_test_port(
             "echo fehler >&2; exit 3",
             workspace.path(),
             test_limits(),
@@ -642,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn operator_command_caps_output() -> TestResult {
         let workspace = TempDir::new().map_err(ctx("temp workspace"))?;
-        let outcome = OperatorCommand::new("yes x", workspace.path())
+        let outcome = test_command("yes x", workspace.path())
             .with_limits(test_limits())
             .with_timeout(Duration::from_secs(30))
             .with_max_output_bytes(1024)
@@ -656,7 +632,7 @@ mod tests {
 
     #[test]
     fn operator_command_trims_command_text() {
-        let command = OperatorCommand::new("  ls -la \n", "/");
+        let command = test_command("  ls -la \n", "/");
         assert_eq!(command.command(), "ls -la");
     }
 }

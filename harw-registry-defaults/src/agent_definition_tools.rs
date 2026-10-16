@@ -2524,8 +2524,17 @@ trait AgentBuildJobStarter: Send + Sync {
         &self,
         request: harw_tool_job::StartRequest,
         prepared: harw_tool_job::PreparedJob,
-    ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError>;
+    ) -> JobStartFuture<'_>;
 }
+
+/// Future von [`AgentBuildJobStarter::start`].
+type JobStartFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<harw_tool_job::JobStatus, harw_tool_job::JobError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Startet über eine echte [`harw_tool_job::JobManager`]-Instanz.
 struct RealJobStarter(std::sync::Arc<harw_tool_job::JobManager>);
@@ -2535,8 +2544,8 @@ impl AgentBuildJobStarter for RealJobStarter {
         &self,
         request: harw_tool_job::StartRequest,
         prepared: harw_tool_job::PreparedJob,
-    ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError> {
-        self.0.start(request, prepared)
+    ) -> JobStartFuture<'_> {
+        Box::pin(async move { self.0.start(request, prepared).await })
     }
 }
 
@@ -2693,8 +2702,9 @@ impl ToolExecutor for AgentsBuildExecutor {
             let prepared = harw_tool_job::PreparedJob {
                 command,
                 executed_on_host: true,
+                env_cleared: false,
             };
-            match self.starter.start(request, prepared) {
+            match self.starter.start(request, prepared).await {
                 Ok(status) => Ok(ToolOutput::json(serde_json::json!({
                     "job_id": status.meta.job_id.as_str(),
                     "note": "Build läuft als Hintergrund-Job. Fortschritt: job.status/job.logs.",
@@ -2840,6 +2850,15 @@ mod agents_build_tests {
             &self,
             request: harw_tool_job::StartRequest,
             _prepared: harw_tool_job::PreparedJob,
+        ) -> super::JobStartFuture<'_> {
+            Box::pin(async move { self.start_now(request) })
+        }
+    }
+
+    impl FakeStarter {
+        fn start_now(
+            &self,
+            request: harw_tool_job::StartRequest,
         ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError> {
             self.recorded
                 .lock()

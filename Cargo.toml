@@ -17,10 +17,17 @@ members = [
     "harw-tool-explorer",
     "harw-killer",
     "harw-tool-process",
+    "harw-tool-gitread",
+    "harw-tool-cargo",
+    "harw-tool-sys",
+    "harw-tool-fsread",
     "harw-tool-container",
     "harw-config",
     "harw-home",
     "harw-plan",
+    # H20 — Step-/TODO-Listenbibliothek (Contract:
+    # docs/plans/h20-step-list-library-contract.md); eigenständig, ohne TUI.
+    "harw-step-list",
     "harw-types",
     # Leaf-Crate für ContentDigest (nur blake3 + serde), re-exportiert von harw-types.
     "harw-digest",
@@ -76,6 +83,7 @@ members = [
     "harw-container-model",
     "harw-placement-model",
     "harw-job",
+    "harw-command",
     "harw-knowledge",
     "harw-channel",
     "harw-channel-telegram",
@@ -127,6 +135,12 @@ members = [
     "harw-lens-federation",
     "harw-lens",
     "harw-tool-lens",
+    "harw-cloud/harw-cloudctl",
+    "harw-cloud/harw-cloud-enroll",
+    "harw-cloud/harw-cloud-gateway",
+    "harw-cloud/harw-cloud-ops",
+    "harw-cloud",
+    "harw-tool-obsidian",
     "harw-web",
     # === Remediation (Plan P0–P3) ===
     "harw-egress",

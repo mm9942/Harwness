@@ -19,6 +19,9 @@ pub mod attach;
 // Runde 5, Teil F: Auswahlfenster für `ask_user`.
 pub(crate) mod ask_user_dialog;
 pub(crate) mod chat_scroll;
+mod recency;
+// h22: read-only StepList-Ansicht für das Explorer-Fenster.
+pub(crate) mod step_list_view;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
 pub(crate) mod child_stream;
 pub(crate) mod choice_dialog;

@@ -84,6 +84,9 @@ pub enum SessionStoreError {
     #[msg("child lease for '{child}' has already completed")]
     ChildLeaseAlreadyCompleted { child: SessionId },
 
+    #[msg("child lease recovery correlation mismatch for '{child}': {detail}")]
+    ChildLeaseRecoveryMismatch { child: SessionId, detail: String },
+
     #[msg("child lease store lock is contended")]
     ChildLeaseLockContended,
 

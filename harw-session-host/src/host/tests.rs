@@ -25,8 +25,10 @@ use tokio::sync::Notify;
 use super::{HostConfig, HostConnection, SessionHost};
 use crate::approvals::MemoryApprovals;
 use crate::driver::{
-    CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome,
+    CancelSignal, DriverEvent, DriverFuture, EventSink, FailureCause, Setting, TurnDriver,
+    TurnInput, TurnOutcome,
 };
+use crate::error::HostError;
 use crate::identity::ClientIdentity;
 use crate::identity::test_identity::{local, scoped};
 use crate::replay::MemoryTranscripts;
@@ -42,6 +44,8 @@ struct FakeDriver {
     gate: Option<Arc<Notify>>,
     park: bool,
     settings: std::sync::Mutex<Vec<Setting>>,
+    /// Results returned (in order) instead of running a normal turn.
+    failures: std::sync::Mutex<std::collections::VecDeque<Result<TurnOutcome, HostError>>>,
 }
 
 impl FakeDriver {
@@ -53,6 +57,13 @@ impl FakeDriver {
             gate: None,
             park: false,
             settings: std::sync::Mutex::new(Vec::new()),
+            failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn script_failure(&self, result: Result<TurnOutcome, HostError>) {
+        if let Ok(mut failures) = self.failures.lock() {
+            failures.push_back(result);
         }
     }
 
@@ -89,6 +100,10 @@ impl TurnDriver for FakeDriver {
     ) -> DriverFuture<'_, TurnOutcome> {
         Box::pin(async move {
             self.turns.fetch_add(1, Ordering::SeqCst);
+            let scripted = self.failures.lock().ok().and_then(|mut f| f.pop_front());
+            if let Some(result) = scripted {
+                return result;
+            }
             let turn_id = TurnId::new();
             sink.emit(DriverEvent::Turn(TurnEvent::TurnStarted {
                 turn_id: turn_id.clone(),
@@ -788,4 +803,170 @@ async fn settings_need_control_and_apply_when_idle() -> TestResult {
     let applied = fx.driver.settings.lock().map_err(|_| "poisoned")?.clone();
     assert_eq!(applied, vec![Setting::Model("other".into())]);
     Ok(())
+}
+
+fn session_error_text(frame: &SessionFrame) -> Option<&str> {
+    match frame {
+        SessionFrame::Session(harw_protocol::SessionEvent::SessionError { message, .. }) => {
+            Some(message.as_str())
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn driver_error_is_visible_and_next_submit_works() -> TestResult {
+    let fx = fixture()?;
+    let client = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = client.create(CreateParams::default()).await?.session_id;
+    let (_ack, mut frames) = client.attach(attach(&session, None)).await?;
+
+    let long = "x".repeat(2_000);
+    fx.driver.script_failure(Err(HostError::Driver(format!(
+        "boom\u{1b}[31m\n\tred {long}"
+    ))));
+    let first = client
+        .submit(submit(&session, "one", "m1", Cursor::default()))
+        .await?;
+    assert!(matches!(first, SubmitResult::Accepted { .. }));
+    let notice = wait_for(&mut frames, |f| session_error_text(f).is_some()).await?;
+    let text = session_error_text(&notice.frame).ok_or("no notice")?;
+    assert!(
+        text.starts_with("turn failed (internal error): driver: boom"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}') && !text.contains('\n'), "{text:?}");
+    assert!(
+        text.chars().count() < 400,
+        "bounded: {}",
+        text.chars().count()
+    );
+    wait_idle(&client, &session).await?;
+
+    // The session is alive: the next submit runs a normal turn.
+    let second = client
+        .submit(submit(&session, "two", "m2", Cursor::default()))
+        .await?;
+    assert!(
+        matches!(second, SubmitResult::Accepted { .. }),
+        "{second:?}"
+    );
+    wait_for(&mut frames, |f| {
+        matches!(f, SessionFrame::Turn(TurnEvent::AssistantDelta { text, .. }) if text == "echo two")
+    })
+    .await?;
+    wait_idle(&client, &session).await?;
+    assert_eq!(fx.driver.turns.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_failure_carries_its_cause_and_never_sets_failed_state() -> TestResult {
+    let fx = fixture()?;
+    let client = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = client.create(CreateParams::default()).await?.session_id;
+    let (_ack, mut frames) = client.attach(attach(&session, None)).await?;
+    for (n, (cause, label)) in [
+        (FailureCause::ProviderAuth, "provider authentication failed"),
+        (FailureCause::Quota, "provider quota or budget exhausted"),
+        (FailureCause::ContextLength, "context length exceeded"),
+        (FailureCause::Refusal, "model refused"),
+        (FailureCause::RequestFailed, "model request failed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fx.driver.script_failure(Ok(TurnOutcome::FailedWith {
+            cause,
+            reason: "provider said no".into(),
+        }));
+        let msg = format!("m{n}");
+        client
+            .submit(submit(&session, "x", &msg, Cursor::default()))
+            .await?;
+        let notice = wait_for(&mut frames, |f| session_error_text(f).is_some()).await?;
+        let text = session_error_text(&notice.frame).ok_or("no notice")?;
+        assert_eq!(text, format!("turn failed ({label}): provider said no"));
+        wait_idle(&client, &session).await?;
+        let listed = client.list().await?;
+        assert!(listed.iter().all(|s| s.state != HostedState::Failed));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_after_restart_explains_itself_and_resume_works() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let transcripts = Arc::new(MemoryTranscripts::new());
+    let approvals = Arc::new(MemoryApprovals::new());
+    let gate = Arc::new(Notify::new());
+    let mut driver = FakeDriver::new(Arc::clone(&transcripts), Arc::clone(&approvals));
+    driver.gate = Some(Arc::clone(&gate));
+    let driver = Arc::new(driver);
+    let first = SessionHost::open(
+        HostConfig::new(dir.path().to_path_buf()),
+        Arc::clone(&driver) as Arc<dyn TurnDriver>,
+        Arc::clone(&transcripts) as Arc<dyn crate::replay::TranscriptSource>,
+        Arc::clone(&approvals) as Arc<dyn crate::approvals::ApprovalBackend>,
+    )?;
+    let client = connect(&first, local(1, PermissionTier::Operator)).await?;
+    let session = client.create(CreateParams::default()).await?.session_id;
+    client
+        .submit(submit(&session, "long", "r1", Cursor::default()))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let second = SessionHost::open(
+        HostConfig::new(dir.path().to_path_buf()),
+        Arc::clone(&driver) as Arc<dyn TurnDriver>,
+        transcripts,
+        approvals,
+    )?;
+    let client = connect(&second, local(1, PermissionTier::Operator)).await?;
+
+    // Attaching explains the state.
+    let (_ack, mut frames) = client.attach(attach(&session, None)).await?;
+    let notice = wait_for(&mut frames, |f| session_error_text(f).is_some()).await?;
+    let text = session_error_text(&notice.frame).ok_or("no notice")?;
+    assert!(
+        text.contains("interrupted") && text.contains("resume"),
+        "{text}"
+    );
+
+    // Submitting is refused with a clear reason.
+    let denied = client
+        .submit(submit(&session, "again", "r2", Cursor::default()))
+        .await?;
+    let SubmitResult::Denied { reason } = denied else {
+        return Err("submit must be denied while interrupted".into());
+    };
+    assert!(
+        reason.contains("interrupted") && reason.contains("resume"),
+        "{reason}"
+    );
+
+    // Resume returns the session to Idle; the next submit is accepted.
+    client.resume(session.clone()).await?;
+    wait_idle(&client, &session).await?;
+    let mut accepted = client
+        .submit(submit(&session, "again", "r3", Cursor::default()))
+        .await?;
+    if let SubmitResult::Stale { head } = accepted {
+        accepted = client.submit(submit(&session, "again", "r3", head)).await?;
+    }
+    assert!(
+        matches!(accepted, SubmitResult::Accepted { .. }),
+        "{accepted:?}"
+    );
+    gate.notify_waiters();
+    Ok(())
+}
+
+#[test]
+fn sanitize_notice_strips_controls_and_bounds_length() {
+    use crate::driver::sanitize_notice;
+    assert_eq!(sanitize_notice("a\u{1b}[0m\n\t b", 50), "a [0m b");
+    assert_eq!(sanitize_notice("   ", 50), "");
+    let cut = sanitize_notice(&"é".repeat(10), 4);
+    assert_eq!(cut, "éééé\u{2026}");
 }

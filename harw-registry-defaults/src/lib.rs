@@ -79,6 +79,7 @@ pub mod research_web;
 pub mod roster;
 pub mod skill_proposal_tools;
 pub mod skill_tools;
+pub mod tool_index;
 pub mod workbench_tools;
 
 #[cfg(test)]
@@ -213,6 +214,15 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Agenten. Die Sichtbarkeitsgrenze zieht `ReadScope`, nicht die
     // Genehmigung — der Aufrufer kann seinen Bereich nicht selbst wählen.
     "lens.ask",
+    // Lesende Obsidian-Vault-Werkzeuge (`harw-tool-obsidian`, siehe
+    // `profile::OBSIDIAN_READ_TOOLS`) — lesen nur Dateien aus dem Vault
+    // innerhalb des Workspace-Bindings, `Permission::ReadWorkspace` wie
+    // `fs.read`; `obsidian.write` bleibt bewusst ausgeschlossen (Dateien
+    // anlegen/überschreiben, nur `Full`).
+    "obsidian.map",
+    "obsidian.read",
+    "obsidian.search",
+    "obsidian.links",
     // Web-Recherche (`harw-tool-web`) — alle vier im Profil `Research` (Rolle
     // `researcher-web`, ohne `fs.*`/`deps.*`); `web.fetch`/`web.search`
     // zusätzlich in den Erkundungsprofilen (`explorer`, `uia-explorer`,
@@ -290,15 +300,14 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // `JOB_READ_TOOLS`): `job.status`/`job.logs`/`job.list` lesen nur
     // Zustand und Logdateien eigener Jobs bzw. der Jobs von Nachfahren
     // (Besitzprüfung über die Sitzung aus dem Ausführungskontext);
-    // `job.wait` ist ein kurzes Polling (höchstens 60 s; das Jobende kommt
-    // als Notiz, R18 F8). Keine
+    // there is no blocking wait tool (background-only rule): the job end
+    // arrives as a notification. Keine
     // Schreibwirkung, kein Prozessstart. `job.start` fragt wie `shell.exec`,
     // `job.stop` wie jedes andere Werkzeug mit Wirkung (nicht in
     // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift).
     "job.status",
     "job.logs",
     "job.list",
-    "job.wait",
     // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge (`TUNNEL_TOOLS`,
     // `profile::TUNNEL_TOOLS`): `tunnel.status`/`tunnel.list` lesen nur den
     // Zustand verwalteter Tunnels des Aufrufers, `tunnel.stop` beendet nur
@@ -442,6 +451,10 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // image, command and workspace access are still the model's choice): an
     // allow rule never skips the question.
     "container.run",
+    // `cargo.test_one` führt Testcode aus dem Workspace aus; zusammen mit
+    // `fs.write` ist das beliebige Codeausführung in der Sandbox. Eine
+    // sitzungsweite „merken“-Freigabe darf es daher nie abdecken.
+    "cargo.test_one",
     // R18 (D-B): die mutierenden `gateway.*`-Werkzeuge
     // (`profile::GATEWAY_MUTATION_TOOLS`, `model_tool(approval = "always")`)
     // — Widerruf, Draining, Listener, Werkzeug-Freigaben fragen unter
@@ -1048,6 +1061,13 @@ mod tests {
             // `process.kill` steht in `ALWAYS_ASK_TOOLS`, fragt also immer.
             "process.list".to_owned(),
             "process.kill".to_owned(),
+            // Obsidian vault tools (Full profile): read + write for coding
+            // agents maintaining the project's long-form memory.
+            "obsidian.map".to_owned(),
+            "obsidian.read".to_owned(),
+            "obsidian.search".to_owned(),
+            "obsidian.links".to_owned(),
+            "obsidian.write".to_owned(),
         ];
 
         let advertised_tools = registered_names(&ar);
@@ -1156,6 +1176,12 @@ mod tests {
         // WorkDriver-Worker (schreibt nur den eigenen Berichts-Slot).
         read_only_surface.extend_from_slice(crate::profile::GATEWAY_READ_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
+        // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge stehen in
+        // `AUTO_APPROVED_TOOLS` (Besitzprüfung im Tool selbst, `tunnel.stop`
+        // beendet nur einen eigenen Tunnel), aber kein read-only Profil
+        // registriert sie mehr — bis zur Montage bleiben sie die statische
+        // Vertrags-Obermenge (siehe `profile::TUNNEL_TOOLS`).
+        read_only_surface.extend_from_slice(&["tunnel.status", "tunnel.list"]);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -1237,6 +1263,10 @@ mod tests {
             "matrix.start",
             "matrix.run",
             "matrix.finish",
+            // PL-90: Intent-Zyklen deklarieren `approval = "always"`
+            // (`harw-ops/src/intent_cycle.rs`).
+            "intent_cycle.start",
+            "intent_cycle.stop",
         ] {
             assert!(
                 DefaultApprovalPolicy::requires_explicit_approval(&call(name)),
@@ -1271,6 +1301,7 @@ mod tests {
         )));
         assert!(!AUTO_APPROVED_TOOLS.contains(&"agent.cancel"));
         assert!(ALWAYS_ASK_TOOLS.contains(&"agent.cancel"));
+        assert!(ALWAYS_ASK_TOOLS.contains(&"cargo.test_one"));
         assert!(DefaultApprovalPolicy::requires_explicit_approval(&call(
             "agent.cancel"
         )));

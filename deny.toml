@@ -25,6 +25,12 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste transitiv über ratatui (nur Compile-Zeit)" },
     # Nicht mehr gepflegt, Proc-Macro über `hax-lib-macros` (libcrux-Kette).
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 transitiv über hax-lib-macros (nur Compile-Zeit)" },
+    # Nicht mehr gepflegt, kein sicheres Upgrade: `serde_yaml` im Cloud-Home-
+    # Gateway (`harw-cloud-gateway`, liest nur die lokale, vom Operator
+    # geschriebene Gateway-Konfiguration) und transitiv über `pingora-core`
+    # (optionales Feature `proxy`). Ablösung durch einen YAML-Parser in
+    # sicherem Rust ist eine eigene Änderung am Cloud-Stack.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml über serde_yaml (harw-cloud-gateway, pingora-core); kein Upgrade verfügbar, nur Operator-Konfiguration" },
 ]
 
 [licenses]

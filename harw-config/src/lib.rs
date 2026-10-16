@@ -77,6 +77,8 @@ pub use harness_config::{
 pub use shell_limits::ShellToml;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`).
 pub use harness_config::ChildStreamModeToml;
+// h7: `[tui] status_expiry` — Verhalten abgelaufener Kind-Statusmeldungen.
+pub use harness_config::StatusExpiryMode;
 // Crypto-Infrastruktur H4: `[infrastructure]`.
 pub use infrastructure_toml::InfrastructureSection;
 // Runde 5, Teil E: `ANTHROPIC_FAST_MODEL`/`fast_model_for_active_provider`

@@ -32,6 +32,9 @@ pub struct PreparedJob {
     pub command: TokioCommand,
     /// Direkt auf dem Host (ohne `bwrap`).
     pub executed_on_host: bool,
+    /// Die Umgebung ist genau das, was am `command` gesetzt ist (nichts wird
+    /// geerbt); sonst kommt die geerbte Umgebung hinzu.
+    pub env_cleared: bool,
 }
 
 /// Future von [`JobLauncher::prepare`].
@@ -130,11 +133,13 @@ impl JobLauncher for ShellJobLauncher {
                 .prepare_background_launch(context, command, crate::JOB_START_TOOL, cpu_budget_secs)
                 .await?;
             let executed_on_host = launch.executed_on_host();
+            let env_cleared = launch.env_cleared();
             let (command, warnings) = launch.into_parts();
             Ok(PreparedLaunch {
                 job: PreparedJob {
                     command,
                     executed_on_host,
+                    env_cleared,
                 },
                 warnings,
             })
@@ -174,6 +179,7 @@ impl JobLauncher for DirectLauncher {
             Ok(PreparedJob {
                 command: command_line,
                 executed_on_host: true,
+                env_cleared: false,
             })
         })
     }
@@ -214,6 +220,7 @@ impl DirectLauncher {
         Ok(PreparedJob {
             command: command_line,
             executed_on_host: true,
+            env_cleared: false,
         })
     }
 }

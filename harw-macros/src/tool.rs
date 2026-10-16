@@ -24,6 +24,26 @@
 //!    leeren Hostnamen in die Scope-Prüfung zu geben. Ein leerer Host würde
 //!    andernfalls an `NetworkScope::allows("")` weitergereicht — ein
 //!    Fail-open-Risiko, falls diese Prüfung leere Eingaben permissiv behandelt.
+//!
+//! # Geplanter Activity-Metadaten-Anschluss
+//!
+//! `docs/planning/71-semantic-activity-patterns/04-macro-metadata.md`
+//! beschreibt einen **noch nicht implementierten** Ausbau von `#[tool]` um
+//! deklarative, semantische Activity-Metadaten (z. B. Domain, Verb,
+//! Ressourcenfeld und beschreibende Effektklasse). Der Compiler-Makro-Pfad ist
+//! dafür ein sinnvoller Anschluss, weil Tool-Autoren dort bereits Name,
+//! Permission, Host-Bindung und Parallelitätszusage deklarieren.
+//!
+//! Dabei gelten zwei harte Grenzen:
+//!
+//! 1. Activity-Metadaten sind beschreibend und dürfen niemals
+//!    `Permission`-/Approval-Prüfungen ersetzen oder erweitern.
+//! 2. Interne Activity-Metadaten sollen nicht ungeprüft in den model-facing
+//!    `ToolSpec` wandern; Provider-Schema und Harw-interne Semantik haben
+//!    unterschiedliche Konsumenten und Kompatibilitätsanforderungen.
+//!
+//! Bis dieser Plan landet, kennt `ToolAttr` ausschließlich die unten
+//! dokumentierten heutigen Schlüssel.
 
 use crate::schema::{doc_string, field_default, schema_for_type};
 use crate::util::pascal_case;

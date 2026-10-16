@@ -199,6 +199,7 @@ pub mod providers {
     provider!(EXPLORE, "explore", "harw-tool-explorer", "tool-explorer");
     provider!(DEPS, "deps", "harw-tool-deps", "tool-deps");
     provider!(LENS, "lens", "harw-tool-lens", "tool-lens");
+    provider!(OBSIDIAN, "obsidian", "harw-tool-obsidian", "tool-obsidian");
     provider!(WEB, "web", "harw-tool-web", "tool-web");
     provider!(BROWSER, "browser", "harw-tool-browser", "tool-browser");
     provider!(SHELL, "shell", "harw-tool-shell", "tool-shell");
@@ -206,6 +207,7 @@ pub mod providers {
     provider!(SUDO, "sudo", "harw-tool-shell", "tool-sudo");
     provider!(JOB, "job", "harw-tool-job", "tool-job");
     provider!(PROCESS, "process", "harw-tool-process", "tool-process");
+    provider!(CARGO, "cargo", "harw-tool-cargo", "tool-cargo");
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
     provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
@@ -239,6 +241,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "knowledge",
     "matrix",
     "tool-browser",
+    "tool-cargo",
     "tool-container",
     "tool-deps",
     "tool-doc",
@@ -247,6 +250,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "tool-job",
     "tool-latex",
     "tool-lens",
+    "tool-obsidian",
     "tool-plan",
     "tool-process",
     "tool-shell",
@@ -264,6 +268,19 @@ pub const WORK_DRIVER_ENQUEUE_TOOL: &str = "work_driver.enqueue";
 pub const WORK_DRIVER_STATUS_TOOL: &str = "work_driver.status";
 /// `work_driver.stop`: cancels a WorkDriver job through the job cancel path.
 pub const WORK_DRIVER_STOP_TOOL: &str = "work_driver.stop";
+/// `intent_cycle.start` (PL-90, `harw-ops/src/intent_cycle.rs`): starts a
+/// durable, read-only intent cycle (explorer + deterministic verifier).
+pub const INTENT_CYCLE_START_TOOL: &str = "intent_cycle.start";
+/// `intent_cycle.status`: reads an intent-cycle job and its bounded status.
+pub const INTENT_CYCLE_STATUS_TOOL: &str = "intent_cycle.status";
+/// `intent_cycle.stop`: cancels an intent-cycle job through the job cancel path.
+pub const INTENT_CYCLE_STOP_TOOL: &str = "intent_cycle.stop";
+/// The three intent-cycle tools.
+pub const INTENT_CYCLE_TOOLS: &[&str] = &[
+    INTENT_CYCLE_START_TOOL,
+    INTENT_CYCLE_STATUS_TOOL,
+    INTENT_CYCLE_STOP_TOOL,
+];
 /// The three WorkDriver tools.
 pub const WORK_DRIVER_TOOLS: &[&str] = &[
     WORK_DRIVER_ENQUEUE_TOOL,
@@ -316,6 +333,12 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("deps.source_list", DEPS, Read),
     // lens
     row!("lens.ask", LENS, Read),
+    // obsidian
+    row!("obsidian.map", OBSIDIAN, Read),
+    row!("obsidian.read", OBSIDIAN, Read),
+    row!("obsidian.search", OBSIDIAN, Read),
+    row!("obsidian.links", OBSIDIAN, Read),
+    row!("obsidian.write", OBSIDIAN, Write),
     // web
     row!("web.fetch", WEB, Network),
     row!("web.docs_rs", WEB, Network),
@@ -341,7 +364,6 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("job.logs", JOB, Meta),
     row!("job.stop", JOB, Meta),
     row!("job.list", JOB, Meta),
-    row!("job.wait", JOB, Meta),
     // agent compiler (#22 wave 2B): compiles an agent definition as a
     // background job, same launch path as `job.start`/`shell.exec`. Never
     // granted to a built-in role by default (no `RegistryProfile` registers
@@ -364,6 +386,13 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("work_driver.stop", AGENTS, Meta),
     // Only WorkDriver worker turns get it; it records the worker's report.
     row!("work_driver.report", AGENTS, Meta),
+    // Intent cycles (PL-90): `intent_cycle.start` admits a durable job that
+    // only READS the named workspace files (explorer + deterministic
+    // verifier, no process, no write, no network) — `Read`, not `Shell`.
+    // Status and stop only read or cancel a job record (`Meta`).
+    row!("intent_cycle.start", AGENTS, Read),
+    row!("intent_cycle.status", AGENTS, Meta),
+    row!("intent_cycle.stop", AGENTS, Meta),
     // gateway (R18): operations in `harw-ops`, served to the UIA root like
     // `work_driver.*`. Reads inspect the gateway; mutations act on it outside
     // the sandbox and always ask.
@@ -388,6 +417,19 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
+    // cargo: only `cargo.test_one` is registered (profile.rs) and carries a
+    // right (`authority::tool_permission`); the rows exist so the catalog
+    // matches `CargoToolProvider::TOOL_NAMES`. They run through the sandboxed
+    // `shell.exec` executor, hence the `Shell` class.
+    row!("cargo.check", CARGO, Shell),
+    row!("cargo.build", CARGO, Shell),
+    row!("cargo.clippy", CARGO, Shell),
+    row!("cargo.test", CARGO, Shell),
+    row!("cargo.fmt_check", CARGO, Shell),
+    row!("cargo.tree", CARGO, Shell),
+    row!("cargo.doc", CARGO, Shell),
+    row!("cargo.metadata", CARGO, Shell),
+    row!("cargo.test_one", CARGO, Shell),
     // plan mode
     row!("plan.write", PLAN, WriteOther),
     row!("plan.exit", PLAN, Interaction),
@@ -562,7 +604,7 @@ mod tests {
     /// (agents, authoring, sudo, latex, matrix, ...) are not listed here.
     #[test]
     fn test_catalog_rows_match_provider_tool_names() -> Result<(), String> {
-        let parity: [(&ToolProvider, &[&[&str]]); 10] = [
+        let parity: [(&ToolProvider, &[&[&str]]); 12] = [
             (
                 &providers::DOC,
                 &[harw_tool_doc::DocToolProvider::TOOL_NAMES],
@@ -580,6 +622,10 @@ mod tests {
                 &[harw_tool_lens::LensToolProvider::TOOL_NAMES],
             ),
             (
+                &providers::OBSIDIAN,
+                &[harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES],
+            ),
+            (
                 &providers::WEB,
                 &[harw_tool_web::WebToolProvider::TOOL_NAMES],
             ),
@@ -587,6 +633,10 @@ mod tests {
             (
                 &providers::PROCESS,
                 &[harw_tool_process::ProcessToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::CARGO,
+                &[harw_tool_cargo::CargoToolProvider::TOOL_NAMES],
             ),
             (
                 &providers::PLAN,
@@ -805,6 +855,30 @@ mod tests {
             assert!(
                 entry.is_some_and(|entry| !entry.always_available),
                 "{tool}: only orchestrators with [work_driver] get it"
+            );
+            assert_eq!(entry.map(CapabilityEntry::feature), Some(CORE_FEATURE));
+            assert!(
+                !crate::AUTO_APPROVED_TOOLS.contains(tool),
+                "{tool} must not be auto-approved"
+            );
+        }
+    }
+
+    /// PL-90: the intent-cycle tools have catalog rows; `start` only reads
+    /// workspace files (`Read`, no manifest flag), status/stop are `Meta`;
+    /// none is auto-approved or always available.
+    #[test]
+    fn test_intent_cycle_tools_are_classified() {
+        let class = |tool: &str| lookup(tool).map(|entry| entry.class);
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        assert_eq!(class(INTENT_CYCLE_START_TOOL), Some(CapabilityClass::Read));
+        assert_eq!(class(INTENT_CYCLE_STATUS_TOOL), Some(CapabilityClass::Meta));
+        assert_eq!(class(INTENT_CYCLE_STOP_TOOL), Some(CapabilityClass::Meta));
+        for tool in INTENT_CYCLE_TOOLS {
+            let entry = lookup(tool);
+            assert!(
+                entry.is_some_and(|entry| !entry.always_available),
+                "{tool}: not always available"
             );
             assert_eq!(entry.map(CapabilityEntry::feature), Some(CORE_FEATURE));
             assert!(

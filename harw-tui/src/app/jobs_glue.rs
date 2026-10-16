@@ -435,10 +435,11 @@ mod tests {
     }
 
     /// Eine TUI mit echter Job-Verwaltung und einem laufenden Job.
-    fn app_with_running_job(
+    async fn app_with_running_job(
         dir: &std::path::Path,
         host: bool,
     ) -> TestResult<(ChatApp, Arc<JobManager>, JobId)> {
+        crate::test_support::install_host_port();
         let manager = JobManager::new(
             JobManagerConfig::new(dir.join("state")),
             Arc::new(NoopNotifier),
@@ -464,8 +465,10 @@ mod tests {
                 PreparedJob {
                     command,
                     executed_on_host: host,
+                    env_cleared: false,
                 },
             )
+            .await
             .map_err(ctx("start"))?;
         let mut app = ChatApp::new(Vec::new(), sandbox(dir)?, SessionId::new());
         app.jobs_ui.test_manager = Some(Arc::clone(&manager));
@@ -477,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn quit_with_running_jobs_asks_and_detach_keeps_them() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let (mut app, manager, id) = app_with_running_job(dir.path(), false)?;
+        let (mut app, manager, id) = app_with_running_job(dir.path(), false).await?;
         assert!(refresh(&mut app, true), "Jobs-Gruppe übernimmt den Job");
         assert_eq!(app.agent_monitor.jobs().len(), 1);
 
@@ -518,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn quit_choice_stop_stops_all_running_jobs() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let (mut app, manager, id) = app_with_running_job(dir.path(), true)?;
+        let (mut app, manager, id) = app_with_running_job(dir.path(), true).await?;
         app.jobs_ui.quit_choice = Some(JobsQuitChoice::Stop);
         assert!(before_quit(&mut app).await);
         let status = manager
@@ -537,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn job_detail_opens_for_the_selected_job() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let (mut app, manager, id) = app_with_running_job(dir.path(), true)?;
+        let (mut app, manager, id) = app_with_running_job(dir.path(), true).await?;
         refresh(&mut app, true);
         let index = app
             .agent_monitor

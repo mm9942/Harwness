@@ -43,6 +43,12 @@ die UIA (Vorschlag, Diff, Delta); mehr Rechte als die Basisrolle oder eine
 neue UIA verlangen zusätzlich eine Nutzerbestätigung. Vorschläge verfallen
 nach 7 Tagen; beim Übernehmen wird erneut validiert.
 
+## Planen vor Ausführen
+Jeder nicht-triviale Auftrag: erst Plan schreiben (Ziel, Schritte, betroffene
+Dateien, Risiken, Verifikation), den Plan gegen das Ziel prüfen, dann
+ausführen — bei neuen Erkenntnissen den Plan anpassen, nicht still weiterlaufen.
+Kleine, offensichtliche Aufgaben: ein Satz zum Vorgehen genügt.
+
 ## Wann delegieren
 Mehrere unabhängige Fragen, Recherche, Analyse, Planausführung oder
 parallele/mehrphasige Arbeit — delegieren statt selbst ausführen. Bei

@@ -15,6 +15,11 @@ Prüfe, ob der Auftrag Projektgedächtnis oder Dateiwissen mitliefert, und
 nutze das, statt dieselbe Information erneut zu erheben.
 Skills: nur mit `skills.search` finden, vor der Arbeit mit `skills.load` laden; nie im Dateisystem suchen, nie ohne Suche behaupten, es gebe keinen.
 
+## Planen vor Ausführen
+Nicht-trivialer Auftrag: erst Vorgehen notieren (Schritte, Risiken,
+Verifikation), prüfen, dann ausführen; bei neuen Erkenntnissen anpassen.
+Kleine Aufgaben: ein Satz zum Vorgehen genügt.
+
 ## Umfang pro Lauf
 Das Spawn-Budget (Tokens, Aufrufe, Zeit) ist hart. Stoppe und gib zurück,
 sobald das Ergebnis belegt ist, das Budget knapp wird, ein Blocker auftritt
@@ -22,8 +27,8 @@ oder der Auftrag mehr verlangt als zugeteilt — melde das, statt
 auszuweiten.
 Lange oder zu verfolgende Prozesse (Builds, Paket-Restores, Testläufe,
 alles über ca. 2 min) startest du mit `job.start`; das Ende kommt als
-Notiz. `job.wait` ist nur ein kurzes Polling (≤ 60 s), nie in Schleife;
-kein tmux.
+notification. Do not wait or poll for it; there is no blocking wait tool
+(`job.status` is a non-blocking snapshot). No tmux.
 `tmux-inspector-worker` ist nur für bestehende tmux-Sitzungen der Nutzerin.
 
 ## Übergabe
@@ -35,3 +40,7 @@ Echte Unklarheit: `parent.message {kind: "question"}` an den Auftraggeber
 Root-Befehle (sudo): mit `host.sudo_exec` darüber (der Nutzer bestätigt und
 gibt sein Passwort im TUI-Fenster ein); sonst den Schritt mit exaktem argv
 und Grund als Blocker zurückgeben. Nie „sudo geht nicht“, nie `sudo -S`.
+
+## Sprache
+Antworte in der Sprache deines Auftrags (deutscher Auftrag = deutsche
+Antwort); wechsle nie in eine dritte Sprache.

@@ -117,8 +117,11 @@ impl ChildRegistryFactory for OrchestratorRegistry {
     }
 }
 
-/// Registry der Worker: keine Werkzeuge, ein antwortendes Modell.
-struct WorkerRegistry;
+/// Registry der Worker: keine Werkzeuge, ein antwortendes Modell. Zählt, wie
+/// viele Worker-Kinder tatsächlich gestartet wurden.
+struct WorkerRegistry {
+    started: Arc<AtomicUsize>,
+}
 
 impl ChildRegistryFactory for WorkerRegistry {
     fn build_registry(
@@ -127,6 +130,7 @@ impl ChildRegistryFactory for WorkerRegistry {
         _input: &SpawnInput,
         _suggestions: Option<&AgentSuggestions>,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
         Ok(ExtensionRegistryBuilder::default().build())
     }
 
@@ -266,6 +270,19 @@ enum Mode {
 /// Fährt UIA → Root-Orchestrator → `delegate_wave(arguments)` und liefert den
 /// Bericht der Welle.
 async fn run_chain(mode: Mode, arguments: Value) -> TestResult<WaveOutcome> {
+    run_chain_with(mode, arguments, ChildLimits::conservative())
+        .await
+        .map(|(outcome, _started)| outcome)
+}
+
+/// Wie [`run_chain`], mit frei wählbaren Kind-Grenzen; liefert zusätzlich die
+/// Zahl tatsächlich gestarteter Worker-Kinder.
+async fn run_chain_with(
+    mode: Mode,
+    arguments: Value,
+    limits: ChildLimits,
+) -> TestResult<(WaveOutcome, usize)> {
+    let started = Arc::new(AtomicUsize::new(0));
     let tmp = std::env::temp_dir().join(format!(
         "harw-delegate-wave-chain-{}-{}",
         std::process::id(),
@@ -294,7 +311,7 @@ async fn run_chain(mode: Mode, arguments: Value) -> TestResult<WaveOutcome> {
     let role = |name: &str| AgentRole::Agent {
         name: name.to_owned(),
     };
-    let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+    let spawner = ManagedAgentSpawner::new(manager, limits)
         .with_role(
             "root-orchestrator",
             role("root-orchestrator"),
@@ -308,13 +325,17 @@ async fn run_chain(mode: Mode, arguments: Value) -> TestResult<WaveOutcome> {
             "explorer",
             role("explorer"),
             AgentRoleId::Worker,
-            Arc::new(WorkerRegistry),
+            Arc::new(WorkerRegistry {
+                started: Arc::clone(&started),
+            }),
         )
         .with_role(
             "executor",
             role("executor"),
             AgentRoleId::Worker,
-            Arc::new(WorkerRegistry),
+            Arc::new(WorkerRegistry {
+                started: Arc::clone(&started),
+            }),
         )
         .with_delegation_catalog([
             info("root-orchestrator", true),
@@ -380,7 +401,7 @@ async fn run_chain(mode: Mode, arguments: Value) -> TestResult<WaveOutcome> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     match (outcomes.pop(), outcomes.is_empty()) {
-        (Some(outcome), true) => Ok(outcome),
+        (Some(outcome), true) => Ok((outcome, started.load(Ordering::SeqCst))),
         other => Err(TestError::Unexpected(format!(
             "genau ein delegate_wave-Aufruf erwartet: {other:?}"
         ))),
@@ -477,6 +498,83 @@ async fn work_mode_chain_delegates_every_visible_target() -> TestResult {
     assert_eq!(
         report.to_json()["results"][2]["error"],
         json!("Ziel geheim ist für dich nicht delegierbar; delegierbar sind: executor, explorer")
+    );
+    Ok(())
+}
+
+/// Fail-fast, all-or-nothing: passen nicht alle Ziele in die freien
+/// Kind-Slots des Aufrufers, wird nichts gestartet und der Fehler nennt die
+/// Grenze, die belegten Slots und die Folge.
+#[tokio::test]
+async fn a_wave_that_exceeds_the_child_capacity_starts_nothing() -> TestResult {
+    let limits = ChildLimits {
+        max_active_children_per_parent: 1,
+        ..ChildLimits::conservative()
+    };
+    let (outcome, started) =
+        run_chain_with(Mode::Work, wave(&["explorer", "executor"]), limits).await?;
+    let Err(message) = outcome else {
+        return Err(TestError::Unexpected(
+            "the wave must be rejected as a whole".to_owned(),
+        ));
+    };
+    assert_eq!(started, 0, "no child may be started: {message}");
+    assert!(message.contains("active child limit reached"), "{message}");
+    assert!(message.contains("2 new child(ren) requested"), "{message}");
+    assert!(message.contains("nothing was started"), "{message}");
+    assert!(
+        message.contains(harw_extension_api::FAIL_FAST_CONSEQUENCE),
+        "{message}"
+    );
+    Ok(())
+}
+
+/// Ein explizites `max_parallel` kleiner als die Zahl lauffähiger Ziele
+/// reiht nicht ein, sondern lehnt die ganze Welle ab.
+#[tokio::test]
+async fn a_wave_larger_than_max_parallel_is_rejected_instead_of_queued() -> TestResult {
+    let arguments = json!({
+        "targets": [
+            { "role": "explorer", "task": "a" },
+            { "role": "explorer", "task": "b" },
+            { "role": "executor", "task": "c" },
+        ],
+        "join": "collect",
+        "max_parallel": 2,
+    });
+    let (outcome, started) =
+        run_chain_with(Mode::Work, arguments, ChildLimits::conservative()).await?;
+    let Err(message) = outcome else {
+        return Err(TestError::Unexpected(
+            "the wave must be rejected as a whole".to_owned(),
+        ));
+    };
+    assert_eq!(started, 0, "{message}");
+    assert!(
+        message.contains("3 targets are runnable but max_parallel is 2"),
+        "{message}"
+    );
+    assert!(message.contains("never queued"), "{message}");
+    Ok(())
+}
+
+/// Ohne `max_parallel` laufen alle Ziele gleichzeitig (keine Warteschlange).
+#[tokio::test]
+async fn a_wave_without_max_parallel_runs_every_target_at_once() -> TestResult {
+    let (outcome, started) = run_chain_with(
+        Mode::Work,
+        wave(&["explorer", "explorer", "executor", "executor", "explorer"]),
+        ChildLimits::conservative(),
+    )
+    .await?;
+    let report = outcome.map_err(TestError::Unexpected)?;
+    assert_eq!(started, 5);
+    assert_eq!(report.max_parallel, 5);
+    assert!(
+        report
+            .targets
+            .iter()
+            .all(|target| target.status.label() == "completed")
     );
     Ok(())
 }

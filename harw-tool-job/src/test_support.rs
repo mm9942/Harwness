@@ -76,6 +76,7 @@ impl Env {
     pub(crate) fn with_config(
         adjust: impl FnOnce(JobManagerConfig) -> JobManagerConfig,
     ) -> TestResult<Self> {
+        install_host_port();
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let recorder = Arc::new(RecordingNotifier::default());
         let config = adjust(fast_config(&dir.path().join("state")));
@@ -220,4 +221,16 @@ pub(crate) mod golden {
         }
         Ok(())
     }
+}
+
+/// Installs the host command port once per test binary (jobs start only
+/// through the job runtime).
+pub(crate) fn install_host_port() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = harw_test_support::unique_tmp("harw-tool-job", "command-jobs");
+        if let Ok(port) = harw_command::JobCommandPort::host(&dir) {
+            let _ = harw_command::install(std::sync::Arc::new(port));
+        }
+    });
 }

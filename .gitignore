@@ -85,3 +85,4 @@ __pycache__/
 *.crdownload
 .terminal-ui/
 .alice/
+harw.env

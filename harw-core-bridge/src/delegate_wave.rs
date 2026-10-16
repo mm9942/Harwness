@@ -15,7 +15,7 @@
 //! delegate_wave {
 //!   targets: [{ role, task, complexity?, id?, continue_from? }, …],   // 1 ..= 16
 //!   join: "all" | "any" | "collect",                 // Standard "all"
-//!   max_parallel: n                                  // Standard min(4, Ziele)
+//!   max_parallel: n                                  // Standard: alle Ziele gleichzeitig
 //! }
 //! ```
 //!
@@ -40,8 +40,12 @@
 //! die der Aufrufer ohnehin sieht — kein Agentenkatalog-Orakel.
 //!
 //! # Ausführung
-//! Die zugelassenen Ziele laufen in einem rollierenden Pool mit höchstens
-//! `max_parallel` Plätzen. Jeder Platz ist genau ein
+//! Admission ist fail-fast und all-or-nothing: es gibt keine Warteschlange.
+//! Vor dem ersten Start wird geprüft, dass **alle** zugelassenen Ziele jetzt
+//! gleichzeitig laufen dürfen (`max_parallel`, Rollenkappung, freie
+//! Kind-Slots, Tiefe, Orchestrierungsgrenzen). Ist das nicht der Fall, wird
+//! **nichts** gestartet und ein detaillierter Fehler zurückgegeben.
+//! Jedes zugelassene Ziel belegt dann einen Platz. Jeder Platz ist genau ein
 //! [`crate::fanout_children`]-Aufruf mit einer einzigen Frage — damit gelten
 //! unverändert dieselben Grenzen wie für `/analyze` und `explore`: monoton
 //! reduzierte Sandbox, Budget-Verschnitt mit der Agent-IR, Effort-Klammer,
@@ -119,9 +123,6 @@ pub const DELEGATE_WAVE_TOOL: &str = "delegate_wave";
 /// Höchstzahl Ziele je Welle. Eine größere Welle ist ein Zerlegungsfehler des
 /// Orchestrators, kein Fan-out.
 pub const MAX_WAVE_TARGETS: usize = 16;
-
-/// Standard-Parallelität, wenn `max_parallel` fehlt.
-pub const DEFAULT_MAX_PARALLEL: usize = 4;
 
 /// Höchstlänge einer vom Modell vergebenen Ziel-ID.
 const MAX_TARGET_ID_CHARS: usize = 64;
@@ -309,7 +310,9 @@ impl DelegateWaveRequest {
         };
 
         let max_parallel = match object.get("max_parallel") {
-            None | Some(Value::Null) => DEFAULT_MAX_PARALLEL,
+            // Without an explicit `max_parallel` all targets run at once: a
+            // wave never queues targets behind a smaller pool.
+            None | Some(Value::Null) => targets.len(),
             Some(value) => match value.as_u64() {
                 Some(0) | None => {
                     return Err(invalid("`max_parallel` must be a positive integer"));
@@ -912,6 +915,27 @@ pub async fn delegate_wave(
             Err(message) => statuses[position] = Some(TargetStatus::Unavailable(message)),
         }
     }
+    // Fail-fast, all-or-nothing admission: no target is queued behind a free
+    // slot. If not every runnable target can start right now, nothing starts.
+    if queue.len() > request.max_parallel {
+        return Err(OpError::NotAvailable(format!(
+            "delegate_wave: {} {} targets are runnable but max_parallel is {}; targets are \
+             never queued behind a smaller pool. Nothing was started. {} Send at most {} \
+             target(s) per wave, or raise max_parallel.",
+            harw_core::background_children::DELEGATION_REJECTED_MARKER,
+            queue.len(),
+            request.max_parallel,
+            harw_extension_api::FAIL_FAST_CONSEQUENCE,
+            request.max_parallel,
+        )));
+    }
+    let wave_roles: Vec<&str> = queue
+        .iter()
+        .map(|(position, _)| request.targets[*position].role.as_str())
+        .collect();
+    spawner
+        .preflight_wave_admission(ctx.session_id(), &wave_roles)
+        .map_err(|error| OpError::NotAvailable(format!("delegate_wave: {error}")))?;
     tracing::info!(
         targets = size,
         admitted = queue.len(),
@@ -945,6 +969,9 @@ pub async fn delegate_wave(
             break;
         }
 
+        // TODO(PL-90 background-only): this is a blocking join. Delegated work
+        // must run only in the background and report back automatically;
+        // converting the synchronous wave join is a separate, later wave.
         let (index, value) = std::future::poll_fn(|cx| {
             for (index, (_, future)) in running.iter_mut().enumerate() {
                 if let Poll::Ready(value) = future.as_mut().poll(cx) {
@@ -1246,7 +1273,7 @@ mod tests {
             ]
         }))?;
         assert_eq!(request.join, WaveJoin::All);
-        assert_eq!(request.max_parallel, 2, "Standard 4, gekappt auf 2 Ziele");
+        assert_eq!(request.max_parallel, 2, "Standard: alle Ziele gleichzeitig");
         assert_eq!(request.targets[0].id, "t1");
         assert_eq!(request.targets[1].id, "plan");
         assert_eq!(request.targets[1].complexity, Some(WaveComplexity::Complex));

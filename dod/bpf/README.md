@@ -6,10 +6,13 @@ task-context `tcp_v4_connect`/`tcp_v6_connect` fentry hooks.  All share the
 byte-addressed header in `include/harw_dod_wire_v1.h`.
 
 `make` first requires exact `clang`, `bpftool`, and `llvm-objdump` output
-lines in `toolchain.lock.toml`.  The checked-in lock is deliberately
-`UNVALIDATED`: this host has none of those tools, and inventing a pin would
-make an unverifiable object look reproducible.  The target-host validation
-records those lines, then `make -C dod/bpf`:
+lines in `toolchain.lock.toml`. The checked-in lock records the Ubuntu
+toolchain validated on the target host. A different distribution or tool
+upgrade can change any of these lines; a mismatch reports the expected and
+actual versions and stops the build. Use the locked tools, or record the
+installed versions in a candidate lock and validate them with
+`make -C dod/bpf TOOLCHAIN_LOCK=/path/to/candidate.lock.toml OUT=/tmp/dod-bpf-check`
+before updating the committed lock. The build:
 
 - derives `vmlinux.h` from the target BTF;
 - builds `bpfel` objects with deterministic source paths;

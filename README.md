@@ -1,4 +1,8 @@
-<p align="center"><img src="docs/assets/harwness-logo.png" alt="Harwness" width="480"></p>
+<p align="center">
+  <img src="docs/assets/harwness-icon.svg" alt="Harwness lion mark" width="180">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/harwness-logo.png" alt="Harwness" width="520">
+</p>
 
 # Harwness
 

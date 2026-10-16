@@ -162,7 +162,7 @@ impl JobEvent {
                 let pid = pid.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
                 format!(
                     "[job {job_id} \"{name}\"] started ({place}, pid {pid}): {command}. You will get \
-                     progress notes and a note when it ends; use job.status / job.logs / job.wait \
+                     progress notes and a note when it ends; use job.status / job.logs \
                      instead of polling."
                 )
             }

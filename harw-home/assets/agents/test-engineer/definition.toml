@@ -5,7 +5,10 @@
 # Benutzerdefinierter Worker auf `worker-base@1`. Die Laufzeit klemmt ihn
 # unter die Decke des generischen schreibenden Workers (Workspace
 # lesen/schreiben ohne Shell und ohne Netz) — siehe
-# `harw_registry_defaults::roster`.
+# `harw_registry_defaults::roster`. Einzige Ausnahme: `cargo.test_one`
+# (genau ein Test hinter dem Rebuild-Wächter), das der Roster nur für diese
+# Definition durchlässt (`roster::TEST_ENGINEER_EXTRA_TOOLS`); `shell.exec`
+# bleibt verboten.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.test-engineer@1"
@@ -46,6 +49,7 @@ admitted = [
   "skills.load",
   "fs.write",
   "fs.edit",
+  "cargo.test_one",
 ]
 forbidden = [
   "shell.exec",
