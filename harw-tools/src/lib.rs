@@ -20,6 +20,7 @@
 /// Re-exported for generated tool schema code that constructs JSON values.
 pub use serde_json;
 
+pub mod args;
 pub mod call;
 pub mod context_load;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod output;
 pub mod provider_macro;
 pub mod sandbox_guard;
 pub mod schema;
+pub mod schema_helpers;
 pub mod spec;
 
 pub use call::ToolCall;

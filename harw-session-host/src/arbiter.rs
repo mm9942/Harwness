@@ -29,21 +29,14 @@ pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 /// Longest accepted `client_msg_id` in bytes.
 pub const MAX_CLIENT_MSG_ID_BYTES: usize = 128;
 
-/// Bounds of one arbiter.
-#[derive(Clone, Copy, Debug)]
-pub struct ArbiterLimits {
-    /// Most queued (not running) inputs.
-    pub queue_cap: usize,
-    /// How many recent `client_msg_id`s are remembered for idempotency.
-    pub idempotency_window: usize,
-}
-
-impl Default for ArbiterLimits {
-    fn default() -> Self {
-        Self {
-            queue_cap: 8,
-            idempotency_window: 256,
-        }
+harw_types::limits_struct! {
+    /// Bounds of one arbiter.
+    #[derive(Clone, Copy, Debug)]
+    pub struct ArbiterLimits {
+        /// Most queued (not running) inputs.
+        pub queue_cap: usize = DEFAULT_QUEUE_CAP = 8,
+        /// How many recent `client_msg_id`s are remembered for idempotency.
+        pub idempotency_window: usize = DEFAULT_IDEMPOTENCY_WINDOW = 256,
     }
 }
 

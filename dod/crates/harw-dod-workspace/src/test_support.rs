@@ -9,59 +9,10 @@
 //! Helfer geben [`TestResult`] zurück und melden Fehlschläge als `Err`
 //! statt zu paniken.
 
-use std::fmt;
 use std::fs;
 use std::path::Path;
 
-/// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben.
-pub(crate) enum TestError {
-    /// Ein erwarteter Wert fehlte (`Option` war `None`).
-    Missing(&'static str),
-    /// Ein Ergebnis hatte eine unerwartete Form.
-    Unexpected(String),
-    /// Ein Fremdfehler mit Kontext (ersetzt `expect("…")`).
-    Context {
-        /// Was gerade versucht wurde.
-        context: &'static str,
-        /// Gerenderter Quellfehler.
-        source: String,
-    },
-}
-
-/// Ergebnis einer Testfunktion bzw. eines Test-Helfers.
-pub(crate) type TestResult<T = ()> = Result<T, TestError>;
-
-impl fmt::Display for TestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Missing(what) => write!(f, "erwarteter Wert fehlt: {what}"),
-            Self::Unexpected(message) => write!(f, "unerwartetes Ergebnis: {message}"),
-            Self::Context { context, source } => write!(f, "{context}: {source}"),
-        }
-    }
-}
-
-// Debug delegiert an Display (Bible R081), damit fehlgeschlagene Tests lesbar bleiben.
-impl fmt::Debug for TestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
-impl std::error::Error for TestError {}
-
-/// Liefert einen `map_err`-Adapter, der einen Fremdfehler mit Kontext versieht.
-///
-/// # Examples
-/// ```rust,ignore
-/// let text = std::fs::read_to_string(path).map_err(ctx("Datei lesen"))?;
-/// ```
-pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
-    move |error| TestError::Context {
-        context,
-        source: error.to_string(),
-    }
-}
+harw_test_support::define_test_error!(pub(crate));
 
 /// Schreibt die Wurzel-`Cargo.toml` eines virtuellen Workspace.
 pub(crate) fn write_root(root: &Path, members: &[&str]) -> TestResult {

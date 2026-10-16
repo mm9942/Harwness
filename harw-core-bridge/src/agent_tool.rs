@@ -130,10 +130,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
-use std::time::{Duration, Instant};
 
 use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
-use harw_core::cancel::CancelToken;
 use harw_core::child_controller::{
     AgentBudget, CHILD_RETURN_MAX_BYTES, ChildRegistryFactory, ChildRunResult, JoinSemantics,
     ManagedAgentSpawner, cap_child_return_text_for_child,
@@ -415,12 +413,11 @@ impl AgentToolAdapter {
     /// - [`OpError::NotAvailable`]: Die Effort-Klammerung des Kindes schlug fehl.
     /// - [`OpError::NotAvailable`]: Die `Surface::AgentTool`-Deklaration trägt ein
     ///   ungültiges `budget_hint`.
-    /// - [`OpError::NotAvailable`]: `spawn_child_or_wait` oder
+    /// - [`OpError::NotAvailable`]: `spawn_child_guarded` oder
     ///   `run_child_with_budget` schlug fehl (Meldung nennt Kind, Rolle und
-    ///   Pause-Sperre). Ein voller Admission-Slot ist dabei **kein**
-    ///   Sofortfehler: `spawn_child_or_wait` wartet bis zu
-    ///   [`CHILD_SLOT_MAX_WAIT`] auf einen frei werdenden Slot, bevor es den
-    ///   Kapazitätsfehler zurückgibt.
+    ///   Pause-Sperre). Ein voller Admission-Slot ist ein **Sofortfehler**
+    ///   mit detaillierter, typisierter Meldung (belegte Slots, Folge für den
+    ///   Aufrufer); es wird nie auf einen freien Slot gewartet.
     /// - [`OpError::NotAvailable`]: Das Kind pausierte, obwohl sein Lebenszyklus
     ///   das Pausieren verbietet.
     /// - [`OpError::NotAvailable`]: Die Abschlussantwort des Kindes ist nicht
@@ -435,7 +432,7 @@ impl AgentToolAdapter {
     /// # Concurrency
     /// `async fn`, `Send`-fähig. Mehrere gleichzeitige `invoke`-Aufrufe auf demselben
     /// Adapter sind sicher, da kein gemeinsamer veränderlicher Zustand verwendet wird.
-    /// `spawn_child_or_wait` und `run_child_with_budget` sind selbst
+    /// `spawn_child_guarded` und `run_child_with_budget` sind selbst
     /// nebenläufigkeitssicher (siehe `ManagedAgentSpawner`-Dokumentation).
     ///
     /// # Examples
@@ -523,34 +520,12 @@ impl AgentToolAdapter {
                 ceiling: None,
             };
 
-            // Der Cancel-Token des laufenden Turns, falls die Laufzeit einen
-            // gesetzt hat (`install_operation_model_tools` in
-            // `harw-runtime::assembly`, aus `ToolExecutionContext::cancel`).
-            // Ohne registrierten Turn (z. B. ein One-Shot-Pfad ohne
-            // `TurnControl` oder ein Test-Fixture) fällt das Warten auf einen
-            // frischen, nie abgebrochenen Token zurück und bleibt allein
-            // durch `CHILD_SLOT_MAX_WAIT` begrenzt.
-            let spawn_cancel = ctx.cancel_token().cloned().unwrap_or_else(CancelToken::new);
-            let wait_started = Instant::now();
+            // Fail-fast admission: a full slot, depth or orchestration limit
+            // is an immediate, typed and detailed error. Nothing waits for a
+            // slot to free up.
             let child_guard = spawner
-                .spawn_child_or_wait(
-                    self.child_name,
-                    spawn_input,
-                    child_sandbox,
-                    None,
-                    CHILD_SLOT_MAX_WAIT,
-                    &spawn_cancel,
-                )
-                .await
-                .map_err(|e| OpError::NotAvailable(format!("Agent-Spawn fehlgeschlagen: {e}")))?;
-            let waited = wait_started.elapsed();
-            if waited > Duration::from_millis(50) {
-                tracing::debug!(
-                    child = %child_guard.child(),
-                    waited_ms = waited.as_millis() as u64,
-                    "AgentToolAdapter: Spawn wartete auf freien Admission-Slot"
-                );
-            }
+                .spawn_child_guarded(self.child_name, spawn_input, child_sandbox, None)
+                .map_err(|e| OpError::NotAvailable(format!("Agent spawn failed: {e}")))?;
             // `keep()` entschärft den frisch erhaltenen `ChildGuard`, ohne das
             // Kind freizugeben: die Freigabepflicht geht unten unverändert an
             // `ChildSlotGuard` über (identische Freigabe-Semantik wie vor
@@ -616,6 +591,9 @@ impl AgentToolAdapter {
             } else {
                 TurnInput::user(args.to_string())
             };
+            // TODO(PL-90 background-only): blocking join on the child run. Delegated
+            // work must run only in the background and report back automatically;
+            // converting this synchronous path is a separate, later wave.
             let run_result = spawner
                 .run_child_with_budget(&child, store.as_ref(), None, turn_input, budget)
                 .await
@@ -2156,10 +2134,13 @@ const QUESTION_ID_EXCERPT_CHARS: usize = 64;
 ///
 /// Ablauf (W4a/A-BRIDGE, K1/K2):
 /// 1. Sandbox einmal monoton reduzieren ([`resolve_authority_reducer`]).
-/// 2. Ein rollierender Pool mit höchstens `max_parallel` Plätzen. Ein Platz
-///    durchläuft **lazy** und vollständig: `spawn_child_or_wait` (wartet bis
-///    zu [`CHILD_SLOT_MAX_WAIT`] auf einen freien Admission-Slot, statt bei
-///    voller Kapazität sofort zu scheitern) → Budget mit dem
+/// 2. All-or-nothing-Vorprüfung (kein Warten, keine Warteschlange): passen
+///    nicht **alle** Fragen gleichzeitig in `max_parallel` bzw. die
+///    Rollenkappung, in die freien Kind-Slots, die Tiefen- und die
+///    Orchestrierungsgrenzen, wird **nichts** gestartet und ein detaillierter
+///    Fehler zurückgegeben. Danach läuft jeder Platz mit höchstens `max_parallel` Plätzen. Ein Platz
+///    durchläuft vollständig: `spawn_child_guarded` (scheitert bei voller
+///    Kapazität sofort mit einem detaillierten Fehler, wartet nie) → Budget mit dem
 ///    IR-Budget verschneiden ([`tighten_budget`]) → Effort klammern (ohne
 ///    Override, fail-closed) → `run_child_with_budget` → Auswertung über
 ///    denselben Contract-Pfad wie [`AgentToolAdapter::invoke`]
@@ -2236,8 +2217,9 @@ const QUESTION_ID_EXCERPT_CHARS: usize = 64;
 ///
 /// # Errors
 /// - [`OpError::NotAvailable`]: kein `ManagedAgentSpawner` bzw. `StateStore` im
-///   Kontext. Nur diese Gesamtausfälle sind `Err` — das Scheitern **einzelner**
-///   Kinder niemals.
+///   Kontext, oder die Welle ist nicht vollständig zulassungsfähig (Kapazität,
+///   Tiefe, Orchestrierungsgrenzen, Rollenkappung, `max_parallel`); dann wurde
+///   nichts gestartet. Das Scheitern **einzelner** Kinder ist niemals ein `Err`.
 ///
 /// # Panics
 /// Keine.
@@ -2336,21 +2318,28 @@ pub(crate) async fn fanout_children_with(
 
     let total = questions.len();
     let requested_slots = max_parallel.max(1);
-    // Sicherheitsnetz gegen `analyze(max_parallel: N)` & Co.: eine
-    // `uia-worker`-Rollenfamilie darf nie mit mehr als einer gleichzeitig
-    // laufenden Instanz gefanoutet werden, unabhängig vom Aufrufer-Wunsch.
-    // `max_concurrent_instances_for_role` kapselt die Organisationsrollen-
-    // Fallunterscheidung vollständig in `harw-core` (die Regel gehört dem
-    // Spawner, nicht diesem Adapter).
+    // Delegated work never queues for a free slot: every requested child
+    // must be admissible *now*, otherwise nothing is started at all. The
+    // concurrency bound is the smaller of `max_parallel` and the per-role
+    // instance cap (`max_concurrent_instances_for_role`, e.g. one for the
+    // `uia-worker` family; the rule belongs to the spawner).
     let slots = requested_slots.min(spawner.max_concurrent_instances_for_role(role));
-    if slots < requested_slots {
+    if total > slots {
+        // Not an error: the wave runs in sequential batches of `slots`
+        // children (each batch fully admissible *now*, never queued).
         tracing::info!(
             role,
-            requested_max_parallel = requested_slots,
-            effective_max_parallel = slots,
-            "agent_fanout.uia_worker_capped",
+            requested = total,
+            allowed_concurrently = slots,
+            "agent_fanout.batched"
         );
     }
+    // All-or-nothing pre-check of capacity, depth and orchestration limits
+    // over the first batch before the first child is started; later batches
+    // are pre-checked the same way right before they start.
+    spawner
+        .preflight_wave_admission(ctx.session_id(), &vec![role; total.min(slots)])
+        .map_err(|error| OpError::NotAvailable(format!("Agent spawn failed: {error}")))?;
     let winner = AtomicBool::new(false);
     // Je Position die Session-ID, sobald das Kind admittiert ist — nur damit
     // der Scheduler laufende Geschwister kooperativ abbrechen kann.
@@ -2371,7 +2360,6 @@ pub(crate) async fn fanout_children_with(
     };
 
     let mut results: Vec<Option<Result<Value, String>>> = (0..total).map(|_| None).collect();
-    let mut pending = questions.iter().enumerate();
     let mut running = Vec::with_capacity(slots.min(total));
     let mut winner_decided = false;
     // Ein Event statt eines betretenen Spans: `span::Entered` ist `!Send` und
@@ -2383,57 +2371,81 @@ pub(crate) async fn fanout_children_with(
         "agent_fanout.start"
     );
 
-    loop {
-        while running.len() < slots {
-            let Some((position, question)) = pending.next() else {
-                break;
-            };
-            if winner_decided {
-                results[position] = Some(Err(CANCELLED_BY_SIBLING.to_owned()));
-                continue;
-            }
-            running.push((
-                position,
-                Box::pin(run_fanout_slot(
-                    &shared,
-                    position,
-                    question,
-                    &admitted[position],
-                )),
-            ));
-        }
-        if running.is_empty() {
-            break;
-        }
-
-        let (index, value) = std::future::poll_fn(|cx| {
-            for (index, (_, future)) in running.iter_mut().enumerate() {
-                if let Poll::Ready(value) = future.as_mut().poll(cx) {
-                    return Poll::Ready((index, value));
+    for (batch_index, batch) in questions.chunks(slots).enumerate() {
+        let base = batch_index * slots;
+        if batch_index > 0 && !winner_decided {
+            // Fail-fast per batch: if the next batch is not admissible now,
+            // none of its children start and each position reports why.
+            if let Err(error) =
+                spawner.preflight_wave_admission(ctx.session_id(), &vec![role; batch.len()])
+            {
+                let message = format!("Agent spawn failed: {error}");
+                tracing::warn!(role, batch = batch_index, error = %error, "agent_fanout.batch_rejected");
+                for slot in &mut results[base..] {
+                    *slot = Some(Err(message.clone()));
                 }
+                break;
             }
-            Poll::Pending
-        })
-        .await;
-        let (position, _finished) = running.remove(index);
+        }
+        let mut pending = batch
+            .iter()
+            .enumerate()
+            .map(|(offset, q)| (base + offset, q));
+        loop {
+            while running.len() < slots {
+                let Some((position, question)) = pending.next() else {
+                    break;
+                };
+                if winner_decided {
+                    results[position] = Some(Err(CANCELLED_BY_SIBLING.to_owned()));
+                    continue;
+                }
+                running.push((
+                    position,
+                    Box::pin(run_fanout_slot(
+                        &shared,
+                        position,
+                        question,
+                        &admitted[position],
+                    )),
+                ));
+            }
+            if running.is_empty() {
+                break;
+            }
 
-        let value = if winner_decided {
-            Err(CANCELLED_BY_SIBLING.to_owned())
-        } else {
-            value
-        };
-        if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && value.is_ok() {
-            winner_decided = true;
-            winner.store(true, Ordering::SeqCst);
-            for (sibling, _) in &running {
-                if let Some(child) = admitted[*sibling].get() {
-                    if !spawner.request_cancellation(child) {
-                        tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
+            // TODO(PL-90 background-only): this is a blocking join. Delegated work
+            // must run only in the background and report back automatically;
+            // converting the synchronous fan-out join is a separate, later wave.
+            let (index, value) = std::future::poll_fn(|cx| {
+                for (index, (_, future)) in running.iter_mut().enumerate() {
+                    if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                        return Poll::Ready((index, value));
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+            let (position, _finished) = running.remove(index);
+
+            let value = if winner_decided {
+                Err(CANCELLED_BY_SIBLING.to_owned())
+            } else {
+                value
+            };
+            if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && value.is_ok() {
+                winner_decided = true;
+                winner.store(true, Ordering::SeqCst);
+                for (sibling, _) in &running {
+                    if let Some(child) = admitted[*sibling].get() {
+                        if !spawner.request_cancellation(child) {
+                            tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
+                        }
                     }
                 }
             }
+            results[position] = Some(value);
         }
-        results[position] = Some(value);
     }
 
     let results: Vec<Result<Value, String>> = results
@@ -2502,41 +2514,16 @@ async fn run_fanout_slot(
         // already enforces, unchanged (see `SpawnInput::ceiling`).
         ceiling: None,
     };
-    // Der Cancel-Token des laufenden Turns, falls die Laufzeit einen gesetzt
-    // hat (`install_operation_model_tools` in `harw-runtime::assembly`, aus
-    // `ToolExecutionContext::cancel`). Ohne registrierten Turn fällt das
-    // Warten auf einen frischen, nie abgebrochenen Token zurück und bleibt
-    // allein durch `CHILD_SLOT_MAX_WAIT` begrenzt.
-    let spawn_cancel = shared
-        .ctx
-        .cancel_token()
-        .cloned()
-        .unwrap_or_else(CancelToken::new);
-    let wait_started = Instant::now();
+    // Fail-fast admission (no waiting for a free slot): the wave pre-check in
+    // `fanout_children_with` already verified that every child fits, so a
+    // rejection here is a concurrent change and is reported immediately.
     let child_guard = shared
         .spawner
-        .spawn_child_or_wait(
-            shared.role,
-            spawn_input,
-            shared.child_sandbox.clone(),
-            None,
-            CHILD_SLOT_MAX_WAIT,
-            &spawn_cancel,
-        )
-        .await
+        .spawn_child_guarded(shared.role, spawn_input, shared.child_sandbox.clone(), None)
         .map_err(|error| {
             tracing::warn!(role = shared.role, position, error = %error, "agent_fanout.spawn_failed");
-            format!("Agent-Spawn fehlgeschlagen: {error}")
+            format!("Agent spawn failed: {error}")
         })?;
-    let waited = wait_started.elapsed();
-    if waited > Duration::from_millis(50) {
-        tracing::debug!(
-            child = %child_guard.child(),
-            position,
-            waited_ms = waited.as_millis() as u64,
-            "agent_fanout.spawn_waited_for_slot"
-        );
-    }
     // `keep()` entschärft den frisch erhaltenen `ChildGuard`, ohne das Kind
     // freizugeben: die Freigabepflicht geht unten unverändert an
     // `ChildSlotGuard` über (identische Freigabe-Semantik wie vor W2d).
@@ -2576,6 +2563,8 @@ async fn run_fanout_slot(
             format!("Reasoning-Effort von Child-Agent '{child}' nicht klammerbar: {error}")
         })?;
 
+    // TODO(PL-90 background-only): blocking join on the child run (see the
+    // fan-out loop); to be replaced by background execution in a later wave.
     let run = shared
         .spawner
         .run_child_with_budget(
@@ -3162,18 +3151,6 @@ fn bind_finding_to_question(finding: &Value, question: &Value) -> Result<(), Str
 
 // ── Slot-Freigabe und Effort-Sperre ──────────────────────────────────────────
 
-/// Obergrenze, wie lange ein Spawn-Versuch auf einen freien Admission-Slot
-/// wartet, bevor er endgültig mit dem ursprünglichen Kapazitätsfehler
-/// fehlschlägt (siehe
-/// [`harw_core::child_controller::ManagedAgentSpawner::spawn_child_or_wait`]).
-///
-/// Ohne dieses Warten scheiterten parallele `explore`-/Fan-out-Aufrufe, die
-/// `max_active_children_per_parent` überschreiten, sofort statt sich
-/// einzureihen. Die Obergrenze ist bewusst endlich, damit ein hängendes
-/// Geschwister-Kind (das seinen Slot nie freigibt) den Parent nicht auf
-/// unbestimmte Zeit blockiert.
-const CHILD_SLOT_MAX_WAIT: Duration = Duration::from_secs(120);
-
 /// Hält den Admission-Slot eines Kindes und gibt ihn beim Drop frei (K1, G-016).
 ///
 /// # Beschreibung
@@ -3361,12 +3338,14 @@ mod tests {
             _suggestions: Option<&AgentSuggestions>,
         ) -> Result<ExtensionRegistry, AgentSpawnError> {
             Err(AgentSpawnError {
+                kind: Default::default(),
                 message: "Test-Factory startet keine Kinder".to_owned(),
             })
         }
 
         fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
             Err(AgentSpawnError {
+                kind: Default::default(),
                 message: "Test-Factory hält keinen Model-Provider".to_owned(),
             })
         }
@@ -4418,6 +4397,7 @@ specialization = "bridge-contract-test"
     #[test]
     fn completed_child_output_maps_unavailable_response_to_not_available() {
         let result = completed_child_output(Err(harw_extension_api::AgentSpawnError {
+            kind: Default::default(),
             message: "no assistant response text".to_owned(),
         }));
 
@@ -4647,8 +4627,8 @@ specialization = "bridge-contract-test"
 
     // ── W4a/A-BRIDGE: K3 Reducer, K4 question_id, K5 Effort ──────────────────
 
-    /// Alle sieben Permissions (Stand `harw-authority`).
-    const ALL_PERMISSIONS: [Permission; 7] = [
+    /// Alle acht Permissions (Stand `harw-authority`).
+    const ALL_PERMISSIONS: [Permission; 8] = [
         Permission::ReadWorkspace,
         Permission::WriteWorkspace,
         Permission::ExecuteProcess,
@@ -4656,9 +4636,10 @@ specialization = "bridge-contract-test"
         Permission::ReadSecrets,
         Permission::ManagePlugins,
         Permission::ReadCargoRegistry,
+        Permission::ManageContainers,
     ];
 
-    /// Alle 2⁷ Teilmengen der Permissions.
+    /// Alle 2⁸ Teilmengen der Permissions.
     fn every_permission_subset() -> Vec<PermissionSet> {
         (0_u32..(1 << ALL_PERMISSIONS.len()))
             .map(|mask| {
@@ -5047,6 +5028,67 @@ specialization = "bridge-contract-test"
             usize::MAX,
             "a non-uia-worker role must stay unbounded"
         );
+        Ok(())
+    }
+
+    /// More questions than concurrent slots no longer fail: the wave runs in
+    /// sequential batches of `slots` and returns one result per position, in
+    /// question order (regression: `/analyze` levels with > max_parallel units).
+    #[tokio::test]
+    async fn fanout_larger_than_max_parallel_runs_in_batches_preserving_order() -> TestResult {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spawner = ManagedAgentSpawner::new(
+            Arc::new(Mutex::new(SessionManager::new(event_tx))),
+            ChildLimits::conservative(),
+        )
+        .with_role(
+            "worker",
+            harw_types::AgentRole::Agent {
+                name: "worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            Arc::new(IrRegistryFactory {
+                ir: ir_with_contract("harwness.return.coding-task@1")?,
+            }),
+        );
+        let mut services = ServiceMap::new();
+        <OpContext as OpContextCoreExt>::register_agent_tool_services(
+            &mut services,
+            Arc::new(spawner),
+            Arc::new(InMemoryStateStore::new()),
+        );
+        let (ctx, tmp) = make_test_ctx_with(services)?;
+        let questions = vec![
+            serde_json::json!({ "question": { "id": "q1", "question": "a" } }),
+            serde_json::json!({ "question": { "id": "q2", "question": "b" } }),
+            serde_json::json!({ "question": { "id": "q3", "question": "c" } }),
+            serde_json::json!({ "question": { "id": "q4", "question": "d" } }),
+            serde_json::json!({ "question": { "id": "q5", "question": "e" } }),
+        ];
+        let result = super::fanout_children(
+            &ctx,
+            "worker",
+            &questions,
+            "reduce_to_read_explore",
+            harw_core::child_controller::AgentBudget::default(),
+            2,
+            harw_core::child_controller::JoinSemantics::AllTerminal,
+            ChildReturnContract::Text,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(tmp);
+        let results = result.map_err(|error| {
+            TestError::Unexpected(format!("batched wave must not be rejected: {error:?}"))
+        })?;
+        assert_eq!(results.len(), questions.len(), "one result per question");
+        for slot in &results {
+            if let Err(message) = slot {
+                assert!(
+                    !message.contains("Nothing was started"),
+                    "no position may report a whole-wave rejection: {message}"
+                );
+            }
+        }
         Ok(())
     }
 

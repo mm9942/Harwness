@@ -78,6 +78,7 @@ use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
+use harw_tools::args::parse_args;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType};
 use serde::{Deserialize, Serialize};
 
@@ -1909,15 +1910,6 @@ fn to_json<T: Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
-/// Parst Werkzeug-Argumente oder liefert die Fehlerausgabe.
-fn parse_args<T: serde::de::DeserializeOwned>(
-    tool: &str,
-    call: &ToolCall,
-) -> Result<T, ToolOutput> {
-    serde_json::from_value(call.arguments.clone())
-        .map_err(|error| ToolOutput::error(format!("{tool}: ungültige Argumente: {error}")))
-}
-
 /// Hinweis nach einem Commit: committet heißt nicht zugewiesen.
 fn activation_hint(name: &str) -> String {
     format!(
@@ -1931,7 +1923,7 @@ struct SkillsValidateExecutor;
 
 impl SkillsValidateExecutor {
     fn run(call: &ToolCall) -> ToolOutput {
-        let args: CandidateArgs = match parse_args("skills.validate", call) {
+        let args: CandidateArgs = match parse_args("skills.validate", &call.arguments) {
             Ok(args) => args,
             Err(output) => return output,
         };
@@ -1966,7 +1958,7 @@ struct SkillsProposeExecutor {
 
 impl SkillsProposeExecutor {
     fn run(&self, call: &ToolCall) -> ToolOutput {
-        let args: CandidateArgs = match parse_args("skills.propose", call) {
+        let args: CandidateArgs = match parse_args("skills.propose", &call.arguments) {
             Ok(args) => args,
             Err(output) => return output,
         };
@@ -2070,7 +2062,7 @@ struct SkillsCommitProposalExecutor {
 
 impl SkillsCommitProposalExecutor {
     fn run(&self, call: &ToolCall) -> ToolOutput {
-        let args: CommitArgs = match parse_args("skills.commit_proposal", call) {
+        let args: CommitArgs = match parse_args("skills.commit_proposal", &call.arguments) {
             Ok(args) => args,
             Err(output) => return output,
         };
@@ -2137,7 +2129,7 @@ struct SkillsRejectProposalExecutor {
 
 impl SkillsRejectProposalExecutor {
     fn run(&self, call: &ToolCall) -> ToolOutput {
-        let args: RejectArgs = match parse_args("skills.reject_proposal", call) {
+        let args: RejectArgs = match parse_args("skills.reject_proposal", &call.arguments) {
             Ok(args) => args,
             Err(output) => return output,
         };

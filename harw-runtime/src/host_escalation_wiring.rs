@@ -233,6 +233,13 @@ mod tests {
     #[tokio::test]
     async fn test_active_sandbox_lease_applies_to_strict_and_cargo_children() -> TestResult {
         let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        // Another test may have installed a port whose store directory is gone;
+        // this one lives in a directory that stays for the whole test run.
+        let port = harw_command::JobCommandPort::host(
+            &std::env::temp_dir().join(format!("harw-runtime-command-jobs-{}", std::process::id())),
+        )
+        .map_err(TestError::Unexpected)?;
+        harw_command::replace(Arc::new(port));
         let profiles = [SandboxProfile::Strict, cargo_profile(&tmp)?];
         for profile in profiles {
             let registry = Arc::new(HostPermitSessionRegistry::default());

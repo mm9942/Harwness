@@ -34,6 +34,7 @@ use std::sync::Arc;
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_config::ResolvedConfig;
 use harw_core::InMemoryStateStore;
+use harw_operations::OpContext;
 use harw_operations::OpError;
 use harw_operations::OpOutput;
 use harw_operations::adapter::CommandAdapter;
@@ -87,6 +88,60 @@ pub(crate) fn run_operation(
     let command = normalize_command_path(path)?;
     refuse_session_bound(&command)?;
 
+    with_assembly(target, |assembly, _home, _config| {
+        let adapter = find_command(assembly, &command)?;
+        let required = adapter.permission();
+        let actual = assembly.principal().tier();
+        if actual < required {
+            return Err(format!(
+                "`{command}` erfordert mindestens Berechtigungsstufe {required:?}, \
+                 der aktuelle Benutzer hat nur {actual:?}"
+            ));
+        }
+
+        let ctx = assembly.op_context(
+            ServiceSurface::Slash,
+            assembly.root_session_id().clone(),
+            TurnId::new(),
+            assembly.sandbox().clone(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Laufzeit konnte nicht gestartet werden: {error}"))?;
+        runtime
+            .block_on(adapter.dispatch(&ctx, args))
+            .map_err(|error| op_error_message(&command, &error))
+    })
+}
+
+/// Führt `f` mit einem Operations-Kontext der Brücke aus (ohne
+/// Slash-Befehl), z. B. für CLI-Befehle, die einen Job einreihen.
+///
+/// # Fehler
+/// `Err(String)`, wenn Home, Konfiguration oder Montage scheitern oder `f`
+/// einen Fehler meldet.
+pub(crate) fn with_op_context<R>(
+    target: OpTarget<'_>,
+    f: impl FnOnce(&OpContext, &Path, &ResolvedConfig) -> Result<R, String>,
+) -> Result<R, String> {
+    with_assembly(target, |assembly, home, config| {
+        let ctx = assembly.op_context(
+            ServiceSurface::Slash,
+            assembly.root_session_id().clone(),
+            TurnId::new(),
+            assembly.sandbox().clone(),
+        );
+        f(&ctx, home, config)
+    })
+}
+
+/// Baut Home, Konfiguration und Assembly der Brücke auf und ruft `f` damit
+/// auf; der Ereigniskanal-Empfänger bleibt bis zum Ende gebunden.
+fn with_assembly<R>(
+    target: OpTarget<'_>,
+    f: impl FnOnce(&RuntimeAssembly, &Path, &ResolvedConfig) -> Result<R, String>,
+) -> Result<R, String> {
     let home = crate::home::resolve_home(target.home)?;
     crate::home::ensure_home(&home)?;
     let spec = runtime_spec(
@@ -102,30 +157,7 @@ pub(crate) fn run_operation(
     // der Empfänger bleibt bis zum Ende dieser Funktion gebunden, damit keine
     // Sendung an einem geschlossenen Kanal endet.
     let (assembly, _event_rx) = bridge_assembly(spec, &home, &config, &agents)?;
-
-    let adapter = find_command(&assembly, &command)?;
-    let required = adapter.permission();
-    let actual = assembly.principal().tier();
-    if actual < required {
-        return Err(format!(
-            "`{command}` erfordert mindestens Berechtigungsstufe {required:?}, \
-             der aktuelle Benutzer hat nur {actual:?}"
-        ));
-    }
-
-    let ctx = assembly.op_context(
-        ServiceSurface::Slash,
-        assembly.root_session_id().clone(),
-        TurnId::new(),
-        assembly.sandbox().clone(),
-    );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Laufzeit konnte nicht gestartet werden: {error}"))?;
-    runtime
-        .block_on(adapter.dispatch(&ctx, args))
-        .map_err(|error| op_error_message(&command, &error))
+    f(&assembly, &home, &config)
 }
 
 /// Montiert die Runtime der Brücke.

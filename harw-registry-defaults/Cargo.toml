@@ -34,11 +34,15 @@ harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
 harw-tool-explorer = { path = "../harw-tool-explorer" }
 harw-tool-process = { path = "../harw-tool-process" }
+# `cargo.test_one` (Plan 93): der einzige registrierte `cargo.*`-Eintrag, nur
+# für `test-engineer` (siehe `profile::CARGO_TEST_ONE_TOOLS`).
+harw-tool-cargo = { path = "../harw-tool-cargo" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
 harw-tool-doc = { version = "0.9.1", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
+harw-tool-obsidian = { path = "../harw-tool-obsidian" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 # Plan R9, Teil F: `job.*` (Hintergrund-Jobs statt tmux) neben `shell.exec`,
 # mit geklontem `ShellToolProvider` (gleiche Rechte, Freigaben, Host-Lease).
@@ -77,6 +81,8 @@ harw-tools = { version = "0.9.1", path = "../harw-tools" }
 # `harw_knowledge::workbench` in den Sitzungs-Scope. Kein Zyklus:
 # `harw-knowledge` hängt (auch transitiv) nicht von `harw-registry-defaults` ab.
 harw-knowledge = { path = "../harw-knowledge" }
+# `memory.recall`/`memory.record` (`memory_tools.rs`) arbeiten direkt auf `FactStore`.
+harw-memory = { path = "../harw-memory" }
 # Zeitstempel der Workbench-Einträge (`harw_knowledge::workbench` datiert in `jiff`).
 jiff = { workspace = true }
 # `agents.build` startet `harw agent build` als Job; `harw_tool_job::PreparedJob`
@@ -99,6 +105,8 @@ browser = ["dep:harw-browser", "dep:harw-tool-browser", "dep:harw-browser-thirty
 workspace = true
 
 [dev-dependencies]
+harw-command = { path = "../harw-command" }
+harw-test-support = { path = "../harw-test-support" }
 # Nur für Tests: die Freigabe-Regeln in `DefaultApprovalPolicy::review`
 # bekommen ihre Werkzeug-Argumente als `serde_json::Value`.
 serde_json = { workspace = true }

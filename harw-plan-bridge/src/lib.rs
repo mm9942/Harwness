@@ -95,10 +95,14 @@
 pub mod cells;
 pub mod context_ext;
 pub mod controller;
+pub mod cycle_explorer;
+pub mod cycle_proposer;
+pub mod cycle_runtime;
 pub mod error;
 pub mod finding_store;
 pub mod fragment_registry;
 pub mod goal_context;
+pub mod intent_cycle;
 pub mod job_bridge;
 pub mod metrics;
 pub mod plan_context;
@@ -112,6 +116,20 @@ pub use crate::cells::{
 };
 pub use crate::context_ext::{OpContextPlanExt, register_plan_services};
 pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
+pub use crate::cycle_explorer::{
+    DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_STEP_BYTES, ExplorerReadCache,
+    ReadOnlyExplorerExecutor, ReadTargetError, ReadTargetMap,
+};
+pub use crate::cycle_proposer::{
+    ModelCycleProposer, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy, RouteSlot,
+    refusal_hint, render_prompt, render_prompt_with,
+};
+pub use crate::cycle_runtime::{
+    AuthorityReissuer, CYCLE_RECORD_SCHEMA, CycleDriver, CycleDriverConfig, CycleJobFuture,
+    CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome, CycleStatus, CycleStepExecutor,
+    CycleStore, CycleStoreError, InFlightStep, PolicyReissuer, StepFailure, StepReconciliation,
+    cycle_job_operation, job_outcome,
+};
 pub use crate::error::{PlanBridgeError, PlanBridgeResult};
 pub use crate::finding_store::{
     FindingStore, evidence_for_finding, finding_locator, offset_from_timestamp,
@@ -120,7 +138,16 @@ pub use crate::fragment_registry::{
     FragmentProviderDeclaration, FragmentProviderRegistry, FragmentRegistryError,
     FragmentRegistryResult,
 };
-pub use crate::goal_context::{DEFAULT_MAX_CHARS, GoalContextProvider};
+pub use crate::goal_context::{
+    DEFAULT_MAX_CHARS, GoalContextProvider, GoalModeScope, GoalModeView, SessionGoalBinding,
+};
+pub use crate::intent_cycle::{
+    AdmissionCeiling, AdmittedCycle, CYCLE_CHECKPOINT_SCHEMA, CheckpointFence, CycleAdmission,
+    CycleCheckpoint, CycleLimits, CycleObservations, CycleProposal, CycleRefusal, CycleTargets,
+    CycleTerminal, EvidenceRecord, EvidenceSourceKind, EvidenceTrust, FenceRefusal, IntentBinding,
+    IntentRevisionError, JoinPolicy, ObservationError, ResumeRefusal, Segment, admit_cycle,
+    apply_observations, check_commit, resume_admission,
+};
 pub use crate::job_bridge::{JobAdmissionTemplate, PlanJobBridge};
 pub use crate::plan_context::{
     PLAN_CONTEXT_MAX_TRUST, PLAN_CONTEXT_MAY_CARRY_USER_CONTENT, PLAN_CONTEXT_NAMESPACE,
@@ -775,3 +802,6 @@ pub(crate) mod testing {
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod cycle_w03_tests;

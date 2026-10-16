@@ -1,0 +1,141 @@
+{
+  "has_executor": {
+    "latex.build": true,
+    "latex.check": true,
+    "latex.template": true
+  },
+  "parallel_safe": {
+    "latex.build": false,
+    "latex.check": false,
+    "latex.template": false
+  },
+  "permissions": null,
+  "tools": [
+    {
+      "description": "Build a LaTeX document inside the isolated project sandbox (no network, no shell escape, .latexmkrc ignored). Uses latexmk; without latexmk the engine runs directly twice (biber in between when needed). Only the .tex file, the engine (xelatex|pdflatex|lualatex) and clean are selectable. Returns status (ok|ok_with_warnings|failed|timeout|cleaned|not_installed), builder, the PDF path, pages, overfull boxes > 1pt with source line and context, underfull_count, missing_chars, language_warnings (missing hyphenation patterns) and the first log errors. Fix ok_with_warnings findings before reporting success. On not_installed stop and pass user_message to the user verbatim. Requires ExecuteProcess and WriteWorkspace.",
+      "name": "latex.build",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "clean": {
+            "description": "true removes auxiliary files (latexmk -c) instead of building.",
+            "type": "boolean"
+          },
+          "engine": {
+            "description": "TeX engine; default xelatex.",
+            "enum": [
+              "xelatex",
+              "pdflatex",
+              "lualatex"
+            ],
+            "type": "string"
+          },
+          "file": {
+            "description": "Path of the .tex file inside the workspace (relative to the workspace root).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Create a new LaTeX document from the bundled Harwness report template: writes harw-report.sty (KOMA scrartcl, fontspec, babel, boxes merke/achtung/beispiel, L columns, TikZ styles) and the main file skeleton for kind bericht|business-paper|handbuch. Never overwrites (error if either file exists). Colours and fonts only when the user asked for them, otherwise the defaults apply. Requires WriteWorkspace.",
+      "name": "latex.template",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "accent": {
+            "description": "Accent colour as 6 hex digits; default 714B67. Only if requested.",
+            "type": "string"
+          },
+          "author": {
+            "description": "Author (plain text, escaped); only from the task, default empty.",
+            "type": "string"
+          },
+          "date": {
+            "description": "Date as text; default today, e.g. 24. September 2026.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Path of the NEW main .tex file inside the workspace (relative to the workspace root). harw-report.sty is written next to it. Neither file may exist yet.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Document type: bericht (report), business-paper, handbuch (manual).",
+            "enum": [
+              "bericht",
+              "business-paper",
+              "handbuch"
+            ],
+            "type": "string"
+          },
+          "language": {
+            "description": "Document language; default german.",
+            "enum": [
+              "german",
+              "english"
+            ],
+            "type": "string"
+          },
+          "main_font": {
+            "description": "Main font family; default DejaVu Serif. Only if requested.",
+            "type": "string"
+          },
+          "mono_font": {
+            "description": "Monospace font family; default DejaVu Sans Mono. Only if requested.",
+            "type": "string"
+          },
+          "sans_font": {
+            "description": "Sans font family; default DejaVu Sans. Only if requested.",
+            "type": "string"
+          },
+          "subtitle": {
+            "description": "Subtitle (plain text, escaped); default empty.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Document title (plain text, escaped). Only from the task.",
+            "type": "string"
+          },
+          "warn": {
+            "description": "Warning colour as 6 hex digits; default C0392B. Only if requested.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Pre-flight check of a LaTeX document before latex.build: reads the document class, packages (also from local .sty files next to it), fontspec fonts and babel/polyglossia languages and checks them with kpsewhich and fc-list inside the sandbox. Returns status (ok|missing|not_installed|failed), missing [{kind, name, hint}] with a Debian/Ubuntu package suggestion and user_message. On missing or not_installed pass user_message to the user; never install anything. Requires ExecuteProcess.",
+      "name": "latex.check",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "description": "Path of the main .tex file inside the workspace (relative to the workspace root).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

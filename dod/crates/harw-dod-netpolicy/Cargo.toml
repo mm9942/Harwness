@@ -21,5 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ipnet = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+
 [lints]
 workspace = true

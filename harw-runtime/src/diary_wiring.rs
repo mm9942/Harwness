@@ -330,6 +330,18 @@ impl ToolOutcomeObserver for DiaryTurnCounter {
         }
         self.recorder.turn_finished(session_id);
     }
+
+    fn on_user_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(inner) = &self.inner {
+            inner.on_user_message(session_id, text);
+        }
+    }
+
+    fn on_assistant_message(&self, session_id: &SessionId, text: &str) {
+        if let Some(inner) = &self.inner {
+            inner.on_assistant_message(session_id, text);
+        }
+    }
 }
 
 /// `1h 05m`, `3m 07s` oder `42s`.

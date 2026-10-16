@@ -35,6 +35,7 @@ harw-sandbox = { path = "../../../harw-sandbox" }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 tempfile = { workspace = true }
 # Zum Bauen von `EgressTarget::Cidr`-Werten in den Tests der Melderegel.
 ipnet = { workspace = true }

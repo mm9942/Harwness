@@ -1,0 +1,45 @@
+[package]
+publish.workspace = true
+name = "harw-session-com"
+description = "Communication layer of the gateway: a Tower-composed Hyper HTTP/1 service that takes a listener-built ClientIdentity as trusted context, upgrades to harw.session.v1 (tokio-tungstenite through harw-session-ws) and serves the session, tool and gateway method tables. Ingress-agnostic (Unix socket now, node transport next); bounded connections, early HTTP refusals, graceful drain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-session-host = { path = "../harw-session-host" }
+harw-session-ws = { path = "../harw-session-ws" }
+harw-types = { path = "../harw-types" }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body-util = "0.1"
+bytes = "1"
+# Handshake key derivation and the upgrade future. 0.30 matches the
+# tokio-tungstenite/tungstenite 0.30 line already in the lockfile. Policy
+# (exact subprotocol, no Origin, path, method) stays in harw-session-ws.
+hyper-tungstenite = "0.30"
+# `util` only: ServiceBuilder, map_response, BoxCloneService. Every transitive
+# crate of this feature set is already in the lockfile.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[dev-dependencies]
+jiff = { workspace = true }
+harw-node-transport = { path = "../harw-node-transport" }
+harw-node-listener = { path = "../harw-node-listener" }
+harw-session-remote = { path = "../harw-session-remote" }
+# Same feature set as harw-node-transport: ML-DSA-65 test keys for the self-cloud e2e.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+
+[lints]
+workspace = true

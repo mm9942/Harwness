@@ -13,5 +13,8 @@ harw-lens-types = { path = "../harw-lens-types" }
 harw-types = { path = "../harw-types" }
 harw-macros = { path = "../harw-macros" }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

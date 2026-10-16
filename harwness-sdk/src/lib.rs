@@ -17,6 +17,7 @@
 //! | [`Tool`], [`FnTool`], [`ContextSource`] | eigene Werkzeuge und Kontext |
 //! | [`ApprovalHandler`], [`AutoDeny`], [`approval_fn`] | Freigaben |
 //! | [`SdkError`] | ein Fehlertyp für alles |
+//! | `RemoteHarwness` → `RemoteSession` (Feature `remote`) | dieselbe Sitzung in einem anderen Prozess, über die Control-Plane |
 //!
 //! # Voraussetzungen
 //! - Eine Tokio-Runtime (`rt` oder `rt-multi-thread`, mit `time`).
@@ -52,8 +53,12 @@ mod error;
 mod event;
 mod harwness;
 mod ids;
+mod media;
 mod session;
 mod tool;
+
+#[cfg(feature = "remote")]
+mod remote;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -71,10 +76,14 @@ pub use error::{Result, SdkError};
 pub use event::{EventSource, EventStream, FinishStatus, SdkEvent, ToolOutput, Usage};
 pub use harwness::Harwness;
 pub use ids::SessionId;
+pub use media::{Image, MAX_IMAGES_PER_MESSAGE};
 pub use session::{
     CancelHandle, MAX_RESUMES_PER_TURN, Message, Role, Session, TurnReport, TurnStatus,
 };
 pub use tool::{ContextItem, ContextSource, FnTool, Tool, ToolContext, ToolError};
+
+#[cfg(feature = "remote")]
+pub use remote::{RemoteBuilder, RemoteHarwness, RemoteSession, RemoteSessionInfo};
 
 /// `serde_json`, in der Fassung, die die SDK-Signaturen verwenden.
 pub use serde_json;
@@ -83,8 +92,8 @@ pub use serde_json;
 pub mod prelude {
     pub use crate::{
         ApprovalHandler, ApprovalPolicy, ApprovalRequest, AutoDeny, BoxFuture, ContextItem,
-        ContextSource, Decision, EventStream, FnTool, Harwness, HarwnessBuilder, Mode, SdkError,
-        SdkEvent, Session, SessionId, Tool, ToolContext, ToolError, TurnReport, TurnStatus,
-        approval_fn,
+        ContextSource, Decision, EventStream, FnTool, Harwness, HarwnessBuilder, Image, Mode,
+        SdkError, SdkEvent, Session, SessionId, Tool, ToolContext, ToolError, TurnReport,
+        TurnStatus, approval_fn,
     };
 }

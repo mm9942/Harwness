@@ -1,0 +1,134 @@
+% Business-Paper auf Basis der Harwness-Vorlage.
+\documentclass[11pt,a4paper]{scrartcl}
+\newcommand{\harwLanguage}{german}
+\newcommand{\harwAccentHex}{714B67}
+\newcommand{\harwWarnHex}{C0392B}
+\newcommand{\harwMainFont}{DejaVu Serif}
+\newcommand{\harwSansFont}{DejaVu Sans}
+\newcommand{\harwMonoFont}{DejaVu Sans Mono}
+\usepackage{harw-report}
+\title{Veröffentlichung von harw – Business-Paper zur Release-Entscheidung}
+\subtitle{Release-Entscheidung}
+\author{Mia}
+\date{2026-10-02}
+\begin{document}
+\maketitle
+
+\begin{merke}[Kernaussage]
+Eine breite Veröffentlichung ist anhand der derzeit belegten Informationen nicht freizugeben. Bereite stattdessen einen begrenzten, beaufsichtigten Linux-Piloten vor und starte ihn erst, wenn Lizenz, Tests/CI, Artefakte, Installation und Rücknahme nachweislich geprüft sind; andernfalls verschieben.
+\end{merke}
+\begin{achtung}[Wichtig vorab]
+Das Matrix-Game ist nach zwei von drei Runden ohne auswertbare Spielzüge beendet worden. Das ist ein Methoden-/Simulationsversagen, kein Release-Votum. Die folgende Business-Analyse ist davon getrennt und ihre Akteursperspektiven sind hypothetisch.
+\end{achtung}
+\tableofcontents
+\newpage
+
+\section{Kontext und Entscheidungsfrage}\label{sec:kontext}
+Harwness beschreibt harw als Rust-Workspace für beaufsichtigte KI-Agenten mit expliziten Berechtigungen, typisierten Werkzeugen, dauerhaftem Ausführungszustand und optionaler Host-Sicherheitsdurchsetzung. Das README nennt den Entwicklungsstatus aktiv und weist darauf hin, dass Schnittstellen und Konfiguration zwischen Revisionen wechseln können (README.md:5–9). Die Workspace-Metadaten nennen Version 0.9.0 und `publish = false` (Cargo.toml:183–192).
+
+\section{Empfehlung und Entscheidungslogik}\label{sec:empfehlung}
+Die Veröffentlichung jetzt nicht als breit verfügbaren, produktionsreifen Release freigeben. Bevorzugt wird ein begrenzter und rücknehmbarer Pilot, jedoch ausschließlich nach Schließung der Mindest-Gates. Ein offenes kritisches Gate oder ein fehlender Rücknahmeweg bedeutet Verschiebung. Diese Empfehlung folgt aus dem Reife- und Nachweisstand, nicht aus einem Matrix-Game-Ergebnis.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=1.1cm]
+\node[harwbox,fill=harwaccent!15,text width=5cm] (decision) {Entscheidung anhand überprüfbarer Mindest-Gates};
+\node[harwbox,fill=harwgrau,below left=of decision] (delay) {Kritisches Gate offen: verschieben};
+\node[harwbox,fill=harwgrau,below right=of decision] (pilot) {Mindest-Gates erfüllt: beaufsichtigter Pilot};
+\draw[harwpfeil] (decision) -- (delay);
+\draw[harwpfeil] (decision) -- (pilot);
+\end{tikzpicture}
+\caption{Analytische Entscheidungslogik, kein Simulationsergebnis.}\label{fig:logik}
+\end{figure}
+
+\section{Belegte Fakten und offene Annahmen}\label{sec:fakten}
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+\textbf{Kategorie} & \textbf{Aussage und Beleg} \\
+\midrule
+Projektfakt & README beschreibt frühen Stand 0.9.0, veränderliche Schnittstellen/Konfiguration und beaufsichtigte lokale Nutzung (README.md:5--7). \\
+Projektfakt & README dokumentiert getaggte GitHub-Releases und nennt Linux-Archive für x86\_64/aarch64, Prüfsummenprüfung und Voraussetzungen bubblewrap/util-linux (README.md:63--80); diese Dokumentation belegt kein aktuell verfügbares konkretes Release-Artefakt. Quellinstallation ist beschrieben (Zeilen 82--91). \\
+Projektfakt & Workspace-Version 0.3.0, \texttt{publish = false} (Cargo.toml:98--105). \\
+Projektfakt & Changelog führt Änderungen unter Unreleased und Matrix-Game-Arbeit (CHANGELOG.md:7, 52--63). \\
+Projektfakt & Packaging empfiehlt heute Source-Installation; Homebrew-Datei ist Formelvorlage mit TODO für URL, SHA-256 und Version (packaging/README.md:3--22). \\
+Auftraggeberhinweis & Kimi OCR TOML-Aktivierbarkeit ist laut Mia in Arbeit, nicht fertig und nicht standardmäßig aktiv. \\
+Projektfakt & Cargo.toml deklariert MIT OR Apache-2.0 (Zeile 108); LICENSE-MIT und LICENSE-APACHE liegen im Repository-Root. Rechteprüfung sämtlicher Release-Inhalte und Freigabe für eine konkrete Verteilung sind damit nicht belegt. \\
+\bottomrule
+\end{tabularx}
+
+\section{Das Matrix-Game liefert kein Entscheidungsergebnis}\label{sec:game}
+Der Bericht nennt Szenario `harw-release-entscheidung`, Lauf `20260924T212906-1`, Ende nach zwei von drei Runden (Matrix-Bericht: Zeilen 5–10). Vier institutionelle Perspektiven waren vorgesehen (Zeilen 20–60). In beiden Runden passten alle Sitze; das Rundenprotokoll führt acht Entscheidungen als `Forfeited` auf (Zeilen 68–104). Die Ergebnistabelle weist pro Akteur zwei verworfene/gepasste Züge aus; zusätzlich steht in „Offene Fragen“ die Angabe 16 gepasster Züge, die mit dieser Tabelle nicht übereinstimmt. Der Bericht nennt null Erfolge, null Misserfolge und eine offene Entscheidung (Zeilen 106–124, 162–164).
+
+Es gibt daraus keine simulierte Zustimmung, Ablehnung oder belastbare Akteurspräferenz. Fehlender Debrief und fehlende Umpire-Synthese bestätigen, dass der Lauf keine Entscheidungsgrundlage geschaffen hat (Zeilen 127--159). Ein geänderter Neustart wurde nicht durchgeführt; es liegt kein auswertbares Matrix-Game-Ergebnis vor. Es werden weder ein weiterer Lauf noch fingierte Ergebnisse behauptet.
+
+\section{Hypothetische Perspektiven und Szenariopfade}\label{sec:pfade}
+Die folgenden Argumente sind analytische Hypothesen, keine Spielzüge oder tatsächlichen Positionen.
+
+\begin{small}
+\setlength{\tabcolsep}{3pt}
+\noindent
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.7cm}LL@{}}
+\toprule
+\textbf{Pfad} & \textbf{Hypothetische Argumente} & \textbf{Bedingung / Kehrseite} \\
+\midrule
+Pilot & Release-Team kann begrenzte Reichweite und transparente Grenzen vertreten. Erstanwendende können beaufsichtigte, rücknehmbare Erprobung bevorzugen. Integrationsperspektive kann einen kleinen Kreis mit klaren Installationsschritten unterstützen. Review-Perspektive kann einen Pilot als Informationsgewinn gegenüber einer breiten Zusage bewerten. & Nur nach nachweisbaren Mindest-Gates; klarer Pilotumfang, Supportgrenzen, Rücknahmeweg, keine Behauptung unbelegter Sicherheit oder Einsatzreife. \\
+Breite Veröffent\-lichung & Reichweite und einfache Auffindbarkeit anstreben. Anwender könnten ein fertiges Einstiegserlebnis erwarten; Integrations- und Review-Perspektiven würden konsistente Pakete, Kompatibilität und belastbare Betriebs-/Supportbelege verlangen. & Derzeit nicht begründbar: Reifegradhinweis und Änderlichkeit sind dokumentiert, während Rechteprüfung sämtlicher Release-Inhalte, Freigabe der konkreten Verteilung, Test- und Artefaktnachweise hier offen sind. OCR nicht als fertige Funktion bewerben. \\
+Verschieben & Release-Team kann die Entscheidung bis zur Schließung der Nachweislücken vertagen. Anwender und Integratoren können klarere Grenzen und reproduzierbare Installation verlangen. Review kann Nicht-Veröffentlichung als legitime Alternative werten. & Verzögerung schützt vor überzogenen Zusagen, verschiebt aber auch Feedback; kein Markt- oder Umsatzschaden wird mangels Daten beziffert. Kriterien und nächste Prüfung festlegen. \\
+\bottomrule
+\end{tabularx}
+\end{small}
+
+\section{Veröffentlichungsgates}\label{sec:gates}
+\begin{enumerate}
+\item \textbf{Recht:} Cargo.toml deklariert MIT OR Apache-2.0 und beide Lizenzdateien liegen im Repository-Root. Rechteprüfung sämtlicher Release-Inhalte und Freigabe der konkreten Verteilung sind damit nicht belegt; beides vorab prüfen und dokumentieren.
+\item \textbf{Qualität:} Relevante Tests und CI für den vorgesehenen Release-Commit ausgeführt und dokumentiert; dieses Papier behauptet keinen Testlauf.
+\item \textbf{Lieferumfang:} Konkrete Artefakte, Zielplattformen, Version und Prüfsummen erzeugt und verifiziert. README-Text allein ist kein Artefaktnachweis.
+\item \textbf{Installation/Rücknahme:} Vorgesehener Installationspfad sowie Upgrade, Deinstallation und Rollback praktisch geprüft.
+\item \textbf{Kommunikation:} Früher Entwicklungsstand und Grenzen offenlegen; Kimi OCR nicht als fertig oder standardmäßig aktiv darstellen.
+\item \textbf{Betrieb:} Verantwortlichkeit, Supportumfang, Meldungsweg sowie Fortsetzungs-/Stoppkriterien benennen.
+\end{enumerate}
+
+\section{Risiken und Mitigationen}\label{sec:risiken}
+\small
+\begin{longtable}{@{}>{\raggedright}p{3.1cm}>{\raggedright}p{4.6cm}>{\raggedright\arraybackslash}p{7.3cm}@{}}
+\toprule
+\textbf{Risiko} & \textbf{Unsicherheit / Beleg} & \textbf{Mitigation} \\
+\midrule\endhead
+\bottomrule\endlastfoot
+Rechte unklar & Rechteprüfung sämtlicher Release-Inhalte und Verteilung noch ungeprüft; MIT OR Apache-2.0 ist in Cargo.toml:108 deklariert. & Rechteprüfung und dokumentierte Lizenzentscheidung vor Verteilung. \\
+Regressionen & Früher Stand und veränderliche Schnittstellen (README.md:7). & Release-Commit festschreiben, relevante Prüfungen dokumentieren, bekannte Grenzen offenlegen. \\
+Paket-/Installations\allowbreak fehler & README beschreibt Linux-Pfade/Voraussetzungen; Packaging empfiehlt Source und Homebrew ist Vorlage. & Zielplattformen begrenzen; Installation, Prüfsummen und Rollback praktisch prüfen. \\
+OCR-Erwartung & TOML-Aktivierung laut Mia in Arbeit. & Funktionsstatus präzise kommunizieren; nicht als Release-Zusage führen. \\
+Supportlast & Kapazität nicht belegt. & Pilotumfang und Supportgrenzen festlegen; bei fehlender Kapazität verschieben. \\
+Spiel\allowbreak fehlinterpretiert & 2/3 Runden, alle Sitze passen, kein auswertbarer Zug. & Simulationsversagen getrennt berichten, keine Spielentscheidung ableiten. \\
+\end{longtable}
+\normalsize
+
+\section{Phasenplan und Entscheidungspunkt}\label{sec:plan}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.2cm}LL@{}}
+\toprule
+\textbf{Phase} & \textbf{Ergebnis} & \textbf{Entscheidungspunkt} \\
+\midrule
+Nachweis\-aufnahme & Lizenz, Release-Commit, CI/Tests, Artefakte, Plattformen, Installation und Rücknahme prüfen. & Offene kritische Punkte verhindern Start. \\
+Release-Kandidat & Begrenzter Kandidat mit Dokumentation, Prüfsummen und Einschränkungen. & Review aller Mindest-Gates. \\
+Beaufsichtigter Pilot & Nur nach Gate-Freigabe, mit begrenztem Umfang, Support und Rücknahme. & Auf Basis tatsächlicher Beobachtungen fortsetzen, nachbessern oder stoppen. \\
+Breite Freigabe oder Verschiebung & Nachweise und Pilotbeobachtungen erneut prüfen. & Breite Veröffentlichung nur bei geschlossenen Gates; andernfalls vertagen. \\
+\bottomrule
+\end{tabularx}
+
+\section{Bedingte Empfehlung und offene Punkte}\label{sec:schluss}
+Die breite Veröffentlichung jetzt nicht freigeben. Einen begrenzten, beaufsichtigten Linux-Piloten vorbereiten und erst nach Erfüllung der Mindest-Gates starten. Sind Lizenz, Test-/CI-Nachweise, tatsächliche Artefakte oder Rücknahme ungeklärt, verschieben. Zeitangaben und Erfolgsschwellen bleiben offen, da keine belastbaren Aufwands- oder Nutzungsdaten vorliegen.
+
+\textbf{Restrisiken:} Rechteprüfung, Teststatus, konkrete Artefakte und Rollback sind noch nachzuweisen; Supportkapazität und Kompatibilitätsumfang sind nicht quantifiziert. Kimi OCR ist laut Auftraggeberin in Arbeit. Die Spielauswertung ist nicht entscheidungsfähig. Autorin und Datum waren nicht angegeben und werden nicht ergänzt.
+
+\appendix
+\section{Belegverzeichnis}\label{sec:quellen}
+\begin{itemize}
+\item \path{README.md}: Zeilen 5--7, 13--29, 59--61, 63--95.
+\item \path{Cargo.toml}: Zeile 108 (Lizenzdeklaration: MIT OR Apache-2.0).
+\item \path{LICENSE-MIT} und \path{LICENSE-APACHE}: Lizenztexte im Repository-Root.
+\item \path{CHANGELOG.md}: Zeile 7 und Zeilen 52--63.
+\item \path{packaging/README.md}: Zeilen 3--13 und 15--22.
+\item \path{matrix/harw-release-entscheidung-20260924T212906-1.md}: Zeilen 5--10, 14--18, 20--60, 68--104, 106--124, 127--170.
+\end{itemize}
+\end{document}

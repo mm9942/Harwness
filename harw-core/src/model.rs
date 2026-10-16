@@ -337,6 +337,22 @@ impl ModelRequest {
                     .map(|(label, _reason)| label.as_str().to_owned())
                     .collect();
 
+                let omission_reasons = assembled
+                    .omissions
+                    .iter()
+                    .map(|(label, reason)| {
+                        let text = match reason {
+                            harw_context::OmissionReason::OverBudget => "over-budget",
+                            harw_context::OmissionReason::BelowCeiling => "below-ceiling",
+                            harw_context::OmissionReason::ExcludedByProgram => {
+                                "excluded-by-program"
+                            }
+                            harw_context::OmissionReason::Superseded => "superseded",
+                        };
+                        (label.as_str().to_owned(), text.to_owned())
+                    })
+                    .collect();
+
                 Ok(Self {
                     system_prompt,
                     instruction_fragments: instructions.fragments,
@@ -346,6 +362,7 @@ impl ModelRequest {
                     context_assembly: ContextAssembly {
                         included_fragment_labels,
                         omitted_fragment_labels,
+                        omission_reasons,
                         history_items_dropped,
                         estimated_context_bytes: assembled.spent.0 as usize,
                         estimated_history_bytes: history_bytes,

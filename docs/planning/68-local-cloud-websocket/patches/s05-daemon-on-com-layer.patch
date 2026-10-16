@@ -1,0 +1,261 @@
+diff --git a/harw-session-daemon/Cargo.toml b/harw-session-daemon/Cargo.toml
+index 3c204b5..ce2afde 100644
+--- a/harw-session-daemon/Cargo.toml
++++ b/harw-session-daemon/Cargo.toml
+@@ -11,6 +11,7 @@ rust-version.workspace = true
+ [dependencies]
+ harw-session-host = { path = "../harw-session-host" }
+ harw-session-ws = { path = "../harw-session-ws" }
++harw-session-com = { path = "../harw-session-com" }
+ harw-types = { path = "../harw-types" }
+ tracing = { workspace = true }
+ tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+diff --git a/harw-session-daemon/src/server.rs b/harw-session-daemon/src/server.rs
+index c163799..0f96e5d 100644
+--- a/harw-session-daemon/src/server.rs
++++ b/harw-session-daemon/src/server.rs
+@@ -7,17 +7,13 @@ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+-use harw_session_host::{ClientIdentity, ConnectionId, SessionHost, caps_for_tier};
+-use harw_session_ws::{WsLimits, serve_connection, upgrade};
+-use harw_types::{
+-    ApprovalActor, AuthStrength, IngressSurface, PermissionTier, Principal, PrincipalKind,
+-    TrustZone,
+-};
+-use hyper::body::{Bytes, Incoming};
+-use hyper::service::service_fn;
+-use hyper_util::rt::{TokioIo, TokioTimer};
++use harw_session_com::local::peer_identity;
++use harw_session_com::{ComConfig, ComServer, HostBinder, PortOffer};
++use harw_session_host::SessionHost;
++use harw_session_ws::WsLimits;
++use harw_types::PermissionTier;
+ use tokio::net::{UnixListener, UnixStream};
+-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
++use tokio::sync::watch;
+ 
+ /// Why the daemon could not start or stop cleanly.
+ #[derive(Debug)]
+@@ -197,13 +193,22 @@ impl UdsServer {
+         host: SessionHost,
+         mut shutdown: watch::Receiver<bool>,
+     ) -> Result<(), DaemonError> {
+-        let max = self
+-            .config
+-            .max_connections
+-            .clamp(1, MAX_CONNECTIONS_CEILING);
+-        let permits = Arc::new(Semaphore::new(max));
+         let socket_id = self.socket_id;
+         let config = Arc::new(self.config);
++        // The per-connection path (peer identity, upgrade, bounded
++        // connections, drain) is the Com layer's; this crate keeps the socket
++        // lifecycle. `PortOffer::All` also serves `tool.*` and `gateway.*`.
++        let com = ComServer::new(
++            &ComConfig {
++                limits: config.limits,
++                max_connections: config.max_connections.clamp(1, MAX_CONNECTIONS_CEILING),
++                header_timeout: config.header_timeout,
++                shutdown_grace: config.shutdown_grace,
++                ..ComConfig::default()
++            },
++            Arc::new(HostBinder::new(host.clone(), PortOffer::All)),
++            shutdown.clone(),
++        );
+         loop {
+             tokio::select! {
+                 changed = shutdown.changed() => {
+@@ -214,7 +219,14 @@ impl UdsServer {
+                 accepted = self.listener.accept() => {
+                     match accepted {
+                         Ok((stream, _)) => {
+-                            handle_accept(stream, &host, &config, &permits, &shutdown);
++                            let Some(identity) =
++                                peer_identity(&stream, config.allowed_uid, config.tier)
++                            else {
++                                continue;
++                            };
++                            if let Err(error) = com.serve_io(stream, identity) {
++                                tracing::warn!(%error, "session daemon: connection dropped");
++                            }
+                         }
+                         Err(error) => {
+                             // Persistent errors such as EMFILE keep the listener
+@@ -227,17 +239,8 @@ impl UdsServer {
+             }
+         }
+         host.drain(config.drain_retry_after_ms);
+-        // Every connection (HTTP phase and upgraded session) holds a permit,
+-        // so owning all permits means nothing is left.
+-        let all = u32::try_from(max).unwrap_or(u32::MAX);
+-        let waited = tokio::time::timeout(config.shutdown_grace, permits.acquire_many(all)).await;
+-        if waited.is_err() {
+-            let live = max.saturating_sub(permits.available_permits());
+-            tracing::warn!(
+-                live,
+-                "session daemon: connections still open after the grace period"
+-            );
+-        }
++        // Every connection (HTTP phase and upgraded session) holds a permit.
++        com.drain().await;
+         remove_own_socket(&config.socket_path, socket_id)
+     }
+ }
+@@ -267,101 +270,3 @@ fn remove_own_socket(path: &Path, id: (u64, u64)) -> Result<(), DaemonError> {
+     }
+ }
+ 
+-fn local_identity(uid: u32, tier: PermissionTier) -> ClientIdentity {
+-    ClientIdentity {
+-        principal: Principal::trusted_ingress(
+-            PrincipalKind::Human,
+-            format!("uid:{uid}"),
+-            IngressSurface::Tui,
+-            tier,
+-        ),
+-        tenant: None,
+-        caps: caps_for_tier(tier),
+-        device: None,
+-        actor: ApprovalActor::Operator {
+-            id: format!("uid:{uid}"),
+-        },
+-        label: format!("local-{uid}"),
+-        zone: TrustZone::Local,
+-        strength: AuthStrength::PeerCredential,
+-        connection: ConnectionId::next(),
+-        agent: None,
+-    }
+-}
+-
+-fn handle_accept(
+-    stream: UnixStream,
+-    host: &SessionHost,
+-    config: &Arc<UdsConfig>,
+-    permits: &Arc<Semaphore>,
+-    shutdown: &watch::Receiver<bool>,
+-) {
+-    let Ok(cred) = stream.peer_cred() else {
+-        tracing::warn!("session daemon: peer credentials unavailable, dropping");
+-        return;
+-    };
+-    if cred.uid() != config.allowed_uid {
+-        tracing::warn!(
+-            uid = cred.uid(),
+-            "session daemon: peer uid not allowed, dropping"
+-        );
+-        return;
+-    }
+-    let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+-        tracing::warn!("session daemon: connection limit reached, dropping");
+-        return;
+-    };
+-    let identity = local_identity(cred.uid(), config.tier);
+-    tokio::spawn(serve_stream(
+-        stream,
+-        host.clone(),
+-        identity,
+-        Arc::clone(config),
+-        permit,
+-        shutdown.clone(),
+-    ));
+-}
+-
+-async fn serve_stream(
+-    stream: UnixStream,
+-    host: SessionHost,
+-    identity: ClientIdentity,
+-    config: Arc<UdsConfig>,
+-    permit: OwnedSemaphorePermit,
+-    shutdown: watch::Receiver<bool>,
+-) {
+-    let limits = config.limits;
+-    let permit = Arc::new(permit);
+-    let service = service_fn(move |request: hyper::Request<Incoming>| {
+-        let host = host.clone();
+-        let identity = identity.clone();
+-        let shutdown = shutdown.clone();
+-        let permit = Arc::clone(&permit);
+-        async move {
+-            let ws_limits = limits;
+-            let upgraded = upgrade::upgrade_server(
+-                request,
+-                limits.tungstenite_config(),
+-                move |ws| async move {
+-                    // The permit lives as long as the session connection.
+-                    let _permit = permit;
+-                    let Ok(port) = host.connect(identity) else {
+-                        return;
+-                    };
+-                    serve_connection(ws, Arc::new(port), ws_limits, shutdown).await;
+-                },
+-            );
+-            let response = match upgraded {
+-                Ok(response) => response.map(|_| http_body_util::Full::new(Bytes::new())),
+-                Err(rejection) => upgrade::rejection_response(&rejection),
+-            };
+-            Ok::<_, std::convert::Infallible>(response)
+-        }
+-    });
+-    let _ = hyper::server::conn::http1::Builder::new()
+-        .timer(TokioTimer::new())
+-        .header_read_timeout(config.header_timeout)
+-        .serve_connection(TokioIo::new(stream), service)
+-        .with_upgrades()
+-        .await;
+-}
+diff --git a/harw-session-daemon/tests/e2e_uds.rs b/harw-session-daemon/tests/e2e_uds.rs
+index ef0ec1a..f030575 100644
+--- a/harw-session-daemon/tests/e2e_uds.rs
++++ b/harw-session-daemon/tests/e2e_uds.rs
+@@ -7,7 +7,7 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use futures_util::{SinkExt, StreamExt};
+-use harw_protocol::methods::{METHOD_SESSION_CREATE, METHOD_SESSION_HELLO};
++use harw_protocol::methods::{METHOD_GATEWAY_STATUS, METHOD_SESSION_CREATE, METHOD_SESSION_HELLO};
+ use harw_protocol::{ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireMessage};
+ use harw_session_daemon::{DaemonError, UdsConfig, UdsServer};
+ use harw_session_host::approvals::MemoryApprovals;
+@@ -184,6 +184,41 @@ async fn owner_can_hello_and_create_a_session() -> TestResult {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn owner_tier_reaches_the_gateway_over_the_daemon_socket() -> TestResult {
++    let d = start(|config, _| config.tier = harw_types::PermissionTier::Owner).await?;
++    let mut ws = upgrade_ws(&d.socket).await?;
++    // Wire minor 2 carries the R18 caps; the host masks them below it.
++    let hello = call(
++        &mut ws,
++        "1",
++        METHOD_SESSION_HELLO,
++        serde_json::json!({"client_label": "uds", "wire_minor": 2}),
++    )
++    .await?;
++    assert!(hello.error.is_none(), "{hello:?}");
++    let status = call(&mut ws, "2", METHOD_GATEWAY_STATUS, serde_json::json!({})).await?;
++    assert!(status.error.is_none(), "gateway.status for an owner: {status:?}");
++    Ok(())
++}
++
++#[tokio::test]
++async fn operator_tier_is_denied_the_gateway_over_the_daemon_socket() -> TestResult {
++    let d = start(|_, _| {}).await?;
++    let mut ws = upgrade_ws(&d.socket).await?;
++    let hello = call(
++        &mut ws,
++        "1",
++        METHOD_SESSION_HELLO,
++        serde_json::json!({"client_label": "uds", "wire_minor": 2}),
++    )
++    .await?;
++    assert!(hello.error.is_none(), "{hello:?}");
++    let status = call(&mut ws, "2", METHOD_GATEWAY_STATUS, serde_json::json!({})).await?;
++    assert!(status.error.is_some(), "an operator has no gateway_read: {status:?}");
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn socket_file_is_owner_only() -> TestResult {
+     let d = start(|_, _| {}).await?;

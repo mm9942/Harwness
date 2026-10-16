@@ -933,6 +933,9 @@ fn write_discovered_model_file(
             // Runde 7, Teil L7: `supported_parameters` ohne `"tools"` →
             // `tool_calling = false`; der Provider bietet dann keine Werkzeuge an.
             tool_calling,
+            // Unknown: images are sent and a model without image input answers
+            // with a visible server error (see `ModelCapabilitiesToml::image_input`).
+            image_input: None,
         },
         default_reasoning_effort: None,
     };

@@ -978,9 +978,6 @@ impl fmt::Display for ResumeStage {
     }
 }
 
-/// Bequemer Ergebnistyp dieses Moduls.
-pub type ApprovalDriverResult<T> = Result<T, ApprovalDriverError>;
-
 /// Fehler, die beim Wiederaufnehmen eines pausierten Turns entstehen.
 ///
 /// # Description
@@ -992,17 +989,21 @@ pub type ApprovalDriverResult<T> = Result<T, ApprovalDriverError>;
 /// ansehen, und ein blindes `?` würde diese Information verlieren. Die
 /// Aufrufstellen benutzen deshalb `.map_err(|source| …)` mit explizitem
 /// [`ResumeStage`].
+#[derive(harw_macros::HarwError)]
 pub enum ApprovalDriverError {
     /// Ein Wiederaufnahme-Aufruf des Kerns ist fehlgeschlagen.
+    #[msg("{stage} failed: {source}")]
     Resume {
         /// Welcher Wiederaufnahmepfad betroffen war.
         stage: ResumeStage,
         /// Der Fehler des Kerns.
+        #[source]
         source: CoreError,
     },
     /// Der Turn meldete eine Freigabepause, die Session hielt aber keinen
     /// zugehörigen Aufruf fest. Ohne ihn gibt es nichts zu fragen und nichts
     /// auszuführen.
+    #[msg("session {session} reported an approval pause without a pending tool call")]
     MissingPendingApproval {
         /// ID der betroffenen Session.
         session: String,
@@ -1010,6 +1011,9 @@ pub enum ApprovalDriverError {
     /// Die Abbruchgrenze für aufeinanderfolgende Wiederaufnahmen wurde
     /// überschritten. Die Session wurde daraufhin ausdrücklich als
     /// fehlgeschlagen markiert, damit kein halbfertiger Pausezustand bleibt.
+    #[msg(
+        "turn still paused ({last_pause}) after {limit} consecutive resumes; the session was failed instead of resuming again"
+    )]
     ResumeLimitExceeded {
         /// Die überschrittene Grenze.
         limit: usize,
@@ -1018,43 +1022,10 @@ pub enum ApprovalDriverError {
     },
 }
 
-impl fmt::Display for ApprovalDriverError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Resume { stage, source } => {
-                write!(formatter, "{stage} failed: {source}")
-            }
-            Self::MissingPendingApproval { session } => write!(
-                formatter,
-                "session {session} reported an approval pause without a pending tool call"
-            ),
-            Self::ResumeLimitExceeded { limit, last_pause } => write!(
-                formatter,
-                "turn still paused ({last_pause}) after {limit} consecutive resumes; \
-                 the session was failed instead of resuming again"
-            ),
-        }
-    }
-}
-
 /// Debug delegiert an [`fmt::Display`], damit es nur eine Formatierung gibt.
 impl fmt::Debug for ApprovalDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl std::error::Error for ApprovalDriverError {
-    /// Liefert den eingebetteten [`CoreError`], falls vorhanden.
-    ///
-    /// # Returns
-    /// - `Some(&CoreError)` für [`ApprovalDriverError::Resume`].
-    /// - `None` für alle anderen Varianten.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Resume { source, .. } => Some(source),
-            Self::MissingPendingApproval { .. } | Self::ResumeLimitExceeded { .. } => None,
-        }
     }
 }
 
@@ -1096,8 +1067,9 @@ pub struct ApprovalDriver {
     handler: Arc<TuiApprovalHandler>,
     /// Abbruchgrenze für aufeinanderfolgende Wiederaufnahmen.
     max_resumes: usize,
-    /// Runde 5, Teil K: startet Orchestratoren der TUI-Wurzel im Hintergrund
-    /// (`crate::app::background_agents`); `None` = immer synchron.
+    /// Starts every handoff of the TUI root in the background
+    /// (`crate::app::background_agents`); `None` = delegation fails with an
+    /// error result (never an inline wait).
     background: Option<Arc<crate::app::background_agents::BackgroundLauncher>>,
 }
 
@@ -1139,8 +1111,8 @@ impl ApprovalDriver {
         }
     }
 
-    /// Runde 5, Teil K: lässt Orchestrator-Handoffs der TUI-Wurzel im
-    /// Hintergrund laufen (siehe `crate::app::background_agents`).
+    /// Runs all handoffs of the TUI root in the background (see
+    /// `crate::app::background_agents`).
     ///
     /// # Returns
     /// Den Treiber mit Hintergrund-Starter.
@@ -1181,11 +1153,12 @@ impl ApprovalDriver {
     ///   [`resume_after_approval`] gerufen. Der [`ApprovalActor`][harw_types::ApprovalActor]
     ///   stammt ebenfalls aus dem festgehaltenen Pausezustand, damit die
     ///   Identitätsprüfung des Kerns nicht an einer TUI-seitigen Kopie scheitert.
-    /// - [`TurnOutcome::AwaitingChild`] — das Kind wird über `children`
-    ///   getrieben und sein Ergebnis über [`resume_after_child`] eingespielt.
-    ///   Ohne Treiber oder bei einem Spawn-Fehler wird ein **Fehler-Ergebnis**
-    ///   eingespielt statt abzubrechen: der Eltern-Turn endet dadurch regulär,
-    ///   statt in `WaitingForChild` hängenzubleiben.
+    /// - [`TurnOutcome::AwaitingChild`] — the child is NEVER driven inline
+    ///   (delegation is background-only). The background launcher detaches it
+    ///   and the one-time start result is fed in through [`resume_after_child`];
+    ///   without a launcher, or when the start fails, an **error result** is
+    ///   fed in instead, so the parent turn ends regularly instead of hanging
+    ///   in `WaitingForChild`.
     ///
     /// Jeder Durchgang ersetzt `outcome` durch das Ergebnis der Wiederaufnahme
     /// — ein Turn darf beliebig oft hintereinander pausieren, und ein Kind darf
@@ -1195,8 +1168,8 @@ impl ApprovalDriver {
     /// - `session` (`&mut AgentSession`): die pausierte Session.
     /// - `model` (`&dyn ModelProvider`): derselbe Provider wie im Ausgangsturn.
     /// - `store` (`&dyn StateStore`): derselbe Store wie im Ausgangsturn.
-    /// - `children` (`Option<&dyn ChildTurnDriver>`): Kind-Treiber; `None`
-    ///   beantwortet jeden Handoff mit einem Fehler-Ergebnis.
+    /// - `_children` (`Option<&dyn ChildTurnDriver>`): unused; kept for call-site
+    ///   compatibility (children are driven by the background launcher only).
     /// - `outcome` ([`TurnOutcome`]): das Ergebnis des Ausgangsturns.
     ///
     /// # Returns
@@ -1220,7 +1193,7 @@ impl ApprovalDriver {
         session: &mut AgentSession,
         model: &dyn ModelProvider,
         store: &dyn StateStore,
-        children: Option<&dyn ChildTurnDriver>,
+        _children: Option<&dyn ChildTurnDriver>,
         outcome: TurnOutcome,
     ) -> ApprovalDriverResult<TurnOutcome> {
         let mut outcome = outcome;
@@ -1280,21 +1253,19 @@ impl ApprovalDriver {
                         "tui.resume.child_pause"
                     );
 
-                    // Runde 5, Teil K: ein Orchestrator der TUI-Wurzel läuft im
-                    // Hintergrund weiter; der Eltern-Turn bekommt sofort
-                    // `{child_id, status: "running", hint}`.
-                    let launched = self
-                        .background
-                        .as_ref()
-                        .and_then(|launcher| launcher.try_launch(session, &child, &call_id, &role));
-                    let result = match launched {
-                        Some(result) => result,
+                    // Delegation is background-only: the child is never driven
+                    // inline. The parent turn gets the one-time start result
+                    // immediately; without a launcher (or if the start fails)
+                    // it gets a detailed error result, never a blocking wait.
+                    let result = match self.background.as_ref() {
+                        Some(launcher) => launcher.try_launch(session, &child, &call_id, &role),
                         None => {
-                            let progress = session
-                                .current_turn()
-                                .cloned()
-                                .map(|turn_id| (turn_id, session.live_emitter()));
-                            Self::child_result(children, &child, &role, store, progress).await
+                            tracing::warn!(child = %child, role = %role, "tui.child.no_launcher");
+                            ToolCallResult::error(format!(
+                                "Delegation is background-only and no background launcher is \
+                                 configured in this terminal session, so '{role}' was not \
+                                 started. There is no foreground fallback."
+                            ))
                         }
                     };
                     outcome = resume_after_child(session, model, store, child, call_id, result)
@@ -1360,49 +1331,6 @@ impl ApprovalDriver {
             return reject(REASON_PROMPT_UNDELIVERABLE);
         }
         self.handler.await_resolution(&pending.request).await
-    }
-
-    /// Treibt ein Kind und verpackt jeden Ausgang als [`ToolCallResult`].
-    ///
-    /// Auch ein Spawn-Fehler und ein fehlender Treiber werden zu einem
-    /// Fehler-Ergebnis: der Eltern-Turn muss das Kind-Werkzeug beantwortet
-    /// bekommen, sonst bliebe er in `WaitingForChild` stehen.
-    ///
-    /// `progress` (Turn-ID und Live-Kanal des pausierten Eltern-Turns) wird
-    /// vor dem Lauf als Fortschritts-Senke des Kindes registriert
-    /// ([`ChildTurnDriver::attach_progress`]).
-    async fn child_result(
-        children: Option<&dyn ChildTurnDriver>,
-        child: &SessionId,
-        role: &str,
-        store: &dyn StateStore,
-        progress: Option<(TurnId, LiveEmitter)>,
-    ) -> ToolCallResult {
-        let Some(driver) = children else {
-            tracing::warn!(child = %child, role = %role, "tui.child.no_driver");
-            return ToolCallResult::error(format!(
-                "child agent '{role}' could not be run: this terminal session has no child driver"
-            ));
-        };
-
-        if let Some((turn_id, emitter)) = progress
-            && !driver.attach_progress(child, turn_id, emitter)
-        {
-            tracing::debug!(child = %child, role = %role, "tui.child.progress_sink_not_attached");
-        }
-
-        match driver.drive_child(child, store).await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(
-                    child = %child,
-                    role = %role,
-                    error = %error,
-                    "tui.child.drive_failed"
-                );
-                ToolCallResult::error(format!("child agent '{role}' failed: {error}"))
-            }
-        }
     }
 }
 
@@ -2348,97 +2276,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_child_result_without_a_driver_is_an_error_result_not_a_hang() -> TestResult {
-        let store = InMemoryStateStore::new();
-        let result =
-            ApprovalDriver::child_result(None, &SessionId::new(), "reviewer", &store, None).await;
-
-        let ToolCallResult::Error { message } = result else {
-            return Err(TestError::Unexpected(
-                "a missing child driver must produce an error result".into(),
-            ));
-        };
-        assert!(message.contains("reviewer"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_child_result_uses_the_configured_driver() {
-        let store = InMemoryStateStore::new();
-        let driver = StubChildDriver {
-            calls: AtomicUsize::new(0),
-        };
-
-        let result = ApprovalDriver::child_result(
-            Some(&driver),
-            &SessionId::new(),
-            "reviewer",
-            &store,
-            Some((TurnId::new(), LiveEmitter::default())),
-        )
-        .await;
-
-        assert!(result.is_success());
-        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
-    }
-
-    /// Attrappe, die registrierte Fortschritts-Senken zählt.
-    struct ProgressRecordingDriver {
-        attached: AtomicUsize,
-    }
-
-    impl ChildTurnDriver for ProgressRecordingDriver {
-        fn drive_child<'a>(
-            &'a self,
-            _child: &'a SessionId,
-            _store: &'a dyn StateStore,
-        ) -> ChildDriveFuture<'a> {
-            Box::pin(async { Ok(ToolCallResult::success(json!({"child": "done"}))) })
-        }
-
-        fn attach_progress(
-            &self,
-            _child: &SessionId,
-            _turn_id: TurnId,
-            _emitter: LiveEmitter,
-        ) -> bool {
-            self.attached.fetch_add(1, Ordering::SeqCst);
-            true
-        }
-    }
-
-    #[tokio::test]
-    async fn test_child_result_attaches_the_parent_progress_sink_before_driving() {
-        let store = InMemoryStateStore::new();
-        let driver = ProgressRecordingDriver {
-            attached: AtomicUsize::new(0),
-        };
-
-        let without = ApprovalDriver::child_result(
-            Some(&driver),
-            &SessionId::new(),
-            "reviewer",
-            &store,
-            None,
-        )
-        .await;
-        assert!(without.is_success());
-        assert_eq!(driver.attached.load(Ordering::SeqCst), 0);
-
-        let with = ApprovalDriver::child_result(
-            Some(&driver),
-            &SessionId::new(),
-            "reviewer",
-            &store,
-            Some((TurnId::new(), LiveEmitter::default())),
-        )
-        .await;
-        assert!(with.is_success());
-        assert_eq!(driver.attached.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_child_pause_resumes_the_parent_turn_through_the_same_loop() -> TestResult {
+    async fn test_child_pause_without_a_launcher_is_an_error_result_not_an_inline_wait()
+    -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, _prompts) = TuiApprovalHandler::new();
         let mut session = test_session(&handler, &executions)?;
@@ -2473,7 +2312,29 @@ mod tests {
             ));
         };
         assert!(matches!(final_outcome, TurnOutcome::Completed));
-        assert_eq!(children.calls.load(Ordering::SeqCst), 1);
+        // The child driver is never used: no inline wait, the parent got an
+        // immediate error result instead.
+        assert_eq!(children.calls.load(Ordering::SeqCst), 0);
+        let errors = session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    harw_protocol::items::TurnItem::ToolResult(result)
+                        if matches!(
+                            &result.result,
+                            ToolCallResult::Error { message }
+                                if message.contains("background-only")
+                        )
+                )
+            })
+            .count();
+        assert_eq!(
+            errors, 1,
+            "the missing launcher must be reported as a tool error"
+        );
         Ok(())
     }
 

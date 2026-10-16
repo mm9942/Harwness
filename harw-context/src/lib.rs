@@ -85,6 +85,7 @@ pub mod fragment;
 pub mod reference;
 pub mod render;
 pub mod selector;
+pub mod sources;
 
 pub use budget::ContextBudgetSpec;
 pub use ceiling::{CeilingViolation, ContextCeiling};
@@ -93,6 +94,7 @@ pub use fragment::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stabili
 pub use reference::{DigestStatus, FragmentReference};
 pub use render::{DetailMode, OmissionReason};
 pub use selector::Selector;
+pub use sources::{ContextSource, SOURCES};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

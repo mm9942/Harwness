@@ -44,7 +44,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
@@ -53,7 +52,9 @@ use harw_knowledge::KnowledgeStore;
 use harw_knowledge::kanban::board::{self, BoardId, CardId, CardRecord, CardState, LaneKind};
 use harw_knowledge::kanban::lifecycle::JobTransitions;
 use harw_knowledge::kanban::notes;
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::args::{parse_args, parse_args_or_default};
+use harw_tools::schema_helpers::{property, strict_object_schema};
+use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
 
 /// Name des Überblick-Werkzeugs.
@@ -106,15 +107,6 @@ impl std::fmt::Debug for KanbanReadToolProvider {
 }
 
 impl KanbanReadToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[KANBAN_LIST, KANBAN_SHOW];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider ohne Ledger (gebundene Karten zeigen `unknown`).
     ///
     /// # Argumente
@@ -136,46 +128,28 @@ impl KanbanReadToolProvider {
     }
 }
 
-impl ToolProvider for KanbanReadToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![list_spec(), show_spec()]
+// Beide Kanban-Werkzeuge lesen nur (`ReadWorkspace`) und sind parallelsicher.
+harw_tools::tool_provider! {
+    impl for KanbanReadToolProvider as provider, parallel_safe: all {
+        KANBAN_LIST => {
+            spec: list_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: KanbanReadExecutor {
+                store: Arc::clone(&provider.store),
+                ledger: provider.ledger.clone(),
+                tool: KanbanTool::List,
+            },
+        },
+        KANBAN_SHOW => {
+            spec: show_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: KanbanReadExecutor {
+                store: Arc::clone(&provider.store),
+                ledger: provider.ledger.clone(),
+                tool: KanbanTool::Show,
+            },
+        },
     }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            KANBAN_LIST => KanbanTool::List,
-            KANBAN_SHOW => KanbanTool::Show,
-            _ => return None,
-        };
-        Some(Arc::new(KanbanReadExecutor {
-            store: Arc::clone(&self.store),
-            ledger: self.ledger.clone(),
-            tool,
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        Self::TOOL_NAMES.contains(&name.as_str())
-    }
-}
-
-fn property(schema_type: JsonSchemaType, description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(schema_type),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
-    }
-    .into_strict()
 }
 
 fn list_spec() -> ToolSpec {
@@ -206,7 +180,7 @@ fn list_spec() -> ToolSpec {
              Karten und {} KiB. Details einer Karte liefert kanban.show. {USAGE_RULE}",
             MAX_OUTPUT_BYTES / 1024
         ),
-        parameters: object_schema(props, &[]),
+        parameters: strict_object_schema(props, &[]),
         strict: true,
     })
 }
@@ -229,7 +203,7 @@ fn show_spec() -> ToolSpec {
              {USAGE_RULE}",
             MAX_OUTPUT_BYTES / 1024
         ),
-        parameters: object_schema(props, &["card"]),
+        parameters: strict_object_schema(props, &["card"]),
         strict: true,
     })
 }
@@ -283,17 +257,6 @@ struct ShowArgs {
     board: Option<String>,
 }
 
-fn parse_args<T: serde::de::DeserializeOwned + Default>(
-    tool: &str,
-    arguments: serde_json::Value,
-) -> Result<T, ToolOutput> {
-    if arguments.is_null() {
-        return Ok(T::default());
-    }
-    serde_json::from_value(arguments)
-        .map_err(|error| ToolOutput::error(format!("{tool}: ungültige Argumente: {error}")))
-}
-
 /// Board-Id aus dem Argument; leer bzw. fehlend heißt `default`.
 fn board_of(raw: Option<&str>) -> BoardId {
     BoardId::new(
@@ -326,7 +289,7 @@ fn execute_list(
     arguments: serde_json::Value,
 ) -> ToolOutput {
     let fail = |detail: String| ToolOutput::error(format!("{KANBAN_LIST}: {detail}"));
-    let args: ListArgs = match parse_args(KANBAN_LIST, arguments) {
+    let args: ListArgs = match parse_args_or_default(KANBAN_LIST, &arguments) {
         Ok(args) => args,
         Err(output) => return output,
     };
@@ -430,9 +393,9 @@ fn execute_show(
     arguments: serde_json::Value,
 ) -> ToolOutput {
     let fail = |detail: String| ToolOutput::error(format!("{KANBAN_SHOW}: {detail}"));
-    let args: ShowArgs = match serde_json::from_value(arguments) {
+    let args: ShowArgs = match parse_args(KANBAN_SHOW, &arguments) {
         Ok(args) => args,
-        Err(error) => return fail(format!("ungültige Argumente: {error}")),
+        Err(out) => return out,
     };
     let board_id = board_of(args.board.as_deref());
     let card_id = CardId::new(args.card.trim());
@@ -517,6 +480,7 @@ fn execute_show(
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_knowledge::kanban::board::{Board, Lane, LaneId, save_board, save_card};
     use harw_knowledge::kanban::lifecycle::InMemoryJobTransitions;
     use harw_knowledge::kanban::notes::{HistoryEntry, HistoryEvent};

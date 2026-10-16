@@ -28,5 +28,8 @@ jiff = { workspace = true }
 # die Digestbildung läuft zur Laufzeit, nicht nur in Tests.
 serde_json = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+
 [lints]
 workspace = true

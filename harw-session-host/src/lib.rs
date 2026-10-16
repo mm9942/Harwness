@@ -21,6 +21,8 @@
 //! - [`arbiter`]: per-session FIFO, compare-and-swap on the head, idempotency.
 //! - [`approvals`]: first-writer-wins approval resolution.
 //! - [`driver`]: the port to the agent runtime that actually runs turns.
+//! - [`durable_approvals`], [`durable_replay`]: durable adapters over
+//!   `harw-session-store` for the approval and transcript ports (S04).
 //! - [`agents`]: R18 agent principal registry (credential → principal,
 //!   delegation, grant/narrow cascade, revocation).
 //! - [`tool_host`]: R18 gateway tool host (tool registry, gateway sandbox,
@@ -34,6 +36,8 @@ pub mod agents;
 pub mod approvals;
 pub mod arbiter;
 pub mod driver;
+pub mod durable_approvals;
+pub mod durable_replay;
 pub mod error;
 pub mod fanout;
 pub mod host;
@@ -44,6 +48,8 @@ pub mod replay;
 pub mod tool_host;
 
 pub use agents::{AgentCredential, AgentRegistry, Delegation, ResolvedAgent};
+pub use durable_approvals::DurableApprovals;
+pub use durable_replay::DurableTranscripts;
 pub use error::HostError;
 pub use host::{HostConfig, HostConnection, SessionHost};
 pub use identity::{

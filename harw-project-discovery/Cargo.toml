@@ -15,6 +15,7 @@ harw-types = { path = "../harw-types" }
 tracing = "0.1"
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 

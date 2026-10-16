@@ -13,6 +13,7 @@ harw-macros = { path = "../harw-macros" }
 serde = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 serde_json = { workspace = true }
 
 [lints]

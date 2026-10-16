@@ -18,6 +18,7 @@ harw-home = { path = "../harw-home" }
 harw-macros = { path = "../harw-macros" }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 # Round-trip ("build, then query") and visibility-separation fixtures reuse
 # the source-binding crate instead of re-implementing chunking/build logic in
 # test code. One-directional: `harw-lens-source` has no dependency (dev or

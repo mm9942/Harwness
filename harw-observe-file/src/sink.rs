@@ -70,6 +70,9 @@ const DIGEST_SUFFIX: &str = ".blake3";
 pub struct FileSink {
     dir: PathBuf,
     max_bytes: u64,
+    /// Obergrenze rotierter Dateien (Retention-Klasse `telemetry_rotated`);
+    /// `None` = unbegrenzt (bisheriges Verhalten).
+    max_rotated_files: Option<usize>,
     state: Mutex<FileSinkState>,
     write_errors: AtomicU64,
 }
@@ -171,6 +174,7 @@ impl FileSink {
         Ok(Self {
             dir: dir.to_path_buf(),
             max_bytes: max_bytes.max(1),
+            max_rotated_files: None,
             state: Mutex::new(FileSinkState {
                 file,
                 size,
@@ -178,6 +182,34 @@ impl FileSink {
             }),
             write_errors: AtomicU64::new(0),
         })
+    }
+
+    /// Begrenzt die Zahl rotierter Dateien (Retention-Hook).
+    ///
+    /// # Description
+    /// Nach jeder Rotation (und sofort beim Setzen) werden die ältesten
+    /// `rotated-*.jsonl` samt ihrer `.blake3`-Beidatei als Paar entfernt, bis
+    /// höchstens `max` Paare übrig sind. Die aktive Datei wird nie berührt;
+    /// ein Paar wird nie halb gelöscht (erst Datei, dann Beidatei; eine
+    /// verwaiste Beidatei räumt der nächste Lauf ab). `max` wird auf
+    /// mindestens `1` angehoben. Das Aufräumen läuft unter der
+    /// Sink-Sperre, ist aber ein einzelnes `read_dir` plus wenige `unlink`s
+    /// und nur nach einer (seltenen) Rotation aktiv.
+    ///
+    /// # Arguments
+    /// - `max` (`Option<usize>`): `None` schaltet das Aufräumen ab.
+    ///
+    /// # Returns
+    /// Der Sink mit gesetztem Limit.
+    #[must_use]
+    pub fn with_max_rotated_files(mut self, max: Option<usize>) -> Self {
+        self.max_rotated_files = max.map(|m| m.max(1));
+        if let Some(limit) = self.max_rotated_files
+            && !prune_rotated_pairs(&self.dir, limit)
+        {
+            self.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        self
     }
 
     /// Anzahl der intern behandelten Schreib-, Serialisierungs- oder
@@ -261,6 +293,11 @@ impl FileSink {
             })?;
         state.file = new_file;
         state.size = 0;
+        if let Some(limit) = self.max_rotated_files
+            && !prune_rotated_pairs(&self.dir, limit)
+        {
+            self.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -400,6 +437,68 @@ fn next_rotation_sequence(dir: &Path) -> u64 {
     max_seen.map_or(0, |m| m + 1)
 }
 
+/// Entfernt die ältesten rotierten Paare (`rotated-N.jsonl` + `.blake3`),
+/// bis höchstens `max` übrig sind, sowie verwaiste Beidateien.
+///
+/// Gibt `false` zurück, wenn ein Löschen oder das Lesen des Verzeichnisses
+/// scheiterte (ein verschwundener Eintrag ist kein Fehler). Rührt nur
+/// Namen nach dem Muster `rotated-<ziffern>.jsonl[.blake3]` an, also nie die
+/// aktive Datei.
+fn prune_rotated_pairs(dir: &Path, max: usize) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut data: Vec<u64> = Vec::new();
+    let mut sidecars: Vec<u64> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(ROTATED_PREFIX) else {
+            continue;
+        };
+        if let Some(digits) = rest.strip_suffix(ROTATED_SUFFIX) {
+            if let Ok(seq) = digits.parse::<u64>() {
+                data.push(seq);
+            }
+        } else if let Some(digits) = rest
+            .strip_suffix(DIGEST_SUFFIX)
+            .and_then(|r| r.strip_suffix(ROTATED_SUFFIX))
+            && let Ok(seq) = digits.parse::<u64>()
+        {
+            sidecars.push(seq);
+        }
+    }
+    data.sort_unstable();
+    let mut ok = true;
+    let remove = |path: PathBuf| match fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let excess = data.len().saturating_sub(max);
+    for seq in data.iter().take(excess) {
+        let base = dir.join(format!("{ROTATED_PREFIX}{seq:010}{ROTATED_SUFFIX}"));
+        let sidecar = PathBuf::from(format!("{}{DIGEST_SUFFIX}", base.display()));
+        // Erst die Datei, dann die Beidatei: bricht es dazwischen ab, bleibt
+        // nur eine verwaiste Beidatei, die der nächste Lauf entfernt.
+        if remove(base) {
+            ok &= remove(sidecar);
+        } else {
+            ok = false;
+        }
+    }
+    for seq in sidecars {
+        if data.binary_search(&seq).is_err() {
+            let sidecar = dir.join(format!(
+                "{ROTATED_PREFIX}{seq:010}{ROTATED_SUFFIX}{DIGEST_SUFFIX}"
+            ));
+            ok &= remove(sidecar);
+        }
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +634,95 @@ mod tests {
         let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
         let sink = FileSink::open(dir.path(), 1_048_576).map_err(ctx("FileSink öffnen"))?;
         assert_eq!(sink.name(), "file");
+        Ok(())
+    }
+
+    fn rotated_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(ROTATED_PREFIX))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_rotation_prunes_oldest_pair_and_respects_cap() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1)
+            .map_err(ctx("FileSink öffnen"))?
+            .with_max_rotated_files(Some(2));
+        for i in 0..5 {
+            sink.record(&key("a"), MetricValue::Count(i), &[]);
+        }
+        let names = rotated_names(dir.path());
+        assert_eq!(
+            names,
+            vec![
+                "rotated-0000000003.jsonl",
+                "rotated-0000000003.jsonl.blake3",
+                "rotated-0000000004.jsonl",
+                "rotated-0000000004.jsonl.blake3",
+            ]
+        );
+        assert!(dir.path().join(ACTIVE_FILE_NAME).exists());
+        assert_eq!(sink.write_error_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_never_touches_active_and_removes_orphan_sidecar() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        fs::write(dir.path().join(ACTIVE_FILE_NAME), b"live\n").map_err(ctx("active"))?;
+        fs::write(dir.path().join("rotated-0000000001.jsonl.blake3"), b"x")
+            .map_err(ctx("orphan"))?;
+        for n in 2..4 {
+            fs::write(dir.path().join(format!("rotated-{n:010}.jsonl")), b"d").map_err(ctx("d"))?;
+            fs::write(
+                dir.path().join(format!("rotated-{n:010}.jsonl.blake3")),
+                b"s",
+            )
+            .map_err(ctx("s"))?;
+        }
+        assert!(prune_rotated_pairs(dir.path(), 1));
+        assert_eq!(
+            rotated_names(dir.path()),
+            vec![
+                "rotated-0000000003.jsonl",
+                "rotated-0000000003.jsonl.blake3"
+            ]
+        );
+        assert_eq!(
+            fs::read(dir.path().join(ACTIVE_FILE_NAME)).map_err(ctx("active lesen"))?,
+            b"live\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlimited_sink_keeps_every_rotated_file() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1).map_err(ctx("FileSink öffnen"))?;
+        for i in 0..3 {
+            sink.record(&key("a"), MetricValue::Count(i), &[]);
+        }
+        assert_eq!(rotated_names(dir.path()).len(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn test_zero_cap_is_treated_as_one() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1)
+            .map_err(ctx("FileSink öffnen"))?
+            .with_max_rotated_files(Some(0));
+        sink.record(&key("a"), MetricValue::Count(1), &[]);
+        sink.record(&key("a"), MetricValue::Count(2), &[]);
+        assert_eq!(rotated_names(dir.path()).len(), 2);
         Ok(())
     }
 

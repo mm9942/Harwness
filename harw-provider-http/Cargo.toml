@@ -24,12 +24,15 @@ harw-types = { path = "../harw-types" }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 secrecy = "0.10.3"
+# Images go out as base64 (`images.rs`); already a dev-dependency here.
+base64 = "0.23.1"
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["time", "sync"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
-base64 = "0.23.1"
+harw-test-support = { path = "../harw-test-support" }
+harw-media = { path = "../harw-media" }
 tempfile = { workspace = true }
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
 

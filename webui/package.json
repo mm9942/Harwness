@@ -2,6 +2,7 @@
   "name": "harw-webui",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
   "description": "Next.js-Schale der Harwness Control Plane (Knoten UI-01). Route-Gruppen fuer Chat/Sessions/Plan/Telemetry/Security/Admin gehoeren UI-02..07 und werden bewusst noch nicht importiert.",
   "scripts": {
     "dev": "next dev",

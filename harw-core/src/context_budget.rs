@@ -494,6 +494,10 @@ impl Default for ContextBudget {
 pub struct ContextAssembly {
     pub included_fragment_labels: Vec<String>,
     pub omitted_fragment_labels: Vec<String>,
+    /// Grund je ausgelassenem Label (`over-budget`, `below-ceiling`,
+    /// `excluded-by-program`, `superseded`, im Bestandspfad
+    /// `over-context-budget`); Labels ohne Eintrag gelten als unbegründet.
+    pub omission_reasons: Vec<(String, String)>,
     /// Anzahl komplett entfernter Historien-Items. Seit Knoten A4 zählt dies
     /// über [`crate::history::ConversationHistory::tail_preserving_current_turn`]
     /// — die zuletzt gesendete `UserMessage` zählt darin nie mit, sie bleibt
@@ -529,6 +533,9 @@ pub(crate) fn assemble(
                 .push(fragment.label.clone());
             selected_context.push(fragment);
         } else {
+            assembly
+                .omission_reasons
+                .push((fragment.label.clone(), "over-context-budget".to_owned()));
             assembly.omitted_fragment_labels.push(fragment.label);
         }
     }
@@ -2114,7 +2121,11 @@ pub fn estimate_request_bytes(request: &crate::model::ModelRequest) -> u64 {
     }
     for message in request.history.to_model_messages() {
         let payload = match &message {
-            ModelMessage::User { text } | ModelMessage::Assistant { text } => text.len() as u64,
+            ModelMessage::User { text, images } => images
+                .iter()
+                .map(|image| image.media.estimated_tokens().saturating_mul(4))
+                .fold(text.len() as u64, u64::saturating_add),
+            ModelMessage::Assistant { text } => text.len() as u64,
             ModelMessage::ToolCall {
                 call_id,
                 name,

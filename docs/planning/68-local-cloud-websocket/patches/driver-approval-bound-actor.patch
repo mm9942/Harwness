@@ -1,0 +1,160 @@
+diff --git a/harw-session-driver/src/bridge.rs b/harw-session-driver/src/bridge.rs
+index 59a1873..0b3f4de 100644
+--- a/harw-session-driver/src/bridge.rs
++++ b/harw-session-driver/src/bridge.rs
+@@ -40,8 +40,7 @@ use harw_protocol::approvals::ApprovalKind;
+ use harw_protocol::{ApprovalRequest, SessionEvent, TurnEvent};
+ use harw_session_host::HostError;
+ use harw_session_host::driver::{
+-    CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput,
+-    TurnOutcome,
++    CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome,
+ };
+ use harw_session_store::{
+     ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, SessionStoreError,
+@@ -261,7 +260,9 @@ impl CoreTurnDriver {
+         Self::with_runtime(config, Arc::new(runtime))
+     }
+ 
+-    fn controls(&self) -> Result<MutexGuard<'_, HashMap<SessionId, TurnControl>>, DriverBridgeError> {
++    fn controls(
++        &self,
++    ) -> Result<MutexGuard<'_, HashMap<SessionId, TurnControl>>, DriverBridgeError> {
+         self.controls
+             .lock()
+             .map_err(|_| DriverBridgeError::Runtime("turn control table poisoned".to_owned()))
+@@ -448,9 +449,15 @@ impl CoreTurnDriver {
+             Some(request) => request,
+             // Host restart between park and resume: ask the core.
+             None => {
+-                let parked = self.runtime.parked_approval(session).await?.ok_or_else(|| {
+-                    DriverBridgeError::Approval("session is not parked on an approval".to_owned())
+-                })?;
++                let parked = self
++                    .runtime
++                    .parked_approval(session)
++                    .await?
++                    .ok_or_else(|| {
++                        DriverBridgeError::Approval(
++                            "session is not parked on an approval".to_owned(),
++                        )
++                    })?;
+                 ItemId::from_str(parked.request.id.as_str())
+             }
+         };
+@@ -538,10 +545,17 @@ impl TurnDriver for CoreTurnDriver {
+                 // Host restart between park and resume: no live token.
+                 None => CancelToken::new(),
+             };
++            // The core only accepts the actor bound when it parked; the
++            // resolver (`record.actor`) stays in the durable record as audit.
++            // Who may resolve is decided by the host (caps), not here.
++            let bound = match self.runtime.parked_approval(&session_id).await? {
++                Some(parked) => parked.actor,
++                None => record.actor,
++            };
+             let (tx, rx) = mpsc::unbounded_channel();
+             let leg = self
+                 .runtime
+-                .resume_after_approval(&session_id, record.actor, resolution, tx);
++                .resume_after_approval(&session_id, bound, resolution, tx);
+             let result = Self::pump(leg, rx, &mut cancel, &token, &sink).await;
+             self.settle(&session_id, &sink, result)
+                 .await
+@@ -641,10 +655,7 @@ impl HarwCoreRuntime {
+         }
+     }
+ 
+-    fn slots(
+-        &self,
+-    ) -> Result<MutexGuard<'_, SlotMap>, DriverBridgeError>
+-    {
++    fn slots(&self) -> Result<MutexGuard<'_, SlotMap>, DriverBridgeError> {
+         self.slots
+             .lock()
+             .map_err(|_| DriverBridgeError::Runtime("session table poisoned".to_owned()))
+@@ -668,9 +679,9 @@ impl HarwCoreRuntime {
+         }
+         let (event_tx, session_events) = mpsc::unbounded_channel();
+         let (turn_tx, turn_events) = mpsc::unbounded_channel();
+-        let mut core = self
+-            .factory
+-            .build(session_id, title, SessionWiring { event_tx, turn_tx })?;
++        let mut core =
++            self.factory
++                .build(session_id, title, SessionWiring { event_tx, turn_tx })?;
+         core.session
+             .hydrate_from_store(core.store.as_ref())
+             .await
+diff --git a/harw-session-driver/tests/bridge_approvals.rs b/harw-session-driver/tests/bridge_approvals.rs
+index bcc8e20..ee94b6e 100644
+--- a/harw-session-driver/tests/bridge_approvals.rs
++++ b/harw-session-driver/tests/bridge_approvals.rs
+@@ -203,10 +203,7 @@ impl CoreRuntime for FakeCore {
+         })
+     }
+ 
+-    fn parked_approval<'a>(
+-        &'a self,
+-        _: &'a SessionId,
+-    ) -> CoreFuture<'a, Option<ParkedApproval>> {
++    fn parked_approval<'a>(&'a self, _: &'a SessionId) -> CoreFuture<'a, Option<ParkedApproval>> {
+         Box::pin(async move { Ok(lock(&self.parked).map_err(|e| runtime_error(&e))?.clone()) })
+     }
+ 
+@@ -493,7 +490,10 @@ async fn a_second_park_after_resume_gets_its_durable_record_from_the_driver() ->
+         "the driver issued the durable record the core skipped"
+     );
+     let announced = rig.sink.approval_requests()?;
+-    ensure!(announced.len() == 2, "two request frames, got {announced:?}");
++    ensure!(
++        announced.len() == 2,
++        "two request frames, got {announced:?}"
++    );
+     ensure!(
+         announced[1].id.as_str() == second.as_str(),
+         "second wire id matches the durable id"
+@@ -554,3 +554,43 @@ async fn first_writer_wins_in_the_durable_backend() -> TestResult {
+     );
+     Ok(())
+ }
++
++#[tokio::test]
++async fn another_controller_resolving_resumes_with_the_bound_actor() -> TestResult {
++    let rig = rig(vec![Leg::ParkDurable, Leg::Complete])?;
++    let request = rig.park().await?;
++
++    // A second controller (not the actor bound at park time) wins the race,
++    // as the host's `resolve_any_actor` permits.
++    let other = ApprovalActor::Operator {
++        id: "second-controller".to_owned(),
++    };
++    ensure!(other != operator(), "test needs two distinct actors");
++    rig.store
++        .resolve_any_actor(
++            &rig.session,
++            &request,
++            ReviewDecision::Approved,
++            None,
++            &other,
++            &SystemClock,
++        )
++        .map_err(|e| e.to_string())?;
++
++    let outcome = rig.resume().await?;
++    ensure!(outcome == TurnOutcome::Completed, "outcome {outcome:?}");
++    // The core accepts only the actor bound at park time; the resolver stays
++    // in the durable record.
++    let resumed = lock(&rig.core.resumed)?.clone();
++    ensure!(
++        resumed == vec![(operator(), ApprovalResolution::Approve)],
++        "core resumed with {resumed:?}"
++    );
++    let record = rig
++        .store
++        .resolution(&rig.session, &request)
++        .map_err(|e| e.to_string())?
++        .ok_or("resolution record missing")?;
++    ensure!(record.actor == other, "audit keeps the resolver");
++    Ok(())
++}

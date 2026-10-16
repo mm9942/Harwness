@@ -47,8 +47,148 @@
 //! }
 //! ```
 
-/// Erzeugt eine zustandslose Provider-Struktur mit den inhärenten Methoden
-/// `tool_specs()`, `tool_executor(name)` und `tool_parallel_safe(name)`.
+/// Interne Hilfen der Makros. Nicht Teil der stabilen API.
+///
+/// Die `const fn`s stehen hier statt im Makro-Rumpf, damit sie nur einmal
+/// existieren und die Makros ausschließlich über `$crate`-Pfade darauf
+/// zugreifen.
+#[doc(hidden)]
+pub mod __private {
+    /// Bytegleichheit zweier Strings, `const`-tauglich.
+    #[must_use]
+    pub const fn str_eq(left: &str, right: &str) -> bool {
+        let left = left.as_bytes();
+        let right = right.as_bytes();
+        if left.len() != right.len() {
+            return false;
+        }
+        let mut index = 0;
+        while index < left.len() {
+            if left[index] != right[index] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    /// `true`, wenn kein Name in `names` doppelt vorkommt.
+    #[must_use]
+    pub const fn names_unique(names: &[&str]) -> bool {
+        let mut outer = 0;
+        while outer < names.len() {
+            let mut inner = outer + 1;
+            while inner < names.len() {
+                if str_eq(names[outer], names[inner]) {
+                    return false;
+                }
+                inner += 1;
+            }
+            outer += 1;
+        }
+        true
+    }
+
+    /// `true`, wenn `needle` in `names` vorkommt.
+    #[must_use]
+    pub const fn names_contain(names: &[&str], needle: &str) -> bool {
+        let mut index = 0;
+        while index < names.len() {
+            if str_eq(names[index], needle) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
+/// Compile-Zeit-Duplikatprüfung der Tool-Namen (intern, von
+/// [`crate::tool_provider_core!`] aufgerufen).
+///
+/// Die Meldung muss ein einzelnes String-Literal bleiben: `panic!` ist im
+/// const-Kontext nur ohne Format-Argumente erlaubt. `concat!` und
+/// `stringify!` expandieren zu genau einem Literal.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __harw_assert_unique_tool_names {
+    ($provider:ty, $names:expr) => {
+        const _: () = {
+            ::core::assert!(
+                $crate::provider_macro::__private::names_unique($names),
+                ::core::concat!(
+                    "tool_provider!(",
+                    ::core::stringify!($provider),
+                    "): zwei Tools deklarieren denselben NAME — tools() würde einen Namen \
+                     bewerben, den executor()/parallel_safe() nicht eindeutig auflösen können"
+                )
+            );
+        };
+    };
+}
+
+/// Intern: Auswertung der `parallel_safe: none | all | [..]`-Angabe der
+/// Impl-Form von [`crate::tool_provider_core!`]. Fehlt die Angabe, gilt `none`.
+/// Unbekannte Namen sind in jedem Fall `false` (fail closed).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __harw_parallel_safe {
+    (() $name:ident; $($known:expr),+) => {
+        false
+    };
+    ((none) $name:ident; $($known:expr),+) => {
+        false
+    };
+    ((all) $name:ident; $($known:expr),+) => {
+        $( $name == $known )||+
+    };
+    (([]) $name:ident; $($known:expr),+) => {
+        false
+    };
+    (([ $($listed:expr),+ $(,)? ]) $name:ident; $($known:expr),+) => {
+        ( $( $name == $listed )||+ ) && ( $( $name == $known )||+ )
+    };
+}
+
+/// Intern: jeder in `parallel_safe: [..]` genannte Name muss ein Tool des
+/// Providers sein — sonst wäre die Zusage ein stiller Tippfehler.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __harw_assert_parallel_listed {
+    (() $provider:ty, $names:expr) => {};
+    ((none) $provider:ty, $names:expr) => {};
+    ((all) $provider:ty, $names:expr) => {};
+    (([]) $provider:ty, $names:expr) => {};
+    (([ $($listed:expr),+ $(,)? ]) $provider:ty, $names:expr) => {
+        const _: () = {
+            $(
+                ::core::assert!(
+                    $crate::provider_macro::__private::names_contain($names, $listed),
+                    ::core::concat!(
+                        "tool_provider!(",
+                        ::core::stringify!($provider),
+                        "): `parallel_safe` nennt ein Tool, das der Provider nicht deklariert"
+                    )
+                );
+            )+
+        };
+    };
+}
+
+/// Intern: optionale `permission:`-Angabe der Impl-Form (`None`, wenn sie fehlt).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __harw_permission_of {
+    () => {
+        ::core::option::Option::None
+    };
+    ($permission:expr) => {
+        ::core::option::Option::Some($permission)
+    };
+}
+
+/// Erzeugt die inhärenten Methoden eines Providers: `tool_specs()`,
+/// `tool_executor(name)` und `tool_parallel_safe(name)`.
 ///
 /// # Description
 /// Dies ist der Kern von [`crate::tool_provider!`] und verwendet ausschließlich
@@ -56,15 +196,15 @@
 /// Makro direkt, wenn ein Crate die Tool-Menge bündeln will, ohne den
 /// `ToolProvider`-Trait aus `harw-extension-api` zu implementieren.
 ///
-/// # Syntax
+/// Es gibt drei Formen.
+///
+/// # Form 1 — zustandslose Unit-Struktur
 /// ```rust,ignore
 /// tool_provider_core! {
 ///     /// Doku-Kommentar (optional, beliebig viele Attribute)
 ///     pub struct FsToolProvider { FsReadTool, FsWriteTool }
 /// }
 /// ```
-///
-/// # Anforderungen an jeden Tool-Typ
 /// Jeder aufgeführte Typ `T` muss bereitstellen:
 /// - `T::NAME: &'static str`,
 /// - `T::PERMISSION: Option<`[`crate::Permission`]`>`,
@@ -72,16 +212,56 @@
 /// - `T::spec() -> `[`crate::ToolSpec`],
 /// - `impl Default for T` und `impl `[`crate::ToolExecutor`]` for T`.
 ///
-/// Genau diese Menge erzeugt `#[harw_macros::tool]`.
+/// Genau diese Menge erzeugt `#[harw_macros::tool]`. Generiert werden
+/// `$name::new()`, `$name::tool_specs()`, `$name::tool_executor(&str)` und
+/// `$name::tool_parallel_safe(&str)` (alle ohne `self`).
 ///
-/// # Generierte Items
-/// - `$vis struct $name;` mit `Debug`, `Clone`, `Copy`, `Default`.
+/// # Form 2 — Struktur mit Zustand (`state`)
+/// ```rust,ignore
+/// tool_provider_core! {
+///     pub struct StoreToolProvider {
+///         state: Arc<Store> as store;
+///         StoreReadTool => StoreReadTool::new(Arc::clone(store)),
+///         StoreWriteTool => StoreWriteTool::new(Arc::clone(store)),
+///     }
+/// }
+/// ```
+/// Der Provider trägt den Zustand `state` (Typ muss `Debug + Clone` sein).
+/// Statt `Default` wird pro Tool der **Konstruktor-Ausdruck** hinter `=>`
+/// ausgewertet; `store` ist darin eine `&State`-Bindung (Name frei wählbar).
+/// Generiert wird zusätzlich `new(state)` und `state()`; `tool_executor` ist
+/// hier eine Methode mit `&self`. Die Tool-Typen brauchen kein `Default`
+/// (z. B. `#[tool(state = ..)]`-Tools), sonst gelten dieselben Anforderungen
+/// wie in Form 1.
+///
+/// # Form 3 — bestehender Typ, extern gebaute Spezifikationen (`impl for`)
+/// ```rust,ignore
+/// tool_provider_core! {
+///     impl for PlanToolProvider as provider, parallel_safe: none {  // none | all | [NAME, ..]; Default none
+///         PLAN_WRITE_TOOL => {
+///             spec: provider.write_spec(),           // ToolSpec, beliebiger Ausdruck
+///             permission: Permission::ReadWorkspace, // optional; fehlt es: None
+///             executor: PlanToolExecutor::new(provider.clone()),
+///         },
+///     }
+/// }
+/// ```
+/// Für Provider, die schon als eigene Struktur mit Feldern und Buildern
+/// existieren und deren Spezifikationen nicht aus einem `#[tool]`-Args-Typ
+/// stammen (`schema_from`, dynamisch gebaute Schemata). Das Makro erzeugt
+/// **nur** `TOOL_NAMES`, `TOOL_PERMISSIONS`, `tool_specs(&self)`,
+/// `tool_executor(&self, &str)` und `tool_parallel_safe(&str)`; die
+/// Struktur bleibt handgeschrieben. `provider` ist `&Self`. `executor:` ist
+/// der Executor-Wert (wird in `Arc` gelegt). `parallel_safe: all` bedeutet
+/// „jedes deklarierte Tool", `[A, B]` nur die genannten (Compile-Fehler, wenn
+/// ein genannter Name nicht deklariert ist); unbekannte Namen sind immer
+/// `false`.
+///
+/// # Generierte Items (alle Formen)
 /// - `$name::TOOL_NAMES: &'static [&'static str]` — Namen in Deklarationsreihenfolge.
 /// - `$name::TOOL_PERMISSIONS: &'static [Option<Permission>]` — parallel dazu die
 ///   deklarierten Berechtigungen, damit ein Crate per Test auditieren kann, dass
 ///   jedes registrierte Tool eine Berechtigung deklariert.
-/// - `$name::new()`, `$name::tool_specs()`, `$name::tool_executor(&str)`,
-///   `$name::tool_parallel_safe(&str)`.
 /// - eine anonyme `const`-Assertion, die doppelte Tool-Namen zum Compile-Fehler macht.
 ///
 /// # Doppelte Tool-Namen
@@ -91,13 +271,153 @@
 /// inklusive dessen (womöglich großzügigerer) Parallelitäts-Zusage. Die
 /// Prüfung läuft deshalb als `const`-Assertion zur Compile-Zeit über
 /// `TOOL_NAMES`, nicht als Test: ein Namenskonflikt darf den Build brechen,
-/// nicht bloß eine Test-Suite.
+/// nicht bloß eine Test-Suite. Das gilt für alle drei Formen.
 ///
 /// # Panics
 /// Der generierte Code panickt nie zur Laufzeit. Die `const`-Assertion schlägt
 /// zur Compile-Zeit fehl, wenn zwei Tool-Namen übereinstimmen.
 #[macro_export]
 macro_rules! tool_provider_core {
+    // Form 2: Struktur mit Zustand.
+    (
+        $(#[$provider_meta:meta])*
+        $vis:vis struct $provider:ident {
+            state: $state:ty as $st:ident;
+            $( $tool:ty => $ctor:expr ),+ $(,)?
+        }
+    ) => {
+        $(#[$provider_meta])*
+        #[derive(::core::fmt::Debug, ::core::clone::Clone)]
+        $vis struct $provider {
+            state: $state,
+        }
+
+        impl $provider {
+            /// Die Namen aller Tools dieses Providers, in Deklarationsreihenfolge.
+            pub const TOOL_NAMES: &'static [&'static str] = &[ $( <$tool>::NAME ),+ ];
+
+            /// Die von den Tools deklarierten Berechtigungen, indexgleich zu
+            /// [`Self::TOOL_NAMES`].
+            pub const TOOL_PERMISSIONS: &'static [::core::option::Option<$crate::Permission>] =
+                &[ $( <$tool>::PERMISSION ),+ ];
+
+            /// Erzeugt den Provider über dem gemeinsamen Zustand.
+            #[must_use]
+            pub fn new(state: $state) -> Self {
+                Self { state }
+            }
+
+            /// Der gemeinsame Zustand, aus dem die Executor gebaut werden.
+            #[must_use]
+            pub fn state(&self) -> &$state {
+                &self.state
+            }
+
+            /// Die Spezifikationen aller Tools, in Deklarationsreihenfolge.
+            #[must_use]
+            pub fn tool_specs() -> ::std::vec::Vec<$crate::ToolSpec> {
+                ::std::vec![ $( <$tool>::spec() ),+ ]
+            }
+
+            /// Löst einen Tool-Namen in einen Executor auf; `None` für
+            /// unbekannte Namen.
+            #[must_use]
+            pub fn tool_executor(
+                &self,
+                name: &str,
+            ) -> ::core::option::Option<::std::sync::Arc<dyn $crate::ToolExecutor>> {
+                let $st = &self.state;
+                $(
+                    if name == <$tool>::NAME {
+                        let executor: ::std::sync::Arc<dyn $crate::ToolExecutor> =
+                            ::std::sync::Arc::new($ctor);
+                        return ::core::option::Option::Some(executor);
+                    }
+                )+
+                ::core::option::Option::None
+            }
+
+            /// Ob nebenläufige Aufrufe dieses Tools sicher sind; unbekannte
+            /// Namen liefern `false` (fail closed).
+            #[must_use]
+            pub fn tool_parallel_safe(name: &str) -> bool {
+                $(
+                    if name == <$tool>::NAME {
+                        return <$tool>::PARALLEL_SAFE;
+                    }
+                )+
+                false
+            }
+        }
+
+        $crate::__harw_assert_unique_tool_names!($provider, <$provider>::TOOL_NAMES);
+    };
+
+    // Form 3: bestehender Typ, extern gebaute Spezifikationen.
+    (
+        impl for $provider:ty as $this:ident $( , parallel_safe: $ps:tt )? {
+            $(
+                $name:expr => {
+                    spec: $spec:expr,
+                    $( permission: $perm:expr, )?
+                    executor: $exec:expr $(,)?
+                }
+            ),+ $(,)?
+        }
+    ) => {
+        impl $provider {
+            /// Die Namen aller Tools dieses Providers, in Deklarationsreihenfolge.
+            pub const TOOL_NAMES: &'static [&'static str] = &[ $( $name ),+ ];
+
+            /// Die deklarierten Berechtigungen, indexgleich zu [`Self::TOOL_NAMES`].
+            pub const TOOL_PERMISSIONS: &'static [::core::option::Option<$crate::Permission>] =
+                &[ $( $crate::__harw_permission_of!($($perm)?) ),+ ];
+
+            /// Die Spezifikationen aller Tools, in Deklarationsreihenfolge.
+            #[must_use]
+            #[allow(clippy::unused_self)]
+            pub fn tool_specs(&self) -> ::std::vec::Vec<$crate::ToolSpec> {
+                #[allow(unused_variables)]
+                let $this = self;
+                ::std::vec![ $( $spec ),+ ]
+            }
+
+            /// Löst einen Tool-Namen in einen Executor auf; `None` für
+            /// unbekannte Namen.
+            #[must_use]
+            #[allow(clippy::unused_self)]
+            pub fn tool_executor(
+                &self,
+                name: &str,
+            ) -> ::core::option::Option<::std::sync::Arc<dyn $crate::ToolExecutor>> {
+                #[allow(unused_variables)]
+                let $this = self;
+                $(
+                    if name == $name {
+                        let executor: ::std::sync::Arc<dyn $crate::ToolExecutor> =
+                            ::std::sync::Arc::new($exec);
+                        return ::core::option::Option::Some(executor);
+                    }
+                )+
+                ::core::option::Option::None
+            }
+
+            /// Ob nebenläufige Aufrufe dieses Tools sicher sind; unbekannte
+            /// Namen liefern `false` (fail closed).
+            #[must_use]
+            #[allow(unused_variables)]
+            pub fn tool_parallel_safe(name: &str) -> bool {
+                $crate::__harw_parallel_safe!(($($ps)?) name; $( $name ),+)
+            }
+        }
+
+        $crate::__harw_assert_unique_tool_names!($provider, <$provider>::TOOL_NAMES);
+        $crate::__harw_assert_parallel_listed!(
+            ($($ps)?) $provider, <$provider>::TOOL_NAMES
+        );
+    };
+
+    // Form 1: zustandslose Unit-Struktur.
     (
         $(#[$provider_meta:meta])*
         $vis:vis struct $provider:ident { $( $tool:ty ),+ $(,)? }
@@ -165,72 +485,44 @@ macro_rules! tool_provider_core {
             }
         }
 
-        // Compile-Zeit-Duplikatprüfung der Tool-Namen.
-        const _: () = {
-            const fn __harw_str_eq(left: &str, right: &str) -> bool {
-                let left = left.as_bytes();
-                let right = right.as_bytes();
-                if left.len() != right.len() {
-                    return false;
-                }
-                let mut index = 0;
-                while index < left.len() {
-                    if left[index] != right[index] {
-                        return false;
-                    }
-                    index += 1;
-                }
-                true
-            }
-
-            const fn __harw_names_unique(names: &[&str]) -> bool {
-                let mut outer = 0;
-                while outer < names.len() {
-                    let mut inner = outer + 1;
-                    while inner < names.len() {
-                        if __harw_str_eq(names[outer], names[inner]) {
-                            return false;
-                        }
-                        inner += 1;
-                    }
-                    outer += 1;
-                }
-                true
-            }
-
-            // Die Meldung muss ein einzelnes String-Literal bleiben: `panic!` ist
-            // im const-Kontext nur ohne Format-Argumente erlaubt. `concat!` und
-            // `stringify!` expandieren zu genau einem Literal.
-            ::core::assert!(
-                __harw_names_unique(<$provider>::TOOL_NAMES),
-                ::core::concat!(
-                    "tool_provider!(",
-                    ::core::stringify!($provider),
-                    "): zwei Tools deklarieren denselben NAME — tools() würde einen Namen \
-                     bewerben, den executor()/parallel_safe() nicht eindeutig auflösen können"
-                )
-            );
-        };
+        $crate::__harw_assert_unique_tool_names!($provider, <$provider>::TOOL_NAMES);
     };
 }
 
-/// Erzeugt eine Provider-Struktur samt `impl ToolProvider` aus einer Liste von
-/// `#[harw_macros::tool]`-Tool-Typen.
+/// Erzeugt eine Provider-Struktur (oder ergänzt einen bestehenden Typ) samt
+/// `impl ToolProvider`.
 ///
 /// # Description
 /// Ruft [`crate::tool_provider_core!`] für die gesamte Logik auf und ergänzt eine
 /// dünne `impl ::harw_extension_api::contributors::ToolProvider`, die
 /// `ToolName` auf `&str` herunterbricht und an die inhärenten Methoden
-/// delegiert.
+/// delegiert. Alle drei Formen von [`crate::tool_provider_core!`] werden
+/// unterstützt; die Syntax ist dieselbe.
 ///
 /// # Syntax
 /// ```rust,ignore
+/// // Form 1: zustandslos
 /// harw_tools::tool_provider! {
 ///     /// Stellt alle Filesystem-Tools bereit.
-///     pub struct FsToolProvider {
-///         FsReadTool,
-///         FsWriteTool,
-///         FsGlobTool,
+///     pub struct FsToolProvider { FsReadTool, FsWriteTool, FsGlobTool }
+/// }
+///
+/// // Form 2: Zustand + Konstruktor-Ausdruck je Tool
+/// harw_tools::tool_provider! {
+///     pub struct StoreToolProvider {
+///         state: Arc<Store> as store;
+///         StoreReadTool => StoreReadTool::new(Arc::clone(store)),
+///     }
+/// }
+///
+/// // Form 3: bestehender Typ, extern gebaute Spezifikationen
+/// harw_tools::tool_provider! {
+///     impl for PlanToolProvider as provider, parallel_safe: none {
+///         PLAN_WRITE_TOOL => {
+///             spec: provider.write_spec(),
+///             permission: Permission::ReadWorkspace,
+///             executor: PlanToolExecutor::new(provider.clone()),
+///         },
 ///     }
 /// }
 /// ```
@@ -243,9 +535,10 @@ macro_rules! tool_provider_core {
 /// oder kann, verwendet [`crate::tool_provider_core!`] direkt.
 ///
 /// # Grenzen
-/// Der erzeugte Provider ist eine Unit-Struktur und kann daher keine
-/// Konfiguration tragen (z. B. `max_read_bytes`). Provider mit Konfiguration
-/// bleiben handgeschrieben; das Makro adressiert den häufigen zustandslosen Fall.
+/// Form 1 ist eine Unit-Struktur ohne Konfiguration. Konfiguration trägt
+/// Form 2 (ein Zustandswert) oder Form 3 (eigene Struktur). Provider, deren
+/// Tool-Menge erst zur Laufzeit feststeht (z. B. aus Deskriptoren), passen in
+/// keine Form und bleiben handgeschrieben.
 ///
 /// # Generierte Items
 /// Alles aus [`crate::tool_provider_core!`], plus
@@ -253,6 +546,83 @@ macro_rules! tool_provider_core {
 /// `parallel_safe(&ToolName)`.
 #[macro_export]
 macro_rules! tool_provider {
+    // Form 2: Struktur mit Zustand.
+    (
+        $(#[$provider_meta:meta])*
+        $vis:vis struct $provider:ident {
+            state: $state:ty as $st:ident;
+            $( $tool:ty => $ctor:expr ),+ $(,)?
+        }
+    ) => {
+        $crate::tool_provider_core! {
+            $(#[$provider_meta])*
+            $vis struct $provider {
+                state: $state as $st;
+                $( $tool => $ctor ),+
+            }
+        }
+
+        impl ::harw_extension_api::contributors::ToolProvider for $provider {
+            fn tools(&self) -> ::std::vec::Vec<$crate::ToolSpec> {
+                <$provider>::tool_specs()
+            }
+
+            fn executor(
+                &self,
+                name: &$crate::ToolName,
+            ) -> ::core::option::Option<::std::sync::Arc<dyn $crate::ToolExecutor>> {
+                self.tool_executor(name.as_str())
+            }
+
+            fn parallel_safe(&self, name: &$crate::ToolName) -> bool {
+                <$provider>::tool_parallel_safe(name.as_str())
+            }
+        }
+    };
+
+    // Form 3: bestehender Typ.
+    (
+        impl for $provider:ty as $this:ident $( , parallel_safe: $ps:tt )? {
+            $(
+                $name:expr => {
+                    spec: $spec:expr,
+                    $( permission: $perm:expr, )?
+                    executor: $exec:expr $(,)?
+                }
+            ),+ $(,)?
+        }
+    ) => {
+        $crate::tool_provider_core! {
+            impl for $provider as $this $( , parallel_safe: $ps )? {
+                $(
+                    $name => {
+                        spec: $spec,
+                        $( permission: $perm, )?
+                        executor: $exec
+                    }
+                ),+
+            }
+        }
+
+        impl ::harw_extension_api::contributors::ToolProvider for $provider {
+            fn tools(&self) -> ::std::vec::Vec<$crate::ToolSpec> {
+                self.tool_specs()
+            }
+
+            fn executor(
+                &self,
+                name: &$crate::ToolName,
+            ) -> ::core::option::Option<::std::sync::Arc<dyn $crate::ToolExecutor>> {
+                self.tool_executor(name.as_str())
+            }
+
+            fn parallel_safe(&self, name: &$crate::ToolName) -> bool {
+                <$provider>::tool_parallel_safe(name.as_str())
+            }
+        }
+    };
+
+    // Form 1: zustandslose Unit-Struktur.
     (
         $(#[$provider_meta:meta])*
         $vis:vis struct $provider:ident { $( $tool:ty ),+ $(,)? }
@@ -536,5 +906,224 @@ mod tests {
             format!("{from_default:?}"),
             "new() and default() must produce the same stateless provider"
         );
+    }
+
+    // ── Form 2: Zustand ──────────────────────────────────────────────────────
+
+    /// Zustand, den der Provider an seine Executor weiterreicht.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Counter {
+        label: &'static str,
+    }
+
+    /// Tool mit Zustand: kein `Default`, Konstruktor nimmt den Zustand.
+    #[derive(Debug, Clone)]
+    struct StatefulTool {
+        label: &'static str,
+    }
+
+    impl StatefulTool {
+        const NAME: &'static str = "test.stateful";
+        const PARALLEL_SAFE: bool = true;
+        const PERMISSION: Option<Permission> = Some(Permission::ReadWorkspace);
+
+        fn new(state: &Counter) -> Self {
+            Self { label: state.label }
+        }
+
+        fn spec() -> ToolSpec {
+            dummy_spec(Self::NAME, "uses state")
+        }
+    }
+
+    impl ToolExecutor for StatefulTool {
+        fn execute<'a>(
+            &'a self,
+            _context: &'a ToolExecutionContext,
+            _call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            let label = self.label;
+            Box::pin(async move { Ok(ToolOutput::text(label)) })
+        }
+    }
+
+    crate::tool_provider_core! {
+        /// Test-Provider mit Zustand.
+        struct StatefulProvider {
+            state: Counter as counter;
+            StatefulTool => StatefulTool::new(counter),
+            BetaTool => BetaTool,
+        }
+    }
+
+    /// Form 2 trägt den Zustand und löst beide Tools auf.
+    #[test]
+    fn test_tool_provider_core_state_form_carries_state_and_resolves_tools() {
+        let provider = StatefulProvider::new(Counter { label: "gamma" });
+
+        assert_eq!(provider.state(), &Counter { label: "gamma" });
+        assert_eq!(
+            StatefulProvider::TOOL_NAMES,
+            &["test.stateful", "test.beta"]
+        );
+        assert!(provider.tool_executor("test.stateful").is_some());
+        assert!(provider.tool_executor("test.beta").is_some());
+        assert!(provider.tool_executor("test.missing").is_none());
+        assert!(StatefulProvider::tool_parallel_safe("test.stateful"));
+        assert!(!StatefulProvider::tool_parallel_safe("test.beta"));
+        assert!(!StatefulProvider::tool_parallel_safe("test.missing"));
+        assert_eq!(
+            StatefulProvider::TOOL_PERMISSIONS,
+            &[
+                Some(Permission::ReadWorkspace),
+                Some(Permission::WriteWorkspace)
+            ]
+        );
+        let specs = StatefulProvider::tool_specs();
+        let names: Vec<&str> = specs.iter().map(ToolSpec::name).collect();
+        assert_eq!(names, vec!["test.stateful", "test.beta"]);
+    }
+
+    // ── Form 3: bestehender Typ, externe Spezifikationen ─────────────────────
+
+    /// Handgeschriebener Provider mit Konfiguration.
+    #[derive(Debug, Clone)]
+    struct ConfiguredProvider {
+        description: &'static str,
+    }
+
+    #[derive(Debug)]
+    struct ParallelAll;
+
+    #[derive(Debug)]
+    struct ParallelDefault;
+
+    #[derive(Debug)]
+    struct ParallelNone;
+
+    const EXT_READ: &str = "ext.read";
+    const EXT_WRITE: &str = "ext.write";
+    const EXT_PLAIN: &str = "ext.plain";
+
+    crate::tool_provider_core! {
+        impl for ConfiguredProvider as provider, parallel_safe: [EXT_READ] {
+            EXT_READ => {
+                spec: dummy_spec(EXT_READ, provider.description),
+                permission: Permission::ReadWorkspace,
+                executor: AlphaTool,
+            },
+            EXT_WRITE => {
+                spec: dummy_spec(EXT_WRITE, "writes"),
+                permission: Permission::WriteWorkspace,
+                executor: BetaTool,
+            },
+            EXT_PLAIN => {
+                spec: dummy_spec(EXT_PLAIN, "no permission"),
+                executor: UnguardedTool,
+            }
+        }
+    }
+
+    crate::tool_provider_core! {
+        impl for ParallelAll as _provider, parallel_safe: all {
+            EXT_READ => { spec: dummy_spec(EXT_READ, "r"), executor: AlphaTool },
+            EXT_WRITE => { spec: dummy_spec(EXT_WRITE, "w"), executor: BetaTool }
+        }
+    }
+
+    crate::tool_provider_core! {
+        impl for ParallelDefault as _provider {
+            EXT_READ => { spec: dummy_spec(EXT_READ, "r"), executor: AlphaTool }
+        }
+    }
+
+    crate::tool_provider_core! {
+        impl for ParallelNone as _provider, parallel_safe: none {
+            EXT_READ => { spec: dummy_spec(EXT_READ, "r"), executor: AlphaTool }
+        }
+    }
+
+    /// Form 3 liest die Spezifikation aus dem Provider-Zustand und behält die
+    /// Deklarationsreihenfolge.
+    #[test]
+    fn test_tool_provider_core_impl_form_builds_specs_from_provider_state() {
+        let provider = ConfiguredProvider {
+            description: "configured",
+        };
+        let specs = provider.tool_specs();
+        let names: Vec<&str> = specs.iter().map(ToolSpec::name).collect();
+
+        assert_eq!(names, vec![EXT_READ, EXT_WRITE, EXT_PLAIN]);
+        assert_eq!(
+            ConfiguredProvider::TOOL_NAMES,
+            &[EXT_READ, EXT_WRITE, EXT_PLAIN]
+        );
+        let descriptions: Vec<&str> = specs
+            .iter()
+            .map(|ToolSpec::Function(function)| function.description.as_str())
+            .collect();
+        assert_eq!(descriptions, vec!["configured", "writes", "no permission"]);
+    }
+
+    /// `permission:` ist optional; fehlt es, steht `None` an der Stelle.
+    #[test]
+    fn test_tool_provider_core_impl_form_permissions_default_to_none() {
+        assert_eq!(
+            ConfiguredProvider::TOOL_PERMISSIONS,
+            &[
+                Some(Permission::ReadWorkspace),
+                Some(Permission::WriteWorkspace),
+                None
+            ]
+        );
+    }
+
+    /// Executor lösen bekannte Namen auf, unbekannte nicht.
+    #[test]
+    fn test_tool_provider_core_impl_form_resolves_executors() {
+        let provider = ConfiguredProvider { description: "d" };
+
+        assert!(provider.tool_executor(EXT_READ).is_some());
+        assert!(provider.tool_executor(EXT_PLAIN).is_some());
+        assert!(provider.tool_executor("ext.missing").is_none());
+    }
+
+    /// `parallel_safe: [..]` gilt nur für genannte Namen; unbekannte sind `false`.
+    #[test]
+    fn test_tool_provider_core_impl_form_parallel_list_is_exact_and_fail_closed() {
+        assert!(ConfiguredProvider::tool_parallel_safe(EXT_READ));
+        assert!(!ConfiguredProvider::tool_parallel_safe(EXT_WRITE));
+        assert!(!ConfiguredProvider::tool_parallel_safe(EXT_PLAIN));
+        assert!(!ConfiguredProvider::tool_parallel_safe("ext.missing"));
+    }
+
+    /// `all`, `none` und die fehlende Angabe.
+    #[test]
+    fn test_tool_provider_core_impl_form_parallel_all_none_and_default() {
+        assert!(ParallelAll::tool_parallel_safe(EXT_READ));
+        assert!(ParallelAll::tool_parallel_safe(EXT_WRITE));
+        assert!(
+            !ParallelAll::tool_parallel_safe("ext.missing"),
+            "`all` must not make unknown names parallel safe"
+        );
+        assert!(!ParallelNone::tool_parallel_safe(EXT_READ));
+        assert!(
+            !ParallelDefault::tool_parallel_safe(EXT_READ),
+            "omitted parallel_safe must default to none"
+        );
+    }
+
+    /// Die Hilfs-Provider bedienen dieselbe generierte API wie der Haupt-Provider.
+    #[test]
+    fn test_tool_provider_core_impl_form_small_providers_serve_generated_api() {
+        assert_eq!(ParallelAll::TOOL_PERMISSIONS, &[None, None]);
+        assert_eq!(ParallelDefault::TOOL_PERMISSIONS, &[None]);
+        assert_eq!(ParallelNone::TOOL_PERMISSIONS, &[None]);
+        assert_eq!(ParallelAll.tool_specs().len(), 2);
+        assert_eq!(ParallelDefault.tool_specs().len(), 1);
+        assert_eq!(ParallelNone.tool_specs().len(), 1);
+        assert!(ParallelAll.tool_executor(EXT_WRITE).is_some());
+        assert!(ParallelDefault.tool_executor(EXT_READ).is_some());
+        assert!(ParallelNone.tool_executor(EXT_WRITE).is_none());
     }
 }

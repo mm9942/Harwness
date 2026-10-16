@@ -31,10 +31,17 @@
 //! Zeitablauf (Ablehnung).
 //!
 //! # Grenzen
-//! - Nur die TUI-Wurzel und nur Orchestrator-Ziele (Erkennung über die
-//!   Rollendefinition, [`OrchestratorRoles`]); `background: false` erzwingt
-//!   synchrones Warten. Worker bleiben synchron. Jeder andere Einstieg hat
-//!   keinen Launcher und bleibt synchron.
+//! - Delegation is background-only (product rule): EVERY handoff of the TUI
+//!   root (orchestrators and workers alike) is detached; there is no
+//!   `background`/`wait` parameter and no synchronous path. If the start is
+//!   not possible (no runtime, detach failure, no launcher), the tool call
+//!   fails immediately with a detailed error result; it never blocks the turn.
+//!   Completion arrives as a notice plus auto-turn; intermediate milestones
+//!   arrive through `parent.message` (`agent_messages`).
+//!   Scope: this covers the turn-loop `transfer_to_*` handoff only.
+//!   `AgentToolAdapter::invoke`, fan-out and `delegate_wave` in
+//!   `harw-core-bridge` still join the child inline (TODO(PL-90
+//!   background-only)); see `docs/guides/background-agents.md`.
 //! - Wie viele Orchestratoren gleichzeitig laufen, begrenzt der Spawner
 //!   (`[agents] max_root_orchestrators`), nicht diese Datei.
 //! - `/new`, `/resume` und Beenden brechen laufende Hintergrund-Kinder ab
@@ -68,7 +75,6 @@ use super::{
 };
 use crate::agent_tree::AgentRow;
 use crate::approval::ChildTurnDriver;
-use crate::child_stream::OrchestratorRoles;
 use crate::choice_dialog::ChoiceAction;
 use crate::host_permit_dialog::HostPermitPromptReceiver;
 use crate::tui_event::TuiEvent;
@@ -138,10 +144,10 @@ pub(crate) const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(10);
 /// abholen, Fortschritt zeichnen).
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Hinweis an das Modell im sofortigen Werkzeugergebnis.
-const RUNNING_HINT: &str = "Der Agent läuft im Hintergrund weiter. Sag der Nutzerin kurz, \
-     dass er gestartet ist, und beende deinen Turn — sein Ergebnis kommt automatisch als \
-     Benachrichtigung. Fortschritt: agent.status {child_id}; Abbruch: agent.cancel {child_id}.";
+/// Hint to the model in the immediate (one-time) start result.
+const RUNNING_HINT: &str = "Started in the background. The result and intermediate states are \
+     delivered to you automatically; do not wait or poll. Briefly tell the user the agent \
+     started and end your turn. Cancel only on explicit request with agent.cancel {child_id}.";
 
 /// Runde 7, Teil A7: Zusatz im sofortigen Werkzeugergebnis, wenn der
 /// startende Turn während des Starts abgebrochen wurde (neue Nachricht,
@@ -185,7 +191,6 @@ pub(crate) struct BackgroundLauncher {
     spawner: Arc<ManagedAgentSpawner>,
     store: Arc<dyn StateStore>,
     hub: Option<AgentEventHub>,
-    roles: OrchestratorRoles,
 }
 
 impl std::fmt::Debug for BackgroundLauncher {
@@ -205,70 +210,49 @@ impl BackgroundLauncher {
     /// - `spawner`: derselbe Spawner, der die Kinder admittiert.
     /// - `store`: derselbe Store wie der synchrone Kind-Treiber.
     /// - `hub`: Agenten-Ereignisbus für den Fortschritt (`None` = ohne).
-    /// - `roles`: Orchestrator-Erkennung über die Rollendefinitionen.
     pub(crate) fn new(
         root: SessionId,
         spawner: Arc<ManagedAgentSpawner>,
         store: Arc<dyn StateStore>,
         hub: Option<AgentEventHub>,
-        roles: OrchestratorRoles,
     ) -> Self {
         Self {
             root,
             spawner,
             store,
             hub,
-            roles,
         }
     }
 
-    /// Entscheidet, ob ein Handoff im Hintergrund läuft.
-    ///
-    /// # Argumente
-    /// - `session_is_root`: ob der Aufrufer die UIA-Wurzel ist.
-    /// - `role`: Zielrolle.
-    /// - `requested`: das optionale `background`-Argument des Aufrufs.
+    /// Starts an already admitted child in the background.
     ///
     /// # Returns
-    /// `true` nur für Orchestrator-Ziele der Wurzel ohne `background: false`.
-    /// Worker bleiben immer synchron (auch mit `background: true`).
-    pub(crate) fn wants_background(
-        &self,
-        session_is_root: bool,
-        role: &str,
-        requested: Option<bool>,
-    ) -> bool {
-        session_is_root && self.roles.is_orchestrator(role) && requested != Some(false)
-    }
-
-    /// Versucht, ein soeben admittiertes Kind im Hintergrund zu starten.
-    ///
-    /// # Returns
-    /// `Some(ergebnis)` mit `{child_id, status: "running", hint}`, wenn das
-    /// Kind abgekoppelt wurde und läuft; `None`, wenn es synchron bleiben
-    /// soll (Worker, `background: false`, kein Laufzeitkontext, Abkoppeln
-    /// gescheitert) — dann treibt der Aufrufer es wie bisher.
+    /// Always a result, never a blocking fallback: a success result
+    /// `{child_id, role, status: "running", hint}` when the child was
+    /// detached and runs, otherwise a detailed ERROR result (no runtime,
+    /// detach failure). The caller returns it to the model as the one-time
+    /// outcome of the start; the final result arrives as a notice.
     pub(crate) fn try_launch(
         &self,
         session: &AgentSession,
         child: &SessionId,
         call_id: &ToolCallId,
         role: &str,
-    ) -> Option<ToolCallResult> {
+    ) -> ToolCallResult {
         let arguments = handoff_arguments(session, call_id);
-        let requested = arguments
-            .as_ref()
-            .and_then(|args| args.get("background"))
-            .and_then(serde_json::Value::as_bool);
-        if !self.wants_background(session.id() == &self.root, role, requested) {
-            if requested == Some(true) {
-                tracing::info!(role, "tui.background.worker_stays_synchronous");
-            }
-            return None;
-        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(role, "tui.background.no_runtime");
-            return None;
+            let message = format!(
+                "Delegation is background-only, but no async runtime is available to run \
+                 '{role}' in the background; the agent was not started."
+            );
+            // Release the admission; the child never ran.
+            let _ = self.spawner.finish_background_child(
+                child,
+                BackgroundStatus::Failed,
+                message.clone(),
+            );
+            return ToolCallResult::error(message);
         };
         let task = arguments.as_ref().and_then(|args| {
             ["task", "instructions", "objective", "question"]
@@ -286,7 +270,12 @@ impl BackgroundLauncher {
             .is_some_and(|token| token.is_cancelled());
         if let Err(error) = self.spawner.detach_for_background(child, task.as_deref()) {
             tracing::warn!(child = %child, error = %error.message, "tui.background.detach_failed");
-            return None;
+            return ToolCallResult::error(format!(
+                "Delegation is background-only, but '{role}' could not be started in the \
+                 background: {}. There is no foreground fallback; the agent was not started \
+                 by this call.",
+                error.message
+            ));
         }
         // Fortschritt wie im synchronen Fall an den Live-Kanal der Wurzel;
         // derselbe Kanal meldet am echten Ende `ChildCompleted` (der Kern
@@ -306,11 +295,7 @@ impl BackgroundLauncher {
             spawner, store, events, child_id, completion,
         ));
         tracing::info!(child = %child, role, start_interrupted, "tui.background.started");
-        Some(ToolCallResult::success(launch_result(
-            child,
-            role,
-            start_interrupted,
-        )))
+        ToolCallResult::success(launch_result(child, role, start_interrupted))
     }
 }
 
@@ -453,7 +438,6 @@ pub(crate) fn attach_launcher(
         spawner,
         Arc::clone(assembly.state_store()),
         Some(assembly.agent_events().clone()),
-        OrchestratorRoles::from_definitions(assembly.config_agents().executable_agents.values()),
     );
     driver.with_background(Arc::new(launcher))
 }

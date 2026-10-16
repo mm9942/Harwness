@@ -1,0 +1,28 @@
+[package]
+name = "harw-dod-container"
+description = "Container sensor: reads the hardening facts (effective capabilities, seccomp, no_new_privs) of expected container scopes from cgroup v2 and procfs; unknown scopes are only reported as unowned"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Capability, ReadScope, SensorHandle, SensorError.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# HostSample, SensorReading and the one `Sensor` trait.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# The one filesystem seam; no direct `std::fs`.
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# ContainerId: the expected-instances set uses the validated id type.
+harw-container-model = { path = "../../../harw-container-model" }
+harw-types = { path = "../../../harw-types" }
+jiff = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

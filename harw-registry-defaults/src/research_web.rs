@@ -5,18 +5,30 @@
 //! (ledger W3/C-CFG), `EgressPolicy` (ledger W3/C-EGRESS).
 //!
 //! # Verantwortlichkeit
-//! Dieses Modul übersetzt die Konfiguration in die Egress-Autorität der
-//! einzigen eingebauten Rolle mit Netz:
+//! Dieses Modul übersetzt die Konfiguration in die Egress-Autorität der Rolle
+//! `researcher-web`. Weitere Rollen führen ebenfalls `web.*`-Werkzeuge (siehe
+//! `crate::profile`); ihr Netz bleibt durch den Sandbox-Scope des Elternteils
+//! begrenzt.
 //! - [`researcher_web_policy`] baut die `harw_egress::EgressPolicy`, die die
-//!   Web-Werkzeuge der Rolle bekommen (`Arc`, geteilt über alle drei Tools).
+//!   Web-Werkzeuge der Rolle bekommen (`Arc`, geteilt über alle vier Tools).
 //! - [`researcher_web_network_scope`] leitet daraus den `NetworkScope` der
 //!   Kind-Sandbox ab — aus der **kanonisierten** Allowlist der Policy, damit
 //!   Sandbox und Client dieselbe Hostmenge sehen.
 //!
-//! Die Registrierung der Web-Werkzeuge **mit** dieser Policy liegt nicht hier:
-//! `harw_tool_web::WebToolProvider` hat (Stand W5 RD) noch keinen Konstruktor,
-//! der eine Policy annimmt (N-WEB parallel). Das Durchreichen ist
-//! Folgearbeit W6 I-CONTRIB.
+//! Die Prozess-Policy der Web-Werkzeuge baut [`install_web_tools`]: sie
+//! installiert das Such-Backend (`[web.search]`) und die Einstellungen des
+//! offenen Recherche-Netzes und übergibt die Policy über
+//! `harw_tool_web::configure`. Diese Policy ist die **Obermenge** aller
+//! erlaubten Ziele; welche davon ein einzelner Agent erreicht, bestimmt sein
+//! Sandbox-`NetworkScope`.
+//!
+//! **Stand heute:** [`researcher_web_policy`] und [`researcher_web_network_scope`]
+//! beschreiben die vorgesehene rollenspezifische Beschränkung (nur
+//! `researcher_web_hosts`, `allow_private` immer `false`), werden von der
+//! Laufzeit aber nicht aufgerufen; sie sind nur re-exportiert und in diesem
+//! Modul getestet. Wirksam sind die Prozess-Policy aus [`install_web_tools`]
+//! und der Wurzel-Scope aus `harw_runtime::sandbox::root_network_scope`, in die
+//! `researcher_web_hosts` wie `allow_hosts` eingeht.
 //!
 //! # Regeln
 //! - Quelle ist **nur** `researcher_web_hosts`; `allow_hosts` (die allgemeine

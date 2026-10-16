@@ -1,0 +1,4 @@
+name = "sys-tools"
+description = "Use the sys.* tools (ps, pgrep, top, free, uptime, uname, env, id, ss, lsof, date, which) to inspect processes and the system without shell commands."
+instructions_file = "instructions.md"
+tools = ["sys.ps", "sys.pgrep", "sys.top", "sys.free", "sys.uptime", "sys.uname", "sys.env", "sys.id", "sys.ss", "sys.lsof", "sys.date", "sys.which"]

@@ -348,6 +348,9 @@ fn flatten(parts: &[harw_protocol::items::ContentPart]) -> String {
         match part {
             ContentPart::Text { text } => buf.push_str(text),
             ContentPart::ImageUrl { .. } => buf.push_str("[image]"),
+            ContentPart::Media { media, .. } => {
+                buf.push_str(&format!("[{}]", media.describe()));
+            }
         }
     }
     buf

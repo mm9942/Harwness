@@ -1,0 +1,132 @@
+{
+  "has_executor": {
+    "memory.recall": true,
+    "memory.record": true
+  },
+  "parallel_safe": {
+    "memory.recall": true,
+    "memory.record": false
+  },
+  "permissions": [
+    "Some(ReadWorkspace)",
+    "Some(WriteWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Ruft gespeicherte Fakten (Präferenzen, Entscheidungen, Fallen, Verweise) per Stichwortsuche aus dem Projekt- und/oder dem globalen Gedächtnis ab. Liefert je Treffer Scope, Name, Beschreibung, Typ und Inhalt (auf 1500 Zeichen gekürzt). Höchstens 20 Treffer. Nur lesend.",
+      "name": "memory.recall",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Höchstzahl Treffer (1–20, Vorgabe 5)."
+          },
+          "query": {
+            "description": "Stichwörter für die Suche.",
+            "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "enum": [
+                  "project",
+                  "global",
+                  "all"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Wo gesucht wird: project, global oder all (Vorgabe all, Projekt zuerst)."
+          }
+        },
+        "required": [
+          "limit",
+          "query",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Hält einen Fakt im Gedächtnis fest (Projekt oder global); derselbe Text aktualisiert den vorhandenen Fakt. Text höchstens 4000 Zeichen; Geheimnisse werden vor dem Speichern geschwärzt. Schreibend, erfordert Freigabe.",
+      "name": "memory.record",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "anyOf": [
+              {
+                "enum": [
+                  "project",
+                  "global"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "project (Vorgabe, bleibt im Repo) oder global (projektübergreifend, braucht Freigabe)."
+          },
+          "text": {
+            "description": "Der festzuhaltende Fakt als Freitext. Keine Geheimnisse; sie werden geschwärzt.",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Kurztitel; bestimmt Namen und Beschreibung. Ohne Angabe aus dem Text abgeleitet."
+          },
+          "type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "fact",
+                  "decision",
+                  "preference",
+                  "pitfall",
+                  "reference"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Art des Fakts (Vorgabe fact)."
+          }
+        },
+        "required": [
+          "scope",
+          "text",
+          "title",
+          "type"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

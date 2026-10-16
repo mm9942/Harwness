@@ -341,6 +341,16 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // setzen frei, ein nicht vertrautes Projekt darf nur verschärfen
     // (`merge_tools_doc`, Ordnung `off` < `ask` < `on`).
     FieldScope { path: "tools.doc.remote_ocr", scope: Scope::Profile, merge: MergeRule::StricterOf, ordering: Some(TOOLS_DOC_REMOTE_OCR_ORDER), intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.enabled", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.engine", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.connection", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "tools.container.images", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.enabled", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.listen", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.allow_non_loopback", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.node_id", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.tier", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.approval_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -445,6 +455,75 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "agent_compiler.cache_max_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "agent_compiler.keep_versions", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "agent_compiler.auto_build_uia", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // [memory] (10) — Projektgedächtnis. Keine Rechtewirkung, aber ein nicht
+    // vertrautes Projekt darf Kontextbudget, Fakt-Obergrenzen und Fristen nicht
+    // setzen (`merge_memory`); Home und Profil ersetzen.
+    FieldScope { path: "memory.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.global_enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.token_budget", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.max_facts", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.max_body_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.max_unused_days", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.consolidate_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.forget_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.promote_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.sweep_deadline_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.context_ledger", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.security_signals", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "memory.llm_extraction", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // [retention.<klasse>] (10 Klassen x 5 = 50) — Aufbewahrungsgrenzen. enabled/keep_newest:
+    // ein nicht vertrautes Projekt darf sie nicht setzen; max_*: Home/Profil setzen frei,
+    // das Projekt darf nur senken (merge_retention). Pfade folgen harw_retention::CLASSES.
+    FieldScope { path: "retention.tui_log.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.tui_log.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.tui_log.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.tui_log.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.tui_log.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.telemetry_rotated.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.telemetry_rotated.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.telemetry_rotated.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.telemetry_rotated.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.telemetry_rotated.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.job_logs.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.job_logs.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.job_logs.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.job_logs.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.job_logs.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.bug_reports.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.bug_reports.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.bug_reports.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.bug_reports.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.bug_reports.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.scan_reports.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.scan_reports.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.scan_reports.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.scan_reports.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.scan_reports.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_spool.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_spool.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_spool.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_spool.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_spool.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.sentinel_export.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.sentinel_export.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.sentinel_export.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.sentinel_export.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.sentinel_export.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.freeze_resolved.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.freeze_resolved.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.freeze_resolved.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.freeze_resolved.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.freeze_resolved.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_transcripts.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_transcripts.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_transcripts.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_transcripts.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_transcripts.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_corrupt_backups.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_corrupt_backups.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_corrupt_backups.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_corrupt_backups.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.session_corrupt_backups.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
 ];
 
 #[cfg(test)]
@@ -466,7 +545,12 @@ mod merge_rule_tests {
         // #22 Welle 2B: +3 für `agent_compiler.*`.
         // R14: +1 für `internal_models.work_driver_judge`.
         // [jobs]: +1 für `jobs.max_running`.
-        assert_eq!(FIELD_TABLE.len(), 120);
+        // [memory]: +11 für `memory.*`.
+        // [retention]: +50 für `retention.<klasse>.*` (10 Klassen x 5 Schlüssel).
+        // [memory]: +2 für `memory.security_signals`, `memory.llm_extraction`.
+        // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
+        // [session_listener]: +6, alle GlobalOnly.
+        assert_eq!(FIELD_TABLE.len(), 193);
     }
 
     #[test]
@@ -485,13 +569,15 @@ mod merge_rule_tests {
         // (`uia_worker_models.*`), Teil I +1 (`tui.child_stream`).
         // #22 Welle 2B: +3 (`agent_compiler.*`).
         // R14: +1 (`internal_models.work_driver_judge`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 61);
-        assert_eq!(count(MergeRule::GlobalOnly), 11);
+        // [memory]: +11 (`memory.*`).
+        // [retention]: +20 ProfileReplaces, +30 MinBound.
+        assert_eq!(count(MergeRule::ProfileReplaces), 94);
+        assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
         // (`permissions.auto_classifier_timeout_secs`).
         // [jobs]: +1 (`jobs.max_running`).
-        assert_eq!(count(MergeRule::MinBound), 22);
+        assert_eq!(count(MergeRule::MinBound), 52);
         assert_eq!(count(MergeRule::CompositeMember), 11);
         assert_eq!(count(MergeRule::Intersection), 4);
         assert_eq!(count(MergeRule::OrBool), 3);

@@ -21,5 +21,8 @@ harw-code-graph = { path = "../harw-code-graph" }
 # wird.
 toml = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

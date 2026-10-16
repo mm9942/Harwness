@@ -29,6 +29,7 @@ pub mod handshake;
 pub mod identity;
 pub mod server;
 pub mod tls;
+pub mod upgrade;
 pub mod uplink;
 mod wire;
 
@@ -52,6 +53,9 @@ pub use identity::{
 };
 pub use server::{NodeTransportServer, ServerOptions, ServerTlsStream};
 pub use tls::TLS_EXPORTER_LABEL;
+pub use upgrade::{
+    UpgradeError, UpgradedClientIo, UpgradedIo, UpgradedServerIo, accept_upgrade, peer_of,
+};
 pub use uplink::{
     DodUplink, FindingSeverity, HealthStatus, UPLINK_CONTENT_TYPE, UPLINK_PATH, UplinkBody,
     UplinkEvent, UplinkLimits, UplinkSender, UplinkStats, encode_line, receive_uplink,

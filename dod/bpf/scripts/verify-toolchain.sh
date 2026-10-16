@@ -20,7 +20,9 @@ require_exact() {
         exit 2
     fi
     if [ "$actual" != "$expected" ]; then
-        echo "DoD BPF ${name} version differs from committed lock" >&2
+        printf 'DoD BPF %s version differs from lock %s\n' "$name" "$lock" >&2
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual" >&2
+        printf '%s\n' 'Use the locked toolchain, or revalidate all BPF objects before updating the lock.' >&2
         exit 2
     fi
 }

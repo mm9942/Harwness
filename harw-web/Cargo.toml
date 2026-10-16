@@ -57,6 +57,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = { workspace = true }
 # `tests/identity_routes.rs` führt eine echte `Execute`-Route aus und braucht
 # dafür einen echten `OpContext` — also eine `SandboxSpec` über einer realen

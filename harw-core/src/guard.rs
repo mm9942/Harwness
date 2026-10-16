@@ -148,13 +148,158 @@ pub trait PitfallAdvisor: Send + Sync {
     /// # Returns
     /// `Some(hinweis)`, falls ein Fakt zutrifft (Hinweistext ≤ 300 Bytes lt.
     /// Vertrag der Implementierung); sonst `None`.
+    /// Legacy session-less advise (PL-90 H1, deprecated for stateful
+    /// advisors): called with no session binding, so a shared advisor cannot
+    /// isolate per-session resolution state. Runtime callers must use
+    /// [`PitfallAdvisor::advise_in_session`] instead; stateless
+    /// implementations should keep delegating to this method from
+    /// `advise_in_session`.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String>;
 
-    /// Runde 9, E3: meldet einen **erfolgreichen** Aufruf. Ein Berater
-    /// verwirft daraufhin die Pitfalls, die auf genau diesen Aufruf passten —
-    /// ein gelöster Fehler hängt danach nicht mehr an späteren Ergebnissen.
-    /// Der Default tut nichts.
+    /// Sessiongebundene Variante. Ein gemeinsam montierter Advisor darf
+    /// den privaten Laufzustand einer anderen Session nicht beeinflussen.
+    /// Bestehende zustandslose Implementierungen bleiben kompatibel.
+    #[must_use]
+    fn advise_in_session(
+        &self,
+        _session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        self.advise(tool_name, arguments)
+    }
+
+    /// Legacy-Aufruf ohne Sessionbindung; neue Runtime-Aufrufer verwenden
+    /// resolved_in_session und dürfen diesen Aufruf nicht direkt benutzen.
+    /// Legacy session-less resolution (PL-90 H1, deprecated for stateful
+    /// advisors): with no session binding, a shared advisor writes into a
+    /// global bucket, so one session's success can silence hints in another.
+    /// Runtime callers must use [`PitfallAdvisor::resolved_in_session`] and
+    /// must not call this directly.
     fn resolved(&self, _tool_name: &str, _arguments: &serde_json::Value) {}
+
+    /// Der Erfolg darf nur einen Hinweis in derselben Session auflösen.
+    /// Ein bestätigter, dauerhaft gültiger Fix gehört stattdessen durch
+    /// die separate Learning-/Verification-Gate in den Knowledge-Store.
+    ///
+    /// Der Default tut bewusst **nichts** (fail-safe): ein Advisor, der
+    /// diese Methode nicht überschreibt, kann Auflösungen nicht pro Session
+    /// führen, und eine Weiterleitung an das ungebundene [`Self::resolved`]
+    /// würde den Erfolg einer Session für alle anderen wirksam machen. Ein
+    /// verbleibender Hinweis ist nur ein Hinweis; ein zu Unrecht
+    /// unterdrückter ist ein Vertrauensbruch zwischen Sessions.
+    fn resolved_in_session(
+        &self,
+        _session_id: &harw_types::SessionId,
+        _tool_name: &str,
+        _arguments: &serde_json::Value,
+    ) {
+    }
+}
+
+/// Standard-Obergrenze für gleichzeitig geführte Sessions in
+/// [`SessionResolvedSet`].
+pub const SESSION_RESOLVED_MAX_SESSIONS: usize = 256;
+/// Standard-Obergrenze für aufgelöste Hinweise je Session in
+/// [`SessionResolvedSet`].
+pub const SESSION_RESOLVED_MAX_ENTRIES: usize = 64;
+
+/// Je Session getrennte, begrenzte Menge „aufgelöster“ Hinweisnamen.
+///
+/// # Beschreibung
+/// Bausteine für [`PitfallAdvisor`]-Implementierungen, die in einer
+/// gemeinsam montierten Instanz Laufzustand pro Session führen müssen.
+/// Eine Auflösung in Session A ist für Session B unsichtbar. Beide
+/// Dimensionen sind begrenzt: über [`Self::with_limits`] hinaus verdrängt die
+/// jeweils älteste Session bzw. der älteste Eintrag. Verdrängung macht einen
+/// Hinweis wieder sichtbar (fail-open für Hinweise, nie für Sessions).
+///
+/// # Concurrency
+/// `Send + Sync`; ein interner `Mutex`, nie über `.await` gehalten.
+#[derive(Debug)]
+pub struct SessionResolvedSet {
+    max_sessions: usize,
+    max_entries: usize,
+    inner: std::sync::Mutex<SessionResolvedInner>,
+}
+
+#[derive(Debug, Default)]
+struct SessionResolvedInner {
+    /// Einfüge-Reihenfolge der Sessions (älteste vorn).
+    order: std::collections::VecDeque<harw_types::SessionId>,
+    names: HashMap<harw_types::SessionId, std::collections::VecDeque<String>>,
+}
+
+impl Default for SessionResolvedSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionResolvedSet {
+    /// Leere Menge mit den Standard-Obergrenzen.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_limits(SESSION_RESOLVED_MAX_SESSIONS, SESSION_RESOLVED_MAX_ENTRIES)
+    }
+
+    /// Leere Menge; beide Grenzen werden auf mindestens 1 angehoben.
+    #[must_use]
+    pub fn with_limits(max_sessions: usize, max_entries: usize) -> Self {
+        Self {
+            max_sessions: max_sessions.max(1),
+            max_entries: max_entries.max(1),
+            inner: std::sync::Mutex::new(SessionResolvedInner::default()),
+        }
+    }
+
+    /// `true`, wenn `name` in genau dieser Session aufgelöst wurde.
+    #[must_use]
+    pub fn contains(&self, session_id: &harw_types::SessionId, name: &str) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .names
+            .get(session_id)
+            .is_some_and(|names| names.iter().any(|existing| existing == name))
+    }
+
+    /// Merkt `name` für `session_id` vor; verdrängt bei Bedarf das Älteste.
+    pub fn insert(&self, session_id: &harw_types::SessionId, name: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inner.names.contains_key(session_id) {
+            while inner.names.len() >= self.max_sessions {
+                let Some(oldest) = inner.order.pop_front() else {
+                    break;
+                };
+                inner.names.remove(&oldest);
+            }
+            inner.order.push_back(session_id.clone());
+        }
+        let names = inner.names.entry(session_id.clone()).or_default();
+        if names.iter().any(|existing| existing == name) {
+            return;
+        }
+        while names.len() >= self.max_entries {
+            names.pop_front();
+        }
+        names.push_back(name.to_owned());
+    }
+
+    /// Vergisst eine Session (z. B. nach ihrem Ende).
+    pub fn forget(&self, session_id: &harw_types::SessionId) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.names.remove(session_id);
+        inner.order.retain(|id| id != session_id);
+    }
 }
 
 /// Wird nach jeder Modellrunde und jedem Tool-Ergebnis benachrichtigt, damit
@@ -1174,5 +1319,78 @@ mod tests {
     fn new_drift_kinds_have_stable_keys() {
         assert_eq!(DriftKind::ReadBudget.key(), "read_budget");
         assert_eq!(DriftKind::StatusPolling.key(), "status_polling");
+    }
+
+    /// Advisor, der nur `SessionResolvedSet` nutzt (Muster des Runtime-Advisors).
+    struct SetAdvisor(SessionResolvedSet);
+
+    impl PitfallAdvisor for SetAdvisor {
+        fn advise(&self, _tool: &str, _args: &serde_json::Value) -> Option<String> {
+            Some("hint".to_owned())
+        }
+        fn advise_in_session(
+            &self,
+            session_id: &harw_types::SessionId,
+            _tool: &str,
+            _args: &serde_json::Value,
+        ) -> Option<String> {
+            (!self.0.contains(session_id, "p")).then(|| "hint".to_owned())
+        }
+        fn resolved_in_session(
+            &self,
+            session_id: &harw_types::SessionId,
+            _tool: &str,
+            _args: &serde_json::Value,
+        ) {
+            self.0.insert(session_id, "p");
+        }
+    }
+
+    #[test]
+    fn test_resolution_in_session_a_does_not_hide_the_hint_in_session_b() {
+        let advisor = SetAdvisor(SessionResolvedSet::new());
+        let (a, b) = (sid(), sid());
+        let args = serde_json::json!({});
+        assert!(advisor.advise_in_session(&a, "t", &args).is_some());
+        advisor.resolved_in_session(&a, "t", &args);
+        assert!(advisor.advise_in_session(&a, "t", &args).is_none());
+        assert!(
+            advisor.advise_in_session(&b, "t", &args).is_some(),
+            "session B must still see the pitfall"
+        );
+    }
+
+    #[test]
+    fn test_default_resolved_in_session_is_a_noop_and_never_goes_global() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Legacy(AtomicUsize);
+        impl PitfallAdvisor for Legacy {
+            fn advise(&self, _t: &str, _a: &serde_json::Value) -> Option<String> {
+                None
+            }
+            fn resolved(&self, _t: &str, _a: &serde_json::Value) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let legacy = Legacy(AtomicUsize::new(0));
+        legacy.resolved_in_session(&sid(), "t", &serde_json::json!({}));
+        assert_eq!(legacy.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_session_resolved_set_is_bounded_and_evicts_oldest() {
+        let set = SessionResolvedSet::with_limits(2, 2);
+        let (a, b, c) = (sid(), sid(), sid());
+        set.insert(&a, "x");
+        set.insert(&b, "x");
+        set.insert(&c, "x");
+        assert!(!set.contains(&a, "x"), "oldest session evicted");
+        assert!(set.contains(&b, "x") && set.contains(&c, "x"));
+        set.insert(&c, "y");
+        set.insert(&c, "z");
+        assert!(!set.contains(&c, "x"), "oldest entry evicted");
+        assert!(set.contains(&c, "y") && set.contains(&c, "z"));
+        set.forget(&c);
+        assert!(!set.contains(&c, "z"));
     }
 }

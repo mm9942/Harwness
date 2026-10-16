@@ -37,13 +37,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
 use harw_knowledge::diary::{self, DiaryTrigger};
 use harw_knowledge::{AgentId, KnowledgeStore};
+use harw_tools::args::parse_args_or_default;
+use harw_tools::schema_helpers::string_property;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
 use serde::Deserialize;
 
@@ -71,12 +72,6 @@ pub struct DiaryToolProvider {
 }
 
 impl DiaryToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[DIARY_READ];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[Some(Permission::ReadWorkspace)];
-
     /// Baut den Provider.
     ///
     /// # Argumente
@@ -91,26 +86,18 @@ impl DiaryToolProvider {
     }
 }
 
-impl ToolProvider for DiaryToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![read_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == DIARY_READ).then(|| {
-            Arc::new(DiaryReadExecutor {
-                store: Arc::clone(&self.store),
-                agent: self.agent.clone(),
-            }) as Arc<dyn ToolExecutor>
-        })
-    }
-}
-
-fn string_property(description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::String),
-        description: Some(description.to_owned()),
-        ..Default::default()
+// `diary.read` liest nur das eigene Tagebuch (`ReadWorkspace`); der Provider
+// deklariert keine Parallelitäts-Zusage (Standard `none`).
+harw_tools::tool_provider! {
+    impl for DiaryToolProvider as provider {
+        DIARY_READ => {
+            spec: read_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: DiaryReadExecutor {
+                store: Arc::clone(&provider.store),
+                agent: provider.agent.clone(),
+            },
+        },
     }
 }
 
@@ -212,13 +199,9 @@ fn execute_read(
     if agent.as_str() == OPERATOR_ID || diary::validate_agent_id(agent).is_err() {
         return fail("kein Agenten-Tagebuch für diese Sitzung".to_owned());
     }
-    let args: ReadArgs = if arguments.is_null() {
-        ReadArgs::default()
-    } else {
-        match serde_json::from_value(arguments) {
-            Ok(args) => args,
-            Err(error) => return fail(format!("ungültige Argumente: {error}")),
-        }
+    let args: ReadArgs = match parse_args_or_default(DIARY_READ, &arguments) {
+        Ok(args) => args,
+        Err(out) => return out,
     };
     let today = now.strftime("%Y-%m-%d").to_string();
     let to = args.to.unwrap_or_else(|| today.clone());
@@ -312,6 +295,7 @@ fn parse_day(raw: &str) -> Option<jiff::civil::Date> {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
 
     fn temporary_store(label: &str) -> TestResult<Arc<KnowledgeStore>> {
         let nonce = std::time::SystemTime::now()

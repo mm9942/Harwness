@@ -1,0 +1,21 @@
+[package]
+publish.workspace = true
+name = "harw-session-client"
+description = "Shared client-side logic of the session control plane: replay and freshness of stream positions, idempotency keys, submit and respond interpretation, approval description and the tally of a turn. Pure and synchronous (no runtime, no I/O); the layer between the protocol and every client (SDK, mobile, TUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+jiff = { workspace = true }
+
+[lints]
+workspace = true

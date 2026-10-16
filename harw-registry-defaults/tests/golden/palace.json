@@ -1,0 +1,68 @@
+{
+  "has_executor": {
+    "palace.recall": true,
+    "palace.search": true
+  },
+  "parallel_safe": {
+    "palace.recall": true,
+    "palace.search": true
+  },
+  "permissions": [
+    "Some(ReadWorkspace)",
+    "Some(ReadWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Durchsucht den Palace — das geprüfte, geteilte Langzeitwissen (nur Knoten mit Status established). Liefert Id, Titel, Score und einen kurzen Ausschnitt je Treffer; den Inhalt holt palace.recall. Nur lesend.",
+      "name": "palace.search",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Höchstzahl Treffer (1–20, Vorgabe 5).",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Stichwörter für die Suche.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Ruft Wissen aus dem Palace ab (nur established): die passenden Knoten mit Inhalt (gekürzt), ausgehenden Links und über Backlinks verbundene Knoten bis zur Hop-Grenze. Nur lesend; Ausgabe gedeckelt.",
+      "name": "palace.recall",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Höchstzahl Knoten insgesamt (1–10, Vorgabe 5).",
+            "type": "integer"
+          },
+          "max_hops": {
+            "description": "Wie viele Backlink-Hops vom Treffer aus mitgenommen werden (0–2, Vorgabe 1).",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Stichwörter für den Recall.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

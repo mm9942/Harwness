@@ -65,7 +65,9 @@
 //! des Kindes kommen über den Agenten-Bus. Treffen Kind-Ereignisse vor der
 //! Agent-Zeile ein, werden sie begrenzt vorgehalten
 //! ([`PENDING_MAX_AGENTS`] × [`PENDING_MAX_EVENTS`]) und beim Anlegen des
-//! Blocks nachgespielt.
+//! Blocks nachgespielt. Frühe Assistant-/Reasoning-Deltas werden dabei je
+//! Stream zusammengeführt, damit ein async gestarteter Agent sein sichtbares
+//! `∴`-Reasoning nicht in der Spawn/Attach-Race verliert.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -842,7 +844,7 @@ fn visible_text(content: &[ContentPart]) -> String {
     for part in content {
         match part {
             ContentPart::Text { text } => visible.push_str(text),
-            ContentPart::ImageUrl { .. } => visible.push_str("[Bild]"),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => visible.push_str("[Bild]"),
         }
     }
     visible
@@ -857,17 +859,52 @@ pub(crate) fn redact_result(result: &ToolCallResult) -> ToolCallResult {
     }
 }
 
-/// Ereignisse, die sich lohnen, bis zum Anlegen des Blocks vorzuhalten
-/// (keine Deltas und reinen Zähler-Ereignisse).
+/// Ereignisse, die sich lohnen, bis zum Anlegen des Blocks vorzuhalten.
+///
+/// Assistant-/Reasoning-Deltas sind ausdrücklich enthalten: seit Agenten
+/// async als Jobs starten können, darf deren erster Stream vor der
+/// `ChildSpawned`-Verarbeitung der TUI eintreffen. Reine Zähler-/Kontext-
+/// Ereignisse bleiben draußen.
 fn is_bufferable(event: &TurnEvent) -> bool {
     !matches!(
         event,
-        TurnEvent::AssistantDelta { .. }
-            | TurnEvent::ReasoningDelta { .. }
-            | TurnEvent::UsageUpdated { .. }
+        TurnEvent::UsageUpdated { .. }
             | TurnEvent::ContextUpdated { .. }
             | TurnEvent::CompactionApplied { .. }
     )
+}
+
+/// Hängt ein Pending-Ereignis begrenzt an. Benachbarte Text-/Reasoning-Deltas
+/// desselben Turns werden zusammengeführt, damit Streaming nicht die
+/// strukturellen Ereignisse aus dem Pending-Ring verdrängt.
+fn push_pending_event(events: &mut VecDeque<TurnEvent>, event: &TurnEvent) {
+    match (events.back_mut(), event) {
+        (
+            Some(TurnEvent::AssistantDelta {
+                turn_id: current_turn,
+                text: current_text,
+            }),
+            TurnEvent::AssistantDelta { turn_id, text },
+        ) if current_turn == turn_id => {
+            push_tail(current_text, text);
+            return;
+        }
+        (
+            Some(TurnEvent::ReasoningDelta {
+                turn_id: current_turn,
+                text: current_text,
+            }),
+            TurnEvent::ReasoningDelta { turn_id, text },
+        ) if current_turn == turn_id => {
+            push_tail(current_text, text);
+            return;
+        }
+        _ => {}
+    }
+    events.push_back(event.clone());
+    while events.len() > PENDING_MAX_EVENTS {
+        events.pop_front();
+    }
 }
 
 // ─── Register ────────────────────────────────────────────────────────────────
@@ -1091,14 +1128,11 @@ impl ChildStreamRegistry {
             return;
         }
         if let Some((_, events)) = self.pending.iter_mut().find(|(id, _)| id == agent_id) {
-            events.push_back(event.clone());
-            while events.len() > PENDING_MAX_EVENTS {
-                events.pop_front();
-            }
+            push_pending_event(events, event);
             return;
         }
         let mut events = VecDeque::new();
-        events.push_back(event.clone());
+        push_pending_event(&mut events, event);
         self.pending.push_back((agent_id.to_owned(), events));
         while self.pending.len() > PENDING_MAX_AGENTS {
             self.pending.pop_front();
@@ -1381,6 +1415,46 @@ mod tests {
         Ok(())
     }
 
+    /// Async-by-default kann das Kind bereits streamen, bevor die Wurzel-
+    /// Oberfläche sein `ChildSpawned` verarbeitet. Das frühe Reasoning darf
+    /// dabei nicht verschwinden; benachbarte Deltas werden bounded
+    /// zusammengeführt und beim Attach sichtbar nachgespielt.
+    #[test]
+    fn reasoning_stream_before_attach_is_replayed() -> TestResult {
+        let mut reg = registry(ChildStreamMode::Orchestrators);
+        let root = SessionId::from_str("root-uia");
+        let orch = SessionId::from_str("child-async-orchestrator");
+        let turn = TurnId::new();
+
+        assert!(!reg.apply(
+            &orch,
+            Some(&root),
+            role_names::ROOT_ORCHESTRATOR,
+            &TurnEvent::ReasoningDelta {
+                turn_id: turn.clone(),
+                text: "Ich plane ".to_owned(),
+            },
+        ));
+        assert!(!reg.apply(
+            &orch,
+            Some(&root),
+            role_names::ROOT_ORCHESTRATOR,
+            &TurnEvent::ReasoningDelta {
+                turn_id: turn,
+                text: "Welle 1".to_owned(),
+            },
+        ));
+
+        let block = reg
+            .attach_root_child(orch.as_str(), role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing("Orchestrator-Block"))?;
+        let rendered = text(&render(&block)?);
+        assert!(
+            rendered.contains("∴ Ich plane Welle 1"),
+            "frühes Reasoning muss nach Attach sichtbar sein: {rendered}"
+        );
+        Ok(())
+    }
     /// Der Deckel hält die Zahl der Einträge; der Rest wird gezählt.
     #[test]
     fn cap_limits_visible_entries() -> TestResult {

@@ -102,6 +102,14 @@ pub struct ModelCapabilitiesToml {
     /// Vorgabe `false`) wirkt nur ein ausdrückliches `false` hier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calling: Option<bool>,
+    /// `Some(false)` heißt, das Modell versteht keine Bilder: der Provider
+    /// sendet dann keine Bilder, sondern an ihrer Stelle einen Hinweistext
+    /// mit den Maßen. `None` = unbekannt, Bilder werden gesendet (ein Modell
+    /// ohne Bildeingabe antwortet dann mit einem Fehler des Servers, der
+    /// sichtbar bleibt). Anders als `vision` (Routing-Hinweis, Vorgabe
+    /// `false`) wirkt nur ein ausdrückliches `false` hier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
 }
 
 #[cfg(test)]

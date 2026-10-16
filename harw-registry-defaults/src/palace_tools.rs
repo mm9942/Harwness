@@ -37,7 +37,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
@@ -47,7 +46,9 @@ use harw_knowledge::memory::recall::search;
 use harw_knowledge::{
     ArtifactKind, KnowledgeArtifact, KnowledgeIndex, KnowledgeStore, RecallQuery, VisibilityScope,
 };
-use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
+use harw_tools::args::parse_args;
+use harw_tools::schema_helpers::{object_schema, property};
+use harw_tools::{FunctionToolSpec, JsonSchemaType, Permission};
 use serde::Deserialize;
 
 /// Name des Such-Werkzeugs.
@@ -87,16 +88,6 @@ pub struct PalaceToolProvider {
 }
 
 impl PalaceToolProvider {
-    /// Die Werkzeugnamen in Provider-Reihenfolge.
-    pub const TOOL_NAMES: &'static [&'static str] = &[PALACE_SEARCH, PALACE_RECALL];
-
-    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`]
-    /// (beide rein lesend).
-    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[
-        Some(Permission::ReadWorkspace),
-        Some(Permission::ReadWorkspace),
-    ];
-
     /// Baut den Provider über dem Speicher der Montage.
     ///
     /// # Argumente
@@ -108,43 +99,19 @@ impl PalaceToolProvider {
     }
 }
 
-impl ToolProvider for PalaceToolProvider {
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![search_spec(), recall_spec()]
-    }
-
-    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        let tool = match name.as_str() {
-            PALACE_SEARCH => PalaceTool::Search,
-            PALACE_RECALL => PalaceTool::Recall,
-            _ => return None,
-        };
-        Some(Arc::new(PalaceExecutor {
-            store: Arc::clone(&self.store),
-            tool,
-        }))
-    }
-
-    fn parallel_safe(&self, name: &ToolName) -> bool {
-        Self::TOOL_NAMES.contains(&name.as_str())
-    }
-}
-
-fn typed(schema_type: JsonSchemaType, description: &str) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(schema_type),
-        description: Some(description.to_owned()),
-        ..Default::default()
-    }
-}
-
-fn object_schema(props: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
-    JsonSchema {
-        schema_type: Some(JsonSchemaType::Object),
-        properties: Some(props),
-        required: Some(required.iter().map(|name| (*name).to_owned()).collect()),
-        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-        ..Default::default()
+// Beide Palace-Werkzeuge lesen nur (`ReadWorkspace`) und sind parallelsicher.
+harw_tools::tool_provider! {
+    impl for PalaceToolProvider as provider, parallel_safe: all {
+        PALACE_SEARCH => {
+            spec: search_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: PalaceExecutor { store: Arc::clone(&provider.store), tool: PalaceTool::Search },
+        },
+        PALACE_RECALL => {
+            spec: recall_spec(),
+            permission: Permission::ReadWorkspace,
+            executor: PalaceExecutor { store: Arc::clone(&provider.store), tool: PalaceTool::Recall },
+        },
     }
 }
 
@@ -152,11 +119,11 @@ fn search_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "query".to_owned(),
-        typed(JsonSchemaType::String, "Stichwörter für die Suche."),
+        property(JsonSchemaType::String, "Stichwörter für die Suche."),
     );
     props.insert(
         "limit".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Höchstzahl Treffer (1–20, Vorgabe 5).",
         ),
@@ -176,18 +143,18 @@ fn recall_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
         "query".to_owned(),
-        typed(JsonSchemaType::String, "Stichwörter für den Recall."),
+        property(JsonSchemaType::String, "Stichwörter für den Recall."),
     );
     props.insert(
         "max_hops".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Wie viele Backlink-Hops vom Treffer aus mitgenommen werden (0–2, Vorgabe 1).",
         ),
     );
     props.insert(
         "limit".to_owned(),
-        typed(
+        property(
             JsonSchemaType::Integer,
             "Höchstzahl Knoten insgesamt (1–10, Vorgabe 5).",
         ),
@@ -304,11 +271,9 @@ fn palace_query(text: &str, max_hops: u8, limit: usize) -> RecallQuery {
 
 /// Kern von `palace.search` (testbar ohne Sandbox-Kontext).
 fn execute_search(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolOutput {
-    let args: SearchArgs = match serde_json::from_value(arguments) {
+    let args: SearchArgs = match parse_args(PALACE_SEARCH, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{PALACE_SEARCH}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     if args.query.trim().is_empty() {
         return ToolOutput::error(format!("{PALACE_SEARCH}: query ist leer"));
@@ -350,11 +315,9 @@ fn execute_search(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolO
 
 /// Kern von `palace.recall` (testbar ohne Sandbox-Kontext).
 fn execute_recall(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolOutput {
-    let args: RecallArgs = match serde_json::from_value(arguments) {
+    let args: RecallArgs = match parse_args(PALACE_RECALL, &arguments) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolOutput::error(format!("{PALACE_RECALL}: ungültige Argumente: {error}"));
-        }
+        Err(out) => return out,
     };
     if args.query.trim().is_empty() {
         return ToolOutput::error(format!("{PALACE_RECALL}: query ist leer"));
@@ -426,6 +389,7 @@ fn execute_recall(store: &KnowledgeStore, arguments: serde_json::Value) -> ToolO
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_extension_api::contributors::ToolProvider;
     use harw_knowledge::memory::palace::{PalaceStatus, set_status};
     use harw_knowledge::memory::topic;
     use harw_knowledge::{AgentId, ArtifactId, Frontmatter};

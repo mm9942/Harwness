@@ -179,6 +179,7 @@ pub use health::{DegradeReason, RetryPolicy, SensorHealth};
 pub use sentinel::{Sentinel, SentinelConfig};
 pub use spool::{
     FindingSpool, SpoolCursor, SpoolEntry, SpoolError, SpoolId, SpoolLimits, SpoolResult,
+    SweepReport,
 };
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

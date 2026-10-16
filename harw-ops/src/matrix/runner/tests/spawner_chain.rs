@@ -301,7 +301,7 @@ async fn play_through_the_chain(
 
     // `transfer_to_matrix-game-master`: der Game Master ist Kind der UIA.
     let game_master = spawner
-        .spawn_child_or_wait(
+        .spawn_child_guarded(
             role_names::MATRIX_GAME_MASTER,
             SpawnInput {
                 parent_session_id: uia,
@@ -312,10 +312,7 @@ async fn play_through_the_chain(
             },
             sandbox,
             None,
-            Duration::from_secs(1),
-            &CancelToken::new(),
         )
-        .await
         .map_err(|error| error.message)?
         .keep();
     let result = spawner

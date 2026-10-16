@@ -110,7 +110,8 @@ Warden do not.
 - `src/session_port.rs` — new
 - `src/methods.rs` — additive constants
 - `src/lib.rs` — exports
-- compatibility fixture(s) under `tests/`
+- compatibility fixture(s) under `tests/` (golden:
+  `tests/fixtures/session_wire_golden.json`)
 
 ### Must expose
 
@@ -393,6 +394,91 @@ SessionId -> Attachment {
 
 Authorization is rechecked where revocation/context expiration requires it;
 the attachment map itself is not authority.
+
+### 3.5 Contract delta (S01, wave A)
+
+Frozen here so S02-S10 do not re-decide it. Code anchors are in
+`harw-protocol/src/session_wire.rs`; shapes are pinned by
+`harw-protocol/tests/fixtures/session_wire_golden.json` and
+`tests/session_wire_compat.rs`.
+
+1. **Connection : attachment is 1:N (R1, D6).** One authenticated
+   connection holds a map `SessionId -> Attachment`. The map is a routing
+   aid, not authority: every target-session operation re-runs tenant + cap
+   admission, and the lease/snapshot is rechecked where revocation or context
+   expiry requires it. Detaching or dropping a connection never cancels a
+   running turn (SES-04).
+2. **Session : host is 1:1 (R2).** A session has one owner host, identified
+   by node id plus `placement_generation` (`PlacementGeneration(u64)`,
+   starts at 1, never wraps, serialized as a bare integer). v1 has no
+   cross-node failover. A client whose remembered placement generation is
+   lower than the host's must resync instead of trusting a cached cursor.
+   `placement_generation` is **not yet carried by any minor-2 message**;
+   adding it is an additive field plus a wire-minor bump (decision for the
+   host scope that first needs it). It is a separate axis from
+   `Cursor::generation` (transcript rewrite by retention).
+3. **Identity chain (R3).** transport credential (UDS uid via `SO_PEERCRED`,
+   or node key + device via `AuthenticatedPeer`) -> `ClientIdentity` ->
+   principal / tier / tenant / cap ceiling. No identity field exists in any
+   request param (`deny_unknown_fields` rejects extras, including `tenant`,
+   `principal`, `actor`). `PermissionTier` is a policy input, not key
+   authorization. Requested caps can narrow, never widen (R4, ID-04).
+4. **Cursor `(generation, durable, live)` (R5).** `durable` is the transcript
+   sequence of the next record the client has not seen; `live` indexes the
+   live ring of the running turn and is disposable; `generation` changes only
+   on a transcript rewrite. The transcript is truth and replay is outside WS
+   (D7). A cursor from an older generation, or one the host cannot serve,
+   is answered with `Resync { reason, head }`; a client never fabricates a
+   cursor. All three components are required on the wire.
+5. **Approvals: first writer wins (R7, APP-01).** `approval.respond` carries
+   no actor; the host derives it from the connection. The durable backend
+   decides the single winner. Every later responder receives
+   `RespondResult::AlreadyResolved { by }` (or `Expired`), and an
+   `ApprovalResolved` frame goes to all attachments. Approval request/result
+   frames are never dropped under backpressure (section 4).
+6. **Compatibility rules.** `SESSION_WIRE_MINOR` is 2;
+   `SESSION_WS_SUBPROTOCOL` is exactly `harw.session.v1`;
+   `SESSION_WS_PATH` is `/v1/session-ws`. Requests and result structs use
+   `deny_unknown_fields`; the one tolerant place is `SessionFrame`, where an
+   unknown `kind` decodes to `Unknown`. Changing a golden shape is a wire
+   change: keep the old shape or bump the minor.
+
+### 3.6 Numbering cross-map (W01-W08, hub labels, slices)
+
+Three labelings exist. Verification against the docs in this directory
+(`../README.md`, `../local-own-cloud-websocket.md`) found:
+
+- **W01-W08** are defined in this document (section 10) and in
+  `../local-own-cloud-websocket.md` section 13. They agree.
+- **RS0-RS9** are the hub's own program rounds (`../README.md` section 9).
+  They predate the WebSocket profile; the W-packages re-cut the same work.
+- **H0-H9 are not defined in the 65-cloud-sessions hub.** The only `H<n>`
+  labels in the planning tree are the harness-pattern rows H1-H7 in
+  `../../75-harness-patterns/README.md` (H1 daemon-owned sessions, H4 durable
+  resume, ... ) and "H11" in `../README.md` (a transport exit criterion).
+  They do not form a W00 numbering. The `H0..H9` column in
+  `W00-ws-integration-map.md` is therefore **unverified and should not be
+  relied on**; the map itself says it is not authoritative for H-labels.
+- **W1-W6 slices** are orchestrator planning labels with no definition in the
+  hub docs; `W1`/`W2` inside `../README.md` mean worker waves within a round.
+
+Authoritative mapping (W-package to hub round, verified by content):
+
+| W00 package | Hub round (`../README.md` section 9) | Orchestrator slice (unverified in hub) | Scopes |
+|-------------|--------------------------------------|----------------------------------------|--------|
+| W01 contract | RS0 contracts, RS1 vocabulary | W1 | S01 |
+| W02 WS substrate + NodeTransport upgrade | RS2-05 (transport), RS4 (listeners, in part) | W2 | S02; substrate landed (R1) |
+| W03 host core | RS3 | W3 | landed (R1); S03, S04 |
+| W04 local usable slice | RS4 | W4 | S03, S05, S06, S09 |
+| W05 own-cloud usable slice | RS2, RS4 (devices, enrollment, revocation) | W5 | S02, S06, S07, S08 |
+| W06 thin TUI | RS5 | W6 | S09 |
+| W07 lifecycle/storage/deploy | RS6, RS8 | W6 | S05 |
+| W08 hardening | RS8 (docs, ledger); observability is new | W6 | backlog |
+
+The mapping of W02 and W05 to RS2/RS4 is by content, not by an explicit hub
+statement; where the hub is silent it is marked as such. Resolve the H-column
+in the integration map (orchestrator-owned) by deleting it or replacing it
+with the RS column above.
 
 ---
 

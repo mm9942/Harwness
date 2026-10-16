@@ -78,7 +78,6 @@ admitted = [
   "job.logs",
   "job.stop",
   "job.list",
-  "job.wait",
   "deps.graph",
   "deps.locked",
   "deps.source_read",

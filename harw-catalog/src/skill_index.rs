@@ -32,7 +32,14 @@ use std::path::{Path, PathBuf};
 
 use harw_config::SkillToml;
 
+use crate::skill_triggers::{
+    MAX_TRIGGERS_FILE_BYTES, SkillTriggerSpec, SkillTriggers, SkillWarning, TriggerIndex,
+    parse_triggers_file,
+};
 use crate::{SkillRuntimeSnapshot, load_skill_runtime_snapshot, sha256_hex};
+
+/// Dateiname der optionalen Trigger-Datei neben `skill.toml`.
+pub const TRIGGERS_FILE: &str = "triggers.toml";
 
 /// Anzeigename der Quelle eines eingebetteten Skills.
 pub const BUNDLED_SKILL_SOURCE: &str = "eingebaut";
@@ -94,11 +101,15 @@ pub struct SkillIndexEntry {
     pub size_bytes: usize,
     /// Alle Überschriften des Anweisungstexts (außerhalb von Codeblöcken).
     pub headings: Vec<SkillHeading>,
+    /// Der `when`-Satz aus `triggers.toml` (<= 160 Zeichen), falls gültig.
+    pub when: Option<String>,
+    /// Die geprüften Trigger aus `triggers.toml` (leer, wenn es keine gibt).
+    pub triggers: SkillTriggers,
     snapshot: SkillRuntimeSnapshot,
 }
 
 impl SkillIndexEntry {
-    fn new(snapshot: SkillRuntimeSnapshot, source: SkillSource) -> Self {
+    fn new(snapshot: SkillRuntimeSnapshot, source: SkillSource, spec: SkillTriggerSpec) -> Self {
         let headings = markdown_headings(&snapshot.instructions)
             .into_iter()
             .map(|(_, level, text)| SkillHeading { level, text })
@@ -111,8 +122,19 @@ impl SkillIndexEntry {
             source,
             size_bytes: snapshot.instructions.len(),
             headings,
+            when: spec.when,
+            triggers: spec.triggers,
             snapshot,
         }
+    }
+
+    /// Der Satz der L0-Katalogzeile: `when`, sonst der erste Satz der
+    /// Beschreibung ([`Self::short_description`]).
+    #[must_use]
+    pub fn catalog_sentence(&self) -> String {
+        self.when
+            .clone()
+            .unwrap_or_else(|| self.short_description())
     }
 
     /// Der eingefrorene Laufzeit-Snapshot (Anweisungen samt SHA-256).
@@ -212,6 +234,8 @@ pub struct SkillIndex {
     entries: BTreeMap<String, SkillIndexEntry>,
     disabled: BTreeSet<String>,
     skipped: Vec<SkippedSkill>,
+    warnings: Vec<SkillWarning>,
+    triggers: TriggerIndex,
 }
 
 /// Die eingebetteten Skill-Dateien aus `harw-home` als
@@ -254,9 +278,10 @@ impl SkillIndex {
             }
             match load_skill_runtime_snapshot(&dir, &manifest) {
                 Ok(snapshot) => {
+                    let spec = index.trigger_spec(&name, read_layer_triggers(&dir));
                     index.entries.insert(
                         name,
-                        SkillIndexEntry::new(snapshot, SkillSource::Layer(dir)),
+                        SkillIndexEntry::new(snapshot, SkillSource::Layer(dir), spec),
                     );
                 }
                 Err(error) => index.skipped.push(SkippedSkill {
@@ -266,7 +291,33 @@ impl SkillIndex {
             }
         }
         index.add_bundle(bundle);
+        index.triggers = TriggerIndex::from_entries(
+            index
+                .entries
+                .values()
+                .map(|entry| (entry.name.as_str(), &entry.triggers)),
+        );
         index
+    }
+
+    /// Prüft den Inhalt einer `triggers.toml`; Fehler und verworfene Teile
+    /// landen als Warnung, der Skill bleibt geladen.
+    fn trigger_spec(
+        &mut self,
+        skill: &str,
+        source: Option<Result<String, String>>,
+    ) -> SkillTriggerSpec {
+        let (spec, reasons) = match source {
+            None => return SkillTriggerSpec::default(),
+            Some(Ok(text)) => parse_triggers_file(&text),
+            Some(Err(reason)) => (SkillTriggerSpec::default(), vec![reason]),
+        };
+        self.warnings
+            .extend(reasons.into_iter().map(|reason| SkillWarning {
+                skill: skill.to_owned(),
+                reason,
+            }));
+        spec
     }
 
     /// Liest `skills/*/skill.toml` eines Layers in aufsteigender
@@ -363,6 +414,18 @@ impl SkillIndex {
                 });
                 continue;
             }
+            let trigger_source = files
+                .get(format!("skills/{dir}/{TRIGGERS_FILE}").as_str())
+                .map(|text| {
+                    if text.len() > MAX_TRIGGERS_FILE_BYTES {
+                        Err(format!(
+                            "{TRIGGERS_FILE} größer als {MAX_TRIGGERS_FILE_BYTES} Bytes, verworfen"
+                        ))
+                    } else {
+                        Ok((*text).to_owned())
+                    }
+                });
+            let spec = self.trigger_spec(&manifest.name, trigger_source);
             let snapshot = SkillRuntimeSnapshot {
                 name: manifest.name.clone(),
                 description: manifest.description.clone(),
@@ -374,7 +437,7 @@ impl SkillIndex {
             };
             bundled.insert(
                 manifest.name.clone(),
-                SkillIndexEntry::new(snapshot, SkillSource::Bundled),
+                SkillIndexEntry::new(snapshot, SkillSource::Bundled, spec),
             );
         }
         self.entries.extend(bundled);
@@ -418,6 +481,18 @@ impl SkillIndex {
     #[must_use]
     pub fn skipped(&self) -> &[SkippedSkill] {
         &self.skipped
+    }
+
+    /// Warnungen zu verworfenen Triggern (der Skill selbst ist geladen).
+    #[must_use]
+    pub fn warnings(&self) -> &[SkillWarning] {
+        &self.warnings
+    }
+
+    /// Der einmal beim Bau erstellte, unveränderliche Trigger-Index.
+    #[must_use]
+    pub fn trigger_index(&self) -> &TriggerIndex {
+        &self.triggers
     }
 
     /// Rangiert die Skills gegen `query`.
@@ -510,7 +585,7 @@ const STOP_WORDS: &[&str] = &[
 ];
 
 /// Faltet Groß-/Kleinschreibung und deutsche Umlaute.
-fn fold(text: &str) -> String {
+pub(crate) fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars().flat_map(char::to_lowercase) {
         match ch {
@@ -525,7 +600,7 @@ fn fold(text: &str) -> String {
 }
 
 /// Zerlegt `text` in gefaltete Wörter aus Buchstaben/Ziffern (≥ 2 Zeichen).
-fn tokens(text: &str) -> Vec<String> {
+pub(crate) fn tokens(text: &str) -> Vec<String> {
     fold(text)
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| word.chars().count() >= 2)
@@ -566,7 +641,7 @@ const HEADING_WEIGHT: u32 = 2;
 const WORD_BONUS: u32 = 5;
 
 /// Score eines Eintrags gegen die (gefalteten, gefilterten) Suchwörter.
-fn score_entry(entry: &SkillIndexEntry, words: &[String]) -> u32 {
+pub(crate) fn score_entry(entry: &SkillIndexEntry, words: &[String]) -> u32 {
     let name_tokens = tokens(&entry.name);
     let description_tokens = tokens(&entry.description);
     let heading_tokens: Vec<String> = entry
@@ -584,6 +659,30 @@ fn score_entry(entry: &SkillIndexEntry, words: &[String]) -> u32 {
         }
     }
     score
+}
+
+/// Liest `triggers.toml` eines Skill-Verzeichnisses. `None`, wenn es fehlt.
+/// Größenprüfung vor dem Lesen; Symlink-/Traversal-Schutz über
+/// [`harw_config::load_skill_instructions`] wie bei `instructions_file`.
+fn read_layer_triggers(dir: &Path) -> Option<Result<String, String>> {
+    let path = dir.join(TRIGGERS_FILE);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(Err(format!("{TRIGGERS_FILE} nicht lesbar: {error}"))),
+    };
+    if !metadata.is_file() {
+        return Some(Err(format!("{TRIGGERS_FILE} ist keine Datei, verworfen")));
+    }
+    if metadata.len() > MAX_TRIGGERS_FILE_BYTES as u64 {
+        return Some(Err(format!(
+            "{TRIGGERS_FILE} größer als {MAX_TRIGGERS_FILE_BYTES} Bytes, verworfen"
+        )));
+    }
+    Some(
+        harw_config::load_skill_instructions(dir, Some(TRIGGERS_FILE))
+            .map_err(|error| format!("{TRIGGERS_FILE} nicht lesbar: {error}")),
+    )
 }
 
 /// Levenshtein-Distanz über Unicode-Zeichen.
@@ -605,7 +704,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Die Überschriften von `text` außerhalb von Codeblöcken als
 /// `(Byte-Offset des Zeilenanfangs, Ebene, Text)`.
-fn markdown_headings(text: &str) -> Vec<(usize, usize, String)> {
+pub(crate) fn markdown_headings(text: &str) -> Vec<(usize, usize, String)> {
     let mut headings = Vec::new();
     let mut in_fence = false;
     let mut offset = 0;
@@ -635,7 +734,7 @@ fn markdown_headings(text: &str) -> Vec<(usize, usize, String)> {
 
 /// Der erste Satz von `text` (bis zum ersten `.`, `!` oder `?` vor
 /// Leerraum bzw. Textende), auf `max_chars` Zeichen gekürzt.
-fn first_sentence(text: &str, max_chars: usize) -> String {
+pub(crate) fn first_sentence(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     let mut end = text.len();
     let mut chars = text.char_indices().peekable();

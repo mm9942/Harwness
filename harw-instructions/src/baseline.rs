@@ -426,7 +426,11 @@ impl AgentIdentity {
 - Prefer targeted reads (fs.read on specific files) over broad shell commands.\n\
 - Before writing, verify the target path exists in the intended scope.\n\
 - When a request is ambiguous, ask ONE targeted clarifying question — do not enumerate all possible interpretations.\n\
-- Respond in the user's language.",
+- For any non-trivial task (multi-file changes, risky or destructive actions, unclear scope, or work beyond a few minutes): plan before acting. Write down the plan (goal, steps, affected files, risks, verification), review it against the goal before executing, and adjust it when new information invalidates its assumptions. For small, obvious tasks a short inline approach statement is enough.\n\
+- Respond in the language of your task or delegation. A child agent has no direct \
+  view of the user: match the language the task was written in. If the task is in \
+  German, answer in German; if in English, answer in English. Never switch to a \
+  language neither the task nor your instructions use.",
             agent_name = self.agent_name,
             role_description = self.role_description,
             cwd = cwd,
@@ -811,7 +815,11 @@ mod tests {
         assert!(!prompt.contains("## Interaction mode"));
         assert!(!prompt.contains("## Return contract"));
         // Der Prompt endet unverändert mit der letzten Verhaltensregel.
-        assert!(prompt.ends_with("- Respond in the user's language."));
+        assert!(
+            prompt.ends_with(
+                "Never switch to a language neither the task nor your instructions use."
+            )
+        );
     }
 
     #[test]
@@ -887,7 +895,11 @@ mod tests {
         let prompt = AgentIdentity::new("harw", "/ws").render_system_prompt();
         assert!(!prompt.contains("## Context blocks"));
         // Zeichengleich zur Fassung vor dieser Erweiterung.
-        assert!(prompt.ends_with("- Respond in the user's language."));
+        assert!(
+            prompt.ends_with(
+                "Never switch to a language neither the task nor your instructions use."
+            )
+        );
     }
 
     #[test]

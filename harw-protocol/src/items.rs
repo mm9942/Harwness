@@ -35,8 +35,28 @@ pub struct AssistantMessageItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
-    ImageUrl { url: String, detail: Option<String> },
+    Text {
+        text: String,
+    },
+    /// An image by URL. Providers do **not** forward it: the harness sends
+    /// only bytes it holds itself (see [`ContentPart::Media`]), never a URL a
+    /// third party would have to fetch.
+    ImageUrl {
+        url: String,
+        detail: Option<String>,
+    },
+    /// An image the media store holds, by reference. This is the form a user
+    /// attachment or a tool-produced image takes in a transcript; provider
+    /// adapters load the bytes through the media source when they build a
+    /// request. Older readers without this variant fail to parse an item that
+    /// carries it; items without images are unchanged.
+    Media {
+        /// The stored image.
+        media: crate::media::MediaRef,
+        /// How much detail a provider should spend, if the sender cares.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<crate::media::ImageDetail>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

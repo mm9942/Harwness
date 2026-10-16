@@ -1,0 +1,22 @@
+[package]
+publish.workspace = true
+name = "harw-media"
+description = "Media store for model input: content-addressed images, format and dimension checks without a decoder, metadata and trailing-data removal, owner-only atomic storage. Pure Rust, no I/O beyond the store directory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-digest = { path = "../harw-digest" }
+harw-fsutil = { path = "../harw-fsutil" }
+rustix = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

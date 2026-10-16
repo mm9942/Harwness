@@ -17,6 +17,7 @@ harw-lens-query = { path = "../harw-lens-query" }
 harw-macros = { path = "../harw-macros" }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 # Nur zum Bauen physischer Fixturindizes in Tests (`build_index`,
 # `CHUNKER_VERSION`) -- wie schon `harw-lens-query/tests/round_trip.rs` es
 # tut. Keine Zyklusgefahr: `harw-lens-source` hat keine (Dev-)Abhaengigkeit

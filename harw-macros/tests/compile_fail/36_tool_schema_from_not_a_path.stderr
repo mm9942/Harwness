@@ -1,0 +1,5 @@
+error: expected identifier
+ --> tests/compile_fail/36_tool_schema_from_not_a_path.rs:9:54
+  |
+9 | #[harw_macros::tool(name = "t.schema", schema_from = "spec_fn")]
+  |                                                      ^^^^^^^^^

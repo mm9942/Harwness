@@ -84,6 +84,11 @@ pub enum EntryKind {
     GatewayTelegram,
     /// Dream-Gateway.
     GatewayDream,
+    /// Von `harw gateway --session-socket` gehostete Sitzung (WebSocket-
+    /// Kontrollebene). Obergrenze `{R, W, X}` ohne Netz; die tatsächlichen
+    /// Rechte schneidet die Tier der Verbindung (`RuntimeNarrowing`), und
+    /// jede Freigabe ist delegiert (nie automatisch).
+    SessionHost,
     /// Ein kompilierter Agent (#22 Welle 3A): Konfiguration, Agent, Skills
     /// und Wissen kommen aus [`RuntimeSpec::embedded`] statt aus `~/.harw`.
     /// [`EntryKind::profile`] liefert dafür nur eine konservative
@@ -178,6 +183,7 @@ impl EntryKind {
     /// | JobPlanNode | {R, W} | Full + None | Fail | None | LocalRoot | ja |
     /// | GatewayTelegram | {R, W} | WorkspaceEdit + None | Interactive | None | Closed | nein |
     /// | GatewayDream | {} | NoTools + None | Fail | None | Closed | nein |
+    /// | SessionHost | {R, W, X} (Tier schneidet) | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot | ja |
     ///
     /// `R` = [`Permission::ReadWorkspace`], `W` = [`Permission::WriteWorkspace`],
     /// `X` = [`Permission::ExecuteProcess`], `N` = [`Permission::NetworkAccess`]
@@ -196,7 +202,9 @@ impl EntryKind {
     /// tragen nur `Tui` und `OneShot`, und zwar egress-gebunden.
     #[must_use]
     pub fn profile(self) -> EntryProfile {
-        use Permission::{ExecuteProcess, NetworkAccess, ReadWorkspace, WriteWorkspace};
+        use Permission::{
+            ExecuteProcess, ManageContainers, NetworkAccess, ReadWorkspace, WriteWorkspace,
+        };
 
         let rwx = || PermissionSet::from_policy([ReadWorkspace, WriteWorkspace, ExecuteProcess]);
         let rwxn = || {
@@ -208,9 +216,22 @@ impl EntryKind {
             ])
         };
 
+        // The interactive TUI additionally carries the container right: the
+        // `container.*` tools exist only when `[tools.container]` is enabled
+        // (global-only, default off) and `container.run` always asks.
+        let tui = || {
+            PermissionSet::from_policy([
+                ReadWorkspace,
+                WriteWorkspace,
+                ExecuteProcess,
+                NetworkAccess,
+                ManageContainers,
+            ])
+        };
+
         match self {
             EntryKind::Tui => EntryProfile {
-                permissions: rwxn(),
+                permissions: tui(),
                 registry_profile: RegistryProfile::Full,
                 operations: OperationSurface::AllWithModelTools,
                 ask: AskResolution::Interactive,
@@ -289,6 +310,15 @@ impl EntryKind {
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::Closed,
                 project_context: false,
+            },
+            EntryKind::SessionHost => EntryProfile {
+                permissions: rwx(),
+                registry_profile: RegistryProfile::Full,
+                operations: OperationSurface::AllWithModelTools,
+                ask: AskResolution::Interactive,
+                spawner: SpawnerPolicy::BuiltinRoles,
+                ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::GatewayDream => EntryProfile {
                 permissions: PermissionSet::empty(),
@@ -544,7 +574,7 @@ mod tests {
     use super::*;
     use harw_types::{IngressSurface, PermissionTier, PrincipalKind};
 
-    const ALL: [EntryKind; 12] = [
+    const ALL: [EntryKind; 13] = [
         EntryKind::Tui,
         EntryKind::OneShot,
         EntryKind::LocalEcho,
@@ -557,9 +587,10 @@ mod tests {
         EntryKind::GatewayTelegram,
         EntryKind::GatewayDream,
         EntryKind::CompiledAgent,
+        EntryKind::SessionHost,
     ];
 
-    const ALL_PERMISSIONS: [Permission; 7] = [
+    const ALL_PERMISSIONS: [Permission; 8] = [
         Permission::ReadWorkspace,
         Permission::WriteWorkspace,
         Permission::ExecuteProcess,
@@ -567,6 +598,7 @@ mod tests {
         Permission::ReadSecrets,
         Permission::ManagePlugins,
         Permission::ReadCargoRegistry,
+        Permission::ManageContainers,
     ];
 
     /// Erzwingt beim Kompilieren, dass `ALL` jede Variante kennt: eine neue
@@ -585,6 +617,7 @@ mod tests {
             EntryKind::GatewayTelegram => 9,
             EntryKind::GatewayDream => 10,
             EntryKind::CompiledAgent => 11,
+            EntryKind::SessionHost => 12,
         }
     }
 
@@ -618,7 +651,8 @@ mod tests {
         use CeilingPolicy as C;
         use OperationSurface as O;
         use Permission::{
-            ExecuteProcess as X, NetworkAccess as N, ReadWorkspace as R, WriteWorkspace as W,
+            ExecuteProcess as X, ManageContainers as M, NetworkAccess as N, ReadWorkspace as R,
+            WriteWorkspace as W,
         };
         use RegistryProfile as P;
         use SpawnerPolicy as S;
@@ -626,7 +660,7 @@ mod tests {
         let expected: [Row; 12] = [
             (
                 EntryKind::Tui,
-                &[R, W, X, N],
+                &[R, W, X, N, M],
                 P::Full,
                 O::AllWithModelTools,
                 A::Interactive,
@@ -836,6 +870,7 @@ mod tests {
             EntryKind::Analyze,
             EntryKind::Doctor,
             EntryKind::JobPlanNode,
+            EntryKind::SessionHost,
         ];
         for kind in ALL {
             assert_eq!(
@@ -863,6 +898,7 @@ mod tests {
                 Permission::WriteWorkspace,
                 Permission::ExecuteProcess,
                 Permission::NetworkAccess,
+                Permission::ManageContainers,
             ])
         );
         for kind in ALL {
@@ -872,12 +908,15 @@ mod tests {
     }
 
     #[test]
-    fn only_tui_and_telegram_ask_interactively() {
+    fn only_attended_entries_ask_interactively() {
         for kind in ALL {
             let interactive = kind.profile().ask == AskResolution::Interactive;
             assert_eq!(
                 interactive,
-                matches!(kind, EntryKind::Tui | EntryKind::GatewayTelegram),
+                matches!(
+                    kind,
+                    EntryKind::Tui | EntryKind::GatewayTelegram | EntryKind::SessionHost
+                ),
                 "{kind:?}"
             );
         }
@@ -898,12 +937,12 @@ mod tests {
         let tui = EntryKind::Tui.profile();
         let doctor = EntryKind::Doctor.profile();
         // Runde 3: die TUI-Wurzel hat egress-gebundenes Netz, die Diagnose
-        // braucht keins — sonst sind die Rechte gleich.
-        let tui_without_network = PermissionSet::from_policy(
-            tui.permissions
-                .iter()
-                .filter(|p| *p != Permission::NetworkAccess),
-        );
+        // braucht keins; das Container-Recht trägt nur die TUI (die Werkzeuge
+        // fragen immer) — sonst sind die Rechte gleich.
+        let tui_without_network =
+            PermissionSet::from_policy(tui.permissions.iter().filter(|p| {
+                !matches!(p, Permission::NetworkAccess | Permission::ManageContainers)
+            }));
         assert_eq!(doctor.permissions, tui_without_network);
         assert!(!doctor.permissions.contains(Permission::NetworkAccess));
         assert_eq!(doctor.registry_profile, tui.registry_profile);
@@ -962,7 +1001,8 @@ mod tests {
                 "ReadWorkspace",
                 "WriteWorkspace",
                 "ExecuteProcess",
-                "NetworkAccess"
+                "NetworkAccess",
+                "ManageContainers"
             ]
         );
         assert_eq!(snapshot.clone(), snapshot);

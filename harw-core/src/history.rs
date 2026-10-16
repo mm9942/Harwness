@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 pub enum ModelMessage {
     User {
         text: String,
+        /// Images of the message, in order, resolved through the process media
+        /// source. An image whose bytes are unavailable stays in the list with
+        /// `data: None` so an adapter can say so instead of dropping it.
+        images: Vec<crate::media::ModelImage>,
     },
     Assistant {
         text: String,
@@ -118,6 +122,74 @@ impl ConversationHistory {
             content: vec![ContentPart::Text { text: text.into() }],
         }));
         id
+    }
+
+    /// Komfort: eine User-Nachricht mit Text und gespeicherten Bildern anhängen.
+    /// Die Bilder gehen vor dem Text in die Nachricht (so bevorzugt es u. a.
+    /// Anthropic). Ist der Text leer, trägt die Nachricht nur die Bilder.
+    pub fn push_user_message(
+        &mut self,
+        text: impl Into<String>,
+        images: impl IntoIterator<Item = harw_protocol::MediaRef>,
+    ) -> ItemId {
+        let id = ItemId::new();
+        let mut content: Vec<ContentPart> = images
+            .into_iter()
+            .map(|media| ContentPart::Media {
+                media,
+                detail: None,
+            })
+            .collect();
+        let text = text.into();
+        if !text.is_empty() || content.is_empty() {
+            content.push(ContentPart::Text { text });
+        }
+        self.items.push(TurnItem::UserMessage(UserMessageItem {
+            id: id.clone(),
+            content,
+        }));
+        id
+    }
+
+    /// Ob eine User-Nachricht ein gespeichertes Bild trägt.
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        self.items.iter().any(|item| match item {
+            TurnItem::UserMessage(m) => m
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::Media { .. })),
+            _ => false,
+        })
+    }
+
+    /// Eine Kopie, in der jedes gespeicherte Bild durch einen Hinweistext
+    /// ersetzt ist (`reason` sagt, warum es nicht gesendet wird). Für Modelle,
+    /// die keine Bilder verstehen: Das Bild verschwindet nicht still, der
+    /// Verlauf nennt es und die Maße, nie die Bytes.
+    #[must_use]
+    pub fn without_images(&self, reason: &str) -> Self {
+        let items = self
+            .items
+            .iter()
+            .map(|item| match item {
+                TurnItem::UserMessage(m) => TurnItem::UserMessage(UserMessageItem {
+                    id: m.id.clone(),
+                    content: m
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            ContentPart::Media { media, .. } => ContentPart::Text {
+                                text: format!("[{} not sent: {reason}]", media.describe()),
+                            },
+                            other => other.clone(),
+                        })
+                        .collect(),
+                }),
+                other => other.clone(),
+            })
+            .collect();
+        Self { items }
     }
 
     /// Komfort: eine Assistant-Textnachricht anhängen.
@@ -253,15 +325,27 @@ impl ConversationHistory {
     /// Projiziert den Verlauf auf die provider-neutrale [`ModelMessage`]-Sicht.
     ///
     /// Reasoning-Items werden bewusst ausgelassen — sie sind Surface-Metadaten,
-    /// kein Modell-Input. Bild-Inhalte werden zu einem Platzhalter reduziert,
-    /// bis ein Provider multimodale Eingaben braucht.
+    /// kein Modell-Input. Gespeicherte Bilder (`ContentPart::Media`) einer
+    /// User-Nachricht werden über die Prozess-Medienquelle aufgelöst und stehen
+    /// in `images`; Bilder per URL und Bilder in Assistant-Nachrichten gehen
+    /// nie an das Modell und erscheinen nur als Platzhalter im Text.
     #[must_use]
     pub fn to_model_messages(&self) -> Vec<ModelMessage> {
         let mut out = Vec::with_capacity(self.items.len());
         for item in &self.items {
             match item {
                 TurnItem::UserMessage(m) => out.push(ModelMessage::User {
-                    text: flatten_content(&m.content),
+                    text: flatten_text(&m.content),
+                    images: m
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Media { media, detail } => {
+                                Some(crate::media::resolve_cached(media, *detail))
+                            }
+                            _ => None,
+                        })
+                        .collect(),
                 }),
                 TurnItem::AssistantMessage(m) => out.push(ModelMessage::Assistant {
                     text: flatten_content(&m.content),
@@ -837,14 +921,32 @@ fn ceil_char_boundary(value: &str, index: usize) -> usize {
     position
 }
 
+/// Der Text einer User-Nachricht: Text-Teile; ein URL-Bild erscheint als
+/// Platzhalter (es wird nie weitergereicht), gespeicherte Bilder gar nicht,
+/// weil sie als `images` neben dem Text stehen.
+fn flatten_text(parts: &[ContentPart]) -> String {
+    let mut buf = String::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text } => buf.push_str(text),
+            ContentPart::ImageUrl { .. } => buf.push_str("[image: external URL not sent]"),
+            ContentPart::Media { .. } => {}
+        }
+    }
+    buf
+}
+
 /// Reduziert eine Liste von `ContentPart`s auf reinen Text. Bilder werden zu
-/// einem `[image]`-Platzhalter, bis multimodale Eingaben gebraucht werden.
+/// einem Platzhalter (für Assistant-Nachrichten und Anzeigen).
 fn flatten_content(parts: &[ContentPart]) -> String {
     let mut buf = String::new();
     for part in parts {
         match part {
             ContentPart::Text { text } => buf.push_str(text),
             ContentPart::ImageUrl { .. } => buf.push_str("[image]"),
+            ContentPart::Media { media, .. } => {
+                buf.push_str(&format!("[{}]", media.describe()));
+            }
         }
     }
     buf
@@ -1459,6 +1561,158 @@ mod tests {
         no_user.push(assistant("newest"));
         let (tail2, _) = no_user.tail_preserving_current_turn(16, 16);
         assert_eq!(tail2.len(), 2);
+        Ok(())
+    }
+
+    // --- Bilder ---------------------------------------------------------
+
+    use harw_media::MemorySource;
+    use std::sync::{Arc, OnceLock};
+
+    /// One source for all tests of this module; images are content-addressed,
+    /// so tests cannot disturb each other.
+    fn images() -> &'static Arc<MemorySource> {
+        static SOURCE: OnceLock<Arc<MemorySource>> = OnceLock::new();
+        SOURCE.get_or_init(|| {
+            let source = Arc::new(MemorySource::new());
+            crate::media::install_media_source(source.clone());
+            source
+        })
+    }
+
+    fn tiny_png(width: u32, height: u32) -> Vec<u8> {
+        let chunk = |kind: &[u8; 4], data: &[u8]| {
+            let mut out = u32::try_from(data.len())
+                .unwrap_or(0)
+                .to_be_bytes()
+                .to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out
+        };
+        let mut ihdr = width.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        out.extend_from_slice(&chunk(b"IDAT", b"pixels"));
+        out.extend_from_slice(&chunk(b"IEND", b""));
+        out
+    }
+
+    #[test]
+    fn a_user_message_carries_its_images_before_its_text_and_resolved() -> TestResult {
+        let media = images()
+            .put(&tiny_png(30, 20))
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let mut history = ConversationHistory::new();
+        history.push_user_message("what is this?", [media.clone()]);
+        let messages = history.to_model_messages();
+        let [ModelMessage::User { text, images }] = messages.as_slice() else {
+            return Err(TestError::Unexpected(format!("{messages:?}")));
+        };
+        assert_eq!(text, "what is this?");
+        assert_eq!(images.len(), 1);
+        let image = images.first().ok_or(TestError::Missing("image"))?;
+        assert_eq!(image.media, media);
+        assert!(image.bytes().is_some_and(|b| b.starts_with(b"\x89PNG")));
+        // In the transcript the images come first.
+        let Some(TurnItem::UserMessage(item)) = history.items().first() else {
+            return Err(TestError::Missing("user item"));
+        };
+        assert!(matches!(
+            item.content.first(),
+            Some(ContentPart::Media { .. })
+        ));
+        assert!(matches!(
+            item.content.last(),
+            Some(ContentPart::Text { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_image_only_message_has_no_empty_text_part() -> TestResult {
+        let media = images()
+            .put(&tiny_png(8, 8))
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let mut history = ConversationHistory::new();
+        history.push_user_message("", [media]);
+        let Some(TurnItem::UserMessage(item)) = history.items().first() else {
+            return Err(TestError::Missing("user item"));
+        };
+        assert_eq!(item.content.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_image_the_source_does_not_have_is_kept_without_bytes() -> TestResult {
+        let unknown = harw_protocol::MediaRef::new(
+            harw_types::ContentDigest::of(b"never ingested"),
+            harw_protocol::ImageFormat::Png,
+            10,
+            4,
+            4,
+        )
+        .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let _ = images();
+        let mut history = ConversationHistory::new();
+        history.push_user_message("look", [unknown]);
+        let messages = history.to_model_messages();
+        let [ModelMessage::User { images, .. }] = messages.as_slice() else {
+            return Err(TestError::Unexpected(format!("{messages:?}")));
+        };
+        assert_eq!(images.len(), 1, "the image is not dropped");
+        assert!(images.first().is_some_and(|i| i.bytes().is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_url_image_is_never_forwarded_and_says_so() {
+        let mut history = ConversationHistory::new();
+        history.push(TurnItem::UserMessage(UserMessageItem {
+            id: ItemId::new(),
+            content: vec![
+                ContentPart::ImageUrl {
+                    url: "https://example.invalid/secret-token".to_owned(),
+                    detail: None,
+                },
+                ContentPart::Text {
+                    text: "hello".to_owned(),
+                },
+            ],
+        }));
+        let messages = history.to_model_messages();
+        let [ModelMessage::User { text, images }] = messages.as_slice() else {
+            return;
+        };
+        assert!(images.is_empty());
+        assert!(text.contains("external URL not sent"), "{text}");
+        assert!(
+            !text.contains("secret-token"),
+            "the URL never reaches the text"
+        );
+    }
+
+    #[test]
+    fn a_media_item_survives_json_and_its_text_form_names_the_image() -> TestResult {
+        let media = images()
+            .put(&tiny_png(64, 48))
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let mut history = ConversationHistory::new();
+        history.push_user_message("x", [media]);
+        let json =
+            serde_json::to_string(&history).map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(json.contains("\"type\":\"media\""), "{json}");
+        assert!(!json.contains("pixels"), "no image bytes in the transcript");
+        let back: ConversationHistory =
+            serde_json::from_str(&json).map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert_eq!(back.len(), 1);
+        let Some(TurnItem::UserMessage(item)) = back.items().first() else {
+            return Err(TestError::Missing("user item"));
+        };
+        assert!(flatten_content(&item.content).contains("image 64x48"));
         Ok(())
     }
 }

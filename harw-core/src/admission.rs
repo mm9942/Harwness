@@ -66,7 +66,6 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
-use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use harw_authority::{AuthorityError, SandboxSpec, WorkspaceBinding, WorkspaceRegistry};
@@ -823,114 +822,62 @@ fn sanitize_task(value: Value) -> Result<Value, JobAdmissionError> {
 }
 
 /// Errors of the admission boundary.
-#[derive(Debug)]
+#[derive(Debug, harw_macros::HarwError)]
 pub enum JobAdmissionError {
     /// Workspace alias violates the alias grammar.
+    #[msg("invalid workspace alias '{0}'")]
     InvalidWorkspaceAlias(String),
     /// Task contains an authority-bearing reserved field.
+    #[msg("reserved task field '{0}' is not admissible")]
     ReservedTaskField(String),
     /// Task nesting exceeds 32 levels.
+    #[msg("task nesting exceeds admission limit")]
     TaskTooDeep,
     /// Policy sandbox is not bound to the resolved workspace.
+    #[msg("policy sandbox is not bound to resolved workspace")]
     SandboxBindingMismatch,
     /// Policy refused the submission.
+    #[msg("admission policy rejected task: {0}")]
     PolicyRejected(String),
     /// Workspace resolution failed.
+    #[msg("workspace resolution failed: {0}")]
+    #[from]
     Workspace(AuthorityError),
     /// Sandbox construction or validation failed.
+    #[msg("sandbox validation failed: {0}")]
+    #[from]
     Sandbox(SandboxError),
     /// Durable persistence failed.
+    #[msg("job admission persistence failed: {0}")]
+    #[from]
     Store(SessionStoreError),
     /// Idempotency key violates the key grammar (key itself is not echoed).
+    #[msg(
+        "invalid idempotency key of {length} bytes: expected 1-{IDEMPOTENCY_KEY_MAX_LEN} bytes of [A-Za-z0-9._:-]"
+    )]
     InvalidIdempotencyKey { length: usize },
     /// Idempotency key already names a job with a different task, kind or scope.
+    #[msg("idempotency key already used for a different submission (job {work_id})")]
     IdempotencyConflict { work_id: WorkId },
     /// A requested budget dimension exceeds the policy ceiling.
+    #[msg("requested {kind:?} budget exceeds the server ceiling")]
     BudgetExceedsCeiling { kind: BudgetKind },
     /// A requested budget dimension is not positive.
+    #[msg("requested {kind:?} budget must be positive")]
     InvalidBudget { kind: BudgetKind },
     /// The submitter exhausted its submission window.
+    #[msg("submission rate limit reached; retry after {retry_after}")]
     RateLimited { retry_after: SignedDuration },
     /// The rate limiter lock is poisoned.
+    #[msg("submission rate limiter is unavailable")]
     LimiterUnavailable,
     /// The job lifecycle rejected the `Ready` transition.
+    #[msg("job could not be made ready: {0}")]
+    #[from]
     JobRuntime(JobRuntimeError),
     /// The blocking admission task panicked or was cancelled.
+    #[msg("blocking admission task failed: {0}")]
     Blocking(String),
-}
-
-impl fmt::Display for JobAdmissionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidWorkspaceAlias(v) => write!(f, "invalid workspace alias '{v}'"),
-            Self::ReservedTaskField(v) => write!(f, "reserved task field '{v}' is not admissible"),
-            Self::TaskTooDeep => f.write_str("task nesting exceeds admission limit"),
-            Self::SandboxBindingMismatch => {
-                f.write_str("policy sandbox is not bound to resolved workspace")
-            }
-            Self::PolicyRejected(v) => write!(f, "admission policy rejected task: {v}"),
-            Self::Workspace(v) => write!(f, "workspace resolution failed: {v}"),
-            Self::Sandbox(v) => write!(f, "sandbox validation failed: {v}"),
-            Self::Store(v) => write!(f, "job admission persistence failed: {v}"),
-            Self::InvalidIdempotencyKey { length } => write!(
-                f,
-                "invalid idempotency key of {length} bytes: expected 1-{IDEMPOTENCY_KEY_MAX_LEN} bytes of [A-Za-z0-9._:-]"
-            ),
-            Self::IdempotencyConflict { work_id } => write!(
-                f,
-                "idempotency key already used for a different submission (job {work_id})"
-            ),
-            Self::BudgetExceedsCeiling { kind } => {
-                write!(f, "requested {kind:?} budget exceeds the server ceiling")
-            }
-            Self::InvalidBudget { kind } => write!(f, "requested {kind:?} budget must be positive"),
-            Self::RateLimited { retry_after } => {
-                write!(
-                    f,
-                    "submission rate limit reached; retry after {retry_after}"
-                )
-            }
-            Self::LimiterUnavailable => f.write_str("submission rate limiter is unavailable"),
-            Self::JobRuntime(v) => write!(f, "job could not be made ready: {v}"),
-            Self::Blocking(v) => write!(f, "blocking admission task failed: {v}"),
-        }
-    }
-}
-
-impl std::error::Error for JobAdmissionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Workspace(v) => Some(v),
-            Self::Sandbox(v) => Some(v),
-            Self::Store(v) => Some(v),
-            Self::JobRuntime(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
-impl From<AuthorityError> for JobAdmissionError {
-    fn from(v: AuthorityError) -> Self {
-        Self::Workspace(v)
-    }
-}
-
-impl From<SandboxError> for JobAdmissionError {
-    fn from(v: SandboxError) -> Self {
-        Self::Sandbox(v)
-    }
-}
-
-impl From<SessionStoreError> for JobAdmissionError {
-    fn from(v: SessionStoreError) -> Self {
-        Self::Store(v)
-    }
-}
-
-impl From<JobRuntimeError> for JobAdmissionError {
-    fn from(v: JobRuntimeError) -> Self {
-        Self::JobRuntime(v)
-    }
 }
 
 #[cfg(test)]

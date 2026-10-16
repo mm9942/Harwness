@@ -1,0 +1,5 @@
+error: the first #[tool(state = ..)] argument must be a reference to the state (`&State`)
+  --> tests/compile_fail/35_tool_state_by_value.rs:11:5
+   |
+11 |     state: u32,
+   |     ^^^^^^^^^^

@@ -84,6 +84,12 @@ pub struct RawDocument {
     /// Der Sichtbarkeits-Bucket-Name, dessen physischer Index dieses
     /// Dokument aufnimmt (siehe [`harw_home::paths::visibility_index_dir`]).
     pub visibility: String,
+    /// `true`, wenn das Dokument ein nicht als UTF-8 lesbares Binary-Artefakt
+    /// repräsentiert; `text` ist dann leer und `content_hash` gesetzt.
+    pub is_binary: bool,
+    /// Inhaltshash (FNV-1a, 16 Hex-Zeichen) des Binary-Artefakts; `None` bei
+    /// regulären Textdokumenten.
+    pub content_hash: Option<String>,
 }
 
 /// Bildet eine [`VisibilityScope`] auf einen Sichtbarkeits-Bucket-Namen ab.
@@ -181,6 +187,8 @@ pub fn collect_design_docs(root: &Path) -> SourceResult<Vec<RawDocument>> {
             source: SourceRef::File { path: display_path },
             text,
             visibility: DEFAULT_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         });
     }
     Ok(documents)
@@ -394,19 +402,38 @@ fn collect_sources_with_extensions(
 
     let mut documents = Vec::with_capacity(files.len());
     for path in files {
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
-            Err(error) => return Err(error.into()),
-        };
+        // Secret-Pfade (`.env`, `auth.toml`, `*.key`) nie lesen oder hashen.
+        if crate::file_metadata::is_secret_path(&path) {
+            continue;
+        }
         let relative = path.strip_prefix(root).unwrap_or(path.as_path());
         let display_path = relative
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                // Nicht-UTF-8: nicht still verwerfen, sondern als
+                // Binary-Artefakt mit Inhaltshash behalten.
+                if let Some(meta) = crate::file_metadata::classify(&path) {
+                    documents.push(RawDocument {
+                        source: SourceRef::File { path: display_path },
+                        text: String::new(),
+                        visibility: DEFAULT_VISIBILITY.to_owned(),
+                        is_binary: true,
+                        content_hash: Some(meta.content_hash),
+                    });
+                }
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         documents.push(RawDocument {
             source: SourceRef::File { path: display_path },
             text,
             visibility: DEFAULT_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         });
     }
     Ok(documents)
@@ -528,6 +555,8 @@ pub fn collect_palace_documents(index: &KnowledgeIndex) -> Vec<RawDocument> {
             },
             text: artifact.body.clone(),
             visibility: visibility_of_scope(&artifact.frontmatter.visibility).to_owned(),
+            is_binary: false,
+            content_hash: None,
         })
         .collect();
     documents.sort_by_key(|d| source_sort_key(&d.source));
@@ -589,6 +618,8 @@ pub fn collect_diary_documents(index: &KnowledgeIndex) -> Vec<RawDocument> {
             },
             text: artifact.body.clone(),
             visibility: visibility_of_scope(&artifact.frontmatter.visibility).to_owned(),
+            is_binary: false,
+            content_hash: None,
         })
         .collect();
     documents.sort_by_key(|d| source_sort_key(&d.source));
@@ -964,13 +995,24 @@ mod tests {
         std::fs::write(dir.path().join("bundle.js"), "a".repeat(1024 * 1024 + 1))?;
 
         let documents = collect_code_sources(dir.path())?;
-        assert_eq!(documents.len(), 1);
+        // Nicht-UTF-8 wird jetzt als Binary-Artefakt behalten; nur >1 MiB wird verworfen.
+        assert_eq!(documents.len(), 2);
         assert_eq!(
-            documents[0].source,
+            documents[1].source,
             SourceRef::File {
                 path: "ok.c".to_owned()
             }
         );
+        assert!(!documents[1].is_binary);
+        assert_eq!(
+            documents[0].source,
+            SourceRef::File {
+                path: "latin1.c".to_owned()
+            }
+        );
+        assert!(documents[0].is_binary);
+        assert_eq!(documents[0].text, "");
+        assert!(documents[0].content_hash.is_some());
         Ok(())
     }
 

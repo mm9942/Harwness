@@ -34,11 +34,14 @@ pub enum Permission {
     ReadSecrets,
     ManagePlugins,
     ReadCargoRegistry,
+    /// Start, stop and inspect containers through the typed container tools
+    /// (`harw-tool-container`). Never implied by `ExecuteProcess`.
+    ManageContainers,
 }
 
 impl Permission {
     /// Every permission, in the sole canonical bit/algebra order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ReadWorkspace,
         Self::WriteWorkspace,
         Self::ExecuteProcess,
@@ -46,6 +49,7 @@ impl Permission {
         Self::ReadSecrets,
         Self::ManagePlugins,
         Self::ReadCargoRegistry,
+        Self::ManageContainers,
     ];
 }
 
@@ -179,7 +183,7 @@ impl PermissionSet {
     }
 
     #[cfg(test)]
-    fn from_test_mask(mask: u8) -> Self {
+    fn from_test_mask(mask: u16) -> Self {
         Self::from_test_permissions(
             Permission::ALL
                 .iter()
@@ -1835,9 +1839,9 @@ mod tests {
 
     #[test]
     fn every_permission_request_restricts_every_parent_set() {
-        for parent_mask in 0_u8..(1 << Permission::ALL.len()) {
+        for parent_mask in 0_u16..(1 << Permission::ALL.len()) {
             let parent = PermissionSet::from_test_mask(parent_mask);
-            for request_mask in 0_u8..(1 << Permission::ALL.len()) {
+            for request_mask in 0_u16..(1 << Permission::ALL.len()) {
                 let request = PermissionRequest::from_permissions(mask_permissions(request_mask));
                 let child = parent.restrict(&request);
 
@@ -2139,7 +2143,7 @@ network_targets = []
         assert!(rights_free.ensure_child_of(&parent).is_err());
     }
 
-    fn mask_permissions(mask: u8) -> impl Iterator<Item = Permission> {
+    fn mask_permissions(mask: u16) -> impl Iterator<Item = Permission> {
         Permission::ALL
             .iter()
             .copied()

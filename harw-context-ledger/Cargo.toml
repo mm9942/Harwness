@@ -1,0 +1,20 @@
+[package]
+publish.workspace = true
+name = "harw-context-ledger"
+description = "Context ledger: per-turn record of which context fragments were offered, omitted and used (labels and sizes only, never content)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

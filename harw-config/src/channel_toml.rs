@@ -5,6 +5,7 @@
 //! (Slack, E-Mail, ...) bekommen eigene `Vec<...>`-Felder in
 //! `ChannelSectionToml`, ohne das bestehende Schema zu brechen.
 
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -321,9 +322,6 @@ fn default_tenant_binding() -> String {
 }
 fn default_transport() -> String {
     "long_poll".to_owned()
-}
-fn default_true() -> bool {
-    true
 }
 fn default_topic_mode() -> String {
     "per_topic_session".to_owned()

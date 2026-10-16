@@ -94,24 +94,16 @@ pub enum UplinkEvent {
     },
 }
 
-/// Size limits of one uplink stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UplinkLimits {
-    /// Largest encoded event line, including the trailing `\n`.
-    pub max_line_bytes: usize,
-    /// Most events per stream.
-    pub max_events: u64,
-    /// Most bytes per stream.
-    pub max_stream_bytes: u64,
-}
-
-impl Default for UplinkLimits {
-    fn default() -> Self {
-        Self {
-            max_line_bytes: 16 * 1024,
-            max_events: 100_000,
-            max_stream_bytes: 64 * 1024 * 1024,
-        }
+harw_types::limits_struct! {
+    /// Size limits of one uplink stream.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct UplinkLimits {
+        /// Largest encoded event line, including the trailing `\n`.
+        pub max_line_bytes: usize = DEFAULT_MAX_LINE_BYTES = 16 * 1024,
+        /// Most events per stream.
+        pub max_events: u64 = DEFAULT_MAX_EVENTS = 100_000,
+        /// Most bytes per stream.
+        pub max_stream_bytes: u64 = DEFAULT_MAX_STREAM_BYTES = 64 * 1024 * 1024,
     }
 }
 

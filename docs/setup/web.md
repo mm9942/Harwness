@@ -1,5 +1,9 @@
 # Running the control plane (`harw web`)
 
+> This page is about the local control plane. For the web tools agents use
+> (`web.fetch`, `web.search`) and their configuration, see
+> [Web research](research-web.md).
+
 `harw web` serves the local control plane: HTTP/1 over a Unix socket,
 authorized per connection through `SO_PEERCRED` (Crypto Masterplan v2 §6.1).
 It needs a HARW home in every mode (`--home` or `HARW_HOME`); the home holds

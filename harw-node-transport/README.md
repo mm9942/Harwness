@@ -152,6 +152,31 @@ There is no per-frame signature.
   buffer never exceeds twice the line limit; maps errors to HTTP 413 / 400
   via `UplinkError::http_status`.
 
+## HTTP/1 upgrade (WebSocket control plane, W00 §2.3)
+
+The `upgrade` module lets a protocol such as the session WebSocket
+(`harw.session.v1`) run over the same mutually authenticated channel. It is
+protocol-agnostic; it knows nothing about WebSocket.
+
+* **Order**: TLS 1.3 (X25519MLKEM768) -> ML-DSA-65 node transcript ->
+  `AuthenticatedPeer` -> HTTP/1 -> `101` -> raw I/O. The peer is final before
+  the first HTTP byte is parsed.
+* **Server**: `NodeTransportServer::serve_upgradable` is `serve_with_shutdown`
+  with Hyper `with_upgrades`. The service answers `101` and calls
+  `accept_upgrade(request)` (on a spawned task) to get an `UpgradedServerIo`
+  holding the peer and the raw I/O. `peer_of(&request)` reads the peer from
+  the request extension, which the server overwrites on every request.
+  Identity is never read from request headers; a request without the
+  extension fails closed (`UpgradeError::MissingPeer`).
+* **Client**: `NodeTransportClient::upgrade(request)` sends the upgrade request
+  on the connection already bound to the expected node by `connect`, requires
+  `101` (`UpgradeError::NotSwitched(status)` otherwise) and returns
+  `UpgradedClientIo { peer, response, io }`. The caller checks
+  `Sec-WebSocket-Accept` and the subprotocol (`harw-session-ws`).
+* Subprotocol and `Origin` policy belong to the session layer
+  (`harw-session-ws::upgrade`), not to this crate. `serve`,
+  `serve_with_shutdown`, `accept`, `connect` and `send_request` are unchanged.
+
 ## Not in this crate (yet)
 
 * Missing: the production `AuthHubSign` adapter bridging

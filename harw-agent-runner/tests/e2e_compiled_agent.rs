@@ -903,6 +903,10 @@ async fn compiled_family_runs_two_workers_as_jobs() -> TestResult {
     let out = tempfile::tempdir()?;
     let exe = build_agent_binary(out.path(), "lead", &compiled.artifact)?;
     let home = tempfile::tempdir()?;
+    harw_command::install_host_default(&std::env::temp_dir().join(format!(
+        "harw-agent-runner-e2e-command-jobs-{}",
+        std::process::id()
+    )));
     let manager = harw_tool_job::JobManager::new(
         harw_tool_job::JobManagerConfig::new(home.path()),
         Arc::new(harw_tool_job::NoopNotifier),
@@ -933,7 +937,26 @@ async fn compiled_family_runs_two_workers_as_jobs() -> TestResult {
             backend.run(spec("writer"), &Io)
         )
     })
-    .await?;
+    .await;
+    let results = match results {
+        Ok(results) => results,
+        Err(elapsed) => {
+            for entry in std::fs::read_dir(home.path().join("jobs"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                for name in ["stderr.log", "stdout.log", "meta.json"] {
+                    eprintln!(
+                        "== {} {name}\n{}",
+                        entry.path().display(),
+                        std::fs::read_to_string(entry.path().join(name)).unwrap_or_default()
+                    );
+                }
+            }
+            return Err(elapsed.into());
+        }
+    };
     for result in [results.0, results.1] {
         assert_eq!(result.status, ChildRunStatus::Completed, "{result:?}");
         assert_eq!(result.text.as_deref(), Some("worker completed"));

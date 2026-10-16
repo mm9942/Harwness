@@ -18,5 +18,8 @@ serde_json = { workspace = true }
 fs4 = { workspace = true }
 tempfile = { workspace = true }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

@@ -87,6 +87,19 @@
 //!   ein Crate für beide Makros denselben Fehlertyp wiederverwenden kann.
 //! - `#[kebab_enum(ctor = "methodenname")]` (Enum-Ebene) — Name der
 //!   assoziierten Fehler-Konstruktorfunktion. Default: `unknown_variant`.
+//! - `#[kebab_enum(case = "snake")]` (Enum-Ebene) — kanonische Namen in
+//!   snake_case statt kebab-case (`CompleteDrain` → `complete_drain`), passend
+//!   zu `serde(rename_all = "snake_case")`. Default bzw. `case = "kebab"`:
+//!   kebab-case. `FromStr`/`parse` akzeptieren unabhängig davon beide
+//!   Schreibweisen und beliebige Groß-/Kleinschreibung.
+//! - `#[kebab_enum(parse_option)]` (Enum-Ebene) — erzeugt zusätzlich
+//!   `pub fn parse(value: &str) -> Option<Self>`; wie `FromStr`, aber ohne
+//!   Fehlertyp und mit abgeschnittenem Leerraum um die Eingabe.
+//! - `#[kebab_enum(no_all)]` (Enum-Ebene) — erzeugt **kein** `ALL`, wenn der
+//!   Typ bereits eine eigene `ALL`-Konstante (z. B. als Array statt Slice)
+//!   mitbringt.
+//! - `#[kebab_enum(no_from_str)]` (Enum-Ebene) — erzeugt **kein** `FromStr`
+//!   (dann sind `error`/`ctor` bedeutungslos und es braucht keinen Fehlertyp).
 //! - `#[kebab_enum(rename = "...")]` (Varianten-Ebene) — überschreibt den
 //!   kanonischen Namen dieser Variante.
 //!
@@ -122,6 +135,30 @@ struct KebabEnumArgs {
     error_path: Path,
     /// Name der assoziierten Fehler-Konstruktorfunktion (Typname, Wert → Fehler).
     ctor_ident: Ident,
+    /// Kanonische Schreibweise der automatisch abgeleiteten Namen.
+    case: Case,
+    /// Zusätzlich `parse(&str) -> Option<Self>` erzeugen.
+    parse_option: bool,
+    /// Kein `FromStr` erzeugen.
+    no_from_str: bool,
+    /// Kein `ALL` erzeugen.
+    no_all: bool,
+}
+
+/// Kanonische Schreibweise der abgeleiteten Namen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Case {
+    Kebab,
+    Snake,
+}
+
+impl Case {
+    fn separator(self) -> &'static str {
+        match self {
+            Self::Kebab => "-",
+            Self::Snake => "_",
+        }
+    }
 }
 
 impl Default for KebabEnumArgs {
@@ -129,6 +166,10 @@ impl Default for KebabEnumArgs {
         Self {
             error_path: syn::parse_quote!(crate::error::InvalidId),
             ctor_ident: Ident::new("unknown_variant", proc_macro2::Span::call_site()),
+            case: Case::Kebab,
+            parse_option: false,
+            no_from_str: false,
+            no_all: false,
         }
     }
 }
@@ -168,10 +209,32 @@ fn parse_kebab_enum_args(attrs: &[Attribute]) -> syn::Result<KebabEnumArgs> {
                     )
                 })?;
                 Ok(())
+            } else if meta.path.is_ident("case") {
+                let lit: LitStr = meta.value()?.parse()?;
+                args.case = match lit.value().as_str() {
+                    "kebab" => Case::Kebab,
+                    "snake" => Case::Snake,
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            &lit,
+                            format!("`case` muss \"kebab\" oder \"snake\" sein, nicht \"{other}\""),
+                        ));
+                    }
+                };
+                Ok(())
+            } else if meta.path.is_ident("parse_option") {
+                args.parse_option = true;
+                Ok(())
+            } else if meta.path.is_ident("no_all") {
+                args.no_all = true;
+                Ok(())
+            } else if meta.path.is_ident("no_from_str") {
+                args.no_from_str = true;
+                Ok(())
             } else {
                 Err(meta.error(
                     "unbekanntes kebab_enum-Attribut auf Enum-Ebene; erwartet: \
-                     error = \"...\", ctor = \"...\"",
+                     error = \"...\", ctor = \"...\", case = \"...\", parse_option, no_from_str, no_all",
                 ))
             }
         })?;
@@ -212,7 +275,7 @@ fn parse_variant_rename(variant: &Variant) -> syn::Result<Option<LitStr>> {
 }
 
 /// Wandelt einen Rust-Bezeichner (z. B. einen Enum-Varianten-`Ident`) in
-/// kebab-case um.
+/// kebab-case (bzw. snake_case, siehe [`Case`]) um.
 ///
 /// Siehe Modul-Doc, Abschnitt "kebab-case-Konvertierungsregel", für die
 /// vollständige Spezifikation der Wortgrenzen-Regeln (insbesondere den
@@ -220,7 +283,7 @@ fn parse_variant_rename(variant: &Variant) -> syn::Result<Option<LitStr>> {
 ///
 /// # Design-doc reference
 /// Spec section "KebabEnum — kebab-case-Konvertierungsregel" (Modul-Doc oben).
-fn to_kebab_case(ident: &str) -> String {
+fn to_case(ident: &str, case: Case) -> String {
     let chars: Vec<char> = ident.chars().collect();
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -256,14 +319,14 @@ fn to_kebab_case(ident: &str) -> String {
         words.push(current);
     }
 
-    words.join("-")
+    words.join(case.separator())
 }
 
 /// Ein aufgelöster Varianten-Eintrag: Bezeichner plus kanonischer und
 /// normalisierter (Groß-/Kleinschreibung sowie `_`/`-` vereinheitlicht) Name.
 struct VariantInfo {
     ident: Ident,
-    /// Von `Display`/`as_str` gelieferter Name (kebab-case oder `rename`-Wert).
+    /// Von `Display`/`as_str` gelieferter Name (kebab-/snake-case oder `rename`-Wert).
     canonical: String,
     /// `canonical` mit `_` → `-` und vollständig kleingeschrieben; Basis für
     /// den `FromStr`-Vergleich und die Kollisionsprüfung.
@@ -323,7 +386,7 @@ pub(crate) fn expand_kebab_enum(input: &DeriveInput) -> syn::Result<TokenStream>
         let rename = parse_variant_rename(variant)?;
         let canonical = match rename {
             Some(lit) => lit.value(),
-            None => to_kebab_case(&variant.ident.to_string()),
+            None => to_case(&variant.ident.to_string(), args.case),
         };
         let normalized = canonical.replace('_', "-").to_ascii_lowercase();
 
@@ -379,18 +442,66 @@ pub(crate) fn expand_kebab_enum(input: &DeriveInput) -> syn::Result<TokenStream>
         })
         .collect();
 
-    Ok(quote! {
-        impl #enum_name {
+    let parse_arms: Vec<TokenStream> = infos
+        .iter()
+        .map(|v| {
+            let ident = &v.ident;
+            let normalized = &v.normalized;
+            quote! { #normalized => ::core::option::Option::Some(#enum_name::#ident), }
+        })
+        .collect();
+
+    let parse_fn = args.parse_option.then(|| {
+        quote! {
+            /// Liest einen Namen (kebab-/snake-case, beliebige Groß-/Kleinschreibung,
+            /// umgebender Leerraum wird ignoriert); unbekannt ergibt `None`.
+            #[must_use]
+            pub fn parse(value: &str) -> ::core::option::Option<Self> {
+                let normalized = value.trim().replace('_', "-").to_ascii_lowercase();
+                match normalized.as_str() {
+                    #(#parse_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    });
+
+    let from_str_impl = (!args.no_from_str).then(|| {
+        quote! {
+            impl ::std::str::FromStr for #enum_name {
+                type Err = #error_path;
+
+                fn from_str(s: &str) -> ::core::result::Result<Self, Self::Err> {
+                    let normalized = s.replace('_', "-").to_ascii_lowercase();
+                    match normalized.as_str() {
+                        #(#from_str_arms)*
+                        _ => ::core::result::Result::Err(#error_path::#ctor_ident(#enum_name_str, s)),
+                    }
+                }
+            }
+        }
+    });
+
+    let all_const = (!args.no_all).then(|| {
+        quote! {
             /// Alle Varianten in Deklarationsreihenfolge.
             pub const ALL: &'static [#enum_name] = &[#(#all_variants),*];
+        }
+    });
 
-            /// Kanonischer kebab-case-Name dieser Variante.
+    Ok(quote! {
+        impl #enum_name {
+            #all_const
+
+            /// Kanonischer Name dieser Variante (kebab- oder snake-case).
             #[must_use]
-            pub fn as_str(&self) -> &'static str {
+            pub const fn as_str(&self) -> &'static str {
                 match self {
                     #(#as_str_arms)*
                 }
             }
+
+            #parse_fn
         }
 
         impl ::std::fmt::Display for #enum_name {
@@ -399,17 +510,7 @@ pub(crate) fn expand_kebab_enum(input: &DeriveInput) -> syn::Result<TokenStream>
             }
         }
 
-        impl ::std::str::FromStr for #enum_name {
-            type Err = #error_path;
-
-            fn from_str(s: &str) -> ::core::result::Result<Self, Self::Err> {
-                let normalized = s.replace('_', "-").to_ascii_lowercase();
-                match normalized.as_str() {
-                    #(#from_str_arms)*
-                    _ => ::core::result::Result::Err(#error_path::#ctor_ident(#enum_name_str, s)),
-                }
-            }
-        }
+        #from_str_impl
     })
 }
 
@@ -418,29 +519,39 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
 
+    fn to_case_kebab(ident: &str) -> String {
+        to_case(ident, Case::Kebab)
+    }
+
+    #[test]
+    fn snake_case_joins_words_with_underscore() {
+        assert_eq!(to_case("CompleteDrain", Case::Snake), "complete_drain");
+        assert_eq!(to_case("HTTPServer", Case::Snake), "http_server");
+    }
+
     #[test]
     fn kebab_case_converts_simple_pascal_case() {
-        assert_eq!(to_kebab_case("AddCriterion"), "add-criterion");
+        assert_eq!(to_case_kebab("AddCriterion"), "add-criterion");
     }
 
     #[test]
     fn kebab_case_groups_leading_acronym_before_a_word() {
-        assert_eq!(to_kebab_case("HTTPServer"), "http-server");
+        assert_eq!(to_case_kebab("HTTPServer"), "http-server");
     }
 
     #[test]
     fn kebab_case_treats_all_caps_identifier_as_one_word() {
-        assert_eq!(to_kebab_case("ID"), "id");
+        assert_eq!(to_case_kebab("ID"), "id");
     }
 
     #[test]
     fn kebab_case_handles_existing_separators() {
-        assert_eq!(to_kebab_case("Already_Snake"), "already-snake");
+        assert_eq!(to_case_kebab("Already_Snake"), "already-snake");
     }
 
     #[test]
     fn kebab_case_handles_single_letter() {
-        assert_eq!(to_kebab_case("A"), "a");
+        assert_eq!(to_case_kebab("A"), "a");
     }
 
     #[test]
@@ -605,6 +716,64 @@ mod tests {
             ));
         };
         assert!(err.to_string().contains("gültiger Pfad"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_snake_case_changes_canonical_names() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(case = "snake")]
+            pub enum Foo { CompleteDrain }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .map_err(ctx("snake case must expand"))?
+            .to_string();
+        assert!(tokens.contains("=> \"complete_drain\""));
+        // FromStr normalises to kebab, so lookup stays tolerant.
+        assert!(tokens.contains("\"complete-drain\" =>"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_rejects_unknown_case() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(case = "camel")]
+            pub enum Foo { A }
+        };
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown case must be rejected".to_owned(),
+            ));
+        };
+        assert!(err.to_string().contains("`case` muss"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_parse_option_and_no_from_str() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(parse_option, no_from_str)]
+            pub enum Foo { A }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .map_err(ctx("flags must expand"))?
+            .to_string();
+        assert!(tokens.contains("fn parse"));
+        assert!(!tokens.contains("FromStr"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_no_all_omits_the_constant() -> TestResult {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(no_all)]
+            pub enum Foo { A }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .map_err(ctx("no_all must expand"))?
+            .to_string();
+        assert!(!tokens.contains("ALL"));
+        assert!(tokens.contains("fn as_str"));
         Ok(())
     }
 }

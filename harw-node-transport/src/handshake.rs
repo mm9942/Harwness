@@ -73,18 +73,12 @@ pub enum Role {
     Client,
 }
 
-/// Freshness policy of the handshake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandshakePolicy {
-    /// Accepted difference between the peer's claimed time and local time.
-    pub max_clock_skew: Duration,
-}
-
-impl Default for HandshakePolicy {
-    fn default() -> Self {
-        Self {
-            max_clock_skew: Duration::from_secs(30),
-        }
+harw_types::limits_struct! {
+    /// Freshness policy of the handshake.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HandshakePolicy {
+        /// Accepted difference between the peer's claimed time and local time.
+        pub max_clock_skew: Duration = DEFAULT_MAX_CLOCK_SKEW = Duration::from_secs(30),
     }
 }
 

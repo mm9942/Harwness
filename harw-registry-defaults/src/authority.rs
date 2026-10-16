@@ -74,11 +74,13 @@ use crate::capability_catalog::{
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
+use crate::memory_tools::{MEMORY_RECALL, MEMORY_RECORD};
 use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
-    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
-    FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    BROWSER_TOOLS, CARGO_TEST_ONE_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS,
+    EXPLORER_TOOLS, FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, OBSIDIAN_READ_TOOLS,
+    PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
@@ -654,9 +656,15 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
     if tool == "fs.write"
         || tool == "fs.edit"
+        // Obsidian vault writes: `obsidian.write` creates or replaces a note
+        // in the vault (`docs/planning` by default) — same file-level right
+        // as `fs.write`, enforced through the sandbox workspace binding.
+        || tool == harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES[4]
         // Runde 7, Teil T2: `latex.template` schreibt Vorlage und Gerüst in
         // den Workspace (kein Prozess) — vor dem `LATEX_TOOLS`-Zweig geprüft.
         || tool == crate::profile::LATEX_TEMPLATE_TOOL
+        // `memory.record` schreibt Fakten (Projekt oder global); nie auto-freigegeben.
+        || tool == MEMORY_RECORD
         || listed(AGENT_DEFINITION_WRITE_TOOLS)
         || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
         || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
@@ -674,6 +682,9 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // dieser Rechtefilter (der pro Werkzeug nur ein Recht liefert).
         || tool == WORK_DRIVER_ENQUEUE_TOOL
         || listed(PROCESS_TOOLS)
+        // `cargo.test_one` startet über `shell.exec` einen Testlauf; die
+        // übrigen `cargo.*` haben bewusst kein Recht (nie registriert).
+        || listed(CARGO_TEST_ONE_TOOLS)
         || listed(LATEX_TOOLS)
         || listed(crate::profile::SUDO_TOOLS)
     {
@@ -690,7 +701,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(WorkbenchReadToolProvider::TOOL_NAMES)
         || listed(DiaryToolProvider::TOOL_NAMES)
         || listed(PalaceToolProvider::TOOL_NAMES)
+        // Obsidian vault reads (first four entries of the provider list).
+        || listed(OBSIDIAN_READ_TOOLS)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
+        || tool == MEMORY_RECALL
         // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
         // Harness-Artefakt `.harw/plans/<slug>.md` und muss unter der
         // Plan-Decke (ohne `WriteWorkspace`) laufen; die übrigen drei lesen
@@ -708,6 +722,11 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || tool == WORK_DRIVER_STOP_TOOL
     {
         Some(Permission::ReadWorkspace)
+    } else if listed(&CONTAINER_TOOLS) {
+        // `container.images` (read-only listing) and `container.run` (starts a
+        // hardened container): both need the dedicated container right, which
+        // no entry grants by default.
+        Some(Permission::ManageContainers)
     } else if listed(DEPS_SOURCE_TOOLS) {
         Some(Permission::ReadCargoRegistry)
     } else if listed(WEB_TOOLS) || listed(BROWSER_TOOLS) {
@@ -716,6 +735,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         None
     }
 }
+
+/// Names of the container tools (`harw-tool-container-run`); registered by the
+/// runtime only when `[tools.container]` is enabled.
+pub const CONTAINER_TOOLS: [&str; 2] = ["container.images", "container.run"];
 
 /// Das Recht, das ein Capability-Label aus `[authority] capabilities`
 /// benennt (#22 Welle 1B).
@@ -736,6 +759,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
 /// | `secrets.read` | `ReadSecrets` |
 /// | `plugins.manage` | `ManagePlugins` |
 /// | `cargo.registry.read` | `ReadCargoRegistry` |
+/// | `containers.manage`, `container` | `ManageContainers` |
 ///
 /// # Rückgabe
 /// `None` für ein fachliches Label ohne Rechtebezug.
@@ -761,6 +785,8 @@ pub fn capability_permission(label: &str) -> Option<Permission> {
         Some(Permission::ManagePlugins)
     } else if matches("cargo.registry.read") {
         Some(Permission::ReadCargoRegistry)
+    } else if matches("containers.manage") || matches("container") {
+        Some(Permission::ManageContainers)
     } else {
         None
     }
@@ -816,6 +842,21 @@ pub fn granted_for_capabilities(
     manifest_tools: Option<&[String]>,
 ) -> PermissionSet {
     let mut granted: Vec<Permission> = profile_rights.iter().collect();
+    // `cargo.test_one` braucht `ExecuteProcess`, das kein Profil trägt
+    // (`RegistryProfile::required_permissions`). Es wird nur vergeben, wenn
+    // ein Schreibprofil und ein Manifest zusammentreffen, das das Werkzeug
+    // führt; der Roster klemmt es für alle außer dem `test-engineer` heraus.
+    // Die Schnitte unten (Autorität, Manifest) gelten danach wie üblich.
+    if profile_rights.contains(Permission::WriteWorkspace)
+        && !granted.contains(&Permission::ExecuteProcess)
+        && manifest_tools.is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| crate::profile::CARGO_TEST_ONE_TOOLS.contains(&tool.as_str()))
+        })
+    {
+        granted.push(Permission::ExecuteProcess);
+    }
     if let Some(authority) = authority_permissions(capabilities) {
         granted.retain(|permission| authority.contains(*permission));
     }
@@ -862,6 +903,22 @@ mod tests {
     }
 
     #[test]
+    fn test_container_tools_need_the_container_right_and_run_always_asks() {
+        for tool in CONTAINER_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ManageContainers),
+                "{tool}"
+            );
+        }
+        assert!(crate::ALWAYS_ASK_TOOLS.contains(&"container.run"));
+        assert!(
+            !crate::AUTO_APPROVED_TOOLS.contains(&"container.run"),
+            "never auto-approved"
+        );
+    }
+
+    #[test]
     fn test_tool_permission_matches_process_provider_declarations() {
         let names = harw_tool_process::ProcessToolProvider::TOOL_NAMES;
         let declared = harw_tool_process::ProcessToolProvider::TOOL_PERMISSIONS;
@@ -875,6 +932,16 @@ mod tests {
     fn test_tool_permission_matches_lens_provider_declarations() {
         let names = harw_tool_lens::LensToolProvider::TOOL_NAMES;
         let declared = harw_tool_lens::LensToolProvider::TOOL_PERMISSIONS;
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_tool_permission_matches_obsidian_provider_declarations() {
+        let names = harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES;
+        let declared = harw_tool_obsidian::ObsidianToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
         }

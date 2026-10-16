@@ -174,3 +174,128 @@ fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
         }
     }
 }
+
+// ── `state = Type` and `schema_from = path` ──────────────────────────────────
+
+/// Externally built specification: no `#[derive(Tool)]` on the args type.
+fn counter_spec() -> ToolSpec {
+    ToolSpec::Function(harw_tools::FunctionToolSpec {
+        name: ToolName::new("placeholder-overwritten-by-the-macro"),
+        description: "placeholder".to_owned(),
+        parameters: harw_tools::JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+#[derive(Deserialize)]
+struct CounterArgs {
+    step: u32,
+}
+
+#[tool(
+    name = "test.counter",
+    description = "Adds a step to the stored base",
+    permission = "read_workspace",
+    state = u32,
+    schema_from = counter_spec,
+    parallel_safe,
+)]
+async fn counter(
+    base: &u32,
+    _context: &ToolExecutionContext,
+    args: CounterArgs,
+) -> Result<ToolOutput, ToolsError> {
+    Ok(ToolOutput::text(format!("{}", *base + args.step)))
+}
+
+#[tool(name = "test.plain", description = "No state", parallel_safe = false)]
+async fn plain(
+    _context: &ToolExecutionContext,
+    _args: FetchArgs,
+) -> Result<ToolOutput, ToolsError> {
+    Ok(ToolOutput::text("plain"))
+}
+
+#[test]
+fn schema_from_builds_spec_with_name_and_description_from_consts() {
+    let ToolSpec::Function(spec) = CounterTool::spec();
+
+    assert_eq!(spec.name.as_str(), "test.counter");
+    assert_eq!(spec.description, "Adds a step to the stored base");
+    assert!(spec.strict, "strict comes from the external schema builder");
+    assert_eq!(spec.parameters.schema_type, Some(JsonSchemaType::Object));
+    assert_eq!(CounterTool::PERMISSION, Some(Permission::ReadWorkspace));
+    let parallel_safe = CounterTool::PARALLEL_SAFE;
+    assert!(parallel_safe);
+}
+
+#[test]
+fn state_tool_passes_state_to_the_function() -> TestResult {
+    let call = ToolCall {
+        id: ToolCallId::from_str("call-2"),
+        name: ToolName::new("test.counter"),
+        arguments: serde_json::json!({ "step": 5 }),
+    };
+
+    let executor = CounterTool::new(37);
+    let out = futures_lite_block_on(executor.execute(&test_execution_context()?, &call))
+        .map_err(ctx("ok"))?;
+    match out {
+        ToolOutput::Text { content } => assert_eq!(content, "42"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected output: {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+harw_tools::tool_provider_core! {
+    /// Provider mixing a stateful tool (constructor expression) and a plain one.
+    struct MixedProvider {
+        state: u32 as base;
+        CounterTool => CounterTool::new(*base),
+        PlainTool => PlainTool,
+    }
+}
+
+#[test]
+fn tool_provider_core_state_form_works_with_real_tool_macro_output() -> TestResult {
+    let provider = MixedProvider::new(10);
+
+    assert_eq!(MixedProvider::TOOL_NAMES, &["test.counter", "test.plain"]);
+    assert_eq!(
+        MixedProvider::TOOL_PERMISSIONS,
+        &[Some(Permission::ReadWorkspace), None]
+    );
+    assert_eq!(MixedProvider::tool_specs().len(), 2);
+    assert!(MixedProvider::tool_parallel_safe("test.counter"));
+    assert!(!MixedProvider::tool_parallel_safe("test.plain"));
+    assert!(!MixedProvider::tool_parallel_safe("test.unknown"));
+    assert!(provider.tool_executor("test.unknown").is_none());
+    assert!(provider.tool_executor("test.plain").is_some());
+
+    let executor = provider
+        .tool_executor("test.counter")
+        .ok_or(TestError::Missing("executor for test.counter"))?;
+    let call = ToolCall {
+        id: ToolCallId::from_str("call-3"),
+        name: ToolName::new("test.counter"),
+        arguments: serde_json::json!({ "step": 1 }),
+    };
+    let out = futures_lite_block_on(executor.execute(&test_execution_context()?, &call))
+        .map_err(ctx("ok"))?;
+    match out {
+        ToolOutput::Text { content } => assert_eq!(content, "11"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected output: {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}

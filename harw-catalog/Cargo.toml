@@ -11,10 +11,17 @@ rust-version.workspace = true
 [dependencies]
 harw-config = { path = "../harw-config" }
 harw-home = { path = "../harw-home" }
+harw-context = { path = "../harw-context" }
+harw-types = { path = "../harw-types" }
+harw-lens-types = { path = "../harw-lens-types" }
+jiff = { workspace = true }
 tempfile = "3"
 toml = "1.1"
 sha2 = "0.11"
 serde_json = "1"
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 
 [lints]
 workspace = true

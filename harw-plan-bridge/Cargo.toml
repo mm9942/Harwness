@@ -17,6 +17,13 @@ harw-research = { path = "../harw-research" }
 harw-operations = { path = "../harw-operations" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-job-runtime = { path = "../harw-job-runtime" }
+# PL-90 W02: durable intent-cycle records (`cycle_runtime.rs`) über die
+# generische, gefencte Speichermechanik und den Lease-Token des Job-Modells.
+harw-job-core = { path = "../harw-job-core" }
+harw-job-store = { path = "../harw-job-store" }
+# PL-90 W03: read-only explorer executor (`cycle_explorer.rs`) reads through
+# the workspace-bound `Scope` (no symlink escape, secret-path denylist).
+harw-tool-fsread = { path = "../harw-tool-fsread" }
 harw-session-store = { path = "../harw-session-store" }
 harw-knowledge = { path = "../harw-knowledge" }
 harw-home = { path = "../harw-home" }
@@ -49,8 +56,13 @@ serde_json = "1.0.150"
 time = { version = "0.3.53", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 jiff = { workspace = true }
 tracing = "0.1.44"
+# PL-90 W02: blockierende Store-Zugriffe des Cycle-Drivers laufen über
+# `spawn_blocking`, Abschlusssignal für `ExecutionControl` über `watch`.
+# PL-90 W03: `time` für den begrenzten Retry-Backoff des Modell-Proposers.
+tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = "3.27.0"
 # Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
 # genau wie `harw-dod-escalate` selbst es in seinen eigenen Tests tut — statt
@@ -59,6 +71,7 @@ tempfile = "3.27.0"
 # `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
 harw-dod-rules = { path = "../dod/crates/harw-dod-rules", features = ["test-support"] }
 harw-sandbox = { path = "../harw-sandbox" }
+tokio = { version = "1.53.0", features = ["rt", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,1020 @@
+//! Entfernte Sitzungen: dieselbe Konversation in einem anderen Prozess.
+//!
+//! # Beschreibung
+//! Ein `harw gateway --session-socket` hostet Sitzungen und spricht
+//! `harw.session.v1` (WebSocket über einen Unix-Socket). [`RemoteHarwness`]
+//! verbindet sich damit; [`RemoteSession`] ist eine angehängte Sitzung. Die
+//! Fläche gleicht der lokalen [`crate::Session`]: [`RemoteSession::send`]
+//! fährt einen Turn zu Ende und liefert einen [`TurnReport`], die Ereignisse
+//! sind dieselben [`SdkEvent`], Freigaben beantwortet derselbe
+//! [`ApprovalHandler`]. Kein interner Protokolltyp erscheint in einer Signatur.
+//!
+//! # Was `send` kapselt
+//! - **Absenden:** ein Prompt trägt einen Idempotenzschlüssel, der einen
+//!   Neustart des Clients übersteht (Epoche aus Startzeit und Zähler); steht
+//!   der Verlauf inzwischen weiter (`Stale`), wird mit dem neuen Stand erneut
+//!   abgesendet.
+//! - **Freigabe:** hält der Turn an, fragt `send` den [`ApprovalHandler`] und
+//!   meldet die Entscheidung. Der Host entscheidet, wer freigeben darf; nur
+//!   wenn er das Recht `approve` erteilt hat ([`RemoteSession::may_approve`]),
+//!   wird der Handler gefragt. Sonst wartet der Turn auf ein anderes Gerät.
+//!   Gewinnt dort jemand anderes, ist das kein Fehler.
+//! - **Strom:** verliert der Strom seine Position (`Lagged`, `Resync`), hängt
+//!   sich die Sitzung ab dem Stand des Hosts neu an; Wiedergabe-Frames älterer
+//!   Positionen zählen nicht als Ereignisse dieses Turns.
+//!
+//! # Grenzen
+//! - `send` setzt voraus, dass kein anderer Client gleichzeitig Turns derselben
+//!   Sitzung fährt. Steht der eigene Prompt hinter laufenden Turns, wartet
+//!   `send` auf deren Ende mit.
+//! - Eine verlorene Verbindung beendet `send` mit einem Fehler; eine
+//!   automatische Wiederverbindung gibt es hier noch nicht (sie kommt aus
+//!   `harw-session-remote`, sobald sie dort vorhanden ist).
+//!
+//! # Nebenläufigkeit
+//! [`RemoteHarwness`] ist billig klonbar. `send` nimmt `&mut self`: eine
+//! [`RemoteSession`] fährt nie zwei Turns zugleich.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use harw_protocol::session_wire::{
+    ApprovalRespondParams, AttachParams, CreateParams, Cursor, DEFAULT_TAIL_ITEMS, FrameEnvelope,
+    InterruptParams, SessionFrame, StreamProfile, SubmitParams,
+};
+use harw_protocol::{FrameSource, PortError, SessionPort};
+use harw_session_client::{
+    AnsweredSet, IdempotencyKeys, MAX_SUBMIT_ATTEMPTS, RespondStep, StreamTracker, SubmitStep,
+    TurnEnd, TurnTally, describe, hosted_state_word, interpret_respond, interpret_submit, review,
+};
+use harw_session_remote::{ConnectOptions, RemotePort, connect_unix};
+use harw_types::ApprovalId;
+
+use crate::approval::{ApprovalHandler, ApprovalRequest, Decision, default_handler};
+use crate::error::{Result, SdkError};
+use crate::event::{EventSource, SdkEvent, Usage, map_turn_event};
+use crate::ids::SessionId;
+use crate::session::{TurnReport, TurnStatus};
+
+/// Eine Sitzung des Hosts, wie `sessions` sie auflistet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RemoteSessionInfo {
+    /// Kennung der Sitzung.
+    pub id: SessionId,
+    /// Titel, falls gesetzt.
+    pub title: Option<String>,
+    /// Zustand in Kurzform: `idle`, `running`, `waiting_for_approval`,
+    /// `waiting_for_child`, `queued`, `interrupted`, `failed`, `closed`
+    /// (oder `unknown` für künftige Zustände).
+    pub state: String,
+    /// Wie viele Clients gerade angehängt sind.
+    pub attached: u32,
+}
+
+/// Übersetzt einen Portfehler an der Grenze in den SDK-Fehler.
+fn session_error(error: PortError) -> SdkError {
+    SdkError::Session {
+        detail: error.to_string(),
+    }
+}
+
+/// Baut eine [`RemoteHarwness`]; siehe [`RemoteHarwness::builder`].
+pub struct RemoteBuilder {
+    socket: Option<PathBuf>,
+    label: String,
+    approvals: Arc<dyn ApprovalHandler>,
+    compact: bool,
+    turn_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for RemoteBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBuilder")
+            .field("socket", &self.socket)
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteBuilder {
+    /// Der Unix-Socket des Hosts (Pflicht), z. B.
+    /// `$XDG_RUNTIME_DIR/harw/session.sock`.
+    #[must_use]
+    pub fn socket(mut self, path: impl Into<PathBuf>) -> Self {
+        self.socket = Some(path.into());
+        self
+    }
+
+    /// Anzeigename dieses Clients (Anwesenheit und Protokoll des Hosts).
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Beantwortet Freigaben; Vorgabe [`crate::AutoDeny`].
+    #[must_use]
+    pub fn approval_handler(mut self, handler: impl ApprovalHandler) -> Self {
+        self.approvals = Arc::new(handler);
+        self
+    }
+
+    /// Fordert das schmale Profil an (kein Reasoning und keine Kind-Deltas,
+    /// zusammengefasster Text); gedacht für Telefone und schmale Leitungen.
+    #[must_use]
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
+    }
+
+    /// Obergrenze für einen ganzen [`RemoteSession::send`]; Vorgabe keine.
+    /// Schützt davor, dass ein Turn ewig auf ein anderes Gerät wartet.
+    #[must_use]
+    pub fn turn_timeout(mut self, timeout: Duration) -> Self {
+        self.turn_timeout = Some(timeout);
+        self
+    }
+
+    /// Verbindet sich, hebt die Verbindung auf `harw.session.v1` und führt
+    /// `session.hello` aus.
+    ///
+    /// # Fehler
+    /// [`SdkError::InvalidInput`] ohne Socket; [`SdkError::Session`], wenn der
+    /// Host nicht erreichbar ist oder die Verbindung ablehnt.
+    pub async fn connect(self) -> Result<RemoteHarwness> {
+        let socket = self
+            .socket
+            .ok_or_else(|| SdkError::invalid("socket", "must be set"))?;
+        let connection = connect_unix(socket, ConnectOptions::new(self.label.clone()))
+            .await
+            .map_err(|error| SdkError::Session {
+                detail: error.to_string(),
+            })?;
+        Ok(RemoteHarwness {
+            port: Arc::new(RemotePort::new(connection)),
+            approvals: self.approvals,
+            label: self.label,
+            compact: self.compact,
+            turn_timeout: self.turn_timeout,
+        })
+    }
+}
+
+/// Eine Verbindung zu einem Host, der Sitzungen bereitstellt.
+#[derive(Clone)]
+pub struct RemoteHarwness {
+    port: Arc<dyn SessionPort>,
+    approvals: Arc<dyn ApprovalHandler>,
+    label: String,
+    compact: bool,
+    turn_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for RemoteHarwness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHarwness")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteHarwness {
+    /// Beginnt eine Verbindung.
+    #[must_use]
+    pub fn builder() -> RemoteBuilder {
+        RemoteBuilder {
+            socket: None,
+            label: "harwness-sdk".to_owned(),
+            approvals: default_handler(),
+            compact: false,
+            turn_timeout: None,
+        }
+    }
+
+    /// Die Sitzungen, die der Host kennt und die dieser Client sehen darf.
+    ///
+    /// # Fehler
+    /// [`SdkError::Session`] bei einem Verbindungs- oder Zugriffsfehler.
+    pub async fn sessions(&self) -> Result<Vec<RemoteSessionInfo>> {
+        let list = self.port.list().await.map_err(session_error)?;
+        Ok(list
+            .into_iter()
+            .map(|summary| RemoteSessionInfo {
+                id: SessionId::from_core(&summary.session_id),
+                title: summary.title,
+                state: hosted_state_word(&summary.state).to_owned(),
+                attached: summary.attached,
+            })
+            .collect())
+    }
+
+    /// Legt eine neue Sitzung an und hängt sich an.
+    ///
+    /// # Fehler
+    /// [`SdkError::Session`], wenn der Host ablehnt (etwa mangels Recht).
+    pub async fn create_session(&self, title: Option<&str>) -> Result<RemoteSession> {
+        let created = self
+            .port
+            .create(CreateParams {
+                workspace: None,
+                title: title.map(str::to_owned),
+            })
+            .await
+            .map_err(session_error)?;
+        self.open(created.session_id, None).await
+    }
+
+    /// Hängt sich an eine vorhandene Sitzung an.
+    ///
+    /// # Fehler
+    /// [`SdkError::InvalidInput`] bei einer ungültigen Kennung;
+    /// [`SdkError::Session`], wenn der Host ablehnt oder sie nicht kennt.
+    pub async fn attach(&self, id: &SessionId) -> Result<RemoteSession> {
+        self.open(id.to_core()?, None).await
+    }
+
+    async fn open(
+        &self,
+        session: harw_types::SessionId,
+        from: Option<Cursor>,
+    ) -> Result<RemoteSession> {
+        let (ack, source) = self
+            .port
+            .attach(AttachParams {
+                session_id: session.clone(),
+                from,
+                profile: if self.compact {
+                    StreamProfile::Compact
+                } else {
+                    StreamProfile::Full
+                },
+                tail_items: DEFAULT_TAIL_ITEMS,
+            })
+            .await
+            .map_err(session_error)?;
+        Ok(RemoteSession {
+            id: SessionId::from_core(&session),
+            wire_id: session,
+            port: Arc::clone(&self.port),
+            approvals: Arc::clone(&self.approvals),
+            compact: self.compact,
+            turn_timeout: self.turn_timeout,
+            source: Some(source),
+            tracker: StreamTracker::new(ack.head),
+            resume: None,
+            may_approve: ack.granted.approve,
+            answered: AnsweredSet::new(),
+            keys: IdempotencyKeys::new(&self.label),
+            stash: VecDeque::new(),
+        })
+    }
+}
+
+/// Was während eines Turns eingesammelt wird: die Zählung der Wurzelsitzung
+/// (aus `harw-session-client`) und wie viele Freigaben vorgelegt wurden.
+#[derive(Default)]
+struct Run {
+    tally: TurnTally,
+    approvals: u32,
+}
+
+/// Eine angehängte Sitzung eines Hosts.
+pub struct RemoteSession {
+    id: SessionId,
+    wire_id: harw_types::SessionId,
+    port: Arc<dyn SessionPort>,
+    approvals: Arc<dyn ApprovalHandler>,
+    compact: bool,
+    turn_timeout: Option<Duration>,
+    source: Option<Box<dyn FrameSource>>,
+    /// Welche Ereignisse neu sind und welche Wiedergabe (siehe
+    /// [`StreamTracker`]: ein Ereignis **auf** dem Stand des Anhängens ist neu,
+    /// Wiedergabe liegt davor).
+    tracker: StreamTracker,
+    /// Wohin neu angehängt wird, solange keine Quelle da ist.
+    resume: Option<Cursor>,
+    may_approve: bool,
+    answered: AnsweredSet,
+    keys: IdempotencyKeys,
+    /// Frames, die beim Leeren des Stroms auftauchten und beachtet werden
+    /// müssen (Freigaben, Neuaufbau): sie gehen vor neuen Frames durch
+    /// [`Self::on_frame`].
+    stash: VecDeque<FrameEnvelope>,
+}
+
+impl std::fmt::Debug for RemoteSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSession")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteSession {
+    /// Die Kennung der Sitzung.
+    #[must_use]
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    /// `true`, wenn der Host diesem Client das Recht `approve` erteilt hat.
+    /// Nur dann fragt [`Self::send`] den [`ApprovalHandler`]; sonst muss ein
+    /// anderes Gerät entscheiden.
+    #[must_use]
+    pub fn may_approve(&self) -> bool {
+        self.may_approve
+    }
+
+    /// Sendet einen Prompt und wartet, bis der Turn endet.
+    ///
+    /// # Fehler
+    /// [`SdkError::Turn`], wenn der Host ablehnt, die Warteschlange voll ist
+    /// oder die Zeitgrenze überschritten wird; [`SdkError::Session`] bei
+    /// einem Verbindungsfehler; [`SdkError::Approval`], wenn eine
+    /// Entscheidung nicht zugestellt werden kann.
+    pub async fn send(&mut self, text: impl Into<String>) -> Result<TurnReport> {
+        self.send_with(text, |_| {}).await
+    }
+
+    /// Wie [`Self::send`], und meldet jedes Ereignis des Turns (Wurzel und
+    /// Kind-Agenten) an `on_event`.
+    ///
+    /// # Fehler
+    /// Wie [`Self::send`].
+    pub async fn send_with<F>(
+        &mut self,
+        text: impl Into<String>,
+        mut on_event: F,
+    ) -> Result<TurnReport>
+    where
+        F: FnMut(&SdkEvent),
+    {
+        let text = text.into();
+        let timeout = self.turn_timeout;
+        let work = self.run_turn(text, &mut on_event);
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, work)
+                .await
+                .map_err(|_| SdkError::Turn {
+                    detail: format!("the turn did not finish within {limit:?}"),
+                })?,
+            None => work.await,
+        }
+    }
+
+    /// Hängt die Sitzung beim Host ab und lässt die Verbindung los. Die
+    /// Sitzung selbst läuft weiter; ein neues [`RemoteHarwness::attach`]
+    /// setzt dort an. Wer die Sitzung nur fallen lässt, hängt sich nicht ab:
+    /// der Host merkt es erst, wenn der Strom bricht.
+    ///
+    /// # Fehler
+    /// [`SdkError::Session`], wenn der Host das Abhängen nicht bestätigt.
+    pub async fn detach(mut self) -> Result<()> {
+        self.source = None;
+        self.port
+            .detach(self.wire_id.clone())
+            .await
+            .map_err(session_error)
+    }
+
+    /// Bricht den laufenden Turn ab.
+    ///
+    /// # Fehler
+    /// [`SdkError::Turn`], wenn der Host ablehnt (etwa mangels Recht).
+    pub async fn cancel(&self) -> Result<()> {
+        self.port
+            .interrupt(InterruptParams {
+                session_id: self.wire_id.clone(),
+                turn_id: None,
+            })
+            .await
+            .map_err(|error| SdkError::Turn {
+                detail: error.to_string(),
+            })
+    }
+
+    async fn run_turn(
+        &mut self,
+        text: String,
+        on_event: &mut dyn FnMut(&SdkEvent),
+    ) -> Result<TurnReport> {
+        self.drain().await;
+        let ahead = self.submit(text).await?;
+        // Die Ereignisse der Turns davor gehören nicht zu diesem Turn.
+        let mut run = Run {
+            tally: TurnTally::behind(ahead),
+            ..Run::default()
+        };
+        while run.tally.finished() < 1 {
+            let envelope = self.next_frame().await?;
+            self.on_frame(envelope, &mut run, on_event).await?;
+        }
+        let summary = run.tally.summary();
+        Ok(TurnReport {
+            session_id: self.id.clone(),
+            status: status_of(summary.end),
+            text: summary.text,
+            usage: summary
+                .usage
+                .as_ref()
+                .map(Usage::from_core)
+                .unwrap_or_default(),
+            tool_calls: summary.tool_calls,
+            approvals: run.approvals,
+        })
+    }
+
+    /// Verbraucht bereits wartende Frames (Wiedergabe beim Anhängen, Ereignisse
+    /// anderer Clients) und merkt sich ihre Position.
+    async fn drain(&mut self) {
+        let Some(source) = self.source.as_mut() else {
+            return;
+        };
+        while let Ok(Ok(Some(envelope))) = tokio::time::timeout(Duration::ZERO, source.next()).await
+        {
+            match envelope.frame {
+                SessionFrame::Turn(_) | SessionFrame::Child { .. } => {
+                    self.tracker
+                        .accept_event(&envelope.cursor, &frame_identity(&envelope.frame));
+                }
+                // Eine offene Freigabe oder ein Neuaufbau darf nicht verloren
+                // gehen, nur weil sie vor dem Absenden eintraf.
+                SessionFrame::ApprovalRequested(_)
+                | SessionFrame::Resync { .. }
+                | SessionFrame::Lagged { .. } => self.stash.push_back(envelope),
+                _ => {}
+            }
+        }
+    }
+
+    /// Sendet den Prompt; wiederholt bei veraltetem Stand (derselbe Schlüssel).
+    /// Liefert, wie viele Turns vor dem eigenen laufen oder warten.
+    async fn submit(&mut self, text: String) -> Result<usize> {
+        let key = self.keys.next_key();
+        for _ in 0..MAX_SUBMIT_ATTEMPTS {
+            let result = self
+                .port
+                .submit(SubmitParams {
+                    session_id: self.wire_id.clone(),
+                    text: text.clone(),
+                    expect_head: self.tracker.expect_head(),
+                    client_msg_id: key.clone(),
+                    force: false,
+                })
+                .await
+                .map_err(|error| SdkError::Turn {
+                    detail: error.to_string(),
+                })?;
+            match interpret_submit(result) {
+                SubmitStep::Accepted { ahead } => return Ok(ahead),
+                SubmitStep::Retry { head } => self.tracker.moved_to(head),
+                SubmitStep::Refused(refusal) => {
+                    return Err(SdkError::Turn {
+                        detail: refusal.to_string(),
+                    });
+                }
+            }
+        }
+        Err(SdkError::Turn {
+            detail: "the session kept moving; the prompt could not be sent".to_owned(),
+        })
+    }
+
+    async fn next_frame(&mut self) -> Result<FrameEnvelope> {
+        if let Some(stashed) = self.stash.pop_front() {
+            return Ok(stashed);
+        }
+        if self.source.is_none() {
+            let from = self.resume.take();
+            self.reattach(from).await?;
+        }
+        let source = self.source.as_mut().ok_or_else(|| SdkError::Session {
+            detail: "the session is not attached".to_owned(),
+        })?;
+        match source.next().await {
+            Ok(Some(envelope)) => Ok(envelope),
+            Ok(None) => {
+                self.source = None;
+                Err(SdkError::Session {
+                    detail: "the host closed the session stream".to_owned(),
+                })
+            }
+            Err(error) => {
+                self.source = None;
+                Err(session_error(error))
+            }
+        }
+    }
+
+    /// Hängt sich neu an; ein Fehlschlag lässt keine Quelle zurück und merkt
+    /// sich das Ziel, damit der nächste Versuch es noch kennt.
+    async fn reattach(&mut self, from: Option<Cursor>) -> Result<()> {
+        self.source = None;
+        self.resume = from;
+        let (ack, source) = self
+            .port
+            .attach(AttachParams {
+                session_id: self.wire_id.clone(),
+                from,
+                profile: if self.compact {
+                    StreamProfile::Compact
+                } else {
+                    StreamProfile::Full
+                },
+                tail_items: DEFAULT_TAIL_ITEMS,
+            })
+            .await
+            .map_err(session_error)?;
+        self.may_approve = ack.granted.approve;
+        self.tracker.reattached(from, ack.head);
+        self.source = Some(source);
+        self.resume = None;
+        Ok(())
+    }
+
+    async fn on_frame(
+        &mut self,
+        envelope: FrameEnvelope,
+        run: &mut Run,
+        on_event: &mut dyn FnMut(&SdkEvent),
+    ) -> Result<()> {
+        let identity = frame_identity(&envelope.frame);
+        match envelope.frame {
+            SessionFrame::Turn(event) if self.tracker.accept_event(&envelope.cursor, &identity) => {
+                let ours = !run.tally.is_ahead();
+                run.tally.apply_root(&event);
+                if !ours {
+                    return Ok(());
+                }
+                let source = EventSource {
+                    session_id: self.id.clone(),
+                    parent: None,
+                    role: "assistant".to_owned(),
+                };
+                if let Some(mapped) = map_turn_event(source, event) {
+                    on_event(&mapped);
+                }
+            }
+            SessionFrame::Child {
+                agent,
+                parent,
+                role,
+                event,
+            } if self.tracker.accept_event(&envelope.cursor, &identity) => {
+                if run.tally.is_ahead() {
+                    return Ok(());
+                }
+                let source = EventSource {
+                    session_id: SessionId::from_core(&agent),
+                    parent: Some(
+                        parent
+                            .as_ref()
+                            .map_or_else(|| self.id.clone(), SessionId::from_core),
+                    ),
+                    role,
+                };
+                if let Some(mapped) = map_turn_event(source, event) {
+                    on_event(&mapped);
+                }
+            }
+            SessionFrame::Snapshot { assistant_text, .. } => {
+                run.tally.apply_snapshot(&assistant_text);
+            }
+            SessionFrame::ApprovalRequested(request) => self.approve(&request, run).await?,
+            SessionFrame::Resync { head, .. } => self.reattach(Some(head)).await?,
+            SessionFrame::Lagged { resume_from } => self.reattach(Some(resume_from)).await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Fragt den Handler und meldet die Entscheidung.
+    async fn approve(
+        &mut self,
+        request: &harw_protocol::ApprovalRequest,
+        run: &mut Run,
+    ) -> Result<()> {
+        if !self.may_approve || !self.answered.first_time(request.id.as_str()) {
+            return Ok(());
+        }
+        run.approvals += 1;
+        let asked = to_sdk_request(&self.id, describe(request));
+        let (decision, reason) = match self.approvals.decide(&asked).await {
+            Decision::Approve => review(true, None),
+            Decision::Deny { reason } => review(false, Some(reason)),
+            #[allow(unreachable_patterns)]
+            _ => review(false, Some("denied".to_owned())),
+        };
+        let answer = self
+            .port
+            .respond(ApprovalRespondParams {
+                request_id: ApprovalId::from_str(request.id.as_str()),
+                decision,
+                reason,
+            })
+            .await
+            .map_err(|error| {
+                // Die Entscheidung kam nicht an: eine Wiederholung der Anfrage
+                // nach dem Neuanhängen muss wieder beantwortet werden.
+                self.answered.forget(request.id.as_str());
+                SdkError::Approval {
+                    detail: error.to_string(),
+                }
+            })?;
+        match interpret_respond(answer) {
+            // Ein anderes Gerät war schneller oder die Frist lief ab: der Turn
+            // geht trotzdem weiter, das ist kein Fehler dieses Clients.
+            RespondStep::Settled => Ok(()),
+            RespondStep::Refused(reason) => Err(SdkError::Approval {
+                detail: format!("not allowed to decide: {reason}"),
+            }),
+            RespondStep::Unknown => Err(SdkError::Approval {
+                detail: "the host answered with an unknown result".to_owned(),
+            }),
+        }
+    }
+}
+
+/// Die Identität eines Frames für [`StreamTracker::accept_event`]: zwei Frames
+/// mit gleichem Cursor (letzte Wiedergabe, erstes Live-Ereignis) sind nur dann
+/// dasselbe Ereignis, wenn auch ihr Inhalt gleich ist.
+fn frame_identity(frame: &SessionFrame) -> String {
+    serde_json::to_string(frame).unwrap_or_default()
+}
+
+/// Der Ausgang eines Turns als SDK-Status.
+fn status_of(end: TurnEnd) -> TurnStatus {
+    match end {
+        TurnEnd::Completed => TurnStatus::Completed,
+        TurnEnd::Aborted => TurnStatus::Cancelled {
+            reason: "user".to_owned(),
+        },
+        TurnEnd::Failed(reason) => TurnStatus::Failed { reason },
+    }
+}
+
+/// Die Beschreibung einer Freigabeanfrage des Hosts in der SDK-Form.
+fn to_sdk_request(
+    session: &SessionId,
+    summary: harw_session_client::ApprovalSummary,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        session_id: session.clone(),
+        request_id: summary.request_id,
+        call_id: summary.call_id,
+        tool: summary.tool,
+        arguments: summary.arguments,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harw_protocol::session_wire::{RespondResult, SubmitResult};
+    use harw_session_client::ApprovalSummary;
+    use harw_types::TurnId;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn the_host_description_becomes_the_sdk_request() -> TestResult {
+        let session = SessionId::new("s1")?;
+        let asked = to_sdk_request(
+            &session,
+            ApprovalSummary {
+                request_id: "a1".to_owned(),
+                call_id: "w1".to_owned(),
+                tool: "shell".to_owned(),
+                arguments: serde_json::json!({"cmd": "ls"}),
+            },
+        );
+        assert_eq!(asked.session_id, session);
+        assert_eq!(
+            (asked.request_id.as_str(), asked.call_id.as_str()),
+            ("a1", "w1")
+        );
+        assert_eq!(asked.tool, "shell");
+        assert_eq!(asked.arguments, serde_json::json!({"cmd": "ls"}));
+        Ok(())
+    }
+
+    #[test]
+    fn the_ways_a_turn_ends_become_sdk_statuses() {
+        assert_eq!(status_of(TurnEnd::Completed), TurnStatus::Completed);
+        assert_eq!(
+            status_of(TurnEnd::Aborted),
+            TurnStatus::Cancelled {
+                reason: "user".to_owned()
+            }
+        );
+        assert_eq!(
+            status_of(TurnEnd::Failed("boom".to_owned())),
+            TurnStatus::Failed {
+                reason: "boom".to_owned()
+            }
+        );
+    }
+
+    // --- Wiedergabe gegen einen scriptbaren Port ------------------------------
+
+    use std::sync::Mutex;
+
+    use harw_protocol::PortFuture;
+    use harw_protocol::TurnEvent;
+    use harw_protocol::items::{AssistantMessageItem, ContentPart};
+    use harw_protocol::session_wire::{
+        AttachAck, HelloAck, HelloParams, HistoryParams, SessionSummary, SetEffortParams,
+        SetModeParams, SetModelParams,
+    };
+
+    type Queue = Arc<Mutex<VecDeque<FrameEnvelope>>>;
+
+    /// Liefert Frames aus einer Warteschlange, sonst nie etwas.
+    struct QueueSource(Queue);
+
+    impl FrameSource for QueueSource {
+        fn next(&mut self) -> PortFuture<'_, Option<FrameEnvelope>> {
+            let next = self.0.lock().ok().and_then(|mut q| q.pop_front());
+            Box::pin(async move {
+                match next {
+                    Some(frame) => Ok(Some(frame)),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    /// Ein Port, dessen `submit` die vorbereiteten Frames in den Strom legt:
+    /// zuerst späte Wiedergabe, dann die Frames des eigenen Turns.
+    struct ScriptPort {
+        queue: Queue,
+        after_submit: Mutex<Vec<FrameEnvelope>>,
+        position: u32,
+        detached: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn unsupported<T: Send + 'static>() -> PortFuture<'static, T> {
+        Box::pin(async { Err(PortError::Protocol("not scripted".to_owned())) })
+    }
+
+    impl SessionPort for ScriptPort {
+        fn hello(&self, _: HelloParams) -> PortFuture<'_, HelloAck> {
+            unsupported()
+        }
+        fn list(&self) -> PortFuture<'_, Vec<SessionSummary>> {
+            unsupported()
+        }
+        fn create(&self, _: CreateParams) -> PortFuture<'_, SessionSummary> {
+            unsupported()
+        }
+        fn attach(&self, _: AttachParams) -> PortFuture<'_, (AttachAck, Box<dyn FrameSource>)> {
+            unsupported()
+        }
+        fn detach(&self, _: harw_types::SessionId) -> PortFuture<'_, ()> {
+            self.detached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn history(&self, _: HistoryParams) -> PortFuture<'_, Vec<FrameEnvelope>> {
+            unsupported()
+        }
+        fn submit(&self, _: SubmitParams) -> PortFuture<'_, SubmitResult> {
+            if let (Ok(mut queue), Ok(mut script)) = (self.queue.lock(), self.after_submit.lock()) {
+                queue.extend(script.drain(..));
+            }
+            let position = self.position;
+            Box::pin(async move { Ok(SubmitResult::Accepted { position }) })
+        }
+        fn interrupt(&self, _: InterruptParams) -> PortFuture<'_, ()> {
+            unsupported()
+        }
+        fn resume(&self, _: harw_types::SessionId) -> PortFuture<'_, ()> {
+            unsupported()
+        }
+        fn close(&self, _: harw_types::SessionId) -> PortFuture<'_, ()> {
+            unsupported()
+        }
+        fn respond(&self, _: ApprovalRespondParams) -> PortFuture<'_, RespondResult> {
+            unsupported()
+        }
+        fn set_model(&self, _: SetModelParams) -> PortFuture<'_, ()> {
+            unsupported()
+        }
+        fn set_mode(&self, _: SetModeParams) -> PortFuture<'_, ()> {
+            unsupported()
+        }
+        fn set_effort(&self, _: SetEffortParams) -> PortFuture<'_, ()> {
+            unsupported()
+        }
+    }
+
+    fn at(generation: u32, durable: u64, live: u32, event: TurnEvent) -> FrameEnvelope {
+        FrameEnvelope {
+            session_id: harw_types::SessionId::from_str("s1"),
+            cursor: Cursor {
+                generation,
+                durable,
+                live,
+            },
+            frame: SessionFrame::Turn(event),
+        }
+    }
+
+    fn answer(text: &str) -> TurnEvent {
+        TurnEvent::ItemAdded {
+            turn_id: TurnId::from_str("t"),
+            item: TurnItem::AssistantMessage(AssistantMessageItem {
+                id: harw_types::ItemId::from_str(format!("m-{text}")),
+                content: vec![ContentPart::Text {
+                    text: text.to_owned(),
+                }],
+                phase: Some(harw_types::MessagePhase::FinalAnswer),
+            }),
+        }
+    }
+
+    fn done() -> TurnEvent {
+        TurnEvent::TurnCompleted {
+            turn_id: TurnId::from_str("t"),
+            usage: None,
+        }
+    }
+
+    use harw_protocol::items::TurnItem;
+
+    fn scripted(
+        before: Vec<FrameEnvelope>,
+        after: Vec<FrameEnvelope>,
+        head: Cursor,
+    ) -> RemoteSession {
+        scripted_at(before, after, head, 0).0
+    }
+
+    fn scripted_at(
+        before: Vec<FrameEnvelope>,
+        after: Vec<FrameEnvelope>,
+        head: Cursor,
+        position: u32,
+    ) -> (RemoteSession, Arc<std::sync::atomic::AtomicBool>) {
+        let detached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queue: Queue = Arc::new(Mutex::new(before.into()));
+        let port = Arc::new(ScriptPort {
+            queue: Arc::clone(&queue),
+            after_submit: Mutex::new(after),
+            position,
+            detached: Arc::clone(&detached),
+        });
+        let session = RemoteSession {
+            id: SessionId::from_core(&harw_types::SessionId::from_str("s1")),
+            wire_id: harw_types::SessionId::from_str("s1"),
+            port,
+            approvals: default_handler(),
+            compact: false,
+            turn_timeout: None,
+            source: Some(Box::new(QueueSource(queue))),
+            tracker: StreamTracker::new(head),
+            resume: None,
+            may_approve: true,
+            answered: AnsweredSet::new(),
+            keys: IdempotencyKeys::with_epoch("test", "e"),
+            stash: VecDeque::new(),
+        };
+        (session, detached)
+    }
+
+    fn frame(cursor: Cursor, frame: SessionFrame) -> FrameEnvelope {
+        FrameEnvelope {
+            session_id: harw_types::SessionId::from_str("s1"),
+            cursor,
+            frame,
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_before_and_after_the_submit_is_not_the_new_turn() -> TestResult {
+        let head = Cursor {
+            generation: 0,
+            durable: 5,
+            live: 0,
+        };
+        // Wiedergabe des alten Turns liegt vor dem Stand des Anhängens.
+        let before = vec![at(0, 3, 0, answer("old")), at(0, 4, 0, done())];
+        // Nach dem Absenden kommt erst noch späte Wiedergabe, dann der neue
+        // Turn; sein erster Frame liegt genau auf dem Stand des Anhängens.
+        let after = vec![
+            at(0, 4, 0, done()),
+            at(
+                0,
+                5,
+                0,
+                TurnEvent::TurnStarted {
+                    turn_id: TurnId::from_str("t"),
+                    thread_id: harw_types::ThreadId::from_str("th"),
+                },
+            ),
+            at(0, 5, 1, answer("new")),
+            at(0, 5, 2, done()),
+        ];
+        let mut session = scripted(before, after, head);
+        let mut events = 0_usize;
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.send_with("go", |_| events += 1),
+        )
+        .await??;
+        assert_eq!(
+            report.text.as_deref(),
+            Some("new"),
+            "not the replayed answer"
+        );
+        assert_eq!(report.status, TurnStatus::Completed);
+        assert_eq!(events, 3, "started, message, finished; no replayed event");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_prompt_queued_behind_a_running_turn_waits_for_its_own_end() -> TestResult {
+        // Ein zweites Ende wird nur mitgezählt, wenn der Host `position > 0` meldete;
+        // hier meldet der Port 0: das erste Ende beendet den Turn.
+        let head = Cursor::default();
+        let after = vec![
+            at(0, 0, 0, answer("only")),
+            at(0, 0, 1, done()),
+            at(0, 0, 2, answer("never read")),
+        ];
+        let mut session = scripted(Vec::new(), after, head);
+        let report = tokio::time::timeout(Duration::from_secs(5), session.send("go")).await??;
+        assert_eq!(report.text.as_deref(), Some("only"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_turns_ahead_of_ours_are_neither_reported_nor_counted() -> TestResult {
+        let head = Cursor::default();
+        let after = vec![
+            at(0, 0, 0, answer("ahead")),
+            at(0, 0, 1, done()),
+            at(0, 0, 2, answer("mine")),
+            at(0, 0, 3, done()),
+        ];
+        let (mut session, _) = scripted_at(Vec::new(), after, head, 1);
+        let mut events = 0_usize;
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.send_with("go", |_| events += 1),
+        )
+        .await??;
+        assert_eq!(report.text.as_deref(), Some("mine"));
+        assert_eq!(events, 2, "only the own message and the own end");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_supplies_the_text_a_lost_position_missed() -> TestResult {
+        let head = Cursor::default();
+        let after = vec![
+            frame(
+                Cursor::default(),
+                SessionFrame::Snapshot {
+                    turn_id: TurnId::from_str("t"),
+                    assistant_text: "partial".to_owned(),
+                    reasoning_collapsed: false,
+                },
+            ),
+            at(0, 0, 1, done()),
+        ];
+        let mut session = scripted(Vec::new(), after, head);
+        let report = tokio::time::timeout(Duration::from_secs(5), session.send("go")).await??;
+        assert_eq!(report.text.as_deref(), Some("partial"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_approval_that_arrived_before_the_submit_is_kept() -> TestResult {
+        let head = Cursor::default();
+        let waiting = frame(
+            Cursor::default(),
+            SessionFrame::Lagged {
+                resume_from: Cursor::default(),
+            },
+        );
+        let mut session = scripted(vec![waiting], vec![at(0, 0, 1, done())], head);
+        session.drain().await;
+        assert_eq!(session.stash.len(), 1, "the frame is stashed, not dropped");
+        let next = session.next_frame().await?;
+        assert!(matches!(next.frame, SessionFrame::Lagged { .. }));
+        assert!(session.stash.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detach_tells_the_host() -> TestResult {
+        let (session, detached) = scripted_at(Vec::new(), Vec::new(), Cursor::default(), 0);
+        session.detach().await?;
+        assert!(detached.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+}

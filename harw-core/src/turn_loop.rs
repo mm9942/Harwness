@@ -1096,6 +1096,9 @@ impl TurnControl {
 pub struct TurnInput {
     /// Optionaler User-Text, der zu Beginn in den Verlauf gespielt wird.
     pub user_text: Option<String>,
+    /// Gespeicherte Bilder, die mit dem User-Text in dieselbe Nachricht gehen
+    /// (siehe `harw-media`). Leer = kein Bild.
+    pub user_images: Vec<harw_protocol::MediaRef>,
     /// Metadaten, die dem `TurnInputContext` mitgegeben werden.
     pub metadata: serde_json::Value,
     /// Steuerblock (Abbruch, Grenzwerte, Uhr, Zähler) dieses Turns.
@@ -1107,9 +1110,23 @@ impl TurnInput {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             user_text: Some(text.into()),
+            user_images: Vec::new(),
             metadata: serde_json::Value::Null,
             control: TurnControl::new(),
         }
+    }
+
+    /// Hängt gespeicherte Bilder an die User-Nachricht dieses Turns. Die
+    /// Bilder müssen im Medienspeicher liegen, den die Laufzeit mit
+    /// [`crate::install_media_source`] eingerichtet hat; sonst nennt der
+    /// Provider sie im Text als nicht gesendet.
+    #[must_use]
+    pub fn with_images(
+        mut self,
+        images: impl IntoIterator<Item = harw_protocol::MediaRef>,
+    ) -> Self {
+        self.user_images.extend(images);
+        self
     }
 
     /// Replaces the control block of this input.
@@ -1128,8 +1145,14 @@ impl TurnInput {
 pub enum TurnOutcome {
     /// Turn vollständig abgeschlossen (keine Tool-Calls mehr).
     Completed,
-    /// Ein Handoff-Tool wurde gerufen — die Session wartet jetzt auf das Child.
-    /// Wiederaufnahme über `resume_after_child`.
+    /// A child is paused on a handoff and the session waits for its result;
+    /// resume via `resume_after_child`.
+    ///
+    /// Delegation tools (`transfer_to_*`, `agents.delegate`) NEVER produce this
+    /// outcome any more: delegation is background-only and a start is a
+    /// one-time return (see `background_only_refusal`). The variant is kept
+    /// only because persisted sessions, `resume_after_child` and the
+    /// host/bridge crates still match on it; it is no longer a delegation mode.
     AwaitingChild {
         child: SessionId,
         call_id: ToolCallId,
@@ -1731,6 +1754,90 @@ fn child_question(arguments: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// Error text for the retired `background:false` / `wait:true` delegation
+/// parameters. Old transcripts and models may still send them; they are
+/// refused with an explanation instead of being silently reinterpreted.
+const LEGACY_INLINE_DELEGATION_ERROR: &str = "Delegation is background-only: the parameters \
+`background:false` and `wait:true` no longer exist. Starting an agent returns immediately with \
+its ids; the result and intermediate states are delivered to you automatically (notifications / \
+auto-turn). Do not wait or poll. Repeat the call without these parameters and continue with \
+other work.";
+
+/// Error text when the session has no background executor for delegation.
+const NO_BACKGROUND_EXECUTOR_ERROR: &str = "Delegation is background-only and no background \
+executor is configured in this session (no agent job submitter is registered and the host \
+declared no in-process background launcher), so the agent was not started. There is no \
+foreground fallback; delegation is unavailable here. Continue without delegating.";
+
+/// Delegation is always background. Returns the tool error for a start that is
+/// not admissible: a legacy inline request (`background:false` / `wait:true`)
+/// or a session without an agent job submitter. Checked before the child is
+/// spawned so a refused start never leaks a child session.
+fn background_only_refusal(
+    session: &AgentSession,
+    arguments: &serde_json::Value,
+) -> Option<ToolCallResult> {
+    let flag = |field: &str| arguments.get(field).and_then(serde_json::Value::as_bool);
+    if flag("background") == Some(false) || flag("wait") == Some(true) {
+        return Some(ToolCallResult::error(LEGACY_INLINE_DELEGATION_ERROR));
+    }
+    if session.registry().agent_job_submitter().is_none() && !session.host_background_launcher() {
+        return Some(ToolCallResult::error(NO_BACKGROUND_EXECUTOR_ERROR));
+    }
+    None
+}
+
+/// Hands a freshly admitted child to the background executor.
+///
+/// # Returns
+/// `Some(result)`: the tool result to record (the one-time start confirmation,
+/// or a detailed error after the child was released because the submit
+/// failed; never an `Err` that would abort the turn and leak the child).
+/// `None`: no durable submitter, but the host declared an in-process launcher;
+/// the caller yields `AwaitingChild` for the host to detach (never inline).
+async fn detach_admitted_child(
+    session: &AgentSession,
+    spawner: &Arc<dyn harw_extension_api::AgentSpawner>,
+    child: &SessionId,
+    role: &str,
+    question: Option<&str>,
+) -> Option<ToolCallResult> {
+    let Some(submitter) = session.registry().agent_job_submitter().cloned() else {
+        if session.host_background_launcher() {
+            return None;
+        }
+        spawner.child_finished(child);
+        return Some(ToolCallResult::error(NO_BACKGROUND_EXECUTOR_ERROR));
+    };
+    match submitter.submit_child(child, question).await {
+        Ok(job) => Some(agent_job_started_result(&job, role)),
+        Err(error) => {
+            tracing::warn!(child = %child, role, error = %error, "turn.delegation.submit_failed");
+            spawner.child_finished(child);
+            Some(ToolCallResult::error(format!(
+                "The '{role}' agent was admitted but could not be started in the background: \
+                 {error}. The child was released and nothing is running for it. Retry the \
+                 delegation, or continue without it."
+            )))
+        }
+    }
+}
+
+/// One-time confirmation returned to the model when a background agent started.
+fn agent_job_started_result(
+    handle: &harw_extension_api::AgentJobHandle,
+    role: &str,
+) -> ToolCallResult {
+    ToolCallResult::success(serde_json::json!({
+        "work_id": handle.work_id.as_str(),
+        "child_id": handle.child.as_str(),
+        "role": role,
+        "status": "started",
+        "async": true,
+        "hint": "Started in the background. The result and intermediate states are delivered to you automatically; do not wait or poll. Continue with other work."
+    }))
+}
+
 /// Argumentfelder eines Handoff-Calls, die — in dieser Reihenfolge — als
 /// Arbeitsauftrag des Kindes gelesen werden. `"question"` ist die ältere
 /// Schreibweise (siehe [`child_question`]).
@@ -1857,7 +1964,7 @@ fn one_line(text: &str, max: usize) -> String {
 }
 
 /// Die gemeinsamen Felder von `transfer_to_<name>` und `agents.delegate`
-/// (`task`, `context`, `continue_from`, `background`, `user_approved`).
+/// (`task`, `context`, `continue_from`, `user_approved`).
 ///
 /// # Beschreibung
 /// Plan R9, Teil C: die Beschreibungen sind bewusst knapp — sie stehen in
@@ -1890,21 +1997,6 @@ fn handoff_properties() -> BTreeMap<String, JsonSchema> {
     properties.insert(
         crate::user_approval::USER_APPROVED_FIELD.to_owned(),
         crate::user_approval::user_approved_schema(),
-    );
-    // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
-    // Orchestrator-Ziele der UIA-Wurzel (Vorgabe dort `true`); jeder andere
-    // Einstieg und jedes Worker-Ziel läuft synchron.
-    properties.insert(
-        "background".to_owned(),
-        JsonSchema {
-            schema_type: Some(JsonSchemaType::Boolean),
-            description: Some(
-                "Optional (nur UIA-Orchestratoren in der TUI, dort Vorgabe true): sofort \
-                 zurück, Ergebnis kommt als Benachrichtigung; false wartet."
-                    .to_owned(),
-            ),
-            ..JsonSchema::default()
-        },
     );
     properties
 }
@@ -1945,7 +2037,7 @@ fn handoff_tool_spec(role: &str, description: Option<&str>) -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
-            "Delegiert an '{role}' und wartet auf das Ergebnis.{summary}{}",
+            "Delegates to '{role}'. Always runs in the background: returns immediately with ids; the result and progress arrive automatically (no waiting or polling).{summary}{}",
             handoff_role_hint(role)
         ),
         parameters: closed_object(handoff_properties(), &["task"]),
@@ -1974,8 +2066,7 @@ fn agents_delegate_tool_spec(names: &[String]) -> ToolSpec {
     );
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(AGENTS_DELEGATE_TOOL),
-        description: "Delegiert an einen sichtbaren Agenten und wartet auf das Ergebnis \
-                      (wie transfer_to_<name>)."
+        description: "Delegates to a visible agent. Always runs in the background: returns immediately with ids; the result and progress arrive automatically (no waiting or polling)."
             .to_owned(),
         parameters: closed_object(properties, &["agent", "task"]),
         strict: false,
@@ -2412,6 +2503,10 @@ fn delegation_step(
     {
         tracing::info!(role = %role, reason = %message, "turn_loop.delegation_refused");
         return (None, Some(ToolCallResult::error(message)));
+    }
+    if let Some(result) = background_only_refusal(session, &arguments) {
+        tracing::info!(role = %role, "turn_loop.delegation_background_only_refused");
+        return (None, Some(result));
     }
     (Some((role, arguments)), None)
 }
@@ -2883,7 +2978,7 @@ fn notify_tool_outcome(
     if matches!(result, ToolCallResult::Success { .. })
         && let Some(advisor) = session.pitfall_advisor()
     {
-        advisor.resolved(tool_name, arguments);
+        advisor.resolved_in_session(session.id(), tool_name, arguments);
     }
     let Some(observer) = session.tool_outcome_observer().cloned() else {
         return;
@@ -2995,7 +3090,7 @@ fn deliver_round_boundary(session: &mut AgentSession) {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ImageUrl { .. } => None,
+                ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => None,
             })
             .collect();
         (!text.trim().is_empty()).then_some(text)
@@ -3058,7 +3153,7 @@ async fn apply_pitfall_advice(
     arguments: &serde_json::Value,
 ) -> Option<String> {
     let advisor = session.pitfall_advisor()?.clone();
-    let hint = advisor.advise(tool_name, arguments)?;
+    let hint = advisor.advise_in_session(session.id(), tool_name, arguments)?;
     let event = DriftEvent {
         kind: DriftKind::PitfallMatch,
         session_id: session.id().to_string(),
@@ -3420,7 +3515,8 @@ async fn run_turn_with_approvals(
     // Hydrate it before appending the new user item so the model sees the
     // complete transcript and the live session remains the single append
     // authority for the rest of this turn.
-    if input.user_text.is_some() && session.history().is_empty() {
+    let has_user_input = input.user_text.is_some() || !input.user_images.is_empty();
+    if has_user_input && session.history().is_empty() {
         let history = match store.load_history(session.id()).await {
             Ok(history) => history,
             Err(error) => {
@@ -3433,8 +3529,15 @@ async fn run_turn_with_approvals(
     }
 
     // User-Input in den Verlauf spielen und persistieren.
-    if let Some(text) = input.user_text {
-        session.history_mut().push_user_text(text);
+    if has_user_input {
+        let text = input.user_text.unwrap_or_default();
+        if input.user_images.is_empty() {
+            session.history_mut().push_user_text(text);
+        } else {
+            session
+                .history_mut()
+                .push_user_message(text, input.user_images);
+        }
         if let Err(error) = persist_last(session, store).await {
             transition_after_turn_failure(session, &ctx, &error);
             return Err(error);
@@ -3816,6 +3919,22 @@ async fn resume_after_approval_with_store(
                 // Plan R9, Teil C: `agents.delegate` wird wie
                 // `transfer_to_<agent>` gespawnt (Argumente ohne `agent`).
                 if let Some((role, handoff_arguments)) = delegation_call(&pending.call) {
+                    // Background-only: refuse before spawning, so no child leaks.
+                    if let Some(result) = background_only_refusal(session, &handoff_arguments) {
+                        notify_tool_outcome(
+                            session,
+                            pending.call.name.as_str(),
+                            &pending.call.arguments,
+                            &result,
+                        );
+                        notify_tool_progress(session);
+                        session
+                            .history_mut()
+                            .push_tool_result(pending.call.id, result, 0);
+                        persist_last(session, store).await?;
+                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                            .await;
+                    }
                     let spawner = session.registry().spawner().cloned().ok_or_else(|| {
                         CoreError::HandoffFailed {
                             role: role.clone(),
@@ -3887,7 +4006,6 @@ async fn resume_after_approval_with_store(
                             });
                         }
                     };
-                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
                     // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
                     // zurück). Ohne dieses Event bliebe ein solches Kind für jeden
@@ -3898,14 +4016,43 @@ async fn resume_after_approval_with_store(
                             turn_id: ctx.turn_id.clone(),
                             child: child.clone(),
                             role: role.clone(),
-                            question,
+                            question: question.clone(),
                         },
                     );
-                    Ok(TurnOutcome::AwaitingChild {
-                        child,
-                        call_id: pending.call.id,
-                        role,
-                    })
+
+                    let Some(result) =
+                        detach_admitted_child(session, &spawner, &child, &role, question.as_deref())
+                            .await
+                    else {
+                        session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
+                        return Ok(TurnOutcome::AwaitingChild {
+                            child,
+                            call_id: pending.call.id,
+                            role,
+                        });
+                    };
+                    notify_tool_outcome(
+                        session,
+                        pending.call.name.as_str(),
+                        &pending.call.arguments,
+                        &result,
+                    );
+                    notify_tool_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(pending.call.id.clone(), result.clone(), 0);
+                    persist_last(session, store).await?;
+                    emit(
+                        session,
+                        TurnEvent::ToolCallCompleted {
+                            turn_id: ctx.turn_id.clone(),
+                            call_id: pending.call.id,
+                            result,
+                            duration_ms: 0,
+                            placement: None,
+                        },
+                    );
+                    drive_turn(session, model, store, approvals, &ctx, handle, control).await
                 } else {
                     let tool_name = pending.call.name.to_string();
                     let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
@@ -4999,22 +5146,49 @@ async fn drive_turn(
                     role: role.clone(),
                     reason: e.to_string(),
                 })?;
-                // state ⇒ WaitingForChild; Loop pausiert.
-                session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
+                let question = child_question(&handoff_arguments);
                 emit(
                     session,
                     TurnEvent::ChildSpawned {
                         turn_id: handle.turn_id.clone(),
                         child: child.clone(),
                         role: role.clone(),
-                        question: child_question(&handoff_arguments),
+                        question: question.clone(),
                     },
                 );
-                return Ok(TurnOutcome::AwaitingChild {
-                    child,
-                    call_id: call.id,
-                    role,
-                });
+
+                // Background-only: admission above established the child
+                // authority; the durable job runtime owns its lifecycle. The
+                // start is a one-time return; there is no blocking fallback
+                // (a missing submitter was refused before the spawn).
+                let Some(result) =
+                    detach_admitted_child(session, &spawner, &child, &role, question.as_deref())
+                        .await
+                else {
+                    session.begin_handoff(child.clone(), call.id.clone(), role.clone())?;
+                    return Ok(TurnOutcome::AwaitingChild {
+                        child,
+                        call_id: call.id,
+                        role,
+                    });
+                };
+                notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                notify_tool_progress(session);
+                session
+                    .history_mut()
+                    .push_tool_result(call.id.clone(), result.clone(), 0);
+                persist_last(session, store).await?;
+                emit(
+                    session,
+                    TurnEvent::ToolCallCompleted {
+                        turn_id: handle.turn_id.clone(),
+                        call_id: call.id,
+                        result,
+                        duration_ms: 0,
+                        placement: None,
+                    },
+                );
+                continue;
             }
 
             // c. Normale Tool-Ausführung — instrumented with tool.call span.
@@ -5289,6 +5463,7 @@ async fn drive_turn(
     // Projektgedächtnis: alle Tool-Ergebnisse dieses Turns wurden bereits
     // über `notify_tool_outcome` gemeldet; hier, am erfolgreichen Turn-Ende,
     // erfährt der Beobachter, dass die Runde abgeschlossen ist.
+    crate::turn_feedback::notify_turn_texts(session);
     if let Some(observer) = session.tool_outcome_observer().cloned() {
         observer.on_turn_finished(session.id());
     }
@@ -5602,6 +5777,12 @@ async fn assemble_round_request(
         .or(session.max_output_tokens())
         .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
 
+    // Kontext-Ledger: die Fakten der gesammelten Fragmente festhalten, bevor
+    // die Montage sie verbraucht (nur wenn ein Ledger registriert ist).
+    let ledger_facts = session
+        .context_ledger()
+        .map(|_| crate::context_ledger_hook::snapshot(&fragments));
+
     // 4. Model-Call (provider-neutral).
     let request = ModelRequest::with_context_program(
         instructions,
@@ -5619,6 +5800,15 @@ async fn assemble_round_request(
     .with_max_output_tokens(max_output_tokens)
     .with_cancel_token(control.cancel_token().clone())
     .with_identity(request_identity(session));
+    if let (Some(ledger), Some(facts)) = (session.context_ledger(), ledger_facts.as_deref()) {
+        crate::context_ledger_hook::record_turn(
+            ledger.as_ref(),
+            session.id().as_str(),
+            turn_id.as_str(),
+            facts,
+            &request.context_assembly,
+        );
+    }
     Ok(match stream_sink_for_round(session, turn_id, total_usage) {
         Some(sink) => request.with_stream_sink(sink),
         None => request,
@@ -6455,6 +6645,338 @@ fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test submitter: records every submitted child and answers with a fresh
+    /// durable work id (stands in for the runtime's background executor).
+    struct RecordingJobSubmitter {
+        submitted: Mutex<Vec<(SessionId, Option<String>)>>,
+    }
+
+    impl RecordingJobSubmitter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn submitted(&self) -> Vec<(SessionId, Option<String>)> {
+            self.submitted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl harw_extension_api::AgentJobSubmitter for RecordingJobSubmitter {
+        fn submit_child<'a>(
+            &'a self,
+            child: &'a SessionId,
+            task: Option<&'a str>,
+        ) -> harw_extension_api::AgentJobFuture<'a> {
+            self.submitted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((child.clone(), task.map(ToOwned::to_owned)));
+            let child = child.clone();
+            Box::pin(async move {
+                Ok(harw_extension_api::AgentJobHandle {
+                    work_id: harw_types::WorkId::new(),
+                    child,
+                })
+            })
+        }
+    }
+
+    /// Session with a spawner and (optionally) a background job submitter.
+    fn delegation_session_with(
+        spawner: Arc<dyn AgentSpawner>,
+        submitter: Option<Arc<RecordingJobSubmitter>>,
+    ) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut builder = ExtensionRegistryBuilder::default().spawner(spawner);
+        if let Some(submitter) = submitter {
+            builder = builder.agent_job_submitter(submitter);
+        }
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, builder.build(), tx)
+                .with_spawn_context(test_spawn_context()?),
+        )
+    }
+
+    #[test]
+    fn background_only_refusal_rejects_legacy_inline_flags_and_missing_executor() -> TestResult {
+        let spawner: Arc<dyn AgentSpawner> = Arc::new(FixedChildSpawner {
+            child: SessionId::new(),
+        });
+        let with =
+            delegation_session_with(Arc::clone(&spawner), Some(RecordingJobSubmitter::new()))?;
+        let without = delegation_session_with(spawner, None)?;
+
+        // Admissible: no flags, or the harmless legacy values.
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"background": true}),
+            serde_json::json!({"wait": false}),
+        ] {
+            assert!(
+                background_only_refusal(&with, &arguments).is_none(),
+                "{arguments}"
+            );
+        }
+        // Legacy inline requests get a detailed error.
+        for arguments in [
+            serde_json::json!({"background": false}),
+            serde_json::json!({"wait": true}),
+        ] {
+            let Some(ToolCallResult::Error { message }) =
+                background_only_refusal(&with, &arguments)
+            else {
+                return Err(TestError::Unexpected(format!("no refusal for {arguments}")));
+            };
+            assert!(message.contains("background-only"), "{message}");
+            assert!(
+                message.contains("delivered to you automatically"),
+                "{message}"
+            );
+        }
+        // No executor: error, never a blocking fallback.
+        let Some(ToolCallResult::Error { message }) =
+            background_only_refusal(&without, &serde_json::json!({}))
+        else {
+            return Err(TestError::Unexpected(
+                "no refusal without executor".to_owned(),
+            ));
+        };
+        assert!(
+            message.contains("no background executor is configured"),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn start_result_is_a_one_time_confirmation() -> TestResult {
+        let handle = harw_extension_api::AgentJobHandle {
+            work_id: harw_types::WorkId::new(),
+            child: SessionId::new(),
+        };
+        let ToolCallResult::Success { value } = agent_job_started_result(&handle, "worker") else {
+            return Err(TestError::Unexpected("start must succeed".to_owned()));
+        };
+        assert_eq!(value["child_id"], serde_json::json!(handle.child.as_str()));
+        assert_eq!(value["work_id"], serde_json::json!(handle.work_id.as_str()));
+        assert_eq!(value["role"], serde_json::json!("worker"));
+        assert_eq!(value["status"], serde_json::json!("started"));
+        let hint = value["hint"].as_str().unwrap_or_default();
+        assert!(hint.contains("delivered to you automatically"), "{hint}");
+        assert!(!hint.contains("work.result"), "no polling advice: {hint}");
+        Ok(())
+    }
+
+    fn started_child_ids(session: &AgentSession) -> Vec<String> {
+        tool_results(session)
+            .into_iter()
+            .filter_map(|result| match result {
+                ToolCallResult::Success { value } => {
+                    value["child_id"].as_str().map(ToOwned::to_owned)
+                }
+                ToolCallResult::Error { .. } => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn worker_delegation_starts_in_the_background_and_the_turn_continues() -> TestResult {
+        let child = SessionId::new();
+        let submitter = RecordingJobSubmitter::new();
+        let mut session = delegation_session_with(
+            Arc::new(FixedChildSpawner {
+                child: child.clone(),
+            }),
+            Some(Arc::clone(&submitter)),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"task": "do it"}),
+            }]),
+            crate::model::ModelResponse::text("started, continuing"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+            .await
+            .map_err(ctx("the start is a one-time return"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            submitter.submitted(),
+            vec![(child.clone(), Some("do it".to_owned()))]
+        );
+        assert_eq!(started_child_ids(&session), vec![child.as_str().to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegation_without_executor_fails_fast_and_spawns_nothing() -> TestResult {
+        let spawner = Arc::new(CapturingSpawner {
+            child: SessionId::new(),
+            targets: vec!["worker".to_owned()],
+            captured: Mutex::new(None),
+        });
+        let mut session = delegation_session_with(spawner.clone(), None)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"task": "do it"}),
+            }]),
+            crate::model::ModelResponse::text("understood"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+            .await
+            .map_err(ctx("a refused start is a tool error, not a pause"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert!(
+            spawner
+                .captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "no child may be spawned"
+        );
+        expect_single_error(
+            &session,
+            "Delegation is background-only and no background executor",
+        )
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_flags_fail_with_a_detailed_error() -> TestResult {
+        for flags in [
+            serde_json::json!({"background": false}),
+            serde_json::json!({"wait": true}),
+        ] {
+            let submitter = RecordingJobSubmitter::new();
+            let mut session = delegation_session_with(
+                Arc::new(FixedChildSpawner {
+                    child: SessionId::new(),
+                }),
+                Some(Arc::clone(&submitter)),
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+            let mut arguments = serde_json::json!({"task": "do it"});
+            if let (Some(target), Some(extra)) = (arguments.as_object_mut(), flags.as_object()) {
+                target.extend(extra.clone());
+            }
+            let model = ScriptedModel::new(vec![
+                response_with(vec![ToolCall {
+                    id: ToolCallId::new(),
+                    name: ToolName::new("transfer_to_worker"),
+                    arguments,
+                }]),
+                crate::model::ModelResponse::text("understood"),
+            ]);
+            let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+                .await
+                .map_err(ctx("legacy flags are a tool error"))?;
+            assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+            assert!(
+                submitter.submitted().is_empty(),
+                "nothing may start for {flags}"
+            );
+            expect_single_error(&session, "Delegation is background-only: the parameters")?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn host_background_launcher_counts_as_executor_and_yields_awaiting_child() -> TestResult {
+        let child = SessionId::new();
+        let mut session = delegation_session_with(
+            Arc::new(FixedChildSpawner {
+                child: child.clone(),
+            }),
+            None,
+        )?;
+        session.set_host_background_launcher(true);
+        assert!(background_only_refusal(&session, &serde_json::json!({})).is_none());
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("transfer_to_worker"),
+            arguments: serde_json::json!({"task": "do it"}),
+        }])]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+            .await
+            .map_err(ctx("the host launcher detaches the pause"))?;
+        let TurnOutcome::AwaitingChild {
+            child: paused,
+            role,
+            ..
+        } = outcome
+        else {
+            return Err(TestError::Unexpected(format!(
+                "expected AwaitingChild, got {outcome:?}"
+            )));
+        };
+        assert_eq!(paused, child);
+        assert_eq!(role, "worker");
+        Ok(())
+    }
+
+    struct FailingJobSubmitter;
+
+    impl harw_extension_api::AgentJobSubmitter for FailingJobSubmitter {
+        fn submit_child<'a>(
+            &'a self,
+            _child: &'a SessionId,
+            _task: Option<&'a str>,
+        ) -> harw_extension_api::AgentJobFuture<'a> {
+            Box::pin(async {
+                Err(harw_extension_api::AgentSpawnError::new(
+                    "job store unavailable",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_submit_releases_the_child_and_returns_a_tool_error() -> TestResult {
+        let spawner = Arc::new(CompletionTrackingSpawner {
+            child_completed: AtomicUsize::new(0),
+            child_finished: AtomicUsize::new(0),
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(spawner.clone())
+            .agent_job_submitter(Arc::new(FailingJobSubmitter))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"task": "do it"}),
+            }]),
+            crate::model::ModelResponse::text("understood"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
+            .await
+            .map_err(ctx("a failed submit is a tool error, not a turn abort"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            spawner.child_finished.load(Ordering::SeqCst),
+            1,
+            "the admitted child must be released"
+        );
+        expect_single_error(
+            &session,
+            "The 'worker' agent was admitted but could not be started",
+        )
+    }
 
     /// Ein Turn-Grenzen-Ende vermerkt die konkrete Grenze mit Wert (statt
     /// „Token-Budget oder Turn-Wächter"); der erste Grund gewinnt.
@@ -8355,22 +8877,26 @@ mod tests {
             .spawner(Arc::new(FixedChildSpawner {
                 child: child.clone(),
             }))
+            .agent_job_submitter(RecordingJobSubmitter::new())
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_spawn_context(test_spawn_context()?)
             .with_turn_event_sink(turn_tx);
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
-            id: ToolCallId::new(),
-            name: ToolName::new("transfer_to_worker"),
-            arguments: serde_json::json!({"question": "wo liegt der Fehler?"}),
-        }])]);
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"question": "wo liegt der Fehler?"}),
+            }]),
+            crate::model::ModelResponse::text("started"),
+        ]);
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("handoff"))
             .await
-            .map_err(ctx("der Handoff pausiert den Turn"))?;
+            .map_err(ctx("the background start does not pause the turn"))?;
 
-        assert!(matches!(outcome, TurnOutcome::AwaitingChild { .. }));
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
         let spawned = drain_turn_events(&mut turn_rx)
             .into_iter()
             .find(|event| matches!(event, TurnEvent::ChildSpawned { .. }))
@@ -8409,6 +8935,7 @@ mod tests {
         ) -> SpawnFuture<'a> {
             Box::pin(async move {
                 Err(harw_extension_api::AgentSpawnError {
+                    kind: Default::default(),
                     message: format!(
                         "{} Grenze max_root_orchestrators=1 erreicht — es läuft bereits: \
                          root-orchestrator (r1).",
@@ -8426,6 +8953,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default()
             .spawner(Arc::new(LimitRejectingSpawner))
+            .agent_job_submitter(RecordingJobSubmitter::new())
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_spawn_context(test_spawn_context()?);
@@ -8481,16 +9009,20 @@ mod tests {
             .spawner(Arc::new(FixedChildSpawner {
                 child: child.clone(),
             }))
+            .agent_job_submitter(RecordingJobSubmitter::new())
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_spawn_context(test_spawn_context()?)
             .with_turn_event_sink(turn_tx);
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
-            id: ToolCallId::new(),
-            name: ToolName::new("transfer_to_reviewer"),
-            arguments: serde_json::json!({"task": "review"}),
-        }])]);
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_reviewer"),
+                arguments: serde_json::json!({"task": "review"}),
+            }]),
+            crate::model::ModelResponse::text("started"),
+        ]);
 
         run_turn(&mut session, &model, &store, TurnInput::user("handoff"))
             .await
@@ -9104,6 +9636,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_the_original_control_after_a_handoff_pause_cancels_the_resumed_turn()
     -> TestResult {
+        // Delegation never pauses any more; the pause below is a persisted /
+        // legacy `AwaitingChild` session that `resume_after_child` still resumes.
         let child = SessionId::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default()
@@ -9114,30 +9648,15 @@ mod tests {
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_spawn_context(test_spawn_context()?);
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
-            id: ToolCallId::new(),
-            name: ToolName::new("transfer_to_worker"),
-            arguments: serde_json::json!({}),
-        }])]);
         let control = TurnControl::new();
         let cancel_token = control.cancel_token().clone();
-        let input = TurnInput::user("go").with_control(control);
-
-        let outcome = run_turn(&mut session, &model, &store, input)
-            .await
+        session.try_start_turn().map_err(ctx("the turn starts"))?;
+        session.set_active_turn_control(control);
+        let call_id_returned = ToolCallId::new();
+        session
+            .begin_handoff(child.clone(), call_id_returned.clone(), "worker".to_owned())
             .map_err(ctx("the handoff pauses the turn"))?;
-        let (child_returned, call_id_returned) = match outcome {
-            TurnOutcome::AwaitingChild {
-                child: awaited_child,
-                call_id: awaited_call_id,
-                ..
-            } => (awaited_child, awaited_call_id),
-            other => {
-                return Err(TestError::Unexpected(format!(
-                    "expected AwaitingChild, got {other:?}"
-                )));
-            }
-        };
+        let child_returned = child;
 
         // Ctrl+C-Äquivalent: der URSPRÜNGLICHE Token wird erst NACH der Pause
         // abgebrochen. Vor Fix A verschluckte `resume_after_child_with_approvals`s
@@ -10059,6 +10578,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_attached_image_reaches_the_model_request_with_its_bytes() -> TestResult {
+        use harw_media::MemorySource;
+        let source = std::sync::Arc::new(MemorySource::new());
+        crate::media::install_media_source(source.clone());
+        let png = {
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut out = u32::try_from(data.len())
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out
+            };
+            let mut ihdr = 12u32.to_be_bytes().to_vec();
+            ihdr.extend_from_slice(&9u32.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+            out.extend_from_slice(&chunk(b"IDAT", b"turn-loop-image"));
+            out.extend_from_slice(&chunk(b"IEND", b""));
+            out
+        };
+        let media = source
+            .put(&png)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("a small image")]);
+
+        run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("what is this?").with_images([media.clone()]),
+        )
+        .await
+        .map_err(ctx("turn with an image"))?;
+
+        let requests = model.take_requests();
+        let first = requests
+            .first()
+            .ok_or(TestError::Missing("model request"))?;
+        let Some(crate::ModelMessage::User { text, images }) = first.messages.first() else {
+            return Err(TestError::Unexpected(format!("{:?}", first.messages)));
+        };
+        assert_eq!(text, "what is this?");
+        assert_eq!(images.len(), 1);
+        let image = images.first().ok_or(TestError::Missing("image"))?;
+        assert_eq!(image.media, media);
+        assert!(image.bytes().is_some_and(|b| b.starts_with(b"\x89PNG")));
+        // The persisted transcript holds the reference, not the pixels.
+        let stored = serde_json::to_string(session.history())
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(stored.contains("\"type\":\"media\""));
+        assert!(!stored.contains("turn-loop-image"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_image_without_text_starts_a_turn_too() -> TestResult {
+        use harw_media::MemorySource;
+        let source = std::sync::Arc::new(MemorySource::new());
+        crate::media::install_media_source(source.clone());
+        let png = {
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut out = u32::try_from(data.len())
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out
+            };
+            let mut ihdr = 5u32.to_be_bytes().to_vec();
+            ihdr.extend_from_slice(&5u32.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+            out.extend_from_slice(&chunk(b"IDAT", b"image-only"));
+            out.extend_from_slice(&chunk(b"IEND", b""));
+            out
+        };
+        let media = source
+            .put(&png)
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("ok")]);
+        let input = TurnInput {
+            user_images: vec![media],
+            ..TurnInput::default()
+        };
+        run_turn(&mut session, &model, &store, input)
+            .await
+            .map_err(ctx("image-only turn"))?;
+        let requests = model.take_requests();
+        let Some(crate::ModelMessage::User { text, images }) = requests
+            .first()
+            .and_then(|request| request.messages.first())
+        else {
+            return Err(TestError::Missing("user message"));
+        };
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn child_session_persists_reasoning_but_never_sends_it_to_the_model() -> TestResult {
         // Kind-Session (mit Parent): das Reasoning-Item landet in History und
         // Store, der nächste Modell-Request sieht es aber nicht als Nachricht.
@@ -10211,21 +10850,25 @@ mod tests {
         let registry = ExtensionRegistryBuilder::default()
             .tool_provider(StubToolProvider::with_names(&["fs.read"]))
             .spawner(spawner.clone())
+            .agent_job_submitter(RecordingJobSubmitter::new())
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_activation(SessionActivation::new(ToolProfile::Minimal))
             .with_spawn_context(test_spawn_context()?);
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = RecordingModel::new(vec![response_with(vec![ToolCall {
-            id: ToolCallId::new(),
-            name: ToolName::new("transfer_to_worker"),
-            arguments: serde_json::json!({"task": "finde den Fehler", "context": "in lib.rs"}),
-        }])]);
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_worker"),
+                arguments: serde_json::json!({"task": "finde den Fehler", "context": "in lib.rs"}),
+            }]),
+            crate::model::ModelResponse::text("started"),
+        ]);
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere"))
             .await
-            .map_err(ctx("der Handoff pausiert den Turn"))?;
-        assert!(matches!(outcome, TurnOutcome::AwaitingChild { .. }));
+            .map_err(ctx("the background start does not pause the turn"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
 
         // (1) Auftrag im SpawnInput.
         let input = spawner
@@ -10270,8 +10913,9 @@ mod tests {
             .ok_or(TestError::Missing("Schema-Properties"))?;
         assert!(properties.contains_key("task"));
         assert!(properties.contains_key("context"));
-        // Runde 5, Teil K: optionaler Hintergrundlauf.
-        assert!(properties.contains_key("background"));
+        // Delegation is background-only: no mode parameters exist any more.
+        assert!(!properties.contains_key("background"));
+        assert!(!properties.contains_key("wait"));
         // Runde 5, Teil J: optionale Fortsetzung, der Auftrag bleibt Pflicht.
         assert!(properties.contains_key("continue_from"));
         // Runde 9, E4: optionale Freigaben der Nutzerin.
@@ -10354,27 +10998,28 @@ mod tests {
         let registry = ExtensionRegistryBuilder::default()
             .tool_provider(StubToolProvider::with_names(&["agent.message"]))
             .spawner(spawner.clone())
+            .agent_job_submitter(RecordingJobSubmitter::new())
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_activation(SessionActivation::new(ToolProfile::Minimal))
             .with_spawn_context(test_spawn_context()?);
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = RecordingModel::new(vec![response_with(vec![ToolCall {
-            id: ToolCallId::new(),
-            name: ToolName::new(crate::child_comms::AGENT_MESSAGE_TOOL),
-            arguments: serde_json::json!({
-                "child_id": finished.as_str(),
-                "text": "Die Nutzerin gibt das Szenario frei.",
-            }),
-        }])]);
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(crate::child_comms::AGENT_MESSAGE_TOOL),
+                arguments: serde_json::json!({
+                    "child_id": finished.as_str(),
+                    "text": "Die Nutzerin gibt das Szenario frei.",
+                }),
+            }]),
+            crate::model::ModelResponse::text("resumed"),
+        ]);
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("antworte"))
             .await
-            .map_err(ctx("die Fortsetzung pausiert den Turn"))?;
-        let TurnOutcome::AwaitingChild { role, .. } = outcome else {
-            return Err(TestError::Unexpected(format!("{outcome:?}")));
-        };
-        assert_eq!(role, "matrix-game-master");
+            .map_err(ctx("the resumption starts in the background"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
         let (spawned_role, input) = spawner
             .captured
             .lock()
@@ -10637,6 +11282,7 @@ mod tests {
         let registry = ExtensionRegistryBuilder::default()
             .tool_provider(StubToolProvider::with_names(&["fs.read"]))
             .spawner(spawner)
+            .agent_job_submitter(RecordingJobSubmitter::new())
             .build();
         Ok(AgentSession::new(AgentRole::Assistant, None, registry, tx)
             .with_activation(SessionActivation::new(ToolProfile::Minimal))
@@ -10705,14 +11351,11 @@ mod tests {
             .map(|name| serde_json::Value::String(name.clone()))
             .collect();
         assert_eq!(agent.enum_values.as_ref(), Some(&expected));
-        for field in [
-            "task",
-            "context",
-            "continue_from",
-            "background",
-            "user_approved",
-        ] {
+        for field in ["task", "context", "continue_from", "user_approved"] {
             assert!(properties.contains_key(field), "{field}");
+        }
+        for field in ["background", "wait"] {
+            assert!(!properties.contains_key(field), "{field} must not exist");
         }
         assert_eq!(
             delegate.parameters.required,
@@ -10765,7 +11408,7 @@ mod tests {
         let writer = find_function(&tools, "transfer_to_uia-writer")?;
         let summary = writer
             .description
-            .split("Ergebnis. ")
+            .split("polling). ")
             .nth(1)
             .ok_or(TestError::Missing("Einzeiler"))?;
         assert!(
@@ -10779,29 +11422,28 @@ mod tests {
 
     /// `agents.delegate` spawnt über denselben Handoff-Weg wie
     /// `transfer_to_*`: gleiche Rolle, Auftrag samt Freigabe-Zeile, Argumente
-    /// ohne `agent`, Turn pausiert mit `AwaitingChild`.
+    /// ohne `agent`; der Start kehrt sofort zurück (Hintergrund, kein Turn-Halt).
     #[tokio::test]
     async fn agents_delegate_spawns_through_the_handoff_path() -> TestResult {
         let spawner = CatalogSpawner::new(analysis_catalog());
         let mut session = catalog_session(Arc::clone(&spawner))?;
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = RecordingModel::new(vec![response_with(vec![ToolCall {
-            id: ToolCallId::new(),
-            name: ToolName::new(AGENTS_DELEGATE_TOOL),
-            arguments: serde_json::json!({
-                "agent": "evidence-critic",
-                "task": "Prüfe die Quellen",
-                "background": false,
-                "user_approved": ["plan"],
-            }),
-        }])]);
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(AGENTS_DELEGATE_TOOL),
+                arguments: serde_json::json!({
+                    "agent": "evidence-critic",
+                    "task": "Prüfe die Quellen",
+                    "user_approved": ["plan"],
+                }),
+            }]),
+            crate::model::ModelResponse::text("started"),
+        ]);
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere"))
             .await
-            .map_err(ctx("agents.delegate pausiert den Turn"))?;
-        let TurnOutcome::AwaitingChild { role, .. } = outcome else {
-            return Err(TestError::Unexpected(format!("{outcome:?}")));
-        };
-        assert_eq!(role, "evidence-critic");
+            .map_err(ctx("agents.delegate starts in the background"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
         let (spawned_role, input) = spawner
             .take()
             .ok_or(TestError::Missing("der Spawner muss aufgerufen werden"))?;
@@ -10811,7 +11453,7 @@ mod tests {
             Some("Die Nutzerin hat vorab freigegeben: plan.\n\nPrüfe die Quellen")
         );
         assert!(input.context.get("agent").is_none());
-        assert_eq!(input.context["background"], serde_json::json!(false));
+        assert!(input.context.get("background").is_none());
         assert_eq!(&input.parent_session_id, session.id());
         Ok(())
     }
@@ -10931,19 +11573,32 @@ mod tests {
                 name: ToolName::new("transfer_to_explorer"),
                 arguments: serde_json::json!({ "task": "erkunde es" }),
             }]),
+            crate::model::ModelResponse::text("started"),
         ]);
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("plane"))
             .await
             .map_err(ctx("Plan-Modus-Delegation"))?;
-        let TurnOutcome::AwaitingChild { role, .. } = outcome else {
-            return Err(TestError::Unexpected(format!("{outcome:?}")));
-        };
+        // The explorer starts in the background; the turn is not paused.
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let (role, _) = spawner
+            .take()
+            .ok_or(TestError::Missing("the explorer must be spawned"))?;
         assert_eq!(role, "explorer");
-        expect_single_error(
-            &session,
-            "Plan-Modus: nur lesende Ziele delegierbar (evidence-critic, explorer); \
-             Schreib-/Ausführungsziele erst nach Planfreigabe.",
-        )?;
+        // First call (writer) is refused; second call (explorer) started.
+        let results = tool_results(&session);
+        match results.as_slice() {
+            [
+                ToolCallResult::Error { message },
+                ToolCallResult::Success { .. },
+            ] => assert!(
+                message.starts_with(
+                    "Plan-Modus: nur lesende Ziele delegierbar (evidence-critic, explorer); \
+                     Schreib-/Ausführungsziele erst nach Planfreigabe."
+                ),
+                "{message}"
+            ),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
         let requests = model.take_requests();
         let first = requests
             .first()

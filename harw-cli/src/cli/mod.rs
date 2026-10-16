@@ -20,6 +20,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueHint};
 
 mod agent;
 mod analyze;
+mod attach;
 mod auth;
 mod channel;
 mod completions;
@@ -31,6 +32,7 @@ mod knowledge;
 mod lens;
 mod mcp;
 mod models;
+mod node;
 mod pr_review;
 mod project;
 mod provider;
@@ -46,6 +48,7 @@ mod tests;
 
 pub use agent::*;
 pub use analyze::*;
+pub use attach::*;
 pub use auth::*;
 pub use channel::*;
 pub use completions::*;
@@ -57,6 +60,7 @@ pub use knowledge::*;
 pub use lens::*;
 pub use mcp::*;
 pub use models::*;
+pub use node::*;
 pub use pr_review::*;
 pub use project::*;
 pub use provider::*;
@@ -150,6 +154,8 @@ pub enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Hängt sich an eine laufende Host-Sitzung an (lokaler Socket oder Own-Cloud-Host).
+    Attach(AttachArgs),
 
     // ── Konfiguration ───────────────────────────────────────────────────
     /// Zeigt und ändert Konfigurationswerte und Freigaben; ohne Unterbefehl startet ein Menü.
@@ -204,6 +210,23 @@ pub enum Command {
         #[command(subcommand)]
         action: JobsAction,
     },
+    /// Räumt ephemere Daten (Logs, Caches, Spools) nach den Aufbewahrungsregeln auf.
+    ///
+    /// Reiht einen Hintergrundauftrag ein und kehrt sofort mit der Auftrags-ID
+    /// zurück (Status und Abbruch über `harw jobs`). Ohne `--apply` nur ein
+    /// Probelauf. Sicherheitsrelevante Klassen werden nur mit ausdrücklichem
+    /// `[retention.<klasse>] enabled = true` gelöscht.
+    Cleanup {
+        /// Löscht wirklich (nur erlaubte Klassen); ohne Flag ein Probelauf.
+        #[arg(long)]
+        apply: bool,
+        /// Nur diese Klasse (wiederholbar); Standard sind alle Klassen.
+        #[arg(long = "class", value_name = "ID")]
+        classes: Vec<String>,
+        /// Frist des Auftrags in Sekunden (Vorgabe 60).
+        #[arg(long, value_name = "SECS")]
+        deadline_secs: Option<u64>,
+    },
     /// Holt einen GitHub-PR read-only, legt den Diff als Fixture ab und
     /// reviewt ihn mit dem Agenten `github-pr-reviewer`.
     ///
@@ -222,6 +245,20 @@ pub enum Command {
         /// Zusätzliche Telemetrie-Exportziele (Vorgabe: beide aus).
         #[command(flatten)]
         telemetry: TelemetryArgs,
+        /// Opt-in: zusätzlich die Sitzungs-Kontrollebene (`harw.session.v1`) auf
+        /// einem lokalen Unix-Socket (Modus 0600, privates Verzeichnis 0700)
+        /// anbieten. Ohne Wert: `$XDG_RUNTIME_DIR/harw/session.sock`, sonst
+        /// `<profil>/session-host/run/session.sock`. Ein Pfad nur als
+        /// `--session-socket=PFAD`. Schlägt der Start fehl, endet der Dienst
+        /// mit Fehler.
+        #[arg(
+            long,
+            value_name = "PATH",
+            value_hint = ValueHint::FilePath,
+            num_args = 0..=1,
+            require_equals = true
+        )]
+        session_socket: Option<Option<PathBuf>>,
     },
     /// Startet den lokalen MCP-Server über HTTP.
     Serve {
@@ -279,6 +316,18 @@ pub enum Command {
         /// Auszuführende Kanal-Aktion.
         #[command(subcommand)]
         action: ChannelAction,
+    },
+    /// Verwaltet die enrollten Geräte des Own-Cloud-Listeners (`node-devices.conf`).
+    Device {
+        /// Auszuführende Geräte-Aktion.
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// Zeigt den Zustand des Own-Cloud-Listeners dieses Knotens.
+    Node {
+        /// Auszuführende Knoten-Aktion.
+        #[command(subcommand)]
+        action: NodeAction,
     },
 
     // ── System ──────────────────────────────────────────────────────────

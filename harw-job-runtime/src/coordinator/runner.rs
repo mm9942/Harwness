@@ -61,7 +61,10 @@ use tokio::time::Instant;
 use super::attempt::{AttemptRecord, attempt_id_for};
 use super::capture::{Output, OutputCapture};
 use super::error::RuntimeError;
-use super::executor::{AttemptContext, AttemptEvent, AttemptRun, Executor, Probe};
+use super::executor::{
+    AttemptContext, AttemptEvent, AttemptRun, Executor, OutputFiles, Probe, StdioHandoff,
+};
+use super::frames::{DEFAULT_FRAME_BUFFER, FrameTap, JobFrame, JobFrames};
 use super::store::CoordinatorStore;
 
 /// Default lease validity.
@@ -88,6 +91,10 @@ pub struct CoordinatorConfig {
     /// How much stdout/stderr a [`JobResult`] keeps per stream (first
     /// `head_bytes` + last `tail_bytes`).
     pub output_capture: OutputCapture,
+    /// Frames of a job kept in flight per subscriber (see
+    /// [`JobFrames`](super::JobFrames)); a subscriber that falls further
+    /// behind lags instead of slowing the job.
+    pub frame_buffer: usize,
 }
 
 impl CoordinatorConfig {
@@ -115,6 +122,7 @@ impl CoordinatorConfig {
                 max_delay: SignedDuration::from_secs(1),
             },
             output_capture: OutputCapture::default(),
+            frame_buffer: DEFAULT_FRAME_BUFFER,
         }
     }
 
@@ -262,6 +270,44 @@ fn total_bytes(captured: &[u8], omitted: u64) -> u64 {
 
 type ResultSender = oneshot::Sender<Result<JobResult, RuntimeError>>;
 
+/// What the durable job record keeps of a job's [`JobSpec`].
+///
+/// The record is written to the job store and read back by
+/// [`Coordinator::recover`]; a spec holds the command line and the
+/// environment, which can carry secrets. The class decides how much of it is
+/// written. The job itself always runs from the spec held in memory; a
+/// record that does not carry the full spec is **never re-run** from the
+/// store after a restart (recovery can reattach to a verified process or
+/// finalize the record, nothing more).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Persistence {
+    /// The full spec, recoverable and retryable after a restart. For
+    /// background jobs and workers.
+    #[default]
+    Durable,
+    /// The program name, the argument **count**, the environment variable
+    /// **names** and the lifecycle; no argument and no environment value.
+    MetadataOnly,
+    /// Nothing about the command is written; only that a job ran. For
+    /// interactive commands whose input may hold anything.
+    Ephemeral,
+}
+
+/// Options of [`Coordinator::submit_with`].
+#[derive(Debug, Clone, Default)]
+pub struct SubmitOptions {
+    /// Append standard output and error to these files instead of piping them
+    /// (no frames, no captured output in the result).
+    pub output_files: Option<OutputFiles>,
+    /// Hand pipes of the first attempt to the submitter (see [`StdioHandoff`]).
+    pub stdio_handoff: Option<StdioHandoff>,
+    /// How much of the spec the job record keeps.
+    pub persistence: Persistence,
+    /// Also return a subscription that sees the job from its very first
+    /// frame.
+    pub stream: bool,
+}
+
 /// Handle to a submitted (or recovered) job.
 #[derive(Debug)]
 pub struct JobHandle {
@@ -269,6 +315,7 @@ pub struct JobHandle {
     attempt_id: AttemptId,
     cancel: Arc<watch::Sender<bool>>,
     result: oneshot::Receiver<Result<JobResult, RuntimeError>>,
+    tap: FrameTap,
 }
 
 impl JobHandle {
@@ -284,6 +331,15 @@ impl JobHandle {
     #[must_use]
     pub fn attempt_id(&self) -> &AttemptId {
         &self.attempt_id
+    }
+
+    /// Subscribes to the job's live frames from now on. A subscriber that
+    /// must not miss the start asks for it at submit time
+    /// ([`Coordinator::submit_with`]). The stream ends when the job is
+    /// finished.
+    #[must_use]
+    pub fn subscribe(&self) -> JobFrames {
+        self.tap.subscribe()
     }
 
     /// Requests cancellation ([`CancellationCause::User`]). Idempotent;
@@ -343,6 +399,11 @@ struct Inner<S, E> {
     config: CoordinatorConfig,
     lease_ttl: SignedDuration,
     active: Mutex<HashMap<String, Arc<watch::Sender<bool>>>>,
+    taps: Mutex<HashMap<String, FrameTap>>,
+    /// Output files of jobs submitted with [`SubmitOptions::output_files`].
+    outputs: Mutex<HashMap<String, OutputFiles>>,
+    /// Stdio handoffs of jobs submitted with [`SubmitOptions::stdio_handoff`].
+    handoffs: Mutex<HashMap<String, StdioHandoff>>,
 }
 
 /// Coordinates a job store and an executor (Job-Runtime-Doc §14).
@@ -481,6 +542,9 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
                 config,
                 lease_ttl,
                 active: Mutex::new(HashMap::new()),
+                taps: Mutex::new(HashMap::new()),
+                outputs: Mutex::new(HashMap::new()),
+                handoffs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -529,9 +593,25 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
     /// [`RuntimeError::InvalidSpec`], store errors on create/claim. Start
     /// and execution failures are reported through [`JobHandle::wait`].
     pub async fn submit(&self, envelope: JobSpecEnvelope) -> Result<JobHandle, RuntimeError> {
+        self.submit_with(envelope, SubmitOptions::default())
+            .await
+            .map(|(handle, _)| handle)
+    }
+
+    /// [`Coordinator::submit`] with options: how much of the spec the job
+    /// record keeps, and optionally a live subscription taken before the job
+    /// starts (so it cannot miss the first frame).
+    ///
+    /// # Errors
+    /// As [`Coordinator::submit`].
+    pub async fn submit_with(
+        &self,
+        envelope: JobSpecEnvelope,
+        options: SubmitOptions,
+    ) -> Result<(JobHandle, Option<JobFrames>), RuntimeError> {
         let spec = envelope.clone().into_spec()?;
         let now = Timestamp::now();
-        let record = self.new_record(&envelope, now)?;
+        let record = self.new_record_with(&envelope, now, options.persistence)?;
         let job_id = record.job.id.clone();
         blocking(&self.inner.store, move |store| store.create_job(record)).await?;
         let runner = self.inner.config.runner_id.clone();
@@ -549,14 +629,29 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
         })
         .await?;
         let attempt_id = attempt_id_for(&job_id, claim.lease.epoch)?;
+        if let Some(files) = options.output_files.clone() {
+            self.inner
+                .outputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job_id.as_str().to_owned(), files);
+        }
+        if let Some(handoff) = options.stdio_handoff.clone() {
+            self.inner
+                .handoffs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job_id.as_str().to_owned(), handoff);
+        }
         let (handle, mut cancel, done) = self.register(&job_id, &attempt_id);
+        let frames = options.stream.then(|| handle.subscribe());
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             let result = run_job(&inner, claim, attempt_id, spec, &mut cancel).await;
             inner.unregister(&job_id);
             let _ = done.send(result);
         });
-        Ok(handle)
+        Ok((handle, frames))
     }
 
     /// Recovers every running job whose lease `runner` holds
@@ -602,10 +697,20 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
         Ok(recovered)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_record(
         &self,
         envelope: &JobSpecEnvelope,
         now: Timestamp,
+    ) -> Result<StoredJob, RuntimeError> {
+        self.new_record_with(envelope, now, Persistence::Durable)
+    }
+
+    pub(crate) fn new_record_with(
+        &self,
+        envelope: &JobSpecEnvelope,
+        now: Timestamp,
+        persistence: Persistence,
     ) -> Result<StoredJob, RuntimeError> {
         let config = &self.inner.config;
         let mut job = Job::new(
@@ -619,12 +724,19 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             .map_err(|error| RuntimeError::InvalidConfig {
                 detail: error.to_string(),
             })?;
-        let input = serde_json::to_value(envelope).map_err(|error| {
-            RuntimeError::InvalidSpec(SpecError::InvalidId {
-                field: "envelope",
-                reason: error.to_string(),
-            })
-        })?;
+        let input = match persistence {
+            Persistence::Durable => serde_json::to_value(envelope).map_err(|error| {
+                RuntimeError::InvalidSpec(SpecError::InvalidId {
+                    field: "envelope",
+                    reason: error.to_string(),
+                })
+            })?,
+            // Deliberately **not** a `JobSpecEnvelope`: recovery then finds no
+            // spec and can never re-run the command from this record.
+            Persistence::MetadataOnly | Persistence::Ephemeral => {
+                redacted_input(&envelope.clone().into_spec()?, persistence)
+            }
+        };
         Ok(StoredJob {
             job,
             scope: config.scope.clone(),
@@ -648,17 +760,24 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
         let (cancel_sender, cancel_receiver) = watch::channel(false);
         let cancel_sender = Arc::new(cancel_sender);
         let (done, result) = oneshot::channel();
+        let tap = FrameTap::new(self.inner.config.frame_buffer);
         self.inner
             .active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(job_id.as_str().to_owned(), Arc::clone(&cancel_sender));
+        self.inner
+            .taps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_id.as_str().to_owned(), tap.clone());
         (
             JobHandle {
                 job_id: job_id.clone(),
                 attempt_id: attempt_id.clone(),
                 cancel: cancel_sender,
                 result,
+                tap,
             },
             cancel_receiver,
             done,
@@ -679,6 +798,7 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             attempt_id: attempt_id.clone(),
             cancel: Arc::new(cancel),
             result: receiver,
+            tap: FrameTap::closed(),
         }
     }
 
@@ -710,7 +830,10 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             job_id: job_id.clone(),
             attempt_id: attempt_id.clone(),
             runner_id: runner.clone(),
+            lease_epoch: lease.epoch,
             workspace_root: inner.config.workspace_root.clone(),
+            output_files: None,
+            stdio_handoff: None,
         };
         let mut record = match bytes {
             Some(bytes) => AttemptRecord::<E::Identity>::from_bytes(attempt_id.as_str(), &bytes)?,
@@ -1017,12 +1140,56 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
     }
 }
 
+/// The job record's input for a class that does not keep the full spec.
+fn redacted_input(spec: &JobSpec, persistence: Persistence) -> serde_json::Value {
+    let class = match persistence {
+        Persistence::Ephemeral => "ephemeral",
+        Persistence::Durable | Persistence::MetadataOnly => "metadata_only",
+    };
+    match persistence {
+        Persistence::MetadataOnly => serde_json::json!({
+            "harw_redacted": {
+                "class": class,
+                "program": spec.program,
+                "arg_count": spec.args.len(),
+                "env_names": spec.env.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            }
+        }),
+        _ => serde_json::json!({ "harw_redacted": { "class": class } }),
+    }
+}
+
 impl<S, E> Inner<S, E> {
     fn unregister(&self, job: &WorkId) {
+        self.handoffs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job.as_str());
+        self.outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job.as_str());
         self.active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(job.as_str());
+        // Ends every subscription of the job.
+        if let Some(tap) = self
+            .taps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job.as_str())
+        {
+            tap.close();
+        }
+    }
+
+    fn tap_for(&self, job: &WorkId) -> Option<FrameTap> {
+        self.taps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job.as_str())
+            .cloned()
     }
 }
 
@@ -1268,16 +1435,30 @@ fn retry_delay(
     Some(delay)
 }
 
-fn attempt_context(
-    config: &CoordinatorConfig,
+fn attempt_context<S, E>(
+    inner: &Inner<S, E>,
     job_id: &WorkId,
     attempt_id: &AttemptId,
+    lease_epoch: u64,
 ) -> AttemptContext {
     AttemptContext {
         job_id: job_id.clone(),
         attempt_id: attempt_id.clone(),
-        runner_id: config.runner_id.clone(),
-        workspace_root: config.workspace_root.clone(),
+        runner_id: inner.config.runner_id.clone(),
+        lease_epoch,
+        workspace_root: inner.config.workspace_root.clone(),
+        output_files: inner
+            .outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id.as_str())
+            .cloned(),
+        stdio_handoff: inner
+            .handoffs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id.as_str())
+            .cloned(),
     }
 }
 
@@ -1512,7 +1693,7 @@ where
         delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
         "retrying job"
     );
-    let ctx = attempt_context(&inner.config, &claim.job.id, &record.attempt_id);
+    let ctx = attempt_context(inner, &claim.job.id, &record.attempt_id, claim.lease.epoch);
     match backoff(inner, claim, delay, cancel).await {
         Backoff::Elapsed => {}
         Backoff::Cancelled => {
@@ -1650,7 +1831,7 @@ where
     E: Executor,
 {
     let mut record = record;
-    let ctx = attempt_context(&inner.config, &claim.job.id, &record.attempt_id);
+    let ctx = attempt_context(inner, &claim.job.id, &record.attempt_id, claim.lease.epoch);
     record.apply(LifecycleEvent::Start, Timestamp::now())?;
     persist(inner, &record).await?;
 
@@ -1740,6 +1921,13 @@ where
         let _ = drain(&mut run).await;
         return Err(error);
     }
+    if let Some(tap) = inner.tap_for(&ctx.job_id) {
+        tap.emit_with(|| JobFrame::AttemptStarted {
+            attempt_id: ctx.attempt_id.clone(),
+            pid: record.pid,
+            sandbox: record.sandbox,
+        });
+    }
     Ok(supervise(inner, claim, ctx, record, run, spec.sandbox, cancel).await)
 }
 
@@ -1780,6 +1968,12 @@ where
     E: Executor,
 {
     let mut output = Output::new(inner.config.output_capture);
+    let tap = inner.tap_for(&ctx.job_id);
+    let emit = |frame: &dyn Fn() -> JobFrame| {
+        if let Some(tap) = &tap {
+            tap.emit_with(frame);
+        }
+    };
     let period = heartbeat_period(&inner.config);
     let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1799,16 +1993,32 @@ where
         let armed = cause.is_none();
         tokio::select! {
             event = run.next_event() => match event {
-                Some(AttemptEvent::Stdout(chunk)) => output.stdout(&chunk),
-                Some(AttemptEvent::Stderr(chunk)) => output.stderr(&chunk),
+                Some(AttemptEvent::Stdout(chunk)) => {
+                    emit(&|| JobFrame::Stdout(Arc::from(chunk.as_slice())));
+                    output.stdout(&chunk);
+                }
+                Some(AttemptEvent::Stderr(chunk)) => {
+                    emit(&|| JobFrame::Stderr(Arc::from(chunk.as_slice())));
+                    output.stderr(&chunk);
+                }
                 Some(AttemptEvent::Error(message)) => {
                     tracing::warn!(job = %ctx.job_id, %message, "supervision error");
+                    emit(&|| JobFrame::Note(message.clone()));
                     if record.recovered && notes.len() < MAX_RECOVERY_NOTES {
                         notes.push(message);
                     }
                 }
-                Some(AttemptEvent::Exited { outcome, sandbox }) => break (outcome, sandbox),
-                None => break (ExitOutcome::Unknown, None),
+                Some(AttemptEvent::Exited { outcome, sandbox }) => {
+                    emit(&|| JobFrame::AttemptEnded { outcome, sandbox });
+                    break (outcome, sandbox)
+                }
+                None => {
+                    emit(&|| JobFrame::AttemptEnded {
+                        outcome: ExitOutcome::Unknown,
+                        sandbox: None,
+                    });
+                    break (ExitOutcome::Unknown, None)
+                }
             },
             _ = heartbeat.tick(), if lease_lost.is_none() => {
                 let renew_claim = claim.clone();

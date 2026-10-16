@@ -143,6 +143,11 @@ pub struct LinuxExecutorOptions {
     pub termination: TerminationPolicy,
     /// How long output is drained after the primary exited.
     pub drain_timeout: Duration,
+    /// Start unsandboxed jobs in a new session (no controlling terminal, so
+    /// `open("/dev/tty")` fails instead of stopping the job) through
+    /// `setsid(1)` when one is available; otherwise they lead their own
+    /// process group as usual.
+    pub new_session: bool,
 }
 
 impl Default for LinuxExecutorOptions {
@@ -153,8 +158,26 @@ impl Default for LinuxExecutorOptions {
             exit_status_dir: None,
             termination: TerminationPolicy::default(),
             drain_timeout: Duration::from_secs(2),
+            new_session: false,
         }
     }
+}
+
+/// `setsid(1)` at a fixed path, else on `PATH` (once per process).
+fn resolve_setsid() -> Option<&'static Path> {
+    static SETSID: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SETSID
+        .get_or_init(|| {
+            let fixed = ["/usr/bin/setsid", "/bin/setsid", "/usr/local/bin/setsid"];
+            if let Some(found) = fixed.iter().map(Path::new).find(|p| p.is_file()) {
+                return Some(found.to_path_buf());
+            }
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("setsid"))
+                .find(|candidate| candidate.is_file())
+        })
+        .as_deref()
 }
 
 /// Linux [`Executor`] (see the module docs).
@@ -194,6 +217,19 @@ impl Launch {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
+    }
+
+    /// `setsid <program> <args>`: in place (same PID) when the caller is not a
+    /// group leader, which is why the spawn must not make it one.
+    fn wrap_in_session(self, setsid: &Path) -> Self {
+        let mut args: Vec<OsString> = vec!["--wait".into(), self.program];
+        args.extend(self.args);
+        Self {
+            program: setsid.as_os_str().to_owned(),
+            args,
+            env: self.env,
+            cwd: self.cwd,
+        }
     }
 
     fn wrap_in_shim(self, status: &Path) -> Self {
@@ -782,17 +818,22 @@ impl LinuxExecutor {
         // `SandboxRequirement::None`: no sandbox requested, run plainly.
         let sandboxed = spec.sandbox != SandboxRequirement::None;
         match (sandboxed, &self.options.sandbox) {
-            (false, _) | (true, LinuxSandboxBackend::None) => Ok(Prepared {
-                launch: Launch {
+            (false, _) | (true, LinuxSandboxBackend::None) => {
+                let mut launch = Launch {
                     program: OsString::from(&spec.program),
                     args: spec.args.iter().map(OsString::from).collect(),
                     env: spec.env.clone(),
                     cwd: Some(workdir),
-                },
-                report: Some(unsandboxed_report(resource_limits)),
-                trampoline_report: None,
-                trampoline_plan: None,
-            }),
+                };
+                let rlimits = apply_prlimit(&mut launch, spec);
+                require_rlimits(spec, rlimits)?;
+                Ok(Prepared {
+                    launch,
+                    report: Some(unsandboxed_report(worse(resource_limits, rlimits))),
+                    trampoline_report: None,
+                    trampoline_plan: None,
+                })
+            }
             (
                 true,
                 LinuxSandboxBackend::LandlockTrampoline {
@@ -814,6 +855,11 @@ impl LinuxExecutor {
                 let mut plan = harw_job_exec::ExecPlanV1::new(&spec.program)
                     .with_args(spec.args.iter().cloned())
                     .with_sandbox(policy, spec.sandbox);
+                // The trampoline applies the rlimits itself, before the
+                // sandbox, and fails the job instead of continuing without.
+                if spec.resources.requests_rlimits() {
+                    plan = plan.with_rlimits(rlimit_set(spec));
+                }
                 if let Some((backend, handle)) = cgroup {
                     plan = plan.with_cgroup(harw_job_exec::CgroupJoin {
                         root: backend.root_path().to_path_buf(),
@@ -856,18 +902,23 @@ impl LinuxExecutor {
                             detail: other.to_string(),
                         },
                     })?;
+                let mut launch = Launch {
+                    program: plan.executable().as_os_str().to_owned(),
+                    args: plan.args().to_vec(),
+                    // bwrap sets the job environment inside (--setenv).
+                    env: Vec::new(),
+                    cwd: None,
+                };
+                // `prlimit` runs in front of bwrap; the limits are inherited
+                // by the sandboxed program.
+                let rlimits = apply_prlimit(&mut launch, spec);
+                require_rlimits(spec, rlimits)?;
                 let report = SandboxReport {
-                    resource_limits,
+                    resource_limits: worse(resource_limits, rlimits),
                     ..plan.report()
                 };
                 Ok(Prepared {
-                    launch: Launch {
-                        program: plan.executable().as_os_str().to_owned(),
-                        args: plan.args().to_vec(),
-                        // bwrap sets the job environment inside (--setenv).
-                        env: Vec::new(),
-                        cwd: None,
-                    },
+                    launch,
                     report: Some(report),
                     trampoline_report: None,
                     trampoline_plan: None,
@@ -905,6 +956,89 @@ impl LinuxExecutor {
         tokio::spawn(forward(handle, events, sender, after));
         AttemptRun::new(attempt_events, control)
     }
+}
+
+/// Fixed search paths for `prlimit` (util-linux); `PATH` is never consulted.
+const PRLIMIT_CANDIDATES: [&str; 2] = ["/usr/bin/prlimit", "/bin/prlimit"];
+
+/// The per-process rlimits the spec asks for.
+fn rlimit_set(spec: &JobSpec) -> harw_job_linux::RlimitSet {
+    use harw_job_linux::{RlimitResource, RlimitSet, RlimitValue};
+    let resources = &spec.resources;
+    let mut set = RlimitSet::new();
+    if let Some(bytes) = resources.address_space_max {
+        set.set(RlimitResource::AddressSpace, RlimitValue::fixed(bytes));
+    }
+    if let Some(seconds) = resources.cpu_time_max {
+        set.set(RlimitResource::Cpu, RlimitValue::fixed(seconds));
+    }
+    if let Some(bytes) = resources.file_size_max {
+        set.set(RlimitResource::FileSize, RlimitValue::fixed(bytes));
+    }
+    if let Some(count) = resources.open_files_max {
+        set.set(RlimitResource::Nofile, RlimitValue::fixed(u64::from(count)));
+    }
+    set
+}
+
+/// The more restrictive of two per-dimension states (what the report says
+/// when two mechanisms each cover part of the request).
+fn worse(a: EnforcementState, b: EnforcementState) -> EnforcementState {
+    let rank = |state: EnforcementState| match state {
+        EnforcementState::Enforced => 0,
+        EnforcementState::Partial => 1,
+        EnforcementState::NotEnforced => 2,
+        _ => 3,
+    };
+    if rank(b) > rank(a) { b } else { a }
+}
+
+/// A job that demands its rlimits does not run without them.
+fn require_rlimits(spec: &JobSpec, state: EnforcementState) -> Result<(), RuntimeError> {
+    if spec.resources.require_rlimits && state != EnforcementState::Enforced {
+        return Err(RuntimeError::Unsupported {
+            operation: "rlimits",
+            detail: "the job requires per-process rlimits but no prlimit is available".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Starts the launch through `prlimit` so the limits hold for the program
+/// (and, rlimits being inherited, for everything it starts). `prlimit`
+/// `exec`s the program, so the PID stays the primary's. Returns whether the
+/// limits are applied: without a `prlimit` they are **not**, and the report
+/// says so (a `Required` job then fails before it runs).
+fn apply_prlimit(launch: &mut Launch, spec: &JobSpec) -> EnforcementState {
+    let resources = &spec.resources;
+    if !resources.requests_rlimits() {
+        return EnforcementState::Enforced;
+    }
+    let Some(prlimit) = PRLIMIT_CANDIDATES
+        .iter()
+        .find(|candidate| Path::new(candidate).is_file())
+    else {
+        return EnforcementState::NotEnforced;
+    };
+    let mut wrapped: Vec<OsString> = Vec::new();
+    if let Some(bytes) = resources.address_space_max {
+        wrapped.push(format!("--as={bytes}").into());
+    }
+    if let Some(seconds) = resources.cpu_time_max {
+        wrapped.push(format!("--cpu={seconds}").into());
+    }
+    if let Some(bytes) = resources.file_size_max {
+        wrapped.push(format!("--fsize={bytes}").into());
+    }
+    if let Some(count) = resources.open_files_max {
+        wrapped.push(format!("--nofile={count}").into());
+    }
+    wrapped.push("--".into());
+    wrapped.push(std::mem::take(&mut launch.program));
+    wrapped.append(&mut launch.args);
+    launch.program = OsString::from(prlimit);
+    launch.args = wrapped;
+    EnforcementState::Enforced
 }
 
 /// The sandbox policy of a profile rooted at the workspace.
@@ -984,25 +1118,80 @@ impl Executor for LinuxExecutor {
             }
             launch = launch.wrap_in_shim(status);
         }
+        // A new session only for plain (unsandboxed) launches: sandbox
+        // backends manage their own namespaces and terminals.
+        let session = if self.options.new_session && spec.sandbox == SandboxRequirement::None {
+            resolve_setsid()
+        } else {
+            None
+        };
+        if let Some(setsid) = session {
+            // `setsid` would report a missing program as exit status 127;
+            // a path that does not exist is a failed spawn, as without it.
+            let program = Path::new(&launch.program);
+            if program.components().count() > 1 && !program.exists() {
+                if let Some(plan) = &prepared.trampoline_plan {
+                    let _ = std::fs::remove_file(plan);
+                }
+                release(cgroup);
+                return Err(RuntimeError::Spawn {
+                    program: spec.program.clone(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                });
+            }
+            launch = launch.wrap_in_session(setsid);
+        }
         // 4. spawn → pidfd → cgroup attach
         let mut command = launch.command();
+        if let Some(files) = &ctx.output_files {
+            let open = |path: &Path| {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map(Stdio::from)
+                    .map_err(|error| RuntimeError::Os {
+                        operation: "open output file",
+                        detail: format!("{}: {error}", path.display()),
+                    })
+            };
+            command
+                .stdout(open(&files.stdout)?)
+                .stderr(open(&files.stderr)?);
+        }
+        if let Some(handoff) = &ctx.stdio_handoff {
+            if handoff.stdin {
+                command.stdin(Stdio::piped());
+            }
+            if handoff.stdout {
+                command.stdout(Stdio::piped());
+            }
+        }
         let spawned = match cgroup {
             Some((backend, handle)) => {
                 let backend: Arc<dyn CgroupBackend> = backend;
-                LinuxJobGroup::spawn_in_cgroup(&mut command, JobCgroup::new(backend, handle))
-                    .map_err(|error| match error {
-                        LaunchError::Process(error) => process_error("spawn", &spec.program, error),
-                        LaunchError::Cgroup(error) => cgroup_error(error),
-                        other => RuntimeError::Os {
-                            operation: "spawn in cgroup",
-                            detail: other.to_string(),
-                        },
-                    })
+                LinuxJobGroup::spawn_in_cgroup_with(
+                    &mut command,
+                    JobCgroup::new(backend, handle),
+                    session.is_some(),
+                )
+                .map_err(|error| match error {
+                    LaunchError::Process(error) => process_error("spawn", &spec.program, error),
+                    LaunchError::Cgroup(error) => cgroup_error(error),
+                    other => RuntimeError::Os {
+                        operation: "spawn in cgroup",
+                        detail: other.to_string(),
+                    },
+                })
             }
+            None if session.is_some() => LinuxJobGroup::spawn_in_new_session(&mut command)
+                .map_err(|error| process_error("spawn", &spec.program, error)),
             None => LinuxJobGroup::spawn(&mut command)
                 .map_err(|error| process_error("spawn", &spec.program, error)),
         };
-        let (group, stdio) = match spawned {
+        let (group, mut stdio) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
                 if let Some(plan) = &prepared.trampoline_plan {
@@ -1012,6 +1201,22 @@ impl Executor for LinuxExecutor {
             }
         };
         let pid = group.primary().pid();
+        if let Some(handoff) = &ctx.stdio_handoff {
+            // The submitter owns these pipes from here on; the supervisor
+            // neither reads nor closes them.
+            handoff.deliver(super::executor::HandedStdio {
+                stdin: if handoff.stdin {
+                    stdio.stdin.take()
+                } else {
+                    None
+                },
+                stdout: if handoff.stdout {
+                    stdio.stdout.take()
+                } else {
+                    None
+                },
+            });
+        }
         // 5. identity after attach
         let identity = match LinuxRecoveryIdentity::capture(
             group.primary(),
@@ -1299,7 +1504,10 @@ mod tests {
             job_id: WorkId::from_str("j"),
             attempt_id: AttemptId::new("j-e1").map_err(ctx("attempt"))?,
             runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
+            output_files: None,
+            stdio_handoff: None,
         })
     }
 
@@ -1392,7 +1600,10 @@ mod tests {
             job_id: WorkId::from_str("j"),
             attempt_id: AttemptId::new("job:1.x-e2").map_err(ctx("attempt"))?,
             runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
             workspace_root: PathBuf::from("/"),
+            output_files: None,
+            stdio_handoff: None,
         };
         assert_eq!(cgroup_name(&context), "harw-job-job_1.x-e2");
         Ok(())

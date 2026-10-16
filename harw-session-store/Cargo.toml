@@ -20,6 +20,9 @@ harw-fsutil = { path = "../harw-fsutil" }
 # AW1-01: ChildLeaseRecord carries a TraceContext (frozen wire form,
 # docs/design/build-history.md §A.4). Path dependency only — no version pin.
 harw-observe = { path = "../harw-observe" }
+# Retention sweeps (opt-in classes session_transcripts, session_corrupt_backups,
+# freeze_resolved): `src/retention.rs`.
+harw-retention = { path = "../harw-retention" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = { workspace = true }

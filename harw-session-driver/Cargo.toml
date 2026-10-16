@@ -1,0 +1,27 @@
+[package]
+publish.workspace = true
+name = "harw-session-driver"
+description = "Production TurnDriver for the session host: bridges harw-session-host's driver port to the harw-core durable turn loop (W00 §2.4 driver.rs, S03)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-protocol = { path = "../harw-protocol" }
+harw-types = { path = "../harw-types" }
+harw-session-host = { path = "../harw-session-host" }
+harw-session-store = { path = "../harw-session-store" }
+# The runtime the driver wraps (`run_turn_durable`, `resume_after_approval_durable`).
+harw-core = { path = "../harw-core" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+thiserror = "2"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+
+[lints]
+workspace = true

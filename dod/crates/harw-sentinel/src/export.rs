@@ -192,8 +192,13 @@ pub fn resolve_host(explicit: Option<&HostId>, hostname_path: &Path) -> Option<H
 
 /// Pfad der rotierten Vorgängerdatei: `<pfad>.1`.
 fn rotated_path(path: &Path) -> PathBuf {
+    generation_path(path, 1)
+}
+
+/// `<pfad>.<generation>`.
+fn generation_path(path: &Path, generation: u32) -> PathBuf {
     let mut name = OsString::from(path.as_os_str());
-    name.push(".1");
+    name.push(format!(".{generation}"));
     PathBuf::from(name)
 }
 
@@ -249,6 +254,8 @@ fn restrict_mode(_file: &File) -> io::Result<()> {
 pub struct FindingsExporter {
     path: PathBuf,
     rotated: PathBuf,
+    /// Anzahl aufbewahrter rotierter Generationen (`<pfad>.1` … `<pfad>.N`).
+    keep: u32,
     host: HostId,
     max_bytes: u64,
     file: Option<File>,
@@ -271,12 +278,23 @@ impl FindingsExporter {
         Self {
             path,
             rotated,
+            keep: 1,
             host,
             max_bytes,
             file: None,
             written: 0,
             failures: 0,
         }
+    }
+
+    /// Bewahrt `keep` rotierte Generationen auf (`<pfad>.1` neueste …
+    /// `<pfad>.<keep>` älteste; Standard 1, mindestens 1). Die älteste fällt
+    /// bei der nächsten Rotation heraus — der Platzbedarf ist damit durch
+    /// `(keep + 1) × max_bytes` begrenzt.
+    #[must_use]
+    pub fn with_keep(mut self, keep: u32) -> Self {
+        self.keep = keep.max(1);
+        self
     }
 
     /// Zielpfad der Exportdatei.
@@ -394,11 +412,24 @@ impl FindingsExporter {
 
     fn rotate(&mut self) -> io::Result<()> {
         self.file = None;
+        // Ältere Generationen nach hinten schieben (`.N-1` → `.N`, …,
+        // `.1` → `.2`); die älteste wird dabei ersetzt. Fehlende Stufen sind
+        // kein Fehler.
+        for generation in (1..self.keep).rev() {
+            let from = generation_path(&self.path, generation);
+            let to = generation_path(&self.path, generation + 1);
+            match fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         match fs::rename(&self.path, &self.rotated) {
             Ok(()) => {
                 tracing::info!(
                     path = %self.path.display(),
                     rotated = %self.rotated.display(),
+                    keep = self.keep,
                     written = self.written(),
                     "findings export rotated"
                 );
@@ -649,6 +680,54 @@ mod tests {
         let size = fs::metadata(&path).map_err(ctx("metadata"))?.len();
         assert!(size <= cap);
         assert_eq!(exporter.failures(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_keep_three_generations_shifts_older_files_and_drops_the_oldest() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let line_len = encode_line(
+            &finding_id()?,
+            &host()?,
+            "structure-drift",
+            Severity::Info,
+            "s",
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("encode"))?
+        .len();
+        // Genau eine Zeile je Datei: jede weitere Zeile rotiert.
+        let cap = u64::try_from(line_len).map_err(ctx("cap"))?;
+        let mut exporter =
+            FindingsExporter::with_max_bytes(path.clone(), host()?, cap).with_keep(3);
+        for _ in 0..6 {
+            assert!(exporter.export_fields(
+                &NullSink,
+                &finding_id()?,
+                "structure-drift",
+                Severity::Info,
+                "s",
+                Timestamp::UNIX_EPOCH,
+            ));
+        }
+        for generation in 1..=3 {
+            let name = format!("findings.jsonl.{generation}");
+            assert_eq!(read_lines(&dir.path().join(&name))?.len(), 1, "{name}");
+        }
+        assert!(
+            !dir.path().join("findings.jsonl.4").exists(),
+            "older generations fall out"
+        );
+        assert_eq!(read_lines(&path)?.len(), 1);
+        assert_eq!(exporter.failures(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_keep_is_at_least_one() -> TestResult {
+        let exporter = FindingsExporter::new(PathBuf::from("/tmp/x.jsonl"), host()?).with_keep(0);
+        assert_eq!(exporter.keep, 1);
         Ok(())
     }
 

@@ -1,0 +1,50 @@
+{
+  "has_executor": {
+    "shell.exec": true
+  },
+  "parallel_safe": {
+    "shell.exec": false
+  },
+  "permissions": null,
+  "tools": [
+    {
+      "description": "Execute a shell command inside the isolated project sandbox. Runs under Bubblewrap via /bin/sh -c and captures stdout+stderr. The shell is POSIX /bin/sh (dash on Debian), not bash: no `source`, use `.` (e.g. `. \"$HOME/.cargo/env\"`); no bash arrays, no `[[ ]]` (use `[ ]`), no `{a,b}` brace expansion, no `<<<` here-strings. Do not edit or create files through shell heredocs, `sed -i`, or `python3 -`; use fs.edit / fs.write instead. Do not run `harw ...` (e.g. `harw gateway`, `harw channel`) to inspect or manage the gateway: the harw binary is not available in the sandbox; use the gateway.* tools. For long-running work (builds, test suites, servers) prefer job.start. Requires ExecuteProcess permission. Default timeout 30 s, build/test commands (cargo, make, npm, pytest, go, ...) 600 s; for long commands set timeout_secs explicitly (capped by [shell] max_timeout_secs, default 900). If the sandbox blocks the command (network, path outside, missing tool, namespace), you may retry with request_host {reason} to ask the user for Host-Mode.",
+      "name": "shell.exec",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "Shell command to execute in the isolated project sandbox. Runs as /bin/sh -c: POSIX sh (dash on Debian), not bash.",
+            "type": "string"
+          },
+          "request_host": {
+            "additionalProperties": false,
+            "description": "Optional. Ask the user to run THIS command on the host (Host-Mode) because the sandbox blocks it. The user approves once or for a host work phase; without approval nothing runs. Only use after a sandbox limit (network, path outside, missing tool, namespace) actually blocked the command. sudo/doas/pkexec stay forbidden.",
+            "properties": {
+              "reason": {
+                "description": "Why this command must run on the host instead of the sandbox (e.g. needs network for cargo fetch, needs a tool or path outside the sandbox).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "reason"
+            ],
+            "type": "object"
+          },
+          "timeout_secs": {
+            "description": "Optional timeout in seconds for this call. Default 30 s; build/test commands (cargo, make, npm, pytest, go, ...) default to 600 s. Capped by the configured maximum ([shell] max_timeout_secs, default 900). Set it explicitly for long-running commands.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

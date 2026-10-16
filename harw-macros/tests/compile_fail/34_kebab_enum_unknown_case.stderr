@@ -1,0 +1,5 @@
+error: `case` muss "kebab" oder "snake" sein, nicht "camel"
+ --> tests/compile_fail/34_kebab_enum_unknown_case.rs:6:21
+  |
+6 | #[kebab_enum(case = "camel")]
+  |                     ^^^^^^^

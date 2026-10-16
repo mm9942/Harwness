@@ -6,13 +6,14 @@
 //! Dieses Crate ist die Grundlage für „Planung hängt an Recherche": ein
 //! Sub-Agent (`researcher-web`) holt damit offizielle Dokumentation und
 //! Crate-Metadaten, **ohne** WebDriver, Headless-Browser oder JavaScript-
-//! Ausführung. Es stellt drei Tools bereit:
+//! Ausführung. Es stellt vier Tools bereit:
 //!
 //! | Tool | Zweck |
 //! |---|---|
 //! | `web.fetch` | eine HTTPS-Ressource als Text, Markdown oder Rohtext |
 //! | `web.docs_rs` | die offizielle Crate-Doku von docs.rs als Markdown |
 //! | `web.crates_io` | kompakte Crate-Metadaten (Version, MSRV, Lizenz, Repo) |
+//! | `web.search` | Websuche über ein konfigurierbares Backend ([`search`]): Titel, URL, Snippet |
 //!
 //! # Sicherheitskontrakt
 //! Dieses Crate ist eine Netz-Ausgangstür des Harness und fail-closed ausgelegt:
@@ -39,19 +40,24 @@
 //!    Elemente erreichen das Modell nicht ([`html`]).
 //! 7. **Blockierendes auf dem Blocking-Pool** ([`fetch::run_blocking`]).
 //! 8. **Fail-open nur bei Transportfehlern** ([`WebToolError::is_transport`]).
+//! 9. **Offenes Recherche-Netz.** Mit `[network].research_web = "open"` prüft
+//!    `web.fetch` zusätzlich eine Domain-Freigabe je Sitzung ([`open_web`]);
+//!    `web.search`, `web.docs_rs` und `web.crates_io` sprechen feste Hosts an.
 //!
 //! # Schlüsseltypen
-//! - [`WebToolProvider`] — der `ToolProvider` über alle drei Tools.
+//! - [`WebToolProvider`] — der `ToolProvider` über alle vier Tools.
 //! - [`WebFetcher`], [`WebFetchOptions`] — Abruf-Motor und Limits.
 //! - [`CacheScope`], [`CacheEntry`] — Cache-Isolation und -Format.
 //! - [`FetchedDocument`], [`OutputFormat`], [`CrateSummary`].
+//! - [`WebSearchConfig`], [`SearchBackend`], [`SearchResult`] — Konfiguration und
+//!   Ausgabe von `web.search`.
 //! - [`WebToolError`] / `WebToolResult` — crate-weiter Fehlertyp.
 //!
 //! # Nebenläufigkeit
 //! Alle öffentlichen Typen sind `Send + Sync`. Der Basis-Fetcher liegt in einem
 //! prozessweiten `OnceLock<Arc<WebFetcher>>` ([`install_fetcher`]); pro
 //! Tool-Aufruf leitet [`scoped_fetcher`] eine Kopie mit Netz- und Cache-Scope
-//! der aktiven Sandbox ab. Alle drei Tools sind `parallel_safe`.
+//! der aktiven Sandbox ab. Alle vier Tools sind `parallel_safe`.
 //!
 //! # Fehler
 //! Alle Fehler sind Varianten von [`WebToolError`]; an der Tool-Grenze werden

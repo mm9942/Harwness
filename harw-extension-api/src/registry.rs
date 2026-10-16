@@ -132,6 +132,7 @@ pub struct ExtensionRegistry {
     approval_handlers: Vec<Arc<dyn ApprovalHandler>>,
     turn_observers: Vec<Arc<dyn TurnObserver>>,
     spawner: Option<Arc<dyn AgentSpawner>>,
+    agent_job_submitter: Option<Arc<dyn AgentJobSubmitter>>,
     /// Namensraum -> (Providername, behauptete `TrustClass`) für jeden über
     /// [`ExtensionRegistryBuilder::context_provider`] oder
     /// [`ExtensionRegistryBuilder::context_provider_declared`] registrierten
@@ -168,6 +169,11 @@ impl ExtensionRegistry {
     }
     pub fn spawner(&self) -> Option<&Arc<dyn AgentSpawner>> {
         self.spawner.as_ref()
+    }
+
+    /// Durable non-blocking agent-job submission capability for this runtime.
+    pub fn agent_job_submitter(&self) -> Option<&Arc<dyn AgentJobSubmitter>> {
+        self.agent_job_submitter.as_ref()
     }
 
     /// Providername und behauptete `TrustClass` eines registrierten
@@ -231,6 +237,7 @@ impl ExtensionRegistry {
             approval_handlers: self.approval_handlers,
             turn_observers: self.turn_observers,
             spawner: self.spawner,
+            agent_job_submitter: self.agent_job_submitter,
             context_provider_namespaces: self.context_provider_namespaces,
         }
     }
@@ -307,6 +314,7 @@ pub struct ExtensionRegistryBuilder {
     approval_handlers: Vec<Arc<dyn ApprovalHandler>>,
     turn_observers: Vec<Arc<dyn TurnObserver>>,
     spawner: Option<Arc<dyn AgentSpawner>>,
+    agent_job_submitter: Option<Arc<dyn AgentJobSubmitter>>,
     context_provider_namespaces: BTreeMap<String, (&'static str, TrustClass)>,
 }
 
@@ -326,6 +334,7 @@ impl std::fmt::Debug for ExtensionRegistryBuilder {
             .field("approval_handlers", &self.approval_handlers.len())
             .field("turn_observers", &self.turn_observers.len())
             .field("spawner", &self.spawner.is_some())
+            .field("agent_job_submitter", &self.agent_job_submitter.is_some())
             .field(
                 "claimed_namespaces",
                 &self.context_provider_namespaces.len(),
@@ -533,6 +542,15 @@ impl ExtensionRegistryBuilder {
         self.spawner = Some(s);
         self
     }
+
+    /// Installs the durable agent-job submitter. When mounted, delegation uses
+    /// this path by default. Runtimes without a durable job substrate retain
+    /// the explicit inline compatibility path; no unmanaged background task is
+    /// created by the core.
+    pub fn agent_job_submitter(mut self, submitter: Arc<dyn AgentJobSubmitter>) -> Self {
+        self.agent_job_submitter = Some(submitter);
+        self
+    }
     pub fn build(self) -> ExtensionRegistry {
         ExtensionRegistry {
             tool_providers: self.tool_providers,
@@ -541,6 +559,7 @@ impl ExtensionRegistryBuilder {
             approval_handlers: self.approval_handlers,
             turn_observers: self.turn_observers,
             spawner: self.spawner,
+            agent_job_submitter: self.agent_job_submitter,
             context_provider_namespaces: self.context_provider_namespaces,
         }
     }

@@ -679,6 +679,8 @@ mod tests {
             },
             text: text.to_owned(),
             visibility: crate::DEFAULT_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         }
     }
 
@@ -754,6 +756,8 @@ mod tests {
                 path: "unchanged.md".to_owned(),
             },
             text: "# Unchanged\n\nStays the same.\n".to_owned(),
+            is_binary: false,
+            content_hash: None,
             visibility: crate::DEFAULT_VISIBILITY.to_owned(),
         };
         let mut changing = RawDocument {
@@ -761,6 +765,8 @@ mod tests {
                 path: "changing.md".to_owned(),
             },
             text: "# Changing\n\nOriginal body.\n".to_owned(),
+            is_binary: false,
+            content_hash: None,
             visibility: crate::DEFAULT_VISIBILITY.to_owned(),
         };
 
@@ -882,6 +888,8 @@ mod tests {
                 id: "palace/normal".to_owned(),
             },
             text: "ordinary palace content".to_owned(),
+            is_binary: false,
+            content_hash: None,
             visibility: crate::DEFAULT_VISIBILITY.to_owned(),
         };
         let operator_doc = RawDocument {
@@ -889,6 +897,8 @@ mod tests {
                 id: "palace/secret".to_owned(),
             },
             text: "operator only secret content".to_owned(),
+            is_binary: false,
+            content_hash: None,
             visibility: crate::OPERATOR_ONLY_VISIBILITY.to_owned(),
         };
 
@@ -950,6 +960,8 @@ mod tests {
             source: SourceRef::Artifact { id: id.to_owned() },
             text: text.to_owned(),
             visibility: crate::OPERATOR_ONLY_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         }
     }
 
@@ -1043,6 +1055,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
             },
             text: source_text.to_owned(),
+            is_binary: false,
+            content_hash: None,
             visibility: crate::DEFAULT_VISIBILITY.to_owned(),
         }];
 
@@ -1084,6 +1098,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
             },
             text: "fn a() {}\n".to_owned(),
+            is_binary: false,
+            content_hash: None,
             visibility: crate::DEFAULT_VISIBILITY.to_owned(),
         }];
 

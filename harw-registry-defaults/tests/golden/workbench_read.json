@@ -1,0 +1,38 @@
+{
+  "has_executor": {
+    "workbench.show": true
+  },
+  "parallel_safe": {
+    "workbench.show": true
+  },
+  "permissions": [
+    "Some(ReadWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Liest die Workbench (nur lesend): angeheftete Dateien (Pfad + Begründung, kein Dateiinhalt), Hypothesen mit Nummer #<n> und das Ende der Notizen. Gekürzt auf 4 KiB. Nur die eigene Sitzung bzw. das eigene Projekt.",
+      "name": "workbench.show",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "description": "\"session\": die Workbench DIESER Sitzung; \"project\": die Projekt-Workbench des aktuellen Projekts (falls bekannt).",
+            "enum": [
+              "session",
+              "project"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

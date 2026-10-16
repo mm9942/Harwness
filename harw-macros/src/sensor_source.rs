@@ -50,7 +50,7 @@
 //!
 //! Struct-Attribut `#[sensor(...)]` (genau einmal wirksam je Struct):
 //! - `capability = <Ident>` — **erforderlich**, genau einmal. Einer der
-//!   vierzehn Bezeichner aus [`CAPABILITY_VARIANTS`], wörtlich wie die
+//!   fünfzehn Bezeichner aus [`CAPABILITY_VARIANTS`], wörtlich wie die
 //!   Variante in `harw_dod_cap::Capability`.
 //! - `id = "..."` — **erforderlich**. Erzeugt `Self::SENSOR_ID`.
 //! - `metrics = "..."` — **erforderlich**. Namenspräfix für die beiden vom
@@ -100,7 +100,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Attribute, Data, DeriveInput, Field, Fields, Ident, LitStr, Path};
 
-/// Die vierzehn erlaubten `harw_dod_cap::Capability`-Variantennamen.
+/// Die fünfzehn erlaubten `harw_dod_cap::Capability`-Variantennamen.
 ///
 /// `harw-macros` hängt nicht produktiv von `harw-dod-cap` ab (siehe
 /// Moduldoku von `lib.rs`) — diese Liste ist deshalb eine bewusst gepflegte
@@ -120,11 +120,12 @@ const CAPABILITY_VARIANTS: &[&str] = &[
     "ReadAuditNetlink",
     "ReadScanReports",
     "ReadWorkspaceGraph",
+    "ReadContainerScopes",
     "WatchFilesystem",
     "LoadBpfProgram",
 ];
 
-/// Prüft, ob `ident` einer der vierzehn erlaubten Capability-Namen ist.
+/// Prüft, ob `ident` einer der fünfzehn erlaubten Capability-Namen ist.
 ///
 /// # Errors
 /// `syn::Error`, gespannt auf `ident`, wenn der Name in
@@ -726,7 +727,7 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn validate_capability_accepts_all_fourteen_variants() {
+    fn validate_capability_accepts_all_fifteen_variants() {
         for name in CAPABILITY_VARIANTS {
             let ident = Ident::new(name, proc_macro2::Span::call_site());
             assert!(validate_capability(&ident).is_ok(), "must accept {name}");

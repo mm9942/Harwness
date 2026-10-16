@@ -147,7 +147,10 @@ impl RootBudget {
             | EntryKind::LocalEcho
             | EntryKind::Analyze
             | EntryKind::Doctor
-            | EntryKind::Web => Self::unbounded_local(),
+            | EntryKind::Web
+            // Gehostete Sitzung auf dem lokalen Socket (derselbe Mensch, dieselbe
+            // Maschine); die Verengung nach Tier schneidet Rechte, nicht Budget.
+            | EntryKind::SessionHost => Self::unbounded_local(),
             // #22 Welle 3A: ein kompilierter Agent läuft wie ein lokales
             // CLI-Werkzeug (derselbe Mensch, dieselbe Maschine); diese
             // Tabellenzeile ist nur die Obergrenze der Konfiguration

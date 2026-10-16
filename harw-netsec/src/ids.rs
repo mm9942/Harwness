@@ -12,8 +12,7 @@
 //! routes yet) and enforce the token rule in their constructor and in
 //! `Deserialize`, so an invalid value cannot exist in memory.
 
-use std::fmt;
-
+use harw_macros::HarwId;
 use harw_types::NodeId;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -55,11 +54,30 @@ pub fn check_node_id(id: &NodeId) -> NetsecResult<()> {
     }
 }
 
+/// Token-rule check for [`ZoneId`], used by `#[derive(HarwId)]`.
+fn validate_zone_id(value: &str) -> NetsecResult<()> {
+    check_token("zone", value)
+}
+
+/// Token-rule check for [`RouteId`], used by `#[derive(HarwId)]`.
+fn validate_route_id(value: &str) -> NetsecResult<()> {
+    check_token("route", value)
+}
+
+fn check_token(kind: &'static str, value: &str) -> NetsecResult<()> {
+    if is_token(value) {
+        Ok(())
+    } else {
+        Err(NetsecError::invalid_identifier(kind, value))
+    }
+}
+
 macro_rules! netsec_id {
-    ($(#[$doc:meta])* $name:ident, $kind:literal) => {
+    ($(#[$doc:meta])* $name:ident, $validate:literal) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, HarwId)]
         #[serde(transparent)]
+        #[harw_id(error = "crate::error::NetsecError", validate = $validate)]
         pub struct $name(String);
 
         impl $name {
@@ -68,24 +86,7 @@ macro_rules! netsec_id {
             /// # Errors
             /// [`NetsecError::InvalidIdentifier`] if `value` is not a token.
             pub fn parse(value: impl Into<String>) -> NetsecResult<Self> {
-                let value = value.into();
-                if is_token(&value) {
-                    Ok(Self(value))
-                } else {
-                    Err(NetsecError::invalid_identifier($kind, &value))
-                }
-            }
-
-            /// Borrows the identifier.
-            #[must_use]
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
+                Self::try_new(value)
             }
         }
 
@@ -104,12 +105,12 @@ macro_rules! netsec_id {
 netsec_id!(
     /// Identifies a network trust zone (e.g. `local`, `lan`, `dmz`).
     ZoneId,
-    "zone"
+    "validate_zone_id"
 );
 netsec_id!(
     /// Identifies one route entry in the topology.
     RouteId,
-    "route"
+    "validate_route_id"
 );
 
 #[cfg(test)]

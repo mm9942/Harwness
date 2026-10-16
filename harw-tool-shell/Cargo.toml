@@ -14,6 +14,7 @@ harw-extension-api = { path = "../harw-extension-api" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
+harw-command = { path = "../harw-command" }
 # Runde 5, Teil B (`host.sudo_exec`): `#[derive(Redact)]` für den Audit-Datensatz,
 # argv-Hash und genullte Passwortpuffer (alle bereits im Cargo.lock).
 harw-macros = { path = "../harw-macros" }
@@ -29,6 +30,7 @@ tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros
 tracing = "0.1"
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync"] }
 

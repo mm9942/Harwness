@@ -18,5 +18,8 @@ toml = "1.1.3"
 harw-macros = { path = "../harw-macros" }
 harw-types = { path = "../harw-types" }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

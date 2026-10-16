@@ -114,6 +114,7 @@ use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
+use harw_tools::args::parse_args;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType};
 use serde::Deserialize;
 
@@ -1095,13 +1096,9 @@ impl ToolExecutor for AgentsValidateExecutor {
     ) -> ToolExecutorFuture<'a> {
         let arguments = call.arguments.clone();
         Box::pin(async move {
-            let args: ValidateArgs = match serde_json::from_value(arguments) {
+            let args: ValidateArgs = match parse_args("agents.validate", &arguments) {
                 Ok(args) => args,
-                Err(error) => {
-                    return Ok(ToolOutput::error(format!(
-                        "agents.validate: ungültige Argumente: {error}"
-                    )));
-                }
+                Err(out) => return Ok(out),
             };
             Ok(validate_output(validate_definition_toml(&args.toml)))
         })
@@ -1203,13 +1200,10 @@ struct AgentsWriteDefinitionExecutor {
 
 impl AgentsWriteDefinitionExecutor {
     fn write(&self, call: &ToolCall) -> ToolOutput {
-        let args: WriteDefinitionArgs = match serde_json::from_value(call.arguments.clone()) {
+        let args: WriteDefinitionArgs = match parse_args("agents.write_definition", &call.arguments)
+        {
             Ok(args) => args,
-            Err(error) => {
-                return ToolOutput::error(format!(
-                    "agents.write_definition: ungültige Argumente: {error}"
-                ));
-            }
+            Err(out) => return out,
         };
         if !matches!(args.scope.as_str(), "project" | "profile" | "run") {
             return ToolOutput::error(format!(
@@ -1478,13 +1472,9 @@ struct AgentsWriteUiaExecutor {
 
 impl AgentsWriteUiaExecutor {
     fn write(&self, call: &ToolCall) -> ToolOutput {
-        let args: WriteUiaArgs = match serde_json::from_value(call.arguments.clone()) {
+        let args: WriteUiaArgs = match parse_args("agents.write_uia", &call.arguments) {
             Ok(args) => args,
-            Err(error) => {
-                return ToolOutput::error(format!(
-                    "agents.write_uia: ungültige Argumente: {error}"
-                ));
-            }
+            Err(out) => return out,
         };
 
         let Some(profile_agents_dir) = &self.profile_agents_dir else {
@@ -1749,13 +1739,9 @@ struct AgentsCommitProposalExecutor {
 
 impl AgentsCommitProposalExecutor {
     fn commit(&self, call: &ToolCall) -> ToolOutput {
-        let args: CommitProposalArgs = match serde_json::from_value(call.arguments.clone()) {
+        let args: CommitProposalArgs = match parse_args("agents.commit_proposal", &call.arguments) {
             Ok(args) => args,
-            Err(error) => {
-                return ToolOutput::error(format!(
-                    "agents.commit_proposal: ungültige Argumente: {error}"
-                ));
-            }
+            Err(out) => return out,
         };
         if !is_valid_slug(&args.proposal_id) {
             return ToolOutput::error(format!(
@@ -2033,13 +2019,9 @@ struct AgentsRejectProposalExecutor {
 
 impl AgentsRejectProposalExecutor {
     fn reject(&self, call: &ToolCall) -> ToolOutput {
-        let args: RejectProposalArgs = match serde_json::from_value(call.arguments.clone()) {
+        let args: RejectProposalArgs = match parse_args("agents.reject_proposal", &call.arguments) {
             Ok(args) => args,
-            Err(error) => {
-                return ToolOutput::error(format!(
-                    "agents.reject_proposal: ungültige Argumente: {error}"
-                ));
-            }
+            Err(out) => return out,
         };
         if !is_valid_slug(&args.proposal_id) {
             return ToolOutput::error(format!(
@@ -2221,13 +2203,10 @@ struct UiaSelfUpdateDocumentExecutor {
 
 impl UiaSelfUpdateDocumentExecutor {
     fn write(&self, call: &ToolCall) -> ToolOutput {
-        let args: UpdateDocumentArgs = match serde_json::from_value(call.arguments.clone()) {
+        let args: UpdateDocumentArgs = match parse_args("uia_self.update_document", &call.arguments)
+        {
             Ok(args) => args,
-            Err(error) => {
-                return ToolOutput::error(format!(
-                    "uia_self.update_document: ungültige Argumente: {error}"
-                ));
-            }
+            Err(out) => return out,
         };
         let Some(target) = SelfDocumentTarget::parse(&args.target) else {
             return ToolOutput::error(format!(
@@ -2545,8 +2524,17 @@ trait AgentBuildJobStarter: Send + Sync {
         &self,
         request: harw_tool_job::StartRequest,
         prepared: harw_tool_job::PreparedJob,
-    ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError>;
+    ) -> JobStartFuture<'_>;
 }
+
+/// Future von [`AgentBuildJobStarter::start`].
+type JobStartFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<harw_tool_job::JobStatus, harw_tool_job::JobError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Startet über eine echte [`harw_tool_job::JobManager`]-Instanz.
 struct RealJobStarter(std::sync::Arc<harw_tool_job::JobManager>);
@@ -2556,8 +2544,8 @@ impl AgentBuildJobStarter for RealJobStarter {
         &self,
         request: harw_tool_job::StartRequest,
         prepared: harw_tool_job::PreparedJob,
-    ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError> {
-        self.0.start(request, prepared)
+    ) -> JobStartFuture<'_> {
+        Box::pin(async move { self.0.start(request, prepared).await })
     }
 }
 
@@ -2668,13 +2656,9 @@ impl ToolExecutor for AgentsBuildExecutor {
     ) -> ToolExecutorFuture<'a> {
         let arguments = call.arguments.clone();
         Box::pin(async move {
-            let args: AgentsBuildArgs = match serde_json::from_value(arguments) {
+            let args: AgentsBuildArgs = match parse_args("agents.build", &arguments) {
                 Ok(args) => args,
-                Err(error) => {
-                    return Ok(ToolOutput::error(format!(
-                        "agents.build: ungültige Argumente: {error}"
-                    )));
-                }
+                Err(out) => return Ok(out),
             };
             if args.name_or_path.trim().is_empty() {
                 return Ok(ToolOutput::error(
@@ -2718,8 +2702,9 @@ impl ToolExecutor for AgentsBuildExecutor {
             let prepared = harw_tool_job::PreparedJob {
                 command,
                 executed_on_host: true,
+                env_cleared: false,
             };
-            match self.starter.start(request, prepared) {
+            match self.starter.start(request, prepared).await {
                 Ok(status) => Ok(ToolOutput::json(serde_json::json!({
                     "job_id": status.meta.job_id.as_str(),
                     "note": "Build läuft als Hintergrund-Job. Fortschritt: job.status/job.logs.",
@@ -2865,6 +2850,15 @@ mod agents_build_tests {
             &self,
             request: harw_tool_job::StartRequest,
             _prepared: harw_tool_job::PreparedJob,
+        ) -> super::JobStartFuture<'_> {
+            Box::pin(async move { self.start_now(request) })
+        }
+    }
+
+    impl FakeStarter {
+        fn start_now(
+            &self,
+            request: harw_tool_job::StartRequest,
         ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError> {
             self.recorded
                 .lock()

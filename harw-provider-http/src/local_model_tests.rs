@@ -15,21 +15,21 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 /// Eine vom Fake-Server beobachtete Anfrage (Kopfzeilen kleingeschrieben).
-struct Observed {
-    head: String,
-    body: Option<Value>,
+pub(crate) struct Observed {
+    pub(crate) head: String,
+    pub(crate) body: Option<Value>,
 }
 
 /// Antwort-Skript einer Verbindung: Teilstücke mit Wartezeit davor, danach
 /// wird die Verbindung noch `hold` lang offen gehalten.
-struct Script {
+pub(crate) struct Script {
     parts: Vec<(Duration, Vec<u8>)>,
     hold: Duration,
 }
 
 impl Script {
     /// Vollständige JSON-Antwort ohne Verzögerung.
-    fn json(body: &Value) -> Self {
+    pub(crate) fn json(body: &Value) -> Self {
         let body = body.to_string();
         let raw = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -42,14 +42,14 @@ impl Script {
     }
 }
 
-type FakeServer = (
+pub(crate) type FakeServer = (
     String,
     Receiver<Observed>,
     thread::JoinHandle<TestResult<()>>,
 );
 
 /// Startet einen Fake-Server, der je Verbindung genau ein [`Script`] abspielt.
-fn fake_server(scripts: Vec<Script>) -> TestResult<FakeServer> {
+pub(crate) fn fake_server(scripts: Vec<Script>) -> TestResult<FakeServer> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind fake server"))?;
     let base_url = format!(
         "http://{}",
@@ -113,12 +113,12 @@ fn read_request(stream: &mut std::net::TcpStream) -> TestResult<Observed> {
     Ok(Observed { head, body })
 }
 
-fn join_error(_payload: Box<dyn std::any::Any + Send>) -> TestError {
+pub(crate) fn join_error(_payload: Box<dyn std::any::Any + Send>) -> TestError {
     TestError::Unexpected("fake server thread panicked".to_owned())
 }
 
 /// Provider-Datei wie vom Katalog-Seed bzw. `harw provider add --no-auth`.
-fn local_provider(
+pub(crate) fn local_provider(
     name: &str,
     base_url: &str,
     extra: Value,
@@ -137,7 +137,7 @@ fn local_provider(
     serde_json::from_value(value).map_err(ctx("provider toml aus JSON"))
 }
 
-fn config_with(provider: harw_config::ProviderToml) -> harw_config::ResolvedConfig {
+pub(crate) fn config_with(provider: harw_config::ProviderToml) -> harw_config::ResolvedConfig {
     let mut config = harw_config::ResolvedConfig::default();
     config.harness.default_provider = Some(provider.name.clone());
     config.harness.default_model = Some("local-model".to_owned());
@@ -188,7 +188,7 @@ fn tool(name: &str) -> ToolSpec {
     })
 }
 
-fn chat_reply(content: &str) -> Value {
+pub(crate) fn chat_reply(content: &str) -> Value {
     serde_json::json!({"choices": [{"message": {"content": content}, "finish_reason": "stop"}]})
 }
 

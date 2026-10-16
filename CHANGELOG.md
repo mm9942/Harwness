@@ -6,10 +6,44 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Changed
+
+- Delegation through the turn-loop handoff (`transfer_to_<role>`, via the agent
+  job submitter or the host background launcher, e.g. the TUI) is now
+  background-only: it returns ids at once, results arrive as notifications,
+  and a missing executor is an immediate error. Not yet converted, still
+  inline (blocking join on the child): `AgentToolAdapter::invoke` (explore /
+  research tools), fan-out, and `delegate_wave`. Follow-up: `TODO(PL-90
+  background-only)`. See `docs/guides/background-agents.md`.
+
+### Fixed
+
+- The shared `MemoryPitfallAdvisor` keeps resolved pitfall hints per session
+  (`SessionResolvedSet`, bounded); a success in one session no longer hides
+  the hint in another. The default `PitfallAdvisor::resolved_in_session` no
+  longer forwards to the unbound `resolved`.
+
 ## [0.9.1] — Unreleased
 
 ### Fixed
 
+- Packaging metadata now states the workspace license (`MIT OR Apache-2.0`)
+  instead of a stale single `MIT`: the Homebrew formula uses
+  `license any_of: ["MIT", "Apache-2.0"]`, `webui/package.json` carries the
+  SPDX expression, and the container image sets the
+  `org.opencontainers.image.licenses` label and ships `LICENSE-MIT` and
+  `LICENSE-APACHE` under `/usr/share/doc/harw/`.
+- New `harw/tests/license_coherence.rs` fails when a workspace member stops
+  inheriting the workspace license, a license text goes missing, or the
+  packaging metadata drifts. `cargo deny` skips private crates, so nothing
+  checked this before.
+- `harw-tool-job`: concurrent job starts no longer exceed `[jobs] max_running`.
+  The capacity check and the insertion of the job were separate steps, so
+  several agents starting jobs at the same time all saw free capacity (with
+  `max_running = 1`, 7 or 8 of 8 simultaneous starts succeeded). `start`,
+  `start_with_warnings`, `start_with_origin` and `start_piped` now reserve a
+  slot atomically; a failed launch gives the slot back. `check_capacity`
+  stays an early, advisory check.
 - `curl -fsSL https://get.harw.dev/harw/install.sh | bash` no longer fails
   with a bare 404 on `Harwness-main.zip`. Without an argument it still
   builds from source. `--binary` (opt-in) reads the mirror instead of the
@@ -89,8 +123,9 @@ Semantic Versioning within the 0.x pre-release range.
   `harw-web`). See `docs/setup/tailscale.md`.
 
 ### Changed
-- `job.wait` is a short poll: `timeout_secs` is limited to 1..=60 (larger
-  values are refused); job completion arrives as a notification.
+- Removed the blocking `job.wait` tool. Delegated work runs only in the
+  background: job progress and completion arrive as notifications, and
+  `job.status` gives a non-blocking snapshot.
 - `shell.exec` documents POSIX `/bin/sh` and steers file edits to `fs.*`.
 
 ### `harw update` installs updates

@@ -860,6 +860,28 @@ impl FreezeStore {
         unlock(lock, result)
     }
 
+    /// Opt-in retention sweep of `*.resolved.json` records (class
+    /// `freeze_resolved`); never touches `.active.json`. See
+    /// [`crate::retention`].
+    ///
+    /// # Errors
+    /// See [`crate::retention::retention_sweep`].
+    pub fn retention_sweep(
+        &self,
+        cfg: &harw_retention::ClassConfig,
+        mode: harw_retention::SweepMode,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::retention::StoreSweepReport, harw_retention::RetentionError> {
+        let home = self.root.parent().unwrap_or(&self.root);
+        crate::retention::retention_sweep(
+            home,
+            crate::retention::StoreClass::FreezeResolved,
+            cfg,
+            mode,
+            deadline,
+        )
+    }
+
     fn records_with_suffix(&self, suffix: &str) -> SessionStoreResult<Vec<Freeze>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -933,7 +955,7 @@ impl FreezeStore {
         Ok(())
     }
 
-    fn lock(&self) -> SessionStoreResult<File> {
+    pub(crate) fn lock(&self) -> SessionStoreResult<File> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)

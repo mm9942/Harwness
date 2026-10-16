@@ -1,0 +1,5 @@
+error: Varianten `CompleteDrain` und `Other` erzeugen denselben kebab-Namen `complete-drain`; verwende #[kebab_enum(rename = "...")] zur Unterscheidung
+  --> tests/compile_fail/35_kebab_enum_snake_collision.rs:10:5
+   |
+10 |     Other,
+   |     ^^^^^

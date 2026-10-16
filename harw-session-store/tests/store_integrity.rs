@@ -509,6 +509,7 @@ fn lease(child: &str, expires_in_seconds: i64) -> TestResult<ChildLeaseRecord> {
             .checked_add(SignedDuration::from_secs(expires_in_seconds))
             .map_err(ctx("lease: admitted_at + expires_in_seconds"))?,
         trace: None,
+        owner_work_id: None,
     })
 }
 

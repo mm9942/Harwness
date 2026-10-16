@@ -1,0 +1,37 @@
+[package]
+name = "harw-tool-gitread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Typisierte, rein lesende Git-Werkzeuge (git.status/diff/log/show/branch/blame) mit eigenem Leser für Refs, Objekte (lose und Packs), Index und .gitignore in reinem Rust."
+publish.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-tool-fsread = { path = "../harw-tool-fsread" }
+harw-tools = { path = "../harw-tools" }
+# Gleiche Fassungen wie im Workspace (Cargo.lock): keine neuen Crates, nur neue
+# direkte Kanten (siehe docs/planning/93-common-command-tools/README.md):
+# - flate2: zlib für Objekte und Packs (Backend `miniz_oxide`, reines Rust),
+# - sha1: Objekt-IDs beim Hashen von Arbeitsverzeichnisdateien,
+# - ignore: `.gitignore`-Muster (Gitignore/GitignoreBuilder).
+flate2 = "1.1.9"
+ignore = "0.4.32"
+rustix = { workspace = true, features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+harw-authority = { path = "../harw-authority" }
+harw-test-support = { path = "../harw-test-support" }
+harw-types = { path = "../harw-types" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

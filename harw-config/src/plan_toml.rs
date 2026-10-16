@@ -23,6 +23,7 @@
 //! (`off`/`ask`/`on`, Default `ask`). Auswertung in `harw-cli`
 //! (`doc_ocr::install_doc_ocr`) und in der Freigabe-Politik.
 
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 
 /// `[tools]` — Container-Sektion für werkzeugspezifische Konfigurationen.
@@ -36,6 +37,57 @@ pub struct ToolsSection {
     pub plan: PlanSection,
     #[serde(default)]
     pub doc: DocSection,
+    #[serde(default)]
+    pub container: ContainerToolsSection,
+}
+
+/// `[tools.container]` — Steuerung der Container-Werkzeuge (`container.run`,
+/// `container.images`). **Nur global** (Home/Profil): ein nicht vertrautes
+/// Projekt darf weder Images noch die Engine setzen. Standard: aus.
+///
+/// # Examples
+/// ```rust
+/// use harw_config::ContainerToolsSection;
+///
+/// let section: ContainerToolsSection = toml::from_str(
+///     "enabled = true\nimages = [\"rust=docker.io/library/rust@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"]",
+/// )
+/// .expect("valid");
+/// assert!(section.enabled);
+/// assert_eq!(section.images.len(), 1);
+/// assert!(!ContainerToolsSection::default().enabled);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerToolsSection {
+    /// Registriert die Container-Werkzeuge. Standard `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Absoluter Pfad der Engine; der Dateiname muss `podman` sein.
+    #[serde(default = "default_container_engine")]
+    pub engine: String,
+    /// Optionale benannte Remote-Verbindung (`podman --connection NAME`).
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// Erlaubte Images als `alias=name@sha256:<digest>` (nur Digest-Pins; das
+    /// Modell nennt nur den Alias).
+    #[serde(default)]
+    pub images: Vec<String>,
+}
+
+fn default_container_engine() -> String {
+    "/usr/bin/podman".to_owned()
+}
+
+impl Default for ContainerToolsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            engine: default_container_engine(),
+            connection: None,
+            images: Vec::new(),
+        }
+    }
 }
 
 /// `[tools.doc]` — Steuerung der Dokument-Werkzeuge (`doc.read_pdf`).
@@ -196,9 +248,6 @@ impl PlanSection {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_max_nodes() -> usize {
     256
 }

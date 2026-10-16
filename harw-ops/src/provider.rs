@@ -1709,8 +1709,11 @@ mod tests {
     #[test]
     fn resolved_config_discovers_from_the_bound_home() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        std::fs::write(dir.path().join("config.toml"), "default_model = \"bound\"\n")
-            .map_err(ctx("seed bound root config"))?;
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_model = \"bound\"\n",
+        )
+        .map_err(ctx("seed bound root config"))?;
         let mut services = ServiceMap::new();
         services.insert(crate::config_util::test_home_context(dir.path())?);
         let context = crate::knowledge_test_support::op_context(services)?;

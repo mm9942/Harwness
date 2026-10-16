@@ -1,0 +1,147 @@
+{
+  "has_executor": {
+    "ask_user": true,
+    "plan.enter": true,
+    "plan.exit": true,
+    "plan.write": true
+  },
+  "parallel_safe": {
+    "ask_user": false,
+    "plan.enter": false,
+    "plan.exit": false,
+    "plan.write": false
+  },
+  "permissions": [
+    "Some(ReadWorkspace)",
+    "Some(ReadWorkspace)",
+    "Some(ReadWorkspace)",
+    "Some(ReadWorkspace)"
+  ],
+  "tools": [
+    {
+      "description": "Write (or overwrite) your plan as Markdown to .harw/plans/<slug>.md. The only writing tool in plan mode; it cannot write anywhere else. Repeated calls in this session overwrite the same plan unless you pass a new slug. Suggested structure: Context / Approach in steps / Affected files / Verification.",
+      "name": "plan.write",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "The complete plan as Markdown.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "Optional file name: lowercase a-z, 0-9 and '-', max 64 chars. Omit to keep the current plan of this session.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Optional title; used to derive the slug of a new plan.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    },
+    {
+      "description": "Present the finished plan to the user for approval (like ExitPlanMode). The TUI shows it with three options: implement in auto mode, implement with per-change approval, or keep planning with feedback. Only works in plan mode, only in the interactive TUI. Call it only after plan.write.",
+      "name": "plan.exit",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "plan_path": {
+            "description": "The plan written with plan.write, e.g. .harw/plans/<slug>.md",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_path"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    },
+    {
+      "description": "Suggest switching to plan mode (read-only exploration, then a written plan) for a larger or risky task. The user must confirm; nothing changes without her.",
+      "name": "plan.enter",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "description": "One sentence why planning first is worth it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    },
+    {
+      "description": "Ask the user 1-4 multiple-choice questions (2-4 options each, free text 'Other' is always offered) in a selection window and get her answers. Use it to clarify requirements instead of guessing. Read-only. Not available outside the interactive TUI: then make an assumption and state it.",
+      "name": "ask_user",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "questions": {
+            "description": "1-4 questions shown together in one selection window.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "header": {
+                  "description": "Optional very short tab label (max 24 chars), e.g. \"Auth\".",
+                  "type": "string"
+                },
+                "multi_select": {
+                  "description": "true lets the user pick several options.",
+                  "type": "boolean"
+                },
+                "options": {
+                  "description": "2-4 distinct options. Do NOT add an \"Other\" option; the UI always offers free text.",
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "description": {
+                        "description": "Optional one-line explanation of the option and its trade-off.",
+                        "type": "string"
+                      },
+                      "label": {
+                        "description": "Short option label (max 80 chars), returned as the answer.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "question": {
+                  "description": "The complete question, ending with a question mark.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "question",
+                "options"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ],
+  "unknown_has_executor": false,
+  "unknown_parallel_safe": false
+}

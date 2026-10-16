@@ -29,6 +29,7 @@ harw-macros = { path = "../../../harw-macros" }
 jiff = { workspace = true }
 
 [dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
 harw-dod-fixtures = { path = "../harw-dod-fixtures" }
 tempfile = { workspace = true }
 

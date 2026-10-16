@@ -270,32 +270,22 @@ mod tests {
         ApprovalId, ChannelId, ItemId, PeerId, SessionId, TenantId, ThreadId, ThreadRef,
         ToolCallId, TurnId, WorkId, WorkspaceId,
     };
-    use crate::test_support::TestResult;
-
-    macro_rules! assert_fallible_apis_reject_blank_ids {
-        ($id_type:ty) => {
-            assert!(<$id_type>::try_from_str("").is_err());
-            assert!(<$id_type>::parse(" \t\n").is_err());
-            assert!("".parse::<$id_type>().is_err());
-            assert!(<$id_type>::try_from(" \t\n").is_err());
-            assert!(<$id_type>::try_from(String::from("")).is_err());
-        };
-    }
+    use crate::test_support::{TestResult, assert_blank_id_apis_rejected_with_try_from};
 
     #[test]
     fn every_id_type_rejects_empty_and_whitespace_only_values_from_fallible_apis() -> TestResult {
-        assert_fallible_apis_reject_blank_ids!(SessionId);
-        assert_fallible_apis_reject_blank_ids!(ThreadId);
-        assert_fallible_apis_reject_blank_ids!(TurnId);
-        assert_fallible_apis_reject_blank_ids!(ToolCallId);
-        assert_fallible_apis_reject_blank_ids!(ItemId);
-        assert_fallible_apis_reject_blank_ids!(WorkId);
-        assert_fallible_apis_reject_blank_ids!(ChannelId);
-        assert_fallible_apis_reject_blank_ids!(PeerId);
-        assert_fallible_apis_reject_blank_ids!(TenantId);
-        assert_fallible_apis_reject_blank_ids!(WorkspaceId);
-        assert_fallible_apis_reject_blank_ids!(ThreadRef);
-        assert_fallible_apis_reject_blank_ids!(ApprovalId);
+        assert_blank_id_apis_rejected_with_try_from!(SessionId);
+        assert_blank_id_apis_rejected_with_try_from!(ThreadId);
+        assert_blank_id_apis_rejected_with_try_from!(TurnId);
+        assert_blank_id_apis_rejected_with_try_from!(ToolCallId);
+        assert_blank_id_apis_rejected_with_try_from!(ItemId);
+        assert_blank_id_apis_rejected_with_try_from!(WorkId);
+        assert_blank_id_apis_rejected_with_try_from!(ChannelId);
+        assert_blank_id_apis_rejected_with_try_from!(PeerId);
+        assert_blank_id_apis_rejected_with_try_from!(TenantId);
+        assert_blank_id_apis_rejected_with_try_from!(WorkspaceId);
+        assert_blank_id_apis_rejected_with_try_from!(ThreadRef);
+        assert_blank_id_apis_rejected_with_try_from!(ApprovalId);
 
         assert_eq!(SessionId::try_from_str(" session ")?.as_str(), " session ");
         Ok(())
@@ -323,26 +313,16 @@ mod tests {
 #[cfg(test)]
 mod aw0_03_ids_tests {
     use super::{ActionId, BaselineId, CgroupId, FindingId, HostId, SensorId};
-    use crate::test_support::TestResult;
-
-    macro_rules! assert_fallible_apis_reject_blank_ids {
-        ($id_type:ty) => {
-            assert!(<$id_type>::try_from_str("").is_err());
-            assert!(<$id_type>::parse(" \t\n").is_err());
-            assert!("".parse::<$id_type>().is_err());
-            assert!(<$id_type>::try_from(" \t\n").is_err());
-            assert!(<$id_type>::try_from(String::from("")).is_err());
-        };
-    }
+    use crate::test_support::{TestResult, assert_blank_id_apis_rejected_with_try_from};
 
     #[test]
     fn test_new_id_types_reject_empty_and_whitespace_only_values() {
-        assert_fallible_apis_reject_blank_ids!(FindingId);
-        assert_fallible_apis_reject_blank_ids!(SensorId);
-        assert_fallible_apis_reject_blank_ids!(ActionId);
-        assert_fallible_apis_reject_blank_ids!(BaselineId);
-        assert_fallible_apis_reject_blank_ids!(HostId);
-        assert_fallible_apis_reject_blank_ids!(CgroupId);
+        assert_blank_id_apis_rejected_with_try_from!(FindingId);
+        assert_blank_id_apis_rejected_with_try_from!(SensorId);
+        assert_blank_id_apis_rejected_with_try_from!(ActionId);
+        assert_blank_id_apis_rejected_with_try_from!(BaselineId);
+        assert_blank_id_apis_rejected_with_try_from!(HostId);
+        assert_blank_id_apis_rejected_with_try_from!(CgroupId);
     }
 
     #[test]
@@ -395,24 +375,14 @@ mod aw0_03_ids_tests {
 #[cfg(test)]
 mod h1_infrastructure_ids_tests {
     use super::{DeviceId, NodeId, SecurityContextId, ServiceIdentityId};
-    use crate::test_support::TestResult;
-
-    macro_rules! assert_fallible_apis_reject_blank_ids {
-        ($id_type:ty) => {
-            assert!(<$id_type>::try_from_str("").is_err());
-            assert!(<$id_type>::parse(" \t\n").is_err());
-            assert!("".parse::<$id_type>().is_err());
-            assert!(<$id_type>::try_from(" \t\n").is_err());
-            assert!(<$id_type>::try_from(String::from("")).is_err());
-        };
-    }
+    use crate::test_support::{TestResult, assert_blank_id_apis_rejected_with_try_from};
 
     #[test]
     fn test_infrastructure_id_types_reject_empty_and_whitespace_only_values() {
-        assert_fallible_apis_reject_blank_ids!(NodeId);
-        assert_fallible_apis_reject_blank_ids!(DeviceId);
-        assert_fallible_apis_reject_blank_ids!(ServiceIdentityId);
-        assert_fallible_apis_reject_blank_ids!(SecurityContextId);
+        assert_blank_id_apis_rejected_with_try_from!(NodeId);
+        assert_blank_id_apis_rejected_with_try_from!(DeviceId);
+        assert_blank_id_apis_rejected_with_try_from!(ServiceIdentityId);
+        assert_blank_id_apis_rejected_with_try_from!(SecurityContextId);
     }
 
     #[test]

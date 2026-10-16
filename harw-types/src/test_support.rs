@@ -117,3 +117,24 @@ pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> T
         source: source.to_string(),
     }
 }
+
+/// Asserts that the fallible constructors of the ID newtype `$id_type`
+/// (`try_from_str`, `parse`, `FromStr`) reject empty and whitespace-only input.
+macro_rules! assert_blank_id_apis_rejected {
+    ($id_type:ty) => {
+        assert!(<$id_type>::try_from_str("").is_err());
+        assert!(<$id_type>::parse(" \t\n").is_err());
+        assert!("".parse::<$id_type>().is_err());
+    };
+}
+
+/// Like [`assert_blank_id_apis_rejected`], plus the `TryFrom<&str>` /
+/// `TryFrom<String>` conversions (only the `newtype_id!` types provide them).
+macro_rules! assert_blank_id_apis_rejected_with_try_from {
+    ($id_type:ty) => {
+        $crate::test_support::assert_blank_id_apis_rejected!($id_type);
+        assert!(<$id_type>::try_from(" \t\n").is_err());
+        assert!(<$id_type>::try_from(String::from("")).is_err());
+    };
+}
+pub(crate) use {assert_blank_id_apis_rejected, assert_blank_id_apis_rejected_with_try_from};

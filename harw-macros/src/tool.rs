@@ -24,6 +24,26 @@
 //!    leeren Hostnamen in die Scope-Prüfung zu geben. Ein leerer Host würde
 //!    andernfalls an `NetworkScope::allows("")` weitergereicht — ein
 //!    Fail-open-Risiko, falls diese Prüfung leere Eingaben permissiv behandelt.
+//!
+//! # Geplanter Activity-Metadaten-Anschluss
+//!
+//! `docs/planning/71-semantic-activity-patterns/04-macro-metadata.md`
+//! beschreibt einen **noch nicht implementierten** Ausbau von `#[tool]` um
+//! deklarative, semantische Activity-Metadaten (z. B. Domain, Verb,
+//! Ressourcenfeld und beschreibende Effektklasse). Der Compiler-Makro-Pfad ist
+//! dafür ein sinnvoller Anschluss, weil Tool-Autoren dort bereits Name,
+//! Permission, Host-Bindung und Parallelitätszusage deklarieren.
+//!
+//! Dabei gelten zwei harte Grenzen:
+//!
+//! 1. Activity-Metadaten sind beschreibend und dürfen niemals
+//!    `Permission`-/Approval-Prüfungen ersetzen oder erweitern.
+//! 2. Interne Activity-Metadaten sollen nicht ungeprüft in den model-facing
+//!    `ToolSpec` wandern; Provider-Schema und Harw-interne Semantik haben
+//!    unterschiedliche Konsumenten und Kompatibilitätsanforderungen.
+//!
+//! Bis dieser Plan landet, kennt `ToolAttr` ausschließlich die unten
+//! dokumentierten heutigen Schlüssel.
 
 use crate::schema::{doc_string, field_default, schema_for_type};
 use crate::util::pascal_case;
@@ -228,6 +248,13 @@ pub(crate) struct ToolAttr {
     host_from: Option<LitStr>,
     /// `parallel_safe` (Flag) oder `parallel_safe = <bool>`; Default `false`.
     parallel_safe: bool,
+    /// `state = <Type>` — der Executor trägt einen Zustand dieses Typs; die
+    /// Funktion bekommt ihn als erstes Argument (`&Type`).
+    state: Option<Type>,
+    /// `schema_from = <path>` — Pfad zu einer Funktion `fn() -> ToolSpec`, die
+    /// die Spezifikation extern baut, statt sie aus `#[derive(Tool)]` des
+    /// Args-Typs abzuleiten.
+    schema_from: Option<syn::Path>,
 }
 
 /// Liest den rohen `#[tool(...)]`-Attribut-Token-Stream in [`ToolAttr`] ein.
@@ -237,6 +264,9 @@ pub(crate) struct ToolAttr {
 /// - `permission = "<wert>"` — einer der Schlüssel aus [`PERMISSION_VALUES`]
 /// - `host_from = "<feldname>"`
 /// - `parallel_safe` als Flag oder `parallel_safe = true|false`
+/// - `state = <Typ>` — zustandsbehafteter Executor (siehe [`ToolAttr::state`])
+/// - `schema_from = <pfad>` — extern gebaute Spezifikation (siehe
+///   [`ToolAttr::schema_from`])
 ///
 /// # Errors
 /// - unbekannter Attribut-Schlüssel,
@@ -249,6 +279,8 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
     let mut permission: Option<LitStr> = None;
     let mut host_from: Option<LitStr> = None;
     let mut parallel_safe = false;
+    let mut state: Option<Type> = None;
+    let mut schema_from: Option<syn::Path> = None;
 
     let attr_parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("name") {
@@ -276,10 +308,22 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
                 parallel_safe = true;
             }
             Ok(())
+        } else if meta.path.is_ident("state") {
+            if state.is_some() {
+                return Err(meta.error("duplicate `state` key"));
+            }
+            state = Some(meta.value()?.parse()?);
+            Ok(())
+        } else if meta.path.is_ident("schema_from") {
+            if schema_from.is_some() {
+                return Err(meta.error("duplicate `schema_from` key"));
+            }
+            schema_from = Some(meta.value()?.parse()?);
+            Ok(())
         } else {
             Err(meta.error(
                 "unsupported `tool` attribute key (expected `name`, `description`, \
-                 `permission`, `host_from`, or `parallel_safe`)",
+                 `permission`, `host_from`, `parallel_safe`, `state`, or `schema_from`)",
             ))
         }
     });
@@ -317,6 +361,8 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
         permission,
         host_from,
         parallel_safe,
+        state,
+        schema_from,
     })
 }
 
@@ -366,23 +412,42 @@ pub(crate) fn expand_tool_fn(
         ));
     }
 
+    let has_state = attr.state.is_some();
+    let signature_hint = if has_state {
+        "#[tool(state = ..)] requires `(state: &State, context: &ToolExecutionContext, args: Args)`"
+    } else {
+        "#[tool] requires `(context: &ToolExecutionContext, args: Args)`"
+    };
     let mut arguments = func.sig.inputs.iter();
-    let context_argument = arguments.next().ok_or_else(|| {
-        syn::Error::new(
-            func.sig.span(),
-            "#[tool] requires `(context: &ToolExecutionContext, args: Args)`",
-        )
-    })?;
-    let args_argument = arguments.next().ok_or_else(|| {
-        syn::Error::new(
-            func.sig.span(),
-            "#[tool] requires `(context: &ToolExecutionContext, args: Args)`",
-        )
-    })?;
+    if has_state {
+        // Der Zustand ist ein geliehener Verweis auf das Feld des Wrappers;
+        // ein Wert-Parameter müsste bei jedem Aufruf klonen.
+        let state_argument = arguments
+            .next()
+            .ok_or_else(|| syn::Error::new(func.sig.span(), signature_hint))?;
+        let is_reference = matches!(state_argument, FnArg::Typed(argument)
+            if matches!(argument.ty.as_ref(), Type::Reference(_)));
+        if !is_reference {
+            return Err(syn::Error::new_spanned(
+                state_argument,
+                "the first #[tool(state = ..)] argument must be a reference to the state (`&State`)",
+            ));
+        }
+    }
+    let context_argument = arguments
+        .next()
+        .ok_or_else(|| syn::Error::new(func.sig.span(), signature_hint))?;
+    let args_argument = arguments
+        .next()
+        .ok_or_else(|| syn::Error::new(func.sig.span(), signature_hint))?;
     if arguments.next().is_some() {
         return Err(syn::Error::new(
             func.sig.span(),
-            "#[tool] accepts exactly `(context: &ToolExecutionContext, args: Args)`",
+            if has_state {
+                "#[tool(state = ..)] accepts exactly `(state: &State, context: &ToolExecutionContext, args: Args)`"
+            } else {
+                "#[tool] accepts exactly `(context: &ToolExecutionContext, args: Args)`"
+            },
         ));
     }
     let has_context_reference = matches!(context_argument, FnArg::Typed(argument)
@@ -411,6 +476,8 @@ pub(crate) fn expand_tool_fn(
         permission,
         host_from,
         parallel_safe,
+        state,
+        schema_from,
     } = attr;
     let tool_name = name.unwrap_or_else(|| fn_name.clone());
 
@@ -472,13 +539,49 @@ pub(crate) fn expand_tool_fn(
         None => proc_macro2::TokenStream::new(),
     };
 
+    // Spezifikationsquelle: extern gebaut (`schema_from`) oder aus dem Args-Typ.
+    let spec_source = match schema_from.as_ref() {
+        Some(path) => quote! { #path() },
+        None => quote! { <#args_type>::tool_spec() },
+    };
+
+    // Ohne Zustand: Unit-Struktur mit `Default`/`Copy` (bisheriges Verhalten).
+    // Mit Zustand: ein Feld, `new(state)`, kein `Default`/`Copy`.
+    let (wrapper_decl, wrapper_ctor, state_arg) = match state.as_ref() {
+        Some(state_type) => (
+            quote! {
+                #[derive(::core::fmt::Debug, ::core::clone::Clone)]
+                pub struct #wrapper_ident {
+                    state: #state_type,
+                }
+            },
+            quote! {
+                /// Baut den Executor über seinem Zustand.
+                #[must_use]
+                pub fn new(state: #state_type) -> Self {
+                    Self { state }
+                }
+            },
+            quote! { &self.state, },
+        ),
+        None => (
+            quote! {
+                #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::default::Default)]
+                pub struct #wrapper_ident;
+            },
+            proc_macro2::TokenStream::new(),
+            proc_macro2::TokenStream::new(),
+        ),
+    };
+
     Ok(quote! {
         #func
 
-        #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::default::Default)]
-        pub struct #wrapper_ident;
+        #wrapper_decl
 
         impl #wrapper_ident {
+            #wrapper_ctor
+
             pub const NAME: &'static str = #tool_name;
             pub const DESCRIPTION: &'static str = #description;
             /// Ob unabhängige Aufrufe dieses Tools nebenläufig laufen dürfen.
@@ -499,7 +602,7 @@ pub(crate) fn expand_tool_fn(
             /// anschließend nicht auflösen kann.
             #[must_use]
             pub fn spec() -> ::harw_tools::ToolSpec {
-                match <#args_type>::tool_spec() {
+                match #spec_source {
                     ::harw_tools::ToolSpec::Function(mut __function) => {
                         __function.name = ::harw_tools::ToolName::new(Self::NAME);
                         __function.description =
@@ -521,7 +624,7 @@ pub(crate) fn expand_tool_fn(
                     #permission_prologue
                     let args: #args_type = ::serde_json::from_value(call.arguments.clone())?;
                     #host_prologue
-                    #fn_ident(context, args).await
+                    #fn_ident(#state_arg context, args).await
                 })
             }
         }
@@ -828,6 +931,140 @@ mod tests {
                 .contains("__function . name = :: harw_tools :: ToolName :: new (Self :: NAME)")
         );
         assert!(expanded.contains("__function . description"));
+        Ok(())
+    }
+
+    /// `state` und `schema_from` werden gelesen.
+    #[test]
+    fn test_parse_tool_attr_reads_state_and_schema_from() -> TestResult {
+        let attr = parse_tool_attr(quote! {
+            state = std::sync::Arc<Store>,
+            schema_from = specs::fetch_spec,
+        })
+        .map_err(ctx("state and schema_from must parse"))?;
+
+        assert!(attr.state.is_some());
+        assert!(attr.schema_from.is_some());
+        Ok(())
+    }
+
+    /// Ohne beide Schlüssel bleibt das bisherige Verhalten unverändert.
+    #[test]
+    fn test_parse_tool_attr_state_and_schema_from_default_to_none() -> TestResult {
+        let attr = parse_tool_attr(quote! { name = "x" }).map_err(ctx("parses"))?;
+
+        assert!(attr.state.is_none());
+        assert!(attr.schema_from.is_none());
+        Ok(())
+    }
+
+    /// Doppelte `state`-/`schema_from`-Schlüssel sind ein Fehler.
+    #[test]
+    fn test_parse_tool_attr_rejects_duplicate_state_and_schema_from() -> TestResult {
+        for tokens in [
+            quote! { state = u8, state = u16 },
+            quote! { schema_from = a, schema_from = b },
+        ] {
+            let Err(error) = parse_tool_attr(tokens) else {
+                return Err(TestError::Unexpected(
+                    "duplicate keys must be rejected".to_owned(),
+                ));
+            };
+            assert!(error.to_string().contains("duplicate"));
+        }
+        Ok(())
+    }
+
+    /// Mit `state` bekommt der Wrapper ein Feld, `new(state)` und reicht
+    /// `&self.state` als erstes Argument durch; `Default`/`Copy` entfallen.
+    #[test]
+    fn test_expand_tool_fn_with_state_builds_stateful_wrapper() -> TestResult {
+        let func: ItemFn = syn::parse_quote! {
+            async fn fetch_page(
+                store: &Store,
+                context: &ToolExecutionContext,
+                args: FetchPageArgs,
+            ) -> Result<ToolOutput, ToolsError> {
+                let _ = (store, context, args);
+                Ok(ToolOutput::text("ok"))
+            }
+        };
+        let attr = parse_tool_attr(quote! { state = Store }).map_err(ctx("parses"))?;
+        let expanded = expand_tool_fn(func, attr)
+            .map_err(ctx("a stateful tool must expand"))?
+            .to_string();
+
+        assert!(expanded.contains("pub struct FetchPageTool { state : Store , }"));
+        assert!(expanded.contains("pub fn new (state : Store) -> Self"));
+        assert!(expanded.contains("fetch_page (& self . state , context , args)"));
+        assert!(!expanded.contains(":: core :: default :: Default"));
+        assert!(!expanded.contains(":: core :: marker :: Copy"));
+        Ok(())
+    }
+
+    /// Mit `state` ist eine Funktion ohne Zustands-Argument ein Fehler.
+    #[test]
+    fn test_expand_tool_fn_with_state_requires_state_argument() -> TestResult {
+        let attr = parse_tool_attr(quote! { state = Store }).map_err(ctx("parses"))?;
+        let Err(error) = expand_tool_fn(sample_fn(), attr) else {
+            return Err(TestError::Unexpected(
+                "two-argument fn must be rejected when `state` is set".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("state: &State"));
+        Ok(())
+    }
+
+    /// Der Zustand muss als Verweis übergeben werden.
+    #[test]
+    fn test_expand_tool_fn_with_state_rejects_by_value_state() -> TestResult {
+        let func: ItemFn = syn::parse_quote! {
+            async fn fetch_page(
+                store: Store,
+                context: &ToolExecutionContext,
+                args: FetchPageArgs,
+            ) -> Result<ToolOutput, ToolsError> {
+                let _ = (store, context, args);
+                Ok(ToolOutput::text("ok"))
+            }
+        };
+        let attr = parse_tool_attr(quote! { state = Store }).map_err(ctx("parses"))?;
+        let Err(error) = expand_tool_fn(func, attr) else {
+            return Err(TestError::Unexpected(
+                "by-value state must be rejected".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("reference to the state"));
+        Ok(())
+    }
+
+    /// Ohne `state` bleibt der Wrapper die bisherige Unit-Struktur.
+    #[test]
+    fn test_expand_tool_fn_without_state_keeps_unit_wrapper() -> TestResult {
+        let attr = parse_tool_attr(quote! {}).map_err(ctx("parses"))?;
+        let expanded = expand_tool_fn(sample_fn(), attr)
+            .map_err(ctx("expands"))?
+            .to_string();
+
+        assert!(expanded.contains("pub struct FetchPageTool ;"));
+        assert!(expanded.contains(":: core :: default :: Default"));
+        assert!(expanded.contains("fetch_page (context , args)"));
+        Ok(())
+    }
+
+    /// `schema_from` ersetzt `Args::tool_spec()`, Name/Beschreibung werden
+    /// weiterhin aus den Consts überschrieben.
+    #[test]
+    fn test_expand_tool_fn_schema_from_replaces_derived_spec() -> TestResult {
+        let attr =
+            parse_tool_attr(quote! { schema_from = specs::fetch_spec }).map_err(ctx("parses"))?;
+        let expanded = expand_tool_fn(sample_fn(), attr)
+            .map_err(ctx("expands"))?
+            .to_string();
+
+        assert!(expanded.contains("match specs :: fetch_spec ()"));
+        assert!(!expanded.contains("tool_spec"));
+        assert!(expanded.contains("__function . name = :: harw_tools :: ToolName :: new"));
         Ok(())
     }
 

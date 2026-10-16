@@ -15,6 +15,11 @@ struct VariantInfo {
     fields: Fields,
     msg: Option<LitStr>,
     is_from: bool,
+    /// Field-level `#[source]` / `#[from]` marker: index of the field that
+    /// `source()` returns. Set for tuple and named variants.
+    source_field: Option<usize>,
+    /// The `#[from]` sits on the single field of a named (struct) variant.
+    from_named: bool,
 }
 
 pub(crate) fn expand_harw_error(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -44,6 +49,51 @@ pub(crate) fn expand_harw_error(input: &DeriveInput) -> syn::Result<proc_macro2:
             }
         }
 
+        let mut source_field = None;
+        let mut from_named = false;
+        for (idx, field) in variant.fields.iter().enumerate() {
+            let mut has_source = false;
+            let mut has_from = false;
+            for attr in &field.attrs {
+                if attr.path().is_ident("source") {
+                    has_source = true;
+                } else if attr.path().is_ident("from") {
+                    has_from = true;
+                }
+            }
+            if !has_source && !has_from {
+                continue;
+            }
+            if source_field.is_some() {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "only one field per variant may carry #[source] or #[from]",
+                ));
+            }
+            if has_from {
+                if is_from {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "#[from] on both the variant and a field is redundant",
+                    ));
+                }
+                if !matches!(&variant.fields, Fields::Named(f) if f.named.len() == 1) {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "field-level #[from] requires a named variant with exactly one field",
+                    ));
+                }
+                from_named = true;
+            }
+            source_field = Some(idx);
+        }
+        if is_from && source_field.is_some() {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "#[from] already wires source(); drop the field-level #[source]",
+            ));
+        }
+
         if is_from {
             let ok = matches!(&variant.fields, Fields::Unnamed(f) if f.unnamed.len() == 1);
             if !ok {
@@ -59,6 +109,8 @@ pub(crate) fn expand_harw_error(input: &DeriveInput) -> syn::Result<proc_macro2:
             fields: variant.fields.clone(),
             msg,
             is_from,
+            source_field,
+            from_named,
         });
     }
 
@@ -163,6 +215,11 @@ fn display_arm(v: &VariantInfo) -> syn::Result<proc_macro2::TokenStream> {
                 Ok(quote! {
                     Self::#ident { #(#names),* } => ::core::write!(f, #fmt),
                 })
+            } else if v.from_named {
+                let inner = &names[0];
+                Ok(quote! {
+                    Self::#ident { #inner } => ::core::fmt::Display::fmt(#inner, f),
+                })
             } else {
                 let name = ident.to_string();
                 Ok(quote! {
@@ -180,6 +237,24 @@ fn source_arm(v: &VariantInfo) -> proc_macro2::TokenStream {
         quote! {
             Self::#ident(inner) => ::core::option::Option::Some(inner),
         }
+    } else if let Some(idx) = v.source_field {
+        match &v.fields {
+            Fields::Named(fields) => {
+                let name = fields.named.iter().nth(idx).and_then(|f| f.ident.clone());
+                quote! { Self::#ident { #name, .. } => ::core::option::Option::Some(#name), }
+            }
+            Fields::Unnamed(fields) => {
+                let pats = (0..fields.unnamed.len()).map(|i| {
+                    if i == idx {
+                        quote! { inner }
+                    } else {
+                        quote! { _ }
+                    }
+                });
+                quote! { Self::#ident( #(#pats),* ) => ::core::option::Option::Some(inner), }
+            }
+            Fields::Unit => quote! { Self::#ident => ::core::option::Option::None, },
+        }
     } else {
         match &v.fields {
             Fields::Unit => quote! { Self::#ident => ::core::option::Option::None, },
@@ -195,18 +270,26 @@ fn source_arm(v: &VariantInfo) -> proc_macro2::TokenStream {
 
 /// Build a `From<Inner>` impl for a `#[from]` variant.
 fn from_impl(enum_name: &Ident, v: &VariantInfo) -> Option<proc_macro2::TokenStream> {
-    if !v.is_from {
+    if !v.is_from && !v.from_named {
         return None;
     }
     let ident = &v.ident;
-    let ty = match &v.fields {
-        Fields::Unnamed(fields) => &fields.unnamed.first()?.ty,
-        _ => return None,
+    let (ty, ctor) = match &v.fields {
+        Fields::Unnamed(fields) => (&fields.unnamed.first()?.ty, None),
+        Fields::Named(fields) => {
+            let f = fields.named.first()?;
+            (&f.ty, f.ident.clone())
+        }
+        Fields::Unit => return None,
+    };
+    let build = match ctor {
+        Some(name) => quote! { #enum_name::#ident { #name: value } },
+        None => quote! { #enum_name::#ident(value) },
     };
     Some(quote! {
         impl ::core::convert::From<#ty> for #enum_name {
             fn from(value: #ty) -> Self {
-                #enum_name::#ident(value)
+                #build
             }
         }
     })

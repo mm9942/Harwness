@@ -33,7 +33,22 @@ pub enum ToolSpec {
     Function(FunctionToolSpec),
 }
 
-/// Spezifikation eines Function-Tools.
+/// Modell-/Provider-seitige Spezifikation eines Function-Tools.
+///
+/// Dieser Typ beschreibt die Oberfläche, die in einen Modell-Request
+/// serialisiert wird: Name, Beschreibung, JSON-Parameterschema und
+/// Strictness. Er ist **nicht** der allgemeine interne Metadatencontainer für
+/// jede Harw-Eigenschaft eines Tools.
+///
+/// Insbesondere plant
+/// `docs/planning/71-semantic-activity-patterns/04-macro-metadata.md`
+/// zusätzliche interne Activity-Semantik (Ressourcen-Key, Verb, Effektklasse,
+/// Pattern-Eignung). Diese Daten sollen als getrennte Harw-interne
+/// Beschreibung modelliert werden, solange kein providerseitiger Grund
+/// besteht, sie in `ToolSpec` zu übertragen.
+///
+/// Ebenso trägt `FunctionToolSpec` keine Laufzeit-Authority: Sichtbarkeit im
+/// Modell-Schema ersetzt weder Permission- noch Approval-Prüfungen.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FunctionToolSpec {
     pub name: ToolName,

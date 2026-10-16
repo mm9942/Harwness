@@ -998,6 +998,9 @@ fn content_bytes(parts: &[ContentPart]) -> u64 {
         .map(|part| match part {
             ContentPart::Text { text } => text.len() as u64,
             ContentPart::ImageUrl { .. } => "[image]".len() as u64,
+            // An image costs tokens, not bytes; four bytes per token keeps
+            // the budget in the unit of this function.
+            ContentPart::Media { media, .. } => media.estimated_tokens().saturating_mul(4),
         })
         .fold(0_u64, u64::saturating_add)
 }
@@ -1418,6 +1421,9 @@ fn render_content(parts: &[ContentPart]) -> String {
         match part {
             ContentPart::Text { text } => buf.push_str(text),
             ContentPart::ImageUrl { .. } => buf.push_str("[image]"),
+            ContentPart::Media { media, .. } => {
+                buf.push_str(&format!("[{}]", media.describe()));
+            }
         }
     }
     buf

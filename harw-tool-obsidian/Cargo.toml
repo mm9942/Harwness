@@ -1,0 +1,26 @@
+[package]
+publish.workspace = true
+name = "harw-tool-obsidian"
+description = "Agent-facing Obsidian vault tools: map, read, search, links and write over a configured vault root"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-authority = { path = "../harw-authority" }
+harw-knowledge = { path = "../harw-knowledge" }
+harw-macros = { path = "../harw-macros" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-tools = { path = "../harw-tools" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+harw-types = { path = "../harw-types" }
+tokio = { version = "1", features = ["rt"] }
+
+[lints]
+workspace = true

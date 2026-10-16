@@ -1,0 +1,31 @@
+[package]
+publish.workspace = true
+name = "harw-mobile-term"
+description = "Experimental: line-oriented phone client for a hosted session (Termux-friendly, no TUI dependencies). Chat, approvals and prompts over a session socket, on the harw-mobile-core model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "harw-mobile"
+path = "src/main.rs"
+
+[dependencies]
+harw-mobile-core = { path = "../harw-mobile-core" }
+harw-protocol = { path = "../harw-protocol" }
+harw-session-remote = { path = "../harw-session-remote" }
+harw-types = { path = "../harw-types" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
+
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+harw-session-daemon = { path = "../harw-session-daemon" }
+harw-session-host = { path = "../harw-session-host" }
+jiff = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

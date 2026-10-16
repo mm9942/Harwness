@@ -12,10 +12,10 @@
 //!   nötig: nur eigene Jobs bzw. die der Nachfahren)
 //! - `job.list {kind?}` — ohne `kind` nur die Übersicht je Art mit Zählern
 //!   pro Zustand; mit `kind` die Zeilen dieser Art
-//! - `job.wait {job_id, timeout_secs}` — kurzes Abfragen (höchstens
-//!   [`MAX_WAIT_SECS`] = 60 s, R18 F8) bis Ende oder Meilenstein; das Ende
-//!   eines Jobs kommt ohnehin als Notiz (siehe „Meldungen“), Agenten
-//!   blockieren also nicht in `job.wait`-Schleifen
+//!
+//! There is deliberately no blocking wait tool: delegated work runs only in
+//! the background; progress and end arrive as notifications (see "Meldungen")
+//! and `job.status` gives a non-blocking snapshot.
 //!
 //! # Rechte
 //! `job.start` läuft über denselben Weg wie `shell.exec`
@@ -78,7 +78,7 @@ pub use launcher::{JobLauncher, LaunchFuture, PreparedJob, ShellJobLauncher};
 pub use logs::{LogQuery, LogSlice};
 pub use manager::{
     Caller, DEFAULT_MAX_PIPED_LINE_BYTES, DetachSummary, JobError, JobManager, JobManagerConfig,
-    JobOrigin, PipedJob, PipedLineError, StartRequest, WaitOutcome,
+    JobOrigin, PipedJob, PipedLineError, StartRequest,
 };
 pub use model::{JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus};
 pub use procfs::JobSignal;
@@ -89,9 +89,13 @@ pub use progress::{
 pub use throttle::{ErrorBatch, NotifyThrottle, ProgressKey, ThrottleConfig};
 pub use tools::{
     FnLineage, JOB_CONTROL_TOOLS, JOB_LIST_TOOL, JOB_LOGS_TOOL, JOB_READ_TOOLS, JOB_START_TOOL,
-    JOB_STATUS_TOOL, JOB_STOP_TOOL, JOB_TOOL_NAMES, JOB_WAIT_TOOL, JobLineage, JobToolProvider,
-    MAX_WAIT_SECS, NoLineage, job_start_command_text, job_tools, shell_quote,
+    JOB_STATUS_TOOL, JOB_STOP_TOOL, JOB_TOOL_NAMES, JobLineage, JobToolProvider, NoLineage,
+    job_start_command_text, job_tools, shell_quote,
 };
 
 #[cfg(test)]
 mod test_support;
+
+// Golden-Test der Provider-Oberfläche (vor/nach der `tool_provider!`-Migration).
+#[cfg(test)]
+mod provider_golden;

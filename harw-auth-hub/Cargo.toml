@@ -62,6 +62,7 @@ fs4 = { workspace = true }
 harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
 
 [dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
 tempfile = { workspace = true }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }

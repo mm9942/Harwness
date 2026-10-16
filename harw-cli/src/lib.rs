@@ -29,8 +29,10 @@
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod agent_cmd;
+mod attach_cmd;
 mod auth;
 mod auth_migrate;
+mod device_cmd;
 // #22: automatischer Artefakt-Build der aktiven UIA im Hintergrund.
 mod auto_build;
 mod chat;
@@ -39,6 +41,7 @@ mod completions;
 mod connect;
 mod doc_ocr;
 // #22: die personalisierte harw mit eingebetteter UIA (`--native`).
+mod cleanup_cmd;
 pub mod embedded_uia;
 mod gateway;
 mod home;
@@ -50,6 +53,7 @@ mod lifecycle;
 mod mcp;
 mod mcp_auth;
 mod models;
+mod node_cmd;
 mod observe;
 mod onboarding;
 mod op_bridge;
@@ -65,6 +69,9 @@ mod runtime_web;
 mod sandbox_cmd;
 mod secret_store;
 mod session_cmd;
+mod session_listener;
+mod session_serve;
+mod session_serve_remote;
 mod settings;
 mod tailscale_cmd;
 mod telegram_launcher;
@@ -179,20 +186,119 @@ pub fn log_sensitive_enabled() -> bool {
     LOG_SENSITIVE.load(Ordering::Relaxed)
 }
 
+/// Größe, ab der `tui.log` rotiert wird (beim Start und zur Laufzeit).
+const TUI_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Zeitbudget für das Aufräumen rotierter TUI-Logs (Klasse `tui_log`).
+const TUI_LOG_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Schreibziel der TUI: `tui.log` mit Größenrotation auch zur Laufzeit.
+///
+/// Rotiert nach `tui.log.<epoch-sekunden>` und räumt danach die Retention-
+/// Klasse `tui_log` (Anzahl/Alter/Bytes; die aktive Datei ist die neueste
+/// und bleibt stets erhalten) im selben Verzeichnis auf. Das passiert höchstens
+/// einmal je `max_bytes` geschriebener Bytes; Fehler dabei werden verschluckt
+/// (Logging darf den Prozess nie stören).
+struct TuiLogFile {
+    dir: std::path::PathBuf,
+    file: std::fs::File,
+    size: u64,
+    max_bytes: u64,
+}
+
+impl TuiLogFile {
+    /// Öffnet `<dir>/tui.log` anhängend; rotiert vorab, wenn schon zu groß.
+    fn open(dir: &std::path::Path, max_bytes: u64) -> std::io::Result<Self> {
+        let path = dir.join("tui.log");
+        let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        let mut this = Self {
+            dir: dir.to_path_buf(),
+            file: Self::open_append(&path)?,
+            size,
+            max_bytes,
+        };
+        if size > max_bytes {
+            this.rotate();
+        } else {
+            prune_tui_logs(dir);
+        }
+        Ok(this)
+    }
+
+    fn open_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+
+    /// Benennt die aktive Datei um, öffnet eine neue und räumt auf. Scheitert
+    /// das Umbenennen, bleibt die alte Datei aktiv (kein Teilzustand).
+    fn rotate(&mut self) {
+        let path = self.dir.join("tui.log");
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut target = self.dir.join(format!("tui.log.{secs}"));
+        let mut n = 1_u32;
+        while target.exists() && n < 1000 {
+            target = self.dir.join(format!("tui.log.{secs}-{n}"));
+            n += 1;
+        }
+        if std::fs::rename(&path, &target).is_err() {
+            // Nicht bei jedem Schreibvorgang erneut versuchen.
+            self.size = 0;
+            return;
+        }
+        if let Ok(file) = Self::open_append(&path) {
+            self.file = file;
+        }
+        self.size = 0;
+        prune_tui_logs(&self.dir);
+    }
+}
+
+impl std::io::Write for TuiLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.size >= self.max_bytes {
+            self.rotate();
+        }
+        let written = self.file.write(buf)?;
+        self.size += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Wendet die Retention-Klasse `tui_log` (Klassenvorgaben) auf `dir` an.
+///
+/// Zeitbegrenzt; Fehler werden ignoriert.
+fn prune_tui_logs(dir: &std::path::Path) {
+    let Some(class) =
+        harw_retention::policy_for(&harw_retention::RetentionConfig::default(), "tui_log")
+    else {
+        return;
+    };
+    if !class.enabled {
+        return;
+    }
+    let Ok(policy) = class.policy(
+        harw_retention::SweepMode::Apply,
+        Some(std::time::Instant::now() + TUI_LOG_PRUNE_BUDGET),
+    ) else {
+        return;
+    };
+    let _ = harw_retention::sweep(dir, &policy, std::time::SystemTime::now());
+}
+
 /// Öffnet (und rotiert bei Bedarf) das Datei-Log der TUI.
-fn open_tui_log_file() -> Option<std::fs::File> {
-    const MAX_BYTES: u64 = 10 * 1024 * 1024;
+fn open_tui_log_file() -> Option<TuiLogFile> {
     let dir = harw_home::paths::logs_dir(&harw_home::home_dir().ok()?);
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("tui.log");
-    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES) {
-        let _ = std::fs::rename(&path, dir.join("tui.log.1"));
-    }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    TuiLogFile::open(&dir, TUI_LOG_MAX_BYTES).ok()
 }
 
 /// Filter-Vorgabe, wenn weder `--log`, `RUST_LOG` noch ein vom Default
@@ -361,7 +467,8 @@ fn init_tracing(settings: &TracingSettings, tui_active: bool) {
     if tui_active {
         use tracing_subscriber::prelude::*;
         // Ins Terminal darf nichts, in eine Datei schon: `<HARW_HOME>/logs/tui.log`
-        // (bei > 10 MiB beim Start nach `tui.log.1` rotiert). Ohne auflösbares
+        // (bei > 10 MiB beim Start und zur Laufzeit nach `tui.log.<ts>` rotiert,
+        // Aufräumen über die Retention-Klasse `tui_log`). Ohne auflösbares
         // Home bleibt es bei der reinen Registry.
         match open_tui_log_file() {
             Some(file) => {
@@ -588,6 +695,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Exec(_) => "exec",
             Command::Analyze(_) => "analyze",
             Command::Session { .. } => "session",
+            Command::Attach(_) => "attach",
             Command::Config { .. } => "config",
             Command::Provider { .. } => "provider",
             Command::Model { .. } => "model",
@@ -596,6 +704,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
             Command::Serve { .. } => "serve",
@@ -607,6 +716,8 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Onboard => "onboard",
             Command::Doctor { .. } => "doctor",
             Command::Update { .. } => "update",
+            Command::Device { .. } => "device",
+            Command::Node { .. } => "node",
             Command::Tailscale { .. } => "tailscale",
             Command::Install { .. } => "install",
             Command::Uninstall { .. } => "uninstall",
@@ -695,8 +806,11 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
         Some(
             Command::Session { .. }
             | Command::Jobs { .. }
+            | Command::Cleanup { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
+            | Command::Device { .. }
+            | Command::Node { .. }
             | Command::Provider { .. },
         ) => Ok(()),
         other => printer.require_text(&command_label(other)),
@@ -805,6 +919,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             ),
             None => Ok(()),
         },
+        Some(Command::Attach(args)) => attach_cmd::run(&args),
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
             let home = home::resolve_home(home_override)?;
@@ -834,7 +949,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Gateway {
             action: None,
             telemetry,
-        }) => gateway::run(home_override, telemetry),
+            session_socket,
+        }) => gateway::run(home_override, telemetry, session_socket),
         Some(Command::Serve { config_dir }) => {
             let (layers, storage_root, home) = resolve_serve_paths(home_override, config_dir)?;
             serve_mcp(layers, storage_root, home)
@@ -869,6 +985,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Cleanup {
+            apply,
+            classes,
+            deadline_secs,
+        }) => cleanup_cmd::run(&global, apply, classes, deadline_secs),
         Some(Command::PrReview(args)) => {
             let args = crate::pr_review::PrReviewArgs {
                 pr: args.pr,
@@ -902,6 +1023,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
         Some(Command::Tailscale { action }) => tailscale_cmd::run(action),
+        Some(Command::Device { action }) => device_cmd::run(&global, action),
+        Some(Command::Node { action }) => node_cmd::run(&global, action),
         Some(Command::Update {
             check,
             yes,
@@ -981,7 +1104,8 @@ fn run_startup_migrations(
     let layers = match command {
         // Der Modell-Katalog und der Wissensindex lesen keine Konfiguration.
         Some(
-            Command::Model {
+            Command::Attach(_)
+            | Command::Model {
                 action: Some(ModelsAction::Catalog { .. }),
             }
             | Command::Knowledge {
@@ -1011,6 +1135,7 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::Cleanup { .. }
             | Command::PrReview(_)
             | Command::Uia { .. }
             | Command::Analyze(_),
@@ -1040,6 +1165,8 @@ fn run_startup_migrations(
             | Command::Run { .. }
             | Command::Debug { .. }
             | Command::Completions(_)
+            | Command::Device { .. }
+            | Command::Node { .. }
             | Command::Tailscale { .. }
             | Command::Update { .. }
             | Command::Install { .. }
@@ -3075,7 +3202,66 @@ fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
         };
         println!("check {id}: {label} — {message}");
     }
+    print_retention_checks(&config.harness.retention);
+    print_memory_precision_check(home);
     any_failed
+}
+
+/// Druckt die Präzision der globalen Gedächtnis-Fakten (geliefert/genutzt/
+/// korrigiert); schweigt, wenn es keinen Speicher oder keine Lieferung gibt.
+fn print_memory_precision_check(home: &Path) {
+    let Ok(profile) =
+        harw_home::paths::profile_dir(home, &harw_home::paths::active_profile_name(home))
+    else {
+        return;
+    };
+    let dir = profile.join("memories");
+    if !dir.is_dir() {
+        return;
+    }
+    let Ok(store) = harw_memory::FactStore::open(&dir, harw_memory::FactScope::Global) else {
+        return;
+    };
+    let report = harw_memory::feedback::report(&store);
+    if report.delivered == 0 {
+        return;
+    }
+    let label = if report.useless.is_empty() {
+        "PASS"
+    } else {
+        "WARN"
+    };
+    let verdicts = harw_memory::fact_outcomes::verdict_stats(&dir);
+    println!(
+        "check memory.precision: {label} — {}; Outcomes {} bestätigt / {} widerlegt / {} offen",
+        report.summary(),
+        verdicts.confirmed,
+        verdicts.refuted,
+        verdicts.inconclusive
+    );
+}
+
+/// Druckt die Aufbewahrungs-Checks: eine `WARN`-Zeile je Klasse, die Daten
+/// unbegrenzt wachsen lässt, und eine `PASS`-Zeile mit den Opt-in-Klassen
+/// (sicherheitsrelevant, nie gelöscht, solange nicht ausdrücklich erlaubt).
+fn print_retention_checks(retention: &harw_retention::RetentionConfig) {
+    let mut opt_in = Vec::new();
+    for class in harw_retention::resolve_all(retention) {
+        let id = class.class.id;
+        let security = class.class.kind == harw_retention::ClassKind::SecurityRelevant;
+        if security && !class.enabled {
+            opt_in.push(id);
+        } else if let Some(message) = class.doctor_warning() {
+            println!("check retention.{id}: WARN — {message}");
+        }
+    }
+    if !opt_in.is_empty() {
+        println!(
+            "check retention.opt-in: PASS — sicherheitsrelevante Klassen werden nie gelöscht, \
+             solange `[retention.<klasse>] enabled = true` fehlt: {}",
+            opt_in.join(", ")
+        );
+    }
 }
 
 /// Ermittelt die Evidenz für den Audit-Integritäts-Check (§4.3).
@@ -5503,6 +5689,62 @@ mod tests {
         assert!(!run_doctor_checks(&home, &config));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
+    }
+
+    fn tui_files(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn tui_log_rotates_at_runtime_and_keeps_active_file() -> TestResult {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut log = TuiLogFile::open(dir.path(), 16).map_err(ctx("open"))?;
+        log.write_all(b"0123456789abcdef\n")
+            .map_err(ctx("write 1"))?;
+        log.write_all(b"second\n").map_err(ctx("write 2"))?;
+        let names = tui_files(dir.path());
+        assert_eq!(names.len(), 2, "one rotation expected: {names:?}");
+        assert!(names.iter().any(|n| n == "tui.log"));
+        let active = std::fs::read_to_string(dir.path().join("tui.log")).map_err(ctx("read"))?;
+        assert_eq!(active, "second\n");
+        Ok(())
+    }
+
+    #[test]
+    fn tui_log_prune_respects_class_file_cap_and_never_removes_active() -> TestResult {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        for n in 0..9_u64 {
+            let path = dir.path().join(format!("tui.log.{}", 1_000 + n));
+            let file = std::fs::File::create(&path).map_err(ctx("create rotated"))?;
+            file.set_modified(old + std::time::Duration::from_secs(n))
+                .map_err(ctx("set mtime"))?;
+        }
+        let mut log = TuiLogFile::open(dir.path(), 8).map_err(ctx("open"))?;
+        log.write_all(b"live\n").map_err(ctx("write"))?;
+        let names = tui_files(dir.path());
+        let cap =
+            harw_retention::policy_for(&harw_retention::RetentionConfig::default(), "tui_log")
+                .and_then(|class| class.max_files)
+                .ok_or(TestError::Unexpected(
+                    "tui_log class has no max_files".to_owned(),
+                ))?;
+        assert!(names.len() as u64 <= cap, "cap {cap} exceeded: {names:?}");
+        assert!(names.iter().any(|n| n == "tui.log"));
+        // the newest rotated files survive, the oldest are gone
+        assert!(names.iter().any(|n| n == "tui.log.1008"));
+        assert!(!names.iter().any(|n| n == "tui.log.1000"));
         Ok(())
     }
 }

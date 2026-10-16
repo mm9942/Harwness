@@ -44,8 +44,8 @@ use std::sync::Arc;
 
 use harw_extension_api::contributors::{ContextProvider, ExtFuture};
 use harw_extension_api::types::{ContextFragment, TurnInputContext};
-use harw_plan::goal::{GoalStore, evaluate_goal};
-use harw_plan::{PlanNodeKind, PlanStore};
+use harw_plan::goal::{Goal, GoalId, GoalStatus, GoalStore, evaluate_goal};
+use harw_plan::{PlanId, PlanNodeKind, PlanStore, RevisionId};
 
 /// Voreingestelltes Zeichenlimit eines Ziel-Fragments.
 pub const DEFAULT_MAX_CHARS: usize = 2000;
@@ -272,6 +272,107 @@ fn kind_label(kind: PlanNodeKind) -> &'static str {
     }
 }
 
+// ── Session→Goal-Bindung und read-only Zielmodus-Projektion (h9) ─────────────
+
+/// Bindet eine UI-Session an das aktuell gültige Goal — **read-only**.
+///
+/// Die Bindung liegt bewusst außerhalb des Goal-Modells (`Goal` bleibt
+/// session-frei, siehe `goal.rs`); sie ist eine Laufzeit-Zuordnung im
+/// Bridge-Layer. Die Projektion [`SessionGoalBinding::projection`] erzeugt
+/// eine reine Ansicht — keine Schreibpfade, keine Mutation.
+#[derive(Debug, Clone)]
+pub struct SessionGoalBinding {
+    /// Id der UI-Session, für die die Projektion gebildet wird.
+    session_id: String,
+    /// True, wenn die Session nachweislich an ein Goal gebunden ist
+    /// (Session→Goal-Bindung nachgewiesen); sonst gilt Profil-Scope.
+    session_bound: bool,
+}
+
+impl SessionGoalBinding {
+    /// Neue Bindungsansicht für `session_id`. `session_bound` nur setzen,
+    /// wenn eine Session→Goal-Bindung nachgewiesen wurde.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, session_bound: bool) -> Self {
+        Self {
+            session_id: session_id.into(),
+            session_bound,
+        }
+    }
+
+    /// Session-Id der Bindung.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Reine Projektion von Goal und gebundenem Plan in eine Ansicht für
+    /// die UI. Nur lesend: Status, Kriterien, Invarianten, Plan-Id/Revision.
+    /// (Welche Kriterien erfüllt sind, entscheidet `evaluate_goal` gegen
+    /// den Plan — die Ansicht listet die Beschreibungen.)
+    #[must_use]
+    pub fn projection(&self, goal: &Goal) -> GoalModeView {
+        GoalModeView {
+            session_id: self.session_id.clone(),
+            scope: if self.session_bound {
+                GoalModeScope::Session
+            } else {
+                GoalModeScope::Profile
+            },
+            goal_id: goal.id.clone(),
+            statement: goal.statement.clone(),
+            status: goal.status,
+            acceptance_criteria: goal
+                .acceptance_criteria
+                .iter()
+                .map(|criterion| criterion.description.clone())
+                .collect(),
+            invariants: goal
+                .invariants
+                .iter()
+                .map(|invariant| invariant.statement.clone())
+                .collect(),
+            plan_id: goal.plan_id.clone(),
+            plan_revision: goal.plan_revision,
+        }
+    }
+}
+
+/// Scope-Angabe der Zielmodus-Anzeige (ehrlich degradieren, h9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalModeScope {
+    /// Session→Goal-Bindung nachgewiesen: Anzeige ist sessionspezifisch.
+    Session,
+    /// Keine nachgewiesene Session-Bindung: Profil-Scope anzeigen.
+    Profile,
+}
+
+/// Read-only Ansicht des Goal-/Planstands für den TUI-Zielmodus.
+///
+/// Reine Projektion — die UI darf daraus nichts mutieren. Bei fehlender
+/// oder veralteter Datenquelle zeigt die UI ehrlich „kein Ziel gebunden".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalModeView {
+    /// Session, für die die Projektion gebildet wurde.
+    pub session_id: String,
+    /// Sessionspezifisch oder Profil-Scope (keine nachgewiesene Bindung).
+    pub scope: GoalModeScope,
+    /// Id des Ziels.
+    pub goal_id: GoalId,
+    /// Zielsatz.
+    pub statement: String,
+    /// Lebenszyklus-Status des Ziels.
+    pub status: GoalStatus,
+    /// Akzeptanzkriterien des Ziels (Beschreibungen).
+    pub acceptance_criteria: Vec<String>,
+    /// Invarianten des Ziels.
+    pub invariants: Vec<String>,
+    /// Gebundener Plan (falls vorhanden).
+    pub plan_id: Option<PlanId>,
+    /// Revision des gebundenen Plans (falls vorhanden).
+    pub plan_revision: Option<RevisionId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +509,29 @@ mod tests {
             Arc::new(InMemoryPlanStore::new()),
         );
         assert_eq!(provider.max_chars(), DEFAULT_MAX_CHARS);
+    }
+
+    /// h9: die Projektion ist rein lesend und gibt Goal-/Planstand
+    /// korrekt wieder; ohne nachgewiesene Session-Bindung gilt Profil-Scope.
+    #[test]
+    fn test_goal_mode_projection_is_read_only_and_scope_honest() {
+        let goal = goal_with_open_criterion();
+        let bound = SessionGoalBinding::new("session-1", true);
+        let view = bound.projection(&goal);
+        assert_eq!(view.session_id, "session-1");
+        assert_eq!(view.scope, GoalModeScope::Session);
+        assert_eq!(view.goal_id, goal.id);
+        assert_eq!(view.statement, "Bridge fertigstellen");
+        assert_eq!(view.status, GoalStatus::Active);
+        assert_eq!(view.acceptance_criteria, vec!["alle Tests grün"]);
+        assert_eq!(view.invariants, vec!["keine unsafe-Blöcke"]);
+        assert_eq!(view.plan_id, goal.plan_id);
+        assert_eq!(view.plan_revision, Some(RevisionId::new(1)));
+
+        // Ohne nachgewiesene Bindung: Profil-Scope, ehrliches Degradieren.
+        let unbound = SessionGoalBinding::new("session-2", false);
+        let view = unbound.projection(&goal);
+        assert_eq!(view.scope, GoalModeScope::Profile);
+        assert_eq!(view.session_id, "session-2");
     }
 }

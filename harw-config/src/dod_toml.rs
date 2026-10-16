@@ -43,6 +43,7 @@
 //! assert!(section.validate().is_ok());
 //! ```
 
+use crate::serde_defaults::default_true;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -112,10 +113,6 @@ impl DodSection {
         }
         Ok(())
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[cfg(test)]

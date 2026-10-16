@@ -1,3 +1,4 @@
+use crate::serde_defaults::default_true;
 use serde::{Deserialize, Serialize};
 
 /// Declarative capability bundle manifest. Discovery reads manifests but never
@@ -31,10 +32,6 @@ pub struct PluginCapabilitiesToml {
     pub channels: Vec<String>,
     #[serde(default)]
     pub network_egress: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[cfg(test)]

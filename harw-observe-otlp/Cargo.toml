@@ -39,5 +39,8 @@ http-body-util = { version = "0.1" }
 bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 
+[dev-dependencies]
+harw-test-support = { path = "../harw-test-support" }
+
 [lints]
 workspace = true

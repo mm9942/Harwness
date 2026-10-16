@@ -28,9 +28,10 @@ use crate::{
 ///   raw `path` string.
 /// - [`Self::AliasCollision`]: An alias from one operation shadows the name or an
 ///   alias of another.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, harw_macros::HarwError)]
 pub enum TuiRegistryError {
     /// Two operations map to the same canonical command name.
+    #[msg("duplicate command name '{name}': claimed by '{first_owner}' and '{second_owner}'")]
     DuplicateCommandName {
         /// Canonical name (without `/`) that collides.
         name: String,
@@ -40,6 +41,7 @@ pub enum TuiRegistryError {
         second_owner: String,
     },
     /// Two operations declare a `Surface::Command` with the same `path`.
+    #[msg("duplicate command path '{path}': claimed by '{first_owner}' and '{second_owner}'")]
     DuplicateCommandPath {
         /// The raw path string (e.g. `"/model"`).
         path: String,
@@ -49,6 +51,7 @@ pub enum TuiRegistryError {
         second_owner: String,
     },
     /// An alias from one operation collides with the name or an alias of another.
+    #[msg("alias '{alias}' from '{second_owner}' collides with '{first_owner}'")]
     AliasCollision {
         /// The alias string that collides.
         alias: String,
@@ -58,45 +61,6 @@ pub enum TuiRegistryError {
         second_owner: String,
     },
 }
-
-impl std::fmt::Display for TuiRegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateCommandName {
-                name,
-                first_owner,
-                second_owner,
-            } => {
-                write!(
-                    f,
-                    "duplicate command name '{name}': claimed by '{first_owner}' and '{second_owner}'"
-                )
-            }
-            Self::DuplicateCommandPath {
-                path,
-                first_owner,
-                second_owner,
-            } => {
-                write!(
-                    f,
-                    "duplicate command path '{path}': claimed by '{first_owner}' and '{second_owner}'"
-                )
-            }
-            Self::AliasCollision {
-                alias,
-                first_owner,
-                second_owner,
-            } => {
-                write!(
-                    f,
-                    "alias '{alias}' from '{second_owner}' collides with '{first_owner}'"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for TuiRegistryError {}
 
 /// Surface on which an invocation entered the system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

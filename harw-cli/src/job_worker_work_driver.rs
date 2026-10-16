@@ -181,9 +181,6 @@ const MAX_OUTCOME_REASON_CHARS: usize = 600;
 /// Höchstlänge einer Worker-Antwort in der Zusammenfassung.
 const WORKER_TEXT_CLIP_CHARS: usize = 2_000;
 
-/// Höchstzahl der `stderr`-Zeilen je fehlgeschlagenem Verifikationsbefehl.
-const FAILING_TAIL_LINES: usize = 5;
-
 /// Kennung des synthetischen Knotens, der Goal-Evidenz in `evaluate_goal` trägt.
 const GOAL_EVIDENCE_NODE: &str = "work-driver-goal-evidence";
 
@@ -1963,22 +1960,27 @@ pub(super) fn report_from_run(run: &VerifyRun) -> VerificationReport {
             }
             VerifyOutcome::Failed { failure, .. } => {
                 failed_steps = failed_steps.saturating_add(1);
-                failing.push(format!("{label}: {failure}"));
-                if let Some(trace) = &report.trace {
-                    let tail = String::from_utf8_lossy(&trace.stderr_tail);
-                    let lines: Vec<&str> = tail
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect();
-                    let skip = lines.len().saturating_sub(FAILING_TAIL_LINES);
-                    failing.extend(
-                        lines
-                            .into_iter()
-                            .skip(skip)
-                            .map(|line| format!("{label}: {line}")),
-                    );
+                // Compiler-Diagnosen und Test-Fehlschläge aus beiden
+                // Strömen, mit Pfad — sonst nur das stderr-Ende
+                // (`super::verify_diagnostics`).
+                let found = report.trace.as_ref().map(|trace| {
+                    super::verify_diagnostics::failure_lines(
+                        &String::from_utf8_lossy(&trace.stdout_tail),
+                        &String::from_utf8_lossy(&trace.stderr_tail),
+                    )
+                });
+                // Die pfadlose Sammelzeile („Exit-Code passt nicht") nur ohne
+                // erkannte Befunde: `failing_lines_for` gäbe sie jedem
+                // Worker und setzte so auch die fort, die kein Befund betrifft.
+                if !found.as_ref().is_some_and(|found| found.recognized) {
+                    failing.push(format!("{label}: {failure}"));
                 }
+                failing.extend(
+                    found
+                        .into_iter()
+                        .flat_map(|found| found.lines)
+                        .map(|line| format!("{label}: {line}")),
+                );
             }
             VerifyOutcome::Unverifiable { reason } => {
                 unverifiable.push(format!("{label}: {reason}"));
@@ -5031,6 +5033,129 @@ mod tests {
         assert_eq!(report.verdict, VerifyVerdict::Passed);
         assert_eq!(report.evidence.len(), 1);
         assert_eq!(report.evidence[0].locator, cmd);
+    }
+
+    /// Ein fehlgeschlagener `Command`-Schritt mit Ausgabe auf beiden Strömen.
+    fn failed_command_run(cmd: &str, stdout: &str, stderr: &str) -> VerifyRun {
+        use harw_job_runtime::{EnforcementState, SandboxReport};
+        use harw_plan_bridge::verify_exec::{CommandTrace, StepFailure, StepReport};
+        VerifyRun {
+            steps: vec![StepReport {
+                index: 0,
+                step: VerificationStep::Command {
+                    cmd: cmd.to_owned(),
+                    expect_exit: 0,
+                },
+                outcome: VerifyOutcome::Failed {
+                    failure: StepFailure::ExitMismatch {
+                        expected: 0,
+                        actual: 101,
+                    },
+                    evidence: None,
+                },
+                trace: Some(CommandTrace {
+                    exit: CommandExit::Exited(101),
+                    stdout_tail: stdout.as_bytes().to_vec(),
+                    stderr_tail: stderr.as_bytes().to_vec(),
+                    truncated: false,
+                    sandbox: SandboxReport::uniform(EnforcementState::Enforced),
+                    material: Vec::new(),
+                }),
+            }],
+            skipped: 0,
+        }
+    }
+
+    /// Der Panic-Ort steht bei `cargo test` auf stdout; er muss mit Pfad in
+    /// `failing` landen, damit `failing_lines_for` ihn dem Besitzer zuordnet.
+    #[test]
+    fn test_report_from_run_routes_test_failures_from_stdout_with_their_path() {
+        let stdout = "---- lexer::tests::splits stdout ----\n\
+                      thread 'lexer::tests::splits' panicked at parser/src/lexer.rs:88:9:\n\
+                      assertion failed: ok\n";
+        let run = failed_command_run(
+            "cargo test -p parser",
+            stdout,
+            "error: test failed, to rerun pass `-p parser --lib`\n",
+        );
+        let report = report_from_run(&run);
+        assert_eq!(report.verdict, VerifyVerdict::Failed);
+        assert_eq!(report.failed_steps, 1);
+        assert_eq!(
+            report.failing,
+            vec![
+                "cargo test -p parser: parser/src/lexer.rs:88:9: test lexer::tests::splits \
+                 failed: assertion failed: ok"
+                    .to_owned()
+            ]
+        );
+    }
+
+    /// Ohne erkannten Befund bleibt die Sammelzeile des Schritts erhalten.
+    #[test]
+    fn test_report_from_run_keeps_the_step_failure_without_findings() {
+        let run = failed_command_run("make check", "", "something odd\n");
+        let report = report_from_run(&run);
+        assert_eq!(report.failing.len(), 2);
+        assert!(report.failing[0].starts_with("make check: "));
+        assert_eq!(report.failing[1], "make check: something odd");
+    }
+
+    /// Review #132: ein verorteter Compilerfehler setzt nur den Besitzer
+    /// seines Pfads fort, nicht jeden `Done`-Worker der Welle.
+    #[test]
+    fn test_a_located_compile_error_continues_only_its_owner() -> TestResult {
+        let cmd = "cargo test --workspace";
+        let stderr = "error[E0308]: mismatched types\n  --> src/a/lib.rs:3:5\n\n\
+                      error: could not compile `a` (lib) due to 1 previous error\n";
+        let report = report_from_run(&failed_command_run(cmd, "", stderr));
+        let goal = goal(vec![command_criterion("tests pass", cmd)]);
+        let goal_report = goal_report(&goal, None).map_err(TestError::Unexpected)?;
+        let done = |id: &str, path: &str| {
+            let mut worker = worker_state(id, vec![path.to_owned()]);
+            worker.last_result = Some(WorkerResultSummary {
+                outcome: WorkerOutcome::Done,
+                summary: "fertig".to_owned(),
+                artifacts: Vec::new(),
+                suggested_next: None,
+                criteria_addressed: Vec::new(),
+            });
+            worker
+        };
+        let workers = vec![done("wa", "src/a"), done("wb", "src/b")];
+        let verification = VerificationState::Failed {
+            failing: report.failing,
+        };
+        let now = offset_from_timestamp(Timestamp::now());
+        let plan = WorkDriver::decide(&WorkDriveInput {
+            goal: &goal,
+            report: &goal_report,
+            iteration: 1,
+            workers: &workers,
+            scope_hints: &[],
+            usage: BudgetUsageSnapshot {
+                tokens_used: 0,
+                started_at: now,
+                iterations_without_progress: 0,
+            },
+            limits: limits_from_spec(&spec(8)),
+            verification: &verification,
+            judge: None,
+            worker_role: None,
+            effective_parallel: None,
+            now,
+        });
+        let driven: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                WorkDriveStep::Continue { worker_id, .. }
+                | WorkDriveStep::Respawn { worker_id, .. } => Some(worker_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(driven, vec!["wa"], "{:?}", plan.rationale);
+        Ok(())
     }
 
     #[test]

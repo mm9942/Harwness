@@ -1,0 +1,16 @@
+[package]
+publish.workspace = true
+name = "harw-test-support"
+description = "Dev-only shared test scaffolding: define_test_error! (TestError/TestResult/ctx/missing) and unique temp paths"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Bewusst ohne Abhängigkeiten: reine std-Hilfen. Nur als `[dev-dependencies]`
+# einbinden, nie als normale Abhängigkeit.
+[dependencies]
+
+[lints]
+workspace = true

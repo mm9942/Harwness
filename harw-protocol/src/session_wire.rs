@@ -95,6 +95,42 @@ impl Cursor {
     }
 }
 
+/// Fencing token of a session's owner-host placement (W00 R2).
+///
+/// A session has exactly one owner host (node id plus this generation); v1 has
+/// no cross-node failover, so the generation only grows when the owner
+/// placement is re-established (restart or re-placement). It is a different
+/// axis from [`Cursor::generation`], which tracks transcript rewrites. A
+/// client holding a lower value than the host's must resync instead of
+/// trusting a cached [`Cursor`]. Not yet carried by a minor-2 message: adding
+/// it to a message is a wire-minor bump.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct PlacementGeneration(pub u64);
+
+impl PlacementGeneration {
+    /// First placement of a session.
+    pub const FIRST: Self = Self(1);
+
+    /// The next placement, or `None` on overflow (never wraps).
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// True when `self` (a client's remembered value) is older than the
+    /// host's `current` placement and so forces a resync.
+    #[must_use]
+    pub const fn is_stale_against(self, current: Self) -> bool {
+        self.0 < current.0
+    }
+}
+
 // serde `skip_serializing_if` needs a `fn(&T) -> bool`.
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -1099,6 +1135,15 @@ mod tests {
         assert!(granted.is_within(ceiling));
         assert!(!ClientCaps::ALL.is_within(ClientCaps::OBSERVE));
         assert!(ClientCaps::NONE.is_within(ClientCaps::NONE));
+    }
+
+    #[test]
+    fn placement_generation_fences_and_never_wraps() {
+        let first = PlacementGeneration::FIRST;
+        assert_eq!(first.next(), Some(PlacementGeneration(2)));
+        assert_eq!(PlacementGeneration(u64::MAX).next(), None);
+        assert!(PlacementGeneration(1).is_stale_against(PlacementGeneration(2)));
+        assert!(!PlacementGeneration(2).is_stale_against(PlacementGeneration(2)));
     }
 
     #[test]

@@ -12,6 +12,8 @@ description = "Public facade of the Harw job runtime (Job-Runtime-Doc §16): Job
 default = []
 # Bubblewrap sandbox backend (`LinuxSandboxBackend::Bwrap`).
 bwrap = ["harw-job-runtime/bwrap"]
+# OCI container backend (`OciExecutor`, Podman/Docker over the engine socket).
+oci = ["dep:harw-job-executor-oci"]
 
 [dependencies]
 # Model: JobSpec (+ builder), WorkspacePath, ResourceRequest, sandbox enums,
@@ -21,6 +23,8 @@ harw-job-core = { path = "../harw-job-core" }
 harw-job-store = { path = "../harw-job-store" }
 # Coordinator, executors, RuntimeError, JobHandle/JobResult.
 harw-job-runtime = { path = "../harw-job-runtime" }
+# Optional OCI container executor (feature `oci`).
+harw-job-executor-oci = { path = "../harw-job-executor-oci", optional = true }
 # WorkId (job identity of the store records).
 harw-types = { path = "../harw-types" }
 

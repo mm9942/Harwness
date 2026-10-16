@@ -1,0 +1,22 @@
+name = "mias-lab"
+api = "openai-chat"
+base_url = "https://mias-lab.mm29942.workers.dev/v1"
+auth = "env:MIA_LAB_API_KEY"
+default_model = "@cf/moonshotai/kimi-k2.7-code"
+models = [
+  "@cf/moonshotai/kimi-k2.7-code",
+  "@cf/moonshotai/kimi-k2.6",
+  "@cf/zai-org/glm-5.3",
+  "@cf/zai-org/glm-5.3-flash",
+  "@cf/zai-org/glm-5.2",
+  "@cf/openai/gpt-oss-120b",
+  "@cf/openai/gpt-oss-20b",
+  "@cf/deepseek-ai/deepseek-v4-flash-0731",
+]
+enabled = true
+gateway_identity_headers = true
+stream = true
+max_concurrency = 8
+request_timeout_secs = 180
+stream_idle_timeout_secs = 180
+retry_timeouts = true

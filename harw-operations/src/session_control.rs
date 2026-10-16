@@ -234,37 +234,25 @@ pub struct ContextUsageSnapshot {
 ///
 /// # Spec
 /// harw-operations Design §session_control — Fehlermodell.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, harw_macros::HarwError)]
 pub enum SessionControlError {
     /// Die Provider-ID ist nicht im Modell-Katalog registriert.
+    #[msg("unknown provider: {0}")]
     UnknownProvider(String),
     /// Die Modell-ID ist nicht registriert oder mit dem aktiven Provider inkompatibel.
+    #[msg("unknown model: {0}")]
     UnknownModel(String),
     /// Der Mutations-Kanal des Controllers ist geschlossen (TUI-Shutdown).
+    #[msg("session controller is disconnected")]
     Disconnected,
     /// Die Oberfläche setzt keinen Interaktionsmodus um.
     ///
     /// Trägt den angeforderten Modusnamen. Wird von der Default-Implementierung
     /// von [`SessionController::request_mode`] erzeugt — siehe dort, warum der
     /// Default fehlschlägt statt Erfolg zu melden.
+    #[msg("this surface does not implement interaction modes (requested: {0})")]
     ModeUnsupported(String),
 }
-
-impl std::fmt::Display for SessionControlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownProvider(id) => write!(f, "unknown provider: {id}"),
-            Self::UnknownModel(id) => write!(f, "unknown model: {id}"),
-            Self::Disconnected => write!(f, "session controller is disconnected"),
-            Self::ModeUnsupported(mode) => write!(
-                f,
-                "this surface does not implement interaction modes (requested: {mode})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SessionControlError {}
 
 // ── SessionController ─────────────────────────────────────────────────────────
 
@@ -829,5 +817,30 @@ mod tests {
             .map_err(ctx("set_context_usage"))?;
         assert_eq!(ctrl.context_usage(), Some(usage));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::SessionControlError;
+
+    #[test]
+    fn display_texts_are_stable() {
+        assert_eq!(
+            SessionControlError::UnknownProvider("p".to_owned()).to_string(),
+            "unknown provider: p"
+        );
+        assert_eq!(
+            SessionControlError::UnknownModel("m".to_owned()).to_string(),
+            "unknown model: m"
+        );
+        assert_eq!(
+            SessionControlError::Disconnected.to_string(),
+            "session controller is disconnected"
+        );
+        assert_eq!(
+            SessionControlError::ModeUnsupported("plan".to_owned()).to_string(),
+            "this surface does not implement interaction modes (requested: plan)"
+        );
     }
 }

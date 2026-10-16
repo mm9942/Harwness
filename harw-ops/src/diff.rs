@@ -58,9 +58,7 @@ use harw_operations::{OpContext, OpError, OpOutput};
 use harw_sandbox::{BwrapLauncher, SandboxError};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Upper bound of the rendered diff (stdout) in bytes.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -289,17 +287,6 @@ struct GitOutput {
     stderr: Vec<u8>,
 }
 
-/// Reads at most `cap` bytes; `true` when more was available.
-async fn read_capped<R: AsyncRead + Unpin>(reader: R, cap: usize) -> (Vec<u8>, bool) {
-    let mut buffer = Vec::new();
-    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
-    // A read error just ends the capture; the exit status tells the rest.
-    let _ = reader.take(limit).read_to_end(&mut buffer).await;
-    let truncated = buffer.len() > cap;
-    buffer.truncate(cap);
-    (buffer, truncated)
-}
-
 /// Runs an allowlisted git plan read-only in its own sandbox.
 ///
 /// # Errors
@@ -333,44 +320,59 @@ async fn run_read_only_git(
             }
             other => OpError::Execution(format!("diff: Lese-Sandbox abgelehnt: {other}")),
         })?;
-    let mut child = tokio::process::Command::new(launcher.executable())
-        .args(bwrap_plan.args())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| OpError::Execution(format!("diff: git-Start fehlgeschlagen: {error}")))?;
-    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+    // The job runtime starts, times and kills the sandboxed git (PL-93).
+    let Some(port) = harw_command::installed() else {
         return Err(OpError::Execution(
-            "diff: git-Ausgabekanäle fehlen".to_owned(),
+            "diff: keine Job-Runtime montiert; Befehle laufen nur über die Job-Runtime".to_owned(),
         ));
     };
-    let run = async {
-        let ((stdout, stdout_truncated), (stderr, _)) = tokio::join!(
-            read_capped(stdout, MAX_OUTPUT_BYTES),
-            read_capped(stderr, MAX_STDERR_BYTES)
-        );
-        let status = child.wait().await;
-        (stdout, stdout_truncated, stderr, status)
-    };
-    match tokio::time::timeout(GIT_TIMEOUT, run).await {
-        Ok((stdout, stdout_truncated, stderr, status)) => {
-            let status = status
-                .map_err(|error| OpError::Execution(format!("diff: Warten auf git: {error}")))?;
-            Ok(GitOutput {
-                exit_code: status.code(),
-                stdout,
-                stdout_truncated,
-                stderr,
-            })
-        }
-        // `child` fällt mit `kill_on_drop` und wird beendet.
-        Err(_elapsed) => Err(OpError::Execution(format!(
+    let mut request = harw_command::CommandRequest::new(
+        launcher.executable().to_string_lossy().into_owned(),
+        "/",
+        GIT_TIMEOUT,
+    );
+    request.args = bwrap_plan
+        .args()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    request.env = std::env::vars().collect();
+    request.max_output_bytes = MAX_OUTPUT_BYTES + MAX_STDERR_BYTES;
+    let done = port
+        .run(request, harw_types::cancel::CancelToken::new())
+        .await;
+    match done.end {
+        harw_command::CommandEnd::Failed(error) => Err(OpError::Execution(format!(
+            "diff: git-Start fehlgeschlagen: {error}"
+        ))),
+        harw_command::CommandEnd::TimedOut => Err(OpError::Execution(format!(
             "diff: git antwortete nicht innerhalb von {} s",
             GIT_TIMEOUT.as_secs()
         ))),
+        harw_command::CommandEnd::Cancelled => {
+            Err(OpError::Execution("diff: abgebrochen".to_owned()))
+        }
+        end => {
+            let (stdout, clipped) = clip(done.stdout, MAX_OUTPUT_BYTES);
+            let (stderr, _) = clip(done.stderr, MAX_STDERR_BYTES);
+            Ok(GitOutput {
+                exit_code: match end {
+                    harw_command::CommandEnd::Exited => Some(done.exit_code),
+                    _ => None,
+                },
+                stdout,
+                stdout_truncated: clipped || done.truncated,
+                stderr,
+            })
+        }
     }
+}
+
+/// Cuts `bytes` at `cap`; whether anything was dropped.
+fn clip(mut bytes: Vec<u8>, cap: usize) -> (Vec<u8>, bool) {
+    let clipped = bytes.len() > cap;
+    bytes.truncate(cap);
+    (bytes, clipped)
 }
 
 /// Renders a finished git run. A non-zero exit is an error carrying git's
@@ -744,6 +746,9 @@ mod tests {
     /// Holy export: a folder with several projects, no repository at the root.
     #[tokio::test]
     async fn test_diff_in_a_non_repository_names_the_repository_subfolders() -> TestResult {
+        harw_command::install_host_default(
+            &std::env::temp_dir().join(format!("harw-ops-diff-jobs-{}", std::process::id())),
+        );
         let (ctx_, base, workspace) = test_context(&[Permission::ReadWorkspace])?;
         for (folder, git) in [("Aquarium", true), ("Holy-Cow-Alt", true), ("notes", false)] {
             std::fs::create_dir_all(workspace.join(folder)).map_err(ctx("create folder"))?;
@@ -816,6 +821,9 @@ mod tests {
     /// checked.
     #[tokio::test]
     async fn test_diff_works_with_plan_mode_permissions() -> TestResult {
+        harw_command::install_host_default(
+            &std::env::temp_dir().join(format!("harw-ops-diff-jobs-{}", std::process::id())),
+        );
         let (ctx_, base, workspace) = test_context(&[Permission::ReadWorkspace])?;
         let outcome = async {
             let Some(git) = find_git() else {

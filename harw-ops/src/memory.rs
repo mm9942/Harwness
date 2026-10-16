@@ -47,6 +47,16 @@
 //!   Confidence-Verfall/Löschung) kann von dieser Operation nicht gestartet
 //!   werden, siehe dort.
 //!
+//! # Wartung als Job
+//! `consolidate`, `forget` und `promote --to-global` blockieren nicht: sie
+//! lösen die Fakt-Wurzeln auf, reihen einen Job der Art
+//! `memory_maintenance` (siehe [`crate::memory_job`]) im Job-Store ein und
+//! geben die Job-Id sofort zurück (`data.job_id`). Fortschritt, Ergebnis und
+//! Abbruch laufen über die vorhandenen Job-Werkzeuge. Die Frist kommt aus
+//! `[memory]` (Vorgabe 30 s); Ablauf bricht ohne Teilzustand ab und endet als
+//! `failed` mit Grund `timed_out: …`. Ohne Job-Store im Kontext antworten sie
+//! mit [`OpError::NotAvailable`] — es gibt keinen blockierenden Rückfall.
+//!
 //! # Scopes und Wurzeln (Contract §2, Design §2)
 //! - `Project`: `<projekt-root>/.harw/memories/` — bleibt im Repo,
 //!   versionierbar, gewährt keine Rechte (siehe [`project_memories_root`]).
@@ -81,12 +91,16 @@ use std::sync::Arc;
 use harw_knowledge::KnowledgeStore;
 use harw_knowledge::memory::topic;
 use harw_macros::operation;
+use harw_memory::consolidation::Deadline;
 use harw_memory::{Fact, FactScope, FactStore, FactType, Memory, slugify};
 use harw_operations::{OpContext, OpError, OpOutput};
 
 use crate::knowledge_args::{FlagSpec, KnowledgeArgs};
 use crate::knowledge_common::{
     AREA_PALACE, KnowledgeCaller, knowledge_store, map_knowledge_error, publish_knowledge,
+};
+use crate::memory_job::{
+    MaintenanceScope, MemoryMaintenanceOp, MemoryMaintenanceSpec, enqueue_memory_maintenance,
 };
 
 /// Obergrenze der Treffer je Wurzel bei `recall` (wie zuvor bei der
@@ -140,7 +154,7 @@ impl harw_operations::FromRawArgs for MemoryArgs {
 /// Siehe Modul-Doku.
 #[operation(
     name = "memory",
-    summary = "Long-Term-Memory: list, recall, record, forget, promote <fact-id>, topics, stats, maintain.",
+    summary = "Long-Term-Memory: list, recall, record, forget (Job), promote <fact-id> | --to-global (Job), consolidate (Job), topics, stats, maintain.",
     domain = "session",
     permission = "operator",
     command(path = "/memory", visibility = "channel_parity")
@@ -258,6 +272,26 @@ fn global_memories_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
     Ok(crate::config_util::bound_home(ctx)?
         .profile_dir
         .join("memories"))
+}
+
+/// Die `[memory]`-Einstellungen des Aufrufers; ohne auflösbare Konfiguration
+/// gelten die Vorgaben (= bisheriges Verhalten).
+fn memory_settings(ctx: &OpContext) -> harw_config::MemorySection {
+    crate::provider::resolved_config(ctx)
+        .map(|config| config.harness.memory.clone())
+        .unwrap_or_default()
+}
+
+/// Baut die Job-Payload für `op` mit Frist und Verfallsfenster aus
+/// `settings`; die Wurzeln setzt der Aufrufer.
+fn maintenance_spec(
+    op: MemoryMaintenanceOp,
+    deadline_secs: u64,
+    settings: &harw_config::MemorySection,
+) -> MemoryMaintenanceSpec {
+    let mut spec = MemoryMaintenanceSpec::new(op, deadline_secs);
+    spec.max_unused_days = i64::from(settings.max_unused_days);
+    spec
 }
 
 /// Trennt `--project`/`--global` aus `tokens`, liefert die verbleibenden
@@ -382,9 +416,21 @@ fn record_fact(ctx: &OpContext, scope: FactScope, text: &str) -> Result<OpOutput
         FactScope::Project => project_memories_root(ctx)?,
         FactScope::Global => global_memories_root(ctx)?,
     };
-    let store = FactStore::open(&root, scope).map_err(|error| {
-        OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
-    })?;
+    let settings = memory_settings(ctx);
+    let store = FactStore::open(&root, scope)
+        .map_err(|error| {
+            OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
+        })?
+        .with_limits(harw_memory::FactLimits {
+            max_facts: settings.max_facts,
+            max_body_bytes: settings.max_body_bytes,
+        });
+    // Globale Wurzel: gegen gleichzeitige Konsolidierung/Promotion/Schreiber
+    // sperren (Lock bleibt bis zum Ende dieser Funktion gehalten).
+    let _global_lock = match scope {
+        FactScope::Global => Some(lock_root(&root, Deadline::default_deletion())?),
+        FactScope::Project => None,
+    };
     let base = slugify(trimmed);
     let name = unique_slug(&store, &base, trimmed)?;
     let now = time::OffsetDateTime::now_utc();
@@ -477,24 +523,64 @@ fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
         ));
     };
 
-    let mut deleted_from = Vec::new();
-    if let Ok(root) = project_memories_root(ctx) {
-        if let Ok(store) = FactStore::open(&root, FactScope::Project) {
-            if store.delete(name).map_err(|error| {
-                OpError::Execution(format!("Fakt löschen fehlgeschlagen (Projekt): {error}"))
-            })? {
-                deleted_from.push("Projekt");
-            }
+    let settings = memory_settings(ctx);
+    let mut spec = maintenance_spec(
+        MemoryMaintenanceOp::Forget { name: name.clone() },
+        settings.forget_deadline_secs,
+        &settings,
+    );
+    spec.project_root = project_memories_root(ctx).ok();
+    spec.global_root = global_memories_root(ctx).ok();
+    enqueue_memory_maintenance(ctx, &spec)
+}
+
+/// Kern von [`forget_fact`] mit Frist: erst prüfen (wo existiert der Fakt?),
+/// dann alle betroffenen Wurzeln sperren, Frist erneut prüfen und erst
+/// danach löschen. Läuft die Frist vorher ab (auch beim Warten auf den
+/// Lock), bleibt alles unverändert und der Fehler nennt den Fristablauf.
+pub(crate) fn forget_with_deadline(
+    project_root: Option<PathBuf>,
+    global_root: Option<PathBuf>,
+    name: &str,
+    deadline: Deadline,
+) -> Result<OpOutput, OpError> {
+    let mut targets: Vec<(&'static str, PathBuf, FactStore)> = Vec::new();
+    for (label, root, scope) in [
+        ("Projekt", project_root, FactScope::Project),
+        ("Global", global_root, FactScope::Global),
+    ] {
+        let Some(root) = root else { continue };
+        let Ok(store) = FactStore::open(&root, scope) else {
+            continue;
+        };
+        let present = store.read(name).map_err(|error| {
+            OpError::Execution(format!("Fakt lesen fehlgeschlagen ({label}): {error}"))
+        })?;
+        if present.is_some() {
+            targets.push((label, root, store));
         }
     }
-    if let Ok(root) = global_memories_root(ctx) {
-        if let Ok(store) = FactStore::open(&root, FactScope::Global) {
+    let mut deleted_from = Vec::new();
+    if !targets.is_empty() {
+        deadline
+            .check("forget-validate")
+            .map_err(|error| OpError::Execution(error.to_string()))?;
+        let mut locks = Vec::new();
+        for (_, root, _) in &targets {
+            locks.push(lock_root(root, deadline.clone())?);
+        }
+        // Commit-Punkt: ab hier wird vollständig gelöscht.
+        deadline
+            .check("forget-commit")
+            .map_err(|error| OpError::Execution(error.to_string()))?;
+        for (label, _, store) in &targets {
             if store.delete(name).map_err(|error| {
-                OpError::Execution(format!("Fakt löschen fehlgeschlagen (Global): {error}"))
+                OpError::Execution(format!("Fakt löschen fehlgeschlagen ({label}): {error}"))
             })? {
-                deleted_from.push("Global");
+                deleted_from.push(*label);
             }
         }
+        drop(locks);
     }
 
     if deleted_from.is_empty() {
@@ -516,10 +602,70 @@ const PROMOTE_FLAGS: &[FlagSpec] = &[
     FlagSpec::switch("project"),
     FlagSpec::switch("global"),
     FlagSpec::value("slug"),
+    FlagSpec::switch("to-global"),
 ];
 
 /// Grammatik von `/memory promote`.
-const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--slug <slug>]";
+const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--slug <slug>] | /memory promote --to-global <fact-id>";
+
+/// Nimmt den Konsolidierungs-Lock an `root` (wartet bis `deadline`).
+///
+/// # Errors
+/// [`OpError::Execution`], wenn der Lock bis zum Fristablauf belegt bleibt
+/// oder nicht angelegt werden kann.
+fn lock_root(
+    root: &Path,
+    deadline: Deadline,
+) -> Result<harw_memory::consolidation::ConsolidationLock, OpError> {
+    harw_memory::consolidation::ConsolidationLock::acquire_until(root, deadline).map_err(|error| {
+        OpError::Execution(format!(
+            "Gedächtnis-Wurzel gesperrt (Konsolidierung/Schreiber läuft): {error}"
+        ))
+    })
+}
+
+/// `/memory promote --to-global <fact-id>` — kopiert einen Projekt-Fakt in
+/// den globalen Scope (Herkunft `promoted_from:`), siehe
+/// [`harw_memory::promote::promote_fact_to_global`]. Absolute Pfade,
+/// repo-spezifische Verweise und Geheimnisse werden abgelehnt. Nicht zu
+/// verwechseln mit `/memory promote <fact-id>` (Palace-Thema).
+///
+/// # Errors
+/// [`OpError::InvalidArguments`] bei Grammatik/unbekanntem/abgelehntem Fakt;
+/// [`OpError::NotAvailable`] ohne gebundenen Root-Space;
+/// [`OpError::Execution`] bei Frist-/Lock-/I/O-Fehlern.
+fn promote_to_global(ctx: &OpContext, args: &KnowledgeArgs) -> Result<OpOutput, OpError> {
+    if args.switch("project") || args.switch("global") || args.value("slug").is_some() {
+        return Err(OpError::InvalidArguments(
+            "--to-global ist nicht mit --project/--global/--slug kombinierbar".to_owned(),
+        ));
+    }
+    let [fact_id] = args.positionals() else {
+        return Err(OpError::InvalidArguments(PROMOTE_USAGE.to_owned()));
+    };
+    let project_root = project_memories_root(ctx)?;
+    let global_root = global_memories_root(ctx)?;
+    let label = project_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map_or_else(
+            || "project".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+    let settings = memory_settings(ctx);
+    let mut spec = maintenance_spec(
+        MemoryMaintenanceOp::PromoteToGlobal {
+            name: fact_id.clone(),
+        },
+        settings.promote_deadline_secs,
+        &settings,
+    );
+    spec.project_root = Some(project_root);
+    spec.global_root = Some(global_root);
+    spec.project_label = label;
+    enqueue_memory_maintenance(ctx, &spec)
+}
 
 /// `/memory promote <fact-id> [--project|--global] [--slug <slug>]`.
 ///
@@ -537,6 +683,9 @@ const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--s
 /// - [`OpError::Execution`] — Lese-/Schreibfehler.
 fn promote_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let args = KnowledgeArgs::parse(tail, PROMOTE_FLAGS)?;
+    if args.switch("to-global") {
+        return promote_to_global(ctx, &args);
+    }
     let [fact_id] = args.positionals() else {
         return Err(OpError::InvalidArguments(PROMOTE_USAGE.to_owned()));
     };
@@ -750,7 +899,23 @@ fn consolidate_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, Op
         FactScope::Project => project_memories_root(ctx)?,
         FactScope::Global => global_memories_root(ctx)?,
     };
-    run_consolidate(&root, scope)
+    let settings = memory_settings(ctx);
+    let maintenance_scope = match scope {
+        FactScope::Project => MaintenanceScope::Project,
+        FactScope::Global => MaintenanceScope::Global,
+    };
+    let mut spec = maintenance_spec(
+        MemoryMaintenanceOp::Consolidate {
+            scope: maintenance_scope,
+        },
+        settings.consolidate_deadline_secs,
+        &settings,
+    );
+    match scope {
+        FactScope::Project => spec.project_root = Some(root),
+        FactScope::Global => spec.global_root = Some(root),
+    }
+    enqueue_memory_maintenance(ctx, &spec)
 }
 
 /// Stößt Phase 2 der Konsolidierung (Design §5.3) an der Fakt-Wurzel `root`
@@ -786,7 +951,7 @@ fn consolidate_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, Op
 /// # Errors
 /// [`OpError::Execution`] bei Lock-/I/O-/Serde-Fehlern der beteiligten
 /// [`FactStore`]/`IncomingStore`/`ConsolidationBaseline`-Aufrufe.
-fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
+pub fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
     use harw_memory::consolidation::{
         ConsolidationBaseline, ConsolidationLock, apply_plan, plan_consolidation, steward_prompt,
     };
@@ -1129,7 +1294,10 @@ mod tests {
         .map_err(ctx("record --global"))?;
 
         let store = FactStore::open(
-            home.path().join("profiles").join("default").join("memories"),
+            home.path()
+                .join("profiles")
+                .join("default")
+                .join("memories"),
             FactScope::Global,
         )
         .map_err(ctx("open bound global store"))?;
@@ -1319,6 +1487,149 @@ mod tests {
             second
                 .text
                 .contains("0 Fakt(en) seit letzter Baseline geändert")
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod forget_deadline_tests {
+    use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use std::time::Duration;
+
+    fn store_with(dir: &Path, scope: FactScope) -> TestResult<FactStore> {
+        let store = FactStore::open(dir, scope).map_err(ctx("open"))?;
+        let now = time::OffsetDateTime::now_utc();
+        store
+            .write(&Fact {
+                name: "kurz".to_owned(),
+                description: "d".to_owned(),
+                fact_type: FactType::Fact,
+                scope,
+                created: now,
+                updated: now,
+                confidence: 1.0,
+                sources: Vec::new(),
+                tags: Vec::new(),
+                body: "x".to_owned(),
+            })
+            .map_err(ctx("write"))?;
+        Ok(store)
+    }
+
+    #[test]
+    fn expired_deadline_leaves_both_scopes_unchanged() -> TestResult {
+        let p = tempfile::tempdir().map_err(ctx("p"))?;
+        let g = tempfile::tempdir().map_err(ctx("g"))?;
+        let ps = store_with(p.path(), FactScope::Project)?;
+        let gs = store_with(g.path(), FactScope::Global)?;
+        let res = forget_with_deadline(
+            Some(p.path().to_path_buf()),
+            Some(g.path().to_path_buf()),
+            "kurz",
+            Deadline::after(Duration::ZERO),
+        );
+        match res {
+            Err(OpError::Execution(msg)) if msg.contains("Frist") => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert!(ps.read("kurz").map_err(ctx("r1"))?.is_some());
+        assert!(gs.read("kurz").map_err(ctx("r2"))?.is_some());
+        assert!(!p.path().join("consolidation.lock").exists());
+        assert!(!g.path().join("consolidation.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn success_path_deletes_in_both_scopes_and_releases_locks() -> TestResult {
+        let p = tempfile::tempdir().map_err(ctx("p"))?;
+        let g = tempfile::tempdir().map_err(ctx("g"))?;
+        let ps = store_with(p.path(), FactScope::Project)?;
+        let gs = store_with(g.path(), FactScope::Global)?;
+        forget_with_deadline(
+            Some(p.path().to_path_buf()),
+            Some(g.path().to_path_buf()),
+            "kurz",
+            Deadline::default_deletion(),
+        )
+        .map_err(ctx("forget"))?;
+        assert!(ps.read("kurz").map_err(ctx("r1"))?.is_none());
+        assert!(gs.read("kurz").map_err(ctx("r2"))?.is_none());
+        assert!(!g.path().join("consolidation.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn held_lock_until_deadline_aborts_without_deleting() -> TestResult {
+        let g = tempfile::tempdir().map_err(ctx("g"))?;
+        let gs = store_with(g.path(), FactScope::Global)?;
+        let held = harw_memory::consolidation::ConsolidationLock::try_acquire(g.path())
+            .map_err(ctx("hold"))?;
+        let res = forget_with_deadline(
+            None,
+            Some(g.path().to_path_buf()),
+            "kurz",
+            Deadline::after(Duration::from_millis(60)),
+        );
+        assert!(matches!(res, Err(OpError::Execution(_))));
+        assert!(gs.read("kurz").map_err(ctx("r"))?.is_some());
+        drop(held);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod job_dispatch_tests {
+    use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_job_runtime::{JobKind, JobState, WorkId};
+    use harw_operations::context::ServiceMap;
+    use harw_session_store::JobStore;
+
+    fn jobs_context() -> TestResult<(tempfile::TempDir, Arc<JobStore>, OpContext)> {
+        let state = tempfile::tempdir().map_err(ctx("state"))?;
+        let jobs = Arc::new(JobStore::new(state.path()));
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&jobs));
+        let context = crate::knowledge_test_support::op_context(services)?;
+        Ok((state, jobs, context))
+    }
+
+    fn job_id(out: &OpOutput) -> TestResult<WorkId> {
+        let data = out.data.as_ref().ok_or(TestError::Missing("data"))?;
+        let id = data["job_id"]
+            .as_str()
+            .ok_or(TestError::Missing("job_id"))?;
+        Ok(WorkId::from_str(id))
+    }
+
+    #[test]
+    fn forget_and_consolidate_enqueue_a_ready_job_and_return_its_id() -> TestResult {
+        let (_state, jobs, context) = jobs_context()?;
+        let forget = forget_fact(&context, &["kurz".to_owned()]).map_err(ctx("forget"))?;
+        let consolidate = consolidate_dispatch(&context, &[]).map_err(ctx("consolidate"))?;
+        for out in [&forget, &consolidate] {
+            let record = jobs.get(&job_id(out)?).map_err(ctx("get"))?;
+            assert_eq!(record.job.state, JobState::Ready);
+            assert_eq!(
+                record.job.kind,
+                JobKind::Custom("memory_maintenance".to_owned())
+            );
+        }
+        // Standardfrist 30 s, keine Frist aus Konfiguration nötig.
+        let data = consolidate.data.ok_or(TestError::Missing("data"))?;
+        assert_eq!(data["deadline_secs"], 30);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_without_job_store_is_not_available() -> TestResult {
+        let context = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+        let result = forget_fact(&context, &["kurz".to_owned()]);
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
         );
         Ok(())
     }
