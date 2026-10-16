@@ -274,10 +274,16 @@ mod tests {
         assert_eq!(chained.plan("i").err(), Some(CycleSpecError::LimitsWidened));
         let mut spawning = spec();
         spawning.limits.max_spawn_depth = 1;
-        assert_eq!(spawning.plan("i").err(), Some(CycleSpecError::LimitsWidened));
+        assert_eq!(
+            spawning.plan("i").err(),
+            Some(CycleSpecError::LimitsWidened)
+        );
         let mut no_stall = spec();
         no_stall.limits.max_stall_transitions = 0;
-        assert_eq!(no_stall.plan("i").err(), Some(CycleSpecError::LimitsWidened));
+        assert_eq!(
+            no_stall.plan("i").err(),
+            Some(CycleSpecError::LimitsWidened)
+        );
         let mut blank = spec();
         blank.objective = " ".to_owned();
         assert_eq!(blank.plan("i").err(), Some(CycleSpecError::BlankObjective));

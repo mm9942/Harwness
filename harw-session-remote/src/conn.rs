@@ -834,7 +834,9 @@ mod tests {
 
         // Delivered frame: recorded.
         let sub = Subscription::new();
-        lock(&shared.state).subs.insert(session.clone(), Arc::clone(&sub));
+        lock(&shared.state)
+            .subs
+            .insert(session.clone(), Arc::clone(&sub));
         shared.on_frame(heartbeat(&session, 2));
         assert_eq!(cursor_of(&shared).map(|c| c.live), Some(2));
 

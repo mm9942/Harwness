@@ -914,9 +914,15 @@ mod tests {
 
         let args = serde_json::json!({"job_id": foreign_id.as_str()});
         let status = run(&IntentCycleStatusOperation, &fx.ctx, args.clone()).await;
-        assert!(matches!(status, Err(OpError::InvalidArguments(_))), "{status:?}");
+        assert!(
+            matches!(status, Err(OpError::InvalidArguments(_))),
+            "{status:?}"
+        );
         let stop = run(&IntentCycleStopOperation, &fx.ctx, args).await;
-        assert!(matches!(stop, Err(OpError::InvalidArguments(_))), "{stop:?}");
+        assert!(
+            matches!(stop, Err(OpError::InvalidArguments(_))),
+            "{stop:?}"
+        );
         let record = fx.jobs.get(&foreign_id).map_err(ctx("foreign job"))?;
         assert_eq!(record.job.state, harw_job_runtime::JobState::Ready);
         Ok(())
@@ -955,9 +961,15 @@ mod tests {
         fx.jobs.admit(&other).map_err(ctx("admit other"))?;
         let args = serde_json::json!({"job_id": other_id.as_str()});
         let status = run(&IntentCycleStatusOperation, &fx.ctx, args.clone()).await;
-        assert!(matches!(status, Err(OpError::InvalidArguments(_))), "{status:?}");
+        assert!(
+            matches!(status, Err(OpError::InvalidArguments(_))),
+            "{status:?}"
+        );
         let stop = run(&IntentCycleStopOperation, &fx.ctx, args).await;
-        assert!(matches!(stop, Err(OpError::InvalidArguments(_))), "{stop:?}");
+        assert!(
+            matches!(stop, Err(OpError::InvalidArguments(_))),
+            "{stop:?}"
+        );
         let record = fx.jobs.get(&other_id).map_err(ctx("other job"))?;
         assert_eq!(record.job.state, harw_job_runtime::JobState::Ready);
         Ok(())

@@ -47,9 +47,9 @@ use harw_job_runtime::{JobClaim, JobKind, JobOutcome};
 use harw_ops::intent_cycle::IntentCycleJobInput;
 use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
-    CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleStore, CycleStoreError,
-    CycleRunError, ExplorerCycleExecutor, INTENT_CYCLE_JOB_KIND, ModelCycleProposer, ProposerRoute, RoutePolicy,
-    job_outcome,
+    CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleRunError, CycleStore,
+    CycleStoreError, ExplorerCycleExecutor, INTENT_CYCLE_JOB_KIND, ModelCycleProposer,
+    ProposerRoute, RoutePolicy, job_outcome,
 };
 use harw_session_store::JobStore;
 use harw_types::{ModelId, SessionId};
@@ -154,8 +154,9 @@ pub(super) async fn execute_intent_cycle_claim(
     if cycle_input.workspace_root.as_deref() != Some(sandbox.workspace().canonical_root()) {
         tracing::warn!(work_id = %work_id.as_str(), "intent-cycle workspace root mismatch");
         return JobOutcome::Blocked {
-            reason: "intent cycle: the job was approved for another workspace than this worker serves"
-                .to_owned(),
+            reason:
+                "intent cycle: the job was approved for another workspace than this worker serves"
+                    .to_owned(),
         };
     }
     let authority = sandbox.authority().clone();
@@ -403,7 +404,11 @@ mod tests {
         usage.wall = SignedDuration::from_secs(60);
         assert_eq!(remaining_wall(&budget, &usage), None);
         usage.wall = SignedDuration::from_secs(3_600);
-        assert_eq!(remaining_wall(&budget, &usage), None, "overdrawn stays exhausted");
+        assert_eq!(
+            remaining_wall(&budget, &usage),
+            None,
+            "overdrawn stays exhausted"
+        );
         let unbounded = Budget {
             max_wall: None,
             ..budget
