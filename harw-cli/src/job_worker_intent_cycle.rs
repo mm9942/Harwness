@@ -225,11 +225,14 @@ pub(super) async fn execute_intent_cycle_claim(
     };
 
     let cycle_id = cycle_input.cycle_id.clone();
+    // Borrow the field up front: `plan.targets`/`plan.checks` were moved out and an
+    // async block captures whole variables, not disjoint fields.
+    let admission = &plan.admission;
     let run = async {
         let mut backoff = PROPOSER_RETRY_BACKOFF.iter();
         loop {
             let result = driver
-                .run(&cycle_id, &claim.token, &plan.admission, &cancel)
+                .run(&cycle_id, &claim.token, admission, &cancel)
                 .await;
             match result {
                 Err(CycleRunError::ProposerUnavailable(reason)) => {
