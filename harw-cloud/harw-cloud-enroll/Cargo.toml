@@ -4,8 +4,8 @@ version = "0.9.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Device enrollment types for the Harwness cloud home (PL-65/68/94)"
-license = "MIT OR Apache-2.0"
 publish = false
+license.workspace = true
 
 [dependencies]
 harw-types = { path = "../../harw-types" }

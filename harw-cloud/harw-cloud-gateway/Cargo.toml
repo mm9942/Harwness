@@ -4,8 +4,8 @@ version = "0.9.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Harwness cloud gateway configuration and status probing"
-license = "MIT OR Apache-2.0"
 publish = false
+license.workspace = true
 
 [dependencies]
 async-trait = "0.1"

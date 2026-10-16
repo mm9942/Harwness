@@ -4,6 +4,7 @@ version = "0.9.1"
 edition = "2024"
 rust-version = "1.85"
 publish = false
+license.workspace = true
 
 [dependencies]
 harw-macros = { path = "../../harw-macros" }
