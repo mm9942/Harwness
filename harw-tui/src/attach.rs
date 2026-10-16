@@ -857,7 +857,7 @@ mod tests {
             sessions: vec![summary("only")],
             ..Fake::default()
         };
-        let mut out = Vec::new();
+        let mut out = Vec::<u8>::new();
         let picked = pick_session(&fake, &mut out).await;
         assert_eq!(picked.map(|s| s.0).ok().as_deref(), Some("only"));
         assert!(out.is_empty());
