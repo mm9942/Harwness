@@ -864,6 +864,30 @@ mod tests {
         }
     }
 
+    /// PL-90: the intent-cycle tools have catalog rows; `start` only reads
+    /// workspace files (`Read`, no manifest flag), status/stop are `Meta`;
+    /// none is auto-approved or always available.
+    #[test]
+    fn test_intent_cycle_tools_are_classified() {
+        let class = |tool: &str| lookup(tool).map(|entry| entry.class);
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        assert_eq!(class(INTENT_CYCLE_START_TOOL), Some(CapabilityClass::Read));
+        assert_eq!(class(INTENT_CYCLE_STATUS_TOOL), Some(CapabilityClass::Meta));
+        assert_eq!(class(INTENT_CYCLE_STOP_TOOL), Some(CapabilityClass::Meta));
+        for tool in INTENT_CYCLE_TOOLS {
+            let entry = lookup(tool);
+            assert!(
+                entry.is_some_and(|entry| !entry.always_available),
+                "{tool}: not always available"
+            );
+            assert_eq!(entry.map(CapabilityEntry::feature), Some(CORE_FEATURE));
+            assert!(
+                !crate::AUTO_APPROVED_TOOLS.contains(tool),
+                "{tool} must not be auto-approved"
+            );
+        }
+    }
+
     /// #22 Welle 2B: `agents.build` ist nicht in [`crate::AUTO_APPROVED_TOOLS`]
     /// — es fragt wie `shell.exec` immer nach Freigabe.
     #[test]

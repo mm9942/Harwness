@@ -1021,6 +1021,19 @@ mod tests {
         }
     }
 
+    /// PL-90: alle drei Intent-Zyklus-Werkzeuge lesen nur den Workspace.
+    #[test]
+    fn test_tool_permission_maps_intent_cycle_tools_to_read_workspace() {
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        for tool in INTENT_CYCLE_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
+    }
+
     #[test]
     fn test_tool_permission_matches_workbench_provider_declarations() {
         let names = WorkbenchToolProvider::TOOL_NAMES;

@@ -1,6 +1,6 @@
 # PL-90 — Intent-Driven Composed Agents
 
-> DRAFT; baseline dev@197a92e92d438bf6bf93b129bb964f4852686149; documentation, not runtime implementation.
+> DRAFT; baseline dev@197a92e92d438bf6bf93b129bb964f4852686149; design dossier with a partial W01–W03 implementation (see the status below and [04 §7](04-migration-verification.md#7-implementation-status)).
 
 This dossier defines the composed-agent facade, adaptive model-turn chains, bounded delegated orchestration, write-capable corrective cycles and domain recipes. Read [Current Architecture](01-current-architecture.md), [Adaptive Intent Contracts](02-adaptive-intent-contracts.md), [Domain Applications](03-domain-applications.md), and [Migration & Verification](04-migration-verification.md). Read the [Error Learning & Agent Run Isolation addendum](05-error-learning-and-run-isolation.md) **before** connecting memory, feedback, child contexts or global knowledge.
 
