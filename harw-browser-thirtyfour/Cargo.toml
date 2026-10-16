@@ -25,7 +25,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
