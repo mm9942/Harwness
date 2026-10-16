@@ -981,6 +981,24 @@ fn merge_tui(
         "tui.child_stream",
         layer_path,
     );
+    // h7: `[tui] status_expiry` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.status_expiry,
+        incoming.status_expiry,
+        present("status_expiry"),
+        role,
+        "tui.status_expiry",
+        layer_path,
+    );
+    // h9: `[tui] goal_mode` (rein darstellende Zielansicht, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.goal_mode,
+        incoming.goal_mode,
+        present("goal_mode"),
+        role,
+        "tui.goal_mode",
+        layer_path,
+    );
 }
 
 // `[session]` (Abschnitt 1.4) — `retention_days` ist `MinBound`
@@ -3111,6 +3129,42 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.jobs.max_running, Some(8));
+        Ok(())
+    }
+
+    // [tui] status_expiry / goal_mode (h7/h9): ProfileReplaces; vor dieser
+    // Verdrahtung wurden Profilwerte beim Zusammenführen still verworfen.
+    #[test]
+    fn test_tui_status_expiry_and_goal_mode_profile_replace() -> TestResult {
+        use crate::StatusExpiryMode;
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.status_expiry, StatusExpiryMode::Consolidate);
+        assert!(!trusted.tui.goal_mode);
+
+        let profile = "[tui]\nstatus_expiry = \"hide\"\ngoal_mode = true";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.status_expiry, StatusExpiryMode::Hide);
+        assert!(trusted.tui.goal_mode);
+
+        let project = "[tui]\nstatus_expiry = \"consolidate\"\ngoal_mode = false";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.status_expiry, StatusExpiryMode::Hide);
+        assert!(
+            trusted.tui.goal_mode,
+            "nicht vertrautes Projekt bleibt wirkungslos"
+        );
         Ok(())
     }
 

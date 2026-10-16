@@ -2795,6 +2795,10 @@ impl ChatApp {
     /// Owner, z. B. ein Driver oder die `plan`-Brücke) publisht den
     /// Bibliothekszustand; die TUI rendert nur. `None` blendet die Ansicht
     /// aus.
+    #[allow(
+        dead_code,
+        reason = "h22: the step owner that publishes into the TUI is not wired yet"
+    )]
     pub(crate) fn set_step_list(&mut self, list: Option<harw_step_list::StepList>) {
         self.step_list = list;
     }

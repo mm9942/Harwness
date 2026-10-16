@@ -105,6 +105,8 @@ see Section 2 for the field's current, implemented rule.
 | `tui.theme` | `String` | `"default-dark"` | `harness_config.rs:292` | RESET |
 | `tui.keybindings_file` | `String` | `"keybindings.toml"` | `harness_config.rs:294` | RESET |
 | `tui.child_stream` | `ChildStreamModeToml` (`orchestrators`/`all`/`none`) | `orchestrators` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.status_expiry` | `StatusExpiryMode` (`consolidate`/`hide`) | `consolidate` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.goal_mode` | `bool` | `false` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 
 ### 1.4 `[session]` (`harness_config.rs:306-343`, Defaults `429-437`)
 
@@ -481,6 +483,8 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `tui.theme` | PROFILE | last explicitly set value wins | Pure UI preference. | |
 | `tui.keybindings_file` | PROFILE | last explicitly set value wins | see above | |
 | `tui.child_stream` | PROFILE | `ProfileReplaces` | Purely presentational (live stream of child agents), not a restriction. | |
+| `tui.status_expiry` | PROFILE | `ProfileReplaces` | Purely presentational (expired child status lines), not a restriction. | |
+| `tui.goal_mode` | PROFILE | `ProfileReplaces` | Purely presentational (read-only goal view), not a restriction. | |
 | `session.store_dir` | PROFILE | last explicitly set value wins | Storage path is profile-local. | |
 | `session.journal_format` | PROFILE | last explicitly set value wins | Pure format choice. | |
 | `session.retention_days` | **GLOBAL as an upper bound (minimum)** (decided 2026-09-21) | `MinBound` | An admin enforces a maximum retention as a compliance guardrail; the profile may only retain for less time, never longer than globally allowed. | |
@@ -812,7 +816,7 @@ subsection numbers, so the table can be checked 1:1 against Section 1.
 **1.2 `[logging]`** (3): `logging.level`, `logging.target_module_paths`,
 `logging.json` — all Profile / `ProfileReplaces`.
 
-**1.3 `[tui]`** (3): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`
+**1.3 `[tui]`** (5): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`, `tui.status_expiry`, `tui.goal_mode`
 — all Profile / `ProfileReplaces`.
 
 **1.4 `[session]`** (5 fields)

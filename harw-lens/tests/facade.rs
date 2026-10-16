@@ -20,6 +20,7 @@ use harw_lens::{
 };
 use harw_lens_embed::{DeterministicEmbedder, EmbeddingDescriptor};
 use harw_lens_types::{CollapsePolicy, EdgeIndex, Locality, Metric, SourceRef};
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::sync::Arc;
 
@@ -47,6 +48,8 @@ fn document(text: &str, path: &str, visibility: &str) -> harw_lens::RawDocument 
         },
         text: text.to_owned(),
         visibility: visibility.to_owned(),
+        is_binary: false,
+        content_hash: None,
     }
 }
 
@@ -286,7 +289,7 @@ fn test_index_verify_status_reflects_built_index() -> TestResult {
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     assert!(
-        index_status(home.path(), DOCS_DESIGN_INDEX).is_err(),
+        index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY).is_err(),
         "status before any build must not report an index"
     );
     let documents = vec![document(
@@ -306,7 +309,7 @@ fn test_index_verify_status_reflects_built_index() -> TestResult {
     )
     .map_err(ctx("build succeeds"))?;
     assert!(
-        index_status(home.path(), DOCS_DESIGN_INDEX).is_ok(),
+        index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY).is_ok(),
         "status after build must report the index"
     );
     Ok(())
@@ -479,8 +482,12 @@ fn test_index_verify_parallel_queries_same_index() -> TestResult {
             10,
         )
     });
-    let r1 = t1.join().map_err(|_| ctx("thread 1 panicked"))?;
-    let r2 = t2.join().map_err(|_| ctx("thread 2 panicked"))?;
+    let r1 = t1
+        .join()
+        .map_err(|_| TestError::Missing("thread 1 panicked"))?;
+    let r2 = t2
+        .join()
+        .map_err(|_| TestError::Missing("thread 2 panicked"))?;
     assert!(r1.is_ok(), "parallel query 1 must succeed: {r1:?}");
     assert!(r2.is_ok(), "parallel query 2 must succeed: {r2:?}");
     Ok(())
@@ -538,8 +545,12 @@ fn test_index_verify_parallel_query_out_of_scope_is_rejected() -> TestResult {
             10,
         )
     });
-    let r1 = t1.join().map_err(|_| ctx("thread 1 panicked"))?;
-    let r2 = t2.join().map_err(|_| ctx("thread 2 panicked"))?;
+    let r1 = t1
+        .join()
+        .map_err(|_| TestError::Missing("thread 1 panicked"))?;
+    let r2 = t2
+        .join()
+        .map_err(|_| TestError::Missing("thread 2 panicked"))?;
     assert!(
         matches!(
             r1,

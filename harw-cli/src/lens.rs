@@ -556,6 +556,8 @@ mod tests {
             },
             text: "# Intro\n\nText.\n".to_owned(),
             visibility: harw_lens::DEFAULT_VISIBILITY.to_owned(),
+            is_binary: false,
+            content_hash: None,
         }];
         let embedder = harw_lens::DeterministicEmbedder::new(8);
         let descriptor = harw_lens::EmbeddingDescriptor {

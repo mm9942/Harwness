@@ -105,6 +105,9 @@ layer = "F"
 layer = "F"
 [packages."harw-tui-layout"]
 layer = "F"
+# Reines Step-/TODO-Datenmodell (nur serde), von harw-tui gelesen (h21).
+[packages."harw-step-list"]
+layer = "F"
 
 # --- C: compiler domain ----------------------------------------------------
 [packages."harw-agent-dsl"]
@@ -392,6 +395,20 @@ layer = "A"
 [packages."harw-tool-sys"]
 layer = "A"
 [packages."harw-tool-tunnel"]
+layer = "A"
+# Obsidian-Vault-Werkzeuge (Tool-Provider wie die übrigen harw-tool-*).
+[packages."harw-tool-obsidian"]
+layer = "A"
+# Cloud-Home-Stack (Enrollment, Gateway, Ops, Steuer-CLI): Anwendung.
+[packages."harw-cloud"]
+layer = "A"
+[packages."harw-cloud-enroll"]
+layer = "A"
+[packages."harw-cloud-gateway"]
+layer = "A"
+[packages."harw-cloud-ops"]
+layer = "A"
+[packages."harw-cloudctl"]
 layer = "A"
 [packages."harw-tool-web"]
 layer = "A"

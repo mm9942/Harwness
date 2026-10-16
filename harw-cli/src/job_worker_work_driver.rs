@@ -3763,6 +3763,8 @@ mod tests {
             orchestrator_role: "orchestrator".to_owned(),
             requested_by: "operator".to_owned(),
             spec: spec(max_iterations),
+            plan_revision: None,
+            frozen_scope: None,
             tenant: None,
         }
     }

@@ -3,6 +3,10 @@
 //! nichts wird gelöscht oder umnummeriert.
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "h7 display view: fields are read by the slot renderer, which is not mounted yet"
+)]
 pub(crate) struct RecencyEntry {
     pub(crate) child: String,
     pub(crate) text: String,
@@ -14,6 +18,10 @@ pub(crate) struct RecencySlots {
     slot2: Option<RecencyEntry>,
 }
 
+#[allow(
+    dead_code,
+    reason = "h7 display view: slot accessors are for the slot renderer, which is not mounted yet"
+)]
 impl RecencySlots {
     pub(crate) fn new() -> Self {
         Self {

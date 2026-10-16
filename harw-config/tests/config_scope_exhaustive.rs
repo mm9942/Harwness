@@ -162,9 +162,23 @@ fn test_field_table_exhaustive_tui_section() {
         theme,
         keybindings_file,
         child_stream,
+        status_expiry,
+        goal_mode,
     } = TuiSection::default();
-    let _ = (theme, keybindings_file, child_stream);
-    for path in ["tui.theme", "tui.keybindings_file", "tui.child_stream"] {
+    let _ = (
+        theme,
+        keybindings_file,
+        child_stream,
+        status_expiry,
+        goal_mode,
+    );
+    for path in [
+        "tui.theme",
+        "tui.keybindings_file",
+        "tui.child_stream",
+        "tui.status_expiry",
+        "tui.goal_mode",
+    ] {
         assert_path_in_field_table_exactly_once(path);
     }
 }
