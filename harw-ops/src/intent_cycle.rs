@@ -58,10 +58,13 @@ pub const INTENT_CYCLE_INPUT_SCHEMA_VERSION: u32 = 1;
 /// Wall-clock budget of one cycle job.
 const INTENT_CYCLE_MAX_WALL_SECS: i64 = 30 * 60;
 
-/// Attempts: a retryable proposer outage (provider 429/overload) leaves the
-/// cycle non-terminal and the job is retried under a new lease, which
-/// resumes the fenced checkpoint instead of starting over.
-const INTENT_CYCLE_MAX_ATTEMPTS: u32 = 3;
+/// Attempts: one, as for `work_driver`. Consumed wall time and tokens are not
+/// persisted across claims (the job store has no fenced usage update), so an
+/// automatic reclaim after a lost lease would start with a fresh budget.
+/// Provider outages are retried inside the claim by the job worker; after a
+/// crash the cycle stays non-terminal and an explicit operator `/retry`
+/// resumes its fenced checkpoint.
+const INTENT_CYCLE_MAX_ATTEMPTS: u32 = 1;
 
 /// Upper bound (characters) of an acceptance criterion name.
 const MAX_CRITERION_NAME_CHARS: usize = 128;
