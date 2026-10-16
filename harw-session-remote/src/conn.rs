@@ -841,11 +841,11 @@ mod tests {
         // Overflowing the queue: the lagging frame is not recorded and the
         // ended attachment's entry is removed.
         let total = u32::try_from(FRAME_QUEUE_CAP).map_err(|error| error.to_string())?;
-        for live in 3..=total {
+        for live in 3..=total + 1 {
             shared.on_frame(heartbeat(&session, live));
         }
-        assert_eq!(cursor_of(&shared).map(|c| c.live), Some(total));
-        shared.on_frame(heartbeat(&session, total + 1));
+        assert_eq!(cursor_of(&shared).map(|c| c.live), Some(total + 1));
+        shared.on_frame(heartbeat(&session, total + 2));
         assert!(lock(&shared.state).subs.is_empty());
         assert_eq!(cursor_of(&shared), None);
         Ok(())
