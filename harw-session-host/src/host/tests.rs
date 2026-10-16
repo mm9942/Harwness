@@ -847,7 +847,10 @@ async fn driver_error_is_visible_and_next_submit_works() -> TestResult {
     let second = client
         .submit(submit(&session, "two", "m2", Cursor::default()))
         .await?;
-    assert!(matches!(second, SubmitResult::Accepted { .. }), "{second:?}");
+    assert!(
+        matches!(second, SubmitResult::Accepted { .. }),
+        "{second:?}"
+    );
     wait_for(&mut frames, |f| {
         matches!(f, SessionFrame::Turn(TurnEvent::AssistantDelta { text, .. }) if text == "echo two")
     })

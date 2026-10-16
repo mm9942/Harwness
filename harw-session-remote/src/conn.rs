@@ -38,7 +38,7 @@ use harw_node_transport::{LocalNode, NodeTransportClient, NodeVerifier, UpgradeE
 use harw_protocol::methods::{METHOD_SESSION_HELLO, NOTIF_EVENT_FRAME};
 use harw_protocol::session_wire::{HelloAck, HelloParams, SESSION_WIRE_MINOR};
 use harw_protocol::{
-    ClientCaps, FrameEnvelope, FrameSource, PortError, PortFuture, ProtocolVersion,
+    ClientCaps, Cursor, FrameEnvelope, FrameSource, PortError, PortFuture, ProtocolVersion,
     RequestEnvelope, ResponseEnvelope, SessionFrame,
 };
 use harw_session_ws::codec::{Inbound, decode, decode_frame_notification, encode_request};
@@ -128,6 +128,9 @@ struct Pending {
 struct State {
     pending: HashMap<String, Pending>,
     subs: HashMap<SessionId, Arc<Subscription>>,
+    /// Newest seen frame cursor per session (h19: attach/resume path). The
+    /// client presents it as `AttachParams::from` on a re-attach.
+    resume_cursors: crate::reconnect::ResumeCursors,
     /// Set once; after that no request is accepted.
     end: Option<PortError>,
 }
@@ -147,6 +150,17 @@ impl Shared {
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    /// h19: record the newest frame cursor seen for `session` (monotonic;
+    /// used by `RemoteConnection::resume_cursor` on a re-attach).
+    fn record_resume_cursor(&self, session: &SessionId, cursor: Cursor) {
+        let mut state = lock(&self.state);
+        state
+            .resume_cursors
+            .record(session, cursor)
+            .map_err(|error| tracing::warn!(%error, "resume cursor record failed"))
+            .ok();
     }
 
     fn end_error(&self) -> PortError {
@@ -197,6 +211,8 @@ impl Shared {
     /// subscription (detached, never attached) are dropped.
     fn on_frame(&self, envelope: FrameEnvelope) {
         let session = envelope.session_id.clone();
+        // h19: record the newest cursor so a re-attach can resume from it.
+        self.record_resume_cursor(&session, envelope.cursor);
         let sub = lock(&self.state).subs.get(&session).cloned();
         let Some(sub) = sub else {
             tracing::trace!(session = %session.as_str(), "frame for a session without attachment");
@@ -405,6 +421,18 @@ impl RemoteConnection {
     #[must_use]
     pub fn hello_ack(&self) -> &HelloAck {
         &self.hello
+    }
+
+    /// Cursor to resume `session` from, if one was recorded (h19: the
+    /// connection reader records every frame cursor; a re-attach presents
+    /// it as `AttachParams::from` and never fabricates a cursor).
+    #[must_use]
+    pub fn resume_cursor(&self, session: &SessionId) -> Option<Cursor> {
+        lock(&self.shared.state)
+            .resume_cursors
+            .cursor(session)
+            .ok()
+            .flatten()
     }
 
     /// Send one request and await its response (correlated by id).

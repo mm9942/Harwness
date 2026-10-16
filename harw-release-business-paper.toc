@@ -1,0 +1,12 @@
+\babel@toc {german}{}\relax 
+\contentsline {section}{\numberline {1}Kontext und Entscheidungsfrage}{2}{section.1}%
+\contentsline {section}{\numberline {2}Empfehlung und Entscheidungslogik}{2}{section.2}%
+\contentsline {section}{\numberline {3}Belegte Fakten und offene Annahmen}{3}{section.3}%
+\contentsline {section}{\numberline {4}Das Matrix-Game liefert kein Entscheidungsergebnis}{3}{section.4}%
+\contentsline {section}{\numberline {5}Hypothetische Perspektiven und Szenariopfade}{3}{section.5}%
+\contentsline {section}{\numberline {6}Veröffentlichungsgates}{4}{section.6}%
+\contentsline {section}{\numberline {7}Risiken und Mitigationen}{5}{section.7}%
+\contentsline {section}{\numberline {8}Phasenplan und Entscheidungspunkt}{5}{section.8}%
+\contentsline {section}{\numberline {9}Bedingte Empfehlung und offene Punkte}{5}{section.9}%
+\contentsline {section}{\numberline {A}Belegverzeichnis}{6}{appendix.A}%
+\providecommand \tocbasic@end@toc@file {}\tocbasic@end@toc@file 

@@ -87,14 +87,11 @@ async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> 
     // Surface provenance is injected by the composition root. A model may
     // mutate only a job in its exact trusted workspace; a typed Slash command
     // retains the historical tenant-visible operator reach.
-    let mutation_scope = ctx
-        .service::<JobMutationScope>()
-        .copied()
-        .ok_or_else(|| {
-            OpError::NotAvailable(
-                "durable job mutation scope is not configured for this surface".to_owned(),
-            )
-        })?;
+    let mutation_scope = ctx.service::<JobMutationScope>().copied().ok_or_else(|| {
+        OpError::NotAvailable(
+            "durable job mutation scope is not configured for this surface".to_owned(),
+        )
+    })?;
     let visible = match mutation_scope {
         JobMutationScope::BoundWorkspace => {
             crate::job_tenant::get_bound_workspace_job(ctx, store, &work_id_typed).map(|_| ())
@@ -172,11 +169,7 @@ mod tests {
     fn make_test_ctx(
         with_store: bool,
     ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
-        make_test_ctx_with_services(
-            with_store,
-            Some(JobMutationScope::TenantVisible),
-            None,
-        )
+        make_test_ctx_with_services(with_store, Some(JobMutationScope::TenantVisible), None)
     }
 
     fn make_test_ctx_with_services(
@@ -492,11 +485,8 @@ mod tests {
 
     #[tokio::test]
     async fn model_cancel_is_confined_to_the_bound_workspace() -> TestResult {
-        let (op_ctx, root, store) = make_test_ctx_with_services(
-            true,
-            Some(JobMutationScope::BoundWorkspace),
-            None,
-        )?;
+        let (op_ctx, root, store) =
+            make_test_ctx_with_services(true, Some(JobMutationScope::BoundWorkspace), None)?;
         let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-other-workspace");
         let mut record = admitted_job(work_id.as_str())?;
@@ -507,7 +497,9 @@ mod tests {
                 id: "test-operator".to_owned(),
             },
         );
-        store.admit(&record).map_err(ctx("admit foreign workspace job"))?;
+        store
+            .admit(&record)
+            .map_err(ctx("admit foreign workspace job"))?;
 
         let result = cancel(
             &op_ctx,
@@ -519,7 +511,11 @@ mod tests {
         .await;
         assert!(matches!(result, Err(OpError::Execution(_))));
         assert_eq!(
-            store.get(&work_id).map_err(ctx("read untouched job"))?.job.state,
+            store
+                .get(&work_id)
+                .map_err(ctx("read untouched job"))?
+                .job
+                .state,
             JobState::Ready
         );
         std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
@@ -575,11 +571,14 @@ mod tests {
         assert_eq!(control.forced.load(Ordering::SeqCst), 0);
         assert!(executions.is_empty());
         assert_eq!(
-            store.get(&work_id).map_err(ctx("read cancelled live job"))?.job.state,
+            store
+                .get(&work_id)
+                .map_err(ctx("read cancelled live job"))?
+                .job
+                .state,
             JobState::Cancelled
         );
         std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
         Ok(())
     }
-
 }

@@ -230,6 +230,7 @@
 mod build;
 mod document;
 mod error;
+pub mod file_metadata;
 mod status;
 #[cfg(test)]
 mod test_support;

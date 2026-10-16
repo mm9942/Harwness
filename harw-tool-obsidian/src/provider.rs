@@ -72,7 +72,15 @@ mod tests {
     fn provider_resolves_known_and_rejects_unknown() {
         let provider = ObsidianToolProvider::new();
         assert!(provider.executor(&ToolName::new("obsidian.read")).is_some());
-        assert!(provider.executor(&ToolName::new("obsidian.write")).is_some());
-        assert!(provider.executor(&ToolName::new("obsidian.delete")).is_none());
+        assert!(
+            provider
+                .executor(&ToolName::new("obsidian.write"))
+                .is_some()
+        );
+        assert!(
+            provider
+                .executor(&ToolName::new("obsidian.delete"))
+                .is_none()
+        );
     }
 }

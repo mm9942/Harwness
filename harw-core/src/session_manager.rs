@@ -94,14 +94,9 @@ impl SessionManager {
                 "cannot create duplicate governed session {id}"
             )));
         }
-        let mut session = AgentSession::new_with_id(
-            id.clone(),
-            role,
-            parent,
-            registry,
-            self.event_tx.clone(),
-        )
-        .with_spawn_context(spawn_context);
+        let mut session =
+            AgentSession::new_with_id(id.clone(), role, parent, registry, self.event_tx.clone())
+                .with_spawn_context(spawn_context);
         self.attach_hub(&mut session);
         self.sessions.insert(id.as_str().to_owned(), session);
         Ok(())

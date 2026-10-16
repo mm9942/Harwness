@@ -126,6 +126,51 @@ impl ResumeCursors {
 mod tests {
     use super::*;
 
+    /// h19: the attach/resume path records every seen frame cursor
+    /// monotonically — the value a re-attach later presents as
+    /// `AttachParams::from` is always the newest actually observed cursor.
+    #[test]
+    fn resume_cursors_are_monotonic_for_the_attach_path() {
+        let session = SessionId::try_from_str("s-resume").expect("valid session id");
+        let mut cursors = ResumeCursors::new();
+        assert!(cursors.cursor(&session).ok().flatten().is_none());
+
+        let first = Cursor {
+            generation: 0,
+            durable: 3,
+            live: 1,
+        };
+        cursors.record(&session, first).expect("record first");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(first));
+
+        // Older or equal cursor: ignored.
+        let older = Cursor {
+            generation: 0,
+            durable: 2,
+            live: 9,
+        };
+        cursors.record(&session, older).expect("record older");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(first));
+
+        // Newer cursor replaces the stored one.
+        let newer = Cursor {
+            generation: 0,
+            durable: 3,
+            live: 5,
+        };
+        cursors.record(&session, newer).expect("record newer");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(newer));
+
+        // Higher generation replaces outright even with lower durable.
+        let regen = Cursor {
+            generation: 1,
+            durable: 0,
+            live: 0,
+        };
+        cursors.record(&session, regen).expect("record regen");
+        assert_eq!(cursors.cursor(&session).ok().flatten(), Some(regen));
+    }
+
     #[test]
     fn default_policy_first_delay_is_bounded() {
         let delay = BackoffPolicy::default().delay(0, 0);

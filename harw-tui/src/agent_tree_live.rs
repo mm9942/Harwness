@@ -481,13 +481,22 @@ mod tests {
             projected.reasoning_preview.as_deref(),
             Some("Ich prüfe die Abhängigkeiten")
         );
-        assert_eq!(projected.preview.as_deref(), Some("Zwischenstand vorhanden"));
+        assert_eq!(
+            projected.preview.as_deref(),
+            Some("Zwischenstand vorhanden")
+        );
 
         let mut rows = vec![row("reasoning-child", Some("uia"))];
         enrich_rows(&mut rows, &monitor, |_| None, Instant::now());
         let details = detail_lines(&rows[0]).join("\n");
-        assert!(details.contains("Reasoning: ∴ Ich prüfe die Abhängigkeiten"), "{details}");
-        assert!(details.contains("Zwischenstand: Zwischenstand vorhanden"), "{details}");
+        assert!(
+            details.contains("Reasoning: ∴ Ich prüfe die Abhängigkeiten"),
+            "{details}"
+        );
+        assert!(
+            details.contains("Zwischenstand: Zwischenstand vorhanden"),
+            "{details}"
+        );
         Ok(())
     }
     /// Ein laufendes Kind zeigt Live-Tokens, Tools und Dauer statt `—`.
