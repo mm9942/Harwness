@@ -143,7 +143,7 @@ pub trait AssemblyContributor: Send + Sync {
 ///   Werkzeuge `mcp.<server>.<tool>` (No-op ohne aktive `[mcps.*]`).
 /// - [`InfrastructureContributor`]: die `infra.*`-Operationen, wenn
 ///   `[infrastructure]` konfiguriert ist (No-op ohne die Sektion).
-/// - [`GatewayDiagnosticsContributor`]: `gateway.health`/`gateway.logs`/
+/// - [`GatewayDiagnosticsContributor`][]: `gateway.health`/`gateway.logs`/
 ///   `gateway.channels.*` für eine UIA-Wurzel (No-op für jede andere Wurzel).
 /// - [`CloudOpsContributor`]: die `cloud.*`-Operationen des Cloud-Home-Stacks
 ///   (`cloud.status`, `cloud.enrollments.list`, `cloudctl.*`) für die
