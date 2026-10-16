@@ -164,7 +164,7 @@ jobs:
       # nextest führt jeden Test in einem eigenen Prozess parallel aus; Doc-Tests
       # unterstützt nextest nicht, die laufen separat über `cargo test --doc`.
       - name: cargo nextest run
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --no-fail-fast
 
       - name: cargo test --doc
         run: cargo test --workspace --doc
