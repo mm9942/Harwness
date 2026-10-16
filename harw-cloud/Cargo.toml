@@ -1,9 +1,10 @@
 [package]
 name = "harw-cloud"
-version = "0.9.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.85"
 publish = false
+license.workspace = true
 
 [dependencies]
 harw-cloud-enroll = { path = "harw-cloud-enroll" }

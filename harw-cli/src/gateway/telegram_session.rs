@@ -821,7 +821,11 @@ impl Engine {
             Ok(session_id) => session_id,
             Err(error) => {
                 tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram operation session id unavailable");
-                self.notify(runtime, target, "Die Sitzung konnte nicht geladen werden.".to_owned());
+                self.notify(
+                    runtime,
+                    target,
+                    "Die Sitzung konnte nicht geladen werden.".to_owned(),
+                );
                 return;
             }
         };
@@ -834,7 +838,11 @@ impl Engine {
             ),
             Err(error) => {
                 tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram operation chat state could not be read");
-                self.notify(runtime, target, "Der Chat-Zustand konnte nicht gelesen werden.".to_owned());
+                self.notify(
+                    runtime,
+                    target,
+                    "Der Chat-Zustand konnte nicht gelesen werden.".to_owned(),
+                );
                 return;
             }
         };

@@ -259,7 +259,10 @@ mod tests {
 
     #[test]
     fn name_projection_is_telegram_safe_and_bounded() {
-        assert_eq!(normalize_telegram_name("/context-proposal"), "context_proposal");
+        assert_eq!(
+            normalize_telegram_name("/context-proposal"),
+            "context_proposal"
+        );
         assert_eq!(normalize_telegram_name("/Agent/STATUS"), "agent_status");
         let fitted = fit_telegram_name(
             "this_command_name_is_much_too_long_for_telegram",

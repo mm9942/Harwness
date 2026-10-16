@@ -252,7 +252,8 @@ impl TelegramClient {
         &self,
         scope: &BotCommandScope,
     ) -> TransportResult<Vec<BotCommand>> {
-        self.call("getMyCommands", GetMyCommandsRequest { scope }).await
+        self.call("getMyCommands", GetMyCommandsRequest { scope })
+            .await
     }
 
     /// Entfernt die Befehlsliste eines [`BotCommandScope`]; Telegram fällt
