@@ -74,8 +74,14 @@ mod child_info_tests {
     #[test]
     fn long_info_is_truncated_with_ellipsis() {
         let out = child_info_segment("writer", Some("uuuu vvvv wwww"), 5, 10);
-        assert_eq!(out, "writer · uuuu vvv… · 5s");
-        assert_eq!(out.chars().count(), 21);
+        // Budget 10 Zeichen inklusive `…`: 9 Zeichen "uuuu vvvv" + `…`.
+        assert_eq!(out, "writer · uuuu vvvv… · 5s");
+        let info = out
+            .strip_prefix("writer · ")
+            .and_then(|rest| rest.strip_suffix(" · 5s"))
+            .unwrap_or_default();
+        assert_eq!(info.chars().count(), 10);
+        assert_eq!(out.chars().count(), 24);
     }
 
     #[test]
