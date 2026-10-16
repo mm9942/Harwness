@@ -174,23 +174,17 @@ pub(super) async fn execute_intent_cycle_claim(
             };
         }
     };
+    // Budget first: an exhausted wall budget must never become a fresh one,
+    // and no record is created or model called for it.
+    let Some(remaining) = remaining_wall(&claim.job.budget, &claim.job.usage) else {
+        return JobOutcome::Failed {
+            reason: "budget: the wall-clock budget is already exhausted".to_owned(),
+        };
+    };
     if let Err(reason) = ensure_record(&store, &cycle_input, &claim, &plan.admission, &authority) {
         return JobOutcome::Failed { reason };
     }
 
-    let remaining = match claim.job.budget.max_wall {
-        Some(max_wall) => {
-            match Duration::try_from(max_wall.saturating_sub(claim.job.usage.wall)) {
-                Ok(left) if !left.is_zero() => left,
-                _ => {
-                    return JobOutcome::Failed {
-                        reason: "budget: the wall-clock budget is already exhausted".to_owned(),
-                    };
-                }
-            }
-        }
-        None => DEFAULT_CYCLE_WALL,
-    };
     let ledger = PromptTokenLedger::new(claim.job.budget.clone(), claim.job.usage.clone());
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: Arc::clone(&provider),
@@ -274,6 +268,20 @@ pub(super) async fn execute_intent_cycle_claim(
         (other, _) => other,
     };
     sanitize_outcome(outcome)
+}
+
+/// Wall time left for this claim: `max_wall - used`, `None` once nothing is
+/// left (never a fresh default); [`DEFAULT_CYCLE_WALL`] only without a budget.
+fn remaining_wall(
+    budget: &harw_job_runtime::Budget,
+    usage: &harw_job_runtime::BudgetUsage,
+) -> Option<Duration> {
+    match budget.max_wall {
+        Some(max_wall) => Duration::try_from(max_wall.saturating_sub(usage.wall))
+            .ok()
+            .filter(|left| !left.is_zero()),
+        None => Some(DEFAULT_CYCLE_WALL),
+    }
 }
 
 /// Creates the cycle record on the first claim; later claims must find a
@@ -374,6 +382,31 @@ fn sanitize_outcome(outcome: JobOutcome) -> JobOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_wall_budget_is_never_refreshed() {
+        use harw_job_runtime::{Budget, BudgetUsage};
+        use jiff::SignedDuration;
+        let budget = Budget {
+            max_tokens: None,
+            max_wall: Some(SignedDuration::from_secs(60)),
+            max_tool_calls: None,
+        };
+        let mut usage = BudgetUsage::default();
+        assert_eq!(
+            remaining_wall(&budget, &usage),
+            Some(Duration::from_secs(60))
+        );
+        usage.wall = SignedDuration::from_secs(60);
+        assert_eq!(remaining_wall(&budget, &usage), None);
+        usage.wall = SignedDuration::from_secs(3_600);
+        assert_eq!(remaining_wall(&budget, &usage), None, "overdrawn stays exhausted");
+        let unbounded = Budget {
+            max_wall: None,
+            ..budget
+        };
+        assert_eq!(remaining_wall(&unbounded, &usage), Some(DEFAULT_CYCLE_WALL));
+    }
 
     #[test]
     fn only_the_intent_cycle_kind_matches() {
