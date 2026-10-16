@@ -3916,6 +3916,11 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
             // `ServiceMap`.
             let _registered =
                 harw_ops::register_work_driver_tools(&mut registry, &plan.plan_config);
+            // PL-90: Intent-Zyklen hängen am selben Gate (siehe
+            // `harw_ops::register_intent_cycle_tools`); der Job-Worker in
+            // `harw-cli` führt die zugelassenen `intent_cycle`-Jobs aus.
+            let _registered =
+                harw_ops::register_intent_cycle_tools(&mut registry, &plan.plan_config);
         }
         registry
     }

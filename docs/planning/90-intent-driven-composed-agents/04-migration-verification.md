@@ -185,15 +185,33 @@ What is NOT done:
 - No retry backoff (the provider layer owns pacing and `Retry-After`).
 - No small-model benchmark (the W03 exit criterion in section 2 is still open).
 
-### 7.4 Not done (PLANNED)
+### 7.4 Production wiring of the read-only recipe — IN PR (MIG-PL90-W03w)
 
-- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). W03 now has its building blocks (7.3) but no wiring or benchmark; W04 is open.
+The W03 building blocks are now reachable end to end:
+
+| Layer | What | Where |
+|---|---|---|
+| Verifier | `ContentCheck` per acceptance criterion; `Verify` re-reads the observed file, requires the same digest, yields `Verified` evidence (source `Verification`) or an `unmet:`/`stale:` claim. `Complete` is now reachable without trusting the model | `harw-plan-bridge/src/cycle_verifier.rs` |
+| Executor | `ExplorerCycleExecutor` = read-only explorer (read, wait) + verifier (verify); everything else refused | same |
+| Spec | `ReadOnlyCycleSpec` (objective, read targets, checks, limits ≤ `MAX_CYCLE_LIMITS`), one canonical intent digest, `plan()` = the single validation of operation and worker | `harw-plan-bridge/src/cycle_spec.rs` |
+| Reissue | `CeilingReissuer`: persisted snapshot ∩ current trusted ceiling of the same workspace (never widens) | `cycle_runtime.rs` |
+| Tools | `intent_cycle.start` (approval always), `.status` (read-only), `.stop` (approval always); behind `[tools.plan]`; `ReadWorkspace` right; catalog class `Read`/`Meta` | `harw-ops/src/intent_cycle.rs`, `harw-registry-defaults` |
+| Job | kind `intent_cycle`, long-run lane, claim fence, read-only explore sandbox as ceiling, record created on first claim (epoch 0 → first lease rebinds), budgeted proposer, job cancel → driver cancel, wall budget | `harw-cli/src/job_worker_intent_cycle.rs` |
+
+Verified locally: `cargo test -p harw-plan-bridge` (cycle tests incl. `spec_read_verify_complete_reaches_completion_proposed`), `cargo test -p harw-ops`, `cargo test -p harw-registry-defaults`, `cargo test -p harw-cli --lib intent_cycle` (worker e2e: admitted job → `Succeeded { terminal: completion_proposed, requires_owner_acceptance: true }`).
+
+Proposer cancellation: the driver races every `propose` against the job's cancel token (`tokio::select!`), so a stop or lease loss drops an in-flight model request; the trait itself still takes no token.
+
+### 7.5 Not done (PLANNED)
+
+- No concrete executor for tools beyond file reads, child spawn or nested recipes; no write-capable adapter (W05). W04 is open.
+- No small-model benchmark (W03 exit criterion).
 - Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
 
 - W03 wiring and W04–W10: no wired explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
 - Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
 
-### 7.5 Base-branch notes found while verifying
+### 7.6 Base-branch notes found while verifying
 
 - `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
 - The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).

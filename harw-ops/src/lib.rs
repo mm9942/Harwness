@@ -117,6 +117,11 @@
 //! Controller-Kreis — Recherche erzeugt Findings, `plan reconcile` macht
 //! Evidenz daraus, `goal check` wertet sie gegen die Kriterien aus.
 //!
+//! **Intent-Zyklus-Fläche** ([`register_intent_cycle_tools`], 3 Ops, hinter
+//! demselben Gate): `intent_cycle.start`, `intent_cycle.status`,
+//! `intent_cycle.stop` (PL-90, siehe `intent_cycle`-Moduldoku). Ebenfalls
+//! nur Modell-Tool- und Web-Flächen.
+//!
 //! **WorkDriver-Fläche** ([`register_work_driver_tools`], 3 Ops, hinter
 //! demselben Gate): `work_driver.enqueue`, `work_driver.status`,
 //! `work_driver.stop`. Nur Modell-Tool- und Web-Flächen, bewusst kein
@@ -252,6 +257,9 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod usage;
+// PL-90: `intent_cycle.*` (start/status/stop) — dauerhafte, nur lesende
+// Intent-Zyklen; registriert über `register_intent_cycle_tools`.
+pub mod intent_cycle;
 pub mod work;
 pub mod work_result;
 // R14: `work_driver.*` (enqueue/status/stop) — nur Tool- und Web-Flächen,
@@ -651,6 +659,58 @@ register_ops! {
     ];
 }
 
+/// Registriert die Intent-Zyklus-Operationen (PL-90) — hinter demselben
+/// Gate wie die Planungsfläche.
+///
+/// # Beschreibung
+/// Fügt `intent_cycle.start`, `intent_cycle.status` und `intent_cycle.stop`
+/// hinzu (siehe [`intent_cycle`]-Moduldoku). Ist `[tools.plan] enabled` aus,
+/// wird nichts registriert. Die Runtime ruft diese Funktion direkt nach
+/// [`register_work_driver_tools`] auf.
+///
+/// # Rückgabe
+/// [`INTENT_CYCLE_TOOL_COUNT`] oder `0`.
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::registry::OperationRegistry;
+/// use harw_plan::config::PlanToolConfig;
+///
+/// let mut registry = OperationRegistry::new();
+/// assert_eq!(
+///     harw_ops::register_intent_cycle_tools(&mut registry, &PlanToolConfig::default()),
+///     0
+/// );
+/// let added = harw_ops::register_intent_cycle_tools(
+///     &mut registry,
+///     &PlanToolConfig::enabled_defaults(),
+/// );
+/// assert_eq!(added, harw_ops::INTENT_CYCLE_TOOL_COUNT);
+/// assert!(registry.find_by_name("intent_cycle.start").is_some());
+/// ```
+pub fn register_intent_cycle_tools(
+    registry: &mut OperationRegistry,
+    config: &PlanToolConfig,
+) -> usize {
+    if !config.enabled {
+        return 0;
+    }
+    for op in intent_cycle_ops() {
+        registry.register(op);
+    }
+    INTENT_CYCLE_TOOL_COUNT
+}
+
+register_ops! {
+    /// Anzahl der Operationen, die [`register_intent_cycle_tools`] bei aktivem Gate hinzufügt.
+    pub const INTENT_CYCLE_TOOL_COUNT;
+    fn intent_cycle_ops = [
+        Arc::new(intent_cycle::IntentCycleStartOperation),
+        Arc::new(intent_cycle::IntentCycleStatusOperation),
+        Arc::new(intent_cycle::IntentCycleStopOperation),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{compact_unavailable_output, register_all};
@@ -667,6 +727,7 @@ mod tests {
         register_all(&mut reg);
         super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         reg
     }
 
@@ -766,6 +827,24 @@ mod tests {
             WebMethod::Post,
             ApprovalPolicy::Always,
         ),
+        (
+            "intent_cycle.start",
+            "/api/intent-cycle/start",
+            WebMethod::Post,
+            ApprovalPolicy::Always,
+        ),
+        (
+            "intent_cycle.status",
+            "/api/intent-cycle/status",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
+        (
+            "intent_cycle.stop",
+            "/api/intent-cycle/stop",
+            WebMethod::Post,
+            ApprovalPolicy::Always,
+        ),
     ];
 
     #[test]
@@ -824,6 +903,8 @@ mod tests {
                     | "analyze"
                     | "work_driver.enqueue"
                     | "work_driver.stop"
+                    | "intent_cycle.start"
+                    | "intent_cycle.stop"
             );
             let expected = if is_mutating {
                 WebMethod::Post
@@ -864,6 +945,9 @@ mod tests {
             ("work_driver.enqueue", PermissionTier::Operator),
             ("work_driver.status", PermissionTier::Observer),
             ("work_driver.stop", PermissionTier::Operator),
+            ("intent_cycle.start", PermissionTier::Operator),
+            ("intent_cycle.status", PermissionTier::Observer),
+            ("intent_cycle.stop", PermissionTier::Operator),
         ];
         for (name, tier) in expected_permissions {
             let op = reg.find_by_name(name.trim()).ok_or_else(|| {
@@ -1113,6 +1197,7 @@ mod tests {
         register_all(&mut reg);
         super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
 
         let registered_names: std::collections::BTreeSet<&str> =
             reg.iter().map(|op| op.meta().name).collect();
@@ -1189,6 +1274,9 @@ mod tests {
             "work_driver.enqueue",
             "work_driver.status",
             "work_driver.stop",
+            "intent_cycle.start",
+            "intent_cycle.status",
+            "intent_cycle.stop",
         ];
 
         for name in declared_names {

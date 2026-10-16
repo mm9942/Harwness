@@ -70,7 +70,7 @@
 use harw_authority::{Permission, PermissionSet};
 
 use crate::capability_catalog::{
-    WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
+    INTENT_CYCLE_TOOLS, WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
@@ -720,6 +720,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // `job.status`/`job.stop`.
         || tool == WORK_DRIVER_STATUS_TOOL
         || tool == WORK_DRIVER_STOP_TOOL
+        // PL-90: an intent cycle only reads the named workspace files
+        // (read-only explorer + deterministic verifier); start, status and
+        // stop therefore need exactly the read right.
+        || listed(INTENT_CYCLE_TOOLS)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(&CONTAINER_TOOLS) {

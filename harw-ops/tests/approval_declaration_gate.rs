@@ -46,6 +46,13 @@ fn full_registry() -> OperationRegistry {
         harw_ops::WORK_DRIVER_TOOL_COUNT,
         "WorkDriver-Fläche muss registriert sein"
     );
+    let added =
+        harw_ops::register_intent_cycle_tools(&mut registry, &PlanToolConfig::enabled_defaults());
+    assert_eq!(
+        added,
+        harw_ops::INTENT_CYCLE_TOOL_COUNT,
+        "Intent-Zyklus-Fläche muss registriert sein"
+    );
     // R18: die `gateway.*`-Fläche einer UIA-Wurzel (mit und ohne Port).
     let added = harw_ops::gateway_ops::register_gateway(&mut registry);
     assert_eq!(added.ok(), Some(harw_ops::gateway_ops::GATEWAY_OP_COUNT));

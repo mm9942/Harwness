@@ -98,6 +98,8 @@ pub mod controller;
 pub mod cycle_explorer;
 pub mod cycle_proposer;
 pub mod cycle_runtime;
+pub mod cycle_spec;
+pub mod cycle_verifier;
 pub mod error;
 pub mod finding_store;
 pub mod fragment_registry;
@@ -125,10 +127,18 @@ pub use crate::cycle_proposer::{
     refusal_hint, render_prompt, render_prompt_with,
 };
 pub use crate::cycle_runtime::{
-    AuthorityReissuer, CYCLE_RECORD_SCHEMA, CycleDriver, CycleDriverConfig, CycleJobFuture,
-    CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome, CycleStatus, CycleStepExecutor,
-    CycleStore, CycleStoreError, InFlightStep, PolicyReissuer, StepFailure, StepReconciliation,
-    cycle_job_operation, job_outcome,
+    AuthorityReissuer, CYCLE_RECORD_SCHEMA, CYCLE_STORE_DIR, CeilingReissuer, CycleDriver,
+    CycleDriverConfig, CycleJobFuture, CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome,
+    CycleStatus, CycleStepExecutor, CycleStore, CycleStoreError, INTENT_CYCLE_JOB_KIND,
+    InFlightStep, PolicyReissuer, StepFailure, StepReconciliation, cycle_job_operation,
+    job_outcome,
+};
+pub use crate::cycle_spec::{
+    CycleSpecError, DEFAULT_CYCLE_LIMITS, MAX_CYCLE_LIMITS, READ_ONLY_CYCLE_SPEC_SCHEMA,
+    ReadOnlyCyclePlan, ReadOnlyCycleSpec,
+};
+pub use crate::cycle_verifier::{
+    AcceptanceChecks, CheckError, ContentCheck, ExplorerCycleExecutor, MAX_ACCEPTANCE_CHECKS,
 };
 pub use crate::error::{PlanBridgeError, PlanBridgeResult};
 pub use crate::finding_store::{

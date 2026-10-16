@@ -34,6 +34,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -54,6 +55,15 @@ use crate::intent_cycle::{
 
 /// Schema version of [`CycleRecord`].
 pub const CYCLE_RECORD_SCHEMA: u32 = 1;
+
+/// `JobKind::Custom` discriminator of an intent-cycle job. Shared by
+/// `intent_cycle.start` (harw-ops), the job worker (harw-cli) and
+/// `harw_runtime::job_ledger`.
+pub const INTENT_CYCLE_JOB_KIND: &str = "intent_cycle";
+
+/// Directory of the [`CycleStore`] below the durable job root
+/// (`<job-root>/intent_cycle/`), next to the job store's own sidecars.
+pub const CYCLE_STORE_DIR: &str = "intent_cycle";
 
 /// Default number of consecutive admission refusals before escalation.
 pub const DEFAULT_MAX_REFUSALS_PER_STEP: u8 = 3;
@@ -217,6 +227,25 @@ impl CycleStore {
     #[must_use]
     pub fn new(records: RecordStore<CycleRecord>) -> Self {
         Self { records }
+    }
+
+    /// Opens (creating if needed) the store at `<job_root>/`[`CYCLE_STORE_DIR`].
+    ///
+    /// # Errors
+    /// The underlying store error.
+    pub fn open_in_job_root(job_root: &Path) -> Result<Self, CycleStoreError> {
+        Ok(Self::new(RecordStore::create_ambient(
+            &job_root.join(CYCLE_STORE_DIR),
+        )?))
+    }
+
+    /// Opens the store at `<job_root>/`[`CYCLE_STORE_DIR`] if it exists;
+    /// creates nothing (status reads must not create directories).
+    ///
+    /// # Errors
+    /// The underlying store error.
+    pub fn open_existing_in_job_root(job_root: &Path) -> Result<Option<Self>, CycleStoreError> {
+        Ok(RecordStore::open_existing_ambient(&job_root.join(CYCLE_STORE_DIR))?.map(Self::new))
     }
 
     /// Persists a new record; an existing id is never overwritten.
@@ -483,6 +512,32 @@ impl AuthorityReissuer for PolicyReissuer {
         self.bootstrap
             .reissue(self.workspace.clone(), snapshot)
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Reissuer for runtimes whose authority does not come from a
+/// [`PolicyBootstrap`] (job workers assembled from the runtime profile
+/// table): the persisted snapshot is cut against the *current* trusted
+/// context of the same workspace. The result is the intersection, so it can
+/// only keep or drop what the snapshot recorded — never add.
+#[derive(Debug, Clone)]
+pub struct CeilingReissuer {
+    ceiling: AuthorityContext,
+}
+
+impl CeilingReissuer {
+    #[must_use]
+    pub fn new(ceiling: AuthorityContext) -> Self {
+        Self { ceiling }
+    }
+}
+
+impl AuthorityReissuer for CeilingReissuer {
+    fn reissue(&self, snapshot: &AuthoritySnapshot) -> Result<AuthorityContext, String> {
+        if !snapshot.workspace().matches(self.ceiling.workspace()) {
+            return Err("snapshot belongs to another workspace".to_owned());
+        }
+        Ok(self.ceiling.restrict(snapshot.request()))
     }
 }
 

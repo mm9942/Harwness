@@ -275,3 +275,102 @@ async fn advance_read_then_reorient_on_evidence_then_escalate() -> TestResult {
     }
     Ok(())
 }
+
+/// Production composition: a [`ReadOnlyCycleSpec`] rebuilt into admission,
+/// target map and checks; the [`ExplorerCycleExecutor`] reads, the
+/// deterministic verifier turns the observation into `Verified` evidence,
+/// and the cycle reaches `CompletionProposed` — first resumed under a new
+/// lease through the narrowing-only [`CeilingReissuer`].
+#[tokio::test]
+async fn spec_read_verify_complete_reaches_completion_proposed() -> TestResult {
+    use std::collections::BTreeMap;
+
+    use crate::cycle_runtime::CeilingReissuer;
+    use crate::cycle_spec::ReadOnlyCycleSpec;
+    use crate::cycle_verifier::{ContentCheck, ExplorerCycleExecutor};
+
+    let ws = Workspace::new()?;
+    ws.write("src/one.rs", FILE_ONE)?;
+    let authority = ws.authority()?;
+    let spec = ReadOnlyCycleSpec::new(
+        "does the first file define its marker?".to_owned(),
+        BTreeMap::from([("source".to_owned(), "src/one.rs".to_owned())]),
+        BTreeMap::from([(
+            "marker-defined".to_owned(),
+            ContentCheck {
+                target: "source".to_owned(),
+                must_contain: vec!["fn first_file_body_marker".to_owned()],
+                must_not_contain: vec!["todo!()".to_owned()],
+            },
+        )]),
+        None,
+    );
+    let plan = spec.plan("intent-spec").map_err(ctx("spec plans"))?;
+
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    let records =
+        RecordStore::create_ambient(&temp.path().join("cycles")).map_err(ctx("record store"))?;
+    let store = Arc::new(CycleStore::new(records));
+    let work_id = WorkId::from_str("job-spec-it");
+    let record = CycleRecord::new(
+        "cycle-spec",
+        work_id.clone(),
+        CycleCheckpoint::initial(&plan.admission, &authority, 0),
+    )
+    .map_err(ctx("record builds"))?;
+    store.create(&record).map_err(ctx("record persists"))?;
+
+    let provider = Scripted::new(&[
+        r#"{"kind":"advance","segments":[{"kind":"read","target":"source"}]}"#,
+        r#"{"kind":"verify","evidence_id":"cycle-spec-0:source"}"#,
+        r#"{"kind":"complete"}"#,
+    ]);
+    let routes = RoutePolicy::new(ProposerRoute {
+        model: ModelId::from("m-default"),
+        effort: None,
+        max_output_tokens: 256,
+    });
+    let proposer = ModelCycleProposer::new(Arc::clone(&provider) as Arc<dyn ModelProvider>, routes);
+    let executor = ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks);
+    let mut driver = CycleDriver::new(
+        Arc::clone(&store),
+        proposer,
+        executor,
+        Arc::new(CeilingReissuer::new(authority)),
+    );
+    let lease = LeaseToken {
+        work_id,
+        epoch: 1,
+        nonce: "nonce-1".to_owned(),
+    };
+    let outcome = driver
+        .run("cycle-spec", &lease, &plan.admission, &CancelToken::new())
+        .await
+        .map_err(ctx("driver runs"))?;
+    let CycleRunOutcome::Terminal {
+        terminal,
+        checkpoint,
+    } = outcome
+    else {
+        return Err(TestError::Missing("terminal outcome"));
+    };
+    assert_eq!(terminal, CycleTerminal::CompletionProposed);
+    assert_eq!(provider.calls(), 3);
+    let covering = checkpoint
+        .criteria_met
+        .get("marker-defined")
+        .ok_or(TestError::Missing("criterion covered"))?;
+    let evidence = checkpoint
+        .evidence
+        .get(covering)
+        .ok_or(TestError::Missing("covering evidence"))?;
+    assert_eq!(evidence.trust, EvidenceTrust::Verified);
+    assert_eq!(evidence.source, EvidenceSourceKind::Verification);
+    let stored = store.load("cycle-spec").map_err(ctx("reload"))?;
+    assert_eq!(
+        stored.status().terminal,
+        Some(CycleTerminal::CompletionProposed)
+    );
+    assert_eq!(stored.checkpoint.fence.epoch, 1);
+    Ok(())
+}

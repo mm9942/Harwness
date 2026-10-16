@@ -337,15 +337,15 @@ fn read_targets(proposal: &CycleProposal) -> Result<Vec<&str>, StepFailure> {
 }
 
 /// One completed read.
-struct ReadOutcome {
-    locator: String,
-    digest: ContentDigest,
-    text: String,
-    bytes: usize,
+pub(crate) struct ReadOutcome {
+    pub(crate) locator: String,
+    pub(crate) digest: ContentDigest,
+    pub(crate) text: String,
+    pub(crate) bytes: usize,
 }
 
 /// Reads one file through `scope`. Blocking; call from `spawn_blocking`.
-fn read_beneath(
+pub(crate) fn read_beneath(
     scope: &Scope,
     relative: &str,
     max_read: usize,

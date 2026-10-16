@@ -268,6 +268,19 @@ pub const WORK_DRIVER_ENQUEUE_TOOL: &str = "work_driver.enqueue";
 pub const WORK_DRIVER_STATUS_TOOL: &str = "work_driver.status";
 /// `work_driver.stop`: cancels a WorkDriver job through the job cancel path.
 pub const WORK_DRIVER_STOP_TOOL: &str = "work_driver.stop";
+/// `intent_cycle.start` (PL-90, `harw-ops/src/intent_cycle.rs`): starts a
+/// durable, read-only intent cycle (explorer + deterministic verifier).
+pub const INTENT_CYCLE_START_TOOL: &str = "intent_cycle.start";
+/// `intent_cycle.status`: reads an intent-cycle job and its bounded status.
+pub const INTENT_CYCLE_STATUS_TOOL: &str = "intent_cycle.status";
+/// `intent_cycle.stop`: cancels an intent-cycle job through the job cancel path.
+pub const INTENT_CYCLE_STOP_TOOL: &str = "intent_cycle.stop";
+/// The three intent-cycle tools.
+pub const INTENT_CYCLE_TOOLS: &[&str] = &[
+    INTENT_CYCLE_START_TOOL,
+    INTENT_CYCLE_STATUS_TOOL,
+    INTENT_CYCLE_STOP_TOOL,
+];
 /// The three WorkDriver tools.
 pub const WORK_DRIVER_TOOLS: &[&str] = &[
     WORK_DRIVER_ENQUEUE_TOOL,
@@ -373,6 +386,13 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("work_driver.stop", AGENTS, Meta),
     // Only WorkDriver worker turns get it; it records the worker's report.
     row!("work_driver.report", AGENTS, Meta),
+    // Intent cycles (PL-90): `intent_cycle.start` admits a durable job that
+    // only READS the named workspace files (explorer + deterministic
+    // verifier, no process, no write, no network) — `Read`, not `Shell`.
+    // Status and stop only read or cancel a job record (`Meta`).
+    row!("intent_cycle.start", AGENTS, Read),
+    row!("intent_cycle.status", AGENTS, Meta),
+    row!("intent_cycle.stop", AGENTS, Meta),
     // gateway (R18): operations in `harw-ops`, served to the UIA root like
     // `work_driver.*`. Reads inspect the gateway; mutations act on it outside
     // the sandbox and always ask.
