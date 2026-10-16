@@ -105,7 +105,7 @@ layer = "F"
 layer = "F"
 [packages."harw-tui-layout"]
 layer = "F"
-# Reines Step-/TODO-Datenmodell (nur serde), von harw-tui gelesen (h21).
+# Reines Step-/TODO-Datenmodell (nur serde und serde_json), von harw-tui gelesen (h21).
 [packages."harw-step-list"]
 layer = "F"
 

@@ -686,9 +686,14 @@ mod tests {
     }
 
     fn fixture() -> TestResult<Fixture> {
+        fixture_scoped(None)
+    }
+
+    /// Like [`fixture`]; the context is scoped to `tenant` (H12) if given.
+    fn fixture_scoped(tenant: Option<&str>) -> TestResult<Fixture> {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         std::fs::create_dir_all(dir.path().join("ws")).map_err(ctx("workspace"))?;
-        let binding = WorkspaceRegistry::build(
+        let registry = WorkspaceRegistry::build(
             dir.path(),
             [WorkspaceRegistration {
                 tenant: TenantId::from_str("test-tenant"),
@@ -696,12 +701,13 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .map_err(ctx("workspace registry"))?
-        .resolve(
-            &TenantId::from_str("test-tenant"),
-            &WorkspaceId::from_str("ws"),
-        )
-        .map_err(ctx("resolve workspace"))?;
+        .map_err(ctx("workspace registry"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("ws"),
+            )
+            .map_err(ctx("resolve workspace"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
         let jobs = Arc::new(JobStore::new(&dir.path().join("state")));
         let mut services = ServiceMap::new();
@@ -712,9 +718,14 @@ mod tests {
             IngressSurface::Cli,
             PermissionTier::Operator,
         ));
+        let op_ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
+        let op_ctx = match tenant {
+            Some(tenant) => op_ctx.with_tenant(TenantId::from_str(tenant)),
+            None => op_ctx,
+        };
         Ok(Fixture {
             _dir: dir,
-            ctx: OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
+            ctx: op_ctx,
             jobs,
         })
     }

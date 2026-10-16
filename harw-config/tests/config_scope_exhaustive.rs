@@ -153,7 +153,7 @@ fn test_field_table_exhaustive_logging_section() {
 }
 
 // ---------------------------------------------------------------------
-// [tui] (Abschnitt 1.3, 3 Felder; Runde 5, Teil I: +`child_stream`)
+// [tui] (Abschnitt 1.3, 5 Felder; Runde 5, Teil I: +`child_stream`; h7/h9: +`status_expiry`, `goal_mode`)
 // ---------------------------------------------------------------------
 
 #[test]

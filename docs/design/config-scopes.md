@@ -428,7 +428,7 @@ analysis: 111** — leaf fields including nested types such as
 `InternalModelChoice`, `OnboardingSeen`; plus `base_dir` as an extra table row
 in Section 1.1, which is **not a TOML field** (`#[serde(skip)]`, so not
 counted). The current, authoritative count is `FIELD_TABLE.len()` in
-`harw-config/src/scope.rs` (120 at last check; it grows as fields are added
+`harw-config/src/scope.rs` (195 at the time of the h7/h9 wiring; it grows as fields are added
 and this document is not re-counted on every addition).
 
 Parsed from the same `config.toml`, with the same layer mechanics, but
