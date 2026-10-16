@@ -63,6 +63,12 @@ const INTENT_CYCLE_MAX_WALL_SECS: i64 = 30 * 60;
 /// resumes the fenced checkpoint instead of starting over.
 const INTENT_CYCLE_MAX_ATTEMPTS: u32 = 3;
 
+/// Upper bound (characters) of an acceptance criterion name.
+const MAX_CRITERION_NAME_CHARS: usize = 128;
+
+/// Upper bound (characters) of the cancellation reason.
+const MAX_STOP_REASON_CHARS: usize = 200;
+
 /// Default cancellation reason of `intent_cycle.stop`.
 const DEFAULT_STOP_REASON: &str = "stopped through intent_cycle.stop";
 
@@ -320,6 +326,11 @@ pub fn spec_from_args(
     }
     let mut acceptance = BTreeMap::new();
     for criterion in &args.acceptance {
+        if criterion.criterion.chars().count() > MAX_CRITERION_NAME_CHARS {
+            return Err(invalid(format!(
+                "acceptance criterion names are limited to {MAX_CRITERION_NAME_CHARS} characters"
+            )));
+        }
         let check = ContentCheck {
             target: criterion.target.clone(),
             must_contain: criterion.must_contain.clone(),
@@ -501,7 +512,7 @@ fn load_cycle_job(
         .ok_or_else(|| OpError::InvalidArguments("job_id is required".to_owned()))?;
     let work_id = WorkId::try_from_str(raw)
         .map_err(|_| OpError::InvalidArguments(format!("malformed job id `{raw}`")))?;
-    let record = match crate::job_tenant::get_visible_job(ctx, jobs, &work_id) {
+    let record = match crate::job_tenant::get_bound_workspace_job(ctx, jobs, &work_id) {
         Ok(record) => record,
         Err(SessionStoreError::JobNotFound { .. }) => {
             return Err(OpError::InvalidArguments(format!(
@@ -627,22 +638,26 @@ async fn intent_cycle_stop(
     let jobs = ctx
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
+    let principal = crate::plan::require_principal(ctx)?;
     let record = load_cycle_job(ctx, jobs, args.job_id.as_deref())?;
-    let reason = args
+    let reason: String = args
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|reason| !reason.is_empty())
-        .unwrap_or(DEFAULT_STOP_REASON);
+        .unwrap_or(DEFAULT_STOP_REASON)
+        .chars()
+        .take(MAX_STOP_REASON_CHARS)
+        .collect();
     let transition = jobs
         .cancel(
             &record.job.id,
             &CancelRequest {
                 cancelled_at: Timestamp::now(),
                 cancelled_by: ApprovalActor::Operator {
-                    id: "intent_cycle.stop".to_owned(),
+                    id: principal.id().to_owned(),
                 },
-                reason: reason.to_owned(),
+                reason,
             },
         )
         .map_err(|error| {
@@ -828,6 +843,177 @@ mod tests {
         assert!(stopped.text.contains("Stopped"));
         let record = fx.jobs.get(&id).map_err(ctx("job"))?;
         assert_eq!(record.job.state, harw_job_runtime::JobState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_token_budget_and_duplicates_are_refused() -> TestResult {
+        let fx = fixture()?;
+        let mut zero = start_args();
+        zero["token_budget"] = serde_json::json!(0);
+        let mut duplicate_target = start_args();
+        duplicate_target["read_targets"] = serde_json::json!([
+            {"id": "lib", "path": "src/lib.rs"},
+            {"id": "lib", "path": "src/other.rs"},
+        ]);
+        let mut duplicate_criterion = start_args();
+        duplicate_criterion["acceptance"] = serde_json::json!([
+            {"criterion": "c", "target": "lib", "must_contain": ["a"]},
+            {"criterion": "c", "target": "lib", "must_contain": ["b"]},
+        ]);
+        for args in [zero, duplicate_target, duplicate_criterion] {
+            let result = run(&IntentCycleStartOperation, &fx.ctx, args).await;
+            assert!(
+                matches!(result, Err(OpError::InvalidArguments(_))),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_stamps_the_tenant_and_foreign_jobs_stay_hidden() -> TestResult {
+        let fx = fixture_scoped(Some("test-tenant"))?;
+        let output = run(&IntentCycleStartOperation, &fx.ctx, start_args())
+            .await
+            .map_err(ctx("start"))?;
+        let id = job_id(&output)?;
+        let record = fx.jobs.get(&id).map_err(ctx("job"))?;
+        let input = IntentCycleJobInput::from_job(&record).map_err(ctx("input"))?;
+        assert_eq!(input.tenant, Some(TenantId::from_str("test-tenant")));
+
+        // A job of another tenant, admitted directly into the same store.
+        let mut foreign = admission_record(
+            &fx.ctx,
+            &Principal::trusted_ingress(
+                PrincipalKind::Model,
+                "model:explorer",
+                IngressSurface::Cli,
+                PermissionTier::Operator,
+            ),
+            WorkId::new(),
+            &input,
+            None,
+        )
+        .map_err(ctx("foreign record"))?;
+        foreign.scope = JobScope::new(
+            TenantId::from_str("other-tenant"),
+            WorkspaceId::from_str("ws"),
+            ApprovalActor::Operator {
+                id: "other".to_owned(),
+            },
+        );
+        let foreign_id = foreign.job.id.clone();
+        fx.jobs.admit(&foreign).map_err(ctx("admit foreign"))?;
+
+        let args = serde_json::json!({"job_id": foreign_id.as_str()});
+        let status = run(&IntentCycleStatusOperation, &fx.ctx, args.clone()).await;
+        assert!(matches!(status, Err(OpError::InvalidArguments(_))), "{status:?}");
+        let stop = run(&IntentCycleStopOperation, &fx.ctx, args).await;
+        assert!(matches!(stop, Err(OpError::InvalidArguments(_))), "{stop:?}");
+        let record = fx.jobs.get(&foreign_id).map_err(ctx("foreign job"))?;
+        assert_eq!(record.job.state, harw_job_runtime::JobState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn other_workspace_jobs_of_the_same_tenant_stay_hidden() -> TestResult {
+        let fx = fixture()?;
+        let output = run(&IntentCycleStartOperation, &fx.ctx, start_args())
+            .await
+            .map_err(ctx("start"))?;
+        let id = job_id(&output)?;
+        let record = fx.jobs.get(&id).map_err(ctx("job"))?;
+        let input = IntentCycleJobInput::from_job(&record).map_err(ctx("input"))?;
+        let mut other = admission_record(
+            &fx.ctx,
+            &Principal::trusted_ingress(
+                PrincipalKind::Model,
+                "model:explorer",
+                IngressSurface::Cli,
+                PermissionTier::Operator,
+            ),
+            WorkId::new(),
+            &input,
+            None,
+        )
+        .map_err(ctx("other record"))?;
+        other.scope = JobScope::new(
+            TenantId::from_str("test-tenant"),
+            WorkspaceId::from_str("other-ws"),
+            ApprovalActor::Operator {
+                id: "other".to_owned(),
+            },
+        );
+        let other_id = other.job.id.clone();
+        fx.jobs.admit(&other).map_err(ctx("admit other"))?;
+        let args = serde_json::json!({"job_id": other_id.as_str()});
+        let status = run(&IntentCycleStatusOperation, &fx.ctx, args.clone()).await;
+        assert!(matches!(status, Err(OpError::InvalidArguments(_))), "{status:?}");
+        let stop = run(&IntentCycleStopOperation, &fx.ctx, args).await;
+        assert!(matches!(stop, Err(OpError::InvalidArguments(_))), "{stop:?}");
+        let record = fx.jobs.get(&other_id).map_err(ctx("other job"))?;
+        assert_eq!(record.job.state, harw_job_runtime::JobState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_is_attributed_to_the_caller_and_bounds_the_reason() -> TestResult {
+        let fx = fixture()?;
+        let output = run(&IntentCycleStartOperation, &fx.ctx, start_args())
+            .await
+            .map_err(ctx("start"))?;
+        let id = job_id(&output)?;
+        run(
+            &IntentCycleStopOperation,
+            &fx.ctx,
+            serde_json::json!({"job_id": id.as_str(), "reason": "x".repeat(5_000)}),
+        )
+        .await
+        .map_err(ctx("stop"))?;
+        let record = fx.jobs.get(&id).map_err(ctx("job"))?;
+        let cancellation = record
+            .cancellation
+            .ok_or(TestError::Missing("cancellation"))?;
+        assert_eq!(cancellation.reason.chars().count(), MAX_STOP_REASON_CHARS);
+        assert_eq!(
+            cancellation.cancelled_by,
+            ApprovalActor::Operator {
+                id: "model:explorer".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlong_criterion_names_are_refused() -> TestResult {
+        let fx = fixture()?;
+        let mut args = start_args();
+        args["acceptance"][0]["criterion"] = serde_json::json!("c".repeat(129));
+        let result = run(&IntentCycleStartOperation, &fx.ctx, args).await;
+        assert!(
+            matches!(result, Err(OpError::InvalidArguments(_))),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_does_not_create_the_cycle_store() -> TestResult {
+        let fx = fixture()?;
+        let output = run(&IntentCycleStartOperation, &fx.ctx, start_args())
+            .await
+            .map_err(ctx("start"))?;
+        let id = job_id(&output)?;
+        run(
+            &IntentCycleStatusOperation,
+            &fx.ctx,
+            serde_json::json!({"job_id": id.as_str()}),
+        )
+        .await
+        .map_err(ctx("status"))?;
+        let dir = fx.jobs.root().join(harw_plan_bridge::CYCLE_STORE_DIR);
+        assert!(!dir.exists(), "status created {}", dir.display());
         Ok(())
     }
 

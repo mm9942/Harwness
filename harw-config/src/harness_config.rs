@@ -581,8 +581,7 @@ impl Default for LoggingSection {
     }
 }
 
-/// `[tui]` — Theme, Verweis auf die Keybindings-Datei (relativ zum
-/// Layer-Verzeichnis dieser `config.toml`) und Live-Stream der Kind-Agenten.
+/// Verhalten abgelaufener Kind-Statusmeldungen (`[tui] status_expiry`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StatusExpiryMode {
@@ -594,6 +593,8 @@ pub enum StatusExpiryMode {
     Hide,
 }
 
+/// `[tui]` — Theme, Verweis auf die Keybindings-Datei (relativ zum
+/// Layer-Verzeichnis dieser `config.toml`) und Live-Stream der Kind-Agenten.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuiSection {

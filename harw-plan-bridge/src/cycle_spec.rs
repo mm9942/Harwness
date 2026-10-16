@@ -101,8 +101,8 @@ impl fmt::Display for CycleSpecError {
             }
             Self::NoAcceptance => f.write_str("at least one acceptance criterion is required"),
             Self::LimitsWidened => f.write_str(
-                "limits must be at least 1 transition and 1 parallel segment and may not exceed \
-                 the host ceiling",
+                "limits must allow at least 1 transition, 1 parallel segment and 1 stall \
+                 transition and may not exceed the host ceiling",
             ),
             Self::Targets(error) => write!(f, "{error}"),
             Self::Checks(error) => write!(f, "{error}"),
@@ -143,7 +143,11 @@ impl ReadOnlyCycleSpec {
     #[must_use]
     pub fn digest(&self) -> ContentDigest {
         // `BTreeMap` keys serialize sorted; the struct field order is fixed.
-        let canonical = serde_json::to_vec(self).unwrap_or_default();
+        // Serializing plain strings, integers and maps cannot fail; should it
+        // ever, the `Debug` rendering still covers every field, so distinct
+        // specs never collapse onto the digest of empty input.
+        let canonical = serde_json::to_vec(self)
+            .unwrap_or_else(|_| format!("harw-cycle-spec\0{self:?}").into_bytes());
         ContentDigest::of(&canonical)
     }
 
@@ -182,7 +186,11 @@ impl ReadOnlyCycleSpec {
         if self.acceptance.is_empty() {
             return Err(CycleSpecError::NoAcceptance);
         }
-        if !self.limits.is_valid() || self.limits.narrowed(&MAX_CYCLE_LIMITS) != self.limits {
+        // `max_stall_transitions == 0` would refuse every non-exit proposal.
+        if !self.limits.is_valid()
+            || self.limits.max_stall_transitions == 0
+            || self.limits.narrowed(&MAX_CYCLE_LIMITS) != self.limits
+        {
             return Err(CycleSpecError::LimitsWidened);
         }
         let targets = ReadTargetMap::new(
@@ -261,6 +269,15 @@ mod tests {
         let mut widened = spec();
         widened.limits.max_transitions = MAX_CYCLE_LIMITS.max_transitions + 1;
         assert_eq!(widened.plan("i").err(), Some(CycleSpecError::LimitsWidened));
+        let mut chained = spec();
+        chained.limits.max_chain_depth = 1;
+        assert_eq!(chained.plan("i").err(), Some(CycleSpecError::LimitsWidened));
+        let mut spawning = spec();
+        spawning.limits.max_spawn_depth = 1;
+        assert_eq!(spawning.plan("i").err(), Some(CycleSpecError::LimitsWidened));
+        let mut no_stall = spec();
+        no_stall.limits.max_stall_transitions = 0;
+        assert_eq!(no_stall.plan("i").err(), Some(CycleSpecError::LimitsWidened));
         let mut blank = spec();
         blank.objective = " ".to_owned();
         assert_eq!(blank.plan("i").err(), Some(CycleSpecError::BlankObjective));

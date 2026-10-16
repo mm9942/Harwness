@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use harw_authority::{AuthorityContext, Permission};
@@ -268,18 +269,26 @@ impl ExplorerCycleExecutor {
                 "only repository evidence can be verified by the content verifier",
             ));
         }
+        // Only checks whose target resolves to exactly the evidence's file
+        // are evaluated: a verdict about another file can never cover a
+        // criterion through this evidence. The explorer records the
+        // normalised path as locator, so compare normalised paths.
         let mut checks = Vec::new();
-        let mut target_of_locator = None;
+        let mut bound = false;
         for target in admission.allowed_read_targets() {
-            if self.targets.path(target) != Some(record.locator.as_str()) {
+            let same_file = self
+                .targets
+                .path(target)
+                .is_some_and(|path| normalized(path) == record.locator);
+            if !same_file {
                 continue;
             }
-            target_of_locator = Some(target.clone());
+            bound = true;
             for (index, criterion, check) in self.checks.for_target(target) {
                 checks.push((index, criterion.clone(), check.clone()));
             }
         }
-        if target_of_locator.is_none() {
+        if !bound {
             return Err(StepFailure::new(
                 "evidence locator is not an admitted read target",
             ));
@@ -320,7 +329,6 @@ impl CycleStepExecutor for ExplorerCycleExecutor {
             _ => None,
         };
         let root = self.authority.workspace().canonical_root().to_path_buf();
-        let key = step.idempotency_key.clone();
         let max_read = self.max_read_bytes;
         let read = verify
             .is_none()
@@ -348,7 +356,7 @@ impl CycleStepExecutor for ExplorerCycleExecutor {
             .await
             .map_err(|error| StepFailure::new(format!("verify task failed: {error}")))?
             .map_err(|reason| StepFailure::new(format!("verify read failed: {reason}")))?;
-            Ok(judge(&key, &plan, outcome.digest, &outcome.text))
+            Ok(judge(&plan, outcome.digest, &outcome.text))
         }
     }
 
@@ -364,8 +372,27 @@ impl CycleStepExecutor for ExplorerCycleExecutor {
     }
 }
 
+/// Workspace-relative path as the explorer records it as evidence locator:
+/// normal components joined by `/` (`a//b` and `a/b` are the same file).
+fn normalized(path: &str) -> String {
+    Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Turns one fresh read into observations (pure).
-fn judge(key: &str, plan: &VerifyPlan, current: ContentDigest, text: &str) -> CycleObservations {
+///
+/// The evidence id is a function of the check and the verified content, not
+/// of the step: re-verifying unchanged content re-reports the same record,
+/// which neither conflicts nor counts as progress, so the model cannot reset
+/// the stall counter by verifying in a loop. Changed content yields a new id
+/// (and never a `ConflictingEvidence`).
+fn judge(plan: &VerifyPlan, current: ContentDigest, text: &str) -> CycleObservations {
     let mut observations = CycleObservations::default();
     if current != plan.observed {
         observations.claims.insert(
@@ -377,7 +404,7 @@ fn judge(key: &str, plan: &VerifyPlan, current: ContentDigest, text: &str) -> Cy
     for (index, criterion, check) in &plan.checks {
         match check.evaluate(text) {
             Ok(()) => {
-                let id = format!("{key}:check:{index}");
+                let id = format!("check:{index}:{current}");
                 let digest = ContentDigest::of(
                     format!("harw-cycle-check\0{criterion}\0{current}").as_bytes(),
                 );
@@ -582,7 +609,39 @@ mod tests {
             ok.ensure_covers(&set(&["d"])),
             Err(CheckError::UncheckedCriterion { .. })
         ));
+        assert!(matches!(
+            ok.ensure_covers(&BTreeSet::new()),
+            Err(CheckError::UnknownCriterion { .. })
+        ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_verification_is_idempotent_and_not_false_progress() -> TestResult {
+        let content = b"pub fn marker() {}\n";
+        let checks = BTreeMap::from([("has-marker".to_owned(), check("lib", &["fn marker"], &[]))]);
+        let (_ws, mut executor, adm, mut state) = fixture(content, checks)?;
+        observed(&mut state, content);
+        let first = executor
+            .execute(&step(verify()), &adm, &state, &CancelToken::new())
+            .await
+            .map_err(|failure| TestError::Unexpected(failure.reason))?;
+        let mut later = step(verify());
+        later.sequence = 2;
+        later.idempotency_key = "cycle-v-2".to_owned();
+        let second = executor
+            .execute(&later, &adm, &state, &CancelToken::new())
+            .await
+            .map_err(|failure| TestError::Unexpected(failure.reason))?;
+        assert_eq!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn locator_comparison_ignores_path_spelling() {
+        assert_eq!(normalized("src//lib.rs"), "src/lib.rs");
+        assert_eq!(normalized("src/lib.rs/"), "src/lib.rs");
+        assert_eq!(normalized("src/lib.rs"), "src/lib.rs");
     }
 
     #[tokio::test]

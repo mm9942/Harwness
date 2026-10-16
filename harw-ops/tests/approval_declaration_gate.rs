@@ -113,7 +113,13 @@ fn no_model_tool_with_a_declared_approval_is_auto_approved() {
 
     // Gegen einen leeren Durchlauf absichern: verschwänden die Deklarationen
     // (etwa durch ein geändertes Makro), wäre der Test sonst still grün.
-    for expected in ["plan", "goal", "stop"] {
+    for expected in [
+        "plan",
+        "goal",
+        "stop",
+        "intent_cycle.start",
+        "intent_cycle.stop",
+    ] {
         assert!(
             gated.contains(&expected),
             "{expected} muss eine ModelTool-Fläche mit approval != None deklarieren \

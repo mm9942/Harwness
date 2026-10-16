@@ -1794,6 +1794,58 @@ mod tests {
     }
 
     #[test]
+    fn ceiling_reissuer_never_widens_and_refuses_foreign_workspace() -> TestResult {
+        let read_only = authority(&[Permission::ReadWorkspace])?;
+        let read_write = authority(&[Permission::ReadWorkspace, Permission::WriteWorkspace])?;
+
+        // Snapshot wider than the ceiling: the ceiling bounds the result.
+        let capped = CeilingReissuer::new(read_only.clone())
+            .reissue(&read_write.snapshot())
+            .map_err(|_| TestError::Missing("same-workspace reissue succeeds"))?;
+        assert!(!capped.permissions().contains(Permission::WriteWorkspace));
+        assert!(capped.is_subset_of(&read_only));
+
+        // Ceiling wider than the snapshot: the snapshot bounds the result.
+        let narrowed = CeilingReissuer::new(read_write.clone())
+            .reissue(&read_only.snapshot())
+            .map_err(|_| TestError::Missing("same-workspace reissue succeeds"))?;
+        assert!(!narrowed.permissions().contains(Permission::WriteWorkspace));
+        assert!(narrowed.is_subset_of(&read_only));
+
+        // Same tenant, different workspace: refused, never rebound.
+        let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(TestError::Missing("harness root"))?
+            .to_path_buf();
+        let tenant = TenantId::from_str("cycle-tenant");
+        let other = WorkspaceId::from_str("cycle-runtime-other");
+        let foreign_binding = WorkspaceRegistry::build(
+            &harness_root,
+            [WorkspaceRegistration {
+                tenant: tenant.clone(),
+                workspace: other.clone(),
+                root: PathBuf::from("harw-plan-bridge"),
+            }],
+        )
+        .map_err(ctx("foreign workspace registers"))?
+        .resolve(&tenant, &other)
+        .map_err(ctx("foreign workspace resolves"))?;
+        let foreign = SandboxSpec::from_resolved(
+            foreign_binding,
+            PermissionSet::from_policy([Permission::ReadWorkspace]),
+        )
+        .authority()
+        .clone();
+        assert!(
+            CeilingReissuer::new(read_write)
+                .reissue(&foreign.snapshot())
+                .is_err(),
+            "a snapshot of another workspace must not be reissued"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn record_and_store_reject_invalid_input() -> TestResult {
         let fx = fixture("cycle-valid")?;
         let checkpoint = fx
