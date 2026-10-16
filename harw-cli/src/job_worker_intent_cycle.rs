@@ -20,10 +20,24 @@
 //!    re-cuts the persisted authority snapshot against the current ceiling.
 //!
 //! A retryable proposer outage (rate limit, overload) leaves the cycle
-//! non-terminal and fails the attempt; the job's retry policy re-claims it
-//! later and the driver resumes the fenced checkpoint. Everything else maps
-//! through `harw_plan_bridge::job_outcome`: `CompletionProposed` is a
-//! succeeded job that still needs owner acceptance.
+//! non-terminal. `JobOutcome::Failed` is terminal in the job store (retry
+//! policies only apply to lease expiry/reclaim and an explicit operator
+//! `retry`), so the worker itself re-runs the driver under the same lease after
+//! a bounded backoff ([`PROPOSER_RETRY_BACKOFF`]); only when that is used up
+//! does the job fail, with the cycle still non-terminal so an operator retry
+//! resumes the fenced checkpoint. Everything else maps through
+//! `harw_plan_bridge::job_outcome`: `CompletionProposed` is a succeeded job
+//! that still needs owner acceptance.
+//!
+//! # Known limitation: workspace binding
+//! The ceiling is cut from the worker's `runtime_root.cwd`, like every other
+//! job kind. `claim.scope` carries only the submitter's tenant/workspace
+//! *aliases* (the worker sandbox always uses tenant `job`, workspace
+//! `project`), so the ids are not comparable and the job input records no
+//! canonical root. Binding a job to its submitting workspace needs
+//! `intent_cycle.start` (`harw-ops`) to store
+//! `ctx.sandbox().workspace().canonical_root()` in `IntentCycleJobInput`; the
+//! worker would then compare it with `sandbox.workspace().canonical_root()`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,12 +49,11 @@ use harw_ops::intent_cycle::IntentCycleJobInput;
 use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
     CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleStore, CycleStoreError,
-    ExplorerCycleExecutor, INTENT_CYCLE_JOB_KIND, ModelCycleProposer, ProposerRoute, RoutePolicy,
+    CycleRunError, ExplorerCycleExecutor, INTENT_CYCLE_JOB_KIND, ModelCycleProposer, ProposerRoute, RoutePolicy,
     job_outcome,
 };
 use harw_session_store::JobStore;
 use harw_types::{ModelId, SessionId};
-use jiff::Timestamp;
 
 use super::{
     BudgetedModelProvider, JobWorkerContext, PromptTokenLedger, WorkerExecutionControl,
@@ -53,6 +66,23 @@ const PROPOSAL_MAX_OUTPUT_TOKENS: u32 = 512;
 
 /// Fallback wall budget when the job carries none.
 const DEFAULT_CYCLE_WALL: Duration = Duration::from_secs(30 * 60);
+
+/// In-claim waits before the driver is re-run after a retryable proposer
+/// outage; once used up the job fails.
+const PROPOSER_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(20),
+    Duration::from_secs(60),
+];
+
+/// Aborts the cancellation bridge when the claim future ends or is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// `true` for the intent-cycle discriminator.
 pub(super) fn is_intent_cycle_kind(kind: &JobKind) -> bool {
@@ -138,10 +168,23 @@ pub(super) async fn execute_intent_cycle_claim(
         return JobOutcome::Failed { reason };
     }
 
+    let remaining = match claim.job.budget.max_wall {
+        Some(max_wall) => {
+            match Duration::try_from(max_wall.saturating_sub(claim.job.usage.wall)) {
+                Ok(left) if !left.is_zero() => left,
+                _ => {
+                    return JobOutcome::Failed {
+                        reason: "budget: the wall-clock budget is already exhausted".to_owned(),
+                    };
+                }
+            }
+        }
+        None => DEFAULT_CYCLE_WALL,
+    };
     let ledger = PromptTokenLedger::new(claim.job.budget.clone(), claim.job.usage.clone());
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: Arc::clone(&provider),
-        ledger,
+        ledger: Arc::clone(&ledger),
     });
     let proposer = ModelCycleProposer::new(
         budgeted,
@@ -161,10 +204,10 @@ pub(super) async fn execute_intent_cycle_claim(
 
     // Job cancellation (stop, lease loss) → driver cancel token.
     let cancel = CancelToken::new();
-    let bridge = {
+    let _bridge = {
         let cancel = cancel.clone();
         let mut cancellation = control.cancellation();
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             loop {
                 if *cancellation.borrow() {
                     cancel.cancel(CancelReason::User);
@@ -174,18 +217,33 @@ pub(super) async fn execute_intent_cycle_claim(
                     return;
                 }
             }
-        })
+        }))
     };
 
-    let remaining = claim
-        .job
-        .budget
-        .max_wall
-        .map(|wall| wall.saturating_sub(Timestamp::now().duration_since(record.submitted_at)))
-        .and_then(|left| Duration::try_from(left).ok())
-        .unwrap_or(DEFAULT_CYCLE_WALL);
     let cycle_id = cycle_input.cycle_id.clone();
-    let run = driver.run(&cycle_id, &claim.token, &plan.admission, &cancel);
+    let run = async {
+        let mut backoff = PROPOSER_RETRY_BACKOFF.iter();
+        loop {
+            let result = driver
+                .run(&cycle_id, &claim.token, &plan.admission, &cancel)
+                .await;
+            match result {
+                Err(CycleRunError::ProposerUnavailable(reason)) => {
+                    let Some(wait) = backoff.next() else {
+                        return Err(CycleRunError::ProposerUnavailable(reason));
+                    };
+                    tracing::info!(work_id = %work_id.as_str(), wait_secs = wait.as_secs(), reason = %reason, "intent cycle proposer unavailable; retrying in-claim");
+                    // A cancel ends the wait; the next `run` then reports it.
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {}
+                        () = tokio::time::sleep(*wait) => {}
+                    }
+                }
+                other => return other,
+            }
+        }
+    };
     let outcome = match tokio::time::timeout(remaining, run).await {
         Ok(result) => {
             if let Err(error) = &result {
@@ -197,7 +255,14 @@ pub(super) async fn execute_intent_cycle_claim(
             reason: "budget: the intent cycle exceeded its wall-clock budget".to_owned(),
         },
     };
-    bridge.abort();
+    cancel.cancel(CancelReason::Budget);
+    // A budget stop surfaces as a blocked/failed proposer; report the budget.
+    let outcome = match (outcome, ledger.exceeded()) {
+        (JobOutcome::Blocked { .. } | JobOutcome::Failed { .. }, Some(reason)) => {
+            JobOutcome::Failed { reason }
+        }
+        (other, _) => other,
+    };
     sanitize_outcome(outcome)
 }
 
@@ -275,8 +340,9 @@ fn proposer_model(
     let resolved =
         harw_config::resolve_internal_model(config, harw_config::InternalModelPoint::Explorer);
     let same_provider = resolved.provider.is_none() || resolved.provider == active;
+    let main_model = resolved.is_main_model();
     let model = match resolved.model {
-        Some(model) if !resolved.is_main_model() && same_provider => Some(model),
+        Some(model) if !main_model && same_provider => Some(model),
         _ => config.harness.default_model.clone(),
     }?;
     Some(ModelId::from(model.as_str()))

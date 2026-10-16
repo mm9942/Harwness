@@ -189,7 +189,10 @@ impl Shared {
                     Effect::Subscribe(session, sub) => {
                         replaced = state.subs.insert(session.clone(), Arc::clone(sub));
                     }
-                    Effect::Unsubscribe(session) => replaced = state.subs.remove(session),
+                    Effect::Unsubscribe(session) => {
+                        replaced = state.subs.remove(session);
+                        state.resume_cursors.remove(session);
+                    }
                     Effect::None => {}
                 }
             }
@@ -211,14 +214,17 @@ impl Shared {
     /// subscription (detached, never attached) are dropped.
     fn on_frame(&self, envelope: FrameEnvelope) {
         let session = envelope.session_id.clone();
-        // h19: record the newest cursor so a re-attach can resume from it.
-        self.record_resume_cursor(&session, envelope.cursor);
+        let cursor = envelope.cursor;
         let sub = lock(&self.state).subs.get(&session).cloned();
         let Some(sub) = sub else {
             tracing::trace!(session = %session.as_str(), "frame for a session without attachment");
             return;
         };
-        if sub.push(envelope) == Push::Closed {
+        if sub.push(envelope) == Push::Open {
+            // h19: only a frame handed to a live subscription advances the
+            // resume cursor; dropped or lagged frames must be replayed.
+            self.record_resume_cursor(&session, cursor);
+        } else {
             let mut state = lock(&self.state);
             if state
                 .subs
@@ -226,6 +232,8 @@ impl Shared {
                 .is_some_and(|current| Arc::ptr_eq(current, &sub))
             {
                 state.subs.remove(&session);
+                // The attachment ended: do not keep its cursor around.
+                state.resume_cursors.remove(&session);
             }
         }
     }
@@ -424,8 +432,11 @@ impl RemoteConnection {
     }
 
     /// Cursor to resume `session` from, if one was recorded (h19: the
-    /// connection reader records every frame cursor; a re-attach presents
-    /// it as `AttachParams::from` and never fabricates a cursor).
+    /// connection reader records the cursor of every frame delivered to a
+    /// live attachment; only an explicit resume presents it as
+    /// `AttachParams::from`, see `RemotePort::attach_with_resume`, and a
+    /// cursor is never fabricated). Entries are dropped on detach or when
+    /// the attachment ends.
     #[must_use]
     pub fn resume_cursor(&self, session: &SessionId) -> Option<Cursor> {
         lock(&self.shared.state)
@@ -800,6 +811,43 @@ mod tests {
         );
         let second = sub.next().await;
         assert!(matches!(second, Ok(None)), "{second:?}");
+        Ok(())
+    }
+
+    /// The resume cursor only advances for frames handed to a live
+    /// subscription, and is dropped when the attachment ends.
+    #[test]
+    fn resume_cursor_tracks_delivered_frames_only() -> Result<(), String> {
+        let session = SessionId::try_from_str("s-rc").map_err(|error| error.to_string())?;
+        let cursor_of = |shared: &Shared| {
+            lock(&shared.state)
+                .resume_cursors
+                .cursor(&session)
+                .ok()
+                .flatten()
+        };
+        let shared = Shared::new();
+
+        // No subscription: dropped, nothing recorded.
+        shared.on_frame(heartbeat(&session, 1));
+        assert_eq!(cursor_of(&shared), None);
+
+        // Delivered frame: recorded.
+        let sub = Subscription::new();
+        lock(&shared.state).subs.insert(session.clone(), Arc::clone(&sub));
+        shared.on_frame(heartbeat(&session, 2));
+        assert_eq!(cursor_of(&shared).map(|c| c.live), Some(2));
+
+        // Overflowing the queue: the lagging frame is not recorded and the
+        // ended attachment's entry is removed.
+        let total = u32::try_from(FRAME_QUEUE_CAP).map_err(|error| error.to_string())?;
+        for live in 3..=total {
+            shared.on_frame(heartbeat(&session, live));
+        }
+        assert_eq!(cursor_of(&shared).map(|c| c.live), Some(total));
+        shared.on_frame(heartbeat(&session, total + 1));
+        assert!(lock(&shared.state).subs.is_empty());
+        assert_eq!(cursor_of(&shared), None);
         Ok(())
     }
 }

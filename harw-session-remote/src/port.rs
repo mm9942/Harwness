@@ -41,9 +41,10 @@ impl RemotePort {
         &self.connection
     }
 
-    /// Attach with the recorded resume cursor (h19): presents the newest
-    /// cursor seen for the session as `AttachParams::from` and never
-    /// fabricates one. `None` means a fresh attach from the tail.
+    /// Explicit resume/reconnect path (h19): fills `AttachParams::from` with
+    /// the newest cursor delivered for the session when the caller left it
+    /// `None`, and never fabricates one. Plain [`SessionPort::attach`] does
+    /// not call this: `from: None` there means a fresh attach from the tail.
     ///
     /// The host enforces generation correctness on its own (a stale or
     /// foreign-generation cursor triggers a resync, see `attach_sync`);
@@ -98,7 +99,6 @@ impl SessionPort for RemotePort {
 
     fn attach(&self, params: AttachParams) -> PortFuture<'_, (AttachAck, Box<dyn FrameSource>)> {
         Box::pin(async move {
-            let params = self.attach_with_resume(params);
             // The subscription is registered by the reader in the same step
             // that resolves this response, so no frame can be missed.
             let sub = Subscription::new();
