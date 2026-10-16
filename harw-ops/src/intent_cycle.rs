@@ -258,6 +258,11 @@ pub struct IntentCycleJobInput {
     /// Tenant scope of the caller (H12), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<TenantId>,
+    /// Canonical workspace root the cycle was approved for (the caller's
+    /// sandbox binding). The job worker refuses to run the cycle against
+    /// any other root; `None` is refused as well (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<std::path::PathBuf>,
 }
 
 impl IntentCycleJobInput {
@@ -427,6 +432,7 @@ async fn intent_cycle_start(
         spec,
         requested_by: principal.id().to_owned(),
         tenant: ctx.tenant().cloned(),
+        workspace_root: Some(ctx.sandbox().workspace().canonical_root().to_path_buf()),
     };
     let record = admission_record(ctx, principal, work_id, &input, args.token_budget)?;
     let job_id = record.job.id.clone();

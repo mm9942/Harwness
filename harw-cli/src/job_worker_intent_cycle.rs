@@ -29,15 +29,14 @@
 //! `harw_plan_bridge::job_outcome`: `CompletionProposed` is a succeeded job
 //! that still needs owner acceptance.
 //!
-//! # Known limitation: workspace binding
-//! The ceiling is cut from the worker's `runtime_root.cwd`, like every other
-//! job kind. `claim.scope` carries only the submitter's tenant/workspace
-//! *aliases* (the worker sandbox always uses tenant `job`, workspace
-//! `project`), so the ids are not comparable and the job input records no
-//! canonical root. Binding a job to its submitting workspace needs
-//! `intent_cycle.start` (`harw-ops`) to store
-//! `ctx.sandbox().workspace().canonical_root()` in `IntentCycleJobInput`; the
-//! worker would then compare it with `sandbox.workspace().canonical_root()`.
+//! # Workspace binding
+//! The ceiling is cut from the worker's `runtime_root.cwd`. `claim.scope`
+//! carries only the submitter's tenant/workspace *aliases* (the worker
+//! sandbox always uses tenant `job`, workspace `project`), so the ids are not
+//! comparable. `intent_cycle.start` therefore records the caller's canonical
+//! workspace root in `IntentCycleJobInput::workspace_root`, and the worker
+//! refuses (`Blocked`, before any record or model call) unless it equals the
+//! canonical root of its own sandbox; a missing root is refused too.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,6 +147,17 @@ pub(super) async fn execute_intent_cycle_claim(
             };
         }
     };
+    // The cycle was approved for one workspace root; the worker's ceiling
+    // must be bound to exactly that root (fail closed, before any record or
+    // model call). Ids differ by construction (tenant alias), so the
+    // canonical roots are compared, as `ensure_same_workspace_root` does.
+    if cycle_input.workspace_root.as_deref() != Some(sandbox.workspace().canonical_root()) {
+        tracing::warn!(work_id = %work_id.as_str(), "intent-cycle workspace root mismatch");
+        return JobOutcome::Blocked {
+            reason: "intent cycle: the job was approved for another workspace than this worker serves"
+                .to_owned(),
+        };
+    }
     let authority = sandbox.authority().clone();
 
     let Some(model) = proposer_model(context, runtime_root, &job_store, &provider, &claim) else {

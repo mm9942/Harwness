@@ -4237,7 +4237,7 @@ mod tests {
             }
         }
 
-        fn cycle_record(id: &str) -> TestResult<StoredJob> {
+        fn cycle_record(id: &str, workspace_root: &Path) -> TestResult<StoredJob> {
             let spec = ReadOnlyCycleSpec::new(
                 "does lib.rs define the marker?".to_owned(),
                 BTreeMap::from([("lib".to_owned(), "src/lib.rs".to_owned())]),
@@ -4258,6 +4258,9 @@ mod tests {
                 spec,
                 requested_by: "operator".to_owned(),
                 tenant: None,
+                workspace_root: Some(
+                    std::fs::canonicalize(workspace_root).map_err(ctx("canonical root"))?,
+                ),
             };
             ready_record_of_kind(
                 id,
@@ -4291,7 +4294,7 @@ mod tests {
             )
             .map_err(ctx("write config"))?;
             let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
-            admit(&store, &cycle_record("cycle-e2e")?)?;
+            admit(&store, &cycle_record("cycle-e2e", &cwd)?)?;
             let provider = Arc::new(Scripted(Mutex::new(VecDeque::from([
                 r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
                 r#"{"kind":"verify","evidence_id":"cycle-e2e-0:lib"}"#.to_owned(),
