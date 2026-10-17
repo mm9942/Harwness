@@ -14,6 +14,13 @@
 //!   Prozess noch lebt **und** seine Identität — Startzeit, Programm,
 //!   cgroup (`meta.json` v2) — passt, sonst [`JobState::Unknown`]; bei einer
 //!   wiederverwendeten PID zusätzlich eine Warnung).
+//! - Überlebende abgelöste Jobs (nach [`JobManager::detach_all`] oder aus
+//!   einer früheren Sitzung) beobachtet ein eigener Task: endet der Prozess,
+//!   geht ein [`JobEvent::Finished`] an den Besitzer — Zustand
+//!   [`JobState::Unknown`], ohne Exit-Status, denn der war nicht
+//!   beobachtbar ([`DetachedWatch`]). Dieselbe Meldung entscheidet auch eine
+//!   Abfrage über denselben gesperrten Übergang, wenn sie das Ende zuerst
+//!   sieht — höchstens eine Meldung pro Job.
 //! - Stop: Signal an die ganze Prozessgruppe, nach der Gnadenfrist SIGKILL.
 //!   Eigene Kinder werden über einen direkt nach dem Start geöffneten pidfd
 //!   gesteuert ([`crate::procfs`]); Jobs früherer Sitzungen nur nach
@@ -87,7 +94,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
@@ -107,6 +114,9 @@ const EVENT_LINE_CHARS: usize = 400;
 const KILL_WAIT: Duration = Duration::from_secs(3);
 /// Abfrageintervall für Prozesse ohne eigenen Überwachungs-Task.
 const FOREIGN_POLL: Duration = Duration::from_millis(200);
+/// Abfrageintervall der Ablösungs-Beobachtung ([`DetachedWatch`]): gröber
+/// als [`FOREIGN_POLL`], denn hier fließen nur Enden abgelöster Jobs.
+const DETACHED_POLL: Duration = Duration::from_millis(500);
 /// Wie oft die Überwachung die Identität des Gruppenführers neu liest (ein
 /// `exec` ändert das Programm; `meta.json` soll die letzte Beobachtung
 /// tragen, damit ein Neustart den Job wiedererkennt).
@@ -1199,7 +1209,7 @@ pub struct JobManager {
     // (`SyncDirectory`); nur Tests ersetzen ihn (`set_dir_sync`).
     dir_sync: Mutex<Arc<dyn DirSync>>,
     // Lebt der Prozess eines Jobs ohne eigenen pidfd noch (Neuladen,
-    // `refresh_foreign`, Stop)? Im Betrieb `recovered_liveness`; nur Tests
+    // `finalize_detached`, Stop)? Im Betrieb `recovered_liveness`; nur Tests
     // setzen eine andere (`with_liveness`).
     liveness: LivenessCheck,
 }
@@ -1298,6 +1308,7 @@ impl JobManager {
             liveness,
         });
         manager.reload(&jobs_dir);
+        manager.spawn_detached_watch();
         Ok(manager)
     }
 
@@ -1936,8 +1947,60 @@ impl JobManager {
     /// [`JobError::NotFound`] für unbekannte oder fremde Jobs.
     pub fn status(&self, id: &JobId, caller: Caller<'_>) -> Result<JobStatus, JobError> {
         let entry = self.entry(id, caller)?;
-        refresh_foreign(&entry, self.liveness);
+        self.finalize_detached(&entry);
         Ok(entry.status())
+    }
+
+    /// Aktualisiert einen nicht beaufsichtigten Job und meldet das Ende eines
+    /// nicht mehr beobachtbaren Prozesses dem Besitzer: Zustand
+    /// [`JobState::Unknown`], [`JobEvent::Finished`] ohne Exit-Status (ohne
+    /// `ended_at`: wann der Prozess endete, war nicht beobachtbar). Ein
+    /// offenes Anhalten wird dabei geschlossen und gebucht. Watch
+    /// ([`DetachedWatch`]) und Abfragen entscheiden über denselben gesperrten
+    /// Übergang — das Ende wird höchstens einmal gemeldet, ein laufendes
+    /// `job.stop` (`stop_requested`) hat Vorrang.
+    fn finalize_detached(&self, entry: &Arc<JobEntry>) {
+        let notification = {
+            let mut state = lock(&entry.state);
+            if state.monitored
+                || state.meta.state != JobState::Detached
+                || state.meta.stop_requested
+            {
+                return;
+            }
+            if !detached_exited(entry, &state.meta, self.liveness) {
+                return;
+            }
+            state.meta.state = JobState::Unknown;
+            // The process is gone: an open suspension ends here.
+            state.meta.end_suspension(Timestamp::now());
+            state.meta.exit_code = None;
+            state.meta.signal = None;
+            state.milestones += 1;
+            detached_finished(&state, JobState::Unknown, self.config.finish_tail_lines)
+        };
+        entry.persist();
+        entry.bump();
+        info!(
+            job_id = %notification.event.job_id(),
+            "detached job ended; reported to owner"
+        );
+        self.notifier.notify(notification);
+    }
+
+    /// Startet die Beobachtung abgelöster Jobs. Nur innerhalb einer
+    /// Tokio-Runtime; außerhalb bleibt die Periodik aus und Abfragen
+    /// finalisieren weiterhin on demand.
+    fn spawn_detached_watch(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(
+            DetachedWatch {
+                manager: Arc::downgrade(self),
+            }
+            .run(),
+        );
     }
 
     /// Alle Jobs, die `caller` steuern darf (älteste zuerst).
@@ -1948,7 +2011,7 @@ impl JobManager {
             .into_iter()
             .filter(|entry| caller.may_control(&lock(&entry.state).meta.owner))
             .map(|entry| {
-                refresh_foreign(&entry, self.liveness);
+                self.finalize_detached(&entry);
                 entry.status()
             })
             .collect()
@@ -2189,7 +2252,7 @@ impl JobManager {
     pub fn suspend(&self, id: &JobId, caller: Caller<'_>) -> Result<SuspendOutcome, JobError> {
         let entry = self.entry(id, caller)?;
         let _serial = lock(&self.suspend_ops);
-        refresh_foreign(&entry, self.liveness);
+        self.finalize_detached(&entry);
         let (state, monitored, stop_requested, phase) = {
             let guard = lock(&entry.state);
             (
@@ -2475,7 +2538,7 @@ impl JobManager {
     pub fn resume(&self, id: &JobId, caller: Caller<'_>) -> Result<SuspendOutcome, JobError> {
         let entry = self.entry(id, caller)?;
         let _serial = lock(&self.suspend_ops);
-        refresh_foreign(&entry, self.liveness);
+        self.finalize_detached(&entry);
         let (phase, since, terminal) = {
             let guard = lock(&entry.state);
             (
@@ -2637,61 +2700,109 @@ impl JobManager {
         }
 
         if !monitored && meta.state == JobState::Detached {
-            // Abgelöster Job dieser Sitzung (eigener pidfd) oder Job einer
-            // früheren Sitzung (nur nach bewiesener Identität).
-            let mut refusal = None;
-            let sent = match signal_entry(entry, &meta, signal) {
-                Ok(()) => true,
-                Err(SignalError::Io(err)) => {
-                    debug!(job_id = %meta.job_id, error = %err, "job stop: signal failed");
-                    true
-                }
-                Err(SignalError::Exited) => false,
-                Err(SignalError::Refused(reason)) => {
-                    refusal = Some(reason);
-                    false
-                }
-            };
-            if sent {
-                if !wait_detached_exit(entry, &meta, self.liveness, grace).await {
-                    self.escalate_kill(entry, &meta, signal);
-                    wait_detached_exit(entry, &meta, self.liveness, KILL_WAIT).await;
-                }
-                if let Some(leader) = &entry.leader {
-                    leader.kill_stragglers();
-                }
-            }
-            {
-                let mut state = lock(&entry.state);
-                state.meta.stop_requested = sent;
-                state.meta.state = if sent {
-                    JobState::Stopped
-                } else {
-                    JobState::Unknown
-                };
-                let ended_at = Timestamp::now();
-                state.meta.ended_at = Some(ended_at);
-                state.meta.end_suspension(ended_at);
-                state.milestones += 1;
-            }
-            entry.persist();
-            entry.bump();
-            if let Some(reason) = refusal {
-                warn!(job_id = %meta.job_id, pid, %reason, "job stop refused: process identity");
-                self.notifier.notify(JobNotification {
-                    owner: meta.owner.clone(),
-                    event: JobEvent::Warning {
-                        job_id: meta.job_id.clone(),
-                        name: meta.name.clone(),
-                        message: format!("job.stop sent no signal: {reason}"),
-                    },
-                });
-            }
+            self.stop_detached(entry, &meta, pid, signal, grace).await;
             return;
         }
 
         if let Some(leader) = entry.leader.as_ref().filter(|_| meta.state.is_terminal()) {
             leader.kill_stragglers();
+        }
+    }
+
+    /// Stop eines abgelösten Jobs (Teil von [`JobManager::deliver_stop`]):
+    /// dieser Sitzung über den eigenen pidfd, einer früheren Sitzung nur nach
+    /// bewiesener Identität. Der Vermerk endet in jedem Fall, das Ende wird
+    /// genau einmal als [`JobEvent::Finished`] gemeldet:
+    /// [`JobState::Stopped`], wenn ein Signal zugestellt wurde, sonst
+    /// [`JobState::Unknown`] (dazu eine Warnung, wenn die Identität das
+    /// Signal verwehrte). Ein offenes Anhalten wird geschlossen und gebucht:
+    /// `job.stop` ist der Weg, einen angehaltenen abgelösten Job zu beenden,
+    /// auch einen ungeklärt angehaltenen.
+    ///
+    /// # Concurrency
+    /// `stop_requested` wird gesetzt und geschrieben, BEVOR signalisiert
+    /// wird, und nur solange der Job noch `Detached` ist: sonst könnte die
+    /// Watch das Signal-Ende als unbekanntes Ende melden, bevor dieser Pfad
+    /// den Stop verzeichnet (`stop_requested` sperrt
+    /// [`JobManager::finalize_detached`]). Haben Watch oder Abfrage das Ende
+    /// schon gemeldet, wird nichts mehr signalisiert.
+    async fn stop_detached(
+        &self,
+        entry: &Arc<JobEntry>,
+        meta: &JobMeta,
+        pid: u32,
+        signal: JobSignal,
+        grace: Duration,
+    ) {
+        {
+            let mut state = lock(&entry.state);
+            if state.meta.state != JobState::Detached {
+                return;
+            }
+            state.meta.stop_requested = true;
+        }
+        entry.persist();
+        let mut refusal = None;
+        let sent = match signal_entry(entry, meta, signal) {
+            Ok(()) => true,
+            Err(SignalError::Io(err)) => {
+                debug!(job_id = %meta.job_id, error = %err, "job stop: signal failed");
+                true
+            }
+            Err(SignalError::Exited) => false,
+            Err(SignalError::Refused(reason)) => {
+                refusal = Some(reason);
+                false
+            }
+        };
+        if sent {
+            if !wait_detached_exit(entry, meta, self.liveness, grace).await {
+                self.escalate_kill(entry, meta, signal);
+                wait_detached_exit(entry, meta, self.liveness, KILL_WAIT).await;
+            }
+            if let Some(leader) = &entry.leader {
+                leader.kill_stragglers();
+            }
+        }
+        let reported = {
+            let mut state = lock(&entry.state);
+            if state.meta.state != JobState::Detached {
+                // A concurrent stop already recorded and reported the end.
+                None
+            } else {
+                let final_state = if sent {
+                    JobState::Stopped
+                } else {
+                    JobState::Unknown
+                };
+                state.meta.stop_requested = sent;
+                state.meta.state = final_state;
+                let ended_at = Timestamp::now();
+                state.meta.ended_at = Some(ended_at);
+                state.meta.end_suspension(ended_at);
+                state.milestones += 1;
+                Some(detached_finished(
+                    &state,
+                    final_state,
+                    self.config.finish_tail_lines,
+                ))
+            }
+        };
+        entry.persist();
+        entry.bump();
+        if let Some(notification) = reported {
+            self.notifier.notify(notification);
+        }
+        if let Some(reason) = refusal {
+            warn!(job_id = %meta.job_id, pid, %reason, "job stop refused: process identity");
+            self.notifier.notify(JobNotification {
+                owner: meta.owner.clone(),
+                event: JobEvent::Warning {
+                    job_id: meta.job_id.clone(),
+                    name: meta.name.clone(),
+                    message: format!("job.stop sent no signal: {reason}"),
+                },
+            });
         }
     }
 
@@ -2739,7 +2850,7 @@ impl JobManager {
         timeout: Duration,
     ) -> Result<JobStatus, JobError> {
         let entry = self.entry(id, caller)?;
-        refresh_foreign(&entry, self.liveness);
+        self.finalize_detached(&entry);
         let deadline = tokio::time::Instant::now() + timeout;
         let mut receiver = entry.changes.subscribe();
         let monitored = lock(&entry.state).monitored;
@@ -2752,7 +2863,7 @@ impl JobManager {
                 // No monitor task: probe for signs of life.
                 let step = tokio::time::Instant::now() + FOREIGN_POLL;
                 tokio::time::sleep_until(step.min(deadline)).await;
-                refresh_foreign(&entry, self.liveness);
+                self.finalize_detached(&entry);
                 if tokio::time::Instant::now() >= deadline {
                     return Ok(entry.status());
                 }
@@ -2874,30 +2985,34 @@ impl JobManager {
     }
 }
 
-/// Aktualisiert einen nicht beaufsichtigten, als laufend geführten Job.
-fn refresh_foreign(entry: &Arc<JobEntry>, liveness: LivenessCheck) {
-    let changed = {
-        let mut state = lock(&entry.state);
-        if state.monitored || state.meta.state != JobState::Detached {
-            return;
+/// Beobachtet abgelöste Jobs (nach [`JobManager::detach_all`] oder aus einer
+/// früheren Sitzung): endet der Prozess, meldet
+/// [`JobManager::finalize_detached`] dem Besitzer ehrlich das Ende —
+/// [`JobState::Unknown`], ohne Exit-Status, denn der war nicht beobachtbar.
+/// Pro `DETACHED_POLL` ein Scan aller Einträge; ein
+/// einziger Task für alle Jobs statt einer Task je Job. Der Task hält den
+/// Manager nur schwach: ist der Manager fort (oder endet die Runtime), endet
+/// auch der Lauf; Abfrage-Pfade finalisieren weiterhin on demand.
+struct DetachedWatch {
+    manager: Weak<JobManager>,
+}
+
+impl DetachedWatch {
+    async fn run(self) {
+        let mut ticker = tokio::time::interval(DETACHED_POLL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // The first tick completes at once: the first scan runs right
+            // after the start.
+            ticker.tick().await;
+            let Some(manager) = self.manager.upgrade() else {
+                return;
+            };
+            let entries: Vec<Arc<JobEntry>> = lock(&manager.jobs).values().cloned().collect();
+            for entry in &entries {
+                manager.finalize_detached(entry);
+            }
         }
-        let alive = match &entry.leader {
-            Some(leader) => !leader.has_exited(),
-            None => liveness(&state.meta) == Liveness::Alive,
-        };
-        if alive {
-            false
-        } else {
-            state.meta.state = JobState::Unknown;
-            // The process is gone: an open suspension ends here.
-            state.meta.end_suspension(Timestamp::now());
-            state.milestones += 1;
-            true
-        }
-    };
-    if changed {
-        entry.persist();
-        entry.bump();
     }
 }
 
@@ -3454,6 +3569,42 @@ fn detached_exited(entry: &JobEntry, meta: &JobMeta, liveness: LivenessCheck) ->
     match &entry.leader {
         Some(leader) => leader.has_exited(),
         None => liveness(meta) != Liveness::Alive,
+    }
+}
+
+/// Ende-Bericht eines nicht beaufsichtigten Jobs an seinen Besitzer
+/// ([`JobManager::finalize_detached`], Stop eines abgelösten Jobs): Zustand
+/// `final_state`, ohne Exit-Status (nicht beobachtbar), Dauer nach Wanduhr
+/// seit dem Start, die letzten `tail_lines` Zeilen.
+fn detached_finished(
+    state: &EntryState,
+    final_state: JobState,
+    tail_lines: usize,
+) -> JobNotification {
+    let duration_secs = state.meta.started_at.map_or(0, |start| {
+        u64::try_from(
+            Timestamp::now()
+                .as_second()
+                .saturating_sub(start.as_second()),
+        )
+        .unwrap_or(0)
+    });
+    JobNotification {
+        owner: state.meta.owner.clone(),
+        event: JobEvent::Finished {
+            job_id: state.meta.job_id.clone(),
+            name: state.meta.name.clone(),
+            state: final_state,
+            exit_code: None,
+            signal: None,
+            duration_secs,
+            tail: state
+                .tail
+                .iter()
+                .skip(state.tail.len().saturating_sub(tail_lines))
+                .cloned()
+                .collect(),
+        },
     }
 }
 
