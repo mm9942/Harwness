@@ -1633,6 +1633,9 @@ mod tests {
             // (harw-ops/src/sandbox_lease.rs).
             "provider-concurrency",
             "sandbox-lease",
+            // `work.result` (harw-ops/src/work_result.rs): liest das Ergebnis
+            // eines eigenen, abgeschlossenen Jobs der gebundenen Workspace.
+            "work.result",
             // Workbench-Werkzeuge (harw-registry-defaults/src/workbench_tools.rs):
             // Notizen und Hypothesen der Sitzung, Recht `ReadWorkspace`.
             "workbench.note",
