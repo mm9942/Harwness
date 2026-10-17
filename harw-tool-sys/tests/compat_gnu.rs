@@ -121,31 +121,40 @@ fn ps_matches_procps_for_a_real_child() -> TestResult {
 
 #[test]
 fn ps_process_set_matches_procps() -> TestResult {
-    let Some(expected) = gnu("ps", &["-e", "-o", "pid="]) else {
-        eprintln!("skipped: ps");
-        return Ok(());
-    };
-    let theirs: std::collections::BTreeSet<i64> = expected
-        .split_whitespace()
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    let got = value(harw_tool_sys::ps::run(
-        &ProcFs::real(),
-        &serde_json::from_value(json!({"fields": ["pid"], "limit": 2000}))?,
-    ))?;
-    let ours: std::collections::BTreeSet<i64> = got["processes"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|p| p["pid"].as_i64()).collect())
-        .unwrap_or_default();
-    // Prozesse kommen und gehen (ps selbst, Aufräumen): kleine Abweichungen sind normal.
-    let only_theirs = theirs.difference(&ours).count();
-    let only_ours = ours.difference(&theirs).count();
-    assert!(
-        only_theirs <= 3 && only_ours <= 3,
-        "ours {} / theirs {}: only_theirs {only_theirs}, only_ours {only_ours}",
-        ours.len(),
-        theirs.len()
-    );
+    // Prozesse kommen und gehen (ps selbst, parallel laufende Testprozesse):
+    // beide Momentaufnahmen sind nie exakt gleichzeitig. Kleine Abweichungen
+    // sind normal; auf einem ausgelasteten Runner wird bis zu fünfmal neu
+    // gemessen, bevor eine Abweichung als echter Fehler gilt.
+    let mut last = String::new();
+    for _ in 0..5 {
+        let Some(expected) = gnu("ps", &["-e", "-o", "pid="]) else {
+            eprintln!("skipped: ps");
+            return Ok(());
+        };
+        let theirs: std::collections::BTreeSet<i64> = expected
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        let got = value(harw_tool_sys::ps::run(
+            &ProcFs::real(),
+            &serde_json::from_value(json!({"fields": ["pid"], "limit": 2000}))?,
+        ))?;
+        let ours: std::collections::BTreeSet<i64> = got["processes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|p| p["pid"].as_i64()).collect())
+            .unwrap_or_default();
+        let only_theirs = theirs.difference(&ours).count();
+        let only_ours = ours.difference(&theirs).count();
+        if only_theirs <= 3 && only_ours <= 3 {
+            return Ok(());
+        }
+        last = format!(
+            "ours {} / theirs {}: only_theirs {only_theirs}, only_ours {only_ours}",
+            ours.len(),
+            theirs.len()
+        );
+    }
+    assert!(last.is_empty(), "{last}");
     Ok(())
 }
 
