@@ -1005,7 +1005,11 @@ fn retry_policy(max_attempts: u32, delay: SignedDuration) -> TestResult<RetryPol
 }
 
 /// A retry policy with a non-zero jitter fraction.
-fn jittered_policy(max_attempts: u32, delay: SignedDuration, jitter: f64) -> TestResult<RetryPolicy> {
+fn jittered_policy(
+    max_attempts: u32,
+    delay: SignedDuration,
+    jitter: f64,
+) -> TestResult<RetryPolicy> {
     RetryPolicy::try_new_with_jitter(max_attempts, delay, 2.0, delay, jitter)
         .map_err(ctx("jittered retry policy"))
 }

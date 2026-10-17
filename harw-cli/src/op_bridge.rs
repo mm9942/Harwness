@@ -43,7 +43,9 @@ use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores, ServiceSurface,
 };
 use harw_session_store::JobStore;
-use harw_types::{IngressSurface, PeerId, PermissionTier, Principal, PrincipalKind, SessionId, TurnId};
+use harw_types::{
+    IngressSurface, PeerId, PermissionTier, Principal, PrincipalKind, SessionId, TurnId,
+};
 
 use crate::runtime_entry::{local_principal, runtime_spec};
 
@@ -236,11 +238,8 @@ pub(crate) fn run_channel_operation(
     // Konfiguration/Trust werden mit maximal Operator geladen. Erst danach
     // darf die statische Telegram-Binding-Policy einen konkreten Absender auf
     // Maintainer hochstufen; Telegram erzeugt niemals Owner.
-    let bootstrap_principal = telegram_command_principal(
-        target.binding_id,
-        target.sender,
-        PermissionTier::Operator,
-    );
+    let bootstrap_principal =
+        telegram_command_principal(target.binding_id, target.sender, PermissionTier::Operator);
     let bootstrap_spec = runtime_spec(
         EntryKind::Analyze,
         target.home,
@@ -284,9 +283,7 @@ pub(crate) fn run_channel_operation(
     })?;
     if !adapter.allows_channel_invocation(&args) {
         return Err(ChannelOpFailure::new(
-            format!(
-                "Diese Form von `{command}` ist über Telegram nicht verfügbar."
-            ),
+            format!("Diese Form von `{command}` ist über Telegram nicht verfügbar."),
             format!("channel policy rejected {command} with {} args", args.len()),
         ));
     }
@@ -307,19 +304,21 @@ pub(crate) fn run_channel_operation(
         TurnId::new(),
         assembly.sandbox().clone(),
     );
-    runtime.block_on(adapter.dispatch(&ctx, args)).map_err(|error| {
-        let detail = op_error_message(&command, &error);
-        let user = match error {
-            OpError::InvalidArguments(message) => {
-                format!("Ungültige Angaben für `{command}`: {message}")
-            }
-            OpError::NotAvailable(_) => {
-                format!("`{command}` ist in diesem Arbeitsbereich nicht verfügbar.")
-            }
-            OpError::Execution(_) => format!("Ausführung von `{command}` ist fehlgeschlagen."),
-        };
-        ChannelOpFailure::new(user, detail)
-    })
+    runtime
+        .block_on(adapter.dispatch(&ctx, args))
+        .map_err(|error| {
+            let detail = op_error_message(&command, &error);
+            let user = match error {
+                OpError::InvalidArguments(message) => {
+                    format!("Ungültige Angaben für `{command}`: {message}")
+                }
+                OpError::NotAvailable(_) => {
+                    format!("`{command}` ist in diesem Arbeitsbereich nicht verfügbar.")
+                }
+                OpError::Execution(_) => format!("Ausführung von `{command}` ist fehlgeschlagen."),
+            };
+            ChannelOpFailure::new(user, detail)
+        })
 }
 
 fn telegram_command_tier(

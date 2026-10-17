@@ -10,9 +10,7 @@
 
 use std::time::Duration;
 
-use harw_job_core::{
-    ExitOutcome, JobState, LifecycleState, RetryPolicy, RunnerId,
-};
+use harw_job_core::{ExitOutcome, JobState, LifecycleState, RetryPolicy, RunnerId};
 use harw_job_store::FsJobRecordStore;
 use jiff::SignedDuration;
 use tempfile::TempDir;
@@ -140,9 +138,6 @@ async fn lifecycle_backoff_respects_the_attempt_cap() -> TestResult {
         .completion
         .map(|completion| completion.outcome)
         .ok_or(TestError::Missing("completion"))?;
-    assert!(matches!(
-        reason,
-        harw_job_core::JobOutcome::Failed { .. }
-    ));
+    assert!(matches!(reason, harw_job_core::JobOutcome::Failed { .. }));
     Ok(())
 }

@@ -361,14 +361,16 @@ mod tests {
 
         // Construction rejects out-of-range jitter.
         for jitter in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
-            assert!(RetryPolicy::try_new_with_jitter(
-                4,
-                SignedDuration::from_secs(1),
-                2.0,
-                SignedDuration::from_secs(30),
-                jitter,
-            )
-            .is_err());
+            assert!(
+                RetryPolicy::try_new_with_jitter(
+                    4,
+                    SignedDuration::from_secs(1),
+                    2.0,
+                    SignedDuration::from_secs(30),
+                    jitter,
+                )
+                .is_err()
+            );
         }
         Ok(())
     }

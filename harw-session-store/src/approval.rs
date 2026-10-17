@@ -565,18 +565,33 @@ impl ApprovalStore {
         if path_is_symlink(&path)? {
             return Err(corrupt("resolution file is a symlink".to_owned()));
         }
-        let bytes = match read_pending(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // `read_pending` meldet auch Symlink (ELOOP) und Nicht-Datei als
-                // NotFound; nur ein wirklich fehlender Eintrag ist `None`.
-                return match std::fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(other) => Err(SessionStoreError::Io(other)),
-                    Ok(_) => Err(corrupt("resolution entry is not a regular file".to_owned())),
-                };
+        // Zwei Versuche: `.resolved.json` erscheint per atomarem Rename. Liegt
+        // der Rename eines parallelen `resolve` genau zwischen dem fehlschlagenden
+        // Lesen und der Metadaten-Prüfung, ist die Datei inzwischen regulär —
+        // dann wird einmal neu gelesen statt sie fälschlich als defekt zu melden.
+        let mut attempt = 0;
+        let bytes = loop {
+            attempt += 1;
+            match read_pending(&path) {
+                Ok(bytes) => break bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // `read_pending` meldet auch Symlink (ELOOP) und Nicht-Datei als
+                    // NotFound; nur ein wirklich fehlender Eintrag ist `None`.
+                    match std::fs::symlink_metadata(&path) {
+                        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(None);
+                        }
+                        Err(other) => return Err(SessionStoreError::Io(other)),
+                        Ok(meta) if meta.file_type().is_file() && attempt < 2 => continue,
+                        Ok(_) => {
+                            return Err(corrupt(
+                                "resolution entry is not a regular file".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(SessionStoreError::Io(error)),
             }
-            Err(error) => return Err(SessionStoreError::Io(error)),
         };
         let record: ApprovalResolutionRecord =
             serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;

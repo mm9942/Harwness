@@ -471,7 +471,9 @@ impl TelegramCommandHandler {
             OperationResolve::Invalid(reply) => {
                 match reply_target(event) {
                     Some(target) => self.reply(key, &target, reply),
-                    None => tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id"),
+                    None => {
+                        tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id")
+                    }
                 }
                 return CommandDisposition::Handled;
             }

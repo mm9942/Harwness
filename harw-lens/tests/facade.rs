@@ -289,8 +289,11 @@ fn test_index_verify_status_reflects_built_index() -> TestResult {
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     assert!(
-        index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY).is_err(),
-        "status before any build must not report an index"
+        matches!(
+            index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY),
+            Ok(None)
+        ),
+        "status before any build must be Ok(None)"
     );
     let documents = vec![document(
         "Statuschunk ueber Hunde.",
@@ -309,8 +312,11 @@ fn test_index_verify_status_reflects_built_index() -> TestResult {
     )
     .map_err(ctx("build succeeds"))?;
     assert!(
-        index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY).is_ok(),
-        "status after build must report the index"
+        matches!(
+            index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY),
+            Ok(Some(_))
+        ),
+        "status after build must report the index (Ok(Some(_)))"
     );
     Ok(())
 }

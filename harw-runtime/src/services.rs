@@ -1322,7 +1322,7 @@ mod tests {
         }
     }
 
-    /// Die Namen der acht immer vorhandenen Dienste.
+    /// Die Namen der neun immer vorhandenen Dienste.
     fn always_present() -> Vec<&'static str> {
         vec![
             type_name::<OperationRegistry>(),
@@ -1663,13 +1663,21 @@ mod tests {
         Ok(())
     }
 
+    /// Ohne optionale Teile liegen die neun Pflichtdienste auf jeder Fläche;
+    /// dazu kommt der unbedingte [`JobMutationScope`]-Marker (Slash:
+    /// `TenantVisible`, Modell-Werkzeug: `BoundWorkspace`), den die Montage
+    /// unabhängig von `job_store` ablegt. Web und Job tragen ihn nicht.
     #[test]
-    fn minimal_parts_register_only_the_mandatory_eight() {
+    fn minimal_parts_register_only_the_mandatory_nine_and_the_job_scope() {
         let services = RuntimeServices::new(minimal_parts());
         for surface in ServiceSurface::ALL {
+            let mut expected = always_present();
+            if matches!(surface, ServiceSurface::Slash | ServiceSurface::ModelTool) {
+                expected.push(type_name::<JobMutationScope>());
+            }
             assert_eq!(
                 services.registered(surface),
-                sorted(always_present()),
+                sorted(expected),
                 "Fläche {} ohne optionale Dienste",
                 surface.as_str()
             );
@@ -1962,6 +1970,8 @@ mod tests {
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<AgentEventHub>>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",
@@ -1972,10 +1982,12 @@ mod tests {
     }
 
     /// Mit Speicher (und `JobStore` samt Freigabe-Akteur) unterscheiden sich
-    /// Web/Job vom Slash-Pfad um genau die drei deklarierten Einträge plus das
-    /// davon abgeleitete Kanban-Ledger.
+    /// Web/Job vom Slash-Pfad um genau die sieben deklarierten Einträge:
+    /// Spawner, Sitzungs-Controller, Wissensspeicher, das davon abgeleitete
+    /// Kanban-Ledger, Live-Job-Registry, Job-Mutations-Scope und den
+    /// Host-Lease-Nutzer-Marker.
     #[test]
-    fn with_a_store_surfaces_differ_only_in_the_three_declared_entries() {
+    fn with_a_store_surfaces_differ_only_in_the_seven_declared_entries() {
         let store = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
         let services = RuntimeServices::new(full_parts()).with_knowledge_store(store);
         let slash = services.registered(ServiceSurface::Slash);
@@ -1993,6 +2005,8 @@ mod tests {
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<KnowledgeStore>>(),
                     type_name::<Arc<dyn JobTransitions>>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",
