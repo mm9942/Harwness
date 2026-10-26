@@ -58,6 +58,7 @@ pub mod error;
 pub mod filesystem;
 #[cfg(target_os = "linux")]
 pub mod group;
+pub mod inventory;
 #[cfg(all(target_os = "linux", feature = "linux-basic"))]
 pub mod proc;
 #[cfg(target_os = "linux")]

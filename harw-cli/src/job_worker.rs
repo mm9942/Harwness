@@ -1148,7 +1148,13 @@ async fn run_prompt_turn(
         };
     };
 
-    let ledger = PromptTokenLedger::new(budget, claim.job.usage.clone());
+    let ledger = PromptTokenLedger::persisted(
+        budget,
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(USAGE_FLUSH_INTERVAL);
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: provider,
         ledger: Arc::clone(&ledger),
@@ -1178,7 +1184,7 @@ async fn run_prompt_turn(
     };
 
     let turn = execute_turn(claim, prompt, model, Arc::clone(&control), setup);
-    match tokio::time::timeout(wall.duration, turn).await {
+    let outcome = match tokio::time::timeout(wall.duration, turn).await {
         // Ein Abbruch durch den Supervisor bleibt ein Abbruch; jeder andere
         // Ausgang eines Turns, der das Token-Budget gerissen hat, ist ein
         // Budget-Fehlschlag — auch wenn das Modell noch geantwortet hat.
@@ -1203,7 +1209,10 @@ async fn run_prompt_turn(
                 reason: wall.reason,
             }
         }
-    }
+    };
+    // Letzter Stand vor dem Festschreiben des Ausgangs durch den Runner.
+    ledger.flush().await;
+    outcome
 }
 
 /// Sicherheitsabstand zwischen dem Ende des Wanduhr-Fensters eines Prompt-Jobs
@@ -1425,6 +1434,15 @@ fn prompt_wall_allowance(
 struct PromptTokenLedger {
     budget: harw_job_runtime::Budget,
     state: Mutex<PromptTokenState>,
+    // Ziel der Persistierung (`flush`); `None` für einen rein flüchtigen Ledger.
+    sink: Option<UsageSink>,
+    // Start des Turns und die beim Claim bereits persistierte Wanduhr; daraus
+    // ergibt sich die laufende Wanduhr in `snapshot`.
+    started: std::time::Instant,
+    base_wall: SignedDuration,
+    // Serialisiert `flush`, damit ein älterer Stand nie nach einem neueren
+    // geschrieben wird (der Store lehnt Rückschritte ab).
+    flush_gate: tokio::sync::Mutex<()>,
 }
 
 struct PromptTokenState {
@@ -1432,15 +1450,123 @@ struct PromptTokenState {
     exceeded: Option<String>,
 }
 
+// Job-Store und Lease-Token, unter denen der Ledger seine Usage festschreibt.
+struct UsageSink {
+    store: Arc<JobStore>,
+    token: harw_job_runtime::LeaseToken,
+}
+
+/// Intervall, in dem ein laufender Turn seine Usage zusätzlich zu den
+/// Runden-Flushes in den Job-Store schreibt.
+pub(super) const USAGE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hält den periodischen Usage-Flush eines Ledgers am Leben; das Verwerfen
+/// bricht den Task ab.
+pub(super) struct UsageFlusher(tokio::task::JoinHandle<()>);
+
+impl Drop for UsageFlusher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl PromptTokenLedger {
+    // Nur noch Tests bauen einen flüchtigen Ledger; Produktionspfade nutzen
+    // `persisted` (sonst schlägt `dead_code` an).
+    #[cfg(test)]
     fn new(budget: harw_job_runtime::Budget, usage: harw_job_runtime::BudgetUsage) -> Arc<Self> {
+        Self::build(budget, usage, None)
+    }
+
+    /// Ledger, der die Usage über [`Self::flush`] unter `token` in `store`
+    /// schreibt.
+    pub(super) fn persisted(
+        budget: harw_job_runtime::Budget,
+        usage: harw_job_runtime::BudgetUsage,
+        store: Arc<JobStore>,
+        token: harw_job_runtime::LeaseToken,
+    ) -> Arc<Self> {
+        Self::build(budget, usage, Some(UsageSink { store, token }))
+    }
+
+    fn build(
+        budget: harw_job_runtime::Budget,
+        usage: harw_job_runtime::BudgetUsage,
+        sink: Option<UsageSink>,
+    ) -> Arc<Self> {
+        let base_wall = usage.wall;
         Arc::new(Self {
             budget,
             state: Mutex::new(PromptTokenState {
                 usage,
                 exceeded: None,
             }),
+            sink,
+            started: std::time::Instant::now(),
+            base_wall,
+            flush_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Aktuelle Usage: Tokens und Tool-Aufrufe aus dem Ledger, Wanduhr als
+    /// Startwert plus verstrichene Zeit. Nie kleiner als der Startwert.
+    pub(super) fn snapshot(&self) -> harw_job_runtime::BudgetUsage {
+        let mut usage = self.state().usage.clone();
+        let elapsed =
+            SignedDuration::try_from(self.started.elapsed()).unwrap_or(SignedDuration::MAX);
+        let running = self.base_wall.saturating_add(elapsed);
+        usage.wall = usage.wall.max(running).max(self.base_wall);
+        usage
+    }
+
+    /// Schreibt [`Self::snapshot`] unter dem Lease-Token in den Job-Store.
+    ///
+    /// # Description
+    /// Ohne Sink ein No-op. Verliert der Job dabei seine Lease (Token passt
+    /// nicht mehr, Lease abgelaufen, Job bereits terminal), wird der Ledger
+    /// geschlossen, damit keine weitere Modell-Runde auf fremde Kosten läuft.
+    /// Alle anderen Fehler werden nur protokolliert.
+    pub(super) async fn flush(self: &Arc<Self>) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let _gate = self.flush_gate.lock().await;
+        let usage = self.snapshot();
+        let store = Arc::clone(&sink.store);
+        let token = sink.token.clone();
+        let work_id = token.work_id.as_str().to_owned();
+        let joined =
+            tokio::task::spawn_blocking(move || store.record_usage(&token.work_id, &token, &usage))
+                .await;
+        match joined {
+            Ok(Ok(_stored)) => {}
+            Ok(Err(
+                harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
+                | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
+                | harw_session_store::SessionStoreError::JobAlreadyTerminal { .. },
+            )) => {
+                tracing::warn!(work_id = %work_id, "job lease lost while recording usage");
+                self.close("lease: job lease lost; usage could not be recorded".into());
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(work_id = %work_id, error = %error, "job usage could not be recorded");
+            }
+            Err(error) => {
+                tracing::warn!(work_id = %work_id, error = %error, "job usage flush task failed");
+            }
+        }
+    }
+
+    /// Startet einen Task, der alle `every` die Usage persistiert; der
+    /// Rückgabewert beendet ihn beim Verwerfen.
+    pub(super) fn spawn_flusher(self: &Arc<Self>, every: std::time::Duration) -> UsageFlusher {
+        let ledger = Arc::clone(self);
+        UsageFlusher(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                ledger.flush().await;
+            }
+        }))
     }
 
     // Ein vergifteter Mutex hält nur Zählerstände; sie bleiben lesbar.
@@ -1526,6 +1652,7 @@ impl ModelProvider for BudgetedModelProvider {
             self.ledger
                 .charge_round(&response.usage)
                 .map_err(harw_core::ModelError::RequestFailed)?;
+            self.ledger.flush().await;
             Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
         })
     }
@@ -6023,5 +6150,112 @@ mod prompt_claim_guard_tests {
         );
         assert!(matches!(expired, Err(ref reason) if reason.starts_with("lease:")));
         Ok(())
+    }
+
+    // ── Usage-Persistierung ───────────────────────────────────────────────
+
+    fn tokens_used(total: u64) -> TokenUsage {
+        TokenUsage {
+            cache_separate: false,
+            input_tokens: total,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_ledger_flush_writes_usage_to_the_job_store() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "usage-flush",
+                serde_json::json!({"prompt": "hello"}),
+                Budget::unbounded(),
+                operator_scope(),
+            )?,
+        )?;
+        let claim = claim_as_worker(&store, "usage-flush")?;
+        let ledger = PromptTokenLedger::persisted(
+            Budget::unbounded(),
+            claim.job.usage.clone(),
+            Arc::clone(&store),
+            claim.token.clone(),
+        );
+
+        ledger
+            .charge_round(&tokens_used(7))
+            .map_err(TestError::Unexpected)?;
+        ledger.flush().await;
+
+        let stored = store
+            .get(&WorkId::from_str("usage-flush"))
+            .map_err(ctx("get job"))?;
+        assert_eq!(stored.job.usage.tokens, 7);
+        assert!(ledger.exceeded().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ledger_closes_when_the_lease_is_lost_during_flush() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "usage-lease-lost",
+                serde_json::json!({"prompt": "hello"}),
+                Budget::unbounded(),
+                operator_scope(),
+            )?,
+        )?;
+        let claim = claim_as_worker(&store, "usage-lease-lost")?;
+        let mut stale_token = claim.token.clone();
+        stale_token.nonce.push_str("-stale");
+        let ledger = PromptTokenLedger::persisted(
+            Budget::unbounded(),
+            claim.job.usage.clone(),
+            Arc::clone(&store),
+            stale_token,
+        );
+
+        ledger
+            .charge_round(&tokens_used(3))
+            .map_err(TestError::Unexpected)?;
+        ledger.flush().await;
+
+        let Some(reason) = ledger.exceeded() else {
+            return Err(TestError::Unexpected(
+                "a lost lease must close the ledger".into(),
+            ));
+        };
+        assert!(reason.starts_with("lease:"), "{reason}");
+        assert!(ledger.admit_round().is_err());
+        let stored = store
+            .get(&WorkId::from_str("usage-lease-lost"))
+            .map_err(ctx("get job"))?;
+        assert_eq!(stored.job.usage.tokens, 0, "a stale token must not write");
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_never_decreases_below_the_starting_usage() {
+        let start = BudgetUsage {
+            tokens: 5,
+            wall: SignedDuration::from_secs(10),
+            tool_calls: 2,
+        };
+        let ledger = PromptTokenLedger::new(Budget::unbounded(), start.clone());
+
+        let first = ledger.snapshot();
+        assert!(first.tokens >= start.tokens);
+        assert!(first.wall >= start.wall);
+        assert!(first.tool_calls >= start.tool_calls);
+
+        let second = ledger.snapshot();
+        assert!(second.wall >= first.wall);
     }
 }

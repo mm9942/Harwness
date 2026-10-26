@@ -319,7 +319,13 @@ pub(super) async fn execute_kanban_claim(
             "budget: the wall-clock budget is already exhausted".to_owned(),
         );
     }
-    let ledger = PromptTokenLedger::new(budget, claim.job.usage.clone());
+    let ledger = PromptTokenLedger::persisted(
+        budget,
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(super::USAGE_FLUSH_INTERVAL);
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: provider,
         ledger: Arc::clone(&ledger),
@@ -335,7 +341,7 @@ pub(super) async fn execute_kanban_claim(
             principal: job_principal(&submitter_id),
             session_id: session_id.clone(),
             state_store: Arc::clone(&state_store),
-            job_store,
+            job_store: Arc::clone(&job_store),
             model: budgeted,
             narrowing: Some(narrowing),
         },
@@ -386,6 +392,7 @@ pub(super) async fn execute_kanban_claim(
             budget_outcome(reason, state_store.as_ref(), &session_id).await
         }
     };
+    ledger.flush().await;
     report(store, &card, &work_id, outcome)
 }
 

@@ -14,8 +14,8 @@
 //! "stale lease attempts mutation").
 
 use harw_job_core::{
-    FencingToken, JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState,
-    Lease, LeaseToken, StoredJob,
+    BudgetUsage, FencingToken, JobCancellation, JobClaim, JobCompletion, JobOutcome,
+    JobRuntimeError, JobState, Lease, LeaseToken, StoredJob,
 };
 use jiff::{SignedDuration, Timestamp};
 
@@ -170,6 +170,71 @@ pub fn renew(record: &mut StoredJob, token: &LeaseToken, now: Timestamp) -> Stor
     };
     record.revision = record.revision.saturating_add(1);
     Ok(renewed)
+}
+
+/// Records the cumulative budget `usage` of a running job under its current,
+/// unexpired lease. Usage is monotonic: no field may fall below the stored
+/// value. An unchanged `usage` is a no-op (no revision bump). The lease expiry
+/// is not touched; returns the usage that is stored after the call.
+///
+/// # Errors
+/// [`StaleLease::TokenMismatch`] if the token names another job,
+/// [`Conflict::AlreadyTerminal`], [`verify_lease`] errors, or
+/// [`Conflict::Rejected`] for a negative wall time or any field that is
+/// lower than the stored value.
+pub fn record_usage(
+    record: &mut StoredJob,
+    token: &LeaseToken,
+    usage: &BudgetUsage,
+    now: Timestamp,
+) -> StoreResult<BudgetUsage> {
+    if token.work_id != record.job.id {
+        return Err(StoreError::stale(
+            record.job.id.as_str(),
+            StaleLease::TokenMismatch,
+        ));
+    }
+    if is_terminal(record.job.state) {
+        return Err(StoreError::conflict(
+            record.job.id.as_str(),
+            Conflict::AlreadyTerminal {
+                state: record.job.state,
+            },
+        ));
+    }
+    verify_lease(record, token, now)?;
+    let rejected = |detail: String| {
+        StoreError::conflict(record.job.id.as_str(), Conflict::Rejected { detail })
+    };
+    if usage.wall.is_negative() {
+        return Err(rejected("usage: negative wall time".to_owned()));
+    }
+    let stored = &record.job.usage;
+    if usage.tokens < stored.tokens {
+        return Err(rejected(format!(
+            "usage regression: tokens {} < {}",
+            usage.tokens, stored.tokens
+        )));
+    }
+    if usage.wall < stored.wall {
+        return Err(rejected(format!(
+            "usage regression: wall {} < {}",
+            usage.wall, stored.wall
+        )));
+    }
+    if usage.tool_calls < stored.tool_calls {
+        return Err(rejected(format!(
+            "usage regression: tool_calls {} < {}",
+            usage.tool_calls, stored.tool_calls
+        )));
+    }
+    if *usage == *stored {
+        return Ok(stored.clone());
+    }
+    record.job.usage = usage.clone();
+    record.job.updated_at = now;
+    record.revision = record.revision.saturating_add(1);
+    Ok(record.job.usage.clone())
 }
 
 /// Completes a non-terminal job exactly once with the current, unexpired

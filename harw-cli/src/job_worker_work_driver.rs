@@ -2211,10 +2211,16 @@ pub(super) async fn execute_work_driver_claim(
     // Budgets: Token-Ledger des Jobs (von `work_driver.enqueue` aus der Spec
     // gespiegelt) für alle Modellrunden des Laufs; die Wandzeit bindet jeden
     // Worker-Turn an das Laufende.
-    let ledger = PromptTokenLedger::new(claim.job.budget.clone(), claim.job.usage.clone());
+    let ledger = PromptTokenLedger::persisted(
+        claim.job.budget.clone(),
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(super::USAGE_FLUSH_INTERVAL);
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: Arc::clone(&provider),
-        ledger,
+        ledger: Arc::clone(&ledger),
     });
     let run_wall = claim.job.budget.max_wall.unwrap_or(DEFAULT_RUN_WALL);
     let elapsed = Timestamp::now().duration_since(record.submitted_at);
@@ -2317,7 +2323,7 @@ pub(super) async fn execute_work_driver_claim(
     };
     let cancellation = control.cancellation();
     let cancelled = move || *cancellation.borrow();
-    match run_rounds(
+    let outcome = match run_rounds(
         &job_store,
         &work_id,
         &driver_input,
@@ -2332,7 +2338,9 @@ pub(super) async fn execute_work_driver_claim(
         RoundsEnd::Yielded => JobOutcome::Failed {
             reason: "work-driver stopped without an outcome".to_owned(),
         },
-    }
+    };
+    ledger.flush().await;
+    outcome
 }
 
 /// Was der Lauf aus der Konfiguration braucht.

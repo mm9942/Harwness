@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_job_core::{
-    JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState, Lease,
-    LeaseToken, StoredJob,
+    BudgetUsage, JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState,
+    Lease, LeaseToken, StoredJob,
 };
 use harw_job_store::{
     Conflict, LEASE_EXPIRED_EXHAUSTED_REASON, RecordStore, StaleLease, StoreError, mechanics,
@@ -302,6 +302,31 @@ impl JobStore {
         let work_id = request.token.work_id.clone();
         self.with_locked(&work_id, |record| {
             mechanics::renew(record, &request.token, request.now).map_err(SessionStoreError::from)
+        })
+    }
+
+    /// Persists the running job's budget usage under the current lease.
+    ///
+    /// Fenced like [`JobStore::renew`]: only the holder of the current,
+    /// non-expired lease may record usage, so a stale worker can never
+    /// overwrite the usage of a reclaimed attempt. Usage is monotonic; a
+    /// regression is rejected with [`SessionStoreError::JobRuntime`] and
+    /// writes nothing. Returns the usage that is stored after the call.
+    /// Publishes no lifecycle event, because the job state does not change.
+    pub fn record_usage(
+        &self,
+        work_id: &WorkId,
+        token: &LeaseToken,
+        usage: &BudgetUsage,
+    ) -> SessionStoreResult<BudgetUsage> {
+        if token.work_id != *work_id {
+            return Err(SessionStoreError::LeaseTokenMismatch {
+                work_id: work_id.clone(),
+            });
+        }
+        self.with_locked(work_id, |record| {
+            mechanics::record_usage(record, token, usage, Timestamp::now())
+                .map_err(SessionStoreError::from)
         })
     }
 
@@ -1986,6 +2011,183 @@ mod tests {
         ));
         let after = store.get(&work_id)?;
         assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[test]
+    fn record_usage_roundtrips_through_get() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let usage = BudgetUsage {
+            tokens: 1_200,
+            wall: SignedDuration::from_secs(7),
+            tool_calls: 3,
+        };
+
+        let stored = store.record_usage(&work_id, &claim.token, &usage)?;
+
+        assert_eq!(stored, usage);
+        assert_eq!(store.get(&work_id)?.job.usage, usage);
+        Ok(())
+    }
+
+    #[test]
+    fn record_usage_rejects_regression_with_job_runtime_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage-regress");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let usage = BudgetUsage {
+            tokens: 500,
+            wall: SignedDuration::from_secs(5),
+            tool_calls: 2,
+        };
+        store.record_usage(&work_id, &claim.token, &usage)?;
+        let before = store.get(&work_id)?;
+
+        let regressed = BudgetUsage {
+            tokens: 499,
+            ..usage.clone()
+        };
+        assert!(matches!(
+            store.record_usage(&work_id, &claim.token, &regressed),
+            Err(SessionStoreError::JobRuntime { .. })
+        ));
+        let negative_wall = BudgetUsage {
+            wall: SignedDuration::from_secs(-1),
+            ..usage.clone()
+        };
+        assert!(matches!(
+            store.record_usage(&work_id, &claim.token, &negative_wall),
+            Err(SessionStoreError::JobRuntime { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_record_usage_after_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage-stale");
+        store.admit(&record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+        let first = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now,
+            },
+        )?;
+        let after_expiry = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("now + 2s"))?;
+        assert_eq!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .len(),
+            1
+        );
+        let second = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-b".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: after_expiry
+                    .checked_add(SignedDuration::from_secs(2))
+                    .map_err(ctx("after_expiry + 2s"))?,
+            },
+        )?;
+        assert!(second.token.epoch > first.token.epoch);
+        let before = store.get(&work_id)?;
+
+        let usage = BudgetUsage {
+            tokens: 10,
+            wall: SignedDuration::from_secs(1),
+            tool_calls: 1,
+        };
+        assert!(matches!(
+            store.record_usage(&work_id, &first.token, &usage),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn record_usage_publishes_no_lifecycle_event() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-usage-quiet");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let events_after_claim = recorded_events(&sink).len();
+
+        store.record_usage(
+            &work_id,
+            &claim.token,
+            &BudgetUsage {
+                tokens: 42,
+                wall: SignedDuration::from_secs(2),
+                tool_calls: 1,
+            },
+        )?;
+
+        assert_eq!(recorded_events(&sink).len(), events_after_claim);
+        Ok(())
+    }
+
+    #[test]
+    fn claim_after_reclaim_sees_the_recorded_usage() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage-carry");
+        store.admit(&record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+        let first = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now,
+            },
+        )?;
+        let usage = BudgetUsage {
+            tokens: 900,
+            wall: SignedDuration::from_secs(4),
+            tool_calls: 5,
+        };
+        store.record_usage(&work_id, &first.token, &usage)?;
+        let after_expiry = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("now + 2s"))?;
+        assert_eq!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .len(),
+            1
+        );
+
+        let second = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-b".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: after_expiry
+                    .checked_add(SignedDuration::from_secs(2))
+                    .map_err(ctx("after_expiry + 2s"))?,
+            },
+        )?;
+
+        assert_eq!(second.job.usage, usage);
         Ok(())
     }
 }

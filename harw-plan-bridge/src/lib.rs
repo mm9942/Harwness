@@ -93,9 +93,13 @@
 #![forbid(unsafe_code)]
 
 pub mod cells;
+pub mod child_return_envelope;
 pub mod context_ext;
 pub mod controller;
+pub mod cycle_benchmark;
 pub mod cycle_explorer;
+pub mod cycle_observation;
+pub mod cycle_outbox;
 pub mod cycle_proposer;
 pub mod cycle_runtime;
 pub mod cycle_spec;
@@ -109,6 +113,7 @@ pub mod job_bridge;
 pub mod metrics;
 pub mod plan_context;
 pub mod security_bridge;
+pub mod target_offer;
 pub mod verify_exec;
 pub mod work_driver;
 

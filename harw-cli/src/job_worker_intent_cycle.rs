@@ -189,7 +189,13 @@ pub(super) async fn execute_intent_cycle_claim(
         return JobOutcome::Failed { reason };
     }
 
-    let ledger = PromptTokenLedger::new(claim.job.budget.clone(), claim.job.usage.clone());
+    let ledger = PromptTokenLedger::persisted(
+        claim.job.budget.clone(),
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(super::USAGE_FLUSH_INTERVAL);
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: Arc::clone(&provider),
         ledger: Arc::clone(&ledger),
@@ -267,6 +273,9 @@ pub(super) async fn execute_intent_cycle_claim(
         },
     };
     cancel.cancel(CancelReason::Budget);
+    // Persist the final usage first; a lost lease closes the ledger, which the
+    // match below then reports.
+    ledger.flush().await;
     // A budget stop surfaces as a blocked/failed proposer; report the budget.
     let outcome = match (outcome, ledger.exceeded()) {
         (JobOutcome::Blocked { .. } | JobOutcome::Failed { .. }, Some(reason)) => {
@@ -403,6 +412,12 @@ mod tests {
         assert_eq!(
             remaining_wall(&budget, &usage),
             Some(Duration::from_secs(60))
+        );
+        usage.wall = SignedDuration::from_secs(25);
+        assert_eq!(
+            remaining_wall(&budget, &usage),
+            Some(Duration::from_secs(35)),
+            "a persisted usage.wall is honoured on reclaim"
         );
         usage.wall = SignedDuration::from_secs(60);
         assert_eq!(remaining_wall(&budget, &usage), None);

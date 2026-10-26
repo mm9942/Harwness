@@ -109,6 +109,7 @@ macro_rules! id_newtype {
     };
 }
 pub mod artifact;
+pub mod caller_identity;
 pub mod context_proposal;
 pub mod context_provider;
 pub mod context_steward;
@@ -117,6 +118,7 @@ pub mod dream;
 pub mod error;
 pub mod index;
 pub mod kanban;
+pub mod learning_recall;
 pub mod lock;
 pub mod memory;
 pub mod model_behavior_proposal;

@@ -13,9 +13,14 @@
 //! Herleitung der Schwellwerte.
 
 mod dock;
+mod mini_live;
 mod placement;
 
 pub use dock::{DockSplit, PHONE_DOCK_SPLIT_MIN_COLS, split_dock};
+pub use mini_live::{
+    CARDS_ROWS, ChatFirstInput, ChatFirstLayout, LiveMode, MINI_LIVE_MAX_BODY_LINES,
+    MINI_LIVE_MIN_CHAT_ROWS, chat_first,
+};
 pub use placement::{
     LayoutInput, PHONE_DOCK_MAX_HEIGHT, PHONE_DOCK_MIN_COLS, PHONE_DOCK_MIN_HEIGHT,
     PHONE_DOCK_MIN_ROWS, Placement, ScreenLayout, WIDE_AGENT_PANEL_MIN_COLS, classify,
