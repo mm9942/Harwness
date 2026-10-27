@@ -14,7 +14,11 @@
 //! ```text
 //! model proposal      CycleProposal::ProposePatch { target ids, evidence id }
 //!   -> admit_cycle        ids inside the write ceiling, evidence id known
-//!   -> journaled step     InFlightStep, durable before anything runs
+//!   -> CycleStore::begin_step
+//!                         InFlightStep, durable before anything runs
+//!   -> CycleStore::journaled_step
+//!                         JournaledStep: that step and its checkpoint as the
+//!                         store holds them, read under the current lease
 //!   -> PatchProposal::from_admitted
 //!                         trusted: id -> path through a WriteTargetMap,
 //!                         evidence must be observed repository evidence
@@ -28,8 +32,9 @@
 //!   stands for is decided by the trusted runtime in a [`WriteTargetMap`],
 //!   which is deliberately not `Deserialize`. A [`PatchProposal`] is likewise
 //!   not `Deserialize`, has private fields, and is built only by
-//!   [`PatchProposal::from_admitted`] from a *journaled, admitted* step and the
-//!   committed checkpoint, never from model JSON directly.
+//!   [`PatchProposal::from_admitted`] from a [`JournaledStep`], the store's
+//!   proof of a *journaled, admitted* step and its committed checkpoint,
+//!   never from model JSON or caller-built state.
 //! - The preimage digest is not taken from the model either: it is the digest
 //!   of the trusted `Repository` evidence record the step referenced, and that
 //!   record's locator must name the same file as the target.
@@ -64,20 +69,40 @@
 //! proposal that already came out of `from_admitted`. A caller therefore
 //! cannot pair an arbitrary evidence id, or the file's current digest, with a
 //! target: the expected preimage always is the digest of a `Repository`
-//! evidence record of trust `Observed` or `Verified` that the *checkpoint*
-//! holds for the step's evidence id, with a locator naming the target's file.
-//! Without such a record there is no proposal, hence no [`AdmittedPatch`].
-//! (A file whose current digest differs from the recorded one is refused by
-//! [`admit_patch`] as [`PatchRefusal::PreimageMismatch`]; the current digest
-//! is never an input.)
+//! evidence record of trust `Observed` or `Verified` that the *stored
+//! checkpoint* holds for the step's evidence id, with a locator naming the
+//! target's file. Without such a record there is no proposal, hence no
+//! [`AdmittedPatch`]. (A file whose current digest differs from the recorded
+//! one is refused by [`admit_patch`] as [`PatchRefusal::PreimageMismatch`];
+//! the current digest is never an input.)
+//!
+//! # Journal provenance
+//!
+//! `from_admitted` takes neither an
+//! [`InFlightStep`](crate::cycle_runtime::InFlightStep) nor a
+//! [`CycleCheckpoint`](crate::intent_cycle::CycleCheckpoint) (both are public
+//! and deserializable, so a caller could fabricate a `ProposePatch` step plus
+//! an `Observed` repository record carrying the current digest). It takes a
+//! [`JournaledStep`], which has private fields, no `Default`, no
+//! `Deserialize`, and is built only by
+//! [`CycleStore::journaled_step`](crate::cycle_runtime::CycleStore::journaled_step):
+//! the store loads the record, fences it against the caller's lease (stale
+//! epoch, another job, not yet rebound are refused) and hands out the
+//! in-flight step begun under that lease together with the checkpoint it was
+//! admitted against. Evidence therefore enters a proposal only through what
+//! the store holds: the record the trusted runtime created (a nested seed may
+//! carry its parent's evidence) and the fenced commit path
+//! ([`CycleStore::commit_step`](crate::cycle_runtime::CycleStore::commit_step),
+//! fed by the trusted executor's observations). What stays trusted is record
+//! creation and the store directory itself: whoever can create records or
+//! write the record files can write any checkpoint.
 //!
 //! [`admit_patch`] still re-checks against the *current* trusted inputs it is
 //! given, because they can differ from those at construction time: the intent
 //! of the admission, the admitted write targets, and the
-//! `target id -> relative path` binding of the [`WriteTargetMap`]. What stays
-//! trusted is the caller of `from_admitted`: it must pass the step that was
-//! actually journaled and the committed checkpoint of the same cycle; this
-//! module cannot tell a real checkpoint from a fabricated one.
+//! `target id -> relative path` binding of the [`WriteTargetMap`]. A
+//! [`JournaledStep`] is a snapshot taken when it was read; the write adapter
+//! still presents its lease to every store write it makes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -88,10 +113,9 @@ use harw_tool_fsread::scope::Scope;
 use harw_types::ContentDigest;
 
 use crate::cycle_explorer::{DEFAULT_MAX_READ_BYTES, normalized, read_beneath};
-use crate::cycle_runtime::InFlightStep;
+use crate::cycle_runtime::JournaledStep;
 use crate::intent_cycle::{
-    CycleAdmission, CycleCheckpoint, CycleProposal, EvidenceSourceKind, EvidenceTrust,
-    is_prompt_safe_char,
+    CycleAdmission, CycleProposal, EvidenceSourceKind, EvidenceTrust, is_prompt_safe_char,
 };
 
 const MAX_TARGET_ID_BYTES: usize = 256;
@@ -212,9 +236,10 @@ fn is_valid_owner(owner: &str) -> bool {
 ///
 /// Not `Deserialize`, no `Default`, no `new`, and every field is private:
 /// [`PatchProposal::from_admitted`] is the only way to obtain one, so each
-/// proposal is backed by a journaled step, a recorded evidence entry and the
-/// trusted [`WriteTargetMap`] (see the module docs, "No hand-built
-/// proposals"). Read it through the getters.
+/// proposal is backed by a step the store journaled ([`JournaledStep`]), an
+/// evidence entry of the stored checkpoint and the trusted
+/// [`WriteTargetMap`] (see the module docs, "No hand-built proposals" and
+/// "Journal provenance"). Read it through the getters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchProposal {
     intent_id: String,
@@ -291,16 +316,21 @@ impl fmt::Display for PatchRefusal {
 impl std::error::Error for PatchRefusal {}
 
 impl PatchProposal {
-    /// Builds the proposal from a journaled, admitted step (never from model
-    /// JSON directly).
+    /// Builds the proposal only from a step the store journaled: `step` comes
+    /// from
+    /// [`CycleStore::journaled_step`](crate::cycle_runtime::CycleStore::journaled_step)
+    /// under the caller's current lease (never from model JSON, never from a
+    /// caller-built [`InFlightStep`](crate::cycle_runtime::InFlightStep) or
+    /// checkpoint).
     ///
-    /// `step.proposal` must be a [`CycleProposal::ProposePatch`] with exactly
-    /// one target that `targets` maps to a path, and its evidence record in
-    /// `state` must be `Repository` evidence of trust `Observed` or
-    /// `Verified` whose locator names that same file (compared in normalized
-    /// form, so `a//b` and `a/b` are one file). The expected preimage is that
-    /// record's digest. This function reads no file and does not consult the
-    /// [`CycleAdmission`]; [`admit_patch`] does.
+    /// The journaled proposal (`step.step().proposal`) must be a
+    /// [`CycleProposal::ProposePatch`] with exactly one target that `targets`
+    /// maps to a path, and its evidence record in the stored checkpoint
+    /// (`step.checkpoint()`) must be `Repository` evidence of trust
+    /// `Observed` or `Verified` whose locator names that same file (compared
+    /// in normalized form, so `a//b` and `a/b` are one file). The expected
+    /// preimage is that record's digest. This function reads no file and does
+    /// not consult the [`CycleAdmission`]; [`admit_patch`] does.
     ///
     /// # Errors
     /// [`PatchRefusal::NotAPatch`], [`PatchRefusal::InvalidOwner`] (`owner_worker`
@@ -310,15 +340,15 @@ impl PatchProposal {
     /// [`PatchRefusal::MissingEvidence`], [`PatchRefusal::EvidenceNotObserved`]
     /// or [`PatchRefusal::EvidenceLocatorMismatch`].
     pub fn from_admitted(
-        step: &InFlightStep,
-        state: &CycleCheckpoint,
+        step: &JournaledStep,
         targets: &WriteTargetMap,
         owner_worker: &str,
     ) -> Result<Self, PatchRefusal> {
+        let (journaled, state) = (step.step(), step.checkpoint());
         let CycleProposal::ProposePatch {
             targets: named,
             evidence_id,
-        } = &step.proposal
+        } = &journaled.proposal
         else {
             return Err(PatchRefusal::NotAPatch);
         };
@@ -355,7 +385,7 @@ impl PatchProposal {
             expected_preimage: record.digest,
             evidence_id: evidence_id.clone(),
             owner_worker: owner_worker.to_owned(),
-            idempotency_key: step.idempotency_key.clone(),
+            idempotency_key: journaled.idempotency_key.clone(),
         })
     }
 
@@ -459,9 +489,11 @@ impl AdmittedPatch {
 /// [`PatchRefusal::PreimageMismatch`]).
 ///
 /// Every [`PatchProposal`] comes from [`PatchProposal::from_admitted`] (the
-/// type has no other constructor), so its preimage digest is always the one a
-/// recorded, observed evidence entry vouches for; see the module docs ("No
-/// hand-built proposals"). Blocking file read: call from `spawn_blocking`.
+/// type has no other constructor) and a store-issued [`JournaledStep`], so
+/// its preimage digest is always the one an observed evidence entry of the
+/// stored checkpoint vouches for; see the module docs ("No hand-built
+/// proposals", "Journal provenance"). Blocking file read: call from
+/// `spawn_blocking`.
 ///
 /// # Errors
 /// A [`PatchRefusal`]; nothing has been created or changed in that case.
@@ -525,10 +557,16 @@ mod tests {
     use std::path::PathBuf;
 
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_types::{TenantId, WorkspaceId};
+    use harw_job_core::LeaseToken;
+    use harw_job_store::RecordStore;
+    use harw_types::{TenantId, WorkId, WorkspaceId};
 
     use super::*;
-    use crate::intent_cycle::{CycleLimits, CycleTargets, IntentBinding};
+    use crate::cycle_runtime::{CycleRecord, CycleStore, CycleStoreError, InFlightStep};
+    use crate::intent_cycle::{
+        AdmittedCycle, CycleCheckpoint, CycleLimits, CycleObservations, CycleRefusal, CycleTargets,
+        EvidenceRecord, IntentBinding, Segment, admit_cycle, apply_observations,
+    };
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// Content the evidence vouches for.
@@ -659,8 +697,8 @@ mod tests {
         digest: ContentDigest,
         source: EvidenceSourceKind,
         trust: EvidenceTrust,
-    ) -> crate::intent_cycle::EvidenceRecord {
-        crate::intent_cycle::EvidenceRecord {
+    ) -> EvidenceRecord {
+        EvidenceRecord {
             id: id.to_owned(),
             source,
             locator: locator.to_owned(),
@@ -669,19 +707,10 @@ mod tests {
         }
     }
 
-    fn patch_step(targets: &[&str], evidence_id: &str) -> InFlightStep {
-        step(CycleProposal::ProposePatch {
+    fn patch_proposal(targets: &[&str], evidence_id: &str) -> CycleProposal {
+        CycleProposal::ProposePatch {
             targets: set(targets),
             evidence_id: evidence_id.to_owned(),
-        })
-    }
-
-    fn step(proposal: CycleProposal) -> InFlightStep {
-        InFlightStep {
-            epoch: 1,
-            sequence: 0,
-            idempotency_key: "cyc-0".to_owned(),
-            proposal,
         }
     }
 
@@ -689,14 +718,110 @@ mod tests {
         WriteTargetMap::new(entries.iter().copied()).map_err(ctx("map builds"))
     }
 
+    /// Cycle every case journals its steps in.
+    const CYCLE: &str = "cyc";
+
+    /// A real [`CycleStore`] in a temp directory holding the record of
+    /// [`CYCLE`], fenced under lease epoch 1 from the start (no rebind).
+    struct Journal {
+        _dir: tempfile::TempDir,
+        store: CycleStore,
+        lease: LeaseToken,
+    }
+
+    impl Journal {
+        fn new(admission: &CycleAdmission, authority: &AuthorityContext) -> TestResult<Self> {
+            let dir = tempfile::tempdir().map_err(ctx("cycle store dir"))?;
+            let records = RecordStore::create_ambient(&dir.path().join("cycles"))
+                .map_err(ctx("cycle record store"))?;
+            let store = CycleStore::new(records);
+            let work_id = WorkId::from_str("job-w05");
+            let checkpoint = CycleCheckpoint::initial(admission, authority, 1);
+            let record = CycleRecord::new(CYCLE, work_id.clone(), checkpoint)
+                .map_err(ctx("record builds"))?;
+            store.create(&record).map_err(ctx("record persists"))?;
+            Ok(Self {
+                _dir: dir,
+                store,
+                lease: LeaseToken {
+                    work_id,
+                    epoch: 1,
+                    nonce: "nonce-1".to_owned(),
+                },
+            })
+        }
+
+        /// The committed checkpoint as stored.
+        fn checkpoint(&self) -> TestResult<CycleCheckpoint> {
+            Ok(self
+                .store
+                .load(CYCLE)
+                .map_err(ctx("record loads"))?
+                .checkpoint)
+        }
+
+        /// Journals `proposal` against the stored checkpoint with
+        /// `begin_step`, after dropping a step an earlier call left in flight
+        /// (as if it never started). Like the runtime's re-journaling of a
+        /// recovered step, this does not re-run `admit_cycle`: several cases
+        /// journal proposals it would already refuse, to show that
+        /// `from_admitted` and `admit_patch` refuse them on their own.
+        fn begin(&self, proposal: CycleProposal) -> TestResult<AdmittedCycle> {
+            let record = self.store.load(CYCLE).map_err(ctx("record loads"))?;
+            if let Some(left) = &record.in_flight {
+                self.store
+                    .clear_step(CYCLE, &self.lease, left)
+                    .map_err(ctx("left-over step clears"))?;
+            }
+            let admitted = AdmittedCycle::recovered(proposal, record.checkpoint.fence.sequence);
+            self.store
+                .begin_step(CYCLE, &self.lease, &admitted)
+                .map_err(ctx("step journals"))?;
+            Ok(admitted)
+        }
+
+        /// Commits an explore step whose execution observed `evidence`: the
+        /// store's commit path is the only way a record reaches the stored
+        /// checkpoint.
+        fn observe(&self, intent: &IntentBinding, evidence: EvidenceRecord) -> TestResult {
+            let admitted = self.begin(CycleProposal::Advance {
+                segments: vec![Segment::Read {
+                    target: "source".to_owned(),
+                }],
+            })?;
+            let next = apply_observations(
+                intent,
+                &self.checkpoint()?,
+                &admitted,
+                CycleObservations {
+                    evidence: vec![evidence],
+                    ..CycleObservations::default()
+                },
+            )
+            .map_err(|_| TestError::Missing("observations apply"))?;
+            self.store
+                .commit_step(CYCLE, &self.lease, &next)
+                .map_err(ctx("explore step commits"))
+        }
+
+        /// Journals `proposal` and reads it back as the store's proof.
+        fn journaled(&self, proposal: CycleProposal) -> TestResult<JournaledStep> {
+            self.begin(proposal)?;
+            self.store
+                .journaled_step(CYCLE, &self.lease)
+                .map_err(ctx("journaled step reads"))
+        }
+    }
+
     /// A workspace holding `src/lib.rs` (= [`OLD`]) with admission, authority,
-    /// scope, a checkpoint that observed that file as `ev-1`, and a target map
-    /// `code -> src/lib.rs`, `docs -> docs/guide.md`.
+    /// scope, a target map `code -> src/lib.rs`, `docs -> docs/guide.md`, and
+    /// a [`Journal`] whose stored checkpoint observed that file as `ev-1`
+    /// through one committed explore step.
     struct Case {
         ws: Workspace,
         authority: AuthorityContext,
         admission: CycleAdmission,
-        state: CycleCheckpoint,
+        journal: Journal,
         targets: WriteTargetMap,
         scope: Scope,
     }
@@ -707,38 +832,55 @@ mod tests {
             ws.write("src/lib.rs", OLD)?;
             let authority = ws.authority(permissions)?;
             let admission = admission_with(write_ids)?;
-            let mut state = CycleCheckpoint::initial(&admission, &authority, 0);
-            let observed = evidence(
-                "ev-1",
-                "src/lib.rs",
-                ContentDigest::of(OLD),
-                EvidenceSourceKind::Repository,
-                EvidenceTrust::Observed,
-            );
-            state.evidence.insert(observed.id.clone(), observed);
+            let journal = Journal::new(&admission, &authority)?;
+            journal.observe(
+                admission.intent(),
+                evidence(
+                    "ev-1",
+                    "src/lib.rs",
+                    ContentDigest::of(OLD),
+                    EvidenceSourceKind::Repository,
+                    EvidenceTrust::Observed,
+                ),
+            )?;
             let scope = Scope::new(authority.workspace().canonical_root()).map_err(ctx("scope"))?;
             Ok(Self {
                 ws,
                 authority,
                 admission,
-                state,
+                journal,
                 targets: map(&[("code", "src/lib.rs"), ("docs", "docs/guide.md")])?,
                 scope,
             })
         }
 
-        fn record(&mut self, record: crate::intent_cycle::EvidenceRecord) {
-            self.state.evidence.insert(record.id.clone(), record);
+        /// Records `evidence` in the stored checkpoint (one more committed
+        /// explore step).
+        fn record(&self, evidence: EvidenceRecord) -> TestResult {
+            self.journal.observe(self.admission.intent(), evidence)
+        }
+
+        /// The store's proof for a freshly journaled `ProposePatch` step.
+        fn patch(&self, targets: &[&str], evidence_id: &str) -> TestResult<JournaledStep> {
+            self.journal.journaled(patch_proposal(targets, evidence_id))
+        }
+
+        /// `from_admitted` on a freshly journaled `ProposePatch` step.
+        fn try_proposal(
+            &self,
+            targets: &[&str],
+            evidence_id: &str,
+        ) -> TestResult<Result<PatchProposal, PatchRefusal>> {
+            Ok(PatchProposal::from_admitted(
+                &self.patch(targets, evidence_id)?,
+                &self.targets,
+                "worker-1",
+            ))
         }
 
         fn proposal(&self, targets: &[&str], evidence_id: &str) -> TestResult<PatchProposal> {
-            PatchProposal::from_admitted(
-                &patch_step(targets, evidence_id),
-                &self.state,
-                &self.targets,
-                "worker-1",
-            )
-            .map_err(ctx("proposal builds"))
+            self.try_proposal(targets, evidence_id)?
+                .map_err(ctx("proposal builds"))
         }
 
         fn admit(&self, proposal: &PatchProposal) -> Result<AdmittedPatch, PatchRefusal> {
@@ -813,7 +955,26 @@ mod tests {
     #[test]
     fn admitted_patch_carries_the_derived_proposal_and_checked_digest() -> TestResult {
         let case = Case::new(&write_rights(), &["code"])?;
-        let proposal = case.proposal(&["code"], "ev-1")?;
+        // The production path: `admit_cycle` against the stored checkpoint,
+        // `begin_step`, then the store's proof of exactly that step.
+        let state = case.journal.checkpoint()?;
+        let admitted_step = admit_cycle(&case.admission, &state, patch_proposal(&["code"], "ev-1"))
+            .map_err(|_| TestError::Missing("the patch step is admitted"))?;
+        let begun = case
+            .journal
+            .store
+            .begin_step(CYCLE, &case.journal.lease, &admitted_step)
+            .map_err(ctx("patch step journals"))?;
+        let step = case
+            .journal
+            .store
+            .journaled_step(CYCLE, &case.journal.lease)
+            .map_err(ctx("journaled step reads"))?;
+        assert_eq!(step.cycle_id(), CYCLE);
+        assert_eq!(step.step(), &begun);
+        assert_eq!(step.checkpoint(), &state);
+        let proposal = PatchProposal::from_admitted(&step, &case.targets, "worker-1")
+            .map_err(ctx("proposal builds"))?;
         assert_eq!(proposal.intent_id(), "intent-w05");
         assert_eq!(proposal.intent_revision(), 1);
         assert_eq!(proposal.target(), "code");
@@ -821,7 +982,11 @@ mod tests {
         assert_eq!(proposal.expected_preimage(), ContentDigest::of(OLD));
         assert_eq!(proposal.evidence_id(), "ev-1");
         assert_eq!(proposal.owner_worker(), "worker-1");
-        assert_eq!(proposal.idempotency_key(), "cyc-0");
+        assert_eq!(
+            proposal.idempotency_key(),
+            "cyc-1",
+            "the step journaled after the explore step"
+        );
         let before = case.ws.snapshot()?;
         let admitted = case.admit(&proposal).map_err(ctx("admits"))?;
         assert_eq!(admitted.proposal(), &proposal);
@@ -832,7 +997,9 @@ mod tests {
 
     #[test]
     fn unauthorized_path_fails_admission_before_any_write() -> TestResult {
-        // `code` maps to a real file but is not in the admission's write set.
+        // `code` maps to a real file but is not in the admission's write set
+        // (`admit_cycle` would refuse the step already; the journal helper
+        // skips it so that `admit_patch`'s own check is what refuses).
         let case = Case::new(&write_rights(), &["docs"])?;
         let before = case.ws.snapshot()?;
         assert_eq!(
@@ -860,20 +1027,14 @@ mod tests {
     #[test]
     fn multi_file_proposal_is_refused_in_first_slice() -> TestResult {
         let case = Case::new(&write_rights(), &["code", "docs"])?;
-        let refused = PatchProposal::from_admitted(
-            &patch_step(&["code", "docs"], "ev-1"),
-            &case.state,
-            &case.targets,
-            "worker-1",
+        assert_eq!(
+            case.try_proposal(&["code", "docs"], "ev-1")?,
+            Err(PatchRefusal::MultiFile)
         );
-        assert_eq!(refused, Err(PatchRefusal::MultiFile));
-        let empty = PatchProposal::from_admitted(
-            &patch_step(&[], "ev-1"),
-            &case.state,
-            &case.targets,
-            "worker-1",
+        assert_eq!(
+            case.try_proposal(&[], "ev-1")?,
+            Err(PatchRefusal::MultiFile)
         );
-        assert_eq!(empty, Err(PatchRefusal::MultiFile));
         Ok(())
     }
 
@@ -898,7 +1059,7 @@ mod tests {
                 ContentDigest::of(b"outside"),
                 EvidenceSourceKind::Repository,
                 EvidenceTrust::Observed,
-            ));
+            ))?;
         }
         for target in ["code", "docs"] {
             let proposal = case.proposal(&[target], &format!("ev-{target}"))?;
@@ -931,21 +1092,18 @@ mod tests {
 
     #[test]
     fn evidence_locator_must_match_target_path() -> TestResult {
-        let mut case = Case::new(&write_rights(), &["code"])?;
+        let case = Case::new(&write_rights(), &["code"])?;
         case.record(evidence(
             "ev-other",
             "src/other.rs",
             ContentDigest::of(OLD),
             EvidenceSourceKind::Repository,
             EvidenceTrust::Observed,
-        ));
-        let refused = PatchProposal::from_admitted(
-            &patch_step(&["code"], "ev-other"),
-            &case.state,
-            &case.targets,
-            "worker-1",
+        ))?;
+        assert_eq!(
+            case.try_proposal(&["code"], "ev-other")?,
+            Err(PatchRefusal::EvidenceLocatorMismatch)
         );
-        assert_eq!(refused, Err(PatchRefusal::EvidenceLocatorMismatch));
         // The same file spelled with a doubled separator is the same file.
         case.record(evidence(
             "ev-spelled",
@@ -953,7 +1111,7 @@ mod tests {
             ContentDigest::of(OLD),
             EvidenceSourceKind::Repository,
             EvidenceTrust::Observed,
-        ));
+        ))?;
         let proposal = case.proposal(&["code"], "ev-spelled")?;
         assert_eq!(proposal.relative_path(), "src/lib.rs");
         assert!(case.admit(&proposal).is_ok());
@@ -962,7 +1120,7 @@ mod tests {
 
     #[test]
     fn evidence_must_be_observed_repository_evidence() -> TestResult {
-        let mut case = Case::new(&write_rights(), &["code"])?;
+        let case = Case::new(&write_rights(), &["code"])?;
         let digest = ContentDigest::of(OLD);
         for (id, source, trust) in [
             (
@@ -977,29 +1135,24 @@ mod tests {
                 EvidenceTrust::Verified,
             ),
         ] {
-            case.record(evidence(id, "src/lib.rs", digest, source, trust));
-            let refused = PatchProposal::from_admitted(
-                &patch_step(&["code"], id),
-                &case.state,
-                &case.targets,
-                "worker-1",
+            case.record(evidence(id, "src/lib.rs", digest, source, trust))?;
+            assert_eq!(
+                case.try_proposal(&["code"], id)?,
+                Err(PatchRefusal::EvidenceNotObserved),
+                "{id}"
             );
-            assert_eq!(refused, Err(PatchRefusal::EvidenceNotObserved), "{id}");
         }
-        let missing = PatchProposal::from_admitted(
-            &patch_step(&["code"], "ev-nope"),
-            &case.state,
-            &case.targets,
-            "worker-1",
+        assert_eq!(
+            case.try_proposal(&["code"], "ev-nope")?,
+            Err(PatchRefusal::MissingEvidence)
         );
-        assert_eq!(missing, Err(PatchRefusal::MissingEvidence));
         case.record(evidence(
             "ev-verified",
             "src/lib.rs",
             digest,
             EvidenceSourceKind::Repository,
             EvidenceTrust::Verified,
-        ));
+        ))?;
         assert!(case.proposal(&["code"], "ev-verified").is_ok());
         Ok(())
     }
@@ -1007,20 +1160,15 @@ mod tests {
     #[test]
     fn non_patch_step_and_unmapped_target_are_refused() -> TestResult {
         let case = Case::new(&write_rights(), &["code"])?;
-        let verify = step(CycleProposal::Verify {
+        let verify = case.journal.journaled(CycleProposal::Verify {
             evidence_id: "ev-1".to_owned(),
-        });
+        })?;
         assert_eq!(
-            PatchProposal::from_admitted(&verify, &case.state, &case.targets, "worker-1"),
+            PatchProposal::from_admitted(&verify, &case.targets, "worker-1"),
             Err(PatchRefusal::NotAPatch)
         );
         assert_eq!(
-            PatchProposal::from_admitted(
-                &patch_step(&["ghost"], "ev-1"),
-                &case.state,
-                &case.targets,
-                "worker-1"
-            ),
+            case.try_proposal(&["ghost"], "ev-1")?,
             Err(PatchRefusal::UnknownTarget)
         );
         Ok(())
@@ -1078,14 +1226,14 @@ mod tests {
             ContentDigest::of(b"TOKEN=1"),
             EvidenceSourceKind::Repository,
             EvidenceTrust::Observed,
-        ));
+        ))?;
         case.record(evidence(
             "ev-new",
             "src/new.rs",
             ContentDigest::of(b""),
             EvidenceSourceKind::Repository,
             EvidenceTrust::Observed,
-        ));
+        ))?;
         let before = case.ws.snapshot()?;
         let secret = case.proposal(&["code"], "ev-env")?;
         assert_eq!(case.admit(&secret), Err(PatchRefusal::PathEscapesWorkspace));
@@ -1124,16 +1272,14 @@ mod tests {
     #[test]
     fn owner_worker_must_be_non_empty_and_free_of_control_characters() -> TestResult {
         let case = Case::new(&write_rights(), &["code"])?;
+        let step = case.patch(&["code"], "ev-1")?;
         for bad in ["", "   ", "worker\n1", "wor\0ker"] {
-            let refused = PatchProposal::from_admitted(
-                &patch_step(&["code"], "ev-1"),
-                &case.state,
-                &case.targets,
-                bad,
-            );
+            let refused = PatchProposal::from_admitted(&step, &case.targets, bad);
             assert_eq!(refused, Err(PatchRefusal::InvalidOwner), "owner {bad:?}");
         }
-        assert_eq!(case.proposal(&["code"], "ev-1")?.owner_worker(), "worker-1");
+        let proposal = PatchProposal::from_admitted(&step, &case.targets, "worker-1")
+            .map_err(ctx("proposal builds"))?;
+        assert_eq!(proposal.owner_worker(), "worker-1");
         Ok(())
     }
 
@@ -1172,21 +1318,13 @@ mod tests {
 
     #[test]
     fn unrecorded_current_digest_cannot_mint_an_admitted_patch() -> TestResult {
-        let mut case = Case::new(&write_rights(), &["code"])?;
+        let case = Case::new(&write_rights(), &["code"])?;
         let current = ContentDigest::of(OLD);
-        let from_admitted = |case: &Case, evidence_id: &str| {
-            PatchProposal::from_admitted(
-                &patch_step(&["code"], evidence_id),
-                &case.state,
-                &case.targets,
-                "worker-1",
-            )
-        };
 
         // The step names evidence the checkpoint never recorded: even though
         // the file's current digest is known, no proposal comes out.
         assert_eq!(
-            from_admitted(&case, "ev-unrecorded"),
+            case.try_proposal(&["code"], "ev-unrecorded")?,
             Err(PatchRefusal::MissingEvidence)
         );
         // Recorded, with exactly the file's current digest, but only reported.
@@ -1196,9 +1334,9 @@ mod tests {
             current,
             EvidenceSourceKind::Repository,
             EvidenceTrust::Reported,
-        ));
+        ))?;
         assert_eq!(
-            from_admitted(&case, "ev-reported"),
+            case.try_proposal(&["code"], "ev-reported")?,
             Err(PatchRefusal::EvidenceNotObserved)
         );
 
@@ -1212,9 +1350,11 @@ mod tests {
             stale,
             EvidenceSourceKind::Repository,
             EvidenceTrust::Observed,
-        ));
+        ))?;
         let before = case.ws.snapshot()?;
-        let proposal = from_admitted(&case, "ev-stale").map_err(ctx("stale proposal builds"))?;
+        let proposal = case
+            .try_proposal(&["code"], "ev-stale")?
+            .map_err(ctx("stale proposal builds"))?;
         assert_eq!(proposal.expected_preimage(), stale);
         assert_ne!(proposal.expected_preimage(), current);
         assert_eq!(case.admit(&proposal), Err(PatchRefusal::PreimageMismatch));
@@ -1229,6 +1369,67 @@ mod tests {
         assert!(!Probe::<PatchProposal>(PhantomData).has_deserialize());
         assert!(!Probe::<AdmittedPatch>(PhantomData).has_default());
         assert!(!Probe::<AdmittedPatch>(PhantomData).has_deserialize());
+        Ok(())
+    }
+
+    #[test]
+    fn fabricated_step_cannot_mint_a_proposal() -> TestResult {
+        let case = Case::new(&write_rights(), &["code"])?;
+        // Type level: `from_admitted` takes only a `JournaledStep`. Its fields
+        // are private and it has no `new`, no `Default` and no `Deserialize`,
+        // so no public constructor exists outside `CycleStore::journaled_step`.
+        assert!(!Probe::<JournaledStep>(PhantomData).has_default());
+        assert!(!Probe::<JournaledStep>(PhantomData).has_deserialize());
+
+        // Run time: a record without an in-flight step yields no proof.
+        assert!(matches!(
+            case.journal
+                .store
+                .journaled_step(CYCLE, &case.journal.lease),
+            Err(CycleStoreError::NoStepInFlight)
+        ));
+
+        // The fabrication from the review: a `ProposePatch` step plus a
+        // checkpoint holding an `Observed` repository record with the file's
+        // *current* digest, both built by the caller. Both types are public
+        // and deserializable, but `from_admitted` accepts neither.
+        let mut forged_state = case.journal.checkpoint()?;
+        forged_state.evidence.insert(
+            "ev-forged".to_owned(),
+            evidence(
+                "ev-forged",
+                "src/lib.rs",
+                ContentDigest::of(OLD),
+                EvidenceSourceKind::Repository,
+                EvidenceTrust::Observed,
+            ),
+        );
+        let forged_step = InFlightStep {
+            epoch: case.journal.lease.epoch,
+            sequence: forged_state.fence.sequence,
+            idempotency_key: format!("{CYCLE}-{}", forged_state.fence.sequence),
+            proposal: patch_proposal(&["code"], "ev-forged"),
+        };
+        // Journaling the very same step through the store yields an equal
+        // step, but the proof carries the *stored* checkpoint, which never
+        // recorded the forged evidence: no proposal, hence no admitted patch.
+        let journaled = case.patch(&["code"], "ev-forged")?;
+        assert_eq!(journaled.step(), &forged_step);
+        assert_ne!(journaled.checkpoint(), &forged_state);
+        assert!(!journaled.checkpoint().evidence.contains_key("ev-forged"));
+        assert_eq!(
+            PatchProposal::from_admitted(&journaled, &case.targets, "worker-1"),
+            Err(PatchRefusal::MissingEvidence)
+        );
+        // Against the stored checkpoint `admit_cycle` refuses the step, too.
+        assert!(matches!(
+            admit_cycle(
+                &case.admission,
+                journaled.checkpoint(),
+                forged_step.proposal
+            ),
+            Err(CycleRefusal::MissingEvidence)
+        ));
         Ok(())
     }
 }

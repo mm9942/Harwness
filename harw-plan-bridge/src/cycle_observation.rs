@@ -39,7 +39,9 @@ pub enum ObservationCategory {
     ToolFailedNoEffect,
     /// A required capability is not available.
     CapabilityUnavailable,
-    /// The provider was temporarily unavailable.
+    /// The provider was unavailable: temporarily (a retryable executor
+    /// failure), or for the proposer at all (missing model route,
+    /// authentication), see [`classify_proposer_failure`].
     ProviderUnavailable,
     /// Verification ran and failed.
     VerificationFailed,
@@ -56,7 +58,8 @@ pub enum ObservationCategory {
 /// Bounded cause code; never free text.
 ///
 /// One variant per [`CycleRefusal`] variant (data-carrying variants would map
-/// to a unit variant), plus executor, reconciliation and fence causes.
+/// to a unit variant), plus proposer, executor, reconciliation and fence
+/// causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CauseCode {
@@ -85,6 +88,9 @@ pub enum CauseCode {
     ExecutorFailed,
     /// The executor failed temporarily and may be retried.
     ExecutorRetryable,
+    /// The proposer could not produce a proposal (missing model route,
+    /// authentication failure, open authentication circuit); no executor ran.
+    ProposerFailed,
     /// Crash reconciliation could not establish the effect.
     ReconcileUncertain,
     /// A verification check was not met (`unmet:` claim).
@@ -197,8 +203,11 @@ pub const fn classify_refusal(refusal: CycleRefusal) -> (ObservationCategory, Ca
     (ObservationCategory::AdmissionRefused, cause)
 }
 
-/// Classifies a proposer or executor failure from its `retryable` flag only;
-/// the reason text is never read.
+/// Classifies an *executor* failure from its `retryable` flag only; the
+/// reason text is never read.
+///
+/// A proposer failure is not an executor failure (no executor ran) and is
+/// classified by [`classify_proposer_failure`] instead.
 #[must_use]
 pub const fn classify_step_failure(failure: &StepFailure) -> (ObservationCategory, CauseCode) {
     if failure.retryable {
@@ -212,6 +221,27 @@ pub const fn classify_step_failure(failure: &StepFailure) -> (ObservationCategor
             CauseCode::ExecutorFailed,
         )
     }
+}
+
+/// Observation for a proposer that could not produce a proposal; no executor ran.
+///
+/// Always `(ProviderUnavailable, ProposerFailed)`: the source of the failure
+/// decides the class, never the reason text (not read) and never the
+/// `retryable` flag. In the driver only permanent failures (missing route,
+/// authentication or 403 errors, an open authentication circuit) reach the
+/// observe path; a retryable proposer failure ends the run as
+/// [`CycleRunError::ProposerUnavailable`](crate::cycle_runtime::CycleRunError::ProposerUnavailable)
+/// before anything is observed or committed, so the next lease retries it.
+/// Unlike [`classify_step_failure`] this never yields
+/// [`ObservationCategory::ToolFailedNoEffect`].
+#[must_use]
+pub fn classify_proposer_failure(failure: &StepFailure) -> (ObservationCategory, CauseCode) {
+    // Neither the reason nor the retry flag changes the class.
+    let _ = failure;
+    (
+        ObservationCategory::ProviderUnavailable,
+        CauseCode::ProposerFailed,
+    )
 }
 
 /// Classifies a crash reconciliation: only an uncertain effect is an
@@ -476,6 +506,30 @@ mod tests {
         assert_eq!(classify_step_failure(&permanent_b), permanent);
         assert_eq!(classify_step_failure(&temporary_a), temporary);
         assert_eq!(classify_step_failure(&temporary_b), temporary);
+    }
+
+    #[test]
+    fn proposer_failure_is_provider_unavailable_never_a_tool_failure() -> TestResult {
+        let expected = (
+            ObservationCategory::ProviderUnavailable,
+            CauseCode::ProposerFailed,
+        );
+        for failure in [
+            StepFailure::new("HTTP 403 model route"),
+            StepFailure::new("model route not configured"),
+            StepFailure::new("authentication circuit open"),
+            StepFailure::retryable("overloaded"),
+        ] {
+            let classified = classify_proposer_failure(&failure);
+            assert_eq!(classified, expected, "{}", failure.reason);
+            assert_ne!(classified.0, ObservationCategory::ToolFailedNoEffect);
+            assert_ne!(classified, classify_step_failure(&failure));
+        }
+        assert_eq!(
+            serde_json::to_value(CauseCode::ProposerFailed).map_err(ctx("cause serialises"))?,
+            serde_json::Value::String("proposer_failed".to_owned())
+        );
+        Ok(())
     }
 
     #[test]

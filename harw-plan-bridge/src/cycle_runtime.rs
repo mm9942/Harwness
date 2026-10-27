@@ -15,7 +15,11 @@
 //!   via [`resume_admission`] and rebind. A writer with an older epoch is
 //!   refused at every store operation.
 //! - **Effect journal:** before an admitted step runs, it is journaled as
-//!   [`InFlightStep`] with a stable idempotency key. After a crash the next
+//!   [`InFlightStep`] with a stable idempotency key. A [`JournaledStep`]
+//!   ([`CycleStore::journaled_step`]) is the store's proof that a step and
+//!   its checkpoint are the ones journaled under the current lease; trusted
+//!   follow-up admissions (`PatchProposal::from_admitted`) take only that
+//!   proof, never caller-built steps or checkpoints. After a crash the next
 //!   lease asks the executor to [reconcile](CycleStepExecutor::reconcile) it:
 //!   not started → dropped, completed → its observations are committed,
 //!   uncertain → the cycle escalates instead of guessing or repeating.
@@ -42,8 +46,12 @@
 //!   [`CycleRecord::observations_dropped`] but never refuse the checkpoint
 //!   commit. The consumer is a job-local drain (wave 4) that reads
 //!   [`CycleStore::pending_observations`] and acknowledges delivered keys
-//!   with [`CycleStore::ack_observations`]; redelivery after a crash is
-//!   idempotent. Fence refusals cannot be recorded in the record they are
+//!   with [`CycleStore::ack_observations`], both under its lease: the read is
+//!   fenced like a write, so a stale, foreign or not yet rebound lease never
+//!   sees a payload. Redelivery after a crash is idempotent. Proposer
+//!   failures are classified apart from executor failures
+//!   ([`classify_proposer_failure`]): no executor ran, so they are never a
+//!   tool failure. Fence refusals cannot be recorded in the record they are
 //!   refused for, so the driver only logs them (classified via
 //!   [`classify_fence`]).
 //!
@@ -68,7 +76,8 @@ use tokio::sync::watch;
 
 use crate::cycle_observation::{
     CauseCode, ObservationCategory, RunObservationV1, build_observation, classify_fence,
-    classify_reconciliation, classify_refusal, classify_step_failure, classify_verification,
+    classify_proposer_failure, classify_reconciliation, classify_refusal, classify_step_failure,
+    classify_verification,
 };
 use crate::cycle_outbox::{Outbox, OutboxEntry, OutboxError};
 use crate::intent_cycle::{
@@ -104,6 +113,42 @@ pub struct InFlightStep {
     /// external effects and to answer [`CycleStepExecutor::reconcile`].
     pub idempotency_key: String,
     pub proposal: CycleProposal,
+}
+
+/// Proof that `step` is the in-flight step the store journaled for `cycle_id`
+/// under the caller's current lease. Only [`CycleStore::journaled_step`] builds it.
+///
+/// Every field is private and there is no `new`, no `Default` and no
+/// `Deserialize`: an [`InFlightStep`] or [`CycleCheckpoint`] a caller built
+/// (or deserialized) cannot be turned into one, so evidence that only the
+/// caller holds never reaches a consumer of this proof. `Clone` merely copies
+/// a proof the store already issued. It is a snapshot taken at read time:
+/// consumers that act on it still present their lease to every store write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournaledStep {
+    cycle_id: String,
+    step: InFlightStep,
+    checkpoint: CycleCheckpoint,
+}
+
+impl JournaledStep {
+    /// The cycle the step belongs to.
+    #[must_use]
+    pub fn cycle_id(&self) -> &str {
+        &self.cycle_id
+    }
+
+    /// The step as the store journaled it.
+    #[must_use]
+    pub fn step(&self) -> &InFlightStep {
+        &self.step
+    }
+
+    /// The committed checkpoint the step was admitted against, as stored.
+    #[must_use]
+    pub fn checkpoint(&self) -> &CycleCheckpoint {
+        &self.checkpoint
+    }
 }
 
 /// Durable record of one cycle, bound to exactly one job.
@@ -302,7 +347,12 @@ impl CycleStore {
         Ok(self.records.create(record)?)
     }
 
-    /// Loads one record without locking.
+    /// Loads one record without locking or fencing: for status projections
+    /// ([`CycleRecord::status`]) and the driver's own state. Anything that
+    /// hands outbox payloads on (a drain writing project memory) reads them
+    /// through the fenced [`CycleStore::pending_observations`] instead, and
+    /// trusted follow-up admissions take a [`CycleStore::journaled_step`]
+    /// proof rather than this record's in-flight step.
     ///
     /// # Errors
     /// The underlying store error.
@@ -362,6 +412,36 @@ impl CycleStore {
             };
             record.in_flight = Some(step.clone());
             Ok(step)
+        })
+    }
+
+    /// Loads the record under `token` (fenced) and returns its journaled step.
+    ///
+    /// The step must have been begun under `token`'s epoch: a step a
+    /// superseded lease left in flight is reconciled, never handed out as
+    /// proof to the lease that took over.
+    ///
+    /// # Errors
+    /// Fence/job errors as every fenced read ([`CycleStoreError::Fence`],
+    /// [`CycleStoreError::WrongJob`], [`CycleStoreError::NotRebound`]);
+    /// [`CycleStoreError::NoStepInFlight`] when nothing is journaled;
+    /// [`CycleStoreError::StepMismatch`] when the journaled step was begun
+    /// under an earlier epoch or against another sequence.
+    pub fn journaled_step(
+        &self,
+        cycle_id: &str,
+        token: &LeaseToken,
+    ) -> Result<JournaledStep, CycleStoreError> {
+        let record = self.load(cycle_id)?;
+        check_fenced(&record, token)?;
+        let step = record.in_flight.ok_or(CycleStoreError::NoStepInFlight)?;
+        if step.epoch != token.epoch || step.sequence != record.checkpoint.fence.sequence {
+            return Err(CycleStoreError::StepMismatch);
+        }
+        Ok(JournaledStep {
+            cycle_id: record.cycle_id,
+            step,
+            checkpoint: record.checkpoint,
         })
     }
 
@@ -439,15 +519,29 @@ impl CycleStore {
         })
     }
 
-    /// Observations committed but not yet acknowledged, in append order.
+    /// Observations committed but not yet acknowledged, in append order,
+    /// read under `token`.
+    ///
+    /// The read is fenced like every write ([`CycleStore::ack_observations`]):
+    /// the record is checked against `token` *before* any payload leaves the
+    /// store, so a superseded epoch or another job's lease cannot copy the
+    /// current owner's observations anywhere (e.g. into project memory)
+    /// before its acknowledgement would be refused.
     ///
     /// # Errors
-    /// The underlying store error.
+    /// The underlying store error; [`CycleStoreError::Fence`] with
+    /// [`FenceRefusal::StaleEpoch`] for a superseded lease,
+    /// [`CycleStoreError::WrongJob`] for another job's lease and
+    /// [`CycleStoreError::NotRebound`] for a newer lease that has not rebound
+    /// the cycle yet.
     pub fn pending_observations(
         &self,
         cycle_id: &str,
+        token: &LeaseToken,
     ) -> Result<Vec<OutboxEntry<RunObservationV1>>, CycleStoreError> {
-        Ok(self.load(cycle_id)?.outbox.pending().to_vec())
+        let record = self.load(cycle_id)?;
+        check_fenced(&record, token)?;
+        Ok(record.outbox.pending().to_vec())
     }
 
     /// Acknowledges delivered observations under `token`, fenced like every
@@ -856,11 +950,13 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
                     let kind = CycleProposal::Blocked {
                         reason: String::new(),
                     };
+                    // No executor ran: a proposer failure is never a tool
+                    // failure, so it gets its own class.
                     self.observe(
                         cycle_id,
                         &checkpoint,
                         &kind,
-                        classify_step_failure(&failure),
+                        classify_proposer_failure(&failure),
                         &[],
                     );
                     CycleProposal::Blocked {
@@ -1956,6 +2052,60 @@ mod tests {
     }
 
     #[test]
+    fn stale_lease_cannot_obtain_a_journaled_step() -> TestResult {
+        let fx = fixture("cycle-journaled")?;
+        let step = crash_mid_step(&fx, "cycle-journaled")?;
+        let fresh = token(&fx.work_id, 1);
+        let record = fx.store.load("cycle-journaled").map_err(ctx("load"))?;
+        let journaled = fx
+            .store
+            .journaled_step("cycle-journaled", &fresh)
+            .map_err(ctx("journaled step under the fresh lease"))?;
+        assert_eq!(journaled.cycle_id(), "cycle-journaled");
+        assert_eq!(journaled.step(), &step);
+        assert_eq!(journaled.checkpoint(), &record.checkpoint);
+        assert!(matches!(
+            fx.store
+                .journaled_step("cycle-journaled", &token(&fx.work_id, 0)),
+            Err(CycleStoreError::Fence(FenceRefusal::StaleEpoch))
+        ));
+        assert!(matches!(
+            fx.store
+                .journaled_step("cycle-journaled", &token(&fx.work_id, 2)),
+            Err(CycleStoreError::NotRebound)
+        ));
+        assert!(matches!(
+            fx.store
+                .journaled_step("cycle-journaled", &token(&WorkId::from_str("other-job"), 1)),
+            Err(CycleStoreError::WrongJob)
+        ));
+        // Epoch 2 takes over: epoch 1 is stale now, and the step it left in
+        // flight is reconciled, never handed to the new lease as proof.
+        let newer = token(&fx.work_id, 2);
+        let (_, taken_over) = resume_admission(&record.checkpoint, &fx.admission, &rights()?, 2)
+            .map_err(|_| TestError::Missing("resume"))?;
+        fx.store
+            .rebind("cycle-journaled", &newer, &taken_over)
+            .map_err(ctx("takeover"))?;
+        assert!(matches!(
+            fx.store.journaled_step("cycle-journaled", &fresh),
+            Err(CycleStoreError::Fence(FenceRefusal::StaleEpoch))
+        ));
+        assert!(matches!(
+            fx.store.journaled_step("cycle-journaled", &newer),
+            Err(CycleStoreError::StepMismatch)
+        ));
+        fx.store
+            .clear_step("cycle-journaled", &newer, &step)
+            .map_err(ctx("clear the reconciled step"))?;
+        assert!(matches!(
+            fx.store.journaled_step("cycle-journaled", &newer),
+            Err(CycleStoreError::NoStepInFlight)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn rebind_refuses_tampering_and_widening() -> TestResult {
         let fx = fixture("cycle-rebind")?;
         let lease = token(&fx.work_id, 1);
@@ -2314,7 +2464,7 @@ mod tests {
             .map_err(ctx("driver runs"))?;
         let pending = fx
             .store
-            .pending_observations("cycle-obs-tool")
+            .pending_observations("cycle-obs-tool", &token(&fx.work_id, 1))
             .map_err(ctx("pending observations"))?;
         assert_eq!(pending.len(), 1, "only the failed step is observed");
         let entry = pending.first().ok_or(TestError::Missing("one entry"))?;
@@ -2330,6 +2480,69 @@ mod tests {
             !json.contains("egress denied"),
             "observations carry no failure text: {json}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permanent_proposer_failure_is_provider_unavailable_not_a_tool_failure() -> TestResult {
+        // Provider and authentication failures `ModelCycleProposer` reports
+        // as permanent: the cycle blocks, no executor runs, and the
+        // observation names the proposer, not a tool.
+        for (cycle_id, reason) in [
+            ("cycle-obs-403", "HTTP 403 model route"),
+            ("cycle-obs-noroute", "model route not configured"),
+            ("cycle-obs-auth", "authentication circuit open"),
+        ] {
+            let fx = fixture(cycle_id)?;
+            let proposer = Script::new(vec![Err(StepFailure::new(reason))]);
+            let executor = Executor::new(vec![]);
+            let executed = Arc::clone(&executor.executed);
+            let mut driver = driver(&fx, proposer, executor, rights()?);
+            let lease = token(&fx.work_id, 1);
+            let outcome = driver
+                .run(cycle_id, &lease, &fx.admission, &CancelToken::new())
+                .await
+                .map_err(ctx("driver runs"))?;
+            assert!(
+                matches!(
+                    outcome,
+                    CycleRunOutcome::Terminal {
+                        terminal: CycleTerminal::Blocked,
+                        ..
+                    }
+                ),
+                "{reason}"
+            );
+            assert!(
+                executed
+                    .lock()
+                    .map_err(|_| TestError::Missing("lock"))?
+                    .is_empty(),
+                "no executor ran for {reason}"
+            );
+            let pending = fx
+                .store
+                .pending_observations(cycle_id, &lease)
+                .map_err(ctx("pending observations"))?;
+            assert_eq!(pending.len(), 1, "one observation for {reason}");
+            let entry = pending.first().ok_or(TestError::Missing("one entry"))?;
+            let payload = &entry.payload;
+            assert_eq!(payload.category, ObservationCategory::ProviderUnavailable);
+            assert_eq!(payload.cause, CauseCode::ProposerFailed);
+            assert_eq!(payload.transition, "blocked");
+            assert!(
+                pending.iter().all(|entry| {
+                    entry.payload.category != ObservationCategory::ToolFailedNoEffect
+                        && entry.payload.cause != CauseCode::ExecutorFailed
+                }),
+                "a proposer failure is never a tool failure: {reason}"
+            );
+            let json = serde_json::to_string(payload).map_err(ctx("observation serialises"))?;
+            assert!(
+                !json.contains(reason),
+                "observations carry no failure text: {json}"
+            );
+        }
         Ok(())
     }
 
@@ -2358,7 +2571,7 @@ mod tests {
         ));
         let pending = fx
             .store
-            .pending_observations("cycle-obs-uncertain")
+            .pending_observations("cycle-obs-uncertain", &token(&fx.work_id, 2))
             .map_err(ctx("pending observations"))?;
         assert_eq!(pending.len(), 1);
         let entry = pending.first().ok_or(TestError::Missing("one entry"))?;
@@ -2383,11 +2596,80 @@ mod tests {
         ));
         assert_eq!(
             fx.store
-                .pending_observations("cycle-obs-stale")
+                .pending_observations("cycle-obs-stale", &token(&fx.work_id, 1))
                 .map_err(ctx("pending observations"))?
                 .len(),
             2,
             "a refused ack changes nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_epoch_cannot_read_pending_observations() -> TestResult {
+        let fx = fixture("cycle-obs-read-stale")?;
+        let keys = commit_observed(&fx, "cycle-obs-read-stale", 2)?;
+        // Epoch 2 takes the cycle over; the epoch-1 drain is a zombie now.
+        let record = fx.store.load("cycle-obs-read-stale").map_err(ctx("load"))?;
+        assert_eq!(record.checkpoint.fence.epoch, 1);
+        let owner = token(&fx.work_id, 2);
+        let (_, taken_over) = resume_admission(&record.checkpoint, &fx.admission, &rights()?, 2)
+            .map_err(|_| TestError::Missing("resume"))?;
+        fx.store
+            .rebind("cycle-obs-read-stale", &owner, &taken_over)
+            .map_err(ctx("takeover"))?;
+        let stale = fx
+            .store
+            .pending_observations("cycle-obs-read-stale", &token(&fx.work_id, 1));
+        assert!(
+            matches!(stale, Err(CycleStoreError::Fence(FenceRefusal::StaleEpoch))),
+            "a stale epoch gets no payload: {stale:?}"
+        );
+        // A newer lease that has not rebound the cycle cannot read either.
+        let unbound = fx
+            .store
+            .pending_observations("cycle-obs-read-stale", &token(&fx.work_id, 3));
+        assert!(
+            matches!(unbound, Err(CycleStoreError::NotRebound)),
+            "a lease that has not rebound gets no payload: {unbound:?}"
+        );
+        // The current owner still sees every pending observation.
+        let current = fx
+            .store
+            .pending_observations("cycle-obs-read-stale", &owner)
+            .map_err(ctx("owner reads"))?;
+        assert_eq!(
+            current
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>(),
+            keys
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_job_token_cannot_read_pending_observations() -> TestResult {
+        let fx = fixture("cycle-obs-read-foreign")?;
+        let keys = commit_observed(&fx, "cycle-obs-read-foreign", 1)?;
+        let foreign = token(&WorkId::from_str("other-job"), 1);
+        let refused = fx
+            .store
+            .pending_observations("cycle-obs-read-foreign", &foreign);
+        assert!(
+            matches!(refused, Err(CycleStoreError::WrongJob)),
+            "another job's lease gets no payload: {refused:?}"
+        );
+        let owned = fx
+            .store
+            .pending_observations("cycle-obs-read-foreign", &token(&fx.work_id, 1))
+            .map_err(ctx("owner reads"))?;
+        assert_eq!(
+            owned
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>(),
+            keys
         );
         Ok(())
     }
@@ -2427,7 +2709,7 @@ mod tests {
         );
         assert!(
             fx.store
-                .pending_observations("cycle-obs-ack")
+                .pending_observations("cycle-obs-ack", &lease)
                 .map_err(ctx("pending observations"))?
                 .is_empty()
         );
@@ -2438,9 +2720,10 @@ mod tests {
     fn crash_between_commit_and_ack_leaves_pending() -> TestResult {
         let fx = fixture("cycle-obs-crash")?;
         let keys = commit_observed(&fx, "cycle-obs-crash", 2)?;
+        let lease = token(&fx.work_id, 1);
         let before = fx
             .store
-            .pending_observations("cycle-obs-crash")
+            .pending_observations("cycle-obs-crash", &lease)
             .map_err(ctx("pending observations"))?;
         // The drain dies before acknowledging: a store reopened over the
         // same directory still holds every observation.
@@ -2448,7 +2731,7 @@ mod tests {
             RecordStore::create_ambient(&fx.cycles_dir).map_err(ctx("store reopens"))?,
         );
         let after = reopened
-            .pending_observations("cycle-obs-crash")
+            .pending_observations("cycle-obs-crash", &lease)
             .map_err(ctx("pending after reopen"))?;
         assert_eq!(after, before);
         assert_eq!(
@@ -2458,7 +2741,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             keys
         );
-        let lease = token(&fx.work_id, 1);
         assert_eq!(
             reopened
                 .ack_observations("cycle-obs-crash", &lease, &keys)

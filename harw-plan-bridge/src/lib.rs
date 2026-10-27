@@ -130,8 +130,9 @@ pub use crate::cycle_explorer::{
 };
 pub use crate::cycle_observation::{
     CauseCode, OBSERVATION_SCHEMA, ObservationCategory, ObservationEventId, ObservationOutcome,
-    RunObservationV1, build_observation, classify_fence, classify_reconciliation, classify_refusal,
-    classify_step_failure, classify_verification, is_countable_as_fix, proposal_kind,
+    RunObservationV1, build_observation, classify_fence, classify_proposer_failure,
+    classify_reconciliation, classify_refusal, classify_step_failure, classify_verification,
+    is_countable_as_fix, proposal_kind,
 };
 pub use crate::cycle_outbox::{
     MAX_ACKED_TAIL, MAX_OUTBOX_PENDING, Outbox, OutboxEntry, OutboxError,
@@ -144,8 +145,8 @@ pub use crate::cycle_runtime::{
     AuthorityReissuer, CYCLE_RECORD_SCHEMA, CYCLE_STORE_DIR, CeilingReissuer, CycleDriver,
     CycleDriverConfig, CycleJobFuture, CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome,
     CycleStatus, CycleStepExecutor, CycleStore, CycleStoreError, INTENT_CYCLE_JOB_KIND,
-    InFlightStep, PolicyReissuer, StepFailure, StepReconciliation, cycle_job_operation,
-    job_outcome,
+    InFlightStep, JournaledStep, PolicyReissuer, StepFailure, StepReconciliation,
+    cycle_job_operation, job_outcome,
 };
 pub use crate::cycle_spec::{
     CycleSpecError, DEFAULT_CYCLE_LIMITS, MAX_CYCLE_LIMITS, READ_ONLY_CYCLE_SPEC_SCHEMA,
