@@ -39,6 +39,7 @@ mod chat;
 mod cli;
 mod completions;
 mod connect;
+mod cycle_cmd;
 mod doc_ocr;
 // #22: die personalisierte harw mit eingebetteter UIA (`--native`).
 mod cleanup_cmd;
@@ -704,6 +705,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::Cycle { .. } => "cycle",
             Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
@@ -787,7 +789,7 @@ fn reject_misplaced_session_flags(
 /// Lehnt `--json` bei Befehlen ohne JSON-Ausgabe ab.
 ///
 /// # Description
-/// JSON liefern `harw session list|show`, `harw jobs …`,
+/// JSON liefern `harw session list|show`, `harw jobs …`, `harw cycle …`,
 /// `harw knowledge memory|proposals` und `harw agent skills|plugins`; diese
 /// Befehle (und `provider`) prüfen ihre Unterfälle selbst. Jeder andere
 /// Befehl bricht mit `--json` ab, statt stillschweigend Text auszugeben.
@@ -806,6 +808,7 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
         Some(
             Command::Session { .. }
             | Command::Jobs { .. }
+            | Command::Cycle { .. }
             | Command::Cleanup { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
@@ -985,6 +988,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Cycle { action }) => cycle_cmd::run(&global, action),
         Some(Command::Cleanup {
             apply,
             classes,
@@ -1135,6 +1139,7 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::Cycle { .. }
             | Command::Cleanup { .. }
             | Command::PrReview(_)
             | Command::Uia { .. }
@@ -4603,6 +4608,7 @@ mod tests {
         for argv in [
             vec!["harw", "session", "list", "--json"],
             vec!["harw", "jobs", "list", "--json"],
+            vec!["harw", "cycle", "list", "--json"],
             // Vor dem Befehl, weil `memory`/`skills` alle folgenden
             // Argumente unverändert weiterreichen.
             vec!["harw", "--json", "knowledge", "memory"],

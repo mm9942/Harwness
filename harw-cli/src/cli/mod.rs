@@ -24,6 +24,7 @@ mod attach;
 mod auth;
 mod channel;
 mod completions;
+mod cycle;
 mod debug;
 mod gateway;
 mod global;
@@ -52,6 +53,7 @@ pub use attach::*;
 pub use auth::*;
 pub use channel::*;
 pub use completions::*;
+pub use cycle::*;
 pub use debug::*;
 pub use gateway::*;
 pub use global::*;
@@ -209,6 +211,12 @@ pub enum Command {
         /// Auszuführende Auftrags-Aktion.
         #[command(subcommand)]
         action: JobsAction,
+    },
+    /// Zeigt und beendet Intent-Cycle-Aufträge.
+    Cycle {
+        /// Auszuführende Cycle-Aktion.
+        #[command(subcommand)]
+        action: CycleAction,
     },
     /// Räumt ephemere Daten (Logs, Caches, Spools) nach den Aufbewahrungsregeln auf.
     ///

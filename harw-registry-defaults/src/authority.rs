@@ -721,8 +721,9 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || tool == WORK_DRIVER_STATUS_TOOL
         || tool == WORK_DRIVER_STOP_TOOL
         // PL-90: an intent cycle only reads the named workspace files
-        // (read-only explorer + deterministic verifier); start, status and
-        // stop therefore need exactly the read right.
+        // (read-only explorer + deterministic verifier); start, status, stop,
+        // list and the `/cycle` command surface (`intent_cycle`) therefore
+        // need exactly the read right.
         || listed(INTENT_CYCLE_TOOLS)
     {
         Some(Permission::ReadWorkspace)
@@ -1021,10 +1022,21 @@ mod tests {
         }
     }
 
-    /// PL-90: alle drei Intent-Zyklus-Werkzeuge lesen nur den Workspace.
+    /// PL-90: alle fünf Intent-Zyklus-Werkzeuge (`start`, `status`, `stop`,
+    /// `list` und die `/cycle`-Befehlsfläche `intent_cycle`) lesen nur den
+    /// Workspace.
     #[test]
     fn test_tool_permission_maps_intent_cycle_tools_to_read_workspace() {
-        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 5);
+        for tool in [
+            "intent_cycle.start",
+            "intent_cycle.status",
+            "intent_cycle.stop",
+            "intent_cycle.list",
+            "intent_cycle",
+        ] {
+            assert!(INTENT_CYCLE_TOOLS.contains(&tool), "{tool}");
+        }
         for tool in INTENT_CYCLE_TOOLS {
             assert_eq!(
                 tool_permission(tool),
