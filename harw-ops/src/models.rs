@@ -41,9 +41,18 @@
 //! Zustandslos; Persistenz über den austauschbaren
 //! [`crate::config_util::SelectionPersistence`]-Dienst (bestes Bemühen, nie `Err`).
 //!
+//! # Lebenszyklus der Provider-Angebote
+//! `set` und `worker` prüfen die ausdrücklich gewählte Provider-/Modell-ID
+//! mit [`crate::live_model::enforce_lifecycle`], **bevor** etwas persistiert
+//! oder ein Provider-Client gebaut wird: ein abgeschaltetes (retired) Modell
+//! wird mit dem empfohlenen Ersatz abgelehnt und die Profil-`config.toml`
+//! bleibt unverändert; ein abgekündigtes (deprecated) Modell wird gespeichert
+//! und die Bestätigung trägt die Warnung.
+//!
 //! # Fehler
 //! - [`OpError::InvalidArguments`]: unbekanntes Sub-Kommando, unbekannte Rolle,
-//!   fehlendes/unauflösbares Ziel, Worker-Modell eines fremden Providers.
+//!   fehlendes/unauflösbares Ziel, Worker-Modell eines fremden Providers,
+//!   laut Provider-Lebenszyklus abgeschaltetes Modell (`set`, `worker`).
 //! - [`OpError::Execution`]: Config-Discovery fehlgeschlagen.
 
 use harw_config::{ModelRole, ResolvedConfig, RoleModelRow};
@@ -154,7 +163,7 @@ fn enabled_provider_name(config: &ResolvedConfig, name: &str) -> Option<String> 
 
 /// Normalisiert einen Provider-Verweis aus dem Modellkatalog auf den
 /// kanonischen Provider-Namen (Schlüssel → `name`); unbekannt bleibt unverändert.
-fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> String {
+pub(crate) fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> String {
     config
         .providers
         .iter()
@@ -362,6 +371,11 @@ fn handle_set(
     effort_level: Option<harw_types::ReasoningEffort>,
 ) -> Result<OpOutput, OpError> {
     let (provider, model) = resolve_target(config, target)?;
+    // Lebenszyklus der ausdrücklichen Wahl, noch vor Provider-Bau und
+    // Persistenz: ein abgeschaltetes Modell wird abgelehnt und lässt Profil-
+    // Config und laufende Montage unverändert, ein abgekündigtes wird mit
+    // Warnung gespeichert.
+    let lifecycle_warning = crate::live_model::enforce_lifecycle(&provider, &model)?;
     let persistence = crate::config_util::selection_persistence(ctx);
     // Live-Übernahme: nur eine Stelle, deren Provider jetzt erreichbar ist,
     // wird überhaupt gespeichert (sonst bliebe eine unbrauchbare Wahl stehen).
@@ -415,11 +429,15 @@ fn handle_set(
         (base, None) => base,
     };
 
-    let text = finish_role_text(
+    let mut text = finish_role_text(
         format!("Modell für {} gesetzt: {provider}/{model}", role.label()),
         note.as_deref(),
         live,
     );
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
     Ok(OpOutput {
         text,
         data: Some(json!({
@@ -911,6 +929,186 @@ mod tests {
         let data = data(&output)?;
         assert_eq!(data["live"]["provider"], serde_json::Value::Null);
         assert_eq!(data["live"]["model"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    // ── Provider-Lebenszyklus: abgeschaltete und abgekündigte Modelle ─────────
+
+    /// Ein in der eingebetteten Lebenszyklus-Tabelle abgeschaltetes Angebot
+    /// (Mistral OCR 4.0, retired 2026-09-30 — für die echte Uhr sicher in der
+    /// Vergangenheit; Ersatz `mistral-ocr-4-1`).
+    const RETIRED_PROVIDER: &str = "mistral";
+    const RETIRED_MODEL: &str = "mistral-ocr-4-0";
+
+    /// Ein abgekündigtes Angebot ohne angekündigtes Retirement (Claude Mythos
+    /// Preview; Ersatz `claude-mythos-5`) — bleibt für die echte Uhr wählbar.
+    const DEPRECATED_PROVIDER: &str = "anthropic";
+    const DEPRECATED_MODEL: &str = "claude-mythos-preview";
+
+    /// Profil-Config, die ein abgelehnter Wechsel byte-gleich lassen muss.
+    const SEEDED_PROFILE: &str =
+        "default_provider = \"provider-a\"\ndefault_model = \"model-a-2026\"\n";
+
+    /// [`test_config`] plus aktivierte Provider für das abgeschaltete und das
+    /// abgekündigte Angebot und das abgeschaltete Modell im Katalog (das
+    /// abgekündigte wird per `provider/modell` gewählt).
+    fn lifecycle_test_config() -> ResolvedConfig {
+        let mut config = test_config();
+        config.providers.insert(
+            RETIRED_PROVIDER.to_owned(),
+            provider(RETIRED_PROVIDER, true),
+        );
+        config.providers.insert(
+            DEPRECATED_PROVIDER.to_owned(),
+            provider(DEPRECATED_PROVIDER, true),
+        );
+        config.models.insert(
+            RETIRED_MODEL.to_owned(),
+            model(RETIRED_MODEL, RETIRED_PROVIDER, &[]),
+        );
+        config
+    }
+
+    /// Kontext mit Controller (Live- und UIA-Auswahl belegt), Config und
+    /// gebundenem Root-Space, dessen Profil-`config.toml` mit
+    /// [`SEEDED_PROFILE`] belegt ist — die echte Datei-Persistenz.
+    struct HomeFixture {
+        ctx: OpContext,
+        controller: Arc<NullSessionController>,
+        config_path: std::path::PathBuf,
+        _root: tempfile::TempDir,
+    }
+
+    fn home_fixture(config: ResolvedConfig) -> TestResult<HomeFixture> {
+        let root = tempfile::tempdir().map_err(ctx("Root-Space anlegen"))?;
+        let profile_dir = root.path().join("profiles").join("default");
+        std::fs::create_dir_all(&profile_dir).map_err(ctx("Profilordner anlegen"))?;
+        let config_path = profile_dir.join("config.toml");
+        std::fs::write(&config_path, SEEDED_PROFILE).map_err(ctx("Profil-Config anlegen"))?;
+        let home = crate::config_util::test_home_context(root.path())?;
+
+        let controller = Arc::new(NullSessionController::new());
+        controller
+            .set_active_provider("provider-a".to_owned())
+            .map_err(ctx("Provider setzen"))?;
+        controller
+            .set_active_model("model-a-2026".to_owned())
+            .map_err(ctx("Modell setzen"))?;
+        controller
+            .set_uia_selection(harw_operations::session_control::UiaSelection::new(
+                Some("provider-a".to_owned()),
+                Some("model-a-2026".to_owned()),
+            ))
+            .map_err(ctx("UIA-Auswahl setzen"))?;
+
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&controller) as SharedSessionController);
+        services.insert(Arc::new(config));
+        services.insert(home);
+        let op_ctx = crate::knowledge_test_support::op_context(services)?;
+        Ok(HomeFixture {
+            ctx: op_ctx,
+            controller,
+            config_path,
+            _root: root,
+        })
+    }
+
+    /// Führt `/models <tokens>` gegen den Root-Space-Kontext aus und erwartet
+    /// die Ablehnung des abgeschalteten Modells: `InvalidArguments` mit
+    /// Ersatzhinweis, Controller-Snapshot unverändert und Profil-`config.toml`
+    /// byte-gleich.
+    async fn assert_retired_refused_and_untouched(
+        fixture: &HomeFixture,
+        tokens: &[&str],
+    ) -> TestResult {
+        let before = fixture.controller.snapshot();
+        let args = ModelsArgs::from_raw_args(&toks(tokens)).map_err(ctx("Argumente"))?;
+        match super::models(&fixture.ctx, args).await {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("retired"), "{message}");
+                assert!(message.contains(RETIRED_MODEL), "{message}");
+                assert!(message.contains("mistral-ocr-4-1"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "{tokens:?}: erwartet InvalidArguments für ein abgeschaltetes Modell, \
+                     gefunden: {other:?}"
+                )));
+            }
+        }
+        assert_eq!(
+            fixture.controller.snapshot(),
+            before,
+            "{tokens:?}: der Controller bleibt unverändert"
+        );
+        let persisted =
+            std::fs::read_to_string(&fixture.config_path).map_err(ctx("Profil-Config lesen"))?;
+        assert_eq!(
+            persisted, SEEDED_PROFILE,
+            "{tokens:?}: die Profil-Config bleibt byte-gleich"
+        );
+        Ok(())
+    }
+
+    /// `/models set <interne Rolle>` auf ein abgeschaltetes Modell: abgelehnt,
+    /// bevor der Provider gebaut oder etwas persistiert wird.
+    #[tokio::test]
+    async fn models_set_internal_role_to_a_retired_model_changes_nothing() -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        assert_retired_refused_and_untouched(&fixture, &["set", "explorer", RETIRED_MODEL]).await
+    }
+
+    /// `/models set uia` (auch in der `provider/modell`-Form) auf ein
+    /// abgeschaltetes Modell: abgelehnt, UIA-Auswahl und Profil unverändert.
+    #[tokio::test]
+    async fn models_set_uia_to_a_retired_model_changes_nothing() -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        let target = format!("{RETIRED_PROVIDER}/{RETIRED_MODEL}");
+        assert_retired_refused_and_untouched(&fixture, &["set", "uia", target.as_str()]).await?;
+        assert_retired_refused_and_untouched(&fixture, &["set", "uia-worker", target.as_str()])
+            .await
+    }
+
+    /// `/models worker` auf ein abgeschaltetes Modell: abgelehnt, keine
+    /// Worker-Wahl persistiert.
+    #[tokio::test]
+    async fn models_worker_to_a_retired_model_changes_nothing() -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        assert_retired_refused_and_untouched(&fixture, &["worker", "all", RETIRED_MODEL]).await
+    }
+
+    /// Ein abgekündigtes (deprecated) Modell wird gespeichert; die
+    /// Bestätigung trägt die Warnung samt Ersatzhinweis — für `set` und
+    /// `worker`.
+    #[tokio::test]
+    async fn deprecated_model_is_persisted_with_a_warning() -> TestResult {
+        let fixture = fixture(lifecycle_test_config(), None)?;
+        let target = format!("{DEPRECATED_PROVIDER}/{DEPRECATED_MODEL}");
+
+        let output = run(&fixture, &["set", "explorer", target.as_str()])
+            .await
+            .map_err(ctx("set explorer"))?;
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert!(output.text.contains("claude-mythos-5"), "{}", output.text);
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![RecordedSelectionPersistCall::InternalModel {
+                point: InternalModelPoint::Explorer,
+                provider: Some(DEPRECATED_PROVIDER.to_owned()),
+                model: Some(DEPRECATED_MODEL.to_owned()),
+            }]
+        );
+
+        let output = run(&fixture, &["worker", "uia-writer", target.as_str()])
+            .await
+            .map_err(ctx("worker uia-writer"))?;
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert_eq!(
+            fixture.recorder.calls().len(),
+            2,
+            "auch die Worker-Wahl wird gespeichert"
+        );
         Ok(())
     }
 

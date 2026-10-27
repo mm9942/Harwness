@@ -40,6 +40,11 @@
 //!   ([`LiveModelRouting::resolved_internal_model`]) fällt auf das
 //!   Hauptmodell zurück, wenn ihr Modell abgeschaltet ist oder im
 //!   Retirement-Fenster liegt.
+//! - [`check_explicit_selection`] ist die gemeinsame Prüfung einer expliziten
+//!   Wahl für Aufrufer **außerhalb** der Live-Wahl: die TUI prüft damit die
+//!   Route des Controllers an der Turn-Grenze, **bevor** sie in die
+//!   Wurzelsitzung geschrieben wird (die Wechsel-Operationen in `harw-ops`
+//!   lehnen ein abgeschaltetes Modell schon vor der Controller-Mutation ab).
 //!
 //! # Nebenläufigkeit
 //! Zustand hinter `RwLock`; ein Neubau ist durch eine eigene Sperre
@@ -283,22 +288,18 @@ impl LiveModelRouting {
         Some(resolved)
     }
 
-    /// Provider, gegen dessen Lebenszyklus eine Wahl geprüft wird: der
-    /// genannte, sonst der des Katalogs, sonst der Vorgabe-Provider der
-    /// Konfiguration; `None`, wenn keiner bekannt ist (dann gibt es nichts zu
-    /// prüfen).
+    /// Provider, gegen dessen Lebenszyklus eine Wahl geprüft wird (siehe
+    /// [`lifecycle_provider_in`]).
     fn lifecycle_provider(&self, provider: Option<&str>, model: &str) -> Option<String> {
-        provider
-            .map(str::to_owned)
-            .or_else(|| catalog_provider_of(&self.config, model))
-            .or_else(|| self.config.harness.default_provider.clone())
+        lifecycle_provider_in(&self.config, provider, model)
     }
 
     /// Erzwingt den Lebenszyklus einer **expliziten** Wahl.
     ///
     /// # Beschreibung
-    /// Abgekündigt (deprecated) → Warnung im Log, die Wahl gilt; ohne
-    /// bekannten Provider wird nichts geprüft.
+    /// Prüft über [`check_explicit_selection`]; abgekündigt (deprecated) →
+    /// Warnung im Log, die Wahl gilt; ohne bekannten Provider wird nichts
+    /// geprüft.
     ///
     /// # Errors
     /// [`RetiredModelError`], wenn das Angebot abgeschaltet ist.
@@ -307,19 +308,8 @@ impl LiveModelRouting {
         provider: Option<&str>,
         model: &str,
     ) -> Result<(), RetiredModelError> {
-        let Some(provider) = self.lifecycle_provider(provider, model) else {
-            return Ok(());
-        };
-        let model_id = resolve_model_id(&self.config, model);
-        let warning =
-            lifecycle::enforce_explicit(&provider, &model_id, time::OffsetDateTime::now_utc())?;
-        if let Some(warning) = warning {
-            tracing::warn!(
-                %warning,
-                provider = provider.as_str(),
-                model = model_id.as_str(),
-                "runtime.live_model.deprecated"
-            );
+        if let Some(warning) = check_explicit_selection(&self.config, provider, model)? {
+            tracing::warn!(%warning, model, "runtime.live_model.deprecated");
         }
         Ok(())
     }
@@ -429,6 +419,51 @@ impl LiveModelControl for LiveModelRouting {
         );
         live
     }
+}
+
+/// Provider, gegen dessen Lebenszyklus eine Wahl geprüft wird: der genannte,
+/// sonst der des Katalogs, sonst der Vorgabe-Provider der Konfiguration;
+/// `None`, wenn keiner bekannt ist (dann gibt es nichts zu prüfen).
+fn lifecycle_provider_in(
+    config: &ResolvedConfig,
+    provider: Option<&str>,
+    model: &str,
+) -> Option<String> {
+    provider
+        .map(str::to_owned)
+        .or_else(|| catalog_provider_of(config, model))
+        .or_else(|| config.harness.default_provider.clone())
+}
+
+/// Prüft eine **explizite** Provider-/Modellwahl gegen den Lebenszyklus der
+/// Provider-Angebote (zur aktuellen Uhrzeit).
+///
+/// # Beschreibung
+/// Löst Provider (genannt, sonst Katalog, sonst Vorgabe-Provider) und
+/// Modell-ID (Katalog-Schlüssel, `id` oder Alias) wie die Live-Wahl auf
+/// ([`LiveModelRouting::set_live_main`]) und prüft mit
+/// [`lifecycle::enforce_explicit`]. Reine Prüfung ohne Zustand: wer sie vor
+/// einer Mutation aufruft, ändert bei einem Fehler nichts. Ein Modell wird
+/// nie ersetzt.
+///
+/// # Rückgabe
+/// `Ok(Some(warnung))` für ein abgekündigtes (deprecated) Modell — die Wahl
+/// gilt, der Aufrufer meldet die Warnung —, sonst `Ok(None)`; auch dann, wenn
+/// kein Provider bekannt ist (nichts zu prüfen).
+///
+/// # Errors
+/// [`RetiredModelError`], wenn das Angebot abgeschaltet (retired) ist; sie
+/// nennt die vom Provider empfohlenen Ersatzmodelle.
+pub fn check_explicit_selection(
+    config: &ResolvedConfig,
+    provider: Option<&str>,
+    model: &str,
+) -> Result<Option<String>, RetiredModelError> {
+    let Some(provider) = lifecycle_provider_in(config, provider, model) else {
+        return Ok(None);
+    };
+    let model_id = resolve_model_id(config, model);
+    lifecycle::enforce_explicit(&provider, &model_id, time::OffsetDateTime::now_utc())
 }
 
 /// Löst eine Modellkennung (Katalog-Schlüssel, `id` oder Alias) zur
@@ -910,6 +945,41 @@ mod tests {
                 Some("anthropic".to_owned()),
                 "claude-mythos-preview".to_owned()
             ))
+        );
+        Ok(())
+    }
+
+    /// Die gemeinsame Prüfung einer expliziten Wahl (für die TUI an der
+    /// Turn-Grenze): abgeschaltet → Fehler mit Ersatz, abgekündigt → Warnung,
+    /// aktiv oder unbekannt → `None`; ohne Provider wird nichts geprüft.
+    #[test]
+    fn check_explicit_selection_reports_retired_deprecated_and_active() -> TestResult {
+        let config = ResolvedConfig::default();
+
+        let Err(error) = check_explicit_selection(&config, Some(RETIRED_PROVIDER), RETIRED_MODEL)
+        else {
+            return Err(TestError::Unexpected(
+                "ein abgeschaltetes Modell muss abgelehnt werden".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("mistral-ocr-4-1"), "{error}");
+
+        let warning = check_explicit_selection(&config, Some("anthropic"), "claude-mythos-preview")
+            .map_err(ctx("abgekündigt bleibt wählbar"))?
+            .ok_or(TestError::Missing("Warnung für das abgekündigte Modell"))?;
+        assert!(warning.contains("claude-mythos-5"), "{warning}");
+
+        assert_eq!(
+            check_explicit_selection(&config, Some("openai"), "gpt-5")
+                .map_err(ctx("unbekanntes Angebot ist erlaubt"))?,
+            None
+        );
+        // Ohne genannten Provider, ohne Katalog und ohne Vorgabe-Provider gibt
+        // es nichts zu prüfen.
+        assert_eq!(
+            check_explicit_selection(&config, None, RETIRED_MODEL)
+                .map_err(ctx("ohne Provider nichts zu prüfen"))?,
+            None
         );
         Ok(())
     }

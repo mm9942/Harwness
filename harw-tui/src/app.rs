@@ -2905,9 +2905,20 @@ impl ChatApp {
     /// Wendet ausstehende Controller-Mutationen auf `session` an.
     ///
     /// # Beschreibung
-    /// Delegiert an [`TuiSessionController::apply_to_session`]. Darf nur zwischen
-    /// Turns aufgerufen werden (nie während ein Turn läuft). Ist ein billiger
-    /// No-op, wenn seit dem letzten Apply keine Setter aufgerufen wurden.
+    /// Delegiert an [`TuiSessionController::apply_to_session_checked`]. Darf nur
+    /// zwischen Turns aufgerufen werden (nie während ein Turn läuft). Ist ein
+    /// billiger No-op, wenn seit dem letzten Apply keine Setter aufgerufen wurden.
+    ///
+    /// Eine ausstehende Modell-/Provider-Route wird **vor** dem Schreiben in
+    /// die Wurzelsitzung gegen den Provider-Lebenszyklus geprüft
+    /// ([`live_model::check_pending_route`]). Ist das Modell abgeschaltet
+    /// (retired), bleibt die Sitzung auf ihrer bisherigen Route, der
+    /// Controller wird darauf zurückgesetzt (damit auch die Kind-Route über
+    /// [`live_model::sync_live_main`] unverändert bleibt) und eine
+    /// Systemzeile meldet die Ablehnung. Die Wechsel-Operationen lehnen ein
+    /// abgeschaltetes Modell schon vor der Controller-Mutation ab; diese
+    /// Prüfung fängt Auswahlen ab, die den Controller auf anderem Weg
+    /// erreicht haben (Start-Auswahl, fremde Schreiber).
     ///
     /// # Argumente
     /// - `session` (`&mut AgentSession`): Die lebende Session, auf die Mutationen
@@ -2925,7 +2936,18 @@ impl ChatApp {
         if let Some(stage) = self.pending_permission_stage.take() {
             self.apply_permission_stage(stage);
         }
-        let applied = self.session_controller.apply_to_session(session);
+        // Lebenszyklus vor dem Schreiben in die Wurzelsitzung: eine
+        // abgeschaltete Route erreicht weder die Sitzung noch (über
+        // `sync_live_main`) die Kinder.
+        let outcome = self
+            .session_controller
+            .apply_to_session_checked(session, |provider, model| {
+                live_model::check_pending_route(self, provider, model)
+            });
+        let applied = outcome.applied;
+        if let Some(rejected) = outcome.rejected_route {
+            live_model::report_rejected_route(self, &rejected);
+        }
         // Runde 5, Teil G: „wie UIA“-Worker folgen der Live-Auswahl der UIA.
         uia_workers::sync_live_uia(self, session);
         // Live-Modellwechsel: neu gestartete Kinder des Wurzel-Baums folgen

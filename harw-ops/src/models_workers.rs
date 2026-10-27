@@ -104,7 +104,9 @@ fn render_workers(ctx: &OpContext, config: &ResolvedConfig) -> OpOutput {
 ///
 /// # Fehler
 /// [`OpError::InvalidArguments`] für eine unbekannte Rolle, ein fehlendes
-/// oder unauflösbares Ziel.
+/// oder unauflösbares Ziel — und für ein laut Provider-Lebenszyklus
+/// abgeschaltetes Modell (vor jeder Persistenz geprüft, mit Ersatzhinweis;
+/// ein abgekündigtes Modell hängt eine Warnung an die Bestätigung).
 pub(crate) fn handle_worker(
     ctx: &OpContext,
     config: &ResolvedConfig,
@@ -142,10 +144,15 @@ pub(crate) fn handle_worker(
         })?]
     };
 
+    let mut lifecycle_warning: Option<String> = None;
     let choice = match UiaWorkerModelChoice::parse(target) {
         Some(UiaWorkerModelChoice::FollowUia) => UiaWorkerModelChoice::FollowUia,
         _ => {
             let (provider, model) = crate::models::resolve_target(config, target)?;
+            // Lebenszyklus der ausdrücklichen Wahl vor jeder Persistenz: ein
+            // abgeschaltetes Modell wird abgelehnt, ein abgekündigtes nur
+            // mit Warnung gespeichert.
+            lifecycle_warning = crate::live_model::enforce_lifecycle(&provider, &model)?;
             UiaWorkerModelChoice::Fixed { provider, model }
         }
     };
@@ -174,6 +181,10 @@ pub(crate) fn handle_worker(
         ),
         note.as_deref(),
     );
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
     if let UiaWorkerModelChoice::Fixed { provider, .. } = &choice
         && !provider_is_logged_in(config, provider)
     {
