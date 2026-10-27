@@ -442,12 +442,98 @@ fn lifecycle_provider_in(
         .or_else(|| config.harness.default_provider.clone())
 }
 
+/// Provider und Modell-ID des Angebots, gegen das der Lebenszyklus geprüft
+/// wird; `None`, wenn kein Provider bekannt ist (nichts zu prüfen).
+///
+/// Mit **genanntem** Provider wird die Modell-ID providergenau aufgelöst
+/// ([`resolve_model_id_for_provider`]); ohne genannten Provider bleibt es bei
+/// der globalen Auflösung ([`resolve_model_id`]) — dort stammt der Provider
+/// aus demselben Katalogeintrag.
+fn lifecycle_offering(
+    config: &ResolvedConfig,
+    provider: Option<&str>,
+    model: &str,
+) -> Option<(String, String)> {
+    let offering_provider = lifecycle_provider_in(config, provider, model)?;
+    let model_id = match provider {
+        Some(named) => resolve_model_id_for_provider(config, named, model),
+        None => resolve_model_id(config, model),
+    };
+    Some((offering_provider, model_id))
+}
+
+/// Normalisiert einen Provider-Verweis (Schlüssel oder `name` eines
+/// konfigurierten Providers) auf den kanonischen Provider-Namen; ein
+/// unbekannter Verweis bleibt unverändert.
+///
+/// Spiegel von `canonical_provider_name` in `harw-ops` (dort nicht
+/// öffentlich), damit Laufzeit und Operationen dieselben Providergrenzen
+/// ziehen.
+fn canonical_provider_name<'a>(config: &'a ResolvedConfig, name: &'a str) -> &'a str {
+    config
+        .providers
+        .iter()
+        .find(|(key, provider)| key.as_str() == name || provider.name == name)
+        .map_or(name, |(_, provider)| provider.name.as_str())
+}
+
+/// Gehört der Katalogeintrag `entry` zum Provider `provider` (Schlüssel oder
+/// `name`, beide Seiten kanonisiert)?
+fn model_belongs_to(
+    config: &ResolvedConfig,
+    entry: &harw_config::ModelToml,
+    provider: &str,
+) -> bool {
+    canonical_provider_name(config, &entry.provider) == canonical_provider_name(config, provider)
+}
+
+/// Löst eine Modellkennung (Katalog-Schlüssel, `id` oder Alias) **innerhalb
+/// des Providers `provider`** zur Modell-ID des Katalogs auf.
+///
+/// # Beschreibung
+/// Rangfolge, jeweils nur unter den Katalogmodellen von `provider`:
+/// Katalog-Schlüssel, dann `id`, dann Alias. Die Auflösung hängt nicht von der
+/// Iterationsreihenfolge der Konfiguration ab: derselbe Alias bei zwei
+/// Providern liefert je Provider dessen eigene ID; benennt ein Alias bei
+/// einem Provider mehrere Modelle (mehrdeutige Konfiguration, von `harw-ops`
+/// beim Setzen abgelehnt), gilt die kleinste Modell-ID. Eine Kennung, die
+/// bei `provider` weder Schlüssel noch `id` noch Alias ist, bleibt
+/// unverändert (frei wählbare Modell-ID) — auch wenn sie Schlüssel, `id`
+/// oder Alias eines Modells eines **anderen** Providers ist: sonst würde aus
+/// `provider-a/<kennung>` still das Modell von Provider B und der
+/// Lebenszyklus-Abgleich liefe gegen die falsche ID.
+fn resolve_model_id_for_provider(config: &ResolvedConfig, provider: &str, model: &str) -> String {
+    if let Some(entry) = config
+        .models
+        .get(model)
+        .filter(|entry| model_belongs_to(config, entry, provider))
+    {
+        return entry.id.clone();
+    }
+    let own: Vec<&harw_config::ModelToml> = config
+        .models
+        .values()
+        .filter(|entry| model_belongs_to(config, entry, provider))
+        .collect();
+    if own.iter().any(|entry| entry.id == model) {
+        return model.to_owned();
+    }
+    own.iter()
+        .filter(|entry| entry.aliases.iter().any(|alias| alias == model))
+        .map(|entry| entry.id.as_str())
+        .min()
+        .map_or_else(|| model.to_owned(), str::to_owned)
+}
+
 /// Prüft eine **explizite** Provider-/Modellwahl gegen den Lebenszyklus der
 /// Provider-Angebote (zur aktuellen Uhrzeit).
 ///
 /// # Beschreibung
 /// Löst Provider (genannt, sonst Katalog, sonst Vorgabe-Provider) und
-/// Modell-ID (Katalog-Schlüssel, `id` oder Alias) wie die Live-Wahl auf
+/// Modell-ID (Katalog-Schlüssel, `id` oder Alias) wie die Live-Wahl auf;
+/// bei genanntem Provider **providergenau** (nur dessen Katalogmodelle, siehe
+/// `resolve_model_id_for_provider`), sodass ein Alias eines anderen Providers
+/// die Wahl nie auf dessen Modell umschreibt
 /// ([`LiveModelRouting::set_live_main`]) und prüft mit
 /// [`lifecycle::enforce_explicit`]. Reine Prüfung ohne Zustand: wer sie vor
 /// einer Mutation aufruft, ändert bei einem Fehler nichts. Ein Modell wird
@@ -485,10 +571,9 @@ fn check_explicit_selection_at(
     model: &str,
     now: lifecycle::OffsetDateTime,
 ) -> Result<Option<String>, RetiredModelError> {
-    let Some(provider) = lifecycle_provider_in(config, provider, model) else {
+    let Some((provider, model_id)) = lifecycle_offering(config, provider, model) else {
         return Ok(None);
     };
-    let model_id = resolve_model_id(config, model);
     lifecycle::enforce_explicit(&provider, &model_id, now)
 }
 
@@ -545,11 +630,11 @@ fn internal_route_decision(
             }
         }
         InternalModelSource::OpenRouterDefault | InternalModelSource::MainModel => {
-            let Some(provider) = lifecycle_provider_in(config, resolved.provider.as_deref(), model)
+            let Some((provider, model_id)) =
+                lifecycle_offering(config, resolved.provider.as_deref(), model)
             else {
                 return keep;
             };
-            let model_id = resolve_model_id(config, model);
             if lifecycle::implicitly_selectable_bundled(&provider, &model_id, now) {
                 keep
             } else {
@@ -568,7 +653,9 @@ fn internal_route_decision(
 ///
 /// # Beschreibung
 /// Grundlage der Modellanzeige (`<provider>/<modell>`): angezeigt wird die
-/// Modell-ID, die tatsächlich angefragt wird, nie ein Alias.
+/// Modell-ID, die tatsächlich angefragt wird, nie ein Alias. Die Auflösung ist
+/// global (ohne Providerbindung); die Lebenszyklus-Prüfung einer Wahl mit
+/// bekanntem Provider löst providergenau auf.
 #[must_use]
 pub fn resolve_model_id(config: &ResolvedConfig, model: &str) -> String {
     config
@@ -1284,6 +1371,145 @@ mod tests {
                 InternalRouteDecision::Keep { warning: None }
             );
         }
+        Ok(())
+    }
+
+    /// Katalogeintrag für die providergenauen Auflösungstests.
+    fn model_toml(id: &str, provider: &str, aliases: &[&str]) -> harw_config::ModelToml {
+        harw_config::ModelToml {
+            stream: None,
+            rate_limit: None,
+            id: id.to_owned(),
+            name: None,
+            provider: provider.to_owned(),
+            aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+            context_window: None,
+            max_tokens: None,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+            default_reasoning_effort: None,
+        }
+    }
+
+    /// Derselbe Alias bei zwei Providern liefert je Provider dessen eigene
+    /// ID, unabhängig von der Iterationsreihenfolge der Konfiguration; ein
+    /// Provider-Verweis über Schlüssel oder `name` zieht dieselbe Grenze.
+    #[test]
+    fn same_alias_under_two_providers_resolves_per_provider() {
+        let mut config = ResolvedConfig::default();
+        config.models.insert(
+            "a-key".to_owned(),
+            model_toml("a-model", "prov-a", &["shared"]),
+        );
+        config.models.insert(
+            "b-key".to_owned(),
+            model_toml("b-model", "prov-b", &["shared"]),
+        );
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-a", "shared"),
+            "a-model"
+        );
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-b", "shared"),
+            "b-model"
+        );
+        // Katalog-Schlüssel und reine `id` des eigenen Providers.
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-a", "a-key"),
+            "a-model"
+        );
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-a", "a-model"),
+            "a-model"
+        );
+    }
+
+    /// Provider-Schlüssel und Provider-`name` gelten als derselbe Provider.
+    #[test]
+    fn provider_reference_by_key_or_name_is_one_provider() {
+        let mut config = ResolvedConfig::default();
+        config
+            .providers
+            .insert("mistral-key".to_owned(), loopback_provider("mistral", None));
+        config.models.insert(
+            "ocr".to_owned(),
+            model_toml("mistral-ocr-4-0", "mistral-key", &["legacy-ocr"]),
+        );
+        for provider in ["mistral", "mistral-key"] {
+            assert_eq!(
+                resolve_model_id_for_provider(&config, provider, "legacy-ocr"),
+                "mistral-ocr-4-0",
+                "{provider}"
+            );
+        }
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "other", "legacy-ocr"),
+            "legacy-ocr"
+        );
+    }
+
+    /// Eine Kennung, die nur bei einem anderen Provider Alias oder Schlüssel
+    /// ist, bleibt unverändert (frei wählbare Modell-ID); die globale
+    /// Auflösung der Anzeige bleibt davon unberührt.
+    #[test]
+    fn an_id_equal_to_another_providers_alias_is_not_remapped() {
+        let mut config = ResolvedConfig::default();
+        config.models.insert(
+            "b-key".to_owned(),
+            model_toml("b-model", "prov-b", &["shared"]),
+        );
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-a", "shared"),
+            "shared"
+        );
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-a", "b-key"),
+            "b-key"
+        );
+        assert_eq!(
+            resolve_model_id_for_provider(&config, "prov-a", "b-model"),
+            "b-model"
+        );
+        assert_eq!(resolve_model_id(&config, "shared"), "b-model");
+    }
+
+    /// Der Alias eines anderen Providers darf eine Wahl nicht auf dessen
+    /// (abgeschaltetes) Modell umschreiben: `openai/my-gpt` bleibt eine freie
+    /// ID und ist erlaubt, obwohl `my-gpt` bei einem Gateway auf
+    /// `gpt-4o-2024-08-06` zeigt; gehört der Alias OpenAI selbst, wird er
+    /// aufgelöst und die Wahl nach dem Retirement abgelehnt.
+    #[test]
+    fn check_explicit_selection_does_not_remap_another_providers_alias() -> TestResult {
+        let after_retirement = utc(2027, 1, 15, 0)?;
+
+        let mut foreign = ResolvedConfig::default();
+        foreign.models.insert(
+            "gw-gpt4o".to_owned(),
+            model_toml("gpt-4o-2024-08-06", "gateway", &["my-gpt"]),
+        );
+        assert_eq!(
+            check_explicit_selection_at(&foreign, Some("openai"), "my-gpt", after_retirement)
+                .map_err(ctx("fremder Alias ist eine freie ID"))?,
+            None
+        );
+
+        let mut own = ResolvedConfig::default();
+        own.models.insert(
+            "oa-gpt4o".to_owned(),
+            model_toml("gpt-4o-2024-08-06", "openai", &["my-gpt"]),
+        );
+        let Err(error) =
+            check_explicit_selection_at(&own, Some("openai"), "my-gpt", after_retirement)
+        else {
+            return Err(TestError::Unexpected(
+                "der eigene Alias eines abgeschalteten Modells muss abgelehnt werden".to_owned(),
+            ));
+        };
+        assert_eq!(error.provider, "openai");
+        assert_eq!(error.model, "gpt-4o-2024-08-06");
+        assert!(error.to_string().contains("gpt-6-luna"), "{error}");
         Ok(())
     }
 }
