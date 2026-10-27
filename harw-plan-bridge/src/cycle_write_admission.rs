@@ -27,8 +27,9 @@
 //! - The model only names *target ids*. Which workspace-relative path an id
 //!   stands for is decided by the trusted runtime in a [`WriteTargetMap`],
 //!   which is deliberately not `Deserialize`. A [`PatchProposal`] is likewise
-//!   not `Deserialize` and is built from a *journaled, admitted* step, never
-//!   from model JSON directly.
+//!   not `Deserialize`, has private fields, and is built only by
+//!   [`PatchProposal::from_admitted`] from a *journaled, admitted* step and the
+//!   committed checkpoint, never from model JSON directly.
 //! - The preimage digest is not taken from the model either: it is the digest
 //!   of the trusted `Repository` evidence record the step referenced, and that
 //!   record's locator must name the same file as the target.
@@ -36,7 +37,7 @@
 //!   [`Permission::WriteWorkspace`]; the proposal belongs to the intent of the
 //!   admission and its target is in [`CycleAdmission::allowed_write_targets`];
 //!   the trusted [`WriteTargetMap`] still maps that target to exactly the
-//!   proposal's path; the owner worker id is sane; the [`Scope`] is the one of
+//!   proposal's path; the [`Scope`] is the one of
 //!   the authority's workspace; the path passes `Scope::rel_readable` (no
 //!   `..`, no absolute path outside the root, no secret path such as `.env`
 //!   or `*.pem`); and the file, re-read beneath the workspace root (regular
@@ -55,20 +56,28 @@
 //! admitted in this slice: there is no preimage to compare, so the re-read
 //! fails closed as [`PatchRefusal::Unreadable`].
 //!
-//! # Hand-built proposals
+//! # No hand-built proposals
 //!
-//! [`PatchProposal`] has public fields (so callers can read it) and could be
-//! built or edited by hand. [`admit_patch`] therefore does not trust the
-//! `target id -> relative path` binding it carries: it receives the trusted
-//! [`WriteTargetMap`] and re-derives the path from the target id, so a
-//! proposal naming an allowed target but a different file is refused. The
-//! intent binding, the target admission and the owner id are re-checked the
-//! same way. What `admit_patch` cannot re-check is the *provenance* of
-//! `evidence_id` and `expected_preimage`: it has no checkpoint. It only proves
-//! that the file currently has the digest the proposal names. The link from
-//! that digest to observed repository evidence is established by
-//! [`PatchProposal::from_admitted`], which is the one constructor trusted code
-//! should use.
+//! Every field of [`PatchProposal`] is private and readable only through
+//! getters. [`PatchProposal::from_admitted`] is the only constructor: there is
+//! no `new`, no `Default` and no `Deserialize`, and `Clone` merely copies a
+//! proposal that already came out of `from_admitted`. A caller therefore
+//! cannot pair an arbitrary evidence id, or the file's current digest, with a
+//! target: the expected preimage always is the digest of a `Repository`
+//! evidence record of trust `Observed` or `Verified` that the *checkpoint*
+//! holds for the step's evidence id, with a locator naming the target's file.
+//! Without such a record there is no proposal, hence no [`AdmittedPatch`].
+//! (A file whose current digest differs from the recorded one is refused by
+//! [`admit_patch`] as [`PatchRefusal::PreimageMismatch`]; the current digest
+//! is never an input.)
+//!
+//! [`admit_patch`] still re-checks against the *current* trusted inputs it is
+//! given, because they can differ from those at construction time: the intent
+//! of the admission, the admitted write targets, and the
+//! `target id -> relative path` binding of the [`WriteTargetMap`]. What stays
+//! trusted is the caller of `from_admitted`: it must pass the step that was
+//! actually journaled and the committed checkpoint of the same cycle; this
+//! module cannot tell a real checkpoint from a fabricated one.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -201,30 +210,21 @@ fn is_valid_owner(owner: &str) -> bool {
 
 /// One single-file patch proposal derived from an admitted step.
 ///
-/// Not `Deserialize`: it is built by [`PatchProposal::from_admitted`] from
-/// trusted state. The fields are public for reading; see the module docs
-/// ("Hand-built proposals") for why they must not be edited before
-/// [`admit_patch`].
+/// Not `Deserialize`, no `Default`, no `new`, and every field is private:
+/// [`PatchProposal::from_admitted`] is the only way to obtain one, so each
+/// proposal is backed by a journaled step, a recorded evidence entry and the
+/// trusted [`WriteTargetMap`] (see the module docs, "No hand-built
+/// proposals"). Read it through the getters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchProposal {
-    /// Intent the cycle was admitted for.
-    pub intent_id: String,
-    /// Revision of that intent.
-    pub intent_revision: u64,
-    /// Write target id (as admitted), not a path.
-    pub target: String,
-    /// Normalized workspace-relative path the trusted map assigned to `target`.
-    pub relative_path: String,
-    /// Digest the file must still have when the patch is admitted, taken from
-    /// the observed repository evidence the step referenced.
-    pub expected_preimage: ContentDigest,
-    /// Id of that evidence record.
-    pub evidence_id: String,
-    /// Worker that will own the file lease and the write.
-    pub owner_worker: String,
-    /// The journaled step's idempotency key; the write adapter deduplicates
-    /// the external effect with it.
-    pub idempotency_key: String,
+    intent_id: String,
+    intent_revision: u64,
+    target: String,
+    relative_path: String,
+    expected_preimage: ContentDigest,
+    evidence_id: String,
+    owner_worker: String,
+    idempotency_key: String,
 }
 
 /// Why a patch was not admitted. Every variant is a fail-closed refusal.
@@ -259,7 +259,8 @@ pub enum PatchRefusal {
     /// The file could not be re-read beneath the workspace root (missing,
     /// not a regular file, symlink, over the size cap, I/O error).
     Unreadable,
-    /// The owner worker id is empty, blank or contains control characters.
+    /// The owner worker id is empty, blank or contains control characters
+    /// (checked by [`PatchProposal::from_admitted`]).
     InvalidOwner,
 }
 
@@ -357,6 +358,57 @@ impl PatchProposal {
             idempotency_key: step.idempotency_key.clone(),
         })
     }
+
+    /// Intent the cycle was admitted for.
+    #[must_use]
+    pub fn intent_id(&self) -> &str {
+        &self.intent_id
+    }
+
+    /// Revision of that intent.
+    #[must_use]
+    pub fn intent_revision(&self) -> u64 {
+        self.intent_revision
+    }
+
+    /// Write target id (as admitted), not a path.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Normalized workspace-relative path the trusted map assigned to the
+    /// target when the proposal was built.
+    #[must_use]
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    /// Digest the file must still have when the patch is admitted: the digest
+    /// of the observed repository evidence the step referenced.
+    #[must_use]
+    pub fn expected_preimage(&self) -> ContentDigest {
+        self.expected_preimage
+    }
+
+    /// Id of that evidence record.
+    #[must_use]
+    pub fn evidence_id(&self) -> &str {
+        &self.evidence_id
+    }
+
+    /// Worker that will own the file lease and the write.
+    #[must_use]
+    pub fn owner_worker(&self) -> &str {
+        &self.owner_worker
+    }
+
+    /// The journaled step's idempotency key; the write adapter deduplicates
+    /// the external effect with it.
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
 }
 
 /// Proof that a patch passed every trusted check at [`admit_patch`] time.
@@ -394,12 +446,11 @@ impl AdmittedPatch {
 ///    target is in [`CycleAdmission::allowed_write_targets`]
 ///    ([`PatchRefusal::TargetNotAdmitted`]);
 /// 3. `targets` maps the proposal's target ([`PatchRefusal::UnknownTarget`])
-///    to a path whose normalized form equals `proposal.relative_path`
-///    ([`PatchRefusal::EvidenceLocatorMismatch`]); a hand-built proposal
-///    cannot pair an allowed target id with a different file;
-/// 4. `owner_worker` is not blank and has no control characters
-///    ([`PatchRefusal::InvalidOwner`]);
-/// 5. `scope` is the scope of the authority's workspace root, and the path
+///    to a path whose normalized form still equals the proposal's
+///    `relative_path` ([`PatchRefusal::EvidenceLocatorMismatch`]); a map or
+///    admission that changed since the proposal was built is not trusted
+///    blindly;
+/// 4. `scope` is the scope of the authority's workspace root, and the path
 ///    passes `Scope::rel_readable` ([`PatchRefusal::PathEscapesWorkspace`]).
 ///
 /// Then the file is re-read beneath `scope` (bounded by
@@ -407,10 +458,10 @@ impl AdmittedPatch {
 /// its digest must equal `expected_preimage` ([`PatchRefusal::Unreadable`],
 /// [`PatchRefusal::PreimageMismatch`]).
 ///
-/// The proposal should come from [`PatchProposal::from_admitted`]; what this
-/// function cannot re-check about a hand-built one is described in the module
-/// docs ("Hand-built proposals"). Blocking file read: call from
-/// `spawn_blocking`.
+/// Every [`PatchProposal`] comes from [`PatchProposal::from_admitted`] (the
+/// type has no other constructor), so its preimage digest is always the one a
+/// recorded, observed evidence entry vouches for; see the module docs ("No
+/// hand-built proposals"). Blocking file read: call from `spawn_blocking`.
 ///
 /// # Errors
 /// A [`PatchRefusal`]; nothing has been created or changed in that case.
@@ -427,38 +478,38 @@ pub fn admit_patch(
     // A proposal minted for another intent (or revision) must not be admitted
     // under this admission, even when the target id happens to coincide.
     let intent = admission.intent();
-    if proposal.intent_id != intent.id || proposal.intent_revision != intent.revision {
+    if proposal.intent_id() != intent.id || proposal.intent_revision() != intent.revision {
         return Err(PatchRefusal::TargetNotAdmitted);
     }
-    if !admission.allowed_write_targets().contains(&proposal.target) {
+    if !admission
+        .allowed_write_targets()
+        .contains(proposal.target())
+    {
         return Err(PatchRefusal::TargetNotAdmitted);
     }
     // The target id -> path binding is the trusted map's, not the proposal's.
-    let Some(mapped) = targets.path(&proposal.target) else {
+    let Some(mapped) = targets.path(proposal.target()) else {
         return Err(PatchRefusal::UnknownTarget);
     };
-    if normalized(mapped) != proposal.relative_path {
+    if normalized(mapped) != proposal.relative_path() {
         return Err(PatchRefusal::EvidenceLocatorMismatch);
-    }
-    if !is_valid_owner(&proposal.owner_worker) {
-        return Err(PatchRefusal::InvalidOwner);
     }
     // The permission above was checked on `authority`; the file must be
     // looked at in that same workspace and nowhere else.
     if scope.root() != authority.workspace().canonical_root() {
         return Err(PatchRefusal::PathEscapesWorkspace);
     }
-    if scope.rel_readable(&proposal.relative_path).is_err() {
+    if scope.rel_readable(proposal.relative_path()).is_err() {
         return Err(PatchRefusal::PathEscapesWorkspace);
     }
     let outcome = read_beneath(
         scope,
-        &proposal.relative_path,
+        proposal.relative_path(),
         DEFAULT_MAX_READ_BYTES,
         DEFAULT_MAX_READ_BYTES,
     )
     .map_err(|_| PatchRefusal::Unreadable)?;
-    if outcome.digest != proposal.expected_preimage {
+    if outcome.digest != proposal.expected_preimage() {
         return Err(PatchRefusal::PreimageMismatch);
     }
     Ok(AdmittedPatch {
@@ -470,6 +521,7 @@ pub fn admit_patch(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::marker::PhantomData;
     use std::path::PathBuf;
 
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
@@ -572,12 +624,17 @@ mod tests {
     }
 
     fn admission_with(write_ids: &[&str]) -> TestResult<CycleAdmission> {
+        admission_for("intent-w05", 1, write_ids)
+    }
+
+    fn admission_for(id: &str, revision: u64, write_ids: &[&str]) -> TestResult<CycleAdmission> {
+        let digest_of = |revision: u64| ContentDigest::of(format!("{id}@{revision}").as_bytes());
         CycleAdmission::new(
             IntentBinding {
-                id: "intent-w05".to_owned(),
-                revision: 1,
-                digest: ContentDigest::of(b"intent-w05@1"),
-                predecessor: None,
+                id: id.to_owned(),
+                revision,
+                digest: digest_of(revision),
+                predecessor: (revision > 1).then(|| digest_of(revision.saturating_sub(1))),
                 acceptance: set(&["patched"]),
             },
             CycleLimits {
@@ -757,19 +814,14 @@ mod tests {
     fn admitted_patch_carries_the_derived_proposal_and_checked_digest() -> TestResult {
         let case = Case::new(&write_rights(), &["code"])?;
         let proposal = case.proposal(&["code"], "ev-1")?;
-        assert_eq!(
-            proposal,
-            PatchProposal {
-                intent_id: "intent-w05".to_owned(),
-                intent_revision: 1,
-                target: "code".to_owned(),
-                relative_path: "src/lib.rs".to_owned(),
-                expected_preimage: ContentDigest::of(OLD),
-                evidence_id: "ev-1".to_owned(),
-                owner_worker: "worker-1".to_owned(),
-                idempotency_key: "cyc-0".to_owned(),
-            }
-        );
+        assert_eq!(proposal.intent_id(), "intent-w05");
+        assert_eq!(proposal.intent_revision(), 1);
+        assert_eq!(proposal.target(), "code");
+        assert_eq!(proposal.relative_path(), "src/lib.rs");
+        assert_eq!(proposal.expected_preimage(), ContentDigest::of(OLD));
+        assert_eq!(proposal.evidence_id(), "ev-1");
+        assert_eq!(proposal.owner_worker(), "worker-1");
+        assert_eq!(proposal.idempotency_key(), "cyc-0");
         let before = case.ws.snapshot()?;
         let admitted = case.admit(&proposal).map_err(ctx("admits"))?;
         assert_eq!(admitted.proposal(), &proposal);
@@ -903,7 +955,7 @@ mod tests {
             EvidenceTrust::Observed,
         ));
         let proposal = case.proposal(&["code"], "ev-spelled")?;
-        assert_eq!(proposal.relative_path, "src/lib.rs");
+        assert_eq!(proposal.relative_path(), "src/lib.rs");
         assert!(case.admit(&proposal).is_ok());
         Ok(())
     }
@@ -975,18 +1027,23 @@ mod tests {
     }
 
     #[test]
-    fn proposal_of_another_intent_is_not_admitted() -> TestResult {
+    fn proposal_is_not_admitted_under_another_intent_or_revision() -> TestResult {
         let case = Case::new(&write_rights(), &["code"])?;
         let proposal = case.proposal(&["code"], "ev-1")?;
-        let mut other_id = proposal.clone();
-        other_id.intent_id = "intent-other".to_owned();
-        assert_eq!(case.admit(&other_id), Err(PatchRefusal::TargetNotAdmitted));
-        let mut other_revision = proposal;
-        other_revision.intent_revision += 1;
-        assert_eq!(
-            case.admit(&other_revision),
-            Err(PatchRefusal::TargetNotAdmitted)
-        );
+        let other_intent = admission_for("intent-other", 1, &["code"])?;
+        let other_revision = admission_for("intent-w05", 2, &["code"])?;
+        for admission in [&other_intent, &other_revision] {
+            assert_eq!(
+                admit_patch(
+                    &proposal,
+                    admission,
+                    &case.targets,
+                    &case.authority,
+                    &case.scope
+                ),
+                Err(PatchRefusal::TargetNotAdmitted)
+            );
+        }
         Ok(())
     }
 
@@ -1040,36 +1097,27 @@ mod tests {
     }
 
     #[test]
-    fn hand_built_proposal_with_foreign_path_is_refused() -> TestResult {
-        let case = Case::new(&write_rights(), &["code"])?;
+    fn proposal_is_refused_when_the_trusted_map_now_names_another_file() -> TestResult {
+        let mut case = Case::new(&write_rights(), &["code"])?;
         // A second file with the very same content, so only the target ->
-        // path binding can stop the forged proposal.
+        // path binding can stop the proposal.
         case.ws.write("src/other.rs", OLD)?;
         let proposal = case.proposal(&["code"], "ev-1")?;
-        let mut forged = proposal.clone();
-        forged.relative_path = "src/other.rs".to_owned();
+        assert!(case.admit(&proposal).is_ok(), "admitted under the old map");
+        case.targets = map(&[("code", "src/other.rs")])?;
         assert_eq!(
-            case.admit(&forged),
+            case.admit(&proposal),
             Err(PatchRefusal::EvidenceLocatorMismatch)
-        );
-        // The same file spelled differently is still the mapped file.
-        let mut respelled = proposal;
-        respelled.relative_path = "src//lib.rs".to_owned();
-        assert_eq!(
-            case.admit(&respelled),
-            Err(PatchRefusal::EvidenceLocatorMismatch),
-            "relative_path must be the normalized form the map yields"
         );
         Ok(())
     }
 
     #[test]
-    fn hand_built_proposal_with_unmapped_target_is_refused() -> TestResult {
-        // `ghost` is admitted by the cycle but the trusted map does not know it.
-        let case = Case::new(&write_rights(), &["code", "ghost"])?;
-        let mut forged = case.proposal(&["code"], "ev-1")?;
-        forged.target = "ghost".to_owned();
-        assert_eq!(case.admit(&forged), Err(PatchRefusal::UnknownTarget));
+    fn proposal_is_refused_when_the_trusted_map_dropped_the_target() -> TestResult {
+        let mut case = Case::new(&write_rights(), &["code"])?;
+        let proposal = case.proposal(&["code"], "ev-1")?;
+        case.targets = map(&[("docs", "docs/guide.md")])?;
+        assert_eq!(case.admit(&proposal), Err(PatchRefusal::UnknownTarget));
         Ok(())
     }
 
@@ -1085,10 +1133,102 @@ mod tests {
             );
             assert_eq!(refused, Err(PatchRefusal::InvalidOwner), "owner {bad:?}");
         }
-        // A hand-built proposal cannot smuggle in a bad owner either.
-        let mut forged = case.proposal(&["code"], "ev-1")?;
-        forged.owner_worker = String::new();
-        assert_eq!(case.admit(&forged), Err(PatchRefusal::InvalidOwner));
+        assert_eq!(case.proposal(&["code"], "ev-1")?.owner_worker(), "worker-1");
+        Ok(())
+    }
+
+    /// Autoref probes: `Probe::<T>(PhantomData).has_default()` is `true` only
+    /// when `T: Default` (the inherent method wins over the trait fallback),
+    /// likewise `has_deserialize()` for `T: DeserializeOwned`.
+    struct Probe<T>(PhantomData<T>);
+
+    trait DefaultFallback {
+        fn has_default(&self) -> bool {
+            false
+        }
+    }
+
+    impl<T> DefaultFallback for Probe<T> {}
+
+    impl<T: Default> Probe<T> {
+        fn has_default(&self) -> bool {
+            true
+        }
+    }
+
+    trait DeserializeFallback {
+        fn has_deserialize(&self) -> bool {
+            false
+        }
+    }
+
+    impl<T> DeserializeFallback for Probe<T> {}
+
+    impl<T: serde::de::DeserializeOwned> Probe<T> {
+        fn has_deserialize(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn unrecorded_current_digest_cannot_mint_an_admitted_patch() -> TestResult {
+        let mut case = Case::new(&write_rights(), &["code"])?;
+        let current = ContentDigest::of(OLD);
+        let from_admitted = |case: &Case, evidence_id: &str| {
+            PatchProposal::from_admitted(
+                &patch_step(&["code"], evidence_id),
+                &case.state,
+                &case.targets,
+                "worker-1",
+            )
+        };
+
+        // The step names evidence the checkpoint never recorded: even though
+        // the file's current digest is known, no proposal comes out.
+        assert_eq!(
+            from_admitted(&case, "ev-unrecorded"),
+            Err(PatchRefusal::MissingEvidence)
+        );
+        // Recorded, with exactly the file's current digest, but only reported.
+        case.record(evidence(
+            "ev-reported",
+            "src/lib.rs",
+            current,
+            EvidenceSourceKind::Repository,
+            EvidenceTrust::Reported,
+        ));
+        assert_eq!(
+            from_admitted(&case, "ev-reported"),
+            Err(PatchRefusal::EvidenceNotObserved)
+        );
+
+        // Observed evidence whose digest differs from the file's current one:
+        // the proposal carries the *recorded* digest, so admission refuses
+        // although a hand-picked current digest would have matched.
+        let stale = ContentDigest::of(b"pub fn stale() {}\n");
+        case.record(evidence(
+            "ev-stale",
+            "src/lib.rs",
+            stale,
+            EvidenceSourceKind::Repository,
+            EvidenceTrust::Observed,
+        ));
+        let before = case.ws.snapshot()?;
+        let proposal = from_admitted(&case, "ev-stale").map_err(ctx("stale proposal builds"))?;
+        assert_eq!(proposal.expected_preimage(), stale);
+        assert_ne!(proposal.expected_preimage(), current);
+        assert_eq!(case.admit(&proposal), Err(PatchRefusal::PreimageMismatch));
+        assert_eq!(case.ws.snapshot()?, before);
+
+        // No other route to a proposal or a proof: neither type has `Default`
+        // or `Deserialize` (the fields are private and there is no `new`).
+        // Sanity-check the probes on a type that has both.
+        assert!(Probe::<String>(PhantomData).has_default());
+        assert!(Probe::<String>(PhantomData).has_deserialize());
+        assert!(!Probe::<PatchProposal>(PhantomData).has_default());
+        assert!(!Probe::<PatchProposal>(PhantomData).has_deserialize());
+        assert!(!Probe::<AdmittedPatch>(PhantomData).has_default());
+        assert!(!Probe::<AdmittedPatch>(PhantomData).has_deserialize());
         Ok(())
     }
 }
