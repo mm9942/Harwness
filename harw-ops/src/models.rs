@@ -47,7 +47,9 @@
 //! oder ein Provider-Client gebaut wird: ein abgeschaltetes (retired) Modell
 //! wird mit dem empfohlenen Ersatz abgelehnt und die Profil-`config.toml`
 //! bleibt unverändert; ein abgekündigtes (deprecated) Modell wird gespeichert
-//! und die Bestätigung trägt die Warnung.
+//! und die Bestätigung trägt die Warnung. Geprüft und persistiert wird stets
+//! die kanonische Katalog-ID: auch `provider/alias` wird vorher auf die
+//! konfigurierte Modell-ID aufgelöst (`resolve_target`).
 //!
 //! # Fehler
 //! - [`OpError::InvalidArguments`]: unbekanntes Sub-Kommando, unbekannte Rolle,
@@ -172,13 +174,33 @@ pub(crate) fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> St
         .unwrap_or_else(|| name.to_owned())
 }
 
+/// Löst eine Modellkennung (Katalog-Schlüssel, `id` oder Alias) zur kanonischen
+/// Modell-ID des Katalogs auf; eine unbekannte Kennung bleibt unverändert.
+///
+/// # Beschreibung
+/// Spiegelt die Auflösung der Runtime (`resolve_model_id` in
+/// `harw-runtime`), damit Lebenszyklus-Prüfung und Persistenz dieselbe ID
+/// sehen wie die spätere Laufzeitprüfung der Wahl.
+fn canonical_model_id(config: &ResolvedConfig, model: &str) -> String {
+    config
+        .models
+        .get(model)
+        .or_else(|| crate::model::configured_model(config, model))
+        .map_or_else(|| model.to_owned(), |entry| entry.id.clone())
+}
+
 /// Löst `target` zu `(provider, modell)` auf.
 ///
 /// # Beschreibung
 /// 1. Bekannte Modell-ID: Schlüssel in `config.models`, `id` oder Alias →
 ///    Provider aus dem Katalog, Modell = kanonische `id`.
 /// 2. Sonst `provider/modell`, getrennt am ersten `/`, wenn das Präfix ein
-///    aktivierter Provider ist.
+///    aktivierter Provider ist. Der Modellteil wird wie in Schritt 1 auf die
+///    kanonische Katalog-`id` normalisiert (Schlüssel oder Alias, z. B.
+///    `mistral/legacy-ocr` → `mistral`, `mistral-ocr-4-0`); eine unbekannte
+///    Kennung (frei wählbare Modell-ID des Providers) bleibt unverändert.
+///    Nur so sieht die Lebenszyklus-Prüfung vor der Persistenz dieselbe ID
+///    wie die spätere Laufzeitprüfung.
 ///
 /// # Fehler
 /// [`OpError::InvalidArguments`] mit deutscher Meldung, wenn beides scheitert.
@@ -196,13 +218,16 @@ pub(crate) fn resolve_target(
             model.id.clone(),
         ));
     }
-    if let Some((prefix, rest)) = target.split_once('/') {
+    let prefixed = target.split_once('/').and_then(|(prefix, rest)| {
         let rest = rest.trim();
-        if !rest.is_empty()
-            && let Some(provider) = enabled_provider_name(config, prefix.trim())
-        {
-            return Ok((provider, rest.to_owned()));
+        if rest.is_empty() {
+            return None;
         }
+        enabled_provider_name(config, prefix.trim())
+            .map(|provider| (provider, canonical_model_id(config, rest)))
+    });
+    if let Some(resolved) = prefixed {
+        return Ok(resolved);
     }
     Err(OpError::InvalidArguments(format!(
         "Unbekanntes Modell: '{target}'. Erwartet wird eine bekannte Modell-ID bzw. ein Alias \
@@ -854,6 +879,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_target_normalizes_provider_prefixed_alias_to_canonical_id() -> TestResult {
+        let config = test_config();
+        // Schlüssel, ID und Alias hinter dem Provider-Präfix landen alle bei
+        // der kanonischen Katalog-ID; der genannte Provider bleibt maßgeblich.
+        for target in [
+            "provider-a/model-a",
+            "provider-a/model-a-2026",
+            "provider-a/a-latest",
+            "provider-a/ a-latest ",
+        ] {
+            let resolved = resolve_target(&config, target).map_err(ctx("provider/alias"))?;
+            assert_eq!(
+                resolved,
+                ("provider-a".to_owned(), "model-a-2026".to_owned()),
+                "Ziel '{target}'"
+            );
+        }
+        // Eine unbekannte Kennung bleibt unverändert (freie Provider-Modell-ID).
+        let resolved =
+            resolve_target(&config, "provider-a/unbekannt").map_err(ctx("freie Modell-ID"))?;
+        assert_eq!(resolved, ("provider-a".to_owned(), "unbekannt".to_owned()));
+        Ok(())
+    }
+
+    #[test]
     fn resolve_target_splits_provider_prefix_at_first_slash() -> TestResult {
         let config = test_config();
         let resolved = resolve_target(&config, "openrouter/nvidia/nemotron-x")
@@ -939,6 +989,8 @@ mod tests {
     /// Vergangenheit; Ersatz `mistral-ocr-4-1`).
     const RETIRED_PROVIDER: &str = "mistral";
     const RETIRED_MODEL: &str = "mistral-ocr-4-0";
+    /// In der Konfiguration eingetragener Alias des abgeschalteten Modells.
+    const RETIRED_ALIAS: &str = "legacy-ocr";
 
     /// Ein abgekündigtes Angebot ohne angekündigtes Retirement (Claude Mythos
     /// Preview; Ersatz `claude-mythos-5`) — bleibt für die echte Uhr wählbar.
@@ -964,7 +1016,7 @@ mod tests {
         );
         config.models.insert(
             RETIRED_MODEL.to_owned(),
-            model(RETIRED_MODEL, RETIRED_PROVIDER, &[]),
+            model(RETIRED_MODEL, RETIRED_PROVIDER, &[RETIRED_ALIAS]),
         );
         config
     }
@@ -1076,6 +1128,75 @@ mod tests {
     async fn models_worker_to_a_retired_model_changes_nothing() -> TestResult {
         let fixture = home_fixture(lifecycle_test_config())?;
         assert_retired_refused_and_untouched(&fixture, &["worker", "all", RETIRED_MODEL]).await
+    }
+
+    /// `provider/alias` eines abgeschalteten Modells: der Alias wird vor der
+    /// Lebenszyklus-Prüfung auf die kanonische Katalog-ID aufgelöst, sodass
+    /// die Ablehnung (mit Ersatzhinweis) greift, bevor etwas persistiert wird
+    /// — für jede Rolle von `set` und für `worker`.
+    #[tokio::test]
+    async fn provider_prefixed_alias_of_a_retired_model_is_refused_and_changes_nothing()
+    -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        let target = format!("{RETIRED_PROVIDER}/{RETIRED_ALIAS}");
+        for tokens in [
+            vec!["set", "explorer", target.as_str()],
+            vec!["set", "uia", target.as_str()],
+            vec!["set", "uia-worker", target.as_str()],
+            vec!["worker", "all", target.as_str()],
+            vec!["worker", "uia-writer", target.as_str()],
+        ] {
+            assert_retired_refused_and_untouched(&fixture, &tokens).await?;
+        }
+        Ok(())
+    }
+
+    /// `provider/alias` (und `provider/schlüssel`) eines nicht abgeschalteten
+    /// Modells wird zur kanonischen Katalog-ID aufgelöst; gespeichert und
+    /// gemeldet wird die ID, nie der Alias — für `set` und `worker`.
+    #[tokio::test]
+    async fn provider_prefixed_alias_of_a_live_model_persists_the_canonical_id() -> TestResult {
+        let fixture = fixture(test_config(), None)?;
+
+        let output = run(&fixture, &["set", "explorer", "provider-a/a-latest"])
+            .await
+            .map_err(ctx("set explorer"))?;
+        assert!(
+            output.text.contains("provider-a/model-a-2026"),
+            "{}",
+            output.text
+        );
+        assert!(!output.text.contains("a-latest"), "{}", output.text);
+        let data = data(&output)?;
+        assert_eq!(data["provider"], serde_json::json!("provider-a"));
+        assert_eq!(data["model"], serde_json::json!("model-a-2026"));
+
+        run(&fixture, &["set", "uia", "provider-a/model-a"])
+            .await
+            .map_err(ctx("set uia"))?;
+        run(&fixture, &["worker", "uia-writer", "provider-a/a-latest"])
+            .await
+            .map_err(ctx("worker uia-writer"))?;
+
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("model-a-2026".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaSelection {
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("model-a-2026".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-writer".to_owned(),
+                    value: Some("provider-a/model-a-2026".to_owned()),
+                },
+            ]
+        );
+        Ok(())
     }
 
     /// Ein abgekündigtes (deprecated) Modell wird gespeichert; die

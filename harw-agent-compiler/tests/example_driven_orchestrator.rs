@@ -110,8 +110,12 @@ fn test_driven_orchestrator_without_work_driver_table_has_no_driver() -> TestRes
         if name == DEFINITION {
             let original = std::fs::read_to_string(entry.path())?;
             let stripped = without_work_driver(&original);
+            // Check the parsed tables, not the text: the example's comments
+            // mention `[work_driver]` and stay in the copy.
+            let before: toml::Table = toml::from_str(&original)?;
+            let after: toml::Table = toml::from_str(&stripped)?;
             assert!(
-                original.contains("[work_driver]") && !stripped.contains("[work_driver]"),
+                before.contains_key("work_driver") && !after.contains_key("work_driver"),
                 "the [work_driver] table was not removed from the copy"
             );
             std::fs::write(copy.join(&name), stripped)?;

@@ -28,6 +28,10 @@
 //!   coverage to [`Coverage::Degraded`] instead of dropping records.
 //!   [`InventoryState::reconcile_snapshot`] is the only way back to
 //!   [`Coverage::Reconciled`].
+//! - A known newer incarnation is never rolled back: a snapshot entry that
+//!   is older than the record (same boot and tgid, strictly smaller
+//!   `birth_ticks`) is ignored, and the snapshot is then not fresh enough
+//!   for [`Coverage::Reconciled`].
 //!
 //! The reducer reads no clock and performs no I/O.
 
@@ -175,6 +179,18 @@ impl Record {
     /// successors, so it is never modified by events.
     fn is_read_only(&self) -> bool {
         self.key.birth_ticks.is_none()
+    }
+
+    /// Whether `key` names an older incarnation of the same tgid than this
+    /// record: same boot, both births known, `key` born strictly earlier.
+    /// Such evidence must never replace or change the record.
+    fn is_newer_than(&self, key: &ProcessKey) -> bool {
+        self.key.boot_id == key.boot_id
+            && self.key.tgid == key.tgid
+            && matches!(
+                (self.key.birth_ticks, key.birth_ticks),
+                (Some(own), Some(other)) if own > other
+            )
     }
 
     /// Whether `key` provably names a different incarnation.
@@ -325,15 +341,38 @@ impl InventoryState {
     /// Reconciles the inventory against a bounded scan of live processes.
     ///
     /// Records missing from `live` become `Unverifiable` (never dead) unless
-    /// already `ExitConfirmed`; live keys are inserted or refreshed.
+    /// already `ExitConfirmed`; live keys are inserted or refreshed, and a
+    /// live key with a strictly newer birth replaces the record.
+    ///
+    /// A live key that is *older* than the record of its tgid (same boot,
+    /// smaller known `birth_ticks`) comes from a scan that was captured
+    /// before the newer incarnation was reported. It is ignored: the record
+    /// is neither rolled back nor downgraded to `Unverifiable`.
+    ///
     /// Coverage becomes [`Coverage::Reconciled`] with `generation`, or
     /// [`Coverage::Degraded`] if some live key could not be recorded
-    /// (capacity, or an unknown birth that cannot be matched).
+    /// (capacity, an unknown birth that cannot be matched, or an entry that
+    /// was ignored because it is older than the record).
     pub fn reconcile_snapshot(&mut self, live: &[ProcessKey], generation: u64) {
         let live_set: BTreeSet<ProcessKey> = live.iter().copied().collect();
+
+        // Tgids whose record is newer than some snapshot entry: the snapshot
+        // predates the record and says nothing about the newer incarnation.
+        let mut ahead_of_snapshot: BTreeSet<u32> = BTreeSet::new();
+        for key in &live_set {
+            let older = self
+                .records
+                .get(&key.tgid)
+                .is_some_and(|record| record.is_newer_than(key));
+            if older {
+                ahead_of_snapshot.insert(key.tgid);
+            }
+        }
+
         for record in self.records.values_mut() {
             if record.state != ProcessObservationState::ExitConfirmed
                 && !live_set.contains(&record.key)
+                && !ahead_of_snapshot.contains(&record.key.tgid)
             {
                 record.state = ProcessObservationState::Unverifiable;
             }
@@ -346,6 +385,10 @@ impl InventoryState {
                     if record.state == ProcessObservationState::Unverifiable {
                         record.state = ProcessObservationState::Live;
                     }
+                } else if record.is_newer_than(key) {
+                    // Stale scan entry: keep the newer incarnation and do not
+                    // claim a fresh reconcile.
+                    incomplete = true;
                 } else if record.provably_differs(key) {
                     *record = Record::live(*key);
                 } else {
@@ -572,6 +615,66 @@ mod tests {
             ProcessObservationState::ExitConfirmed
         );
         assert_eq!(record(&inv, 6)?.state, ProcessObservationState::Live);
+        Ok(())
+    }
+
+    #[test]
+    fn older_snapshot_never_rolls_a_newer_birth_back() -> TestResult {
+        let mut inv = InventoryState::new(8);
+        assert_eq!(
+            inv.apply_observation(Observation::Created(key(10, 100))),
+            ApplyOutcome::Applied
+        );
+        // A scan captures the old incarnation (boot=1, pid=10, birth=100) ...
+        let scan = [key(10, 100)];
+        // ... and before it is reconciled the PID reuse arrives as an event.
+        assert_eq!(
+            inv.apply_observation(Observation::Created(key(10, 200))),
+            ApplyOutcome::Applied
+        );
+
+        // The in-flight snapshot is older than the record: it must not roll
+        // the birth back, and it must not mark the newer process unverifiable.
+        inv.reconcile_snapshot(&scan, 1);
+        let rec = record(&inv, 10)?;
+        assert_eq!(rec.key, key(10, 200));
+        assert_eq!(rec.state, ProcessObservationState::Live);
+        // A snapshot older than the events is not a fresh reconcile.
+        assert_eq!(inv.coverage(), Coverage::Degraded { generation: 1 });
+
+        // The delayed exit of the old incarnation cannot kill the new one.
+        assert_eq!(
+            inv.apply_observation(Observation::ExitConfirmed(key(10, 100))),
+            ApplyOutcome::Stale
+        );
+        let rec = record(&inv, 10)?;
+        assert_eq!(rec.key, key(10, 200));
+        assert_eq!(rec.state, ProcessObservationState::Live);
+
+        // The exit of the newer incarnation does.
+        assert_eq!(
+            inv.apply_observation(Observation::ExitConfirmed(key(10, 200))),
+            ApplyOutcome::Applied
+        );
+        let rec = record(&inv, 10)?;
+        assert_eq!(rec.key, key(10, 200));
+        assert_eq!(rec.state, ProcessObservationState::ExitConfirmed);
+        Ok(())
+    }
+
+    #[test]
+    fn test_newer_snapshot_birth_replaces_record() -> TestResult {
+        let mut inv = InventoryState::new(8);
+        inv.apply_observation(Observation::Created(key(10, 100)));
+        inv.reconcile_snapshot(&[key(10, 200)], 2);
+        let rec = record(&inv, 10)?;
+        assert_eq!(rec.key, key(10, 200));
+        assert_eq!(rec.state, ProcessObservationState::Live);
+        assert_eq!(inv.coverage(), Coverage::Reconciled { generation: 2 });
+        // Equal birth refreshes in place.
+        inv.reconcile_snapshot(&[key(10, 200)], 3);
+        assert_eq!(record(&inv, 10)?.key, key(10, 200));
+        assert_eq!(inv.coverage(), Coverage::Reconciled { generation: 3 });
         Ok(())
     }
 

@@ -148,11 +148,7 @@ impl LiveActivityRanker {
         let mut ordered = self.sorted(now_ms, visible);
         self.apply_lead_dwell(now_ms, &mut ordered);
 
-        let new_lead = ordered.first().map(|c| c.run_id.clone());
-        if new_lead != self.lead {
-            self.lead = new_lead;
-            self.lead_since_ms = Some(now_ms);
-        }
+        self.track_lead(now_ms, ordered.first().map(|c| c.run_id.clone()));
 
         let ids: Vec<String> = ordered.iter().map(|c| c.run_id.clone()).collect();
         self.prev_order.clone_from(&ids);
@@ -243,8 +239,25 @@ impl LiveActivityRanker {
         }
     }
 
+    /// Verfolgt Wechsel an Position 0: weicht der neue Lead vom verfolgten ab,
+    /// gilt er ab `now_ms` als sichtbarer Lead (Beginn seiner Haltezeit).
+    ///
+    /// Das Auswertungsfenster (`last_eval_ms`) bleibt unberührt; es wird nur
+    /// von einer vollen Auswertung gesetzt.
+    fn track_lead(&mut self, now_ms: u64, new_lead: Option<String>) {
+        if new_lead != self.lead {
+            self.lead = new_lead;
+            self.lead_since_ms = Some(now_ms);
+        }
+    }
+
     /// Coalescing (Regel 6): alte Reihenfolge, Verschwundene entfernt, neue
     /// sichtbare Runs (in Schlüsselreihenfolge) angehängt.
+    ///
+    /// Rückt dadurch ein anderer Run an Position 0 (etwa weil der Lead
+    /// verschwindet), übernimmt er den Lead samt Haltezeit ab `now_ms`;
+    /// sonst bekäme er bei der nächsten vollen Auswertung nur die Restzeit des
+    /// unsichtbaren Leads. Das Coalescing-Fenster wird dabei nicht verlängert.
     fn coalesced(&mut self, now_ms: u64, visible: Vec<&LiveCandidate>) -> Vec<String> {
         let present: HashSet<&str> = visible.iter().map(|c| c.run_id.as_str()).collect();
         let mut out: Vec<String> = self
@@ -263,6 +276,7 @@ impl LiveActivityRanker {
                 .into_iter()
                 .map(|c| c.run_id.clone()),
         );
+        self.track_lead(now_ms, out.first().cloned());
         self.prev_order.clone_from(&out);
         out
     }
@@ -452,6 +466,42 @@ mod tests {
         ];
         expect(&mut r, 500, &vanished_and_new, &["b", "c"])?;
         expect(&mut r, 750, &changed, &["b", "a"])
+    }
+
+    #[test]
+    fn disappearing_lead_hands_dwell_to_the_next_visible_run() -> TestResult {
+        let dwell = RankerConfig::default().lead_dwell_ms;
+        let mut r = ranker();
+        let start = [
+            cand("a", ActivityTier::Active, 0),
+            cand("b", ActivityTier::Active, 0),
+        ];
+        expect(&mut r, 0, &start, &["a", "b"])?;
+        assert_eq!(r.lead.as_deref(), Some("a"));
+        assert_eq!(r.lead_since_ms, Some(0));
+
+        // t=500 (im Coalescing-Fenster): `a` verschwindet, `b` ist nun der
+        // sichtbare Lead und startet seine Haltezeit; das Fenster bleibt bei 0.
+        let only_b = [cand("b", ActivityTier::Active, 0)];
+        expect(&mut r, 500, &only_b, &["b"])?;
+        assert_eq!(r.lead.as_deref(), Some("b"));
+        assert_eq!(r.lead_since_ms, Some(500));
+        assert_eq!(r.last_eval_ms, Some(0));
+
+        // t=800: ein neuerer Herausforderer `c` darf `b` nicht verdrängen.
+        let b_and_c = [
+            cand("b", ActivityTier::Active, 0),
+            cand("c", ActivityTier::Active, 800),
+        ];
+        expect(&mut r, 800, &b_and_c, &["b", "c"])?;
+        assert_eq!(r.lead.as_deref(), Some("b"));
+        assert_eq!(r.lead_since_ms, Some(500));
+        expect(&mut r, 2000, &b_and_c, &["b", "c"])?;
+
+        // Erst nach der vollen Haltezeit ab t=500 übernimmt `c`.
+        expect(&mut r, 500 + dwell + 1, &b_and_c, &["c", "b"])?;
+        assert_eq!(r.lead.as_deref(), Some("c"));
+        Ok(())
     }
 
     #[test]
