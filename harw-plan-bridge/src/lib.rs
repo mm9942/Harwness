@@ -145,7 +145,7 @@ pub use crate::cycle_runtime::{
     AuthorityReissuer, CYCLE_RECORD_SCHEMA, CYCLE_STORE_DIR, CeilingReissuer, CycleDriver,
     CycleDriverConfig, CycleJobFuture, CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome,
     CycleStatus, CycleStepExecutor, CycleStore, CycleStoreError, INTENT_CYCLE_JOB_KIND,
-    InFlightStep, JournaledStep, LeaseLivenessGuard, PolicyReissuer, StepFailure,
+    InFlightStep, JournaledStep, LeaseHold, LeaseLivenessGuard, PolicyReissuer, StepFailure,
     StepReconciliation, cycle_job_operation, job_outcome,
 };
 pub use crate::cycle_spec::{

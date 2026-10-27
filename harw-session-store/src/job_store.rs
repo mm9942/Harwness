@@ -60,19 +60,58 @@ const HOLD_LOCK_RETRIES: u32 = 5;
 /// (20 + 40 + … + 100 ms, 300 ms at most in total).
 const HOLD_LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Proof that a job lease was the current, non-expired claim when it was
-/// taken, and that it stays so while the guard lives: the guard holds the
-/// job's per-record lock, the same lock every lease mutation (`claim`,
-/// `renew`, `record_usage`, `complete`, `cancel`, `reclaim`,
-/// `reconcile_expired`, …) takes, so none of them can replace the lease
-/// until the guard is dropped — they are refused as
+/// Proof that a job lease is the current claim, with the deadline until
+/// which it stays live.
+///
+/// The guard holds the job's per-record lock, the same lock every lease
+/// mutation (`claim`, `renew`, `record_usage`, `complete`, `cancel`,
+/// `reclaim`, `reconcile_expired`, …) takes, so none of them can replace
+/// the lease until the guard is dropped — they are refused as
 /// [`SessionStoreError::JobLockContended`] (the heartbeat retries, the
-/// expiry scan skips the job for this pass). Dropping the guard releases the
+/// expiry scan skips the job for this pass). A record lock cannot stop the
+/// wall clock, though: the lease still expires at [`JobLeaseGuard::deadline`]
+/// (a full TTL after [`JobStore::hold_live_lease`] renewed it). A caller
+/// therefore checks [`JobLeaseGuard::still_live`] immediately before it
+/// publishes the commit the guard protects. Dropping the guard releases the
 /// lock. Keep it for one short commit only.
 #[derive(Debug)]
 #[must_use = "the lease is only held while the guard lives"]
 pub struct JobLeaseGuard {
     _lock: RecordLock,
+    work_id: WorkId,
+    deadline: Timestamp,
+}
+
+impl JobLeaseGuard {
+    /// When the held lease expires (its renewed `expires_at`). While the
+    /// guard lives nobody can renew or replace the lease, so this is exact.
+    #[must_use]
+    pub fn deadline(&self) -> Timestamp {
+        self.deadline
+    }
+
+    /// `Ok` while the held lease has not expired (`now < deadline`).
+    ///
+    /// # Errors
+    /// [`SessionStoreError::JobLeaseExpired`] once the deadline has passed:
+    /// the protected commit must not be published.
+    pub fn still_live(&self) -> SessionStoreResult<()> {
+        if Timestamp::now() < self.deadline {
+            Ok(())
+        } else {
+            Err(SessionStoreError::JobLeaseExpired {
+                work_id: self.work_id.clone(),
+                expired_at: self.deadline,
+            })
+        }
+    }
+
+    /// Test seam: moves the deadline (e.g. into the past) without waiting.
+    #[cfg(test)]
+    fn with_deadline(mut self, deadline: Timestamp) -> Self {
+        self.deadline = deadline;
+        self
+    }
 }
 
 /// Query for an eventually-consistent job list snapshot.
@@ -353,53 +392,74 @@ impl JobStore {
         })
     }
 
-    /// Takes the job's per-record lock, verifies under it that `token` is
-    /// the current, non-expired lease, and returns a [`JobLeaseGuard`] that
-    /// keeps the lock — and with it the lease — until it is dropped.
+    /// Renews the lease of `token` durably, takes the job's per-record lock,
+    /// verifies under it that `token` is still the current, non-expired
+    /// lease, and returns a [`JobLeaseGuard`] that keeps the lock until it is
+    /// dropped and knows the lease's deadline.
     ///
-    /// The checks are those of [`JobStore::record_usage`]: the job is not
-    /// terminal, the token matches the current lease (nonce and fencing
-    /// epoch) and the lease has not expired at `Timestamp::now()`. Nothing is
-    /// written: the lease is neither renewed nor its revision bumped. Because
-    /// the lock is held, a caller that commits *while* holding the guard
-    /// commits under a lease that cannot be reclaimed, cancelled or renewed
-    /// in between — verification and commit are one step. Lock order for
+    /// 1. **Renew**: the same fenced [`mechanics::renew`] the heartbeat uses
+    ///    ([`JobStore::renew`]), after the terminal-state check of
+    ///    [`JobStore::record_usage`]. The lease's `expires_at` moves to
+    ///    `now + ttl` and is persisted, so the protected commit starts with a
+    ///    fresh, bounded window instead of whatever was left — a hold taken
+    ///    just before expiry does not inherit a few milliseconds.
+    /// 2. **Hold and re-verify**: the lock is taken and the record re-read
+    ///    under it; a cancellation or reclaim that slipped in between the
+    ///    renewal and the lock is seen here and refused. The deadline is the
+    ///    `expires_at` read under the lock.
+    ///
+    /// While the guard lives, the lease can be neither replaced nor renewed,
+    /// so a caller that commits *while* holding it and checks
+    /// [`JobLeaseGuard::still_live`] right before publishing commits under a
+    /// lease that is current and unexpired at that moment. What remains is
+    /// the time between that final check and the caller's atomic publish
+    /// (microseconds to an fsync), bounded by the renewed TTL. Lock order for
     /// such callers: this job lock first, then their own record lock (the
     /// intent-cycle store); never the other way round.
     ///
     /// A contended lock (typically the holder's own heartbeat renewing at
     /// the same moment) is retried `HOLD_LOCK_RETRIES` (5) times with a
     /// growing pause, so a live lease does not look dead. Blocking (it
-    /// sleeps between retries); call it from a blocking thread.
+    /// sleeps between retries); call it from a blocking thread. Publishes no
+    /// lifecycle event (the job state does not change).
     ///
     /// # Errors
     /// [`SessionStoreError::JobNotFound`],
     /// [`SessionStoreError::JobAlreadyTerminal`],
     /// [`SessionStoreError::LeaseTokenMismatch`] (no lease, another nonce or
-    /// epoch), [`SessionStoreError::JobLeaseExpired`],
-    /// [`SessionStoreError::JobLockContended`] once the retries are used up,
-    /// or a read error. The lock is released on every error.
+    /// epoch), [`SessionStoreError::JobLeaseExpired`] (nothing is renewed
+    /// then), [`SessionStoreError::JobLockContended`] once the retries are
+    /// used up, or a read/write error. The lock is released on every error.
     pub fn hold_live_lease(&self, token: &LeaseToken) -> SessionStoreResult<JobLeaseGuard> {
         let id = validate_id(token.work_id.as_str())?;
-        let Some(store) = self.existing_store()? else {
-            return Err(SessionStoreError::JobNotFound {
-                work_id: token.work_id.clone(),
-            });
-        };
         let mut attempt = 0_u32;
-        let lock = loop {
-            match store.lock(id) {
-                Ok(lock) => break lock,
-                Err(StoreError::Contended { .. }) if attempt < HOLD_LOCK_RETRIES => {
+        loop {
+            match self.renew_and_hold(id, token) {
+                Err(SessionStoreError::JobLockContended { .. }) if attempt < HOLD_LOCK_RETRIES => {
                     attempt += 1;
                     std::thread::sleep(HOLD_LOCK_RETRY_PAUSE * attempt);
                 }
-                Err(error) => return Err(SessionStoreError::from(error)),
+                other => return other,
             }
-        };
+        }
+    }
+
+    // Ein Versuch von `hold_live_lease`: erneuern (persistiert), dann sperren
+    // und unter der Sperre erneut prüfen.
+    fn renew_and_hold(&self, id: &str, token: &LeaseToken) -> SessionStoreResult<JobLeaseGuard> {
+        self.with_locked(&token.work_id, |record| {
+            if mechanics::is_terminal(record.job.state) {
+                return Err(SessionStoreError::JobAlreadyTerminal {
+                    work_id: token.work_id.clone(),
+                    state: record.job.state,
+                });
+            }
+            mechanics::renew(record, token, Timestamp::now()).map_err(SessionStoreError::from)
+        })?;
+        let store = self.store()?;
+        let lock = store.lock(id)?;
         // Unter der Sperre: der Datensatz kann sich bis zum Drop des Guards
-        // nicht ändern. Geprüft wird nur die In-Memory-Kopie; nichts wird
-        // zurückgeschrieben.
+        // nicht ändern. Geprüft wird nur die In-Memory-Kopie.
         let mut record = store.load(id)?;
         if mechanics::is_terminal(record.job.state) {
             return Err(SessionStoreError::JobAlreadyTerminal {
@@ -407,8 +467,12 @@ impl JobStore {
                 state: record.job.state,
             });
         }
-        mechanics::verify_lease(&mut record, token, Timestamp::now())?;
-        Ok(JobLeaseGuard { _lock: lock })
+        let deadline = mechanics::verify_lease(&mut record, token, Timestamp::now())?.expires_at;
+        Ok(JobLeaseGuard {
+            _lock: lock,
+            work_id: token.work_id.clone(),
+            deadline,
+        })
     }
 
     /// Completes a Running job exactly once with the current non-expired lease.
@@ -2202,24 +2266,97 @@ mod tests {
     }
 
     #[test]
-    fn hold_live_lease_accepts_the_live_claim_and_writes_nothing() -> TestResult {
+    fn hold_live_lease_renews_the_lease_for_a_commit_window() -> TestResult {
         let temp = tempfile::tempdir()?;
         let sink = Arc::new(RecordingSink::default());
         let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
         let work_id = WorkId::from_str("work-verify-live");
-        store.admit(&record(work_id.as_str())?)?;
-        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        store.admit(&StoredJob {
+            not_before: Timestamp::now()
+                .checked_sub(SignedDuration::from_secs(60))
+                .map_err(ctx("now - 60s"))?,
+            ..record(work_id.as_str())?
+        })?;
+        // Vor 30 s für 60 s beansprucht: noch 30 s übrig.
+        let claimed_at = Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(30))
+            .map_err(ctx("now - 30s"))?;
+        let claim = claim_for(&store, &work_id, claimed_at)?;
         let before = store.get(&work_id)?;
+        let before_expiry = before
+            .lease
+            .as_ref()
+            .map(|lease| lease.expires_at)
+            .ok_or(TestError::Missing("claimed lease"))?;
         let events_after_claim = recorded_events(&sink).len();
 
-        let first = store.hold_live_lease(&claim.token)?;
-        drop(first);
+        let held = store.hold_live_lease(&claim.token)?;
+        let after = store.get(&work_id)?;
+        let renewed = after
+            .lease
+            .as_ref()
+            .ok_or(TestError::Missing("held lease"))?;
+        assert!(
+            renewed.expires_at > before_expiry,
+            "the hold starts a fresh window"
+        );
+        assert_eq!(held.deadline(), renewed.expires_at);
+        assert_eq!(renewed.token(), claim.token, "same epoch and nonce");
+        assert_eq!(after.revision, before.revision.saturating_add(1));
+        assert_eq!(after.job.state, JobState::Running);
+        held.still_live()?;
+        drop(held);
         // Beim Drop freigegeben: der nächste Halter bekommt die Sperre sofort.
         let second = store.hold_live_lease(&claim.token)?;
         drop(second);
+        assert_eq!(
+            recorded_events(&sink).len(),
+            events_after_claim,
+            "a hold publishes no lifecycle event"
+        );
+        Ok(())
+    }
 
-        assert_eq!(store.get(&work_id)?, before, "holding writes nothing");
-        assert_eq!(recorded_events(&sink).len(), events_after_claim);
+    #[test]
+    fn near_expiry_hold_lets_a_delayed_commit_pass_and_refuses_after_the_deadline() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-hold-near-expiry");
+        let claimed_at = Timestamp::now()
+            .checked_sub(SignedDuration::from_millis(850))
+            .map_err(ctx("now - 850ms"))?;
+        store.admit(&StoredJob {
+            not_before: claimed_at,
+            ..record(work_id.as_str())?
+        })?;
+        // 1 s TTL, vor ~0,85 s beansprucht: ohne Erneuerung bliebe kaum Zeit.
+        let claim = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now: claimed_at,
+            },
+        )?;
+        let original_expiry = claim.lease.expires_at;
+
+        let held = store.hold_live_lease(&claim.token)?;
+        assert!(held.deadline() > original_expiry, "renewed under the hold");
+        // Ein Commit 200 ms später — nach dem ursprünglichen Ablauf — ist
+        // noch durch das erneuerte Fenster gedeckt.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(Timestamp::now() > original_expiry);
+        held.still_live()?;
+
+        // Ist die Frist verstrichen, darf nichts mehr veröffentlicht werden.
+        let past = Timestamp::now()
+            .checked_sub(SignedDuration::from_millis(1))
+            .map_err(ctx("now - 1ms"))?;
+        let overdue = held.with_deadline(past);
+        assert!(matches!(
+            overdue.still_live(),
+            Err(SessionStoreError::JobLeaseExpired { .. })
+        ));
         Ok(())
     }
 
@@ -2234,12 +2371,13 @@ mod tests {
         let after_expiry = now
             .checked_add(SignedDuration::from_secs(120))
             .map_err(ctx("now + 120s"))?;
-        let before = store.get(&work_id)?;
 
         fn contended<T>(result: &SessionStoreResult<T>) -> bool {
             matches!(result, Err(SessionStoreError::JobLockContended { .. }))
         }
         let held = store.hold_live_lease(&claim.token)?;
+        // Stand nach der Erneuerung durch den Halter.
+        let before = store.get(&work_id)?;
         let renewed = store.renew(&RenewalRequest {
             token: claim.token.clone(),
             now,

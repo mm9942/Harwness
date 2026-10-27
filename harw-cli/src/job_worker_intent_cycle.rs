@@ -91,11 +91,14 @@
 //! ([`CycleStore::with_lease_liveness`]) backed by
 //! [`JobStore::hold_live_lease`]: every fenced read and write — the
 //! driver's rebind, journal and commits as well as the drain's read,
-//! decision and acknowledgement — runs while the job's record lock is held
-//! and the claim's token was verified under it as the current, non-expired
-//! lease (nothing is renewed). No cancellation, reclaim or expiry scan can
-//! replace the lease between that verification and the cycle write. Lock
-//! order: job record first, cycle record second. The epoch fence alone would
+//! decision and acknowledgement — first renews the claim's lease (a fresh
+//! TTL window, persisted like a heartbeat), then runs while the job's record
+//! lock is held and the token was verified under it as the current,
+//! non-expired lease. No cancellation, reclaim or expiry scan can replace
+//! the lease between that verification and the cycle write, and the write's
+//! last step checks the renewed deadline before it is published
+//! ([`JobLeaseGuard::still_live`]). Lock order: job record first, cycle
+//! record second. The epoch fence alone would
 //! still admit an expired lease until a reclaim rebinds the cycle. So once
 //! the job lease has expired or been revoked (lost heartbeat, operator
 //! cancellation), the driver's next write fails closed and the drain learns
@@ -124,7 +127,6 @@
 //! refuses (`Blocked`, before any record or model call) unless it equals the
 //! canonical root of its own sandbox; a missing root is refused too.
 
-use std::any::Any;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,11 +139,12 @@ use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
     CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleRunError, CycleStore,
     CycleStoreError, DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, ExplorerCycleExecutor,
-    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, LeaseLivenessGuard, ModelCycleProposer,
+    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, LeaseHold, LeaseLivenessGuard, ModelCycleProposer,
     ProposerRoute, RoutePolicy, job_outcome, warm_cache,
 };
 use harw_runtime::live_model;
 use harw_session_store::JobStore;
+use harw_session_store::job_store::JobLeaseGuard;
 use harw_types::{ModelId, SessionId};
 
 use super::{
@@ -406,21 +409,32 @@ pub(super) async fn execute_intent_cycle_claim(
     sanitize_outcome(outcome)
 }
 
-/// Lease guard of the cycle store: [`JobStore::hold_live_lease`] verifies
-/// under the job's record lock that the presented token is the current,
-/// non-expired lease and keeps that lock until the cycle operation is done.
-/// Any error — expired, revoked, replaced, terminal, unreadable or a lock
-/// that stays contended beyond the store's retries — refuses the cycle
-/// operation (fail closed).
+/// Lease guard of the cycle store: [`JobStore::hold_live_lease`] renews the
+/// presented token's lease (a fresh commit window), verifies under the job's
+/// record lock that it is still the current, non-expired lease and keeps
+/// that lock until the cycle operation is done. Any error — expired,
+/// revoked, replaced, terminal, unreadable or a lock that stays contended
+/// beyond the store's retries — refuses the cycle operation (fail closed).
 struct JobLeaseLiveness(Arc<JobStore>);
 
 impl LeaseLivenessGuard for JobLeaseLiveness {
-    fn hold(&self, token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+    fn hold(&self, token: &LeaseToken) -> Result<Box<dyn LeaseHold>, String> {
         let held = self
             .0
             .hold_live_lease(token)
             .map_err(|error| error.to_string())?;
-        Ok(Box::new(held))
+        Ok(Box::new(HeldJobLease(held)))
+    }
+}
+
+/// One held job lease; its deadline is the renewed `expires_at`
+/// ([`JobLeaseGuard::still_live`]), checked by the cycle store right before
+/// it publishes.
+struct HeldJobLease(JobLeaseGuard);
+
+impl LeaseHold for HeldJobLease {
+    fn still_live(&self) -> Result<(), String> {
+        self.0.still_live().map_err(|error| error.to_string())
     }
 }
 

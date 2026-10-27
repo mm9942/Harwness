@@ -39,6 +39,13 @@
 //!    drain (this claim's or the one that takes over): delivery is at least
 //!    once, and never lost.
 //!
+//! An accepted entry is a committed decision and is never re-made: a later
+//! drain — possibly a newer binary with a changed classification or gate —
+//! skips [`is_learnable`] and the gate for it and rebuilds its fact exactly
+//! as it was accepted (the fact text depends only on the typed observation).
+//! An accepted entry whose fact cannot be rebuilt stays accepted and is
+//! reported, never acknowledged without its fact.
+//!
 //! # Binding to the job
 //!
 //! Both halves act on the data of exactly one job:
@@ -141,7 +148,8 @@ pub(super) struct DrainReport {
     /// Learnable observations the gate (or the id check) kept out of memory.
     pub screened_out: usize,
     /// Accepted lessons whose fact did not become durable in this drain
-    /// (write failed); they stay accepted for the next drain.
+    /// (the write failed, or the fact cannot be rebuilt); they stay accepted
+    /// and are never acknowledged unlearned.
     pub pending_materialization: usize,
 }
 
@@ -238,6 +246,15 @@ pub(super) fn lesson_fact(observation: &RunObservationV1, now: Timestamp) -> Opt
     if !is_learnable(observation.category) {
         return None;
     }
+    accepted_fact(observation, now)
+}
+
+/// The fact of an observation whose delivery is already committed
+/// ([`DeliveryState::Accepted`]): built exactly like [`lesson_fact`], but
+/// without asking today's classification whether it is learnable — an
+/// accepted decision is never re-made. `None` when the fact cannot be
+/// reconstructed (no safe cycle id).
+fn accepted_fact(observation: &RunObservationV1, now: Timestamp) -> Option<Fact> {
     let event = &observation.event_id;
     let cycle_id = safe_id(&event.cycle_id)?;
     let category = snake_name(observation.category);
@@ -278,12 +295,18 @@ pub(super) fn lesson_fact(observation: &RunObservationV1, now: Timestamp) -> Opt
 ///    the lease: unless the record belongs to `token.work_id`, is fenced
 ///    under `token.epoch` and (with a lease guard) `token` is the live job
 ///    claim, the store refuses before any payload is returned.
-/// 2. Every entry is decided in memory:
+/// 2. Every entry that is still [`DeliveryState::Pending`] is decided in
+///    memory:
 ///    - not learnable (see [`is_learnable`]): acknowledged, no fact;
 ///    - the gate does not accept the fact, the observation has no safe id or
 ///      it names another cycle: counted in `screened_out`, acknowledged;
-///    - accepted: marked [`DeliveryState::Accepted`] (if it is not already),
-///      to be materialised.
+///    - accepted: marked [`DeliveryState::Accepted`], to be materialised.
+///
+///    An entry that is already accepted is never decided again: today's
+///    classification and gate are not consulted, its fact is rebuilt as it
+///    was accepted. If that is impossible (no safe id, another cycle), it
+///    stays accepted (`pending_materialization`, logged) and is never
+///    acknowledged unlearned.
 ///
 ///    The decision is committed in one fenced, lease-held write
 ///    ([`CycleStore::decide_observations`]); a refusal ends the drain with
@@ -324,8 +347,24 @@ pub(super) fn drain_cycle_observations(
     let mut lessons: Vec<(String, Fact)> = Vec::new();
     let mut accept: Vec<String> = Vec::new();
     let mut ack: Vec<String> = Vec::new();
+    let mut unreconstructable = 0_usize;
     for entry in &pending {
         let observation = &entry.payload;
+        if entry.state == DeliveryState::Accepted {
+            // A committed decision: materialise it, never re-screen it. Only
+            // the drained cycle's own observations are ever materialised.
+            let fact = if observation.event_id.cycle_id == cycle_id {
+                accepted_fact(observation, now)
+            } else {
+                None
+            };
+            match fact {
+                Some(fact) => lessons.push((entry.key.clone(), fact)),
+                // Never acknowledged unlearned: it stays accepted.
+                None => unreconstructable += 1,
+            }
+            continue;
+        }
         if !is_learnable(observation.category) {
             ack.push(entry.key.clone());
             continue;
@@ -338,9 +377,7 @@ pub(super) fn drain_cycle_observations(
         };
         match verdict {
             Some(GateVerdict::Accept(fact)) => {
-                if entry.state == DeliveryState::Pending {
-                    accept.push(entry.key.clone());
-                }
+                accept.push(entry.key.clone());
                 lessons.push((entry.key.clone(), fact));
             }
             Some(GateVerdict::Review(_) | GateVerdict::Reject(_)) | None => {
@@ -356,8 +393,16 @@ pub(super) fn drain_cycle_observations(
             .map_err(|error| format!("decide observations: {error}"))?;
         report.acked += acked;
     }
+    if unreconstructable > 0 {
+        tracing::warn!(
+            cycle_id,
+            unreconstructable,
+            "accepted intent cycle lessons cannot be rebuilt; they stay accepted, never acknowledged unlearned"
+        );
+    }
+    report.pending_materialization = unreconstructable;
     if lessons.is_empty() {
-        // Nothing to learn: the project memories are never created.
+        // Nothing to write: the project memories are never created.
         return Ok(report);
     }
     // Phase 2, materialise the accepted lessons idempotently.
@@ -379,7 +424,7 @@ pub(super) fn drain_cycle_observations(
         }
     }
     report.written = durable.len();
-    report.pending_materialization = lessons.len().saturating_sub(durable.len());
+    report.pending_materialization += lessons.len().saturating_sub(durable.len());
     if durable.is_empty() {
         return Ok(report);
     }
@@ -565,7 +610,6 @@ pub(super) fn lesson_lines(learning_root: &Path, objective: &str, now_unix: i64)
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -581,8 +625,8 @@ mod tests {
         CauseCode, CeilingReissuer, CycleAdmission, CycleCheckpoint, CycleDriver, CycleLimits,
         CycleObservations, CycleProposal, CycleProposer, CycleRecord, CycleRefusal,
         CycleRunOutcome, CycleStepExecutor, CycleStoreError, CycleTargets, INTENT_CYCLE_JOB_KIND,
-        InFlightStep, IntentBinding, LeaseLivenessGuard, StepFailure, StepReconciliation,
-        admit_cycle, apply_observations, build_observation, resume_admission,
+        InFlightStep, IntentBinding, LeaseHold, LeaseLivenessGuard, StepFailure,
+        StepReconciliation, admit_cycle, apply_observations, build_observation, resume_admission,
     };
     use harw_session_store::{ClaimRequest, JobStore, SessionStoreError};
     use harw_types::{ApprovalActor, ContentDigest, TenantId, WorkId, WorkspaceId};
@@ -1177,10 +1221,98 @@ mod tests {
             }
         );
         assert_eq!(fact_files(&fx.learning_root)?.len(), 2);
+        // Every hold renewed the lease like a heartbeat: same claim, later
+        // expiry, nothing else changed.
+        let after = jobs.get(&lease.work_id).map_err(ctx("job record after"))?;
+        assert_eq!(after.job.state, before.job.state);
+        assert_eq!(after.lease_epoch, before.lease_epoch);
+        let (held_before, held_after) = match (before.lease.as_ref(), after.lease.as_ref()) {
+            (Some(held_before), Some(held_after)) => (held_before, held_after),
+            _ => return Err(TestError::Missing("the claim's lease")),
+        };
+        assert_eq!(held_after.token(), lease);
+        assert!(held_after.expires_at >= held_before.expires_at);
+        assert!(after.revision > before.revision, "renewals are durable");
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_entries_are_materialised_even_if_they_would_now_be_screened_out() -> TestResult {
+        // Accepted by an earlier drain whose classification still learned
+        // admission refusals; today's drain would acknowledge them unlearned.
+        let fx = fixture(&[(
+            ObservationCategory::AdmissionRefused,
+            CauseCode::ReadNotAllowed,
+        )])?;
+        let keys = pending_keys(&fx)?;
+        assert!(!is_learnable(ObservationCategory::AdmissionRefused));
         assert_eq!(
-            jobs.get(&lease.work_id).map_err(ctx("job record after"))?,
-            before,
-            "the liveness check never writes the job record"
+            fx.store
+                .decide_observations(CYCLE_ID, &fx.token, &keys, &[])
+                .map_err(ctx("an earlier decision"))?,
+            (1, 0)
+        );
+
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 1,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        let facts = FactStore::open(&fx.learning_root, FactScope::Project)
+            .map_err(ctx("open facts"))?
+            .list()
+            .map_err(ctx("list facts"))?;
+        let descriptions: Vec<&str> = facts.iter().map(|fact| fact.description.as_str()).collect();
+        assert_eq!(
+            descriptions,
+            vec!["Intent cycle observed admission_refused/read_not_allowed on transition wait"],
+            "the committed decision is materialised, not re-screened"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_entry_that_cannot_be_reconstructed_stays_accepted() -> TestResult {
+        let fx = fixture_with(
+            &[(
+                ObservationCategory::ToolFailedNoEffect,
+                CauseCode::ExecutorFailed,
+            )],
+            |observations| {
+                for observation in observations.iter_mut() {
+                    observation.event_id.cycle_id = "cycle with\nspaces".to_owned();
+                }
+            },
+        )?;
+        let keys = pending_keys(&fx)?;
+        fx.store
+            .decide_observations(CYCLE_ID, &fx.token, &keys, &[])
+            .map_err(ctx("an earlier decision"))?;
+
+        // Drained twice: never acknowledged without its fact.
+        for _ in 0..2 {
+            let report = drain(&fx)?;
+            assert_eq!(
+                report,
+                DrainReport {
+                    acked: 0,
+                    written: 0,
+                    screened_out: 0,
+                    pending_materialization: 1
+                }
+            );
+            assert_eq!(pending_keys(&fx)?, keys);
+            assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted]);
+        }
+        assert!(
+            !fx.learning_root.exists(),
+            "nothing to write, so the project memories are never created"
         );
         Ok(())
     }
@@ -1248,10 +1380,19 @@ mod tests {
         holds: Arc<AtomicUsize>,
     }
 
+    /// A hold that never passes its deadline.
+    struct LiveHold;
+
+    impl LeaseHold for LiveHold {
+        fn still_live(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     impl LeaseLivenessGuard for CountingGuard {
-        fn hold(&self, _token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+        fn hold(&self, _token: &LeaseToken) -> Result<Box<dyn LeaseHold>, String> {
             if self.holds.fetch_add(1, Ordering::SeqCst) < self.live_for {
-                Ok(Box::new(()))
+                Ok(Box::new(LiveHold))
             } else {
                 Err(format!("lease lost after {} operations", self.live_for))
             }
@@ -1540,7 +1681,7 @@ mod tests {
     }
 
     impl LeaseLivenessGuard for PausedGuard {
-        fn hold(&self, token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+        fn hold(&self, token: &LeaseToken) -> Result<Box<dyn LeaseHold>, String> {
             let held = self.inner.hold(token)?;
             let between = self.between.lock().ok().and_then(|mut slot| slot.take());
             if let Some(between) = between {
