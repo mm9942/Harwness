@@ -24,13 +24,16 @@
 //!    fenced write held under the live lease
 //!    ([`CycleStore::decide_observations`]): screened and non-learnable
 //!    entries are acknowledged directly; learnable ones are marked
-//!    [`DeliveryState::Accepted`] and stay in the outbox. That write is the
+//!    [`DeliveryState::Accepted`] and stay in the outbox, each together with
+//!    the complete fact it will be written as (a schema-versioned
+//!    `LessonDescriptor`). That write is the
 //!    commit of the learning decision — the job lease cannot be replaced
 //!    between its verification and the write, so an expired, cancelled or
 //!    reclaimed lease never accepts anything.
 //! 3. **Materialise**: open the project [`FactStore`] and write each
-//!    accepted fact. The fact name is a pure function of the observation's
-//!    dedupe key, so a repeated write produces the same file (idempotent).
+//!    accepted fact — on a replay exactly the stored descriptor, never a
+//!    new rendering — so a repeated write produces the same file with the
+//!    same content (idempotent, also across a rolling upgrade).
 //! 4. **Acknowledge** exactly the entries whose fact write succeeded
 //!    ([`CycleStore::ack_observations`], lease held again). An entry whose
 //!    fact is not durable yet — a crash after the decision, project
@@ -40,11 +43,13 @@
 //!    once, and never lost.
 //!
 //! An accepted entry is a committed decision and is never re-made: a later
-//! drain — possibly a newer binary with a changed classification or gate —
-//! skips [`is_learnable`] and the gate for it and rebuilds its fact exactly
-//! as it was accepted (the fact text depends only on the typed observation).
-//! An accepted entry whose fact cannot be rebuilt stays accepted and is
-//! reported, never acknowledged without its fact.
+//! drain — possibly a newer binary with a changed classification, gate,
+//! renderer or naming — skips [`is_learnable`] and the gate for it and
+//! writes the fact stored with the decision. Only entries accepted before
+//! descriptors were stored are rebuilt from their typed payload. An
+//! accepted entry whose fact can be neither read back (a descriptor this
+//! binary cannot honour, e.g. a newer schema) nor rebuilt stays accepted
+//! and is reported, never acknowledged without its fact.
 //!
 //! # Binding to the job
 //!
@@ -102,6 +107,7 @@ use harw_memory::learning_gate::{GateVerdict, screen};
 use harw_memory::types::Timestamp;
 use harw_plan_bridge::intent_cycle::is_prompt_safe_char;
 use harw_plan_bridge::{CycleStore, DeliveryState, ObservationCategory, RunObservationV1};
+use serde::{Deserialize, Serialize};
 
 /// Tag carried by every fact this module writes; recall reads only these.
 pub(super) const LESSON_TAG: &str = "pl90";
@@ -249,6 +255,92 @@ pub(super) fn lesson_fact(observation: &RunObservationV1, now: Timestamp) -> Opt
     accepted_fact(observation, now)
 }
 
+/// Schema of the [`LessonDescriptor`] this module stores and can replay.
+const LESSON_DESCRIPTOR_SCHEMA: u32 = 1;
+
+/// The materialisation of an accepted lesson: stored in its outbox entry
+/// when the entry is accepted, and written verbatim by every replay. A
+/// later binary with another fact renderer or naming therefore rewrites the
+/// same file with the same content instead of writing a second, differently
+/// named fact beside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LessonDescriptor {
+    schema: u32,
+    fact: StoredFact,
+}
+
+/// The durable fields of the accepted [`Fact`]; `created` and `updated` are
+/// set when it is written (an existing file keeps its `created`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredFact {
+    name: String,
+    description: String,
+    fact_type: FactType,
+    scope: FactScope,
+    confidence: f32,
+    sources: Vec<String>,
+    tags: Vec<String>,
+    body: String,
+}
+
+impl LessonDescriptor {
+    fn of(fact: &Fact) -> Self {
+        Self {
+            schema: LESSON_DESCRIPTOR_SCHEMA,
+            fact: StoredFact {
+                name: fact.name.clone(),
+                description: fact.description.clone(),
+                fact_type: fact.fact_type,
+                scope: fact.scope,
+                confidence: fact.confidence,
+                sources: fact.sources.clone(),
+                tags: fact.tags.clone(),
+                body: fact.body.clone(),
+            },
+        }
+    }
+
+    /// The fact to write, or `None` when this binary cannot honour the
+    /// descriptor: another schema, or anything but a project pitfall tagged
+    /// [`LESSON_TAG`] (the scope is never taken from stored data beyond
+    /// that check — only project memories are ever written).
+    fn fact(self, now: Timestamp) -> Option<Fact> {
+        let stored = self.fact;
+        let lesson = self.schema == LESSON_DESCRIPTOR_SCHEMA
+            && stored.scope == FactScope::Project
+            && stored.fact_type == FactType::Pitfall
+            && stored.tags.iter().any(|tag| tag == LESSON_TAG);
+        lesson.then(|| Fact {
+            name: stored.name,
+            description: stored.description,
+            fact_type: FactType::Pitfall,
+            scope: FactScope::Project,
+            created: now,
+            updated: now,
+            confidence: stored.confidence,
+            sources: stored.sources,
+            tags: stored.tags,
+            body: stored.body,
+        })
+    }
+}
+
+/// The materialisation stored with an accepted lesson (see
+/// [`LessonDescriptor`]).
+fn lesson_descriptor(fact: &Fact) -> Result<serde_json::Value, String> {
+    serde_json::to_value(LessonDescriptor::of(fact)).map_err(|error| error.to_string())
+}
+
+/// The fact a stored materialisation describes; `None` when it is malformed
+/// or this binary cannot honour it ([`LessonDescriptor::fact`]).
+fn stored_lesson(stored: &serde_json::Value, now: Timestamp) -> Option<Fact> {
+    serde_json::from_value::<LessonDescriptor>(stored.clone())
+        .ok()?
+        .fact(now)
+}
+
 /// The fact of an observation whose delivery is already committed
 /// ([`DeliveryState::Accepted`]): built exactly like [`lesson_fact`], but
 /// without asking today's classification whether it is learnable — an
@@ -300,13 +392,16 @@ fn accepted_fact(observation: &RunObservationV1, now: Timestamp) -> Option<Fact>
 ///    - not learnable (see [`is_learnable`]): acknowledged, no fact;
 ///    - the gate does not accept the fact, the observation has no safe id or
 ///      it names another cycle: counted in `screened_out`, acknowledged;
-///    - accepted: marked [`DeliveryState::Accepted`], to be materialised.
+///    - accepted: marked [`DeliveryState::Accepted`] with its stored
+///      descriptor (the complete fact), to be materialised.
 ///
 ///    An entry that is already accepted is never decided again: today's
-///    classification and gate are not consulted, its fact is rebuilt as it
-///    was accepted. If that is impossible (no safe id, another cycle), it
-///    stays accepted (`pending_materialization`, logged) and is never
-///    acknowledged unlearned.
+///    classification and gate are not consulted and its stored descriptor
+///    is written as it is (entries accepted before descriptors existed are
+///    rebuilt from their payload). If neither works (unknown descriptor
+///    schema, no safe id, another cycle), it stays accepted
+///    (`pending_materialization`, logged) and is never acknowledged
+///    unlearned.
 ///
 ///    The decision is committed in one fenced, lease-held write
 ///    ([`CycleStore::decide_observations`]); a refusal ends the drain with
@@ -345,18 +440,22 @@ pub(super) fn drain_cycle_observations(
     // Decide every entry in memory; nothing leaves the process yet.
     let now = Timestamp::now_utc();
     let mut lessons: Vec<(String, Fact)> = Vec::new();
-    let mut accept: Vec<String> = Vec::new();
+    let mut accept: Vec<(String, serde_json::Value)> = Vec::new();
     let mut ack: Vec<String> = Vec::new();
     let mut unreconstructable = 0_usize;
     for entry in &pending {
         let observation = &entry.payload;
         if entry.state == DeliveryState::Accepted {
-            // A committed decision: materialise it, never re-screen it. Only
-            // the drained cycle's own observations are ever materialised.
-            let fact = if observation.event_id.cycle_id == cycle_id {
-                accepted_fact(observation, now)
-            } else {
-                None
+            // A committed decision: write exactly the stored materialisation,
+            // never re-screen or re-render it. Entries accepted before
+            // materialisations were stored are rebuilt from their typed
+            // payload, and only for the drained cycle's own observations.
+            let fact = match &entry.materialization {
+                Some(stored) => stored_lesson(stored, now),
+                None if observation.event_id.cycle_id == cycle_id => {
+                    accepted_fact(observation, now)
+                }
+                None => None,
             };
             match fact {
                 Some(fact) => lessons.push((entry.key.clone(), fact)),
@@ -376,10 +475,17 @@ pub(super) fn drain_cycle_observations(
             None
         };
         match verdict {
-            Some(GateVerdict::Accept(fact)) => {
-                accept.push(entry.key.clone());
-                lessons.push((entry.key.clone(), fact));
-            }
+            Some(GateVerdict::Accept(fact)) => match lesson_descriptor(&fact) {
+                Ok(stored) => {
+                    accept.push((entry.key.clone(), stored));
+                    lessons.push((entry.key.clone(), fact));
+                }
+                Err(error) => {
+                    // Not accepted without its materialisation; it stays
+                    // pending and is decided again by the next drain.
+                    tracing::warn!(cycle_id, error = %error, "intent cycle lesson could not be described; left pending");
+                }
+            },
             Some(GateVerdict::Review(_) | GateVerdict::Reject(_)) | None => {
                 report.screened_out += 1;
                 ack.push(entry.key.clone());
@@ -622,8 +728,8 @@ mod tests {
     use harw_core::cancel::{CancelReason, CancelToken};
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, RetryPolicy, StoredJob};
     use harw_plan_bridge::{
-        CauseCode, CeilingReissuer, CycleAdmission, CycleCheckpoint, CycleDriver, CycleLimits,
-        CycleObservations, CycleProposal, CycleProposer, CycleRecord, CycleRefusal,
+        CYCLE_STORE_DIR, CauseCode, CeilingReissuer, CycleAdmission, CycleCheckpoint, CycleDriver,
+        CycleLimits, CycleObservations, CycleProposal, CycleProposer, CycleRecord, CycleRefusal,
         CycleRunOutcome, CycleStepExecutor, CycleStoreError, CycleTargets, INTENT_CYCLE_JOB_KIND,
         InFlightStep, IntentBinding, LeaseHold, LeaseLivenessGuard, StepFailure,
         StepReconciliation, admit_cycle, apply_observations, build_observation, resume_admission,
@@ -1244,11 +1350,11 @@ mod tests {
             ObservationCategory::AdmissionRefused,
             CauseCode::ReadNotAllowed,
         )])?;
-        let keys = pending_keys(&fx)?;
         assert!(!is_learnable(ObservationCategory::AdmissionRefused));
+        let decision = accepted_by_a_drain(&fx)?;
         assert_eq!(
             fx.store
-                .decide_observations(CYCLE_ID, &fx.token, &keys, &[])
+                .decide_observations(CYCLE_ID, &fx.token, &decision, &[])
                 .map_err(ctx("an earlier decision"))?,
             (1, 0)
         );
@@ -1291,13 +1397,22 @@ mod tests {
             },
         )?;
         let keys = pending_keys(&fx)?;
+        // Accepted by a newer binary with a descriptor schema this one cannot
+        // honour.
+        let newer: Vec<(String, serde_json::Value)> = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    serde_json::json!({ "schema": 99, "fact": { "name": "x" } }),
+                )
+            })
+            .collect();
         fx.store
-            .decide_observations(CYCLE_ID, &fx.token, &keys, &[])
-            .map_err(ctx("an earlier decision"))?;
-
-        // Drained twice: never acknowledged without its fact.
-        for _ in 0..2 {
-            let report = drain(&fx)?;
+            .decide_observations(CYCLE_ID, &fx.token, &newer, &[])
+            .map_err(ctx("a newer binary's decision"))?;
+        let stays_accepted = |fx: &Fixture| -> TestResult {
+            let report = drain(fx)?;
             assert_eq!(
                 report,
                 DrainReport {
@@ -1307,13 +1422,129 @@ mod tests {
                     pending_materialization: 1
                 }
             );
-            assert_eq!(pending_keys(&fx)?, keys);
-            assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted]);
-        }
+            assert_eq!(pending_keys(fx)?, keys);
+            assert_eq!(entry_states(fx)?, vec![DeliveryState::Accepted]);
+            Ok(())
+        };
+        // Drained twice: never acknowledged without its fact.
+        stays_accepted(&fx)?;
+        stays_accepted(&fx)?;
+
+        // Without a descriptor (the previous layout) the payload cannot be
+        // rebuilt either (no safe cycle id): still accepted.
+        edit_record(&fx, "/outbox/pending/0", "materialization", None)?;
+        stays_accepted(&fx)?;
         assert!(
             !fx.learning_root.exists(),
             "nothing to write, so the project memories are never created"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_entry_without_a_stored_fact_is_rebuilt_from_its_payload() -> TestResult {
+        // Accepted under the previous layout (no descriptor), of a category
+        // today's drain would not learn: rebuilt, written, acknowledged.
+        let fx = fixture(&[(
+            ObservationCategory::AdmissionRefused,
+            CauseCode::ReadNotAllowed,
+        )])?;
+        let decision = accepted_by_a_drain(&fx)?;
+        fx.store
+            .decide_observations(CYCLE_ID, &fx.token, &decision, &[])
+            .map_err(ctx("an earlier decision"))?;
+        edit_record(&fx, "/outbox/pending/0", "materialization", None)?;
+        let stored = fx.store.load(CYCLE_ID).map_err(ctx("load record"))?;
+        assert!(
+            stored
+                .outbox
+                .pending()
+                .iter()
+                .all(|entry| entry.state == DeliveryState::Accepted
+                    && entry.materialization.is_none()),
+            "the previous layout"
+        );
+
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 1,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        assert_eq!(fact_files(&fx.learning_root)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_upgrade_replays_the_stored_fact_not_a_new_rendering() -> TestResult {
+        let fx = fixture(&[(
+            ObservationCategory::ToolFailedNoEffect,
+            CauseCode::ExecutorFailed,
+        )])?;
+        // v1 decides (the descriptor is stored), writes fact A and loses its
+        // lease before the final acknowledgement.
+        let (v1, _holds) = counting_store(&fx, 2)?;
+        let lost = drain_cycle_observations(&v1, CYCLE_ID, &fx.token, &fx.learning_root);
+        assert!(lost.is_err(), "{lost:?}");
+        let project =
+            FactStore::open(&fx.learning_root, FactScope::Project).map_err(ctx("open facts"))?;
+        let written_by_v1 = project.list().map_err(ctx("list facts"))?;
+        let [fact_a] = written_by_v1.as_slice() else {
+            return Err(TestError::Missing("exactly one fact written by v1"));
+        };
+        let files_by_v1 = fact_files(&fx.learning_root)?;
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted]);
+
+        // v2 renders observations differently: what reconstruction would
+        // see now yields another name and description.
+        edit_record(
+            &fx,
+            "/outbox/pending/0/payload",
+            "cause",
+            Some(serde_json::json!("unclassified")),
+        )?;
+        edit_record(
+            &fx,
+            "/outbox/pending/0/payload",
+            "transition",
+            Some(serde_json::json!("advance")),
+        )?;
+        let changed = first_payload(&fx)?;
+        let rerendered = accepted_fact(&changed, Timestamp::now_utc())
+            .ok_or(TestError::Missing("a v2 rendering"))?;
+        assert_ne!(rerendered.name, fact_a.name);
+        assert_ne!(rerendered.description, fact_a.description);
+
+        // v2 replays exactly the stored fact and acknowledges it.
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 1,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        let files_after = fact_files(&fx.learning_root)?;
+        assert_eq!(
+            files_after.keys().collect::<Vec<_>>(),
+            files_by_v1.keys().collect::<Vec<_>>(),
+            "exactly the one fact v1 wrote, no second file"
+        );
+        let replayed = project.list().map_err(ctx("list facts again"))?;
+        let [fact] = replayed.as_slice() else {
+            return Err(TestError::Missing("exactly one fact after the replay"));
+        };
+        let mut unchanged = fact.clone();
+        unchanged.updated = fact_a.updated;
+        assert_eq!(&unchanged, fact_a, "the content is unchanged");
         Ok(())
     }
 
@@ -1509,6 +1740,58 @@ mod tests {
         Ok(())
     }
 
+    /// The decision a drain stores for every pending entry: its key with the
+    /// descriptor of its fact (rendered as the drain would accept it).
+    fn accepted_by_a_drain(fx: &Fixture) -> TestResult<Vec<(String, serde_json::Value)>> {
+        let now = Timestamp::now_utc();
+        let record = fx.store.load(CYCLE_ID).map_err(ctx("load record"))?;
+        record
+            .outbox
+            .pending()
+            .iter()
+            .map(|entry| {
+                let fact =
+                    accepted_fact(&entry.payload, now).ok_or(TestError::Missing("a lesson"))?;
+                let stored = lesson_descriptor(&fact).map_err(TestError::Unexpected)?;
+                Ok((entry.key.clone(), stored))
+            })
+            .collect()
+    }
+
+    /// Sets (`Some`) or removes (`None`) `field` of the JSON object at
+    /// `pointer` in the stored cycle record — stands in for what another
+    /// binary left behind.
+    fn edit_record(
+        fx: &Fixture,
+        pointer: &str,
+        field: &str,
+        value: Option<serde_json::Value>,
+    ) -> TestResult {
+        let path = fx
+            .base
+            .join("jobs")
+            .join(CYCLE_STORE_DIR)
+            .join(harw_job_store::RECORDS_DIR)
+            .join(format!("{CYCLE_ID}.json"));
+        let bytes = std::fs::read(&path).map_err(ctx("read record"))?;
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(ctx("decode record"))?;
+        let object = record
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(TestError::Missing("record object"))?;
+        match value {
+            Some(value) => {
+                object.insert(field.to_owned(), value);
+            }
+            None => {
+                object.remove(field);
+            }
+        }
+        let encoded = serde_json::to_vec(&record).map_err(ctx("encode record"))?;
+        std::fs::write(&path, encoded).map_err(ctx("write record"))
+    }
+
     /// Makes `FactStore::open` fail: a regular file where `facts/` belongs.
     fn block_project_memories(fx: &Fixture) -> TestResult {
         std::fs::create_dir_all(&fx.learning_root).map_err(ctx("create learning root"))?;
@@ -1523,12 +1806,12 @@ mod tests {
     #[test]
     fn crash_after_accept_before_write_is_recovered_on_the_next_drain() -> TestResult {
         let fx = fixture(&TWO_LEARNABLE)?;
-        let keys = pending_keys(&fx)?;
         // A drain committed its decision and the process died before any
         // fact was written.
+        let decision = accepted_by_a_drain(&fx)?;
         assert_eq!(
             fx.store
-                .decide_observations(CYCLE_ID, &fx.token, &keys, &[])
+                .decide_observations(CYCLE_ID, &fx.token, &decision, &[])
                 .map_err(ctx("decision before the crash"))?,
             (2, 0)
         );
@@ -1759,8 +2042,9 @@ mod tests {
             }));
 
         // The commit under the held lease: the drain's decision.
+        let decision = accepted_by_a_drain(&fx)?;
         let decided = guarded
-            .decide_observations(CYCLE_ID, &lease, &keys, &[])
+            .decide_observations(CYCLE_ID, &lease, &decision, &[])
             .map_err(ctx("decision under the held lease"))?;
         assert_eq!(decided, (2, 0));
         let (attempts, states_when_reclaimed, requeued_at) = reclaimer

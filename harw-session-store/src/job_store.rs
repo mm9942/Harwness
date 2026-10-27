@@ -2322,19 +2322,22 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-hold-near-expiry");
-        let claimed_at = Timestamp::now()
-            .checked_sub(SignedDuration::from_millis(850))
-            .map_err(ctx("now - 850ms"))?;
         store.admit(&StoredJob {
-            not_before: claimed_at,
+            not_before: Timestamp::now()
+                .checked_sub(SignedDuration::from_secs(60))
+                .map_err(ctx("now - 60s"))?,
             ..record(work_id.as_str())?
         })?;
-        // 1 s TTL, vor ~0,85 s beansprucht: ohne Erneuerung bliebe kaum Zeit.
+        // 2 s TTL, vor 1,7 s beansprucht (erst unmittelbar vor dem Claim
+        // berechnet): ohne Erneuerung blieben ~300 ms.
+        let claimed_at = Timestamp::now()
+            .checked_sub(SignedDuration::from_millis(1_700))
+            .map_err(ctx("now - 1.7s"))?;
         let claim = store.claim(
             &work_id,
             &ClaimRequest {
                 worker_id: "worker-a".to_owned(),
-                lease_ttl: SignedDuration::from_secs(1),
+                lease_ttl: SignedDuration::from_secs(2),
                 now: claimed_at,
             },
         )?;
@@ -2342,9 +2345,9 @@ mod tests {
 
         let held = store.hold_live_lease(&claim.token)?;
         assert!(held.deadline() > original_expiry, "renewed under the hold");
-        // Ein Commit 200 ms später — nach dem ursprünglichen Ablauf — ist
+        // Ein Commit 400 ms später — nach dem ursprünglichen Ablauf — ist
         // noch durch das erneuerte Fenster gedeckt.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(Timestamp::now() > original_expiry);
         held.still_live()?;
 

@@ -20,11 +20,14 @@
 //!   therefore replay every append without creating duplicates.
 //! - **Ordered.** Pending entries keep their append order.
 //! - **Two-phase delivery.** A consumer whose delivery has an external side
-//!   effect first [accepts](Outbox::accept) an entry ([`DeliveryState`]):
-//!   the entry stays pending, marked as committed to delivery, until the
-//!   consumer acknowledges it after the side effect is durable. A crash in
-//!   between leaves it accepted, so it is delivered again (at least once);
-//!   the consumer's side effect must therefore be idempotent. Entries the
+//!   effect first [accepts](Outbox::accept) an entry ([`DeliveryState`]),
+//!   storing *what* it will deliver (an opaque, consumer-versioned
+//!   materialisation) with it: the entry stays pending, marked as committed
+//!   to delivery, until the consumer acknowledges it after the side effect
+//!   is durable. A crash in between leaves it accepted, so it is delivered
+//!   again (at least once) — from the stored materialisation, so a newer
+//!   consumer replays exactly what was decided instead of rendering it
+//!   anew; the side effect must therefore be idempotent. Entries the
 //!   consumer decides not to deliver are acknowledged directly.
 //!
 //! The acked-key tail is capped at [`MAX_ACKED_TAIL`] keys (oldest evicted
@@ -73,6 +76,13 @@ pub struct OutboxEntry<T> {
     /// delivery have no such field and load as [`DeliveryState::Pending`].
     #[serde(default)]
     pub state: DeliveryState,
+    /// What the consumer committed to deliver, stored by [`Outbox::accept`]:
+    /// opaque to the outbox and versioned by the consumer. `None` while
+    /// pending, and for entries accepted before materialisations were
+    /// stored. Not serialised when absent, so pending entries keep their
+    /// former shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<serde_json::Value>,
 }
 
 /// Why an outbox operation was refused.
@@ -181,12 +191,14 @@ impl<T> Outbox<T> {
         Ok(true)
     }
 
-    /// Marks the pending entry with `key` as [`DeliveryState::Accepted`]: the
-    /// consumer committed to delivering it. The entry stays pending (and
-    /// counts against [`MAX_OUTBOX_PENDING`]) until [`Outbox::ack`].
+    /// Marks the pending entry with `key` as [`DeliveryState::Accepted`] and
+    /// stores `materialization` — what the consumer committed to deliver —
+    /// with it. The entry stays pending (and counts against
+    /// [`MAX_OUTBOX_PENDING`]) until [`Outbox::ack`].
     ///
     /// Returns `Ok(true)` when a pending entry changed to accepted,
-    /// `Ok(false)` for an unknown, already acked or already accepted key.
+    /// `Ok(false)` for an unknown, already acked or already accepted key; an
+    /// accepted entry keeps the materialisation it was accepted with.
     ///
     /// # Errors
     ///
@@ -196,6 +208,7 @@ impl<T> Outbox<T> {
         acceptor_epoch: u64,
         current_epoch: u64,
         key: &str,
+        materialization: serde_json::Value,
     ) -> Result<bool, OutboxError> {
         if acceptor_epoch < current_epoch {
             return Err(OutboxError::StaleEpoch);
@@ -207,6 +220,7 @@ impl<T> Outbox<T> {
             return Ok(false);
         }
         entry.state = DeliveryState::Accepted;
+        entry.materialization = Some(materialization);
         Ok(true)
     }
 
@@ -260,7 +274,16 @@ mod tests {
             sequence,
             payload: format!("payload-{key}"),
             state: DeliveryState::Pending,
+            materialization: None,
         }
+    }
+
+    fn materialization_of(outbox: &Outbox<String>, key: &str) -> Option<serde_json::Value> {
+        outbox
+            .pending()
+            .iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.materialization.clone())
     }
 
     fn state_of(outbox: &Outbox<String>, key: &str) -> Option<DeliveryState> {
@@ -277,25 +300,36 @@ mod tests {
         check(outbox.append(2, 2, entry("a", 0)) == Ok(true), "append a")?;
         check(outbox.append(2, 2, entry("b", 1)) == Ok(true), "append b")?;
         check(
-            outbox.accept(1, 2, "a") == Err(OutboxError::StaleEpoch),
+            outbox.accept(1, 2, "a", serde_json::json!({"v": "a"})) == Err(OutboxError::StaleEpoch),
             "stale accept refused",
         )?;
         check(
             state_of(&outbox, "a") == Some(DeliveryState::Pending),
             "stale accept changed nothing",
         )?;
-        check(outbox.accept(2, 2, "a") == Ok(true), "first accept marks")?;
         check(
-            outbox.accept(2, 2, "a") == Ok(false),
+            outbox.accept(2, 2, "a", serde_json::json!({"v": "a"})) == Ok(true),
+            "first accept marks",
+        )?;
+        check(
+            outbox.accept(2, 2, "a", serde_json::json!({"v": "a"})) == Ok(false),
             "second accept is a no-op",
         )?;
         check(
-            outbox.accept(2, 2, "unknown") == Ok(false),
+            outbox.accept(2, 2, "unknown", serde_json::json!({"v": "unknown"})) == Ok(false),
             "unknown key is a no-op",
         )?;
         check(
             state_of(&outbox, "a") == Some(DeliveryState::Accepted),
             "a is accepted",
+        )?;
+        check(
+            materialization_of(&outbox, "a") == Some(serde_json::json!({"v": "a"})),
+            "the materialisation is stored with the decision",
+        )?;
+        check(
+            materialization_of(&outbox, "b").is_none(),
+            "a pending entry has none",
         )?;
         check(
             state_of(&outbox, "b") == Some(DeliveryState::Pending),
@@ -314,11 +348,19 @@ mod tests {
             "re-append does not reset the state",
         )?;
         check(
+            outbox.accept(2, 2, "a", serde_json::json!({"v": "other"})) == Ok(false),
+            "a second accept is a no-op",
+        )?;
+        check(
+            materialization_of(&outbox, "a") == Some(serde_json::json!({"v": "a"})),
+            "the first materialisation is kept",
+        )?;
+        check(
             outbox.ack(2, 2, "a") == Ok(true),
             "ack removes the accepted",
         )?;
         check(
-            outbox.accept(2, 2, "a") == Ok(false),
+            outbox.accept(2, 2, "a", serde_json::json!({"v": "a"})) == Ok(false),
             "an acked key cannot be accepted",
         )?;
         check(keys(&outbox) == ["b"], "only b is left")
@@ -328,7 +370,10 @@ mod tests {
     fn accepted_state_survives_a_round_trip_and_legacy_entries_load_pending() -> TestResult {
         let mut outbox = Outbox::new();
         check(outbox.append(1, 1, entry("a", 0)) == Ok(true), "append")?;
-        check(outbox.accept(1, 1, "a") == Ok(true), "accept")?;
+        check(
+            outbox.accept(1, 1, "a", serde_json::json!({"v": "a"})) == Ok(true),
+            "accept",
+        )?;
         let json = serde_json::to_string(&outbox).map_err(ctx("serialize outbox"))?;
         let restored: Outbox<String> =
             serde_json::from_str(&json).map_err(ctx("deserialize outbox"))?;
@@ -340,6 +385,20 @@ mod tests {
         check(
             state_of(&loaded, "k") == Some(DeliveryState::Pending),
             "an entry without a state loads as pending",
+        )?;
+        check(
+            !serde_json::to_string(&loaded)
+                .map_err(ctx("serialize legacy outbox"))?
+                .contains("materialization"),
+            "a pending entry keeps its former shape",
+        )?;
+        let accepted_legacy = r#"{"pending":[{"key":"k","epoch":1,"sequence":0,"payload":"p","state":"accepted"}],"acked_keys_tail":[]}"#;
+        let accepted: Outbox<String> = serde_json::from_str(accepted_legacy)
+            .map_err(ctx("accepted without materialisation"))?;
+        check(
+            state_of(&accepted, "k") == Some(DeliveryState::Accepted)
+                && materialization_of(&accepted, "k").is_none(),
+            "an entry accepted before materialisations were stored has none",
         )?;
         let tampered = r#"{"pending":[{"key":"k","epoch":1,"sequence":0,"payload":"p","extra":1}],"acked_keys_tail":[]}"#;
         check(
