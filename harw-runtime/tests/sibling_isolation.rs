@@ -6,13 +6,20 @@
 //! Kindern geteilter Provider, ein gecachter Spawner oder eine für die Rolle
 //! einmal gebaute und dann geteilte Identität. Diese Datei hält fest, dass die
 //! Fabrik je Kind alles neu baut — auch die Agent-Id: sie ist laufgebunden
-//! (`<rolle>.<uuid>`), zwei Geschwister **derselben** Rolle unterscheiden sich
-//! also, und ein `SelfOnly`-Eintrag des einen ist für das andere unsichtbar.
+//! (`<rolle>.<kind-sitzungs-id>`), zwei Geschwister **derselben** Rolle
+//! unterscheiden sich also, und ein `SelfOnly`-Eintrag des einen ist für das
+//! andere unsichtbar. Weil die Id aus der Kind-Sitzung folgt, die der
+//! Controller vor dem Bau meldet (`ChildRegistryFactory::announce_child_session`),
+//! behält ein durabel wiederhergestelltes Kind (`recover_root_child` stellt die
+//! ursprüngliche Kind-ID wieder her) seine Wissens-Identität: Tagebuch und
+//! `SelfOnly`-Einträge von vor dem Neustart bleiben ihm zugeordnet.
 //!
 //! # Grenzen
 //! - Sitzungs-Ids entstehen im Spawner (`ManagedAgentSpawner::admit`), nicht in
 //!   der Fabrik; ohne laufenden Spawner stellt dieses Fixture keine Kind-
-//!   Sitzung bereit. Die Sitzungstrennung deckt `harw-core` ab.
+//!   Sitzung bereit. Die Tests melden die Kind-Sitzung deshalb selbst, in der
+//!   Reihenfolge der Admission (melden, bauen). Die Sitzungstrennung und die
+//!   Meldung durch den Controller deckt `harw-core` ab.
 //! - Die `ExtensionRegistry` hält keine Dienste. Die Identität eines Kindes
 //!   liegt in den `OpContext`-Fabriken seiner Operations-Werkzeuge; hier
 //!   erreichbar ist sie über
@@ -251,5 +258,117 @@ fn same_role_siblings_cannot_recall_each_others_self_only_artifacts() -> TestRes
     let anonymous = RecallQuery::new("canary", VisibilityScope::SelfOnly);
     let result = search(&index, &anonymous).map_err(ctx("Recall ohne Identität"))?;
     assert!(result.hits.is_empty());
+    Ok(())
+}
+
+/// Wie die Admission des Controllers: erst die Kind-Sitzung melden, dann bauen.
+fn build_for_session(
+    factory: &RuntimeChildRegistryFactory,
+    role: &str,
+    parent: &SessionId,
+    child: &SessionId,
+) -> TestResult<(ExtensionRegistry, Arc<CallerIdentity>)> {
+    factory.announce_child_session(role, child);
+    build(factory, role, parent)
+}
+
+/// Durable Wiederherstellung (schreiben → Neustart → lesen): ein Kind schreibt
+/// unter seiner Lauf-Identität eine `SelfOnly`-Notiz und einen Diary-Eintrag.
+/// Nach dem Neustart baut die Fabrik die Registry für dieselbe Kind-Sitzung neu
+/// (`recover_root_child`): das wiederhergestellte Kind trägt dieselbe Agent-Id,
+/// findet seine Notiz und liest sein Tagebuch — ein Geschwister derselben Rolle
+/// weiterhin nicht.
+#[test]
+fn recovered_child_keeps_its_prior_notes_and_diary_while_a_sibling_stays_blind() -> TestResult {
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    let sibling = SessionId::new();
+
+    // Vor dem Absturz: das Kind schreibt unter seiner Agent-Id.
+    let before_crash = factory()?;
+    let (_registry, identity_before) =
+        build_for_session(&before_crash, role_names::EXPLORER, &parent, &child)?;
+    let root = tempfile::tempdir().map_err(ctx("temporary knowledge root"))?;
+    let store = KnowledgeStore::new(root.path());
+    let frontmatter = Frontmatter::new(
+        identity_before.agent_id.clone(),
+        VisibilityScope::SelfOnly,
+        jiff::Timestamp::UNIX_EPOCH,
+    );
+    let note = KnowledgeArtifact::new(
+        ArtifactId::new("topic/recovery-canary"),
+        ArtifactKind::TopicMemory,
+        frontmatter,
+        "recovery canary notes written before the crash",
+    );
+    store
+        .write_artifact(&store.topic_path("recovery-canary"), &note)
+        .map_err(ctx("Notiz vor dem Absturz schreiben"))?;
+    let (index, report) =
+        KnowledgeIndex::rebuild_with_report(&store).map_err(ctx("Index neu aufbauen"))?;
+    assert!(report.is_clean(), "Index sauber: {report:?}");
+    let now = jiff::Timestamp::from_second(1_758_715_200).map_err(ctx("Zeitstempel"))?;
+    let date = now.strftime("%Y-%m-%d").to_string();
+    harw_knowledge::diary::record(
+        &store,
+        &identity_before.agent_id,
+        harw_knowledge::diary::DiaryTrigger::Manual,
+        "Tagebucheintrag vor dem Absturz",
+        now,
+    )
+    .map_err(ctx("Tagebucheintrag schreiben"))?;
+
+    // Neustart: neue Fabrik; die Wiederherstellung baut die Registry derselben
+    // Kind-Sitzung neu, ein Geschwister kommt mit eigener Sitzung dazu.
+    let restarted = factory()?;
+    let (_recovered_registry, identity_after) =
+        build_for_session(&restarted, role_names::EXPLORER, &parent, &child)?;
+    let (_sibling_registry, identity_sibling) =
+        build_for_session(&restarted, role_names::EXPLORER, &parent, &sibling)?;
+    assert_eq!(
+        identity_after.agent_id, identity_before.agent_id,
+        "das wiederhergestellte Kind behält seine Wissens-Identität"
+    );
+    assert_eq!(identity_after.role, identity_before.role);
+    assert_ne!(
+        identity_sibling.agent_id, identity_after.agent_id,
+        "das Geschwister bekommt eine eigene Identität"
+    );
+
+    // Notiz: das wiederhergestellte Kind findet sie, das Geschwister nicht.
+    let recall = |identity: &Arc<CallerIdentity>| -> TestResult<usize> {
+        let query = RecallQuery::new("canary", VisibilityScope::SelfOnly)
+            .with_caller_identity((**identity).clone());
+        let result = search(&index, &query).map_err(ctx("Recall"))?;
+        Ok(result.hits.len())
+    };
+    assert_eq!(
+        recall(&identity_after)?,
+        1,
+        "das wiederhergestellte Kind findet seine Notiz von vor dem Absturz"
+    );
+    assert_eq!(
+        recall(&identity_sibling)?,
+        0,
+        "das Geschwister findet die SelfOnly-Notiz nicht"
+    );
+
+    // Tagebuch: dasselbe Verzeichnis wie vor dem Absturz; das des Geschwisters
+    // ist ein anderes und leer.
+    let read_diary = |identity: &Arc<CallerIdentity>| -> TestResult<usize> {
+        let day = harw_knowledge::diary::read_day_entries(&store, &identity.agent_id, &date)
+            .map_err(ctx("Tagebuch lesen"))?;
+        Ok(day.map_or(0, |day| day.entries.len()))
+    };
+    assert_eq!(
+        read_diary(&identity_after)?,
+        1,
+        "das wiederhergestellte Kind liest sein Tagebuch von vor dem Absturz"
+    );
+    assert_eq!(
+        read_diary(&identity_sibling)?,
+        0,
+        "das Geschwister liest das Tagebuch des Kindes nicht"
+    );
     Ok(())
 }

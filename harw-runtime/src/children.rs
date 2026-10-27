@@ -433,6 +433,17 @@ pub struct RuntimeChildRegistryFactory {
     /// gescheiterter Admission-Rest wird von der nächsten Montage derselben
     /// Rolle überschrieben. Nie ein Schlüssel aus Modell-JSON.
     pending_run_identities: Mutex<HashMap<String, Arc<CallerIdentity>>>,
+    /// Die vom Controller gemeldete Kind-Sitzung je Rolle
+    /// ([`ChildRegistryFactory::announce_child_session`]), bis
+    /// [`ChildRegistryFactory::build_registry`] sie entnimmt und daraus die
+    /// Lauf-Identität ableitet. Der Controller meldet unmittelbar vor dem Bau
+    /// derselben Admission und unter demselben Sitzungs-Lock; `build_registry`
+    /// entnimmt den Eintrag als Erstes, ein Rest kann also nur von einer
+    /// Admission stammen, die den Bau nie erreicht, und wird von der nächsten
+    /// Meldung derselben Rolle überschrieben. Bei einer durablen
+    /// Wiederherstellung ist es die ursprüngliche Kind-ID, die Identität also
+    /// dieselbe wie vor dem Neustart. Nie ein Wert aus Modell-JSON.
+    announced_child_sessions: Mutex<HashMap<String, harw_types::SessionId>>,
 }
 
 /// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
@@ -552,6 +563,7 @@ impl RuntimeChildRegistryFactory {
             live_models: None,
             custom_agents: HashMap::new(),
             pending_run_identities: Mutex::new(HashMap::new()),
+            announced_child_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -598,22 +610,28 @@ impl RuntimeChildRegistryFactory {
             .map_or(role, |wiring| wiring.base_role.as_str())
     }
 
-    /// Mintet die vertrauenswürdige, **laufgebundene** Aufruferidentität
+    /// Baut die vertrauenswürdige, **laufgebundene** Aufruferidentität
     /// eines neuen Kindes dieser Rolle (PL-90 W03d: Lauf-Isolation der
     /// Wissensflächen).
     ///
     /// # Beschreibung
     /// Die Identität entsteht ausschließlich hier, aus dem registrierten
-    /// Rollennamen und einem frischen Token — nie aus Modell-JSON oder
+    /// Rollennamen und einer frischen Sitzungs-ID — nie aus Modell-JSON oder
     /// `SpawnInput.context`:
-    /// - `agent_id` ist [`mint_run_agent_id`]`(role)`, also `<rolle>.<uuid>`
-    ///   (UUID v4 aus `harw-types`, als Pfadkomponente sicher). Jedes Kind
-    ///   bekommt eine eigene Id; zwei gleichzeitige Geschwister **derselben**
-    ///   Rolle vergleichen sich in `is_visible` also nie als Autor und sehen
-    ///   einander `SelfOnly`-Einträge nicht. Dieselbe Id tragen Diary-Autor
-    ///   (`diary.read`, Recorder) und die `OpContext`-Dienste der Operations-
-    ///   Werkzeuge des Kindes; `build_registry` mintet sie genau einmal je Kind
-    ///   und hält sie für dessen ganzen Lauf;
+    /// - `agent_id` ist `run_agent_id(role, kind)`, also
+    ///   `<rolle>.<kind-sitzungs-id>` (UUID v4 aus `harw-types`, als
+    ///   Pfadkomponente sicher). Jedes Kind bekommt eine eigene Id; zwei
+    ///   gleichzeitige Geschwister **derselben** Rolle vergleichen sich in
+    ///   `is_visible` also nie als Autor und sehen einander `SelfOnly`-
+    ///   Einträge nicht. Dieselbe Id tragen Diary-Autor (`diary.read`,
+    ///   Recorder) und die `OpContext`-Dienste der Operations-Werkzeuge des
+    ///   Kindes; `build_registry` baut sie genau einmal je Kind und hält sie
+    ///   für dessen ganzen Lauf. Weil sie aus der Kind-Sitzung folgt, die der
+    ///   Controller vor dem Bau meldet
+    ///   ([`ChildRegistryFactory::announce_child_session`]) und bei einer
+    ///   durablen Wiederherstellung unverändert wiederherstellt, trägt ein
+    ///   wiederhergestelltes Kind dieselbe Id wie vor dem Absturz und
+    ///   behält sein Tagebuch und seine `SelfOnly`-Einträge;
     /// - `role` ist die Basisrolle ([`Self::lookup_role`]); für einen
     ///   benutzerdefinierten Agenten ist das seine eingebaute Rolle, nicht
     ///   sein eigener Name — wie bei allen namensgebundenen Tabellen
@@ -627,15 +645,49 @@ impl RuntimeChildRegistryFactory {
     ///   `SelfOnly` und `DescendantTree` nie, weil der Autor eines
     ///   Geschwisters weder der Aufrufer ist noch in dessen Vorfahren steht.
     ///
-    /// Jeder Aufruf liefert eine **neue** Instanz mit **neuer** Id; die
-    /// Fabrik cacht nichts je Rolle. Öffentlich, damit Tests die Identität
-    /// einer Montage prüfen können; ein Aufruf außerhalb von `build_registry`
-    /// bindet nichts.
+    /// Dieser Einstieg ohne Sitzung leitet die Id aus einer **frischen**
+    /// Sitzungs-ID ab: jeder Aufruf liefert eine **neue** Instanz mit
+    /// **neuer** Id; die Fabrik cacht nichts je Rolle. Öffentlich, damit Tests
+    /// die Identität einer Montage prüfen können; ein Aufruf außerhalb von
+    /// `build_registry` bindet nichts.
     #[must_use]
     pub fn child_caller_identity(&self, role: &str) -> Arc<CallerIdentity> {
-        Arc::new(CallerIdentity::new(mint_run_agent_id(role)).with_role(
+        self.caller_identity_for_child(role, &harw_types::SessionId::new())
+    }
+
+    /// Wie [`Self::child_caller_identity`], aber für die Kind-Sitzung `child`:
+    /// dieselbe Sitzung ergibt dieselbe `agent_id`, verschiedene Sitzungen
+    /// verschiedene (siehe [`run_agent_id`]).
+    fn caller_identity_for_child(
+        &self,
+        role: &str,
+        child: &harw_types::SessionId,
+    ) -> Arc<CallerIdentity> {
+        Arc::new(CallerIdentity::new(run_agent_id(role, child)).with_role(
             harw_knowledge::AgentRoleRef::new(self.lookup_role(role).to_owned()),
         ))
+    }
+
+    /// Merkt die vom Controller gemeldete Kind-Sitzung vor, bis
+    /// [`ChildRegistryFactory::build_registry`] sie entnimmt (siehe
+    /// [`ChildRegistryFactory::announce_child_session`]).
+    fn note_announced_child_session(&self, role: &str, child: &harw_types::SessionId) {
+        let mut announced = self
+            .announced_child_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        announced.insert(role.to_owned(), child.clone());
+    }
+
+    /// Entnimmt die für `role` gemeldete Kind-Sitzung; `None`, wenn kein
+    /// Controller eine gemeldet hat (etwa bei einem direkten
+    /// `build_registry`-Aufruf ohne Admission).
+    fn take_announced_child_session(&self, role: &str) -> Option<harw_types::SessionId> {
+        let mut announced = self
+            .announced_child_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        announced.remove(role)
     }
 
     /// Merkt die Identität des soeben gebauten Kindes vor, bis
@@ -1672,20 +1724,31 @@ impl RuntimeChildRegistryFactory {
     }
 }
 
-/// Mintet die laufgebundene Agent-Id eines Kindes: `<rolle>.<uuid>`
-/// (PL-90 W03d).
+/// Leitet die laufgebundene Agent-Id eines Kindes aus seiner Sitzung ab:
+/// `<rolle>.<kind-sitzungs-id>` (PL-90 W03d).
 ///
 /// # Description
-/// Der Suffix ist eine frische UUID v4 aus den `harw-types`-Ids (keine neue
-/// Abhängigkeit), je Aufruf neu. Pfadtrenner, `:` und Steuerzeichen im
-/// Rollennamen werden durch `-` ersetzt; die Id ist damit eine einzelne
-/// Pfadkomponente (`diary/<agent-id>/…`,
-/// [`harw_knowledge::diary::validate_agent_id`]). Zwei Kinder derselben Rolle
-/// bekommen nie dieselbe Id.
+/// Die Kind-Sitzungs-ID ist über eine durable Wiederherstellung stabil
+/// (`recover_root_child` stellt `ChildRecoveryView::child` wieder her) und
+/// sonst eine UUID v4 aus den `harw-types`-Ids (keine neue Abhängigkeit), die
+/// der Controller je Kind genau einmal vergibt. Dieselbe Sitzung ergibt
+/// deshalb vor und nach einem Neustart dieselbe Id, und zwei Kinder
+/// derselben Rolle bekommen nie dieselbe Id — ohne dass etwas Neues
+/// persistiert werden müsste.
+///
+/// Pfadsicherheit: die Id ist eine einzelne Pfadkomponente
+/// (`diary/<agent-id>/…`, [`harw_knowledge::diary::validate_agent_id`]).
+/// Pfadtrenner, `:` und Steuerzeichen im Rollennamen werden durch `-`
+/// ersetzt. Die Sitzungs-ID einer Wiederherstellung stammt aus einem
+/// gespeicherten Snapshot und wird deshalb zeichenweise kodiert: `%`, `.`,
+/// Pfadtrenner, `:` und Steuerzeichen werden zu `%XX` (Hexcode des Zeichens).
+/// Die Kodierung ist injektiv — verschiedene Sitzungs-IDs bleiben
+/// verschieden — und lässt eine UUID unverändert.
 ///
 /// # Arguments
 /// - `role`: der registrierte Rollenname des Kindes.
-fn mint_run_agent_id(role: &str) -> harw_knowledge::AgentId {
+/// - `child`: die Sitzung des Kindes.
+fn run_agent_id(role: &str, child: &harw_types::SessionId) -> harw_knowledge::AgentId {
     let component: String = role
         .chars()
         .map(|c| {
@@ -1696,8 +1759,15 @@ fn mint_run_agent_id(role: &str) -> harw_knowledge::AgentId {
             }
         })
         .collect();
-    let run = harw_types::SessionId::new();
-    harw_knowledge::AgentId::new(format!("{component}.{}", run.as_str()))
+    let mut run = String::with_capacity(child.as_str().len());
+    for c in child.as_str().chars() {
+        if matches!(c, '%' | '.' | '/' | '\\' | ':') || c.is_control() {
+            run.push_str(&format!("%{:02X}", u32::from(c)));
+        } else {
+            run.push(c);
+        }
+    }
+    harw_knowledge::AgentId::new(format!("{component}.{run}"))
 }
 
 /// Die Dienste des `OpContext` eines Matrix-Werkzeugs des Game Masters.
@@ -1766,10 +1836,18 @@ fn delegate_wave_services(
 }
 
 impl ChildRegistryFactory for RuntimeChildRegistryFactory {
+    /// Merkt die Kind-Sitzung der gerade beginnenden Admission vor, damit
+    /// `build_registry` die Lauf-Identität daraus ableitet (PL-90 W03d). Bei
+    /// einer durablen Wiederherstellung ist das die ursprüngliche Kind-ID —
+    /// das Kind behält so seine Wissens-Identität (Tagebuch, `SelfOnly`).
+    fn announce_child_session(&self, role: &str, child: &harw_types::SessionId) {
+        self.note_announced_child_session(role, child);
+    }
+
     /// Runde 5, Teil C: meldet das Kind mit seiner laufgebundenen Agent-Id
-    /// (`<rolle>.<uuid>`, aus `build_registry`) beim Diary-Recorder an und
-    /// liefert dessen Verdichtungs- und Runden-Beobachter; ohne Recorder keine
-    /// Beobachter.
+    /// (`<rolle>.<kind-sitzungs-id>`, aus `build_registry`) beim Diary-
+    /// Recorder an und liefert dessen Verdichtungs- und Runden-Beobachter;
+    /// ohne Recorder keine Beobachter.
     fn child_session_observers(
         &self,
         role: &str,
@@ -1780,11 +1858,11 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // PL-90 W03d: die in `build_registry` gemintete Lauf-Id dieses Kindes
         // (immer entnehmen, auch ohne Recorder, damit nichts hängen bleibt).
         // Ohne vorgemerkte Identität (z. B. die Steward-Sonderregistry, die
-        // `build_registry` nicht durchläuft) wird hier eine frische Id
-        // gemintet — nie der bloße Rollenname, den sich Geschwister teilen
-        // würden.
+        // `build_registry` nicht durchläuft) wird die Id hier aus der
+        // Kind-Sitzung abgeleitet — nie der bloße Rollenname, den sich
+        // Geschwister teilen würden, und dieselbe nach einer Wiederherstellung.
         let agent = self.take_run_identity(role).map_or_else(
-            || mint_run_agent_id(role),
+            || run_agent_id(role, child),
             |identity| identity.agent_id.clone(),
         );
         let Some(recorder) = &self.diary else {
@@ -1845,8 +1923,12 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// bauen ihren `OpContext` aus einer `ServiceMap`, die eine für dieses
     /// Kind neu erzeugte `Arc<CallerIdentity>` trägt
     /// ([`Self::child_caller_identity`]); kein Geschwister teilt sie, und ihre
-    /// `agent_id` (`<rolle>.<uuid>`) ist je Kind verschieden, auch bei gleicher
-    /// Rolle. Dieselbe Id ist der Autor von `diary.read` und des
+    /// `agent_id` (`<rolle>.<kind-sitzungs-id>`) ist je Kind verschieden, auch
+    /// bei gleicher Rolle, und über eine durable Wiederherstellung stabil
+    /// (abgeleitet aus der Kind-Sitzung, die der Controller vor dem Bau
+    /// meldet, siehe [`ChildRegistryFactory::announce_child_session`]; ohne
+    /// Meldung, etwa bei einem direkten Aufruf, aus einer frischen Sitzungs-ID).
+    /// Dieselbe Id ist der Autor von `diary.read` und des
     /// Diary-Recorders. Die übrigen Wissens-Lesewerkzeuge der Kinder
     /// (`palace.*`, …) laufen nicht über einen `OpContext` und lesen die
     /// Identität nicht; ihre Sicht bleibt die ihres jeweiligen Providers
@@ -1857,6 +1939,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         input: &SpawnInput,
         _suggestions: Option<&harw_catalog::AgentSuggestions>,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
+        // Die gemeldete Kind-Sitzung gehört genau diesem Bau: als Erstes
+        // entnehmen, auch wenn der Bau gleich scheitert, damit nichts für einen
+        // späteren Bau derselben Rolle hängen bleibt.
+        let announced_child = self.take_announced_child_session(role);
         // Plan R9, Teil B: ein benutzerdefinierter Agent läuft mit dem Profil
         // seines Roster-Eintrags; alle namensgebundenen Tabellen
         // (Composition-Werkzeuge, Matrix, Wissen, sudo) gelten für seine
@@ -1875,14 +1961,19 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // PL-90 W03d: die `ExtensionRegistry` kennt keine Dienste — sie halten
         // allein die `OpContext`-Fabriken der Operations-Werkzeuge eines
         // Kindes (`delegate_wave`, Matrix-Werkzeuge). Die laufgebundene
-        // Identität (`<rolle>.<uuid>`) entsteht hier genau einmal je Kind
-        // (nie aus `input`/Modell-JSON, nie zwischen Geschwistern geteilt),
-        // bleibt für dessen ganzen Lauf gleich und wandert in die
+        // Identität (`<rolle>.<kind-sitzungs-id>`) entsteht hier genau einmal
+        // je Kind (nie aus `input`/Modell-JSON, nie zwischen Geschwistern
+        // geteilt), bleibt für dessen ganzen Lauf gleich und wandert in die
         // `ServiceMap` jeder dieser Fabriken, in den Diary-Provider
         // (`with_knowledge_readers`) und — über `note_run_identity` — in den
-        // Diary-Recorder (`child_session_observers`). Eine Elternrolle ist aus
-        // `SpawnInput` nicht herleitbar; siehe [`Self::child_caller_identity`].
-        let identity = self.child_caller_identity(role);
+        // Diary-Recorder (`child_session_observers`). Sie folgt aus der
+        // Kind-Sitzung, die der Controller gemeldet hat — bei einer durablen
+        // Wiederherstellung die ursprüngliche, die Identität also dieselbe wie
+        // vor dem Neustart; ohne Meldung (direkter Aufruf ohne Admission) aus
+        // einer frischen Sitzungs-ID. Eine Elternrolle ist aus `SpawnInput`
+        // nicht herleitbar; siehe [`Self::child_caller_identity`].
+        let child_session = announced_child.unwrap_or_else(harw_types::SessionId::new);
+        let identity = self.caller_identity_for_child(role, &child_session);
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
             // Addendum F+G: die organisatorische Rolle eines Kindes ist die
@@ -2372,6 +2463,11 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         if role != role_names::AGENT_STEWARD {
             return self.build_registry_with_capabilities(role, input, snapshot);
         }
+        // Die Steward-Sonderregistry trägt keine laufgebundene Identität (keine
+        // Wissens- oder Operations-Werkzeuge); die gemeldete Kind-Sitzung wird
+        // verworfen, damit sie keinen späteren Bau derselben Rolle erreicht.
+        // `child_session_observers` leitet die Id dieses Kindes selbst ab.
+        let _ = self.take_announced_child_session(role);
 
         let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {
             kind: Default::default(),
@@ -4441,6 +4537,236 @@ mod tests {
                 .all(|tool| names.iter().any(|name| name == tool)),
             "der Game Master trägt seine Matrix-Werkzeuge: {names:?}"
         );
+        Ok(())
+    }
+
+    /// PL-90 W03d (Review P2): die Lauf-Identität folgt aus der vom Controller
+    /// gemeldeten Kind-Sitzung ([`ChildRegistryFactory::announce_child_session`]).
+    /// Eine neu gebaute Fabrik (Neustart: `recover_root_child` baut die Registry
+    /// neu und stellt die ursprüngliche Kind-ID wieder her) leitet für dieselbe
+    /// Sitzung dieselbe Agent-Id ab; ein Geschwister derselben Rolle mit eigener
+    /// Sitzung bekommt eine andere, ein Bau ohne Meldung eine frische.
+    #[test]
+    fn announced_child_session_makes_the_run_identity_stable_across_a_restart() -> TestResult {
+        let new_factory = || -> TestResult<RuntimeChildRegistryFactory> {
+            RuntimeChildRegistryFactory::new(
+                test_project(),
+                Arc::new(harw_core::EchoModelProvider::new("echo")),
+                test_chain(&harw_config::ResolvedConfig::default()),
+            )
+            .map_err(ctx("factory builds"))
+        };
+        // Wie die Admission: erst die Kind-Sitzung melden, dann bauen.
+        let admit = |factory: &RuntimeChildRegistryFactory,
+                     child: &harw_types::SessionId|
+         -> TestResult<Arc<CallerIdentity>> {
+            factory.announce_child_session(role_names::EXPLORER, child);
+            let _registry = factory
+                .build_registry(role_names::EXPLORER, &test_spawn_input(), None)
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            factory
+                .pending_run_identity(role_names::EXPLORER)
+                .ok_or(TestError::Missing(
+                    "vorgemerkte Identität nach build_registry",
+                ))
+        };
+
+        let child = harw_types::SessionId::new();
+        let before_crash = admit(&new_factory()?, &child)?;
+        assert_eq!(
+            before_crash.agent_id.as_str(),
+            format!("{}.{}", role_names::EXPLORER, child.as_str()),
+            "die Agent-Id ist <rolle>.<kind-sitzungs-id>"
+        );
+
+        // Neustart: neue Fabrik, dieselbe Kind-Sitzung (Wiederherstellung).
+        let restarted = new_factory()?;
+        let recovered = admit(&restarted, &child)?;
+        assert_eq!(
+            recovered.agent_id, before_crash.agent_id,
+            "ein wiederhergestelltes Kind trägt dieselbe Agent-Id wie vor dem Absturz"
+        );
+        assert_eq!(recovered.role, before_crash.role);
+        assert!(
+            !Arc::ptr_eq(&recovered, &before_crash),
+            "die Identität wird neu gebaut, nicht geteilt"
+        );
+
+        // Ein Geschwister derselben Rolle (eigene Sitzung) bleibt getrennt.
+        let sibling = admit(&restarted, &harw_types::SessionId::new())?;
+        assert_ne!(sibling.agent_id, recovered.agent_id);
+
+        // Ohne Meldung leitet der Bau aus einer frischen Sitzung ab und erbt
+        // nichts von der letzten Meldung.
+        let _registry = restarted
+            .build_registry(role_names::EXPLORER, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let unannounced = restarted
+            .pending_run_identity(role_names::EXPLORER)
+            .ok_or(TestError::Missing("vorgemerkte Identität ohne Meldung"))?;
+        assert_ne!(unannounced.agent_id, sibling.agent_id);
+        assert_ne!(unannounced.agent_id, recovered.agent_id);
+        Ok(())
+    }
+
+    /// PL-90 W03d: die aus der Kind-Sitzung abgeleitete Agent-Id ist eine
+    /// einzelne, sichere Pfadkomponente — auch für eine Sitzungs-ID, die aus
+    /// einem gespeicherten Wiederherstellungs-Snapshot stammt — und die
+    /// Ableitung bleibt injektiv; eine UUID bleibt unverändert.
+    #[test]
+    fn run_agent_id_is_a_safe_and_injective_path_component() -> TestResult {
+        let id =
+            |role: &str, child: &str| run_agent_id(role, &harw_types::SessionId::from_str(child));
+
+        let uuid = harw_types::SessionId::new();
+        assert_eq!(
+            run_agent_id(role_names::EXPLORER, &uuid).as_str(),
+            format!("{}.{}", role_names::EXPLORER, uuid.as_str())
+        );
+
+        for hostile in [
+            "../../etc",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+            "a:b",
+            "a\nb",
+            "x%2Fy",
+            "/abs",
+        ] {
+            let agent = id(role_names::EXPLORER, hostile);
+            assert!(
+                harw_knowledge::diary::validate_agent_id(&agent).is_ok(),
+                "{hostile:?} → {agent}"
+            );
+            assert!(
+                !agent.as_str().contains(['/', '\\', ':']),
+                "{hostile:?} → {agent}"
+            );
+        }
+        // Rollenname mit Pfadtrenner: wie bisher durch `-` ersetzt.
+        let custom = id("my/role", "child");
+        assert_eq!(custom.as_str(), "my-role.child");
+
+        // Verschiedene Sitzungs-IDs bleiben verschieden.
+        assert_ne!(id("r", "a/b"), id("r", "a-b"));
+        assert_ne!(id("r", "a.b"), id("r", "a%2Eb"));
+        assert_ne!(id("r", "x%2Fy"), id("r", "x/y"));
+        assert_ne!(id("r", "a"), id("r", "b"));
+        Ok(())
+    }
+
+    /// PL-90 W03d (Review P2): schreiben → durable Wiederherstellung → lesen.
+    /// Ein Kind schreibt über den Diary-Recorder unter seiner Lauf-Id einen
+    /// Verdichtungs-Eintrag; nach einem Neustart (neue Fabrik, neuer Recorder,
+    /// dieselbe Kind-Sitzung) liest das wiederhergestellte Kind dasselbe
+    /// Tagebuch und schreibt darin weiter. Ein Geschwister derselben Rolle hat
+    /// ein eigenes, leeres Tagebuch.
+    #[test]
+    fn recovered_child_keeps_its_diary_and_a_sibling_stays_apart() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("temporary knowledge root"))?;
+        let store = Arc::new(harw_knowledge::KnowledgeStore::new(root.path()));
+        let at = 1_758_715_200;
+        // Ein „Prozess“: Fabrik samt Recorder; nach dem Neustart beides neu.
+        let new_process = || -> TestResult<RuntimeChildRegistryFactory> {
+            let clock: crate::diary_wiring::DiaryClock = Arc::new(move || {
+                jiff::Timestamp::from_second(at).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+            });
+            let recorder = Arc::new(
+                crate::diary_wiring::DiaryRecorder::new(
+                    Arc::clone(&store),
+                    harw_knowledge::AgentId::new("root".to_owned()),
+                )
+                .with_clock(clock),
+            );
+            let factory = RuntimeChildRegistryFactory::new(
+                test_project(),
+                Arc::new(harw_core::EchoModelProvider::new("echo")),
+                test_chain(&harw_config::ResolvedConfig::default()),
+            )
+            .map_err(ctx("factory builds"))?;
+            Ok(factory.with_child_diary(Some(recorder)))
+        };
+        // Wie die Admission: melden, bauen, bei den Beobachtern anmelden.
+        let admit = |factory: &RuntimeChildRegistryFactory,
+                     child: &harw_types::SessionId|
+         -> TestResult<(harw_knowledge::AgentId, harw_core::ChildSessionObservers)> {
+            factory.announce_child_session(role_names::EXPLORER, child);
+            let _registry = factory
+                .build_registry(role_names::EXPLORER, &test_spawn_input(), None)
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            let agent = factory
+                .pending_run_identity(role_names::EXPLORER)
+                .ok_or(TestError::Missing("vorgemerkte Identität"))?
+                .agent_id
+                .clone();
+            let observers = factory.child_session_observers(role_names::EXPLORER, child);
+            Ok((agent, observers))
+        };
+        let compact = |observers: &harw_core::ChildSessionObservers,
+                       child: &harw_types::SessionId,
+                       summary: &str|
+         -> TestResult {
+            let observer = observers
+                .compaction
+                .as_ref()
+                .ok_or(TestError::Missing("compaction observer"))?;
+            observer.on_compacted(
+                child,
+                &harw_core::CompactionOutcome {
+                    tokens_before: 80_000,
+                    tokens_after: 9_000,
+                    summarized: true,
+                    summary_text: Some(summary.to_owned()),
+                    ..harw_core::CompactionOutcome::default()
+                },
+            );
+            Ok(())
+        };
+
+        // Vor dem Absturz: das Kind schreibt einen Eintrag in sein Tagebuch.
+        let child = harw_types::SessionId::new();
+        let (before, observers) = admit(&new_process()?, &child)?;
+        compact(&observers, &child, "Vor dem Absturz: Module kartiert.")?;
+        assert_eq!(diary_entries(&store, before.as_str(), at)?.len(), 1);
+
+        // Durable Wiederherstellung: neuer Prozess, dieselbe Kind-Sitzung.
+        let restarted = new_process()?;
+        let (after, observers) = admit(&restarted, &child)?;
+        assert_eq!(
+            after, before,
+            "dieselbe Wissens-Identität nach dem Neustart"
+        );
+        let prior = diary_entries(&store, after.as_str(), at)?;
+        assert!(
+            prior
+                .iter()
+                .any(|entry| entry.text.contains("Vor dem Absturz")),
+            "das wiederhergestellte Kind liest seinen Eintrag von vor dem Absturz: {prior:?}"
+        );
+        compact(&observers, &child, "Nach der Wiederherstellung: weiter.")?;
+        assert_eq!(
+            diary_entries(&store, after.as_str(), at)?.len(),
+            2,
+            "das Kind schreibt im selben Tagebuch weiter"
+        );
+
+        // Ein Geschwister derselben Rolle hat ein eigenes Tagebuch.
+        let sibling_session = harw_types::SessionId::new();
+        let (sibling, sibling_observers) = admit(&restarted, &sibling_session)?;
+        assert_ne!(sibling, after);
+        assert!(
+            diary_entries(&store, sibling.as_str(), at)?.is_empty(),
+            "das Geschwister sieht das Tagebuch des Kindes nicht"
+        );
+        compact(
+            &sibling_observers,
+            &sibling_session,
+            "Eigene Notiz des Geschwisters.",
+        )?;
+        assert_eq!(diary_entries(&store, sibling.as_str(), at)?.len(), 1);
+        assert_eq!(diary_entries(&store, after.as_str(), at)?.len(), 2);
         Ok(())
     }
 
