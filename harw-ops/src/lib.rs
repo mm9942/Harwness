@@ -117,10 +117,13 @@
 //! Controller-Kreis — Recherche erzeugt Findings, `plan reconcile` macht
 //! Evidenz daraus, `goal check` wertet sie gegen die Kriterien aus.
 //!
-//! **Intent-Zyklus-Fläche** ([`register_intent_cycle_tools`], 3 Ops, hinter
+//! **Intent-Zyklus-Fläche** ([`register_intent_cycle_tools`], 5 Ops, hinter
 //! demselben Gate): `intent_cycle.start`, `intent_cycle.status`,
-//! `intent_cycle.stop` (PL-90, siehe `intent_cycle`-Moduldoku). Ebenfalls
-//! nur Modell-Tool- und Web-Flächen.
+//! `intent_cycle.list`, `intent_cycle.stop` (PL-90, siehe
+//! `intent_cycle`-Moduldoku) mit Modell-Tool- und Web-Flächen sowie die
+//! reine Befehls-Operation `intent_cycle` (`/cycle list|status|stop`, nur
+//! TUI/CLI, Operator-Stufe). Das Modell stoppt einen Zyklus weiterhin nur über
+//! das freigabepflichtige `intent_cycle.stop`.
 //!
 //! **WorkDriver-Fläche** ([`register_work_driver_tools`], 3 Ops, hinter
 //! demselben Gate): `work_driver.enqueue`, `work_driver.status`,
@@ -257,8 +260,8 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod usage;
-// PL-90: `intent_cycle.*` (start/status/stop) — dauerhafte, nur lesende
-// Intent-Zyklen; registriert über `register_intent_cycle_tools`.
+// PL-90: `intent_cycle.*` (start/status/list/stop) und `/cycle` — dauerhafte,
+// nur lesende Intent-Zyklen; registriert über `register_intent_cycle_tools`.
 pub mod intent_cycle;
 pub mod work;
 pub mod work_result;
@@ -663,7 +666,8 @@ register_ops! {
 /// Gate wie die Planungsfläche.
 ///
 /// # Beschreibung
-/// Fügt `intent_cycle.start`, `intent_cycle.status` und `intent_cycle.stop`
+/// Fügt `intent_cycle.start`, `intent_cycle.status`, `intent_cycle.list`,
+/// `intent_cycle.stop` und die Befehls-Operation `intent_cycle` (`/cycle`)
 /// hinzu (siehe [`intent_cycle`]-Moduldoku). Ist `[tools.plan] enabled` aus,
 /// wird nichts registriert. Die Runtime ruft diese Funktion direkt nach
 /// [`register_work_driver_tools`] auf.
@@ -702,12 +706,15 @@ pub fn register_intent_cycle_tools(
 }
 
 register_ops! {
-    /// Anzahl der Operationen, die [`register_intent_cycle_tools`] bei aktivem Gate hinzufügt.
+    /// Anzahl der Operationen, die [`register_intent_cycle_tools`] bei aktivem Gate hinzufügt
+    /// (fünf: `intent_cycle.start`/`.status`/`.list`/`.stop` und `intent_cycle` für `/cycle`).
     pub const INTENT_CYCLE_TOOL_COUNT;
     fn intent_cycle_ops = [
         Arc::new(intent_cycle::IntentCycleStartOperation),
         Arc::new(intent_cycle::IntentCycleStatusOperation),
+        Arc::new(intent_cycle::IntentCycleListOperation),
         Arc::new(intent_cycle::IntentCycleStopOperation),
+        Arc::new(intent_cycle::IntentCycleCommandOperation),
     ];
 }
 
@@ -840,6 +847,12 @@ mod tests {
             ApprovalPolicy::None,
         ),
         (
+            "intent_cycle.list",
+            "/api/intent-cycle/list",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
+        (
             "intent_cycle.stop",
             "/api/intent-cycle/stop",
             WebMethod::Post,
@@ -947,7 +960,10 @@ mod tests {
             ("work_driver.stop", PermissionTier::Operator),
             ("intent_cycle.start", PermissionTier::Operator),
             ("intent_cycle.status", PermissionTier::Observer),
+            ("intent_cycle.list", PermissionTier::Observer),
             ("intent_cycle.stop", PermissionTier::Operator),
+            // Reine Befehls-Operation (`/cycle`): ohne Web-Fläche, daher nur hier.
+            ("intent_cycle", PermissionTier::Operator),
         ];
         for (name, tier) in expected_permissions {
             let op = reg.find_by_name(name.trim()).ok_or_else(|| {
@@ -1091,6 +1107,62 @@ mod tests {
                 "{name} darf keine Command-Fläche tragen (kein TUI-Befehl)"
             );
         }
+    }
+
+    #[test]
+    fn register_intent_cycle_tools_follows_the_plan_gate_and_only_the_cycle_op_has_a_command() {
+        let mut reg = OperationRegistry::new();
+        register_all(&mut reg);
+        let before = reg.len();
+
+        let closed = super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::default());
+        assert_eq!(closed, 0, "geschlossenes Gate darf nichts registrieren");
+        assert_eq!(reg.len(), before);
+        assert!(
+            reg.find_by_command("/cycle").is_none(),
+            "/cycle darf bei geschlossenem Gate nicht auffindbar sein"
+        );
+
+        let added =
+            super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        assert_eq!(added, super::INTENT_CYCLE_TOOL_COUNT);
+        assert_eq!(super::INTENT_CYCLE_TOOL_COUNT, 5);
+        assert_eq!(reg.len(), before + super::INTENT_CYCLE_TOOL_COUNT);
+
+        // `/cycle` löst auf die Befehls-Operation `intent_cycle` auf ...
+        assert_eq!(
+            reg.find_by_command("/cycle").map(|op| op.meta().name),
+            Some("intent_cycle")
+        );
+        // ... die übrigen vier Zyklus-Operationen tragen keine Befehlsfläche ...
+        for name in [
+            "intent_cycle.start",
+            "intent_cycle.status",
+            "intent_cycle.list",
+            "intent_cycle.stop",
+        ] {
+            let op = reg.find_by_name(name);
+            assert!(op.is_some(), "{name} wurde nicht registriert");
+            assert!(
+                op.is_some_and(|op| !op
+                    .meta()
+                    .surfaces
+                    .iter()
+                    .any(|surface| matches!(surface, Surface::Command { .. }))),
+                "{name} darf keine Command-Fläche tragen"
+            );
+        }
+        // ... und die Befehls-Operation ist für das Modell unerreichbar: nur
+        // Befehlsfläche, kein Modell-Tool, keine Web-Route.
+        let command = reg.find_by_name("intent_cycle");
+        assert!(
+            command.is_some_and(|op| op
+                .meta()
+                .surfaces
+                .iter()
+                .all(|surface| matches!(surface, Surface::Command { .. }))),
+            "intent_cycle darf nur eine Command-Fläche tragen"
+        );
     }
 
     #[test]
@@ -1276,7 +1348,9 @@ mod tests {
             "work_driver.stop",
             "intent_cycle.start",
             "intent_cycle.status",
+            "intent_cycle.list",
             "intent_cycle.stop",
+            "intent_cycle",
         ];
 
         for name in declared_names {
