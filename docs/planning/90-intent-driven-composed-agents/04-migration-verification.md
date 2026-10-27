@@ -38,10 +38,10 @@ Proof: fake README versus source truth, surprise dependency boundary, symlink/ou
 
 Before widening orchestration, implement [05 — Error Learning & Agent Run Isolation](05-error-learning-and-run-isolation.md) as **two small separate waves**:
 
-- **W03c (PLANNED):** classify admission, executor, provider and reconciliation failures into typed non-secret run observations; atomically persist a bounded, epoch-fenced outbox **in the same CycleStore transaction as a committed checkpoint**. Do not write global memory from CycleDriver, do not count unverified fixes, and never retry an uncertain external effect blindly.
-- **W03d (PLANNED):** trusted run/agent/session principal through the job/child boundary; enforce per-session STM and independently assembled per-run context. A parent receives only an authorized bounded return, siblings receive no private history. Audit MemoryContextProvider session matching and bulk project/global fact injection; make child retrieval explicit and policy checked, with root compatibility governed separately.
+- **W03c (PARTIAL: library landed, driver integration PLANNED):** classify admission, executor, provider and reconciliation failures into typed non-secret run observations; atomically persist a bounded, epoch-fenced outbox **in the same CycleStore transaction as a committed checkpoint**. Do not write global memory from CycleDriver, do not count unverified fixes, and never retry an uncertain external effect blindly.
+- **W03d (CURRENT for identity, recall and the parent boundary; per-session STM enforcement is a library contract; limitations in 05 §4):** trusted run/agent/session principal through the job/child boundary; enforce per-session STM and independently assembled per-run context. A parent receives only an authorized bounded return, siblings receive no private history. Audit MemoryContextProvider session matching and bulk project/global fact injection; make child retrieval explicit and policy checked, with root compatibility governed separately.
 
-The existing W03 code and tests do **not** implement these subwaves. Cross-run learning consumption and promotion remain W09a–W09c.
+The W03 cycle code itself does **not** yet implement the W03c driver integration; the W03d pieces live in `harw-knowledge`, `harw-ops`, `harw-research`, `harw-core-bridge` and `harw-runtime`. Cross-run learning consumption and promotion remain W09a–W09c.
 
 Proof: different agents cannot share STM/transcripts via provider reuse or the same trace; stale lease cannot append or ack learning; a crash between commit/delivery is idempotent; forbidden actions never become learned permissions; no context growth with sibling count. Keep current W01–W03 tests and arch gates green.
 
@@ -133,7 +133,7 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 11. How intent-driven writes request expansion of path scope without silently violating original acceptance contract.
 12. Trace/event schema that makes graph evolution understandable in TUI/Web/Telegram while hiding secret material.
 
-**Additional PL-90 status note (2026-10-08):** W03c, W03d and W09a–W09c are **PLANNED ONLY**; this PR currently contains no durable learning outbox or production cross-run memory consumer. The new [05 addendum](05-error-learning-and-run-isolation.md) introduces evidence-based gates, not a tested feature.
+**Additional PL-90 status note (2026-10-08, updated 2026-10-27):** W09a–W09c are **PLANNED ONLY**; this PR contains no production cross-run memory consumer. The W03c outbox **library** has landed (`cycle_observation.rs`, `cycle_outbox.rs`, §7.7) but `CycleDriver` does not call it yet; the driver integration (observations built at refusal, step failure and reconciliation, persisted in the same `CycleStore` commit as the checkpoint) follows in the outbox wave, so there is still no durable learning outbox in a running cycle. W03d is **CURRENT** with documented limitations (identity-bound recall, parent envelope sanitizer, root-only facts pinned by test; see [05 §4](05-error-learning-and-run-isolation.md)). The [05 addendum](05-error-learning-and-run-isolation.md) still introduces evidence-based gates for the unfinished parts, not a tested learning feature.
 
 ## 7. Implementation status
 
@@ -206,7 +206,8 @@ Proposer cancellation: the driver races every `propose` against the job's cancel
 
 ### 7.5 Not done (PLANNED)
 
-- No concrete executor for tools beyond file reads, waits and the content verifier, child spawn or nested recipes; no write-capable adapter (W05). W04 is open.
+- No concrete executor for tools beyond file reads, waits and the content verifier; no child spawn or nested recipes.
+- W05 is PARTIAL — `harw-plan-bridge::cycle_write_admission` (trusted `PatchProposal::from_admitted` + `admit_patch`: WriteWorkspace right, admitted target, scope-safe path, target→path re-check, preimage re-read) and `harw-plan-bridge::file_lease` (per-job, epoch-fenced, all-or-nothing file reservations) landed; there is still no write executor, `ReadOnlyCycleSpec` still forces empty write targets, and no production caller grants WriteWorkspace to a cycle. W04 is PARTIAL (compact offers), see §7.7.
 - No small-model benchmark (W03 exit criterion).
 - Network-scope widening on resume is checked; the test is scheduled with the proposer-correctness wave (`resume_refuses_widened_network_scope`).
 
@@ -224,16 +225,29 @@ Proposer cancellation: the driver races every `propose` against the job's cancel
 | Module | Contract | Missing integration step |
 |---|---|---|
 | `harw-plan-bridge/src/cycle_observation.rs` (`RunObservationV1`, typed classifiers) + `cycle_outbox.rs` (epoch-fenced `Outbox<T>`, 64 pending / 128 acked tail) | W03c (05 §3) | build observations in `CycleDriver` at refusal/step failure/reconciliation; persist `Outbox<RunObservationV1>` in the same `CycleStore` CAS commit as the checkpoint |
-| `harw-plan-bridge/src/child_return_envelope.rs` | W03d-3 (05 §2.2) | contract for future `Segment::Child` steps; the production child→parent path is `harw-research::return_envelope` |
-| `harw-extension-api/src/target_offer.rs` | W04 (top-k role offers) | feed `DelegationTargets` and the orchestrator prompt |
+| `harw-plan-bridge/src/child_return_envelope.rs` | W03d-3 (05 §2.2) — **CURRENT (wired: the production child→parent path is `harw-research::return_envelope::sanitize_for_parent`, called from the `ReturnEnvelope` contract arm in `harw-core-bridge/src/agent_tool.rs`; limit violations are content-free contract violations, an over-long summary is truncated and flagged)** | this module stays the contract for future `Segment::Child` steps and has no production caller; its caps are pinned equal to the research gate by `caps_match_harw_research_envelope_caps` |
+| `harw-extension-api/src/target_offer.rs` | W04 (top-k role offers) — **PARTIAL** | PARTIAL — compact offers rendered for large target lists (`DelegationTargets::offers` feeds the `delegation.targets` block in `harw-core/src/turn_loop.rs`; the tool schema and admission are unchanged); DAG-change tool, reconciliation, capability snapshot still PLANNED |
 | `harw-plan-bridge/src/cycle_benchmark.rs` | W03 exit (small-model benchmark scoring) | benchmark harness and fixtures |
-| `harw-knowledge/src/caller_identity.rs` | W03d-2 (05 §1) | build `CallerIdentity` at admission; use `is_visible` in recall |
+| `harw-knowledge/src/caller_identity.rs` | W03d-2 (05 §1) — **CURRENT (wired: `RecallQuery::with_caller_identity` and `artifact_visible` decide recall and index visibility by identity; `KnowledgeCaller::from_context` reads the `Arc<CallerIdentity>` service; `RuntimeChildRegistryFactory::child_caller_identity` mints one per child into the `OpContext` services of its operation tools)** | limitations (05 §4): `ancestors` stay empty because `SpawnInput` has no parent role (needs a trusted spawn record); ids are role-bound; the root `ServiceMap` carries no identity; child knowledge readers (`diary.read`, `palace.*`, …) run outside `OpContext` |
 | `harw-knowledge/src/learning_recall.rs` | W09b (05 §2.3) | retrieval path calling `select_lessons` |
-| `harw-memory/src/context_provider.rs::with_session_gate` | W03d-1 (05 §1) | contract for future STM mounts; `MemoryContextProvider` currently has no production caller (root uses a facts-only provider, children mount none) |
+| `harw-memory/src/context_provider.rs::with_session_gate` | W03d-1 (05 §1) — **CURRENT (library contract; root-only facts policy wired and pinned)**: with the opt-in gate a foreign session's STM contributes nothing | no production caller: `MemoryContextProvider` is not mounted (the root uses the facts-only `MemoryFactsContextProvider`, root-only by explicit policy and pinned by `child_registry_has_no_memory_facts_provider`; children mount none); a future STM mount must enable the gate |
 | `harw-model-catalog/src/lifecycle.rs` | PL-86 D1/D5 | router and explicit selection consult it (D3) |
 | `harw-tui-layout/src/mini_live.rs`, `harw-tui/src/{live_ranker,recency_view}.rs` | PL-94 W02 U0 / W01 M2b | mount in the TUI renderer |
 | `harw-job-linux/src/inventory.rs` | linux-user-cloud-control H04/H05 | procfs/DoD source |
 
 These modules compile and are tested, but have no production caller; they are not evidence of the corresponding wave being complete.
+
+### 7.8 W05 crosswalk (draft): Gap-Hunt gates → cycle transitions
+
+This is the state-to-transition crosswalk that §2 W05 requires before porting, and it is a draft.
+
+| Gap-Hunt gate | Cycle transition / check |
+|---|---|
+| `gap-fix` single file | `ProposePatch` + `admit_patch` |
+| `contract-wave` | `MultiFile` refused in slice 1 |
+| `change=false` entries | future `WriteTargetMap` entries with no patch |
+| ripple `clear\|skipped\|findings\|missing` | future `Verify` / `Reorient` |
+| frozen-SHA central gate | future `Verify` with pinned digest |
+| human-only achievement | `CompletionProposed` stays owner-accepted |
 
 The comparison to Claude Code remains limited to repository-visible workflows (Gap-Hunt kit), **not a claim about Anthropic's internal implementation**.

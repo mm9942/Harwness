@@ -104,7 +104,9 @@ pub mod cycle_proposer;
 pub mod cycle_runtime;
 pub mod cycle_spec;
 pub mod cycle_verifier;
+pub mod cycle_write_admission;
 pub mod error;
+pub mod file_lease;
 pub mod finding_store;
 pub mod fragment_registry;
 pub mod goal_context;
@@ -152,7 +154,14 @@ pub use crate::cycle_spec::{
 pub use crate::cycle_verifier::{
     AcceptanceChecks, CheckError, ContentCheck, ExplorerCycleExecutor, MAX_ACCEPTANCE_CHECKS,
 };
+pub use crate::cycle_write_admission::{
+    AdmittedPatch, PatchProposal, PatchRefusal, WriteTargetError, WriteTargetMap, admit_patch,
+};
 pub use crate::error::{PlanBridgeError, PlanBridgeResult};
+pub use crate::file_lease::{
+    FILE_LEASE_DIR, FILE_LEASE_SCHEMA, FileLeaseRecord, FileLeaseRegistry, LeaseSet,
+    ReserveRefusal, lease_id_for,
+};
 pub use crate::finding_store::{
     FindingStore, evidence_for_finding, finding_locator, offset_from_timestamp,
 };
