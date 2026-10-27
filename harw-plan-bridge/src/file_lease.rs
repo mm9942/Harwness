@@ -43,9 +43,10 @@
 //! One claim cannot be named: a record written before membership existed has
 //! holders that no caller can ever name. The next same-holder reserve adds the
 //! single claim `"untracked"` (at the record's epoch), which no rollback ends;
-//! only [`FileLeaseRegistry::release`] frees such a record. Records of the two
-//! earlier layouts (a single `reservation` id; a list of `reservations`) are
-//! read as claims at the record's epoch and rewritten in the current layout by
+//! only [`FileLeaseRegistry::release`] frees such a record. Records of the
+//! earlier layouts (a single `reservation` id; a list of `reservations`; a
+//! numeric `overflow` count shared by all counted calls) are read as claims or
+//! counts at the record's epoch and rewritten in the current layout by
 //! the next mutation.
 //!
 //! # Holders and fencing
@@ -141,7 +142,7 @@ const UNTRACKED_MEMBER: &str = "untracked";
 
 /// One reserved path.
 ///
-/// Deserialization accepts the current layout and the two earlier ones (see
+/// Deserialization accepts the current layout and the three earlier ones (see
 /// the module docs); anything else, including unknown fields, is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileLeaseRecord {
