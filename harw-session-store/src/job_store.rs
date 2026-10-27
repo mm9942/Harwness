@@ -330,6 +330,42 @@ impl JobStore {
         })
     }
 
+    /// Verifies, without renewing or writing anything, that `token` is the
+    /// current, non-expired lease of its job.
+    ///
+    /// Same lease checks as [`JobStore::record_usage`] — the job is not
+    /// terminal, the token matches the current lease (nonce and fencing
+    /// epoch) and the lease has not expired at `Timestamp::now()` — but
+    /// read-only: the record is read like [`JobStore::get`] and nothing is
+    /// persisted, so the lease is neither extended nor its revision bumped.
+    /// The read takes no record lock on purpose: records are replaced
+    /// atomically (temp + rename), so it sees exactly one committed revision,
+    /// while the per-record try-lock would refuse with
+    /// [`SessionStoreError::JobLockContended`] whenever the holder's own
+    /// heartbeat renews at the same moment and turn a live lease into a
+    /// spurious refusal. The verdict is a point-in-time answer either way; a
+    /// caller that must cover a side effect with it consults it inside its
+    /// own atomic commit (the intent-cycle store does so under its record
+    /// lock).
+    ///
+    /// # Errors
+    /// [`SessionStoreError::JobNotFound`],
+    /// [`SessionStoreError::JobAlreadyTerminal`],
+    /// [`SessionStoreError::LeaseTokenMismatch`] (no lease, another nonce or
+    /// epoch), [`SessionStoreError::JobLeaseExpired`], or a read error.
+    pub fn verify_lease(&self, token: &LeaseToken) -> SessionStoreResult<()> {
+        let mut record = self.get(&token.work_id)?;
+        if mechanics::is_terminal(record.job.state) {
+            return Err(SessionStoreError::JobAlreadyTerminal {
+                work_id: token.work_id.clone(),
+                state: record.job.state,
+            });
+        }
+        // Prüft nur die In-Memory-Kopie; nichts wird zurückgeschrieben.
+        mechanics::verify_lease(&mut record, token, Timestamp::now())?;
+        Ok(())
+    }
+
     /// Completes a Running job exactly once with the current non-expired lease.
     pub fn complete(
         &self,
@@ -2117,6 +2153,116 @@ mod tests {
             Err(SessionStoreError::LeaseTokenMismatch { .. })
         ));
         assert_eq!(store.get(&work_id)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_lease_accepts_the_live_claim_and_writes_nothing() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-verify-live");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let before = store.get(&work_id)?;
+        let events_after_claim = recorded_events(&sink).len();
+
+        store.verify_lease(&claim.token)?;
+        store.verify_lease(&claim.token)?;
+
+        assert_eq!(store.get(&work_id)?, before, "verification writes nothing");
+        assert_eq!(recorded_events(&sink).len(), events_after_claim);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_lease_refuses_an_expired_claim_before_any_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-verify-expired");
+        let past = Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(120))
+            .map_err(ctx("now - 120s"))?;
+        store.admit(&StoredJob {
+            not_before: past,
+            ..record(work_id.as_str())?
+        })?;
+        // Zwei Minuten alter Claim mit 1 s TTL: jetzt abgelaufen, aber nie
+        // reclaimed — Epoche und Nonce sind weiterhin die des Datensatzes.
+        let claim = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now: past,
+            },
+        )?;
+        let before = store.get(&work_id)?;
+        assert_eq!(before.job.state, JobState::Running);
+        assert_eq!(before.lease_epoch, claim.token.epoch);
+        assert_eq!(
+            before.lease.as_ref().map(Lease::token),
+            Some(claim.token.clone()),
+            "the expired lease is still the recorded one"
+        );
+
+        assert!(matches!(
+            store.verify_lease(&claim.token),
+            Err(SessionStoreError::JobLeaseExpired { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before, "a refusal writes nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_lease_refuses_foreign_tokens_and_finished_jobs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-verify-foreign");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let before = store.get(&work_id)?;
+
+        let wrong_nonce = LeaseToken {
+            nonce: "forged-nonce".to_owned(),
+            ..claim.token.clone()
+        };
+        assert!(matches!(
+            store.verify_lease(&wrong_nonce),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let older_epoch = LeaseToken {
+            epoch: claim.token.epoch.saturating_sub(1),
+            ..claim.token.clone()
+        };
+        assert!(matches!(
+            store.verify_lease(&older_epoch),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let unknown_job = LeaseToken {
+            work_id: WorkId::from_str("work-verify-missing"),
+            ..claim.token.clone()
+        };
+        assert!(matches!(
+            store.verify_lease(&unknown_job),
+            Err(SessionStoreError::JobNotFound { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before, "refusals write nothing");
+
+        store.complete(
+            &work_id,
+            &CompleteRequest {
+                token: claim.token.clone(),
+                completed_at: Timestamp::now(),
+                outcome: JobOutcome::Succeeded {
+                    result: serde_json::json!({}),
+                },
+            },
+        )?;
+        assert!(matches!(
+            store.verify_lease(&claim.token),
+            Err(SessionStoreError::JobAlreadyTerminal { .. })
+        ));
         Ok(())
     }
 

@@ -89,13 +89,18 @@
 //! the store loads the record, fences it against the caller's lease (stale
 //! epoch, another job, not yet rebound are refused) and hands out the
 //! in-flight step begun under that lease together with the checkpoint it was
-//! admitted against. Evidence therefore enters a proposal only through what
-//! the store holds: the record the trusted runtime created (a nested seed may
-//! carry its parent's evidence) and the fenced commit path
+//! admitted against. Evidence enters a proposal only through what the store
+//! holds: the record the trusted runtime created (a nested seed may carry
+//! its parent's evidence) and the fenced commit path
 //! ([`CycleStore::commit_step`](crate::cycle_runtime::CycleStore::commit_step),
 //! fed by the trusted executor's observations). What stays trusted is record
-//! creation and the store directory itself: whoever can create records or
-//! write the record files can write any checkpoint.
+//! creation, the `next` checkpoint handed to `commit_step` (the store fences
+//! it by identity, authority, ceiling and epoch/sequence order, it does not
+//! re-derive its evidence) and the store directory itself: whoever can create
+//! records, commit checkpoints under the job's lease or write the record files
+//! can write any checkpoint. The proof relies on holding the job's lease;
+//! the worker additionally binds every fenced store operation to the live
+//! job-store lease (nonce and expiry) through the store's liveness check.
 //!
 //! [`admit_patch`] still re-checks against the *current* trusted inputs it is
 //! given, because they can differ from those at construction time: the intent

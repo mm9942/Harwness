@@ -69,10 +69,32 @@
 //! whatever its result (wall-clock timeout included), the pending
 //! observations are drained once into project pitfall facts and acknowledged
 //! under the claim's lease; that also settles entries an earlier claim left
-//! between commit and acknowledgement. There is no drain before the run: the
-//! store fence needs the rebound lease, which only exists after the driver
-//! ran. Store access runs on blocking threads; a drain or recall failure is
-//! only logged and never changes the job outcome.
+//! between commit and acknowledgement, including those it committed with a
+//! terminal step: the driver rebinds the cycle to the claim's lease before it
+//! returns, for an already terminal cycle too (only the fence epoch moves; no
+//! step runs). There is no drain before the run: the store fence needs the
+//! rebound lease, which only exists after the driver ran. A run that ended
+//! before its rebind (refused reissue, resume or rebind, or the timeout)
+//! leaves the drain refused (`NotRebound`) and the entries pending for the
+//! next claim. Store access runs on blocking threads; a drain or recall
+//! failure is only logged and never changes the job outcome.
+//!
+//! # Fenced to the live claim
+//! The cycle store is opened with a lease liveness check
+//! ([`CycleStore::with_lease_liveness`]) backed by
+//! [`JobStore::verify_lease`]: every fenced read and write — the driver's
+//! rebind, journal and commits as well as the drain's read and
+//! acknowledgement — first proves that the claim's token is still the
+//! current, non-expired job lease (read-only; nothing is renewed). The epoch
+//! fence alone would still admit an expired lease until a reclaim rebinds
+//! the cycle. So once the job lease has expired or been revoked (lost
+//! heartbeat, operator cancellation), the driver's next write fails closed
+//! and the drain learns nothing — whichever way the run ended, cancellation
+//! and wall-clock timeout included; the observations stay pending for the
+//! claim that takes over.
+//! The drain acknowledges before it writes any fact, so the lease-fenced
+//! acknowledgement is the commit of every lesson (see
+//! `intent_cycle_learning::drain_cycle_observations`).
 //!
 //! # Workspace binding
 //! The ceiling is cut from the worker's `runtime_root.cwd`. `claim.scope`
@@ -95,8 +117,8 @@ use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
     CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleRunError, CycleStore,
     CycleStoreError, DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, ExplorerCycleExecutor,
-    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, ModelCycleProposer, ProposerRoute, RoutePolicy,
-    job_outcome, warm_cache,
+    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, LeaseLivenessCheck, ModelCycleProposer,
+    ProposerRoute, RoutePolicy, job_outcome, warm_cache,
 };
 use harw_session_store::JobStore;
 use harw_types::{ModelId, SessionId};
@@ -220,8 +242,10 @@ pub(super) async fn execute_intent_cycle_claim(
         };
     };
 
+    // Fenced to the live claim, not only to its epoch (see "Fenced to the
+    // live claim"): the driver and the learning drain share this store.
     let store = match CycleStore::open_in_job_root(job_store.root()) {
-        Ok(store) => Arc::new(store),
+        Ok(store) => Arc::new(store.with_lease_liveness(lease_liveness(&job_store))),
         Err(error) => {
             return JobOutcome::Failed {
                 reason: sanitize_failure(&format!("intent-cycle store unavailable: {error}")),
@@ -361,6 +385,20 @@ pub(super) async fn execute_intent_cycle_claim(
     sanitize_outcome(outcome)
 }
 
+/// Liveness check of the cycle store: the presented token must still be the
+/// current, non-expired lease of its job ([`JobStore::verify_lease`], which
+/// reads the job record and writes nothing). Any error — expired, revoked,
+/// replaced, terminal or unreadable — refuses the cycle operation (fail
+/// closed).
+pub(super) fn lease_liveness(job_store: &Arc<JobStore>) -> LeaseLivenessCheck {
+    let job_store = Arc::clone(job_store);
+    Arc::new(move |token: &LeaseToken| {
+        job_store
+            .verify_lease(token)
+            .map_err(|error| error.to_string())
+    })
+}
+
 /// Wall time left for this claim: `max_wall - used`, `None` once nothing is
 /// left (never a fresh default); [`DEFAULT_CYCLE_WALL`] only without a budget.
 fn remaining_wall(
@@ -463,7 +501,14 @@ async fn warm_after_takeover(
 /// refused (`NotRebound`). The drain after the run also settles entries an
 /// earlier incarnation committed but did not acknowledge: after the rebind
 /// they are pending under the new fence and are acknowledged under the new
-/// token.
+/// token. That includes a cycle the earlier incarnation already ended:
+/// `CycleDriver::run` hands a terminal record over to a newer lease before
+/// it returns `Terminal`. A run that ended before its rebind leaves the drain
+/// refused (`NotRebound`) and the entries pending for the next claim.
+/// `store` carries the claim's liveness check: if the job lease expired or
+/// was revoked meanwhile, the read and the acknowledgement are refused and no
+/// lesson is written, whichever way the run ended (cancellation and timeout
+/// included).
 async fn drain_learning(
     store: &Arc<CycleStore>,
     cycle_id: &str,
