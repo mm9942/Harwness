@@ -29,6 +29,23 @@
 //! - **Jobs:** [`cycle_job_operation`] plugs a driver into
 //!   `harw_core::DurableJobRunner`, which owns claim, heartbeat, lease-loss
 //!   cancellation and the terminal job commit.
+//! - **Observations (W03c):** the driver classifies what went wrong in a
+//!   step (refused proposals, executor and proposer failures, an uncertain
+//!   recovery, unmet or stale verification claims) into typed, text-free
+//!   [`RunObservationV1`]s. They are written into the record's bounded
+//!   [`Outbox`] in the *same locked write* as the step's checkpoint
+//!   ([`CycleStore::commit_step_observed`]), so an observation exists exactly
+//!   when its transition does. Append and acknowledgement are epoch-fenced
+//!   like every other write; at most
+//!   [`MAX_OUTBOX_PENDING`](crate::cycle_outbox::MAX_OUTBOX_PENDING) are
+//!   pending, newer ones are dropped and counted in
+//!   [`CycleRecord::observations_dropped`] but never refuse the checkpoint
+//!   commit. The consumer is a job-local drain (wave 4) that reads
+//!   [`CycleStore::pending_observations`] and acknowledges delivered keys
+//!   with [`CycleStore::ack_observations`]; redelivery after a crash is
+//!   idempotent. Fence refusals cannot be recorded in the record they are
+//!   refused for, so the driver only logs them (classified via
+//!   [`classify_fence`]).
 //!
 //! Not in this module: which tools, child agents or model routes an executor
 //! uses (W03+), and goal acceptance — a `CompletionProposed` cycle is a
@@ -49,6 +66,11 @@ use harw_types::WorkId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+use crate::cycle_observation::{
+    CauseCode, ObservationCategory, RunObservationV1, build_observation, classify_fence,
+    classify_reconciliation, classify_refusal, classify_step_failure, classify_verification,
+};
+use crate::cycle_outbox::{Outbox, OutboxEntry, OutboxError};
 use crate::intent_cycle::{
     AdmittedCycle, CycleAdmission, CycleCheckpoint, CycleObservations, CycleProposal, CycleRefusal,
     CycleTerminal, FenceRefusal, ObservationError, ResumeRefusal, admit_cycle, apply_observations,
@@ -93,6 +115,14 @@ pub struct CycleRecord {
     pub work_id: WorkId,
     pub checkpoint: CycleCheckpoint,
     pub in_flight: Option<InFlightStep>,
+    /// Typed run observations committed together with the checkpoint and not
+    /// yet acknowledged by the downstream drain (W03c). Records written
+    /// before W03c have no such field and load with an empty outbox.
+    #[serde(default)]
+    pub outbox: Outbox<RunObservationV1>,
+    /// Observations dropped because the outbox was full at commit time.
+    #[serde(default)]
+    pub observations_dropped: u32,
 }
 
 impl StoreRecord for CycleRecord {
@@ -129,6 +159,8 @@ impl CycleRecord {
             work_id,
             checkpoint,
             in_flight: None,
+            outbox: Outbox::new(),
+            observations_dropped: 0,
         })
     }
 
@@ -152,6 +184,8 @@ impl CycleRecord {
                 .as_ref()
                 .map(|step| step.idempotency_key.clone()),
             terminal: checkpoint.terminal,
+            pending_observations: self.outbox.len(),
+            observations_dropped: self.observations_dropped,
         }
     }
 }
@@ -171,6 +205,10 @@ pub struct CycleStatus {
     pub criteria_covered: Vec<String>,
     pub in_flight: Option<String>,
     pub terminal: Option<CycleTerminal>,
+    /// Observations committed but not yet acknowledged (W03c).
+    pub pending_observations: usize,
+    /// Observations dropped because the outbox was full (W03c).
+    pub observations_dropped: u32,
 }
 
 /// Failures of [`CycleStore`] operations.
@@ -329,6 +367,8 @@ impl CycleStore {
 
     /// Commits the outcome of the journaled step and clears the journal.
     ///
+    /// Same as [`CycleStore::commit_step_observed`] without observations.
+    ///
     /// # Errors
     /// [`CycleStoreError`] for a foreign or stale lease, a missing or
     /// mismatching journaled step, or a [`check_commit`] refusal.
@@ -337,6 +377,28 @@ impl CycleStore {
         cycle_id: &str,
         token: &LeaseToken,
         next: &CycleCheckpoint,
+    ) -> Result<(), CycleStoreError> {
+        self.commit_step_observed(cycle_id, token, next, &[])
+    }
+
+    /// [`CycleStore::commit_step`] plus the step's `observations`, in the
+    /// same locked write.
+    ///
+    /// Each observation is appended to the record's outbox under its
+    /// [`dedupe_key`](crate::cycle_observation::ObservationEventId::dedupe_key),
+    /// so replaying a commit never duplicates one. A full outbox drops the
+    /// newest observations (counted in [`CycleRecord::observations_dropped`])
+    /// but never refuses the checkpoint commit.
+    ///
+    /// # Errors
+    /// [`CycleStoreError`] for a foreign or stale lease, a missing or
+    /// mismatching journaled step, or a [`check_commit`] refusal.
+    pub fn commit_step_observed(
+        &self,
+        cycle_id: &str,
+        token: &LeaseToken,
+        next: &CycleCheckpoint,
+        observations: &[RunObservationV1],
     ) -> Result<(), CycleStoreError> {
         self.records.update_locked(cycle_id, |record| {
             check_fenced(record, token)?;
@@ -350,7 +412,67 @@ impl CycleStore {
             check_commit(&record.checkpoint, next).map_err(CycleStoreError::Fence)?;
             record.checkpoint = next.clone();
             record.in_flight = None;
+            for observation in observations {
+                let entry = OutboxEntry {
+                    key: observation.event_id.dedupe_key(),
+                    epoch: token.epoch,
+                    sequence: next.fence.sequence,
+                    payload: observation.clone(),
+                };
+                match record
+                    .outbox
+                    .append(token.epoch, record.checkpoint.fence.epoch, entry)
+                {
+                    Ok(_) => {}
+                    Err(OutboxError::Full) => {
+                        record.observations_dropped = record.observations_dropped.saturating_add(1);
+                        tracing::warn!(cycle_id, "intent cycle observation dropped: outbox full");
+                    }
+                    Err(OutboxError::StaleEpoch) => {
+                        // Unreachable after `check_fenced`; counted like a
+                        // full outbox so the loss stays visible.
+                        record.observations_dropped = record.observations_dropped.saturating_add(1);
+                    }
+                }
+            }
             Ok(())
+        })
+    }
+
+    /// Observations committed but not yet acknowledged, in append order.
+    ///
+    /// # Errors
+    /// The underlying store error.
+    pub fn pending_observations(
+        &self,
+        cycle_id: &str,
+    ) -> Result<Vec<OutboxEntry<RunObservationV1>>, CycleStoreError> {
+        Ok(self.load(cycle_id)?.outbox.pending().to_vec())
+    }
+
+    /// Acknowledges delivered observations under `token`, fenced like every
+    /// other write. Returns how many pending entries were removed; unknown or
+    /// already acknowledged keys count as 0, so redelivery after a crash is
+    /// idempotent.
+    ///
+    /// # Errors
+    /// [`CycleStoreError`] for a foreign, stale or not yet rebound lease.
+    pub fn ack_observations(
+        &self,
+        cycle_id: &str,
+        token: &LeaseToken,
+        keys: &[String],
+    ) -> Result<usize, CycleStoreError> {
+        self.records.update_locked(cycle_id, |record| {
+            check_fenced(record, token)?;
+            let current = record.checkpoint.fence.epoch;
+            let mut removed = 0;
+            for key in keys {
+                if matches!(record.outbox.ack(token.epoch, current, key), Ok(true)) {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
         })
     }
 
@@ -618,6 +740,8 @@ pub struct CycleDriver<P, E> {
     executor: E,
     reissuer: Arc<dyn AuthorityReissuer>,
     config: CycleDriverConfig,
+    /// Observations of the step in progress; moved into the step's commit.
+    pending: Vec<RunObservationV1>,
 }
 
 impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
@@ -634,6 +758,7 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             executor,
             reissuer,
             config: CycleDriverConfig::default(),
+            pending: Vec::new(),
         }
     }
 
@@ -660,6 +785,8 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
         current: &CycleAdmission,
         cancel: &CancelToken,
     ) -> Result<CycleRunOutcome, CycleRunError> {
+        // Observations of an interrupted earlier run were never committed.
+        self.pending.clear();
         let id = cycle_id.to_owned();
         let mut record = self.blocking(move |store| store.load(&id)).await?;
         if let Some(terminal) = record.checkpoint.terminal {
@@ -683,7 +810,8 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             let (id, lease) = (cycle_id.to_owned(), token.clone());
             record = self
                 .blocking(move |store| store.rebind(&id, &lease, &resumed))
-                .await?;
+                .await
+                .inspect_err(|error| log_fence_refusal(cycle_id, error))?;
             self.executor.rebind_authority(&reissued);
             admission
         };
@@ -723,13 +851,29 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
                 Err(failure) if failure.retryable => {
                     return Err(CycleRunError::ProposerUnavailable(failure.reason));
                 }
-                Err(failure) => CycleProposal::Blocked {
-                    reason: format!(
-                        "proposer unavailable: {}",
-                        failure.reason.chars().take(400).collect::<String>()
-                    ),
-                },
+                Err(failure) => {
+                    // Only the proposal kind is used; the reason stays out.
+                    let kind = CycleProposal::Blocked {
+                        reason: String::new(),
+                    };
+                    self.observe(
+                        cycle_id,
+                        &checkpoint,
+                        &kind,
+                        classify_step_failure(&failure),
+                        &[],
+                    );
+                    CycleProposal::Blocked {
+                        reason: format!(
+                            "proposer unavailable: {}",
+                            failure.reason.chars().take(400).collect::<String>()
+                        ),
+                    }
+                }
             };
+            // `admit_cycle` consumes the proposal; a refusal is observed
+            // against what was proposed.
+            let attempted = proposal.clone();
             let admitted = match admit_cycle(&admission, &checkpoint, proposal) {
                 Ok(admitted) => {
                     last_refusal = None;
@@ -739,6 +883,13 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
                 Err(refusal) => {
                     refusals = refusals.saturating_add(1);
                     last_refusal = Some(refusal);
+                    self.observe(
+                        cycle_id,
+                        &checkpoint,
+                        &attempted,
+                        classify_refusal(refusal),
+                        &[],
+                    );
                     tracing::debug!(
                         cycle_id,
                         ?refusal,
@@ -760,16 +911,29 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             let (id, lease, journal) = (cycle_id.to_owned(), token.clone(), admitted.clone());
             let step = self
                 .blocking(move |store| store.begin_step(&id, &lease, &journal))
-                .await?;
+                .await
+                .inspect_err(|error| log_fence_refusal(cycle_id, error))?;
             let observations = if admitted.terminal().is_some() {
                 CycleObservations::default()
             } else {
-                match self
+                let executed = self
                     .executor
                     .execute(&step, &admission, &checkpoint, cancel)
-                    .await
-                {
-                    Ok(observations) => observations,
+                    .await;
+                match executed {
+                    Ok(observations) => {
+                        if let Some(class) = classify_verification(&observations) {
+                            let evidence_ids = verify_evidence_ids(admitted.proposal());
+                            self.observe(
+                                cycle_id,
+                                &checkpoint,
+                                admitted.proposal(),
+                                class,
+                                &evidence_ids,
+                            );
+                        }
+                        observations
+                    }
                     Err(failure) if cancel.is_cancelled() => {
                         // Leave the journal entry: the next lease reconciles.
                         tracing::info!(cycle_id, reason = %failure.reason, "intent cycle step interrupted");
@@ -777,6 +941,13 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
                     }
                     Err(failure) => {
                         tracing::warn!(cycle_id, reason = %failure.reason, "intent cycle step failed without effect");
+                        self.observe(
+                            cycle_id,
+                            &checkpoint,
+                            admitted.proposal(),
+                            classify_step_failure(&failure),
+                            &[],
+                        );
                         CycleObservations::default()
                     }
                 }
@@ -808,7 +979,11 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
         state: &CycleCheckpoint,
         step: InFlightStep,
     ) -> Result<CycleCheckpoint, CycleRunError> {
-        match self.executor.reconcile(&step).await {
+        let reconciliation = self.executor.reconcile(&step).await;
+        if let Some(class) = classify_reconciliation(&reconciliation) {
+            self.observe(cycle_id, state, &step.proposal, class, &[]);
+        }
+        match reconciliation {
             StepReconciliation::NotStarted => {
                 let (id, lease) = (cycle_id.to_owned(), token.clone());
                 self.blocking(move |store| store.clear_step(&id, &lease, &step))
@@ -853,8 +1028,12 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
         let next = apply_observations(admission.intent(), state, admitted, observations)
             .map_err(CycleRunError::Observation)?;
         let (id, lease, candidate) = (cycle_id.to_owned(), token.clone(), next.clone());
-        self.blocking(move |store| store.commit_step(&id, &lease, &candidate))
-            .await?;
+        // The step's observations travel with its checkpoint; if the commit
+        // fails they are lost with it and the next lease re-runs the step.
+        let observed = std::mem::take(&mut self.pending);
+        self.blocking(move |store| store.commit_step_observed(&id, &lease, &candidate, &observed))
+            .await
+            .inspect_err(|error| log_fence_refusal(cycle_id, error))?;
         tracing::info!(
             cycle_id,
             epoch = next.fence.epoch,
@@ -867,6 +1046,30 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
         Ok(next)
     }
 
+    /// Queues one observation of the step in progress. `index` is the
+    /// position within the step, so every observation of a commit has a
+    /// distinct [`dedupe_key`](crate::cycle_observation::ObservationEventId::dedupe_key).
+    fn observe(
+        &mut self,
+        cycle_id: &str,
+        checkpoint: &CycleCheckpoint,
+        proposal: &CycleProposal,
+        (category, cause): (ObservationCategory, CauseCode),
+        evidence_ids: &[String],
+    ) {
+        let index = u32::try_from(self.pending.len()).unwrap_or(u32::MAX);
+        self.pending.push(build_observation(
+            cycle_id,
+            checkpoint.fence,
+            index,
+            checkpoint,
+            proposal,
+            category,
+            cause,
+            evidence_ids,
+        ));
+    }
+
     async fn blocking<T, F>(&mut self, operation: F) -> Result<T, CycleRunError>
     where
         T: Send + 'static,
@@ -877,6 +1080,28 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             .await
             .map_err(|error| CycleRunError::Join(error.to_string()))?
             .map_err(CycleRunError::Store)
+    }
+}
+
+/// Evidence id a `Verify` proposal refers to; empty for every other proposal.
+fn verify_evidence_ids(proposal: &CycleProposal) -> Vec<String> {
+    match proposal {
+        CycleProposal::Verify { evidence_id } => vec![evidence_id.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// A fence refusal cannot be recorded in the record it was refused for, so
+/// it is only logged, classified like any other observation.
+fn log_fence_refusal(cycle_id: &str, error: &CycleRunError) {
+    if let CycleRunError::Store(CycleStoreError::Fence(refusal)) = error {
+        let (category, cause) = classify_fence(*refusal);
+        tracing::warn!(
+            cycle_id,
+            ?category,
+            ?cause,
+            "intent cycle write refused by the epoch fence; not recorded as an observation"
+        );
     }
 }
 
@@ -1002,6 +1227,8 @@ mod tests {
     use jiff::{SignedDuration, Timestamp};
 
     use super::*;
+    use crate::cycle_observation::ObservationOutcome;
+    use crate::cycle_outbox::MAX_OUTBOX_PENDING;
     use crate::intent_cycle::{
         CycleLimits, CycleTargets, EvidenceRecord, EvidenceSourceKind, EvidenceTrust,
         IntentBinding, Segment,
@@ -1089,6 +1316,8 @@ mod tests {
 
     struct Fixture {
         _temp: tempfile::TempDir,
+        /// Directory of the fixture's record store (to reopen it).
+        cycles_dir: PathBuf,
         store: Arc<CycleStore>,
         work_id: WorkId,
         admission: CycleAdmission,
@@ -1096,8 +1325,9 @@ mod tests {
 
     fn fixture(cycle_id: &str) -> TestResult<Fixture> {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let records = RecordStore::create_ambient(&temp.path().join("cycles"))
-            .map_err(ctx("cycle record store"))?;
+        let cycles_dir = temp.path().join("cycles");
+        let records =
+            RecordStore::create_ambient(&cycles_dir).map_err(ctx("cycle record store"))?;
         let store = Arc::new(CycleStore::new(records));
         let admission = admission()?;
         let work_id = WorkId::from_str("job-w02");
@@ -1107,6 +1337,7 @@ mod tests {
         store.create(&record).map_err(ctx("record persists"))?;
         Ok(Fixture {
             _temp: temp,
+            cycles_dir,
             store,
             work_id,
             admission,
@@ -1961,6 +2192,337 @@ mod tests {
             stored.checkpoint.fence.epoch >= 1,
             "fenced under the job lease epoch"
         );
+        Ok(())
+    }
+
+    fn sample_observation(
+        cycle_id: &str,
+        checkpoint: &CycleCheckpoint,
+        index: u32,
+    ) -> RunObservationV1 {
+        build_observation(
+            cycle_id,
+            checkpoint.fence,
+            index,
+            checkpoint,
+            &wait(),
+            ObservationCategory::ToolFailedNoEffect,
+            CauseCode::ExecutorFailed,
+            &[],
+        )
+    }
+
+    /// Takes the cycle over at epoch 1, journals a `wait` step and commits it
+    /// together with `count` observations. Returns their outbox keys.
+    fn commit_observed(fx: &Fixture, cycle_id: &str, count: u32) -> TestResult<Vec<String>> {
+        crash_mid_step(fx, cycle_id)?;
+        let record = fx.store.load(cycle_id).map_err(ctx("load"))?;
+        let admitted = AdmittedCycle::recovered(wait(), record.checkpoint.fence.sequence);
+        let next = apply_observations(
+            fx.admission.intent(),
+            &record.checkpoint,
+            &admitted,
+            CycleObservations::default(),
+        )
+        .map_err(|_| TestError::Missing("apply"))?;
+        let observations: Vec<RunObservationV1> = (0..count)
+            .map(|index| sample_observation(cycle_id, &record.checkpoint, index))
+            .collect();
+        fx.store
+            .commit_step_observed(cycle_id, &token(&fx.work_id, 1), &next, &observations)
+            .map_err(ctx("commit with observations"))?;
+        Ok(observations
+            .iter()
+            .map(|observation| observation.event_id.dedupe_key())
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn refusal_observations_land_in_the_same_record_write() -> TestResult {
+        let fx = fixture("cycle-obs-refused")?;
+        let patch = || {
+            Ok(CycleProposal::ProposePatch {
+                targets: set(&["secrets.toml"]),
+                evidence_id: "none".to_owned(),
+            })
+        };
+        let proposer = Script::new(vec![patch(), patch(), patch()]);
+        let mut driver = driver(&fx, proposer, Executor::new(vec![]), rights()?);
+        let outcome = driver
+            .run(
+                "cycle-obs-refused",
+                &token(&fx.work_id, 1),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver runs"))?;
+        assert!(matches!(
+            outcome,
+            CycleRunOutcome::Terminal {
+                terminal: CycleTerminal::Escalated,
+                ..
+            }
+        ));
+        let record = fx
+            .store
+            .load("cycle-obs-refused")
+            .map_err(ctx("record reloads"))?;
+        assert_eq!(record.outbox.len(), 3);
+        assert_eq!(record.observations_dropped, 0);
+        assert_eq!(record.status().pending_observations, 3);
+        for (position, entry) in record.outbox.pending().iter().enumerate() {
+            let payload = &entry.payload;
+            assert_eq!(payload.category, ObservationCategory::AdmissionRefused);
+            assert_eq!(payload.cause, CauseCode::WriteNotAllowed);
+            assert_eq!(payload.transition, "propose_patch");
+            assert_eq!(
+                entry.sequence, record.checkpoint.fence.sequence,
+                "the observation is stamped with the sequence of its own commit"
+            );
+            assert_eq!(payload.event_id.sequence, 0, "refused against sequence 0");
+            assert_eq!(
+                u32::try_from(position).ok(),
+                Some(payload.event_id.index),
+                "indexes count up within the step"
+            );
+            assert_eq!(entry.key, payload.event_id.dedupe_key());
+            assert_eq!(entry.epoch, 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_failure_without_effect_is_observed_as_tool_failed_no_effect() -> TestResult {
+        let fx = fixture("cycle-obs-tool")?;
+        let proposer = Script::new(vec![
+            Ok(wait()),
+            Ok(CycleProposal::Failed {
+                reason: "stop".to_owned(),
+            }),
+        ]);
+        let executor = Executor::new(vec![Err(StepFailure::new("egress denied by gateway"))]);
+        let mut driver = driver(&fx, proposer, executor, rights()?);
+        driver
+            .run(
+                "cycle-obs-tool",
+                &token(&fx.work_id, 1),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver runs"))?;
+        let pending = fx
+            .store
+            .pending_observations("cycle-obs-tool")
+            .map_err(ctx("pending observations"))?;
+        assert_eq!(pending.len(), 1, "only the failed step is observed");
+        let entry = pending.first().ok_or(TestError::Missing("one entry"))?;
+        let payload = &entry.payload;
+        assert_eq!(payload.category, ObservationCategory::ToolFailedNoEffect);
+        assert_eq!(payload.cause, CauseCode::ExecutorFailed);
+        assert_eq!(payload.outcome, ObservationOutcome::Pending);
+        assert_eq!(payload.transition, "wait");
+        assert_eq!(payload.event_id.sequence, 0);
+        assert_eq!(entry.sequence, 1);
+        let json = serde_json::to_string(payload).map_err(ctx("observation serialises"))?;
+        assert!(
+            !json.contains("egress denied"),
+            "observations carry no failure text: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncertain_reconciliation_is_inconclusive_observation() -> TestResult {
+        let fx = fixture("cycle-obs-uncertain")?;
+        let step = crash_mid_step(&fx, "cycle-obs-uncertain")?;
+        let mut executor = Executor::new(vec![]);
+        executor.reconciliation = StepReconciliation::Uncertain;
+        let mut driver = driver(&fx, Script::new(vec![]), executor, rights()?);
+        let outcome = driver
+            .run(
+                "cycle-obs-uncertain",
+                &token(&fx.work_id, 2),
+                &fx.admission,
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(ctx("driver resumes"))?;
+        assert!(matches!(
+            outcome,
+            CycleRunOutcome::Terminal {
+                terminal: CycleTerminal::Escalated,
+                ..
+            }
+        ));
+        let pending = fx
+            .store
+            .pending_observations("cycle-obs-uncertain")
+            .map_err(ctx("pending observations"))?;
+        assert_eq!(pending.len(), 1);
+        let entry = pending.first().ok_or(TestError::Missing("one entry"))?;
+        let payload = &entry.payload;
+        assert_eq!(payload.category, ObservationCategory::UncertainEffect);
+        assert_eq!(payload.cause, CauseCode::ReconcileUncertain);
+        assert_eq!(payload.outcome, ObservationOutcome::Inconclusive);
+        assert_eq!(payload.transition, "wait", "the journaled step's kind");
+        assert_eq!(payload.event_id.sequence, step.sequence);
+        assert_eq!(payload.epoch, 2, "recorded under the recovering lease");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_epoch_cannot_ack_observations() -> TestResult {
+        let fx = fixture("cycle-obs-stale")?;
+        let keys = commit_observed(&fx, "cycle-obs-stale", 2)?;
+        assert!(matches!(
+            fx.store
+                .ack_observations("cycle-obs-stale", &token(&fx.work_id, 0), &keys),
+            Err(CycleStoreError::Fence(FenceRefusal::StaleEpoch))
+        ));
+        assert_eq!(
+            fx.store
+                .pending_observations("cycle-obs-stale")
+                .map_err(ctx("pending observations"))?
+                .len(),
+            2,
+            "a refused ack changes nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ack_is_idempotent_on_redelivery() -> TestResult {
+        let fx = fixture("cycle-obs-ack")?;
+        let keys = commit_observed(&fx, "cycle-obs-ack", 2)?;
+        let lease = token(&fx.work_id, 1);
+        let first = keys.get(..1).ok_or(TestError::Missing("first key"))?;
+        assert_eq!(
+            fx.store
+                .ack_observations("cycle-obs-ack", &lease, first)
+                .map_err(ctx("first ack"))?,
+            1
+        );
+        assert_eq!(
+            fx.store
+                .ack_observations("cycle-obs-ack", &lease, first)
+                .map_err(ctx("redelivered ack"))?,
+            0,
+            "an already acknowledged key counts as 0"
+        );
+        let unknown = ["cycle-obs-ack:9:9".to_owned()];
+        assert_eq!(
+            fx.store
+                .ack_observations("cycle-obs-ack", &lease, &unknown)
+                .map_err(ctx("unknown ack"))?,
+            0
+        );
+        assert_eq!(
+            fx.store
+                .ack_observations("cycle-obs-ack", &lease, &keys)
+                .map_err(ctx("full redelivery"))?,
+            1,
+            "only the still-pending key is removed"
+        );
+        assert!(
+            fx.store
+                .pending_observations("cycle-obs-ack")
+                .map_err(ctx("pending observations"))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crash_between_commit_and_ack_leaves_pending() -> TestResult {
+        let fx = fixture("cycle-obs-crash")?;
+        let keys = commit_observed(&fx, "cycle-obs-crash", 2)?;
+        let before = fx
+            .store
+            .pending_observations("cycle-obs-crash")
+            .map_err(ctx("pending observations"))?;
+        // The drain dies before acknowledging: a store reopened over the
+        // same directory still holds every observation.
+        let reopened = CycleStore::new(
+            RecordStore::create_ambient(&fx.cycles_dir).map_err(ctx("store reopens"))?,
+        );
+        let after = reopened
+            .pending_observations("cycle-obs-crash")
+            .map_err(ctx("pending after reopen"))?;
+        assert_eq!(after, before);
+        assert_eq!(
+            after
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>(),
+            keys
+        );
+        let lease = token(&fx.work_id, 1);
+        assert_eq!(
+            reopened
+                .ack_observations("cycle-obs-crash", &lease, &keys)
+                .map_err(ctx("ack after reopen"))?,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_outbox_drops_newest_but_commits_checkpoint() -> TestResult {
+        let fx = fixture("cycle-obs-full")?;
+        let capacity = u32::try_from(MAX_OUTBOX_PENDING).unwrap_or(u32::MAX);
+        let keys = commit_observed(&fx, "cycle-obs-full", capacity.saturating_add(1))?;
+        let record = fx.store.load("cycle-obs-full").map_err(ctx("reload"))?;
+        assert_eq!(record.checkpoint.fence.sequence, 1, "checkpoint committed");
+        assert_eq!(record.in_flight, None);
+        assert_eq!(record.observations_dropped, 1);
+        assert_eq!(record.outbox.len(), MAX_OUTBOX_PENDING);
+        let kept: Vec<String> = record
+            .outbox
+            .pending()
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect();
+        assert_eq!(
+            kept,
+            keys.get(..MAX_OUTBOX_PENDING)
+                .ok_or(TestError::Missing("oldest keys"))?
+                .to_vec(),
+            "the oldest observations stay, the newest is dropped"
+        );
+        let status = record.status();
+        assert_eq!(status.pending_observations, MAX_OUTBOX_PENDING);
+        assert_eq!(status.observations_dropped, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn records_without_outbox_field_still_load() -> TestResult {
+        let fx = fixture("cycle-obs-legacy")?;
+        let record = fx.store.load("cycle-obs-legacy").map_err(ctx("load"))?;
+        let mut value = serde_json::to_value(&record).map_err(ctx("record serialises"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or(TestError::Missing("record is a JSON object"))?;
+        assert!(object.remove("outbox").is_some(), "outbox is serialised");
+        assert!(
+            object.remove("observations_dropped").is_some(),
+            "observations_dropped is serialised"
+        );
+        let legacy = value.clone();
+        let loaded: CycleRecord =
+            serde_json::from_value(legacy).map_err(ctx("pre-W03c record loads"))?;
+        assert!(loaded.outbox.is_empty());
+        assert_eq!(loaded.observations_dropped, 0);
+        assert_eq!(loaded, record);
+        // Unknown fields stay refused.
+        let mut tampered = value;
+        tampered
+            .as_object_mut()
+            .ok_or(TestError::Missing("record is a JSON object"))?
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<CycleRecord>(tampered).is_err());
         Ok(())
     }
 }

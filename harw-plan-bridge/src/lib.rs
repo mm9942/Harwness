@@ -131,7 +131,7 @@ pub use crate::cycle_explorer::{
 pub use crate::cycle_observation::{
     CauseCode, OBSERVATION_SCHEMA, ObservationCategory, ObservationEventId, ObservationOutcome,
     RunObservationV1, build_observation, classify_fence, classify_reconciliation, classify_refusal,
-    classify_step_failure, is_countable_as_fix, proposal_kind,
+    classify_step_failure, classify_verification, is_countable_as_fix, proposal_kind,
 };
 pub use crate::cycle_outbox::{
     MAX_ACKED_TAIL, MAX_OUTBOX_PENDING, Outbox, OutboxEntry, OutboxError,

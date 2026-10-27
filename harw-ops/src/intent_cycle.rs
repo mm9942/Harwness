@@ -62,6 +62,9 @@ const INTENT_CYCLE_MAX_WALL_SECS: i64 = 30 * 60;
 /// tokens are persisted lease-fenced by `JobStore::record_usage` and flushed by
 /// the worker's token ledger, so a reclaim after a lost lease resumes the
 /// fenced checkpoint with the already consumed budget rather than a fresh one.
+/// Usage whose write failed is left as a durable marker: a reclaim first
+/// settles any unresolved usage marker, and an unsettleable marker fails the
+/// job instead of granting fresh budget.
 /// Provider outages are still retried inside the claim by the job worker; a
 /// crash with the second attempt spent leaves the cycle non-terminal for an
 /// explicit operator `/retry`.
@@ -602,6 +605,10 @@ async fn intent_cycle_status(
                 status.evidence
             ));
             lines.push(format!(
+                "pending observations {}, dropped {}",
+                status.pending_observations, status.observations_dropped
+            ));
+            lines.push(format!(
                 "criteria covered: {}",
                 if status.criteria_covered.is_empty() {
                     "none".to_owned()
@@ -699,8 +706,13 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_job_runtime::LeaseToken;
     use harw_operations::context::ServiceMap;
     use harw_operations::{OpInput, Operation};
+    use harw_plan_bridge::{
+        CauseCode, CycleCheckpoint, CycleObservations, CycleProposal, CycleRecord,
+        ObservationCategory, admit_cycle, apply_observations, build_observation,
+    };
     use harw_types::{
         IngressSurface, PermissionTier, PrincipalKind, SessionId, TurnId, WorkspaceId,
     };
@@ -1049,6 +1061,110 @@ mod tests {
         .map_err(ctx("status"))?;
         let dir = fx.jobs.root().join(harw_plan_bridge::CYCLE_STORE_DIR);
         assert!(!dir.exists(), "status created {}", dir.display());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_reports_pending_observations() -> TestResult {
+        let fx = fixture()?;
+        let output = run(&IntentCycleStartOperation, &fx.ctx, start_args())
+            .await
+            .map_err(ctx("start"))?;
+        let id = job_id(&output)?;
+        let stored = fx.jobs.get(&id).map_err(ctx("job"))?;
+        let input = IntentCycleJobInput::from_job(&stored).map_err(ctx("input"))?;
+        let plan = input.spec.plan(&input.intent_id).map_err(ctx("plan"))?;
+
+        // The worker creates the record on its first claim; do the same by hand.
+        let store = CycleStore::open_in_job_root(fx.jobs.root()).map_err(ctx("cycle store"))?;
+        let initial = CycleCheckpoint::initial(&plan.admission, fx.ctx.sandbox().authority(), 0);
+        let record = CycleRecord::new(input.cycle_id.clone(), id.clone(), initial.clone())
+            .map_err(ctx("cycle record"))?;
+        store.create(&record).map_err(ctx("create record"))?;
+
+        // Without an observation the line reports an empty outbox.
+        let before = run(
+            &IntentCycleStatusOperation,
+            &fx.ctx,
+            serde_json::json!({"job_id": id.as_str()}),
+        )
+        .await
+        .map_err(ctx("status before"))?;
+        assert!(
+            before.text.contains("pending observations 0, dropped 0"),
+            "{}",
+            before.text
+        );
+
+        // Journal one step and commit it together with one observation.
+        let admitted = admit_cycle(
+            &plan.admission,
+            &initial,
+            CycleProposal::Wait {
+                reason: "waiting for the owner".to_owned(),
+            },
+        )
+        .map_err(|_| TestError::Missing("admitted wait"))?;
+        let token = LeaseToken {
+            work_id: id.clone(),
+            epoch: 0,
+            nonce: "nonce-0".to_owned(),
+        };
+        store
+            .begin_step(&input.cycle_id, &token, &admitted)
+            .map_err(ctx("begin step"))?;
+        let next = apply_observations(
+            plan.admission.intent(),
+            &initial,
+            &admitted,
+            CycleObservations::default(),
+        )
+        .map_err(|_| TestError::Missing("next checkpoint"))?;
+        let observation = build_observation(
+            &input.cycle_id,
+            initial.fence,
+            0,
+            &initial,
+            admitted.proposal(),
+            ObservationCategory::ToolFailedNoEffect,
+            CauseCode::ExecutorFailed,
+            &[],
+        );
+        store
+            .commit_step_observed(&input.cycle_id, &token, &next, &[observation])
+            .map_err(ctx("commit step"))?;
+
+        let status = run(
+            &IntentCycleStatusOperation,
+            &fx.ctx,
+            serde_json::json!({"job_id": id.as_str()}),
+        )
+        .await
+        .map_err(ctx("status"))?;
+        assert!(
+            status.text.contains("pending observations 1, dropped 0"),
+            "{}",
+            status.text
+        );
+        let cycle = status
+            .data
+            .as_ref()
+            .and_then(|data| data.get("cycle"))
+            .ok_or(TestError::Missing("cycle projection"))?;
+        assert_eq!(
+            cycle
+                .get("pending_observations")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "{cycle}"
+        );
+        assert_eq!(
+            cycle
+                .get("observations_dropped")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "{cycle}"
+        );
         Ok(())
     }
 

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cycle_runtime::{StepFailure, StepReconciliation};
 use crate::intent_cycle::{
-    CheckpointFence, CycleCheckpoint, CycleProposal, CycleRefusal, FenceRefusal,
+    CheckpointFence, CycleCheckpoint, CycleObservations, CycleProposal, CycleRefusal, FenceRefusal,
     is_prompt_safe_char,
 };
 
@@ -87,6 +87,11 @@ pub enum CauseCode {
     ExecutorRetryable,
     /// Crash reconciliation could not establish the effect.
     ReconcileUncertain,
+    /// A verification check was not met (`unmet:` claim).
+    VerificationUnmet,
+    /// Verification was refused because the file changed since it was read
+    /// (`stale:` claim).
+    VerificationStale,
     /// A write came from a superseded lease epoch.
     StaleEpoch,
     /// No mapping fits.
@@ -224,6 +229,43 @@ pub const fn classify_reconciliation(
     }
 }
 
+/// Prefix of a verifier claim id for a check that was not met.
+const UNMET_CLAIM_PREFIX: &str = "unmet:";
+
+/// Prefix of a verifier claim id for evidence that went stale before it could
+/// be verified.
+const STALE_CLAIM_PREFIX: &str = "stale:";
+
+/// Classifies the verifier claims of a successful step.
+///
+/// A claim id starting with `unmet:` is
+/// `(VerificationFailed, VerificationUnmet)`; one starting with `stale:` is
+/// `(VerificationFailed, VerificationStale)`; any other set of claims yields
+/// `None`. Only the claim id prefix is read, never the claim body, so text a
+/// model or an executor wrote cannot influence the result. The claims are
+/// walked in id order and the first match wins, which makes the result
+/// deterministic should both kinds ever be present (`stale:` sorts first).
+#[must_use]
+pub fn classify_verification(
+    observations: &CycleObservations,
+) -> Option<(ObservationCategory, CauseCode)> {
+    observations.claims.keys().find_map(|id| {
+        if id.starts_with(STALE_CLAIM_PREFIX) {
+            Some((
+                ObservationCategory::VerificationFailed,
+                CauseCode::VerificationStale,
+            ))
+        } else if id.starts_with(UNMET_CLAIM_PREFIX) {
+            Some((
+                ObservationCategory::VerificationFailed,
+                CauseCode::VerificationUnmet,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
 /// Classifies a checkpoint fence refusal. A widened ceiling maps to
 /// [`CauseCode::CeilingMismatch`]; refusals without a fitting cause are
 /// [`CauseCode::Unclassified`].
@@ -351,7 +393,7 @@ mod tests {
                 id: "intent-obs".to_owned(),
                 revision: 3,
                 digest: ContentDigest::of(b"intent-obs@3"),
-                predecessor: None,
+                predecessor: Some(ContentDigest::of(b"intent-obs@2")),
                 acceptance: BTreeSet::from(["done".to_owned()]),
             },
             CycleLimits {
@@ -448,6 +490,56 @@ mod tests {
         assert_eq!(
             classify_reconciliation(&StepReconciliation::NotStarted),
             None
+        );
+    }
+
+    fn claims(entries: &[(&str, &str)]) -> CycleObservations {
+        CycleObservations {
+            claims: entries
+                .iter()
+                .map(|(id, body)| ((*id).to_owned(), (*body).to_owned()))
+                .collect(),
+            ..CycleObservations::default()
+        }
+    }
+
+    #[test]
+    fn verification_claims_are_classified_by_prefix_only() {
+        assert_eq!(
+            classify_verification(&claims(&[("unmet:0", "needle missing")])),
+            Some((
+                ObservationCategory::VerificationFailed,
+                CauseCode::VerificationUnmet
+            ))
+        );
+        assert_eq!(
+            classify_verification(&claims(&[("stale:cycle-v-0:lib", "file changed")])),
+            Some((
+                ObservationCategory::VerificationFailed,
+                CauseCode::VerificationStale
+            ))
+        );
+        assert_eq!(classify_verification(&CycleObservations::default()), None);
+        assert_eq!(
+            classify_verification(&claims(&[("note:1", "ok"), ("check:0:abc", "fine")])),
+            None
+        );
+        // A prefix inside the claim body, or in the middle of an id, never counts.
+        assert_eq!(
+            classify_verification(&claims(&[
+                ("note:1", "unmet:0 stale:x"),
+                ("x-unmet:2", "stale:y"),
+                (" stale:3", "unmet:4"),
+            ])),
+            None
+        );
+        // Mixed claims are resolved deterministically in id order.
+        assert_eq!(
+            classify_verification(&claims(&[("unmet:0", "a"), ("stale:z", "b")])),
+            Some((
+                ObservationCategory::VerificationFailed,
+                CauseCode::VerificationStale
+            ))
         );
     }
 
