@@ -113,6 +113,8 @@ pub(crate) mod btw;
 pub(crate) mod background_agents;
 // Runde 5, Teil M: Kind-Meldungen (`parent.message`) an die UIA.
 mod agent_messages;
+// PL-94 W01 M2b: Anzeigereihenfolge der Kind-Statusmeldungen (`crate::live_ranker`).
+mod live_order_glue;
 // Runde 5, Teil O: Doppel-Esc bei laufenden Kindern, ehrliche Abbruch-Beschriftung.
 mod turn_safety;
 // Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten im Freigabedialog.
@@ -134,7 +136,7 @@ pub(crate) mod jobs_glue;
 #[cfg(test)]
 mod live_views_tests;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write as _};
 use std::sync::{Arc, Mutex};
@@ -1052,6 +1054,10 @@ pub struct ChatApp {
     child_infos: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Zwei zuletzt eingetroffene Agentenmeldungen als reine Anzeigekopie.
     recency: crate::recency::RecencySlots,
+    /// Zustand des Live-Aktivitäts-Rankers: bestimmt die Reihenfolge der
+    /// Kind-Statusmeldungen in der Statuszeile (`app/live_order_glue.rs`).
+    /// Hinter einer `RefCell`, weil das Zeichnen nur `&ChatApp` hat.
+    live_order: RefCell<live_order_glue::LiveOrder>,
     /// TOML-gesteuertes Verhalten abgelaufener Kind-Statusmeldungen
     /// (nach dem 30s-Fenster): `[tui].status_expiry` — konsolidieren oder
     /// ausblenden. Default: konsolidieren.
@@ -1490,6 +1496,7 @@ impl ChatApp {
             deferred_input: std::collections::VecDeque::new(),
             child_infos: std::collections::HashMap::new(),
             recency: crate::recency::RecencySlots::new(),
+            live_order: RefCell::new(live_order_glue::LiveOrder::new(Instant::now())),
             status_expiry: harw_config::StatusExpiryMode::default(),
             step_list: None,
             pending_turns: std::collections::VecDeque::new(),
@@ -9833,6 +9840,64 @@ fn draw_viewport(
     Ok(())
 }
 
+/// Einrückung der Körperzeilen des Mini-Live-Streifens unter seiner Kopfzeile.
+const LIVE_STRIP_INDENT: u16 = 2;
+
+/// Kopfzeilen-Beschriftung des Mini-Live-Streifens (eine Spalte je Zeichen).
+const LIVE_STRIP_LABEL: &str = " Live ";
+
+/// Zeichnet den Mini-Live-Streifen des Portrait-Docks (PL-94 W02): eine
+/// Kopfzeile und darunter bis zu `body_lines` Recency-Slots, neueste
+/// Agentenmeldung zuerst. Bei `body_lines == 0` ist nur Platz für die
+/// Kopfzeile; sie trägt dann die neueste Meldung selbst. Die Texte stammen von
+/// Agenten und sind in [`crate::recency_view::slot_lines`] bereits bereinigt
+/// und auf die Breite gekürzt.
+fn render_live_strip(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    recency: &crate::recency::RecencySlots,
+    body_lines: u16,
+    theme: style::Theme,
+) {
+    let label = Span::styled(
+        LIVE_STRIP_LABEL,
+        Style::default()
+            .fg(style::accent_color(theme))
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if body_lines == 0 {
+        let label_width = u16::try_from(LIVE_STRIP_LABEL.chars().count()).unwrap_or(0);
+        let newest =
+            crate::recency_view::slot_lines(recency, area.width.saturating_sub(label_width))
+                .into_iter()
+                .next()
+                .map(|line| line.text)
+                .unwrap_or_default();
+        rows.push(Line::from(vec![
+            label,
+            Span::styled(newest, style::dim_style(theme)),
+        ]));
+    } else {
+        rows.push(Line::from(label));
+        let indent = " ".repeat(usize::from(LIVE_STRIP_INDENT));
+        let body =
+            crate::recency_view::slot_lines(recency, area.width.saturating_sub(LIVE_STRIP_INDENT));
+        for line in body.into_iter().take(usize::from(body_lines)) {
+            let line_style = if line.slot == 1 {
+                Style::default()
+            } else {
+                style::dim_style(theme)
+            };
+            rows.push(Line::from(Span::styled(
+                format!("{indent}{}", line.text),
+                line_style,
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
 /// Renders the same viewport on a real terminal or a test backend.
 fn render_viewport(
     frame: &mut ratatui::Frame<'_>,
@@ -9999,6 +10064,31 @@ fn render_viewport(
                 queue_area,
             );
         }
+        // Mini-Live-Streifen (PL-94 W02): die zwei letzten Agentenmeldungen
+        // (Recency-Slots, h7) zwischen Dock und Chat. `chat_first` verteilt die
+        // Höhe (siehe `panes::portrait_live_strip`): der Chat behält seine
+        // Mindesthöhe, der Körper bleibt auf `MINI_LIVE_MAX_BODY_LINES` Zeilen
+        // begrenzt und entfällt vor der Kopfzeile. Ohne Meldungen gibt es keinen
+        // Streifen, der Chat bleibt unverändert.
+        let wanted_body_lines = crate::recency_view::slot_lines(
+            &app.recency,
+            below_dock.width.saturating_sub(LIVE_STRIP_INDENT),
+        )
+        .len();
+        let live_strip = crate::panes::portrait_live_strip(
+            below_dock,
+            u16::try_from(wanted_body_lines).unwrap_or(u16::MAX),
+        );
+        if let Some(strip_area) = live_strip.live {
+            render_live_strip(
+                frame,
+                strip_area,
+                &app.recency,
+                live_strip.body_lines,
+                theme,
+            );
+        }
+        let below_dock = live_strip.chat;
         let pane_areas = crate::panes::split(below_dock, &app.panels);
         let history_area_for_regions =
             pane_areas
@@ -10386,17 +10476,23 @@ fn render_viewport(
     // Info-Zwischenstände der Kind-Agenten (30s-Fenster, passend zur Drossel
     // `PARENT_INFO_MIN_INTERVAL`): Ältere Einträge werden nicht aufgenommen
     // (nur ausgeblendet, nicht gelöscht).
-    for (child, (info, at)) in &app.child_infos {
+    // Die Reihenfolge bestimmt der Live-Aktivitäts-Ranker (PL-94 W01): zuletzt
+    // bedeutsam aktive Kinder zuerst, ruhige und beendete zuletzt; bei Platzmangel
+    // kürzt `fit_segments` das weiter rechts stehende Segment zuerst.
+    for child in app.child_info_display_order(Instant::now()) {
+        let Some((info, at)) = app.child_infos.get(&child) else {
+            continue;
+        };
         let age = at.elapsed().as_secs();
         if child_info_visible(age) {
             segments.push(Seg::optional(
                 120,
-                status_line::child_info_segment(child, Some(info), age, 40),
+                status_line::child_info_segment(&child, Some(info), age, 40),
             ));
         } else if app.status_expiry == harw_config::StatusExpiryMode::Consolidate {
             // `[tui].status_expiry = "consolidate"` (Default): abgelaufene
             // Meldungen nur noch kompakt (Name + Alter) und niedrig priorisiert.
-            segments.push(Seg::optional(60, child_info_expired_segment(child, age)));
+            segments.push(Seg::optional(60, child_info_expired_segment(&child, age)));
         }
         // Modus "hide": abgelaufene Meldungen entfallen komplett.
     }
@@ -15303,6 +15399,151 @@ forbidden = [{forbidden}]
             "portrait dock expected at the top:\n{shown}"
         );
         assert!(shown.contains("root-orchestrator"), "{shown}");
+        Ok(())
+    }
+
+    /// Zeichnet `app` auf einem Testterminal und liefert die Zeilen als Text.
+    fn rendered_rows(app: &ChatApp, width: u16, height: u16) -> TestResult<Vec<String>> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| render_viewport(frame, app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        Ok((0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect())
+    }
+
+    /// PL-94 W02/h7: im Portrait-Dock (46×78) steht zwischen Dock und Chat der
+    /// Mini-Live-Streifen mit den zwei letzten Agentenmeldungen — Kopfzeile
+    /// plus zwei Körperzeilen, wie `chat_first` sie für diese Höhe vorsieht
+    /// (neueste Meldung zuerst). Der Chat beginnt erst darunter.
+    #[test]
+    fn portrait_dock_shows_the_recency_slots_in_the_mini_live_strip_at_46x78() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.recency.push(crate::recency::RecencyEntry {
+            child: "alt".to_owned(),
+            text: "erste Meldung".to_owned(),
+        });
+        app.recency.push(crate::recency::RecencyEntry {
+            child: "neu".to_owned(),
+            text: "zweite Meldung".to_owned(),
+        });
+        app.push_line(
+            Role::System,
+            "einzigartige-verlaufszeile-im-chat".to_owned(),
+        );
+        let rows = rendered_rows(&app, 46, 78)?;
+        let shown = rows.join("\n");
+        let row_at = |index: usize| rows.get(index).map(String::as_str).unwrap_or_default();
+
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        let header = usize::from(dock.y + dock.height);
+        assert!(
+            row_at(header).contains("Live"),
+            "Kopfzeile fehlt direkt unter dem Dock:\n{shown}"
+        );
+        assert!(
+            row_at(header + 1).contains("1 neu: zweite Meldung"),
+            "Slot 1 fehlt:\n{shown}"
+        );
+        assert!(
+            row_at(header + 2).contains("2 alt: erste Meldung"),
+            "Slot 2 fehlt:\n{shown}"
+        );
+        let history_row = rows
+            .iter()
+            .position(|row| row.contains("einzigartige-verlaufszeile"))
+            .ok_or(TestError::Missing("Verlaufszeile"))?;
+        assert!(
+            history_row > header + 2,
+            "der Chat beginnt erst unter dem Streifen:\n{shown}"
+        );
+        Ok(())
+    }
+
+    /// Ohne Agentenmeldungen gibt es keinen Streifen: Dock und Chat liegen wie
+    /// vor der Einbindung direkt aufeinander.
+    #[test]
+    fn portrait_dock_without_recency_has_no_mini_live_strip() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        let rows = rendered_rows(&app, 46, 78)?;
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        let below_dock = rows
+            .get(usize::from(dock.y + dock.height))
+            .ok_or(TestError::Missing("Zeile unter dem Dock"))?;
+        assert!(
+            !below_dock.contains("Live"),
+            "unerwarteter Streifen:\n{}",
+            rows.join("\n")
+        );
+        Ok(())
+    }
+
+    /// Knapper Platz (46×28 mit achtzeiligem Composer, darunter bleiben 9
+    /// Zeilen unter dem Dock): der Chat behält seine Mindesthöhe von 8 Zeilen,
+    /// vom Streifen bleibt nur die Kopfzeile, und sie trägt die neueste
+    /// Meldung selbst; Slot 2 entfällt (Körper zuerst, dann Kopfzeile).
+    #[test]
+    fn portrait_dock_collapses_the_strip_to_its_header_when_space_is_short() -> TestResult {
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.recency.push(crate::recency::RecencyEntry {
+            child: "alt".to_owned(),
+            text: "erste Meldung".to_owned(),
+        });
+        app.recency.push(crate::recency::RecencyEntry {
+            child: "neu".to_owned(),
+            text: "zweite Meldung".to_owned(),
+        });
+        app.input.insert_str("z1\nz2\nz3\nz4\nz5\nz6\nz7\nz8");
+        let rows = rendered_rows(&app, 46, 28)?;
+        let shown = rows.join("\n");
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        let header = rows
+            .get(usize::from(dock.y + dock.height))
+            .ok_or(TestError::Missing("Kopfzeile unter dem Dock"))?;
+        assert!(
+            header.contains("Live") && header.contains("1 neu: zweite Meldung"),
+            "die Kopfzeile trägt die neueste Meldung:\n{shown}"
+        );
+        assert!(!shown.contains("2 alt"), "Slot 2 entfällt:\n{shown}");
+        Ok(())
+    }
+
+    /// Breite Terminals (Landschaft) behalten ihre Aufteilung: die Recency-Slots
+    /// ändern das Bild bei 120×42 nicht (der Streifen gehört nur zum
+    /// Portrait-Dock).
+    #[test]
+    fn wide_layout_is_unchanged_by_the_recency_slots() -> TestResult {
+        let mut app = test_chat_app()?;
+        let before = rendered_rows(&app, 120, 42)?;
+        app.recency.push(crate::recency::RecencyEntry {
+            child: "neu".to_owned(),
+            text: "zweite Meldung".to_owned(),
+        });
+        let after = rendered_rows(&app, 120, 42)?;
+        assert_eq!(before, after);
         Ok(())
     }
 

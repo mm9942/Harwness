@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "h7: slot renderer not mounted in app.rs yet")]
-
 //! Reine Textprojektion der Recency-Slots (h7), ohne ratatui.
 //!
 //! Slot 1 (neueste Agentenmeldung) steht vor Slot 2 (die davor). Jeder belegte

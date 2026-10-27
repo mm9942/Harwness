@@ -27,7 +27,9 @@
 //! wandelt deren Klassifikation (breite Seitenspalte, oben angedockter
 //! Portrait-Dock oder Zusammenfassungs-/Kompakt-Fallback) in
 //! `ratatui::layout::Rect` um, [`split_dock_areas`] entsprechend die interne
-//! Aufteilung des Docks. `PaneFocus`, `PanelState`, `PanelKey`, [`split`] und
+//! Aufteilung des Docks, [`portrait_live_strip`] die Höhenverteilung des
+//! Mini-Live-Streifens zwischen Dock und Chat (über
+//! [`harw_tui_layout::chat_first`]). `PaneFocus`, `PanelState`, `PanelKey`, [`split`] und
 //! `split_right_column` bleiben unverändert und beschreiben weiterhin nur
 //! die breite Seitenspalten-Darstellung von oben.
 
@@ -128,6 +130,81 @@ pub(crate) fn split_dock_areas(dock: Rect) -> DockAreas {
         harw_tui_layout::DockSplit::Split { agents, jobs } => DockAreas::Split {
             agents: to_rect(agents),
             jobs: to_rect(jobs),
+        },
+    }
+}
+
+/// Mini-Live-Streifen des Portrait-Docks (PL-94 W02) und der danach
+/// verbleibende Chat-Bereich, bereits als `ratatui::layout::Rect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PortraitLive {
+    /// Streifen (Kopfzeile plus Körper) direkt unter dem Dock; `None`, wenn
+    /// nichts anzuzeigen ist oder der Chat sonst unter seine Mindesthöhe fiele.
+    pub live: Option<Rect>,
+    /// Zeilen des Körpers unterhalb der Kopfzeile: `0` bei reiner Kopfzeile
+    /// und ohne Streifen, höchstens `MINI_LIVE_MAX_BODY_LINES`.
+    pub body_lines: u16,
+    /// Chat-Bereich: der gesamte Rest unterhalb des Streifens.
+    pub chat: Rect,
+}
+
+/// Verteilt den Bereich unter dem Portrait-Dock auf Mini-Live-Streifen und
+/// Chat (PL-94 W02 U0/U1) mithilfe von [`harw_tui_layout::chat_first`].
+///
+/// # Beschreibung
+/// `chat_first` gibt dem Chat immer zuerst seine Mindesthöhe
+/// (`MINI_LIVE_MIN_CHAT_ROWS`) und verteilt nur den Rest an die Blöcke darüber
+/// (Karten, Finished-Streifen, Live-Kopf, Live-Körper). Den Dock berechnet
+/// weiterhin [`classify_screen`]; er vertritt hier die Karten-Zeile und den
+/// Finished-Streifen. Damit `chat_first` dieselbe Rangfolge und dieselbe
+/// Chat-Untergrenze anwendet, bekommt es eine um genau diese Zeilen
+/// (`CARDS_ROWS` plus 1) verlängerte Fläche; übernommen werden nur
+/// Live-Streifen und Chat. Der Körper wird auf `body_lines_wanted` und
+/// `MINI_LIVE_MAX_BODY_LINES` begrenzt und schrumpft vor dem Chat: zuerst
+/// entfällt der Körper, dann die Kopfzeile.
+///
+/// Ohne Wunsch (`body_lines_wanted == 0`) oder bei leerer Fläche gibt es
+/// keinen Streifen und `chat == below_dock`.
+pub(crate) fn portrait_live_strip(below_dock: Rect, body_lines_wanted: u16) -> PortraitLive {
+    let without = PortraitLive {
+        live: None,
+        body_lines: 0,
+        chat: below_dock,
+    };
+    if body_lines_wanted == 0 || below_dock.width == 0 || below_dock.height == 0 {
+        return without;
+    }
+    let dock_rows = harw_tui_layout::CARDS_ROWS.saturating_add(1);
+    let layout = harw_tui_layout::chat_first(harw_tui_layout::ChatFirstInput {
+        area: harw_tui_layout::Rect {
+            x: 0,
+            y: 0,
+            width: below_dock.width,
+            height: below_dock.height.saturating_add(dock_rows),
+        },
+        live_body_lines_wanted: body_lines_wanted,
+        min_chat_rows: harw_tui_layout::MINI_LIVE_MIN_CHAT_ROWS,
+    });
+    let Some(live) = layout.live else {
+        return without;
+    };
+    let body_lines = match layout.live_mode {
+        harw_tui_layout::LiveMode::Body { lines } => lines,
+        harw_tui_layout::LiveMode::Header | harw_tui_layout::LiveMode::Hidden => 0,
+    };
+    PortraitLive {
+        live: Some(Rect {
+            x: below_dock.x,
+            y: below_dock.y,
+            width: below_dock.width,
+            height: live.height,
+        }),
+        body_lines,
+        chat: Rect {
+            x: below_dock.x,
+            y: below_dock.y.saturating_add(live.height),
+            width: below_dock.width,
+            height: layout.chat.height,
         },
     }
 }
@@ -464,6 +541,83 @@ mod tests {
             DockAreas::Combined(r) => assert_eq!(r, dock),
             other => return Err(format!("expected Combined, got {other:?}").into()),
         }
+        Ok(())
+    }
+
+    /// 46×78 (Referenz-Portrait aus W02): der Dock bleibt bei 15 Zeilen, der
+    /// Streifen kommt aus `chat_first` und der Chat behält den Rest.
+    #[test]
+    fn portrait_live_strip_follows_chat_first_at_46x78() -> TestResult {
+        let screen = classify_screen(Rect::new(0, 0, 46, 78), 1, 3);
+        assert!(matches!(
+            screen.placement,
+            harw_tui_layout::Placement::PortraitDock { .. }
+        ));
+        // Arbeitsfläche 78 - (1 + 3) = 74, Dock = 74 / 3 = 24 -> geklemmt auf 15.
+        assert_eq!(screen.chat, Rect::new(0, 15, 46, 59));
+
+        let two = portrait_live_strip(screen.chat, 2);
+        assert_eq!(two.live, Some(Rect::new(0, 15, 46, 3)));
+        assert_eq!(two.body_lines, 2);
+        assert_eq!(two.chat, Rect::new(0, 18, 46, 56));
+
+        // Mehr als `MINI_LIVE_MAX_BODY_LINES` Wunschzeilen werden gekappt.
+        let max = harw_tui_layout::MINI_LIVE_MAX_BODY_LINES;
+        let many = portrait_live_strip(screen.chat, 99);
+        assert_eq!(many.body_lines, max);
+        assert_eq!(many.live, Some(Rect::new(0, 15, 46, 1 + max)));
+        assert_eq!(many.chat, Rect::new(0, 16 + max, 46, 58 - max));
+
+        // Ohne Wunsch bleibt der Chat unverändert.
+        let none = portrait_live_strip(screen.chat, 0);
+        assert_eq!(none.live, None);
+        assert_eq!(none.chat, screen.chat);
+        Ok(())
+    }
+
+    /// Der Chat behält seine Mindesthöhe: bei knappem Platz entfällt zuerst
+    /// der Körper, dann die Kopfzeile, nie ein Chat-Zeilenanteil darunter.
+    #[test]
+    fn portrait_live_strip_collapses_body_then_header_before_the_chat() -> TestResult {
+        let floor = harw_tui_layout::MINI_LIVE_MIN_CHAT_ROWS;
+        let max = harw_tui_layout::MINI_LIVE_MAX_BODY_LINES;
+        for height in 0..=80u16 {
+            for wanted in 0..=6u16 {
+                let below = Rect::new(3, 7, 46, height);
+                let out = portrait_live_strip(below, wanted);
+                match out.live {
+                    None => {
+                        assert_eq!(out.chat, below, "h={height} w={wanted}");
+                        assert_eq!(out.body_lines, 0, "h={height} w={wanted}");
+                    }
+                    Some(strip) => {
+                        assert!(wanted > 0, "h={height} w={wanted}");
+                        assert_eq!((strip.x, strip.y, strip.width), (3, 7, 46));
+                        assert_eq!(strip.height, 1 + out.body_lines, "h={height} w={wanted}");
+                        assert!(out.body_lines <= wanted.min(max), "h={height} w={wanted}");
+                        assert_eq!(out.chat.y, strip.y + strip.height, "h={height} w={wanted}");
+                        assert_eq!(
+                            strip.height + out.chat.height,
+                            height,
+                            "h={height} w={wanted}"
+                        );
+                        assert!(out.chat.height >= floor, "h={height} w={wanted}");
+                    }
+                }
+            }
+        }
+        // Genau an den Kanten: 8 Zeilen tragen keinen Streifen, 9 nur die
+        // Kopfzeile, 10 die Kopfzeile mit einer Körperzeile.
+        let at = |height| portrait_live_strip(Rect::new(0, 0, 46, height), 2);
+        assert_eq!(at(8).live, None);
+        assert_eq!(
+            (at(9).live.map(|r| r.height), at(9).body_lines),
+            (Some(1), 0)
+        );
+        assert_eq!(
+            (at(10).live.map(|r| r.height), at(10).body_lines),
+            (Some(2), 1)
+        );
         Ok(())
     }
 

@@ -5,10 +5,9 @@
 //! Momentaufnahme von Kandidaten plus eine Uhrzeit (`now_ms`) und liefert eine
 //! Reihenfolge von `run_id`s. Es gibt keine Uhr, keine I/O und keine
 //! Abhängigkeit auf Monitor- oder Stream-Module; alles ist deterministisch.
-#![allow(
-    dead_code,
-    reason = "PL-94 W01 M2b: the inline-chat renderer that consumes the ranker is not mounted yet"
-)]
+//!
+//! Eingehängt ist er in `app/live_order_glue.rs`: dort bestimmt er die
+//! Anzeigereihenfolge der Kind-Statusmeldungen in der Statuszeile.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -49,6 +48,10 @@ pub(crate) struct LiveCandidate {
     pub(crate) last_meaningful_ms: u64,
     /// Anzahl Reasoning-Deltas seit der letzten Auswertung. Wird bewusst
     /// ignoriert: geschwätzige Runs dürfen nicht nach oben rutschen.
+    #[allow(
+        dead_code,
+        reason = "PL-94 W01: Teil des Eingabevertrags, wird absichtlich nie gelesen (kein Rang durch Geschwätzigkeit)"
+    )]
     pub(crate) reasoning_deltas_since_last_eval: u32,
     /// Zeitpunkt (ms), seit dem der Run terminal ist; `None` solange er läuft.
     /// Fehlt der Wert bei einem terminalen Run, gilt `last_meaningful_ms`.
