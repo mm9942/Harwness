@@ -8,6 +8,8 @@
 //!    „Neunter Nachtrag")
 //! 5. Für jeden ToolCall:
 //!    a. Guardrail (ApprovalHandler)
+//!    a2. Zulassung beim [`ToolCallMeter`] (falls am [`TurnControl`]
+//!        registriert): bucht den Aufruf, bevor irgendetwas davon läuft
 //!    b. Handoff? → AgentSpawner → WaitingForChild
 //!    c. Sonst: ToolExecutor::execute
 //!    d. ToolResult in History
@@ -491,6 +493,7 @@ use crate::guard::{DriftEvent, DriftKind, GuardVerdict, SessionGuardVerdict, Tur
 use crate::model::{ModelProvider, ModelRequest, RequestIdentity};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
 use crate::state_store::{StateStore, StateStoreError, UsageRound};
+use crate::tool_call_meter::ToolCallMeter;
 use harw_extension_api::{
     ApprovalDecision, DelegationTargetInfo, LoadedInstructions, SpawnInput, ToolExecutor,
     TurnInputContext, TurnStartInput, TurnStopInput,
@@ -632,6 +635,10 @@ struct TurnMeter {
 /// eines erschöpften Werkzeug-Budgets nicht ausgeführt wurde.
 pub const TOOL_BUDGET_SKIP_PREFIX: &str = "nicht ausgeführt: Werkzeug-Budget erschöpft";
 
+/// Präfix des Ergebnisses eines Werkzeugaufrufs, den der [`ToolCallMeter`]
+/// abgewiesen hat; danach folgt `": "` und der Grund des Meters.
+pub const TOOL_CALL_REFUSED_PREFIX: &str = "nicht ausgeführt: Werkzeugaufruf abgewiesen";
+
 /// Vorgabe-Schwelle (Prozent des Limits), ab der ein Turn mit
 /// [`TurnTokenBudget`] die Abschluss-Anweisung
 /// ([`TOKEN_BUDGET_WRAP_UP_INSTRUCTION`]) in jede weitere Anfrage legt.
@@ -741,6 +748,9 @@ pub struct TurnControl {
     clock: Arc<dyn Clock>,
     meter: Arc<Mutex<TurnMeter>>,
     token_budget: Option<TurnTokenBudget>,
+    // Bucht jeden Werkzeugaufruf vor seiner Ausführung (siehe
+    // `crate::tool_call_meter`); Klone teilen denselben Meter.
+    tool_call_meter: Option<Arc<dyn ToolCallMeter>>,
 }
 
 impl std::fmt::Debug for TurnControl {
@@ -749,6 +759,7 @@ impl std::fmt::Debug for TurnControl {
             .field("cancel", &self.cancel)
             .field("limits", &self.limits)
             .field("token_budget", &self.token_budget)
+            .field("tool_call_meter", &self.tool_call_meter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -772,7 +783,26 @@ impl TurnControl {
             clock: Arc::new(SystemClock),
             meter: Arc::new(Mutex::new(TurnMeter::default())),
             token_budget: None,
+            tool_call_meter: None,
         }
+    }
+
+    /// Registriert den [`ToolCallMeter`], der jeden Werkzeugaufruf bucht und
+    /// zulässt, bevor er ausgeführt wird.
+    ///
+    /// # Beschreibung
+    /// Der Meter gilt für alle Ausführungswege des Turns (sequenziell,
+    /// parallel und die Fortsetzung nach einer Rückfrage) und überlebt eine
+    /// Pause mit dem Steuerblock. Eine Abweisung beendet den Turn mit
+    /// `CancelReason::Budget`; die Einzelheiten stehen in
+    /// [`crate::tool_call_meter`].
+    ///
+    /// # Arguments
+    /// - `meter` (`Arc<dyn ToolCallMeter>`): geteilter Meter des Aufrufers.
+    #[must_use]
+    pub fn with_tool_call_meter(mut self, meter: Arc<dyn ToolCallMeter>) -> Self {
+        self.tool_call_meter = Some(meter);
+        self
     }
 
     /// Setzt ein Token-Budget über neue, ungecachte Tokens
@@ -3974,6 +4004,36 @@ async fn resume_after_approval_with_store(
                 drive_turn(session, model, store, approvals, &ctx, handle, control).await
             }
             ApprovalResolution::Approve => {
+                // Zulassung beim `ToolCallMeter` (falls registriert): der nun
+                // genehmigte Aufruf wird gebucht, bevor er ausgeführt oder
+                // gespawnt wird — derselbe Haken wie im sequenziellen Pfad von
+                // `drive_turn` (Schritt a2). Eine Abweisung beantwortet den
+                // einen wartenden Call und beendet den Turn mit
+                // `CancelReason::Budget`.
+                if let Some(refused) =
+                    admit_tool_call(&control, pending.call.name.as_str()).await
+                {
+                    notify_tool_outcome(
+                        session,
+                        pending.call.name.as_str(),
+                        &pending.call.arguments,
+                        &refused,
+                    );
+                    notify_tool_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(pending.call.id, refused, 0);
+                    persist_last(session, store).await?;
+                    return cancel_turn_with_pending_calls(
+                        session,
+                        store,
+                        handle,
+                        harw_types::TokenUsage::default(),
+                        CancelReason::Budget,
+                        Vec::new(),
+                    )
+                    .await;
+                }
                 // Plan R9, Teil C: `agents.delegate` wird wie
                 // `transfer_to_<agent>` gespawnt (Argumente ohne `agent`).
                 if let Some((role, handoff_arguments)) = delegation_call(&pending.call) {
@@ -5060,6 +5120,32 @@ async fn drive_turn(
                         request,
                     });
                 }
+            }
+
+            // a2. Zulassung beim `ToolCallMeter` (falls registriert): der
+            // genehmigte Aufruf wird gebucht — und vom Meter festgeschrieben —,
+            // BEVOR er ausgeführt wird, gleich ob normales Werkzeug, Handoff
+            // oder lokal beantworteter Aufruf. Eine Abweisung beantwortet
+            // diesen Call, gibt allen noch offenen Calls der Antwort ein
+            // synthetisches Ergebnis und beendet den Turn wie ein Treffer des
+            // Werkzeug-Budgets (`CancelReason::Budget`).
+            if let Some(refused) = admit_tool_call(&control, call.name.as_str()).await {
+                notify_tool_outcome(session, call.name.as_str(), &call.arguments, &refused);
+                notify_tool_progress(session);
+                session
+                    .history_mut()
+                    .push_tool_result(call.id.clone(), refused, 0);
+                persist_last(session, store).await?;
+                let remaining: Vec<ToolCall> = tool_call_iter.map(|(_, call)| call).collect();
+                return cancel_turn_with_pending_calls(
+                    session,
+                    store,
+                    handle,
+                    total_usage,
+                    CancelReason::Budget,
+                    remaining,
+                )
+                .await;
             }
 
             // b. Handoff-Detection (Runde 9, E3: auch `agent.message` an ein
@@ -6304,6 +6390,34 @@ async fn skip_calls_over_tool_budget(
     cancel_turn(session, handle, total_usage, CancelReason::Budget).await
 }
 
+/// Bucht einen genehmigten Werkzeugaufruf beim [`ToolCallMeter`] des
+/// Steuerblocks, bevor irgendetwas davon ausgeführt wird.
+///
+/// # Beschreibung
+/// Ohne registrierten Meter ein No-op. Weist der Meter den Aufruf ab, wird
+/// der Grund als Stop-Grund des Turns vermerkt
+/// ([`TurnControl::stop_detail`]) und als Fehlerergebnis mit
+/// [`TOOL_CALL_REFUSED_PREFIX`] zurückgegeben. Der Aufrufer führt den Aufruf
+/// dann **nicht** aus, beantwortet ihn mit diesem Ergebnis und beendet den
+/// Turn mit `CancelReason::Budget`.
+///
+/// # Returns
+/// `None`, wenn der Aufruf laufen darf; `Some(result)`, wenn er abgewiesen
+/// wurde.
+async fn admit_tool_call(control: &TurnControl, tool: &str) -> Option<ToolCallResult> {
+    let meter = control.tool_call_meter.as_ref()?;
+    match meter.admit_tool_call(tool).await {
+        Ok(()) => None,
+        Err(reason) => {
+            tracing::warn!(tool = %tool, reason = %reason, "turn_loop.tool_call_refused");
+            control.note_stop_detail(format!("Werkzeugaufruf abgewiesen: {reason}"));
+            Some(ToolCallResult::error(format!(
+                "{TOOL_CALL_REFUSED_PREFIX}: {reason}"
+            )))
+        }
+    }
+}
+
 /// Execute a complete model response concurrently only when every call is an
 /// explicitly parallel-safe ordinary tool and every guardrail allows it. Any
 /// ambiguity falls back to the sequential path below; handoffs and approvals
@@ -6447,8 +6561,31 @@ async fn try_execute_parallel_calls(
             )
         })
         .collect();
+    let mut results: Vec<ParallelCallSlot> = vec![None; calls.len()];
+    // Zulassung beim `ToolCallMeter` (falls registriert), Call für Call in
+    // Antwort-Reihenfolge und unmittelbar vor dem Start des jeweiligen
+    // Jobs: jeder Aufruf ist gebucht, bevor er läuft. Die davor zugelassenen
+    // Jobs laufen weiter; der erste abgewiesene und alle folgenden werden
+    // nicht gestartet, sondern bekommen das Abweisungsergebnis. Ein Meter
+    // wird nach der ersten Abweisung nicht erneut befragt.
+    let mut refusal: Option<ToolCallResult> = None;
     let mut joins = tokio::task::JoinSet::new();
     for (position, (call, executor)) in jobs.into_iter().enumerate() {
+        if refusal.is_none() {
+            refusal = admit_tool_call(control, call.name.as_str()).await;
+        }
+        if let Some(refused) = &refusal {
+            results[position] = Some((
+                call.id.clone(),
+                refused.clone(),
+                0,
+                call.name.to_string(),
+                call.arguments.clone(),
+                false,
+                None,
+            ));
+            continue;
+        }
         let execution_context = execution_context.clone();
         let tool_name = call.name.to_string();
         let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
@@ -6486,7 +6623,6 @@ async fn try_execute_parallel_calls(
             .instrument(tool_span),
         );
     }
-    let mut results: Vec<ParallelCallSlot> = vec![None; calls.len()];
     // Fix C (Moduldoku „Siebter Nachtrag"): dieser Join-Loop wartete bisher
     // ungeraced auf **alle** Aufrufe, bevor überhaupt auf Cancel reagiert
     // wurde — ein Ausführer, der `ctx.cancel()` selbst nie abfragt, blockierte
@@ -6631,6 +6767,11 @@ async fn try_execute_parallel_calls(
             persist_last(session, store).await?;
         }
         return Ok(ParallelOutcome::Aborted(reason));
+    }
+    // Der Meter hat Aufrufe abgewiesen: alle Ergebnisse sind gepaart, der Turn
+    // endet wie bei einem Treffer des Werkzeug-Budgets.
+    if refusal.is_some() {
+        return Ok(ParallelOutcome::Aborted(CancelReason::Budget));
     }
     Ok(ParallelOutcome::Executed)
 }
@@ -8477,6 +8618,384 @@ mod tests {
                 .count();
             assert_eq!(results, batch, "jeder tool_call hat sein tool_result");
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // ToolCallMeter: Zulassung und Buchung vor der Ausführung
+    // ------------------------------------------------------------------
+
+    /// Meter, der die ersten `allowed` Aufrufe zulässt und jeden weiteren
+    /// abweist. Er hält fest, welche Werkzeuge angefragt wurden und wie viele
+    /// Ausführungen zum Zeitpunkt der jeweiligen Anfrage schon liefen.
+    struct LimitedMeter {
+        allowed: usize,
+        asked: Mutex<Vec<(String, usize)>>,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl LimitedMeter {
+        fn new(allowed: usize, executions: Arc<AtomicUsize>) -> Arc<Self> {
+            Arc::new(Self {
+                allowed,
+                asked: Mutex::new(Vec::new()),
+                executions,
+            })
+        }
+
+        fn asked(&self) -> Vec<(String, usize)> {
+            self.asked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl crate::tool_call_meter::ToolCallMeter for LimitedMeter {
+        fn admit_tool_call<'a>(
+            &'a self,
+            tool: &'a str,
+        ) -> crate::tool_call_meter::ToolCallAdmissionFuture<'a> {
+            let index = {
+                let mut asked = self
+                    .asked
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                asked.push((tool.to_owned(), self.executions.load(Ordering::SeqCst)));
+                asked.len().saturating_sub(1)
+            };
+            let limit = self.allowed;
+            Box::pin(async move {
+                if index < limit {
+                    Ok(())
+                } else {
+                    Err(format!("budget: tool-call limit of {limit} reached"))
+                }
+            })
+        }
+    }
+
+    /// Fehlermeldungen aller Tool-Ergebnisse des Verlaufs samt Call-Id.
+    fn error_results(session: &AgentSession) -> Vec<(ToolCallId, String)> {
+        session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolResult(result) => match &result.result {
+                    ToolCallResult::Error { message } => {
+                        Some((result.call_id.clone(), message.clone()))
+                    }
+                    ToolCallResult::Success { .. } => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_result_count(session: &AgentSession) -> usize {
+        session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TurnItem::ToolResult(_)))
+            .count()
+    }
+
+    fn error_of<'a>(errors: &'a [(ToolCallId, String)], id: &ToolCallId) -> Option<&'a str> {
+        errors
+            .iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, message)| message.as_str())
+    }
+
+    /// Sequenzieller Pfad: Weist der Meter den zweiten Aufruf ab, läuft nur der
+    /// erste. Der zweite bekommt das Abweisungsergebnis, der dritte wird nicht
+    /// einmal mehr angefragt und vor der Ausführung abgebrochen, und der Turn
+    /// endet mit `Budget`. Der erste Aufruf wurde gebucht, bevor er lief.
+    #[tokio::test]
+    async fn meter_refusing_the_second_call_skips_it_and_ends_the_turn_sequentially() -> TestResult
+    {
+        let ids: Vec<ToolCallId> = (0..3).map(|_| ToolCallId::new()).collect();
+        let [first, second, third] = ids.as_slice() else {
+            return Err(TestError::Missing("drei Call-Ids"));
+        };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingApproval::allow_everything());
+        // `lookup` ist nicht parallel-sicher: die Antwort läuft sequenziell.
+        let provider =
+            StubParallelProvider::with_serial_tool(&["lookup"], "lookup", Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(ids.iter().map(|id| call(id, "lookup")).collect()),
+            crate::model::ModelResponse::text("darf nicht mehr angefragt werden"),
+        ]);
+        let meter = LimitedMeter::new(1, Arc::clone(&executions));
+        let concrete = Arc::clone(&meter);
+        let control = TurnControl::new().with_tool_call_meter(concrete);
+        let check = control.clone();
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("drei Aufrufe").with_control(control),
+        )
+        .await
+        .map_err(ctx("die Abweisung beendet den Turn regulär"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1, "nur der erste lief");
+        assert_eq!(
+            meter.asked(),
+            vec![("lookup".to_owned(), 0), ("lookup".to_owned(), 1)],
+            "gebucht, bevor ausgeführt; nach der Abweisung wird nicht weiter gefragt"
+        );
+        let stop = check.stop_detail();
+        assert!(
+            stop.as_deref()
+                .is_some_and(|detail| detail.contains("tool-call limit of 1 reached")),
+            "{stop:?}"
+        );
+        let errors = error_results(&session);
+        assert_eq!(error_of(&errors, first), None, "der erste Aufruf lief");
+        assert!(
+            error_of(&errors, second)
+                .is_some_and(|message| message.starts_with(TOOL_CALL_REFUSED_PREFIX)),
+            "{errors:?}"
+        );
+        assert!(
+            error_of(&errors, third)
+                .is_some_and(|message| message.starts_with("turn cancelled before execution")),
+            "{errors:?}"
+        );
+        assert_eq!(
+            tool_result_count(&session),
+            3,
+            "jeder tool_call hat sein tool_result"
+        );
+        let remaining = model
+            .responses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert_eq!(remaining, 1, "nach der Abweisung folgt keine Modellrunde");
+        Ok(())
+    }
+
+    /// Paralleler Pfad: Die zugelassenen Aufrufe laufen, der abgewiesene und
+    /// alle folgenden werden nicht gestartet; der Turn endet mit `Budget`.
+    #[tokio::test]
+    async fn meter_refusal_in_the_parallel_path_starts_only_the_admitted_prefix() -> TestResult {
+        let ids: Vec<ToolCallId> = (0..3).map(|_| ToolCallId::new()).collect();
+        let [first, second, third] = ids.as_slice() else {
+            return Err(TestError::Missing("drei Call-Ids"));
+        };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(ids.iter().map(|id| call(id, "lookup")).collect()),
+            crate::model::ModelResponse::text("darf nicht mehr angefragt werden"),
+        ]);
+        let meter = LimitedMeter::new(2, Arc::clone(&executions));
+        let concrete = Arc::clone(&meter);
+        let control = TurnControl::new().with_tool_call_meter(concrete);
+        let check = control.clone();
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("parallel").with_control(control),
+        )
+        .await
+        .map_err(ctx("die Abweisung beendet den Turn regulär"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "nur zwei Jobs gestartet"
+        );
+        assert_eq!(
+            meter.asked().len(),
+            3,
+            "der dritte wurde gefragt und abgewiesen"
+        );
+        assert!(
+            check
+                .stop_detail()
+                .is_some_and(|detail| detail.contains("tool-call limit of 2 reached"))
+        );
+        let errors = error_results(&session);
+        assert_eq!(error_of(&errors, first), None);
+        assert_eq!(error_of(&errors, second), None);
+        assert!(
+            error_of(&errors, third)
+                .is_some_and(|message| message.starts_with(TOOL_CALL_REFUSED_PREFIX)),
+            "{errors:?}"
+        );
+        assert_eq!(
+            tool_result_count(&session),
+            3,
+            "jeder tool_call hat sein tool_result"
+        );
+        Ok(())
+    }
+
+    /// Ein Meter, der schon den ersten Aufruf abweist, lässt nichts laufen.
+    #[tokio::test]
+    async fn meter_refusing_the_first_call_executes_nothing() -> TestResult {
+        let id = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![call(&id, "lookup")])]);
+        let meter = LimitedMeter::new(0, Arc::clone(&executions));
+        let concrete = Arc::clone(&meter);
+        let control = TurnControl::new().with_tool_call_meter(concrete);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("ein Aufruf").with_control(control),
+        )
+        .await
+        .map_err(ctx("die Abweisung beendet den Turn regulär"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_result_count(&session), 1);
+        Ok(())
+    }
+
+    /// Ein von der Guardrail verweigerter Aufruf wird nicht gebucht: der Meter
+    /// sieht nur den Aufruf, der tatsächlich laufen würde.
+    #[tokio::test]
+    async fn meter_is_not_asked_for_calls_the_guardrail_denied() -> TestResult {
+        let denied = ToolCallId::new();
+        let allowed = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingApproval::new(vec![(
+            denied.clone(),
+            ApprovalDecision::Deny("policy".to_owned()),
+        )]));
+        let provider =
+            StubParallelProvider::with_serial_tool(&["lookup"], "lookup", Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![call(&denied, "lookup"), call(&allowed, "lookup")]),
+            crate::model::ModelResponse::text("fertig"),
+        ]);
+        let meter = LimitedMeter::new(5, Arc::clone(&executions));
+        let concrete = Arc::clone(&meter);
+        let control = TurnControl::new().with_tool_call_meter(concrete);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("verweigert und erlaubt").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            meter.asked(),
+            vec![("lookup".to_owned(), 0)],
+            "nur der erlaubte Aufruf wurde gebucht"
+        );
+        Ok(())
+    }
+
+    /// Fortsetzungspfad nach einer Rückfrage: Auch der nun genehmigte Aufruf
+    /// wird erst gebucht; ein abweisender Meter verhindert die Ausführung.
+    #[tokio::test]
+    async fn meter_refusal_blocks_an_approved_call_on_the_ask_user_resume_path() -> TestResult {
+        let call_id = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
+        let actor = ApprovalActor::Operator {
+            id: "test-operator".to_owned(),
+        };
+        session
+            .begin_approval(
+                call(&call_id, "lookup"),
+                harw_types::ItemId::new(),
+                actor.clone(),
+                jiff::Timestamp::now(),
+            )
+            .map_err(ctx("pause for approval"))?;
+        let meter = LimitedMeter::new(0, Arc::clone(&executions));
+        let concrete = Arc::clone(&meter);
+        session.set_active_turn_control(TurnControl::new().with_tool_call_meter(concrete));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = crate::model::EchoModelProvider::new("must not be reached");
+
+        let outcome = resume_after_approval(
+            &mut session,
+            &model,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await
+        .map_err(ctx("die Abweisung beendet den Turn regulär"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(meter.asked(), vec![("lookup".to_owned(), 0)]);
+        let errors = error_results(&session);
+        assert!(
+            error_of(&errors, &call_id)
+                .is_some_and(|message| message.starts_with(TOOL_CALL_REFUSED_PREFIX)),
+            "{errors:?}"
+        );
         Ok(())
     }
 
