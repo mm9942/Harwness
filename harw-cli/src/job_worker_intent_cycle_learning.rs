@@ -1984,7 +1984,14 @@ mod tests {
         let fx = fixture(&TWO_LEARNABLE)?;
         let (jobs, lease) =
             claimed_job(&fx, jiff::Timestamp::now(), SignedDuration::from_secs(60))?;
-        let keys = pending_keys(&fx)?;
+        // The record is bound to the claim: only its lease may read the keys.
+        let keys: Vec<String> = fx
+            .store
+            .pending_observations(CYCLE_ID, &lease)
+            .map_err(ctx("pending observations under the claim"))?
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
 
         // An operator reclaim (revoke the lease, requeue the job) that starts
         // inside the window and retries until it wins.

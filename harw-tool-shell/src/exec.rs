@@ -384,6 +384,32 @@ impl ShellExecutor {
         (stdout, stderr, stdout_truncated || stderr_truncated)
     }
 
+    /// Kürzt einen Strom, den der Port bereits genau am Byte-Budget
+    /// abgeschnitten hat, so weit, dass der Marker noch hineinpasst, und hängt
+    /// ihn an.
+    ///
+    /// # Description
+    /// [`Self::truncate_output`] hängt den Marker nur an, wenn noch etwas zu
+    /// kürzen ist. Hat der Kommando-Port den Strom selbst auf das Budget
+    /// gestutzt (`CommandEnd::OutputLimit`), bleibt nichts zu kürzen, der
+    /// Leser sähe aber auch keinen Schnitt. Deshalb weicht der Präfix hier um
+    /// die Markerlänge zurück (an einer UTF-8-Grenze); ist das Budget kleiner
+    /// als der Marker, bleibt es beim größten gültigen Präfix ohne Marker.
+    fn cut_with_marker(bytes: &[u8], limit: usize) -> String {
+        let limit = limit.min(bytes.len());
+        if limit < TRUNCATION_MARKER.len() {
+            return Self::truncate_output(bytes, limit).0;
+        }
+        let prefix_limit = limit - TRUNCATION_MARKER.len();
+        let prefix_end = match std::str::from_utf8(&bytes[..prefix_limit]) {
+            Ok(_) => prefix_limit,
+            Err(error) => error.valid_up_to(),
+        };
+        let mut clipped = String::from_utf8_lossy(&bytes[..prefix_end]).into_owned();
+        clipped.push_str(TRUNCATION_MARKER);
+        clipped
+    }
+
     /// Prüft für Host-Profil-Ausführung, dass ein gültiger Permit den
     /// konkreten Antrag trägt, stellt bei Bedarf einen neuen Permit für
     /// einen bereits sitzungsweit zugestimmten Auftrag aus, oder fragt —
@@ -1043,9 +1069,27 @@ impl ShellExecutor {
         executed_on_host: bool,
     ) -> ToolOutput {
         let exit_code = exit_code.unwrap_or(-1);
-        let (stdout_str, stderr_str, truncated) =
+        let (stdout_str, stderr_str, clipped) =
             Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
-        let truncated = truncated || killed_by_output_limit;
+        let (stdout_str, stderr_str) = if killed_by_output_limit && !clipped {
+            // Der Port hat den Strom genau am Budget abgeschnitten: hier war
+            // nichts mehr zu kürzen, der Marker fehlte sonst. Er steht auf
+            // stdout, sofern dort etwas angekommen ist, andernfalls auf stderr.
+            if stdout.is_empty() {
+                (
+                    stdout_str,
+                    Self::cut_with_marker(stderr, self.max_output_bytes),
+                )
+            } else {
+                (
+                    Self::cut_with_marker(stdout, self.max_output_bytes),
+                    stderr_str,
+                )
+            }
+        } else {
+            (stdout_str, stderr_str)
+        };
+        let truncated = clipped || killed_by_output_limit;
 
         info!(
             exit_code,
@@ -1972,6 +2016,51 @@ mod tests {
                     "expected Json output, got: {other:?}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Der Port stutzt die Ausgabe selbst genau auf das Budget: nichts bleibt
+    /// zu kürzen, der Marker muss trotzdem im Budget stehen — auf stdout,
+    /// sonst auf stderr.
+    #[test]
+    fn test_completed_output_marks_a_port_cut_with_the_marker() -> TestResult {
+        let limit = TRUNCATION_MARKER.len() + 10;
+        let executor = ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: limit,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
+        };
+        let cut: Vec<u8> = b"this_is_a_longer_string_than_ten_bytes"[..limit].to_vec();
+        for (stdout, stderr) in [(cut.as_slice(), &b""[..]), (&b""[..], cut.as_slice())] {
+            let ToolOutput::Json { content } =
+                executor.completed_output(None, stdout, stderr, true, false)
+            else {
+                return Err(TestError::Missing("Json output"));
+            };
+            assert_eq!(content["truncated"], true);
+            assert_eq!(content["killed_by_output_limit"], true);
+            let out = content["stdout"].as_str().unwrap_or("");
+            let err = content["stderr"].as_str().unwrap_or("");
+            let marked = if stdout.is_empty() { err } else { out };
+            assert!(
+                marked.ends_with(TRUNCATION_MARKER),
+                "the cut stream carries the marker: {out:?} / {err:?}"
+            );
+            assert!(marked.starts_with("this_is_a_"), "{marked:?}");
+            assert!(
+                out.len() + err.len() <= limit,
+                "within the budget: {out:?} / {err:?}"
+            );
         }
         Ok(())
     }

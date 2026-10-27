@@ -7,7 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+use harw_agent_compiler::discovery::Target;
+use harw_agent_compiler::passes::{Pass, RightsCheck};
 use harw_agent_compiler::{AgentInput, Compiled, Compiler, CompilerEnv, CompilerOptions};
+use harw_agent_dsl::lower_v2::WORK_DRIVER_TOOLS;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -29,14 +32,19 @@ fn example_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(dir)
 }
 
-/// Compiles the definition directory `dir` in an isolated harw home, with the
-/// real built-in defaults installed as the `harw` binary does at start.
-fn compile_dir(dir: &Path, scratch: &Path) -> Result<Compiled, Box<dyn std::error::Error>> {
+/// A compiler over an isolated harw home in `scratch`, with the real
+/// built-in defaults installed as the `harw` binary does at start.
+fn compiler_in(scratch: &Path) -> Result<Compiler, Box<dyn std::error::Error>> {
     harw_registry_defaults::compiler_defaults::install();
     let home = scratch.join("home");
     std::fs::create_dir_all(&home)?;
     let env = CompilerEnv::isolated(home, scratch.to_path_buf());
-    let mut compiler = Compiler::new(env, CompilerOptions::default())?;
+    Ok(Compiler::new(env, CompilerOptions::default())?)
+}
+
+/// Compiles the definition directory `dir` through the real pipeline.
+fn compile_dir(dir: &Path, scratch: &Path) -> Result<Compiled, Box<dyn std::error::Error>> {
+    let mut compiler = compiler_in(scratch)?;
     Ok(compiler.compile_input(&AgentInput::Path(dir.to_path_buf()))?)
 }
 
@@ -75,7 +83,7 @@ fn test_driven_orchestrator_example_lowers_its_work_driver() -> TestResult {
         .as_ref()
         .ok_or("the example's [work_driver] table did not reach the IR")?;
     assert_eq!(driver.worker_role, "executor");
-    assert_eq!(driver.judge_role.as_deref(), Some("analyst"));
+    assert_eq!(driver.judge_role.as_deref(), Some("evidence-critic"));
     assert_eq!(driver.max_iterations, 8);
     assert_eq!(driver.max_parallel_workers, 3);
     assert_eq!(driver.max_attempts_per_worker, 3);
@@ -89,6 +97,14 @@ fn test_driven_orchestrator_example_lowers_its_work_driver() -> TestResult {
     );
     assert_eq!(driver.token_budget, Some(800_000));
     assert_eq!(driver.wall_budget_secs, Some(5400));
+
+    // Lowering grants the three tools and the rights check lets them through.
+    for tool in WORK_DRIVER_TOOLS {
+        assert!(
+            compiled.unit.ir.tools.admitted.iter().any(|t| t == tool),
+            "`{tool}` is missing from the compiled tool list"
+        );
+    }
     Ok(())
 }
 
@@ -129,5 +145,35 @@ fn test_driven_orchestrator_without_work_driver_table_has_no_driver() -> TestRes
         compiled.unit.ir.work_driver.is_none(),
         "a definition without [work_driver] must lower to work_driver == None"
     );
+    Ok(())
+}
+
+#[test]
+fn test_work_driver_tools_pass_the_rights_check_only_with_the_table() -> TestResult {
+    let dir = example_dir()?;
+    let scratch = tempfile::tempdir()?;
+    let mut compiler = compiler_in(scratch.path())?;
+    let Target::Entry(entry) = compiler.resolve(&AgentInput::Path(dir))? else {
+        return Err("the example is not a definition entry".into());
+    };
+    let mut unit = compiler.front_end(&entry).map_err(|d| d.to_string())?;
+    let rights = RightsCheck {
+        ceilings: compiler.ceilings(),
+        author: None,
+    };
+
+    // With the table, the three tools lowering added stay inside the base role.
+    let with_table = rights.run(&mut unit);
+    assert!(!with_table.has_errors(), "{with_table}");
+
+    // The same tool list without the table widens the base role: the
+    // exemption is keyed on `[work_driver]`, not on the tool names alone.
+    unit.ir.work_driver = None;
+    let without_table = rights.run(&mut unit);
+    let widening = without_table
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "HARW-BUILD-004")
+        .count();
+    assert_eq!(widening, WORK_DRIVER_TOOLS.len(), "{without_table}");
     Ok(())
 }

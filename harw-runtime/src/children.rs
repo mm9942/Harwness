@@ -1972,7 +1972,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // vor dem Neustart; ohne Meldung (direkter Aufruf ohne Admission) aus
         // einer frischen Sitzungs-ID. Eine Elternrolle ist aus `SpawnInput`
         // nicht herleitbar; siehe [`Self::child_caller_identity`].
-        let child_session = announced_child.unwrap_or_else(harw_types::SessionId::new);
+        let child_session = announced_child.unwrap_or_default();
         let identity = self.caller_identity_for_child(role, &child_session);
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
