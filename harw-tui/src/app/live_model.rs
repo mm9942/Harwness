@@ -19,14 +19,24 @@ use super::ChatApp;
 
 /// Meldet die generische Controller-Auswahl an die Live-Modellwahl der
 /// Montage (nur an der Turn-Grenze aufrufen).
+///
+/// # Beschreibung
+/// Wählt der Controller ein abgeschaltetes (retired) Modell, lehnt die
+/// Montage die Wahl ab (fail-closed): neu gestartete Kinder behalten dann
+/// die bisherige Live-Wahl bzw. den Stand des Starts. Die Ablehnung wird nur
+/// protokolliert — die Sitzungszeilen gehören der Wechsel-Operation, und diese
+/// Funktion läuft an jeder Turn-Grenze, würde also dieselbe Zeile wiederholen.
 pub(super) fn sync_live_main(app: &ChatApp) {
     let Some(runtime) = app.runtime() else {
         return;
     };
     let snap = app.session_controller.snapshot();
-    runtime
+    if let Err(error) = runtime
         .live_models()
-        .set_live_main(snap.active_provider, snap.active_model);
+        .set_live_main(snap.active_provider, snap.active_model)
+    {
+        tracing::warn!(%error, "tui.live_model.sync_refused");
+    }
 }
 
 /// Provider und Modell, die die Wurzelsitzung jetzt (bzw. ab dem nächsten

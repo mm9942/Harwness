@@ -3018,7 +3018,8 @@ mod tests {
             None
         );
 
-        live.set_live_main(Some("openai".to_owned()), Some("gpt-5".to_owned()));
+        live.set_live_main(Some("openai".to_owned()), Some("gpt-5".to_owned()))
+            .map_err(ctx("live main is not retired"))?;
         assert_eq!(
             factory.main_model_for_task(role_names::ROOT_ORCHESTRATOR, None),
             Some("gpt-5".to_owned())

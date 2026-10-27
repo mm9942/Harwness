@@ -16,6 +16,7 @@
 //! - [`LifecycleStatus`]: abgeleiteter Status zu einem Zeitpunkt.
 //! - [`ExplicitSelection`] und [`RetiredModelError`]: Ergebnis einer expliziten Auswahl.
 //! - [`LifecycleEntry`], [`bundled_lifecycles`], [`lookup`]: eingebettete Tabelle.
+//! - [`enforce_explicit`], [`implicitly_selectable_bundled`]: Prüfung gegen die eingebettete Tabelle.
 //!
 //! # Fehlerquellen
 //! Ausschließlich [`RetiredModelError`] bei expliziter Auswahl eines
@@ -35,7 +36,11 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use time::{Date, Duration, Month, OffsetDateTime};
+/// Zeitpunkt-Typ der Lebenszyklus-Prüfungen; re-exportiert, damit Aufrufer
+/// ohne eigene `time`-Abhängigkeit `enforce_explicit`/`implicitly_selectable_bundled`
+/// mit `OffsetDateTime::now_utc()` füttern können.
+pub use time::OffsetDateTime;
+use time::{Date, Duration, Month};
 
 use crate::descriptor::ModelId;
 
@@ -377,6 +382,54 @@ pub fn lookup<'a>(
         .find(|entry| entry.provider == provider && entry.model == model)
 }
 
+/// Formuliert die Warnung für ein abgekündigtes Angebot samt Ersatzmodellen.
+fn deprecation_warning(provider: &str, model: &str, replacements: &[ModelId]) -> String {
+    if replacements.is_empty() {
+        return format!("Modell {provider}/{model} ist abgekündigt; ohne Ersatzhinweis");
+    }
+    let names: Vec<&str> = replacements.iter().map(ModelId::as_str).collect();
+    format!(
+        "Modell {provider}/{model} ist abgekündigt; empfohlener Ersatz: {}",
+        names.join(", ")
+    )
+}
+
+/// Prüft eine explizite Auswahl gegen die eingebettete Tabelle.
+///
+/// Unbekanntes Angebot → `Ok(None)`. Deprecated/RetirementWindow →
+/// `Ok(Some(warnung))` mit den Ersatzmodellen im Text. Retired →
+/// [`RetiredModelError`]. Die Modell-ID wird nie ersetzt.
+///
+/// # Errors
+/// [`RetiredModelError`], wenn das Angebot zum Zeitpunkt `now` abgeschaltet
+/// (retired) ist; `replacements` enthält die empfohlenen Ersatzmodelle.
+pub fn enforce_explicit(
+    provider: &str,
+    model: &str,
+    now: OffsetDateTime,
+) -> Result<Option<String>, RetiredModelError> {
+    let entries = bundled_lifecycles();
+    let Some(entry) = lookup(&entries, provider, model) else {
+        return Ok(None);
+    };
+    match entry.lifecycle.check_explicit(provider, model, now)? {
+        ExplicitSelection::Ok => Ok(None),
+        ExplicitSelection::Deprecated { replacements } => {
+            Ok(Some(deprecation_warning(provider, model, &replacements)))
+        }
+    }
+}
+
+/// `true`, wenn `provider`/`model` jetzt implizit (Router/Default) gewählt werden darf.
+///
+/// Unbekanntes Angebot → `true`; sonst [`ProviderLifecycle::implicitly_selectable`]
+/// (`false` im Retirement-Fenster und nach dem Retirement).
+#[must_use]
+pub fn implicitly_selectable_bundled(provider: &str, model: &str, now: OffsetDateTime) -> bool {
+    let entries = bundled_lifecycles();
+    lookup(&entries, provider, model).is_none_or(|entry| entry.lifecycle.implicitly_selectable(now))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -634,6 +687,77 @@ mod tests {
         let json = serde_json::to_string(&lifecycle)?;
         let parsed: ProviderLifecycle = serde_json::from_str(&json)?;
         assert_eq!(parsed, lifecycle);
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_explicit_unknown_model_is_ok() -> TestResult {
+        let now = utc(2026, 10, 27, 0)?;
+
+        let outcome =
+            enforce_explicit("nope", "x", now).map_err(ctx("unknown offer is allowed"))?;
+
+        assert_eq!(outcome, None);
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_explicit_retired_names_replacement() -> TestResult {
+        // `mistral-ocr-4-0`: Retirement 2026-09-30, also am 2026-10-14 vollzogen.
+        let now = utc(2026, 10, 14, 0)?;
+
+        let Err(error) = enforce_explicit("mistral", "mistral-ocr-4-0", now) else {
+            return Err(TestError::Unexpected(
+                "retired model must be rejected".to_owned(),
+            ));
+        };
+
+        assert_eq!(error.provider, "mistral");
+        assert_eq!(error.model, "mistral-ocr-4-0");
+        assert!(!error.replacements.is_empty());
+        assert_eq!(error.replacements, vec![ModelId::from("mistral-ocr-4-1")]);
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_explicit_deprecated_warns() -> TestResult {
+        // Sonnet 4.5: deprecated seit 2026-09-30, Retirement erst 2026-11-30.
+        let now = utc(2026, 10, 27, 0)?;
+
+        let warning = enforce_explicit("anthropic", "claude-sonnet-4-5-20250929", now)
+            .map_err(ctx("deprecated model stays selectable"))?
+            .ok_or(TestError::Missing("deprecation warning"))?;
+
+        assert!(warning.contains("claude-sonnet-4-5-20250929"));
+        assert!(warning.contains("claude-sonnet-5-5"));
+
+        let active = enforce_explicit("anthropic", "claude-haiku-5-5", now)
+            .map_err(ctx("active model is allowed"))?;
+        assert_eq!(active, None);
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_skips_retirement_window() -> TestResult {
+        let sonnet = ("anthropic", "claude-sonnet-4-5-20250929");
+        // Retirement 2026-11-30: Fenster ab 2026-11-29 10:00 UTC.
+        let in_window = utc(2026, 11, 29, 10)?;
+        let well_before = utc(2026, 10, 27, 0)?;
+
+        assert!(!implicitly_selectable_bundled(
+            sonnet.0, sonnet.1, in_window
+        ));
+        assert!(implicitly_selectable_bundled(
+            sonnet.0,
+            sonnet.1,
+            well_before
+        ));
+        assert!(!implicitly_selectable_bundled(
+            "mistral",
+            "mistral-ocr-4-0",
+            well_before
+        ));
+        assert!(implicitly_selectable_bundled("nope", "x", in_window));
         Ok(())
     }
 }

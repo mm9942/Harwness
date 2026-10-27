@@ -30,6 +30,17 @@
 //!   Router ein; scheitert das, lehnt die Wechsel-Operation ab und das alte
 //!   Modell bleibt aktiv.
 //!
+//! # Lebenszyklus der Provider-Angebote
+//! - Eine **explizite** Wahl ([`LiveModelRouting::set_live_main`],
+//!   [`LiveModelControl::set_internal_model`]) eines abgeschalteten
+//!   (retired) Modells wird abgelehnt (fail-closed, Zustand unverändert,
+//!   nie ein stiller Austausch); ein abgekündigtes (deprecated) Modell wird
+//!   mit Warnung zugelassen.
+//! - Eine **implizit** aufgelöste Kind-Stelle
+//!   ([`LiveModelRouting::resolved_internal_model`]) fällt auf das
+//!   Hauptmodell zurück, wenn ihr Modell abgeschaltet ist oder im
+//!   Retirement-Fenster liegt.
+//!
 //! # Nebenläufigkeit
 //! Zustand hinter `RwLock`; ein Neubau ist durch eine eigene Sperre
 //! serialisiert. Eine vergiftete Sperre gilt als „keine Live-Wahl"
@@ -44,6 +55,8 @@ use harw_config::{
     ResolvedInternalModel, catalog_provider_of,
 };
 use harw_core::{ModelProvider, PinnedModelProvider};
+use harw_model_catalog::lifecycle;
+pub use harw_model_catalog::lifecycle::RetiredModelError;
 use harw_ops::live_model::LiveModelControl;
 use harw_provider_http::{RoutingBackends, SecretResolver};
 use harw_types::{ModelId, ProviderId};
@@ -153,16 +166,51 @@ impl LiveModelRouting {
     /// Die TUI ruft das an jeder Turn-Grenze auf (ein laufender Turn behält
     /// sein Modell). Ohne Modell gilt wieder der Stand des Starts. Wirkt nur
     /// auf **neu** gestartete Kinder.
-    pub fn set_live_main(&self, provider: Option<String>, model: Option<String>) {
+    ///
+    /// # Lebenszyklus
+    /// Fail-closed für abgeschaltete (retired) Modelle: Provider (genannt,
+    /// sonst Katalog, sonst Vorgabe-Provider) und Modell-ID werden gegen den
+    /// Lebenszyklus geprüft, bevor die Wahl gespeichert wird; ein
+    /// abgeschaltetes Modell wird abgelehnt und der bisherige Stand bleibt
+    /// unverändert. Ein abgekündigtes (deprecated) Modell wird mit einer
+    /// Warnung im Log zugelassen. Das Zurücksetzen (`model: None`) schlägt nie
+    /// fehl.
+    ///
+    /// # Errors
+    /// [`RetiredModelError`], wenn das gewählte Modell abgeschaltet ist; sie
+    /// nennt die vom Provider empfohlenen Ersatzmodelle.
+    pub fn set_live_main(
+        &self,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Result<(), RetiredModelError> {
         let route = model
             .filter(|model| !model.trim().is_empty())
             .map(|model| LiveMainRoute {
                 provider: provider.filter(|provider| !provider.trim().is_empty()),
                 model,
             });
+        // Die TUI ruft diese Methode an jeder Turn-Grenze auf: eine unveränderte
+        // Wahl wurde bereits geprüft, sonst würde jede Runde dieselbe Warnung
+        // wiederholen.
+        let unchanged = self
+            .state
+            .read()
+            .ok()
+            .is_some_and(|state| state.main == route);
+        if unchanged {
+            return Ok(());
+        }
+        if let Some(route) = &route {
+            self.enforce_lifecycle(route.provider.as_deref(), &route.model)
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "runtime.live_model.main_refused");
+                })?;
+        }
         if let Ok(mut state) = self.state.write() {
             state.main = route;
         }
+        Ok(())
     }
 
     /// Provider/Modell, das ein jetzt gestartetes ungepinntes Kind anspricht;
@@ -198,15 +246,82 @@ impl LiveModelRouting {
     }
 
     /// Aktuelle Auflösung einer Kind-Modellstelle.
+    ///
+    /// # Rückgabe
+    /// `None` für eine unbekannte Stelle — und für eine Stelle, deren Modell
+    /// nicht implizit wählbar ist (abgeschaltet oder im Retirement-Fenster,
+    /// siehe [`lifecycle::implicitly_selectable_bundled`]): der Aufrufer
+    /// fällt dann auf das Hauptmodell zurück, statt still ein Modell
+    /// anzusprechen, das der Provider abschaltet.
     #[must_use]
     pub fn resolved_internal_model(
         &self,
         point: InternalModelPoint,
     ) -> Option<ResolvedInternalModel> {
-        self.state
+        let resolved = self
+            .state
             .read()
             .ok()
-            .and_then(|state| state.resolved.get(&point).cloned())
+            .and_then(|state| state.resolved.get(&point).cloned())?;
+        if let Some(model) = resolved.model.as_deref() {
+            let now = time::OffsetDateTime::now_utc();
+            let selectable = self
+                .lifecycle_provider(resolved.provider.as_deref(), model)
+                .is_none_or(|provider| {
+                    let model_id = resolve_model_id(&self.config, model);
+                    lifecycle::implicitly_selectable_bundled(&provider, &model_id, now)
+                });
+            if !selectable {
+                tracing::warn!(
+                    point = point.key(),
+                    model,
+                    "retired or in retirement window; falling back to main model"
+                );
+                return None;
+            }
+        }
+        Some(resolved)
+    }
+
+    /// Provider, gegen dessen Lebenszyklus eine Wahl geprüft wird: der
+    /// genannte, sonst der des Katalogs, sonst der Vorgabe-Provider der
+    /// Konfiguration; `None`, wenn keiner bekannt ist (dann gibt es nichts zu
+    /// prüfen).
+    fn lifecycle_provider(&self, provider: Option<&str>, model: &str) -> Option<String> {
+        provider
+            .map(str::to_owned)
+            .or_else(|| catalog_provider_of(&self.config, model))
+            .or_else(|| self.config.harness.default_provider.clone())
+    }
+
+    /// Erzwingt den Lebenszyklus einer **expliziten** Wahl.
+    ///
+    /// # Beschreibung
+    /// Abgekündigt (deprecated) → Warnung im Log, die Wahl gilt; ohne
+    /// bekannten Provider wird nichts geprüft.
+    ///
+    /// # Errors
+    /// [`RetiredModelError`], wenn das Angebot abgeschaltet ist.
+    fn enforce_lifecycle(
+        &self,
+        provider: Option<&str>,
+        model: &str,
+    ) -> Result<(), RetiredModelError> {
+        let Some(provider) = self.lifecycle_provider(provider, model) else {
+            return Ok(());
+        };
+        let model_id = resolve_model_id(&self.config, model);
+        let warning =
+            lifecycle::enforce_explicit(&provider, &model_id, time::OffsetDateTime::now_utc())?;
+        if let Some(warning) = warning {
+            tracing::warn!(
+                %warning,
+                provider = provider.as_str(),
+                model = model_id.as_str(),
+                "runtime.live_model.deprecated"
+            );
+        }
+        Ok(())
     }
 
     /// Konfiguration mit dem Default-Modell, das der Router tatsächlich
@@ -279,6 +394,26 @@ impl LiveModelControl for LiveModelRouting {
         point: InternalModelPoint,
         choice: Option<InternalModelChoice>,
     ) -> bool {
+        // Eine explizite Wahl eines abgeschalteten Modells wird abgelehnt
+        // (Zustand unverändert); abgekündigt → nur Warnung. Geroutet wird mit
+        // dem genannten, sonst dem Vorgabe-Provider (wie bei der Auflösung).
+        if let Some(InternalModelChoice {
+            provider,
+            model: Some(model),
+        }) = &choice
+        {
+            let provider = provider
+                .as_deref()
+                .or(self.config.harness.default_provider.as_deref());
+            if let Err(error) = self.enforce_lifecycle(provider, model) {
+                tracing::warn!(
+                    point = point.key(),
+                    %error,
+                    "runtime.live_model.internal_model_refused"
+                );
+                return false;
+            }
+        }
         let Ok(mut state) = self.state.write() else {
             return false;
         };
@@ -653,6 +788,166 @@ mod tests {
             last(&recorder),
             Some((Some("b".to_owned()), Some("b-model".to_owned())))
         );
+        Ok(())
+    }
+
+    /// Ein in der eingebetteten Lebenszyklus-Tabelle abgeschaltetes Angebot
+    /// (Mistral OCR 4.0, retired 2026-09-30 — für die echte Uhr sicher in der
+    /// Vergangenheit).
+    const RETIRED_PROVIDER: &str = "mistral";
+    const RETIRED_MODEL: &str = "mistral-ocr-4-0";
+
+    fn retired_choice() -> InternalModelChoice {
+        InternalModelChoice {
+            provider: Some(RETIRED_PROVIDER.to_owned()),
+            model: Some(RETIRED_MODEL.to_owned()),
+        }
+    }
+
+    /// Eine explizite Wahl eines abgeschalteten Modells wird mit dem Ersatz
+    /// abgelehnt und ändert nichts; das Zurücksetzen schlägt nie fehl.
+    #[test]
+    fn explicit_retired_model_is_refused_with_replacement() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(ResolvedConfig::default()));
+        let Err(error) = routing.set_live_main(
+            Some(RETIRED_PROVIDER.to_owned()),
+            Some(RETIRED_MODEL.to_owned()),
+        ) else {
+            return Err(TestError::Unexpected(
+                "ein abgeschaltetes Modell darf nicht gewählt werden".to_owned(),
+            ));
+        };
+        assert_eq!(error.provider, RETIRED_PROVIDER);
+        assert_eq!(error.model, RETIRED_MODEL);
+        assert!(
+            error.to_string().contains("mistral-ocr-4-1"),
+            "die Meldung nennt den Ersatz: {error}"
+        );
+        assert!(routing.live_main().is_none());
+
+        // Eine bestehende Wahl bleibt bei einer abgelehnten Wahl erhalten.
+        routing
+            .set_live_main(Some("openai".to_owned()), Some("gpt-5".to_owned()))
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(
+            routing
+                .set_live_main(
+                    Some(RETIRED_PROVIDER.to_owned()),
+                    Some(RETIRED_MODEL.to_owned())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            routing.live_main(),
+            Some((Some("openai".to_owned()), "gpt-5".to_owned()))
+        );
+
+        routing
+            .set_live_main(None, None)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(routing.live_main().is_none());
+        Ok(())
+    }
+
+    /// Ohne Provider und mit einem Alias wird über den Katalog auf Provider
+    /// und Modell-ID aufgelöst, bevor der Lebenszyklus geprüft wird.
+    #[test]
+    fn retired_model_behind_a_catalog_alias_is_refused() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config.models.insert(
+            "ocr".to_owned(),
+            harw_config::ModelToml {
+                stream: None,
+                rate_limit: None,
+                id: RETIRED_MODEL.to_owned(),
+                name: None,
+                provider: RETIRED_PROVIDER.to_owned(),
+                aliases: vec!["legacy-ocr".to_owned()],
+                context_window: None,
+                max_tokens: None,
+                prompt_caching: None,
+                reasoning: false,
+                input_types: Vec::new(),
+                capabilities: harw_config::ModelCapabilitiesToml::default(),
+                default_reasoning_effort: None,
+            },
+        );
+        let routing = LiveModelRouting::new(Arc::new(config));
+        let Err(error) = routing.set_live_main(None, Some("legacy-ocr".to_owned())) else {
+            return Err(TestError::Unexpected(
+                "der Alias eines abgeschalteten Modells muss abgelehnt werden".to_owned(),
+            ));
+        };
+        assert_eq!(error.provider, RETIRED_PROVIDER);
+        assert_eq!(error.model, RETIRED_MODEL);
+        assert!(routing.live_main().is_none());
+        Ok(())
+    }
+
+    /// Ein abgekündigtes, aber noch nicht abgeschaltetes Modell (Claude
+    /// Mythos Preview, Retirement nicht angekündigt) wird zugelassen.
+    #[test]
+    fn deprecated_model_is_accepted() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(ResolvedConfig::default()));
+        routing
+            .set_live_main(
+                Some("anthropic".to_owned()),
+                Some("claude-mythos-preview".to_owned()),
+            )
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert_eq!(
+            routing.live_main(),
+            Some((
+                Some("anthropic".to_owned()),
+                "claude-mythos-preview".to_owned()
+            ))
+        );
+        Ok(())
+    }
+
+    /// Eine Rollenwahl auf ein abgeschaltetes Modell meldet `false` und lässt
+    /// die Stelle unverändert (weiter auf dem Hauptmodell).
+    #[test]
+    fn explicit_retired_role_choice_is_refused_and_changes_nothing() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(ResolvedConfig::default()));
+        assert!(
+            !routing
+                .set_internal_model(InternalModelPoint::RootOrchestrator, Some(retired_choice()))
+        );
+        let resolved = routing
+            .resolved_internal_model(InternalModelPoint::RootOrchestrator)
+            .ok_or(TestError::Missing("Stelle des Wurzel-Orchestrators"))?;
+        assert!(resolved.is_main_model());
+        Ok(())
+    }
+
+    /// Eine beim Start aufgelöste Stelle mit abgeschaltetem Modell liefert
+    /// keine Auflösung (Rückfall auf das Hauptmodell); eine andere Stelle
+    /// mit nutzbarem Modell bleibt unberührt.
+    #[test]
+    fn implicit_route_skips_retired_model() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config
+            .harness
+            .internal_models
+            .set_choice(InternalModelPoint::RootOrchestrator, Some(retired_choice()));
+        config.harness.internal_models.set_choice(
+            InternalModelPoint::Explorer,
+            Some(InternalModelChoice {
+                provider: Some("openai".to_owned()),
+                model: Some("gpt-5".to_owned()),
+            }),
+        );
+        let routing = LiveModelRouting::new(Arc::new(config));
+        assert!(
+            routing
+                .resolved_internal_model(InternalModelPoint::RootOrchestrator)
+                .is_none()
+        );
+        let explorer = routing
+            .resolved_internal_model(InternalModelPoint::Explorer)
+            .ok_or(TestError::Missing("Stelle des Explorers"))?;
+        assert_eq!(explorer.model.as_deref(), Some("gpt-5"));
         Ok(())
     }
 }
