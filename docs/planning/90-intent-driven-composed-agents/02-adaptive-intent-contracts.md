@@ -156,7 +156,7 @@ verified proposal for commit / PR / human completion
 
 A patch operation must carry: `intent_id`, `base_sha`, `repository_ref`, `allowed_paths`, `expected_preimage_digests`, `change_kind`, `owner_worker`, `risk_class`, `review_plan`, `rollback_strategy`, `approval_ref` if needed, and `idempotency_key`. Recheck base/preimages immediately before edit and again before merge; an unseen file modification is a conflict, not permission for `git add -A`. For multi-file changes, reserve the entire declared contract set and reject undeclared files; untouched declared entries can be `change=false`.
 
-First slice landed: `PatchProposal` carries intent_id/revision, target, preimage digest, evidence id, owner and idempotency key; repository_ref/base_sha/risk_class/review_plan/rollback_strategy/approval_ref follow with the executor.
+First slice (PR #151, not merged): `PatchProposal` carries intent_id/revision, target, preimage digest, evidence id, owner and idempotency key; repository_ref/base_sha/risk_class/review_plan/rollback_strategy/approval_ref follow with the executor.
 
 Reversal is not always equivalent to `git reset`: before publication, prefer separate worktrees / clean revert of owned changes only; after publication, create explicit compensating commits; for irreversible external actions use a human-approved mitigation plan. A model can propose rollback, not erase someone else's changes without ownership proof.
 
