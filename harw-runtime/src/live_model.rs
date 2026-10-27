@@ -530,12 +530,12 @@ fn resolve_model_id_for_provider(config: &ResolvedConfig, provider: &str, model:
 ///
 /// # Beschreibung
 /// Löst Provider (genannt, sonst Katalog, sonst Vorgabe-Provider) und
-/// Modell-ID (Katalog-Schlüssel, `id` oder Alias) wie die Live-Wahl auf;
-/// bei genanntem Provider **providergenau** (nur dessen Katalogmodelle, siehe
-/// `resolve_model_id_for_provider`), sodass ein Alias eines anderen Providers
-/// die Wahl nie auf dessen Modell umschreibt
+/// Modell-ID (Katalog-Schlüssel, `id` oder Alias) wie die Live-Wahl auf
 /// ([`LiveModelRouting::set_live_main`]) und prüft mit
-/// [`lifecycle::enforce_explicit`]. Reine Prüfung ohne Zustand: wer sie vor
+/// [`lifecycle::enforce_explicit`]. Bei genanntem Provider wird
+/// **providergenau** aufgelöst (nur dessen Katalogmodelle, siehe
+/// `resolve_model_id_for_provider`), sodass ein Alias eines anderen Providers
+/// die Wahl nie auf dessen Modell umschreibt. Reine Prüfung ohne Zustand: wer sie vor
 /// einer Mutation aufruft, ändert bei einem Fehler nichts. Ein Modell wird
 /// nie ersetzt.
 ///
