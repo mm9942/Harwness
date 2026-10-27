@@ -1286,6 +1286,35 @@ pub async fn gather_context(
     fragments
 }
 
+/// Höchstzahl der Wunsch-Tags, die [`wanted_tags`] aus einem Text liest.
+const MAX_WANTED_TAGS: usize = 8;
+
+/// Mindestlänge (in Zeichen) eines Worts, damit es als Wunsch-Tag zählt.
+const MIN_WANTED_TAG_CHARS: usize = 4;
+
+/// Leitet aus dem Text der jüngsten User-Nachricht die Wunsch-Tags für die
+/// kompakte Zielempfehlung ab: kleingeschriebene Wörter ab
+/// [`MIN_WANTED_TAG_CHARS`] Zeichen, ohne Duplikate, in Textreihenfolge, die
+/// ersten [`MAX_WANTED_TAGS`].
+///
+/// # Beschreibung
+/// Wörter trennen sich an allem außer Buchstaben, Ziffern, `-` und `_`;
+/// Bindestriche und Unterstriche am Rand fallen weg. Reine Darstellungshilfe:
+/// ein Tag verleiht kein Ziel und entzieht keines.
+fn wanted_tags(text: &str) -> BTreeSet<String> {
+    let mut tags = BTreeSet::new();
+    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
+        if tags.len() >= MAX_WANTED_TAGS {
+            break;
+        }
+        let word = word.trim_matches(['-', '_']);
+        if word.chars().count() >= MIN_WANTED_TAG_CHARS {
+            tags.insert(word.to_lowercase());
+        }
+    }
+    tags
+}
+
 /// Baut den Delegationsziel-Kontextblock (Nachtrag F) aus bereits sortierten
 /// Rollennamen — oder `None`, wenn keine Ziele sichtbar sind.
 ///
@@ -1295,6 +1324,16 @@ pub async fn gather_context(
 /// - `via_delegate_tool` (`bool`): ob die Ziele über `agents.delegate`
 ///   (statt `transfer_to_<name>`) angeboten werden.
 /// - `catalog` (`bool`): ob `agents.catalog` angeboten wird.
+/// - `offered` (`&[String]`): die kompakte Top-k-Empfehlung
+///   ([`harw_extension_api::DelegationTargets::offers`]); leer ⇒ keine
+///   Empfehlung.
+///
+/// # Beschreibung
+/// Bei mehr als [`crate::delegation_visibility::DELEGATE_TOOL_THRESHOLD`]
+/// Zielen und nicht leerer Empfehlung steht im Block nur die Anzahl plus die
+/// Empfehlung statt aller Namen. Das ist reine Darstellung: das
+/// Werkzeugschema (`agents.delegate`) bleibt unverändert, jeder Name bleibt
+/// aufrufbar, und die Admission prüft jedes Ziel weiterhin selbst.
 ///
 /// # Returns
 /// `None` bei leerer Liste oder wenn die (statischen, stets gültigen)
@@ -1304,6 +1343,7 @@ fn delegation_targets_fragment(
     names: &[String],
     via_delegate_tool: bool,
     catalog: bool,
+    offered: &[String],
 ) -> Option<harw_context::Fragment> {
     if names.is_empty() {
         return None;
@@ -1320,17 +1360,35 @@ fn delegation_targets_fragment(
     } else {
         ""
     };
-    let body = format!(
-        "Delegierbare Ziele ({tool}): {}.{details}",
-        names.join(", ")
-    );
+    let with_offers =
+        names.len() > crate::delegation_visibility::DELEGATE_TOOL_THRESHOLD && !offered.is_empty();
+    let body = if with_offers {
+        format!(
+            "Delegierbare Ziele ({tool}): {} Ziele. Empfohlen für diese Aufgabe: {}. \
+             Alle Namen stehen im Werkzeugschema.{details}",
+            names.len(),
+            offered.join(", ")
+        )
+    } else {
+        format!(
+            "Delegierbare Ziele ({tool}): {}.{details}",
+            names.join(", ")
+        )
+    };
+    // Die Empfehlung folgt der letzten Nutzernachricht und ist damit nicht
+    // cache-stabil; die reine Namensliste bleibt es.
+    let stability = if with_offers {
+        harw_context::Stability::Fresh
+    } else {
+        harw_context::Stability::Stable
+    };
     let label = harw_context::FragmentLabel::try_new("delegation.targets").ok()?;
     let section = harw_context::SectionName::try_new("delegation.targets").ok()?;
     Some(harw_context::Fragment {
         label,
         section,
         trust: harw_context::TrustClass::Instruction,
-        stability: harw_context::Stability::Stable,
+        stability,
         origin: harw_context::FragmentOrigin {
             provider: "turn_loop.delegation_targets".to_owned(),
             namespace: "core".to_owned(),
@@ -5750,8 +5808,16 @@ async fn assemble_round_request(
                 let via_delegate_tool =
                     tools.iter().any(|spec| spec.name() == AGENTS_DELEGATE_TOOL);
                 let catalog = tools.iter().any(|spec| spec.name() == AGENTS_CATALOG_TOOL);
+                // Kompakte Top-k-Empfehlung für große Ziellisten: Wunsch-Tags
+                // aus der jüngsten User-Nachricht; reine Darstellung, das
+                // Werkzeugschema und die Admission bleiben unberührt.
+                let wanted = wanted_tags(session.history().last_user_text().unwrap_or_default());
+                let offered = delegation.offers(
+                    &wanted,
+                    crate::delegation_visibility::DELEGATE_TOOL_THRESHOLD,
+                );
                 if let Some(fragment) =
-                    delegation_targets_fragment(&names, via_delegate_tool, catalog)
+                    delegation_targets_fragment(&names, via_delegate_tool, catalog, &offered)
                 {
                     fragments.push(fragment);
                 }
@@ -12746,5 +12812,109 @@ mod tests {
                 node: Some("gw-1".to_owned())
             })
         );
+    }
+
+    fn nine_names() -> Vec<String> {
+        [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+    }
+
+    fn fragment_body(names: &[String], offered: &[String]) -> TestResult<String> {
+        Ok(delegation_targets_fragment(names, true, true, offered)
+            .ok_or(TestError::Missing("ein Delegationsziel-Fragment"))?
+            .body)
+    }
+
+    #[test]
+    fn large_target_lists_render_offers_without_hiding_delegate_names() -> TestResult {
+        let names = nine_names();
+        let offered = vec!["charlie".to_owned(), "india".to_owned()];
+
+        let body = fragment_body(&names, &offered)?;
+
+        assert!(body.contains("Empfohlen"), "{body}");
+        assert!(body.contains("9 Ziele"), "{body}");
+        assert!(body.contains("charlie, india"), "{body}");
+        assert!(body.contains("Details: `agents.catalog`."), "{body}");
+        for hidden in [
+            "alpha", "bravo", "delta", "echo", "foxtrot", "golf", "hotel",
+        ] {
+            assert!(!body.contains(hidden), "{hidden} steht im Block: {body}");
+        }
+
+        // Darstellung, nicht Sichtbarkeit: das Werkzeugschema nennt weiter
+        // jeden Namen, also bleibt jedes Ziel aufrufbar.
+        let ToolSpec::Function(function) = agents_delegate_tool_spec(&names);
+        let enum_values = function
+            .parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("agent"))
+            .and_then(|agent| agent.enum_values.as_ref())
+            .ok_or(TestError::Missing("agent-Enum im Delegationsschema"))?;
+        let schema_names: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            schema_names,
+            names.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn small_or_unoffered_target_lists_keep_the_full_name_list() -> TestResult {
+        let names = nine_names();
+        let offered = vec!["charlie".to_owned()];
+
+        // Höchstens acht Ziele: die Empfehlung bleibt unbeachtet.
+        let small: Vec<String> = names.iter().take(8).cloned().collect();
+        let body = fragment_body(&small, &offered)?;
+        assert_eq!(
+            body,
+            "Delegierbare Ziele (agents.delegate): alpha, bravo, charlie, delta, echo, \
+             foxtrot, golf, hotel. Details: `agents.catalog`."
+        );
+
+        // Große Liste ohne Empfehlung: ebenfalls die vollständige Liste.
+        let body = fragment_body(&names, &[])?;
+        assert!(!body.contains("Empfohlen"), "{body}");
+        assert!(body.contains("alpha, bravo"), "{body}");
+        assert!(body.contains("india"), "{body}");
+        Ok(())
+    }
+
+    #[test]
+    fn wanted_tags_are_lowercase_and_capped() {
+        let text = "Bitte REVIEW den Rust-Code; fix es, und Tests! \
+                    alpha bravo charlie delta echo foxtrot golf hotel";
+        let tags = wanted_tags(text);
+
+        assert_eq!(tags.len(), 8);
+        assert!(tags.iter().all(|tag| *tag == tag.to_lowercase()));
+        assert!(tags.iter().all(|tag| tag.chars().count() >= 4));
+        // In Textreihenfolge: die ersten acht Wörter ab vier Zeichen.
+        let expected: BTreeSet<String> = [
+            "bitte",
+            "review",
+            "rust-code",
+            "tests",
+            "alpha",
+            "bravo",
+            "charlie",
+            "delta",
+        ]
+        .iter()
+        .map(|tag| (*tag).to_owned())
+        .collect();
+        assert_eq!(tags, expected);
+
+        // Kurze Wörter, Duplikate und Randzeichen fallen weg.
+        let tags = wanted_tags("Der -Plan- plan PLAN, ein Test");
+        let expected: BTreeSet<String> = ["plan", "test"].iter().map(|t| (*t).to_owned()).collect();
+        assert_eq!(tags, expected);
+        assert!(wanted_tags("").is_empty());
     }
 }

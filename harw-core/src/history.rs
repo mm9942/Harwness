@@ -265,6 +265,23 @@ impl ConversationHistory {
         self.items.last()
     }
 
+    /// Der erste Text der zuletzt angehängten User-Nachricht (falls vorhanden).
+    ///
+    /// Trägt die jüngste User-Nachricht keinen Text (nur Bilder), ist das
+    /// Ergebnis `None` — ältere User-Nachrichten werden bewusst nicht
+    /// herangezogen.
+    #[must_use]
+    pub fn last_user_text(&self) -> Option<&str> {
+        let message = self.items.iter().rev().find_map(|item| match item {
+            TurnItem::UserMessage(message) => Some(message),
+            _ => None,
+        })?;
+        message.content.iter().find_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
     /// Hängt einen Wächter-Hinweis an das zuletzt angehängte Item dieser
     /// Historie an, ohne eine neue [`TurnItem`]-Variante zu erzeugen
     /// (Welle FANIN-K).
@@ -1433,6 +1450,17 @@ mod tests {
 
     fn texts(history: &ConversationHistory) -> Vec<String> {
         history.items().iter().filter_map(text_of).collect()
+    }
+
+    #[test]
+    fn last_user_text_returns_the_most_recent_user_text() {
+        let mut history = ConversationHistory::new();
+        assert_eq!(history.last_user_text(), None);
+        history.push_user_text("erste Aufgabe");
+        history.push_assistant_text("Antwort", None);
+        history.push_user_text("zweite Aufgabe");
+        history.push_assistant_text("noch eine Antwort", None);
+        assert_eq!(history.last_user_text(), Some("zweite Aufgabe"));
     }
 
     #[test]
