@@ -232,13 +232,24 @@ impl CommandAdapter {
     ///
     /// `TuiOnly` ist immer gesperrt, `ChannelParity` übernimmt die gesamte
     /// Command-Grammatik. `ChannelReduced` ist fail-closed und erlaubt nur
-    /// die von [`Operation::channel_subcommands`] deklarierten Formen.
+    /// die von [`Operation::channel_subcommands`] deklarierten Formen
+    /// (geprüft wird das erste Argument-Token).
+    ///
+    /// Zusätzlich wird die Sperrliste [`Operation::channel_denied_tokens`]
+    /// über die **gesamte** Argumentliste geprüft: erscheint eines der
+    /// gesperrten Tokens an irgendeiner Position, ist der Aufruf verboten.
+    /// Das Wildcard `"*"` in `channel_subcommands` umgeht diese Sperrliste
+    /// nicht.
     #[must_use]
     pub fn allows_channel_invocation(&self, raw_args: &[String]) -> bool {
         match self.visibility {
             CommandVisibility::TuiOnly => false,
             CommandVisibility::ChannelParity => true,
             CommandVisibility::ChannelReduced => {
+                let denied = self.op.channel_denied_tokens();
+                if raw_args.iter().any(|t| denied.contains(&t.as_str())) {
+                    return false;
+                }
                 let allowed = self.op.channel_subcommands();
                 if allowed.contains(&"*") {
                     return true;
@@ -507,6 +518,91 @@ mod tests {
         }
     }
 
+    /// Op mit allen drei Command-Sichtbarkeiten und gesperrten Nebenverben.
+    ///
+    /// Erlaubt auf `/denied-reduced` nur `review`, sperrt aber `accept` und
+    /// `reject` an jeder Argumentposition.
+    struct DeniedTokensOp;
+
+    impl Operation for DeniedTokensOp {
+        fn meta(&self) -> &OperationMeta {
+            static META: OnceLock<OperationMeta> = OnceLock::new();
+            META.get_or_init(|| OperationMeta {
+                name: "denied-tokens",
+                summary: "Command mit gesperrten Nebenverben.",
+                domain: OperationDomain::Misc,
+                permission: PermissionTier::Operator,
+                surfaces: vec![
+                    Surface::Command {
+                        path: "/denied-tui",
+                        visibility: CommandVisibility::TuiOnly,
+                    },
+                    Surface::Command {
+                        path: "/denied-parity",
+                        visibility: CommandVisibility::ChannelParity,
+                    },
+                    Surface::Command {
+                        path: "/denied-reduced",
+                        visibility: CommandVisibility::ChannelReduced,
+                    },
+                ],
+                aliases: &[],
+                category: OperationCategory::Misc,
+                args_schema: None,
+                output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
+            })
+        }
+
+        fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
+            Box::pin(async { Ok(OpOutput::from("denied".to_owned())) })
+        }
+
+        fn channel_subcommands(&self) -> &'static [&'static str] {
+            &["review"]
+        }
+
+        fn channel_denied_tokens(&self) -> &'static [&'static str] {
+            &["accept", "reject"]
+        }
+    }
+
+    /// Op mit `ChannelReduced`-Fläche, Wildcard-Freigabe und Sperrliste.
+    struct WildcardDeniedOp;
+
+    impl Operation for WildcardDeniedOp {
+        fn meta(&self) -> &OperationMeta {
+            static META: OnceLock<OperationMeta> = OnceLock::new();
+            META.get_or_init(|| OperationMeta {
+                name: "wildcard-denied",
+                summary: "Wildcard-Command mit gesperrtem Nebenverb.",
+                domain: OperationDomain::Misc,
+                permission: PermissionTier::Operator,
+                surfaces: vec![Surface::Command {
+                    path: "/wildcard",
+                    visibility: CommandVisibility::ChannelReduced,
+                }],
+                aliases: &[],
+                category: OperationCategory::Misc,
+                args_schema: None,
+                output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
+            })
+        }
+
+        fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
+            Box::pin(async { Ok(OpOutput::from("wildcard".to_owned())) })
+        }
+
+        fn channel_subcommands(&self) -> &'static [&'static str] {
+            &["*"]
+        }
+
+        fn channel_denied_tokens(&self) -> &'static [&'static str] {
+            &["accept"]
+        }
+    }
+
     /// Op mit gemischten Surfaces: ein Command und ein ModelTool.
     struct MixedSurfaceOp;
 
@@ -686,6 +782,68 @@ mod tests {
         assert!(reduced.allows_channel_invocation(&[]));
         assert!(reduced.allows_channel_invocation(&["show".to_owned()]));
         assert!(!reduced.allows_channel_invocation(&["run".to_owned()]));
+    }
+
+    #[test]
+    fn channel_reduced_refuses_denied_nested_verb() {
+        let adapters = CommandAdapter::from_operation(Arc::new(DeniedTokensOp));
+        let reduced = &adapters[2];
+        assert_eq!(reduced.visibility(), CommandVisibility::ChannelReduced);
+        assert!(
+            !reduced.allows_channel_invocation(&[
+                "review".to_owned(),
+                "x".to_owned(),
+                "accept".to_owned(),
+                "p".to_owned(),
+            ]),
+            "gesperrtes Nebenverb hinter erlaubtem Erst-Token muss abgelehnt werden"
+        );
+        assert!(
+            reduced.allows_channel_invocation(&["review".to_owned(), "x".to_owned()]),
+            "erlaubte Form ohne gesperrtes Token muss zulässig bleiben"
+        );
+        assert!(
+            !reduced.allows_channel_invocation(&["accept".to_owned()]),
+            "gesperrtes Token als Erst-Token muss abgelehnt werden"
+        );
+    }
+
+    #[test]
+    fn channel_reduced_wildcard_still_honours_denied_tokens() {
+        let adapters = CommandAdapter::from_operation(Arc::new(WildcardDeniedOp));
+        let reduced = &adapters[0];
+        assert_eq!(reduced.visibility(), CommandVisibility::ChannelReduced);
+        assert!(
+            reduced.allows_channel_invocation(&["list".to_owned()]),
+            "Wildcard muss beliebige nicht gesperrte Formen freigeben"
+        );
+        assert!(
+            !reduced.allows_channel_invocation(&[
+                "review".to_owned(),
+                "1".to_owned(),
+                "accept".to_owned(),
+                "2".to_owned(),
+            ]),
+            "Wildcard darf die Sperrliste nicht umgehen"
+        );
+    }
+
+    #[test]
+    fn tui_only_and_parity_are_unaffected_by_denied_tokens() {
+        let adapters = CommandAdapter::from_operation(Arc::new(DeniedTokensOp));
+        let tui_only = &adapters[0];
+        let parity = &adapters[1];
+        assert_eq!(tui_only.visibility(), CommandVisibility::TuiOnly);
+        assert_eq!(parity.visibility(), CommandVisibility::ChannelParity);
+        let clean = vec!["review".to_owned(), "x".to_owned()];
+        let with_denied = vec!["review".to_owned(), "x".to_owned(), "accept".to_owned()];
+        assert!(!tui_only.allows_channel_invocation(&clean));
+        assert!(!tui_only.allows_channel_invocation(&with_denied));
+        assert!(parity.allows_channel_invocation(&clean));
+        assert!(
+            parity.allows_channel_invocation(&with_denied),
+            "ChannelParity übernimmt die volle Grammatik, auch mit gesperrten Tokens"
+        );
     }
 
     // ── dispatch tests ────────────────────────────────────────────────────────
