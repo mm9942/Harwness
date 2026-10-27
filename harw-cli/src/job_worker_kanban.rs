@@ -383,7 +383,14 @@ pub(super) async fn execute_kanban_claim(
     );
 
     let prompt = kanban_prompt(&card, &card_notes);
-    let turn = execute_turn(claim, prompt, model, Arc::clone(&control), setup);
+    let turn = execute_turn(
+        claim,
+        prompt,
+        model,
+        Arc::clone(&control),
+        setup,
+        super::ledger_tool_meter(&ledger),
+    );
     let outcome = match tokio::time::timeout(wall, turn).await {
         Ok(outcome @ JobOutcome::Cancelled { .. }) => outcome,
         Ok(outcome) => match ledger.exceeded() {

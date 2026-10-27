@@ -5,17 +5,21 @@
 //! Den Speicherfehler erzeugt [`break_store`]: das Sperrverzeichnis des
 //! Job-Stores wird durch eine Datei ersetzt, jede Mutation scheitert mit einem
 //! I/O-Fehler (kein Lease-Fehler). Anders als entzogene Dateirechte wirkt das
-//! auch, wenn die Tests als root laufen.
+//! auch, wenn die Tests als root laufen. Ebenso macht [`block_dir`] ein
+//! Marker-Verzeichnis unbeschreibbar (Review B2 zu #151: Rundenreservierung).
 
 use super::prompt_claim_guard_tests::{
     FixedUsageProvider, admit, claim_as_worker, empty_request, failure_reason, operator_scope,
     record, run_once, temp_dir, tokens_used,
 };
-use super::usage_marker::{USAGE_UNRESOLVED_DIR, UnresolvedUsage, UsageMarkerStore};
+use super::usage_marker::{
+    InFlightUsage, USAGE_INFLIGHT_DIR, USAGE_UNRESOLVED_DIR, UnresolvedUsage, UsageMarkerStore,
+};
 use super::*;
 use crate::test_support::{TestError, TestResult, ctx, some_or};
 use harw_job_runtime::{BudgetUsage, StoredJob};
 use harw_types::ApprovalActor;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -23,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const PARKED_LOCKS: &str = "locks-parked";
 
 // Ersetzt das Sperrverzeichnis des Job-Stores durch eine Datei.
-fn break_store(store: &JobStore) -> TestResult {
+pub(super) fn break_store(store: &JobStore) -> TestResult {
     let locks = store.root().join(harw_job_store::LOCKS_DIR);
     std::fs::rename(&locks, store.root().join(PARKED_LOCKS)).map_err(ctx("park locks dir"))?;
     std::fs::write(&locks, b"not a directory").map_err(ctx("block locks dir"))?;
@@ -31,15 +35,35 @@ fn break_store(store: &JobStore) -> TestResult {
 }
 
 // Macht [`break_store`] rückgängig.
-fn repair_store(store: &JobStore) -> TestResult {
+pub(super) fn repair_store(store: &JobStore) -> TestResult {
     let locks = store.root().join(harw_job_store::LOCKS_DIR);
     std::fs::remove_file(&locks).map_err(ctx("remove locks blocker"))?;
     std::fs::rename(store.root().join(PARKED_LOCKS), &locks).map_err(ctx("restore locks dir"))?;
     Ok(())
 }
 
+// Ersetzt das (noch nicht vorhandene) Verzeichnis `dir` unterhalb der
+// Job-Store-Wurzel durch eine Datei: jeder Zugriff darauf scheitert mit einem
+// I/O-Fehler.
+fn block_dir(store: &JobStore, dir: &str) -> TestResult {
+    let path = store.root().join(dir);
+    if path.exists() {
+        return Err(TestError::Unexpected(format!(
+            "'{dir}' must not exist before it is blocked"
+        )));
+    }
+    std::fs::write(&path, b"not a directory").map_err(ctx("block marker dir"))?;
+    Ok(())
+}
+
+// Macht [`block_dir`] rückgängig.
+fn unblock_dir(store: &JobStore, dir: &str) -> TestResult {
+    std::fs::remove_file(store.root().join(dir)).map_err(ctx("unblock marker dir"))?;
+    Ok(())
+}
+
 // Lässt einen Prompt-Job zu und claimt ihn als Worker.
-fn admitted_claim(store: &JobStore, id: &str, budget: Budget) -> TestResult<JobClaim> {
+pub(super) fn admitted_claim(store: &JobStore, id: &str, budget: Budget) -> TestResult<JobClaim> {
     admit(
         store,
         &record(
@@ -52,7 +76,47 @@ fn admitted_claim(store: &JobStore, id: &str, budget: Budget) -> TestResult<JobC
     claim_as_worker(store, id)
 }
 
-fn persisted_ledger(
+// Wie [`admitted_claim`], aber mit zwei Versuchen und kurzer Wartezeit bis
+// zum Reclaim (wie `INTENT_CYCLE_MAX_ATTEMPTS`).
+pub(super) fn admitted_retryable_claim(
+    store: &JobStore,
+    id: &str,
+    budget: Budget,
+) -> TestResult<JobClaim> {
+    let mut stored = record(
+        id,
+        serde_json::json!({"prompt": "hello"}),
+        budget,
+        operator_scope(),
+    )?;
+    stored.job.retry = RetryPolicy {
+        max_attempts: 2,
+        base_delay: SignedDuration::from_millis(1),
+        factor: 1.0,
+        max_delay: SignedDuration::from_millis(1),
+        jitter: 0.0,
+    };
+    admit(store, &stored)?;
+    claim_as_worker(store, id)
+}
+
+// Der Lease-Halter ist tot: die Lease wird reclaimt und der Job erneut
+// geclaimt (höhere Epoche).
+pub(super) async fn reclaim_and_claim_again(store: &JobStore, id: &str) -> TestResult<JobClaim> {
+    store
+        .reclaim(
+            &WorkId::from_str(id),
+            Timestamp::now(),
+            ApprovalActor::Operator {
+                id: "operator".to_owned(),
+            },
+        )
+        .map_err(ctx("reclaim"))?;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    claim_as_worker(store, id)
+}
+
+pub(super) fn persisted_ledger(
     store: &Arc<JobStore>,
     claim: &JobClaim,
     budget: Budget,
@@ -70,10 +134,105 @@ fn stored_tokens(store: &JobStore, id: &str) -> TestResult<u64> {
     Ok(stored.job.usage.tokens)
 }
 
-fn read_marker(store: &JobStore, id: &str) -> TestResult<Option<UnresolvedUsage>> {
+pub(super) fn read_marker(store: &JobStore, id: &str) -> TestResult<Option<UnresolvedUsage>> {
     UsageMarkerStore::in_job_root(store.root())
         .read(id)
         .map_err(TestError::Unexpected)
+}
+
+fn read_in_flight(store: &JobStore, id: &str) -> TestResult<Option<InFlightUsage>> {
+    UsageMarkerStore::in_job_root(store.root())
+        .read_in_flight(id)
+        .map_err(TestError::Unexpected)
+}
+
+// Erwartet, dass die Verrechnung eines Claims scheitert, und liefert den Grund.
+fn expect_unsettled(settled: Result<BudgetUsage, String>) -> TestResult<String> {
+    match settled {
+        Err(reason) => Ok(reason),
+        Ok(usage) => Err(TestError::Unexpected(format!(
+            "an unproven reservation must not settle, got {usage:?}"
+        ))),
+    }
+}
+
+/// Antwortet mit fester Usage; beim Aufruf Nummer `fail_storage_on` (ab 1)
+/// fallen vorher Job-Datensatz und Marker-Verzeichnis aus — der Speicher
+/// bricht also weg, während die Runde läuft.
+struct StorageFailingProvider {
+    store: Arc<JobStore>,
+    calls: AtomicUsize,
+    tokens_per_call: u64,
+    fail_storage_on: usize,
+}
+
+impl ModelProvider for StorageFailingProvider {
+    fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let failed = if call == self.fail_storage_on {
+            break_store(&self.store).and_then(|()| block_dir(&self.store, USAGE_UNRESOLVED_DIR))
+        } else {
+            Ok(())
+        };
+        let mut response = harw_core::ModelResponse::text("fixed");
+        response.usage = tokens_used(self.tokens_per_call);
+        Box::pin(async move {
+            failed.map_err(|error| {
+                harw_core::ModelError::RequestFailed(format!("test fixture: {error}"))
+            })?;
+            Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
+        })
+    }
+}
+
+/// Antwortet erst, wenn der Test die Runde freigibt: Aufruf `n` wartet auf
+/// den `n`-ten Empfänger und meldet dessen Token-Zahl.
+struct GatedProvider {
+    calls: AtomicUsize,
+    gates: Mutex<VecDeque<(tokio::sync::oneshot::Receiver<()>, u64)>>,
+}
+
+impl ModelProvider for GatedProvider {
+    fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+        let gate = self
+            .gates
+            .lock()
+            .ok()
+            .and_then(|mut gates| gates.pop_front());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let Some((gate, tokens)) = gate else {
+                return Err(harw_core::ModelError::RequestFailed(
+                    "test fixture: no gate left".to_owned(),
+                ));
+            };
+            gate.await.map_err(|_| {
+                harw_core::ModelError::RequestFailed("test fixture: gate dropped".to_owned())
+            })?;
+            let mut response = harw_core::ModelResponse::text("gated");
+            response.usage = tokens_used(tokens);
+            Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
+        })
+    }
+}
+
+type RoundHandle = tokio::task::JoinHandle<Result<harw_core::ModelResponse, harw_core::ModelError>>;
+
+// Startet eine Modell-Runde über `budgeted` in einem eigenen Task.
+fn spawn_round(budgeted: &Arc<BudgetedModelProvider>) -> RoundHandle {
+    let budgeted = Arc::clone(budgeted);
+    tokio::spawn(async move { budgeted.respond(empty_request()).await })
+}
+
+// Wartet, bis `calls` mindestens `count` erreicht (höchstens fünf Sekunden).
+async fn wait_for_calls(calls: &AtomicUsize, count: usize) -> TestResult {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while calls.load(Ordering::SeqCst) < count {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .map_err(ctx("wait for the model call"))
 }
 
 fn owed(tokens: u64) -> BudgetUsage {
@@ -468,5 +627,380 @@ async fn failed_write_then_crash_then_reclaim_does_not_get_a_fresh_budget() -> T
         reclaimed.charge_round(&tokens_used(11)).is_err(),
         "the reclaim must not get a fresh budget of 100 tokens"
     );
+    Ok(())
+}
+
+// ── Rundenreservierung (Review B2 zu #151) ────────────────────────────────
+
+#[tokio::test]
+async fn double_write_failure_then_crash_then_reclaim_cannot_spend_again() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let budget = Budget {
+        max_tokens: Some(100),
+        max_wall: None,
+        max_tool_calls: None,
+    };
+    let first = admitted_retryable_claim(&store, "double-fail", budget.clone())?;
+    let ledger = persisted_ledger(&store, &first, budget);
+    let inner = Arc::new(StorageFailingProvider {
+        store: Arc::clone(&store),
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 30,
+        fail_storage_on: 2,
+    });
+    let budgeted = BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&ledger),
+    };
+
+    // Runde 1: verbucht, ihre Reservierung ist wieder entfernt.
+    budgeted
+        .respond(empty_request())
+        .await
+        .map_err(ctx("round 1"))?;
+    assert_eq!(stored_tokens(&store, "double-fail")?, 30);
+    assert!(
+        read_in_flight(&store, "double-fail")?.is_none(),
+        "a recorded round leaves no reservation"
+    );
+
+    // Runde 2: während des Modellaufrufs fallen Job-Datensatz UND
+    // Marker-Verzeichnis aus; weder `record_usage` noch der Marker gelingen.
+    let failed = budgeted.respond(empty_request()).await;
+    assert!(
+        failed.is_err(),
+        "a round whose usage is neither recorded nor marked must fail closed"
+    );
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        store.root().join(USAGE_UNRESOLVED_DIR).is_file(),
+        "the fixture must have blocked the marker directory"
+    );
+    assert!(ledger.admit_round().is_err(), "no round after the failure");
+    let reservation = some_or(
+        read_in_flight(&store, "double-fail")?,
+        "the reservation of round 2 survives the double failure",
+    )?;
+    assert_eq!(reservation.usage_before.tokens, 30);
+    assert_eq!(reservation.epoch, first.token.epoch);
+
+    // Der Worker stirbt; danach ist der Speicher wieder heil.
+    drop(budgeted);
+    drop(ledger);
+    repair_store(&store)?;
+    unblock_dir(&store, USAGE_UNRESOLVED_DIR)?;
+    assert!(
+        read_marker(&store, "double-fail")?.is_none(),
+        "no unresolved-usage marker could be written"
+    );
+
+    // Reclaim: der Job-Datensatz kennt nur Runde 1 (30 von 100 Tokens) ...
+    let second = reclaim_and_claim_again(&store, "double-fail").await?;
+    assert!(second.token.epoch > first.token.epoch);
+    assert_eq!(second.job.usage.tokens, 30);
+    // ... die Reservierung beweist, dass Runde 2 nie verbucht wurde: kein
+    // frisches Budget für die schon ausgegebenen Tokens.
+    let reason = expect_unsettled(settle_unresolved_usage(&store, &second))?;
+    assert!(
+        reason.starts_with("usage accounting unresolved"),
+        "{reason}"
+    );
+    assert!(reason.contains("in-flight model round"), "{reason}");
+    assert!(
+        read_in_flight(&store, "double-fail")?.is_some(),
+        "an unproven reservation stays"
+    );
+    assert_eq!(stored_tokens(&store, "double-fail")?, 30);
+
+    // Der asynchrone Pfad der Worker übernimmt ebenfalls keine Usage.
+    let mut reclaimed = second.clone();
+    let settled = settle_claim_usage(&store, &mut reclaimed).await;
+    assert!(settled.is_err(), "{settled:?}");
+    assert_eq!(reclaimed.job.usage, second.job.usage);
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_flight_marker_is_stale_once_usage_advanced() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let first = admitted_retryable_claim(&store, "stale-reservation", Budget::unbounded())?;
+    // Versuch 1 reservierte bei 20 Tokens und verbuchte danach 50; nur das
+    // Entfernen der Reservierung ging verloren.
+    UsageMarkerStore::in_job_root(store.root())
+        .write_in_flight(&InFlightUsage::new(
+            "stale-reservation",
+            first.token.epoch,
+            owed(20),
+        ))
+        .map_err(TestError::Unexpected)?;
+    store
+        .record_usage(&first.token.work_id, &first.token, &owed(50))
+        .map_err(ctx("record usage"))?;
+
+    let second = reclaim_and_claim_again(&store, "stale-reservation").await?;
+    let settled = settle_unresolved_usage(&store, &second).map_err(TestError::Unexpected)?;
+
+    assert_eq!(settled.tokens, 50);
+    assert!(
+        read_in_flight(&store, "stale-reservation")?.is_none(),
+        "a reservation below the stored usage is proven recorded and removed"
+    );
+    Ok(())
+}
+
+#[test]
+fn in_flight_marker_of_the_current_attempt_is_left_alone() -> TestResult {
+    let temp = temp_dir()?;
+    let store = JobStore::new(temp.path());
+    let claim = admitted_claim(&store, "own-reservation", Budget::unbounded())?;
+    UsageMarkerStore::in_job_root(store.root())
+        .write_in_flight(&InFlightUsage::new(
+            "own-reservation",
+            claim.token.epoch,
+            owed(500),
+        ))
+        .map_err(TestError::Unexpected)?;
+
+    let settled = settle_unresolved_usage(&store, &claim).map_err(TestError::Unexpected)?;
+
+    assert_eq!(settled, claim.job.usage);
+    assert!(
+        read_in_flight(&store, "own-reservation")?.is_some(),
+        "a reservation of the same epoch belongs to this attempt"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unreadable_in_flight_marker_fails_the_job_without_a_model_call() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    admit(
+        &store,
+        &record(
+            "unreadable-reservation",
+            serde_json::json!({"prompt": "hello"}),
+            Budget::unbounded(),
+            operator_scope(),
+        )?,
+    )?;
+    let dir = store.root().join(USAGE_INFLIGHT_DIR);
+    std::fs::create_dir_all(&dir).map_err(ctx("create reservation dir"))?;
+    std::fs::write(dir.join("unreadable-reservation.json"), b"{ not json")
+        .map_err(ctx("write reservation"))?;
+    let inner = Arc::new(FixedUsageProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 1,
+    });
+
+    run_once(
+        &store,
+        temp.path(),
+        Arc::clone(&inner) as Arc<dyn ModelProvider>,
+    )
+    .await?;
+
+    let reason = failure_reason(&store, "unreadable-reservation")?;
+    assert!(
+        reason.starts_with("usage accounting unresolved"),
+        "{reason}"
+    );
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        0,
+        "a broken reservation must never look like no reservation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reservation_write_failure_refuses_the_round_before_spending() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let claim = admitted_claim(&store, "reserve-fail", Budget::unbounded())?;
+    let ledger = persisted_ledger(&store, &claim, Budget::unbounded());
+    let inner = Arc::new(FixedUsageProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 5,
+    });
+    let budgeted = BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&ledger),
+    };
+    block_dir(&store, USAGE_INFLIGHT_DIR)?;
+
+    assert!(
+        budgeted.respond(empty_request()).await.is_err(),
+        "a round that cannot be reserved must be refused"
+    );
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        0,
+        "the inner provider is never called without a durable reservation"
+    );
+    let closed = some_or(
+        ledger.exceeded(),
+        "the failed reservation must close the ledger",
+    )?;
+    assert!(closed.starts_with("usage:"), "{closed}");
+    assert_eq!(ledger.snapshot().tokens, 0, "nothing was spent");
+    assert_eq!(stored_tokens(&store, "reserve-fail")?, 0);
+
+    // Auch mit wieder heilem Verzeichnis bleibt der Ledger geschlossen.
+    unblock_dir(&store, USAGE_INFLIGHT_DIR)?;
+    assert!(budgeted.respond(empty_request()).await.is_err());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_rounds_keep_the_reservation_until_every_round_is_recorded() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let first = admitted_retryable_claim(&store, "concurrent", Budget::unbounded())?;
+    let ledger = persisted_ledger(&store, &first, Budget::unbounded());
+    let (release_a, gate_a) = tokio::sync::oneshot::channel::<()>();
+    let (release_b, gate_b) = tokio::sync::oneshot::channel::<()>();
+    let inner = Arc::new(GatedProvider {
+        calls: AtomicUsize::new(0),
+        gates: Mutex::new(VecDeque::from([(gate_a, 40), (gate_b, 30)])),
+    });
+    let budgeted = Arc::new(BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&ledger),
+    });
+
+    // Zwei Worker-Turns teilen sich den Ledger (wie im WorkDriver).
+    let round_a = spawn_round(&budgeted);
+    wait_for_calls(&inner.calls, 1).await?;
+    let round_b = spawn_round(&budgeted);
+    wait_for_calls(&inner.calls, 2).await?;
+
+    // Runde A endet und wird verbucht, während B noch läuft: die
+    // Reservierung bleibt und wurde vor dem Festschreiben angehoben.
+    release_a
+        .send(())
+        .map_err(|()| TestError::Unexpected("round A stopped waiting".to_owned()))?;
+    round_a
+        .await
+        .map_err(ctx("round A task"))?
+        .map_err(ctx("round A"))?;
+    assert_eq!(stored_tokens(&store, "concurrent")?, 40);
+    let reservation = some_or(
+        read_in_flight(&store, "concurrent")?,
+        "round B still holds the reservation",
+    )?;
+    assert_eq!(
+        reservation.usage_before.tokens, 40,
+        "the reservation must not let the recorded round A prove round B"
+    );
+
+    // Jetzt fällt der Speicher aus, B endet, und der Worker stirbt.
+    break_store(&store)?;
+    block_dir(&store, USAGE_UNRESOLVED_DIR)?;
+    release_b
+        .send(())
+        .map_err(|()| TestError::Unexpected("round B stopped waiting".to_owned()))?;
+    let round_b = round_b.await.map_err(ctx("round B task"))?;
+    assert!(round_b.is_err(), "round B is neither recorded nor marked");
+    drop(budgeted);
+    drop(ledger);
+    repair_store(&store)?;
+    unblock_dir(&store, USAGE_UNRESOLVED_DIR)?;
+
+    // Der Reclaim sieht nur Runde A; Runde B ist unbewiesen.
+    let second = reclaim_and_claim_again(&store, "concurrent").await?;
+    assert_eq!(second.job.usage.tokens, 40);
+    let reason = expect_unsettled(settle_unresolved_usage(&store, &second))?;
+    assert!(reason.contains("in-flight model round"), "{reason}");
+    Ok(())
+}
+
+/// Scheitert ohne Usage (etwa ein abgewiesener Request).
+struct ErroringProvider;
+
+impl ModelProvider for ErroringProvider {
+    fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+        Box::pin(async {
+            Err::<harw_core::ModelResponse, harw_core::ModelError>(
+                harw_core::ModelError::RequestFailed("test fixture: refused".to_owned()),
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn provider_error_releases_the_reservation() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let claim = admitted_claim(&store, "provider-error", Budget::unbounded())?;
+    let ledger = persisted_ledger(&store, &claim, Budget::unbounded());
+    let budgeted = BudgetedModelProvider {
+        inner: Arc::new(ErroringProvider),
+        ledger: Arc::clone(&ledger),
+    };
+
+    assert!(budgeted.respond(empty_request()).await.is_err());
+    assert!(
+        read_in_flight(&store, "provider-error")?.is_some(),
+        "the reservation is written before the provider is called"
+    );
+    // Ohne gemeldete Usage gibt es nichts zu verbuchen: der nächste Flush
+    // entfernt die Reservierung.
+    ledger.flush().await.map_err(ctx("flush after the error"))?;
+    assert!(read_in_flight(&store, "provider-error")?.is_none());
+    assert!(
+        ledger.exceeded().is_none(),
+        "a provider error is no accounting failure"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn overrun_round_stays_reserved_and_blocks_a_reclaim() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let budget = Budget {
+        max_tokens: Some(50),
+        max_wall: None,
+        max_tool_calls: None,
+    };
+    let first = admitted_retryable_claim(&store, "overrun", budget.clone())?;
+    let ledger = persisted_ledger(&store, &first, budget);
+    let inner = Arc::new(FixedUsageProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 30,
+    });
+    let budgeted = BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&ledger),
+    };
+
+    budgeted
+        .respond(empty_request())
+        .await
+        .map_err(ctx("round 1"))?;
+    // Runde 2 meldet 30 weitere Tokens, die das Budget von 50 überschreiten:
+    // ausgegeben, aber nicht verbuchbar.
+    assert!(budgeted.respond(empty_request()).await.is_err());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    let outcome = ledger
+        .finish(JobOutcome::Blocked {
+            reason: "stopped".to_owned(),
+        })
+        .await;
+    assert!(matches!(outcome, JobOutcome::Blocked { .. }), "{outcome:?}");
+    assert_eq!(stored_tokens(&store, "overrun")?, 30);
+    let reservation = some_or(
+        read_in_flight(&store, "overrun")?,
+        "the unaccounted round stays reserved",
+    )?;
+    assert_eq!(reservation.usage_before.tokens, 30);
+
+    let second = reclaim_and_claim_again(&store, "overrun").await?;
+    let reason = expect_unsettled(settle_unresolved_usage(&store, &second))?;
+    assert!(reason.contains("in-flight model round"), "{reason}");
     Ok(())
 }

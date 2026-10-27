@@ -98,6 +98,26 @@
 //! 4. der Ausgang eines Jobs, dessen letzte Usage nicht festgeschrieben werden
 //!    konnte, wird zu `Failed` ([`PromptTokenLedger::finish`]).
 //!
+//! Scheitern Festschreiben UND Marker (volles oder schreibgeschütztes
+//! Job-Dateisystem, Review B2 zu #151), hilft der Marker nicht. Deshalb wird
+//! jede Modell-Runde vorab durabel reserviert
+//! (`<job-root>/usage-inflight/<work-id>.json`, `usage_marker::InFlightUsage`):
+//! lässt sich die Reservierung nicht schreiben, startet die Runde nicht (es
+//! wurde nichts ausgegeben); nach dem Festschreiben wird sie entfernt (eine
+//! Runde, deren gemeldete Usage der Ledger nicht verbuchen durfte, bleibt
+//! reserviert). Findet
+//! [`settle_unresolved_usage`] die Reservierung eines früheren Versuchs, gilt
+//! deren Runde nur als verbucht, wenn die verrechnete Usage in Tokens oder
+//! Werkzeugaufrufen echt über dem reservierten Stand liegt; sonst endet der
+//! Job als `Failed{usage accounting unresolved: …}` ohne Modellaufruf
+//! (konservativ: kein Reclaim mit unbewiesenem Budget).
+//!
+//! Werkzeugaufrufe werden beim Dispatch gebucht (Review P1-b zu #151): der
+//! `harw_core::ToolCallMeter` jedes Job-Turns ([`LedgerToolMeter`]) bucht den
+//! Aufruf gegen `max_tool_calls` und schreibt ihn unter der aktuellen Lease
+//! fest, BEVOR das Werkzeug läuft; scheitert das (Budget, Lease, Speicher),
+//! läuft das Werkzeug nicht.
+//!
 //! # Concurrency
 //! Every entry point is `async` and `Send`.  All shared state travels as
 //! `Arc<…>`; the worker itself holds no global state — the plan store, the
@@ -170,6 +190,10 @@ mod usage_marker;
 #[cfg(test)]
 #[path = "job_worker_usage_tests.rs"]
 mod usage_tests;
+
+#[cfg(test)]
+#[path = "job_worker_tool_call_tests.rs"]
+mod tool_call_tests;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -1220,7 +1244,14 @@ async fn run_prompt_turn(
         }
     };
 
-    let turn = execute_turn(claim, prompt, model, Arc::clone(&control), setup);
+    let turn = execute_turn(
+        claim,
+        prompt,
+        model,
+        Arc::clone(&control),
+        setup,
+        ledger_tool_meter(&ledger),
+    );
     let outcome = match tokio::time::timeout(wall.duration, turn).await {
         // Ein Abbruch durch den Supervisor bleibt ein Abbruch; jeder andere
         // Ausgang eines Turns, der das Token-Budget gerissen hat, ist ein
@@ -1484,6 +1515,12 @@ struct PromptTokenLedger {
 struct PromptTokenState {
     usage: harw_job_runtime::BudgetUsage,
     exceeded: Option<String>,
+    // Reservierte Modell-Runden, deren Usage noch nicht verbucht ist
+    // ([`RoundReservation`]); mehrere Worker-Turns können sich einen Ledger
+    // teilen (WorkDriver).
+    rounds_in_flight: u32,
+    // Ob eine Rundenreservierung dieses Ledgers auf der Platte liegen kann.
+    reservation_marked: bool,
 }
 
 // Job-Store und Lease-Token, unter denen der Ledger seine Usage festschreibt,
@@ -1515,6 +1552,11 @@ const USAGE_LEASE_LOST_REASON: &str = "lease: job lease lost; usage could not be
 // konnte.
 const USAGE_UNRECORDED_REASON: &str =
     "usage: job usage could not be recorded durably; no further model rounds";
+
+// Schließgrund des Ledgers, wenn eine Modell-Runde nicht durabel reserviert
+// werden konnte (Review B2 zu #151); die Runde hat nichts ausgegeben.
+const USAGE_RESERVATION_FAILED_REASON: &str =
+    "usage: the model round could not be reserved durably; no further model rounds";
 
 // Präfix aller `Failed`-Gründe, die aus nicht verbuchter Usage entstehen.
 const USAGE_UNRESOLVED_PREFIX: &str = "usage accounting unresolved: ";
@@ -1553,15 +1595,39 @@ impl std::fmt::Display for UsageFlushError {
 
 impl std::error::Error for UsageFlushError {}
 
+// Was ein Flush mit der Rundenreservierung tun muss (Review B2 zu #151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationStep {
+    // Keine Reservierung dieses Ledgers liegt auf der Platte.
+    Untouched,
+    // Runden sind offen: die Reservierung VOR dem Festschreiben auf den
+    // festzuschreibenden Stand anheben. Sonst bewiese der neue Stand beim
+    // Reclaim eine Runde, die noch gar nicht verbucht ist.
+    Advance,
+    // Keine Runde offen: die Reservierung NACH erfolgreichem Festschreiben
+    // entfernen.
+    Clear,
+}
+
 // Ergebnis eines Festschreib-Versuchs auf dem Blocking-Thread.
 enum UsageWrite {
-    Recorded,
+    // Festgeschrieben; `cleared`: die Rundenreservierung wurde entfernt.
+    Recorded {
+        cleared: bool,
+    },
     LeaseLost,
     // Anderer Speicherfehler: `reason` nennt ihn, `marker` ist das Ergebnis des
     // Marker-Schreibens.
     Failed {
         reason: String,
         marker: Result<(), String>,
+    },
+    // Die Reservierung ließ sich nicht anheben; bewusst nichts
+    // festgeschrieben und kein Marker geschrieben: die liegende Reservierung
+    // (älterer, höchstens gleich großer Stand) sperrt jeden Reclaim, während
+    // ein Marker mit dem neuen Stand eine offene Runde als verbucht ausgäbe.
+    Unreserved {
+        reason: String,
     },
 }
 
@@ -1588,15 +1654,29 @@ fn record_usage_retrying(
 
 // Schreibt `usage` fest; scheitert das aus einem anderen Grund als einem
 // Lease-Verlust, wird der Verbrauch im selben (nicht abbrechbaren)
-// Blocking-Aufruf als Marker abgelegt. Blockierend.
+// Blocking-Aufruf als Marker abgelegt. `reservation` sagt, was dabei mit der
+// Rundenreservierung geschieht (vorher anheben bzw. nachher entfernen).
+// Blockierend.
 fn write_usage_or_mark(
     store: &JobStore,
     markers: &usage_marker::UsageMarkerStore,
     token: &harw_job_runtime::LeaseToken,
     usage: &harw_job_runtime::BudgetUsage,
+    reservation: ReservationStep,
 ) -> UsageWrite {
+    if reservation == ReservationStep::Advance {
+        let advanced =
+            usage_marker::InFlightUsage::new(token.work_id.as_str(), token.epoch, usage.clone());
+        if let Err(error) = markers.write_in_flight(&advanced) {
+            return UsageWrite::Unreserved {
+                reason: format!("the in-flight reservation could not be advanced: {error}"),
+            };
+        }
+    }
     match record_usage_retrying(store, token, usage) {
-        Ok(_stored) => UsageWrite::Recorded,
+        Ok(_stored) => UsageWrite::Recorded {
+            cleared: reservation == ReservationStep::Clear && clear_reservation(markers, token),
+        },
         Err(
             harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
             | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
@@ -1618,29 +1698,63 @@ fn write_usage_or_mark(
     }
 }
 
+// Entfernt die Rundenreservierung nach erfolgreichem Festschreiben.
+// Ein Fehler ist nur eine Warnung: die festgeschriebene Usage liegt dann über
+// dem reservierten Stand, der nächste Claim erkennt die Reservierung als
+// verbucht und entfernt sie selbst. Blockierend.
+fn clear_reservation(
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+) -> bool {
+    match markers.remove_in_flight(token.work_id.as_str(), token.epoch) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                work_id = %token.work_id.as_str(),
+                error = %error,
+                "in-flight usage reservation could not be removed after recording"
+            );
+            false
+        }
+    }
+}
+
 // Grund eines `Failed`-Ausgangs wegen nicht verbuchter Usage; wie jeder
 // Ausgangsgrund auf die erste Zeile und `MAX_REASON_BYTES` begrenzt.
 fn unresolved_usage_reason(detail: &str) -> String {
     sanitize_failure(&format!("{USAGE_UNRESOLVED_PREFIX}{detail}"))
 }
 
-/// Verrechnet einen offenen Usage-Marker mit einem frisch geclaimten Job.
+/// Verrechnet einen offenen Usage-Marker mit einem frisch geclaimten Job und
+/// prüft die Rundenreservierung eines früheren Versuchs.
 ///
 /// # Description
 /// Muss vor jeder Budget-Ableitung und jeder Modell-Runde eines Claims laufen
-/// (Review P1 zu #151). Ohne Marker ist das Ergebnis `claim.job.usage`. Mit
-/// Marker wird das Feld-Maximum aus Marker und gespeicherter Usage unter
+/// (Review P1 zu #151). Ohne Marker ist die Ausgangs-Usage `claim.job.usage`.
+/// Mit Marker wird das Feld-Maximum aus Marker und gespeicherter Usage unter
 /// `claim.token` lease-gesichert festgeschrieben und erst danach der Marker
 /// entfernt; ein verbliebener Marker wird beim nächsten Claim unschädlich
 /// erneut verrechnet.
+///
+/// Danach die Rundenreservierung (Review B2 zu #151, siehe Moduldoku "Usage
+/// accounting"): stammt sie aus einer älteren Epoche als `claim.token`, gilt
+/// ihre Runde nur als verbucht, wenn die verrechnete Usage in Tokens oder
+/// Werkzeugaufrufen echt über dem reservierten Stand liegt — dann wird sie
+/// entfernt. Sonst ist der Verbrauch der Runde unbewiesen (Festschreiben und
+/// Marker sind gescheitert, dann starb der Worker), und der Claim scheitert
+/// (konservativ: kein Reclaim mit unbewiesenem Budget). Eine Reservierung
+/// derselben oder einer jüngeren Epoche gehört nicht zu einem früheren
+/// Versuch und bleibt unberührt.
 ///
 /// # Returns
 /// Die Usage, von der der Claim auszugehen hat.
 ///
 /// # Errors
-/// `usage accounting unresolved: …`, wenn der Marker nicht lesbar ist oder sich
-/// nicht festschreiben lässt. Der Aufrufer beendet den Job dann als `Failed`
-/// (endgültig, also ohne automatischen Reclaim) und ruft kein Modell auf.
+/// `usage accounting unresolved: …`, wenn Marker oder Reservierung nicht
+/// lesbar sind, der Marker sich nicht festschreiben lässt oder die Runde einer
+/// Reservierung nicht als verbucht bewiesen ist. Der Aufrufer beendet den Job
+/// dann als `Failed` (endgültig, also ohne automatischen Reclaim) und ruft
+/// kein Modell auf.
 ///
 /// # Concurrency
 /// Blockierend (Dateizugriff, Job-Sperre); aus `async`-Code über
@@ -1651,21 +1765,58 @@ pub(super) fn settle_unresolved_usage(
 ) -> Result<harw_job_runtime::BudgetUsage, String> {
     let markers = usage_marker::UsageMarkerStore::in_job_root(store.root());
     let work_id = claim.job.id.as_str();
-    let marker = match markers.read(work_id) {
-        Ok(Some(marker)) => marker,
-        Ok(None) => return Ok(claim.job.usage.clone()),
+    let settled = match markers.read(work_id) {
+        Ok(Some(marker)) => {
+            let merged = usage_marker::UsageMarkerStore::merged(&marker.usage, &claim.job.usage);
+            let stored = record_usage_retrying(store, &claim.token, &merged).map_err(|error| {
+                unresolved_usage_reason(&format!(
+                    "the unresolved usage could not be recorded: {error}"
+                ))
+            })?;
+            if let Err(error) = markers.remove(work_id) {
+                tracing::warn!(work_id = %work_id, error = %error, "settled usage marker could not be removed");
+            }
+            stored
+        }
+        Ok(None) => claim.job.usage.clone(),
         Err(detail) => return Err(unresolved_usage_reason(&detail)),
     };
-    let merged = usage_marker::UsageMarkerStore::merged(&marker.usage, &claim.job.usage);
-    let stored = record_usage_retrying(store, &claim.token, &merged).map_err(|error| {
-        unresolved_usage_reason(&format!(
-            "the unresolved usage could not be recorded: {error}"
-        ))
-    })?;
-    if let Err(error) = markers.remove(work_id) {
-        tracing::warn!(work_id = %work_id, error = %error, "settled usage marker could not be removed");
+    settle_in_flight_reservation(&markers, claim, &settled)?;
+    Ok(settled)
+}
+
+// Prüft die Rundenreservierung eines früheren Versuchs gegen die verrechnete
+// Usage `settled` (siehe `settle_unresolved_usage`). Blockierend.
+fn settle_in_flight_reservation(
+    markers: &usage_marker::UsageMarkerStore,
+    claim: &JobClaim,
+    settled: &harw_job_runtime::BudgetUsage,
+) -> Result<(), String> {
+    let work_id = claim.job.id.as_str();
+    let reservation = match markers.read_in_flight(work_id) {
+        Ok(Some(reservation)) => reservation,
+        Ok(None) => return Ok(()),
+        Err(detail) => return Err(unresolved_usage_reason(&detail)),
+    };
+    if reservation.epoch >= claim.token.epoch {
+        return Ok(());
     }
-    Ok(stored)
+    if !reservation.superseded_by(settled) {
+        tracing::error!(
+            work_id = %work_id,
+            reservation_epoch = reservation.epoch,
+            claim_epoch = claim.token.epoch,
+            "in-flight model round of an earlier attempt was never recorded; refusing the reclaim"
+        );
+        return Err(unresolved_usage_reason(&format!(
+            "an in-flight model round started at epoch {} with {} tokens was never recorded; refusing to reclaim with an unproven budget",
+            reservation.epoch, reservation.usage_before.tokens
+        )));
+    }
+    if let Err(error) = markers.remove_in_flight(work_id, reservation.epoch) {
+        tracing::warn!(work_id = %work_id, error = %error, "recorded in-flight usage reservation could not be removed");
+    }
+    Ok(())
 }
 
 /// Async-Hülle um [`settle_unresolved_usage`]: läuft auf einem Blocking-Thread
@@ -1734,6 +1885,8 @@ impl PromptTokenLedger {
             state: Mutex::new(PromptTokenState {
                 usage,
                 exceeded: None,
+                rounds_in_flight: 0,
+                reservation_marked: false,
             }),
             sink,
             started: std::time::Instant::now(),
@@ -1745,12 +1898,30 @@ impl PromptTokenLedger {
     /// Aktuelle Usage: Tokens und Tool-Aufrufe aus dem Ledger, Wanduhr als
     /// Startwert plus verstrichene Zeit. Nie kleiner als der Startwert.
     pub(super) fn snapshot(&self) -> harw_job_runtime::BudgetUsage {
-        let mut usage = self.state().usage.clone();
+        let state = self.state();
+        self.snapshot_of(&state)
+    }
+
+    // Wie `snapshot`, aus einem bereits gesperrten Zustand: `flush` braucht
+    // Stand und offene Runden aus derselben Sperre.
+    fn snapshot_of(&self, state: &PromptTokenState) -> harw_job_runtime::BudgetUsage {
+        let mut usage = state.usage.clone();
         let elapsed =
             SignedDuration::try_from(self.started.elapsed()).unwrap_or(SignedDuration::MAX);
         let running = self.base_wall.saturating_add(elapsed);
         usage.wall = usage.wall.max(running).max(self.base_wall);
         usage
+    }
+
+    // Was der nächste Flush mit der Rundenreservierung tun muss.
+    fn reservation_step(state: &PromptTokenState) -> ReservationStep {
+        if !state.reservation_marked {
+            ReservationStep::Untouched
+        } else if state.rounds_in_flight > 0 {
+            ReservationStep::Advance
+        } else {
+            ReservationStep::Clear
+        }
     }
 
     /// Schreibt [`Self::snapshot`] unter dem Lease-Token in den Job-Store.
@@ -1767,7 +1938,14 @@ impl PromptTokenLedger {
     ///   zuerst verrechnet ([`settle_unresolved_usage`]), und als
     ///   [`UsageFlushError::NotRecorded`] gemeldet — auch wenn sich der Marker
     ///   nicht schreiben ließ (dann steht die Buchhaltung offen UND ohne
-    ///   Marker, was auf Fehlerstufe protokolliert wird).
+    ///   Marker, was auf Fehlerstufe protokolliert wird; die
+    ///   Rundenreservierung sperrt dann den Reclaim, Review B2 zu #151).
+    ///
+    /// Die Rundenreservierung ([`Self::reserve_round`]) wird dabei nachgeführt:
+    /// sind Runden offen, wird sie vor dem Festschreiben auf den
+    /// festzuschreibenden Stand angehoben (scheitert das, wird bewusst nichts
+    /// festgeschrieben, siehe [`UsageFlushError::NotRecorded`]); ist keine
+    /// Runde offen, wird sie nach erfolgreichem Festschreiben entfernt.
     ///
     /// # Errors
     /// Siehe oben; der Aufrufer darf den Fehler nicht ignorieren, wenn er
@@ -1777,18 +1955,31 @@ impl PromptTokenLedger {
             return Ok(());
         };
         let _gate = self.flush_gate.lock().await;
-        let usage = self.snapshot();
+        // Stand und offene Runden aus derselben Sperre: eine Runde ist darin
+        // entweder noch offen oder schon verbucht, nie keines von beiden.
+        let (usage, reservation) = {
+            let state = self.state();
+            (self.snapshot_of(&state), Self::reservation_step(&state))
+        };
         let store = Arc::clone(&sink.store);
         let token = sink.token.clone();
         let markers = sink.markers.clone();
         let work_id = token.work_id.as_str().to_owned();
         let write_usage = usage.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            write_usage_or_mark(&store, &markers, &token, &write_usage)
+            write_usage_or_mark(&store, &markers, &token, &write_usage, reservation)
         })
         .await;
         let write = match joined {
             Ok(write) => write,
+            Err(error) if reservation == ReservationStep::Advance => {
+                // Offene Runden: kein Marker mit dem neuen Stand (er gäbe eine
+                // offene Runde als verbucht aus); die liegende Reservierung
+                // sperrt den Reclaim.
+                UsageWrite::Unreserved {
+                    reason: format!("usage flush task failed: {error}"),
+                }
+            }
             Err(error) => {
                 // Der Blocking-Task selbst ist abgestürzt (Panik, Shutdown):
                 // Marker in einem frischen Task nachholen.
@@ -1803,7 +1994,12 @@ impl PromptTokenLedger {
             }
         };
         match write {
-            UsageWrite::Recorded => Ok(()),
+            UsageWrite::Recorded { cleared } => {
+                if cleared {
+                    self.state().reservation_marked = false;
+                }
+                Ok(())
+            }
             UsageWrite::LeaseLost => {
                 tracing::warn!(work_id = %work_id, "job lease lost while recording usage");
                 self.close(USAGE_LEASE_LOST_REASON.to_owned());
@@ -1829,6 +2025,15 @@ impl PromptTokenLedger {
                         format!("{reason}; marker not written: {marker_error}")
                     }
                 };
+                self.close(USAGE_UNRECORDED_REASON.to_owned());
+                Err(UsageFlushError::NotRecorded(reason))
+            }
+            UsageWrite::Unreserved { reason } => {
+                tracing::error!(
+                    work_id = %work_id,
+                    reason = %reason,
+                    "job usage left unrecorded: the in-flight reservation could not be advanced; it blocks any reclaim, no further model rounds"
+                );
                 self.close(USAGE_UNRECORDED_REASON.to_owned());
                 Err(UsageFlushError::NotRecorded(reason))
             }
@@ -1898,6 +2103,81 @@ impl PromptTokenLedger {
         Ok(())
     }
 
+    // Nach `admit_round`, BEVOR der Provider etwas ausgibt (Review B2 zu #151):
+    // zählt die Runde als offen und legt mit Sink die durable Reservierung mit
+    // dem Stand vor der Runde ab (`usage_marker::InFlightUsage`). Lässt sie
+    // sich nicht schreiben, wird der Ledger geschlossen und die Runde
+    // abgewiesen — ausgegeben wurde nichts. Unter dem Flush-Gate, damit
+    // Reservierung und Festschreiben nie verschränkt auf die Platte gehen.
+    async fn reserve_round(&self) -> Result<RoundReservation<'_>, String> {
+        let _gate = self.flush_gate.lock().await;
+        {
+            let mut state = self.state();
+            if let Some(reason) = &state.exceeded {
+                return Err(reason.clone());
+            }
+            state.rounds_in_flight = state.rounds_in_flight.saturating_add(1);
+        }
+        // Ab hier gibt jeder Rückweg die Runde über `Drop` wieder frei.
+        let reservation = RoundReservation {
+            ledger: self,
+            release: true,
+        };
+        let Some(sink) = &self.sink else {
+            return Ok(reservation);
+        };
+        // Ein gleichzeitig verbuchter Stand kann nur größer sein: das hebt die
+        // Schwelle, ab der ein Reclaim die Runde als verbucht ansieht.
+        let usage_before = self.snapshot();
+        let marker = usage_marker::InFlightUsage::new(
+            sink.token.work_id.as_str(),
+            sink.token.epoch,
+            usage_before,
+        );
+        let markers = sink.markers.clone();
+        let written = tokio::task::spawn_blocking(move || markers.write_in_flight(&marker))
+            .await
+            .unwrap_or_else(|join| Err(format!("usage reservation task failed: {join}")));
+        match written {
+            Ok(()) => {
+                self.state().reservation_marked = true;
+                Ok(reservation)
+            }
+            Err(error) => {
+                tracing::error!(
+                    work_id = %sink.token.work_id.as_str(),
+                    error = %error,
+                    "model round could not be reserved durably; refused before any spend"
+                );
+                self.close(USAGE_RESERVATION_FAILED_REASON.to_owned());
+                Err(USAGE_RESERVATION_FAILED_REASON.to_owned())
+            }
+        }
+    }
+
+    // Vor jedem Werkzeugaufruf (Review P1-b zu #151): bucht genau einen
+    // Aufruf gegen `max_tool_calls`. Ein geschlossener Ledger lässt keinen zu;
+    // ein erschöpftes Budget schließt ihn.
+    fn charge_tool_call(&self) -> Result<(), String> {
+        let mut state = self.state();
+        if let Some(reason) = &state.exceeded {
+            return Err(reason.clone());
+        }
+        match self.budget.charge_tool_call(&mut state.usage) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let reason = match error {
+                    harw_job_runtime::JobRuntimeError::BudgetExceeded { limit, .. } => format!(
+                        "budget: tool-call limit of {limit} is exhausted; no further tool call"
+                    ),
+                    other => format!("budget: {other}"),
+                };
+                state.exceeded = Some(reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
     // Nach jeder Modell-Runde: verbucht die gemeldete Usage.
     fn charge_round(&self, usage: &harw_types::TokenUsage) -> Result<(), String> {
         let mut state = self.state();
@@ -1928,17 +2208,96 @@ impl PromptTokenLedger {
     }
 }
 
+/// Eine reservierte, noch nicht verbuchte Modell-Runde
+/// ([`PromptTokenLedger::reserve_round`]).
+///
+/// # Description
+/// Das Verwerfen gibt die Runde frei — auch wenn der Turn mitten in der Runde
+/// abgebrochen wird oder der Provider ohne Usage scheitert. Die durable
+/// Reservierung bleibt dabei liegen; der nächste Flush ohne offene Runde
+/// entfernt sie nach dem Festschreiben. Nur eine Runde, deren gemeldete Usage
+/// der Ledger nicht verbuchen durfte, bleibt offen
+/// ([`Self::keep_unaccounted`]).
+struct RoundReservation<'a> {
+    ledger: &'a PromptTokenLedger,
+    // `false`: die Runde bleibt für den Rest des Ledgers offen.
+    release: bool,
+}
+
+impl RoundReservation<'_> {
+    // Die Runde hat Usage gemeldet, die der Ledger nicht verbuchen durfte
+    // (Budget überschritten oder Ledger inzwischen geschlossen): ihr Verbrauch
+    // ist real, aber nicht verbucht. Sie bleibt deshalb offen, ihre
+    // Reservierung wird von diesem Ledger nie entfernt und sperrt jeden
+    // Reclaim (fail closed).
+    fn keep_unaccounted(mut self) {
+        self.release = false;
+    }
+}
+
+impl Drop for RoundReservation<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            let mut state = self.ledger.state();
+            state.rounds_in_flight = state.rounds_in_flight.saturating_sub(1);
+        }
+    }
+}
+
+/// Bucht jeden Werkzeugaufruf eines Job-Turns im [`PromptTokenLedger`] und
+/// schreibt ihn unter der aktuellen Lease fest, BEVOR das Werkzeug läuft
+/// (Review P1-b zu #151).
+///
+/// # Description
+/// Registriert über `TurnControl::with_tool_call_meter` am Turn jedes
+/// Job-Pfads mit Ledger ([`ledger_tool_meter`]). Zugelassen wird nur, was
+/// gebucht ([`PromptTokenLedger::charge_tool_call`]) UND festgeschrieben
+/// ([`PromptTokenLedger::flush`]) ist; jeder Fehler weist den Aufruf ab (fail
+/// closed): erschöpftes Budget, geschlossener Ledger, verlorene Lease (ein
+/// Worker mit veralteter Epoche führt kein Werkzeug mehr aus) oder ein
+/// Speicherfehler (dann hat `flush` den Ledger geschlossen und den Marker
+/// geschrieben). Eine Rundenreservierung wie bei Modell-Runden braucht es
+/// nicht: der Aufruf ist festgeschrieben, bevor irgendetwas davon geschieht.
+///
+/// # Concurrency
+/// `Send + Sync`: nur ein `Arc`; der Turn-Loop ruft den Meter nacheinander.
+struct LedgerToolMeter {
+    ledger: Arc<PromptTokenLedger>,
+}
+
+impl harw_core::ToolCallMeter for LedgerToolMeter {
+    fn admit_tool_call<'a>(&'a self, _tool: &'a str) -> harw_core::ToolCallAdmissionFuture<'a> {
+        Box::pin(async move {
+            self.ledger.charge_tool_call()?;
+            // Feste, pfadfreie Gründe: der Grund geht an das Modell.
+            self.ledger.flush().await.map_err(|error| match error {
+                UsageFlushError::LeaseLost => USAGE_LEASE_LOST_REASON.to_owned(),
+                UsageFlushError::NotRecorded(_) => USAGE_UNRECORDED_REASON.to_owned(),
+            })
+        })
+    }
+}
+
+// Der `ToolCallMeter` für den `TurnControl` eines Job-Turns über `ledger`.
+fn ledger_tool_meter(ledger: &Arc<PromptTokenLedger>) -> Arc<dyn harw_core::ToolCallMeter> {
+    Arc::new(LedgerToolMeter {
+        ledger: Arc::clone(ledger),
+    })
+}
+
 /// Ein [`ModelProvider`], der jede Runde gegen einen [`PromptTokenLedger`]
 /// prüft und verbucht.
 ///
 /// # Description
 /// Vor der Runde wird zugelassen oder abgewiesen, ohne den inneren Provider zu
-/// berühren; nach der Runde wird die Usage verbucht und festgeschrieben.
-/// Überschreitet sie das Budget oder lässt sie sich nicht festschreiben, endet
-/// der Turn mit einem Modellfehler (die Antwort der Runde wird nicht
-/// weitergereicht), damit weder Tool-Runden noch weitere Modellaufrufe folgen.
-/// `execute_prompt_claim` ersetzt diesen Fehler durch den Schließgrund des
-/// Ledgers (`budget:`, `lease:` oder `usage:`).
+/// berühren, und die Runde durabel reserviert
+/// ([`PromptTokenLedger::reserve_round`]; scheitert das, wird der innere
+/// Provider nicht aufgerufen); nach der Runde wird die Usage verbucht und
+/// festgeschrieben. Überschreitet sie das Budget oder lässt sie sich nicht
+/// festschreiben, endet der Turn mit einem Modellfehler (die Antwort der Runde
+/// wird nicht weitergereicht), damit weder Tool-Runden noch weitere
+/// Modellaufrufe folgen. `execute_prompt_claim` ersetzt diesen Fehler durch
+/// den Schließgrund des Ledgers (`budget:`, `lease:` oder `usage:`).
 ///
 /// # Concurrency
 /// `Send + Sync`: nur `Arc`s.
@@ -1953,10 +2312,24 @@ impl ModelProvider for BudgetedModelProvider {
             self.ledger
                 .admit_round()
                 .map_err(harw_core::ModelError::RequestFailed)?;
-            let response = self.inner.respond(request).await?;
-            self.ledger
-                .charge_round(&response.usage)
+            // Durable Reservierung, bevor der Provider etwas ausgibt (Review
+            // B2 zu #151); ein Fehler des Providers gibt sie über `Drop` frei.
+            let reservation = self
+                .ledger
+                .reserve_round()
+                .await
                 .map_err(harw_core::ModelError::RequestFailed)?;
+            let response = self.inner.respond(request).await?;
+            match self.ledger.charge_round(&response.usage) {
+                // Erst nach dem Verbuchen freigeben: ein gleichzeitiger Flush
+                // sieht die Runde so entweder offen oder verbucht, nie keines
+                // von beiden.
+                Ok(()) => drop(reservation),
+                Err(reason) => {
+                    reservation.keep_unaccounted();
+                    return Err(harw_core::ModelError::RequestFailed(reason));
+                }
+            }
             // Lässt sich die Usage dieser Runde nicht festschreiben, wird ihre
             // Antwort nicht weitergereicht: nicht verbuchte Arbeit schreitet
             // nicht fort (fail closed; `flush` hat den Ledger geschlossen).
@@ -2020,8 +2393,17 @@ fn plan_node_submitter_id(claim: &JobClaim) -> String {
 // The plan-node path: typed payload, contract-derived permissions, role-derived
 // registry profile (both applied as a `RuntimeNarrowing` of
 // `EntryKind::JobPlanNode`), and a mandatory report back into the plan.
+//
+// Budget (Review P1-b zu #151): wie die übrigen Job-Arten läuft der Turn über
+// einen persistierten `PromptTokenLedger` — offene Usage eines früheren
+// Versuchs wird zuerst verrechnet (`settle_claim_usage`), jede Modell-Runde
+// reserviert und verbucht (`BudgetedModelProvider`), jeder Werkzeugaufruf vor
+// seiner Ausführung gebucht und festgeschrieben (`LedgerToolMeter`), und
+// `PromptTokenLedger::finish` schreibt den letzten Stand fest, bevor der
+// Ausgang an den Plan geht. Grenzen sind die des Jobs (`claim.job.budget`,
+// von der Plan-Brücke gesetzt), nicht die MCP-Obergrenzen der Prompt-Jobs.
 async fn execute_plan_node_claim(
-    claim: JobClaim,
+    mut claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
     job_store: Arc<JobStore>,
@@ -2124,6 +2506,29 @@ async fn execute_plan_node_claim(
         );
     };
 
+    // Offene Usage eines früheren Versuchs zuerst verrechnen, vor dem Ledger:
+    // ein Reclaim startet nie mit frischem Budget.
+    if let Err(reason) = settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(
+            task = %payload.task_id,
+            work_id = %work_id,
+            reason = %reason,
+            "plan-node job usage accounting unresolved"
+        );
+        return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+    }
+    let ledger = PromptTokenLedger::persisted(
+        claim.job.budget.clone(),
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(USAGE_FLUSH_INTERVAL);
+    let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
+        inner: provider,
+        ledger: Arc::clone(&ledger),
+    });
+
     let (entry, narrowing) = plan_node_narrowing(&payload, kind, &sandbox);
     let profile = narrowing.registry_profile;
     let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
@@ -2136,7 +2541,7 @@ async fn execute_plan_node_claim(
             session_id: durable_session_id(&claim),
             state_store: job_state_store(&context.transcript_root),
             job_store,
-            model: provider,
+            model: budgeted,
             narrowing: Some(narrowing),
         },
         PauseDisposition::Failed,
@@ -2167,13 +2572,42 @@ async fn execute_plan_node_claim(
         "plan-node job starting"
     );
 
-    let outcome = execute_turn(claim, plan_node_prompt(&payload), model, control, setup).await;
+    let outcome = execute_turn(
+        claim,
+        plan_node_prompt(&payload),
+        model,
+        control,
+        setup,
+        ledger_tool_meter(&ledger),
+    )
+    .await;
+    // Wie beim Prompt-Job: ein Abbruch durch den Supervisor bleibt ein
+    // Abbruch; jeder andere Ausgang eines Turns, den der Ledger gestoppt hat
+    // (Budget, Lease, Buchhaltung), endet mit dessen Grund.
+    let outcome = match outcome {
+        outcome @ JobOutcome::Cancelled { .. } => outcome,
+        outcome => match ledger.exceeded() {
+            Some(reason) => {
+                tracing::warn!(
+                    task = %payload.task_id,
+                    work_id = %work_id,
+                    reason = %reason,
+                    "plan-node job stopped by its ledger (budget, lease or usage accounting)"
+                );
+                JobOutcome::Failed { reason }
+            }
+            None => outcome,
+        },
+    };
     let outcome = enforce_patch_admission(
         &payload.contract,
         &workspace_root,
         &before_snapshot,
         outcome,
     );
+    // Letzter Stand vor dem Bericht an den Plan: nicht festschreibbare Usage
+    // macht auch einen Erfolg zum Fehlschlag.
+    let outcome = ledger.finish(outcome).await;
 
     report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome, &admission)
 }
@@ -2392,12 +2826,16 @@ fn job_assembly_with_contributors(
     builder.build().map_err(|error| error.to_string())
 }
 
+// Führt einen Job-Turn aus. `tool_meter` (Review P1-b zu #151) sitzt am
+// `TurnControl` des Turns und bucht jeden Werkzeugaufruf unter der Lease,
+// bevor er läuft ([`LedgerToolMeter`]); ohne Meter läuft kein Job-Turn.
 async fn execute_turn(
     claim: JobClaim,
     prompt: String,
     provider: Arc<dyn ModelProvider>,
     control: Arc<WorkerExecutionControl>,
     setup: TurnSetup,
+    tool_meter: Arc<dyn harw_core::ToolCallMeter>,
 ) -> JobOutcome {
     let TurnSetup {
         mut session,
@@ -2407,16 +2845,13 @@ async fn execute_turn(
 
     let session_id = durable_session_id(&claim);
     let durable_store = Arc::clone(&state_store);
+    let input = TurnInput::user(prompt)
+        .with_control(harw_core::turn_loop::TurnControl::new().with_tool_call_meter(tool_meter));
 
     let mut turn = tokio::spawn(async move {
-        run_turn(
-            &mut session,
-            provider.as_ref(),
-            state_store.as_ref(),
-            TurnInput::user(prompt),
-        )
-        .await
-        .map(|outcome| (outcome, session))
+        run_turn(&mut session, provider.as_ref(), state_store.as_ref(), input)
+            .await
+            .map(|outcome| (outcome, session))
     });
     control.set_abort_handle(turn.abort_handle());
     let mut cancellation = control.cancellation();

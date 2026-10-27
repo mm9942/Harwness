@@ -14,6 +14,32 @@
 //! entfernt ihn erst danach; lässt er sich nicht lesen oder verrechnen, endet
 //! der Job fehlgeschlagen statt mit frischem Budget weiterzulaufen.
 //!
+//! # Rundenreservierung (Review B2 zu #151)
+//! Der Marker oben hilft nur, wenn er sich schreiben lässt. Scheitern
+//! `record_usage` UND der Marker (volles oder schreibgeschütztes
+//! Job-Dateisystem) und stirbt der Worker danach, sähe ein Reclaim nur die
+//! ältere Usage. Deshalb legt der Worker VOR jeder Modell-Runde eine durable
+//! Reservierung ab ([`InFlightUsage`], `<job-root>/usage-inflight/<work-id>.json`)
+//! mit dem Stand, von dem die Runde ausgeht (`usage_before`). Lässt sich die
+//! Reservierung nicht schreiben, startet die Runde nicht — es wurde nichts
+//! ausgegeben. Nach dem Festschreiben der Usage wird sie entfernt; laufen
+//! mehrere Runden zugleich, bleibt sie liegen, bis keine mehr offen ist, und
+//! wird vor jedem Festschreiben auf den festzuschreibenden Stand angehoben.
+//! Eine Runde, deren gemeldete Usage der Ledger nicht verbuchen durfte
+//! (Budget überschritten, Ledger geschlossen), bleibt reserviert.
+//!
+//! Konservative Regel beim Reclaim (kein Reclaim, solange die Buchhaltung
+//! nicht bewiesen ist): Findet der nächste Claim (höhere Epoche) eine
+//! Reservierung, gilt deren Runde nur dann als verbucht, wenn die — nach dem
+//! Marker oben verrechnete — gespeicherte Usage in Tokens oder
+//! Werkzeugaufrufen echt über `usage_before` liegt
+//! ([`InFlightUsage::superseded_by`]); dann wird die Reservierung entfernt.
+//! Sonst ist der Verbrauch der Runde unbewiesen, und der Job endet
+//! fehlgeschlagen ohne Modellaufruf, statt dasselbe Budget ein zweites Mal
+//! auszugeben. Eine Reservierung derselben (oder einer jüngeren) Epoche gehört
+//! nicht zu einem früheren Versuch und bleibt unberührt. Werkzeugaufrufe
+//! brauchen keine Reservierung: sie werden festgeschrieben, bevor sie laufen.
+//!
 //! # Concurrency
 //! Kein Dateilock: der Schreiber ist der Lease-Halter des Jobs, und innerhalb
 //! eines Prozesses serialisiert der Flush-Gate des Ledgers die Zugriffe. Jede
@@ -29,6 +55,10 @@ use serde::{Deserialize, Serialize};
 
 /// Verzeichnisname unterhalb der Job-Store-Wurzel (`JobStore::root()`).
 pub(crate) const USAGE_UNRESOLVED_DIR: &str = "usage-unresolved";
+
+/// Verzeichnisname der Rundenreservierungen unterhalb der Job-Store-Wurzel
+/// (Review B2 zu #151).
+pub(crate) const USAGE_INFLIGHT_DIR: &str = "usage-inflight";
 
 /// Aktuelle Schemaversion der Marker-Datei.
 const SCHEMA_VERSION: u32 = 1;
@@ -93,10 +123,61 @@ impl UnresolvedUsage {
     }
 }
 
-/// Dateibasierter Speicher der Marker unter `<job-root>/usage-unresolved/`.
+/// Durable Reservierung einer Modell-Runde, bevor sie etwas ausgibt (Review B2
+/// zu #151).
+///
+/// # Description
+/// `usage_before` ist der absolute Stand (Gesamtverbrauch des Jobs), von dem
+/// die Runde ausgeht, kein Delta. Ein späterer Claim gilt die Runde nur dann
+/// als verbucht, wenn die gespeicherte Usage darüber liegt
+/// ([`Self::superseded_by`]); siehe Moduldoku, "Rundenreservierung".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InFlightUsage {
+    /// Schemaversion der Datei; derzeit `1`.
+    pub schema_version: u32,
+    /// Job, zu dem die Runde gehört.
+    pub work_id: String,
+    /// Lease-Epoche des Workers, der die Runde reserviert hat.
+    pub epoch: u64,
+    /// Absoluter Verbrauchsstand, von dem die Runde ausgeht.
+    pub usage_before: BudgetUsage,
+    /// Zeitpunkt der Reservierung.
+    pub started_at: jiff::Timestamp,
+}
+
+impl InFlightUsage {
+    /// Baut eine Reservierung mit aktueller Schemaversion und Zeitstempel.
+    pub(crate) fn new(work_id: &str, epoch: u64, usage_before: BudgetUsage) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            work_id: work_id.to_owned(),
+            epoch,
+            usage_before,
+            started_at: jiff::Timestamp::now(),
+        }
+    }
+
+    /// `true`, wenn `stored` in Tokens oder Werkzeugaufrufen echt über
+    /// `usage_before` liegt: dann wurde nach der Reservierung verbucht.
+    ///
+    /// # Description
+    /// Die Wanduhr zählt bewusst nicht — sie wächst auch ohne Runde (der
+    /// periodische Flush schreibt sie fort) und bewiese nichts. Eine Runde,
+    /// die weder Tokens noch Werkzeugaufrufe meldet, gilt danach nie als
+    /// bewiesen (fail closed).
+    #[must_use]
+    pub(crate) fn superseded_by(&self, stored: &BudgetUsage) -> bool {
+        stored.tokens > self.usage_before.tokens || stored.tool_calls > self.usage_before.tool_calls
+    }
+}
+
+/// Dateibasierter Speicher der Marker unter `<job-root>/usage-unresolved/`
+/// und der Rundenreservierungen unter `<job-root>/usage-inflight/`.
 #[derive(Debug, Clone)]
 pub(crate) struct UsageMarkerStore {
     dir: PathBuf,
+    in_flight_dir: PathBuf,
 }
 
 impl UsageMarkerStore {
@@ -105,6 +186,7 @@ impl UsageMarkerStore {
     pub(crate) fn in_job_root(job_root: &Path) -> Self {
         Self {
             dir: job_root.join(USAGE_UNRESOLVED_DIR),
+            in_flight_dir: job_root.join(USAGE_INFLIGHT_DIR),
         }
     }
 
@@ -154,7 +236,7 @@ impl UsageMarkerStore {
         if let Some(parent) = self.dir.parent() {
             sync_dir(parent)?;
         }
-        self.write_atomic(&path, &marker.work_id, &bytes)
+        write_atomic(&self.dir, &path, &marker.work_id, &bytes)
     }
 
     /// Liest den Marker zu `work_id`.
@@ -170,33 +252,8 @@ impl UsageMarkerStore {
     /// aussehen, sonst bekäme der Job frisches Budget.
     pub(crate) fn read(&self, work_id: &str) -> Result<Option<UnresolvedUsage>, String> {
         let path = self.path_for(work_id)?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "usage marker for '{work_id}' must not be a symbolic link"
-                ));
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(format!(
-                    "usage marker for '{work_id}' is not a regular file"
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "usage marker for '{work_id}' is not accessible: {error}"
-                ));
-            }
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "usage marker for '{work_id}' cannot be read: {error}"
-                ));
-            }
+        let Some(bytes) = read_regular_file(&path, MARKER_LABEL, work_id)? else {
+            return Ok(None);
         };
         let marker: UnresolvedUsage = serde_json::from_slice(&bytes)
             .map_err(|error| format!("usage marker for '{work_id}' is malformed: {error}"))?;
@@ -231,6 +288,112 @@ impl UsageMarkerStore {
         }
     }
 
+    /// Schreibt die Rundenreservierung atomar (temp + rename + fsync des
+    /// Verzeichnisses); ersetzt eine vorhandene derselben oder einer älteren
+    /// Epoche.
+    ///
+    /// # Errors
+    /// Unsichere Arbeits-ID, unbekannte Schemaversion, eine vorhandene, aber
+    /// unlesbare Reservierung (sie wird nicht überschrieben — der nächste
+    /// Claim schlägt an ihr ohnehin geschlossen fehl), eine vorhandene
+    /// Reservierung einer jüngeren Epoche (ein veralteter Lease-Halter darf
+    /// die Reservierung des aktuellen nicht ersetzen) oder jeder I/O-Fehler.
+    /// Der Aufrufer startet die Runde dann nicht.
+    pub(crate) fn write_in_flight(&self, reservation: &InFlightUsage) -> Result<(), String> {
+        let path = self.in_flight_path_for(&reservation.work_id)?;
+        if reservation.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{IN_FLIGHT_LABEL}: unsupported schema version {} (expected {SCHEMA_VERSION})",
+                reservation.schema_version
+            ));
+        }
+        if let Some(existing) = self.read_in_flight(&reservation.work_id)? {
+            if existing.epoch > reservation.epoch {
+                return Err(format!(
+                    "{IN_FLIGHT_LABEL} for '{}' is held by the newer epoch {} (writer epoch {})",
+                    reservation.work_id, existing.epoch, reservation.epoch
+                ));
+            }
+        }
+        let bytes = serde_json::to_vec(reservation)
+            .map_err(|error| format!("{IN_FLIGHT_LABEL}: encoding failed: {error}"))?;
+        // Das Verzeichnis entsteht einmal je Job-Store; nur dann muss sein
+        // Eintrag im Elternverzeichnis dauerhaft gemacht werden.
+        let existed = self.in_flight_dir.is_dir();
+        std::fs::create_dir_all(&self.in_flight_dir).map_err(|error| {
+            format!(
+                "{IN_FLIGHT_LABEL}: cannot create '{}': {error}",
+                self.in_flight_dir.display()
+            )
+        })?;
+        if !existed {
+            if let Some(parent) = self.in_flight_dir.parent() {
+                sync_dir(parent)?;
+            }
+        }
+        write_atomic(&self.in_flight_dir, &path, &reservation.work_id, &bytes)
+    }
+
+    /// Liest die Rundenreservierung zu `work_id`.
+    ///
+    /// # Returns
+    /// `Ok(None)`, wenn keine Reservierung existiert; sonst die Reservierung.
+    ///
+    /// # Errors
+    /// Fail-closed wie [`Self::read`]: unsichere Arbeits-ID, Symlink oder
+    /// Nicht-Datei, nicht lesbare Datei, ungültiges JSON, unbekannte Felder
+    /// oder Schemaversion, oder eine Reservierung einer anderen Arbeits-ID.
+    /// Eine kaputte Reservierung darf nie wie "keine Reservierung" aussehen.
+    pub(crate) fn read_in_flight(&self, work_id: &str) -> Result<Option<InFlightUsage>, String> {
+        let path = self.in_flight_path_for(work_id)?;
+        let Some(bytes) = read_regular_file(&path, IN_FLIGHT_LABEL, work_id)? else {
+            return Ok(None);
+        };
+        let reservation: InFlightUsage = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{IN_FLIGHT_LABEL} for '{work_id}' is malformed: {error}"))?;
+        if reservation.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{IN_FLIGHT_LABEL} for '{work_id}' has unsupported schema version {}",
+                reservation.schema_version
+            ));
+        }
+        if reservation.work_id != work_id {
+            return Err(format!(
+                "{IN_FLIGHT_LABEL} for '{work_id}' belongs to another job"
+            ));
+        }
+        Ok(Some(reservation))
+    }
+
+    /// Entfernt die Rundenreservierung zu `work_id`, sofern sie aus Epoche
+    /// `epoch` oder einer älteren stammt; idempotent.
+    ///
+    /// # Description
+    /// Eine Reservierung einer jüngeren Epoche gehört dem aktuellen
+    /// Lease-Halter und bleibt liegen (`Ok`). Kein Dateilock: der Aufrufer ist
+    /// der Lease-Halter, der eben festgeschrieben hat, oder der Claim, der die
+    /// Reservierung eines früheren Versuchs als verbucht bewiesen hat.
+    ///
+    /// # Errors
+    /// Unsichere Arbeits-ID, eine unlesbare Reservierung (sie bleibt liegen;
+    /// der nächste Claim schlägt an ihr geschlossen fehl) oder ein I/O-Fehler
+    /// beim Löschen bzw. beim fsync des Verzeichnisses.
+    pub(crate) fn remove_in_flight(&self, work_id: &str, epoch: u64) -> Result<(), String> {
+        let path = self.in_flight_path_for(work_id)?;
+        match self.read_in_flight(work_id)? {
+            None => return Ok(()),
+            Some(existing) if existing.epoch > epoch => return Ok(()),
+            Some(_) => {}
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_dir(&self.in_flight_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "{IN_FLIGHT_LABEL} for '{work_id}' cannot be removed: {error}"
+            )),
+        }
+    }
+
     /// Feldweises Maximum zweier Usages.
     #[must_use]
     pub(crate) fn merged(a: &BudgetUsage, b: &BudgetUsage) -> BudgetUsage {
@@ -248,31 +411,74 @@ impl UsageMarkerStore {
         Ok(self.dir.join(format!("{work_id}.{MARKER_EXTENSION}")))
     }
 
-    // temp + fsync + rename + fsync des Verzeichnisses; die Temp-Datei wird bei
-    // jedem Fehler wieder entfernt.
-    fn write_atomic(&self, path: &Path, work_id: &str, bytes: &[u8]) -> Result<(), String> {
-        let temp = self.dir.join(temp_name(work_id));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        restrict_mode(&mut options);
-        let mut file = options.open(&temp).map_err(|error| {
-            format!(
-                "usage marker: cannot create temp file '{}': {error}",
-                temp.display()
-            )
-        })?;
-        let written = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        if let Err(error) = written {
-            remove_quietly(&temp);
-            return Err(format!("usage marker: cannot write temp file: {error}"));
-        }
-        if let Err(error) = std::fs::rename(&temp, path) {
-            remove_quietly(&temp);
-            return Err(format!("usage marker: cannot publish marker: {error}"));
-        }
-        sync_dir(&self.dir)
+    // Pfad der Reservierungsdatei; dieselbe Regel für die Arbeits-ID.
+    fn in_flight_path_for(&self, work_id: &str) -> Result<PathBuf, String> {
+        harw_job_store::validate_id(work_id)
+            .map_err(|error| format!("{IN_FLIGHT_LABEL}: {error}"))?;
+        Ok(self
+            .in_flight_dir
+            .join(format!("{work_id}.{MARKER_EXTENSION}")))
     }
+}
+
+/// Bezeichnung des Markers in Fehlertexten.
+const MARKER_LABEL: &str = "usage marker";
+
+/// Bezeichnung der Rundenreservierung in Fehlertexten.
+const IN_FLIGHT_LABEL: &str = "in-flight usage reservation";
+
+// Liest die Datei unter `path` fail-closed: `Ok(None)` nur, wenn sie fehlt;
+// ein Symlink, eine Nicht-Datei oder ein Lesefehler ist ein Fehler. `label`
+// benennt die Dateiart im Fehlertext.
+fn read_regular_file(path: &Path, label: &str, work_id: &str) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "{label} for '{work_id}' must not be a symbolic link"
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!("{label} for '{work_id}' is not a regular file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "{label} for '{work_id}' is not accessible: {error}"
+            ));
+        }
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{label} for '{work_id}' cannot be read: {error}")),
+    }
+}
+
+// temp + fsync + rename + fsync des Verzeichnisses `dir`; die Temp-Datei wird
+// bei jedem Fehler wieder entfernt.
+fn write_atomic(dir: &Path, path: &Path, work_id: &str, bytes: &[u8]) -> Result<(), String> {
+    let temp = dir.join(temp_name(work_id));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    restrict_mode(&mut options);
+    let mut file = options.open(&temp).map_err(|error| {
+        format!(
+            "usage marker: cannot create temp file '{}': {error}",
+            temp.display()
+        )
+    })?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        remove_quietly(&temp);
+        return Err(format!("usage marker: cannot write temp file: {error}"));
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        remove_quietly(&temp);
+        return Err(format!("usage marker: cannot publish marker: {error}"));
+    }
+    sync_dir(dir)
 }
 
 // Erste Zeile, ohne Steuerzeichen, höchstens `MAX_REASON_CHARS` Zeichen.
@@ -366,6 +572,24 @@ mod tests {
     fn marker_file(root: &Path, work_id: &str) -> PathBuf {
         root.join(USAGE_UNRESOLVED_DIR)
             .join(format!("{work_id}.json"))
+    }
+
+    fn reservation(work_id: &str, epoch: u64, tokens: u64, tool_calls: u32) -> InFlightUsage {
+        InFlightUsage::new(work_id, epoch, usage(tokens, tool_calls))
+    }
+
+    fn reservation_file(root: &Path, work_id: &str) -> PathBuf {
+        root.join(USAGE_INFLIGHT_DIR)
+            .join(format!("{work_id}.json"))
+    }
+
+    fn read_reservation(store: &UsageMarkerStore, work_id: &str) -> TestResult<InFlightUsage> {
+        some_or(
+            store
+                .read_in_flight(work_id)
+                .map_err(TestError::Unexpected)?,
+            "reservation present",
+        )
     }
 
     fn expect_err<T: std::fmt::Debug>(result: Result<T, String>, what: &str) -> TestResult<String> {
@@ -659,5 +883,174 @@ mod tests {
         .map_err(ctx("create symlink"))?;
         expect_err(store.read("job-1"), "symlinked marker")?;
         Ok(())
+    }
+
+    // ── Rundenreservierung (Review B2 zu #151) ────────────────────────────
+
+    #[test]
+    fn test_in_flight_round_trip_and_epoch_guarded_remove() -> TestResult {
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        if store
+            .read_in_flight("job-1")
+            .map_err(TestError::Unexpected)?
+            .is_some()
+        {
+            return Err(TestError::Unexpected(
+                "a reservation appeared out of nowhere".to_owned(),
+            ));
+        }
+        let written = reservation("job-1", 4, 70, 1);
+        store
+            .write_in_flight(&written)
+            .map_err(TestError::Unexpected)?;
+        let read = read_reservation(&store, "job-1")?;
+        if read != written {
+            return Err(TestError::Unexpected(format!(
+                "round trip changed the reservation: {written:?} -> {read:?}"
+            )));
+        }
+        // Reservierung und Marker liegen getrennt.
+        if store
+            .read("job-1")
+            .map_err(TestError::Unexpected)?
+            .is_some()
+        {
+            return Err(TestError::Unexpected(
+                "a reservation must not look like an unresolved-usage marker".to_owned(),
+            ));
+        }
+
+        // Eine ältere Epoche entfernt die Reservierung einer jüngeren nicht.
+        store
+            .remove_in_flight("job-1", 3)
+            .map_err(TestError::Unexpected)?;
+        read_reservation(&store, "job-1")?;
+        store
+            .remove_in_flight("job-1", 4)
+            .map_err(TestError::Unexpected)?;
+        store
+            .remove_in_flight("job-1", 4)
+            .map_err(TestError::Unexpected)?;
+        if store
+            .read_in_flight("job-1")
+            .map_err(TestError::Unexpected)?
+            .is_some()
+        {
+            return Err(TestError::Unexpected(
+                "the reservation survived its removal".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_flight_write_never_replaces_a_newer_epoch() -> TestResult {
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        store
+            .write_in_flight(&reservation("job-1", 5, 10, 0))
+            .map_err(TestError::Unexpected)?;
+        expect_err(
+            store.write_in_flight(&reservation("job-1", 4, 99, 0)),
+            "stale writer",
+        )?;
+        let read = read_reservation(&store, "job-1")?;
+        assert_eq!((read.epoch, read.usage_before.tokens), (5, 10));
+
+        // Dieselbe oder eine jüngere Epoche ersetzt sie (Anheben, Reclaim).
+        store
+            .write_in_flight(&reservation("job-1", 5, 20, 0))
+            .map_err(TestError::Unexpected)?;
+        store
+            .write_in_flight(&reservation("job-1", 6, 30, 1))
+            .map_err(TestError::Unexpected)?;
+        let read = read_reservation(&store, "job-1")?;
+        assert_eq!((read.epoch, read.usage_before.tokens), (6, 30));
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_flight_malformed_unknown_or_foreign_fails_closed() -> TestResult {
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        std::fs::create_dir_all(root.path().join(USAGE_INFLIGHT_DIR))
+            .map_err(ctx("create reservation dir"))?;
+        let path = reservation_file(root.path(), "job-1");
+        std::fs::write(&path, b"{ not json").map_err(ctx("write garbage"))?;
+        expect_err(store.read_in_flight("job-1"), "garbage reservation")?;
+        expect_err(
+            store.write_in_flight(&reservation("job-1", 1, 5, 0)),
+            "write over a garbage reservation",
+        )?;
+        expect_err(
+            store.remove_in_flight("job-1", 9),
+            "remove of a garbage reservation",
+        )?;
+        let after = std::fs::read(&path).map_err(ctx("re-read garbage"))?;
+        if after != b"{ not json" {
+            return Err(TestError::Unexpected(
+                "the unreadable reservation was touched".to_owned(),
+            ));
+        }
+
+        std::fs::remove_file(&path).map_err(ctx("remove garbage"))?;
+        store
+            .write_in_flight(&reservation("job-1", 1, 5, 0))
+            .map_err(TestError::Unexpected)?;
+        let text = std::fs::read_to_string(&path).map_err(ctx("read reservation"))?;
+        let with_extra = text.replacen('{', "{\"surprise\":true,", 1);
+        std::fs::write(&path, with_extra).map_err(ctx("write extra field"))?;
+        expect_err(store.read_in_flight("job-1"), "unknown field")?;
+        let future_schema = text.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+        std::fs::write(&path, future_schema).map_err(ctx("write future schema"))?;
+        expect_err(store.read_in_flight("job-1"), "future schema")?;
+        let foreign = text.replacen("\"work_id\":\"job-1\"", "\"work_id\":\"job-2\"", 1);
+        std::fs::write(&path, foreign).map_err(ctx("write foreign reservation"))?;
+        expect_err(store.read_in_flight("job-1"), "foreign reservation")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_flight_unsafe_work_ids_are_rejected() -> TestResult {
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        for id in ["", "../escape", "a/b", "a\\b", "a.b", "job\n1", "job 1"] {
+            expect_err(store.read_in_flight(id), "read with unsafe id")?;
+            expect_err(store.remove_in_flight(id, 1), "remove with unsafe id")?;
+            expect_err(
+                store.write_in_flight(&reservation(id, 1, 1, 0)),
+                "write with unsafe id",
+            )?;
+        }
+        let entries = std::fs::read_dir(root.path())
+            .map_err(ctx("read job root"))?
+            .count();
+        if entries != 0 {
+            return Err(TestError::Unexpected(format!(
+                "{entries} entries were created for rejected ids"
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_superseded_by_needs_more_tokens_or_tool_calls() {
+        let reserved = reservation("job-1", 1, 10, 2);
+        assert!(
+            !reserved.superseded_by(&usage(10, 2)),
+            "equal usage proves nothing"
+        );
+        assert!(!reserved.superseded_by(&usage(9, 2)));
+        assert!(
+            !reserved.superseded_by(&BudgetUsage {
+                tokens: 10,
+                wall: SignedDuration::from_secs(500),
+                tool_calls: 2,
+            }),
+            "wall time alone proves nothing"
+        );
+        assert!(reserved.superseded_by(&usage(11, 2)));
+        assert!(reserved.superseded_by(&usage(10, 3)));
     }
 }
