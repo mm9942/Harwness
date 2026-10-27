@@ -262,7 +262,7 @@ pub(super) async fn execute_intent_cycle_claim(
 
     let Some(routes) = proposer_routes(context, runtime_root, &job_store, &provider, &claim) else {
         return JobOutcome::Blocked {
-            reason: "intent cycle: no model is configured for the cycle proposer".to_owned(),
+            reason: "intent cycle: no admitted model for the cycle proposer (none configured, or every configured model is retired)".to_owned(),
         };
     };
 
