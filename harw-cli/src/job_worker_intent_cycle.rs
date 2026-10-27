@@ -59,6 +59,21 @@
 //! thread) so the proposer sees the same excerpts it would have seen without
 //! the restart; files that changed meanwhile or are unreadable are skipped.
 //!
+//! # Learning and recall (W09a/W09b)
+//! Only when the trusted job input names a project memories root
+//! (`IntentCycleJobInput::learning_root`, written solely by
+//! `intent_cycle.start` from the operator's resolved home); without it
+//! nothing is learned or recalled. Before the driver runs, the matching
+//! project lessons (at most eight lines) are handed to the proposer as
+//! low-trust data (`ModelCycleProposer::with_lessons`). After the run,
+//! whatever its result (wall-clock timeout included), the pending
+//! observations are drained once into project pitfall facts and acknowledged
+//! under the claim's lease; that also settles entries an earlier claim left
+//! between commit and acknowledgement. There is no drain before the run: the
+//! store fence needs the rebound lease, which only exists after the driver
+//! ran. Store access runs on blocking threads; a drain or recall failure is
+//! only logged and never changes the job outcome.
+//!
 //! # Workspace binding
 //! The ceiling is cut from the worker's `runtime_root.cwd`. `claim.scope`
 //! carries only the submitter's tenant/workspace *aliases* (the worker
@@ -68,12 +83,13 @@
 //! refuses (`Blocked`, before any record or model call) unless it equals the
 //! canonical root of its own sandbox; a missing root is refused too.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use harw_core::ModelProvider;
 use harw_core::cancel::{CancelReason, CancelToken};
-use harw_job_runtime::{JobClaim, JobKind, JobOutcome};
+use harw_job_runtime::{JobClaim, JobKind, JobOutcome, LeaseToken};
 use harw_ops::intent_cycle::IntentCycleJobInput;
 use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
@@ -243,6 +259,9 @@ pub(super) async fn execute_intent_cycle_claim(
     {
         tracing::info!(work_id = %work_id.as_str(), filled, "intent cycle excerpt cache warmed after takeover");
     }
+    // Learning and recall only under the trusted project memories root.
+    let learning_root = cycle_input.learning_root.as_deref();
+    let lessons = recall_lessons(learning_root, plan.admission.objective()).await;
 
     let ledger = PromptTokenLedger::persisted(
         claim.job.budget.clone(),
@@ -255,7 +274,9 @@ pub(super) async fn execute_intent_cycle_claim(
         inner: Arc::clone(&provider),
         ledger: Arc::clone(&ledger),
     });
-    let proposer = ModelCycleProposer::new(budgeted, routes).with_excerpts(cache.clone());
+    let proposer = ModelCycleProposer::new(budgeted, routes)
+        .with_excerpts(cache.clone())
+        .with_lessons(lessons);
     let executor =
         ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks).with_cache(cache);
     let mut driver = CycleDriver::new(
@@ -310,7 +331,11 @@ pub(super) async fn execute_intent_cycle_claim(
             }
         }
     };
-    let outcome = match tokio::time::timeout(remaining, run).await {
+    let finished = tokio::time::timeout(remaining, run).await;
+    // Learn from what the run committed, whatever its result; the drain never
+    // changes the outcome.
+    drain_learning(&store, &cycle_id, &claim.token, learning_root).await;
+    let outcome = match finished {
         Ok(result) => {
             if let Err(error) = &result {
                 tracing::warn!(work_id = %work_id.as_str(), error = %error, "intent cycle run ended with an error");
@@ -422,6 +447,81 @@ async fn warm_after_takeover(
         Err(error) => {
             tracing::warn!(error = %error, "intent cycle excerpt cache warm-up task failed");
             None
+        }
+    }
+}
+
+/// Drains the pending observations of `cycle_id` into project lessons (see
+/// `intent_cycle_learning::drain_cycle_observations`) on a blocking thread,
+/// under the claim's lease. Does nothing without a learning root and never
+/// fails the claim: the result is only logged.
+///
+/// Called once, after [`CycleDriver::run`] (on every result, the wall-clock
+/// timeout included). The store fence only lets the lease read and
+/// acknowledge the outbox once the cycle is rebound to it, and that rebind
+/// happens inside `CycleDriver::run`; a drain before the run would always be
+/// refused (`NotRebound`). The drain after the run also settles entries an
+/// earlier incarnation committed but did not acknowledge: after the rebind
+/// they are pending under the new fence and are acknowledged under the new
+/// token.
+async fn drain_learning(
+    store: &Arc<CycleStore>,
+    cycle_id: &str,
+    token: &LeaseToken,
+    learning_root: Option<&Path>,
+) {
+    let Some(root) = learning_root else {
+        return;
+    };
+    let (store, id, lease, root) = (
+        Arc::clone(store),
+        cycle_id.to_owned(),
+        token.clone(),
+        root.to_path_buf(),
+    );
+    let joined = tokio::task::spawn_blocking(move || {
+        super::intent_cycle_learning::drain_cycle_observations(&store, &id, &lease, &root)
+    })
+    .await;
+    match joined {
+        Ok(Ok(report)) => {
+            if report.acked > 0 || report.written > 0 {
+                tracing::info!(
+                    cycle_id,
+                    acked = report.acked,
+                    written = report.written,
+                    screened_out = report.screened_out,
+                    "intent cycle observations drained into project lessons"
+                );
+            }
+        }
+        Ok(Err(reason)) => {
+            tracing::warn!(cycle_id, reason = %reason, "intent cycle observations not drained");
+        }
+        Err(error) => {
+            tracing::warn!(cycle_id, error = %error, "intent cycle observation drain task failed");
+        }
+    }
+}
+
+/// Project lesson lines for the proposer prompt (see
+/// `intent_cycle_learning::lesson_lines`), read on a blocking thread. Empty
+/// without a learning root or when the recall task fails.
+async fn recall_lessons(learning_root: Option<&Path>, objective: &str) -> Vec<String> {
+    let Some(root) = learning_root.map(Path::to_path_buf) else {
+        return Vec::new();
+    };
+    let objective = objective.to_owned();
+    let now_unix = jiff::Timestamp::now().as_second();
+    let joined = tokio::task::spawn_blocking(move || {
+        super::intent_cycle_learning::lesson_lines(&root, &objective, now_unix)
+    })
+    .await;
+    match joined {
+        Ok(lines) => lines,
+        Err(error) => {
+            tracing::warn!(error = %error, "intent cycle lesson recall task failed");
+            Vec::new()
         }
     }
 }

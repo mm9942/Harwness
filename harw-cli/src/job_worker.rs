@@ -149,6 +149,9 @@ mod work_driver_job;
 #[path = "job_worker_intent_cycle.rs"]
 mod intent_cycle_job;
 
+#[path = "job_worker_intent_cycle_learning.rs"]
+mod intent_cycle_learning;
+
 #[path = "job_worker_verify_diagnostics.rs"]
 mod verify_diagnostics;
 
@@ -4698,9 +4701,72 @@ mod tests {
             }
         }
 
-        fn cycle_record(id: &str, workspace_root: &Path) -> TestResult<StoredJob> {
+        /// [`Scripted`] that rewrites one workspace file right before the
+        /// reply with index `at`: the repository changes under the running
+        /// cycle, between two of its steps.
+        struct RewritingScripted {
+            inner: Scripted,
+            at: usize,
+            path: PathBuf,
+            content: &'static str,
+        }
+
+        impl ModelProvider for RewritingScripted {
+            fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+                if self.inner.prompts().len() == self.at {
+                    // A failed write surfaces as a missing completion below.
+                    if let Err(error) = std::fs::write(&self.path, self.content) {
+                        tracing::warn!(error = %error, "test workspace rewrite failed");
+                    }
+                }
+                self.inner.respond(request)
+            }
+        }
+
+        /// Objective of the marker cycle used by most tests.
+        const MARKER_OBJECTIVE: &str = "does lib.rs define the marker?";
+
+        /// Writes `src/lib.rs` into the job's cwd and configures the default
+        /// model the proposer runs on; returns the cwd.
+        fn cycle_workspace(context: &JobWorkerContext, lib: &str) -> TestResult<PathBuf> {
+            let root = context
+                .runtime_root
+                .as_ref()
+                .ok_or(TestError::Missing("runtime root"))?;
+            std::fs::create_dir_all(root.cwd.join("src")).map_err(ctx("mkdir src"))?;
+            std::fs::write(root.cwd.join("src/lib.rs"), lib).map_err(ctx("write lib"))?;
+            let config = root.home.join("config.toml");
+            // Top-level keys must precede the first table.
+            let text = std::fs::read_to_string(&config).map_err(ctx("read config"))?;
+            std::fs::write(
+                &config,
+                format!("default_model = \"cycle-test-model\"\n{text}"),
+            )
+            .map_err(ctx("write config"))?;
+            Ok(root.cwd.clone())
+        }
+
+        /// Contents of the `pl90-*.md` lesson files under `<root>/facts`.
+        fn lesson_files(root: &Path) -> TestResult<Vec<String>> {
+            let mut lessons = Vec::new();
+            for entry in std::fs::read_dir(root.join("facts")).map_err(ctx("read facts dir"))? {
+                let entry = entry.map_err(ctx("facts dir entry"))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("pl90-") && name.ends_with(".md") {
+                    lessons.push(std::fs::read_to_string(entry.path()).map_err(ctx("read fact"))?);
+                }
+            }
+            Ok(lessons)
+        }
+
+        fn cycle_record(
+            id: &str,
+            objective: &str,
+            workspace_root: &Path,
+            learning_root: Option<PathBuf>,
+        ) -> TestResult<StoredJob> {
             let spec = ReadOnlyCycleSpec::new(
-                "does lib.rs define the marker?".to_owned(),
+                objective.to_owned(),
                 BTreeMap::from([("lib".to_owned(), "src/lib.rs".to_owned())]),
                 BTreeMap::from([(
                     "marker-defined".to_owned(),
@@ -4722,6 +4788,7 @@ mod tests {
                 workspace_root: Some(
                     std::fs::canonicalize(workspace_root).map_err(ctx("canonical root"))?,
                 ),
+                learning_root,
             };
             ready_record_of_kind(
                 id,
@@ -4734,33 +4801,17 @@ mod tests {
         async fn worker_drives_a_cycle_to_completion_proposed() -> TestResult {
             let temp = temp_dir()?;
             let context = job_context(temp.path())?;
-            let cwd = context
-                .runtime_root
-                .as_ref()
-                .map(|root| root.cwd.clone())
-                .ok_or(TestError::Missing("runtime cwd"))?;
-            std::fs::create_dir_all(cwd.join("src")).map_err(ctx("mkdir src"))?;
             // The second line is a sentinel only the file read can put into a
             // prompt: the intent text and the checks never mention it.
-            std::fs::write(
-                cwd.join("src/lib.rs"),
+            let cwd = cycle_workspace(
+                &context,
                 "pub fn cycle_marker() {}\n// excerpt-sentinel-4711\n",
-            )
-            .map_err(ctx("write lib"))?;
-            let config = context
-                .runtime_root
-                .as_ref()
-                .map(|root| root.home.join("config.toml"))
-                .ok_or(TestError::Missing("runtime home"))?;
-            // Top-level keys must precede the first table.
-            let text = std::fs::read_to_string(&config).map_err(ctx("read config"))?;
-            std::fs::write(
-                &config,
-                format!("default_model = \"cycle-test-model\"\n{text}"),
-            )
-            .map_err(ctx("write config"))?;
+            )?;
             let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
-            admit(&store, &cycle_record("cycle-e2e", &cwd)?)?;
+            admit(
+                &store,
+                &cycle_record("cycle-e2e", MARKER_OBJECTIVE, &cwd, None)?,
+            )?;
             let provider = Arc::new(Scripted::new([
                 r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
                 r#"{"kind":"verify","evidence_id":"cycle-e2e-0:lib"}"#.to_owned(),
@@ -4800,6 +4851,113 @@ mod tests {
             let status = cycles.load("cycle-e2e").map_err(ctx("cycle"))?.status();
             assert_eq!(status.terminal, Some(CycleTerminal::CompletionProposed));
             assert_eq!(status.criteria_covered, vec!["marker-defined".to_owned()]);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn worker_learns_project_pitfalls_from_failed_verifications() -> TestResult {
+            let temp = temp_dir()?;
+            let context = job_context(temp.path())?;
+            // The marker is missing at first, so verifying the first read fails.
+            let cwd = cycle_workspace(&context, "pub fn other() {}\n")?;
+            let learning_root = temp.path().join("project-memories");
+            let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
+            admit(
+                &store,
+                &cycle_record(
+                    "cycle-learn",
+                    MARKER_OBJECTIVE,
+                    &cwd,
+                    Some(learning_root.clone()),
+                )?,
+            )?;
+            let provider = Arc::new(RewritingScripted {
+                inner: Scripted::new([
+                    r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                    // `unmet:` claim: committed as a VerificationFailed observation.
+                    r#"{"kind":"verify","evidence_id":"cycle-learn-0:lib"}"#.to_owned(),
+                    // The file gains the marker before this reply (see `at`).
+                    r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                    r#"{"kind":"verify","evidence_id":"cycle-learn-2:lib"}"#.to_owned(),
+                    r#"{"kind":"complete"}"#.to_owned(),
+                ]),
+                at: 2,
+                path: cwd.join("src/lib.rs"),
+                content: "pub fn cycle_marker() {}\n",
+            });
+            let completed = run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                None,
+                Arc::clone(&context),
+            )
+            .await;
+            assert_eq!(completed, 1);
+            let outcome = completion_of(&store, "cycle-learn")?;
+            let JobOutcome::Succeeded { result } = outcome else {
+                return Err(TestError::Unexpected(format!("{outcome:?}")));
+            };
+            assert_eq!(result["terminal"], "completion_proposed");
+            let first = provider.inner.prompts();
+            assert!(
+                first.iter().all(|prompt| !prompt.contains("LESSONS")),
+                "nothing was learned before the first cycle"
+            );
+
+            // The failed verification became exactly one project pitfall ...
+            let lessons = lesson_files(&learning_root)?;
+            assert_eq!(lessons.len(), 1, "{lessons:?}");
+            let lesson = lessons.first().ok_or(TestError::Missing("lesson"))?;
+            assert!(
+                lesson.contains("verification_failed/verification_unmet"),
+                "{lesson}"
+            );
+            assert!(lesson.contains("scope: project"), "{lesson}");
+            // ... and the outbox was acknowledged under the job's lease.
+            let cycles = CycleStore::open_existing_in_job_root(store.root())
+                .map_err(ctx("open cycle store"))?
+                .ok_or(TestError::Missing("cycle store"))?;
+            let status = cycles.load("cycle-learn").map_err(ctx("cycle"))?.status();
+            assert_eq!(status.terminal, Some(CycleTerminal::CompletionProposed));
+            assert_eq!(status.pending_observations, 0);
+
+            // A later cycle of the project is shown the lesson as data.
+            admit(
+                &store,
+                &cycle_record(
+                    "cycle-recall",
+                    "verify that lib.rs defines the marker",
+                    &cwd,
+                    Some(learning_root.clone()),
+                )?,
+            )?;
+            let recall = Arc::new(Scripted::new([
+                r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                r#"{"kind":"verify","evidence_id":"cycle-recall-0:lib"}"#.to_owned(),
+                r#"{"kind":"complete"}"#.to_owned(),
+            ]));
+            let completed = run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&recall) as Arc<dyn ModelProvider>,
+                None,
+                context,
+            )
+            .await;
+            assert_eq!(completed, 1);
+            let prompts = recall.prompts();
+            let opening = prompts.first().ok_or(TestError::Missing("recall prompt"))?;
+            assert!(
+                opening.contains("LESSONS")
+                    && opening.contains("verification_failed/verification_unmet"),
+                "the recalled lesson must reach the proposer: {opening}"
+            );
+            assert!(matches!(
+                completion_of(&store, "cycle-recall")?,
+                JobOutcome::Succeeded { .. }
+            ));
+            assert_eq!(lesson_files(&learning_root)?.len(), 1);
             Ok(())
         }
 

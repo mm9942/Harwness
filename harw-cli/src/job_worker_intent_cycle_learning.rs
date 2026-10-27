@@ -19,13 +19,35 @@
 //! function of the observation's dedupe key, so a crash between the write and
 //! the acknowledgement only rewrites the same file on the next drain.
 //!
+//! # Binding to the job
+//!
+//! Both halves act on the data of exactly one job:
+//!
+//! - `learning_root` is bound to the job by its trusted input
+//!   (`harw_ops::intent_cycle::IntentCycleJobInput::learning_root`). Only
+//!   `intent_cycle.start` writes that field, from the operator's resolved
+//!   home context (the project memories of the bound home); it is never a
+//!   tool argument, and without it nothing is learned or recalled.
+//! - The observations are bound to the job by the store's lease fence:
+//!   [`CycleStore::pending_observations`] takes the claim's [`LeaseToken`]
+//!   and refuses, *before* any payload leaves the store, unless the record
+//!   belongs to `token.work_id` and is fenced under `token.epoch`. On a
+//!   refusal [`drain_cycle_observations`] returns without opening the
+//!   project memories, writing or acknowledging anything, so a superseded
+//!   epoch or another job's lease can never copy the current owner's
+//!   observations into memory.
+//! - A pending observation that names another cycle than the drained one is
+//!   never learned (screened out and acknowledged).
+//!
 //! # Recall (W09b)
 //!
-//! [`lesson_lines`] searches the same project root for lessons matching the
-//! objective's keywords and returns at most
+//! [`lesson_lines`] lists the same project root, keeps only the lessons this
+//! module wrote (tag [`LESSON_TAG`], project scope) *before* any limit, ranks
+//! them by the objective's keywords and returns at most
 //! [`MAX_RECALL_TOP_K`](harw_knowledge::learning_recall::MAX_RECALL_TOP_K)
 //! single, sanitized lines within the token ceiling of
-//! [`select_lessons`]. The proposer renders them as low-trust data.
+//! [`select_lessons`]. Ordinary notes never compete with lessons for a slot.
+//! The proposer renders the lines as low-trust data.
 
 use std::collections::BTreeSet;
 use std::fmt::Debug;
@@ -56,7 +78,8 @@ const MAX_KEYWORDS: usize = 8;
 /// Shortest word that counts as a keyword.
 const MIN_KEYWORD_CHARS: usize = 4;
 
-/// Facts fetched by the keyword search before the tag filter and the budget.
+/// Distinct lesson lines (eligible, ranked, de-duplicated) handed to the
+/// recall budget.
 const SEARCH_LIMIT: usize = 32;
 
 /// Longest recalled lesson line, in characters.
@@ -229,29 +252,37 @@ fn project_store<'a>(
 /// Turns the pending observations of `cycle_id` into project pitfall facts and
 /// acknowledges them under `token`.
 ///
+/// The pending list is read through the store's lease fence first: unless the
+/// record belongs to `token.work_id` and is fenced under `token.epoch`, the
+/// store refuses before any payload is returned and the drain ends there (the
+/// project memories are not opened, nothing is written or acknowledged).
 /// Only [`FactScope::Project`] under `learning_root` is ever opened. Per
 /// pending entry:
 ///
 /// - not learnable (see [`is_learnable`]): acknowledged, no fact;
-/// - the gate does not accept the fact (or the observation has no safe id):
-///   counted in `screened_out` and acknowledged, so it is not retried forever;
+/// - the gate does not accept the fact, the observation has no safe id or it
+///   names another cycle: counted in `screened_out` and acknowledged, so it is
+///   not retried forever;
 /// - accepted: written, then acknowledged.
 ///
 /// A fact that cannot be written stops the drain; what was handled before is
 /// still acknowledged and the failing entry stays pending for the next drain.
 ///
 /// # Errors
-/// The pending list cannot be read, the project memories cannot be opened
-/// (nothing is acknowledged then), or the acknowledgement fails (the facts are
-/// already written; the next drain rewrites the same files).
+/// The lease does not own the record (stale epoch, another job, not yet
+/// rebound) or the pending list cannot be read: nothing is read, written or
+/// acknowledged then. The project memories cannot be opened (nothing is
+/// acknowledged), or the acknowledgement fails (the facts are already
+/// written; the next drain rewrites the same files).
 pub(super) fn drain_cycle_observations(
     store: &CycleStore,
     cycle_id: &str,
     token: &LeaseToken,
     learning_root: &Path,
 ) -> Result<DrainReport, String> {
+    // Fenced read: a stale or foreign lease gets an error, never a payload.
     let pending = store
-        .pending_observations(cycle_id)
+        .pending_observations(cycle_id, token)
         .map_err(|error| format!("read pending observations: {error}"))?;
     let mut report = DrainReport::default();
     if pending.is_empty() {
@@ -266,7 +297,12 @@ pub(super) fn drain_cycle_observations(
             to_ack.push(entry.key.clone());
             continue;
         }
-        let verdict = lesson_fact(observation, now).map(screen);
+        // Only observations of the drained cycle are learned.
+        let verdict = if observation.event_id.cycle_id == cycle_id {
+            lesson_fact(observation, now).map(screen)
+        } else {
+            None
+        };
         let fact = match verdict {
             Some(GateVerdict::Accept(fact)) => fact,
             Some(GateVerdict::Review(_) | GateVerdict::Reject(_)) | None => {
@@ -340,11 +376,49 @@ fn clean_line(text: &str) -> String {
     printable.trim().to_owned()
 }
 
-/// Relevance of the `index`-th search hit: 1000 for the best, 10 less per
+/// Relevance of the `index`-th ranked lesson: 1000 for the best, 10 less per
 /// position, never below 0.
 fn relevance_milli(index: usize) -> u32 {
     let penalty = u32::try_from(index).unwrap_or(u32::MAX).saturating_mul(10);
     1_000u32.saturating_sub(penalty)
+}
+
+/// How many of `words` (lowercase) occur in the name, the description or a
+/// tag of `fact`, compared in lowercase.
+fn keyword_hits(fact: &Fact, words: &[String]) -> usize {
+    let name = fact.name.to_lowercase();
+    let description = fact.description.to_lowercase();
+    let tags: Vec<String> = fact.tags.iter().map(|tag| tag.to_lowercase()).collect();
+    words
+        .iter()
+        .filter(|word| {
+            let word = word.as_str();
+            name.contains(word)
+                || description.contains(word)
+                || tags.iter().any(|tag| tag.contains(word))
+        })
+        .count()
+}
+
+/// The lessons among `facts` that match at least one of `words`, best first:
+/// more matching keywords first, ties by name (deterministic).
+///
+/// Only project-scoped facts tagged [`LESSON_TAG`] are eligible. That is
+/// decided here, before any limit, so ordinary notes that match the keywords
+/// better can never push a lesson out of the recall.
+fn ranked_lessons(facts: Vec<Fact>, words: &[String]) -> Vec<Fact> {
+    let mut scored: Vec<(usize, Fact)> = facts
+        .into_iter()
+        .filter(|fact| {
+            fact.scope == FactScope::Project && fact.tags.iter().any(|tag| tag == LESSON_TAG)
+        })
+        .filter_map(|fact| {
+            let hits = keyword_hits(&fact, words);
+            (hits > 0).then_some((hits, fact))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    scored.into_iter().map(|(_, fact)| fact).collect()
 }
 
 /// Lesson lines for the next proposer prompt: project pitfalls written by
@@ -353,9 +427,11 @@ fn relevance_milli(index: usize) -> u32 {
 /// At most [`MAX_RECALL_TOP_K`] lines within [`MAX_RECALL_TOKENS`] estimated
 /// tokens, best match first, each a single printable line of at most
 /// [`MAX_LESSON_CHARS`] characters; identical lines appear once. Only facts
-/// that carry [`LESSON_TAG`] and are project-scoped qualify. Empty when the
-/// objective has no keyword, when `learning_root` has no `facts` directory
-/// (nothing is created) or when the store cannot be read.
+/// that carry [`LESSON_TAG`] and are project-scoped qualify, and that is
+/// decided over every fact of the root before the [`SEARCH_LIMIT`] cut (see
+/// [`ranked_lessons`]). Empty when the objective has no keyword, when
+/// `learning_root` has no `facts` directory (nothing is created) or when the
+/// store cannot be read.
 pub(super) fn lesson_lines(learning_root: &Path, objective: &str, now_unix: i64) -> Vec<String> {
     let words = keywords(objective);
     if words.is_empty() || !learning_root.join("facts").is_dir() {
@@ -368,27 +444,29 @@ pub(super) fn lesson_lines(learning_root: &Path, objective: &str, now_unix: i64)
             return Vec::new();
         }
     };
-    let terms: Vec<&str> = words.iter().map(String::as_str).collect();
-    let found = match store.search(&terms, SEARCH_LIMIT) {
-        Ok(found) => found,
+    // Every fact of the root: eligibility is decided before any limit (the
+    // store's keyword search would cut the ranking of *all* facts first).
+    let facts = match store.list() {
+        Ok(facts) => facts,
         Err(error) => {
-            tracing::warn!(error = %error, "intent cycle lessons: search failed");
+            tracing::warn!(error = %error, "intent cycle lessons: project memories unreadable");
             return Vec::new();
         }
     };
 
-    // (fact name, cleaned line) in search order, one entry per distinct line.
+    // (fact name, cleaned line) in rank order, one entry per distinct line;
+    // duplicates do not use up the limit either.
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut lines: Vec<(String, String)> = Vec::new();
-    for fact in &found {
-        if fact.scope != FactScope::Project || !fact.tags.iter().any(|tag| tag == LESSON_TAG) {
-            continue;
+    for fact in ranked_lessons(facts, &words) {
+        if lines.len() >= SEARCH_LIMIT {
+            break;
         }
         let line = clean_line(&fact.description);
         if line.is_empty() || !seen.insert(line.clone()) {
             continue;
         }
-        lines.push((fact.name.clone(), line));
+        lines.push((fact.name, line));
     }
     let candidates: Vec<LessonCandidate> = lines
         .iter()
@@ -434,7 +512,7 @@ mod tests {
     use harw_plan_bridge::{
         CauseCode, CycleAdmission, CycleCheckpoint, CycleLimits, CycleObservations, CycleProposal,
         CycleRecord, CycleTargets, IntentBinding, admit_cycle, apply_observations,
-        build_observation,
+        build_observation, resume_admission,
     };
     use harw_types::{ContentDigest, TenantId, WorkId, WorkspaceId};
 
@@ -444,13 +522,17 @@ mod tests {
     const CYCLE_ID: &str = "job-learning";
 
     /// A job root with one cycle record whose outbox holds the observations,
-    /// plus the lease that owns it. `_temp` keeps the directory alive.
+    /// plus the lease that owns it. `_temp` keeps the directory alive;
+    /// `admission` and `authority` let a test take the cycle over under a
+    /// newer lease.
     struct Fixture {
         _temp: tempfile::TempDir,
         base: PathBuf,
         store: CycleStore,
         token: LeaseToken,
         learning_root: PathBuf,
+        admission: CycleAdmission,
+        authority: AuthorityContext,
     }
 
     fn authority(base: &Path) -> TestResult<AuthorityContext> {
@@ -563,6 +645,8 @@ mod tests {
             store,
             token,
             learning_root,
+            admission,
+            authority,
         })
     }
 
@@ -578,7 +662,7 @@ mod tests {
     fn pending_keys(fx: &Fixture) -> TestResult<Vec<String>> {
         Ok(fx
             .store
-            .pending_observations(CYCLE_ID)
+            .pending_observations(CYCLE_ID, &fx.token)
             .map_err(ctx("pending observations"))?
             .into_iter()
             .map(|entry| entry.key)
@@ -608,7 +692,7 @@ mod tests {
 
     fn first_payload(fx: &Fixture) -> TestResult<RunObservationV1> {
         fx.store
-            .pending_observations(CYCLE_ID)
+            .pending_observations(CYCLE_ID, &fx.token)
             .map_err(ctx("pending observations"))?
             .into_iter()
             .next()
@@ -696,6 +780,105 @@ mod tests {
         let second = drain(&fx)?;
         assert_eq!(second, DrainReport::default());
         assert_eq!(fact_files(&fx.learning_root)?, files_after_first);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_token_reads_nothing_and_writes_no_facts() -> TestResult {
+        let fx = fixture(&[
+            (
+                ObservationCategory::ToolFailedNoEffect,
+                CauseCode::ExecutorFailed,
+            ),
+            (
+                ObservationCategory::VerificationFailed,
+                CauseCode::VerificationUnmet,
+            ),
+        ])?;
+        // A newer lease takes the cycle over; the fixture's lease is a zombie.
+        let owner = LeaseToken {
+            work_id: fx.token.work_id.clone(),
+            epoch: fx.token.epoch.saturating_add(1),
+            nonce: "nonce-1".to_owned(),
+        };
+        let record = fx.store.load(CYCLE_ID).map_err(ctx("load record"))?;
+        let (_, resumed) = resume_admission(
+            &record.checkpoint,
+            &fx.admission,
+            &fx.authority,
+            owner.epoch,
+        )
+        .map_err(|_| TestError::Missing("resumed checkpoint"))?;
+        fx.store
+            .rebind(CYCLE_ID, &owner, &resumed)
+            .map_err(ctx("take over"))?;
+        assert!(fx.token.epoch < resumed.fence.epoch);
+
+        // The stale lease gets no payload and the drain writes nothing.
+        assert!(fx.store.pending_observations(CYCLE_ID, &fx.token).is_err());
+        let stale = drain_cycle_observations(&fx.store, CYCLE_ID, &fx.token, &fx.learning_root);
+        assert!(stale.is_err(), "{stale:?}");
+        // Another job's lease under the current epoch is refused the same way.
+        let foreign = LeaseToken {
+            work_id: WorkId::from_str("another-job"),
+            epoch: owner.epoch,
+            nonce: "nonce-foreign".to_owned(),
+        };
+        let foreign_drain =
+            drain_cycle_observations(&fx.store, CYCLE_ID, &foreign, &fx.learning_root);
+        assert!(foreign_drain.is_err(), "{foreign_drain:?}");
+        assert!(
+            !fx.learning_root.join("facts").exists(),
+            "a refused drain must not open the project memories"
+        );
+        assert!(!fx.learning_root.exists());
+
+        // The owner still sees and learns every entry.
+        let pending = fx
+            .store
+            .pending_observations(CYCLE_ID, &owner)
+            .map_err(ctx("pending under the owner's lease"))?;
+        assert_eq!(pending.len(), 2);
+        let report = drain_cycle_observations(&fx.store, CYCLE_ID, &owner, &fx.learning_root)
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 2,
+                written: 2,
+                screened_out: 0
+            }
+        );
+        let files = fact_files(&fx.learning_root)?;
+        assert_eq!(files.len(), 2);
+        assert!(files.keys().all(|name| name.starts_with("pl90-")));
+        Ok(())
+    }
+
+    #[test]
+    fn observations_of_another_cycle_are_never_learned() -> TestResult {
+        let fx = fixture_with(
+            &[(
+                ObservationCategory::ToolFailedNoEffect,
+                CauseCode::ExecutorFailed,
+            )],
+            |observations| {
+                for observation in observations.iter_mut() {
+                    observation.event_id.cycle_id = "job-other".to_owned();
+                }
+            },
+        )?;
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 0,
+                screened_out: 1
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        assert!(!fx.learning_root.join("facts").exists());
         Ok(())
     }
 
@@ -911,6 +1094,7 @@ mod tests {
             CauseCode::CeilingMismatch,
             CauseCode::ExecutorFailed,
             CauseCode::ExecutorRetryable,
+            CauseCode::ProposerFailed,
             CauseCode::ReconcileUncertain,
             CauseCode::VerificationUnmet,
             CauseCode::VerificationStale,
@@ -975,6 +1159,81 @@ mod tests {
             assert!(!line.contains("leak"), "{line:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn lessons_are_not_crowded_out_by_ordinary_facts() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("temp directory"))?;
+        let root = temp.path().join("memories");
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("open facts"))?;
+        // Ordinary notes that match every keyword in name, description and tags.
+        for index in 0..40 {
+            store
+                .write(&lesson(
+                    &format!("advance-parser-error-handling-{index:02}"),
+                    "advance the parser error handling: parser error handling notes",
+                    FactScope::Project,
+                    &["advance", "parser", "error", "handling"],
+                ))
+                .map_err(ctx("write note"))?;
+        }
+        let pitfall =
+            "Intent cycle observed tool_failed_no_effect/executor_failed on transition advance";
+        store
+            .write(&lesson(
+                "pl90-tool-failed-no-effect-executor-failed-0123456789ab",
+                pitfall,
+                FactScope::Project,
+                &[
+                    LESSON_TAG,
+                    "tool_failed_no_effect",
+                    "executor_failed",
+                    "advance",
+                ],
+            ))
+            .map_err(ctx("write lesson"))?;
+        // Precondition: the store's own keyword search ranks and cuts all
+        // facts first, so its top results hold no lesson at all.
+        let searched = store
+            .search(&["advance", "parser", "error", "handling"], SEARCH_LIMIT)
+            .map_err(ctx("search"))?;
+        assert_eq!(searched.len(), SEARCH_LIMIT);
+        assert!(
+            searched
+                .iter()
+                .all(|fact| !fact.tags.iter().any(|tag| tag == LESSON_TAG))
+        );
+
+        let lines = lesson_lines(&root, "Advance the parser error handling", 0);
+        assert_eq!(lines, vec![pitfall.to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn ranking_counts_keywords_and_breaks_ties_by_name() {
+        let words = keywords("parser cache loader");
+        let make = |name: &str, description: &str| {
+            lesson(name, description, FactScope::Project, &[LESSON_TAG])
+        };
+        let ranked: Vec<String> = ranked_lessons(
+            vec![
+                make("pl90-b", "parser problem"),
+                make("pl90-a", "parser problem"),
+                make("pl90-c", "parser and cache problem"),
+                make("pl90-d", "unrelated problem"),
+                lesson(
+                    "pl90-e",
+                    "parser cache loader",
+                    FactScope::Global,
+                    &[LESSON_TAG],
+                ),
+            ],
+            &words,
+        )
+        .into_iter()
+        .map(|fact| fact.name)
+        .collect();
+        assert_eq!(ranked, ["pl90-c", "pl90-a", "pl90-b"].map(str::to_owned));
     }
 
     #[test]
