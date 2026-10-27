@@ -173,13 +173,24 @@ fn pgrep_matches_procps() -> TestResult {
         return Ok(());
     };
     assert_eq!(expected.trim(), pid.to_string());
-    let by_name = value(harw_tool_sys::pgrep::run(
-        &ProcFs::real(),
-        0,
-        &serde_json::from_value(json!({"pattern": "sleep", "exact": true, "newest": true}))?,
-    ))?;
-    let theirs = gnu("pgrep", &["-x", "-n", "sleep"]).unwrap_or_default();
-    assert_eq!(by_name["pids"][0].to_string(), theirs.trim());
+    // Der jüngste `sleep` kann zwischen den beiden Messungen wechseln (parallel
+    // laufende Testprozesse starten eigene `sleep`s): wie beim Prozess-Set wird
+    // bis zu fünfmal neu gemessen, bevor eine Abweichung als echter Fehler gilt.
+    let mut last = String::new();
+    for _ in 0..5 {
+        let by_name = value(harw_tool_sys::pgrep::run(
+            &ProcFs::real(),
+            0,
+            &serde_json::from_value(json!({"pattern": "sleep", "exact": true, "newest": true}))?,
+        ))?;
+        let ours = by_name["pids"][0].to_string();
+        let theirs = gnu("pgrep", &["-x", "-n", "sleep"]).unwrap_or_default();
+        if ours == theirs.trim() {
+            return Ok(());
+        }
+        last = format!("newest sleep: ours {ours} / theirs {}", theirs.trim());
+    }
+    assert!(last.is_empty(), "{last}");
     Ok(())
 }
 

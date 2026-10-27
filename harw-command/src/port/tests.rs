@@ -112,7 +112,27 @@ async fn the_output_budget_stops_the_job() -> TestResult {
     let outcome = port(&root)?.run(request, CancelToken::new()).await;
     assert_eq!(outcome.end, CommandEnd::OutputLimit, "{outcome:?}");
     assert!(outcome.truncated);
+    assert_eq!(outcome.truncated_stream, Some(OutputStream::Stdout));
     assert!(outcome.combined.len() <= 4096);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_cut_stream_is_reported_even_when_stdout_is_longer() -> TestResult {
+    let root = dir("budget-stderr")?;
+    // Stdout arrives complete and first (the pause keeps the two pipe readers
+    // from reordering the frames); stderr is the stream that overflows.
+    let mut request = sh(
+        "printf 'before-and-longer\\n'; sleep 1; yes y >&2",
+        Duration::from_secs(20),
+    );
+    request.max_output_bytes = 4096;
+    let outcome = port(&root)?.run(request, CancelToken::new()).await;
+    assert_eq!(outcome.end, CommandEnd::OutputLimit, "{outcome:?}");
+    assert_eq!(outcome.stdout, b"before-and-longer\n", "{outcome:?}");
+    assert!(outcome.truncated, "{outcome:?}");
+    assert_eq!(outcome.truncated_stream, Some(OutputStream::Stderr));
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }

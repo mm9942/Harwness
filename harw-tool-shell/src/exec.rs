@@ -58,7 +58,9 @@
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_authority::{Permission, SandboxSpec};
-use harw_command::{CommandEnd, CommandRequest, CommandSandbox, Persistence, ResourceRequest};
+use harw_command::{
+    CommandEnd, CommandRequest, CommandSandbox, OutputStream, Persistence, ResourceRequest,
+};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
@@ -392,10 +394,13 @@ impl ShellExecutor {
     /// kürzen ist. Hat der Kommando-Port den Strom selbst gestutzt
     /// (`CommandEnd::OutputLimit`, oder `truncated` eines nachgelesenen
     /// Job-Ergebnisses), bleibt nichts zu kürzen, der Leser sähe aber auch
-    /// keinen Schnitt. Passt der Marker hinter den vollständigen Strom, wird
-    /// nichts entfernt; sonst weicht der Präfix um die Markerlänge zurück (an
-    /// einer UTF-8-Grenze); ist `limit` kleiner als der Marker, bleibt es beim
-    /// größten gültigen Präfix ohne Marker.
+    /// keinen Schnitt. Welcher Strom das ist, bestimmt der Aufrufer anhand der
+    /// vom Port gemeldeten Herkunft ([`OutputStream`], siehe
+    /// [`Self::completed_output`]), nicht anhand der Länge; diese Funktion
+    /// bekommt nur die Bytes dieses einen Stroms. Passt der Marker hinter den
+    /// vollständigen Strom, wird nichts entfernt; sonst weicht der Präfix um
+    /// die Markerlänge zurück (an einer UTF-8-Grenze); ist `limit` kleiner als
+    /// der Marker, bleibt es beim größten gültigen Präfix ohne Marker.
     fn cut_with_marker(bytes: &[u8], limit: usize) -> String {
         if limit < TRUNCATION_MARKER.len() {
             return Self::truncate_output(bytes, limit).0;
@@ -996,13 +1001,21 @@ impl ShellExecutor {
                     max_output_bytes = self.max_output_bytes,
                     "shell.exec output limit exceeded; process tree killed"
                 );
-                Ok(self.completed_output(None, &done.stdout, &done.stderr, true, executed_on_host))
+                Ok(self.completed_output(
+                    None,
+                    &done.stdout,
+                    &done.stderr,
+                    true,
+                    done.truncated_stream,
+                    executed_on_host,
+                ))
             }
             CommandEnd::Exited => Ok(self.completed_output(
                 Some(done.exit_code),
                 &done.stdout,
                 &done.stderr,
                 done.truncated,
+                done.truncated_stream,
                 executed_on_host,
             )),
             CommandEnd::Signaled(_) => Ok(self.completed_output(
@@ -1010,6 +1023,7 @@ impl ShellExecutor {
                 &done.stdout,
                 &done.stderr,
                 done.truncated,
+                done.truncated_stream,
                 executed_on_host,
             )),
         }
@@ -1057,6 +1071,11 @@ impl ShellExecutor {
     ///
     /// `killed_by_output_limit` ist der Kürzungshinweis für den Aufrufer: Die Ausgabe ist
     /// gekappt **und** das Kommando lief nicht zu Ende; `exit_code` ist dann `-1` (Signal).
+    /// `cut` ist die Herkunft dieses Hinweises: der Strom, den der Kommando-Port als
+    /// erstes gekappt hat (`CommandOutcome::truncated_stream`, ein [`OutputStream`]). Nur
+    /// dieser Strom bekommt den Marker, wenn der Port die Ausgabe selbst auf das Budget
+    /// gestutzt hat; bei `None` (nichts gekürzt oder Herkunft unbekannt) erzwingt die
+    /// Funktion keinen Marker, `truncated` bleibt aber gesetzt.
     /// `executed_on_host` fügt (nur wenn `true`, Plan Teil B1) das Feld
     /// `"executed_on": "host"` hinzu — die bestehende Sandbox-Ausgabe (`false`) bleibt
     /// byte-identisch zu vorher, ohne dieses Feld.
@@ -1066,6 +1085,7 @@ impl ShellExecutor {
         stdout: &[u8],
         stderr: &[u8],
         killed_by_output_limit: bool,
+        cut: Option<OutputStream>,
         executed_on_host: bool,
     ) -> ToolOutput {
         let exit_code = exit_code.unwrap_or(-1);
@@ -1074,23 +1094,28 @@ impl ShellExecutor {
         let (stdout_str, stderr_str) = if killed_by_output_limit && !clipped {
             // Der Port hat die Ausgabe selbst gekürzt: hier war nichts mehr zu
             // kürzen, der Marker fehlte sonst. Das Budget gilt für beide Ströme
-            // zusammen, also trägt der längere Strom den Marker (bei
-            // Gleichstand stdout) — er ist der, den der Port gekappt hat, und
-            // der einzige, in den der Marker sicher passt. Noch freies Budget
-            // wird genutzt, bevor Ausgabe für den Marker weicht.
+            // zusammen und wird in der Reihenfolge der eintreffenden Frames
+            // verbraucht; die Längen verraten deshalb nicht, welcher Strom
+            // gekappt wurde (ein vollständiger stdout kann länger sein als der
+            // gekappte stderr). Der Port meldet den Strom selbst (`cut`), nur
+            // er trägt den Marker. Ohne Angabe (`None`) bleibt die Ausgabe
+            // unverändert: ein geratener Träger würde einen vollständigen
+            // Strom als gekappt ausgeben; `truncated` bleibt trotzdem gesetzt.
+            // Noch freies Budget wird genutzt, bevor Ausgabe für den Marker
+            // weicht.
             let spare = self
                 .max_output_bytes
                 .saturating_sub(stdout.len() + stderr.len());
-            if stdout.len() >= stderr.len() {
-                (
+            match cut {
+                Some(OutputStream::Stdout) => (
                     Self::cut_with_marker(stdout, stdout.len() + spare),
                     stderr_str,
-                )
-            } else {
-                (
+                ),
+                Some(OutputStream::Stderr) => (
                     stdout_str,
                     Self::cut_with_marker(stderr, stderr.len() + spare),
-                )
+                ),
+                None => (stdout_str, stderr_str),
             }
         } else {
             (stdout_str, stderr_str)
@@ -2011,7 +2036,7 @@ mod tests {
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
         };
-        match executor.completed_output(None, b"", b"", true, false) {
+        match executor.completed_output(None, b"", b"", true, None, false) {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], -1);
                 assert_eq!(content["truncated"], true);
@@ -2027,8 +2052,8 @@ mod tests {
     }
 
     /// Der Port stutzt die Ausgabe selbst genau auf das Budget: nichts bleibt
-    /// zu kürzen, der Marker muss trotzdem im Budget stehen — auf dem
-    /// längeren Strom, den der Port gekappt hat; ein kurzer, vollständiger
+    /// zu kürzen, der Marker muss trotzdem im Budget stehen — auf dem Strom,
+    /// den der Port als gekappt meldet (`cut`); ein kurzer, vollständiger
     /// stdout bleibt dabei unangetastet, und freies Budget wird vor dem
     /// Kürzen genutzt.
     #[test]
@@ -2058,19 +2083,20 @@ mod tests {
             .get(..limit - short.len())
             .ok_or(TestError::Missing("a flood that fills the rest"))?
             .to_vec();
-        let cases: [(&[u8], &[u8], bool); 3] = [
-            (cut.as_slice(), b"", true),
-            (b"", cut.as_slice(), false),
+        let cases: [(&[u8], &[u8], OutputStream); 3] = [
+            (cut.as_slice(), b"", OutputStream::Stdout),
+            (b"", cut.as_slice(), OutputStream::Stderr),
             // Kurzer, vollständiger stdout und eine stderr-Flut: der Marker
             // gehört auf stderr, stdout bleibt ganz.
-            (short, flood.as_slice(), false),
+            (short, flood.as_slice(), OutputStream::Stderr),
         ];
-        for (stdout, stderr, on_stdout) in cases {
+        for (stdout, stderr, stream) in cases {
             let ToolOutput::Json { content } =
-                executor.completed_output(None, stdout, stderr, true, false)
+                executor.completed_output(None, stdout, stderr, true, Some(stream), false)
             else {
                 return Err(TestError::Missing("Json output"));
             };
+            let on_stdout = stream == OutputStream::Stdout;
             assert_eq!(content["truncated"], true);
             assert_eq!(content["killed_by_output_limit"], true);
             let out = content["stdout"].as_str().unwrap_or("");
@@ -2104,7 +2130,7 @@ mod tests {
         // Freies Budget (z. B. ein nachgelesenes Job-Ergebnis unter dem
         // Budget): der Marker wird angehängt, ohne Ausgabe zu opfern.
         let ToolOutput::Json { content } =
-            executor.completed_output(None, b"hello", b"", true, false)
+            executor.completed_output(None, b"hello", b"", true, Some(OutputStream::Stdout), false)
         else {
             return Err(TestError::Missing("Json output"));
         };
@@ -2112,6 +2138,146 @@ mod tests {
             content["stdout"].as_str().unwrap_or(""),
             format!("hello{TRUNCATION_MARKER}")
         );
+        Ok(())
+    }
+
+    /// Ein [`ShellExecutor`] mit dem gegebenen Ausgabe-Budget für die reinen
+    /// `completed_output`-Tests; alles andere bleibt auf den Vorgaben.
+    fn executor_with_output_budget(max_output_bytes: usize) -> ShellExecutor {
+        ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
+        }
+    }
+
+    /// Der Port verbraucht das gemeinsame Budget in der Reihenfolge der
+    /// eintreffenden Frames: ein vollständiger, längerer Strom neben einem
+    /// kürzeren, gekappten Strom ist möglich, in beiden Richtungen. Der Marker
+    /// gehört auf den vom Port gemeldeten Strom (`cut`), nicht auf den
+    /// längeren; der vollständige Strom bleibt Byte für Byte erhalten.
+    #[test]
+    fn test_completed_output_marks_the_reported_stream_not_the_longer_one() -> TestResult {
+        let short_len = TRUNCATION_MARKER.len() + 10;
+        let long_len = short_len + 2;
+        let limit = long_len + short_len;
+        let executor = executor_with_output_budget(limit);
+        let sample = b"this_is_a_longer_string_than_ten_bytes".repeat(2);
+        let long: Vec<u8> = sample
+            .get(..long_len)
+            .ok_or(TestError::Missing("a sample for the complete stream"))?
+            .to_vec();
+        let short: Vec<u8> = sample
+            .get(..short_len)
+            .ok_or(TestError::Missing("a sample for the cut stream"))?
+            .to_vec();
+        // (stdout, stderr, vom Port als gekappt gemeldeter Strom)
+        let cases: [(&[u8], &[u8], OutputStream); 2] = [
+            // Vollständiger, längerer stdout; der Port hat stderr gekappt.
+            (long.as_slice(), short.as_slice(), OutputStream::Stderr),
+            // Gekappter, kürzerer stdout; stderr ist vollständig und länger.
+            (short.as_slice(), long.as_slice(), OutputStream::Stdout),
+        ];
+        for (stdout, stderr, stream) in cases {
+            let ToolOutput::Json { content } =
+                executor.completed_output(None, stdout, stderr, true, Some(stream), false)
+            else {
+                return Err(TestError::Missing("Json output"));
+            };
+            assert_eq!(content["truncated"], true);
+            assert_eq!(content["killed_by_output_limit"], true);
+            let out = content["stdout"]
+                .as_str()
+                .ok_or(TestError::Missing("the stdout string"))?;
+            let err = content["stderr"]
+                .as_str()
+                .ok_or(TestError::Missing("the stderr string"))?;
+            let (marked, intact, cut_bytes, intact_bytes) = match stream {
+                OutputStream::Stdout => (out, err, stdout, stderr),
+                OutputStream::Stderr => (err, out, stderr, stdout),
+            };
+            assert!(
+                intact_bytes.len() > cut_bytes.len(),
+                "the premise: the complete stream is the longer one"
+            );
+            let kept = marked
+                .strip_suffix(TRUNCATION_MARKER)
+                .ok_or(TestError::Missing(
+                    "the marker at the end of the reported stream",
+                ))?;
+            assert!(
+                !kept.is_empty() && cut_bytes.starts_with(kept.as_bytes()),
+                "a prefix of the reported stream: {out:?} / {err:?}"
+            );
+            assert_eq!(
+                intact.as_bytes(),
+                intact_bytes,
+                "the complete stream is byte-identical"
+            );
+            assert!(
+                out.len() + err.len() <= limit,
+                "within the budget: {out:?} / {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Meldet der Port keinen Strom (`cut == None`: Herkunft unbekannt), rät
+    /// `completed_output` keinen Träger: kein Marker, beide Ströme bleiben
+    /// unangetastet, `truncated` bleibt wahr.
+    #[test]
+    fn test_completed_output_without_provenance_forces_no_marker() -> TestResult {
+        let limit = TRUNCATION_MARKER.len() + 10;
+        let executor = executor_with_output_budget(limit);
+        let sample = b"this_is_a_longer_string_than_ten_bytes";
+        let full: Vec<u8> = sample
+            .get(..limit)
+            .ok_or(TestError::Missing("a sample that fills the budget"))?
+            .to_vec();
+        let head: Vec<u8> = sample
+            .get(..limit - 8)
+            .ok_or(TestError::Missing("a sample for the larger stream"))?
+            .to_vec();
+        let tail: Vec<u8> = sample
+            .get(..8)
+            .ok_or(TestError::Missing("a sample for the smaller stream"))?
+            .to_vec();
+        let cases: [(&[u8], &[u8]); 2] = [
+            // Ein Strom füllt das ganze Budget.
+            (full.as_slice(), b""),
+            // Beide Ströme teilen sich das volle Budget.
+            (head.as_slice(), tail.as_slice()),
+        ];
+        for (stdout, stderr) in cases {
+            let ToolOutput::Json { content } =
+                executor.completed_output(None, stdout, stderr, true, None, false)
+            else {
+                return Err(TestError::Missing("Json output"));
+            };
+            assert_eq!(content["truncated"], true);
+            assert_eq!(content["killed_by_output_limit"], true);
+            let out = content["stdout"]
+                .as_str()
+                .ok_or(TestError::Missing("the stdout string"))?;
+            let err = content["stderr"]
+                .as_str()
+                .ok_or(TestError::Missing("the stderr string"))?;
+            assert_eq!(out.as_bytes(), stdout, "stdout is untouched");
+            assert_eq!(err.as_bytes(), stderr, "stderr is untouched");
+            assert!(
+                !out.contains(TRUNCATION_MARKER) && !err.contains(TRUNCATION_MARKER),
+                "no marker without a reported stream: {out:?} / {err:?}"
+            );
+        }
         Ok(())
     }
 
