@@ -43,8 +43,15 @@
 //! model differs from the explorer model it becomes the escalation route: the
 //! proposer switches to it after 2 consecutive refusals or 2 stalled
 //! transitions (`RoutePolicy::with_escalation(route, 2, 2)`). The choice is
-//! made from trusted counters only; no model output influences it. Without any
-//! configured model the job is blocked. No reasoning effort is configured
+//! made from trusted counters only; no model output influences it. Both
+//! candidates are canonicalised (catalog key, id or alias → the requested
+//! model id) and admitted against the provider lifecycle on the job's
+//! provider first, exactly like an explicit live selection
+//! (`harw_runtime::live_model::check_explicit_selection`), because the
+//! proposer puts the route's model straight into the request: a retired
+//! default never becomes the escalation route, a retired explorer leaves the
+//! default as the only route, a deprecated model stays with a warning.
+//! Without any admitted model the job is blocked. No reasoning effort is configured
 //! here (the internal-model settings carry none), so the provider default
 //! applies.
 //!
@@ -80,21 +87,33 @@
 //! failure is only logged and never changes the job outcome.
 //!
 //! # Fenced to the live claim
-//! The cycle store is opened with a lease liveness check
+//! The cycle store is opened with a lease guard
 //! ([`CycleStore::with_lease_liveness`]) backed by
-//! [`JobStore::verify_lease`]: every fenced read and write — the driver's
-//! rebind, journal and commits as well as the drain's read and
-//! acknowledgement — first proves that the claim's token is still the
-//! current, non-expired job lease (read-only; nothing is renewed). The epoch
-//! fence alone would still admit an expired lease until a reclaim rebinds
-//! the cycle. So once the job lease has expired or been revoked (lost
-//! heartbeat, operator cancellation), the driver's next write fails closed
-//! and the drain learns nothing — whichever way the run ended, cancellation
-//! and wall-clock timeout included; the observations stay pending for the
-//! claim that takes over.
-//! The drain acknowledges before it writes any fact, so the lease-fenced
-//! acknowledgement is the commit of every lesson (see
-//! `intent_cycle_learning::drain_cycle_observations`).
+//! [`JobStore::hold_live_lease`]: every fenced read and write — the
+//! driver's rebind, journal and commits as well as the drain's read,
+//! decision and acknowledgement — runs while the job's record lock is held
+//! and the claim's token was verified under it as the current, non-expired
+//! lease (nothing is renewed). No cancellation, reclaim or expiry scan can
+//! replace the lease between that verification and the cycle write. Lock
+//! order: job record first, cycle record second. The epoch fence alone would
+//! still admit an expired lease until a reclaim rebinds the cycle. So once
+//! the job lease has expired or been revoked (lost heartbeat, operator
+//! cancellation), the driver's next write fails closed and the drain learns
+//! nothing — whichever way the run ended, cancellation and wall-clock
+//! timeout included; the observations stay pending for the claim that takes
+//! over.
+//!
+//! The holds are short (one cycle-record write or read). A heartbeat renewal
+//! that meets one sees `JobLockContended`, which `DurableJobRunner` treats as
+//! transient and retries; `JobStore::hold_live_lease` itself retries a lock
+//! it meets held by the heartbeat or the usage flush, so neither side makes
+//! a live lease look lost.
+//!
+//! Learning is delivered in two phases (see
+//! `intent_cycle_learning::drain_cycle_observations`): the drain commits its
+//! decision under the held lease (accepted lessons stay in the outbox), then
+//! writes the facts idempotently, and acknowledges each lesson only once its
+//! fact is durable.
 //!
 //! # Workspace binding
 //! The ceiling is cut from the worker's `runtime_root.cwd`. `claim.scope`
@@ -105,6 +124,7 @@
 //! refuses (`Blocked`, before any record or model call) unless it equals the
 //! canonical root of its own sandbox; a missing root is refused too.
 
+use std::any::Any;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,9 +137,10 @@ use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
     CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleRunError, CycleStore,
     CycleStoreError, DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, ExplorerCycleExecutor,
-    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, LeaseLivenessCheck, ModelCycleProposer,
+    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, LeaseLivenessGuard, ModelCycleProposer,
     ProposerRoute, RoutePolicy, job_outcome, warm_cache,
 };
+use harw_runtime::live_model;
 use harw_session_store::JobStore;
 use harw_types::{ModelId, SessionId};
 
@@ -385,18 +406,27 @@ pub(super) async fn execute_intent_cycle_claim(
     sanitize_outcome(outcome)
 }
 
-/// Liveness check of the cycle store: the presented token must still be the
-/// current, non-expired lease of its job ([`JobStore::verify_lease`], which
-/// reads the job record and writes nothing). Any error — expired, revoked,
-/// replaced, terminal or unreadable — refuses the cycle operation (fail
-/// closed).
-pub(super) fn lease_liveness(job_store: &Arc<JobStore>) -> LeaseLivenessCheck {
-    let job_store = Arc::clone(job_store);
-    Arc::new(move |token: &LeaseToken| {
-        job_store
-            .verify_lease(token)
-            .map_err(|error| error.to_string())
-    })
+/// Lease guard of the cycle store: [`JobStore::hold_live_lease`] verifies
+/// under the job's record lock that the presented token is the current,
+/// non-expired lease and keeps that lock until the cycle operation is done.
+/// Any error — expired, revoked, replaced, terminal, unreadable or a lock
+/// that stays contended beyond the store's retries — refuses the cycle
+/// operation (fail closed).
+struct JobLeaseLiveness(Arc<JobStore>);
+
+impl LeaseLivenessGuard for JobLeaseLiveness {
+    fn hold(&self, token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+        let held = self
+            .0
+            .hold_live_lease(token)
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(held))
+    }
+}
+
+/// The cycle store's lease guard for `job_store` (see [`JobLeaseLiveness`]).
+pub(super) fn lease_liveness(job_store: &Arc<JobStore>) -> Arc<dyn LeaseLivenessGuard> {
+    Arc::new(JobLeaseLiveness(Arc::clone(job_store)))
 }
 
 /// Wall time left for this claim: `max_wall - used`, `None` once nothing is
@@ -505,10 +535,9 @@ async fn warm_after_takeover(
 /// `CycleDriver::run` hands a terminal record over to a newer lease before
 /// it returns `Terminal`. A run that ended before its rebind leaves the drain
 /// refused (`NotRebound`) and the entries pending for the next claim.
-/// `store` carries the claim's liveness check: if the job lease expired or
-/// was revoked meanwhile, the read and the acknowledgement are refused and no
-/// lesson is written, whichever way the run ended (cancellation and timeout
-/// included).
+/// `store` carries the claim's lease guard: if the job lease expired or was
+/// revoked meanwhile, the read and the decision are refused and no lesson is
+/// written, whichever way the run ended (cancellation and timeout included).
 async fn drain_learning(
     store: &Arc<CycleStore>,
     cycle_id: &str,
@@ -536,7 +565,15 @@ async fn drain_learning(
                     acked = report.acked,
                     written = report.written,
                     screened_out = report.screened_out,
+                    pending_materialization = report.pending_materialization,
                     "intent cycle observations drained into project lessons"
+                );
+            }
+            if report.pending_materialization > 0 {
+                tracing::warn!(
+                    cycle_id,
+                    pending_materialization = report.pending_materialization,
+                    "intent cycle lessons stay accepted until their facts can be written"
                 );
             }
         }
@@ -608,24 +645,67 @@ fn proposer_routes(
         harw_config::resolve_internal_model(config, harw_config::InternalModelPoint::Explorer);
     let same_provider = resolved.provider.is_none() || resolved.provider == active;
     let main_model = resolved.is_main_model();
+    // Canonical model ids (catalog key, id or alias → the id that is actually
+    // requested), so the escalation compares and requests real offerings.
+    let canonical =
+        |model: &str| ModelId::from(live_model::resolve_model_id(config, model).as_str());
     let explorer = match resolved.model {
-        Some(model) if !main_model && same_provider => Some(ModelId::from(model.as_str())),
+        Some(model) if !main_model && same_provider => Some(canonical(model.as_str())),
         _ => None,
     };
-    let default = config.harness.default_model.as_deref().map(ModelId::from);
-    routes_from(explorer, default, PROPOSAL_MAX_OUTPUT_TOKENS)
+    let default = config.harness.default_model.as_deref().map(canonical);
+    // Both run on the job's provider: admit them there like an explicit
+    // live selection (as `LiveModelRouting` does), because
+    // `ModelCycleProposer` puts the route's model straight into the request.
+    let admit = |model: &ModelId| -> RouteAdmission {
+        live_model::check_explicit_selection(config, active.as_deref(), model.as_str())
+            .map_err(|error| error.to_string())
+    };
+    routes_from(explorer, default, PROPOSAL_MAX_OUTPUT_TOKENS, &admit)
 }
 
-/// Route policy from the two candidate models. The default slot is the
-/// explorer model, falling back to the default model. The escalation slot is
-/// the default model, and only when it differs from the explorer model (an
-/// escalation to the same model would change nothing). No models at all gives
-/// `None`: the job is blocked. `effort` stays `None`; the provider chooses.
+/// Lifecycle verdict of a route candidate on the job's provider: `Ok(None)`
+/// live, `Ok(Some(warning))` deprecated (kept, the warning is logged),
+/// `Err(reason)` retired (never routed to).
+type RouteAdmission = Result<Option<String>, String>;
+
+/// `model` if `admit` lets it run; a deprecated model is kept with a
+/// warning, a retired one is dropped (logged once per claim).
+fn admitted(
+    model: ModelId,
+    slot: &'static str,
+    admit: &dyn Fn(&ModelId) -> RouteAdmission,
+) -> Option<ModelId> {
+    match admit(&model) {
+        Ok(None) => Some(model),
+        Ok(Some(warning)) => {
+            tracing::warn!(slot, model = %model.as_str(), warning = %warning, "intent cycle proposer route is deprecated");
+            Some(model)
+        }
+        Err(reason) => {
+            tracing::warn!(slot, model = %model.as_str(), reason = %reason, "intent cycle proposer route is retired and not used");
+            None
+        }
+    }
+}
+
+/// Route policy from the two candidate models, each admitted by `admit`
+/// first (lifecycle on the job's provider; a retired candidate counts as
+/// absent). The default slot is the explorer model, falling back to the
+/// default model. The escalation slot is the default model, and only when it
+/// differs from the explorer model (an escalation to the same model would
+/// change nothing). A retired default therefore never becomes the
+/// escalation; a retired explorer leaves the default as the only route. No
+/// admitted model at all gives `None`: the job is blocked. `effort` stays
+/// `None`; the provider chooses.
 fn routes_from(
     explorer: Option<ModelId>,
     default: Option<ModelId>,
     max_output_tokens: u32,
+    admit: &dyn Fn(&ModelId) -> RouteAdmission,
 ) -> Option<RoutePolicy> {
+    let explorer = explorer.and_then(|model| admitted(model, "explorer", admit));
+    let default = default.and_then(|model| admitted(model, "default", admit));
     let route = |model: ModelId| ProposerRoute {
         model,
         effort: None,
@@ -662,6 +742,8 @@ fn sanitize_outcome(outcome: JobOutcome) -> JobOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_model_catalog::lifecycle;
 
     #[test]
     fn exhausted_wall_budget_is_never_refreshed() {
@@ -727,9 +809,10 @@ mod tests {
             effort: None,
             max_output_tokens: 128,
         };
+        let live = |_: &ModelId| -> RouteAdmission { Ok(None) };
 
         // Explorer a, default b: a runs by default, b takes over on escalation.
-        let both = routes_from(Some(model("a")), Some(model("b")), 128);
+        let both = routes_from(Some(model("a")), Some(model("b")), 128, &live);
         assert_eq!(
             both,
             Some(RoutePolicy::new(route("a")).with_escalation(
@@ -750,22 +833,105 @@ mod tests {
         );
 
         // Same model twice: one route, nothing to escalate to.
-        let same = routes_from(Some(model("a")), Some(model("a")), 128);
+        let same = routes_from(Some(model("a")), Some(model("a")), 128, &live);
         assert_eq!(same, Some(RoutePolicy::new(route("a"))));
         assert!(same.is_some_and(|policy| policy.route(RouteSlot::Escalation).is_none()));
 
         // No explorer model: the default model is the only route.
         assert_eq!(
-            routes_from(None, Some(model("b")), 128),
+            routes_from(None, Some(model("b")), 128, &live),
             Some(RoutePolicy::new(route("b")))
         );
         // Explorer model without a default: one route as well.
         assert_eq!(
-            routes_from(Some(model("a")), None, 128),
+            routes_from(Some(model("a")), None, 128, &live),
             Some(RoutePolicy::new(route("a")))
         );
         // No model at all blocks the job.
-        assert_eq!(routes_from(None, None, 128), None);
+        assert_eq!(routes_from(None, None, 128, &live), None);
+    }
+
+    /// The bundled Mistral lifecycle table at the injected instant `unix`.
+    fn mistral_at(unix: i64) -> TestResult<impl Fn(&ModelId) -> RouteAdmission> {
+        let now = lifecycle::OffsetDateTime::from_unix_timestamp(unix)
+            .map_err(ctx("valid test instant"))?;
+        Ok(move |model: &ModelId| {
+            lifecycle::enforce_explicit("mistral", model.as_str(), now)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// 2026-08-01T00:00Z, before `mistral/labs-leanstral-1-5` retires.
+    const BEFORE_RETIREMENT: i64 = 1_785_542_400;
+
+    /// 2026-10-15T00:00Z, after it retired (2026-09-30).
+    const AFTER_RETIREMENT: i64 = 1_792_022_400;
+
+    fn route(name: &str) -> ProposerRoute {
+        ProposerRoute {
+            model: ModelId::from(name),
+            effort: None,
+            max_output_tokens: 128,
+        }
+    }
+
+    #[test]
+    fn retired_default_is_never_selected_for_escalation() -> TestResult {
+        use harw_plan_bridge::RouteSlot;
+        let explorer = || Some(ModelId::from("mistral-small-latest"));
+        let retired = || Some(ModelId::from("labs-leanstral-1-5"));
+
+        // Control: before the cutoff the default is a live escalation route.
+        let before = routes_from(explorer(), retired(), 128, &mistral_at(BEFORE_RETIREMENT)?);
+        assert_eq!(
+            before,
+            Some(
+                RoutePolicy::new(route("mistral-small-latest")).with_escalation(
+                    route("labs-leanstral-1-5"),
+                    ESCALATE_AFTER_REFUSALS,
+                    ESCALATE_AT_STALL_TRANSITIONS
+                )
+            )
+        );
+        // After it: the explorer runs alone, nothing to escalate to.
+        let after = routes_from(explorer(), retired(), 128, &mistral_at(AFTER_RETIREMENT)?).ok_or(
+            TestError::Missing("the live explorer keeps the job running"),
+        )?;
+        assert_eq!(after, RoutePolicy::new(route("mistral-small-latest")));
+        assert!(after.route(RouteSlot::Escalation).is_none());
+        assert_eq!(after.select(9, 9), RouteSlot::Default);
+        // A deprecated default stays usable (with a warning).
+        let deprecated = |_: &ModelId| -> RouteAdmission { Ok(Some("deprecated".to_owned())) };
+        assert!(
+            routes_from(explorer(), retired(), 128, &deprecated)
+                .is_some_and(|policy| policy.route(RouteSlot::Escalation).is_some())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retired_explorer_falls_back_to_a_live_default() -> TestResult {
+        let after = mistral_at(AFTER_RETIREMENT)?;
+        assert_eq!(
+            routes_from(
+                Some(ModelId::from("labs-leanstral-1-5")),
+                Some(ModelId::from("mistral-large-latest")),
+                128,
+                &after
+            ),
+            Some(RoutePolicy::new(route("mistral-large-latest")))
+        );
+        // Both retired: no route at all, the job is blocked (fail closed).
+        assert_eq!(
+            routes_from(
+                Some(ModelId::from("labs-leanstral-1-5")),
+                Some(ModelId::from("mistral-ocr-4-0")),
+                128,
+                &after
+            ),
+            None
+        );
+        Ok(())
     }
 
     #[test]

@@ -13,25 +13,31 @@
 //! the learning gate, and is written under the project memories root the job
 //! was started with. The global scope is never opened.
 //!
-//! Every pending entry is acknowledged once it has been decided: learned,
-//! refused by the gate, or not learnable at all (admission refusals are a
-//! normal part of a run, not a lesson).
+//! Every pending entry is decided once: learned, refused by the gate, or not
+//! learnable at all (admission refusals are a normal part of a run, not a
+//! lesson).
 //!
-//! # Ordering: decide, acknowledge, then write
+//! # Ordering: decide, materialise, then acknowledge (two-phase delivery)
 //!
-//! A drain reads the pending entries (fenced), decides every one of them in
-//! memory, acknowledges all of them in one fenced write, and only after that
-//! acknowledgement succeeded writes the accepted facts to the [`FactStore`].
-//! The acknowledgement is the commit of the learning decision: the store
-//! checks the lease (epoch fence and, in the worker, the liveness of the job
-//! claim) under the record lock of that very write, so there is no window
-//! between a lease check and the external write in which an expired lease
-//! could still learn. The fact write is the deterministic materialisation of
-//! the committed decision: the fact name is a pure function of the
-//! observation's dedupe key, so writing it twice produces the same file, and
-//! a crash (or a failed write) between the acknowledgement and the write
-//! loses at most those lessons — never writes one the lease was not
-//! entitled to.
+//! 1. **Read** the pending entries under the lease (fenced, lease held).
+//! 2. **Decide** every entry in memory, then commit the decision in one
+//!    fenced write held under the live lease
+//!    ([`CycleStore::decide_observations`]): screened and non-learnable
+//!    entries are acknowledged directly; learnable ones are marked
+//!    [`DeliveryState::Accepted`] and stay in the outbox. That write is the
+//!    commit of the learning decision — the job lease cannot be replaced
+//!    between its verification and the write, so an expired, cancelled or
+//!    reclaimed lease never accepts anything.
+//! 3. **Materialise**: open the project [`FactStore`] and write each
+//!    accepted fact. The fact name is a pure function of the observation's
+//!    dedupe key, so a repeated write produces the same file (idempotent).
+//! 4. **Acknowledge** exactly the entries whose fact write succeeded
+//!    ([`CycleStore::ack_observations`], lease held again). An entry whose
+//!    fact is not durable yet — a crash after the decision, project
+//!    memories that cannot be opened, a failed write, a refused final
+//!    acknowledgement — stays accepted and is materialised again by the next
+//!    drain (this claim's or the one that takes over): delivery is at least
+//!    once, and never lost.
 //!
 //! # Binding to the job
 //!
@@ -52,15 +58,19 @@
 //!   observations into memory.
 //! - The epoch fence alone cannot refuse the *same* lease after its job
 //!   claim expired but before a reclaim rebinds the cycle. The worker's
-//!   store therefore carries a lease liveness check
+//!   store therefore holds the job lease around every fenced operation
 //!   ([`CycleStore::with_lease_liveness`], backed by
-//!   `JobStore::verify_lease`): the read and the acknowledgement are refused
-//!   for a token that is no longer the current, non-expired claim. Because
-//!   facts are written only after the acknowledgement succeeded (see the
-//!   ordering above), a lease that expires after the read and before the
-//!   acknowledgement writes nothing either.
+//!   `JobStore::hold_live_lease`): the read, the decision and the
+//!   acknowledgement are refused for a token that is no longer the current,
+//!   non-expired claim, and the lease cannot be replaced while one of them
+//!   runs. Facts are only written for entries accepted under such a held
+//!   lease (see the ordering above), so a lease that is lost after the read
+//!   and before the decision writes nothing. A fact written after the
+//!   decision materialises a lesson the lease was entitled to; if its lease
+//!   is lost before the acknowledgement, the entry stays accepted and the
+//!   claim that takes over acknowledges it after rewriting the same file.
 //! - A pending observation that names another cycle than the drained one is
-//!   never learned (screened out and acknowledged).
+//!   never learned (screened out and acknowledged at the decision).
 //!
 //! # Recall (W09b)
 //!
@@ -84,7 +94,7 @@ use harw_memory::facts::{Fact, FactScope, FactStore, FactType, slugify};
 use harw_memory::learning_gate::{GateVerdict, screen};
 use harw_memory::types::Timestamp;
 use harw_plan_bridge::intent_cycle::is_prompt_safe_char;
-use harw_plan_bridge::{CycleStore, ObservationCategory, RunObservationV1};
+use harw_plan_bridge::{CycleStore, DeliveryState, ObservationCategory, RunObservationV1};
 
 /// Tag carried by every fact this module writes; recall reads only these.
 pub(super) const LESSON_TAG: &str = "pl90";
@@ -123,12 +133,16 @@ const NAME_HASH_HEX_CHARS: usize = 12;
 /// What one [`drain_cycle_observations`] call did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct DrainReport {
-    /// Outbox entries acknowledged (removed from the pending list).
+    /// Outbox entries acknowledged (removed): screened and non-learnable ones
+    /// at the decision, learned ones once their fact was written.
     pub acked: usize,
-    /// Pitfall facts written, after the acknowledgement succeeded.
+    /// Pitfall facts written (durable) by this drain.
     pub written: usize,
     /// Learnable observations the gate (or the id check) kept out of memory.
     pub screened_out: usize,
+    /// Accepted lessons whose fact did not become durable in this drain
+    /// (write failed); they stay accepted for the next drain.
+    pub pending_materialization: usize,
 }
 
 /// Categories that become a lesson.
@@ -257,44 +271,47 @@ pub(super) fn lesson_fact(observation: &RunObservationV1, now: Timestamp) -> Opt
     })
 }
 
-/// Turns the pending observations of `cycle_id` into project pitfall facts
-/// and acknowledges them under `token` — acknowledgement first, facts second
-/// (see the module docs, "Ordering").
+/// Turns the pending observations of `cycle_id` into project pitfall facts in
+/// two phases under `token` (see the module docs, "Ordering").
 ///
-/// 1. The pending list is read through the store's lease fence: unless the
-///    record belongs to `token.work_id`, is fenced under `token.epoch` and
-///    (with a liveness check) `token` is the live job claim, the store
-///    refuses before any payload is returned and the drain ends there.
-/// 2. Every entry is decided in memory, nothing leaves the process yet:
-///    - not learnable (see [`is_learnable`]): no fact;
+/// 1. The pending list (pending and already accepted entries) is read under
+///    the lease: unless the record belongs to `token.work_id`, is fenced
+///    under `token.epoch` and (with a lease guard) `token` is the live job
+///    claim, the store refuses before any payload is returned.
+/// 2. Every entry is decided in memory:
+///    - not learnable (see [`is_learnable`]): acknowledged, no fact;
 ///    - the gate does not accept the fact, the observation has no safe id or
-///      it names another cycle: counted in `screened_out`, no fact;
-///    - accepted: kept as a fact to write.
-/// 3. All entries are acknowledged in one fenced, liveness-checked write; a
-///    refusal ends the drain with nothing written (the entries stay pending
-///    for the lease that takes over).
-/// 4. Only then is [`FactScope::Project`] under `learning_root` opened (and
-///    only if there is a fact to write) and the accepted facts are written.
-///    A fact that cannot be written is logged and lost: it is already
-///    acknowledged, and the remaining facts are still written.
+///      it names another cycle: counted in `screened_out`, acknowledged;
+///    - accepted: marked [`DeliveryState::Accepted`] (if it is not already),
+///      to be materialised.
+///
+///    The decision is committed in one fenced, lease-held write
+///    ([`CycleStore::decide_observations`]); a refusal ends the drain with
+///    nothing accepted, acknowledged or written.
+/// 3. If there is something to materialise, [`FactScope::Project`] under
+///    `learning_root` is opened and every accepted fact is written
+///    (idempotently: the name derives from the dedupe key). A write that
+///    fails is logged; its entry stays accepted (`pending_materialization`).
+/// 4. Exactly the entries whose fact was written are acknowledged.
 ///
 /// The global scope is never opened.
 ///
 /// # Errors
 /// The lease does not own the record (stale epoch, another job, not yet
-/// rebound), is no longer live, or the pending list cannot be read: nothing
-/// is acknowledged or written. The acknowledgement is refused or fails:
-/// nothing is written. The project memories cannot be opened after the
-/// acknowledgement: no fact is written and the acknowledged lessons are lost
-/// (the message says how many entries were acknowledged).
+/// rebound), is not live, or the pending list cannot be read, or the
+/// decision is refused: nothing is accepted, acknowledged or written. The
+/// project memories cannot be opened: the accepted entries stay accepted,
+/// no fact is written. The final acknowledgement is refused or fails: the
+/// facts are durable, their entries stay accepted and the next drain
+/// rewrites the same files before acknowledging them.
 pub(super) fn drain_cycle_observations(
     store: &CycleStore,
     cycle_id: &str,
     token: &LeaseToken,
     learning_root: &Path,
 ) -> Result<DrainReport, String> {
-    // Fenced read: a stale, foreign or expired lease gets an error, never a
-    // payload.
+    // Read under the lease: a stale, foreign or dead lease gets an error,
+    // never a payload.
     let pending = store
         .pending_observations(cycle_id, token)
         .map_err(|error| format!("read pending observations: {error}"))?;
@@ -302,14 +319,15 @@ pub(super) fn drain_cycle_observations(
     if pending.is_empty() {
         return Ok(report);
     }
-    // Decide every entry in memory; nothing is written before the ack.
+    // Decide every entry in memory; nothing leaves the process yet.
     let now = Timestamp::now_utc();
-    let mut lessons: Vec<Fact> = Vec::new();
-    let mut to_ack: Vec<String> = Vec::with_capacity(pending.len());
+    let mut lessons: Vec<(String, Fact)> = Vec::new();
+    let mut accept: Vec<String> = Vec::new();
+    let mut ack: Vec<String> = Vec::new();
     for entry in &pending {
-        to_ack.push(entry.key.clone());
         let observation = &entry.payload;
         if !is_learnable(observation.category) {
+            ack.push(entry.key.clone());
             continue;
         }
         // Only observations of the drained cycle are learned.
@@ -319,39 +337,61 @@ pub(super) fn drain_cycle_observations(
             None
         };
         match verdict {
-            Some(GateVerdict::Accept(fact)) => lessons.push(fact),
+            Some(GateVerdict::Accept(fact)) => {
+                if entry.state == DeliveryState::Pending {
+                    accept.push(entry.key.clone());
+                }
+                lessons.push((entry.key.clone(), fact));
+            }
             Some(GateVerdict::Review(_) | GateVerdict::Reject(_)) | None => {
                 report.screened_out += 1;
+                ack.push(entry.key.clone());
             }
         }
     }
-    // The commit of the learning decision: fence and liveness are checked
-    // under the record lock of this write. Refused → nothing is written.
-    report.acked = store
-        .ack_observations(cycle_id, token, &to_ack)
-        .map_err(|error| format!("acknowledge observations: {error}"))?;
+    // Phase 1, the commit of the decision: lease held across the write.
+    if !accept.is_empty() || !ack.is_empty() {
+        let (_accepted, acked) = store
+            .decide_observations(cycle_id, token, &accept, &ack)
+            .map_err(|error| format!("decide observations: {error}"))?;
+        report.acked += acked;
+    }
     if lessons.is_empty() {
-        // No learnable lesson: the project memories are never created.
+        // Nothing to learn: the project memories are never created.
         return Ok(report);
     }
-    // Materialise the committed lessons; fact names derive from the dedupe
-    // key, so a repeated write produces the same file.
+    // Phase 2, materialise the accepted lessons idempotently.
     let project = FactStore::open(learning_root, FactScope::Project).map_err(|error| {
         format!(
-            "open project memories after acknowledging {} observations: {error}",
-            report.acked
+            "open project memories: {error}; {} accepted lessons stay pending",
+            lessons.len()
         )
     })?;
-    for fact in &lessons {
+    let mut durable: Vec<String> = Vec::with_capacity(lessons.len());
+    for (key, fact) in &lessons {
         match project.write(fact) {
-            Ok(()) => report.written += 1,
+            Ok(()) => durable.push(key.clone()),
             Err(error) => tracing::warn!(
                 cycle_id,
                 error = %error,
-                "intent cycle lesson could not be written after its acknowledgement; it is lost"
+                "intent cycle lesson could not be written; it stays accepted for the next drain"
             ),
         }
     }
+    report.written = durable.len();
+    report.pending_materialization = lessons.len().saturating_sub(durable.len());
+    if durable.is_empty() {
+        return Ok(report);
+    }
+    // Phase 3, acknowledge exactly the durable lessons.
+    report.acked += store
+        .ack_observations(cycle_id, token, &durable)
+        .map_err(|error| {
+            format!(
+                "acknowledge {} written lessons (they stay accepted): {error}",
+                durable.len()
+            )
+        })?;
     Ok(report)
 }
 
@@ -525,11 +565,11 @@ pub(super) fn lesson_lines(learning_root: &Path, objective: &str, now_unix: i64)
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::collections::BTreeMap;
-    use std::future::Future;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
 
     use harw_authority::{
         AuthorityContext, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
@@ -540,11 +580,11 @@ mod tests {
     use harw_plan_bridge::{
         CauseCode, CeilingReissuer, CycleAdmission, CycleCheckpoint, CycleDriver, CycleLimits,
         CycleObservations, CycleProposal, CycleProposer, CycleRecord, CycleRefusal,
-        CycleRunOutcome, CycleStepExecutor, CycleTargets, INTENT_CYCLE_JOB_KIND, InFlightStep,
-        IntentBinding, LeaseLivenessCheck, StepFailure, StepReconciliation, admit_cycle,
-        apply_observations, build_observation, resume_admission,
+        CycleRunOutcome, CycleStepExecutor, CycleStoreError, CycleTargets, INTENT_CYCLE_JOB_KIND,
+        InFlightStep, IntentBinding, LeaseLivenessGuard, StepFailure, StepReconciliation,
+        admit_cycle, apply_observations, build_observation, resume_admission,
     };
-    use harw_session_store::{ClaimRequest, JobStore};
+    use harw_session_store::{ClaimRequest, JobStore, SessionStoreError};
     use harw_types::{ApprovalActor, ContentDigest, TenantId, WorkId, WorkspaceId};
     use jiff::SignedDuration;
 
@@ -772,7 +812,8 @@ mod tests {
             DrainReport {
                 acked: 3,
                 written: 2,
-                screened_out: 0
+                screened_out: 0,
+                pending_materialization: 0
             }
         );
         assert!(pending_keys(&fx)?.is_empty());
@@ -878,7 +919,8 @@ mod tests {
             DrainReport {
                 acked: 2,
                 written: 2,
-                screened_out: 0
+                screened_out: 0,
+                pending_materialization: 0
             }
         );
         let files = fact_files(&fx.learning_root)?;
@@ -906,7 +948,8 @@ mod tests {
             DrainReport {
                 acked: 1,
                 written: 0,
-                screened_out: 1
+                screened_out: 1,
+                pending_materialization: 0
             }
         );
         assert!(pending_keys(&fx)?.is_empty());
@@ -931,7 +974,8 @@ mod tests {
             DrainReport {
                 acked: 4,
                 written: 0,
-                screened_out: 0
+                screened_out: 0,
+                pending_materialization: 0
             }
         );
         assert!(pending_keys(&fx)?.is_empty());
@@ -1128,7 +1172,8 @@ mod tests {
             DrainReport {
                 acked: 2,
                 written: 2,
-                screened_out: 0
+                screened_out: 0,
+                pending_materialization: 0
             }
         );
         assert_eq!(fact_files(&fx.learning_root)?.len(), 2);
@@ -1196,23 +1241,54 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lease_lost_between_read_and_ack_writes_no_fact() -> TestResult {
-        let fx = fixture(&TWO_LEARNABLE)?;
-        // Live for the read, gone at the acknowledgement: exactly the window
-        // a separate precheck before the fact write would leave open.
-        let checks = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&checks);
-        let liveness: LeaseLivenessCheck = Arc::new(move |_token: &LeaseToken| {
-            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                Ok(())
+    /// A lease guard that is live for the first `live_for` holds and refuses
+    /// every later one; `holds` counts the attempts.
+    struct CountingGuard {
+        live_for: usize,
+        holds: Arc<AtomicUsize>,
+    }
+
+    impl LeaseLivenessGuard for CountingGuard {
+        fn hold(&self, _token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+            if self.holds.fetch_add(1, Ordering::SeqCst) < self.live_for {
+                Ok(Box::new(()))
             } else {
-                Err("lease expired after the read".to_owned())
+                Err(format!("lease lost after {} operations", self.live_for))
             }
-        });
-        let guarded = CycleStore::open_in_job_root(&fx.base.join("jobs"))
+        }
+    }
+
+    /// The fixture's cycle store behind a [`CountingGuard`].
+    fn counting_store(fx: &Fixture, live_for: usize) -> TestResult<(CycleStore, Arc<AtomicUsize>)> {
+        let holds = Arc::new(AtomicUsize::new(0));
+        let store = CycleStore::open_in_job_root(&fx.base.join("jobs"))
             .map_err(ctx("cycle store"))?
-            .with_lease_liveness(liveness);
+            .with_lease_liveness(Arc::new(CountingGuard {
+                live_for,
+                holds: Arc::clone(&holds),
+            }));
+        Ok((store, holds))
+    }
+
+    /// Delivery states of the pending entries, in outbox order.
+    fn entry_states(fx: &Fixture) -> TestResult<Vec<DeliveryState>> {
+        Ok(fx
+            .store
+            .load(CYCLE_ID)
+            .map_err(ctx("load record"))?
+            .outbox
+            .pending()
+            .iter()
+            .map(|entry| entry.state)
+            .collect())
+    }
+
+    #[test]
+    fn lease_lost_between_read_and_decision_writes_no_fact() -> TestResult {
+        let fx = fixture(&TWO_LEARNABLE)?;
+        // Live for the read, gone at the decision: nothing may be accepted,
+        // acknowledged or written.
+        let (guarded, holds) = counting_store(&fx, 1)?;
 
         let reason =
             match drain_cycle_observations(&guarded, CYCLE_ID, &fx.token, &fx.learning_root) {
@@ -1225,18 +1301,394 @@ mod tests {
             };
         assert_eq!(
             reason,
-            "acknowledge observations: job lease is not live: lease expired after the read"
+            "decide observations: job lease is not live: lease lost after 1 operations"
         );
         assert_eq!(
-            checks.load(Ordering::SeqCst),
+            holds.load(Ordering::SeqCst),
             2,
-            "the read and the acknowledgement each consulted the lease"
+            "the read and the decision each held the lease"
         );
         assert!(
             !fx.learning_root.exists(),
-            "no fact is written without a successful acknowledgement"
+            "no fact without a decision committed under the lease"
         );
-        assert_eq!(pending_keys(&fx)?.len(), 2);
+        assert_eq!(
+            entry_states(&fx)?,
+            vec![DeliveryState::Pending; 2],
+            "nothing was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lease_lost_before_the_final_ack_keeps_lessons_accepted() -> TestResult {
+        let fx = fixture(&TWO_LEARNABLE)?;
+        // Live for the read and the decision; gone before the facts are
+        // acknowledged. The facts materialise the committed decision, the
+        // entries stay accepted until a live lease acknowledges them.
+        let (guarded, holds) = counting_store(&fx, 2)?;
+
+        let reason =
+            match drain_cycle_observations(&guarded, CYCLE_ID, &fx.token, &fx.learning_root) {
+                Err(reason) => reason,
+                Ok(report) => {
+                    return Err(TestError::Unexpected(format!(
+                        "a lost lease acknowledged: {report:?}"
+                    )));
+                }
+            };
+        assert!(
+            reason.starts_with("acknowledge 2 written lessons (they stay accepted)"),
+            "{reason}"
+        );
+        assert_eq!(holds.load(Ordering::SeqCst), 3);
+        let written = fact_files(&fx.learning_root)?;
+        assert_eq!(written.len(), 2);
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted; 2]);
+
+        // The next drain under a live lease rewrites the same files and
+        // acknowledges them.
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 2,
+                written: 2,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        let rewritten = fact_files(&fx.learning_root)?;
+        assert_eq!(
+            rewritten.keys().collect::<Vec<_>>(),
+            written.keys().collect::<Vec<_>>(),
+            "idempotent: the same fact files"
+        );
+        Ok(())
+    }
+
+    /// Makes `FactStore::open` fail: a regular file where `facts/` belongs.
+    fn block_project_memories(fx: &Fixture) -> TestResult {
+        std::fs::create_dir_all(&fx.learning_root).map_err(ctx("create learning root"))?;
+        std::fs::write(fx.learning_root.join("facts"), b"not a directory")
+            .map_err(ctx("block the facts directory"))
+    }
+
+    fn unblock_project_memories(fx: &Fixture) -> TestResult {
+        std::fs::remove_file(fx.learning_root.join("facts")).map_err(ctx("unblock facts"))
+    }
+
+    #[test]
+    fn crash_after_accept_before_write_is_recovered_on_the_next_drain() -> TestResult {
+        let fx = fixture(&TWO_LEARNABLE)?;
+        let keys = pending_keys(&fx)?;
+        // A drain committed its decision and the process died before any
+        // fact was written.
+        assert_eq!(
+            fx.store
+                .decide_observations(CYCLE_ID, &fx.token, &keys, &[])
+                .map_err(ctx("decision before the crash"))?,
+            (2, 0)
+        );
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted; 2]);
+
+        // The next drain cannot open the project memories: nothing is lost,
+        // nothing is written, the entries stay accepted.
+        block_project_memories(&fx)?;
+        let blocked = drain(&fx);
+        let Err(TestError::Unexpected(reason)) = blocked else {
+            return Err(TestError::Missing("a drain with blocked memories fails"));
+        };
+        assert!(reason.contains("open project memories"), "{reason}");
+        assert!(
+            reason.contains("2 accepted lessons stay pending"),
+            "{reason}"
+        );
+        assert!(fx.learning_root.join("facts").is_file(), "no fact written");
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted; 2]);
+
+        // Repaired: the accepted lessons are materialised and acknowledged.
+        unblock_project_memories(&fx)?;
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 2,
+                written: 2,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert_eq!(fact_files(&fx.learning_root)?.len(), 2);
+        assert!(pending_keys(&fx)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_write_failure_keeps_the_failed_entry_accepted() -> TestResult {
+        let fx = fixture(&TWO_LEARNABLE)?;
+        let keys = pending_keys(&fx)?;
+        let (first_key, second_key) = match keys.as_slice() {
+            [first, second] => (first.clone(), second.clone()),
+            _ => return Err(TestError::Missing("two pending keys")),
+        };
+        // The first lesson's fact path is occupied by a directory: its write
+        // fails, the second one succeeds.
+        let first = lesson_fact(&first_payload(&fx)?, Timestamp::now_utc())
+            .ok_or(TestError::Missing("first lesson"))?;
+        let occupied = fx
+            .learning_root
+            .join("facts")
+            .join(format!("{}.md", first.name));
+        std::fs::create_dir_all(&occupied).map_err(ctx("occupy the first fact path"))?;
+
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 1,
+                screened_out: 0,
+                pending_materialization: 1
+            }
+        );
+        assert_eq!(pending_keys(&fx)?, vec![first_key.clone()]);
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted]);
+        assert!(!pending_keys(&fx)?.contains(&second_key));
+
+        // Repaired: the failed lesson is written and acknowledged.
+        std::fs::remove_dir(&occupied).map_err(ctx("free the first fact path"))?;
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 1,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        let files = fact_files(&fx.learning_root)?;
+        assert_eq!(files.len(), 2);
+        assert!(files.contains_key(&format!("{}.md", first.name)));
+        Ok(())
+    }
+
+    #[test]
+    fn screened_entries_are_acked_directly_without_materialization() -> TestResult {
+        let fx = fixture_with(
+            &[
+                (
+                    ObservationCategory::ToolFailedNoEffect,
+                    CauseCode::ExecutorFailed,
+                ),
+                (
+                    ObservationCategory::AdmissionRefused,
+                    CauseCode::ReadNotAllowed,
+                ),
+                (
+                    ObservationCategory::VerificationFailed,
+                    CauseCode::VerificationUnmet,
+                ),
+            ],
+            |observations| {
+                if let Some(other) = observations.get_mut(2) {
+                    other.event_id.cycle_id = "job-other".to_owned();
+                }
+            },
+        )?;
+        let keys = pending_keys(&fx)?;
+        let learnable = keys
+            .first()
+            .cloned()
+            .ok_or(TestError::Missing("learnable key"))?;
+        // Materialisation is impossible, yet the decision still settles the
+        // entries that need none.
+        block_project_memories(&fx)?;
+        let blocked = drain(&fx);
+        assert!(blocked.is_err(), "{blocked:?}");
+        assert_eq!(
+            pending_keys(&fx)?,
+            vec![learnable],
+            "the non-learnable and the foreign entry are acknowledged"
+        );
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted]);
+
+        unblock_project_memories(&fx)?;
+        let report = drain(&fx)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 1,
+                written: 1,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
+        assert!(pending_keys(&fx)?.is_empty());
+        Ok(())
+    }
+
+    /// Wraps a lease guard and runs `between` once, right after the lease was
+    /// verified and is held: the window between the lease check and the
+    /// cycle commit.
+    struct PausedGuard {
+        inner: Arc<dyn LeaseLivenessGuard>,
+        between: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl LeaseLivenessGuard for PausedGuard {
+        fn hold(&self, token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+            let held = self.inner.hold(token)?;
+            let between = self.between.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(between) = between {
+                between();
+            }
+            Ok(held)
+        }
+    }
+
+    /// What the reclaimer reports: attempts until it won, the delivery
+    /// states it found right after winning, and when the job is claimable
+    /// again.
+    type Reclaimed = (usize, Vec<DeliveryState>, Option<jiff::Timestamp>);
+
+    #[test]
+    fn reclaim_cannot_slip_between_lease_check_and_cycle_commit() -> TestResult {
+        let fx = fixture(&TWO_LEARNABLE)?;
+        let (jobs, lease) =
+            claimed_job(&fx, jiff::Timestamp::now(), SignedDuration::from_secs(60))?;
+        let keys = pending_keys(&fx)?;
+
+        // An operator reclaim (revoke the lease, requeue the job) that starts
+        // inside the window and retries until it wins.
+        let (go, go_seen) = mpsc::channel::<()>();
+        let (tried, tried_seen) = mpsc::channel::<()>();
+        let reclaimer = {
+            let jobs = Arc::clone(&jobs);
+            let observer =
+                CycleStore::open_in_job_root(&fx.base.join("jobs")).map_err(ctx("observer"))?;
+            let work_id = lease.work_id.clone();
+            std::thread::spawn(move || -> Result<Reclaimed, String> {
+                go_seen.recv().map_err(|error| error.to_string())?;
+                for attempt in 1..=2_000_usize {
+                    let result = jobs.reclaim(
+                        &work_id,
+                        jiff::Timestamp::now(),
+                        ApprovalActor::Operator {
+                            id: "operator".to_owned(),
+                        },
+                    );
+                    if attempt == 1 {
+                        tried.send(()).map_err(|error| error.to_string())?;
+                    }
+                    match result {
+                        Ok(expired) => {
+                            let states = observer
+                                .load(CYCLE_ID)
+                                .map_err(|error| error.to_string())?
+                                .outbox
+                                .pending()
+                                .iter()
+                                .map(|entry| entry.state)
+                                .collect();
+                            return Ok((attempt, states, expired.retry_scheduled_for));
+                        }
+                        Err(SessionStoreError::JobLockContended { .. }) => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(other) => return Err(other.to_string()),
+                    }
+                }
+                Err("the reclaim never got the job lock".to_owned())
+            })
+        };
+        let between: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // Inside the window: the production guard holds the job lock.
+            assert!(go.send(()).is_ok(), "the reclaimer waits for the window");
+            assert!(tried_seen.recv().is_ok(), "the reclaimer tried once");
+        });
+        let guarded = CycleStore::open_in_job_root(&fx.base.join("jobs"))
+            .map_err(ctx("cycle store"))?
+            .with_lease_liveness(Arc::new(PausedGuard {
+                inner: super::super::intent_cycle_job::lease_liveness(&jobs),
+                between: Mutex::new(Some(between)),
+            }));
+
+        // The commit under the held lease: the drain's decision.
+        let decided = guarded
+            .decide_observations(CYCLE_ID, &lease, &keys, &[])
+            .map_err(ctx("decision under the held lease"))?;
+        assert_eq!(decided, (2, 0));
+        let (attempts, states_when_reclaimed, requeued_at) = reclaimer
+            .join()
+            .map_err(|_| TestError::Missing("reclaimer thread"))?
+            .map_err(TestError::Unexpected)?;
+        assert!(
+            attempts > 1,
+            "the reclaim was refused while the lease was held"
+        );
+        assert_eq!(
+            states_when_reclaimed,
+            vec![DeliveryState::Accepted; 2],
+            "the reclaim won only after the commit was durable"
+        );
+
+        // The reclaim replaced the lease: the old token gets nothing more.
+        let job = jobs.get(&lease.work_id).map_err(ctx("job record"))?;
+        assert!(job.lease_epoch > lease.epoch);
+        assert!(job.lease.is_none());
+        let late = guarded.ack_observations(CYCLE_ID, &lease, &keys);
+        assert!(
+            matches!(late, Err(CycleStoreError::LeaseNotLive(_))),
+            "{late:?}"
+        );
+        let late_drain = drain_cycle_observations(&guarded, CYCLE_ID, &lease, &fx.learning_root);
+        assert!(late_drain.is_err(), "{late_drain:?}");
+        assert!(!fx.learning_root.exists(), "the old lease learned nothing");
+        assert_eq!(entry_states(&fx)?, vec![DeliveryState::Accepted; 2]);
+
+        // The claim that takes over materialises the accepted lessons.
+        let requeued_at = requeued_at.ok_or(TestError::Missing("a retry is scheduled"))?;
+        let next = jobs
+            .claim(
+                &lease.work_id,
+                &ClaimRequest {
+                    worker_id: "worker-b".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: requeued_at,
+                },
+            )
+            .map_err(ctx("the next claim"))?;
+        let record = fx.store.load(CYCLE_ID).map_err(ctx("load record"))?;
+        let (_, resumed) = resume_admission(
+            &record.checkpoint,
+            &fx.admission,
+            &fx.authority,
+            next.token.epoch,
+        )
+        .map_err(|_| TestError::Missing("resumed checkpoint"))?;
+        fx.store
+            .rebind(CYCLE_ID, &next.token, &resumed)
+            .map_err(ctx("rebind to the next claim"))?;
+        let report = drain_cycle_observations(
+            &worker_store(&fx, &jobs)?,
+            CYCLE_ID,
+            &next.token,
+            &fx.learning_root,
+        )
+        .map_err(TestError::Unexpected)?;
+        assert_eq!(
+            report,
+            DrainReport {
+                acked: 2,
+                written: 2,
+                screened_out: 0,
+                pending_materialization: 0
+            }
+        );
         Ok(())
     }
 
@@ -1245,33 +1697,30 @@ mod tests {
     struct NoStep;
 
     impl CycleProposer for NoStep {
-        fn propose(
+        async fn propose(
             &mut self,
             _admission: &CycleAdmission,
             _state: &CycleCheckpoint,
             _last_refusal: Option<CycleRefusal>,
             _cancel: &CancelToken,
-        ) -> impl Future<Output = Result<CycleProposal, StepFailure>> + Send {
-            async { Err(StepFailure::new("no proposal expected after cancellation")) }
+        ) -> Result<CycleProposal, StepFailure> {
+            Err(StepFailure::new("no proposal expected after cancellation"))
         }
     }
 
     impl CycleStepExecutor for NoStep {
-        fn execute(
+        async fn execute(
             &mut self,
             _step: &InFlightStep,
             _admission: &CycleAdmission,
             _state: &CycleCheckpoint,
             _cancel: &CancelToken,
-        ) -> impl Future<Output = Result<CycleObservations, StepFailure>> + Send {
-            async { Err(StepFailure::new("no step expected after cancellation")) }
+        ) -> Result<CycleObservations, StepFailure> {
+            Err(StepFailure::new("no step expected after cancellation"))
         }
 
-        fn reconcile(
-            &mut self,
-            _step: &InFlightStep,
-        ) -> impl Future<Output = StepReconciliation> + Send {
-            async { StepReconciliation::Uncertain }
+        async fn reconcile(&mut self, _step: &InFlightStep) -> StepReconciliation {
+            StepReconciliation::Uncertain
         }
     }
 

@@ -19,6 +19,13 @@
 //!   already acked key is likewise `Ok(false)`. After a crash the writer can
 //!   therefore replay every append without creating duplicates.
 //! - **Ordered.** Pending entries keep their append order.
+//! - **Two-phase delivery.** A consumer whose delivery has an external side
+//!   effect first [accepts](Outbox::accept) an entry ([`DeliveryState`]):
+//!   the entry stays pending, marked as committed to delivery, until the
+//!   consumer acknowledges it after the side effect is durable. A crash in
+//!   between leaves it accepted, so it is delivered again (at least once);
+//!   the consumer's side effect must therefore be idempotent. Entries the
+//!   consumer decides not to deliver are acknowledged directly.
 //!
 //! The acked-key tail is capped at [`MAX_ACKED_TAIL`] keys (oldest evicted
 //! first), so idempotency of re-appends covers the most recent acked keys
@@ -35,9 +42,24 @@ pub const MAX_OUTBOX_PENDING: usize = 64;
 /// Maximum number of acked keys remembered for idempotent re-appends.
 pub const MAX_ACKED_TAIL: usize = 128;
 
+/// Delivery state of a pending [`OutboxEntry`] (see the module docs,
+/// "Two-phase delivery").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    /// Not decided by the consumer yet.
+    #[default]
+    Pending,
+    /// The consumer committed to delivering it; it stays pending until it is
+    /// acknowledged after the delivery is durable.
+    Accepted,
+}
+
 /// One outbox entry: an idempotency key, the epoch of the writer that
-/// produced it, a sequence number and the payload to deliver.
+/// produced it, a sequence number, the payload to deliver and its delivery
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutboxEntry<T> {
     /// Idempotency key; an entry with a known key is never added twice.
     pub key: String,
@@ -47,6 +69,10 @@ pub struct OutboxEntry<T> {
     pub sequence: u64,
     /// Payload to deliver.
     pub payload: T,
+    /// Where the consumer stands with it. Entries written before two-phase
+    /// delivery have no such field and load as [`DeliveryState::Pending`].
+    #[serde(default)]
+    pub state: DeliveryState,
 }
 
 /// Why an outbox operation was refused.
@@ -155,6 +181,35 @@ impl<T> Outbox<T> {
         Ok(true)
     }
 
+    /// Marks the pending entry with `key` as [`DeliveryState::Accepted`]: the
+    /// consumer committed to delivering it. The entry stays pending (and
+    /// counts against [`MAX_OUTBOX_PENDING`]) until [`Outbox::ack`].
+    ///
+    /// Returns `Ok(true)` when a pending entry changed to accepted,
+    /// `Ok(false)` for an unknown, already acked or already accepted key.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboxError::StaleEpoch`] when `acceptor_epoch < current_epoch`.
+    pub fn accept(
+        &mut self,
+        acceptor_epoch: u64,
+        current_epoch: u64,
+        key: &str,
+    ) -> Result<bool, OutboxError> {
+        if acceptor_epoch < current_epoch {
+            return Err(OutboxError::StaleEpoch);
+        }
+        let Some(entry) = self.pending.iter_mut().find(|entry| entry.key == key) else {
+            return Ok(false);
+        };
+        if entry.state == DeliveryState::Accepted {
+            return Ok(false);
+        }
+        entry.state = DeliveryState::Accepted;
+        Ok(true)
+    }
+
     /// All pending entries in append order.
     #[must_use]
     pub fn pending(&self) -> &[OutboxEntry<T>] {
@@ -204,7 +259,93 @@ mod tests {
             epoch: 1,
             sequence,
             payload: format!("payload-{key}"),
+            state: DeliveryState::Pending,
         }
+    }
+
+    fn state_of(outbox: &Outbox<String>, key: &str) -> Option<DeliveryState> {
+        outbox
+            .pending()
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.state)
+    }
+
+    #[test]
+    fn accept_marks_once_keeps_the_entry_pending_and_is_fenced() -> TestResult {
+        let mut outbox = Outbox::new();
+        check(outbox.append(2, 2, entry("a", 0)) == Ok(true), "append a")?;
+        check(outbox.append(2, 2, entry("b", 1)) == Ok(true), "append b")?;
+        check(
+            outbox.accept(1, 2, "a") == Err(OutboxError::StaleEpoch),
+            "stale accept refused",
+        )?;
+        check(
+            state_of(&outbox, "a") == Some(DeliveryState::Pending),
+            "stale accept changed nothing",
+        )?;
+        check(outbox.accept(2, 2, "a") == Ok(true), "first accept marks")?;
+        check(
+            outbox.accept(2, 2, "a") == Ok(false),
+            "second accept is a no-op",
+        )?;
+        check(
+            outbox.accept(2, 2, "unknown") == Ok(false),
+            "unknown key is a no-op",
+        )?;
+        check(
+            state_of(&outbox, "a") == Some(DeliveryState::Accepted),
+            "a is accepted",
+        )?;
+        check(
+            state_of(&outbox, "b") == Some(DeliveryState::Pending),
+            "b is untouched",
+        )?;
+        check(
+            keys(&outbox) == ["a", "b"],
+            "accepted stays pending, in order",
+        )?;
+        check(
+            outbox.append(2, 2, entry("a", 9)) == Ok(false),
+            "re-append of an accepted key is a no-op",
+        )?;
+        check(
+            state_of(&outbox, "a") == Some(DeliveryState::Accepted),
+            "re-append does not reset the state",
+        )?;
+        check(
+            outbox.ack(2, 2, "a") == Ok(true),
+            "ack removes the accepted",
+        )?;
+        check(
+            outbox.accept(2, 2, "a") == Ok(false),
+            "an acked key cannot be accepted",
+        )?;
+        check(keys(&outbox) == ["b"], "only b is left")
+    }
+
+    #[test]
+    fn accepted_state_survives_a_round_trip_and_legacy_entries_load_pending() -> TestResult {
+        let mut outbox = Outbox::new();
+        check(outbox.append(1, 1, entry("a", 0)) == Ok(true), "append")?;
+        check(outbox.accept(1, 1, "a") == Ok(true), "accept")?;
+        let json = serde_json::to_string(&outbox).map_err(ctx("serialize outbox"))?;
+        let restored: Outbox<String> =
+            serde_json::from_str(&json).map_err(ctx("deserialize outbox"))?;
+        check(restored == outbox, "accepted survives a crash")?;
+
+        let legacy = r#"{"pending":[{"key":"k","epoch":1,"sequence":0,"payload":"p"}],"acked_keys_tail":[]}"#;
+        let loaded: Outbox<String> =
+            serde_json::from_str(legacy).map_err(ctx("pre two-phase outbox"))?;
+        check(
+            state_of(&loaded, "k") == Some(DeliveryState::Pending),
+            "an entry without a state loads as pending",
+        )?;
+        let tampered = r#"{"pending":[{"key":"k","epoch":1,"sequence":0,"payload":"p","extra":1}],"acked_keys_tail":[]}"#;
+        check(
+            serde_json::from_str::<Outbox<String>>(tampered).is_err(),
+            "unknown entry fields are rejected",
+        )
     }
 
     fn keys(outbox: &Outbox<String>) -> Vec<&str> {

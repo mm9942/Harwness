@@ -135,7 +135,7 @@ pub use crate::cycle_observation::{
     is_countable_as_fix, proposal_kind,
 };
 pub use crate::cycle_outbox::{
-    MAX_ACKED_TAIL, MAX_OUTBOX_PENDING, Outbox, OutboxEntry, OutboxError,
+    DeliveryState, MAX_ACKED_TAIL, MAX_OUTBOX_PENDING, Outbox, OutboxEntry, OutboxError,
 };
 pub use crate::cycle_proposer::{
     ModelCycleProposer, PromptExtras, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy,
@@ -145,7 +145,7 @@ pub use crate::cycle_runtime::{
     AuthorityReissuer, CYCLE_RECORD_SCHEMA, CYCLE_STORE_DIR, CeilingReissuer, CycleDriver,
     CycleDriverConfig, CycleJobFuture, CycleProposer, CycleRecord, CycleRunError, CycleRunOutcome,
     CycleStatus, CycleStepExecutor, CycleStore, CycleStoreError, INTENT_CYCLE_JOB_KIND,
-    InFlightStep, JournaledStep, LeaseLivenessCheck, PolicyReissuer, StepFailure,
+    InFlightStep, JournaledStep, LeaseLivenessGuard, PolicyReissuer, StepFailure,
     StepReconciliation, cycle_job_operation, job_outcome,
 };
 pub use crate::cycle_spec::{

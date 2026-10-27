@@ -18,12 +18,13 @@
 //!   incarnation. Between the expiry of a job lease and the reclaim that
 //!   rebinds the cycle, the expired lease's epoch is still the record's
 //!   epoch. A store built [`with_lease_liveness`](CycleStore::with_lease_liveness)
-//!   therefore also asks the job store whether the presented
-//!   [`LeaseToken`] is the current, non-expired claim
-//!   ([`LeaseLivenessCheck`]), after the epoch fence, in every fenced
-//!   operation — inside the record lock for writes, so the check and the
-//!   write are one step. A refusal is [`CycleStoreError::LeaseNotLive`] and
-//!   writes nothing.
+//!   therefore *holds* the job lease for every fenced operation
+//!   ([`LeaseLivenessGuard`]): it verifies that the presented
+//!   [`LeaseToken`] is the current, non-expired claim and keeps the job
+//!   record from being reclaimed, cancelled or renewed until the cycle
+//!   operation — read or locked write — has finished. Lock order: job lease
+//!   first, cycle record second, released in reverse. A refusal is
+//!   [`CycleStoreError::LeaseNotLive`] and reads or writes nothing.
 //! - **Effect journal:** before an admitted step runs, it is journaled as
 //!   [`InFlightStep`] with a stable idempotency key. A [`JournaledStep`]
 //!   ([`CycleStore::journaled_step`]) is the store's proof that a step and
@@ -55,11 +56,15 @@
 //!   pending, newer ones are dropped and counted in
 //!   [`CycleRecord::observations_dropped`] but never refuse the checkpoint
 //!   commit. The consumer is a job-local drain (wave 4) that reads
-//!   [`CycleStore::pending_observations`] and acknowledges delivered keys
-//!   with [`CycleStore::ack_observations`], both under its lease: the read is
+//!   [`CycleStore::pending_observations`], records its decision with
+//!   [`CycleStore::decide_observations`] (two-phase delivery: entries it
+//!   will deliver are marked [`DeliveryState::Accepted`] and stay until
+//!   their delivery is durable, the rest is acknowledged at once) and
+//!   acknowledges delivered keys with [`CycleStore::ack_observations`], all
+//!   under its lease: the read is
 //!   fenced like a write, so a stale, foreign or not yet rebound lease never
-//!   sees a payload (and, with a liveness check, neither does an expired
-//!   one). Redelivery after a crash is idempotent. A lease that finds the
+//!   sees a payload (and, with a lease guard, neither does an expired,
+//!   cancelled or reclaimed one). Redelivery after a crash is idempotent. A lease that finds the
 //!   cycle already terminal still takes the record over (only the fence
 //!   epoch moves, see [`CycleDriver::run`]), so observations committed with
 //!   the terminal step but never acknowledged are drained by it rather than
@@ -74,6 +79,7 @@
 //! uses (W03+), and goal acceptance — a `CompletionProposed` cycle is a
 //! succeeded *job*, not an achieved goal.
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -94,7 +100,7 @@ use crate::cycle_observation::{
     classify_proposer_failure, classify_reconciliation, classify_refusal, classify_step_failure,
     classify_verification,
 };
-use crate::cycle_outbox::{Outbox, OutboxEntry, OutboxError};
+use crate::cycle_outbox::{DeliveryState, Outbox, OutboxEntry, OutboxError};
 use crate::intent_cycle::{
     AdmittedCycle, CycleAdmission, CycleCheckpoint, CycleObservations, CycleProposal, CycleRefusal,
     CycleTerminal, FenceRefusal, ObservationError, ResumeRefusal, admit_cycle, apply_observations,
@@ -291,9 +297,9 @@ pub enum CycleStoreError {
     /// The journaled step does not match the commit or clear request.
     StepMismatch,
     InvalidRecord,
-    /// The epoch fence admitted the lease, but the job store reports that it
-    /// is no longer the current, non-expired claim (see
-    /// [`LeaseLivenessCheck`]). Nothing was read out or written.
+    /// The job store reports that the lease is not the current, non-expired
+    /// claim, or it could not be held (see [`LeaseLivenessGuard`]). Nothing
+    /// was read out or written.
     LeaseNotLive(String),
 }
 
@@ -323,32 +329,47 @@ impl fmt::Display for CycleStoreError {
 
 impl std::error::Error for CycleStoreError {}
 
-/// Read-only check that a [`LeaseToken`] is still the current, non-expired
-/// claim of its job; `Err` carries a rendered reason.
+/// Holds a job lease live for the duration of one cycle-store operation.
 ///
 /// The epoch fence protects against an *older* incarnation: once a reclaim
 /// has rebound the cycle to a newer epoch, every write of the superseded
 /// epoch is refused. It cannot see that the *same* incarnation's job lease
-/// expired while no reclaim has rebound the cycle yet — in that window the
-/// expired lease's epoch is still the record's epoch. The liveness check
-/// covers exactly that window: [`CycleStore`] consults it after the epoch
-/// fence in every fenced operation (inside the record lock for writes) and
-/// refuses with [`CycleStoreError::LeaseNotLive`]. Production wires it to
-/// `harw_session_store::JobStore::verify_lease` (nonce, epoch and expiry
-/// against the live job record; nothing is written or renewed). The check
-/// must not take the cycle store's own locks.
-pub type LeaseLivenessCheck = Arc<dyn Fn(&LeaseToken) -> Result<(), String> + Send + Sync>;
+/// expired, or was cancelled or reclaimed, while no reclaim has rebound the
+/// cycle yet — in that window the old epoch is still the record's epoch. A
+/// point-in-time check would not close it either: the job record could be
+/// replaced between the check and the cycle write. The guard therefore
+/// *holds* the lease: [`CycleStore`] calls [`LeaseLivenessGuard::hold`]
+/// before every fenced operation, runs the operation (its locked write or
+/// fenced read) while the returned hold lives, and drops the hold
+/// afterwards.
+///
+/// Lock order: the job lease (whatever `hold` takes) first, the cycle
+/// record lock second; released in reverse. An implementation must never
+/// take the cycle store's locks. Production
+/// (`harw-cli`'s intent-cycle worker) wraps
+/// `harw_session_store::JobStore::hold_live_lease`, which holds the job's
+/// per-record lock, so no claim, renewal, cancellation or reclaim of the job
+/// can commit in between; keep holds short — the job's own heartbeat waits
+/// for them.
+pub trait LeaseLivenessGuard: Send + Sync {
+    /// Verifies that `token` is the current, non-expired lease of its job
+    /// and keeps it from being replaced until the returned hold is dropped.
+    ///
+    /// # Errors
+    /// A rendered reason when the lease is not live or cannot be held.
+    fn hold(&self, token: &LeaseToken) -> Result<Box<dyn Any + Send>, String>;
+}
 
 /// Fenced persistence of [`CycleRecord`]s.
 pub struct CycleStore {
     records: RecordStore<CycleRecord>,
-    /// Consulted after the epoch fence by every fenced operation; `None`
-    /// keeps the epoch fence only.
-    liveness: Option<LeaseLivenessCheck>,
+    /// Holds the job lease around every fenced operation; `None` keeps the
+    /// epoch fence only.
+    liveness: Option<Arc<dyn LeaseLivenessGuard>>,
 }
 
 impl CycleStore {
-    /// A store with the epoch fence only (no [`LeaseLivenessCheck`]).
+    /// A store with the epoch fence only (no [`LeaseLivenessGuard`]).
     #[must_use]
     pub fn new(records: RecordStore<CycleRecord>) -> Self {
         Self {
@@ -358,32 +379,33 @@ impl CycleStore {
     }
 
     /// Additionally fences every lease-bound operation to the live job claim
-    /// (see [`LeaseLivenessCheck`]): `rebind`, `begin_step`, `commit_step`,
-    /// `commit_step_observed`, `clear_step` and `ack_observations` consult
-    /// `check` under the record lock before they write, and the fenced reads
-    /// `pending_observations` and `journaled_step` before any payload leaves
-    /// the store. Unfenced [`CycleStore::load`] and [`CycleStore::create`] do
+    /// (see [`LeaseLivenessGuard`]): `rebind`, `begin_step`, `commit_step`,
+    /// `commit_step_observed`, `clear_step`, `decide_observations` and
+    /// `ack_observations` hold the lease across their locked write, and the
+    /// fenced reads `pending_observations` and `journaled_step` across the
+    /// read. The hold is taken before the cycle record lock and released
+    /// after it. Unfenced [`CycleStore::load`] and [`CycleStore::create`] do
     /// not take a lease and are unaffected.
     #[must_use]
-    pub fn with_lease_liveness(mut self, check: LeaseLivenessCheck) -> Self {
-        self.liveness = Some(check);
+    pub fn with_lease_liveness(mut self, guard: Arc<dyn LeaseLivenessGuard>) -> Self {
+        self.liveness = Some(guard);
         self
     }
 
-    /// Consults the liveness check, if one is configured.
-    fn check_liveness(&self, token: &LeaseToken) -> Result<(), CycleStoreError> {
+    /// Holds the job lease for one fenced operation (`None` without a
+    /// guard). The caller keeps the result alive until its record lock is
+    /// released: job lease first, cycle record second.
+    fn hold_lease(
+        &self,
+        token: &LeaseToken,
+    ) -> Result<Option<Box<dyn Any + Send>>, CycleStoreError> {
         match &self.liveness {
-            Some(check) => check(token).map_err(CycleStoreError::LeaseNotLive),
-            None => Ok(()),
+            Some(guard) => guard
+                .hold(token)
+                .map(Some)
+                .map_err(CycleStoreError::LeaseNotLive),
+            None => Ok(None),
         }
-    }
-
-    /// The epoch fence, then the liveness check: the gate of every fenced
-    /// operation except [`CycleStore::rebind`] (which fences the candidate
-    /// itself and then consults the liveness check).
-    fn check_lease(&self, record: &CycleRecord, token: &LeaseToken) -> Result<(), CycleStoreError> {
-        check_fenced(record, token)?;
-        self.check_liveness(token)
     }
 
     /// Opens (creating if needed) the store at `<job_root>/`[`CYCLE_STORE_DIR`].
@@ -439,20 +461,20 @@ impl CycleStore {
     /// # Errors
     /// [`CycleStoreError`] if the record belongs to another job, the
     /// candidate is not fenced under `token`, [`check_rebind`] refuses, or
-    /// the liveness check refuses `token` ([`CycleStoreError::LeaseNotLive`]).
+    /// the lease cannot be held live ([`CycleStoreError::LeaseNotLive`]).
     pub fn rebind(
         &self,
         cycle_id: &str,
         token: &LeaseToken,
         resumed: &CycleCheckpoint,
     ) -> Result<CycleRecord, CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         self.records.update_locked(cycle_id, |record| {
             check_schema_and_job(record, token)?;
             if resumed.fence.epoch != token.epoch {
                 return Err(CycleStoreError::EpochMismatch);
             }
             check_rebind(&record.checkpoint, resumed).map_err(CycleStoreError::Fence)?;
-            self.check_liveness(token)?;
             record.checkpoint = resumed.clone();
             Ok(record.clone())
         })
@@ -470,8 +492,9 @@ impl CycleStore {
         token: &LeaseToken,
         admitted: &AdmittedCycle,
     ) -> Result<InFlightStep, CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         self.records.update_locked(cycle_id, |record| {
-            self.check_lease(record, token)?;
+            check_fenced(record, token)?;
             if record.in_flight.is_some() {
                 return Err(CycleStoreError::StepInFlight);
             }
@@ -508,8 +531,9 @@ impl CycleStore {
         cycle_id: &str,
         token: &LeaseToken,
     ) -> Result<JournaledStep, CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         let record = self.load(cycle_id)?;
-        self.check_lease(&record, token)?;
+        check_fenced(&record, token)?;
         let step = record.in_flight.ok_or(CycleStoreError::NoStepInFlight)?;
         if step.epoch != token.epoch || step.sequence != record.checkpoint.fence.sequence {
             return Err(CycleStoreError::StepMismatch);
@@ -556,8 +580,9 @@ impl CycleStore {
         next: &CycleCheckpoint,
         observations: &[RunObservationV1],
     ) -> Result<(), CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         self.records.update_locked(cycle_id, |record| {
-            self.check_lease(record, token)?;
+            check_fenced(record, token)?;
             let step = record
                 .in_flight
                 .as_ref()
@@ -574,6 +599,7 @@ impl CycleStore {
                     epoch: token.epoch,
                     sequence: next.fence.sequence,
                     payload: observation.clone(),
+                    state: DeliveryState::Pending,
                 };
                 match record
                     .outbox
@@ -585,7 +611,7 @@ impl CycleStore {
                         tracing::warn!(cycle_id, "intent cycle observation dropped: outbox full");
                     }
                     Err(OutboxError::StaleEpoch) => {
-                        // Unreachable after `check_lease`; counted like a
+                        // Unreachable after `check_fenced`; counted like a
                         // full outbox so the loss stays visible.
                         record.observations_dropped = record.observations_dropped.saturating_add(1);
                     }
@@ -602,10 +628,12 @@ impl CycleStore {
     /// the record is checked against `token` *before* any payload leaves the
     /// store, so a superseded epoch or another job's lease cannot copy the
     /// current owner's observations anywhere (e.g. into project memory)
-    /// before its acknowledgement would be refused. The read is a snapshot:
-    /// a consumer with external side effects acknowledges first
-    /// ([`CycleStore::ack_observations`] re-checks the lease under the record
-    /// lock) and only then acts on the payloads.
+    /// before its acknowledgement would be refused. Accepted entries
+    /// ([`DeliveryState::Accepted`]) are pending too: their delivery is
+    /// committed but not yet confirmed. The read is a snapshot: a consumer
+    /// with external side effects commits its decision first
+    /// ([`CycleStore::decide_observations`], which holds the lease across
+    /// its locked write) and only then acts on the payloads.
     ///
     /// # Errors
     /// The underlying store error; [`CycleStoreError::Fence`] with
@@ -613,14 +641,15 @@ impl CycleStore {
     /// [`CycleStoreError::WrongJob`] for another job's lease,
     /// [`CycleStoreError::NotRebound`] for a newer lease that has not rebound
     /// the cycle yet and [`CycleStoreError::LeaseNotLive`] for a lease the
-    /// liveness check refuses (expired before a reclaim rebound the cycle).
+    /// guard cannot hold (expired, cancelled or reclaimed before a rebind).
     pub fn pending_observations(
         &self,
         cycle_id: &str,
         token: &LeaseToken,
     ) -> Result<Vec<OutboxEntry<RunObservationV1>>, CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         let record = self.load(cycle_id)?;
-        self.check_lease(&record, token)?;
+        check_fenced(&record, token)?;
         Ok(record.outbox.pending().to_vec())
     }
 
@@ -629,10 +658,8 @@ impl CycleStore {
     /// already acknowledged keys count as 0, so redelivery after a crash is
     /// idempotent.
     ///
-    /// The fence and the liveness check run under the record lock of this
-    /// write, so a consumer that acknowledges *before* its external side
-    /// effect ties that effect to a lease that was live at the commit — there
-    /// is no window between a separate precheck and the write.
+    /// The lease is held across the locked write, so the acknowledgement is
+    /// committed under a lease that cannot be replaced in between.
     ///
     /// # Errors
     /// [`CycleStoreError`] for a foreign, stale, not yet rebound or no longer
@@ -643,8 +670,9 @@ impl CycleStore {
         token: &LeaseToken,
         keys: &[String],
     ) -> Result<usize, CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         self.records.update_locked(cycle_id, |record| {
-            self.check_lease(record, token)?;
+            check_fenced(record, token)?;
             let current = record.checkpoint.fence.epoch;
             let mut removed = 0;
             for key in keys {
@@ -653,6 +681,45 @@ impl CycleStore {
                 }
             }
             Ok(removed)
+        })
+    }
+
+    /// Records a consumer's delivery decision in one fenced write held under
+    /// the live lease (two-phase delivery, see [`DeliveryState`]): every key
+    /// in `accept` becomes [`DeliveryState::Accepted`] and stays pending
+    /// until it is acknowledged after its delivery is durable; every key in
+    /// `ack` is acknowledged (removed) directly. A key in both lists is
+    /// acknowledged. Returns `(accepted, acked)`: entries newly accepted and
+    /// entries removed; unknown, already accepted or already acknowledged
+    /// keys count as 0, so a replayed decision is idempotent.
+    ///
+    /// # Errors
+    /// [`CycleStoreError`] for a foreign, stale, not yet rebound or no longer
+    /// live lease; nothing is changed then.
+    pub fn decide_observations(
+        &self,
+        cycle_id: &str,
+        token: &LeaseToken,
+        accept: &[String],
+        ack: &[String],
+    ) -> Result<(usize, usize), CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
+        self.records.update_locked(cycle_id, |record| {
+            check_fenced(record, token)?;
+            let current = record.checkpoint.fence.epoch;
+            let mut accepted = 0;
+            for key in accept {
+                if matches!(record.outbox.accept(token.epoch, current, key), Ok(true)) {
+                    accepted += 1;
+                }
+            }
+            let mut acked = 0;
+            for key in ack {
+                if matches!(record.outbox.ack(token.epoch, current, key), Ok(true)) {
+                    acked += 1;
+                }
+            }
+            Ok((accepted, acked))
         })
     }
 
@@ -667,8 +734,9 @@ impl CycleStore {
         token: &LeaseToken,
         step: &InFlightStep,
     ) -> Result<(), CycleStoreError> {
+        let _lease = self.hold_lease(token)?;
         self.records.update_locked(cycle_id, |record| {
-            self.check_lease(record, token)?;
+            check_fenced(record, token)?;
             if record.in_flight.as_ref() != Some(step) {
                 return Err(CycleStoreError::StepMismatch);
             }
@@ -983,7 +1051,7 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
                 // lease so it can drain and acknowledge it: only the epoch
                 // moves; state, ceiling and authority stay as recorded, which
                 // `check_rebind` verifies (no reissue is needed, nothing is
-                // admitted under it). Fenced and liveness-checked like every
+                // admitted under it). Fenced and lease-held like every
                 // rebind; a refusal ends the run (fail closed).
                 let mut handover = record.checkpoint.clone();
                 handover.fence.epoch = token.epoch;
@@ -1437,7 +1505,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
@@ -2934,15 +3002,36 @@ mod tests {
         Ok(())
     }
 
-    /// A liveness check that refuses every token once `expired` is set.
-    fn flag_liveness(expired: &Arc<AtomicBool>) -> LeaseLivenessCheck {
-        let expired = Arc::clone(expired);
-        Arc::new(move |_token: &LeaseToken| {
-            if expired.load(Ordering::SeqCst) {
-                Err("lease expired at the job store".to_owned())
-            } else {
-                Ok(())
+    /// A lease guard that refuses every token once `expired` is set and
+    /// counts the holds that are still alive in `held`.
+    struct FlagGuard {
+        expired: Arc<AtomicBool>,
+        held: Arc<AtomicUsize>,
+    }
+
+    /// One hold of [`FlagGuard`]; dropping it releases it.
+    struct FlagHold(Arc<AtomicUsize>);
+
+    impl Drop for FlagHold {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl LeaseLivenessGuard for FlagGuard {
+        fn hold(&self, _token: &LeaseToken) -> Result<Box<dyn Any + Send>, String> {
+            if self.expired.load(Ordering::SeqCst) {
+                return Err("lease expired at the job store".to_owned());
             }
+            self.held.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FlagHold(Arc::clone(&self.held))))
+        }
+    }
+
+    fn flag_liveness(expired: &Arc<AtomicBool>, held: &Arc<AtomicUsize>) -> Arc<FlagGuard> {
+        Arc::new(FlagGuard {
+            expired: Arc::clone(expired),
+            held: Arc::clone(held),
         })
     }
 
@@ -3062,11 +3151,11 @@ mod tests {
         Ok(())
     }
 
-    /// The fixture's records behind a second store that consults `check`.
-    fn guarded_store(fx: &Fixture, check: LeaseLivenessCheck) -> TestResult<CycleStore> {
+    /// The fixture's records behind a second store that holds `guard`.
+    fn guarded_store(fx: &Fixture, guard: Arc<FlagGuard>) -> TestResult<CycleStore> {
         let records =
             RecordStore::create_ambient(&fx.cycles_dir).map_err(ctx("cycle store reopens"))?;
-        Ok(CycleStore::new(records).with_lease_liveness(check))
+        Ok(CycleStore::new(records).with_lease_liveness(guard))
     }
 
     fn is_not_live<T>(result: &Result<T, CycleStoreError>) -> bool {
@@ -3081,7 +3170,8 @@ mod tests {
         let keys = commit_observed(&fx, id, 2)?;
         let lease = token(&fx.work_id, 1);
         let expired = Arc::new(AtomicBool::new(false));
-        let guarded = guarded_store(&fx, flag_liveness(&expired))?;
+        let held = Arc::new(AtomicUsize::new(0));
+        let guarded = guarded_store(&fx, flag_liveness(&expired, &held))?;
         let record = fx.store.load(id).map_err(ctx("load"))?;
         assert_eq!(record.checkpoint.fence.epoch, lease.epoch);
         let admitted = AdmittedCycle::recovered(wait(), record.checkpoint.fence.sequence);
@@ -3111,6 +3201,11 @@ mod tests {
         guarded
             .journaled_step(id, &lease)
             .map_err(ctx("journaled step while live"))?;
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            0,
+            "every hold is released when its operation returns"
+        );
 
         // The job lease expires and no reclaim rebinds the cycle: epoch 1 is
         // still the record's epoch, so the epoch fence alone admits it.
@@ -3137,6 +3232,8 @@ mod tests {
         assert!(is_not_live(&journaled), "{journaled:?}");
         let acked = guarded.ack_observations(id, &lease, &keys);
         assert!(is_not_live(&acked), "{acked:?}");
+        let decided = guarded.decide_observations(id, &lease, &keys, &[]);
+        assert!(is_not_live(&decided), "{decided:?}");
         let committed = guarded.commit_step(id, &lease, &next);
         assert!(is_not_live(&committed), "{committed:?}");
         let observed = guarded.commit_step_observed(id, &lease, &next, &[observation]);
@@ -3212,12 +3309,91 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn decide_observations_accepts_and_acks_in_one_fenced_write() -> TestResult {
+        let id = "cycle-decide";
+        let fx = fixture(id)?;
+        let keys = commit_observed(&fx, id, 3)?;
+        let lease = token(&fx.work_id, 1);
+        let (first, second, third) = match keys.as_slice() {
+            [first, second, third] => (first.clone(), second.clone(), third.clone()),
+            _ => return Err(TestError::Missing("three observation keys")),
+        };
+        let state = |store: &CycleStore, key: &str| -> TestResult<Option<DeliveryState>> {
+            Ok(store
+                .load(id)
+                .map_err(ctx("load"))?
+                .outbox
+                .pending()
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.state))
+        };
+
+        assert!(matches!(
+            fx.store.decide_observations(
+                id,
+                &token(&fx.work_id, 0),
+                std::slice::from_ref(&first),
+                &[]
+            ),
+            Err(CycleStoreError::Fence(FenceRefusal::StaleEpoch))
+        ));
+        assert_eq!(state(&fx.store, &first)?, Some(DeliveryState::Pending));
+
+        let decided = fx
+            .store
+            .decide_observations(
+                id,
+                &lease,
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&second),
+            )
+            .map_err(ctx("decide"))?;
+        assert_eq!(decided, (1, 1));
+        // Durable: a store reopened over the same directory sees the decision.
+        let reopened = CycleStore::new(
+            RecordStore::create_ambient(&fx.cycles_dir).map_err(ctx("store reopens"))?,
+        );
+        assert_eq!(state(&reopened, &first)?, Some(DeliveryState::Accepted));
+        assert_eq!(state(&reopened, &second)?, None, "acknowledged directly");
+        assert_eq!(state(&reopened, &third)?, Some(DeliveryState::Pending));
+        let pending = reopened
+            .pending_observations(id, &lease)
+            .map_err(ctx("pending"))?;
+        assert_eq!(pending.len(), 2, "accepted entries stay pending");
+
+        // A replayed decision changes nothing; the accepted entry leaves only
+        // with its acknowledgement.
+        assert_eq!(
+            reopened
+                .decide_observations(
+                    id,
+                    &lease,
+                    std::slice::from_ref(&first),
+                    std::slice::from_ref(&second),
+                )
+                .map_err(ctx("replayed decision"))?,
+            (0, 0)
+        );
+        assert_eq!(
+            reopened
+                .ack_observations(id, &lease, std::slice::from_ref(&first))
+                .map_err(ctx("ack the delivered entry"))?,
+            1
+        );
+        assert_eq!(state(&reopened, &first)?, None);
+        assert_eq!(state(&reopened, &third)?, Some(DeliveryState::Pending));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn driver_fails_closed_when_the_job_lease_is_not_live() -> TestResult {
         let id = "cycle-dead-lease";
         let fx = fixture(id)?;
         let expired = Arc::new(AtomicBool::new(true));
-        let guarded = Arc::new(guarded_store(&fx, flag_liveness(&expired))?);
+        let held = Arc::new(AtomicUsize::new(0));
+        let guarded = Arc::new(guarded_store(&fx, flag_liveness(&expired, &held))?);
         let before = fx.store.load(id).map_err(ctx("load"))?;
         let proposer = Script::new(vec![Ok(CycleProposal::Complete {})]);
         let executor = Executor::new(vec![]);
