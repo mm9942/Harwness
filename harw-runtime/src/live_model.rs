@@ -467,7 +467,7 @@ fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_config::{HarnessConfig, OriginAllowlistToml, ProviderToml, SecretRef};
     use harw_core::{ModelError, ModelFuture, ModelRequest};
     use harw_extension_api::types::LoadedInstructions;
@@ -590,7 +590,9 @@ mod tests {
         let before = routing.main_model_provider(&base);
         assert!(Arc::ptr_eq(&before, &base), "ohne Wahl kein Wrapper");
 
-        routing.set_live_main(Some("openai".to_owned()), Some("gpt-5".to_owned()));
+        routing
+            .set_live_main(Some("openai".to_owned()), Some("gpt-5".to_owned()))
+            .map_err(ctx("set live main"))?;
         let after = routing.main_model_provider(&base);
         let _ = ask(after.as_ref())?;
         assert_eq!(
@@ -599,7 +601,9 @@ mod tests {
         );
         assert_eq!(after.pinned_model_id().as_deref(), Some("gpt-5"));
 
-        routing.set_live_main(Some("anthropic".to_owned()), Some("claude-x".to_owned()));
+        routing
+            .set_live_main(Some("anthropic".to_owned()), Some("claude-x".to_owned()))
+            .map_err(ctx("set live main"))?;
         let _ = ask(after.as_ref())?;
         assert_eq!(
             last(&recorder),
@@ -607,14 +611,16 @@ mod tests {
             "ein laufendes Kind behält sein Modell"
         );
 
-        routing.set_live_main(None, None);
+        routing
+            .set_live_main(None, None)
+            .map_err(ctx("set live main"))?;
         assert!(routing.live_main().is_none());
         Ok(())
     }
 
     /// Eine Live-Wahl ohne Provider übernimmt den Provider aus dem Katalog.
     #[test]
-    fn live_main_without_provider_uses_the_catalog_provider() {
+    fn live_main_without_provider_uses_the_catalog_provider() -> TestResult {
         let mut config = ResolvedConfig::default();
         config.models.insert(
             "gpt-5".to_owned(),
@@ -635,11 +641,14 @@ mod tests {
             },
         );
         let routing = LiveModelRouting::new(Arc::new(config));
-        routing.set_live_main(None, Some("gpt-5".to_owned()));
+        routing
+            .set_live_main(None, Some("gpt-5".to_owned()))
+            .map_err(ctx("set live main"))?;
         assert_eq!(
             routing.live_main(),
             Some((Some("openai".to_owned()), "gpt-5".to_owned()))
         );
+        Ok(())
     }
 
     /// `/models set orchestrator …` wirkt für neue Kinder sofort; eine Stelle
