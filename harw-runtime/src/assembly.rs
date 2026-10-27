@@ -5372,7 +5372,9 @@ fn build_spawner(
         std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
     > = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
-    // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
+    // Fabriken (Agent-Id = laufgebundene Id `<rolle>.<uuid>` je Kind, von der
+    // Fabrik in `build_registry` gemintet — PL-90 W03d; die Id "child" hier
+    // ist nur der Vorgabewert ohne Zuordnung; Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
     let child_diary = knowledge.as_ref().map(|(store, _)| {
         Arc::new(

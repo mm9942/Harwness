@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_catalog::{
@@ -302,9 +302,11 @@ pub fn resolve_internal_models_for_children(
 ///
 /// # Nebenläufigkeit
 /// `Send + Sync`: alle Felder sind nach der Konstruktion unveränderlich; die
-/// einzige Zustandsänderung pro Aufruf ist die frische
+/// Zustandsänderungen pro Aufruf sind die frische
 /// [`ApprovalModeCell`](harw_extension_api::approval_mode::ApprovalModeCell)
-/// in [`ApprovalChain::for_child`], die das Kind allein besitzt.
+/// in [`ApprovalChain::for_child`], die das Kind allein besitzt, und die
+/// vorgemerkte Lauf-Identität zwischen `build_registry` und
+/// `child_session_observers` (siehe [`Self::child_caller_identity`]).
 pub struct RuntimeChildRegistryFactory {
     /// Der **einmal** ermittelte Projektkontext des Elternteils.
     project: ProjectContext,
@@ -403,7 +405,8 @@ pub struct RuntimeChildRegistryFactory {
     /// Kind `workbench.show`/`diary.read`/`palace.*`/`kanban.*`.
     knowledge: Option<ChildKnowledgeWiring>,
     /// Runde 5, Teil C: automatische Diary-Einträge der Kinder (Verdichtung,
-    /// Sitzungsende; Agent-Id = Rollenname). `None`, solange
+    /// Sitzungsende; Agent-Id = laufgebundene Id des Kindes, siehe
+    /// [`Self::child_caller_identity`]). `None`, solange
     /// [`Self::with_child_diary`] nicht aufgerufen wurde — dann schreibt kein
     /// Kind ins Tagebuch.
     diary: Option<Arc<crate::diary_wiring::DiaryRecorder>>,
@@ -422,6 +425,14 @@ pub struct RuntimeChildRegistryFactory {
     /// Instruktionen. Leer, solange [`Self::with_custom_agents`] nicht
     /// aufgerufen wurde.
     custom_agents: HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+    /// PL-90 W03d: die in [`ChildRegistryFactory::build_registry`] gerade
+    /// gemintete Lauf-Identität je Rolle, bis
+    /// [`ChildRegistryFactory::child_session_observers`] sie derselben
+    /// Admission zuordnet. Der `ChildController` hält zwischen beiden Aufrufen
+    /// den Sitzungs-Lock, die Aufrufe verschränken sich also nie; ein
+    /// gescheiterter Admission-Rest wird von der nächsten Montage derselben
+    /// Rolle überschrieben. Nie ein Schlüssel aus Modell-JSON.
+    pending_run_identities: Mutex<HashMap<String, Arc<CallerIdentity>>>,
 }
 
 /// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
@@ -540,6 +551,7 @@ impl RuntimeChildRegistryFactory {
             uia_worker_routing: None,
             live_models: None,
             custom_agents: HashMap::new(),
+            pending_run_identities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -586,37 +598,84 @@ impl RuntimeChildRegistryFactory {
             .map_or(role, |wiring| wiring.base_role.as_str())
     }
 
-    /// Die vertrauenswürdige Aufruferidentität eines Kindes dieser Rolle
-    /// (PL-90 W03d: Lauf-Isolation der Wissensflächen).
+    /// Mintet die vertrauenswürdige, **laufgebundene** Aufruferidentität
+    /// eines neuen Kindes dieser Rolle (PL-90 W03d: Lauf-Isolation der
+    /// Wissensflächen).
     ///
     /// # Beschreibung
     /// Die Identität entsteht ausschließlich hier, aus dem registrierten
-    /// Rollennamen — nie aus Modell-JSON oder `SpawnInput.context`:
-    /// - `agent_id` ist `role`, also derselbe Autor, unter dem der
-    ///   Diary-Recorder und `DiaryToolProvider` das Kind führen;
-    /// - `role` ist die Basisrolle (`lookup_role`); für einen
+    /// Rollennamen und einem frischen Token — nie aus Modell-JSON oder
+    /// `SpawnInput.context`:
+    /// - `agent_id` ist [`mint_run_agent_id`]`(role)`, also `<rolle>.<uuid>`
+    ///   (UUID v4 aus `harw-types`, als Pfadkomponente sicher). Jedes Kind
+    ///   bekommt eine eigene Id; zwei gleichzeitige Geschwister **derselben**
+    ///   Rolle vergleichen sich in `is_visible` also nie als Autor und sehen
+    ///   einander `SelfOnly`-Einträge nicht. Dieselbe Id tragen Diary-Autor
+    ///   (`diary.read`, Recorder) und die `OpContext`-Dienste der Operations-
+    ///   Werkzeuge des Kindes; `build_registry` mintet sie genau einmal je Kind
+    ///   und hält sie für dessen ganzen Lauf;
+    /// - `role` ist die Basisrolle ([`Self::lookup_role`]); für einen
     ///   benutzerdefinierten Agenten ist das seine eingebaute Rolle, nicht
     ///   sein eigener Name — wie bei allen namensgebundenen Tabellen
     ///   (Plan R9, Teil B) gilt eine Rollenfreigabe also auch für Agenten
-    ///   auf dieser Basis;
+    ///   auf dieser Basis (und für alle Geschwister dieser Rolle);
     /// - `ancestors` bleibt **leer**: `SpawnInput` trägt nur die
-    ///   `parent_session_id`, keine Elternrolle, und die Rolle des Elternteils
-    ///   ist hier nicht vertrauenswürdig herleitbar. Das ist fail-closed (ein
-    ///   Kind sieht den `DescendantTree` seines Elternteils nicht), öffnet
-    ///   aber nichts: Geschwister sehen einander über `SelfOnly` und
-    ///   `DescendantTree` nie, weil der Autor eines Geschwisters weder der
-    ///   Aufrufer ist noch in dessen Vorfahren steht.
+    ///   `parent_session_id`, keine Elternrolle oder -Id, und die Id des
+    ///   Elternteils ist hier nicht vertrauenswürdig herleitbar. Das ist
+    ///   fail-closed (ein Kind sieht den `DescendantTree` seines Elternteils
+    ///   nicht), öffnet aber nichts: Geschwister sehen einander über
+    ///   `SelfOnly` und `DescendantTree` nie, weil der Autor eines
+    ///   Geschwisters weder der Aufrufer ist noch in dessen Vorfahren steht.
     ///
-    /// Jeder Aufruf liefert eine **neue** Instanz; die Fabrik hält keinen
-    /// Zustand zwischen Kindern, damit Geschwister nie dieselbe Identität
-    /// teilen.
+    /// Jeder Aufruf liefert eine **neue** Instanz mit **neuer** Id; die
+    /// Fabrik cacht nichts je Rolle. Öffentlich, damit Tests die Identität
+    /// einer Montage prüfen können; ein Aufruf außerhalb von `build_registry`
+    /// bindet nichts.
     #[must_use]
     pub fn child_caller_identity(&self, role: &str) -> Arc<CallerIdentity> {
-        Arc::new(
-            CallerIdentity::new(harw_knowledge::AgentId::new(role.to_owned())).with_role(
-                harw_knowledge::AgentRoleRef::new(self.lookup_role(role).to_owned()),
-            ),
-        )
+        Arc::new(CallerIdentity::new(mint_run_agent_id(role)).with_role(
+            harw_knowledge::AgentRoleRef::new(self.lookup_role(role).to_owned()),
+        ))
+    }
+
+    /// Merkt die Identität des soeben gebauten Kindes vor, bis
+    /// [`ChildRegistryFactory::child_session_observers`] sie seiner Sitzung
+    /// zuordnet (gleiches Muster wie `host_escalation_wiring::note_spawn`).
+    fn note_run_identity(&self, role: &str, identity: Arc<CallerIdentity>) {
+        let mut pending = self
+            .pending_run_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.insert(role.to_owned(), identity);
+    }
+
+    /// Entnimmt die vorgemerkte Identität von `role`; `None`, wenn für diese
+    /// Montage keine vorgemerkt wurde.
+    fn take_run_identity(&self, role: &str) -> Option<Arc<CallerIdentity>> {
+        let mut pending = self
+            .pending_run_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.remove(role)
+    }
+
+    /// Die Identität, die der letzte `build_registry`-Aufruf für `role`
+    /// montiert hat und die noch keiner Sitzung zugeordnet wurde.
+    ///
+    /// # Beschreibung
+    /// Dieselbe `Arc`-Instanz, die in den `OpContext`-Diensten dieses Kindes
+    /// steckt; ihre `agent_id` ist zugleich die des Diary-Providers und des
+    /// Diary-Recorders. Nur zwischen `build_registry` und
+    /// `child_session_observers` derselben Admission aussagekräftig (danach
+    /// entnimmt der Observer-Haken sie) und für Tests gedacht: die
+    /// `ExtensionRegistry` selbst hält keine Dienste.
+    #[must_use]
+    pub fn pending_run_identity(&self, role: &str) -> Option<Arc<CallerIdentity>> {
+        let pending = self
+            .pending_run_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.get(role).cloned()
     }
 
     /// Das Registry-Profil von `role`: für einen benutzerdefinierten Agenten
@@ -1059,7 +1118,8 @@ impl RuntimeChildRegistryFactory {
     /// (`ReadWorkspace`) das Profil der Rolle trägt — nie pauschal. Die
     /// Werkzeuge sind rein lesend: `workbench.show` auf das Projekt des
     /// Elternteils gedeckelt, `diary.read` auf die Einträge des Kindes
-    /// (Agent-Id = Rollenname), `palace.*` auf `established`-Knoten,
+    /// (laufgebundene Agent-Id, nie der bloße Rollenname), `palace.*` auf
+    /// `established`-Knoten,
     /// `kanban.*` (nur Root-Orchestrator, jeder Aufruf fragt) ohne Übergang.
     ///
     /// # Arguments
@@ -1094,8 +1154,9 @@ impl RuntimeChildRegistryFactory {
     /// Kinder (Runde 5, Teil C).
     ///
     /// # Beschreibung
-    /// Jedes über diese Fabrik admittierte Kind wird mit seinem Rollennamen
-    /// als Agent-Id beim Recorder angemeldet
+    /// Jedes über diese Fabrik admittierte Kind wird mit seiner laufgebundenen
+    /// Agent-Id (`<rolle>.<uuid>`, PL-90 W03d: dieselbe Id wie in
+    /// `diary.read` und `CallerIdentity`) beim Recorder angemeldet
     /// ([`crate::diary_wiring::DiaryRecorder::session_started`]); Verdichtung
     /// und Runden zählt der Recorder über die Beobachter, die
     /// [`ChildRegistryFactory::child_session_observers`] an die Kind-Sitzung
@@ -1121,6 +1182,9 @@ impl RuntimeChildRegistryFactory {
     /// Hängt die lesenden Wissens-Provider an die Kind-Registry von `role`
     /// (siehe [`Self::with_knowledge`]).
     ///
+    /// `agent` ist die laufgebundene Agent-Id des Kindes
+    /// ([`Self::child_caller_identity`]): unter ihr liest `diary.read`.
+    ///
     /// # Rückgabe
     /// Der Builder, ergänzt um jeden zugelassenen Provider; unverändert ohne
     /// Wissensspeicher, für eine Rolle ohne Wissenszugang, ohne eingebaute
@@ -1128,6 +1192,7 @@ impl RuntimeChildRegistryFactory {
     fn with_knowledge_readers(
         &self,
         role: &str,
+        agent: &harw_knowledge::AgentId,
         profile: harw_registry_defaults::RegistryProfile,
         mut builder: harw_extension_api::ExtensionRegistryBuilder,
     ) -> harw_extension_api::ExtensionRegistryBuilder {
@@ -1172,11 +1237,9 @@ impl RuntimeChildRegistryFactory {
             harw_registry_defaults::DiaryToolProvider::TOOL_NAMES,
             harw_registry_defaults::DiaryToolProvider::TOOL_PERMISSIONS,
         ) {
-            builder =
-                builder.tool_provider(Arc::new(harw_registry_defaults::DiaryToolProvider::new(
-                    Arc::clone(store),
-                    harw_knowledge::AgentId::new(role.to_owned()),
-                )));
+            builder = builder.tool_provider(Arc::new(
+                harw_registry_defaults::DiaryToolProvider::new(Arc::clone(store), agent.clone()),
+            ));
         }
         if admits(
             harw_registry_defaults::PalaceToolProvider::TOOL_NAMES,
@@ -1609,6 +1672,34 @@ impl RuntimeChildRegistryFactory {
     }
 }
 
+/// Mintet die laufgebundene Agent-Id eines Kindes: `<rolle>.<uuid>`
+/// (PL-90 W03d).
+///
+/// # Description
+/// Der Suffix ist eine frische UUID v4 aus den `harw-types`-Ids (keine neue
+/// Abhängigkeit), je Aufruf neu. Pfadtrenner, `:` und Steuerzeichen im
+/// Rollennamen werden durch `-` ersetzt; die Id ist damit eine einzelne
+/// Pfadkomponente (`diary/<agent-id>/…`,
+/// [`harw_knowledge::diary::validate_agent_id`]). Zwei Kinder derselben Rolle
+/// bekommen nie dieselbe Id.
+///
+/// # Arguments
+/// - `role`: der registrierte Rollenname des Kindes.
+fn mint_run_agent_id(role: &str) -> harw_knowledge::AgentId {
+    let component: String = role
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let run = harw_types::SessionId::new();
+    harw_knowledge::AgentId::new(format!("{component}.{}", run.as_str()))
+}
+
 /// Die Dienste des `OpContext` eines Matrix-Werkzeugs des Game Masters.
 ///
 /// # Description
@@ -1675,9 +1766,10 @@ fn delegate_wave_services(
 }
 
 impl ChildRegistryFactory for RuntimeChildRegistryFactory {
-    /// Runde 5, Teil C: meldet das Kind mit seinem Rollennamen beim
-    /// Diary-Recorder an und liefert dessen Verdichtungs- und
-    /// Runden-Beobachter; ohne Recorder keine Beobachter.
+    /// Runde 5, Teil C: meldet das Kind mit seiner laufgebundenen Agent-Id
+    /// (`<rolle>.<uuid>`, aus `build_registry`) beim Diary-Recorder an und
+    /// liefert dessen Verdichtungs- und Runden-Beobachter; ohne Recorder keine
+    /// Beobachter.
     fn child_session_observers(
         &self,
         role: &str,
@@ -1685,10 +1777,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     ) -> harw_core::ChildSessionObservers {
         // Runde 5, Teil N: Kind-ID und Baum-Pfad für Host-Mode-Anfragen.
         crate::host_escalation_wiring::bind_child(self.host_permit_wiring.as_ref(), role, child);
+        // PL-90 W03d: die in `build_registry` gemintete Lauf-Id dieses Kindes
+        // (immer entnehmen, auch ohne Recorder, damit nichts hängen bleibt).
+        // Ohne vorgemerkte Identität (z. B. die Steward-Sonderregistry, die
+        // `build_registry` nicht durchläuft) wird hier eine frische Id
+        // gemintet — nie der bloße Rollenname, den sich Geschwister teilen
+        // würden.
+        let agent = self.take_run_identity(role).map_or_else(
+            || mint_run_agent_id(role),
+            |identity| identity.agent_id.clone(),
+        );
         let Some(recorder) = &self.diary else {
             return harw_core::ChildSessionObservers::default();
         };
-        recorder.session_started(child, Some(harw_knowledge::AgentId::new(role.to_owned())));
+        recorder.session_started(child, Some(agent));
         harw_core::ChildSessionObservers {
             compaction: Some(recorder.compaction_observer(None)),
             tool_outcome: Some(recorder.tool_outcome_observer(None)),
@@ -1742,10 +1844,13 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// Die Operations-Werkzeuge des Kindes (`delegate_wave`, Matrix-Werkzeuge)
     /// bauen ihren `OpContext` aus einer `ServiceMap`, die eine für dieses
     /// Kind neu erzeugte `Arc<CallerIdentity>` trägt
-    /// ([`Self::child_caller_identity`]); kein Geschwister teilt sie. Die
-    /// Wissens-Lesewerkzeuge der Kinder (`diary.read`, `palace.*`, …) laufen
-    /// nicht über einen `OpContext` und lesen diese Identität nicht; ihre
-    /// Sicht bleibt die ihres jeweiligen Providers (`with_knowledge_readers`).
+    /// ([`Self::child_caller_identity`]); kein Geschwister teilt sie, und ihre
+    /// `agent_id` (`<rolle>.<uuid>`) ist je Kind verschieden, auch bei gleicher
+    /// Rolle. Dieselbe Id ist der Autor von `diary.read` und des
+    /// Diary-Recorders. Die übrigen Wissens-Lesewerkzeuge der Kinder
+    /// (`palace.*`, …) laufen nicht über einen `OpContext` und lesen die
+    /// Identität nicht; ihre Sicht bleibt die ihres jeweiligen Providers
+    /// (`with_knowledge_readers`).
     fn build_registry(
         &self,
         role: &str,
@@ -1769,11 +1874,14 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             })?;
         // PL-90 W03d: die `ExtensionRegistry` kennt keine Dienste — sie halten
         // allein die `OpContext`-Fabriken der Operations-Werkzeuge eines
-        // Kindes (`delegate_wave`, Matrix-Werkzeuge). Die Identität entsteht
-        // hier genau einmal je Kind (nie aus `input`/Modell-JSON, nie
-        // zwischen Geschwistern geteilt) und wandert in die `ServiceMap` jeder
-        // dieser Fabriken. Eine Elternrolle ist aus `SpawnInput` nicht
-        // herleitbar; siehe [`Self::child_caller_identity`].
+        // Kindes (`delegate_wave`, Matrix-Werkzeuge). Die laufgebundene
+        // Identität (`<rolle>.<uuid>`) entsteht hier genau einmal je Kind
+        // (nie aus `input`/Modell-JSON, nie zwischen Geschwistern geteilt),
+        // bleibt für dessen ganzen Lauf gleich und wandert in die
+        // `ServiceMap` jeder dieser Fabriken, in den Diary-Provider
+        // (`with_knowledge_readers`) und — über `note_run_identity` — in den
+        // Diary-Recorder (`child_session_observers`). Eine Elternrolle ist aus
+        // `SpawnInput` nicht herleitbar; siehe [`Self::child_caller_identity`].
         let identity = self.child_caller_identity(role);
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
@@ -1958,7 +2066,8 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         }
         // Plan Teil D: lesende Wissenswerkzeuge nur für zugelassene Rollen,
         // deren Definition sie admittiert (siehe `with_knowledge_readers`).
-        registry_builder = self.with_knowledge_readers(role, profile, registry_builder);
+        registry_builder =
+            self.with_knowledge_readers(role, &identity.agent_id, profile, registry_builder);
         // Runde 5, Teil B: `host.sudo_exec` nur für die Host-Shell-Worker, nur
         // mit sudo-Fragekanal (TUI) und nur, wenn die Definition der Rolle es
         // admittiert (siehe `with_sudo_exec`).
@@ -1977,6 +2086,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             project_root = %self.project.project_root.display(),
             "runtime.child_registry.assembled"
         );
+        // Erst nach erfolgreicher Montage vormerken: ein gescheiterter Bau
+        // hinterlässt keine Identität für `child_session_observers`.
+        self.note_run_identity(role, identity);
         Ok(registry)
     }
 
@@ -4191,13 +4303,15 @@ mod tests {
     }
 
     /// PL-90 W03d: die Operations-Werkzeuge einer Kind-Registry tragen die
-    /// Identität ihrer Rolle.
+    /// laufgebundene Identität ihrer Rolle.
     ///
     /// Die `ExtensionRegistry` selbst hält keine Dienste; sie liegen in den
     /// `OpContext`-Fabriken der Operations-Werkzeuge (`delegate_wave`,
-    /// Matrix-Werkzeuge). Geprüft wird deshalb (1) die Identität je Rolle,
-    /// (2) dass beide Dienst-Zusammenstellungen genau diese Instanz tragen und
-    /// (3) dass die Registries dieser Rollen mit ihren Werkzeugen montieren.
+    /// Matrix-Werkzeuge). Geprüft wird deshalb (1) die Identität je Rolle
+    /// (`<rolle>.<uuid>`, je Aufruf neu), (2) dass beide Dienst-
+    /// Zusammenstellungen genau diese Instanz tragen und (3) dass die
+    /// Registries dieser Rollen mit ihren Werkzeugen und je einer eigenen
+    /// vorgemerkten Identität montieren.
     #[test]
     fn child_registry_carries_caller_identity_of_its_role() -> TestResult {
         let factory = RuntimeChildRegistryFactory::new(
@@ -4207,7 +4321,8 @@ mod tests {
         )
         .map_err(ctx("factory builds"))?;
 
-        // (1) Autor ist der Rollenname, die Rolle die Basisrolle (hier gleich),
+        // (1) Autor ist die laufgebundene Id `<rolle>.<uuid>` (je Aufruf neu,
+        // als Pfadkomponente sicher), die Rolle die Basisrolle (hier gleich),
         // Vorfahren sind nicht herleitbar, ein Kind ist nie Operator.
         for role in [
             role_names::ROOT_ORCHESTRATOR,
@@ -4215,11 +4330,26 @@ mod tests {
             role_names::EXPLORER,
         ] {
             let identity = factory.child_caller_identity(role);
-            assert_eq!(
-                identity.agent_id,
-                harw_knowledge::AgentId::new(role),
-                "{role}"
+            assert!(
+                identity.agent_id.as_str().starts_with(&format!("{role}.")),
+                "{role}: Id {} trägt den Rollennamen als Präfix",
+                identity.agent_id
             );
+            assert_ne!(
+                identity.agent_id.as_str(),
+                role,
+                "{role}: nie der bloße Rollenname, den sich Geschwister teilen"
+            );
+            assert!(
+                harw_knowledge::diary::validate_agent_id(&identity.agent_id).is_ok(),
+                "{role}: die Id ist eine sichere Pfadkomponente"
+            );
+            let twin = factory.child_caller_identity(role);
+            assert_ne!(
+                identity.agent_id, twin.agent_id,
+                "{role}: jedes Kind bekommt eine eigene Id"
+            );
+            assert!(!Arc::ptr_eq(&identity, &twin), "{role}");
             assert_eq!(
                 identity.role,
                 Some(harw_knowledge::AgentRoleRef::new(role)),
@@ -4257,7 +4387,10 @@ mod tests {
             "die Matrix-Werkzeuge müssen dieselbe Identitätsinstanz tragen"
         );
 
-        // (3) Die Registries mit Operations-Werkzeugen montieren.
+        // (3) Die Registries mit Operations-Werkzeugen montieren, jede mit
+        // ihrer eigenen laufgebundenen Identität (für den Observer-Haken
+        // vorgemerkt). Eine zweite Montage derselben Rolle bekommt eine
+        // andere Id.
         let registry = factory
             .build_registry(role_names::ROOT_ORCHESTRATOR, &test_spawn_input(), None)
             .map_err(|error| TestError::Unexpected(error.message))?;
@@ -4267,6 +4400,37 @@ mod tests {
                 .any(|name| name == harw_core_bridge::DELEGATE_WAVE_TOOL),
             "der Orchestrator trägt delegate_wave"
         );
+        let first = factory
+            .pending_run_identity(role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing(
+                "vorgemerkte Identität nach build_registry",
+            ))?;
+        assert!(
+            first
+                .agent_id
+                .as_str()
+                .starts_with(&format!("{}.", role_names::ROOT_ORCHESTRATOR))
+        );
+        assert_eq!(
+            first.role,
+            Some(harw_knowledge::AgentRoleRef::new(
+                role_names::ROOT_ORCHESTRATOR
+            ))
+        );
+        let _second_registry = factory
+            .build_registry(role_names::ROOT_ORCHESTRATOR, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let second = factory
+            .pending_run_identity(role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing(
+                "vorgemerkte Identität der zweiten Montage",
+            ))?;
+        assert_ne!(
+            first.agent_id, second.agent_id,
+            "zwei Montagen derselben Rolle teilen keine Agent-Id"
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+
         let registry = factory
             .build_registry(role_names::MATRIX_GAME_MASTER, &test_spawn_input(), None)
             .map_err(|error| TestError::Unexpected(error.message))?;
@@ -4280,9 +4444,9 @@ mod tests {
         Ok(())
     }
 
-    /// PL-90 W03d: ein benutzerdefinierter Agent tritt unter seinem eigenen
-    /// Namen auf, mit der Basisrolle als Rolle (wie alle namensgebundenen
-    /// Tabellen, Plan R9, Teil B).
+    /// PL-90 W03d: ein benutzerdefinierter Agent tritt mit einer Id auf, die
+    /// seinen eigenen Namen als Präfix trägt, und mit der Basisrolle als Rolle
+    /// (wie alle namensgebundenen Tabellen, Plan R9, Teil B).
     #[test]
     fn child_caller_identity_of_a_custom_agent_uses_its_base_role() -> TestResult {
         let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -4316,7 +4480,11 @@ specialization = "web-scout"
         .with_custom_agents(roster.custom_wiring());
 
         let identity = factory.child_caller_identity("web-scout");
-        assert_eq!(identity.agent_id, harw_knowledge::AgentId::new("web-scout"));
+        assert!(
+            identity.agent_id.as_str().starts_with("web-scout."),
+            "{}",
+            identity.agent_id
+        );
         assert_eq!(
             identity.role,
             Some(harw_knowledge::AgentRoleRef::new(role_names::EXPLORER))
@@ -4404,9 +4572,11 @@ specialization = "web-scout"
         let Some(profile) = profile_for_role(role) else {
             return Vec::new();
         };
+        let agent = factory.child_caller_identity(role).agent_id.clone();
         let registry = factory
             .with_knowledge_readers(
                 role,
+                &agent,
                 profile,
                 harw_extension_api::ExtensionRegistryBuilder::default(),
             )
@@ -4501,12 +4671,15 @@ specialization = "web-scout"
         .unwrap_or_default())
     }
 
-    /// Ein Kind mit Runde und Verdichtung schreibt unter seinem Rollennamen
-    /// einen `compaction`- und genau einen `end-of-session`-Eintrag, auch
-    /// bei doppelter Freigabe; ein Kind ohne Runde schreibt nichts; ohne
-    /// Recorder liefert die Fabrik keine Beobachter.
+    /// Ein Kind mit Runde und Verdichtung schreibt unter seiner
+    /// laufgebundenen Agent-Id (`<rolle>.<uuid>`, in `build_registry`
+    /// gemintet) einen `compaction`- und genau einen `end-of-session`-Eintrag,
+    /// auch bei doppelter Freigabe; unter dem bloßen Rollennamen entsteht
+    /// nichts, ein Geschwister derselben Rolle schreibt in sein eigenes
+    /// Tagebuch; ein Kind ohne Runde schreibt nichts; ohne Recorder liefert die
+    /// Fabrik keine Beobachter.
     #[test]
-    fn child_diary_records_compaction_and_one_session_end_under_the_role_name() -> TestResult {
+    fn child_diary_records_compaction_and_one_session_end_under_the_run_bound_id() -> TestResult {
         let root = tempfile::tempdir().map_err(ctx("temporary knowledge root"))?;
         let store = Arc::new(harw_knowledge::KnowledgeStore::new(root.path()));
         let at = 1_758_715_200;
@@ -4531,16 +4704,28 @@ specialization = "web-scout"
         assert!(observers.compaction.is_none() && observers.tool_outcome.is_none());
 
         let factory = without.with_child_diary(Some(Arc::clone(&recorder)));
+        // Wie die Admission: erst die Registry bauen (mintet und merkt die
+        // Lauf-Id vor), dann die Sitzung anmelden.
+        let _registry = factory
+            .build_registry(role_names::EXPLORER, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let run_id = factory
+            .pending_run_identity(role_names::EXPLORER)
+            .ok_or(TestError::Missing("vorgemerkte Identität"))?
+            .agent_id
+            .clone();
         let busy = harw_types::SessionId::from_str("child-busy");
         let observers = factory.child_session_observers(role_names::EXPLORER, &busy);
+        assert!(
+            factory.pending_run_identity(role_names::EXPLORER).is_none(),
+            "der Observer-Haken entnimmt die vorgemerkte Identität"
+        );
         let turns = observers
             .tool_outcome
-            .ok_or(crate::test_support::TestError::Missing("turn observer"))?;
+            .ok_or(TestError::Missing("turn observer"))?;
         let compaction = observers
             .compaction
-            .ok_or(crate::test_support::TestError::Missing(
-                "compaction observer",
-            ))?;
+            .ok_or(TestError::Missing("compaction observer"))?;
         turns.on_turn_finished(&busy);
         compaction.on_compacted(
             &busy,
@@ -4555,7 +4740,7 @@ specialization = "web-scout"
         factory.child_session_released(role_names::EXPLORER, &busy);
         factory.child_session_released(role_names::EXPLORER, &busy);
 
-        let written = diary_entries(&store, role_names::EXPLORER, at)?;
+        let written = diary_entries(&store, run_id.as_str(), at)?;
         let triggers: Vec<_> = written.iter().map(|entry| entry.trigger).collect();
         assert_eq!(
             triggers,
@@ -4566,12 +4751,45 @@ specialization = "web-scout"
             "{written:?}"
         );
         assert!(written[1].text.contains("1 Turns"), "{}", written[1].text);
+        assert!(
+            diary_entries(&store, role_names::EXPLORER, at)?.is_empty(),
+            "unter dem bloßen Rollennamen entsteht kein Tagebuch"
+        );
         assert!(diary_entries(&store, "root", at)?.is_empty());
 
+        // Ein Geschwister derselben Rolle: eigene Id, eigenes Tagebuch; das
+        // des ersten Kindes bleibt unverändert.
+        let _sibling_registry = factory
+            .build_registry(role_names::EXPLORER, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let sibling_id = factory
+            .pending_run_identity(role_names::EXPLORER)
+            .ok_or(TestError::Missing("vorgemerkte Identität des Geschwisters"))?
+            .agent_id
+            .clone();
+        assert_ne!(sibling_id, run_id, "Geschwister teilen keine Agent-Id");
+        let sibling = harw_types::SessionId::from_str("child-sibling");
+        let sibling_turns = factory
+            .child_session_observers(role_names::EXPLORER, &sibling)
+            .tool_outcome
+            .ok_or(TestError::Missing("turn observer des Geschwisters"))?;
+        sibling_turns.on_turn_finished(&sibling);
+        factory.child_session_released(role_names::EXPLORER, &sibling);
+        assert_eq!(diary_entries(&store, sibling_id.as_str(), at)?.len(), 1);
+        assert_eq!(diary_entries(&store, run_id.as_str(), at)?.len(), 2);
+
         // Ein Kind ohne beendete Runde hinterlässt keinen Eintrag.
+        let _planner_registry = factory
+            .build_registry(role_names::PLANNER, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let planner_id = factory
+            .pending_run_identity(role_names::PLANNER)
+            .ok_or(TestError::Missing("vorgemerkte Identität des Planners"))?
+            .agent_id
+            .clone();
         let _ = factory.child_session_observers(role_names::PLANNER, &idle);
         factory.child_session_released(role_names::PLANNER, &idle);
-        assert!(diary_entries(&store, role_names::PLANNER, at)?.is_empty());
+        assert!(diary_entries(&store, planner_id.as_str(), at)?.is_empty());
         Ok(())
     }
 
