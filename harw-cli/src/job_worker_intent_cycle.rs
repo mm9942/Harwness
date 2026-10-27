@@ -34,6 +34,29 @@
 //! `harw_plan_bridge::job_outcome`: `CompletionProposed` is a succeeded job
 //! that still needs owner acceptance.
 //!
+//! # Routes
+//! The proposer runs on a [`RoutePolicy`] built by [`routes_from`]: the
+//! default route is the configured `Explorer` internal model (when it runs on
+//! the job's provider), falling back to the default model. When the default
+//! model differs from the explorer model it becomes the escalation route: the
+//! proposer switches to it after 2 consecutive refusals or 2 stalled
+//! transitions (`RoutePolicy::with_escalation(route, 2, 2)`). The choice is
+//! made from trusted counters only; no model output influences it. Without any
+//! configured model the job is blocked. No reasoning effort is configured
+//! here (the internal-model settings carry none), so the provider default
+//! applies.
+//!
+//! # Excerpt cache
+//! One [`ExplorerReadCache`] per claim is shared by the executor (it fills the
+//! cache with the text of every successful read) and the proposer (it shows
+//! bounded excerpts of observed repository evidence, and only when the cached
+//! text carries exactly the digest the checkpoint recorded). The cache is
+//! process-local and digest-bound; it is not persisted. After a lease
+//! takeover (the loaded checkpoint has `fence.sequence > 0`) the worker
+//! re-reads the recorded evidence files once ([`warm_cache`], on a blocking
+//! thread) so the proposer sees the same excerpts it would have seen without
+//! the restart; files that changed meanwhile or are unreadable are skipped.
+//!
 //! # Workspace binding
 //! The ceiling is cut from the worker's `runtime_root.cwd`. `claim.scope`
 //! carries only the submitter's tenant/workspace *aliases* (the worker
@@ -53,8 +76,9 @@ use harw_ops::intent_cycle::IntentCycleJobInput;
 use harw_plan::PlanNodeKind;
 use harw_plan_bridge::{
     CeilingReissuer, CycleCheckpoint, CycleDriver, CycleRecord, CycleRunError, CycleStore,
-    CycleStoreError, ExplorerCycleExecutor, INTENT_CYCLE_JOB_KIND, ModelCycleProposer,
-    ProposerRoute, RoutePolicy, job_outcome,
+    CycleStoreError, DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, ExplorerCycleExecutor,
+    ExplorerReadCache, INTENT_CYCLE_JOB_KIND, ModelCycleProposer, ProposerRoute, RoutePolicy,
+    job_outcome, warm_cache,
 };
 use harw_session_store::JobStore;
 use harw_types::{ModelId, SessionId};
@@ -67,6 +91,12 @@ use crate::runtime_jobs::{JobAssemblyInputs, JobEntry, job_assembly, job_princip
 
 /// Output cap of one proposal (one small JSON object).
 const PROPOSAL_MAX_OUTPUT_TOKENS: u32 = 512;
+
+/// Consecutive refusals after which the proposer escalates to the default model.
+const ESCALATE_AFTER_REFUSALS: u32 = 2;
+
+/// Stalled transitions after which the proposer escalates to the default model.
+const ESCALATE_AT_STALL_TRANSITIONS: u32 = 2;
 
 /// Fallback wall budget when the job carries none.
 const DEFAULT_CYCLE_WALL: Duration = Duration::from_secs(30 * 60);
@@ -166,7 +196,7 @@ pub(super) async fn execute_intent_cycle_claim(
     }
     let authority = sandbox.authority().clone();
 
-    let Some(model) = proposer_model(context, runtime_root, &job_store, &provider, &claim) else {
+    let Some(routes) = proposer_routes(context, runtime_root, &job_store, &provider, &claim) else {
         return JobOutcome::Blocked {
             reason: "intent cycle: no model is configured for the cycle proposer".to_owned(),
         };
@@ -190,6 +220,20 @@ pub(super) async fn execute_intent_cycle_claim(
     if let Err(reason) = ensure_record(&store, &cycle_input, &claim, &plan.admission, &authority) {
         return JobOutcome::Failed { reason };
     }
+    // Shared by the executor (fills it on every read) and the proposer (shows
+    // digest-bound excerpts). Process-local, so a lease takeover starts empty
+    // and is warmed from the recorded evidence.
+    let cache = ExplorerReadCache::new(DEFAULT_CACHE_BYTES);
+    if let Some(filled) = warm_after_takeover(
+        Arc::clone(&store),
+        cycle_input.cycle_id.clone(),
+        cache.clone(),
+        authority.clone(),
+    )
+    .await
+    {
+        tracing::info!(work_id = %work_id.as_str(), filled, "intent cycle excerpt cache warmed after takeover");
+    }
 
     let ledger = PromptTokenLedger::persisted(
         claim.job.budget.clone(),
@@ -202,15 +246,9 @@ pub(super) async fn execute_intent_cycle_claim(
         inner: Arc::clone(&provider),
         ledger: Arc::clone(&ledger),
     });
-    let proposer = ModelCycleProposer::new(
-        budgeted,
-        RoutePolicy::new(ProposerRoute {
-            model,
-            effort: None,
-            max_output_tokens: PROPOSAL_MAX_OUTPUT_TOKENS,
-        }),
-    );
-    let executor = ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks);
+    let proposer = ModelCycleProposer::new(budgeted, routes).with_excerpts(cache.clone());
+    let executor =
+        ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks).with_cache(cache);
     let mut driver = CycleDriver::new(
         Arc::clone(&store),
         proposer,
@@ -341,15 +379,53 @@ fn ensure_record(
     }
 }
 
-/// The proposer's model: the configured `Explorer` internal model when it
-/// runs on the job's provider, else the default model.
-fn proposer_model(
+/// Refills `cache` from the evidence of a stored checkpoint after a lease
+/// takeover. `None` when nothing was attempted (fresh cycle at sequence 0) or
+/// the record could not be read; the warm-up is an optimisation, never a
+/// reason to fail the claim.
+async fn warm_after_takeover(
+    store: Arc<CycleStore>,
+    cycle_id: String,
+    cache: ExplorerReadCache,
+    authority: harw_authority::AuthorityContext,
+) -> Option<usize> {
+    let joined = tokio::task::spawn_blocking(move || {
+        let record = store.load(&cycle_id)?;
+        if record.checkpoint.fence.sequence == 0 {
+            return Ok(None);
+        }
+        let filled = warm_cache(
+            &cache,
+            &authority,
+            &record.checkpoint,
+            DEFAULT_MAX_READ_BYTES,
+        );
+        Ok::<_, CycleStoreError>(Some(filled))
+    })
+    .await;
+    match joined {
+        Ok(Ok(filled)) => filled,
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "intent cycle excerpt cache not warmed: record unreadable");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "intent cycle excerpt cache warm-up task failed");
+            None
+        }
+    }
+}
+
+/// Builds the proposer's route policy (see [`routes_from`]) from the
+/// configuration: the `Explorer` internal model counts only when it is an
+/// explicit choice that runs on the job's provider.
+fn proposer_routes(
     context: &JobWorkerContext,
     runtime_root: &super::JobRuntimeRoot,
     job_store: &Arc<JobStore>,
     provider: &Arc<dyn ModelProvider>,
     claim: &JobClaim,
-) -> Option<ModelId> {
+) -> Option<RoutePolicy> {
     let submitter = match claim.scope.submitter() {
         harw_types::ApprovalActor::Operator { id } if super::is_scope_identifier(id) => id.clone(),
         _ => "intent-cycle".to_owned(),
@@ -377,11 +453,42 @@ fn proposer_model(
         harw_config::resolve_internal_model(config, harw_config::InternalModelPoint::Explorer);
     let same_provider = resolved.provider.is_none() || resolved.provider == active;
     let main_model = resolved.is_main_model();
-    let model = match resolved.model {
-        Some(model) if !main_model && same_provider => Some(model),
-        _ => config.harness.default_model.clone(),
-    }?;
-    Some(ModelId::from(model.as_str()))
+    let explorer = match resolved.model {
+        Some(model) if !main_model && same_provider => Some(ModelId::from(model.as_str())),
+        _ => None,
+    };
+    let default = config.harness.default_model.as_deref().map(ModelId::from);
+    routes_from(explorer, default, PROPOSAL_MAX_OUTPUT_TOKENS)
+}
+
+/// Route policy from the two candidate models. The default slot is the
+/// explorer model, falling back to the default model. The escalation slot is
+/// the default model, and only when it differs from the explorer model (an
+/// escalation to the same model would change nothing). No models at all gives
+/// `None`: the job is blocked. `effort` stays `None`; the provider chooses.
+fn routes_from(
+    explorer: Option<ModelId>,
+    default: Option<ModelId>,
+    max_output_tokens: u32,
+) -> Option<RoutePolicy> {
+    let route = |model: ModelId| ProposerRoute {
+        model,
+        effort: None,
+        max_output_tokens,
+    };
+    let escalation = match (&explorer, &default) {
+        (Some(first), Some(second)) if first != second => Some(second.clone()),
+        _ => None,
+    };
+    let policy = RoutePolicy::new(route(explorer.or(default)?));
+    Some(match escalation {
+        Some(model) => policy.with_escalation(
+            route(model),
+            ESCALATE_AFTER_REFUSALS,
+            ESCALATE_AT_STALL_TRANSITIONS,
+        ),
+        None => policy,
+    })
 }
 
 /// Failure reasons go back to MCP clients verbatim; keep them bounded.
@@ -452,6 +559,58 @@ mod tests {
             INTENT_CYCLE_JOB_KIND,
             harw_runtime::job_ledger::INTENT_CYCLE_JOB_KIND
         );
+    }
+
+    #[test]
+    fn routes_escalate_to_the_default_model_when_it_differs() {
+        use harw_plan_bridge::RouteSlot;
+        fn model(name: &str) -> ModelId {
+            ModelId::from(name)
+        }
+        let route = |name: &str| ProposerRoute {
+            model: model(name),
+            effort: None,
+            max_output_tokens: 128,
+        };
+
+        // Explorer a, default b: a runs by default, b takes over on escalation.
+        let both = routes_from(Some(model("a")), Some(model("b")), 128);
+        assert_eq!(
+            both,
+            Some(RoutePolicy::new(route("a")).with_escalation(
+                route("b"),
+                ESCALATE_AFTER_REFUSALS,
+                ESCALATE_AT_STALL_TRANSITIONS
+            ))
+        );
+        let Some(both) = both else {
+            return;
+        };
+        assert_eq!(both.select(0, 0), RouteSlot::Default);
+        assert_eq!(both.select(0, 2), RouteSlot::Escalation);
+        assert_eq!(both.select(2, 0), RouteSlot::Escalation);
+        assert_eq!(
+            both.route(RouteSlot::Escalation).map(|r| r.model.clone()),
+            Some(model("b"))
+        );
+
+        // Same model twice: one route, nothing to escalate to.
+        let same = routes_from(Some(model("a")), Some(model("a")), 128);
+        assert_eq!(same, Some(RoutePolicy::new(route("a"))));
+        assert!(same.is_some_and(|policy| policy.route(RouteSlot::Escalation).is_none()));
+
+        // No explorer model: the default model is the only route.
+        assert_eq!(
+            routes_from(None, Some(model("b")), 128),
+            Some(RoutePolicy::new(route("b")))
+        );
+        // Explorer model without a default: one route as well.
+        assert_eq!(
+            routes_from(Some(model("a")), None, 128),
+            Some(RoutePolicy::new(route("a")))
+        );
+        // No model at all blocks the job.
+        assert_eq!(routes_from(None, None, 128), None);
     }
 
     #[test]

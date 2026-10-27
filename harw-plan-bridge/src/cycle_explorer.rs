@@ -198,10 +198,12 @@ fn is_plain_relative(path: &str) -> bool {
 /// id. Optional and lossy by design: never part of a checkpoint and not
 /// surviving a restart.
 ///
-/// This is an optional building block that is **not yet wired to the
-/// proposer**: `cycle_proposer` renders ids and digests-free metadata only
-/// and never reads this cache. Wiring file content into prompts needs its own
-/// review of the prompt-injection and size limits.
+/// Every entry remembers the [`ContentDigest`] of the text it holds.
+/// [`ExplorerReadCache::get_bound`] hands the text out only when that digest
+/// equals the one the checkpoint recorded for the evidence, so a consumer
+/// (the proposer's excerpts) can never show content that differs from what
+/// the durable evidence record vouches for. [`ExplorerReadCache::get`]
+/// ignores the digest and is meant for diagnostics and tests.
 ///
 /// Content of a step is inserted only when the whole step succeeded. When the
 /// byte cap would be exceeded, older entries are evicted first (by insertion
@@ -216,7 +218,7 @@ struct CacheState {
     max_bytes: usize,
     used: usize,
     order: Vec<String>,
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, (ContentDigest, String)>,
 }
 
 impl ExplorerReadCache {
@@ -236,7 +238,20 @@ impl ExplorerReadCache {
         self.inner
             .lock()
             .ok()
-            .and_then(|state| state.entries.get(evidence_id).cloned())
+            .and_then(|state| state.entries.get(evidence_id).map(|(_, text)| text.clone()))
+    }
+
+    /// The cached text for `evidence_id`, only when it was stored under
+    /// exactly `digest` (the digest the checkpoint recorded).
+    #[must_use]
+    pub fn get_bound(&self, evidence_id: &str, digest: ContentDigest) -> Option<String> {
+        self.inner.lock().ok().and_then(|state| {
+            state
+                .entries
+                .get(evidence_id)
+                .filter(|(stored, _)| *stored == digest)
+                .map(|(_, text)| text.clone())
+        })
     }
 
     /// Bytes currently held.
@@ -245,26 +260,26 @@ impl ExplorerReadCache {
         self.inner.lock().map_or(0, |state| state.used)
     }
 
-    fn insert(&self, evidence_id: &str, text: String) {
+    fn insert(&self, evidence_id: &str, digest: ContentDigest, text: String) {
         let Ok(mut state) = self.inner.lock() else {
             return;
         };
         if text.len() > state.max_bytes {
             return;
         }
-        if let Some(old) = state.entries.remove(evidence_id) {
+        if let Some((_, old)) = state.entries.remove(evidence_id) {
             state.used = state.used.saturating_sub(old.len());
             state.order.retain(|id| id != evidence_id);
         }
         while state.used + text.len() > state.max_bytes && !state.order.is_empty() {
             let oldest = state.order.remove(0);
-            if let Some(old) = state.entries.remove(&oldest) {
+            if let Some((_, old)) = state.entries.remove(&oldest) {
                 state.used = state.used.saturating_sub(old.len());
             }
         }
         state.used += text.len();
         state.order.push(evidence_id.to_owned());
-        state.entries.insert(evidence_id.to_owned(), text);
+        state.entries.insert(evidence_id.to_owned(), (digest, text));
     }
 }
 
@@ -397,6 +412,67 @@ fn read_bounded(
     Ok(bytes)
 }
 
+/// Workspace-relative path as the explorer records it as evidence locator:
+/// normal components joined by `/` (`a//b` and `a/b` are the same file).
+pub(crate) fn normalized(path: &str) -> String {
+    Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Refills `cache` from the files `state` has recorded evidence for.
+///
+/// Used after a lease takeover: the cache is process-local and lost with the
+/// previous holder, while the checkpoint still names every file the cycle
+/// observed. Each `Repository` record of trust `Observed` or `Verified` is
+/// re-read beneath the workspace root (its locator is already
+/// workspace-relative) and its text is stored **only when the current digest
+/// equals the recorded one**, so the model sees unchanged files again and a
+/// file that changed meanwhile is never shown under its old digest; it has to
+/// be read again. Files that are unreadable, over `max_read` bytes, denied by
+/// the secret-path policy or gone are skipped, never an error. Nothing is
+/// filled when `authority` lacks [`Permission::ReadWorkspace`] or the
+/// workspace root cannot be opened.
+///
+/// Returns the number of entries filled. Blocking I/O: call from
+/// `spawn_blocking`.
+pub fn warm_cache(
+    cache: &ExplorerReadCache,
+    authority: &AuthorityContext,
+    state: &CycleCheckpoint,
+    max_read: usize,
+) -> usize {
+    if !authority.permissions().contains(Permission::ReadWorkspace) {
+        return 0;
+    }
+    let Ok(scope) = Scope::new(authority.workspace().canonical_root()) else {
+        return 0;
+    };
+    let mut filled = 0;
+    for record in state.evidence.values() {
+        if record.source != EvidenceSourceKind::Repository {
+            continue;
+        }
+        match record.trust {
+            EvidenceTrust::Observed | EvidenceTrust::Verified => {}
+            EvidenceTrust::Reported => continue,
+        }
+        let Ok(outcome) = read_beneath(&scope, &record.locator, max_read, max_read) else {
+            continue;
+        };
+        if outcome.digest == record.digest {
+            cache.insert(&record.id, outcome.digest, outcome.text);
+            filled += 1;
+        }
+    }
+    filled
+}
+
 impl CycleStepExecutor for ReadOnlyExplorerExecutor {
     fn execute(
         &mut self,
@@ -474,7 +550,7 @@ impl CycleStepExecutor for ReadOnlyExplorerExecutor {
                 .map_err(|reason| StepFailure::new(format!("read '{target}' failed: {reason}")))?;
                 used += outcome.bytes;
                 let id = format!("{key}:{target}");
-                texts.push((id.clone(), outcome.text));
+                texts.push((id.clone(), outcome.digest, outcome.text));
                 evidence.push(EvidenceRecord {
                     id,
                     source: EvidenceSourceKind::Repository,
@@ -485,8 +561,8 @@ impl CycleStepExecutor for ReadOnlyExplorerExecutor {
             }
             // Content leaves the step only when the whole step succeeded.
             if let Some(cache) = cache {
-                for (id, text) in texts {
-                    cache.insert(&id, text);
+                for (id, digest, text) in texts {
+                    cache.insert(&id, digest, text);
                 }
             }
             Ok(CycleObservations {
@@ -1089,17 +1165,184 @@ mod tests {
 
     #[test]
     fn cache_is_bounded_and_evicts_oldest() {
+        let digest = ContentDigest::of(b"any");
         let cache = ExplorerReadCache::new(10);
-        cache.insert("a", "123456".to_owned());
-        cache.insert("b", "1234".to_owned());
+        cache.insert("a", digest, "123456".to_owned());
+        cache.insert("b", digest, "1234".to_owned());
         assert_eq!(cache.used_bytes(), 10);
-        cache.insert("c", "12345".to_owned());
+        cache.insert("c", digest, "12345".to_owned());
         assert_eq!(cache.get("a"), None);
         assert_eq!(cache.get("b").as_deref(), Some("1234"));
         assert_eq!(cache.used_bytes(), 9);
-        cache.insert("huge", "x".repeat(11));
+        cache.insert("huge", digest, "x".repeat(11));
         assert_eq!(cache.get("huge"), None);
         assert_eq!(cache.used_bytes(), 9);
+    }
+
+    #[test]
+    fn cache_entries_are_digest_bound() {
+        let (a, b) = (ContentDigest::of(b"text a"), ContentDigest::of(b"text b"));
+        let cache = ExplorerReadCache::new(64);
+        cache.insert("cyc-0:source", a, "text a".to_owned());
+        assert_eq!(cache.get_bound("cyc-0:source", b), None);
+        assert_eq!(
+            cache.get_bound("cyc-0:source", a).as_deref(),
+            Some("text a")
+        );
+        assert_eq!(cache.get_bound("cyc-0:unknown", a), None);
+        // `get` ignores the digest; re-inserting under a new digest rebinds
+        // the entry and keeps the byte accounting exact.
+        assert_eq!(cache.get("cyc-0:source").as_deref(), Some("text a"));
+        cache.insert("cyc-0:source", b, "text b!".to_owned());
+        assert_eq!(cache.get_bound("cyc-0:source", a), None);
+        assert_eq!(
+            cache.get_bound("cyc-0:source", b).as_deref(),
+            Some("text b!")
+        );
+        assert_eq!(cache.used_bytes(), "text b!".len());
+    }
+
+    fn repository_record(
+        id: &str,
+        locator: &str,
+        digest: ContentDigest,
+        trust: EvidenceTrust,
+    ) -> EvidenceRecord {
+        EvidenceRecord {
+            id: id.to_owned(),
+            source: EvidenceSourceKind::Repository,
+            locator: locator.to_owned(),
+            digest,
+            trust,
+        }
+    }
+
+    fn checkpoint_with(
+        authority: &AuthorityContext,
+        records: Vec<EvidenceRecord>,
+    ) -> TestResult<CycleCheckpoint> {
+        let mut state = CycleCheckpoint::initial(&admission()?, authority, 1);
+        for record in records {
+            state.evidence.insert(record.id.clone(), record);
+        }
+        Ok(state)
+    }
+
+    #[test]
+    fn warm_cache_refills_only_unchanged_files() -> TestResult {
+        let ws = Workspace::new()?;
+        ws.write("src/kept.rs", b"pub fn kept() {}\n")?;
+        ws.write("src/changed.rs", b"pub fn before() {}\n")?;
+        ws.write("src/reported.rs", b"pub fn reported() {}\n")?;
+        ws.write("src/verified.rs", b"pub fn verified() {}\n")?;
+        ws.write("src/other.rs", b"pub fn other() {}\n")?;
+        let authority = ws.authority(&read_rights())?;
+        let mut tool_record = repository_record(
+            "cyc-0:tool",
+            "src/other.rs",
+            ContentDigest::of(b"pub fn other() {}\n"),
+            EvidenceTrust::Observed,
+        );
+        tool_record.source = EvidenceSourceKind::Tool;
+        let state = checkpoint_with(
+            &authority,
+            vec![
+                repository_record(
+                    "cyc-0:kept",
+                    "src/kept.rs",
+                    ContentDigest::of(b"pub fn kept() {}\n"),
+                    EvidenceTrust::Observed,
+                ),
+                repository_record(
+                    "cyc-0:changed",
+                    "src/changed.rs",
+                    ContentDigest::of(b"pub fn before() {}\n"),
+                    EvidenceTrust::Observed,
+                ),
+                repository_record(
+                    "cyc-0:reported",
+                    "src/reported.rs",
+                    ContentDigest::of(b"pub fn reported() {}\n"),
+                    EvidenceTrust::Reported,
+                ),
+                repository_record(
+                    "cyc-0:verified",
+                    "src/verified.rs",
+                    ContentDigest::of(b"pub fn verified() {}\n"),
+                    EvidenceTrust::Verified,
+                ),
+                repository_record(
+                    "cyc-0:gone",
+                    "src/gone.rs",
+                    ContentDigest::of(b"pub fn gone() {}\n"),
+                    EvidenceTrust::Observed,
+                ),
+                tool_record,
+            ],
+        )?;
+        // The file changes after it was observed (e.g. while no lease held it).
+        ws.write("src/changed.rs", b"pub fn after() {}\n")?;
+
+        let cache = ExplorerReadCache::new(DEFAULT_CACHE_BYTES);
+        let filled = warm_cache(&cache, &authority, &state, DEFAULT_MAX_READ_BYTES);
+
+        assert_eq!(filled, 2);
+        let kept = ContentDigest::of(b"pub fn kept() {}\n");
+        assert_eq!(
+            cache.get_bound("cyc-0:kept", kept).as_deref(),
+            Some("pub fn kept() {}\n")
+        );
+        let verified = ContentDigest::of(b"pub fn verified() {}\n");
+        assert_eq!(
+            cache.get_bound("cyc-0:verified", verified).as_deref(),
+            Some("pub fn verified() {}\n")
+        );
+        // Changed, merely reported, missing and non-repository evidence stay out.
+        for id in [
+            "cyc-0:changed",
+            "cyc-0:reported",
+            "cyc-0:gone",
+            "cyc-0:tool",
+        ] {
+            assert_eq!(cache.get(id), None, "{id}");
+        }
+        assert_eq!(
+            cache.used_bytes(),
+            "pub fn kept() {}\n".len() + "pub fn verified() {}\n".len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn warm_cache_needs_read_permission_and_honours_the_read_cap() -> TestResult {
+        let ws = Workspace::new()?;
+        ws.write("src/lib.rs", b"pub fn hello() {}\n")?;
+        let digest = ContentDigest::of(b"pub fn hello() {}\n");
+        let record = |trust| repository_record("cyc-0:source", "src/lib.rs", digest, trust);
+
+        let blind = ws.authority(&[])?;
+        let state = checkpoint_with(&blind, vec![record(EvidenceTrust::Observed)])?;
+        let cache = ExplorerReadCache::new(DEFAULT_CACHE_BYTES);
+        assert_eq!(
+            warm_cache(&cache, &blind, &state, DEFAULT_MAX_READ_BYTES),
+            0
+        );
+        assert_eq!(cache.get("cyc-0:source"), None);
+
+        let reading = ws.authority(&read_rights())?;
+        let state = checkpoint_with(&reading, vec![record(EvidenceTrust::Observed)])?;
+        // A file over the per-read cap is refused, not truncated.
+        assert_eq!(warm_cache(&cache, &reading, &state, 4), 0);
+        assert_eq!(cache.get("cyc-0:source"), None);
+        assert_eq!(
+            warm_cache(&cache, &reading, &state, DEFAULT_MAX_READ_BYTES),
+            1
+        );
+        assert_eq!(
+            cache.get_bound("cyc-0:source", digest).as_deref(),
+            Some("pub fn hello() {}\n")
+        );
+        Ok(())
     }
 
     // ----- integration: CycleDriver + scripted proposer + explorer -----
@@ -1120,6 +1363,7 @@ mod tests {
             _admission: &CycleAdmission,
             _state: &CycleCheckpoint,
             _last_refusal: Option<CycleRefusal>,
+            _cancel: &CancelToken,
         ) -> impl Future<Output = Result<CycleProposal, StepFailure>> + Send {
             let next = self
                 .0

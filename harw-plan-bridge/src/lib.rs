@@ -124,7 +124,7 @@ pub use crate::context_ext::{OpContextPlanExt, register_plan_services};
 pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
 pub use crate::cycle_explorer::{
     DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_STEP_BYTES, ExplorerReadCache,
-    ReadOnlyExplorerExecutor, ReadTargetError, ReadTargetMap,
+    ReadOnlyExplorerExecutor, ReadTargetError, ReadTargetMap, warm_cache,
 };
 pub use crate::cycle_observation::{
     CauseCode, OBSERVATION_SCHEMA, ObservationCategory, ObservationEventId, ObservationOutcome,
@@ -135,8 +135,8 @@ pub use crate::cycle_outbox::{
     MAX_ACKED_TAIL, MAX_OUTBOX_PENDING, Outbox, OutboxEntry, OutboxError,
 };
 pub use crate::cycle_proposer::{
-    ModelCycleProposer, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy, RouteSlot,
-    refusal_hint, render_prompt, render_prompt_with,
+    ModelCycleProposer, PromptExtras, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy,
+    RouteSlot, refusal_hint, render_prompt, render_prompt_with, render_prompt_with_extras,
 };
 pub use crate::cycle_runtime::{
     AuthorityReissuer, CYCLE_RECORD_SCHEMA, CYCLE_STORE_DIR, CeilingReissuer, CycleDriver,
@@ -167,8 +167,8 @@ pub use crate::intent_cycle::{
     AdmissionCeiling, AdmittedCycle, CYCLE_CHECKPOINT_SCHEMA, CheckpointFence, CycleAdmission,
     CycleCheckpoint, CycleLimits, CycleObservations, CycleProposal, CycleRefusal, CycleTargets,
     CycleTerminal, EvidenceRecord, EvidenceSourceKind, EvidenceTrust, FenceRefusal, IntentBinding,
-    IntentRevisionError, JoinPolicy, ObservationError, ResumeRefusal, Segment, admit_cycle,
-    apply_observations, check_commit, resume_admission,
+    IntentRevisionError, JoinPolicy, MAX_OBJECTIVE_PROMPT_CHARS, ObservationError, ResumeRefusal,
+    Segment, admit_cycle, apply_observations, check_commit, resume_admission,
 };
 pub use crate::job_bridge::{JobAdmissionTemplate, PlanJobBridge};
 pub use crate::plan_context::{

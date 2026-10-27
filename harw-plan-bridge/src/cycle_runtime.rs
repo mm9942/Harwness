@@ -24,6 +24,8 @@
 //!   proposals are fed back a bounded number of times, then the cycle
 //!   escalates; an unavailable proposer (provider 403, offline model) is a
 //!   capability blocker and ends the cycle as `Blocked`, never a retry loop.
+//!   The job's cancel token is handed to the proposer (so an in-flight model
+//!   call aborts) and additionally raced by the driver as a second guard.
 //! - **Jobs:** [`cycle_job_operation`] plugs a driver into
 //!   `harw_core::DurableJobRunner`, which owns claim, heartbeat, lease-loss
 //!   cancellation and the terminal job commit.
@@ -432,11 +434,15 @@ pub trait CycleProposer: Send {
     /// [`StepFailure::retryable`] one leaves the cycle non-terminal and
     /// surfaces as [`CycleRunError::ProposerUnavailable`], which the job
     /// runner retries under a new lease.
+    ///
+    /// `cancel` is the job's cancel token; proposers pass it to the model
+    /// request so a stop or lease loss aborts an in-flight call.
     fn propose(
         &mut self,
         admission: &CycleAdmission,
         state: &CycleCheckpoint,
         last_refusal: Option<CycleRefusal>,
+        cancel: &CancelToken,
     ) -> impl Future<Output = Result<CycleProposal, StepFailure>> + Send;
 }
 
@@ -703,12 +709,14 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
             if cancel.is_cancelled() {
                 return Ok(CycleRunOutcome::Cancelled { checkpoint });
             }
+            // The proposer gets `cancel` so its model call aborts; the race
+            // below is the second guard for proposers that ignore it.
             let proposed = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     return Ok(CycleRunOutcome::Cancelled { checkpoint });
                 }
-                proposed = self.proposer.propose(&admission, &checkpoint, last_refusal) => proposed,
+                proposed = self.proposer.propose(&admission, &checkpoint, last_refusal, cancel) => proposed,
             };
             let proposal = match proposed {
                 Ok(proposal) => proposal,
@@ -1142,6 +1150,7 @@ mod tests {
             _admission: &CycleAdmission,
             _state: &CycleCheckpoint,
             last_refusal: Option<CycleRefusal>,
+            _cancel: &CancelToken,
         ) -> impl Future<Output = Result<CycleProposal, StepFailure>> + Send {
             if let Ok(mut seen) = self.refusals.lock() {
                 seen.push(last_refusal);
@@ -1422,6 +1431,7 @@ mod tests {
             _admission: &CycleAdmission,
             _state: &CycleCheckpoint,
             _last_refusal: Option<CycleRefusal>,
+            _cancel: &CancelToken,
         ) -> impl Future<Output = Result<CycleProposal, StepFailure>> + Send {
             std::future::pending()
         }

@@ -4352,13 +4352,36 @@ mod tests {
             ContentCheck, CycleStore, CycleTerminal, INTENT_CYCLE_JOB_KIND, ReadOnlyCycleSpec,
         };
 
-        /// Replays scripted proposals, one per model call.
-        struct Scripted(Mutex<VecDeque<String>>);
+        /// Replays scripted proposals, one per model call, and records the
+        /// user prompt (the debug rendering of the request history) of every
+        /// call.
+        struct Scripted {
+            replies: Mutex<VecDeque<String>>,
+            prompts: Mutex<Vec<String>>,
+        }
+
+        impl Scripted {
+            fn new(replies: impl IntoIterator<Item = String>) -> Self {
+                Self {
+                    replies: Mutex::new(replies.into_iter().collect()),
+                    prompts: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.prompts
+                    .lock()
+                    .map_or_else(|_| Vec::new(), |prompts| prompts.clone())
+            }
+        }
 
         impl ModelProvider for Scripted {
-            fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+                if let Ok(mut prompts) = self.prompts.lock() {
+                    prompts.push(format!("{:?}", request.history));
+                }
                 let next = self
-                    .0
+                    .replies
                     .lock()
                     .ok()
                     .and_then(|mut queue| queue.pop_front())
@@ -4409,8 +4432,13 @@ mod tests {
                 .map(|root| root.cwd.clone())
                 .ok_or(TestError::Missing("runtime cwd"))?;
             std::fs::create_dir_all(cwd.join("src")).map_err(ctx("mkdir src"))?;
-            std::fs::write(cwd.join("src/lib.rs"), "pub fn cycle_marker() {}\n")
-                .map_err(ctx("write lib"))?;
+            // The second line is a sentinel only the file read can put into a
+            // prompt: the intent text and the checks never mention it.
+            std::fs::write(
+                cwd.join("src/lib.rs"),
+                "pub fn cycle_marker() {}\n// excerpt-sentinel-4711\n",
+            )
+            .map_err(ctx("write lib"))?;
             let config = context
                 .runtime_root
                 .as_ref()
@@ -4425,20 +4453,33 @@ mod tests {
             .map_err(ctx("write config"))?;
             let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
             admit(&store, &cycle_record("cycle-e2e", &cwd)?)?;
-            let provider = Arc::new(Scripted(Mutex::new(VecDeque::from([
+            let provider = Arc::new(Scripted::new([
                 r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
                 r#"{"kind":"verify","evidence_id":"cycle-e2e-0:lib"}"#.to_owned(),
                 r#"{"kind":"complete"}"#.to_owned(),
-            ]))));
+            ]));
             let completed = run_job_worker_once(
                 Arc::clone(&store),
                 Arc::new(JobExecutionRegistry::new()),
-                provider as Arc<dyn ModelProvider>,
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
                 None,
                 context,
             )
             .await;
             assert_eq!(completed, 1);
+            // The executor's read text reaches the proposer as an excerpt: the
+            // first prompt precedes any read, the second one shows the file.
+            let prompts = provider.prompts();
+            let first = prompts.first().ok_or(TestError::Missing("first prompt"))?;
+            let second = prompts.get(1).ok_or(TestError::Missing("second prompt"))?;
+            assert!(
+                !first.contains("excerpt-sentinel-4711"),
+                "nothing was read before the first prompt"
+            );
+            assert!(
+                second.contains("EXCERPT") && second.contains("excerpt-sentinel-4711"),
+                "the second prompt must carry the read file as an excerpt: {second}"
+            );
             let outcome = completion_of(&store, "cycle-e2e")?;
             let JobOutcome::Succeeded { result } = outcome else {
                 return Err(TestError::Unexpected(format!("{outcome:?}")));
