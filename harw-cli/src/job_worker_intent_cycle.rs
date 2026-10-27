@@ -279,9 +279,9 @@ pub(super) async fn execute_intent_cycle_claim(
             };
         }
     };
-    // Offene Usage eines früheren Versuchs zuerst verrechnen (Review P1 zu
-    // #151): `remaining_wall` und der Ledger gehen vom verrechneten Stand aus,
-    // ein Reclaim startet nie mit frischem Budget.
+    // Settle the open usage of an earlier attempt first (review P1 on #151):
+    // `remaining_wall` and the ledger start from the settled state, a reclaim
+    // never starts with a fresh budget.
     if let Err(reason) = super::settle_claim_usage(&job_store, &mut claim).await {
         tracing::error!(work_id = %work_id.as_str(), reason = %reason, "intent-cycle usage accounting unresolved");
         return JobOutcome::Failed { reason };
@@ -625,40 +625,88 @@ async fn recall_lessons(learning_root: Option<&Path>, objective: &str) -> Vec<St
     }
 }
 
-/// Warum für den Cycle-Proposer keine Modellroute aufgebaut werden konnte.
+/// Why no model route could be built for the cycle proposer.
 ///
-/// Jede Variante ist ein eigener Verdrahtungsfehler und wird als eigener
-/// Blocked-Grund gemeldet (`route_blocked`): ein fehlendes Modell darf nie als
-/// "zurückgezogen" erscheinen und umgekehrt.
+/// Every variant is a distinct wiring failure and is reported as its own
+/// Blocked reason (`route_blocked`): a missing model must never read as
+/// "retired" and vice versa.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteFailure {
-    /// Konfiguration nicht lesbar/zusammensetzbar (Grund sanitisiert).
-    Configuration(String),
-    /// Weder Explorer- noch Vorgabemodell konfiguriert.
+    /// The configuration could not be read or assembled; only the
+    /// path-free phase of the assembly error is kept (see [`AssemblyPhase`]).
+    Configuration(AssemblyPhase),
+    /// Neither an Explorer nor a default model is configured.
     NoCandidate,
-    /// Explorer verworfen (gleicher Provider wie Hauptmodell / anderer
-    /// Provider) und kein Vorgabemodell.
+    /// The Explorer choice was discarded (same model as the main model, or a
+    /// different provider) and no default model is configured.
     ExplorerUnusable {
-        /// Kurze, sanitisierte Begründung (Hauptmodell oder Providerwechsel).
+        /// Short, sanitized reason (main model or provider switch).
         reason: String,
     },
-    /// Jeder konfigurierte Kandidat ist zurückgezogen (Lifecycle).
+    /// Every configured candidate is retired (lifecycle).
     AllRetired {
-        /// Eine Ablehnung je zurückgezogenem Kandidaten (Slot und Modell).
+        /// One refusal per retired candidate (slot and model).
         refusals: Vec<String>,
     },
 }
 
-/// Jeweils genau eine Zeile ohne Geheimnisse: der Text geht wörtlich in den
-/// Blocked-Grund des Jobs. Er bleibt kurz, weil `sanitize_failure` Gründe auf
-/// `MAX_REASON_BYTES` Zeichen kürzt und kein Modellname dabei abgeschnitten
-/// werden soll.
+/// The phase of a runtime assembly that failed, read from the fixed prefix of
+/// the `RuntimeError` text (`runtime <phase> error: <detail>`). Only this
+/// prefix ever reaches a Blocked reason: the detail can name configuration
+/// paths, project roots or trust details (R3, the same rule as
+/// `RUNTIME_ASSEMBLY_FAILED_REASON` in the worker), so it is only logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssemblyPhase {
+    /// `runtime config error`: the configuration could not be loaded or
+    /// resolved.
+    Config,
+    /// `runtime trust error`: the trust check failed.
+    Trust,
+    /// `runtime discovery error`: project discovery failed.
+    Discovery,
+    /// Any other phase (registry, sandbox, provider, store, spawner) or a text
+    /// without a known prefix.
+    Other,
+}
+
+impl AssemblyPhase {
+    /// Classifies an assembly error by its fixed prefix and keeps nothing of
+    /// the text after it.
+    fn of(error: &str) -> Self {
+        if error.starts_with("runtime config error") {
+            Self::Config
+        } else if error.starts_with("runtime trust error") {
+            Self::Trust
+        } else if error.starts_with("runtime discovery error") {
+            Self::Discovery
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Fixed, path-free wording for the Blocked reason.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "configuration error",
+            Self::Trust => "trust error",
+            Self::Discovery => "project discovery error",
+            Self::Other => "assembly error",
+        }
+    }
+}
+
+/// Exactly one line each, free of secrets and paths: the text goes verbatim
+/// into the job's Blocked reason. It stays short because `sanitize_failure`
+/// cuts reasons to `MAX_REASON_BYTES` characters and no model name should be
+/// truncated by that.
 impl std::fmt::Display for RouteFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Configuration(reason) => {
-                write!(f, "the model configuration could not be assembled: {reason}")
-            }
+            Self::Configuration(phase) => write!(
+                f,
+                "the model configuration could not be assembled ({}; see the worker log)",
+                phase.as_str()
+            ),
             Self::NoCandidate => f.write_str(
                 "no model is configured for the cycle proposer (no Explorer internal model and no default model)",
             ),
@@ -675,9 +723,9 @@ impl std::fmt::Display for RouteFailure {
     }
 }
 
-/// Blocked-Ausgang eines Jobs, dessen Proposer-Route nicht aufgebaut werden
-/// konnte: Präfix `intent cycle:` plus der Text der [`RouteFailure`], wie jeder
-/// Ausgangsgrund auf die erste Zeile und `MAX_REASON_BYTES` begrenzt.
+/// Blocked outcome of a job whose proposer route could not be built: the
+/// prefix `intent cycle:` plus the text of the [`RouteFailure`], bounded to
+/// the first line and `MAX_REASON_BYTES` like every outcome reason.
 fn route_blocked(failure: &RouteFailure) -> JobOutcome {
     JobOutcome::Blocked {
         reason: sanitize_failure(&format!("intent cycle: {failure}")),
@@ -716,9 +764,9 @@ fn proposer_routes(
 ///
 /// # Errors
 /// [`RouteFailure::Configuration`] if the runtime assembly cannot read or
-/// assemble the configuration (the reason is the first line of the assembly
-/// error, bounded by `sanitize_failure`; the full error is only logged);
-/// otherwise the failures of [`config_routes`].
+/// assemble the configuration (the reason carries only the path-free
+/// [`AssemblyPhase`]; the full error is only logged, R3); otherwise the
+/// failures of [`config_routes`].
 fn routes_from_assembly(
     transcript_root: &Path,
     runtime_root: &super::JobRuntimeRoot,
@@ -740,7 +788,7 @@ fn routes_from_assembly(
     })
     .map_err(|error| {
         tracing::warn!(error = %error, "intent cycle could not read the configuration");
-        RouteFailure::Configuration(sanitize_failure(&error))
+        RouteFailure::Configuration(AssemblyPhase::of(&error))
     })?;
     let config = assembly.config();
     let active = provider
@@ -1147,8 +1195,8 @@ mod tests {
         Ok(())
     }
 
-    /// Provider, der nie angefragt wird: die Routenwahl liest nur die
-    /// Konfiguration.
+    /// A provider that is never asked: route selection only reads the
+    /// configuration.
     struct UnusedProvider;
 
     impl ModelProvider for UnusedProvider {
@@ -1161,7 +1209,7 @@ mod tests {
         }
     }
 
-    /// Der Fehler eines Routenergebnisses; eine Route ist hier ein Testfehler.
+    /// The failure of a route result; a built route is a test failure here.
     fn failure_of(result: Result<RoutePolicy, RouteFailure>) -> TestResult<RouteFailure> {
         match result {
             Err(failure) => Ok(failure),
@@ -1171,7 +1219,7 @@ mod tests {
         }
     }
 
-    /// Konfiguration mit Provider `mistral` und einer Explorer-Wahl.
+    /// Configuration with provider `mistral` and an Explorer choice.
     fn explorer_config(provider: Option<&str>, model: Option<&str>) -> harw_config::ResolvedConfig {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("mistral".to_owned());
@@ -1185,7 +1233,7 @@ mod tests {
         config
     }
 
-    /// Modell der Route in `slot`.
+    /// The model of the route in `slot`.
     fn model_in(policy: &RoutePolicy, slot: harw_plan_bridge::RouteSlot) -> Option<ModelId> {
         policy.route(slot).map(|route| route.model.clone())
     }
@@ -1207,6 +1255,7 @@ mod tests {
         .map_err(ctx("write config"))?;
         let job_store = Arc::new(JobStore::new(&temp.path().join("store")));
         let provider: Arc<dyn ModelProvider> = Arc::new(UnusedProvider);
+        let home_text = home.display().to_string();
 
         let result = routes_from_assembly(
             temp.path(),
@@ -1217,24 +1266,99 @@ mod tests {
             "config-broken",
         );
         let failure = failure_of(result)?;
-        let RouteFailure::Configuration(reason) = &failure else {
-            return Err(TestError::Unexpected(format!(
-                "a broken configuration must be a Configuration failure, got {failure:?}"
-            )));
-        };
-        // The precise (first-line) cause is exposed, not a retirement claim,
-        // and the offending source line with its value is not.
-        assert!(reason.contains("TOML"), "cause is named: {reason}");
-        assert!(!reason.contains('\n'), "one line: {reason}");
-        assert!(!reason.contains(CANARY), "no config content: {reason}");
+        // The configuration phase is named, not a retirement claim, and
+        // neither the offending source line with its value nor the home path
+        // reaches the reason (R3).
+        assert_eq!(
+            failure,
+            RouteFailure::Configuration(AssemblyPhase::Config),
+            "a broken configuration is a Configuration failure of the config phase"
+        );
         let JobOutcome::Blocked { reason: blocked } = route_blocked(&failure) else {
             return Err(TestError::Missing("a blocked outcome"));
         };
         assert!(blocked.starts_with("intent cycle: "), "{blocked}");
         assert!(blocked.contains("configuration"), "{blocked}");
+        assert!(!blocked.contains('\n'), "one line: {blocked}");
         assert!(!blocked.contains("retired"), "{blocked}");
         assert!(!blocked.contains(CANARY), "{blocked}");
+        assert!(!blocked.contains(&home_text), "no home path: {blocked}");
         Ok(())
+    }
+
+    /// R3: an assembly error whose text names a path (project discovery
+    /// against a missing cwd names the cwd verbatim) reaches the Blocked
+    /// reason only as its phase.
+    #[test]
+    fn assembly_error_naming_a_path_is_reported_without_it() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("temp dir"))?;
+        let home = temp.path().join("home");
+        harw_home::ensure_home(&home).map_err(ctx("scaffold home"))?;
+        let missing_cwd = temp.path().join("does-not-exist");
+        let missing_text = missing_cwd.display().to_string();
+        let temp_text = temp.path().display().to_string();
+        let job_store = Arc::new(JobStore::new(&temp.path().join("store")));
+        let provider: Arc<dyn ModelProvider> = Arc::new(UnusedProvider);
+
+        let result = routes_from_assembly(
+            temp.path(),
+            &super::super::JobRuntimeRoot {
+                home,
+                cwd: missing_cwd,
+            },
+            &job_store,
+            &provider,
+            "operator",
+            "cwd-missing",
+        );
+        let failure = failure_of(result)?;
+        let RouteFailure::Configuration(phase) = &failure else {
+            return Err(TestError::Unexpected(format!(
+                "a failed assembly must be a Configuration failure, got {failure:?}"
+            )));
+        };
+        let JobOutcome::Blocked { reason } = route_blocked(&failure) else {
+            return Err(TestError::Missing("a blocked outcome"));
+        };
+        assert!(!reason.contains(&missing_text), "no cwd path: {reason}");
+        assert!(!reason.contains("does-not-exist"), "no cwd path: {reason}");
+        assert!(!reason.contains(&temp_text), "no temp path: {reason}");
+        assert!(
+            reason.contains(phase.as_str()),
+            "the phase is named: {reason}"
+        );
+        Ok(())
+    }
+
+    /// Only the fixed prefix of a `RuntimeError` text decides the phase; the
+    /// detail after it (paths, trust details) is never kept.
+    #[test]
+    fn assembly_phase_keeps_only_the_fixed_prefix() {
+        const DETAIL: &str = "failed to read file '/home/alice/.harw/config.toml': denied";
+        let cases = [
+            ("runtime config error", AssemblyPhase::Config),
+            ("runtime trust error", AssemblyPhase::Trust),
+            ("runtime discovery error", AssemblyPhase::Discovery),
+            ("runtime registry error", AssemblyPhase::Other),
+            ("runtime sandbox error", AssemblyPhase::Other),
+            ("runtime provider error", AssemblyPhase::Other),
+            ("runtime store error", AssemblyPhase::Other),
+            ("runtime spawner error", AssemblyPhase::Other),
+            (
+                "/home/alice/.harw/config.toml: unreadable",
+                AssemblyPhase::Other,
+            ),
+            ("", AssemblyPhase::Other),
+        ];
+        for (prefix, expected) in cases {
+            let text = format!("{prefix}: {DETAIL}");
+            let phase = AssemblyPhase::of(&text);
+            assert_eq!(phase, expected, "{text}");
+            let reason = RouteFailure::Configuration(phase).to_string();
+            assert!(!reason.contains("alice"), "{reason}");
+            assert!(!reason.contains("config.toml"), "{reason}");
+            assert!(!reason.contains('/'), "no path separator: {reason}");
+        }
     }
 
     #[test]
@@ -1322,7 +1446,7 @@ mod tests {
     #[test]
     fn route_failures_are_blocked_with_a_distinct_one_line_reason() -> TestResult {
         let failures = [
-            RouteFailure::Configuration("runtime config error: failed to parse TOML".to_owned()),
+            RouteFailure::Configuration(AssemblyPhase::Config),
             RouteFailure::NoCandidate,
             RouteFailure::ExplorerUnusable {
                 reason: "provider 'openrouter' is not the job's provider 'mistral'".to_owned(),

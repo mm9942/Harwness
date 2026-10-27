@@ -312,7 +312,7 @@ impl LessonDescriptor {
             && stored.scope == FactScope::Project
             && stored.fact_type == FactType::Pitfall
             && stored.tags.iter().any(|tag| tag == LESSON_TAG);
-        lesson.then(|| Fact {
+        lesson.then_some(Fact {
             name: stored.name,
             description: stored.description,
             fact_type: FactType::Pitfall,

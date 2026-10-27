@@ -3419,7 +3419,7 @@ mod tests {
     }
 
     /// The fixture's records behind a second store that holds `guard`.
-    fn guarded_store(fx: &Fixture, guard: Arc<FlagGuard>) -> TestResult<CycleStore> {
+    fn guarded_store(fx: &Fixture, guard: Arc<dyn LeaseLivenessGuard>) -> TestResult<CycleStore> {
         let records =
             RecordStore::create_ambient(&fx.cycles_dir).map_err(ctx("cycle store reopens"))?;
         Ok(CycleStore::new(records).with_lease_liveness(guard))
