@@ -16,25 +16,37 @@
 //!
 //! # Reservation membership
 //! Every [`FileLeaseRegistry::reserve`] call draws a fresh opaque id (returned
-//! as [`LeaseSet::reservation`]). A record keeps the ids of **every** call
-//! that currently holds it ([`FileLeaseRecord::reservations`]): creating a
-//! record stores the call's id, a same-holder refresh adds the call's id and
-//! keeps the ids already there. A call's id leaves the set only when that
-//! call fails and rolls back; a successful call stays a member until the
-//! record is released. Two interleaved calls of the same holder (even at the
-//! same epoch) therefore share a record that lives as long as one of them
-//! succeeds and disappears when all of them have failed.
+//! as [`LeaseSet::reservation`]). A record keeps a **claim** for every call
+//! that currently holds it ([`FileLeaseRecord::reservations`]: call id to the
+//! epoch the call reserved under). Creating a record stores the call's claim;
+//! a same-holder refresh adds the call's claim and keeps the others. A claim
+//! ends only when its call fails and rolls back; a successful call keeps its
+//! claim until the record is released. Two interleaved calls of the same
+//! holder (at any epochs) therefore share a record that lives as long as one
+//! of them succeeds and disappears when all of them have failed.
 //!
-//! A record that cannot name its holders is never deleted by a rollback. That
-//! covers a record written before membership existed (empty set: held by an
-//! unknown reservation) and the calls beyond a small cap on the member list
-//! (64 ids); both are represented by the member `"untracked"`, which the next
-//! same-holder reserve adds and no rollback removes. Only
-//! [`FileLeaseRegistry::release`] frees such a record.
+//! The record's epoch is the highest epoch among its claims. A refresh raises
+//! it; when a failed call's claim ends it falls back to the highest remaining
+//! one, so a sole surviving claim with an older epoch can roll itself back.
+//!
+//! A record names at most 64 claims. Further calls are only counted
+//! ([`FileLeaseRecord::overflow`]); their rollback decrements the counter, so
+//! they end like named claims, and the record is deleted when no named claim
+//! and no counted one is left. Counted calls do not record their epoch, so
+//! the record's epoch is not lowered while any is counted.
+//!
+//! One claim cannot be named: a record written before membership existed has
+//! holders that no caller can ever name. The next same-holder reserve adds the
+//! single claim `"untracked"` (at the record's epoch), which no rollback ends;
+//! only [`FileLeaseRegistry::release`] frees such a record. Records of the two
+//! earlier layouts (a single `reservation` id; a list of `reservations`) are
+//! read as claims at the record's epoch and rewritten in the current layout by
+//! the next mutation.
 //!
 //! # Holders and fencing
 //! A holder is the pair `(owner, cycle_id)`. The same holder re-reserving a
-//! path is idempotent and may only move the recorded epoch forward; a holder
+//! path is idempotent and may only move the recorded epoch forward (it falls
+//! back only when a failed call's claim ends, see above); a holder
 //! presenting an older epoch than the record is refused
 //! ([`ReserveRefusal::StaleEpoch`]). A path held by another holder is never
 //! taken over, whatever the epochs (takeover of dead holders belongs to the
@@ -51,30 +63,30 @@
 //!    otherwise `update_locked`, which re-reads the owner under the lock), so
 //!    no check-then-create window exists for a single path;
 //! 4. on a refusal midway, the call leaves every record it touched, created
-//!    **or** refreshed, before the refusal is returned (rollback): its id is
-//!    removed from the record's members, or, if it is the only member, the
-//!    record is deleted. A record that another call of the same holder still
-//!    claims (a successful one, or one still in flight) is kept; the last
-//!    member to fail deletes it. So all-or-nothing also holds for interleaved calls of
-//!    the same holder: if every call that touched a path fails, the path is
-//!    free again. The deletion is fenced with the epoch of the call being
-//!    undone, as `release` is: a call never removes the last claim of a
-//!    record that a newer epoch has advanced (it presents a stale epoch); the
-//!    holder of that epoch frees it with `release`.
+//!    **or** refreshed, before the refusal is returned (rollback): its claim
+//!    ends, or, if it is the only claim, the record is deleted. A record that
+//!    another call of the same holder still claims (a successful one, or one
+//!    still in flight) is kept; the last claim to fail deletes it. So
+//!    all-or-nothing also holds for interleaved calls of the same holder: if
+//!    every call that touched a path fails, the path is free again. The
+//!    deletion is fenced with the epoch of the call being undone, as
+//!    `release` is: a record whose epoch is higher than that (a counted
+//!    overflow claim does not lower it, for instance) is kept, and the holder
+//!    of that epoch frees it with `release`.
 //!
 //! What is *not* atomic: other readers can briefly observe a half-reserved
 //! set while a call is in progress, and a crash (or an I/O failure during
-//! rollback, which is logged) can leave part of a set behind, or an id in a
-//! record's members that no live call owns any more. Those records belong to
-//! the same holder, so repeating the reserve is idempotent and
+//! rollback, which is logged) can leave part of a set behind, or a claim in a
+//! record that no live call owns any more. Those records belong to the same
+//! holder, so repeating the reserve is idempotent and
 //! [`FileLeaseRegistry::release`] with the same set cleans them up. At no
 //! point do two holders own the same path.
 //!
-//! [`FileLeaseRegistry::release`] works on keys, not on membership: it frees
+//! [`FileLeaseRegistry::release`] works on keys, not on claims: it frees
 //! every record of the presenting holder that the set names, whoever its
-//! members are. Membership could not replace that: a crashed call leaves an
-//! id behind that no later set can name, and records without members
-//! (`"untracked"`) would never be freeable.
+//! claimants are. Claims could not replace that: a crashed call leaves a claim
+//! behind that no later set can name, and an `"untracked"` claim would never
+//! be freeable.
 //!
 //! # Store mechanics
 //! Creation, refresh and lookup reuse `RecordStore` (per-record try-lock,
@@ -85,14 +97,14 @@
 //! holder under it and unlinks `records/<id>.json` (the documented, stable
 //! layout) followed by a directory `fsync`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::{Component, Path};
 
 use harw_job_store::{RECORDS_DIR, RecordStore, StoreError, StoreRecord};
 use harw_types::{ContentDigest, SessionId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Schema version of [`FileLeaseRecord`].
 pub const FILE_LEASE_SCHEMA: u32 = 1;
@@ -113,17 +125,19 @@ const MAX_ECHOED_PATH_CHARS: usize = 200;
 const RESERVE_ATTEMPTS: u8 = 3;
 /// Hex characters of the path digest used as record id (128 bits).
 const LEASE_ID_HEX_CHARS: usize = 32;
-/// Most reservation ids one record lists. Further calls are represented by
-/// [`UNTRACKED_MEMBER`], which keeps the record from being rolled back.
+/// Most claims one record names. Further calls are only counted in
+/// [`FileLeaseRecord::overflow`].
 const MAX_RESERVATION_MEMBERS: usize = 64;
-/// Member standing for reservations the record cannot name (written before
-/// membership existed, or beyond [`MAX_RESERVATION_MEMBERS`]). Never a UUID,
-/// so no live call id equals it, and no rollback removes it.
+/// Claim standing for the unknown holders of a record written before
+/// membership existed. Never a UUID, so no live call id equals it, and no
+/// rollback ends it.
 const UNTRACKED_MEMBER: &str = "untracked";
 
 /// One reserved path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Deserialization accepts the current layout and the two earlier ones (see
+/// the module docs); anything else, including unknown fields, is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileLeaseRecord {
     pub schema_version: u32,
     /// Store id of this record: [`lease_id_for`] of [`FileLeaseRecord::key`].
@@ -134,25 +148,102 @@ pub struct FileLeaseRecord {
     pub owner: String,
     /// Cycle the reservation belongs to; `(owner, cycle_id)` is the holder.
     pub cycle_id: String,
-    /// Lease epoch the holder reserved under (only ever moves forward).
+    /// Highest lease epoch among the claims on this record. A refresh moves
+    /// it forward; when a failed call's claim ends it falls back to the
+    /// highest epoch of the remaining named claims (unless counted overflow
+    /// claims remain, which record no epoch).
     pub epoch: u64,
     pub acquired_at: jiff::Timestamp,
-    /// Ids ([`LeaseSet::reservation`]) of the reserve calls that currently
-    /// hold this record: a create stores the call's id, a same-holder refresh
-    /// adds it and keeps the others. A failed call's rollback removes its own
-    /// id, and the record is deleted when the last member rolls back; a
-    /// successful call stays a member until release. A record written before this field
-    /// existed loads with an empty set, which counts as held by an unknown
-    /// reservation: no rollback deletes it, and the next same-holder reserve
-    /// adds the member `"untracked"` that no rollback removes (the same member
-    /// stands for calls beyond a cap of 64 ids).
-    #[serde(default)]
-    pub reservations: BTreeSet<String>,
+    /// Claims of the reserve calls that currently hold this record: the id of
+    /// the call ([`LeaseSet::reservation`]) to the epoch it reserved under. A
+    /// create stores the call's claim, a same-holder refresh adds it and keeps
+    /// the others. A failed call's rollback ends its own claim, and the record
+    /// is deleted when the last claim ends; a successful call keeps its claim
+    /// until release. A record written before membership existed has none, and
+    /// the next same-holder reserve adds the claim `"untracked"` (at the
+    /// record's epoch), which no rollback ends.
+    pub reservations: BTreeMap<String, u64>,
+    /// Calls beyond the cap of 64 named claims, counted instead of named. A
+    /// call's rollback decrements it; the record is deleted when it and
+    /// `reservations` are both empty.
+    pub overflow: u32,
 }
 
 impl StoreRecord for FileLeaseRecord {
     fn record_id(&self) -> &str {
         &self.key_id
+    }
+}
+
+impl<'de> Deserialize<'de> for FileLeaseRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        FileLeaseRecordWire::deserialize(deserializer).map(Self::from)
+    }
+}
+
+// Everything `FileLeaseRecord` reads from disk. Besides the current fields it
+// takes the layouts that were written under the same schema version before:
+// a single `reservation` id (one claim) and a plain list of `reservations`
+// ids (claims); both become claims at the record's epoch. Unknown fields stay
+// refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileLeaseRecordWire {
+    schema_version: u32,
+    key_id: String,
+    key: String,
+    owner: String,
+    cycle_id: String,
+    epoch: u64,
+    acquired_at: jiff::Timestamp,
+    #[serde(default)]
+    reservations: WireClaims,
+    #[serde(default)]
+    overflow: u32,
+    #[serde(default)]
+    reservation: String,
+}
+
+// `reservations` as a map (current layout) or as a list of ids (earlier one).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireClaims {
+    Epochs(BTreeMap<String, u64>),
+    Ids(BTreeSet<String>),
+}
+
+impl Default for WireClaims {
+    fn default() -> Self {
+        Self::Epochs(BTreeMap::new())
+    }
+}
+
+impl From<FileLeaseRecordWire> for FileLeaseRecord {
+    fn from(wire: FileLeaseRecordWire) -> Self {
+        let epoch = wire.epoch;
+        let mut reservations = match wire.reservations {
+            WireClaims::Epochs(epochs) => epochs,
+            WireClaims::Ids(ids) => ids.into_iter().map(|id| (id, epoch)).collect(),
+        };
+        // An empty id is the earlier layout's "none" (a record that predates
+        // reservation ids altogether).
+        if !wire.reservation.is_empty() {
+            reservations.entry(wire.reservation).or_insert(epoch);
+        }
+        Self {
+            schema_version: wire.schema_version,
+            key_id: wire.key_id,
+            key: wire.key,
+            owner: wire.owner,
+            cycle_id: wire.cycle_id,
+            epoch,
+            acquired_at: wire.acquired_at,
+            reservations,
+            overflow: wire.overflow,
+        }
     }
 }
 
@@ -164,10 +255,11 @@ pub struct LeaseSet {
     pub owner: String,
     pub epoch: u64,
     /// Opaque id of the [`FileLeaseRegistry::reserve`] call that produced
-    /// this set; a member of [`FileLeaseRecord::reservations`] of every
-    /// record the call created or refreshed (beyond the member cap of a
-    /// record it is represented by the member `"untracked"` instead).
-    /// Informational for [`FileLeaseRegistry::release`], which works on keys.
+    /// this set; the key of the call's claim in
+    /// [`FileLeaseRecord::reservations`] of every record it created or
+    /// refreshed (beyond the cap of named claims the call is only counted in
+    /// [`FileLeaseRecord::overflow`]). Informational for
+    /// [`FileLeaseRegistry::release`], which works on keys.
     pub reservation: String,
     /// Normalized paths, in sorted order.
     pub keys: BTreeSet<String>,
@@ -248,10 +340,10 @@ impl FileLeaseRegistry {
     ///
     /// Keys are visited in sorted order and decided inside each record lock;
     /// on a refusal the call leaves every record it created or refreshed:
-    /// its reservation id is removed from the record's members, and a record
-    /// with no other member is deleted (fenced with this call's own `epoch`).
-    /// A record that another call of the same holder still claims is kept.
-    /// See the module docs for what is and is not atomic.
+    /// its claim ends, and a record without another claim is deleted (fenced
+    /// with this call's own `epoch`). A record that another call of the same
+    /// holder still claims is kept. See the module docs for what is and is
+    /// not atomic.
     ///
     /// # Errors
     /// [`ReserveRefusal::InvalidPath`] for a path that cannot be a plain
@@ -276,13 +368,14 @@ impl FileLeaseRegistry {
         // `harw_types` has no dedicated reservation id; a v4 UUID is opaque
         // and unique across calls and processes, which is all that is needed.
         let reservation = SessionId::new().0;
-        // Every key this call decided, created or refreshed: the rollback
-        // leaves all of them, not only the ones it created.
-        let mut touched: Vec<Entry> = Vec::new();
+        // Every key this call decided, created or refreshed, and how the
+        // record counted the call: the rollback leaves all of them, not only
+        // the ones it created.
+        let mut touched: Vec<Touched> = Vec::new();
         for key in &keys {
             let entry = Entry::new(key);
             match self.reserve_key(&entry, &holder, epoch, &reservation) {
-                Ok(()) => touched.push(entry),
+                Ok(counted) => touched.push(Touched { entry, counted }),
                 Err(refusal) => {
                     self.roll_back(&touched, &holder, epoch, &reservation);
                     return Err(refusal);
@@ -305,10 +398,10 @@ impl FileLeaseRegistry {
     /// else's reservation. The set's own `epoch` and `reservation` fields are
     /// informational; `epoch` is the fencing epoch the caller presents now.
     ///
-    /// Release works on keys, not on membership: it frees every record of
-    /// this holder that the set names, also one that a later reserve call of
-    /// the same holder shares (the holder is the unit of ownership; the
-    /// reservation ids only decide when a failed call's rollback may delete).
+    /// Release works on keys, not on claims: it frees every record of this
+    /// holder that the set names, also one that a later reserve call of the
+    /// same holder shares (the holder is the unit of ownership; the claims
+    /// only decide when a failed call's rollback may delete).
     ///
     /// Each record is removed under its own lock; if a store failure stops
     /// the call midway, the keys already removed stay removed and calling
@@ -366,14 +459,15 @@ impl FileLeaseRegistry {
 
     // Decides one key inside the record lock: create it if free, otherwise
     // refresh it if (and only if) the same holder already owns it. Either way
-    // the record lists `reservation` among its members afterwards.
+    // the record holds a claim of this call afterwards; the result says how it
+    // was recorded (named, or only counted beyond the cap).
     fn reserve_key(
         &self,
         entry: &Entry,
         holder: &Holder<'_>,
         epoch: u64,
         reservation: &str,
-    ) -> Result<(), ReserveRefusal> {
+    ) -> Result<Counted, ReserveRefusal> {
         for _ in 0..RESERVE_ATTEMPTS {
             let record = FileLeaseRecord {
                 schema_version: FILE_LEASE_SCHEMA,
@@ -383,10 +477,11 @@ impl FileLeaseRegistry {
                 cycle_id: holder.cycle_id.to_owned(),
                 epoch,
                 acquired_at: jiff::Timestamp::now(),
-                reservations: BTreeSet::from([reservation.to_owned()]),
+                reservations: BTreeMap::from([(reservation.to_owned(), epoch)]),
+                overflow: 0,
             };
             match self.records.create(&record) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(Counted::Named),
                 Err(StoreError::AlreadyExists { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -394,7 +489,7 @@ impl FileLeaseRegistry {
                 refresh(existing, entry, holder, epoch, reservation)
             });
             match refreshed {
-                Ok(()) => return Ok(()),
+                Ok(counted) => return Ok(counted),
                 Err(Failure::Refused(refusal)) => return Err(refusal),
                 // Released between `create` and `update_locked`: decide again.
                 Err(Failure::Store(StoreError::NotFound { .. })) => {}
@@ -408,36 +503,40 @@ impl FileLeaseRegistry {
     }
 
     // Undoes this call on every record it touched (created or refreshed):
-    // its id leaves the members, and a record nobody else claims is deleted
+    // its claim ends, and a record nobody else claims is deleted
     // (`leave_key`). A record still claimed by another call of the same
     // holder, successful or in flight, is kept (`Removal::Claimed`), so the
     // path never goes to someone else while a `LeaseSet` covers it, and when
     // every call that touched it has failed the path is free again. The
     // deletion is fenced with the epoch this call reserved under (never
-    // `u64::MAX`): the last claim on a record that a newer epoch advanced is
-    // not this stale call's to remove, reported as `StaleEpoch` and kept.
-    // Any other failure is logged, not returned: the original refusal is the
-    // more useful answer, and the leftovers belong to the same holder
-    // (idempotent re-reserve / release).
-    fn roll_back(&self, touched: &[Entry], holder: &Holder<'_>, epoch: u64, reservation: &str) {
-        for entry in touched.iter().rev() {
-            match self.leave_key(entry, holder, epoch, reservation) {
+    // `u64::MAX`): a record whose epoch is higher than that is not this
+    // stale call's to remove, reported as `StaleEpoch` and kept. Any other
+    // failure is logged, not returned: the original refusal is the more
+    // useful answer, and the leftovers belong to the same holder (idempotent
+    // re-reserve / release).
+    fn roll_back(&self, touched: &[Touched], holder: &Holder<'_>, epoch: u64, reservation: &str) {
+        for touch in touched.iter().rev() {
+            let claim = Claim {
+                reservation,
+                counted: touch.counted,
+            };
+            match self.leave_key(&touch.entry, holder, epoch, claim) {
                 Ok(Removal::Done) => {}
                 Ok(Removal::Claimed) => {
                     tracing::debug!(
-                        key = %entry.key,
+                        key = %touch.entry.key,
                         "file lease rollback kept a record other reservations still claim"
                     );
                 }
                 Err(ReserveRefusal::StaleEpoch) => {
                     tracing::debug!(
-                        key = %entry.key,
+                        key = %touch.entry.key,
                         "file lease rollback kept a record advanced by a newer epoch"
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        key = %entry.key,
+                        key = %touch.entry.key,
                         error = %error,
                         "file lease rollback failed; the holder keeps the lease until release"
                     );
@@ -446,30 +545,29 @@ impl FileLeaseRegistry {
         }
     }
 
-    // Takes `reservation` out of the record's members, or deletes the record
-    // if the call is its only member. The set is never written empty, so a
-    // record without members always means "written before membership
-    // existed". Two steps, each under the record lock: `leave` removes the
-    // call unless it is the last member; for the last member the record is
-    // deleted under its own lock after re-checking that the set still is
-    // exactly this call. If another call joined in between, the call is no
-    // longer the last member and the next round removes it from the set.
+    // Ends `claim` on the record, or deletes the record if the claim is the
+    // only one. The claims are never written empty, so a record without any
+    // always means "written before membership existed". Two steps, each
+    // under the record lock: `leave` ends the claim unless it is the last
+    // one; for the last claim the record is deleted under its own lock after
+    // re-checking that it still is the only one. If another call joined in
+    // between, the claim is no longer the last and the next round ends it.
     fn leave_key(
         &self,
         entry: &Entry,
         holder: &Holder<'_>,
         epoch: u64,
-        reservation: &str,
+        claim: Claim<'_>,
     ) -> Result<Removal, ReserveRefusal> {
         for _ in 0..RESERVE_ATTEMPTS {
-            let left = self.records.update_locked(&entry.id, |existing| {
-                leave(existing, entry, holder, epoch, reservation)
-            });
+            let left = self
+                .records
+                .update_locked(&entry.id, |existing| leave(existing, entry, holder, claim));
             match left {
                 Ok(Membership::Foreign) => return Ok(Removal::Done),
                 Ok(Membership::Claimed) => return Ok(Removal::Claimed),
                 Ok(Membership::Sole) => {
-                    let removal = self.remove_held(entry, holder, epoch, Some(reservation))?;
+                    let removal = self.remove_held(entry, holder, epoch, Some(claim))?;
                     if matches!(removal, Removal::Done) {
                         return Ok(Removal::Done);
                     }
@@ -485,18 +583,18 @@ impl FileLeaseRegistry {
         )))
     }
 
-    // `only_member`: `Some(id)` deletes the record only while `id` is its one
-    // and only member (rollback); `None` removes by holder and epoch alone
-    // (release).
+    // `only_claim`: `Some(claim)` deletes the record only while `claim` is
+    // its one and only claim (rollback); `None` removes by holder and epoch
+    // alone (release).
     fn remove_held(
         &self,
         entry: &Entry,
         holder: &Holder<'_>,
         epoch: u64,
-        only_member: Option<&str>,
+        only_claim: Option<Claim<'_>>,
     ) -> Result<Removal, ReserveRefusal> {
         let lock = self.records.lock(&entry.id)?;
-        let removed = self.remove_under_lock(entry, holder, epoch, only_member);
+        let removed = self.remove_under_lock(entry, holder, epoch, only_claim);
         let unlocked = lock.release();
         match (removed, unlocked) {
             (Err(error), _) => Err(error),
@@ -510,7 +608,7 @@ impl FileLeaseRegistry {
         entry: &Entry,
         holder: &Holder<'_>,
         epoch: u64,
-        only_member: Option<&str>,
+        only_claim: Option<Claim<'_>>,
     ) -> Result<Removal, ReserveRefusal> {
         let record = match self.records.load(&entry.id) {
             Ok(record) => record,
@@ -521,11 +619,9 @@ impl FileLeaseRegistry {
         if !holder.matches(&record) {
             return Ok(Removal::Done);
         }
-        // Anybody else among the members (or nobody known, as for a record
-        // written before membership existed) keeps the record.
-        if only_member
-            .is_some_and(|id| record.reservations.len() != 1 || !record.reservations.contains(id))
-        {
+        // Any other claim (or nobody known, as for a record written before
+        // membership existed) keeps the record.
+        if only_claim.is_some_and(|claim| !claim.is_sole(&record)) {
             return Ok(Removal::Claimed);
         }
         if record.epoch > epoch {
@@ -578,6 +674,50 @@ impl Entry {
     }
 }
 
+// A key a reserve call decided, and how that record counted the call.
+struct Touched {
+    entry: Entry,
+    counted: Counted,
+}
+
+// How a record counts one reserve call.
+#[derive(Clone, Copy)]
+enum Counted {
+    // As a named claim in `reservations`.
+    Named,
+    // Only in `overflow` (the record already names the maximum).
+    Overflow,
+}
+
+// One call's claim on a record, as its rollback presents it.
+#[derive(Clone, Copy)]
+struct Claim<'a> {
+    reservation: &'a str,
+    counted: Counted,
+}
+
+impl Claim<'_> {
+    // Does the record still count this call?
+    fn is_held_by(&self, record: &FileLeaseRecord) -> bool {
+        match self.counted {
+            Counted::Named => record.reservations.contains_key(self.reservation),
+            Counted::Overflow => record.overflow > 0,
+        }
+    }
+
+    // Is this call the only claim on the record?
+    fn is_sole(&self, record: &FileLeaseRecord) -> bool {
+        match self.counted {
+            Counted::Named => {
+                record.overflow == 0
+                    && record.reservations.len() == 1
+                    && record.reservations.contains_key(self.reservation)
+            }
+            Counted::Overflow => record.overflow == 1 && record.reservations.is_empty(),
+        }
+    }
+}
+
 // What `remove_under_lock` / `leave_key` did with the record they looked at.
 enum Removal {
     // Removed, already gone, or held by a different holder (nothing to do).
@@ -590,9 +730,9 @@ enum Removal {
 enum Membership {
     // The record belongs to a different holder; untouched.
     Foreign,
-    // Other claims remain (or the record cannot name its members).
+    // Other claims remain (or the record cannot name its claimants).
     Claimed,
-    // The call is the record's only member (nothing was changed): the record
+    // The call is the record's only claim (nothing was changed): the record
     // may be deleted.
     Sole,
 }
@@ -617,7 +757,7 @@ fn refresh(
     holder: &Holder<'_>,
     epoch: u64,
     reservation: &str,
-) -> Result<(), Failure> {
+) -> Result<Counted, Failure> {
     check_consistent(existing, entry).map_err(Failure::Refused)?;
     if !holder.matches(existing) {
         return Err(Failure::Refused(ReserveRefusal::AlreadyOwned {
@@ -628,55 +768,65 @@ fn refresh(
     if existing.epoch > epoch {
         return Err(Failure::Refused(ReserveRefusal::StaleEpoch));
     }
-    existing.epoch = epoch;
-    join(&mut existing.reservations, reservation);
-    Ok(())
+    Ok(join(existing, reservation, epoch))
 }
 
-// Adds a refreshing call to the members, keeping the ones already there. An
-// empty set means the record predates membership: its holders are unknown, so
-// the `UNTRACKED_MEMBER` is added first and keeps it alive through any
-// rollback. The same member stands in for the call once the list is full, so
-// the record stays bounded and is never deleted on behalf of a call it could
-// not name.
-fn join(reservations: &mut BTreeSet<String>, reservation: &str) {
-    if reservations.is_empty() {
-        reservations.insert(UNTRACKED_MEMBER.to_owned());
+// Adds a refreshing call to the claims, keeping the ones already there, and
+// moves the record's epoch forward. A record without any claim predates
+// membership: its holders are unknown, so the `UNTRACKED_MEMBER` claim (at the
+// record's old epoch) is added first and keeps it alive through any rollback.
+// Beyond the cap the call is only counted, which its rollback undoes.
+fn join(existing: &mut FileLeaseRecord, reservation: &str, epoch: u64) -> Counted {
+    if existing.reservations.is_empty() && existing.overflow == 0 {
+        existing
+            .reservations
+            .insert(UNTRACKED_MEMBER.to_owned(), existing.epoch);
     }
-    if reservations.len() < MAX_RESERVATION_MEMBERS {
-        reservations.insert(reservation.to_owned());
+    let counted = if existing.reservations.len() < MAX_RESERVATION_MEMBERS {
+        existing.reservations.insert(reservation.to_owned(), epoch);
+        Counted::Named
     } else {
-        reservations.insert(UNTRACKED_MEMBER.to_owned());
-    }
+        existing.overflow = existing.overflow.saturating_add(1);
+        Counted::Overflow
+    };
+    existing.epoch = epoch;
+    counted
 }
 
-// Runs under the record lock: takes the rolling-back call out of the members
-// unless it is the only one (then the record is the caller's to delete).
+// Runs under the record lock: ends the rolling-back call's claim unless it is
+// the only one (then the record is the caller's to delete).
 fn leave(
     existing: &mut FileLeaseRecord,
     entry: &Entry,
     holder: &Holder<'_>,
-    epoch: u64,
-    reservation: &str,
+    claim: Claim<'_>,
 ) -> Result<Membership, Failure> {
     check_consistent(existing, entry).map_err(Failure::Refused)?;
     if !holder.matches(existing) {
         return Ok(Membership::Foreign);
     }
-    // Not a member: the record predates membership or the list overflowed.
-    // Its claimants are unknown, so it stays.
-    if !existing.reservations.contains(reservation) {
+    // No such claim: the record was released and created anew, or predates
+    // membership. Its claimants are unknown, so it stays.
+    if !claim.is_held_by(existing) {
         return Ok(Membership::Claimed);
     }
-    // The last claim of a record that a newer epoch advanced is not this
-    // stale call's to give up; nothing is written.
-    if existing.reservations.len() == 1 && existing.epoch > epoch {
-        return Err(Failure::Refused(ReserveRefusal::StaleEpoch));
-    }
-    if existing.reservations.len() == 1 {
+    if claim.is_sole(existing) {
         return Ok(Membership::Sole);
     }
-    existing.reservations.remove(reservation);
+    match claim.counted {
+        Counted::Named => {
+            existing.reservations.remove(claim.reservation);
+        }
+        Counted::Overflow => {
+            existing.overflow = existing.overflow.saturating_sub(1);
+        }
+    }
+    // The record's epoch is the highest among its claims. Counted calls record
+    // none, so it is only lowered while every claim is named.
+    let highest = existing.reservations.values().copied().max();
+    if let (0, Some(highest)) = (existing.overflow, highest) {
+        existing.epoch = highest;
+    }
     Ok(Membership::Claimed)
 }
 
@@ -741,26 +891,58 @@ fn io_refusal(error: io::Error) -> ReserveRefusal {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use harw_job_store::RECORDS_DIR;
 
     use super::{
-        Entry, FileLeaseRecord, FileLeaseRegistry, Holder, LeaseSet, MAX_RESERVATION_MEMBERS,
-        ReserveRefusal, UNTRACKED_MEMBER, lease_id_for,
+        Counted, Entry, FILE_LEASE_DIR, FileLeaseRecord, FileLeaseRegistry, Holder, LeaseSet,
+        MAX_RESERVATION_MEMBERS, ReserveRefusal, Touched, UNTRACKED_MEMBER, lease_id_for,
     };
     use crate::test_support::{TestResult, ctx, missing};
 
     struct Fixture {
-        _temp: tempfile::TempDir,
+        temp: tempfile::TempDir,
         registry: FileLeaseRegistry,
     }
 
     fn fixture() -> TestResult<Fixture> {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let registry = FileLeaseRegistry::open_in_job_root(temp.path()).map_err(ctx("open"))?;
-        Ok(Fixture {
-            _temp: temp,
-            registry,
-        })
+        Ok(Fixture { temp, registry })
+    }
+
+    // The key a one-path reserve touched, counted as a named claim.
+    fn named(key: &str) -> Touched {
+        Touched {
+            entry: Entry::new(key),
+            counted: Counted::Named,
+        }
+    }
+
+    // The key a call touched that the record only counted (beyond the cap).
+    fn counted_only(key: &str) -> Touched {
+        Touched {
+            entry: Entry::new(key),
+            counted: Counted::Overflow,
+        }
+    }
+
+    fn claims(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(id, epoch)| ((*id).to_owned(), *epoch))
+            .collect()
+    }
+
+    // `<job-root>/intent_cycle/leases/records/<id>.json`, the stable layout
+    // of the store, to plant and inspect records as an earlier build wrote them.
+    fn record_file(fx: &Fixture, path: &str) -> std::path::PathBuf {
+        fx.temp
+            .path()
+            .join(FILE_LEASE_DIR)
+            .join(RECORDS_DIR)
+            .join(format!("{}.json", lease_id_for(path)))
     }
 
     fn set(paths: &[&str]) -> BTreeSet<String> {
@@ -784,13 +966,15 @@ mod tests {
         Ok(record.map(|record| record.owner))
     }
 
-    fn members_of(fx: &Fixture, path: &str) -> TestResult<BTreeSet<String>> {
-        let record = fx
-            .registry
+    fn record_of(fx: &Fixture, path: &str) -> TestResult<FileLeaseRecord> {
+        fx.registry
             .owner_of(path)
             .map_err(ctx("owner_of"))?
-            .ok_or_else(missing("the path must be reserved"))?;
-        Ok(record.reservations)
+            .ok_or_else(missing("the path must be reserved"))
+    }
+
+    fn members_of(fx: &Fixture, path: &str) -> TestResult<BTreeMap<String, u64>> {
+        Ok(record_of(fx, path)?.reservations)
     }
 
     #[test]
@@ -872,7 +1056,7 @@ mod tests {
         // `a.rs` (it is in the call's `touched` list) and has not reached
         // `z.rs` yet.
         let older = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [Entry::new("a.rs")];
+        let touched = [named("a.rs")];
         // Meanwhile epoch 2 of the same holder refreshes `a.rs` and receives
         // a successful `LeaseSet`.
         let newer = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 2)?;
@@ -880,7 +1064,10 @@ mod tests {
         assert_ne!(older.reservation, newer.reservation);
         assert_eq!(
             members_of(&fx, "a.rs")?,
-            set(&[older.reservation.as_str(), newer.reservation.as_str()])
+            claims(&[
+                (older.reservation.as_str(), 1),
+                (newer.reservation.as_str(), 2)
+            ])
         );
 
         // Sequential public calls cannot reproduce this interleaving: once
@@ -894,22 +1081,22 @@ mod tests {
         assert_eq!(fenced, Err(ReserveRefusal::StaleEpoch));
         fx.registry
             .roll_back(&touched, &holder, 1, &older.reservation);
-        let record = fx
-            .registry
-            .owner_of("a.rs")
-            .map_err(ctx("owner_of"))?
-            .ok_or_else(missing(
-                "a.rs must still be reserved after the epoch-1 rollback",
-            ))?;
+        let record = record_of(&fx, "a.rs")?;
         assert_eq!(record.owner, "worker-x");
         assert_eq!(record.cycle_id, "cycle-x");
         assert_eq!(record.epoch, 2);
-        assert_eq!(record.reservations, set(&[newer.reservation.as_str()]));
-        // The epoch fence holds on its own as well: the epoch-2 call's id is
-        // the last claim, and an epoch-1 presenter may not give it up.
+        assert_eq!(
+            record.reservations,
+            claims(&[(newer.reservation.as_str(), 2)])
+        );
+        // The epoch fence holds on its own as well: the epoch-2 claim is the
+        // last one, and a presenter of epoch 1 may not delete its record.
         fx.registry
             .roll_back(&touched, &holder, 1, &newer.reservation);
-        assert_eq!(members_of(&fx, "a.rs")?, set(&[newer.reservation.as_str()]));
+        assert_eq!(
+            members_of(&fx, "a.rs")?,
+            claims(&[(newer.reservation.as_str(), 2)])
+        );
         // Nobody else can take the path over while epoch 2 holds it.
         let takeover = fx
             .registry
@@ -924,7 +1111,7 @@ mod tests {
         // The foreign record is untouched as well.
         assert_eq!(holder_of(&fx, "z.rs")?.as_deref(), Some("worker-y"));
 
-        // A rollback at the record's own epoch by its last member still
+        // A rollback at the record's own epoch by its last claim still
         // removes it, and a rollback for a record that is gone is a no-op.
         fx.registry
             .roll_back(&touched, &holder, 2, &newer.reservation);
@@ -951,18 +1138,21 @@ mod tests {
         // record it wrote is the one a one-path reserve writes, so that call
         // stands in for A's creation and yields A's reservation id.
         let call_a = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [Entry::new("a.rs")];
+        let touched = [named("a.rs")];
 
         // Call B: `reserve({a.rs}, X, cycle, 1)` at the SAME epoch finds the
-        // record already held by X, joins its members and returns a
-        // successful set.
+        // record already held by X, adds its claim and returns a successful
+        // set.
         let call_b = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
         assert_eq!(call_b.epoch, call_a.epoch);
         assert_ne!(call_a.reservation, call_b.reservation);
         assert!(!call_b.reservation.is_empty());
         assert_eq!(
             members_of(&fx, "a.rs")?,
-            set(&[call_a.reservation.as_str(), call_b.reservation.as_str()])
+            claims(&[
+                (call_a.reservation.as_str(), 1),
+                (call_b.reservation.as_str(), 1)
+            ])
         );
 
         // A now runs into the foreign `z.rs` and is refused (the refusal
@@ -981,17 +1171,14 @@ mod tests {
         );
         fx.registry
             .roll_back(&touched, &holder, 1, &call_a.reservation);
-        let record = fx
-            .registry
-            .owner_of("a.rs")
-            .map_err(ctx("owner_of"))?
-            .ok_or_else(missing(
-                "a.rs must still be reserved after A's rollback, B holds it",
-            ))?;
+        let record = record_of(&fx, "a.rs")?;
         assert_eq!(record.owner, "worker-x");
         assert_eq!(record.cycle_id, "cycle-x");
         assert_eq!(record.epoch, 1);
-        assert_eq!(record.reservations, set(&[call_b.reservation.as_str()]));
+        assert_eq!(
+            record.reservations,
+            claims(&[(call_b.reservation.as_str(), 1)])
+        );
         // Another holder, even at a higher epoch, cannot take the path while
         // B's set is alive.
         let takeover = fx
@@ -1007,7 +1194,7 @@ mod tests {
         // The foreign record is untouched as well.
         assert_eq!(holder_of(&fx, "z.rs")?.as_deref(), Some("worker-y"));
 
-        // Control: once B's id is the last member and rolls back too, the
+        // Control: once B's claim is the last one and rolls back too, the
         // record is removed and the path is free for others again.
         fx.registry
             .roll_back(&touched, &holder, 1, &call_b.reservation);
@@ -1031,11 +1218,12 @@ mod tests {
         // Call A: `reserve({a.rs, z.rs}, X, cycle, 1)` has created `a.rs`
         // (it is in A's `touched` list) and has not reached `z.rs` yet.
         let call_a = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [Entry::new("a.rs")];
+        let touched = [named("a.rs")];
 
         // Call B: `reserve({a.rs, y.rs}, X, cycle, 1)` refreshes `a.rs`
-        // (joining A's record without creating it) and is then refused at the
-        // foreign `y.rs`. Its own rollback runs inside this public call.
+        // (adding its claim to A's record without creating it) and is then
+        // refused at the foreign `y.rs`. Its own rollback runs inside this
+        // public call.
         let call_b = fx
             .registry
             .reserve(&set(&["a.rs", "y.rs"]), "worker-x", "cycle-x", 1);
@@ -1046,10 +1234,10 @@ mod tests {
                 owner: "worker-y".to_owned(),
             })
         );
-        // B has left again, but A is still in flight and claims `a.rs`.
+        // B's claim has ended, but A is still in flight and claims `a.rs`.
         assert_eq!(
             members_of(&fx, "a.rs")?,
-            set(&[call_a.reservation.as_str()])
+            claims(&[(call_a.reservation.as_str(), 1)])
         );
         assert_eq!(holder_of(&fx, "a.rs")?.as_deref(), Some("worker-x"));
 
@@ -1069,42 +1257,90 @@ mod tests {
     }
 
     #[test]
+    fn both_failing_calls_across_epochs_leave_the_shared_record_unowned() -> TestResult {
+        let fx = fixture()?;
+        let holder = Holder {
+            owner: "worker-x",
+            cycle_id: "cycle-x",
+        };
+        reserve(&fx, &["y.rs", "z.rs"], "worker-y", "cycle-y", 1)?;
+
+        // Call A at epoch 1: `reserve({a.rs, z.rs})` has created `a.rs` and
+        // has not reached `z.rs` yet.
+        let call_a = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
+        let touched = [named("a.rs")];
+
+        // Call B at epoch 2: `reserve({a.rs, y.rs})` refreshes `a.rs`, which
+        // moves the record's epoch to 2, and is then refused at the foreign
+        // `y.rs`. Its rollback ends its claim and takes the epoch it had
+        // advanced along: the record falls back to the epoch of A's claim.
+        let call_b = fx
+            .registry
+            .reserve(&set(&["a.rs", "y.rs"]), "worker-x", "cycle-x", 2);
+        assert_eq!(
+            call_b,
+            Err(ReserveRefusal::AlreadyOwned {
+                path: "y.rs".to_owned(),
+                owner: "worker-y".to_owned(),
+            })
+        );
+        let record = record_of(&fx, "a.rs")?;
+        assert_eq!(record.epoch, 1);
+        assert_eq!(
+            record.reservations,
+            claims(&[(call_a.reservation.as_str(), 1)])
+        );
+
+        // A is refused at `z.rs` too. It is the sole claim and presents
+        // epoch 1, which no longer is stale: neither call returned a
+        // `LeaseSet`, so `a.rs` must be free.
+        fx.registry
+            .roll_back(&touched, &holder, 1, &call_a.reservation);
+        assert_eq!(holder_of(&fx, "a.rs")?, None);
+        reserve(&fx, &["a.rs"], "worker-y", "cycle-y", 1)?;
+        assert_eq!(holder_of(&fx, "a.rs")?.as_deref(), Some("worker-y"));
+        Ok(())
+    }
+
+    #[test]
     fn rollback_never_removes_a_record_without_a_reservation_id() -> TestResult {
         let fx = fixture()?;
         let holder = Holder {
             owner: "worker-x",
             cycle_id: "cycle-x",
         };
-        // A record written before `reservations` existed has no such key.
+        // A record written before reservation ids existed has no such key.
         let json = format!(
             r#"{{"schema_version":1,"key_id":"{}","key":"a.rs","owner":"worker-x","cycle_id":"cycle-x","epoch":1,"acquired_at":"2026-01-01T00:00:00Z"}}"#,
             lease_id_for("a.rs")
         );
-        let legacy: FileLeaseRecord = serde_json::from_str(&json).map_err(ctx("legacy record"))?;
+        std::fs::write(record_file(&fx, "a.rs"), &json).map_err(ctx("plant legacy record"))?;
+        let legacy = record_of(&fx, "a.rs")?;
         assert!(legacy.reservations.is_empty());
-        fx.registry
-            .records
-            .create(&legacy)
-            .map_err(ctx("store legacy record"))?;
-        let touched = [Entry::new("a.rs")];
+        assert_eq!(legacy.overflow, 0);
+        let touched = [named("a.rs")];
         // No live call id (nor an empty one) is allowed to roll it back.
         fx.registry
             .roll_back(&touched, &holder, 1, "some-live-call");
         fx.registry.roll_back(&touched, &holder, 1, "");
         assert_eq!(holder_of(&fx, "a.rs")?.as_deref(), Some("worker-x"));
         // The legacy record is still the holder's: a new reserve adopts it,
-        // and the unknown earlier reservation stays represented.
-        let adopting = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
+        // and the unknown earlier holders stay represented at their epoch.
+        let adopting = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 2)?;
+        let record = record_of(&fx, "a.rs")?;
+        assert_eq!(record.epoch, 2);
         assert_eq!(
-            members_of(&fx, "a.rs")?,
-            set(&[UNTRACKED_MEMBER, adopting.reservation.as_str()])
+            record.reservations,
+            claims(&[(UNTRACKED_MEMBER, 1), (adopting.reservation.as_str(), 2)])
         );
-        // If the adopting call fails, its rollback gives up only its own
-        // claim: the record the legacy reservation held is kept.
+        // If the adopting call fails, its rollback ends only its own claim:
+        // the record the legacy holders kept is kept, at their epoch.
         fx.registry
-            .roll_back(&touched, &holder, 1, &adopting.reservation);
-        assert_eq!(members_of(&fx, "a.rs")?, set(&[UNTRACKED_MEMBER]));
-        assert_eq!(holder_of(&fx, "a.rs")?.as_deref(), Some("worker-x"));
+            .roll_back(&touched, &holder, 2, &adopting.reservation);
+        let record = record_of(&fx, "a.rs")?;
+        assert_eq!(record.epoch, 1);
+        assert_eq!(record.reservations, claims(&[(UNTRACKED_MEMBER, 1)]));
+        assert_eq!(record.owner, "worker-x");
         // Only release (by key) frees such a record.
         fx.registry
             .release(&adopting, 1)
@@ -1114,31 +1350,146 @@ mod tests {
     }
 
     #[test]
-    fn member_list_is_bounded_and_overflow_is_never_rolled_back() -> TestResult {
+    fn predecessor_record_layouts_are_migrated() -> TestResult {
+        let fx = fixture()?;
+        let uuid = "2f6c0f0e-1d54-4f0e-9d9e-0a1b2c3d4e5f";
+        let id = lease_id_for("a.rs");
+        // Exactly what the previous build wrote under the same schema
+        // version: one `reservation` id, no `reservations`.
+        let parent = format!(
+            r#"{{"schema_version":1,"key_id":"{id}","key":"a.rs","owner":"worker-x","cycle_id":"cycle-x","epoch":1,"acquired_at":"2026-01-01T00:00:00Z","reservation":"{uuid}"}}"#
+        );
+        let parsed: FileLeaseRecord = serde_json::from_str(&parent).map_err(ctx("parent json"))?;
+        assert_eq!(parsed.reservations, claims(&[(uuid, 1)]));
+        assert_eq!(parsed.overflow, 0);
+        // The current layout round-trips.
+        let encoded = serde_json::to_string(&parsed).map_err(ctx("encode"))?;
+        let decoded: FileLeaseRecord = serde_json::from_str(&encoded).map_err(ctx("decode"))?;
+        assert_eq!(decoded, parsed);
+
+        // The store reads that file as a live lease (it is not quarantined)...
+        std::fs::write(record_file(&fx, "a.rs"), &parent).map_err(ctx("plant parent record"))?;
+        let loaded = record_of(&fx, "a.rs")?;
+        assert_eq!(loaded.owner, "worker-x");
+        assert_eq!(loaded.reservations, claims(&[(uuid, 1)]));
+        // ...so another holder is still refused...
+        let takeover = fx
+            .registry
+            .reserve(&set(&["a.rs"]), "worker-y", "cycle-y", 5);
+        assert_eq!(
+            takeover,
+            Err(ReserveRefusal::AlreadyOwned {
+                path: "a.rs".to_owned(),
+                owner: "worker-x".to_owned(),
+            })
+        );
+        // ...and the next mutation by the holder rewrites it in the current
+        // layout, keeping the earlier call's claim.
+        let next = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 2)?;
+        assert_eq!(
+            members_of(&fx, "a.rs")?,
+            claims(&[(uuid, 1), (next.reservation.as_str(), 2)])
+        );
+        let text = std::fs::read_to_string(record_file(&fx, "a.rs")).map_err(ctx("read file"))?;
+        assert!(text.contains(r#""reservations""#));
+        assert!(!text.contains(r#""reservation":"#));
+
+        // The layout before that (a plain list of ids, no epochs) becomes
+        // claims at the record's epoch.
+        let list = format!(
+            r#"{{"schema_version":1,"key_id":"{id}","key":"a.rs","owner":"worker-x","cycle_id":"cycle-x","epoch":3,"acquired_at":"2026-01-01T00:00:00Z","reservations":["{uuid}","{UNTRACKED_MEMBER}"]}}"#
+        );
+        let listed: FileLeaseRecord = serde_json::from_str(&list).map_err(ctx("list json"))?;
+        assert_eq!(
+            listed.reservations,
+            claims(&[(uuid, 3), (UNTRACKED_MEMBER, 3)])
+        );
+
+        // Everything else stays refused.
+        let unknown = parent.replacen("\"epoch\":1", "\"epoch\":1,\"bogus\":true", 1);
+        assert!(serde_json::from_str::<FileLeaseRecord>(&unknown).is_err());
+        let wrong_type = parent.replacen("\"reservation\":", "\"reservations\":", 1);
+        assert!(serde_json::from_str::<FileLeaseRecord>(&wrong_type).is_err());
+        Ok(())
+    }
+
+    // One call more than a record names: the last one is only counted.
+    fn reserve_beyond_cap(fx: &Fixture) -> TestResult<Vec<LeaseSet>> {
+        let mut calls = Vec::new();
+        for _ in 0..=MAX_RESERVATION_MEMBERS {
+            calls.push(reserve(fx, &["a.rs"], "worker-x", "cycle-x", 1)?);
+        }
+        Ok(calls)
+    }
+
+    #[test]
+    fn overflow_members_are_rolled_back_like_named_ones() -> TestResult {
         let fx = fixture()?;
         let holder = Holder {
             owner: "worker-x",
             cycle_id: "cycle-x",
         };
-        // One call more than the list holds.
-        let mut calls = Vec::new();
-        for _ in 0..=MAX_RESERVATION_MEMBERS {
-            calls.push(reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?);
+
+        // 65 calls on one record; the record names 64 of them and counts the
+        // last one. Then all of them fail, the named ones first: the record
+        // stays, held by the counted call alone...
+        let calls = reserve_beyond_cap(&fx)?;
+        let (counted, named_calls) = calls
+            .split_last()
+            .ok_or_else(missing("the loop reserved at least once"))?;
+        let record = record_of(&fx, "a.rs")?;
+        assert_eq!(record.reservations.len(), MAX_RESERVATION_MEMBERS);
+        assert_eq!(record.overflow, 1);
+        assert!(!record.reservations.contains_key(&counted.reservation));
+        for call in named_calls {
+            fx.registry
+                .roll_back(&[named("a.rs")], &holder, 1, &call.reservation);
         }
-        let last = calls
-            .last()
-            .ok_or_else(missing("the loop above reserved at least once"))?;
-        let members = members_of(&fx, "a.rs")?;
-        assert_eq!(members.len(), MAX_RESERVATION_MEMBERS + 1);
-        assert!(members.contains(UNTRACKED_MEMBER));
-        assert!(!members.contains(&last.reservation));
-        // The overflowing call is not a member, so its rollback cannot
-        // delete the record (nor shrink the list).
-        let touched = [Entry::new("a.rs")];
+        let record = record_of(&fx, "a.rs")?;
+        assert!(record.reservations.is_empty());
+        assert_eq!(record.overflow, 1);
+        assert_eq!(record.owner, "worker-x");
+        // ...and the counted call's rollback deletes it: all 65 calls failed,
+        // so nobody holds the path.
         fx.registry
-            .roll_back(&touched, &holder, 1, &last.reservation);
-        assert_eq!(members_of(&fx, "a.rs")?, members);
-        assert_eq!(holder_of(&fx, "a.rs")?.as_deref(), Some("worker-x"));
+            .roll_back(&[counted_only("a.rs")], &holder, 1, &counted.reservation);
+        assert_eq!(holder_of(&fx, "a.rs")?, None);
+        reserve(&fx, &["a.rs"], "worker-y", "cycle-y", 1)?;
+        fx.registry
+            .release(
+                &LeaseSet {
+                    cycle_id: "cycle-y".to_owned(),
+                    owner: "worker-y".to_owned(),
+                    epoch: 1,
+                    reservation: String::new(),
+                    keys: set(&["a.rs"]),
+                },
+                1,
+            )
+            .map_err(ctx("release"))?;
+
+        // The other order: the counted call fails first and the named claims
+        // keep the record until the last of them ends.
+        let calls = reserve_beyond_cap(&fx)?;
+        let (counted, named_calls) = calls
+            .split_last()
+            .ok_or_else(missing("the loop reserved at least once"))?;
+        fx.registry
+            .roll_back(&[counted_only("a.rs")], &holder, 1, &counted.reservation);
+        let record = record_of(&fx, "a.rs")?;
+        assert_eq!(record.reservations.len(), MAX_RESERVATION_MEMBERS);
+        assert_eq!(record.overflow, 0);
+        let (last, rest) = named_calls
+            .split_last()
+            .ok_or_else(missing("the record names 64 calls"))?;
+        for call in rest {
+            fx.registry
+                .roll_back(&[named("a.rs")], &holder, 1, &call.reservation);
+        }
+        assert_eq!(members_of(&fx, "a.rs")?.len(), 1);
+        fx.registry
+            .roll_back(&[named("a.rs")], &holder, 1, &last.reservation);
+        assert_eq!(holder_of(&fx, "a.rs")?, None);
         Ok(())
     }
 
@@ -1195,21 +1546,24 @@ mod tests {
         assert_eq!(first.owner, again.owner);
         assert_eq!(first.cycle_id, again.cycle_id);
         assert_ne!(first.reservation, again.reservation);
-        // The record is shared by both calls: the set grows by the new id.
+        // The record is shared by both calls: the claims grow by the new id.
         for path in ["a.rs", "b.rs"] {
             assert_eq!(
                 members_of(&fx, path)?,
-                set(&[first.reservation.as_str(), again.reservation.as_str()])
+                claims(&[
+                    (first.reservation.as_str(), 1),
+                    (again.reservation.as_str(), 1)
+                ])
             );
         }
         let newer = reserve(&fx, &["a.rs", "b.rs"], "worker-a", "cycle-a", 2)?;
         assert_eq!(newer.epoch, 2);
         assert_eq!(
             members_of(&fx, "a.rs")?,
-            set(&[
-                first.reservation.as_str(),
-                again.reservation.as_str(),
-                newer.reservation.as_str(),
+            claims(&[
+                (first.reservation.as_str(), 1),
+                (again.reservation.as_str(), 1),
+                (newer.reservation.as_str(), 2),
             ])
         );
         let record = fx.registry.owner_of("a.rs").map_err(ctx("owner_of"))?;
