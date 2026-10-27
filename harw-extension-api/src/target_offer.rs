@@ -8,7 +8,7 @@
 //!
 //! The selection never widens authority. `allowed` is the trusted ceiling
 //! that corresponds to
-//! [`CycleAdmission::allowed_children`](crate::intent_cycle::CycleAdmission::allowed_children);
+//! `CycleAdmission::allowed_children` in `harw-plan-bridge::intent_cycle`;
 //! a candidate outside that set is dropped no matter how well it scores.
 
 use std::collections::BTreeSet;

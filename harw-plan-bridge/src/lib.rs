@@ -113,7 +113,6 @@ pub mod job_bridge;
 pub mod metrics;
 pub mod plan_context;
 pub mod security_bridge;
-pub mod target_offer;
 pub mod verify_exec;
 pub mod work_driver;
 
@@ -126,6 +125,14 @@ pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
 pub use crate::cycle_explorer::{
     DEFAULT_CACHE_BYTES, DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_STEP_BYTES, ExplorerReadCache,
     ReadOnlyExplorerExecutor, ReadTargetError, ReadTargetMap,
+};
+pub use crate::cycle_observation::{
+    CauseCode, OBSERVATION_SCHEMA, ObservationCategory, ObservationEventId, ObservationOutcome,
+    RunObservationV1, build_observation, classify_fence, classify_reconciliation, classify_refusal,
+    classify_step_failure, is_countable_as_fix, proposal_kind,
+};
+pub use crate::cycle_outbox::{
+    MAX_ACKED_TAIL, MAX_OUTBOX_PENDING, Outbox, OutboxEntry, OutboxError,
 };
 pub use crate::cycle_proposer::{
     ModelCycleProposer, PromptLimits, ProposerConfig, ProposerRoute, RoutePolicy, RouteSlot,

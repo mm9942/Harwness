@@ -253,7 +253,10 @@ fn is_valid_evidence_id(id: &str) -> bool {
 /// character outside the prompt-safe set are dropped (never truncated); at
 /// most 8 valid ids are kept, in order.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "trusted builder: every field is a separate identity input; a parameter struct would only hide the same arity"
+)]
 pub fn build_observation(
     cycle_id: &str,
     fence: CheckpointFence,

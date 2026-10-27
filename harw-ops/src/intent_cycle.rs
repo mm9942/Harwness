@@ -58,13 +58,14 @@ pub const INTENT_CYCLE_INPUT_SCHEMA_VERSION: u32 = 1;
 /// Wall-clock budget of one cycle job.
 const INTENT_CYCLE_MAX_WALL_SECS: i64 = 30 * 60;
 
-/// Attempts: one, as for `work_driver`. Consumed wall time and tokens are not
-/// persisted across claims (the job store has no fenced usage update), so an
-/// automatic reclaim after a lost lease would start with a fresh budget.
-/// Provider outages are retried inside the claim by the job worker; after a
-/// crash the cycle stays non-terminal and an explicit operator `/retry`
-/// resumes its fenced checkpoint.
-const INTENT_CYCLE_MAX_ATTEMPTS: u32 = 1;
+/// Attempts: two (the original claim plus one reclaim). Consumed wall time and
+/// tokens are persisted lease-fenced by `JobStore::record_usage` and flushed by
+/// the worker's token ledger, so a reclaim after a lost lease resumes the
+/// fenced checkpoint with the already consumed budget rather than a fresh one.
+/// Provider outages are still retried inside the claim by the job worker; a
+/// crash with the second attempt spent leaves the cycle non-terminal for an
+/// explicit operator `/retry`.
+const INTENT_CYCLE_MAX_ATTEMPTS: u32 = 2;
 
 /// Upper bound (characters) of an acceptance criterion name.
 const MAX_CRITERION_NAME_CHARS: usize = 128;
@@ -800,6 +801,18 @@ mod tests {
         assert_eq!(input.spec.limits.max_transitions, 8);
         assert!(input.spec.plan(&input.intent_id).is_ok());
         assert_eq!(record.job.retry.max_attempts, INTENT_CYCLE_MAX_ATTEMPTS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_policy_allows_one_reclaim() -> TestResult {
+        let fx = fixture()?;
+        let output = run(&IntentCycleStartOperation, &fx.ctx, start_args())
+            .await
+            .map_err(ctx("start"))?;
+        let id = job_id(&output)?;
+        let record = fx.jobs.get(&id).map_err(ctx("job"))?;
+        assert_eq!(record.job.retry.max_attempts, 2);
         Ok(())
     }
 

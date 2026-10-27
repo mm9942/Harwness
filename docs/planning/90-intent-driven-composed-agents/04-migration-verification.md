@@ -1,6 +1,6 @@
 # 04 — Implementation waves, review gates, metrics and migration ledger
 
-> Status: **proposal** (§§1–6), documented on the pinned `dev@197a92e92d438bf6bf93b129bb964f4852686149` baseline. §7 records what is implemented so far (partial W01–W03; the read-only recipe is wired). This PR does not widen admission rights and must not be presented as a passed build.
+> Status: **proposal** (§§1–6), documented on the pinned `dev@197a92e92d438bf6bf93b129bb964f4852686149` baseline. §7 records what is implemented so far (partial W01–W03; the read-only recipe is wired). The W01–W03 waves are merged on `dev` via PR #148 (ledger entry `MIG-PL90-W03w`); the rest of this document remains proposal.
 
 ## 1. Implementation ownership principles
 
@@ -139,7 +139,7 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 
 Status vocabulary as in the dossier: `CURRENT` = merged and checked, `IN PR` = code in this PR with locally green tests, `PLANNED` = design only.
 
-### 7.1 `harw-plan-bridge/src/intent_cycle.rs` — IN PR
+### 7.1 `harw-plan-bridge/src/intent_cycle.rs` — CURRENT (MIG-PL90-W03w, PR #148)
 
 Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cycle` tests green) and `cargo clippy -p harw-plan-bridge --all-targets -- -D warnings` (clean). The original seven source-only tests had never been run; running them found one real defect: `{"kind":"complete","permission":"full_access"}` deserialized, because serde does not enforce `deny_unknown_fields` on unit variants of internally tagged enums. All proposal and join variants are now struct variants and the test covers four injection shapes.
 
@@ -154,7 +154,7 @@ Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cyc
 | Durable fence | `CycleCheckpoint` (schema v1) with `CheckpointFence { epoch, sequence }`; `check_commit` is the CAS rule: same epoch → sequence + 1, new epoch → never rewind, stale epoch refused, intent/authority/ceiling immutable across commits | — |
 | Resume | checkpoint stores the non-authorizing `AuthoritySnapshot` and `AdmissionCeiling`; `resume_admission` takes the context from `PolicyBootstrap::reissue`, refuses another workspace or any permission the snapshot never held, intersects stored ceiling × current admission × reissued permissions (write targets need `WriteWorkspace`, reads need `ReadWorkspace`), narrows limits, re-fences under the new epoch; test covers a policy + role upgrade between crash and resume | R01 |
 
-### 7.2 `harw-plan-bridge/src/cycle_runtime.rs` — IN PR (W02 runtime binding)
+### 7.2 `harw-plan-bridge/src/cycle_runtime.rs` — CURRENT (MIG-PL90-W03w, PR #148; W02 runtime binding)
 
 Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycle_runtime`), clippy `-D warnings` clean, `xtask gates arch` without violations for `harw-plan-bridge` (new edges A → J `harw-job-core`/`harw-job-store` are permitted by `A.may_depend_on = ["*"]`).
 
@@ -170,7 +170,7 @@ Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycl
 
 Covered failure injections: stale epoch / zombie executor, foreign job, double journal, crash with completed / uncertain / not-started step, tampered or widened rebind, policy downgrade between submit and claim, unavailable proposer, executor capability failure, cancellation, end-to-end through a real `JobStore` + `DurableJobRunner`.
 
-### 7.3 `cycle_explorer.rs` / `cycle_proposer.rs` — IN PR (W03 building blocks)
+### 7.3 `cycle_explorer.rs` / `cycle_proposer.rs` — CURRENT (MIG-PL90-W03w, PR #148; W03 building blocks)
 
 Intermediate state: the two halves of the W03 explorer exist as independently tested modules and are now merged together with one cross-module test (`cycle_w03_tests.rs`: `CycleDriver` + `ModelCycleProposer` over a scripted fake `ModelProvider` + `ReadOnlyExplorerExecutor` over a temp workspace; Advance(read) -> digest-bound `Observed` evidence -> Reorient on that evidence -> read -> Escalate; it also asserts the turn-2 prompt contains the evidence id and locator but no file content and no digest). Verified locally: `cargo test -p harw-plan-bridge` (271 lib + 20 `intent_cycle` tests green), clippy `-D warnings` clean, `rustfmt --edition 2024 --check` clean, `xtask gates arch` shows only the 6 pre-existing violations (`harw-cloud*`, `harw-tool-obsidian`). New edge: `harw-plan-bridge` -> `harw-tool-fsread`.
 
@@ -187,7 +187,7 @@ What is NOT done:
 - ~~No retry backoff.~~ The proposer now sleeps bounded waits (see the table above); the provider layer still owns pacing.
 - No small-model benchmark (the W03 exit criterion in section 2 is still open).
 
-### 7.4 Production wiring of the read-only recipe — IN PR (MIG-PL90-W03w)
+### 7.4 Production wiring of the read-only recipe — CURRENT (MIG-PL90-W03w, PR #148)
 
 The W03 building blocks are now reachable end to end:
 
@@ -208,7 +208,7 @@ Proposer cancellation: the driver races every `propose` against the job's cancel
 
 - No concrete executor for tools beyond file reads, waits and the content verifier, child spawn or nested recipes; no write-capable adapter (W05). W04 is open.
 - No small-model benchmark (W03 exit criterion).
-- Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
+- Network-scope widening on resume is checked; the test is scheduled with the proposer-correctness wave (`resume_refuses_widened_network_scope`).
 
 - W04–W10: no wired orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
 - Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
@@ -218,5 +218,22 @@ Proposer cancellation: the driver races every `propose` against the job's cancel
 - `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
 - The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).
 - Two `harw-core` lib tests fail on the base once it compiles (`child_controller::tests::teil_o::without_a_relay_the_child_still_fails_closed`, `turn_loop::tests::uia_keeps_transfer_tools_with_one_line_descriptions`); unrelated to this PR and left for a separate fix.
+
+### 7.7 Landed library modules without a production caller (CURRENT, library only)
+
+| Module | Contract | Missing integration step |
+|---|---|---|
+| `harw-plan-bridge/src/cycle_observation.rs` (`RunObservationV1`, typed classifiers) + `cycle_outbox.rs` (epoch-fenced `Outbox<T>`, 64 pending / 128 acked tail) | W03c (05 §3) | build observations in `CycleDriver` at refusal/step failure/reconciliation; persist `Outbox<RunObservationV1>` in the same `CycleStore` CAS commit as the checkpoint |
+| `harw-plan-bridge/src/child_return_envelope.rs` | W03d-3 (05 §2.2) | contract for future `Segment::Child` steps; the production child→parent path is `harw-research::return_envelope` |
+| `harw-extension-api/src/target_offer.rs` | W04 (top-k role offers) | feed `DelegationTargets` and the orchestrator prompt |
+| `harw-plan-bridge/src/cycle_benchmark.rs` | W03 exit (small-model benchmark scoring) | benchmark harness and fixtures |
+| `harw-knowledge/src/caller_identity.rs` | W03d-2 (05 §1) | build `CallerIdentity` at admission; use `is_visible` in recall |
+| `harw-knowledge/src/learning_recall.rs` | W09b (05 §2.3) | retrieval path calling `select_lessons` |
+| `harw-memory/src/context_provider.rs::with_session_gate` | W03d-1 (05 §1) | contract for future STM mounts; `MemoryContextProvider` currently has no production caller (root uses a facts-only provider, children mount none) |
+| `harw-model-catalog/src/lifecycle.rs` | PL-86 D1/D5 | router and explicit selection consult it (D3) |
+| `harw-tui-layout/src/mini_live.rs`, `harw-tui/src/{live_ranker,recency_view}.rs` | PL-94 W02 U0 / W01 M2b | mount in the TUI renderer |
+| `harw-job-linux/src/inventory.rs` | linux-user-cloud-control H04/H05 | procfs/DoD source |
+
+These modules compile and are tested, but have no production caller; they are not evidence of the corresponding wave being complete.
 
 The comparison to Claude Code remains limited to repository-visible workflows (Gap-Hunt kit), **not a claim about Anthropic's internal implementation**.

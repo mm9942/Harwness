@@ -591,6 +591,38 @@ mod tests {
     }
 
     #[test]
+    fn bundled_replacements_exist_in_the_anthropic_catalog() -> TestResult {
+        let catalog = crate::vendor_anthropic::anthropic_descriptors();
+        let known: BTreeSet<&str> = catalog.iter().map(|d| d.model.as_str()).collect();
+        // Ersatz-IDs anderer Provider werden hier nicht geprüft.
+        let other_providers = crate::descriptor::bootstrap_descriptors();
+        let foreign: BTreeSet<&str> = other_providers
+            .iter()
+            .filter(|d| d.provider != "anthropic")
+            .map(|d| d.model.as_str())
+            .collect();
+
+        let entries = bundled_lifecycles();
+        let mut checked = 0_usize;
+        for entry in entries.iter().filter(|e| e.provider == "anthropic") {
+            for replacement in &entry.lifecycle.replacements {
+                let id = replacement.as_str();
+                if !known.contains(id) && foreign.contains(id) {
+                    continue;
+                }
+                assert!(
+                    known.contains(id),
+                    "replacement {id} of anthropic/{} fehlt in anthropic_descriptors()",
+                    entry.model
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "kein Anthropic-Ersatzmodell geprüft");
+        Ok(())
+    }
+
+    #[test]
     fn lifecycle_serde_round_trip() -> TestResult {
         let lifecycle = ProviderLifecycle {
             deprecated_at: Some(RetirementDate::Instant(utc(2026, 9, 30, 6)?)),

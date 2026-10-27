@@ -25,10 +25,12 @@
 //! `retry`), so the worker itself re-runs the driver under the same lease after
 //! a bounded backoff ([`PROPOSER_RETRY_BACKOFF`]); only when that is used up
 //! does the job fail, with the cycle still non-terminal so an operator retry
-//! resumes the fenced checkpoint. The job has exactly one attempt
-//! (`harw_ops::intent_cycle`): consumed wall time and tokens are not persisted
-//! across claims, so an automatic reclaim would otherwise grant a fresh
-//! budget; a lost lease is never requeued behind the operator's back. Everything else maps through
+//! resumes the fenced checkpoint. The job has two attempts
+//! (`harw_ops::intent_cycle`): consumed wall time and tokens are persisted
+//! lease-fenced (`PromptTokenLedger::persisted` flushes to
+//! `JobStore::record_usage`), so a reclaim after a lost lease resumes with the
+//! consumed budget (`remaining_wall` reads the persisted wall) instead of a
+//! fresh one. Everything else maps through
 //! `harw_plan_bridge::job_outcome`: `CompletionProposed` is a succeeded job
 //! that still needs owner acceptance.
 //!

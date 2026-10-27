@@ -116,7 +116,8 @@ fn claude(spec: ClaudeSpec) -> ModelDescriptor {
 /// Returns curated [`ModelDescriptor`] entries for all known Anthropic Claude models.
 ///
 /// # Description
-/// Reihenfolge: aktuelle Modelle (Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5),
+/// Reihenfolge: aktuelle Modelle (Fable 5.1, Opus 5.5, Sonnet 5, Sonnet 5.5,
+/// Haiku 5.5, Haiku 4.5),
 /// dann die nur auf Einladung verfügbaren Mythos-Modelle (`Preview`), dann
 /// die noch verfügbaren Legacy-Modelle (`Deprecated`), zuletzt auf der
 /// Claude-API zurückgezogene Modelle (`Retired`).
@@ -133,7 +134,7 @@ fn claude(spec: ClaudeSpec) -> ModelDescriptor {
 ///   (Cache-Lesen 0,1× Input; 0,025× bei Fable/Mythos 5.1; 0,05× bei Opus 5.5).
 ///
 /// # Returns
-/// `Vec<ModelDescriptor>` mit 15 Einträgen (4 aktuell + 3 Mythos + 7 Legacy + 1 Retired).
+/// `Vec<ModelDescriptor>` mit 17 Einträgen (6 aktuell + 2 Mythos + 8 Legacy + 1 Retired).
 ///
 /// # Concurrency
 /// Pure, no side effects, no locks.
@@ -184,6 +185,34 @@ pub fn anthropic_descriptors() -> Vec<ModelDescriptor> {
             computer_use: true,
             code_execution: true,
             price: (2.0, 10.0, 0.20),
+            lifecycle: Ga,
+        }),
+        // Preis $2/$10 laut docs/research/models/anthropic-lifecycle-2026-10-14.md;
+        // Kontext, Max-Output und Cache-Lesen ($0.20) sind bis zum Doku-Audit von
+        // Sonnet 5 übernommen.
+        claude(ClaudeSpec {
+            model: "claude-sonnet-5-5",
+            context_window: CTX_1M,
+            max_output_tokens: OUT_128K,
+            tool_calling: Native,
+            computer_use: true,
+            code_execution: true,
+            price: (2.0, 10.0, 0.20),
+            lifecycle: Ga,
+        }),
+        // Veröffentlicht 2026-10-07 (docs/research/models/anthropic-lifecycle-2026-10-14.md).
+        // Preis $0.10/$0.50 gilt laut Doku nur bis 100k Prompt-Tokens (darüber
+        // $0.50/$2.50, hier nicht abgebildet). Kontext 200K ist unverifiziert;
+        // Max-Output 64K wie Haiku 4.5. Cache-Lesen $0.01 ist unverifiziert: die
+        // Doku nennt keinen Cache-Satz.
+        claude(ClaudeSpec {
+            model: "claude-haiku-5-5",
+            context_window: CTX_200K,
+            max_output_tokens: OUT_64K,
+            tool_calling: Native,
+            computer_use: true,
+            code_execution: true,
+            price: (0.10, 0.50, 0.01),
             lifecycle: Ga,
         }),
         // models/overview: 200K / 64K, extended thinking, kein Effort;
@@ -373,6 +402,8 @@ mod tests {
             "claude-fable-5-1",
             "claude-opus-5-5",
             "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "claude-haiku-4-5-20251001",
             "claude-mythos-5-1",
             "claude-fable-5",
@@ -505,6 +536,8 @@ mod tests {
             "claude-fable-5-1",
             "claude-opus-5-5",
             "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "claude-haiku-4-5-20251001",
         ];
         let map: std::collections::HashMap<ModelId, ToolCallingSupport> = anthropic_descriptors()
@@ -535,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_anthropic_descriptors_ga_set_is_current_lineup() {
-        // Genau die vier Modelle der Vergleichstabelle sind GA.
+        // Genau die sechs Modelle der Vergleichstabelle sind GA.
         let mut ga: Vec<String> = anthropic_descriptors()
             .into_iter()
             .filter(|d| d.lifecycle == ModelLifecycle::Ga)
@@ -547,8 +580,10 @@ mod tests {
             vec![
                 "claude-fable-5-1",
                 "claude-haiku-4-5-20251001",
+                "claude-haiku-5-5",
                 "claude-opus-5-5",
                 "claude-sonnet-5",
+                "claude-sonnet-5-5",
             ]
         );
     }
