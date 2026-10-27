@@ -36,10 +36,13 @@
 //!   (retired) Modells wird abgelehnt (fail-closed, Zustand unverändert,
 //!   nie ein stiller Austausch); ein abgekündigtes (deprecated) Modell wird
 //!   mit Warnung zugelassen.
-//! - Eine **implizit** aufgelöste Kind-Stelle
-//!   ([`LiveModelRouting::resolved_internal_model`]) fällt auf das
-//!   Hauptmodell zurück, wenn ihr Modell abgeschaltet ist oder im
-//!   Retirement-Fenster liegt.
+//! - Die Auflösung einer Kind-Stelle
+//!   ([`LiveModelRouting::resolved_internal_model`]) unterscheidet nach
+//!   [`InternalModelSource`]: eine **explizite** Wahl gilt nach derselben
+//!   Regel wie beim Setzen (Retirement-Fenster und abgekündigt → Warnung, die
+//!   Route bleibt; erst abgeschaltet → Rückfall auf das Hauptmodell, mit
+//!   Ersatzhinweis im Log), eine **implizit** aufgelöste Stelle fällt schon
+//!   im Retirement-Fenster auf das Hauptmodell zurück.
 //! - [`check_explicit_selection`] ist die gemeinsame Prüfung einer expliziten
 //!   Wahl für Aufrufer **außerhalb** der Live-Wahl: die TUI prüft damit die
 //!   Route des Controllers an der Turn-Grenze, **bevor** sie in die
@@ -56,8 +59,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use harw_config::{
-    InternalModelChoice, InternalModelPoint, InternalModelsToml, ResolvedConfig,
-    ResolvedInternalModel, catalog_provider_of,
+    InternalModelChoice, InternalModelPoint, InternalModelSource, InternalModelsToml,
+    ResolvedConfig, ResolvedInternalModel, catalog_provider_of,
 };
 use harw_core::{ModelProvider, PinnedModelProvider};
 use harw_model_catalog::lifecycle;
@@ -252,12 +255,19 @@ impl LiveModelRouting {
 
     /// Aktuelle Auflösung einer Kind-Modellstelle.
     ///
+    /// # Lebenszyklus
+    /// Die Entscheidung trifft `internal_route_decision` zur aktuellen Uhr
+    /// und richtet sich nach [`ResolvedInternalModel::source`]: eine
+    /// **explizite** Wahl folgt der Regel des Setzens
+    /// ([`lifecycle::enforce_explicit`]) — abgekündigt oder im
+    /// Retirement-Fenster bleibt sie (mit Warnung im Log), erst nach dem
+    /// Retirement fällt sie zurück —, jede andere Herkunft nur dann, wenn sie
+    /// implizit wählbar ist ([`lifecycle::implicitly_selectable_bundled`]).
+    ///
     /// # Rückgabe
-    /// `None` für eine unbekannte Stelle — und für eine Stelle, deren Modell
-    /// nicht implizit wählbar ist (abgeschaltet oder im Retirement-Fenster,
-    /// siehe [`lifecycle::implicitly_selectable_bundled`]): der Aufrufer
-    /// fällt dann auf das Hauptmodell zurück, statt still ein Modell
-    /// anzusprechen, das der Provider abschaltet.
+    /// `None` für eine unbekannte Stelle — und für eine Stelle, die auf das
+    /// Hauptmodell zurückfällt: der Aufrufer nutzt dann das Hauptmodell,
+    /// statt still ein Modell anzusprechen, das der Provider abschaltet.
     #[must_use]
     pub fn resolved_internal_model(
         &self,
@@ -268,30 +278,27 @@ impl LiveModelRouting {
             .read()
             .ok()
             .and_then(|state| state.resolved.get(&point).cloned())?;
-        if let Some(model) = resolved.model.as_deref() {
-            let now = time::OffsetDateTime::now_utc();
-            let selectable = self
-                .lifecycle_provider(resolved.provider.as_deref(), model)
-                .is_none_or(|provider| {
-                    let model_id = resolve_model_id(&self.config, model);
-                    lifecycle::implicitly_selectable_bundled(&provider, &model_id, now)
-                });
-            if !selectable {
+        let now = lifecycle::OffsetDateTime::now_utc();
+        match internal_route_decision(&self.config, &resolved, now) {
+            InternalRouteDecision::Keep { warning } => {
+                if let Some(warning) = warning {
+                    tracing::warn!(
+                        point = point.key(),
+                        %warning,
+                        "runtime.live_model.deprecated"
+                    );
+                }
+                Some(resolved)
+            }
+            InternalRouteDecision::FallBack { reason } => {
                 tracing::warn!(
                     point = point.key(),
-                    model,
-                    "retired or in retirement window; falling back to main model"
+                    %reason,
+                    "runtime.live_model.internal_route_fallback"
                 );
-                return None;
+                None
             }
         }
-        Some(resolved)
-    }
-
-    /// Provider, gegen dessen Lebenszyklus eine Wahl geprüft wird (siehe
-    /// [`lifecycle_provider_in`]).
-    fn lifecycle_provider(&self, provider: Option<&str>, model: &str) -> Option<String> {
-        lifecycle_provider_in(&self.config, provider, model)
     }
 
     /// Erzwingt den Lebenszyklus einer **expliziten** Wahl.
@@ -459,11 +466,101 @@ pub fn check_explicit_selection(
     provider: Option<&str>,
     model: &str,
 ) -> Result<Option<String>, RetiredModelError> {
+    check_explicit_selection_at(
+        config,
+        provider,
+        model,
+        lifecycle::OffsetDateTime::now_utc(),
+    )
+}
+
+/// Wie [`check_explicit_selection`], aber zum übergebenen Zeitpunkt `now`
+/// (die Uhr ist injizierbar; kein Zugriff auf die Systemzeit).
+///
+/// # Errors
+/// [`RetiredModelError`], wenn das Angebot zu `now` abgeschaltet ist.
+fn check_explicit_selection_at(
+    config: &ResolvedConfig,
+    provider: Option<&str>,
+    model: &str,
+    now: lifecycle::OffsetDateTime,
+) -> Result<Option<String>, RetiredModelError> {
     let Some(provider) = lifecycle_provider_in(config, provider, model) else {
         return Ok(None);
     };
     let model_id = resolve_model_id(config, model);
-    lifecycle::enforce_explicit(&provider, &model_id, time::OffsetDateTime::now_utc())
+    lifecycle::enforce_explicit(&provider, &model_id, now)
+}
+
+/// Entscheidung über die Route einer aufgelösten Kind-Stelle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InternalRouteDecision {
+    /// Die Route gilt; `warning` meldet ein abgekündigtes Angebot (samt
+    /// Ersatzhinweis), das weiter nutzbar bleibt.
+    Keep {
+        /// Warnung für das Log, falls das Angebot abgekündigt ist.
+        warning: Option<String>,
+    },
+    /// Rückfall auf das Hauptmodell; `reason` begründet das im Log.
+    FallBack {
+        /// Begründung samt Ersatzhinweis, soweit bekannt.
+        reason: String,
+    },
+}
+
+/// Entscheidet zum Zeitpunkt `now`, ob die Route einer aufgelösten
+/// Kind-Stelle gilt oder auf das Hauptmodell zurückfällt.
+///
+/// # Beschreibung
+/// Rein und ohne Uhr: der Zeitpunkt wird übergeben (die Produktion reicht
+/// `OffsetDateTime::now_utc()` durch, Tests einen festen Wert). Die Regel
+/// hängt an [`ResolvedInternalModel::source`]:
+/// - [`InternalModelSource::Explicit`]: dieselbe Prüfung wie beim Setzen der
+///   Wahl ([`check_explicit_selection_at`]). Abgekündigt oder im
+///   Retirement-Fenster → die Route bleibt, mit Warnung; erst abgeschaltet →
+///   Rückfall, die Begründung nennt den empfohlenen Ersatz. Eine vom Setter
+///   angenommene Wahl wird so nie vor dem Retirement still verworfen.
+/// - Jede andere Herkunft: nur bei
+///   [`lifecycle::implicitly_selectable_bundled`] (nicht im
+///   Retirement-Fenster, nicht abgeschaltet), sonst Rückfall.
+///
+/// Eine Stelle ohne Modell (Hauptmodell) oder ohne bekannten Provider hat
+/// nichts zu prüfen und bleibt.
+fn internal_route_decision(
+    config: &ResolvedConfig,
+    resolved: &ResolvedInternalModel,
+    now: lifecycle::OffsetDateTime,
+) -> InternalRouteDecision {
+    let keep = InternalRouteDecision::Keep { warning: None };
+    let Some(model) = resolved.model.as_deref() else {
+        return keep;
+    };
+    match resolved.source {
+        InternalModelSource::Explicit => {
+            match check_explicit_selection_at(config, resolved.provider.as_deref(), model, now) {
+                Ok(warning) => InternalRouteDecision::Keep { warning },
+                Err(retired) => InternalRouteDecision::FallBack {
+                    reason: retired.to_string(),
+                },
+            }
+        }
+        InternalModelSource::OpenRouterDefault | InternalModelSource::MainModel => {
+            let Some(provider) = lifecycle_provider_in(config, resolved.provider.as_deref(), model)
+            else {
+                return keep;
+            };
+            let model_id = resolve_model_id(config, model);
+            if lifecycle::implicitly_selectable_bundled(&provider, &model_id, now) {
+                keep
+            } else {
+                InternalRouteDecision::FallBack {
+                    reason: format!(
+                        "model {model_id} of provider {provider} is retired or in its retirement window"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 /// Löst eine Modellkennung (Katalog-Schlüssel, `id` oder Alias) zur
@@ -1002,7 +1099,8 @@ mod tests {
 
     /// Eine beim Start aufgelöste Stelle mit abgeschaltetem Modell liefert
     /// keine Auflösung (Rückfall auf das Hauptmodell); eine andere Stelle
-    /// mit nutzbarem Modell bleibt unberührt.
+    /// mit nutzbarem Modell bleibt unberührt. (Echte Uhr: Mistral OCR 4.0 ist
+    /// seit 2026-09-30 abgeschaltet, die Wahl ist hier explizit.)
     #[test]
     fn implicit_route_skips_retired_model() -> TestResult {
         let mut config = ResolvedConfig::default();
@@ -1027,6 +1125,165 @@ mod tests {
             .resolved_internal_model(InternalModelPoint::Explorer)
             .ok_or(TestError::Missing("Stelle des Explorers"))?;
         assert_eq!(explorer.model.as_deref(), Some("gpt-5"));
+        Ok(())
+    }
+
+    /// Das gebündelte Mistral-Angebot `zai-glm-5-2`: Retirement zum
+    /// Kalenderdatum 2026-10-31, also Fenster ab 2026-10-30 10:00 UTC und
+    /// abgeschaltet ab 2026-10-31 12:00 UTC; Ersatz `zai-glm-5-3`.
+    const WINDOW_PROVIDER: &str = "mistral";
+    const WINDOW_MODEL: &str = "zai-glm-5-2";
+
+    fn window_route(source: InternalModelSource) -> ResolvedInternalModel {
+        ResolvedInternalModel {
+            point: InternalModelPoint::RootOrchestrator,
+            provider: Some(WINDOW_PROVIDER.to_owned()),
+            model: Some(WINDOW_MODEL.to_owned()),
+            source,
+        }
+    }
+
+    /// Injizierte Uhr: voller Zeitpunkt in UTC (Monat 1–12).
+    fn utc(year: i32, month: u8, day: u8, hour: u8) -> TestResult<lifecycle::OffsetDateTime> {
+        let month = time::Month::try_from(month).map_err(ctx("gültiger Testmonat"))?;
+        let date =
+            time::Date::from_calendar_date(year, month, day).map_err(ctx("gültiges Testdatum"))?;
+        let moment = date.with_hms(hour, 0, 0).map_err(ctx("gültige Testzeit"))?;
+        Ok(moment.assume_utc())
+    }
+
+    fn fall_back_reason(decision: InternalRouteDecision) -> TestResult<String> {
+        match decision {
+            InternalRouteDecision::FallBack { reason } => Ok(reason),
+            InternalRouteDecision::Keep { warning } => Err(TestError::Unexpected(format!(
+                "Rückfall auf das Hauptmodell erwartet, die Route blieb (Warnung: {warning:?})"
+            ))),
+        }
+    }
+
+    /// Eine explizite Wahl bleibt im Retirement-Fenster (mit Warnung und
+    /// Ersatzhinweis): der Setter hat sie angenommen, sie darf nicht still
+    /// zum Hauptmodell werden. Geprüft an Fensteranfang, Mitte und Ende.
+    #[test]
+    fn explicit_route_is_kept_inside_the_retirement_window() -> TestResult {
+        let config = ResolvedConfig::default();
+        let route = window_route(InternalModelSource::Explicit);
+        for now in [
+            utc(2026, 10, 30, 10)?,
+            utc(2026, 10, 30, 12)?,
+            utc(2026, 10, 31, 11)?,
+        ] {
+            let InternalRouteDecision::Keep { warning } =
+                internal_route_decision(&config, &route, now)
+            else {
+                return Err(TestError::Unexpected(format!(
+                    "explizite Wahl muss im Fenster bleiben ({now})"
+                )));
+            };
+            let warning = warning.ok_or(TestError::Missing("Warnung im Retirement-Fenster"))?;
+            assert!(warning.contains("zai-glm-5-3"), "{warning}");
+        }
+        Ok(())
+    }
+
+    /// Dieselbe Stelle mit impliziter Herkunft wird im Retirement-Fenster
+    /// übersprungen (Rückfall auf das Hauptmodell).
+    #[test]
+    fn implicit_route_is_skipped_inside_the_retirement_window() -> TestResult {
+        let config = ResolvedConfig::default();
+        for source in [
+            InternalModelSource::OpenRouterDefault,
+            InternalModelSource::MainModel,
+        ] {
+            let route = window_route(source);
+            for now in [
+                utc(2026, 10, 30, 10)?,
+                utc(2026, 10, 30, 12)?,
+                utc(2026, 10, 31, 11)?,
+            ] {
+                let reason = fall_back_reason(internal_route_decision(&config, &route, now))?;
+                assert!(reason.contains(WINDOW_MODEL), "{reason}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Vor dem Fenster (2026-10-30 09:00 UTC) bleiben beide Herkünfte ohne
+    /// Warnung.
+    #[test]
+    fn both_sources_are_kept_before_the_retirement_window() -> TestResult {
+        let config = ResolvedConfig::default();
+        let now = utc(2026, 10, 30, 9)?;
+        for source in [
+            InternalModelSource::Explicit,
+            InternalModelSource::OpenRouterDefault,
+        ] {
+            assert_eq!(
+                internal_route_decision(&config, &window_route(source), now),
+                InternalRouteDecision::Keep { warning: None }
+            );
+        }
+        Ok(())
+    }
+
+    /// Nach dem Retirement (ab 2026-10-31 12:00 UTC) fällt auch die explizite
+    /// Wahl zurück; die Begründung nennt den Ersatz. Eine Stunde vorher gilt
+    /// sie noch.
+    #[test]
+    fn explicit_route_falls_back_after_retirement() -> TestResult {
+        let config = ResolvedConfig::default();
+        let route = window_route(InternalModelSource::Explicit);
+
+        assert!(matches!(
+            internal_route_decision(&config, &route, utc(2026, 10, 31, 11)?),
+            InternalRouteDecision::Keep { warning: Some(_) }
+        ));
+        for now in [utc(2026, 10, 31, 12)?, utc(2026, 11, 1, 0)?] {
+            let reason = fall_back_reason(internal_route_decision(&config, &route, now))?;
+            assert!(reason.contains(WINDOW_MODEL), "{reason}");
+            assert!(reason.contains("zai-glm-5-3"), "{reason}");
+        }
+        Ok(())
+    }
+
+    /// Nach dem Retirement fällt auch die implizite Herkunft zurück.
+    #[test]
+    fn implicit_route_falls_back_after_retirement() -> TestResult {
+        let config = ResolvedConfig::default();
+        let route = window_route(InternalModelSource::OpenRouterDefault);
+        let reason = fall_back_reason(internal_route_decision(
+            &config,
+            &route,
+            utc(2026, 11, 1, 0)?,
+        ))?;
+        assert!(reason.contains(WINDOW_MODEL), "{reason}");
+        Ok(())
+    }
+
+    /// Ein unbekanntes Angebot und eine Stelle ohne Modell bleiben zu jeder
+    /// Zeit unberührt.
+    #[test]
+    fn unknown_offering_and_main_model_routes_are_always_kept() -> TestResult {
+        let config = ResolvedConfig::default();
+        let now = utc(2026, 11, 1, 0)?;
+        let unknown = ResolvedInternalModel {
+            point: InternalModelPoint::Explorer,
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-5".to_owned()),
+            source: InternalModelSource::Explicit,
+        };
+        let main = ResolvedInternalModel {
+            point: InternalModelPoint::Explorer,
+            provider: None,
+            model: None,
+            source: InternalModelSource::MainModel,
+        };
+        for route in [unknown, main] {
+            assert_eq!(
+                internal_route_decision(&config, &route, now),
+                InternalRouteDecision::Keep { warning: None }
+            );
+        }
         Ok(())
     }
 }
