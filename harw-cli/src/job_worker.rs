@@ -78,6 +78,26 @@
 //! session's `SpawnContext::approval_actor` is `None` and no identity is even
 //! eligible to answer; no responder is mounted.
 //!
+//! # Usage accounting
+//! Jede Modell-Runde eines Jobs wird über den [`PromptTokenLedger`] verbucht und
+//! per `JobStore::record_usage` lease-gesichert festgeschrieben. Schlägt das
+//! Festschreiben aus einem anderen Grund als einem Lease-Verlust fehl
+//! ([`UsageFlushError::NotRecorded`]), wäre der Verbrauch real, aber nur im
+//! Speicher des Workers: ein Reclaim nach einem Absturz lüde die ältere
+//! `job.usage` und gäbe dasselbe Budget ein zweites Mal frei. Deshalb gilt:
+//!
+//! 1. der Ledger wird geschlossen, die nächste Runde scheitert fail closed und
+//!    die Antwort der laufenden Runde wird nicht weitergereicht;
+//! 2. der offene Verbrauch wird als durabler Marker neben dem Job-Store
+//!    abgelegt (`usage_marker`, `<job-root>/usage-unresolved/<work-id>.json`);
+//! 3. jeder Claim verrechnet einen vorhandenen Marker zuerst mit der
+//!    gespeicherten Usage ([`settle_unresolved_usage`]), bevor Wanduhr-Fenster,
+//!    Ledger oder Modell-Runde daraus Budget ableiten; ein nicht lesbarer oder
+//!    nicht verrechenbarer Marker beendet den Job endgültig als
+//!    `Failed{usage accounting unresolved: …}` ohne Modellaufruf;
+//! 4. der Ausgang eines Jobs, dessen letzte Usage nicht festgeschrieben werden
+//!    konnte, wird zu `Failed` ([`PromptTokenLedger::finish`]).
+//!
 //! # Concurrency
 //! Every entry point is `async` and `Send`.  All shared state travels as
 //! `Arc<…>`; the worker itself holds no global state — the plan store, the
@@ -140,6 +160,13 @@ mod retention_job;
 
 #[path = "job_worker_learning.rs"]
 mod learning_job;
+
+#[path = "job_usage_marker.rs"]
+mod usage_marker;
+
+#[cfg(test)]
+#[path = "job_worker_usage_tests.rs"]
+mod usage_tests;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -1117,7 +1144,7 @@ fn telegram_submitter_id(submitter: &harw_types::ApprovalActor) -> Result<String
 // Wanduhr, Runtime-Montage (`JobEntry::Prompt`) und Ausführung. Aufrufer haben
 // Zaun und Eingabe bereits geprüft.
 async fn run_prompt_turn(
-    claim: JobClaim,
+    mut claim: JobClaim,
     submitter_id: &str,
     prompt: String,
     provider: Arc<dyn ModelProvider>,
@@ -1126,6 +1153,13 @@ async fn run_prompt_turn(
     context: &JobWorkerContext,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
+
+    // Offene Usage eines früheren Versuchs zuerst verrechnen, vor Wanduhr-
+    // Fenster und Ledger: ein Reclaim startet nie mit frischem Budget.
+    if let Err(reason) = settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(work_id = %work_id, reason = %reason, "prompt job usage accounting unresolved");
+        return JobOutcome::Failed { reason };
+    }
 
     let budget = effective_prompt_budget(&claim.job.budget);
     let wall = match prompt_wall_allowance(
@@ -1191,7 +1225,7 @@ async fn run_prompt_turn(
         Ok(outcome @ JobOutcome::Cancelled { .. }) => outcome,
         Ok(outcome) => match ledger.exceeded() {
             Some(reason) => {
-                tracing::warn!(work_id = %work_id, reason = %reason, "prompt job exceeded its token budget");
+                tracing::warn!(work_id = %work_id, reason = %reason, "prompt job stopped by its ledger (budget, lease or usage accounting)");
                 JobOutcome::Failed { reason }
             }
             None => outcome,
@@ -1211,8 +1245,7 @@ async fn run_prompt_turn(
         }
     };
     // Letzter Stand vor dem Festschreiben des Ausgangs durch den Runner.
-    ledger.flush().await;
-    outcome
+    ledger.finish(outcome).await
 }
 
 /// Sicherheitsabstand zwischen dem Ende des Wanduhr-Fensters eines Prompt-Jobs
@@ -1450,10 +1483,12 @@ struct PromptTokenState {
     exceeded: Option<String>,
 }
 
-// Job-Store und Lease-Token, unter denen der Ledger seine Usage festschreibt.
+// Job-Store und Lease-Token, unter denen der Ledger seine Usage festschreibt,
+// sowie der Marker-Speicher für Usage, die sich nicht festschreiben ließ.
 struct UsageSink {
     store: Arc<JobStore>,
     token: harw_job_runtime::LeaseToken,
+    markers: usage_marker::UsageMarkerStore,
 }
 
 /// Intervall, in dem ein laufender Turn seine Usage zusätzlich zu den
@@ -1467,6 +1502,193 @@ pub(super) struct UsageFlusher(tokio::task::JoinHandle<()>);
 impl Drop for UsageFlusher {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+// Schließgrund des Ledgers nach verlorener Lease.
+const USAGE_LEASE_LOST_REASON: &str = "lease: job lease lost; usage could not be recorded";
+
+// Schließgrund des Ledgers, wenn die Usage nicht durabel festgeschrieben werden
+// konnte.
+const USAGE_UNRECORDED_REASON: &str =
+    "usage: job usage could not be recorded durably; no further model rounds";
+
+// Präfix aller `Failed`-Gründe, die aus nicht verbuchter Usage entstehen.
+const USAGE_UNRESOLVED_PREFIX: &str = "usage accounting unresolved: ";
+
+// Wiederholungen und Pause (je Versuch verlängert) bei kurzzeitig belegter
+// Job-Sperre: ein gleichzeitiger Heartbeat oder Abbruch ist kein Speicherfehler.
+const USAGE_LOCK_RETRIES: u32 = 5;
+const USAGE_LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Grund, aus dem [`PromptTokenLedger::flush`] die Usage nicht festschreiben
+/// konnte.
+///
+/// # Description
+/// In beiden Fällen ist der Ledger danach geschlossen: es folgt keine weitere
+/// Modell-Runde.
+#[derive(Debug)]
+pub(super) enum UsageFlushError {
+    /// Die Lease des Jobs ist verloren (Token passt nicht mehr, Lease
+    /// abgelaufen oder Job bereits terminal); ein anderer Worker besitzt den
+    /// Job.
+    LeaseLost,
+    /// Das Festschreiben scheiterte an einem Speicherfehler. Die Usage ist als
+    /// Marker abgelegt, soweit das gelang (siehe Moduldoku, "Usage
+    /// accounting"); der Text nennt den Grund.
+    NotRecorded(String),
+}
+
+impl std::fmt::Display for UsageFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LeaseLost => f.write_str(USAGE_LEASE_LOST_REASON),
+            Self::NotRecorded(reason) => write!(f, "{USAGE_UNRESOLVED_PREFIX}{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for UsageFlushError {}
+
+// Ergebnis eines Festschreib-Versuchs auf dem Blocking-Thread.
+enum UsageWrite {
+    Recorded,
+    LeaseLost,
+    // Anderer Speicherfehler: `reason` nennt ihn, `marker` ist das Ergebnis des
+    // Marker-Schreibens.
+    Failed {
+        reason: String,
+        marker: Result<(), String>,
+    },
+}
+
+// `JobStore::record_usage`, wiederholt bei kurzzeitig belegter Job-Sperre.
+// Blockierend.
+fn record_usage_retrying(
+    store: &JobStore,
+    token: &harw_job_runtime::LeaseToken,
+    usage: &harw_job_runtime::BudgetUsage,
+) -> Result<harw_job_runtime::BudgetUsage, harw_session_store::SessionStoreError> {
+    let mut attempt = 0_u32;
+    loop {
+        match store.record_usage(&token.work_id, token, usage) {
+            Err(harw_session_store::SessionStoreError::JobLockContended { .. })
+                if attempt < USAGE_LOCK_RETRIES =>
+            {
+                attempt += 1;
+                std::thread::sleep(USAGE_LOCK_RETRY_PAUSE * attempt);
+            }
+            other => return other,
+        }
+    }
+}
+
+// Schreibt `usage` fest; scheitert das aus einem anderen Grund als einem
+// Lease-Verlust, wird der Verbrauch im selben (nicht abbrechbaren)
+// Blocking-Aufruf als Marker abgelegt. Blockierend.
+fn write_usage_or_mark(
+    store: &JobStore,
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    usage: &harw_job_runtime::BudgetUsage,
+) -> UsageWrite {
+    match record_usage_retrying(store, token, usage) {
+        Ok(_stored) => UsageWrite::Recorded,
+        Err(
+            harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
+            | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
+            | harw_session_store::SessionStoreError::JobAlreadyTerminal { .. },
+        ) => UsageWrite::LeaseLost,
+        Err(error) => {
+            let reason = format!("record_usage failed: {error}");
+            let marker = usage_marker::UnresolvedUsage::new(
+                token.work_id.as_str(),
+                token.epoch,
+                usage.clone(),
+                &reason,
+            );
+            UsageWrite::Failed {
+                reason,
+                marker: markers.write(&marker),
+            }
+        }
+    }
+}
+
+// Grund eines `Failed`-Ausgangs wegen nicht verbuchter Usage; wie jeder
+// Ausgangsgrund auf die erste Zeile und `MAX_REASON_BYTES` begrenzt.
+fn unresolved_usage_reason(detail: &str) -> String {
+    sanitize_failure(&format!("{USAGE_UNRESOLVED_PREFIX}{detail}"))
+}
+
+/// Verrechnet einen offenen Usage-Marker mit einem frisch geclaimten Job.
+///
+/// # Description
+/// Muss vor jeder Budget-Ableitung und jeder Modell-Runde eines Claims laufen
+/// (Review P1 zu #151). Ohne Marker ist das Ergebnis `claim.job.usage`. Mit
+/// Marker wird das Feld-Maximum aus Marker und gespeicherter Usage unter
+/// `claim.token` lease-gesichert festgeschrieben und erst danach der Marker
+/// entfernt; ein verbliebener Marker wird beim nächsten Claim unschädlich
+/// erneut verrechnet.
+///
+/// # Returns
+/// Die Usage, von der der Claim auszugehen hat.
+///
+/// # Errors
+/// `usage accounting unresolved: …`, wenn der Marker nicht lesbar ist oder sich
+/// nicht festschreiben lässt. Der Aufrufer beendet den Job dann als `Failed`
+/// (endgültig, also ohne automatischen Reclaim) und ruft kein Modell auf.
+///
+/// # Concurrency
+/// Blockierend (Dateizugriff, Job-Sperre); aus `async`-Code über
+/// [`settle_claim_usage`] aufrufen.
+pub(super) fn settle_unresolved_usage(
+    store: &JobStore,
+    claim: &JobClaim,
+) -> Result<harw_job_runtime::BudgetUsage, String> {
+    let markers = usage_marker::UsageMarkerStore::in_job_root(store.root());
+    let work_id = claim.job.id.as_str();
+    let marker = match markers.read(work_id) {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return Ok(claim.job.usage.clone()),
+        Err(detail) => return Err(unresolved_usage_reason(&detail)),
+    };
+    let merged = usage_marker::UsageMarkerStore::merged(&marker.usage, &claim.job.usage);
+    let stored = record_usage_retrying(store, &claim.token, &merged).map_err(|error| {
+        unresolved_usage_reason(&format!(
+            "the unresolved usage could not be recorded: {error}"
+        ))
+    })?;
+    if let Err(error) = markers.remove(work_id) {
+        tracing::warn!(work_id = %work_id, error = %error, "settled usage marker could not be removed");
+    }
+    Ok(stored)
+}
+
+/// Async-Hülle um [`settle_unresolved_usage`]: läuft auf einem Blocking-Thread
+/// und trägt die verrechnete Usage in `claim.job.usage` ein, damit
+/// Wanduhr-Fenster und Ledger des Claims davon ausgehen.
+///
+/// # Errors
+/// Wie [`settle_unresolved_usage`]; auch ein abgestürzter Blocking-Task zählt
+/// als nicht verrechnet.
+pub(super) async fn settle_claim_usage(
+    store: &Arc<JobStore>,
+    claim: &mut JobClaim,
+) -> Result<(), String> {
+    let store = Arc::clone(store);
+    let snapshot = claim.clone();
+    let joined =
+        tokio::task::spawn_blocking(move || settle_unresolved_usage(&store, &snapshot)).await;
+    match joined {
+        Ok(Ok(usage)) => {
+            claim.job.usage = usage;
+            Ok(())
+        }
+        Ok(Err(reason)) => Err(reason),
+        Err(error) => Err(unresolved_usage_reason(&format!(
+            "the settlement task failed: {error}"
+        ))),
     }
 }
 
@@ -1486,7 +1708,16 @@ impl PromptTokenLedger {
         store: Arc<JobStore>,
         token: harw_job_runtime::LeaseToken,
     ) -> Arc<Self> {
-        Self::build(budget, usage, Some(UsageSink { store, token }))
+        let markers = usage_marker::UsageMarkerStore::in_job_root(store.root());
+        Self::build(
+            budget,
+            usage,
+            Some(UsageSink {
+                store,
+                token,
+                markers,
+            }),
+        )
     }
 
     fn build(
@@ -1522,37 +1753,104 @@ impl PromptTokenLedger {
     /// Schreibt [`Self::snapshot`] unter dem Lease-Token in den Job-Store.
     ///
     /// # Description
-    /// Ohne Sink ein No-op. Verliert der Job dabei seine Lease (Token passt
-    /// nicht mehr, Lease abgelaufen, Job bereits terminal), wird der Ledger
-    /// geschlossen, damit keine weitere Modell-Runde auf fremde Kosten läuft.
-    /// Alle anderen Fehler werden nur protokolliert.
-    pub(super) async fn flush(self: &Arc<Self>) {
+    /// Ohne Sink ein No-op. In jedem Fehlerfall wird der Ledger geschlossen,
+    /// damit keine weitere Modell-Runde auf nicht verbuchte Kosten läuft:
+    /// - Verliert der Job seine Lease (Token passt nicht mehr, Lease
+    ///   abgelaufen, Job bereits terminal), ist das [`UsageFlushError::LeaseLost`].
+    /// - Jeder andere Speicherfehler (nach einigen Wiederholungen bei belegter
+    ///   Job-Sperre) lässt den Verbrauch real, aber nicht im Job-Datensatz
+    ///   zurück; ein Reclaim sähe dann ältere Zahlen. Er wird deshalb als
+    ///   durabler Marker abgelegt (`usage_marker`), den der nächste Claim
+    ///   zuerst verrechnet ([`settle_unresolved_usage`]), und als
+    ///   [`UsageFlushError::NotRecorded`] gemeldet — auch wenn sich der Marker
+    ///   nicht schreiben ließ (dann steht die Buchhaltung offen UND ohne
+    ///   Marker, was auf Fehlerstufe protokolliert wird).
+    ///
+    /// # Errors
+    /// Siehe oben; der Aufrufer darf den Fehler nicht ignorieren, wenn er
+    /// Arbeit auf Grundlage dieser Usage fortsetzen würde.
+    pub(super) async fn flush(self: &Arc<Self>) -> Result<(), UsageFlushError> {
         let Some(sink) = &self.sink else {
-            return;
+            return Ok(());
         };
         let _gate = self.flush_gate.lock().await;
         let usage = self.snapshot();
         let store = Arc::clone(&sink.store);
         let token = sink.token.clone();
+        let markers = sink.markers.clone();
         let work_id = token.work_id.as_str().to_owned();
-        let joined =
-            tokio::task::spawn_blocking(move || store.record_usage(&token.work_id, &token, &usage))
-                .await;
-        match joined {
-            Ok(Ok(_stored)) => {}
-            Ok(Err(
-                harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
-                | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
-                | harw_session_store::SessionStoreError::JobAlreadyTerminal { .. },
-            )) => {
-                tracing::warn!(work_id = %work_id, "job lease lost while recording usage");
-                self.close("lease: job lease lost; usage could not be recorded".into());
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(work_id = %work_id, error = %error, "job usage could not be recorded");
-            }
+        let write_usage = usage.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            write_usage_or_mark(&store, &markers, &token, &write_usage)
+        })
+        .await;
+        let write = match joined {
+            Ok(write) => write,
             Err(error) => {
-                tracing::warn!(work_id = %work_id, error = %error, "job usage flush task failed");
+                // Der Blocking-Task selbst ist abgestürzt (Panik, Shutdown):
+                // Marker in einem frischen Task nachholen.
+                let reason = format!("usage flush task failed: {error}");
+                let marker =
+                    usage_marker::UnresolvedUsage::new(&work_id, sink.token.epoch, usage, &reason);
+                let markers = sink.markers.clone();
+                let written = tokio::task::spawn_blocking(move || markers.write(&marker)).await;
+                let marker =
+                    written.unwrap_or_else(|join| Err(format!("usage marker task failed: {join}")));
+                UsageWrite::Failed { reason, marker }
+            }
+        };
+        match write {
+            UsageWrite::Recorded => Ok(()),
+            UsageWrite::LeaseLost => {
+                tracing::warn!(work_id = %work_id, "job lease lost while recording usage");
+                self.close(USAGE_LEASE_LOST_REASON.to_owned());
+                Err(UsageFlushError::LeaseLost)
+            }
+            UsageWrite::Failed { reason, marker } => {
+                let reason = match marker {
+                    Ok(()) => {
+                        tracing::error!(
+                            work_id = %work_id,
+                            reason = %reason,
+                            "job usage could not be recorded; unresolved-usage marker written, no further model rounds"
+                        );
+                        reason
+                    }
+                    Err(marker_error) => {
+                        tracing::error!(
+                            work_id = %work_id,
+                            reason = %reason,
+                            marker_error = %marker_error,
+                            "job usage could not be recorded and the unresolved-usage marker could not be written: accounting is unresolved AND unmarked"
+                        );
+                        format!("{reason}; marker not written: {marker_error}")
+                    }
+                };
+                self.close(USAGE_UNRECORDED_REASON.to_owned());
+                Err(UsageFlushError::NotRecorded(reason))
+            }
+        }
+    }
+
+    /// Letzter Flush vor dem Festschreiben des Ausgangs durch den Runner.
+    ///
+    /// # Description
+    /// Ließ sich die Usage nicht festschreiben ([`UsageFlushError::NotRecorded`]),
+    /// ersetzt `Failed` den Ausgang: für nicht verbuchte Arbeit wird kein Erfolg
+    /// gemeldet. Unverändert bleiben der Ausgang bei verlorener Lease (der
+    /// Runner scheitert dann ohnehin am Lease-Zaun) und ein Abbruch durch den
+    /// Supervisor (`Cancelled` behauptet keinen Erfolg; der Marker deckt die
+    /// offene Usage ab).
+    pub(super) async fn finish(self: &Arc<Self>, outcome: JobOutcome) -> JobOutcome {
+        match self.flush().await {
+            Ok(()) | Err(UsageFlushError::LeaseLost) => outcome,
+            Err(error @ UsageFlushError::NotRecorded(_)) => {
+                if matches!(outcome, JobOutcome::Cancelled { .. }) {
+                    return outcome;
+                }
+                JobOutcome::Failed {
+                    reason: sanitize_failure(&error.to_string()),
+                }
             }
         }
     }
@@ -1564,7 +1862,9 @@ impl PromptTokenLedger {
         UsageFlusher(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                ledger.flush().await;
+                // Fehler schließt `flush` selbst (Ledger geschlossen, Marker
+                // geschrieben); der periodische Flush hat nichts weiter zu tun.
+                let _ = ledger.flush().await;
             }
         }))
     }
@@ -1630,10 +1930,12 @@ impl PromptTokenLedger {
 ///
 /// # Description
 /// Vor der Runde wird zugelassen oder abgewiesen, ohne den inneren Provider zu
-/// berühren; nach der Runde wird die Usage verbucht. Überschreitet sie das
-/// Budget, endet der Turn mit einem Modellfehler, damit weder Tool-Runden noch
-/// weitere Modellaufrufe folgen. `execute_prompt_claim` ersetzt diesen Fehler
-/// durch den `budget:`-Grund des Ledgers.
+/// berühren; nach der Runde wird die Usage verbucht und festgeschrieben.
+/// Überschreitet sie das Budget oder lässt sie sich nicht festschreiben, endet
+/// der Turn mit einem Modellfehler (die Antwort der Runde wird nicht
+/// weitergereicht), damit weder Tool-Runden noch weitere Modellaufrufe folgen.
+/// `execute_prompt_claim` ersetzt diesen Fehler durch den Schließgrund des
+/// Ledgers (`budget:`, `lease:` oder `usage:`).
 ///
 /// # Concurrency
 /// `Send + Sync`: nur `Arc`s.
@@ -1652,7 +1954,13 @@ impl ModelProvider for BudgetedModelProvider {
             self.ledger
                 .charge_round(&response.usage)
                 .map_err(harw_core::ModelError::RequestFailed)?;
-            self.ledger.flush().await;
+            // Lässt sich die Usage dieser Runde nicht festschreiben, wird ihre
+            // Antwort nicht weitergereicht: nicht verbuchte Arbeit schreitet
+            // nicht fort (fail closed; `flush` hat den Ledger geschlossen).
+            self.ledger
+                .flush()
+                .await
+                .map_err(|error| harw_core::ModelError::RequestFailed(error.to_string()))?;
             Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
         })
     }
@@ -5512,11 +5820,11 @@ mod prompt_claim_guard_tests {
 
     // ── Fixtures ──────────────────────────────────────────────────────────
 
-    fn temp_dir() -> TestResult<tempfile::TempDir> {
+    pub(super) fn temp_dir() -> TestResult<tempfile::TempDir> {
         tempfile::tempdir().map_err(ctx("temp directory"))
     }
 
-    fn operator_scope() -> JobScope {
+    pub(super) fn operator_scope() -> JobScope {
         JobScope::new(
             TenantId::from_str("tenant"),
             WorkspaceId::from_str("workspace"),
@@ -5526,7 +5834,7 @@ mod prompt_claim_guard_tests {
         )
     }
 
-    fn record(
+    pub(super) fn record(
         id: &str,
         input: serde_json::Value,
         budget: Budget,
@@ -5562,12 +5870,12 @@ mod prompt_claim_guard_tests {
         })
     }
 
-    fn admit(store: &JobStore, record: &StoredJob) -> TestResult {
+    pub(super) fn admit(store: &JobStore, record: &StoredJob) -> TestResult {
         store.admit(record).map_err(ctx("admit"))?;
         Ok(())
     }
 
-    fn failure_reason(store: &JobStore, id: &str) -> TestResult<String> {
+    pub(super) fn failure_reason(store: &JobStore, id: &str) -> TestResult<String> {
         let stored = store.get(&WorkId::from_str(id)).map_err(ctx("get job"))?;
         match stored.completion.map(|completion| completion.outcome) {
             Some(JobOutcome::Failed { reason }) => Ok(reason),
@@ -5577,7 +5885,7 @@ mod prompt_claim_guard_tests {
         }
     }
 
-    async fn run_once(
+    pub(super) async fn run_once(
         store: &Arc<JobStore>,
         root: &Path,
         provider: Arc<dyn ModelProvider>,
@@ -5618,7 +5926,7 @@ mod prompt_claim_guard_tests {
     }
 
     // Claimt einen zugelassenen Job als dieser Worker (`WORKER_ID`).
-    fn claim_as_worker(store: &JobStore, id: &str) -> TestResult<JobClaim> {
+    pub(super) fn claim_as_worker(store: &JobStore, id: &str) -> TestResult<JobClaim> {
         store
             .claim(
                 &WorkId::from_str(id),
@@ -5631,7 +5939,7 @@ mod prompt_claim_guard_tests {
             .map_err(ctx("claim"))
     }
 
-    fn empty_request() -> harw_core::ModelRequest {
+    pub(super) fn empty_request() -> harw_core::ModelRequest {
         harw_core::ModelRequest::new(
             harw_extension_api::LoadedInstructions {
                 system_prompt: String::new(),
@@ -5644,9 +5952,9 @@ mod prompt_claim_guard_tests {
     }
 
     /// Antwortet sofort mit fester Usage und zählt die Aufrufe.
-    struct FixedUsageProvider {
-        calls: AtomicUsize,
-        tokens_per_call: u64,
+    pub(super) struct FixedUsageProvider {
+        pub(super) calls: AtomicUsize,
+        pub(super) tokens_per_call: u64,
     }
 
     impl ModelProvider for FixedUsageProvider {
@@ -6195,7 +6503,7 @@ mod prompt_claim_guard_tests {
 
     // ── Usage-Persistierung ───────────────────────────────────────────────
 
-    fn tokens_used(total: u64) -> TokenUsage {
+    pub(super) fn tokens_used(total: u64) -> TokenUsage {
         TokenUsage {
             cache_separate: false,
             input_tokens: total,
@@ -6230,7 +6538,7 @@ mod prompt_claim_guard_tests {
         ledger
             .charge_round(&tokens_used(7))
             .map_err(TestError::Unexpected)?;
-        ledger.flush().await;
+        ledger.flush().await.map_err(ctx("flush"))?;
 
         let stored = store
             .get(&WorkId::from_str("usage-flush"))
@@ -6266,7 +6574,11 @@ mod prompt_claim_guard_tests {
         ledger
             .charge_round(&tokens_used(3))
             .map_err(TestError::Unexpected)?;
-        ledger.flush().await;
+        let flushed = ledger.flush().await;
+        assert!(
+            matches!(flushed, Err(UsageFlushError::LeaseLost)),
+            "{flushed:?}"
+        );
 
         let Some(reason) = ledger.exceeded() else {
             return Err(TestError::Unexpected(

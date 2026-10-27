@@ -2153,7 +2153,7 @@ pub(super) fn attribute_changes(
 
 /// Führt einen geclaimten `work_driver`-Job aus (siehe Moduldoku).
 pub(super) async fn execute_work_driver_claim(
-    claim: JobClaim,
+    mut claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
     job_store: Arc<JobStore>,
@@ -2207,6 +2207,14 @@ pub(super) async fn execute_work_driver_claim(
         ApprovalActor::Operator { id } if super::is_scope_identifier(id) => id.clone(),
         _ => "work-driver".to_owned(),
     };
+
+    // Offene Usage eines früheren Versuchs zuerst verrechnen (Review P1 zu
+    // #151): der Ledger geht vom verrechneten Stand aus, ein Reclaim startet nie
+    // mit frischem Budget.
+    if let Err(reason) = super::settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(work_id = %work_id.as_str(), reason = %reason, "work-driver usage accounting unresolved");
+        return JobOutcome::Failed { reason };
+    }
 
     // Budgets: Token-Ledger des Jobs (von `work_driver.enqueue` aus der Spec
     // gespiegelt) für alle Modellrunden des Laufs; die Wandzeit bindet jeden
@@ -2339,8 +2347,8 @@ pub(super) async fn execute_work_driver_claim(
             reason: "work-driver stopped without an outcome".to_owned(),
         },
     };
-    ledger.flush().await;
-    outcome
+    // Nicht festschreibbare Usage macht auch einen Erfolg zum Fehlschlag.
+    ledger.finish(outcome).await
 }
 
 /// Was der Lauf aus der Konfiguration braucht.

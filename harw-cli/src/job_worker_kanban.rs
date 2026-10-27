@@ -201,7 +201,7 @@ fn annotate(
 
 /// Führt einen geclaimten `kanban_card`-Job aus (siehe Moduldoku).
 pub(super) async fn execute_kanban_claim(
-    claim: JobClaim,
+    mut claim: JobClaim,
     gate: KanbanGate,
     provider: Arc<dyn ModelProvider>,
     job_store: Arc<JobStore>,
@@ -299,6 +299,12 @@ pub(super) async fn execute_kanban_claim(
         workspace_root: Some(sandbox.workspace().canonical_root().to_path_buf()),
     };
 
+    // Offene Usage eines früheren Versuchs zuerst verrechnen (Review P1 zu
+    // #151), vor Wanduhr-Fenster und Ledger.
+    if let Err(reason) = super::settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(work_id = %work_id.as_str(), reason = %reason, "kanban job usage accounting unresolved");
+        return finish_failed(store, &card, &work_id, reason);
+    }
     let budget = effective_prompt_budget(&claim.job.budget);
     let wall = budget.max_wall.map_or(SignedDuration::ZERO, |max| {
         max.saturating_sub(claim.job.usage.wall)
@@ -392,7 +398,8 @@ pub(super) async fn execute_kanban_claim(
             budget_outcome(reason, state_store.as_ref(), &session_id).await
         }
     };
-    ledger.flush().await;
+    // Nicht festschreibbare Usage macht auch einen Erfolg zum Fehlschlag.
+    let outcome = ledger.finish(outcome).await;
     report(store, &card, &work_id, outcome)
 }
 

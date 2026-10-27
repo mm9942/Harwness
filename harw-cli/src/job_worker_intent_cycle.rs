@@ -30,7 +30,9 @@
 //! lease-fenced (`PromptTokenLedger::persisted` flushes to
 //! `JobStore::record_usage`), so a reclaim after a lost lease resumes with the
 //! consumed budget (`remaining_wall` reads the persisted wall) instead of a
-//! fresh one. Everything else maps through
+//! fresh one. Usage that could not be persisted is left as a durable marker;
+//! every claim settles it first (`settle_claim_usage`) and fails the job
+//! without a model call if it cannot. Everything else maps through
 //! `harw_plan_bridge::job_outcome`: `CompletionProposed` is a succeeded job
 //! that still needs owner acceptance.
 //!
@@ -125,7 +127,7 @@ pub(super) fn is_intent_cycle_kind(kind: &JobKind) -> bool {
 
 /// Executes one claimed intent-cycle job (see module docs).
 pub(super) async fn execute_intent_cycle_claim(
-    claim: JobClaim,
+    mut claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
     job_store: Arc<JobStore>,
@@ -210,6 +212,13 @@ pub(super) async fn execute_intent_cycle_claim(
             };
         }
     };
+    // Offene Usage eines früheren Versuchs zuerst verrechnen (Review P1 zu
+    // #151): `remaining_wall` und der Ledger gehen vom verrechneten Stand aus,
+    // ein Reclaim startet nie mit frischem Budget.
+    if let Err(reason) = super::settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(work_id = %work_id.as_str(), reason = %reason, "intent-cycle usage accounting unresolved");
+        return JobOutcome::Failed { reason };
+    }
     // Budget first: an exhausted wall budget must never become a fresh one,
     // and no record is created or model called for it.
     let Some(remaining) = remaining_wall(&claim.job.budget, &claim.job.usage) else {
@@ -314,8 +323,9 @@ pub(super) async fn execute_intent_cycle_claim(
     };
     cancel.cancel(CancelReason::Budget);
     // Persist the final usage first; a lost lease closes the ledger, which the
-    // match below then reports.
-    ledger.flush().await;
+    // match below then reports. Usage that cannot be recorded turns even a
+    // successful outcome into `Failed` (`PromptTokenLedger::finish`).
+    let outcome = ledger.finish(outcome).await;
     // A budget stop surfaces as a blocked/failed proposer; report the budget.
     let outcome = match (outcome, ledger.exceeded()) {
         (JobOutcome::Blocked { .. } | JobOutcome::Failed { .. }, Some(reason)) => {
