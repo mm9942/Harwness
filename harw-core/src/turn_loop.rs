@@ -9,7 +9,17 @@
 //! 5. Für jeden ToolCall:
 //!    a. Guardrail (ApprovalHandler)
 //!    a2. Zulassung beim [`ToolCallMeter`] (falls am [`TurnControl`]
-//!        registriert): bucht den Aufruf, bevor irgendetwas davon läuft
+//!    registriert): bucht den Aufruf, bevor irgendetwas davon läuft, und
+//!    liefert einen [`ToolCallPermit`] — die Dispatcher-Seite des
+//!    Lease-Zauns. Der Loop hält ihn, bis das Ergebnis genau dieses Aufrufs
+//!    feststeht (b/c: Kind gespawnt und übergeben, Werkzeug ausgeführt,
+//!    lokale Antwort erzeugt), und lässt ihn dann fallen: sequenziell vor
+//!    der nächsten Zulassung, parallel je Job nach dessen eigener
+//!    Ausführung, in jedem Fall vor der nächsten Modellrunde. Solange er
+//!    lebt, hält der Guard des Meters (falls einer drinsteckt) die Lease:
+//!    ein Reclaim läuft nie zwischen Buchung und Seiteneffekt, sondern wird
+//!    über den Dispatch serialisiert. Was der Guard ist, entscheidet der
+//!    Meter (siehe [`crate::tool_call_meter`]).
 //!    b. Handoff? → AgentSpawner → WaitingForChild
 //!    c. Sonst: ToolExecutor::execute
 //!    d. ToolResult in History
@@ -493,7 +503,7 @@ use crate::guard::{DriftEvent, DriftKind, GuardVerdict, SessionGuardVerdict, Tur
 use crate::model::{ModelProvider, ModelRequest, RequestIdentity};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
 use crate::state_store::{StateStore, StateStoreError, UsageRound};
-use crate::tool_call_meter::ToolCallMeter;
+use crate::tool_call_meter::{ToolCallMeter, ToolCallPermit};
 use harw_extension_api::{
     ApprovalDecision, DelegationTargetInfo, LoadedInstructions, SpawnInput, ToolExecutor,
     TurnInputContext, TurnStartInput, TurnStopInput,
@@ -793,9 +803,10 @@ impl TurnControl {
     /// # Beschreibung
     /// Der Meter gilt für alle Ausführungswege des Turns (sequenziell,
     /// parallel und die Fortsetzung nach einer Rückfrage) und überlebt eine
-    /// Pause mit dem Steuerblock. Eine Abweisung beendet den Turn mit
-    /// `CancelReason::Budget`; die Einzelheiten stehen in
-    /// [`crate::tool_call_meter`].
+    /// Pause mit dem Steuerblock. Den [`ToolCallPermit`] einer Zulassung
+    /// hält der Turn-Loop, bis das Ergebnis des Aufrufs feststeht. Eine
+    /// Abweisung beendet den Turn mit `CancelReason::Budget`; die
+    /// Einzelheiten stehen in [`crate::tool_call_meter`].
     ///
     /// # Arguments
     /// - `meter` (`Arc<dyn ToolCallMeter>`): geteilter Meter des Aufrufers.
@@ -4009,36 +4020,43 @@ async fn resume_after_approval_with_store(
                 // gespawnt wird — derselbe Haken wie im sequenziellen Pfad von
                 // `drive_turn` (Schritt a2). Eine Abweisung beantwortet den
                 // einen wartenden Call und beendet den Turn mit
-                // `CancelReason::Budget`.
-                if let Some(refused) =
-                    admit_tool_call(&control, pending.call.name.as_str()).await
-                {
-                    notify_tool_outcome(
-                        session,
-                        pending.call.name.as_str(),
-                        &pending.call.arguments,
-                        &refused,
-                    );
-                    notify_tool_progress(session);
-                    session
-                        .history_mut()
-                        .push_tool_result(pending.call.id, refused, 0);
-                    persist_last(session, store).await?;
-                    return cancel_turn_with_pending_calls(
-                        session,
-                        store,
-                        handle,
-                        harw_types::TokenUsage::default(),
-                        CancelReason::Budget,
-                        Vec::new(),
-                    )
-                    .await;
-                }
+                // `CancelReason::Budget`. Der Permit (Lease-Zaun, siehe
+                // `crate::tool_call_meter`) lebt, bis das Ergebnis dieses
+                // Aufrufs feststeht, und fällt auf jedem Weg VOR dem
+                // Weiterlaufen des Turns (`drive_turn`): sonst hielte er die
+                // Lease über weitere Modellrunden und Zulassungen hinweg.
+                let permit = match admit_tool_call(&control, pending.call.name.as_str()).await {
+                    Ok(permit) => permit,
+                    Err(refused) => {
+                        notify_tool_outcome(
+                            session,
+                            pending.call.name.as_str(),
+                            &pending.call.arguments,
+                            &refused,
+                        );
+                        notify_tool_progress(session);
+                        session
+                            .history_mut()
+                            .push_tool_result(pending.call.id, refused, 0);
+                        persist_last(session, store).await?;
+                        return cancel_turn_with_pending_calls(
+                            session,
+                            store,
+                            handle,
+                            harw_types::TokenUsage::default(),
+                            CancelReason::Budget,
+                            Vec::new(),
+                        )
+                        .await;
+                    }
+                };
                 // Plan R9, Teil C: `agents.delegate` wird wie
                 // `transfer_to_<agent>` gespawnt (Argumente ohne `agent`).
                 if let Some((role, handoff_arguments)) = delegation_call(&pending.call) {
                     // Background-only: refuse before spawning, so no child leaks.
                     if let Some(result) = background_only_refusal(session, &handoff_arguments) {
+                        // Nichts gespawnt: das Ergebnis steht fest.
+                        drop(permit);
                         notify_tool_outcome(
                             session,
                             pending.call.name.as_str(),
@@ -4082,6 +4100,7 @@ async fn resume_after_approval_with_store(
                     let context = match governed_spawn_context(session) {
                         Ok(context) => context,
                         Err(error) => {
+                            drop(permit);
                             let result = missing_tool_execution_context_result(error)?;
                             session
                                 .history_mut()
@@ -4108,6 +4127,7 @@ async fn resume_after_approval_with_store(
                                 &error.message,
                             ) =>
                         {
+                            drop(permit);
                             session.history_mut().push_tool_result(
                                 pending.call.id,
                                 ToolCallResult::error(error.message),
@@ -4149,6 +4169,8 @@ async fn resume_after_approval_with_store(
                             role,
                         });
                     };
+                    // Seiteneffekt-Grenze: Kind gespawnt und übergeben.
+                    drop(permit);
                     notify_tool_outcome(
                         session,
                         pending.call.name.as_str(),
@@ -4247,6 +4269,9 @@ async fn resume_after_approval_with_store(
                     }
                     .instrument(tool_span)
                     .await?;
+                    // Seiteneffekt-Grenze: das Werkzeug ist gelaufen (oder
+                    // abgebrochen), sein Ergebnis steht fest.
+                    drop(permit);
                     if was_cancelled {
                         // Derselbe Weg wie im sequenziellen Pfad oben: der
                         // laufende Call bekommt sein eigenes (bereits als
@@ -5128,25 +5153,31 @@ async fn drive_turn(
             // oder lokal beantworteter Aufruf. Eine Abweisung beantwortet
             // diesen Call, gibt allen noch offenen Calls der Antwort ein
             // synthetisches Ergebnis und beendet den Turn wie ein Treffer des
-            // Werkzeug-Budgets (`CancelReason::Budget`).
-            if let Some(refused) = admit_tool_call(&control, call.name.as_str()).await {
-                notify_tool_outcome(session, call.name.as_str(), &call.arguments, &refused);
-                notify_tool_progress(session);
-                session
-                    .history_mut()
-                    .push_tool_result(call.id.clone(), refused, 0);
-                persist_last(session, store).await?;
-                let remaining: Vec<ToolCall> = tool_call_iter.map(|(_, call)| call).collect();
-                return cancel_turn_with_pending_calls(
-                    session,
-                    store,
-                    handle,
-                    total_usage,
-                    CancelReason::Budget,
-                    remaining,
-                )
-                .await;
-            }
+            // Werkzeug-Budgets (`CancelReason::Budget`). Der Permit
+            // (Lease-Zaun, siehe `crate::tool_call_meter`) lebt, bis das
+            // Ergebnis dieses Aufrufs feststeht, und fällt spätestens am Ende
+            // dieser Iteration — also vor der Zulassung des nächsten Calls.
+            let permit = match admit_tool_call(&control, call.name.as_str()).await {
+                Ok(permit) => permit,
+                Err(refused) => {
+                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &refused);
+                    notify_tool_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(call.id.clone(), refused, 0);
+                    persist_last(session, store).await?;
+                    let remaining: Vec<ToolCall> = tool_call_iter.map(|(_, call)| call).collect();
+                    return cancel_turn_with_pending_calls(
+                        session,
+                        store,
+                        handle,
+                        total_usage,
+                        CancelReason::Budget,
+                        remaining,
+                    )
+                    .await;
+                }
+            };
 
             // b. Handoff-Detection (Runde 9, E3: auch `agent.message` an ein
             // eigenes, beendetes Kind — als Fortsetzung, [`message_resume_handoff`];
@@ -5156,6 +5187,8 @@ async fn drive_turn(
             // Modell, kein Turn-Abbruch.
             let (handoff, local_result) = delegation_step(session, &call);
             if let Some(mut result) = local_result {
+                // Lokal beantwortet: das Ergebnis steht fest.
+                drop(permit);
                 let abort_reason = apply_tool_guard(
                     session,
                     store,
@@ -5208,6 +5241,7 @@ async fn drive_turn(
                 let context = match governed_spawn_context(session) {
                     Ok(context) => context,
                     Err(error) => {
+                        drop(permit);
                         let mut result = missing_tool_execution_context_result(error)?;
                         let abort_reason = apply_tool_guard(
                             session,
@@ -5254,6 +5288,7 @@ async fn drive_turn(
                     ) || crate::child_handoff::is_continuation_rejection(&error.message)
                         || crate::delegation_visibility::is_plan_mode_refusal(&error.message))
                 {
+                    drop(permit);
                     let mut result = ToolCallResult::error(error.message.clone());
                     let abort_reason = apply_tool_guard(
                         session,
@@ -5316,6 +5351,8 @@ async fn drive_turn(
                         role,
                     });
                 };
+                // Seiteneffekt-Grenze: Kind gespawnt und übergeben.
+                drop(permit);
                 notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
                 notify_tool_progress(session);
                 session
@@ -5417,6 +5454,9 @@ async fn drive_turn(
             }
             .instrument(tool_span)
             .await?;
+            // Seiteneffekt-Grenze: das Werkzeug ist gelaufen (oder
+            // abgebrochen), sein Ergebnis steht fest.
+            drop(permit);
             if was_cancelled {
                 // Derselbe Weg wie ein Vorab-`tool_checkpoint()`-Treffer
                 // (Moduldoku „W4a A-LOOP"): der laufende Call bekommt sein
@@ -6394,24 +6434,30 @@ async fn skip_calls_over_tool_budget(
 /// Steuerblocks, bevor irgendetwas davon ausgeführt wird.
 ///
 /// # Beschreibung
-/// Ohne registrierten Meter ein No-op. Weist der Meter den Aufruf ab, wird
-/// der Grund als Stop-Grund des Turns vermerkt
+/// Ohne registrierten Meter ein No-op ([`ToolCallPermit::unguarded`]). Weist
+/// der Meter den Aufruf ab, wird der Grund als Stop-Grund des Turns vermerkt
 /// ([`TurnControl::stop_detail`]) und als Fehlerergebnis mit
 /// [`TOOL_CALL_REFUSED_PREFIX`] zurückgegeben. Der Aufrufer führt den Aufruf
 /// dann **nicht** aus, beantwortet ihn mit diesem Ergebnis und beendet den
 /// Turn mit `CancelReason::Budget`.
 ///
 /// # Returns
-/// `None`, wenn der Aufruf laufen darf; `Some(result)`, wenn er abgewiesen
-/// wurde.
-async fn admit_tool_call(control: &TurnControl, tool: &str) -> Option<ToolCallResult> {
-    let meter = control.tool_call_meter.as_ref()?;
+/// `Ok(permit)`, wenn der Aufruf laufen darf: der Aufrufer hält `permit`,
+/// bis das Ergebnis dieses Aufrufs feststeht (Lease-Zaun, siehe
+/// [`crate::tool_call_meter`]); `Err(result)`, wenn er abgewiesen wurde.
+async fn admit_tool_call(
+    control: &TurnControl,
+    tool: &str,
+) -> Result<ToolCallPermit, ToolCallResult> {
+    let Some(meter) = control.tool_call_meter.as_ref() else {
+        return Ok(ToolCallPermit::unguarded());
+    };
     match meter.admit_tool_call(tool).await {
-        Ok(()) => None,
+        Ok(permit) => Ok(permit),
         Err(reason) => {
             tracing::warn!(tool = %tool, reason = %reason, "turn_loop.tool_call_refused");
             control.note_stop_detail(format!("Werkzeugaufruf abgewiesen: {reason}"));
-            Some(ToolCallResult::error(format!(
+            Err(ToolCallResult::error(format!(
                 "{TOOL_CALL_REFUSED_PREFIX}: {reason}"
             )))
         }
@@ -6567,25 +6613,38 @@ async fn try_execute_parallel_calls(
     // Jobs: jeder Aufruf ist gebucht, bevor er läuft. Die davor zugelassenen
     // Jobs laufen weiter; der erste abgewiesene und alle folgenden werden
     // nicht gestartet, sondern bekommen das Abweisungsergebnis. Ein Meter
-    // wird nach der ersten Abweisung nicht erneut befragt.
+    // wird nach der ersten Abweisung nicht erneut befragt. Jeder gestartete
+    // Job bekommt seinen eigenen Permit (Lease-Zaun, siehe
+    // `crate::tool_call_meter`) als Wert und lässt ihn nach seiner
+    // Ausführung fallen; ein Abbruch (`abort_all`) lässt ihn mit dem Job
+    // fallen.
     let mut refusal: Option<ToolCallResult> = None;
     let mut joins = tokio::task::JoinSet::new();
     for (position, (call, executor)) in jobs.into_iter().enumerate() {
+        let mut permit = None;
         if refusal.is_none() {
-            refusal = admit_tool_call(control, call.name.as_str()).await;
+            match admit_tool_call(control, call.name.as_str()).await {
+                Ok(admitted) => permit = Some(admitted),
+                Err(refused) => refusal = Some(refused),
+            }
         }
-        if let Some(refused) = &refusal {
-            results[position] = Some((
-                call.id.clone(),
-                refused.clone(),
-                0,
-                call.name.to_string(),
-                call.arguments.clone(),
-                false,
-                None,
-            ));
+        // Ohne Permit startet kein Job: dieser oder ein früherer Aufruf wurde
+        // abgewiesen. Fehlte `refusal` dennoch, bliebe der Slot leer und die
+        // Auslieferung unten scheiterte geschlossen.
+        let Some(permit) = permit else {
+            if let (Some(refused), Some(slot)) = (&refusal, results.get_mut(position)) {
+                *slot = Some((
+                    call.id.clone(),
+                    refused.clone(),
+                    0,
+                    call.name.to_string(),
+                    call.arguments.clone(),
+                    false,
+                    None,
+                ));
+            }
             continue;
-        }
+        };
         let execution_context = execution_context.clone();
         let tool_name = call.name.to_string();
         let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
@@ -6597,6 +6656,8 @@ async fn try_execute_parallel_calls(
                 let placed = executor
                     .traced_execute_placed(&execution_context, &call)
                     .await;
+                // Seiteneffekt-Grenze dieses Jobs: das Werkzeug ist gelaufen.
+                drop(permit);
                 let placement = wire_placement(placed.placement);
                 let output = placed.output;
                 let cancelled = matches!(output, Err(ToolsError::Cancelled));
@@ -8667,7 +8728,7 @@ mod tests {
             let limit = self.allowed;
             Box::pin(async move {
                 if index < limit {
-                    Ok(())
+                    Ok(crate::tool_call_meter::ToolCallPermit::unguarded())
                 } else {
                     Err(format!("budget: tool-call limit of {limit} reached"))
                 }
@@ -8995,6 +9056,501 @@ mod tests {
             error_of(&errors, &call_id)
                 .is_some_and(|message| message.starts_with(TOOL_CALL_REFUSED_PREFIX)),
             "{errors:?}"
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // ToolCallPermit: Lease-Zaun bis zur Seiteneffekt-Grenze
+    // ------------------------------------------------------------------
+
+    /// Gemeinsames Protokoll der Zaun-Tests: Ausführungen, freigegebene
+    /// Guards, Abweisungen, Modellrunden und Reclaim-Versuche in
+    /// Eintrittsreihenfolge.
+    type FenceLog = Arc<Mutex<Vec<&'static str>>>;
+
+    fn fence_log() -> FenceLog {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn push_fence(log: &Mutex<Vec<&'static str>>, entry: &'static str) {
+        log.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
+    }
+
+    fn fence_entries(log: &Mutex<Vec<&'static str>>) -> Vec<&'static str> {
+        log.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Protokolleinträge (Ausführung, Freigabe des Guards) je Werkzeugname.
+    fn fence_labels(tool: &str) -> (&'static str, &'static str) {
+        match tool {
+            "alpha" => ("executed alpha", "dropped alpha"),
+            "beta" => ("executed beta", "dropped beta"),
+            _ => ("executed", "dropped"),
+        }
+    }
+
+    /// Guard eines Permits: protokolliert seine Freigabe und hält optional
+    /// die Lese-Seite einer Lease, die ein Reclaim exklusiv braucht.
+    struct FenceGuard {
+        log: FenceLog,
+        label: &'static str,
+        _lease: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    }
+
+    impl Drop for FenceGuard {
+        fn drop(&mut self) {
+            // Läuft, bevor `_lease` freigegeben wird (Felder fallen danach).
+            push_fence(&self.log, self.label);
+        }
+    }
+
+    /// Meter, der die ersten `allowed` Aufrufe mit einem protokollierenden
+    /// Guard zulässt und jeden weiteren abweist.
+    struct FenceMeter {
+        allowed: usize,
+        asked: AtomicUsize,
+        log: FenceLog,
+    }
+
+    impl FenceMeter {
+        fn new(allowed: usize, log: &FenceLog) -> Arc<Self> {
+            Arc::new(Self {
+                allowed,
+                asked: AtomicUsize::new(0),
+                log: Arc::clone(log),
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::tool_call_meter::ToolCallMeter for FenceMeter {
+        fn admit_tool_call<'a>(
+            &'a self,
+            tool: &'a str,
+        ) -> crate::tool_call_meter::ToolCallAdmissionFuture<'a> {
+            Box::pin(async move {
+                if self.asked.fetch_add(1, Ordering::SeqCst) < self.allowed {
+                    Ok(crate::tool_call_meter::ToolCallPermit::guarded(Box::new(
+                        FenceGuard {
+                            log: Arc::clone(&self.log),
+                            label: fence_labels(tool).1,
+                            _lease: None,
+                        },
+                    )))
+                } else {
+                    push_fence(&self.log, "refused");
+                    Err(format!(
+                        "budget: tool-call limit of {} reached",
+                        self.allowed
+                    ))
+                }
+            })
+        }
+    }
+
+    /// Meter, dessen Guard die Lese-Seite einer Lease hält. Unmittelbar nach
+    /// der Buchung — vor dem Start des Werkzeugs — stößt er einen Reclaim an,
+    /// der die Lease exklusiv will, und gibt den Permit erst heraus, wenn der
+    /// Reclaim es versucht hat.
+    struct LeaseMeter {
+        lease: Arc<tokio::sync::RwLock<()>>,
+        log: FenceLog,
+        reclaim: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+
+    impl LeaseMeter {
+        fn new(log: &FenceLog) -> Arc<Self> {
+            Arc::new(Self {
+                lease: Arc::new(tokio::sync::RwLock::new(())),
+                log: Arc::clone(log),
+                reclaim: Mutex::new(None),
+            })
+        }
+
+        fn take_reclaim(&self) -> Option<tokio::task::JoinHandle<()>> {
+            self.reclaim
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }
+    }
+
+    impl crate::tool_call_meter::ToolCallMeter for LeaseMeter {
+        fn admit_tool_call<'a>(
+            &'a self,
+            tool: &'a str,
+        ) -> crate::tool_call_meter::ToolCallAdmissionFuture<'a> {
+            Box::pin(async move {
+                let held = Arc::clone(&self.lease).read_owned().await;
+                let (tried, attempted) = tokio::sync::oneshot::channel();
+                let lease = Arc::clone(&self.lease);
+                let log = Arc::clone(&self.log);
+                let reclaim = tokio::spawn(async move {
+                    if lease.try_write().is_err() {
+                        push_fence(&log, "reclaim blocked");
+                    }
+                    if tried.send(()).is_err() {
+                        return;
+                    }
+                    let _reclaimed = lease.write_owned().await;
+                    push_fence(&log, "reclaimed");
+                });
+                *self
+                    .reclaim
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reclaim);
+                if attempted.await.is_err() {
+                    return Err("reclaim attempt never ran".to_owned());
+                }
+                Ok(crate::tool_call_meter::ToolCallPermit::guarded(Box::new(
+                    FenceGuard {
+                        log: Arc::clone(&self.log),
+                        label: fence_labels(tool).1,
+                        _lease: Some(held),
+                    },
+                )))
+            })
+        }
+    }
+
+    /// Werkzeug, das jede Ausführung protokolliert und — mit Barriere — erst
+    /// zurückkehrt, wenn alle Parteien laufen.
+    struct FenceExecutor {
+        log: FenceLog,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    impl ToolExecutor for FenceExecutor {
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolExecutionContext,
+            call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            Box::pin(async move {
+                push_fence(&self.log, fence_labels(call.name.as_str()).0);
+                if let Some(barrier) = &self.barrier {
+                    barrier.wait().await;
+                }
+                Ok(ToolOutput::Text {
+                    content: "ok".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct FenceProvider {
+        names: Vec<ToolName>,
+        parallel: bool,
+        log: FenceLog,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    impl FenceProvider {
+        /// Nicht parallel-sichere Werkzeuge: jede Antwort läuft sequenziell.
+        fn serial(names: &[&str], log: &FenceLog) -> Arc<Self> {
+            Arc::new(Self {
+                names: names.iter().map(|name| ToolName::new(*name)).collect(),
+                parallel: false,
+                log: Arc::clone(log),
+                barrier: None,
+            })
+        }
+
+        /// Parallel-sichere Werkzeuge, deren Ausführungen sich an einer
+        /// Barriere für `parties` Aufrufe treffen.
+        fn joined(names: &[&str], log: &FenceLog, parties: usize) -> Arc<Self> {
+            Arc::new(Self {
+                names: names.iter().map(|name| ToolName::new(*name)).collect(),
+                parallel: true,
+                log: Arc::clone(log),
+                barrier: Some(Arc::new(tokio::sync::Barrier::new(parties))),
+            })
+        }
+    }
+
+    impl ToolProvider for FenceProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            self.names
+                .iter()
+                .map(|name| {
+                    ToolSpec::Function(FunctionToolSpec {
+                        name: name.clone(),
+                        description: "fence tool".to_owned(),
+                        parameters: JsonSchema::default(),
+                        strict: false,
+                    })
+                })
+                .collect()
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            self.names.contains(name).then(|| {
+                Arc::new(FenceExecutor {
+                    log: Arc::clone(&self.log),
+                    barrier: self.barrier.clone(),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+
+        fn parallel_safe(&self, name: &ToolName) -> bool {
+            self.parallel && self.names.contains(name)
+        }
+    }
+
+    /// Modell, das jede Runde protokolliert und mit Text antwortet.
+    struct FenceModel {
+        log: FenceLog,
+    }
+
+    impl ModelProvider for FenceModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            push_fence(&self.log, "model");
+            Box::pin(async { Ok(crate::model::ModelResponse::text("fertig")) })
+        }
+    }
+
+    /// Sequenzieller Pfad: der Guard des Permits lebt, bis das Werkzeug
+    /// gelaufen ist, und fällt erst danach.
+    #[tokio::test]
+    async fn permit_is_held_until_the_tool_has_executed() -> TestResult {
+        let id = ToolCallId::new();
+        let log = fence_log();
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let mut session = guarded_session(FenceProvider::serial(&["lookup"], &log), handler)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![call(&id, "lookup")]),
+            crate::model::ModelResponse::text("fertig"),
+        ]);
+        let control = TurnControl::new().with_tool_call_meter(FenceMeter::new(1, &log));
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("ein Aufruf").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            fence_entries(&log),
+            vec!["executed", "dropped"],
+            "der Guard fällt erst, nachdem das Werkzeug gelaufen ist"
+        );
+        Ok(())
+    }
+
+    /// Paralleler Pfad: jeder Job hält seinen eigenen Permit. Die Barriere
+    /// zwingt beide Ausführungen gleichzeitig in Flight; jeder Guard fällt
+    /// erst nach der Ausführung seines eigenen Aufrufs.
+    #[tokio::test]
+    async fn parallel_calls_each_hold_their_own_permit() -> TestResult {
+        let log = fence_log();
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let mut session =
+            guarded_session(FenceProvider::joined(&["alpha", "beta"], &log, 2), handler)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![
+                call(&ToolCallId::new(), "alpha"),
+                call(&ToolCallId::new(), "beta"),
+            ]),
+            crate::model::ModelResponse::text("fertig"),
+        ]);
+        let meter = FenceMeter::new(2, &log);
+        let concrete = Arc::clone(&meter);
+        let control = TurnControl::new().with_tool_call_meter(concrete);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_turn(
+                &mut session,
+                &model,
+                &store,
+                TurnInput::user("parallel").with_control(control),
+            ),
+        )
+        .await
+        .map_err(ctx(
+            "beide Jobs laufen gleichzeitig, sonst hinge die Barriere",
+        ))?
+        .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(meter.asked(), 2, "jeder Aufruf wurde einzeln zugelassen");
+        let entries = fence_entries(&log);
+        assert_eq!(
+            entries.len(),
+            4,
+            "zwei Ausführungen, zwei Guards: {entries:?}"
+        );
+        let at = |entry: &str| {
+            entries
+                .iter()
+                .position(|logged| *logged == entry)
+                .ok_or_else(|| TestError::Unexpected(format!("{entry} fehlt: {entries:?}")))
+        };
+        let executed_alpha = at("executed alpha")?;
+        let dropped_alpha = at("dropped alpha")?;
+        let executed_beta = at("executed beta")?;
+        let dropped_beta = at("dropped beta")?;
+        assert!(executed_alpha < dropped_alpha, "{entries:?}");
+        assert!(executed_beta < dropped_beta, "{entries:?}");
+        assert!(
+            executed_alpha.max(executed_beta) < dropped_alpha.min(dropped_beta),
+            "beide Permits leben gleichzeitig, solange ihre Werkzeuge laufen: {entries:?}"
+        );
+        Ok(())
+    }
+
+    /// Ein abgewiesener Aufruf läuft nie und bekommt keinen Permit; der
+    /// Permit des zugelassenen Vorgängers ist zu diesem Zeitpunkt schon
+    /// gefallen (vor der nächsten Zulassung).
+    #[tokio::test]
+    async fn refused_admission_never_executes() -> TestResult {
+        let admitted = ToolCallId::new();
+        let refused = ToolCallId::new();
+        let log = fence_log();
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let mut session = guarded_session(FenceProvider::serial(&["lookup"], &log), handler)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![call(&admitted, "lookup"), call(&refused, "lookup")]),
+            crate::model::ModelResponse::text("darf nicht mehr angefragt werden"),
+        ]);
+        let control = TurnControl::new().with_tool_call_meter(FenceMeter::new(1, &log));
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("zwei Aufrufe").with_control(control),
+        )
+        .await
+        .map_err(ctx("die Abweisung beendet den Turn regulär"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fence_entries(&log),
+            vec!["executed", "dropped", "refused"],
+            "der erste Permit fällt vor der nächsten Zulassung; der abgewiesene Aufruf läuft nie"
+        );
+        let errors = error_results(&session);
+        assert_eq!(error_of(&errors, &admitted), None, "der erste Aufruf lief");
+        assert!(
+            error_of(&errors, &refused)
+                .is_some_and(|message| message.starts_with(TOOL_CALL_REFUSED_PREFIX)),
+            "{errors:?}"
+        );
+        Ok(())
+    }
+
+    /// Fortsetzungspfad nach einer Rückfrage: der Permit des genehmigten
+    /// Aufrufs lebt bis nach der Ausführung und fällt, bevor der Turn mit der
+    /// nächsten Modellrunde weiterläuft.
+    #[tokio::test]
+    async fn permit_is_released_before_the_resumed_turn_continues() -> TestResult {
+        let call_id = ToolCallId::new();
+        let log = fence_log();
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let mut session = guarded_session(FenceProvider::serial(&["lookup"], &log), handler)?;
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
+        let actor = ApprovalActor::Operator {
+            id: "test-operator".to_owned(),
+        };
+        session
+            .begin_approval(
+                call(&call_id, "lookup"),
+                harw_types::ItemId::new(),
+                actor.clone(),
+                jiff::Timestamp::now(),
+            )
+            .map_err(ctx("pause for approval"))?;
+        session.set_active_turn_control(
+            TurnControl::new().with_tool_call_meter(FenceMeter::new(1, &log)),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = FenceModel {
+            log: Arc::clone(&log),
+        };
+
+        let outcome = resume_after_approval(
+            &mut session,
+            &model,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await
+        .map_err(ctx("der fortgesetzte Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            fence_entries(&log),
+            vec!["executed", "dropped", "model"],
+            "der Permit fällt nach der Ausführung und vor der nächsten Modellrunde"
+        );
+        Ok(())
+    }
+
+    /// Barriere-Test zum Lease-Zaun: ein Reclaim, der nach der Buchung, aber
+    /// vor dem Start des Werkzeugs versucht wird, kommt nicht durch, solange
+    /// der Permit lebt. Er gelingt erst, nachdem das Werkzeug gelaufen und der
+    /// Permit gefallen ist; danach führt der alte Worker nichts mehr aus.
+    #[tokio::test]
+    async fn reclaim_between_admission_and_execution_waits_for_the_permit() -> TestResult {
+        let id = ToolCallId::new();
+        let log = fence_log();
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let mut session = guarded_session(FenceProvider::serial(&["lookup"], &log), handler)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![call(&id, "lookup")]),
+            crate::model::ModelResponse::text("fertig"),
+        ]);
+        let meter = LeaseMeter::new(&log);
+        let concrete = Arc::clone(&meter);
+        let control = TurnControl::new().with_tool_call_meter(concrete);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("ein Aufruf").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn läuft durch"))?;
+        let reclaim = meter
+            .take_reclaim()
+            .ok_or(TestError::Missing("der Meter hat einen Reclaim angestoßen"))?;
+        tokio::time::timeout(Duration::from_secs(5), reclaim)
+            .await
+            .map_err(ctx("der Reclaim kommt nach dem Fallen des Permits durch"))?
+            .map_err(ctx("der Reclaim-Task endet regulär"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            fence_entries(&log),
+            vec!["reclaim blocked", "executed", "dropped", "reclaimed"],
+            "der Reclaim wartet auf den Permit; nach ihm läuft beim alten Worker nichts mehr"
         );
         Ok(())
     }

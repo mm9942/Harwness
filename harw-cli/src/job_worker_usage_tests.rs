@@ -7,6 +7,12 @@
 //! I/O-Fehler (kein Lease-Fehler). Anders als entzogene Dateirechte wirkt das
 //! auch, wenn die Tests als root laufen. Ebenso macht [`block_dir`] ein
 //! Marker-Verzeichnis unbeschreibbar (Review B2 zu #151: Rundenreservierung).
+//!
+//! Die Reservierung einer Runde, deren Provider schon aufgerufen war, bleibt
+//! bei Fehler und Abbruch liegen (Review P1 4394111159, 4394114784); jede
+//! Reservierung entsteht und fällt unter der Job-Lease (Review P1 4394111166,
+//! P2 4394114795) — die Wettläufe mit einem Reclaim werden über Kanäle und
+//! die echte Job-Sperre gesteuert, ohne lange Pausen.
 
 use super::prompt_claim_guard_tests::{
     FixedUsageProvider, admit, claim_as_worker, empty_request, failure_reason, operator_scope,
@@ -17,6 +23,7 @@ use super::usage_marker::{
 };
 use super::*;
 use crate::test_support::{TestError, TestResult, ctx, some_or};
+use harw_core::ToolCallMeter;
 use harw_job_runtime::{BudgetUsage, StoredJob};
 use harw_types::ApprovalActor;
 use std::collections::VecDeque;
@@ -157,20 +164,28 @@ fn expect_unsettled(settled: Result<BudgetUsage, String>) -> TestResult<String> 
 }
 
 /// Antwortet mit fester Usage; beim Aufruf Nummer `fail_storage_on` (ab 1)
-/// fallen vorher Job-Datensatz und Marker-Verzeichnis aus — der Speicher
-/// bricht also weg, während die Runde läuft.
+/// fällt vorher der Job-Datensatz aus und mit `block_markers` auch das
+/// Marker-Verzeichnis — der Speicher bricht also weg, während die Runde läuft
+/// (nach ihrer Reservierung).
 struct StorageFailingProvider {
     store: Arc<JobStore>,
     calls: AtomicUsize,
     tokens_per_call: u64,
     fail_storage_on: usize,
+    block_markers: bool,
 }
 
 impl ModelProvider for StorageFailingProvider {
     fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         let failed = if call == self.fail_storage_on {
-            break_store(&self.store).and_then(|()| block_dir(&self.store, USAGE_UNRESOLVED_DIR))
+            break_store(&self.store).and_then(|()| {
+                if self.block_markers {
+                    block_dir(&self.store, USAGE_UNRESOLVED_DIR)
+                } else {
+                    Ok(())
+                }
+            })
         } else {
             Ok(())
         };
@@ -291,9 +306,14 @@ async fn respond_fails_closed_when_usage_cannot_be_recorded() -> TestResult {
     let store = Arc::new(JobStore::new(temp.path()));
     let claim = admitted_claim(&store, "respond-closed", Budget::unbounded())?;
     let ledger = persisted_ledger(&store, &claim, Budget::unbounded());
-    let inner = Arc::new(FixedUsageProvider {
+    // Der Job-Datensatz fällt während Runde 2 aus, nach ihrer Reservierung
+    // (mit kaputtem Store ließe sich die Runde gar nicht erst reservieren).
+    let inner = Arc::new(StorageFailingProvider {
+        store: Arc::clone(&store),
         calls: AtomicUsize::new(0),
         tokens_per_call: 5,
+        fail_storage_on: 2,
+        block_markers: false,
     });
     let budgeted = BudgetedModelProvider {
         inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
@@ -304,7 +324,6 @@ async fn respond_fails_closed_when_usage_cannot_be_recorded() -> TestResult {
         budgeted.respond(empty_request()).await.is_ok(),
         "with an intact store the response is handed back"
     );
-    break_store(&store)?;
     assert!(
         budgeted.respond(empty_request()).await.is_err(),
         "the response of a round whose usage is unrecorded must not be handed back"
@@ -648,6 +667,7 @@ async fn double_write_failure_then_crash_then_reclaim_cannot_spend_again() -> Te
         calls: AtomicUsize::new(0),
         tokens_per_call: 30,
         fail_storage_on: 2,
+        block_markers: true,
     });
     let budgeted = BudgetedModelProvider {
         inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
@@ -918,43 +938,425 @@ async fn concurrent_rounds_keep_the_reservation_until_every_round_is_recorded() 
     Ok(())
 }
 
-/// Scheitert ohne Usage (etwa ein abgewiesener Request).
-struct ErroringProvider;
+/// Scheitert beim ersten Aufruf, nachdem er angenommen wurde (wie ein
+/// SSE-Stream, der Teile geliefert hat und dann mit einem Transportfehler
+/// abreißt, bevor die Usage kommt); jeder weitere Aufruf antwortet mit
+/// `tokens_per_call` Tokens.
+struct PartialStreamProvider {
+    calls: AtomicUsize,
+    tokens_per_call: u64,
+}
 
-impl ModelProvider for ErroringProvider {
+impl ModelProvider for PartialStreamProvider {
     fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
-        Box::pin(async {
-            Err::<harw_core::ModelResponse, harw_core::ModelError>(
-                harw_core::ModelError::RequestFailed("test fixture: refused".to_owned()),
-            )
+        let call = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let mut response = harw_core::ModelResponse::text("streamed");
+        response.usage = tokens_used(self.tokens_per_call);
+        Box::pin(async move {
+            if call == 1 {
+                return Err(harw_core::ModelError::RequestFailed(
+                    "test fixture: stream truncated before the usage arrived".to_owned(),
+                ));
+            }
+            Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
         })
     }
 }
 
 #[tokio::test]
-async fn provider_error_releases_the_reservation() -> TestResult {
+async fn partial_stream_error_keeps_the_round_reserved() -> TestResult {
     let temp = temp_dir()?;
     let store = Arc::new(JobStore::new(temp.path()));
-    let claim = admitted_claim(&store, "provider-error", Budget::unbounded())?;
-    let ledger = persisted_ledger(&store, &claim, Budget::unbounded());
+    let first = admitted_retryable_claim(&store, "partial-stream", Budget::unbounded())?;
+    let ledger = persisted_ledger(&store, &first, Budget::unbounded());
+    let inner = Arc::new(PartialStreamProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 25,
+    });
     let budgeted = BudgetedModelProvider {
-        inner: Arc::new(ErroringProvider),
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
         ledger: Arc::clone(&ledger),
     };
 
+    // Runde 1: der Provider war aufgerufen, dann riss der Stream ab.
     assert!(budgeted.respond(empty_request()).await.is_err());
-    assert!(
-        read_in_flight(&store, "provider-error")?.is_some(),
-        "the reservation is written before the provider is called"
-    );
-    // Ohne gemeldete Usage gibt es nichts zu verbuchen: der nächste Flush
-    // entfernt die Reservierung.
-    ledger.flush().await.map_err(ctx("flush after the error"))?;
-    assert!(read_in_flight(&store, "provider-error")?.is_none());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    let reservation = some_or(
+        read_in_flight(&store, "partial-stream")?,
+        "a dispatched round without usage stays reserved",
+    )?;
+    assert!(reservation.unproven_spend, "{reservation:?}");
     assert!(
         ledger.exceeded().is_none(),
         "a provider error is no accounting failure"
     );
+
+    // Runde 2 gelingt und wird verbucht: die Reservierung wird angehoben,
+    // aber nicht entfernt.
+    budgeted
+        .respond(empty_request())
+        .await
+        .map_err(ctx("round 2"))?;
+    assert_eq!(stored_tokens(&store, "partial-stream")?, 25);
+    let raised = some_or(
+        read_in_flight(&store, "partial-stream")?,
+        "the unproven round keeps its reservation",
+    )?;
+    assert!(raised.unproven_spend, "{raised:?}");
+    assert_eq!(
+        raised.usage_before.tokens, 25,
+        "raised to the recorded state"
+    );
+
+    // Letzter Flush, dann stirbt der Worker.
+    let outcome = ledger
+        .finish(JobOutcome::Succeeded {
+            result: serde_json::json!({"assistant": "done"}),
+        })
+        .await;
+    assert!(
+        matches!(outcome, JobOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        read_in_flight(&store, "partial-stream")?.is_some_and(|kept| kept.unproven_spend),
+        "the final flush must not clear an unproven round"
+    );
+    drop(budgeted);
+    drop(ledger);
+
+    // Der Reclaim sieht 25 Tokens; die abgerissene Runde 1 ist darin nicht
+    // enthalten: kein frisches Budget.
+    let second = reclaim_and_claim_again(&store, "partial-stream").await?;
+    assert_eq!(second.job.usage.tokens, 25);
+    let reason = expect_unsettled(settle_unresolved_usage(&store, &second))?;
+    assert!(reason.contains("in-flight model round"), "{reason}");
+    assert!(reason.contains("never accounted"), "{reason}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_round_keeps_the_round_reserved() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let first = admitted_retryable_claim(&store, "cancelled-round", Budget::unbounded())?;
+    let ledger = persisted_ledger(&store, &first, Budget::unbounded());
+    // Der Sender bleibt bis zum Ende am Leben: die Runde endet nur durch den
+    // Abbruch, nie durch eine Antwort oder einen Fehler des Providers.
+    let (_never_released, gate) = tokio::sync::oneshot::channel::<()>();
+    let inner = Arc::new(GatedProvider {
+        calls: AtomicUsize::new(0),
+        gates: Mutex::new(VecDeque::from([(gate, 40)])),
+    });
+    let budgeted = Arc::new(BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&ledger),
+    });
+
+    // Die Runde läuft im Provider; dann bricht ein Timeout sie ab.
+    let round = spawn_round(&budgeted);
+    wait_for_calls(&inner.calls, 1).await?;
+    round.abort();
+    let aborted = round.await;
+    assert!(
+        aborted
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled),
+        "the round must have been cancelled mid-flight"
+    );
+
+    // Der nächste Flush (hier: der letzte vor dem Ausgang) schreibt den
+    // unbewiesenen Verbrauch in die Reservierung und entfernt sie nicht.
+    let outcome = ledger
+        .finish(JobOutcome::Failed {
+            reason: "timeout".to_owned(),
+        })
+        .await;
+    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    let reservation = some_or(
+        read_in_flight(&store, "cancelled-round")?,
+        "a cancelled round stays reserved",
+    )?;
+    assert!(reservation.unproven_spend, "{reservation:?}");
+    drop(budgeted);
+    drop(ledger);
+
+    let second = reclaim_and_claim_again(&store, "cancelled-round").await?;
+    let reason = expect_unsettled(settle_unresolved_usage(&store, &second))?;
+    assert!(reason.contains("in-flight model round"), "{reason}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn error_before_dispatch_releases_the_reservation() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let budget = Budget {
+        max_tokens: Some(10),
+        max_wall: None,
+        max_tool_calls: None,
+    };
+    let claim = admitted_claim(&store, "before-dispatch", budget.clone())?;
+    let ledger = persisted_ledger(&store, &claim, budget);
+    let inner = Arc::new(FixedUsageProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 10,
+    });
+    let budgeted = BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&ledger),
+    };
+
+    // Eine reservierte, aber nie aufgerufene Runde gibt nichts aus: das
+    // Verwerfen gibt sie frei, der nächste Flush entfernt die Reservierung.
+    let reserved = ledger
+        .reserve_round()
+        .await
+        .map_err(TestError::Unexpected)?;
+    assert!(read_in_flight(&store, "before-dispatch")?.is_some());
+    drop(reserved);
+    ledger
+        .flush()
+        .await
+        .map_err(ctx("flush after the release"))?;
+    assert!(read_in_flight(&store, "before-dispatch")?.is_none());
+    assert!(!ledger.state().unproven_spend);
+
+    // Runde 1 schöpft das Budget aus; die Abweisung der nächsten durch den
+    // Ledger liegt vor dem Aufruf und hinterlässt keine Reservierung.
+    budgeted
+        .respond(empty_request())
+        .await
+        .map_err(ctx("round 1"))?;
+    assert!(read_in_flight(&store, "before-dispatch")?.is_none());
+    let refused = budgeted.respond(empty_request()).await;
+    assert!(refused.is_err(), "the exhausted budget refuses the round");
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        1,
+        "a refused round never reaches the provider"
+    );
+    assert!(read_in_flight(&store, "before-dispatch")?.is_none());
+    let state = ledger.state();
+    assert_eq!(state.rounds_in_flight, 0);
+    assert!(!state.unproven_spend);
+    Ok(())
+}
+
+// ── Rundenreservierung unter der Lease (Review P1 4394111166, P2 4394114795) ──
+
+#[tokio::test]
+async fn reclaim_before_reserve_refuses_the_round_without_dispatch() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let first = admitted_retryable_claim(&store, "reserve-stale", Budget::unbounded())?;
+    let stale = persisted_ledger(&store, &first, Budget::unbounded());
+    let inner = Arc::new(FixedUsageProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 5,
+    });
+    let budgeted = BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(&stale),
+    };
+
+    // Die Lease läuft ab und wird zurückgefordert, bevor der alte Worker
+    // seine nächste Runde reserviert.
+    let second = reclaim_and_claim_again(&store, "reserve-stale").await?;
+    assert!(second.token.epoch > first.token.epoch);
+
+    assert!(
+        budgeted.respond(empty_request()).await.is_err(),
+        "a reclaimed worker must not start a round"
+    );
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        0,
+        "the provider is never called under a lost lease"
+    );
+    assert!(
+        read_in_flight(&store, "reserve-stale")?.is_none(),
+        "the stale worker wrote no reservation"
+    );
+    let closed = some_or(stale.exceeded(), "the stale ledger is closed")?;
+    assert!(closed.starts_with("lease:"), "{closed}");
+    assert_eq!(stored_tokens(&store, "reserve-stale")?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn old_epoch_cleanup_cannot_unlink_the_new_epochs_reservation() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let id = "cleanup-race";
+    let first = admitted_retryable_claim(&store, id, Budget::unbounded())?;
+    let markers = UsageMarkerStore::in_job_root(store.root());
+    // Epoche 1 hat eine Runde reserviert und wieder freigegeben; ihr nächster
+    // Flush würde die Reservierung entfernen.
+    let old = persisted_ledger(&store, &first, Budget::unbounded());
+    let reserved = old.reserve_round().await.map_err(TestError::Unexpected)?;
+    drop(reserved);
+
+    // Phase 1: das Aufräumen von Epoche 1 hat seine Prüfung bestanden und
+    // pausiert vor dem Entfernen. Solange es die Lease hält, kommt kein
+    // Reclaim dazwischen.
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let cleanup = std::thread::spawn({
+        let store = Arc::clone(&store);
+        let token = first.token.clone();
+        let markers = markers.clone();
+        move || {
+            under_live_lease(&store, &token, &LeaseAccess::Free, || {
+                let seen = markers.read_in_flight(id);
+                let paused = paused_tx.send(());
+                let resumed = resume_rx.recv();
+                (
+                    seen,
+                    paused.is_ok() && resumed.is_ok(),
+                    markers.remove_in_flight(id, token.epoch),
+                )
+            })
+        }
+    });
+    paused_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(ctx("wait for the paused cleanup"))?;
+    let contended = store.reclaim(
+        &WorkId::from_str(id),
+        Timestamp::now(),
+        ApprovalActor::Operator {
+            id: "operator".to_owned(),
+        },
+    );
+    assert!(
+        matches!(
+            contended,
+            Err(harw_session_store::SessionStoreError::JobLockContended { .. })
+        ),
+        "a reclaim must wait for the paused cleanup: {contended:?}"
+    );
+    resume_tx.send(()).map_err(ctx("resume the cleanup"))?;
+    let joined = cleanup
+        .join()
+        .map_err(|_| TestError::Unexpected("the cleanup thread panicked".to_owned()))?;
+    match joined {
+        Ok((Ok(Some(_)), true, Ok(()))) => {}
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "the cleanup of epoch 1 must finish under its lease: {other:?}"
+            )));
+        }
+    }
+
+    // Phase 2: jetzt erst der Reclaim; Epoche 2 reserviert ihre Runde.
+    let second = reclaim_and_claim_again(&store, id).await?;
+    settle_unresolved_usage(&store, &second).map_err(TestError::Unexpected)?;
+    let current = persisted_ledger(&store, &second, Budget::unbounded());
+    let in_flight = current
+        .reserve_round()
+        .await
+        .map_err(TestError::Unexpected)?;
+
+    // Ein Aufräumen von Epoche 1, das erst jetzt weiterläuft, wird
+    // abgewiesen, bevor es die Reservierung auch nur liest.
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let late = under_live_lease(&store, &first.token, &LeaseAccess::Free, || {
+        ran.store(true, Ordering::SeqCst);
+        markers.remove_in_flight(id, first.token.epoch)
+    });
+    assert!(matches!(late, Err(LeaseRefusal::Lost)), "{late:?}");
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "the stale cleanup must not run"
+    );
+    // Ebenso der Flush des alten Ledgers (sein Schritt wäre das Entfernen).
+    let flushed = old.flush().await;
+    assert!(
+        matches!(flushed, Err(UsageFlushError::LeaseLost)),
+        "{flushed:?}"
+    );
+
+    let kept = some_or(
+        read_in_flight(&store, id)?,
+        "the reservation of epoch 2 survives",
+    )?;
+    assert_eq!(kept.epoch, second.token.epoch);
+    drop(in_flight);
+    Ok(())
+}
+
+#[tokio::test]
+async fn old_epoch_write_cannot_overwrite_a_newer_reservation() -> TestResult {
+    let temp = temp_dir()?;
+    let store = Arc::new(JobStore::new(temp.path()));
+    let id = "overwrite-race";
+    let first = admitted_retryable_claim(&store, id, Budget::unbounded())?;
+    let inner = Arc::new(FixedUsageProvider {
+        calls: AtomicUsize::new(0),
+        tokens_per_call: 5,
+    });
+    let stale_provider = |ledger: &Arc<PromptTokenLedger>| BudgetedModelProvider {
+        inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+        ledger: Arc::clone(ledger),
+    };
+    let blocked = persisted_ledger(&store, &first, Budget::unbounded());
+    let refused = persisted_ledger(&store, &first, Budget::unbounded());
+
+    // Epoche 2 hält die Lease (ein laufender Werkzeugaufruf) und reserviert
+    // unter diesem Halt ihre nächste Runde.
+    let second = reclaim_and_claim_again(&store, id).await?;
+    let current = persisted_ledger(&store, &second, Budget::unbounded());
+    let permit = LedgerToolMeter {
+        ledger: Arc::clone(&current),
+    }
+    .admit_tool_call("fs.write")
+    .await
+    .map_err(TestError::Unexpected)?;
+    let in_flight = current
+        .reserve_round()
+        .await
+        .map_err(TestError::Unexpected)?;
+    let before = some_or(read_in_flight(&store, id)?, "reservation of epoch 2")?;
+    assert_eq!(before.epoch, second.token.epoch);
+
+    // Der alte Worker wartet vergeblich auf die Sperre und reserviert nichts.
+    assert!(
+        stale_provider(&blocked)
+            .respond(empty_request())
+            .await
+            .is_err()
+    );
+    let closed = some_or(blocked.exceeded(), "the blocked ledger is closed")?;
+    assert!(closed.starts_with("usage:"), "{closed}");
+    drop(permit);
+    // Ohne Halt wird er abgewiesen, weil seine Lease nicht mehr gilt.
+    assert!(
+        stale_provider(&refused)
+            .respond(empty_request())
+            .await
+            .is_err()
+    );
+    let closed = some_or(refused.exceeded(), "the refused ledger is closed")?;
+    assert!(closed.starts_with("lease:"), "{closed}");
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        0,
+        "the stale worker never reaches the provider"
+    );
+    let markers = UsageMarkerStore::in_job_root(store.root());
+    let stale = InFlightUsage::new(id, first.token.epoch, owed(999));
+    let written = under_live_lease(&store, &first.token, &LeaseAccess::Free, || {
+        markers.write_in_flight(&stale)
+    });
+    assert!(matches!(written, Err(LeaseRefusal::Lost)), "{written:?}");
+    // Zweite Linie: auch ohne Lease-Prüfung lehnt der Marker-Speicher die
+    // ältere Epoche ab.
+    assert!(markers.write_in_flight(&stale).is_err());
+
+    let after = some_or(read_in_flight(&store, id)?, "reservation of epoch 2")?;
+    assert_eq!(after, before, "the newer reservation is untouched");
+    drop(in_flight);
     Ok(())
 }
 

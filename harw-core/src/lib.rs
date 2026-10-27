@@ -139,7 +139,7 @@ pub use state_store::{
 };
 pub use stream::{ModelStreamEvent, StreamSink};
 pub use testing::RecordingModelProvider;
-pub use tool_call_meter::{ToolCallAdmissionFuture, ToolCallMeter};
+pub use tool_call_meter::{ToolCallAdmissionFuture, ToolCallMeter, ToolCallPermit};
 pub use turn_loop::{
     ApprovalResolution, TurnInput, TurnOutcome, TurnTokenBudget, resume_after_approval,
     resume_after_approval_durable, resume_after_child, resume_after_child_durable, run_turn,

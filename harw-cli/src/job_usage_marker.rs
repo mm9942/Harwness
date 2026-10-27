@@ -40,11 +40,30 @@
 //! nicht zu einem früheren Versuch und bleibt unberührt. Werkzeugaufrufe
 //! brauchen keine Reservierung: sie werden festgeschrieben, bevor sie laufen.
 //!
+//! Unbewiesener Verbrauch (Review P1 4394111159, 4394114784): Hat der Worker
+//! den Provider einer Runde schon aufgerufen, beweist ein Fehler, Timeout oder
+//! Abbruch danach nicht, dass nichts ausgegeben wurde (ein Stream kann Teile
+//! geliefert haben, bevor er abriss). Die Reservierung trägt dann
+//! [`InFlightUsage::unproven_spend`]; eine solche Reservierung gilt beim
+//! Reclaim nie als verbucht, auch wenn die gespeicherte Usage inzwischen
+//! darüber liegt, und der Worker entfernt sie nie.
+//!
 //! # Concurrency
-//! Kein Dateilock: der Schreiber ist der Lease-Halter des Jobs, und innerhalb
-//! eines Prozesses serialisiert der Flush-Gate des Ledgers die Zugriffe. Jede
-//! einzelne Datei wird atomar ersetzt (temp + rename + fsync des
-//! Verzeichnisses), ein Absturz hinterlässt also nie eine halbe Marker-Datei.
+//! Rundenreservierungen werden nur unter der Lease des Schreibers angelegt,
+//! angehoben und entfernt: der Job-Worker hält dabei die Job-Sperre
+//! (`JobStore::hold_live_lease` bzw. den Lease-Halt eines laufenden
+//! Werkzeugaufrufs), dieselbe Sperre, die Claim, Reclaim und Ablauf nehmen
+//! (Review P1 4394111166, P2 4394114795). Ein veralteter Schreiber wird so
+//! abgewiesen, bevor er die Reservierung einer jüngeren Epoche überschreiben
+//! oder entfernen kann; die Epochen-Prüfungen hier bleiben als zweite Linie.
+//! Innerhalb eines Prozesses serialisiert zusätzlich der Flush-Gate des
+//! Ledgers. Marker für nicht verbuchte Usage werden dagegen ohne Job-Sperre
+//! geschrieben (sie entstehen gerade dann, wenn der Job-Store nicht
+//! beschreibbar ist); sie werden nur feldweise vereinigt, nie verkleinert,
+//! und nur entfernt, wenn eine festgeschriebene Usage sie abdeckt
+//! ([`UsageMarkerStore::remove_if_covered`]). Jede einzelne Datei wird atomar
+//! ersetzt (temp + rename + fsync des Verzeichnisses), ein Absturz
+//! hinterlässt also nie eine halbe Marker-Datei.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -144,10 +163,18 @@ pub(crate) struct InFlightUsage {
     pub usage_before: BudgetUsage,
     /// Zeitpunkt der Reservierung.
     pub started_at: jiff::Timestamp,
+    /// `true`, sobald eine Runde dieses Versuchs nach dem Aufruf des
+    /// Providers ohne verbuchte Usage endete (Fehler, Timeout, Abbruch oder
+    /// nicht verbuchbare Usage): ihr Verbrauch ist unbewiesen, die
+    /// Reservierung gilt nie als verbucht ([`Self::superseded_by`]). Fehlt in
+    /// Dateien älterer Worker und gilt dann als `false`.
+    #[serde(default)]
+    pub unproven_spend: bool,
 }
 
 impl InFlightUsage {
-    /// Baut eine Reservierung mit aktueller Schemaversion und Zeitstempel.
+    /// Baut eine Reservierung mit aktueller Schemaversion und Zeitstempel;
+    /// ohne unbewiesenen Verbrauch.
     pub(crate) fn new(work_id: &str, epoch: u64, usage_before: BudgetUsage) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -155,20 +182,33 @@ impl InFlightUsage {
             epoch,
             usage_before,
             started_at: jiff::Timestamp::now(),
+            unproven_spend: false,
         }
     }
 
+    /// Dieselbe Reservierung mit gesetztem bzw. gelöschtem
+    /// [`Self::unproven_spend`].
+    #[must_use]
+    pub(crate) fn with_unproven_spend(mut self, unproven_spend: bool) -> Self {
+        self.unproven_spend = unproven_spend;
+        self
+    }
+
     /// `true`, wenn `stored` in Tokens oder Werkzeugaufrufen echt über
-    /// `usage_before` liegt: dann wurde nach der Reservierung verbucht.
+    /// `usage_before` liegt und die Reservierung keinen unbewiesenen
+    /// Verbrauch trägt: dann wurde nach der Reservierung verbucht.
     ///
     /// # Description
     /// Die Wanduhr zählt bewusst nicht — sie wächst auch ohne Runde (der
     /// periodische Flush schreibt sie fort) und bewiese nichts. Eine Runde,
     /// die weder Tokens noch Werkzeugaufrufe meldet, gilt danach nie als
-    /// bewiesen (fail closed).
+    /// bewiesen (fail closed). Mit [`Self::unproven_spend`] beweist keine
+    /// gespeicherte Usage etwas: die unverbuchte Runde steckt in keinem Stand.
     #[must_use]
     pub(crate) fn superseded_by(&self, stored: &BudgetUsage) -> bool {
-        stored.tokens > self.usage_before.tokens || stored.tool_calls > self.usage_before.tool_calls
+        !self.unproven_spend
+            && (stored.tokens > self.usage_before.tokens
+                || stored.tool_calls > self.usage_before.tool_calls)
     }
 }
 
@@ -288,6 +328,37 @@ impl UsageMarkerStore {
         }
     }
 
+    /// Entfernt den Marker zu `work_id`, sofern `covered_by` ihn feldweise
+    /// abdeckt (Tokens, Wanduhr und Werkzeugaufrufe jeweils höchstens so groß).
+    ///
+    /// # Description
+    /// Für Aufrufer, die eben `covered_by` festgeschrieben haben: ein Marker,
+    /// der seither (ohne Job-Sperre, siehe Moduldoku) um weiteren Verbrauch
+    /// gewachsen ist, bleibt liegen, statt mit dem Löschen verloren zu gehen.
+    ///
+    /// # Returns
+    /// `Ok(None)`, wenn danach kein Marker mehr liegt (entfernt oder nie
+    /// vorhanden); `Ok(Some(usage))` mit dessen Usage, wenn ein nicht
+    /// abgedeckter Marker liegen bleibt.
+    ///
+    /// # Errors
+    /// Wie [`Self::read`] und [`Self::remove`]; ein unlesbarer Marker bleibt
+    /// liegen.
+    pub(crate) fn remove_if_covered(
+        &self,
+        work_id: &str,
+        covered_by: &BudgetUsage,
+    ) -> Result<Option<BudgetUsage>, String> {
+        let Some(marker) = self.read(work_id)? else {
+            return Ok(None);
+        };
+        if Self::merged(&marker.usage, covered_by) != *covered_by {
+            return Ok(Some(marker.usage));
+        }
+        self.remove(work_id)?;
+        Ok(None)
+    }
+
     /// Schreibt die Rundenreservierung atomar (temp + rename + fsync des
     /// Verzeichnisses); ersetzt eine vorhandene derselben oder einer älteren
     /// Epoche.
@@ -370,9 +441,11 @@ impl UsageMarkerStore {
     ///
     /// # Description
     /// Eine Reservierung einer jüngeren Epoche gehört dem aktuellen
-    /// Lease-Halter und bleibt liegen (`Ok`). Kein Dateilock: der Aufrufer ist
+    /// Lease-Halter und bleibt liegen (`Ok`). Kein eigener Dateilock: der
+    /// Aufrufer hält die Job-Sperre unter seiner Lease (siehe Moduldoku) —
     /// der Lease-Halter, der eben festgeschrieben hat, oder der Claim, der die
-    /// Reservierung eines früheren Versuchs als verbucht bewiesen hat.
+    /// Reservierung eines früheren Versuchs als verbucht bewiesen hat. Die
+    /// Epochen-Prüfung hier ist die zweite Linie.
     ///
     /// # Errors
     /// Unsichere Arbeits-ID, eine unlesbare Reservierung (sie bleibt liegen;
@@ -1052,5 +1125,89 @@ mod tests {
         );
         assert!(reserved.superseded_by(&usage(11, 2)));
         assert!(reserved.superseded_by(&usage(10, 3)));
+    }
+
+    // ── Unbewiesener Verbrauch (Review P1 4394111159) ─────────────────────
+
+    #[test]
+    fn test_unproven_spend_is_never_superseded_and_survives_a_round_trip() -> TestResult {
+        let unproven = reservation("job-1", 2, 10, 2).with_unproven_spend(true);
+        assert!(
+            !unproven.superseded_by(&usage(1_000, 50)),
+            "no stored usage proves a round whose spend is unproven"
+        );
+
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        store
+            .write_in_flight(&unproven)
+            .map_err(TestError::Unexpected)?;
+        let read = read_reservation(&store, "job-1")?;
+        assert!(read.unproven_spend, "{read:?}");
+        assert_eq!(read, unproven);
+        Ok(())
+    }
+
+    #[test]
+    fn test_reservation_of_an_older_worker_reads_without_unproven_spend() -> TestResult {
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        store
+            .write_in_flight(&reservation("job-1", 1, 5, 0))
+            .map_err(TestError::Unexpected)?;
+        let path = reservation_file(root.path(), "job-1");
+        let text = std::fs::read_to_string(&path).map_err(ctx("read reservation"))?;
+        let legacy = text.replacen(",\"unproven_spend\":false", "", 1);
+        if legacy == text {
+            return Err(TestError::Unexpected(format!(
+                "the field must be serialized: {text}"
+            )));
+        }
+        std::fs::write(&path, legacy).map_err(ctx("write legacy reservation"))?;
+        let read = read_reservation(&store, "job-1")?;
+        assert!(!read.unproven_spend, "{read:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_if_covered_keeps_a_marker_that_grew() -> TestResult {
+        let root = temp_dir()?;
+        let store = UsageMarkerStore::in_job_root(root.path());
+        // Ohne Marker bleibt nichts liegen.
+        assert_eq!(
+            store
+                .remove_if_covered("job-1", &usage(1, 0))
+                .map_err(TestError::Unexpected)?,
+            None
+        );
+        store
+            .write(&marker("job-1", 1, 40, 3))
+            .map_err(TestError::Unexpected)?;
+        // Mehr Werkzeugaufrufe als festgeschrieben: der Marker bleibt.
+        let kept = store
+            .remove_if_covered("job-1", &usage(40, 2))
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(kept, Some(usage(40, 3)));
+        some_or(
+            store.read("job-1").map_err(TestError::Unexpected)?,
+            "an uncovered marker stays",
+        )?;
+        // Ein abgedeckter Marker wird entfernt.
+        assert_eq!(
+            store
+                .remove_if_covered("job-1", &usage(41, 3))
+                .map_err(TestError::Unexpected)?,
+            None
+        );
+        if store
+            .read("job-1")
+            .map_err(TestError::Unexpected)?
+            .is_some()
+        {
+            return Err(TestError::Unexpected(
+                "a covered marker must be removed".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

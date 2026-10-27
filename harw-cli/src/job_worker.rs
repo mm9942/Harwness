@@ -112,11 +112,42 @@
 //! Job als `Failed{usage accounting unresolved: …}` ohne Modellaufruf
 //! (konservativ: kein Reclaim mit unbewiesenem Budget).
 //!
+//! Ist der Provider einer Runde einmal aufgerufen, beweist ein Fehler, ein
+//! Timeout oder ein Abbruch nicht mehr, dass nichts ausgegeben wurde (Review
+//! P1 4394111159, 4394114784: ein Stream kann Teile geliefert haben, bevor er
+//! abriss). Freigegeben wird die Runde deshalb nur nach dem Verbuchen ihrer
+//! Usage, die durable Reservierung erst nach deren Festschreiben; endet sie
+//! anders, bleibt sie reserviert und trägt `unproven_spend`, und ein Reclaim
+//! gilt sie nie als verbucht. Nur Fehler, die nachweislich vor dem Aufruf
+//! liegen (Abweisung durch den Ledger, gescheiterte Reservierung), geben sie
+//! frei.
+//!
+//! Jede Reservierung wird unter der Job-Lease angelegt, angehoben und entfernt
+//! (Review P1 4394111166, P2 4394114795): der Ledger hält dabei die Job-Sperre
+//! (`JobStore::hold_live_lease`), die auch Claim, Reclaim und Ablauf nehmen.
+//! Ein Worker mit abgelaufener oder zurückgeforderter Lease reserviert nicht
+//! und ruft den Provider nicht auf; ein Aufräumen oder Anheben einer älteren
+//! Epoche läuft entweder ganz vor dem Reclaim oder wird abgewiesen und kann
+//! die Reservierung der neuen Epoche weder überschreiben noch entfernen. Die
+//! Verrechnung beim Claim läuft unmittelbar nach `JobStore::claim` unter
+//! derselben Disziplin ([`settle_unresolved_usage`]).
+//!
 //! Werkzeugaufrufe werden beim Dispatch gebucht (Review P1-b zu #151): der
 //! `harw_core::ToolCallMeter` jedes Job-Turns ([`LedgerToolMeter`]) bucht den
 //! Aufruf gegen `max_tool_calls` und schreibt ihn unter der aktuellen Lease
 //! fest, BEVOR das Werkzeug läuft; scheitert das (Budget, Lease, Speicher),
-//! läuft das Werkzeug nicht.
+//! läuft das Werkzeug nicht. Danach hält der zurückgegebene
+//! `harw_core::ToolCallPermit` die Job-Sperre, bis die Ausführung des Aufrufs
+//! zurückgekehrt ist (Lease-Zaun, Review P1 4394111171, [`LeaseHold`]): ein
+//! Reclaim läuft nie zwischen Buchung und Seiteneffekt, sondern danach, und
+//! der nächste Flush des alten Workers scheitert geschlossen. Gleichzeitige
+//! Aufrufe teilen sich den Halt; was der Ledger währenddessen festschreibt,
+//! bucht er unter dem Halt als Marker. Folge für den Heartbeat: das Renew des
+//! Runners scheitert, solange der Halt lebt, und wird in kurzen Abständen
+//! wiederholt (`harw_core::DurableJobRunner` behandelt eine belegte Sperre
+//! als vorübergehend). Hält ein Werkzeugaufruf länger als die verbleibende
+//! Lease, endet der Job mit verlorener Lease, statt einen veralteten Worker
+//! weiterlaufen zu lassen.
 //!
 //! # Concurrency
 //! Every entry point is `async` and `Send`.  All shared state travels as
@@ -1507,9 +1538,14 @@ struct PromptTokenLedger {
     // ergibt sich die laufende Wanduhr in `snapshot`.
     started: std::time::Instant,
     base_wall: SignedDuration,
-    // Serialisiert `flush`, damit ein älterer Stand nie nach einem neueren
-    // geschrieben wird (der Store lehnt Rückschritte ab).
+    // Serialisiert `flush`, die Rundenreservierung und das Nehmen des
+    // Lease-Halts: ein älterer Stand wird nie nach einem neueren geschrieben
+    // (der Store lehnt Rückschritte ab), und ob ein Schritt unter einem
+    // laufenden Halt läuft, ändert sich nicht, während er läuft.
     flush_gate: tokio::sync::Mutex<()>,
+    // Lease-Halt laufender Werkzeugaufrufe ([`LeaseHold`]); lebt, solange ein
+    // Permit lebt. Neu genommen nur unter `flush_gate`.
+    lease_hold: Mutex<std::sync::Weak<LeaseHold>>,
 }
 
 struct PromptTokenState {
@@ -1521,6 +1557,16 @@ struct PromptTokenState {
     rounds_in_flight: u32,
     // Ob eine Rundenreservierung dieses Ledgers auf der Platte liegen kann.
     reservation_marked: bool,
+    // Eine Runde endete nach dem Aufruf des Providers ohne verbuchte Usage
+    // (Fehler, Abbruch, nicht verbuchbare Usage; Review P1 4394111159): ihr
+    // Verbrauch ist unbewiesen. Jede weitere Reservierung dieses Ledgers
+    // trägt das (`usage_marker::InFlightUsage::unproven_spend`) und wird nie
+    // entfernt.
+    unproven_spend: bool,
+    // Ob ein unter gehaltener Lease gebuchter Stand als Marker liegen kann
+    // (`UsageWrite::Booked`); der nächste Flush ohne Halt entfernt ihn nach
+    // dem Festschreiben.
+    booking_marked: bool,
 }
 
 // Job-Store und Lease-Token, unter denen der Ledger seine Usage festschreibt,
@@ -1557,6 +1603,17 @@ const USAGE_UNRECORDED_REASON: &str =
 // werden konnte (Review B2 zu #151); die Runde hat nichts ausgegeben.
 const USAGE_RESERVATION_FAILED_REASON: &str =
     "usage: the model round could not be reserved durably; no further model rounds";
+
+// Schließgrund des Ledgers, wenn sich die Lease für einen gebuchten
+// Werkzeugaufruf nicht halten ließ (Lease-Zaun, Review P1 4394111171); das
+// Werkzeug lief nicht.
+const USAGE_LEASE_HOLD_FAILED_REASON: &str =
+    "lease: the job lease could not be held for the tool call; no further tool call";
+
+// Grund eines Markers, der einen Stand unter dem Lease-Halt eines laufenden
+// Werkzeugaufrufs bucht (`UsageWrite::Booked`).
+const USAGE_BOOKED_UNDER_HOLD_REASON: &str =
+    "usage booked while a running tool call held the job lease";
 
 // Präfix aller `Failed`-Gründe, die aus nicht verbuchter Usage entstehen.
 const USAGE_UNRESOLVED_PREFIX: &str = "usage accounting unresolved: ";
@@ -1600,21 +1657,40 @@ impl std::error::Error for UsageFlushError {}
 enum ReservationStep {
     // Keine Reservierung dieses Ledgers liegt auf der Platte.
     Untouched,
-    // Runden sind offen: die Reservierung VOR dem Festschreiben auf den
-    // festzuschreibenden Stand anheben. Sonst bewiese der neue Stand beim
-    // Reclaim eine Runde, die noch gar nicht verbucht ist.
+    // Runden sind offen (oder eine Runde mit unbewiesenem Verbrauch): die
+    // Reservierung VOR dem Festschreiben auf den festzuschreibenden Stand
+    // anheben. Sonst bewiese der neue Stand beim Reclaim eine Runde, die noch
+    // gar nicht verbucht ist.
     Advance,
     // Keine Runde offen: die Reservierung NACH erfolgreichem Festschreiben
     // entfernen.
     Clear,
 }
 
+// Was ein Flush außer dem Festschreiben tun muss; aus derselben Sperre gelesen
+// wie der festzuschreibende Stand.
+#[derive(Debug, Clone, Copy)]
+struct FlushPlan {
+    reservation: ReservationStep,
+    // Die angehobene Reservierung trägt `unproven_spend`.
+    unproven_spend: bool,
+    // Ein unter gehaltener Lease gebuchter Marker kann noch liegen.
+    booking_marked: bool,
+}
+
 // Ergebnis eines Festschreib-Versuchs auf dem Blocking-Thread.
 enum UsageWrite {
-    // Festgeschrieben; `cleared`: die Rundenreservierung wurde entfernt.
+    // Festgeschrieben; `cleared`: die Rundenreservierung wurde entfernt;
+    // `unbooked`: kein unter gehaltener Lease gebuchter Marker liegt mehr.
     Recorded {
         cleared: bool,
+        unbooked: bool,
     },
+    // Unter dem Lease-Halt eines laufenden Werkzeugaufrufs in den Marker
+    // gebucht: die Job-Sperre gehört diesem Prozess, `record_usage` käme
+    // nicht an sie heran. Ein Reclaim verrechnet den Marker zuerst; der
+    // nächste Flush ohne Halt schreibt den Stand in den Job-Datensatz.
+    Booked,
     LeaseLost,
     // Anderer Speicherfehler: `reason` nennt ihn, `marker` ist das Ergebnis des
     // Marker-Schreibens.
@@ -1629,6 +1705,124 @@ enum UsageWrite {
     Unreserved {
         reason: String,
     },
+}
+
+/// Prozesslokaler, geteilter Halt der Job-Lease, solange zugelassene
+/// Werkzeugaufrufe laufen (Lease-Zaun, Review P1 4394111171).
+///
+/// # Description
+/// Hält den Guard aus `JobStore::hold_live_lease`: die Lease ist beim Nehmen
+/// um eine volle TTL erneuert, und der Guard hält die Job-Sperre — dieselbe
+/// Sperre, die Claim, Renew, `record_usage`, Reclaim und der Ablauf-Scan
+/// nehmen. Solange der Halt lebt, kann niemand die Lease ersetzen: ein
+/// Reclaim wird hinter den Seiteneffekt des Werkzeugs serialisiert. Nach der
+/// Wanduhr läuft die Lease trotzdem ab (`JobLeaseGuard::deadline`); was unter
+/// dem Halt noch geschrieben wird, prüft vorher [`Self::live`].
+///
+/// [`LedgerToolMeter`] legt ihn als `Arc` in jeden `harw_core::ToolCallPermit`;
+/// der Ledger kennt ihn nur als `Weak`. Gleichzeitige Permits teilen sich einen
+/// Halt, der letzte fallende gibt die Sperre frei (das Schließen der
+/// Sperrdatei blockiert nicht).
+///
+/// # Concurrency
+/// `Send + Sync`; wird nur gehalten, nie gesperrt.
+#[derive(Debug)]
+struct LeaseHold {
+    guard: harw_session_store::job_store::JobLeaseGuard,
+}
+
+impl LeaseHold {
+    // Ob die gehaltene Lease nach der Wanduhr noch gilt.
+    fn live(&self) -> bool {
+        self.guard.still_live().is_ok()
+    }
+}
+
+// Wie ein lease-gebundener Schritt des Ledgers die Lease hält; unter
+// `flush_gate` bestimmt.
+#[derive(Clone)]
+enum LeaseAccess {
+    // Ein laufender Werkzeugaufruf hält die Lease ([`LeaseHold`]).
+    Held(Arc<LeaseHold>),
+    // Kein Halt: der Schritt nimmt die Job-Sperre kurz selbst.
+    Free,
+}
+
+// Warum ein lease-gebundener Schritt nicht laufen durfte.
+#[derive(Debug)]
+enum LeaseRefusal {
+    // Der Token ist nicht mehr die gültige Lease des Jobs (anderer Halter,
+    // abgelaufen, Job terminal).
+    Lost,
+    // Die Lease ließ sich nicht halten (Speicherfehler, dauerhaft belegte
+    // Sperre); der Text nennt den Grund.
+    Unavailable(String),
+}
+
+// Lease-Verlust im Sinne des Ledgers: der Token ist nicht mehr die gültige
+// Lease des Jobs.
+fn is_lease_loss(error: &harw_session_store::SessionStoreError) -> bool {
+    matches!(
+        error,
+        harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
+            | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
+            | harw_session_store::SessionStoreError::JobAlreadyTerminal { .. }
+    )
+}
+
+fn lease_refusal(error: &harw_session_store::SessionStoreError) -> LeaseRefusal {
+    if is_lease_loss(error) {
+        LeaseRefusal::Lost
+    } else {
+        LeaseRefusal::Unavailable(error.to_string())
+    }
+}
+
+// Führt `operation` aus, während die Lease `token` nachweislich gilt und
+// niemand sie ersetzen kann (Review P1 4394111166, P2 4394114795): unter dem
+// laufenden Halt (`LeaseAccess::Held`) oder unter der kurz genommenen
+// Job-Sperre (`JobStore::hold_live_lease`, wiederholt bei kurz belegter
+// Sperre); in beiden Fällen unmittelbar davor nach der Wanduhr geprüft
+// (`JobLeaseGuard::still_live`). Claim, Reclaim und Ablauf nehmen dieselbe
+// Sperre: ein veralteter Schreiber wird abgewiesen, statt nach einem Reclaim die
+// Reservierung der neuen Epoche zu überschreiben oder zu entfernen, und ein
+// Reclaim wartet, bis ein laufender Schritt fertig ist. Blockierend.
+fn under_live_lease<T>(
+    store: &JobStore,
+    token: &harw_job_runtime::LeaseToken,
+    access: &LeaseAccess,
+    operation: impl FnOnce() -> T,
+) -> Result<T, LeaseRefusal> {
+    match access {
+        LeaseAccess::Held(hold) => {
+            if hold.live() {
+                Ok(operation())
+            } else {
+                Err(LeaseRefusal::Lost)
+            }
+        }
+        LeaseAccess::Free => {
+            let guard = store
+                .hold_live_lease(token)
+                .map_err(|error| lease_refusal(&error))?;
+            guard.still_live().map_err(|error| lease_refusal(&error))?;
+            let result = operation();
+            drop(guard);
+            Ok(result)
+        }
+    }
+}
+
+// Nimmt den Lease-Halt für `token` (`JobStore::hold_live_lease`: erneuert die
+// Lease, hält die Job-Sperre und kennt den Ablauf). Blockierend.
+fn acquire_lease_hold(
+    store: &JobStore,
+    token: &harw_job_runtime::LeaseToken,
+) -> Result<LeaseHold, LeaseRefusal> {
+    let guard = store
+        .hold_live_lease(token)
+        .map_err(|error| lease_refusal(&error))?;
+    Ok(LeaseHold { guard })
 }
 
 // `JobStore::record_usage`, wiederholt bei kurzzeitig belegter Job-Sperre.
@@ -1654,36 +1848,54 @@ fn record_usage_retrying(
 
 // Schreibt `usage` fest; scheitert das aus einem anderen Grund als einem
 // Lease-Verlust, wird der Verbrauch im selben (nicht abbrechbaren)
-// Blocking-Aufruf als Marker abgelegt. `reservation` sagt, was dabei mit der
-// Rundenreservierung geschieht (vorher anheben bzw. nachher entfernen).
+// Blocking-Aufruf als Marker abgelegt. `plan` sagt, was dabei mit der
+// Rundenreservierung geschieht (vorher anheben bzw. nachher entfernen) und ob
+// ein gebuchter Marker aufzuräumen ist; jeder Zugriff auf die Reservierung
+// läuft unter der Lease (`under_live_lease`). Unter einem laufenden Halt
+// (`access`) wird statt festzuschreiben gebucht (`book_under_hold`).
 // Blockierend.
 fn write_usage_or_mark(
     store: &JobStore,
     markers: &usage_marker::UsageMarkerStore,
     token: &harw_job_runtime::LeaseToken,
     usage: &harw_job_runtime::BudgetUsage,
-    reservation: ReservationStep,
+    plan: FlushPlan,
+    access: &LeaseAccess,
 ) -> UsageWrite {
-    if reservation == ReservationStep::Advance {
+    if plan.reservation == ReservationStep::Advance {
         let advanced =
-            usage_marker::InFlightUsage::new(token.work_id.as_str(), token.epoch, usage.clone());
-        if let Err(error) = markers.write_in_flight(&advanced) {
-            return UsageWrite::Unreserved {
-                reason: format!("the in-flight reservation could not be advanced: {error}"),
-            };
+            usage_marker::InFlightUsage::new(token.work_id.as_str(), token.epoch, usage.clone())
+                .with_unproven_spend(plan.unproven_spend);
+        match under_live_lease(store, token, access, || markers.write_in_flight(&advanced)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return UsageWrite::Unreserved {
+                    reason: format!("the in-flight reservation could not be advanced: {error}"),
+                };
+            }
+            Err(LeaseRefusal::Lost) => return UsageWrite::LeaseLost,
+            Err(LeaseRefusal::Unavailable(reason)) => {
+                return UsageWrite::Unreserved {
+                    reason: format!(
+                        "the job lease could not be held to advance the in-flight reservation: {reason}"
+                    ),
+                };
+            }
         }
     }
+    if let LeaseAccess::Held(hold) = access {
+        return book_under_hold(markers, token, usage, hold);
+    }
     match record_usage_retrying(store, token, usage) {
-        Ok(_stored) => UsageWrite::Recorded {
-            cleared: reservation == ReservationStep::Clear && clear_reservation(markers, token),
-        },
-        Err(
-            harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
-            | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
-            | harw_session_store::SessionStoreError::JobAlreadyTerminal { .. },
-        ) => UsageWrite::LeaseLost,
+        Ok(stored) => {
+            let (cleared, unbooked) = clean_up_after_record(store, markers, token, &stored, plan);
+            UsageWrite::Recorded { cleared, unbooked }
+        }
+        Err(error) if is_lease_loss(&error) => UsageWrite::LeaseLost,
         Err(error) => {
             let reason = format!("record_usage failed: {error}");
+            // Ohne Job-Sperre: der Marker entsteht gerade, wenn der Job-Store
+            // nicht beschreibbar ist; er wird nur feldweise vereinigt.
             let marker = usage_marker::UnresolvedUsage::new(
                 token.work_id.as_str(),
                 token.epoch,
@@ -1698,10 +1910,72 @@ fn write_usage_or_mark(
     }
 }
 
-// Entfernt die Rundenreservierung nach erfolgreichem Festschreiben.
-// Ein Fehler ist nur eine Warnung: die festgeschriebene Usage liegt dann über
-// dem reservierten Stand, der nächste Claim erkennt die Reservierung als
-// verbucht und entfernt sie selbst. Blockierend.
+// Bucht `usage` unter dem laufenden Lease-Halt `hold` als Marker (siehe
+// `UsageWrite::Booked`). Die Lease kann niemand ersetzen, solange der Halt
+// lebt; abgelaufen sein kann sie trotzdem. Blockierend.
+fn book_under_hold(
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    usage: &harw_job_runtime::BudgetUsage,
+    hold: &LeaseHold,
+) -> UsageWrite {
+    if !hold.live() {
+        return UsageWrite::LeaseLost;
+    }
+    let booking = usage_marker::UnresolvedUsage::new(
+        token.work_id.as_str(),
+        token.epoch,
+        usage.clone(),
+        USAGE_BOOKED_UNDER_HOLD_REASON,
+    );
+    match markers.write(&booking) {
+        Ok(()) => UsageWrite::Booked,
+        Err(error) => UsageWrite::Failed {
+            reason: format!("usage could not be booked under the held job lease: {error}"),
+            marker: Err(error),
+        },
+    }
+}
+
+// Nach erfolgreichem Festschreiben von `stored`: entfernt unter der Lease die
+// Rundenreservierung (`ReservationStep::Clear`) und einen gebuchten Marker,
+// den `stored` abdeckt. Liefert `(cleared, unbooked)`. Ein Fehler ist nur eine
+// Warnung: Reservierung bzw. Marker liegen dann unter dem festgeschriebenen
+// Stand, der nächste Flush oder Claim räumt sie auf. Blockierend.
+fn clean_up_after_record(
+    store: &JobStore,
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    stored: &harw_job_runtime::BudgetUsage,
+    plan: FlushPlan,
+) -> (bool, bool) {
+    let clear = plan.reservation == ReservationStep::Clear;
+    if !clear && !plan.booking_marked {
+        return (false, false);
+    }
+    let cleaned = under_live_lease(store, token, &LeaseAccess::Free, || {
+        let cleared = clear && clear_reservation(markers, token);
+        let unbooked = plan.booking_marked && remove_booking(markers, token, stored);
+        (cleared, unbooked)
+    });
+    match cleaned {
+        Ok(cleaned) => cleaned,
+        Err(refusal) => {
+            tracing::warn!(
+                work_id = %token.work_id.as_str(),
+                refusal = ?refusal,
+                "usage recorded, but the job lease could not be held to clean up the reservation"
+            );
+            (false, false)
+        }
+    }
+}
+
+// Entfernt die Rundenreservierung nach erfolgreichem Festschreiben; der
+// Aufrufer hält die Lease. Ein Fehler ist nur eine Warnung: die
+// festgeschriebene Usage liegt dann über dem reservierten Stand, der nächste
+// Claim erkennt die Reservierung als verbucht und entfernt sie selbst.
+// Blockierend.
 fn clear_reservation(
     markers: &usage_marker::UsageMarkerStore,
     token: &harw_job_runtime::LeaseToken,
@@ -1713,6 +1987,28 @@ fn clear_reservation(
                 work_id = %token.work_id.as_str(),
                 error = %error,
                 "in-flight usage reservation could not be removed after recording"
+            );
+            false
+        }
+    }
+}
+
+// Entfernt einen unter gehaltener Lease gebuchten Marker, sobald `stored` ihn
+// abdeckt; der Aufrufer hält die Lease. `true`, wenn keiner mehr liegt.
+// Blockierend.
+fn remove_booking(
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    stored: &harw_job_runtime::BudgetUsage,
+) -> bool {
+    match markers.remove_if_covered(token.work_id.as_str(), stored) {
+        Ok(None) => true,
+        Ok(Some(_uncovered)) => false,
+        Err(error) => {
+            tracing::warn!(
+                work_id = %token.work_id.as_str(),
+                error = %error,
+                "booked usage marker could not be removed after recording"
             );
             false
         }
@@ -1733,25 +2029,43 @@ fn unresolved_usage_reason(detail: &str) -> String {
 /// (Review P1 zu #151). Ohne Marker ist die Ausgangs-Usage `claim.job.usage`.
 /// Mit Marker wird das Feld-Maximum aus Marker und gespeicherter Usage unter
 /// `claim.token` lease-gesichert festgeschrieben und erst danach der Marker
-/// entfernt; ein verbliebener Marker wird beim nächsten Claim unschädlich
-/// erneut verrechnet.
+/// entfernt, soweit der festgeschriebene Stand ihn abdeckt; ein seither
+/// gewachsener Marker bleibt liegen und geht in die gelieferte Usage ein. Ein
+/// verbliebener Marker wird beim nächsten Claim unschädlich erneut verrechnet.
 ///
 /// Danach die Rundenreservierung (Review B2 zu #151, siehe Moduldoku "Usage
 /// accounting"): stammt sie aus einer älteren Epoche als `claim.token`, gilt
-/// ihre Runde nur als verbucht, wenn die verrechnete Usage in Tokens oder
-/// Werkzeugaufrufen echt über dem reservierten Stand liegt — dann wird sie
-/// entfernt. Sonst ist der Verbrauch der Runde unbewiesen (Festschreiben und
-/// Marker sind gescheitert, dann starb der Worker), und der Claim scheitert
+/// ihre Runde nur als verbucht, wenn sie keinen unbewiesenen Verbrauch trägt
+/// (`usage_marker::InFlightUsage::unproven_spend`) und die verrechnete Usage
+/// in Tokens oder Werkzeugaufrufen echt über dem reservierten Stand liegt —
+/// dann wird sie entfernt. Sonst ist der Verbrauch der Runde unbewiesen
+/// (Festschreiben und Marker sind gescheitert, oder die Runde endete nach dem
+/// Aufruf des Providers ohne verbuchte Usage), und der Claim scheitert
 /// (konservativ: kein Reclaim mit unbewiesenem Budget). Eine Reservierung
 /// derselben oder einer jüngeren Epoche gehört nicht zu einem früheren
 /// Versuch und bleibt unberührt.
+///
+/// Reihenfolge zur Lease (Review P1 4394111166, P2 4394114795): die Claim-API
+/// lässt keinen Code unter ihrer Sperre laufen; `JobStore::claim` hat die
+/// Job-Sperre wieder freigegeben, wenn die Verrechnung beginnt. Sie läuft
+/// deshalb unmittelbar danach unter derselben Sperrdisziplin: das
+/// Festschreiben des Markers nimmt die Sperre über `record_usage`, Prüfen und
+/// Entfernen von Marker und Reservierung laufen unter
+/// `JobStore::hold_live_lease(&claim.token)`. Ein Schreiber einer älteren
+/// Epoche nimmt für jeden Zugriff auf die Reservierung dieselbe Sperre unter
+/// seinem eigenen Token: Er war entweder vor dem Claim fertig (der Claim
+/// wartet auf die Sperre) oder wird danach abgewiesen, weil seine Lease nicht
+/// mehr gilt. Er kann deshalb weder seit dem Claim eine Reservierung anlegen
+/// noch die dieser Verrechnung oder des neuen Versuchs überschreiben oder
+/// entfernen.
 ///
 /// # Returns
 /// Die Usage, von der der Claim auszugehen hat.
 ///
 /// # Errors
 /// `usage accounting unresolved: …`, wenn Marker oder Reservierung nicht
-/// lesbar sind, der Marker sich nicht festschreiben lässt oder die Runde einer
+/// lesbar sind, der Marker sich nicht festschreiben lässt, die Lease des
+/// Claims sich für das Aufräumen nicht halten lässt oder die Runde einer
 /// Reservierung nicht als verbucht bewiesen ist. Der Aufrufer beendet den Job
 /// dann als `Failed` (endgültig, also ohne automatischen Reclaim) und ruft
 /// kein Modell auf.
@@ -1765,28 +2079,72 @@ pub(super) fn settle_unresolved_usage(
 ) -> Result<harw_job_runtime::BudgetUsage, String> {
     let markers = usage_marker::UsageMarkerStore::in_job_root(store.root());
     let work_id = claim.job.id.as_str();
-    let settled = match markers.read(work_id) {
-        Ok(Some(marker)) => {
+    let marked = markers
+        .read(work_id)
+        .map_err(|detail| unresolved_usage_reason(&detail))?;
+    let settled = match &marked {
+        Some(marker) => {
             let merged = usage_marker::UsageMarkerStore::merged(&marker.usage, &claim.job.usage);
-            let stored = record_usage_retrying(store, &claim.token, &merged).map_err(|error| {
+            record_usage_retrying(store, &claim.token, &merged).map_err(|error| {
                 unresolved_usage_reason(&format!(
                     "the unresolved usage could not be recorded: {error}"
                 ))
-            })?;
-            if let Err(error) = markers.remove(work_id) {
-                tracing::warn!(work_id = %work_id, error = %error, "settled usage marker could not be removed");
-            }
-            stored
+            })?
         }
-        Ok(None) => claim.job.usage.clone(),
-        Err(detail) => return Err(unresolved_usage_reason(&detail)),
+        None => claim.job.usage.clone(),
     };
-    settle_in_flight_reservation(&markers, claim, &settled)?;
-    Ok(settled)
+    // Ohne Marker und ohne Reservierung ist nichts zu prüfen oder zu
+    // entfernen; seit dem Claim legt kein älterer Schreiber mehr eine an.
+    let reserved = markers
+        .read_in_flight(work_id)
+        .map_err(|detail| unresolved_usage_reason(&detail))?
+        .is_some();
+    if marked.is_none() && !reserved {
+        return Ok(settled);
+    }
+    let held = under_live_lease(store, &claim.token, &LeaseAccess::Free, || {
+        let settled = if marked.is_some() {
+            fold_remaining_marker(&markers, work_id, settled)
+        } else {
+            settled
+        };
+        settle_in_flight_reservation(&markers, claim, &settled).map(|()| settled)
+    });
+    match held {
+        Ok(result) => result,
+        Err(LeaseRefusal::Lost) => Err(unresolved_usage_reason(
+            "the job lease was lost during the settlement",
+        )),
+        Err(LeaseRefusal::Unavailable(reason)) => Err(unresolved_usage_reason(&format!(
+            "the job lease could not be held for the settlement: {reason}"
+        ))),
+    }
+}
+
+// Entfernt den eben verrechneten Marker, soweit `settled` ihn abdeckt; ein
+// seither (ohne Job-Sperre) gewachsener Marker bleibt liegen und geht in den
+// gelieferten Stand ein. Der Aufrufer hält die Lease. Blockierend.
+fn fold_remaining_marker(
+    markers: &usage_marker::UsageMarkerStore,
+    work_id: &str,
+    settled: harw_job_runtime::BudgetUsage,
+) -> harw_job_runtime::BudgetUsage {
+    match markers.remove_if_covered(work_id, &settled) {
+        Ok(None) => settled,
+        Ok(Some(remaining)) => {
+            tracing::warn!(work_id = %work_id, "usage marker grew during the settlement; it stays and is counted");
+            usage_marker::UsageMarkerStore::merged(&remaining, &settled)
+        }
+        Err(error) => {
+            tracing::warn!(work_id = %work_id, error = %error, "settled usage marker could not be removed");
+            settled
+        }
+    }
 }
 
 // Prüft die Rundenreservierung eines früheren Versuchs gegen die verrechnete
-// Usage `settled` (siehe `settle_unresolved_usage`). Blockierend.
+// Usage `settled` (siehe `settle_unresolved_usage`); der Aufrufer hält die
+// Lease des Claims. Blockierend.
 fn settle_in_flight_reservation(
     markers: &usage_marker::UsageMarkerStore,
     claim: &JobClaim,
@@ -1806,12 +2164,21 @@ fn settle_in_flight_reservation(
             work_id = %work_id,
             reservation_epoch = reservation.epoch,
             claim_epoch = claim.token.epoch,
+            unproven_spend = reservation.unproven_spend,
             "in-flight model round of an earlier attempt was never recorded; refusing the reclaim"
         );
-        return Err(unresolved_usage_reason(&format!(
-            "an in-flight model round started at epoch {} with {} tokens was never recorded; refusing to reclaim with an unproven budget",
-            reservation.epoch, reservation.usage_before.tokens
-        )));
+        let detail = if reservation.unproven_spend {
+            format!(
+                "an in-flight model round of epoch {} was dispatched but never accounted; refusing to reclaim with an unproven budget",
+                reservation.epoch
+            )
+        } else {
+            format!(
+                "an in-flight model round started at epoch {} with {} tokens was never recorded; refusing to reclaim with an unproven budget",
+                reservation.epoch, reservation.usage_before.tokens
+            )
+        };
+        return Err(unresolved_usage_reason(&detail));
     }
     if let Err(error) = markers.remove_in_flight(work_id, reservation.epoch) {
         tracing::warn!(work_id = %work_id, error = %error, "recorded in-flight usage reservation could not be removed");
@@ -1887,11 +2254,14 @@ impl PromptTokenLedger {
                 exceeded: None,
                 rounds_in_flight: 0,
                 reservation_marked: false,
+                unproven_spend: false,
+                booking_marked: false,
             }),
             sink,
             started: std::time::Instant::now(),
             base_wall,
             flush_gate: tokio::sync::Mutex::new(()),
+            lease_hold: Mutex::new(std::sync::Weak::new()),
         })
     }
 
@@ -1913,14 +2283,46 @@ impl PromptTokenLedger {
         usage
     }
 
-    // Was der nächste Flush mit der Rundenreservierung tun muss.
-    fn reservation_step(state: &PromptTokenState) -> ReservationStep {
-        if !state.reservation_marked {
+    // Was der nächste Flush außer dem Festschreiben tun muss. Eine Runde mit
+    // unbewiesenem Verbrauch bleibt offen: ihre Reservierung wird nur noch
+    // angehoben, nie entfernt.
+    fn flush_plan(state: &PromptTokenState) -> FlushPlan {
+        let reservation = if !state.reservation_marked {
             ReservationStep::Untouched
-        } else if state.rounds_in_flight > 0 {
+        } else if state.rounds_in_flight > 0 || state.unproven_spend {
             ReservationStep::Advance
         } else {
             ReservationStep::Clear
+        };
+        FlushPlan {
+            reservation,
+            unproven_spend: state.unproven_spend,
+            booking_marked: state.booking_marked,
+        }
+    }
+
+    // Weak-Slot des Lease-Halts; ein vergifteter Mutex hält nur eine
+    // Referenz.
+    fn hold_slot(&self) -> std::sync::MutexGuard<'_, std::sync::Weak<LeaseHold>> {
+        match self.lease_hold.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // Ob gerade ein Werkzeugaufruf die Lease hält.
+    fn lease_held(&self) -> bool {
+        self.hold_slot().strong_count() > 0
+    }
+
+    // Unter `flush_gate`: der laufende Halt, falls ein Werkzeugaufruf die
+    // Lease gerade hält. Ein neuer Halt entsteht nur unter dem Gate, ein
+    // gelieferter lebt mindestens so lange wie der Schritt, der ihn nutzt.
+    fn lease_access(&self) -> LeaseAccess {
+        let hold = self.hold_slot().upgrade();
+        match hold {
+            Some(hold) => LeaseAccess::Held(hold),
+            None => LeaseAccess::Free,
         }
     }
 
@@ -1941,11 +2343,19 @@ impl PromptTokenLedger {
     ///   Marker, was auf Fehlerstufe protokolliert wird; die
     ///   Rundenreservierung sperrt dann den Reclaim, Review B2 zu #151).
     ///
-    /// Die Rundenreservierung ([`Self::reserve_round`]) wird dabei nachgeführt:
-    /// sind Runden offen, wird sie vor dem Festschreiben auf den
-    /// festzuschreibenden Stand angehoben (scheitert das, wird bewusst nichts
+    /// Die Rundenreservierung ([`Self::reserve_round`]) wird dabei nachgeführt,
+    /// jeweils unter der Lease (Review P1 4394111166, P2 4394114795): sind
+    /// Runden offen oder trägt der Ledger unbewiesenen Verbrauch, wird sie vor
+    /// dem Festschreiben auf den festzuschreibenden Stand angehoben und trägt
+    /// `unproven_spend` mit (scheitert das, wird bewusst nichts
     /// festgeschrieben, siehe [`UsageFlushError::NotRecorded`]); ist keine
     /// Runde offen, wird sie nach erfolgreichem Festschreiben entfernt.
+    ///
+    /// Hält gerade ein Werkzeugaufruf die Lease ([`LeaseHold`]), gehört die
+    /// Job-Sperre diesem Prozess und `record_usage` käme nicht an sie heran:
+    /// der Stand wird dann unter dem Halt als Marker gebucht (ein Reclaim
+    /// verrechnet ihn zuerst) und erst vom nächsten Flush ohne Halt
+    /// festgeschrieben, der den Marker danach entfernt.
     ///
     /// # Errors
     /// Siehe oben; der Aufrufer darf den Fehler nicht ignorieren, wenn er
@@ -1955,11 +2365,23 @@ impl PromptTokenLedger {
             return Ok(());
         };
         let _gate = self.flush_gate.lock().await;
-        // Stand und offene Runden aus derselben Sperre: eine Runde ist darin
-        // entweder noch offen oder schon verbucht, nie keines von beiden.
-        let (usage, reservation) = {
+        let access = self.lease_access();
+        self.flush_gated(sink, access).await
+    }
+
+    // Rumpf von `flush`: der Aufrufer hält `flush_gate` und hat `access`
+    // darunter bestimmt.
+    async fn flush_gated(
+        &self,
+        sink: &UsageSink,
+        access: LeaseAccess,
+    ) -> Result<(), UsageFlushError> {
+        // Stand, offene Runden und Merkmale aus derselben Sperre: eine Runde
+        // ist darin entweder noch offen oder schon verbucht, nie keines von
+        // beiden.
+        let (usage, plan) = {
             let state = self.state();
-            (self.snapshot_of(&state), Self::reservation_step(&state))
+            (self.snapshot_of(&state), Self::flush_plan(&state))
         };
         let store = Arc::clone(&sink.store);
         let token = sink.token.clone();
@@ -1967,12 +2389,12 @@ impl PromptTokenLedger {
         let work_id = token.work_id.as_str().to_owned();
         let write_usage = usage.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            write_usage_or_mark(&store, &markers, &token, &write_usage, reservation)
+            write_usage_or_mark(&store, &markers, &token, &write_usage, plan, &access)
         })
         .await;
         let write = match joined {
             Ok(write) => write,
-            Err(error) if reservation == ReservationStep::Advance => {
+            Err(error) if plan.reservation == ReservationStep::Advance => {
                 // Offene Runden: kein Marker mit dem neuen Stand (er gäbe eine
                 // offene Runde als verbucht aus); die liegende Reservierung
                 // sperrt den Reclaim.
@@ -1994,10 +2416,18 @@ impl PromptTokenLedger {
             }
         };
         match write {
-            UsageWrite::Recorded { cleared } => {
+            UsageWrite::Recorded { cleared, unbooked } => {
+                let mut state = self.state();
                 if cleared {
-                    self.state().reservation_marked = false;
+                    state.reservation_marked = false;
                 }
+                if unbooked {
+                    state.booking_marked = false;
+                }
+                Ok(())
+            }
+            UsageWrite::Booked => {
+                self.state().booking_marked = true;
                 Ok(())
             }
             UsageWrite::LeaseLost => {
@@ -2040,6 +2470,61 @@ impl PromptTokenLedger {
         }
     }
 
+    // Für einen eben gebuchten Werkzeugaufruf (Review P1-b zu #151, P1
+    // 4394111171): schreibt den Stand fest und liefert den Lease-Halt, den
+    // der Permit bis zum Ende der Ausführung hält. Läuft schon ein Halt
+    // (parallele Aufrufe einer Antwort, gleichzeitige Turns eines Ledgers),
+    // wird unter ihm gebucht und er geteilt; sonst wird nach dem
+    // Festschreiben ein neuer genommen. Beides unter dem Flush-Gate: kein
+    // Schritt ohne Halt trifft so die Sperre, die dieser Prozess selbst hält.
+    // Ohne Sink gibt es nichts zu halten (`None`). Jeder Fehler weist den
+    // Aufruf ab (feste, pfadfreie Gründe: sie gehen an das Modell); ein
+    // gebuchter, aber abgewiesener Aufruf bleibt gebucht (konservativ).
+    async fn book_and_hold(&self) -> Result<Option<Arc<LeaseHold>>, String> {
+        let Some(sink) = &self.sink else {
+            return Ok(None);
+        };
+        let _gate = self.flush_gate.lock().await;
+        let access = self.lease_access();
+        self.flush_gated(sink, access.clone())
+            .await
+            .map_err(|error| match error {
+                UsageFlushError::LeaseLost => USAGE_LEASE_LOST_REASON.to_owned(),
+                UsageFlushError::NotRecorded(_) => USAGE_UNRECORDED_REASON.to_owned(),
+            })?;
+        if let LeaseAccess::Held(hold) = access {
+            return Ok(Some(hold));
+        }
+        let store = Arc::clone(&sink.store);
+        let token = sink.token.clone();
+        let acquired =
+            tokio::task::spawn_blocking(move || acquire_lease_hold(&store, &token)).await;
+        let detail = match acquired {
+            Ok(Ok(hold)) => {
+                let hold = Arc::new(hold);
+                *self.hold_slot() = Arc::downgrade(&hold);
+                return Ok(Some(hold));
+            }
+            Ok(Err(LeaseRefusal::Lost)) => {
+                tracing::warn!(
+                    work_id = %sink.token.work_id.as_str(),
+                    "tool call refused before it ran: the job lease was lost after booking"
+                );
+                self.close(USAGE_LEASE_LOST_REASON.to_owned());
+                return Err(USAGE_LEASE_LOST_REASON.to_owned());
+            }
+            Ok(Err(LeaseRefusal::Unavailable(reason))) => reason,
+            Err(join) => format!("lease hold task failed: {join}"),
+        };
+        tracing::error!(
+            work_id = %sink.token.work_id.as_str(),
+            error = %detail,
+            "tool call refused before it ran: the job lease could not be held"
+        );
+        self.close(USAGE_LEASE_HOLD_FAILED_REASON.to_owned());
+        Err(USAGE_LEASE_HOLD_FAILED_REASON.to_owned())
+    }
+
     /// Letzter Flush vor dem Festschreiben des Ausgangs durch den Runner.
     ///
     /// # Description
@@ -2070,6 +2555,13 @@ impl PromptTokenLedger {
         UsageFlusher(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
+                // Solange ein Werkzeugaufruf die Lease hält, käme nur die
+                // Wanduhr hinzu, und sie ließe sich nur als Marker buchen:
+                // dieser Takt entfällt, der nächste Flush ohne Halt holt sie
+                // nach.
+                if ledger.lease_held() {
+                    continue;
+                }
                 // Fehler schließt `flush` selbst (Ledger geschlossen, Marker
                 // geschrieben); der periodische Flush hat nichts weiter zu tun.
                 let _ = ledger.flush().await;
@@ -2105,23 +2597,37 @@ impl PromptTokenLedger {
 
     // Nach `admit_round`, BEVOR der Provider etwas ausgibt (Review B2 zu #151):
     // zählt die Runde als offen und legt mit Sink die durable Reservierung mit
-    // dem Stand vor der Runde ab (`usage_marker::InFlightUsage`). Lässt sie
-    // sich nicht schreiben, wird der Ledger geschlossen und die Runde
-    // abgewiesen — ausgegeben wurde nichts. Unter dem Flush-Gate, damit
-    // Reservierung und Festschreiben nie verschränkt auf die Platte gehen.
+    // dem Stand vor der Runde ab (`usage_marker::InFlightUsage`, mit dem
+    // unbewiesenen Verbrauch früherer Runden). Geschrieben wird unter der
+    // Lease (`under_live_lease`, Review P1 4394111166): ein Worker, dessen
+    // Lease abgelaufen oder zurückgefordert ist, reserviert nicht und ruft den
+    // Provider nicht auf; läuft die Lease erst danach ab, liegt die
+    // Reservierung schon und sperrt den Reclaim. Lässt sie sich nicht
+    // schreiben oder die Lease nicht halten, wird der Ledger geschlossen und
+    // die Runde abgewiesen — ausgegeben wurde nichts. Unter dem Flush-Gate,
+    // damit Reservierung und Festschreiben nie verschränkt auf die Platte
+    // gehen.
     async fn reserve_round(&self) -> Result<RoundReservation<'_>, String> {
         let _gate = self.flush_gate.lock().await;
-        {
+        let unproven_spend = {
             let mut state = self.state();
             if let Some(reason) = &state.exceeded {
                 return Err(reason.clone());
             }
             state.rounds_in_flight = state.rounds_in_flight.saturating_add(1);
-        }
-        // Ab hier gibt jeder Rückweg die Runde über `Drop` wieder frei.
+            // Ab hier kann eine Reservierung auf der Platte liegen — auch
+            // wenn dieses Future verworfen wird und der Schreib-Task allein
+            // zu Ende läuft.
+            if self.sink.is_some() {
+                state.reservation_marked = true;
+            }
+            state.unproven_spend
+        };
+        // Ab hier gibt jeder Rückweg vor dem Dispatch die Runde über `Drop`
+        // wieder frei.
         let reservation = RoundReservation {
             ledger: self,
-            release: true,
+            phase: RoundPhase::Reserved,
         };
         let Some(sink) = &self.sink else {
             return Ok(reservation);
@@ -2133,26 +2639,39 @@ impl PromptTokenLedger {
             sink.token.work_id.as_str(),
             sink.token.epoch,
             usage_before,
-        );
+        )
+        .with_unproven_spend(unproven_spend);
+        let access = self.lease_access();
+        let store = Arc::clone(&sink.store);
+        let token = sink.token.clone();
         let markers = sink.markers.clone();
-        let written = tokio::task::spawn_blocking(move || markers.write_in_flight(&marker))
-            .await
-            .unwrap_or_else(|join| Err(format!("usage reservation task failed: {join}")));
-        match written {
-            Ok(()) => {
-                self.state().reservation_marked = true;
-                Ok(reservation)
-            }
-            Err(error) => {
-                tracing::error!(
+        let written = tokio::task::spawn_blocking(move || {
+            under_live_lease(&store, &token, &access, || markers.write_in_flight(&marker))
+        })
+        .await;
+        let detail = match written {
+            Ok(Ok(Ok(()))) => return Ok(reservation),
+            Ok(Err(LeaseRefusal::Lost)) => {
+                tracing::warn!(
                     work_id = %sink.token.work_id.as_str(),
-                    error = %error,
-                    "model round could not be reserved durably; refused before any spend"
+                    "model round refused before any spend: the job lease is lost"
                 );
-                self.close(USAGE_RESERVATION_FAILED_REASON.to_owned());
-                Err(USAGE_RESERVATION_FAILED_REASON.to_owned())
+                self.close(USAGE_LEASE_LOST_REASON.to_owned());
+                return Err(USAGE_LEASE_LOST_REASON.to_owned());
             }
-        }
+            Ok(Err(LeaseRefusal::Unavailable(reason))) => {
+                format!("the job lease could not be held: {reason}")
+            }
+            Ok(Ok(Err(error))) => error,
+            Err(join) => format!("usage reservation task failed: {join}"),
+        };
+        tracing::error!(
+            work_id = %sink.token.work_id.as_str(),
+            error = %detail,
+            "model round could not be reserved durably; refused before any spend"
+        );
+        self.close(USAGE_RESERVATION_FAILED_REASON.to_owned());
+        Err(USAGE_RESERVATION_FAILED_REASON.to_owned())
     }
 
     // Vor jedem Werkzeugaufruf (Review P1-b zu #151): bucht genau einen
@@ -2212,55 +2731,117 @@ impl PromptTokenLedger {
 /// ([`PromptTokenLedger::reserve_round`]).
 ///
 /// # Description
-/// Das Verwerfen gibt die Runde frei — auch wenn der Turn mitten in der Runde
-/// abgebrochen wird oder der Provider ohne Usage scheitert. Die durable
-/// Reservierung bleibt dabei liegen; der nächste Flush ohne offene Runde
-/// entfernt sie nach dem Festschreiben. Nur eine Runde, deren gemeldete Usage
-/// der Ledger nicht verbuchen durfte, bleibt offen
+/// Vor dem Aufruf des Providers gibt das Verwerfen die Runde frei: es wurde
+/// nichts ausgegeben. Ab [`Self::dispatched`] beweist kein Fehler, Timeout
+/// oder Abbruch mehr, dass nichts ausgegeben wurde (Review P1 4394111159,
+/// 4394114784: ein Stream kann Teile geliefert haben, bevor er abriss). Wird
+/// die Reservierung danach ohne [`Self::settle`] verworfen, bleibt die Runde
+/// für den Rest des Ledgers offen, und der Ledger merkt sich unbewiesenen
+/// Verbrauch (`PromptTokenState::unproven_spend`), den jeder weitere Flush in
+/// die durable Reservierung schreibt; dieser Ledger entfernt sie nie mehr,
+/// und sie sperrt jeden Reclaim. [`Self::settle`] schließt die Runde erst
+/// nach dem Verbuchen ihrer Usage; die durable Reservierung fällt danach erst
+/// mit einem Flush, der diesen Stand festgeschrieben hat. Eine Runde, deren
+/// gemeldete Usage der Ledger nicht verbuchen durfte, bleibt ebenso offen
 /// ([`Self::keep_unaccounted`]).
 struct RoundReservation<'a> {
     ledger: &'a PromptTokenLedger,
-    // `false`: die Runde bleibt für den Rest des Ledgers offen.
-    release: bool,
+    phase: RoundPhase,
+}
+
+// Lebenslauf einer [`RoundReservation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundPhase {
+    // Reserviert, der Provider ist noch nicht aufgerufen.
+    Reserved,
+    // Der Provider ist aufgerufen: Verbrauch ist möglich.
+    Dispatched,
+    // Verbucht oder dauerhaft offen gelassen; das Verwerfen tut nichts mehr.
+    Done,
 }
 
 impl RoundReservation<'_> {
+    // Unmittelbar vor dem Aufruf des Providers.
+    fn dispatched(&mut self) {
+        if self.phase == RoundPhase::Reserved {
+            self.phase = RoundPhase::Dispatched;
+        }
+    }
+
+    // Die gemeldete Usage ist verbucht: die Runde ist nicht mehr offen. Ein
+    // gleichzeitiger Flush sieht sie so entweder offen oder verbucht, nie
+    // keines von beiden.
+    fn settle(mut self) {
+        self.phase = RoundPhase::Done;
+        let mut state = self.ledger.state();
+        state.rounds_in_flight = state.rounds_in_flight.saturating_sub(1);
+    }
+
     // Die Runde hat Usage gemeldet, die der Ledger nicht verbuchen durfte
     // (Budget überschritten oder Ledger inzwischen geschlossen): ihr Verbrauch
-    // ist real, aber nicht verbucht. Sie bleibt deshalb offen, ihre
-    // Reservierung wird von diesem Ledger nie entfernt und sperrt jeden
-    // Reclaim (fail closed).
+    // ist real, aber nicht verbucht. Sie bleibt deshalb offen und gilt als
+    // unbewiesen; ihre Reservierung wird von diesem Ledger nie entfernt und
+    // sperrt jeden Reclaim (fail closed).
     fn keep_unaccounted(mut self) {
-        self.release = false;
+        self.phase = RoundPhase::Done;
+        self.ledger.state().unproven_spend = true;
     }
 }
 
 impl Drop for RoundReservation<'_> {
     fn drop(&mut self) {
-        if self.release {
-            let mut state = self.ledger.state();
-            state.rounds_in_flight = state.rounds_in_flight.saturating_sub(1);
+        match self.phase {
+            RoundPhase::Reserved => {
+                let mut state = self.ledger.state();
+                state.rounds_in_flight = state.rounds_in_flight.saturating_sub(1);
+            }
+            // Nach dem Dispatch ohne verbuchte Usage verworfen (Fehler des
+            // Providers, Timeout, Abbruch): die Runde bleibt offen.
+            RoundPhase::Dispatched => self.ledger.state().unproven_spend = true,
+            RoundPhase::Done => {}
         }
     }
 }
 
-/// Bucht jeden Werkzeugaufruf eines Job-Turns im [`PromptTokenLedger`] und
+/// Bucht jeden Werkzeugaufruf eines Job-Turns im [`PromptTokenLedger`],
 /// schreibt ihn unter der aktuellen Lease fest, BEVOR das Werkzeug läuft
-/// (Review P1-b zu #151).
+/// (Review P1-b zu #151), und hält die Lease, bis die Ausführung zurückkehrt
+/// (Lease-Zaun, Review P1 4394111171).
 ///
 /// # Description
 /// Registriert über `TurnControl::with_tool_call_meter` am Turn jedes
 /// Job-Pfads mit Ledger ([`ledger_tool_meter`]). Zugelassen wird nur, was
 /// gebucht ([`PromptTokenLedger::charge_tool_call`]) UND festgeschrieben
-/// ([`PromptTokenLedger::flush`]) ist; jeder Fehler weist den Aufruf ab (fail
-/// closed): erschöpftes Budget, geschlossener Ledger, verlorene Lease (ein
-/// Worker mit veralteter Epoche führt kein Werkzeug mehr aus) oder ein
-/// Speicherfehler (dann hat `flush` den Ledger geschlossen und den Marker
-/// geschrieben). Eine Rundenreservierung wie bei Modell-Runden braucht es
-/// nicht: der Aufruf ist festgeschrieben, bevor irgendetwas davon geschieht.
+/// ([`PromptTokenLedger::book_and_hold`]) ist; jeder Fehler weist den Aufruf
+/// ab (fail closed): erschöpftes Budget, geschlossener Ledger, verlorene
+/// Lease (ein Worker mit veralteter Epoche führt kein Werkzeug mehr aus),
+/// eine nicht haltbare Lease oder ein Speicherfehler (dann hat der Flush den
+/// Ledger geschlossen und den Marker geschrieben). Eine Rundenreservierung
+/// wie bei Modell-Runden braucht es nicht: der Aufruf ist festgeschrieben,
+/// bevor irgendetwas davon geschieht.
+///
+/// Der zurückgegebene `harw_core::ToolCallPermit` hält einen [`LeaseHold`] —
+/// die Job-Sperre, die auch jeder Reclaim braucht. Der Dispatcher lässt den
+/// Permit erst fallen, wenn die Ausführung des Aufrufs zurückgekehrt ist; ein
+/// Reclaim zwischen Buchung und Seiteneffekt ist damit ausgeschlossen, er
+/// wird hinter den Seiteneffekt serialisiert und findet danach eine Lease, die
+/// dem alten Worker nicht mehr gehört (sein nächster Flush scheitert
+/// geschlossen). Gleichzeitige Permits (parallele Aufrufe einer Antwort)
+/// teilen sich einen Halt.
+///
+/// Heartbeat: Der Halt erneuert die Lease beim Nehmen um eine volle TTL
+/// (`JobStore::hold_live_lease`). Solange er lebt, scheitert das Renew des
+/// Runners an der belegten Sperre; `harw_core::DurableJobRunner` behandelt
+/// das als vorübergehend und versucht es in kurzen Abständen erneut, bis die
+/// Lease nach seiner eigenen Rechnung abgelaufen ist. Ein Werkzeugaufruf
+/// (oder eine Kette sich überlappender Aufrufe), der länger hält als die
+/// verbleibende Lease, beendet den Job deshalb: der Runner meldet den
+/// Lease-Verlust und bricht ab, und der nächste Flush des Ledgers scheitert
+/// am Lease-Zaun, statt einen veralteten Worker weiterlaufen zu lassen.
 ///
 /// # Concurrency
-/// `Send + Sync`: nur ein `Arc`; der Turn-Loop ruft den Meter nacheinander.
+/// `Send + Sync`: nur ein `Arc`; der Turn-Loop ruft den Meter nacheinander,
+/// gleichzeitige Turns eines Ledgers serialisiert dessen Flush-Gate.
 struct LedgerToolMeter {
     ledger: Arc<PromptTokenLedger>,
 }
@@ -2269,11 +2850,11 @@ impl harw_core::ToolCallMeter for LedgerToolMeter {
     fn admit_tool_call<'a>(&'a self, _tool: &'a str) -> harw_core::ToolCallAdmissionFuture<'a> {
         Box::pin(async move {
             self.ledger.charge_tool_call()?;
-            // Feste, pfadfreie Gründe: der Grund geht an das Modell.
-            self.ledger.flush().await.map_err(|error| match error {
-                UsageFlushError::LeaseLost => USAGE_LEASE_LOST_REASON.to_owned(),
-                UsageFlushError::NotRecorded(_) => USAGE_UNRECORDED_REASON.to_owned(),
-            })
+            let permit = match self.ledger.book_and_hold().await? {
+                Some(hold) => harw_core::ToolCallPermit::guarded(Box::new(hold)),
+                None => harw_core::ToolCallPermit::unguarded(),
+            };
+            Ok::<harw_core::ToolCallPermit, String>(permit)
         })
     }
 }
@@ -2290,14 +2871,17 @@ fn ledger_tool_meter(ledger: &Arc<PromptTokenLedger>) -> Arc<dyn harw_core::Tool
 ///
 /// # Description
 /// Vor der Runde wird zugelassen oder abgewiesen, ohne den inneren Provider zu
-/// berühren, und die Runde durabel reserviert
+/// berühren, und die Runde unter der Lease durabel reserviert
 /// ([`PromptTokenLedger::reserve_round`]; scheitert das, wird der innere
 /// Provider nicht aufgerufen); nach der Runde wird die Usage verbucht und
 /// festgeschrieben. Überschreitet sie das Budget oder lässt sie sich nicht
 /// festschreiben, endet der Turn mit einem Modellfehler (die Antwort der Runde
 /// wird nicht weitergereicht), damit weder Tool-Runden noch weitere
 /// Modellaufrufe folgen. `execute_prompt_claim` ersetzt diesen Fehler durch
-/// den Schließgrund des Ledgers (`budget:`, `lease:` oder `usage:`).
+/// den Schließgrund des Ledgers (`budget:`, `lease:` oder `usage:`). Endet die
+/// Runde nach dem Aufruf des inneren Providers ohne verbuchte Usage (Fehler,
+/// Timeout, Abbruch), bleibt sie reserviert und gilt als unbewiesen (siehe
+/// [`RoundReservation`]).
 ///
 /// # Concurrency
 /// `Send + Sync`: nur `Arc`s.
@@ -2312,19 +2896,41 @@ impl ModelProvider for BudgetedModelProvider {
             self.ledger
                 .admit_round()
                 .map_err(harw_core::ModelError::RequestFailed)?;
-            // Durable Reservierung, bevor der Provider etwas ausgibt (Review
-            // B2 zu #151); ein Fehler des Providers gibt sie über `Drop` frei.
-            let reservation = self
+            // Durable Reservierung unter der Lease, bevor der Provider etwas
+            // ausgibt (Review B2 zu #151, P1 4394111166); ein Fehler bis
+            // hierher gibt sie über `Drop` frei.
+            let mut reservation = self
                 .ledger
                 .reserve_round()
                 .await
                 .map_err(harw_core::ModelError::RequestFailed)?;
-            let response = self.inner.respond(request).await?;
+            // Ab dem Aufruf beweist kein Fehler und kein Abbruch mehr, dass
+            // nichts ausgegeben wurde (Review P1 4394111159): wird dieses
+            // Future ab jetzt verworfen (Timeout, Abbruch), bleibt die Runde
+            // über `Drop` reserviert.
+            reservation.dispatched();
+            let response = match self.inner.respond(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(reservation);
+                    // Den unbewiesenen Verbrauch sofort durabel machen (die
+                    // angehobene Reservierung trägt ihn). Scheitert das,
+                    // schließt `flush` den Ledger; die liegende Reservierung
+                    // sperrt den Reclaim auch so.
+                    if let Err(flush_error) = self.ledger.flush().await {
+                        tracing::warn!(
+                            error = %flush_error,
+                            "unproven model round could not be marked durably after a provider error"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             match self.ledger.charge_round(&response.usage) {
-                // Erst nach dem Verbuchen freigeben: ein gleichzeitiger Flush
-                // sieht die Runde so entweder offen oder verbucht, nie keines
-                // von beiden.
-                Ok(()) => drop(reservation),
+                // Erst nach dem Verbuchen abschließen: ein gleichzeitiger
+                // Flush sieht die Runde so entweder offen oder verbucht, nie
+                // keines von beiden.
+                Ok(()) => reservation.settle(),
                 Err(reason) => {
                     reservation.keep_unaccounted();
                     return Err(harw_core::ModelError::RequestFailed(reason));
@@ -2333,6 +2939,8 @@ impl ModelProvider for BudgetedModelProvider {
             // Lässt sich die Usage dieser Runde nicht festschreiben, wird ihre
             // Antwort nicht weitergereicht: nicht verbuchte Arbeit schreitet
             // nicht fort (fail closed; `flush` hat den Ledger geschlossen).
+            // Die durable Reservierung fällt erst mit einem Flush, der den
+            // verbuchten Stand festgeschrieben hat.
             self.ledger
                 .flush()
                 .await
