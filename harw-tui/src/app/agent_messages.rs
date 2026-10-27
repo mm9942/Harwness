@@ -78,6 +78,7 @@ pub(crate) fn collect_parent_messages(app: &mut ChatApp) -> bool {
         }
         app.recency.push(crate::recency::RecencyEntry {
             child: message.child.as_str().to_owned(),
+            role: message.role.clone(),
             text: message.text.clone(),
         });
         // Info-Zwischenstände des Kindes zusätzlich für die Statuszeile

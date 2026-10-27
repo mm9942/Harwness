@@ -15452,10 +15452,12 @@ forbidden = [{forbidden}]
         dock_test_running_agent(&mut app, "w1", "uia-worker");
         app.recency.push(crate::recency::RecencyEntry {
             child: "alt".to_owned(),
+            role: String::new(),
             text: "erste Meldung".to_owned(),
         });
         app.recency.push(crate::recency::RecencyEntry {
             child: "neu".to_owned(),
+            role: String::new(),
             text: "zweite Meldung".to_owned(),
         });
         app.push_line(
@@ -15495,6 +15497,50 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Befund P2 (Review): Im Betrieb ist `RecencyEntry::child` die 36 Zeichen
+    /// lange Sitzungs-UUID. Bei 40 Spalten (Streifenbudget 38) darf sie die
+    /// Meldung nicht verdrängen: die Zeile zeigt die Rolle (bis 12 Spalten)
+    /// statt der UUID, und der Meldung bleiben mindestens 12 Spalten.
+    #[test]
+    fn portrait_dock_strip_keeps_message_room_with_real_session_id_at_40_cols() -> TestResult {
+        const SESSION_ID: &str = "0196f3a2-7b1e-4c8d-9a35-5e2f8d41b6c7";
+        let mut app = test_chat_app()?;
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        app.recency.push(crate::recency::RecencyEntry {
+            child: SESSION_ID.to_owned(),
+            role: "uia-writer".to_owned(),
+            text: "Datei geschrieben und alle Tests gruen".to_owned(),
+        });
+        let rows = rendered_rows(&app, 40, 60)?;
+        let shown = rows.join("\n");
+        let dock = app
+            .last_regions
+            .get()
+            .agents
+            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        assert_eq!(dock.width, 40, "Portrait-Dock erwartet:\n{shown}");
+        let line = rows
+            .iter()
+            .find(|row| row.contains("1 uia-writer: "))
+            .ok_or(TestError::Missing("Slot-1-Zeile mit der Rolle"))?;
+        assert!(
+            !shown.contains(SESSION_ID) && !shown.contains("0196f3a2"),
+            "die Sitzungs-ID gehört nicht in den Streifen:\n{shown}"
+        );
+        let (_, message) = line
+            .split_once("1 uia-writer: ")
+            .ok_or(TestError::Missing("Meldung hinter der Kennung"))?;
+        assert!(
+            message.trim_end().chars().count() >= 12,
+            "der Meldung bleiben weniger als 12 Spalten: {line:?}"
+        );
+        assert!(
+            line.contains("1 uia-writer: Datei geschrieben und a\u{2026}"),
+            "Zeile unerwartet: {line:?}"
+        );
+        Ok(())
+    }
+
     /// Ohne Agentenmeldungen gibt es keinen Streifen: Dock und Chat liegen wie
     /// vor der Einbindung direkt aufeinander.
     #[test]
@@ -15528,10 +15574,12 @@ forbidden = [{forbidden}]
         dock_test_running_agent(&mut app, "w1", "uia-worker");
         app.recency.push(crate::recency::RecencyEntry {
             child: "alt".to_owned(),
+            role: String::new(),
             text: "erste Meldung".to_owned(),
         });
         app.recency.push(crate::recency::RecencyEntry {
             child: "neu".to_owned(),
+            role: String::new(),
             text: "zweite Meldung".to_owned(),
         });
         app.input.insert_str("z1\nz2\nz3\nz4\nz5\nz6\nz7\nz8");
@@ -15562,6 +15610,7 @@ forbidden = [{forbidden}]
         let before = rendered_rows(&app, 120, 42)?;
         app.recency.push(crate::recency::RecencyEntry {
             child: "neu".to_owned(),
+            role: String::new(),
             text: "zweite Meldung".to_owned(),
         });
         let after = rendered_rows(&app, 120, 42)?;
