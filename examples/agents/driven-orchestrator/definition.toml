@@ -38,10 +38,11 @@ instructions_file = "system.md"
 
 # Spawn targets. `worker_role` and `judge_role` of `[work_driver]` must both
 # appear here (or in `[spawn] child_orchestrators`), and each needs
-# `max_depth = 0`. `executor` is the built-in code-writing worker;
-# `evidence-critic` is a read-only reviewer bundled with harw. A profile that
-# defines its own code-writing worker names that role here and in
-# `worker_role`.
+# `max_depth = 0`. `executor` is the built-in worker that runs tightly
+# scoped sandbox process jobs (`shell.exec`, `job.*`; it writes no code
+# itself); `evidence-critic` is a read-only reviewer bundled with harw. A
+# profile that defines its own code-writing worker names that role here and
+# in `worker_role`.
 [delegation]
 targets = [
   "executor",

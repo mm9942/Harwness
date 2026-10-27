@@ -384,23 +384,23 @@ impl ShellExecutor {
         (stdout, stderr, stdout_truncated || stderr_truncated)
     }
 
-    /// Kürzt einen Strom, den der Port bereits genau am Byte-Budget
-    /// abgeschnitten hat, so weit, dass der Marker noch hineinpasst, und hängt
-    /// ihn an.
+    /// Hängt den Marker an einen Strom, den der Port bereits gekürzt hat, und
+    /// hält das Ergebnis in `limit` Bytes.
     ///
     /// # Description
     /// [`Self::truncate_output`] hängt den Marker nur an, wenn noch etwas zu
-    /// kürzen ist. Hat der Kommando-Port den Strom selbst auf das Budget
-    /// gestutzt (`CommandEnd::OutputLimit`), bleibt nichts zu kürzen, der
-    /// Leser sähe aber auch keinen Schnitt. Deshalb weicht der Präfix hier um
-    /// die Markerlänge zurück (an einer UTF-8-Grenze); ist das Budget kleiner
-    /// als der Marker, bleibt es beim größten gültigen Präfix ohne Marker.
+    /// kürzen ist. Hat der Kommando-Port den Strom selbst gestutzt
+    /// (`CommandEnd::OutputLimit`, oder `truncated` eines nachgelesenen
+    /// Job-Ergebnisses), bleibt nichts zu kürzen, der Leser sähe aber auch
+    /// keinen Schnitt. Passt der Marker hinter den vollständigen Strom, wird
+    /// nichts entfernt; sonst weicht der Präfix um die Markerlänge zurück (an
+    /// einer UTF-8-Grenze); ist `limit` kleiner als der Marker, bleibt es beim
+    /// größten gültigen Präfix ohne Marker.
     fn cut_with_marker(bytes: &[u8], limit: usize) -> String {
-        let limit = limit.min(bytes.len());
         if limit < TRUNCATION_MARKER.len() {
             return Self::truncate_output(bytes, limit).0;
         }
-        let prefix_limit = limit - TRUNCATION_MARKER.len();
+        let prefix_limit = (limit - TRUNCATION_MARKER.len()).min(bytes.len());
         let prefix_end = match std::str::from_utf8(&bytes[..prefix_limit]) {
             Ok(_) => prefix_limit,
             Err(error) => error.valid_up_to(),
@@ -1072,18 +1072,24 @@ impl ShellExecutor {
         let (stdout_str, stderr_str, clipped) =
             Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
         let (stdout_str, stderr_str) = if killed_by_output_limit && !clipped {
-            // Der Port hat den Strom genau am Budget abgeschnitten: hier war
-            // nichts mehr zu kürzen, der Marker fehlte sonst. Er steht auf
-            // stdout, sofern dort etwas angekommen ist, andernfalls auf stderr.
-            if stdout.is_empty() {
+            // Der Port hat die Ausgabe selbst gekürzt: hier war nichts mehr zu
+            // kürzen, der Marker fehlte sonst. Das Budget gilt für beide Ströme
+            // zusammen, also trägt der längere Strom den Marker (bei
+            // Gleichstand stdout) — er ist der, den der Port gekappt hat, und
+            // der einzige, in den der Marker sicher passt. Noch freies Budget
+            // wird genutzt, bevor Ausgabe für den Marker weicht.
+            let spare = self
+                .max_output_bytes
+                .saturating_sub(stdout.len() + stderr.len());
+            if stdout.len() >= stderr.len() {
                 (
-                    stdout_str,
-                    Self::cut_with_marker(stderr, self.max_output_bytes),
+                    Self::cut_with_marker(stdout, stdout.len() + spare),
+                    stderr_str,
                 )
             } else {
                 (
-                    Self::cut_with_marker(stdout, self.max_output_bytes),
-                    stderr_str,
+                    stdout_str,
+                    Self::cut_with_marker(stderr, stderr.len() + spare),
                 )
             }
         } else {
@@ -2021,8 +2027,10 @@ mod tests {
     }
 
     /// Der Port stutzt die Ausgabe selbst genau auf das Budget: nichts bleibt
-    /// zu kürzen, der Marker muss trotzdem im Budget stehen — auf stdout,
-    /// sonst auf stderr.
+    /// zu kürzen, der Marker muss trotzdem im Budget stehen — auf dem
+    /// längeren Strom, den der Port gekappt hat; ein kurzer, vollständiger
+    /// stdout bleibt dabei unangetastet, und freies Budget wird vor dem
+    /// Kürzen genutzt.
     #[test]
     fn test_completed_output_marks_a_port_cut_with_the_marker() -> TestResult {
         let limit = TRUNCATION_MARKER.len() + 10;
@@ -2040,8 +2048,24 @@ mod tests {
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
         };
-        let cut: Vec<u8> = b"this_is_a_longer_string_than_ten_bytes"[..limit].to_vec();
-        for (stdout, stderr) in [(cut.as_slice(), &b""[..]), (&b""[..], cut.as_slice())] {
+        let sample = b"this_is_a_longer_string_than_ten_bytes";
+        let cut: Vec<u8> = sample
+            .get(..limit)
+            .ok_or(TestError::Missing("a sample longer than the limit"))?
+            .to_vec();
+        let short = b"ready\n";
+        let flood: Vec<u8> = sample
+            .get(..limit - short.len())
+            .ok_or(TestError::Missing("a flood that fills the rest"))?
+            .to_vec();
+        let cases: [(&[u8], &[u8], bool); 3] = [
+            (cut.as_slice(), b"", true),
+            (b"", cut.as_slice(), false),
+            // Kurzer, vollständiger stdout und eine stderr-Flut: der Marker
+            // gehört auf stderr, stdout bleibt ganz.
+            (short, flood.as_slice(), false),
+        ];
+        for (stdout, stderr, on_stdout) in cases {
             let ToolOutput::Json { content } =
                 executor.completed_output(None, stdout, stderr, true, false)
             else {
@@ -2051,17 +2075,43 @@ mod tests {
             assert_eq!(content["killed_by_output_limit"], true);
             let out = content["stdout"].as_str().unwrap_or("");
             let err = content["stderr"].as_str().unwrap_or("");
-            let marked = if stdout.is_empty() { err } else { out };
+            let (marked, intact, source) = if on_stdout {
+                (out, err, stdout)
+            } else {
+                (err, out, stderr)
+            };
+            // Der gekappte Strom endet mit dem Marker, davor steht ein echter,
+            // nicht leerer Präfix seiner Bytes.
+            let kept = marked
+                .strip_suffix(TRUNCATION_MARKER)
+                .ok_or(TestError::Missing(
+                    "the marker at the end of the cut stream",
+                ))?;
             assert!(
-                marked.ends_with(TRUNCATION_MARKER),
-                "the cut stream carries the marker: {out:?} / {err:?}"
+                !kept.is_empty() && source.starts_with(kept.as_bytes()),
+                "a prefix of the cut stream: {out:?} / {err:?}"
             );
-            assert!(marked.starts_with("this_is_a_"), "{marked:?}");
+            assert_eq!(
+                intact.as_bytes(),
+                if on_stdout { stderr } else { stdout },
+                "the other stream is untouched"
+            );
             assert!(
                 out.len() + err.len() <= limit,
                 "within the budget: {out:?} / {err:?}"
             );
         }
+        // Freies Budget (z. B. ein nachgelesenes Job-Ergebnis unter dem
+        // Budget): der Marker wird angehängt, ohne Ausgabe zu opfern.
+        let ToolOutput::Json { content } =
+            executor.completed_output(None, b"hello", b"", true, false)
+        else {
+            return Err(TestError::Missing("Json output"));
+        };
+        assert_eq!(
+            content["stdout"].as_str().unwrap_or(""),
+            format!("hello{TRUNCATION_MARKER}")
+        );
         Ok(())
     }
 
