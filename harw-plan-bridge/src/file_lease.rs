@@ -29,11 +29,16 @@
 //! it; when a failed call's claim ends it falls back to the highest remaining
 //! one, so a sole surviving claim with an older epoch can roll itself back.
 //!
-//! A record names at most 64 claims. Further calls are only counted
-//! ([`FileLeaseRecord::overflow`]); their rollback decrements the counter, so
-//! they end like named claims, and the record is deleted when no named claim
-//! and no counted one is left. Counted calls do not record their epoch, so
-//! the record's epoch is not lowered while any is counted.
+//! A record names at most 64 claims. Further calls are only counted, per
+//! epoch ([`FileLeaseRecord::overflow`]: epoch to number of calls); their
+//! rollback decrements the count of their own epoch, so they end like named
+//! claims, and the record is deleted when no named claim and no counted one is
+//! left. The record's epoch is the highest over named claims *and* counted
+//! epochs, recomputed after every rollback. A counted call can only end its
+//! claim on the incarnation of the record it touched
+//! ([`FileLeaseRecord::generation`], a fresh id for every created record): a
+//! delayed rollback of an old call never decrements the count of a record that
+//! was released and created anew.
 //!
 //! One claim cannot be named: a record written before membership existed has
 //! holders that no caller can ever name. The next same-holder reserve adds the
@@ -70,9 +75,9 @@
 //!    all-or-nothing also holds for interleaved calls of the same holder: if
 //!    every call that touched a path fails, the path is free again. The
 //!    deletion is fenced with the epoch of the call being undone, as
-//!    `release` is: a record whose epoch is higher than that (a counted
-//!    overflow claim does not lower it, for instance) is kept, and the holder
-//!    of that epoch frees it with `release`.
+//!    `release` is: a record whose epoch is higher than that (a stale
+//!    presenter) is kept, and the holder of that epoch frees it with
+//!    `release`.
 //!
 //! What is *not* atomic: other readers can briefly observe a half-reserved
 //! set while a call is in progress, and a crash (or an I/O failure during
@@ -104,6 +109,7 @@ use std::path::{Component, Path};
 
 use harw_job_store::{RECORDS_DIR, RecordStore, StoreError, StoreRecord};
 use harw_types::{ContentDigest, SessionId};
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Schema version of [`FileLeaseRecord`].
@@ -150,8 +156,7 @@ pub struct FileLeaseRecord {
     pub cycle_id: String,
     /// Highest lease epoch among the claims on this record. A refresh moves
     /// it forward; when a failed call's claim ends it falls back to the
-    /// highest epoch of the remaining named claims (unless counted overflow
-    /// claims remain, which record no epoch).
+    /// highest epoch of the remaining claims (named and counted).
     pub epoch: u64,
     pub acquired_at: jiff::Timestamp,
     /// Claims of the reserve calls that currently hold this record: the id of
@@ -163,10 +168,20 @@ pub struct FileLeaseRecord {
     /// the next same-holder reserve adds the claim `"untracked"` (at the
     /// record's epoch), which no rollback ends.
     pub reservations: BTreeMap<String, u64>,
-    /// Calls beyond the cap of 64 named claims, counted instead of named. A
-    /// call's rollback decrements it; the record is deleted when it and
-    /// `reservations` are both empty.
-    pub overflow: u32,
+    /// Calls beyond the cap of 64 named claims, counted instead of named:
+    /// epoch the call reserved under to the number of such calls. A call's
+    /// rollback decrements the count of its own epoch (a zero count is
+    /// dropped); the record is deleted when this and `reservations` are both
+    /// empty. Only the incarnation of the record the call touched
+    /// ([`FileLeaseRecord::generation`]) counts its rollback.
+    pub overflow: BTreeMap<u64, u32>,
+    /// Id of this incarnation of the record, drawn when it is created and kept
+    /// by every refresh. A counted call remembers the generation it touched,
+    /// so its delayed rollback cannot decrement the count of a record that was
+    /// released and created anew. A record written before generations
+    /// existed has none (empty); the next same-holder reserve gives it one,
+    /// and no call that touched it earlier can match it.
+    pub generation: String,
 }
 
 impl StoreRecord for FileLeaseRecord {
@@ -186,9 +201,10 @@ impl<'de> Deserialize<'de> for FileLeaseRecord {
 
 // Everything `FileLeaseRecord` reads from disk. Besides the current fields it
 // takes the layouts that were written under the same schema version before:
-// a single `reservation` id (one claim) and a plain list of `reservations`
-// ids (claims); both become claims at the record's epoch. Unknown fields stay
-// refused.
+// a single `reservation` id (one claim), a plain list of `reservations` ids
+// (claims) and a single `overflow` count; all of them become claims or counts
+// at the record's epoch. Records from before `generation` existed keep it
+// empty. Unknown fields stay refused.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileLeaseRecordWire {
@@ -202,9 +218,11 @@ struct FileLeaseRecordWire {
     #[serde(default)]
     reservations: WireClaims,
     #[serde(default)]
-    overflow: u32,
+    overflow: WireOverflow,
     #[serde(default)]
     reservation: String,
+    #[serde(default)]
+    generation: String,
 }
 
 // `reservations` as a map (current layout) or as a list of ids (earlier one).
@@ -221,6 +239,60 @@ impl Default for WireClaims {
     }
 }
 
+// `overflow` as a map of epoch to count (current layout) or as a single count
+// (earlier layout, where every counted call shared one number). Not an
+// untagged enum: serde buffers untagged input and then cannot read the
+// integer map keys back from JSON strings.
+enum WireOverflow {
+    Count(u32),
+    Epochs(BTreeMap<u64, u32>),
+}
+
+impl Default for WireOverflow {
+    fn default() -> Self {
+        Self::Count(0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireOverflow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OverflowVisitor;
+
+        impl<'de> Visitor<'de> for OverflowVisitor {
+            type Value = WireOverflow;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a count or a map of epoch to count")
+            }
+
+            fn visit_u64<E>(self, count: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                u32::try_from(count)
+                    .map(WireOverflow::Count)
+                    .map_err(E::custom)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut epochs = BTreeMap::new();
+                while let Some((epoch, count)) = map.next_entry::<u64, u32>()? {
+                    epochs.insert(epoch, count);
+                }
+                Ok(WireOverflow::Epochs(epochs))
+            }
+        }
+
+        deserializer.deserialize_any(OverflowVisitor)
+    }
+}
+
 impl From<FileLeaseRecordWire> for FileLeaseRecord {
     fn from(wire: FileLeaseRecordWire) -> Self {
         let epoch = wire.epoch;
@@ -233,6 +305,13 @@ impl From<FileLeaseRecordWire> for FileLeaseRecord {
         if !wire.reservation.is_empty() {
             reservations.entry(wire.reservation).or_insert(epoch);
         }
+        // The earlier single count belongs to the record's epoch; zero counts
+        // are no claims.
+        let mut overflow = match wire.overflow {
+            WireOverflow::Count(count) => BTreeMap::from([(epoch, count)]),
+            WireOverflow::Epochs(epochs) => epochs,
+        };
+        overflow.retain(|_, count| *count > 0);
         Self {
             schema_version: wire.schema_version,
             key_id: wire.key_id,
@@ -242,7 +321,8 @@ impl From<FileLeaseRecordWire> for FileLeaseRecord {
             epoch,
             acquired_at: wire.acquired_at,
             reservations,
-            overflow: wire.overflow,
+            overflow,
+            generation: wire.generation,
         }
     }
 }
@@ -375,7 +455,7 @@ impl FileLeaseRegistry {
         for key in &keys {
             let entry = Entry::new(key);
             match self.reserve_key(&entry, &holder, epoch, &reservation) {
-                Ok(counted) => touched.push(Touched { entry, counted }),
+                Ok(placement) => touched.push(Touched { entry, placement }),
                 Err(refusal) => {
                     self.roll_back(&touched, &holder, epoch, &reservation);
                     return Err(refusal);
@@ -460,15 +540,17 @@ impl FileLeaseRegistry {
     // Decides one key inside the record lock: create it if free, otherwise
     // refresh it if (and only if) the same holder already owns it. Either way
     // the record holds a claim of this call afterwards; the result says how it
-    // was recorded (named, or only counted beyond the cap).
+    // was recorded (named, or only counted beyond the cap) and in which
+    // incarnation of the record.
     fn reserve_key(
         &self,
         entry: &Entry,
         holder: &Holder<'_>,
         epoch: u64,
         reservation: &str,
-    ) -> Result<Counted, ReserveRefusal> {
+    ) -> Result<Placement, ReserveRefusal> {
         for _ in 0..RESERVE_ATTEMPTS {
+            let generation = SessionId::new().0;
             let record = FileLeaseRecord {
                 schema_version: FILE_LEASE_SCHEMA,
                 key_id: entry.id.clone(),
@@ -478,10 +560,16 @@ impl FileLeaseRegistry {
                 epoch,
                 acquired_at: jiff::Timestamp::now(),
                 reservations: BTreeMap::from([(reservation.to_owned(), epoch)]),
-                overflow: 0,
+                overflow: BTreeMap::new(),
+                generation: generation.clone(),
             };
             match self.records.create(&record) {
-                Ok(()) => return Ok(Counted::Named),
+                Ok(()) => {
+                    return Ok(Placement {
+                        counted: Counted::Named,
+                        generation,
+                    });
+                }
                 Err(StoreError::AlreadyExists { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -489,7 +577,7 @@ impl FileLeaseRegistry {
                 refresh(existing, entry, holder, epoch, reservation)
             });
             match refreshed {
-                Ok(counted) => return Ok(counted),
+                Ok(placement) => return Ok(placement),
                 Err(Failure::Refused(refusal)) => return Err(refusal),
                 // Released between `create` and `update_locked`: decide again.
                 Err(Failure::Store(StoreError::NotFound { .. })) => {}
@@ -518,9 +606,11 @@ impl FileLeaseRegistry {
         for touch in touched.iter().rev() {
             let claim = Claim {
                 reservation,
-                counted: touch.counted,
+                epoch,
+                counted: touch.placement.counted,
+                generation: &touch.placement.generation,
             };
-            match self.leave_key(&touch.entry, holder, epoch, claim) {
+            match self.leave_key(&touch.entry, holder, claim) {
                 Ok(Removal::Done) => {}
                 Ok(Removal::Claimed) => {
                     tracing::debug!(
@@ -556,7 +646,6 @@ impl FileLeaseRegistry {
         &self,
         entry: &Entry,
         holder: &Holder<'_>,
-        epoch: u64,
         claim: Claim<'_>,
     ) -> Result<Removal, ReserveRefusal> {
         for _ in 0..RESERVE_ATTEMPTS {
@@ -567,7 +656,7 @@ impl FileLeaseRegistry {
                 Ok(Membership::Foreign) => return Ok(Removal::Done),
                 Ok(Membership::Claimed) => return Ok(Removal::Claimed),
                 Ok(Membership::Sole) => {
-                    let removal = self.remove_held(entry, holder, epoch, Some(claim))?;
+                    let removal = self.remove_held(entry, holder, claim.epoch, Some(claim))?;
                     if matches!(removal, Removal::Done) {
                         return Ok(Removal::Done);
                     }
@@ -677,7 +766,14 @@ impl Entry {
 // A key a reserve call decided, and how that record counted the call.
 struct Touched {
     entry: Entry,
+    placement: Placement,
+}
+
+// How one record counted one reserve call, and which incarnation of the
+// record it did so in.
+struct Placement {
     counted: Counted,
+    generation: String,
 }
 
 // How a record counts one reserve call.
@@ -689,32 +785,43 @@ enum Counted {
     Overflow,
 }
 
-// One call's claim on a record, as its rollback presents it.
+// One call's claim on a record, as its rollback presents it: the call's id
+// and epoch, how the record counted it, and the generation it touched.
 #[derive(Clone, Copy)]
 struct Claim<'a> {
     reservation: &'a str,
+    epoch: u64,
     counted: Counted,
+    generation: &'a str,
 }
 
 impl Claim<'_> {
-    // Does the record still count this call?
+    // Does the record still count this call? A named claim is identified by
+    // the call's unique id. A counted claim has no identity of its own, so it
+    // only counts in the incarnation of the record it touched; an empty
+    // generation (a record from before generations existed) never matches.
     fn is_held_by(&self, record: &FileLeaseRecord) -> bool {
         match self.counted {
             Counted::Named => record.reservations.contains_key(self.reservation),
-            Counted::Overflow => record.overflow > 0,
+            Counted::Overflow => {
+                !self.generation.is_empty()
+                    && record.generation == self.generation
+                    && record.overflow.contains_key(&self.epoch)
+            }
         }
     }
 
     // Is this call the only claim on the record?
     fn is_sole(&self, record: &FileLeaseRecord) -> bool {
-        match self.counted {
-            Counted::Named => {
-                record.overflow == 0
-                    && record.reservations.len() == 1
-                    && record.reservations.contains_key(self.reservation)
+        self.is_held_by(record)
+            && match self.counted {
+                Counted::Named => record.overflow.is_empty() && record.reservations.len() == 1,
+                Counted::Overflow => {
+                    record.reservations.is_empty()
+                        && record.overflow.len() == 1
+                        && record.overflow.get(&self.epoch) == Some(&1)
+                }
             }
-            Counted::Overflow => record.overflow == 1 && record.reservations.is_empty(),
-        }
     }
 }
 
@@ -757,7 +864,7 @@ fn refresh(
     holder: &Holder<'_>,
     epoch: u64,
     reservation: &str,
-) -> Result<Counted, Failure> {
+) -> Result<Placement, Failure> {
     check_consistent(existing, entry).map_err(Failure::Refused)?;
     if !holder.matches(existing) {
         return Err(Failure::Refused(ReserveRefusal::AlreadyOwned {
@@ -768,25 +875,35 @@ fn refresh(
     if existing.epoch > epoch {
         return Err(Failure::Refused(ReserveRefusal::StaleEpoch));
     }
-    Ok(join(existing, reservation, epoch))
+    let counted = join(existing, reservation, epoch);
+    Ok(Placement {
+        counted,
+        generation: existing.generation.clone(),
+    })
 }
 
 // Adds a refreshing call to the claims, keeping the ones already there, and
 // moves the record's epoch forward. A record without any claim predates
 // membership: its holders are unknown, so the `UNTRACKED_MEMBER` claim (at the
 // record's old epoch) is added first and keeps it alive through any rollback.
-// Beyond the cap the call is only counted, which its rollback undoes.
+// A record without a generation predates generations and gets one now. Beyond
+// the cap the call is only counted (under its own epoch), which its rollback
+// undoes.
 fn join(existing: &mut FileLeaseRecord, reservation: &str, epoch: u64) -> Counted {
-    if existing.reservations.is_empty() && existing.overflow == 0 {
+    if existing.reservations.is_empty() && existing.overflow.is_empty() {
         existing
             .reservations
             .insert(UNTRACKED_MEMBER.to_owned(), existing.epoch);
+    }
+    if existing.generation.is_empty() {
+        existing.generation = SessionId::new().0;
     }
     let counted = if existing.reservations.len() < MAX_RESERVATION_MEMBERS {
         existing.reservations.insert(reservation.to_owned(), epoch);
         Counted::Named
     } else {
-        existing.overflow = existing.overflow.saturating_add(1);
+        let count = existing.overflow.entry(epoch).or_insert(0);
+        *count = count.saturating_add(1);
         Counted::Overflow
     };
     existing.epoch = epoch;
@@ -818,13 +935,19 @@ fn leave(
             existing.reservations.remove(claim.reservation);
         }
         Counted::Overflow => {
-            existing.overflow = existing.overflow.saturating_sub(1);
+            if let Some(count) = existing.overflow.get_mut(&claim.epoch) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    existing.overflow.remove(&claim.epoch);
+                }
+            }
         }
     }
-    // The record's epoch is the highest among its claims. Counted calls record
-    // none, so it is only lowered while every claim is named.
-    let highest = existing.reservations.values().copied().max();
-    if let (0, Some(highest)) = (existing.overflow, highest) {
+    // The record's epoch is the highest among the claims that remain, named
+    // and counted ones alike.
+    let named = existing.reservations.values().copied().max();
+    let counted = existing.overflow.keys().next_back().copied();
+    if let Some(highest) = named.max(counted) {
         existing.epoch = highest;
     }
     Ok(Membership::Claimed)
@@ -897,7 +1020,8 @@ mod tests {
 
     use super::{
         Counted, Entry, FILE_LEASE_DIR, FileLeaseRecord, FileLeaseRegistry, Holder, LeaseSet,
-        MAX_RESERVATION_MEMBERS, ReserveRefusal, Touched, UNTRACKED_MEMBER, lease_id_for,
+        MAX_RESERVATION_MEMBERS, Placement, ReserveRefusal, Touched, UNTRACKED_MEMBER,
+        lease_id_for,
     };
     use crate::test_support::{TestResult, ctx, missing};
 
@@ -912,20 +1036,22 @@ mod tests {
         Ok(Fixture { temp, registry })
     }
 
-    // The key a one-path reserve touched, counted as a named claim.
-    fn named(key: &str) -> Touched {
-        Touched {
+    // The key a call touched, as the record in its current incarnation
+    // counts the call (`counted`). Take it right after the call, before the
+    // record is released.
+    fn touch(fx: &Fixture, key: &str, counted: Counted) -> TestResult<Touched> {
+        let generation = record_of(fx, key)?.generation;
+        Ok(Touched {
             entry: Entry::new(key),
-            counted: Counted::Named,
-        }
+            placement: Placement {
+                counted,
+                generation,
+            },
+        })
     }
 
-    // The key a call touched that the record only counted (beyond the cap).
-    fn counted_only(key: &str) -> Touched {
-        Touched {
-            entry: Entry::new(key),
-            counted: Counted::Overflow,
-        }
+    fn counts(pairs: &[(u64, u32)]) -> BTreeMap<u64, u32> {
+        pairs.iter().copied().collect()
     }
 
     fn claims(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
@@ -1056,7 +1182,7 @@ mod tests {
         // `a.rs` (it is in the call's `touched` list) and has not reached
         // `z.rs` yet.
         let older = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [named("a.rs")];
+        let touched = [touch(&fx, "a.rs", Counted::Named)?];
         // Meanwhile epoch 2 of the same holder refreshes `a.rs` and receives
         // a successful `LeaseSet`.
         let newer = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 2)?;
@@ -1138,7 +1264,7 @@ mod tests {
         // record it wrote is the one a one-path reserve writes, so that call
         // stands in for A's creation and yields A's reservation id.
         let call_a = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [named("a.rs")];
+        let touched = [touch(&fx, "a.rs", Counted::Named)?];
 
         // Call B: `reserve({a.rs}, X, cycle, 1)` at the SAME epoch finds the
         // record already held by X, adds its claim and returns a successful
@@ -1218,7 +1344,7 @@ mod tests {
         // Call A: `reserve({a.rs, z.rs}, X, cycle, 1)` has created `a.rs`
         // (it is in A's `touched` list) and has not reached `z.rs` yet.
         let call_a = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [named("a.rs")];
+        let touched = [touch(&fx, "a.rs", Counted::Named)?];
 
         // Call B: `reserve({a.rs, y.rs}, X, cycle, 1)` refreshes `a.rs`
         // (adding its claim to A's record without creating it) and is then
@@ -1268,7 +1394,7 @@ mod tests {
         // Call A at epoch 1: `reserve({a.rs, z.rs})` has created `a.rs` and
         // has not reached `z.rs` yet.
         let call_a = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 1)?;
-        let touched = [named("a.rs")];
+        let touched = [touch(&fx, "a.rs", Counted::Named)?];
 
         // Call B at epoch 2: `reserve({a.rs, y.rs})` refreshes `a.rs`, which
         // moves the record's epoch to 2, and is then refused at the foreign
@@ -1317,8 +1443,9 @@ mod tests {
         std::fs::write(record_file(&fx, "a.rs"), &json).map_err(ctx("plant legacy record"))?;
         let legacy = record_of(&fx, "a.rs")?;
         assert!(legacy.reservations.is_empty());
-        assert_eq!(legacy.overflow, 0);
-        let touched = [named("a.rs")];
+        assert!(legacy.overflow.is_empty());
+        assert!(legacy.generation.is_empty());
+        let touched = [touch(&fx, "a.rs", Counted::Named)?];
         // No live call id (nor an empty one) is allowed to roll it back.
         fx.registry
             .roll_back(&touched, &holder, 1, "some-live-call");
@@ -1333,6 +1460,8 @@ mod tests {
             record.reservations,
             claims(&[(UNTRACKED_MEMBER, 1), (adopting.reservation.as_str(), 2)])
         );
+        // The adopted record gets its own generation.
+        assert!(!record.generation.is_empty());
         // If the adopting call fails, its rollback ends only its own claim:
         // the record the legacy holders kept is kept, at their epoch.
         fx.registry
@@ -1349,6 +1478,13 @@ mod tests {
         Ok(())
     }
 
+    // A record of epoch 3 with one named claim and the given `overflow` JSON.
+    fn single_with_overflow(id: &str, uuid: &str, overflow: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"key_id":"{id}","key":"a.rs","owner":"worker-x","cycle_id":"cycle-x","epoch":3,"acquired_at":"2026-01-01T00:00:00Z","reservations":{{"{uuid}":3}},"overflow":{overflow}}}"#
+        )
+    }
+
     #[test]
     fn predecessor_record_layouts_are_migrated() -> TestResult {
         let fx = fixture()?;
@@ -1361,11 +1497,20 @@ mod tests {
         );
         let parsed: FileLeaseRecord = serde_json::from_str(&parent).map_err(ctx("parent json"))?;
         assert_eq!(parsed.reservations, claims(&[(uuid, 1)]));
-        assert_eq!(parsed.overflow, 0);
-        // The current layout round-trips.
-        let encoded = serde_json::to_string(&parsed).map_err(ctx("encode"))?;
-        let decoded: FileLeaseRecord = serde_json::from_str(&encoded).map_err(ctx("decode"))?;
-        assert_eq!(decoded, parsed);
+        assert!(parsed.overflow.is_empty());
+        // No generation: no call that touched the record earlier can match it.
+        assert!(parsed.generation.is_empty());
+        // The current layout round-trips, counted epochs included.
+        let counted = FileLeaseRecord {
+            overflow: counts(&[(1, 2), (2, 1)]),
+            generation: "g".to_owned(),
+            ..parsed.clone()
+        };
+        for record in [&parsed, &counted] {
+            let encoded = serde_json::to_string(record).map_err(ctx("encode"))?;
+            let decoded: FileLeaseRecord = serde_json::from_str(&encoded).map_err(ctx("decode"))?;
+            assert_eq!(&decoded, record);
+        }
 
         // The store reads that file as a live lease (it is not quarantined)...
         std::fs::write(record_file(&fx, "a.rs"), &parent).map_err(ctx("plant parent record"))?;
@@ -1390,6 +1535,7 @@ mod tests {
             members_of(&fx, "a.rs")?,
             claims(&[(uuid, 1), (next.reservation.as_str(), 2)])
         );
+        assert!(!record_of(&fx, "a.rs")?.generation.is_empty());
         let text = std::fs::read_to_string(record_file(&fx, "a.rs")).map_err(ctx("read file"))?;
         assert!(text.contains(r#""reservations""#));
         assert!(!text.contains(r#""reservation":"#));
@@ -1404,6 +1550,29 @@ mod tests {
             listed.reservations,
             claims(&[(uuid, 3), (UNTRACKED_MEMBER, 3)])
         );
+
+        // The previous build's layout (named claims and a single counted
+        // number, no generation): the number belongs to the record's epoch.
+        let single = format!(
+            r#"{{"schema_version":1,"key_id":"{id}","key":"a.rs","owner":"worker-x","cycle_id":"cycle-x","epoch":3,"acquired_at":"2026-01-01T00:00:00Z","reservations":{{"{uuid}":3}},"overflow":2}}"#
+        );
+        let single: FileLeaseRecord = serde_json::from_str(&single).map_err(ctx("single json"))?;
+        assert_eq!(single.overflow, counts(&[(3, 2)]));
+        assert!(single.generation.is_empty());
+        let none = single_with_overflow(&id, uuid, "0");
+        let none: FileLeaseRecord = serde_json::from_str(&none).map_err(ctx("zero json"))?;
+        assert!(none.overflow.is_empty());
+        let per_epoch = single_with_overflow(&id, uuid, r#"{"1":2,"3":1}"#);
+        let per_epoch: FileLeaseRecord =
+            serde_json::from_str(&per_epoch).map_err(ctx("map json"))?;
+        assert_eq!(per_epoch.overflow, counts(&[(1, 2), (3, 1)]));
+        for bad in ["-1", "4294967296", r#""x""#, r#"{"x":1}"#, "[1]"] {
+            let text = single_with_overflow(&id, uuid, bad);
+            assert!(
+                serde_json::from_str::<FileLeaseRecord>(&text).is_err(),
+                "overflow {bad} must be refused"
+            );
+        }
 
         // Everything else stays refused.
         let unknown = parent.replacen("\"epoch\":1", "\"epoch\":1,\"bogus\":true", 1);
@@ -1437,22 +1606,32 @@ mod tests {
         let (counted, named_calls) = calls
             .split_last()
             .ok_or_else(missing("the loop reserved at least once"))?;
+        let named_touch = touch(&fx, "a.rs", Counted::Named)?;
+        let counted_touch = touch(&fx, "a.rs", Counted::Overflow)?;
         let record = record_of(&fx, "a.rs")?;
         assert_eq!(record.reservations.len(), MAX_RESERVATION_MEMBERS);
-        assert_eq!(record.overflow, 1);
+        assert_eq!(record.overflow, counts(&[(1, 1)]));
         assert!(!record.reservations.contains_key(&counted.reservation));
         for call in named_calls {
-            fx.registry
-                .roll_back(&[named("a.rs")], &holder, 1, &call.reservation);
+            fx.registry.roll_back(
+                std::slice::from_ref(&named_touch),
+                &holder,
+                1,
+                &call.reservation,
+            );
         }
         let record = record_of(&fx, "a.rs")?;
         assert!(record.reservations.is_empty());
-        assert_eq!(record.overflow, 1);
+        assert_eq!(record.overflow, counts(&[(1, 1)]));
         assert_eq!(record.owner, "worker-x");
         // ...and the counted call's rollback deletes it: all 65 calls failed,
         // so nobody holds the path.
-        fx.registry
-            .roll_back(&[counted_only("a.rs")], &holder, 1, &counted.reservation);
+        fx.registry.roll_back(
+            std::slice::from_ref(&counted_touch),
+            &holder,
+            1,
+            &counted.reservation,
+        );
         assert_eq!(holder_of(&fx, "a.rs")?, None);
         reserve(&fx, &["a.rs"], "worker-y", "cycle-y", 1)?;
         fx.registry
@@ -1474,22 +1653,170 @@ mod tests {
         let (counted, named_calls) = calls
             .split_last()
             .ok_or_else(missing("the loop reserved at least once"))?;
-        fx.registry
-            .roll_back(&[counted_only("a.rs")], &holder, 1, &counted.reservation);
+        let named_touch = touch(&fx, "a.rs", Counted::Named)?;
+        let counted_touch = touch(&fx, "a.rs", Counted::Overflow)?;
+        fx.registry.roll_back(
+            std::slice::from_ref(&counted_touch),
+            &holder,
+            1,
+            &counted.reservation,
+        );
         let record = record_of(&fx, "a.rs")?;
         assert_eq!(record.reservations.len(), MAX_RESERVATION_MEMBERS);
-        assert_eq!(record.overflow, 0);
+        assert!(record.overflow.is_empty());
         let (last, rest) = named_calls
             .split_last()
             .ok_or_else(missing("the record names 64 calls"))?;
         for call in rest {
-            fx.registry
-                .roll_back(&[named("a.rs")], &holder, 1, &call.reservation);
+            fx.registry.roll_back(
+                std::slice::from_ref(&named_touch),
+                &holder,
+                1,
+                &call.reservation,
+            );
         }
         assert_eq!(members_of(&fx, "a.rs")?.len(), 1);
-        fx.registry
-            .roll_back(&[named("a.rs")], &holder, 1, &last.reservation);
+        fx.registry.roll_back(
+            std::slice::from_ref(&named_touch),
+            &holder,
+            1,
+            &last.reservation,
+        );
         assert_eq!(holder_of(&fx, "a.rs")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_claims_across_epochs_roll_back_in_any_order() -> TestResult {
+        let fx = fixture()?;
+        let holder = Holder {
+            owner: "worker-x",
+            cycle_id: "cycle-x",
+        };
+        for counted_c_first in [true, false] {
+            // 64 named claims at epoch 1, then two counted calls: B at epoch
+            // 1 and C at epoch 2, which moves the record to epoch 2.
+            let calls = reserve_beyond_cap(&fx)?;
+            let (call_b, named_calls) = calls
+                .split_last()
+                .ok_or_else(missing("the loop reserved at least once"))?;
+            let call_c = reserve(&fx, &["a.rs"], "worker-x", "cycle-x", 2)?;
+            let named_touch = touch(&fx, "a.rs", Counted::Named)?;
+            let counted_touch = touch(&fx, "a.rs", Counted::Overflow)?;
+            let record = record_of(&fx, "a.rs")?;
+            assert_eq!(record.epoch, 2);
+            assert_eq!(record.reservations.len(), MAX_RESERVATION_MEMBERS);
+            assert_eq!(record.overflow, counts(&[(1, 1), (2, 1)]));
+
+            // The counted call of the epoch that is rolled back first takes
+            // its epoch with it, whichever one that is.
+            let (first, first_epoch, last, last_epoch, epoch_between) = if counted_c_first {
+                (&call_c, 2, call_b, 1, 1)
+            } else {
+                (call_b, 1, &call_c, 2, 2)
+            };
+            fx.registry.roll_back(
+                std::slice::from_ref(&counted_touch),
+                &holder,
+                first_epoch,
+                &first.reservation,
+            );
+            let record = record_of(&fx, "a.rs")?;
+            assert_eq!(record.epoch, epoch_between);
+            assert_eq!(record.overflow, counts(&[(last_epoch, 1)]));
+            for call in named_calls {
+                fx.registry.roll_back(
+                    std::slice::from_ref(&named_touch),
+                    &holder,
+                    1,
+                    &call.reservation,
+                );
+            }
+            // Only the other counted call is left. It is the sole claim and
+            // its epoch is the record's, so it may delete the record.
+            let record = record_of(&fx, "a.rs")?;
+            assert!(record.reservations.is_empty());
+            assert_eq!(record.epoch, last_epoch);
+            assert_eq!(record.owner, "worker-x");
+            fx.registry.roll_back(
+                std::slice::from_ref(&counted_touch),
+                &holder,
+                last_epoch,
+                &last.reservation,
+            );
+            assert_eq!(holder_of(&fx, "a.rs")?, None);
+        }
+        reserve(&fx, &["a.rs"], "worker-y", "cycle-y", 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn old_overflow_rollback_cannot_touch_a_recreated_record() -> TestResult {
+        let fx = fixture()?;
+        let holder = Holder {
+            owner: "worker-x",
+            cycle_id: "cycle-x",
+        };
+
+        // An old call X0 is the counted 65th call on the record and touches
+        // `a.rs` in this incarnation of it.
+        let old_calls = reserve_beyond_cap(&fx)?;
+        let (old_counted, old_named) = old_calls
+            .split_last()
+            .ok_or_else(missing("the loop reserved at least once"))?;
+        let old_touch = touch(&fx, "a.rs", Counted::Overflow)?;
+        let old_generation = old_touch.placement.generation.clone();
+        let first = old_named
+            .first()
+            .ok_or_else(missing("the record names 64 calls"))?;
+        // The holder releases the path and it is created anew.
+        fx.registry.release(first, 1).map_err(ctx("release"))?;
+        assert_eq!(holder_of(&fx, "a.rs")?, None);
+
+        // The new incarnation again has 64 named claims and a counted call Y
+        // that returned a successful `LeaseSet`.
+        let new_calls = reserve_beyond_cap(&fx)?;
+        let (new_counted, new_named) = new_calls
+            .split_last()
+            .ok_or_else(missing("the loop reserved at least once"))?;
+        let record = record_of(&fx, "a.rs")?;
+        assert_ne!(record.generation, old_generation);
+        assert_eq!(record.overflow, counts(&[(1, 1)]));
+        assert!(!record.reservations.contains_key(&new_counted.reservation));
+
+        // X0's delayed failure must not decrement Y's count.
+        fx.registry.roll_back(
+            std::slice::from_ref(&old_touch),
+            &holder,
+            1,
+            &old_counted.reservation,
+        );
+        assert_eq!(record_of(&fx, "a.rs")?.overflow, counts(&[(1, 1)]));
+
+        // The new named calls fail; Y still holds a set, so the record stays
+        // and nobody else can take the path.
+        let named_touch = touch(&fx, "a.rs", Counted::Named)?;
+        for call in new_named {
+            fx.registry.roll_back(
+                std::slice::from_ref(&named_touch),
+                &holder,
+                1,
+                &call.reservation,
+            );
+        }
+        let record = record_of(&fx, "a.rs")?;
+        assert!(record.reservations.is_empty());
+        assert_eq!(record.overflow, counts(&[(1, 1)]));
+        let takeover = fx
+            .registry
+            .reserve(&set(&["a.rs"]), "worker-y", "cycle-y", 5);
+        assert_eq!(
+            takeover,
+            Err(ReserveRefusal::AlreadyOwned {
+                path: "a.rs".to_owned(),
+                owner: "worker-x".to_owned(),
+            })
+        );
         Ok(())
     }
 
@@ -1538,7 +1865,11 @@ mod tests {
             .owner_of("a.rs")
             .map_err(ctx("owner_of"))?
             .map(|record| record.acquired_at);
+        let generation = record_of(&fx, "a.rs")?.generation;
+        assert!(!generation.is_empty());
         let again = reserve(&fx, &["a.rs", "b.rs"], "worker-a", "cycle-a", 1)?;
+        // A refresh keeps the incarnation of the record.
+        assert_eq!(record_of(&fx, "a.rs")?.generation, generation);
         // Same holder, epoch and keys; every call carries its own
         // reservation id.
         assert_eq!(first.keys, again.keys);
