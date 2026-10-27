@@ -47,6 +47,7 @@ use harw_extension_api::{
     AgentJobFuture, AgentJobSubmitter, AgentSpawnError, AgentSpawner, ExtensionRegistry,
     SpawnFuture, SpawnInput,
 };
+use harw_knowledge::caller_identity::CallerIdentity;
 use harw_operations::OpContext;
 use harw_operations::adapter::ModelToolProvider;
 use harw_operations::context::ServiceMap;
@@ -583,6 +584,39 @@ impl RuntimeChildRegistryFactory {
         self.custom_agents
             .get(role)
             .map_or(role, |wiring| wiring.base_role.as_str())
+    }
+
+    /// Die vertrauenswürdige Aufruferidentität eines Kindes dieser Rolle
+    /// (PL-90 W03d: Lauf-Isolation der Wissensflächen).
+    ///
+    /// # Beschreibung
+    /// Die Identität entsteht ausschließlich hier, aus dem registrierten
+    /// Rollennamen — nie aus Modell-JSON oder `SpawnInput.context`:
+    /// - `agent_id` ist `role`, also derselbe Autor, unter dem der
+    ///   Diary-Recorder und `DiaryToolProvider` das Kind führen;
+    /// - `role` ist die Basisrolle (`lookup_role`); für einen
+    ///   benutzerdefinierten Agenten ist das seine eingebaute Rolle, nicht
+    ///   sein eigener Name — wie bei allen namensgebundenen Tabellen
+    ///   (Plan R9, Teil B) gilt eine Rollenfreigabe also auch für Agenten
+    ///   auf dieser Basis;
+    /// - `ancestors` bleibt **leer**: `SpawnInput` trägt nur die
+    ///   `parent_session_id`, keine Elternrolle, und die Rolle des Elternteils
+    ///   ist hier nicht vertrauenswürdig herleitbar. Das ist fail-closed (ein
+    ///   Kind sieht den `DescendantTree` seines Elternteils nicht), öffnet
+    ///   aber nichts: Geschwister sehen einander über `SelfOnly` und
+    ///   `DescendantTree` nie, weil der Autor eines Geschwisters weder der
+    ///   Aufrufer ist noch in dessen Vorfahren steht.
+    ///
+    /// Jeder Aufruf liefert eine **neue** Instanz; die Fabrik hält keinen
+    /// Zustand zwischen Kindern, damit Geschwister nie dieselbe Identität
+    /// teilen.
+    #[must_use]
+    pub fn child_caller_identity(&self, role: &str) -> Arc<CallerIdentity> {
+        Arc::new(
+            CallerIdentity::new(harw_knowledge::AgentId::new(role.to_owned())).with_role(
+                harw_knowledge::AgentRoleRef::new(self.lookup_role(role).to_owned()),
+            ),
+        )
     }
 
     /// Das Registry-Profil von `role`: für einen benutzerdefinierten Agenten
@@ -1311,7 +1345,12 @@ impl RuntimeChildRegistryFactory {
     /// `Arc<dyn StateStore>` (sofern hinterlegt). Fehlt einer der beiden
     /// Dienste, scheitert `delegate_wave` selbst fail-closed mit
     /// `OpError::NotAvailable`.
-    fn delegate_wave_provider(&self) -> ModelToolProvider {
+    ///
+    /// PL-90 W03d: dazu trägt jede `ServiceMap` die `identity` dieses Kindes
+    /// (`Arc<CallerIdentity>`, siehe [`Self::child_caller_identity`]), damit
+    /// Wissens-Operationen, die über diesen Kontext laufen, identitätsgebunden
+    /// lesen ([`delegate_wave_services`]).
+    fn delegate_wave_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
         // Plan R9, Teil B: ein benutzerdefinierter Agent (als Ziel oder als
         // Aufrufer) gilt mit Reducer und Delegationszielen seiner Basisrolle.
         // Eigene `[delegation].targets` eines benutzerdefinierten Aufrufers
@@ -1346,13 +1385,7 @@ impl RuntimeChildRegistryFactory {
         let slot = Arc::clone(&self.spawner_slot);
         let state_store = self.delegate_wave_store.clone();
         ModelToolProvider::new([operation], move |execution_context| {
-            let mut services = ServiceMap::new();
-            if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
-                services.insert(spawner);
-            }
-            if let Some(store) = &state_store {
-                services.insert(Arc::clone(store));
-            }
+            let services = delegate_wave_services(&slot, state_store.as_ref(), &identity);
             let ctx = OpContext::new(
                 execution_context.session_id().clone(),
                 execution_context.turn_id().clone(),
@@ -1385,15 +1418,22 @@ impl RuntimeChildRegistryFactory {
     /// `StateStore` für die Sitz-Agenten sowie den gebundenen Root-Space
     /// ([`Self::with_home_context`]) für den Matrix-Speicher. Sandbox und
     /// `CancelToken` kommen aus dem Ausführungskontext.
-    fn matrix_game_master_provider(&self) -> ModelToolProvider {
+    ///
+    /// PL-90 W03d: `identity` ist die Identität dieses Kindes
+    /// ([`Self::child_caller_identity`]); sie liegt in jeder `ServiceMap`.
+    fn matrix_game_master_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
         let slot = Arc::clone(&self.spawner_slot);
         let state_store = self.delegate_wave_store.clone();
         let home_context = self.home_context.clone();
         ModelToolProvider::new(
             harw_ops::matrix::game_master::game_master_operations(),
             move |execution_context| {
-                let services =
-                    game_master_services(&slot, state_store.as_ref(), home_context.as_ref());
+                let services = game_master_services(
+                    &slot,
+                    state_store.as_ref(),
+                    home_context.as_ref(),
+                    &identity,
+                );
                 let ctx = OpContext::new(
                     execution_context.session_id().clone(),
                     execution_context.turn_id().clone(),
@@ -1577,16 +1617,19 @@ impl RuntimeChildRegistryFactory {
 /// nur, wenn er vorhanden ist. Fehlt ein Dienst, scheitert die Operation,
 /// die ihn verlangt, fail-closed mit `OpError::NotAvailable`; insbesondere
 /// liest ohne `home_context` keine Operation den Matrix-Speicher über
-/// `HARW_HOME`.
+/// `HARW_HOME`. Dazu kommt immer die Identität des Kindes (PL-90 W03d).
 ///
 /// # Arguments
 /// - `slot`: die Rückwärtsreferenz auf den Managed-Spawner.
 /// - `state_store`: der geteilte `StateStore` des Laufs, falls gesetzt.
 /// - `home_context`: der gebundene Root-Space der Wurzel, falls gesetzt.
+/// - `identity`: die vertrauenswürdige Identität dieses Kindes (immer
+///   gesetzt; dieselbe Instanz, nicht eine Kopie).
 fn game_master_services(
     slot: &OnceLock<Weak<ManagedAgentSpawner>>,
     state_store: Option<&Arc<dyn StateStore>>,
     home_context: Option<&Arc<harw_home::ResolvedHomeContext>>,
+    identity: &Arc<CallerIdentity>,
 ) -> ServiceMap {
     let mut services = ServiceMap::new();
     if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
@@ -1598,6 +1641,36 @@ fn game_master_services(
     if let Some(context) = home_context {
         services.insert(Arc::clone(context));
     }
+    services.insert(Arc::clone(identity));
+    services
+}
+
+/// Die Dienste des `OpContext` von `delegate_wave` (PL-90 W03d).
+///
+/// # Description
+/// Spawner (aus dem schwachen Slot, erst hier aufgelöst), `StateStore` — je
+/// nur, wenn vorhanden — und die Identität des Kindes. Die Identität fehlt nie:
+/// sie hängt nicht an einem Laufzeitdienst, sondern an der Rolle, mit der die
+/// Registry gebaut wurde. Fehlen Spawner oder `StateStore`, scheitert
+/// `delegate_wave` selbst fail-closed (`OpError::NotAvailable`).
+///
+/// # Arguments
+/// - `slot`: die Rückwärtsreferenz auf den Managed-Spawner.
+/// - `state_store`: der geteilte `StateStore` des Laufs, falls gesetzt.
+/// - `identity`: die vertrauenswürdige Identität dieses Kindes.
+fn delegate_wave_services(
+    slot: &OnceLock<Weak<ManagedAgentSpawner>>,
+    state_store: Option<&Arc<dyn StateStore>>,
+    identity: &Arc<CallerIdentity>,
+) -> ServiceMap {
+    let mut services = ServiceMap::new();
+    if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
+        services.insert(spawner);
+    }
+    if let Some(store) = state_store {
+        services.insert(Arc::clone(store));
+    }
+    services.insert(Arc::clone(identity));
     services
 }
 
@@ -1664,6 +1737,15 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// # Fehler
     /// [`AgentSpawnError`], wenn `role` **keine** bekannte Rolle ist
     /// (fail-closed, kein `unwrap_or_default`) oder die Montage scheitert.
+    ///
+    /// # Identität (PL-90 W03d)
+    /// Die Operations-Werkzeuge des Kindes (`delegate_wave`, Matrix-Werkzeuge)
+    /// bauen ihren `OpContext` aus einer `ServiceMap`, die eine für dieses
+    /// Kind neu erzeugte `Arc<CallerIdentity>` trägt
+    /// ([`Self::child_caller_identity`]); kein Geschwister teilt sie. Die
+    /// Wissens-Lesewerkzeuge der Kinder (`diary.read`, `palace.*`, …) laufen
+    /// nicht über einen `OpContext` und lesen diese Identität nicht; ihre
+    /// Sicht bleibt die ihres jeweiligen Providers (`with_knowledge_readers`).
     fn build_registry(
         &self,
         role: &str,
@@ -1685,6 +1767,14 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                  no registry profile is declared for it"
                 ),
             })?;
+        // PL-90 W03d: die `ExtensionRegistry` kennt keine Dienste — sie halten
+        // allein die `OpContext`-Fabriken der Operations-Werkzeuge eines
+        // Kindes (`delegate_wave`, Matrix-Werkzeuge). Die Identität entsteht
+        // hier genau einmal je Kind (nie aus `input`/Modell-JSON, nie
+        // zwischen Geschwistern geteilt) und wandert in die `ServiceMap` jeder
+        // dieser Fabriken. Eine Elternrolle ist aus `SpawnInput` nicht
+        // herleitbar; siehe [`Self::child_caller_identity`].
+        let identity = self.child_caller_identity(role);
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
             // Addendum F+G: die organisatorische Rolle eines Kindes ist die
@@ -1825,15 +1915,16 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // `SessionActivation` des Kindes schaltet das Werkzeug zusätzlich nur
         // frei, wenn seine Definition es admittiert.
         if role_gets_delegate_wave(lookup) {
-            registry_builder =
-                registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
+            registry_builder = registry_builder
+                .tool_provider(Arc::new(self.delegate_wave_provider(Arc::clone(&identity))));
         }
         // Runde 7, Teil M: die Matrix-Werkzeuge ausschließlich für den Game
         // Master (rollengebundener `ModelToolProvider`, siehe
         // `matrix_game_master_provider`).
         if !harw_registry_defaults::profile::matrix_tools_for_role(lookup).is_empty() {
-            registry_builder =
-                registry_builder.tool_provider(Arc::new(self.matrix_game_master_provider()));
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                self.matrix_game_master_provider(Arc::clone(&identity)),
+            ));
         }
         // Runde 5, Teil H: `agent.result` für jede Rolle, die Kinder starten
         // darf; der Spawner wird wie bei `delegate_wave` nur schwach gehalten.
@@ -3968,11 +4059,12 @@ mod tests {
         )
         .map_err(ctx("factory builds"))?
         .with_delegate_wave_store(Arc::new(harw_core::InMemoryStateStore::default()));
-        let names: Vec<String> =
-            harw_extension_api::ToolProvider::tools(&factory.delegate_wave_provider())
-                .iter()
-                .map(|spec| spec.name().to_owned())
-                .collect();
+        let provider = factory
+            .delegate_wave_provider(factory.child_caller_identity(role_names::ROOT_ORCHESTRATOR));
+        let names: Vec<String> = harw_extension_api::ToolProvider::tools(&provider)
+            .iter()
+            .map(|spec| spec.name().to_owned())
+            .collect();
         assert_eq!(names, vec![harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned()]);
         Ok(())
     }
@@ -3988,11 +4080,13 @@ mod tests {
             test_chain(&harw_config::ResolvedConfig::default()),
         )
         .map_err(ctx("factory builds"))?;
-        let names: Vec<String> =
-            harw_extension_api::ToolProvider::tools(&factory.matrix_game_master_provider())
-                .iter()
-                .map(|spec| spec.name().to_owned())
-                .collect();
+        let provider = factory.matrix_game_master_provider(
+            factory.child_caller_identity(role_names::MATRIX_GAME_MASTER),
+        );
+        let names: Vec<String> = harw_extension_api::ToolProvider::tools(&provider)
+            .iter()
+            .map(|spec| spec.name().to_owned())
+            .collect();
         assert_eq!(
             names,
             harw_registry_defaults::profile::MATRIX_GAME_MASTER_TOOLS
@@ -4043,10 +4137,12 @@ mod tests {
         )
         .map_err(ctx("factory builds"))?;
 
+        let identity = factory.child_caller_identity(role_names::MATRIX_GAME_MASTER);
         let unbound = game_master_services(
             &factory.spawner_slot,
             factory.delegate_wave_store.as_ref(),
             factory.home_context.as_ref(),
+            &identity,
         );
         assert!(
             unbound
@@ -4060,6 +4156,7 @@ mod tests {
             &factory.spawner_slot,
             factory.delegate_wave_store.as_ref(),
             factory.home_context.as_ref(),
+            &identity,
         );
         let found = bound
             .get::<Arc<harw_home::ResolvedHomeContext>>()
@@ -4068,6 +4165,233 @@ mod tests {
             Arc::ptr_eq(found, &context),
             "die ServiceMap muss dieselbe Instanz tragen"
         );
+        Ok(())
+    }
+
+    /// Ein vertrauenswürdiger Spawn-Auftrag ohne Kontext: nur die
+    /// Eltern-Korrelation, die `build_registry` liest.
+    fn test_spawn_input() -> SpawnInput {
+        SpawnInput {
+            parent_session_id: harw_types::SessionId::new(),
+            handoff_call_id: harw_types::ToolCallId::new(),
+            instructions: None,
+            context: serde_json::Value::Null,
+            ceiling: None,
+        }
+    }
+
+    /// Die Namen aller Werkzeuge einer fertigen Registry.
+    fn registry_tool_names(registry: &ExtensionRegistry) -> Vec<String> {
+        registry
+            .tool_providers()
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|spec| spec.name().to_owned())
+            .collect()
+    }
+
+    /// PL-90 W03d: die Operations-Werkzeuge einer Kind-Registry tragen die
+    /// Identität ihrer Rolle.
+    ///
+    /// Die `ExtensionRegistry` selbst hält keine Dienste; sie liegen in den
+    /// `OpContext`-Fabriken der Operations-Werkzeuge (`delegate_wave`,
+    /// Matrix-Werkzeuge). Geprüft wird deshalb (1) die Identität je Rolle,
+    /// (2) dass beide Dienst-Zusammenstellungen genau diese Instanz tragen und
+    /// (3) dass die Registries dieser Rollen mit ihren Werkzeugen montieren.
+    #[test]
+    fn child_registry_carries_caller_identity_of_its_role() -> TestResult {
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+
+        // (1) Autor ist der Rollenname, die Rolle die Basisrolle (hier gleich),
+        // Vorfahren sind nicht herleitbar, ein Kind ist nie Operator.
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::MATRIX_GAME_MASTER,
+            role_names::EXPLORER,
+        ] {
+            let identity = factory.child_caller_identity(role);
+            assert_eq!(
+                identity.agent_id,
+                harw_knowledge::AgentId::new(role),
+                "{role}"
+            );
+            assert_eq!(
+                identity.role,
+                Some(harw_knowledge::AgentRoleRef::new(role)),
+                "{role}"
+            );
+            assert!(identity.ancestors.is_empty(), "{role}: keine Elternrolle");
+            assert!(!identity.operator, "{role}: ein Kind ist nie Operator");
+        }
+
+        // (2) Beide ServiceMaps tragen dieselbe Instanz, keine Kopie.
+        let identity = factory.child_caller_identity(role_names::ROOT_ORCHESTRATOR);
+        let wave = delegate_wave_services(
+            &factory.spawner_slot,
+            factory.delegate_wave_store.as_ref(),
+            &identity,
+        );
+        let carried = wave.get::<Arc<CallerIdentity>>().ok_or(TestError::Missing(
+            "delegate_wave-ServiceMap ohne Identität",
+        ))?;
+        assert!(
+            Arc::ptr_eq(carried, &identity),
+            "delegate_wave muss dieselbe Identitätsinstanz tragen"
+        );
+        let master = game_master_services(
+            &factory.spawner_slot,
+            factory.delegate_wave_store.as_ref(),
+            factory.home_context.as_ref(),
+            &identity,
+        );
+        let carried = master
+            .get::<Arc<CallerIdentity>>()
+            .ok_or(TestError::Missing("Game-Master-ServiceMap ohne Identität"))?;
+        assert!(
+            Arc::ptr_eq(carried, &identity),
+            "die Matrix-Werkzeuge müssen dieselbe Identitätsinstanz tragen"
+        );
+
+        // (3) Die Registries mit Operations-Werkzeugen montieren.
+        let registry = factory
+            .build_registry(role_names::ROOT_ORCHESTRATOR, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert!(
+            registry_tool_names(&registry)
+                .iter()
+                .any(|name| name == harw_core_bridge::DELEGATE_WAVE_TOOL),
+            "der Orchestrator trägt delegate_wave"
+        );
+        let registry = factory
+            .build_registry(role_names::MATRIX_GAME_MASTER, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let names = registry_tool_names(&registry);
+        assert!(
+            harw_registry_defaults::profile::MATRIX_GAME_MASTER_TOOLS
+                .iter()
+                .all(|tool| names.iter().any(|name| name == tool)),
+            "der Game Master trägt seine Matrix-Werkzeuge: {names:?}"
+        );
+        Ok(())
+    }
+
+    /// PL-90 W03d: ein benutzerdefinierter Agent tritt unter seinem eigenen
+    /// Namen auf, mit der Basisrolle als Rolle (wie alle namensgebundenen
+    /// Tabellen, Plan R9, Teil B).
+    #[test]
+    fn child_caller_identity_of_a_custom_agent_uses_its_base_role() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = home.path().join("agents").join("web-scout");
+        std::fs::create_dir_all(&path).map_err(ctx("Agentenordner"))?;
+        std::fs::write(
+            path.join("definition.toml"),
+            r#"schema = "harwness.agent/v1"
+id = "user.agent.web-scout@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.explorer@1" }
+role = "worker"
+specialization = "web-scout"
+"#,
+        )
+        .map_err(ctx("definition"))?;
+        std::fs::write(path.join("system.md"), "Kurz recherchieren.").map_err(ctx("system.md"))?;
+        let config =
+            harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let agents = harw_registry_defaults::ConfigAgents::from_config(&config)
+            .map_err(ctx("Agenten senken"))?;
+        let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
+            .map_err(ctx("Roster"))?;
+        let factory = RuntimeChildRegistryFactory::with_definitions(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+            roster.definitions().clone(),
+        )
+        .with_custom_agents(roster.custom_wiring());
+
+        let identity = factory.child_caller_identity("web-scout");
+        assert_eq!(identity.agent_id, harw_knowledge::AgentId::new("web-scout"));
+        assert_eq!(
+            identity.role,
+            Some(harw_knowledge::AgentRoleRef::new(role_names::EXPLORER))
+        );
+        assert!(identity.ancestors.is_empty());
+        assert!(!identity.operator);
+        Ok(())
+    }
+
+    /// PL-90 W03d (Audit W03d-1): der Gedächtnis-Fakten-Recall der Wurzel
+    /// (`MemoryFactsContextProvider`, Namensraum
+    /// `harw.runtime.memory_facts`) ist ausdrücklich nur der Wurzel
+    /// vorbehalten. Keine Kind-Registry registriert einen Context-Provider in
+    /// diesem Namensraum.
+    #[test]
+    fn child_registry_has_no_memory_facts_provider() -> TestResult {
+        use harw_extension_api::types::{ContextFragment, TurnInputContext};
+        use harw_extension_api::{ContextProvider, ExtFuture};
+
+        /// Gegenprobe: ein Provider im Namensraum der Wurzel-Fakten.
+        struct FactsStub;
+        impl ContextProvider for FactsStub {
+            fn contribute<'a>(
+                &'a self,
+                _ctx: &'a TurnInputContext,
+            ) -> ExtFuture<'a, Vec<ContextFragment>> {
+                Box::pin(async { Vec::new() })
+            }
+
+            fn namespace(&self) -> &'static str {
+                harw_context::sources::memory_facts.namespace
+            }
+        }
+
+        let namespace: &str = harw_context::sources::memory_facts.namespace;
+        // Die Abfrage unten erkennt einen solchen Provider tatsächlich.
+        let probe = ExtensionRegistry::builder()
+            .context_provider(Arc::new(FactsStub))
+            .map_err(|error| TestError::Unexpected(format!("{error:?}")))?
+            .build();
+        assert!(probe.context_provider_namespace(namespace).is_some());
+        assert!(
+            probe
+                .context_providers()
+                .iter()
+                .any(|provider| provider.namespace() == namespace)
+        );
+
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::CODING_ORCHESTRATOR,
+            role_names::EXPLORER,
+            role_names::EXECUTOR,
+        ] {
+            let registry = factory
+                .build_registry(role, &test_spawn_input(), None)
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            assert!(
+                registry.context_provider_namespace(namespace).is_none(),
+                "{role}: kein Fakten-Namensraum in der Kind-Registry"
+            );
+            assert!(
+                !registry
+                    .context_providers()
+                    .iter()
+                    .any(|provider| provider.namespace() == namespace),
+                "{role}: kein Fakten-Provider in der Kind-Registry"
+            );
+        }
         Ok(())
     }
 

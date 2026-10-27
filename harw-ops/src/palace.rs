@@ -48,7 +48,9 @@
 //! Alle Lesepfade laufen über `harw_knowledge::memory::recall::search_with`
 //! mit der Sicht des echten Aufrufers
 //! ([`crate::knowledge_common::KnowledgeCaller`]: Operator → `OperatorOnly`,
-//! Agent → `SelfOnly`; dieselbe Disziplin wie `/context-proposal`);
+//! Agent → `SelfOnly`; dieselbe Disziplin wie `/context-proposal`) und, falls
+//! die Montage eine Identität vorgibt, mit dieser
+//! ([`crate::knowledge_common::KnowledgeCaller::query`]);
 //! `KnowledgeIndex::get` wird nur mit Ids aufgerufen, die der Recall bereits
 //! als sichtbar bestätigt hat. Backlinks werden auf sichtbare Quellen
 //! gefiltert. Ein Thema wird nur promotet, wenn es für den Aufrufer sichtbar
@@ -64,8 +66,7 @@
 //! - [`OpError::Execution`] — Index-/Ein-/Ausgabefehler.
 
 use harw_knowledge::artifact::{
-    ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, MAX_RECALL_ARTIFACTS,
-    MAX_RECALL_HOPS, RecallQuery,
+    ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, MAX_RECALL_ARTIFACTS, MAX_RECALL_HOPS,
 };
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -78,7 +79,7 @@ use harw_knowledge::memory::palace::{
 };
 use harw_knowledge::memory::recall::{ListAllRanker, search, search_with};
 use harw_knowledge::memory::topic;
-use harw_knowledge::{AgentId, KnowledgeLock, KnowledgeStore, VisibilityScope};
+use harw_knowledge::{AgentId, KnowledgeLock, KnowledgeStore};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 
@@ -194,11 +195,10 @@ pub fn run_palace_as(
 ) -> Result<OpOutput, OpError> {
     let args = KnowledgeArgs::parse(tokens, &[])?;
     let tail = args.rest();
-    let viewer = &caller.viewer;
     match args.subcommand() {
-        None | Some("list") => list(store, viewer),
-        Some("show") => show(store, viewer, tail),
-        Some("search") => search_nodes(store, viewer, tail),
+        None | Some("list") => list(store, caller),
+        Some("show") => show(store, caller, tail),
+        Some("search") => search_nodes(store, caller, tail),
         Some("promote") => promote(store, caller, tail, now),
         Some("supersede") => supersede(store, caller, tail, now),
         Some("edit") => edit(store, caller, tail, now),
@@ -252,9 +252,9 @@ fn node_summary(node: &KnowledgeArtifact) -> serde_json::Value {
     })
 }
 
-fn list(store: &KnowledgeStore, viewer: &VisibilityScope) -> Result<OpOutput, OpError> {
+fn list(store: &KnowledgeStore, caller: &KnowledgeCaller) -> Result<OpOutput, OpError> {
     let index = rebuild(store)?;
-    let nodes = visible_nodes(&index, viewer)?;
+    let nodes = visible_nodes(&index, caller)?;
     let summaries: Vec<serde_json::Value> = nodes.iter().map(node_summary).collect();
     let data = serde_json::json!({ "nodes": summaries });
     if nodes.is_empty() {
@@ -294,12 +294,13 @@ fn rebuild(store: &KnowledgeStore) -> Result<Arc<KnowledgeIndex>, OpError> {
     })
 }
 
-/// Alle für `viewer` sichtbaren Palace-Knoten (einziger Lesepfad).
+/// Alle für `caller` sichtbaren Palace-Knoten (einziger Lesepfad); die
+/// Anfrage trägt die Identität des Aufrufers ([`KnowledgeCaller::query`]).
 fn visible_nodes(
     index: &KnowledgeIndex,
-    viewer: &VisibilityScope,
+    caller: &KnowledgeCaller,
 ) -> Result<Vec<KnowledgeArtifact>, OpError> {
-    let mut query = RecallQuery::new(String::new(), viewer.clone());
+    let mut query = caller.query(String::new());
     query.kinds = vec![ArtifactKind::PalaceNode];
     query.max_hops = 0;
     let result = search_with(index, &query, &ListAllRanker).map_err(map_knowledge_error)?;
@@ -312,7 +313,7 @@ fn visible_nodes(
 
 fn show(
     store: &KnowledgeStore,
-    viewer: &VisibilityScope,
+    caller: &KnowledgeCaller,
     tail: &[String],
 ) -> Result<OpOutput, OpError> {
     let raw = tail
@@ -320,7 +321,7 @@ fn show(
         .ok_or_else(|| OpError::InvalidArguments("Aufruf: /palace show <id>".to_owned()))?;
     let target = node_id(raw);
     let index = rebuild(store)?;
-    let node = visible_nodes(&index, viewer)?
+    let node = visible_nodes(&index, caller)?
         .into_iter()
         .find(|artifact| artifact.id == target)
         .ok_or_else(|| {
@@ -333,7 +334,7 @@ fn show(
     let backlinks: Vec<String> = index
         .backlinks(&node.id)
         .into_iter()
-        .filter(|source| source.visibility.visible_to_caller(viewer))
+        .filter(|source| caller.can_read(&source.visibility))
         .map(|source| source.id.to_string())
         .collect();
 
@@ -364,7 +365,7 @@ fn show(
 
 fn search_nodes(
     store: &KnowledgeStore,
-    viewer: &VisibilityScope,
+    caller: &KnowledgeCaller,
     tail: &[String],
 ) -> Result<OpOutput, OpError> {
     let args = KnowledgeArgs::parse(tail, SEARCH_FLAGS)?;
@@ -386,7 +387,7 @@ fn search_nodes(
     };
 
     let index = rebuild(store)?;
-    let mut query = RecallQuery::new(text.trim(), viewer.clone());
+    let mut query = caller.query(text.trim());
     query.kinds = vec![ArtifactKind::PalaceNode];
     query.max_hops = max_hops;
     query.max_artifacts = max_artifacts;
@@ -1195,6 +1196,7 @@ mod tests {
         let agent = KnowledgeCaller {
             agent: AgentId::new("root-explorer"),
             viewer: VisibilityScope::SelfOnly,
+            identity: None,
         };
         for tokens in [
             vec!["edit", "a", "x"],

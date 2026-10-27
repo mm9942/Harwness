@@ -129,7 +129,9 @@ mod test_support;
 pub mod visibility;
 pub mod workbench;
 
-pub use artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, RecallQuery};
+pub use artifact::{
+    ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, RecallQuery, artifact_visible,
+};
 pub use context_provider::{
     KNOWLEDGE_CONTEXT_MAX_TRUST, KNOWLEDGE_CONTEXT_MAY_CARRY_USER_CONTENT,
     KNOWLEDGE_CONTEXT_NAMESPACE, KnowledgeContextProvider,

@@ -15,7 +15,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::{ArtifactId, ArtifactKind, KnowledgeArtifact};
+use crate::artifact::{ArtifactId, ArtifactKind, KnowledgeArtifact, RecallQuery, artifact_visible};
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::memory::core::core_memory_id;
 use crate::store::KnowledgeStore;
@@ -161,6 +161,26 @@ impl KnowledgeIndex {
         self.artifacts
             .values()
             .filter(move |artifact| artifact.frontmatter.visibility.visible_to_caller(caller))
+    }
+
+    /// Iterate over artifacts visible to `query`'s caller (§2.3, PL-90 W03d).
+    ///
+    /// Unlike [`Self::visible_to`], which only has a bare scope to go on, this
+    /// decides through [`artifact_visible`]: identity-based when the query
+    /// carries a trusted `CallerIdentity`, the same fail-closed scope
+    /// heuristic as [`Self::visible_to`] otherwise. Author and scope are read
+    /// from the indexed frontmatter fields, never from `Frontmatter::extra`.
+    pub fn visible_to_query<'a>(
+        &'a self,
+        query: &'a RecallQuery,
+    ) -> impl Iterator<Item = &'a KnowledgeArtifact> {
+        self.artifacts.values().filter(move |artifact| {
+            artifact_visible(
+                &artifact.frontmatter.visibility,
+                &artifact.frontmatter.author_agent_id,
+                query,
+            )
+        })
     }
 
     /// Serialize the index contents to a JSON cache blob.
@@ -847,5 +867,38 @@ mod tests {
         std::fs::remove_dir_all(first_root).ok();
         std::fs::remove_dir_all(second_root).ok();
         Ok(())
+    }
+
+    /// `visible_to_query` follows the bound identity; without one it is the
+    /// same fail-closed scope heuristic as `visible_to`.
+    #[test]
+    fn visible_to_query_follows_the_bound_identity() {
+        use crate::caller_identity::CallerIdentity;
+
+        let mut index = KnowledgeIndex::new();
+        for (id, author) in [("topic/a", "a"), ("topic/b", "b")] {
+            index.insert(KnowledgeArtifact::new(
+                ArtifactId::new(id),
+                ArtifactKind::TopicMemory,
+                Frontmatter::new(
+                    AgentId::new(author),
+                    VisibilityScope::SelfOnly,
+                    jiff::Timestamp::UNIX_EPOCH,
+                ),
+                "body",
+            ));
+        }
+
+        let anonymous = RecallQuery::new("", VisibilityScope::SelfOnly);
+        assert_eq!(index.visible_to_query(&anonymous).count(), 0);
+
+        let identity_a = CallerIdentity::new(AgentId::new("a"));
+        let query_a =
+            RecallQuery::new("", VisibilityScope::SelfOnly).with_caller_identity(identity_a);
+        let ids: Vec<ArtifactId> = index
+            .visible_to_query(&query_a)
+            .map(|artifact| artifact.id.clone())
+            .collect();
+        assert_eq!(ids, vec![ArtifactId::new("topic/a")]);
     }
 }

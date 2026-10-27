@@ -17,6 +17,18 @@
 //!   evidence was observed or verified; only the trusted runtime upgrades it.
 //! - `deny_unknown_fields` makes an extra field (for example `transcript`) a
 //!   deserialization error.
+//!
+//! # Caps shared with `harw-research`
+//! The parent-facing caps mirror those of `harw_research::sanitize_for_parent`
+//! (the sanitizer for the read-only `ReturnEnvelope` contract) and **must be
+//! kept equal**: [`MAX_SUMMARY_CHARS`] = `harw_research::MAX_SUMMARY_CHARS`,
+//! [`MAX_EVIDENCE_REFS`] = `harw_research::MAX_LIST_ENTRIES` and
+//! [`MAX_LOCATOR_CHARS`] = `harw_research::MAX_ENTRY_CHARS`. The test
+//! `caps_match_harw_research_envelope_caps` fails when one side drifts. The
+//! two gates differ in shape, not in size: this one has typed evidence
+//! references and cuts the summary at exactly the cap, while the research gate
+//! bounds string lists and a JSON payload and counts its `…` truncation marker
+//! inside the cap.
 
 use std::fmt;
 
@@ -50,6 +62,7 @@ pub enum ChildStatus {
 
 /// One evidence reference returned by a child.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
     /// Where the evidence lives; must stay inside the child's namespace.
     pub locator: String,
@@ -289,6 +302,16 @@ mod tests {
         let exact = sanitize(raw, PREFIX).map_err(ctx("exact summary sanitizes"))?;
         assert!(!exact.summary_truncated);
         Ok(())
+    }
+
+    /// The parent-facing caps are shared with `harw-research`'s envelope
+    /// sanitizer; a one-sided change would let one gate accept what the other
+    /// refuses.
+    #[test]
+    fn caps_match_harw_research_envelope_caps() {
+        assert_eq!(MAX_SUMMARY_CHARS, harw_research::MAX_SUMMARY_CHARS);
+        assert_eq!(MAX_EVIDENCE_REFS, harw_research::MAX_LIST_ENTRIES);
+        assert_eq!(MAX_LOCATOR_CHARS, harw_research::MAX_ENTRY_CHARS);
     }
 
     #[test]
