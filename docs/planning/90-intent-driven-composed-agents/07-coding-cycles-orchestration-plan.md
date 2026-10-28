@@ -7,7 +7,7 @@ Baseline: `dev` at `fcb12b41f5e53c19cc20607a63c98b829452b505` (PR #151). Revalid
 
 Deliver real end-to-end coding cycles, with two complementary execution modes: (1) parallel coding workers with genuinely isolated file rights and (2) a durable, long-lived, tool-using model supervisor that can invoke governed tools and cycles. Installation must make the necessary components available and explain readiness; automatic execution must be demonstrable, not just a configuration flag. Preserve user configuration and the existing host source installer.
 
-Owner decisions still required: whether each start needs approval or a bounded, revocable preauthorized policy; exactly what `make install` starts and whether background services are opted in; whether isolation uses per-worker worktrees, enforceable exact-file capabilities, or both; and the policy for conflicts, integration and owner acceptance. No default below supersedes these decisions.
+Owner decisions still required: whether each start needs approval or a bounded, revocable preauthorized policy; exactly what `make install` starts and whether background services are opted in; whether per-worker worktrees complement the mandatory enforceable file and OS boundaries; and the policy for conflicts, integration and owner acceptance. No default below supersedes these decisions.
 
 ## Current evidence and competing approaches
 
@@ -42,7 +42,7 @@ Owner decisions still required: whether each start needs approval or a bounded, 
 ### W2 — File isolation and workspace lifecycle
 
 - Define a versioned, non-widenable per-worker scope and propagate it through trusted authority, compiled agent snapshots, job claims and reissue. Unknown versions must fail closed on all supported workers.
-- Implement either verified file-capability enforcement across every effect path, or isolated worktrees with explicit admission and controlled integration; demonstrate how writable mounts, linked Git directories, shell, symlinks and extension paths are constrained. Fail closed for unsupported backends.
+- Implement verified per-worker authority and OS containment across every effect path, regardless of whether worktrees are used. Worktrees isolate repository state, not permissions; they must never substitute for pre-mutation enforcement. If used, provide explicit admission and controlled integration. Demonstrate that writable mounts, linked/shared Git directories, shell, absolute and symlinked host paths and extension paths cannot escape the admitted scope; fail closed for unsupported backends.
 - Integrate fenced reservation with canonical repository identity and base revision; test overlap, cancellation, reclaim and rollback. Distinguish lease ownership from actual authorization.
 
 ### W3 — Durable model supervisor and coding execution
@@ -59,7 +59,7 @@ Owner decisions still required: whether each start needs approval or a bounded, 
 
 ### W5 — Security, verification and rollout
 
-- Write negative and crash/restart integration tests before enabling write automation. Cover foreign tenant/workspace, stale epoch and approval, duplicate admission, lost acknowledgement after a real write, cancellation, symlink/rename escape, restricted worker trying another worker's file, exhausted budget, provider outage, conflict and failed verification.
+- Write negative and crash/restart integration tests before enabling write automation. Cover foreign tenant/workspace, stale epoch and approval, duplicate admission, lost acknowledgement after a real write, cancellation, symlink/rename and parent-directory replacement races, absolute host paths, sibling-worktree/shared-Git-directory writes, restricted worker trying another worker's file, exhausted budget, provider outage, conflict and failed verification.
 - Exercise an end-to-end two-worker change with disjoint files and actual overlap, integration and central verification; prove the one-agent mode can use its approved tools and cycles without relying on children. Record versions and exact commit.
 - Run formatting, clippy, workspace tests, documentation tests, xtask architecture/privilege gates, relevant sandbox/DoD tests and full CI on the final head. Report local tests separately from GitHub Actions. No merge or enablement while required security or recovery checks are unverified.
 
