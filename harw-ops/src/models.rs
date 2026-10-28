@@ -41,15 +41,29 @@
 //! Zustandslos; Persistenz über den austauschbaren
 //! [`crate::config_util::SelectionPersistence`]-Dienst (bestes Bemühen, nie `Err`).
 //!
+//! # Lebenszyklus der Provider-Angebote
+//! `set` und `worker` prüfen die ausdrücklich gewählte Provider-/Modell-ID
+//! mit [`crate::live_model::enforce_lifecycle`], **bevor** etwas persistiert
+//! oder ein Provider-Client gebaut wird: ein abgeschaltetes (retired) Modell
+//! wird mit dem empfohlenen Ersatz abgelehnt und die Profil-`config.toml`
+//! bleibt unverändert; ein abgekündigtes (deprecated) Modell wird gespeichert
+//! und die Bestätigung trägt die Warnung. Geprüft und persistiert wird stets
+//! die kanonische Katalog-ID: auch `provider/alias` wird vorher auf die
+//! konfigurierte Modell-ID **dieses Providers** aufgelöst (`resolve_target`);
+//! ein Alias oder Schlüssel, der nur zu einem anderen Provider gehört, wird
+//! abgelehnt, bevor etwas persistiert wird.
+//!
 //! # Fehler
 //! - [`OpError::InvalidArguments`]: unbekanntes Sub-Kommando, unbekannte Rolle,
-//!   fehlendes/unauflösbares Ziel, Worker-Modell eines fremden Providers.
+//!   fehlendes/unauflösbares Ziel, Worker-Modell eines fremden Providers,
+//!   laut Provider-Lebenszyklus abgeschaltetes Modell (`set`, `worker`).
 //! - [`OpError::Execution`]: Config-Discovery fehlgeschlagen.
 
 use harw_config::{ModelRole, ResolvedConfig, RoleModelRow};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 /// Hinweis, der jeder Anzeige und jeder Änderung beigefügt wird.
 pub(crate) const EFFECTIVE_NEXT_SESSION: &str =
@@ -154,7 +168,7 @@ fn enabled_provider_name(config: &ResolvedConfig, name: &str) -> Option<String> 
 
 /// Normalisiert einen Provider-Verweis aus dem Modellkatalog auf den
 /// kanonischen Provider-Namen (Schlüssel → `name`); unbekannt bleibt unverändert.
-fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> String {
+pub(crate) fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> String {
     config
         .providers
         .iter()
@@ -163,37 +177,171 @@ fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> String {
         .unwrap_or_else(|| name.to_owned())
 }
 
+/// Gehört der Katalogeintrag `entry` zum kanonischen Provider `provider`?
+fn model_belongs_to(
+    config: &ResolvedConfig,
+    entry: &harw_config::ModelToml,
+    provider: &str,
+) -> bool {
+    canonical_provider_name(config, &entry.provider) == provider
+}
+
+/// Löst eine Modellkennung (Katalog-Schlüssel, `id` oder Alias) **innerhalb
+/// des Providers `provider`** zur kanonischen Modell-ID des Katalogs auf.
+///
+/// # Argumente
+/// - `provider`: kanonischer Provider-Name (aus [`enabled_provider_name`]);
+///   nur Katalogeinträge dieses Providers werden berücksichtigt.
+/// - `model`: Modellteil hinter dem Provider-Präfix (bereits getrimmt).
+///
+/// # Beschreibung
+/// Rangfolge, jeweils nur unter den Modellen von `provider`: Katalog-Schlüssel,
+/// dann `id`, dann Alias. Die Auflösung ist deterministisch (keine Abhängigkeit
+/// von der Iterationsreihenfolge der Konfiguration): derselbe Alias bei zwei
+/// Providern liefert je Provider dessen eigene ID. Eine Kennung, die **kein**
+/// Provider als Schlüssel oder Alias führt, bleibt unverändert (frei wählbare
+/// Modell-ID des Providers); das gilt auch für die reine `id` eines Modells
+/// eines anderen Providers, die dabei nicht umgeschrieben wird.
+///
+/// # Fehler
+/// [`OpError::InvalidArguments`] (fail-closed, vor jeder Persistenz), wenn
+/// - `model` bei `provider` mehrere verschiedene Modelle als Alias benennt
+///   (mehrdeutige Konfiguration), oder
+/// - `model` bei `provider` unbekannt ist, aber Katalog-Schlüssel oder Alias
+///   eines Modells eines **anderen** Providers ist: sonst entstünde ein
+///   Paar aus Provider A und dem Modell von Provider B.
+fn canonical_model_id(
+    config: &ResolvedConfig,
+    provider: &str,
+    model: &str,
+) -> Result<String, OpError> {
+    if let Some(entry) = config
+        .models
+        .get(model)
+        .filter(|entry| model_belongs_to(config, entry, provider))
+    {
+        return Ok(entry.id.clone());
+    }
+    let own: Vec<&harw_config::ModelToml> = config
+        .models
+        .values()
+        .filter(|entry| model_belongs_to(config, entry, provider))
+        .collect();
+    if own.iter().any(|entry| entry.id == model) {
+        return Ok(model.to_owned());
+    }
+    let aliased: BTreeSet<&str> = own
+        .iter()
+        .filter(|entry| entry.aliases.iter().any(|alias| alias == model))
+        .map(|entry| entry.id.as_str())
+        .collect();
+    let mut aliased = aliased.into_iter();
+    match (aliased.next(), aliased.next()) {
+        (Some(id), None) => return Ok(id.to_owned()),
+        (Some(first), Some(second)) => {
+            return Err(OpError::InvalidArguments(format!(
+                "Alias '{model}' ist bei Provider '{provider}' mehrdeutig \
+                 (z. B. '{first}' und '{second}'). Bitte die Modell-ID angeben."
+            )));
+        }
+        (None, _) => {}
+    }
+    let others: BTreeSet<String> = config
+        .models
+        .iter()
+        .filter(|(key, entry)| {
+            (key.as_str() == model || entry.aliases.iter().any(|alias| alias == model))
+                && !model_belongs_to(config, entry, provider)
+        })
+        .map(|(_, entry)| canonical_provider_name(config, &entry.provider))
+        .collect();
+    let Some(first) = others.first() else {
+        return Ok(model.to_owned());
+    };
+    let list = others
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(OpError::InvalidArguments(format!(
+        "'{model}' ist ein Alias bzw. Katalog-Schlüssel von Provider {list}, aber kein Modell \
+         von '{provider}'. Bitte '{first}/{model}' oder eine Modell-ID von '{provider}' angeben."
+    )))
+}
+
 /// Löst `target` zu `(provider, modell)` auf.
 ///
 /// # Beschreibung
 /// 1. Bekannte Modell-ID: Schlüssel in `config.models`, `id` oder Alias →
-///    Provider aus dem Katalog, Modell = kanonische `id`.
+///    Provider aus dem Katalog, Modell = kanonische `id`. Passt die Kennung
+///    auf mehrere verschiedene (Provider, `id`)-Paare — derselbe Alias bei
+///    zwei Providern oder bei zwei Modellen eines Providers —, ist sie
+///    mehrdeutig und wird abgelehnt (sonst entschiede die Iterationsreihenfolge
+///    der Konfiguration); `provider/modell` löst die Mehrdeutigkeit auf.
 /// 2. Sonst `provider/modell`, getrennt am ersten `/`, wenn das Präfix ein
-///    aktivierter Provider ist.
+///    aktivierter Provider ist. Der Modellteil wird **providergenau** (nur
+///    Katalogmodelle dieses Providers) auf die kanonische Katalog-`id`
+///    normalisiert (Schlüssel oder Alias, z. B. `mistral/legacy-ocr` →
+///    `mistral`, `mistral-ocr-4-0`); eine allen Providern unbekannte Kennung
+///    (frei wählbare Modell-ID des Providers) bleibt unverändert. Nur so
+///    sieht die Lebenszyklus-Prüfung vor der Persistenz dieselbe ID wie die
+///    spätere Laufzeitprüfung.
 ///
 /// # Fehler
-/// [`OpError::InvalidArguments`] mit deutscher Meldung, wenn beides scheitert.
+/// [`OpError::InvalidArguments`] mit deutscher Meldung, wenn beides scheitert,
+/// sowie fail-closed für eine mehrdeutige unpräfixierte Kennung (die
+/// Meldung nennt die Kandidaten als sortierte `provider/id`-Liste), für einen
+/// Alias/Schlüssel, der nur zu einem anderen Provider gehört, und für einen
+/// bei dem Provider mehrdeutigen Alias (siehe `canonical_model_id`).
 pub(crate) fn resolve_target(
     config: &ResolvedConfig,
     target: &str,
 ) -> Result<(String, String), OpError> {
-    let known = config
+    // Alle Katalogeinträge, auf die `target` als Schlüssel, `id` oder Alias
+    // passt — als (Provider, Modell-ID)-Paare, sortiert und ohne Dubletten
+    // (dasselbe Modell unter zwei Schlüsseln ist eindeutig).
+    let candidates: Vec<(String, String)> = config
         .models
-        .get(target)
-        .or_else(|| crate::model::configured_model(config, target));
-    if let Some(model) = known {
-        return Ok((
-            canonical_provider_name(config, &model.provider),
-            model.id.clone(),
-        ));
-    }
-    if let Some((prefix, rest)) = target.split_once('/') {
-        let rest = rest.trim();
-        if !rest.is_empty()
-            && let Some(provider) = enabled_provider_name(config, prefix.trim())
-        {
-            return Ok((provider, rest.to_owned()));
+        .iter()
+        .filter(|(key, entry)| {
+            key.as_str() == target
+                || entry.id == target
+                || entry.aliases.iter().any(|alias| alias == target)
+        })
+        .map(|(_, entry)| {
+            (
+                canonical_provider_name(config, &entry.provider),
+                entry.id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    match candidates.as_slice() {
+        [] => {}
+        [(provider, model)] => return Ok((provider.clone(), model.clone())),
+        several => {
+            let list = several
+                .iter()
+                .map(|(provider, model)| format!("{provider}/{model}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(OpError::InvalidArguments(format!(
+                "Mehrdeutiges Modell: '{target}' passt auf mehrere Katalogmodelle ({list}). \
+                 Bitte 'provider/modell' angeben."
+            )));
         }
+    }
+    let prefixed = target.split_once('/').and_then(|(prefix, rest)| {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        enabled_provider_name(config, prefix.trim()).map(|provider| (provider, rest))
+    });
+    if let Some((provider, rest)) = prefixed {
+        let model = canonical_model_id(config, &provider, rest)?;
+        return Ok((provider, model));
     }
     Err(OpError::InvalidArguments(format!(
         "Unbekanntes Modell: '{target}'. Erwartet wird eine bekannte Modell-ID bzw. ein Alias \
@@ -362,6 +510,11 @@ fn handle_set(
     effort_level: Option<harw_types::ReasoningEffort>,
 ) -> Result<OpOutput, OpError> {
     let (provider, model) = resolve_target(config, target)?;
+    // Lebenszyklus der ausdrücklichen Wahl, noch vor Provider-Bau und
+    // Persistenz: ein abgeschaltetes Modell wird abgelehnt und lässt Profil-
+    // Config und laufende Montage unverändert, ein abgekündigtes wird mit
+    // Warnung gespeichert.
+    let lifecycle_warning = crate::live_model::enforce_lifecycle(&provider, &model)?;
     let persistence = crate::config_util::selection_persistence(ctx);
     // Live-Übernahme: nur eine Stelle, deren Provider jetzt erreichbar ist,
     // wird überhaupt gespeichert (sonst bliebe eine unbrauchbare Wahl stehen).
@@ -415,11 +568,15 @@ fn handle_set(
         (base, None) => base,
     };
 
-    let text = finish_role_text(
+    let mut text = finish_role_text(
         format!("Modell für {} gesetzt: {provider}/{model}", role.label()),
         note.as_deref(),
         live,
     );
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
     Ok(OpOutput {
         text,
         data: Some(json!({
@@ -669,6 +826,30 @@ mod tests {
         config
     }
 
+    /// [`test_config`] plus `provider-b` und Katalogmodelle, die denselben
+    /// Alias (`shared`) bei **zwei** Providern führen, sowie einen Alias
+    /// (`b-only`) und einen Katalog-Schlüssel (`b-key`), die nur zu
+    /// `provider-b` gehören.
+    fn shared_alias_config() -> ResolvedConfig {
+        let mut config = test_config();
+        config
+            .providers
+            .insert("provider-b".to_owned(), provider("provider-b", true));
+        config.models.insert(
+            "model-a-shared".to_owned(),
+            model("model-a-shared-id", "provider-a", &["shared"]),
+        );
+        config.models.insert(
+            "model-b-shared".to_owned(),
+            model("model-b-shared-id", "provider-b", &["shared", "b-only"]),
+        );
+        config.models.insert(
+            "b-key".to_owned(),
+            model("model-b-key-id", "provider-b", &[]),
+        );
+        config
+    }
+
     struct Fixture {
         ctx: OpContext,
         recorder: Arc<RecordingSelectionPersistence>,
@@ -836,6 +1017,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_target_normalizes_provider_prefixed_alias_to_canonical_id() -> TestResult {
+        let config = test_config();
+        // Schlüssel, ID und Alias hinter dem Provider-Präfix landen alle bei
+        // der kanonischen Katalog-ID; der genannte Provider bleibt maßgeblich.
+        for target in [
+            "provider-a/model-a",
+            "provider-a/model-a-2026",
+            "provider-a/a-latest",
+            "provider-a/ a-latest ",
+        ] {
+            let resolved = resolve_target(&config, target).map_err(ctx("provider/alias"))?;
+            assert_eq!(
+                resolved,
+                ("provider-a".to_owned(), "model-a-2026".to_owned()),
+                "Ziel '{target}'"
+            );
+        }
+        // Eine unbekannte Kennung bleibt unverändert (freie Provider-Modell-ID).
+        let resolved =
+            resolve_target(&config, "provider-a/unbekannt").map_err(ctx("freie Modell-ID"))?;
+        assert_eq!(resolved, ("provider-a".to_owned(), "unbekannt".to_owned()));
+        Ok(())
+    }
+
+    #[test]
     fn resolve_target_splits_provider_prefix_at_first_slash() -> TestResult {
         let config = test_config();
         let resolved = resolve_target(&config, "openrouter/nvidia/nemotron-x")
@@ -911,6 +1117,532 @@ mod tests {
         let data = data(&output)?;
         assert_eq!(data["live"]["provider"], serde_json::Value::Null);
         assert_eq!(data["live"]["model"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    // ── Provider-Lebenszyklus: abgeschaltete und abgekündigte Modelle ─────────
+
+    /// Ein in der eingebetteten Lebenszyklus-Tabelle abgeschaltetes Angebot
+    /// (Mistral OCR 4.0, retired 2026-09-30 — für die echte Uhr sicher in der
+    /// Vergangenheit; Ersatz `mistral-ocr-4-1`).
+    const RETIRED_PROVIDER: &str = "mistral";
+    const RETIRED_MODEL: &str = "mistral-ocr-4-0";
+    /// In der Konfiguration eingetragener Alias des abgeschalteten Modells.
+    const RETIRED_ALIAS: &str = "legacy-ocr";
+
+    /// Ein abgekündigtes Angebot ohne angekündigtes Retirement (Claude Mythos
+    /// Preview; Ersatz `claude-mythos-5`) — bleibt für die echte Uhr wählbar.
+    const DEPRECATED_PROVIDER: &str = "anthropic";
+    const DEPRECATED_MODEL: &str = "claude-mythos-preview";
+
+    /// Profil-Config, die ein abgelehnter Wechsel byte-gleich lassen muss.
+    const SEEDED_PROFILE: &str =
+        "default_provider = \"provider-a\"\ndefault_model = \"model-a-2026\"\n";
+
+    /// [`test_config`] plus aktivierte Provider für das abgeschaltete und das
+    /// abgekündigte Angebot und das abgeschaltete Modell im Katalog (das
+    /// abgekündigte wird per `provider/modell` gewählt).
+    fn lifecycle_test_config() -> ResolvedConfig {
+        let mut config = test_config();
+        config.providers.insert(
+            RETIRED_PROVIDER.to_owned(),
+            provider(RETIRED_PROVIDER, true),
+        );
+        config.providers.insert(
+            DEPRECATED_PROVIDER.to_owned(),
+            provider(DEPRECATED_PROVIDER, true),
+        );
+        config.models.insert(
+            RETIRED_MODEL.to_owned(),
+            model(RETIRED_MODEL, RETIRED_PROVIDER, &[RETIRED_ALIAS]),
+        );
+        config
+    }
+
+    /// Kontext mit Controller (Live- und UIA-Auswahl belegt), Config und
+    /// gebundenem Root-Space, dessen Profil-`config.toml` mit
+    /// [`SEEDED_PROFILE`] belegt ist — die echte Datei-Persistenz.
+    struct HomeFixture {
+        ctx: OpContext,
+        controller: Arc<NullSessionController>,
+        config_path: std::path::PathBuf,
+        _root: tempfile::TempDir,
+    }
+
+    fn home_fixture(config: ResolvedConfig) -> TestResult<HomeFixture> {
+        let root = tempfile::tempdir().map_err(ctx("Root-Space anlegen"))?;
+        let profile_dir = root.path().join("profiles").join("default");
+        std::fs::create_dir_all(&profile_dir).map_err(ctx("Profilordner anlegen"))?;
+        let config_path = profile_dir.join("config.toml");
+        std::fs::write(&config_path, SEEDED_PROFILE).map_err(ctx("Profil-Config anlegen"))?;
+        let home = crate::config_util::test_home_context(root.path())?;
+
+        let controller = Arc::new(NullSessionController::new());
+        controller
+            .set_active_provider("provider-a".to_owned())
+            .map_err(ctx("Provider setzen"))?;
+        controller
+            .set_active_model("model-a-2026".to_owned())
+            .map_err(ctx("Modell setzen"))?;
+        controller
+            .set_uia_selection(harw_operations::session_control::UiaSelection::new(
+                Some("provider-a".to_owned()),
+                Some("model-a-2026".to_owned()),
+            ))
+            .map_err(ctx("UIA-Auswahl setzen"))?;
+
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&controller) as SharedSessionController);
+        services.insert(Arc::new(config));
+        services.insert(home);
+        let op_ctx = crate::knowledge_test_support::op_context(services)?;
+        Ok(HomeFixture {
+            ctx: op_ctx,
+            controller,
+            config_path,
+            _root: root,
+        })
+    }
+
+    /// Führt `/models <tokens>` gegen den Root-Space-Kontext aus und erwartet
+    /// die Ablehnung: `InvalidArguments`, dessen Meldung jedes Stichwort aus
+    /// `needles` enthält, Controller-Snapshot unverändert und Profil-
+    /// `config.toml` byte-gleich.
+    async fn assert_refused_and_untouched(
+        fixture: &HomeFixture,
+        tokens: &[&str],
+        needles: &[&str],
+    ) -> TestResult {
+        let before = fixture.controller.snapshot();
+        let args = ModelsArgs::from_raw_args(&toks(tokens)).map_err(ctx("Argumente"))?;
+        match super::models(&fixture.ctx, args).await {
+            Err(OpError::InvalidArguments(message)) => {
+                for needle in needles {
+                    assert!(
+                        message.contains(needle),
+                        "{tokens:?}: '{needle}' fehlt in '{message}'"
+                    );
+                }
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "{tokens:?}: erwartet InvalidArguments, gefunden: {other:?}"
+                )));
+            }
+        }
+        assert_eq!(
+            fixture.controller.snapshot(),
+            before,
+            "{tokens:?}: der Controller bleibt unverändert"
+        );
+        let persisted =
+            std::fs::read_to_string(&fixture.config_path).map_err(ctx("Profil-Config lesen"))?;
+        assert_eq!(
+            persisted, SEEDED_PROFILE,
+            "{tokens:?}: die Profil-Config bleibt byte-gleich"
+        );
+        Ok(())
+    }
+
+    /// Wie [`assert_refused_and_untouched`] für ein abgeschaltetes Modell:
+    /// die Meldung nennt `retired`, das Modell und den Ersatz.
+    async fn assert_retired_refused_and_untouched(
+        fixture: &HomeFixture,
+        tokens: &[&str],
+    ) -> TestResult {
+        assert_refused_and_untouched(
+            fixture,
+            tokens,
+            &["retired", RETIRED_MODEL, "mistral-ocr-4-1"],
+        )
+        .await
+    }
+
+    /// `/models set <interne Rolle>` auf ein abgeschaltetes Modell: abgelehnt,
+    /// bevor der Provider gebaut oder etwas persistiert wird.
+    #[tokio::test]
+    async fn models_set_internal_role_to_a_retired_model_changes_nothing() -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        assert_retired_refused_and_untouched(&fixture, &["set", "explorer", RETIRED_MODEL]).await
+    }
+
+    /// `/models set uia` (auch in der `provider/modell`-Form) auf ein
+    /// abgeschaltetes Modell: abgelehnt, UIA-Auswahl und Profil unverändert.
+    #[tokio::test]
+    async fn models_set_uia_to_a_retired_model_changes_nothing() -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        let target = format!("{RETIRED_PROVIDER}/{RETIRED_MODEL}");
+        assert_retired_refused_and_untouched(&fixture, &["set", "uia", target.as_str()]).await?;
+        assert_retired_refused_and_untouched(&fixture, &["set", "uia-worker", target.as_str()])
+            .await
+    }
+
+    /// `/models worker` auf ein abgeschaltetes Modell: abgelehnt, keine
+    /// Worker-Wahl persistiert.
+    #[tokio::test]
+    async fn models_worker_to_a_retired_model_changes_nothing() -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        assert_retired_refused_and_untouched(&fixture, &["worker", "all", RETIRED_MODEL]).await
+    }
+
+    /// `provider/alias` eines abgeschalteten Modells: der Alias wird vor der
+    /// Lebenszyklus-Prüfung auf die kanonische Katalog-ID aufgelöst, sodass
+    /// die Ablehnung (mit Ersatzhinweis) greift, bevor etwas persistiert wird
+    /// — für jede Rolle von `set` und für `worker`.
+    #[tokio::test]
+    async fn provider_prefixed_alias_of_a_retired_model_is_refused_and_changes_nothing()
+    -> TestResult {
+        let fixture = home_fixture(lifecycle_test_config())?;
+        let target = format!("{RETIRED_PROVIDER}/{RETIRED_ALIAS}");
+        for tokens in [
+            vec!["set", "explorer", target.as_str()],
+            vec!["set", "uia", target.as_str()],
+            vec!["set", "uia-worker", target.as_str()],
+            vec!["worker", "all", target.as_str()],
+            vec!["worker", "uia-writer", target.as_str()],
+        ] {
+            assert_retired_refused_and_untouched(&fixture, &tokens).await?;
+        }
+        Ok(())
+    }
+
+    /// Derselbe Alias bei zwei Providern: `provider-a/shared` ergibt die ID
+    /// von A, `provider-b/shared` die von B — unabhängig von der
+    /// Iterationsreihenfolge der Konfiguration, in `resolve_target` wie in
+    /// `set` und `worker` (gespeichert wird je Provider dessen eigene ID).
+    #[tokio::test]
+    async fn same_alias_on_two_providers_resolves_per_provider() -> TestResult {
+        // Die Modelle liegen in einer `HashMap`: mehrfach neu aufbauen, damit
+        // eine von der Iterationsreihenfolge abhängige Auflösung auffiele.
+        for _ in 0..32 {
+            let config = shared_alias_config();
+            for (target, provider_name, model_id) in [
+                ("provider-a/shared", "provider-a", "model-a-shared-id"),
+                ("provider-b/shared", "provider-b", "model-b-shared-id"),
+                ("provider-b/b-only", "provider-b", "model-b-shared-id"),
+                ("provider-b/b-key", "provider-b", "model-b-key-id"),
+                // Die reine ID eines fremden Providers ist weder Alias noch
+                // Schlüssel: sie bleibt unverändert.
+                (
+                    "provider-a/model-b-shared-id",
+                    "provider-a",
+                    "model-b-shared-id",
+                ),
+            ] {
+                let resolved = resolve_target(&config, target).map_err(ctx("provider/alias"))?;
+                assert_eq!(
+                    resolved,
+                    (provider_name.to_owned(), model_id.to_owned()),
+                    "Ziel '{target}'"
+                );
+            }
+        }
+
+        let fixture = fixture(shared_alias_config(), None)?;
+        run(&fixture, &["set", "explorer", "provider-a/shared"])
+            .await
+            .map_err(ctx("set explorer provider-a/shared"))?;
+        run(&fixture, &["set", "explorer", "provider-b/shared"])
+            .await
+            .map_err(ctx("set explorer provider-b/shared"))?;
+        run(&fixture, &["worker", "uia-writer", "provider-b/shared"])
+            .await
+            .map_err(ctx("worker uia-writer provider-b/shared"))?;
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("model-a-shared-id".to_owned()),
+                },
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("provider-b".to_owned()),
+                    model: Some("model-b-shared-id".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-writer".to_owned(),
+                    value: Some("provider-b/model-b-shared-id".to_owned()),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    /// Ein Alias oder Katalog-Schlüssel, der nur zu einem anderen Provider
+    /// gehört (`provider-a/<nur-provider-b>`), wird fail-closed abgelehnt —
+    /// nie als Paar (Provider A, Modell von B) geprüft oder gespeichert:
+    /// Controller und Profil-Config bleiben für jede Rolle unverändert.
+    #[tokio::test]
+    async fn cross_provider_only_alias_is_refused_and_changes_nothing() -> TestResult {
+        let config = shared_alias_config();
+        for target in ["provider-a/b-only", "provider-a/b-key"] {
+            match resolve_target(&config, target) {
+                Err(OpError::InvalidArguments(message)) => {
+                    assert!(message.contains("provider-b"), "{target}: {message}");
+                    assert!(
+                        message.contains("kein Modell von 'provider-a'"),
+                        "{target}: {message}"
+                    );
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{target}: erwartet InvalidArguments, gefunden: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        let fixture = home_fixture(config)?;
+        for target in ["provider-a/b-only", "provider-a/b-key"] {
+            for tokens in [
+                vec!["set", "explorer", target],
+                vec!["set", "uia", target],
+                vec!["set", "uia-worker", target],
+                vec!["worker", "all", target],
+                vec!["worker", "uia-writer", target],
+            ] {
+                assert_refused_and_untouched(
+                    &fixture,
+                    &tokens,
+                    &["provider-b", "kein Modell von 'provider-a'"],
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Eine unpräfixierte Kennung, die als Alias bei zwei Providern (oder bei
+    /// zwei Modellen eines Providers) steht, ist mehrdeutig: abgelehnt mit den
+    /// sortierten `provider/id`-Kandidaten, vor Lebenszyklus-Prüfung und
+    /// Persistenz — Controller und Profil-Config bleiben unverändert.
+    #[tokio::test]
+    async fn unprefixed_ambiguous_alias_is_refused_and_changes_nothing() -> TestResult {
+        let config = shared_alias_config();
+        match resolve_target(&config, "shared") {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("Mehrdeutig"), "{message}");
+                assert!(
+                    message.contains("provider-a/model-a-shared-id, provider-b/model-b-shared-id"),
+                    "sortierte Kandidaten erwartet: {message}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, gefunden: {other:?}"
+                )));
+            }
+        }
+
+        // Zwei Modelle desselben Providers mit gleichem Alias.
+        let mut twin = shared_alias_config();
+        twin.models.insert(
+            "model-a-twin".to_owned(),
+            model("model-a-twin-id", "provider-a", &["twin"]),
+        );
+        twin.models.insert(
+            "model-a-twin-2".to_owned(),
+            model("model-a-twin-2-id", "provider-a", &["twin"]),
+        );
+        match resolve_target(&twin, "twin") {
+            Err(OpError::InvalidArguments(message)) => assert!(
+                message.contains("provider-a/model-a-twin-2-id, provider-a/model-a-twin-id"),
+                "{message}"
+            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, gefunden: {other:?}"
+                )));
+            }
+        }
+
+        let fixture = home_fixture(config)?;
+        for tokens in [
+            vec!["set", "explorer", "shared"],
+            vec!["set", "uia", "shared"],
+            vec!["set", "uia-worker", "shared"],
+            vec!["worker", "all", "shared"],
+            vec!["worker", "uia-writer", "shared"],
+        ] {
+            assert_refused_and_untouched(
+                &fixture,
+                &tokens,
+                &[
+                    "Mehrdeutig",
+                    "provider-a/model-a-shared-id",
+                    "provider-b/model-b-shared-id",
+                ],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Eindeutige unpräfixierte Kennungen lösen wie bisher auf (Schlüssel,
+    /// `id`, Alias); dasselbe Modell unter zwei Schlüsseln ist eindeutig, und
+    /// eine unbekannte Kennung bleibt abgelehnt.
+    #[tokio::test]
+    async fn unprefixed_unique_alias_still_resolves() -> TestResult {
+        let mut config = shared_alias_config();
+        // Dasselbe Modell (gleicher Provider, gleiche ID) unter zweitem Schlüssel.
+        config.models.insert(
+            "model-a-copy".to_owned(),
+            model("model-a-2026", "provider-a", &["a-latest"]),
+        );
+        for (target, provider_name, model_id) in [
+            ("model-a", "provider-a", "model-a-2026"),
+            ("model-a-2026", "provider-a", "model-a-2026"),
+            ("a-latest", "provider-a", "model-a-2026"),
+            ("b-only", "provider-b", "model-b-shared-id"),
+            ("b-key", "provider-b", "model-b-key-id"),
+            ("vendor/router-model", "openrouter", "vendor/router-model"),
+        ] {
+            let resolved = resolve_target(&config, target).map_err(ctx("unpräfixiert"))?;
+            assert_eq!(
+                resolved,
+                (provider_name.to_owned(), model_id.to_owned()),
+                "Ziel '{target}'"
+            );
+        }
+        assert!(matches!(
+            resolve_target(&config, "gibtsnicht"),
+            Err(OpError::InvalidArguments(ref message)) if message.contains("Unbekanntes Modell")
+        ));
+
+        // Auch durch `set` und `worker` hindurch: eindeutig → gespeichert.
+        let fixture = fixture(config, None)?;
+        run(&fixture, &["set", "explorer", "b-only"])
+            .await
+            .map_err(ctx("set explorer b-only"))?;
+        run(&fixture, &["worker", "uia-writer", "a-latest"])
+            .await
+            .map_err(ctx("worker uia-writer a-latest"))?;
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("provider-b".to_owned()),
+                    model: Some("model-b-shared-id".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-writer".to_owned(),
+                    value: Some("provider-a/model-a-2026".to_owned()),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    /// Nennt ein Alias bei einem Provider mehrere verschiedene Modelle, ist
+    /// `provider/alias` mehrdeutig und wird abgelehnt (statt vom Zufall der
+    /// Iterationsreihenfolge abzuhängen); der andere Provider bleibt aufgelöst.
+    #[test]
+    fn duplicate_alias_within_one_provider_is_refused_as_ambiguous() -> TestResult {
+        let mut config = shared_alias_config();
+        config.models.insert(
+            "model-a-twin".to_owned(),
+            model("model-a-twin-id", "provider-a", &["shared"]),
+        );
+        match resolve_target(&config, "provider-a/shared") {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("mehrdeutig"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, gefunden: {other:?}"
+                )));
+            }
+        }
+        let resolved = resolve_target(&config, "provider-b/shared").map_err(ctx("provider-b"))?;
+        assert_eq!(
+            resolved,
+            ("provider-b".to_owned(), "model-b-shared-id".to_owned())
+        );
+        Ok(())
+    }
+
+    /// `provider/alias` (und `provider/schlüssel`) eines nicht abgeschalteten
+    /// Modells wird zur kanonischen Katalog-ID aufgelöst; gespeichert und
+    /// gemeldet wird die ID, nie der Alias — für `set` und `worker`.
+    #[tokio::test]
+    async fn provider_prefixed_alias_of_a_live_model_persists_the_canonical_id() -> TestResult {
+        let fixture = fixture(test_config(), None)?;
+
+        let output = run(&fixture, &["set", "explorer", "provider-a/a-latest"])
+            .await
+            .map_err(ctx("set explorer"))?;
+        assert!(
+            output.text.contains("provider-a/model-a-2026"),
+            "{}",
+            output.text
+        );
+        assert!(!output.text.contains("a-latest"), "{}", output.text);
+        let data = data(&output)?;
+        assert_eq!(data["provider"], serde_json::json!("provider-a"));
+        assert_eq!(data["model"], serde_json::json!("model-a-2026"));
+
+        run(&fixture, &["set", "uia", "provider-a/model-a"])
+            .await
+            .map_err(ctx("set uia"))?;
+        run(&fixture, &["worker", "uia-writer", "provider-a/a-latest"])
+            .await
+            .map_err(ctx("worker uia-writer"))?;
+
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("model-a-2026".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaSelection {
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("model-a-2026".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-writer".to_owned(),
+                    value: Some("provider-a/model-a-2026".to_owned()),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    /// Ein abgekündigtes (deprecated) Modell wird gespeichert; die
+    /// Bestätigung trägt die Warnung samt Ersatzhinweis — für `set` und
+    /// `worker`.
+    #[tokio::test]
+    async fn deprecated_model_is_persisted_with_a_warning() -> TestResult {
+        let fixture = fixture(lifecycle_test_config(), None)?;
+        let target = format!("{DEPRECATED_PROVIDER}/{DEPRECATED_MODEL}");
+
+        let output = run(&fixture, &["set", "explorer", target.as_str()])
+            .await
+            .map_err(ctx("set explorer"))?;
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert!(output.text.contains("claude-mythos-5"), "{}", output.text);
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![RecordedSelectionPersistCall::InternalModel {
+                point: InternalModelPoint::Explorer,
+                provider: Some(DEPRECATED_PROVIDER.to_owned()),
+                model: Some(DEPRECATED_MODEL.to_owned()),
+            }]
+        );
+
+        let output = run(&fixture, &["worker", "uia-writer", target.as_str()])
+            .await
+            .map_err(ctx("worker uia-writer"))?;
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert_eq!(
+            fixture.recorder.calls().len(),
+            2,
+            "auch die Worker-Wahl wird gespeichert"
+        );
         Ok(())
     }
 

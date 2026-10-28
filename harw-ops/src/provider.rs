@@ -611,6 +611,14 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 ///      [`OpError::InvalidArguments`] with a message asking the operator to
 ///      use `/model switch` first. **Never silently falls back to another
 ///      model.**
+///
+///    An explicit `model` additionally passes the provider lifecycle
+///    ([`crate::live_model::enforce_lifecycle`]) **before** anything is
+///    mutated or persisted: a retired model is rejected with
+///    [`OpError::InvalidArguments`] (naming the suggested replacement) and
+///    leaves controller, root session, child route and the persisted default
+///    untouched; a deprecated model switches normally and the warning is
+///    appended to the confirmation text.
 /// 4. Only when all checks pass, calls `controller.set_active_provider(id)`
 ///    and, if a model argument was given, `controller.set_active_model(id)`.
 /// 5. Best-effort persists the resulting active provider/model as the
@@ -647,7 +655,7 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// - [`OpError::Execution`]: controller not in context, or controller mutation failed.
 /// - [`OpError::NotAvailable`]: no configuration resolvable (see [`resolved_config`]).
 /// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, unknown
-///   model, or provider/model incompatibility.
+///   model, provider/model incompatibility, or a retired model (lifecycle).
 ///
 /// # Spec Reference
 /// harwness Plan v2 — Task C; `/uia-provider` follow-up (UIA-specific pinned selection);
@@ -692,6 +700,7 @@ pub(crate) fn handle_switch_core(
     // An explicit model argument is validated against the catalog directly;
     // otherwise the *current* active model (if any) must already be
     // compatible with the target provider.
+    let mut lifecycle_warning: Option<String> = None;
     let resolved_model: Option<String> = match &model {
         Some(requested_model) => {
             let configured =
@@ -707,6 +716,11 @@ pub(crate) fn handle_switch_core(
                      (model belongs to provider '{model_provider}')"
                 )));
             }
+            // Lifecycle of the explicit choice: a retired offering is refused
+            // here, before the provider client is rebuilt, the controller is
+            // mutated or anything is persisted. A deprecated one only warns.
+            lifecycle_warning =
+                crate::live_model::enforce_lifecycle(&canonical_target, &configured.id)?;
             Some(configured.id.clone())
         }
         None => {
@@ -763,6 +777,10 @@ pub(crate) fn handle_switch_core(
         ),
         None => format!("provider switched to {canonical_target}; next turn will use it"),
     };
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
     match persist(
         Some(canonical_target.as_str()),
         snap_after.active_model.as_deref(),
@@ -800,7 +818,12 @@ pub(crate) fn handle_switch_core(
 /// - [`OpError::NotAvailable`]: keine Config auflösbar (siehe [`resolved_config`]).
 /// - [`OpError::Execution`]: Controller fehlt oder Mutation schlug fehl.
 /// - [`OpError::InvalidArguments`]: unbekannter oder deaktivierter Provider,
-///   fehlende Zugangsdaten, unbekanntes oder inkompatibles Modell.
+///   fehlende Zugangsdaten, unbekanntes oder inkompatibles Modell, oder ein
+///   abgeschaltetes (retired) Modell. Der Lebenszyklus einer ausdrücklich
+///   genannten Modell-Wahl wird wie beim generischen Wechsel
+///   ([`crate::live_model::enforce_lifecycle`]) vor jeder Mutation und
+///   Persistenz geprüft; ein abgekündigtes Modell hängt eine Warnung an die
+///   Bestätigung.
 pub(crate) fn handle_uia_switch_core(
     ctx: &OpContext,
     target: String,
@@ -835,6 +858,7 @@ pub(crate) fn handle_uia_switch_core(
     let current = crate::model::effective_uia_selection(Some(controller), &config);
 
     let mut cleared_incompatible_model = None;
+    let mut lifecycle_warning: Option<String> = None;
     let resolved_model = match model {
         Some(requested_model) => {
             let configured =
@@ -851,6 +875,10 @@ pub(crate) fn handle_uia_switch_core(
                      use `/uia-model switch <id>` for a compatible UIA model"
                 )));
             }
+            // Wie beim generischen Wechsel: ein abgeschaltetes Modell wird vor
+            // jeder Mutation abgelehnt, ein abgekündigtes nur mit Warnung.
+            lifecycle_warning =
+                crate::live_model::enforce_lifecycle(&canonical_target, &configured.id)?;
             Some(configured.id.clone())
         }
         None => match current.model() {
@@ -900,6 +928,10 @@ pub(crate) fn handle_uia_switch_core(
             ),
         },
     };
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
     match persist(selection.provider.as_deref(), selection.model.as_deref()) {
         Some(note) => {
             text.push('\n');

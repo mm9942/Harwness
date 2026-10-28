@@ -13,10 +13,22 @@
 //!   lease every [`heartbeat_interval`] of the claim TTL, so a job running
 //!   longer than its TTL still commits.
 //! - **Lease loss**: a renewal rejected by the fence (token mismatch, expired,
-//!   terminal, missing) — or a local lease deadline passing while renewals
-//!   fail transiently — cancels the job [`CancelToken`] with
+//!   terminal, missing) cancels the job [`CancelToken`] with
 //!   [`CancelReason::LeaseLost`], asks the control to stop, and force-aborts
 //!   after a bounded grace period.
+//! - **Deadline check against the record**: the runner caches the deadline
+//!   of its own last renewal, but a lease hold
+//!   ([`JobStore::hold_live_lease`]) renews the lease durably while it keeps
+//!   the job lock, so a heartbeat can meet `JobLockContended` past that
+//!   cached deadline although the lease is live. Once the cached deadline
+//!   has passed, a transiently failed renewal therefore reads the record
+//!   lock-free ([`JobStore::get`]): a lease that is still this runner's and
+//!   unexpired there moves the cached deadline to the record's `expires_at`
+//!   and the heartbeat keeps retrying; a lease replaced, revoked or finished
+//!   there is lost at once. Past the record's own deadline only a contended
+//!   lock is waited out, for at most one [`heartbeat_interval`] (a renewal
+//!   that started in time may still be being written); every other failure,
+//!   and the end of that window, loses the lease as before.
 //! - **Drop guard**: dropping the run future (task abort, shutdown) unregisters
 //!   the live execution, cancels the job token with `LeaseLost` and stops the
 //!   heartbeat; the unrenewed lease then lapses and `reconcile_expired`
@@ -34,7 +46,9 @@
 //! The runner is `Send + Sync` and may be shared behind an `Arc`; each
 //! [`DurableJobRunner::run_with_cancel`] call drives exactly one job on the
 //! calling task.  Heartbeat and commit are sequential on that task, so they
-//! never contend for the same job lock inside one process.
+//! never contend for the same job lock inside one process. A lease hold taken
+//! by the operation itself ([`JobStore::hold_live_lease`]) does contend with
+//! the heartbeat; see the deadline check above.
 //!
 //! # Errors
 //! [`DurableJobRunnerError`] (store, registry, lease loss, blocking-pool join).
@@ -56,7 +70,9 @@ use crate::cancel::{CancelReason, CancelToken};
 use crate::execution_registry::{
     ExecutionControl, ExecutionGuard, ExecutionRegistryError, JobExecutionRegistry,
 };
-use harw_job_core::{JobClaim, JobCompletion, JobKind, JobOutcome, JobScope, Lease, LeaseToken};
+use harw_job_core::{
+    JobClaim, JobCompletion, JobKind, JobOutcome, JobScope, JobState, Lease, LeaseToken, StoredJob,
+};
 use harw_session_store::{
     ClaimRequest, CompleteRequest, JobStore, RenewalRequest, SessionStoreError,
 };
@@ -213,6 +229,17 @@ pub fn heartbeat_interval(lease_ttl: SignedDuration) -> Duration {
     Duration::from_nanos(u64::try_from(third).unwrap_or(u64::MAX)).max(MIN_HEARTBEAT_INTERVAL)
 }
 
+// How long the heartbeat waits out a contended job lock past the latest
+// known durable lease deadline: one heartbeat interval of the TTL (`ttl / 3`).
+// Past that deadline nobody can renew the lease any more (the fence refuses an
+// expired lease), so the only thing worth waiting for is a renewal that
+// started in time and is still being written under the lock (a write plus an
+// fsync, far below one interval). A longer wait would only keep the job
+// running on an expired lease. Zero (no wait) if the interval does not fit.
+fn contention_grace(lease_ttl: SignedDuration) -> SignedDuration {
+    SignedDuration::try_from(heartbeat_interval(lease_ttl)).unwrap_or(SignedDuration::ZERO)
+}
+
 /// A composable owner of durable job execution.
 ///
 /// # Concurrency
@@ -316,7 +343,10 @@ impl DurableJobRunner {
     /// 4. Polls the future while renewing the lease every
     ///    [`heartbeat_interval`]. On lease loss the token is cancelled with
     ///    [`CancelReason::LeaseLost`] and, after the grace period, the control
-    ///    is force-aborted and the future dropped.
+    ///    is force-aborted and the future dropped. A renewal that fails only
+    ///    transiently past the cached deadline is checked against the job
+    ///    record first (see the module docs), so a lease hold that renewed
+    ///    the lease is not mistaken for a loss.
     /// 5. Commits the outcome under the same token, then invokes
     ///    [`JobOutbox::on_committed`] once, then unregisters.
     ///
@@ -426,6 +456,8 @@ impl DurableJobRunner {
         };
 
         let interval = heartbeat_interval(request.lease_ttl);
+        let retry_after = (interval / 4).max(MIN_HEARTBEAT_INTERVAL);
+        let lock_grace = contention_grace(request.lease_ttl);
         let mut operation = std::pin::pin!(operation);
         let mut next_beat = tokio::time::Instant::now() + interval;
         let mut lost: Option<LeaseLoss> = None;
@@ -448,16 +480,36 @@ impl DurableJobRunner {
                             debug!(work_id = %work_id, expires_at = %lease.expires_at, "lease renewed");
                         }
                         RenewOutcome::Transient(cause) => {
-                            if Timestamp::now() >= lease_expires_at {
-                                lost = Some(self.lose_lease(work_id, &job_token, &control, cause));
-                            } else {
-                                warn!(
-                                    work_id = %work_id,
-                                    error = ?cause.as_ref().map(ToString::to_string),
-                                    "transient lease renewal failure; retrying"
-                                );
-                                next_beat = tokio::time::Instant::now()
-                                    + (interval / 4).max(MIN_HEARTBEAT_INTERVAL);
+                            let verdict = self
+                                .judge_transient(
+                                    &lease_token,
+                                    cause.as_ref(),
+                                    lease_expires_at,
+                                    lock_grace,
+                                )
+                                .await;
+                            match verdict {
+                                RetryVerdict::Lost(evidence) => {
+                                    lost = Some(self.lose_lease(
+                                        work_id,
+                                        &job_token,
+                                        &control,
+                                        evidence.or(cause),
+                                    ));
+                                }
+                                RetryVerdict::Retry => {
+                                    warn!(
+                                        work_id = %work_id,
+                                        error = ?cause.as_ref().map(ToString::to_string),
+                                        "transient lease renewal failure; retrying"
+                                    );
+                                    next_beat = tokio::time::Instant::now() + retry_after;
+                                }
+                                RetryVerdict::Extended(deadline)
+                                | RetryVerdict::Waiting(deadline) => {
+                                    lease_expires_at = deadline;
+                                    next_beat = tokio::time::Instant::now() + retry_after;
+                                }
                             }
                         }
                         RenewOutcome::Lost(cause) => {
@@ -513,6 +565,71 @@ impl DurableJobRunner {
             Err(join_error) => {
                 warn!(token_epoch = token.epoch, error = %join_error, "renew task failed");
                 RenewOutcome::Transient(None)
+            }
+        }
+    }
+
+    // Decides what a transiently failed renewal means. Before the cached
+    // deadline: retry. After it: the cached deadline only knows this runner's
+    // own renewals, so the job record decides (see `past_deadline_verdict`).
+    async fn judge_transient(
+        &self,
+        token: &LeaseToken,
+        cause: Option<&SessionStoreError>,
+        cached_deadline: Timestamp,
+        lock_grace: SignedDuration,
+    ) -> RetryVerdict {
+        if Timestamp::now() < cached_deadline {
+            return RetryVerdict::Retry;
+        }
+        let contended = matches!(cause, Some(SessionStoreError::JobLockContended { .. }));
+        let recorded = self.recorded_lease(token).await;
+        let verdict = past_deadline_verdict(
+            recorded,
+            cached_deadline,
+            contended,
+            lock_grace,
+            Timestamp::now(),
+        );
+        match &verdict {
+            RetryVerdict::Extended(deadline) => debug!(
+                work_id = %token.work_id,
+                expires_at = %deadline,
+                "lease renewed durably by a lease hold; heartbeat waits for the job lock"
+            ),
+            RetryVerdict::Waiting(deadline) => warn!(
+                work_id = %token.work_id,
+                expired_at = %deadline,
+                "job lock still contended past the lease deadline; waiting within the grace window"
+            ),
+            RetryVerdict::Retry | RetryVerdict::Lost(_) => {}
+        }
+        verdict
+    }
+
+    // Reads the job record lock-free on the blocking pool and classifies this
+    // runner's lease in it.
+    async fn recorded_lease(&self, token: &LeaseToken) -> RecordedLease {
+        let store = Arc::clone(&self.store);
+        let work_id = token.work_id.clone();
+        match blocking("get", move || store.get(&work_id)).await {
+            Ok(Ok(record)) => classify_recorded_lease(&record, token),
+            Ok(Err(cause @ SessionStoreError::JobNotFound { .. })) => RecordedLease::Gone(cause),
+            Ok(Err(cause)) => {
+                warn!(
+                    work_id = %token.work_id,
+                    error = %cause,
+                    "job record unreadable during lease check"
+                );
+                RecordedLease::Unreadable
+            }
+            Err(join_error) => {
+                warn!(
+                    work_id = %token.work_id,
+                    error = %join_error,
+                    "job record read task failed"
+                );
+                RecordedLease::Unreadable
             }
         }
     }
@@ -620,6 +737,88 @@ enum RenewOutcome {
     Lost(SessionStoreError),
 }
 
+// What a lock-free read of the job record says about this runner's lease.
+enum RecordedLease {
+    // Still this runner's lease (token and fencing epoch match) on an
+    // unfinished job, valid until `expires_at`, which may already have passed.
+    Held { expires_at: Timestamp },
+    // Replaced, revoked, finished or deleted: the record proves the loss.
+    Gone(SessionStoreError),
+    // The record could not be read; it proves nothing either way.
+    Unreadable,
+}
+
+// Heartbeat decision after a transiently failed renewal.
+enum RetryVerdict {
+    // Keep retrying at the short interval; the cached deadline stands.
+    Retry,
+    // The record shows the lease durably renewed (by a lease hold) until this
+    // instant: adopt it as the cached deadline and keep retrying.
+    Extended(Timestamp),
+    // Past every known deadline, but the job lock is contended and the grace
+    // window is still open: keep retrying against this known deadline.
+    Waiting(Timestamp),
+    // The lease is lost; the record's evidence, if it gave one.
+    Lost(Option<SessionStoreError>),
+}
+
+// Mirrors the fence (`verify_lease` and the terminal check of
+// `JobStore::hold_live_lease`) on a lock-free copy of the record, without
+// the expiry check, which `past_deadline_verdict` makes against the clock.
+fn classify_recorded_lease(record: &StoredJob, token: &LeaseToken) -> RecordedLease {
+    if matches!(
+        record.job.state,
+        JobState::Completed | JobState::Failed | JobState::Cancelled
+    ) {
+        return RecordedLease::Gone(SessionStoreError::JobAlreadyTerminal {
+            work_id: token.work_id.clone(),
+            state: record.job.state,
+        });
+    }
+    match record.lease.as_ref() {
+        Some(lease) if lease.matches_token(token) && record.lease_epoch == token.epoch => {
+            RecordedLease::Held {
+                expires_at: lease.expires_at,
+            }
+        }
+        _ => RecordedLease::Gone(SessionStoreError::LeaseTokenMismatch {
+            work_id: token.work_id.clone(),
+        }),
+    }
+}
+
+// Decides a transiently failed renewal once the cached deadline has passed.
+// - The record shows this runner's lease still unexpired (a lease hold renewed
+//   it): adopt the record's deadline and keep retrying, whatever the failure.
+// - The record shows the lease replaced, revoked, finished or gone: lost.
+// - Otherwise the lease is past the latest known deadline (the record's, if
+//   later than the cached one). Only a contended lock can still hide a renewal
+//   that started in time; it is waited out until `grace` after that deadline.
+//   Any other failure, or the end of the window, loses the lease.
+fn past_deadline_verdict(
+    recorded: RecordedLease,
+    cached_deadline: Timestamp,
+    contended: bool,
+    grace: SignedDuration,
+    now: Timestamp,
+) -> RetryVerdict {
+    let known = match recorded {
+        RecordedLease::Gone(cause) => return RetryVerdict::Lost(Some(cause)),
+        RecordedLease::Held { expires_at } if now < expires_at => {
+            return RetryVerdict::Extended(expires_at);
+        }
+        RecordedLease::Held { expires_at } => cached_deadline.max(expires_at),
+        RecordedLease::Unreadable => cached_deadline,
+    };
+    // Fail closed: a grace that overflows the timestamp range is no grace.
+    let window_end = known.checked_add(grace).unwrap_or(known);
+    if contended && now < window_end {
+        RetryVerdict::Waiting(known)
+    } else {
+        RetryVerdict::Lost(None)
+    }
+}
+
 // Detected lease loss awaiting cooperative stop.
 struct LeaseLoss {
     deadline: tokio::time::Instant,
@@ -691,7 +890,7 @@ impl Drop for RunGuard {
 mod tests {
     use super::*;
     use crate::execution_registry::ExecutionControl;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_job_core::{Budget, Job, JobKind, RetryPolicy, StoredJob};
     use harw_types::{ApprovalActor, TenantId, WorkspaceId};
     use jiff::SignedDuration;
@@ -814,6 +1013,163 @@ mod tests {
         assert!(!is_lease_lost(&SessionStoreError::JobLockContended {
             work_id: WorkId::from_str("w"),
         }));
+    }
+
+    #[test]
+    fn test_classify_recorded_lease_mirrors_the_fence() -> TestResult {
+        let now = Timestamp::now();
+        let mut stored = record("work-classify")?;
+        let lease = Lease::acquire_fenced(
+            stored.job.id.clone(),
+            "runner",
+            now,
+            SignedDuration::from_secs(60),
+            1,
+            "nonce-a",
+        )
+        .map_err(ctx("fenced lease"))?;
+        let token = lease.token();
+        stored.job.state = JobState::Running;
+        stored.lease_epoch = 1;
+        stored.lease = Some(lease.clone());
+        assert!(matches!(
+            classify_recorded_lease(&stored, &token),
+            RecordedLease::Held { expires_at } if expires_at == lease.expires_at
+        ));
+        let foreign = LeaseToken {
+            nonce: "nonce-b".to_owned(),
+            ..token.clone()
+        };
+        assert!(matches!(
+            classify_recorded_lease(&stored, &foreign),
+            RecordedLease::Gone(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let mut superseded = stored.clone();
+        superseded.lease_epoch = 2;
+        assert!(matches!(
+            classify_recorded_lease(&superseded, &token),
+            RecordedLease::Gone(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let mut revoked = stored.clone();
+        revoked.lease = None;
+        assert!(matches!(
+            classify_recorded_lease(&revoked, &token),
+            RecordedLease::Gone(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let mut finished = stored;
+        finished.job.state = JobState::Cancelled;
+        assert!(matches!(
+            classify_recorded_lease(&finished, &token),
+            RecordedLease::Gone(SessionStoreError::JobAlreadyTerminal {
+                state: JobState::Cancelled,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_past_deadline_verdict_trusts_the_record_and_bounds_contention() -> TestResult {
+        let now = Timestamp::now();
+        let at = |millis: i64| -> TestResult<Timestamp> {
+            now.checked_add(SignedDuration::from_millis(millis))
+                .map_err(ctx("timestamp offset"))
+        };
+        let cached = at(-100)?;
+        let grace = SignedDuration::from_millis(500);
+        // A lease hold renewed the lease: the record's deadline is adopted,
+        // whatever made the renewal fail.
+        let renewed = at(2_000)?;
+        for contended in [true, false] {
+            assert!(matches!(
+                past_deadline_verdict(
+                    RecordedLease::Held {
+                        expires_at: renewed
+                    },
+                    cached,
+                    contended,
+                    grace,
+                    now,
+                ),
+                RetryVerdict::Extended(deadline) if deadline == renewed
+            ));
+        }
+        // Past the durable deadline a contended lock is waited out, against
+        // the later of the cached and the recorded deadline ...
+        let recorded = at(-50)?;
+        assert!(matches!(
+            past_deadline_verdict(
+                RecordedLease::Held {
+                    expires_at: recorded
+                },
+                cached,
+                true,
+                grace,
+                now,
+            ),
+            RetryVerdict::Waiting(deadline) if deadline == recorded
+        ));
+        assert!(matches!(
+            past_deadline_verdict(RecordedLease::Unreadable, cached, true, grace, now),
+            RetryVerdict::Waiting(deadline) if deadline == cached
+        ));
+        // ... but only within the grace window ...
+        assert!(matches!(
+            past_deadline_verdict(
+                RecordedLease::Held {
+                    expires_at: recorded
+                },
+                cached,
+                true,
+                grace,
+                at(450)?,
+            ),
+            RetryVerdict::Lost(None)
+        ));
+        // ... and never for a failure that is not contention.
+        assert!(matches!(
+            past_deadline_verdict(
+                RecordedLease::Held {
+                    expires_at: recorded
+                },
+                cached,
+                false,
+                grace,
+                now,
+            ),
+            RetryVerdict::Lost(None)
+        ));
+        assert!(matches!(
+            past_deadline_verdict(RecordedLease::Unreadable, cached, false, grace, now),
+            RetryVerdict::Lost(None)
+        ));
+        // A replaced, revoked or finished lease is lost at once, with the
+        // record's evidence, even while the lock is contended.
+        assert!(matches!(
+            past_deadline_verdict(
+                RecordedLease::Gone(SessionStoreError::LeaseTokenMismatch {
+                    work_id: WorkId::from_str("w"),
+                }),
+                cached,
+                true,
+                grace,
+                now,
+            ),
+            RetryVerdict::Lost(Some(SessionStoreError::LeaseTokenMismatch { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_contention_grace_is_one_heartbeat_interval() {
+        assert_eq!(
+            contention_grace(SignedDuration::from_secs(90)),
+            SignedDuration::from_secs(30)
+        );
+        assert_eq!(
+            contention_grace(SignedDuration::from_secs(-5)),
+            SignedDuration::from_millis(10)
+        );
     }
 
     #[tokio::test]
@@ -940,6 +1296,125 @@ mod tests {
             store.get(&work_id).map_err(ctx("record"))?.job.state,
             harw_job_core::JobState::Cancelled
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_survives_a_hold_that_crosses_the_cached_deadline() -> TestResult {
+        // TTL 1.5 s: heartbeat every 500 ms, retries every 125 ms, grace 500 ms.
+        // The claim is backdated by 900 ms, so its expiry (the runner's cached
+        // deadline, it never renews before the hold) lies 600 ms ahead: after
+        // the first heartbeat, which already meets the hold.
+        let ttl = SignedDuration::from_millis(1_500);
+        let claimed_at = Timestamp::now()
+            .checked_sub(SignedDuration::from_millis(900))
+            .map_err(ctx("now - 900ms"))?;
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let work_id = WorkId::from_str("work-hold-crossing");
+        store
+            .admit(&StoredJob {
+                not_before: claimed_at,
+                ..record(work_id.as_str())?
+            })
+            .map_err(ctx("admit record"))?;
+        let executions = Arc::new(JobExecutionRegistry::new());
+        let runner = DurableJobRunner::new(Arc::clone(&store), Arc::clone(&executions));
+        let control = FakeControl::new();
+        let observed = Arc::clone(&control);
+        let (claimed, claimed_rx) = oneshot::channel();
+        let (finish, finish_rx) = oneshot::channel::<()>();
+        let request = ClaimRequest {
+            worker_id: "runner".to_owned(),
+            lease_ttl: ttl,
+            now: claimed_at,
+        };
+        let run_work_id = work_id.clone();
+        let run = tokio::spawn(async move {
+            runner
+                .run_with_cancel(&run_work_id, &request, move |claim, token| {
+                    let _ = claimed.send((claim.token.clone(), claim.lease.expires_at, token));
+                    (control, async move {
+                        let _ = finish_rx.await;
+                        JobOutcome::Succeeded {
+                            result: serde_json::json!({"held": true}),
+                        }
+                    })
+                })
+                .await
+        });
+        let (token, original_expiry, job_token) = claimed_rx
+            .await
+            .map_err(ctx("claim reached the operation"))?;
+        let before_hold = store
+            .get(&work_id)?
+            .lease
+            .ok_or(TestError::Missing("claimed lease"))?;
+        assert_eq!(
+            before_hold.heartbeat_at, before_hold.acquired_at,
+            "the heartbeat has not renewed yet, its cached deadline is the claim's expiry"
+        );
+
+        // The hold renews the lease durably and keeps the job lock.
+        let hold_store = Arc::clone(&store);
+        let hold_token = token.clone();
+        let held = tokio::task::spawn_blocking(move || hold_store.hold_live_lease(&hold_token))
+            .await
+            .map_err(ctx("hold task"))??;
+        assert!(held.deadline() > original_expiry, "renewed past the expiry");
+        let held_lease = store
+            .get(&work_id)?
+            .lease
+            .ok_or(TestError::Missing("held lease"))?;
+
+        // Keep the lock until 300 ms past the original expiry: the heartbeat
+        // meets it there at least twice and must read the renewed deadline.
+        let release_at = original_expiry
+            .checked_add(SignedDuration::from_millis(300))
+            .map_err(ctx("expiry + 300ms"))?;
+        let wait = Duration::try_from(Timestamp::now().duration_until(release_at))
+            .unwrap_or(Duration::ZERO);
+        tokio::time::sleep(wait).await;
+        assert!(
+            Timestamp::now() > original_expiry,
+            "the hold crossed the expiry"
+        );
+        held.still_live()?;
+        assert!(
+            !job_token.is_cancelled(),
+            "contention past the cached deadline is no lease loss"
+        );
+        assert_eq!(observed.graceful.load(Ordering::SeqCst), 0);
+        drop(held);
+
+        // Once the hold is gone, the heartbeat's next renewal succeeds.
+        let mut renewed = None;
+        for _ in 0..200 {
+            let lease = store
+                .get(&work_id)?
+                .lease
+                .ok_or(TestError::Missing("running lease"))?;
+            if lease.heartbeat_at > held_lease.heartbeat_at {
+                renewed = Some(lease);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let renewed = renewed.ok_or(TestError::Missing("heartbeat renewal after the hold"))?;
+        assert!(renewed.matches_token(&token));
+        assert!(renewed.expires_at > held_lease.expires_at);
+        assert!(!job_token.is_cancelled());
+        assert_eq!(observed.graceful.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.forced.load(Ordering::SeqCst), 0);
+
+        let _ = finish.send(());
+        let completion = run
+            .await
+            .map_err(ctx("runner task"))?
+            .map_err(ctx("run commits under the live lease"))?;
+        assert!(matches!(completion.outcome, JobOutcome::Succeeded { .. }));
+        assert!(executions.is_empty());
+        assert_eq!(store.get(&work_id)?.job.state, JobState::Completed);
         Ok(())
     }
 }

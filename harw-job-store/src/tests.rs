@@ -6,8 +6,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use harw_job_core::{
-    Budget, Job, JobCancellation, JobKind, JobOutcome, JobScope, JobState, RetryPolicy, RunnerId,
-    StoredJob, WorkId,
+    Budget, BudgetUsage, Job, JobCancellation, JobClaim, JobKind, JobOutcome, JobScope, JobState,
+    RetryPolicy, RunnerId, StoredJob, WorkId,
 };
 use harw_types::{ApprovalActor, TenantId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Conflict, StaleLease, StoreError, StoreResult};
 use crate::job_record_store::{ClaimTerms, FsJobRecordStore, JobRecordStore, JobTransition};
-use crate::mechanics::token_fencing;
+use crate::mechanics::{self, token_fencing};
 use crate::record_store::{RecordStore, StoreRecord};
 use crate::test_support::{TestError, TestResult, ctx};
 
@@ -687,5 +687,236 @@ fn a_stored_job_survives_the_store_round_trip_unchanged() -> TestResult {
     assert_eq!(store.load(&WorkId::from_str("job-round-trip"))?, record);
     let raw = std::fs::read(temp.path().join("jobs/records/job-round-trip.json"))?;
     assert_eq!(raw, serde_json::to_vec(&record)?);
+    Ok(())
+}
+
+// --- persisted job budget usage ---------------------------------------------
+
+fn usage(tokens: u64, wall_secs: i64, tool_calls: u32) -> BudgetUsage {
+    BudgetUsage {
+        tokens,
+        wall: SignedDuration::from_secs(wall_secs),
+        tool_calls,
+    }
+}
+
+fn record_usage(
+    store: &FsJobRecordStore,
+    claim: &JobClaim,
+    reported: &BudgetUsage,
+    now: Timestamp,
+) -> StoreResult<BudgetUsage> {
+    store
+        .records()
+        .update_locked(claim.job.id.as_str(), |record| {
+            mechanics::record_usage(record, &claim.token, reported, now)
+        })
+}
+
+#[test]
+fn record_usage_persists_and_returns_stored_usage() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let claim = store.claim_job(&work_id, &runner("runner-a")?, terms(60, now))?;
+    let claimed = store.load(&work_id)?;
+    assert_eq!(claimed.job.usage, BudgetUsage::default());
+
+    let at = later(now, 1)?;
+    let reported = usage(120, 7, 3);
+    let stored = record_usage(&store, &claim, &reported, at)?;
+
+    assert_eq!(stored, reported);
+    let persisted = store.load(&work_id)?;
+    assert_eq!(persisted.job.usage, reported);
+    assert_eq!(persisted.job.updated_at, at);
+    assert_eq!(persisted.revision, claimed.revision.saturating_add(1));
+    assert_eq!(persisted.lease, claimed.lease);
+    assert_eq!(persisted.job.state, JobState::Running);
+    Ok(())
+}
+
+#[test]
+fn record_usage_is_idempotent_for_equal_usage_and_does_not_bump_revision() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-idem");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let claim = store.claim_job(&work_id, &runner("runner-a")?, terms(60, now))?;
+    let reported = usage(50, 4, 2);
+    record_usage(&store, &claim, &reported, later(now, 1)?)?;
+    let before = store.load(&work_id)?;
+
+    let again = record_usage(&store, &claim, &reported, later(now, 2)?)?;
+
+    assert_eq!(again, reported);
+    let after = store.load(&work_id)?;
+    assert_eq!(after, before);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.job.updated_at, before.job.updated_at);
+    Ok(())
+}
+
+#[test]
+fn record_usage_rejects_a_decrease_in_each_field_and_writes_nothing() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-regress");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let claim = store.claim_job(&work_id, &runner("runner-a")?, terms(60, now))?;
+    let baseline = usage(100, 10, 5);
+    record_usage(&store, &claim, &baseline, later(now, 1)?)?;
+    let before = store.load(&work_id)?;
+
+    let regressions = [
+        ("tokens", usage(99, 10, 5)),
+        ("wall", usage(100, 9, 5)),
+        ("tool_calls", usage(100, 10, 4)),
+    ];
+    for (field, regressed) in regressions {
+        let result = record_usage(&store, &claim, &regressed, later(now, 2)?);
+        assert!(
+            matches!(
+                &result,
+                Err(StoreError::Conflict {
+                    conflict: Conflict::Rejected { detail },
+                    ..
+                }) if detail.contains(field)
+            ),
+            "decreasing {field} must be rejected, got {result:?}"
+        );
+        assert_eq!(store.load(&work_id)?, before, "{field} regression wrote");
+    }
+    Ok(())
+}
+
+#[test]
+fn record_usage_accepts_a_partial_increase() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-partial");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let claim = store.claim_job(&work_id, &runner("runner-a")?, terms(60, now))?;
+    record_usage(&store, &claim, &usage(100, 10, 5), later(now, 1)?)?;
+    let before = store.load(&work_id)?;
+
+    let partial = usage(150, 10, 5);
+    let stored = record_usage(&store, &claim, &partial, later(now, 2)?)?;
+
+    assert_eq!(stored, partial);
+    let after = store.load(&work_id)?;
+    assert_eq!(after.job.usage, partial);
+    assert_eq!(after.revision, before.revision.saturating_add(1));
+    Ok(())
+}
+
+#[test]
+fn record_usage_with_a_stale_token_is_rejected_after_reclaim() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-stale");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let first = store.claim_job(&work_id, &runner("runner-a")?, terms(1, now))?;
+    let expiry = later(now, 2)?;
+    let page = store.reconcile_expired(expiry, 100, None)?;
+    assert_eq!(page.expired.len(), 1);
+    let second = store.claim_job(&work_id, &runner("runner-b")?, terms(60, later(expiry, 2)?))?;
+    let before = store.load(&work_id)?;
+
+    let stale = record_usage(&store, &first, &usage(10, 1, 1), later(expiry, 3)?);
+
+    assert!(matches!(
+        stale,
+        Err(StoreError::StaleLease {
+            reason: StaleLease::TokenMismatch,
+            ..
+        })
+    ));
+    assert_eq!(store.load(&work_id)?, before);
+    let fresh = record_usage(&store, &second, &usage(10, 1, 1), later(expiry, 3)?)?;
+    assert_eq!(fresh, usage(10, 1, 1));
+    Ok(())
+}
+
+#[test]
+fn record_usage_after_lease_expiry_is_rejected() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-expired");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let claim = store.claim_job(&work_id, &runner("runner-a")?, terms(1, now))?;
+    let before = store.load(&work_id)?;
+
+    let late = record_usage(&store, &claim, &usage(10, 1, 1), later(now, 2)?);
+
+    assert!(matches!(
+        late,
+        Err(StoreError::StaleLease {
+            reason: StaleLease::Expired { .. },
+            ..
+        })
+    ));
+    assert_eq!(store.load(&work_id)?, before);
+    Ok(())
+}
+
+#[test]
+fn record_usage_on_a_terminal_job_is_rejected() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-terminal");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let claim = store.claim_job(&work_id, &runner("runner-a")?, terms(60, now))?;
+    store.transition(
+        &claim,
+        JobTransition::Complete {
+            completed_at: later(now, 1)?,
+            outcome: succeeded(),
+        },
+    )?;
+    let before = store.load(&work_id)?;
+
+    let after_done = record_usage(&store, &claim, &usage(10, 1, 1), later(now, 2)?);
+
+    assert!(matches!(
+        after_done,
+        Err(StoreError::Conflict {
+            conflict: Conflict::AlreadyTerminal {
+                state: JobState::Completed
+            },
+            ..
+        })
+    ));
+    assert_eq!(store.load(&work_id)?, before);
+    Ok(())
+}
+
+#[test]
+fn usage_survives_reclaim_and_is_visible_in_the_next_claim() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = FsJobRecordStore::create_ambient(&temp.path().join("jobs"))?;
+    let now = Timestamp::now();
+    let work_id = WorkId::from_str("job-usage-reclaim");
+    store.create_job(stored_job(work_id.as_str(), now)?)?;
+    let first = store.claim_job(&work_id, &runner("runner-a")?, terms(10, now))?;
+    let reported = usage(300, 12, 6);
+    record_usage(&store, &first, &reported, later(now, 1)?)?;
+
+    let expiry = later(now, 20)?;
+    let page = store.reconcile_expired(expiry, 100, None)?;
+    assert_eq!(page.expired.len(), 1);
+    assert_eq!(store.load(&work_id)?.job.usage, reported);
+
+    let second = store.claim_job(&work_id, &runner("runner-b")?, terms(60, later(expiry, 2)?))?;
+
+    assert_eq!(second.job.usage, reported);
     Ok(())
 }

@@ -1393,6 +1393,7 @@ mod tests {
         let agent = crate::knowledge_common::KnowledgeCaller {
             agent: AgentId::new("explorer"),
             viewer: VisibilityScope::SelfOnly,
+            identity: None,
         };
         let hidden = list_provisional_topics(&store, &agent).map_err(ctx("topics as agent"))?;
         let data = hidden.data.ok_or(TestError::Missing("agent topics data"))?;

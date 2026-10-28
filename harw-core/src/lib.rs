@@ -56,6 +56,8 @@ pub mod stream;
 #[cfg(test)]
 mod test_support;
 pub mod testing;
+// Zulassung einzelner Werkzeugaufrufe vor ihrer Ausführung (Job-Budget).
+pub mod tool_call_meter;
 pub mod turn_loop;
 // Runde 9, Teil E4: vorab erteilte Freigaben der Nutzerin im Handoff.
 pub mod user_approval;
@@ -137,6 +139,7 @@ pub use state_store::{
 };
 pub use stream::{ModelStreamEvent, StreamSink};
 pub use testing::RecordingModelProvider;
+pub use tool_call_meter::{ToolCallAdmissionFuture, ToolCallMeter, ToolCallPermit};
 pub use turn_loop::{
     ApprovalResolution, TurnInput, TurnOutcome, TurnTokenBudget, resume_after_approval,
     resume_after_approval_durable, resume_after_child, resume_after_child_durable, run_turn,

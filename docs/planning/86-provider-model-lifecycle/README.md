@@ -86,6 +86,8 @@ Selection/router behavior:
 
 This preserves Harwness' atomic model/provider switching semantics.
 
+Status 2026-10-27: `enforce_explicit`/`implicitly_selectable_bundled` landed in `harw-model-catalog::lifecycle`; the runtime consults them for explicit live-model choices and implicit internal-model routes (`harw-runtime::live_model`).
+
 ### D4 — Source refresh
 
 Add a Mistral Serverless lifecycle source beside the existing research files. Keep direct-Z.AI metadata independent.

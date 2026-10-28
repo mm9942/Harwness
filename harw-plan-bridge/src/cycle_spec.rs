@@ -213,7 +213,8 @@ impl ReadOnlyCycleSpec {
                 ..CycleTargets::default()
             },
         )
-        .map_err(CycleSpecError::Admission)?;
+        .map_err(CycleSpecError::Admission)?
+        .with_objective(&self.objective);
         Ok(ReadOnlyCyclePlan {
             admission,
             targets,
@@ -250,6 +251,16 @@ mod tests {
         assert!(plan.admission.allowed_write_targets().is_empty());
         assert!(plan.admission.allowed_children().is_empty());
         assert_eq!(plan.admission.intent().digest, spec().digest());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_passes_objective_into_admission() -> TestResult {
+        let plan = spec().plan("intent-1").map_err(ctx("plan"))?;
+        assert_eq!(
+            plan.admission.objective(),
+            "find out whether the marker exists"
+        );
         Ok(())
     }
 

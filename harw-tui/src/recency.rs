@@ -3,12 +3,12 @@
 //! nichts wird gelöscht oder umnummeriert.
 
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "h7 display view: fields are read by the slot renderer, which is not mounted yet"
-)]
 pub(crate) struct RecencyEntry {
+    /// Sitzungs-ID des meldenden Kindes (im Betrieb eine 36 Zeichen lange UUID).
     pub(crate) child: String,
+    /// Organisatorische Rolle des Kindes (z. B. `uia-writer`); kann leer sein.
+    /// Die Anzeige bevorzugt sie als kurze Kennung vor der Sitzungs-ID.
+    pub(crate) role: String,
     pub(crate) text: String,
 }
 
@@ -18,10 +18,6 @@ pub(crate) struct RecencySlots {
     slot2: Option<RecencyEntry>,
 }
 
-#[allow(
-    dead_code,
-    reason = "h7 display view: slot accessors are for the slot renderer, which is not mounted yet"
-)]
 impl RecencySlots {
     pub(crate) fn new() -> Self {
         Self {
@@ -47,26 +43,35 @@ impl RecencySlots {
 #[cfg(test)]
 mod tests {
     use super::{RecencyEntry, RecencySlots};
+    use crate::test_support::{TestError, TestResult};
 
     fn entry(text: &str) -> RecencyEntry {
         RecencyEntry {
             child: "agent".to_owned(),
+            role: String::new(),
             text: text.to_owned(),
         }
     }
 
+    fn text_of(entry: Option<&RecencyEntry>, what: &'static str) -> TestResult<String> {
+        entry
+            .map(|entry| entry.text.clone())
+            .ok_or(TestError::Missing(what))
+    }
+
     #[test]
-    fn push_rota() {
+    fn push_rota() -> TestResult {
         let mut slots = RecencySlots::new();
         slots.push(entry("A"));
-        assert_eq!(slots.slot1().unwrap().text, "A");
+        assert_eq!(text_of(slots.slot1(), "Slot 1")?, "A");
         assert!(slots.slot2().is_none());
         slots.push(entry("B"));
-        assert_eq!(slots.slot1().unwrap().text, "B");
-        assert_eq!(slots.slot2().unwrap().text, "A");
+        assert_eq!(text_of(slots.slot1(), "Slot 1")?, "B");
+        assert_eq!(text_of(slots.slot2(), "Slot 2")?, "A");
         slots.push(entry("C"));
-        assert_eq!(slots.slot1().unwrap().text, "C");
-        assert_eq!(slots.slot2().unwrap().text, "B");
+        assert_eq!(text_of(slots.slot1(), "Slot 1")?, "C");
+        assert_eq!(text_of(slots.slot2(), "Slot 2")?, "B");
+        Ok(())
     }
 
     #[test]
@@ -77,11 +82,26 @@ mod tests {
     }
 
     #[test]
-    fn discarded_third() {
+    fn discarded_third() -> TestResult {
         let mut slots = RecencySlots::new();
         slots.push(entry("A"));
         slots.push(entry("B"));
         slots.push(entry("C"));
-        assert_eq!(slots.slot2().unwrap().text, "B");
+        assert_eq!(text_of(slots.slot2(), "Slot 2")?, "B");
+        Ok(())
+    }
+
+    #[test]
+    fn role_is_carried_alongside_child_and_text() -> TestResult {
+        let mut slots = RecencySlots::new();
+        slots.push(RecencyEntry {
+            child: "0196f3a2-7b1e-4c8d-9a35-5e2f8d41b6c7".to_owned(),
+            role: "uia-writer".to_owned(),
+            text: "fertig".to_owned(),
+        });
+        let newest = slots.slot1().ok_or(TestError::Missing("Slot 1"))?;
+        assert_eq!(newest.role, "uia-writer");
+        assert_eq!(newest.child, "0196f3a2-7b1e-4c8d-9a35-5e2f8d41b6c7");
+        Ok(())
     }
 }

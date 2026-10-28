@@ -275,11 +275,19 @@ pub const INTENT_CYCLE_START_TOOL: &str = "intent_cycle.start";
 pub const INTENT_CYCLE_STATUS_TOOL: &str = "intent_cycle.status";
 /// `intent_cycle.stop`: cancels an intent-cycle job through the job cancel path.
 pub const INTENT_CYCLE_STOP_TOOL: &str = "intent_cycle.stop";
-/// The three intent-cycle tools.
+/// `intent_cycle.list`: lists the intent-cycle jobs of the bound workspace
+/// (read-only, observer tier).
+pub const INTENT_CYCLE_LIST_TOOL: &str = "intent_cycle.list";
+/// `intent_cycle`: the `/cycle` command surface (`list`, `status`, `stop`);
+/// an operator-tier operation, not a model tool.
+pub const INTENT_CYCLE_COMMAND_TOOL: &str = "intent_cycle";
+/// The five intent-cycle tools.
 pub const INTENT_CYCLE_TOOLS: &[&str] = &[
     INTENT_CYCLE_START_TOOL,
     INTENT_CYCLE_STATUS_TOOL,
     INTENT_CYCLE_STOP_TOOL,
+    INTENT_CYCLE_LIST_TOOL,
+    INTENT_CYCLE_COMMAND_TOOL,
 ];
 /// The three WorkDriver tools.
 pub const WORK_DRIVER_TOOLS: &[&str] = &[
@@ -389,10 +397,15 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // Intent cycles (PL-90): `intent_cycle.start` admits a durable job that
     // only READS the named workspace files (explorer + deterministic
     // verifier, no process, no write, no network) — `Read`, not `Shell`.
-    // Status and stop only read or cancel a job record (`Meta`).
+    // Status and stop only read or cancel a job record (`Meta`); so do
+    // `intent_cycle.list` (read-only listing of the bound workspace's cycle
+    // jobs) and `intent_cycle` (the `/cycle` command surface that dispatches
+    // to list/status/stop — it adds no capability beyond those).
     row!("intent_cycle.start", AGENTS, Read),
     row!("intent_cycle.status", AGENTS, Meta),
     row!("intent_cycle.stop", AGENTS, Meta),
+    row!("intent_cycle.list", AGENTS, Meta),
+    row!("intent_cycle", AGENTS, Meta),
     // gateway (R18): operations in `harw-ops`, served to the UIA root like
     // `work_driver.*`. Reads inspect the gateway; mutations act on it outside
     // the sandbox and always ask.
@@ -865,15 +878,21 @@ mod tests {
     }
 
     /// PL-90: the intent-cycle tools have catalog rows; `start` only reads
-    /// workspace files (`Read`, no manifest flag), status/stop are `Meta`;
-    /// none is auto-approved or always available.
+    /// workspace files (`Read`, no manifest flag), status/stop/list and the
+    /// `/cycle` command surface are `Meta`; none is auto-approved or always
+    /// available.
     #[test]
     fn test_intent_cycle_tools_are_classified() {
         let class = |tool: &str| lookup(tool).map(|entry| entry.class);
-        assert_eq!(INTENT_CYCLE_TOOLS.len(), 3);
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 5);
         assert_eq!(class(INTENT_CYCLE_START_TOOL), Some(CapabilityClass::Read));
         assert_eq!(class(INTENT_CYCLE_STATUS_TOOL), Some(CapabilityClass::Meta));
         assert_eq!(class(INTENT_CYCLE_STOP_TOOL), Some(CapabilityClass::Meta));
+        assert_eq!(class(INTENT_CYCLE_LIST_TOOL), Some(CapabilityClass::Meta));
+        assert_eq!(
+            class(INTENT_CYCLE_COMMAND_TOOL),
+            Some(CapabilityClass::Meta)
+        );
         for tool in INTENT_CYCLE_TOOLS {
             let entry = lookup(tool);
             assert!(

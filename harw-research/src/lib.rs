@@ -14,7 +14,8 @@
 //! - [`schema`]: JSON-Schema- und Prompt-Erzeugung für `ResearchFinding`.
 //! - [`validate`]: toleranter Parser (schneidet ```json-Fences weg) und
 //!   Validierungsregeln.
-//! - [`return_envelope`]: der reduzierte Kind-Agenten-Return-Contract.
+//! - [`return_envelope`]: der reduzierte Kind-Agenten-Return-Contract samt
+//!   [`sanitize_for_parent`], der begrenzten, inhaltssicheren Eltern-Grenze.
 //! - [`error`]: der zentrale Fehlertyp [`ResearchError`] und Alias
 //!   [`ResearchResult`].
 //!
@@ -56,7 +57,9 @@ pub mod validate;
 
 pub use error::{ResearchError, ResearchResult};
 pub use return_envelope::{
-    ReturnEnvelope, ReturnOutcome, envelope_with_finding, parse_return_envelope,
+    EnvelopeRefusal, MAX_ENTRY_CHARS, MAX_LIST_ENTRIES, MAX_PAYLOAD_BYTES, MAX_SUMMARY_CHARS,
+    ReturnEnvelope, ReturnOutcome, SanitizedReturnEnvelope, envelope_with_finding,
+    parse_return_envelope, sanitize_for_parent,
 };
 pub use schema::{finding_json_schema, finding_schema_prompt, finding_schema_prompt_with_example};
 pub use types::{

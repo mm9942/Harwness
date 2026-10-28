@@ -1155,6 +1155,10 @@ const PLAN_TOOL_NAMES: &[&str] = &[
     "intent_cycle.start",
     "intent_cycle.status",
     "intent_cycle.stop",
+    // Welle 7: `intent_cycle.list` (Modell-Tool, readonly) und die
+    // `/cycle`-Befehlsfläche `intent_cycle` hängen am selben Gate.
+    "intent_cycle.list",
+    "intent_cycle",
 ];
 
 /// Runde 5, Teil H: `agent.result` steht an der Wurzel genau dann, wenn sie

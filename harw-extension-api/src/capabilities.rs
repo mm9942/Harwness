@@ -5,6 +5,7 @@ use harw_catalog::AgentSuggestions;
 use harw_context::ContextCeiling;
 use harw_types::{SessionId, ToolCallId, WorkId};
 use jiff::Timestamp;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -250,6 +251,36 @@ impl DelegationTargets {
             .iter()
             .any(|target| target.name == name)
     }
+
+    /// Kompakte Top-k-Empfehlung: die admittierten Ziele, deren Rolle/Skills
+    /// die gewünschten Tags treffen, höchstens `k` (≤ `MAX_TARGET_OFFERS`).
+    /// Reine Darstellungshilfe — ändert weder Sichtbarkeit noch Admission.
+    ///
+    /// # Beschreibung
+    /// `targets` ist bereits die sichtbarkeitsgefilterte, admittierte Liste;
+    /// deshalb sind `granted` und `model_ready` hier immer `true`. Die echte
+    /// Modellbereitschaft kommt erst mit dem Capability-Snapshot.
+    #[must_use]
+    pub fn offers(&self, wanted_tags: &BTreeSet<String>, k: usize) -> Vec<String> {
+        let allowed: BTreeSet<String> = self.names().into_iter().collect();
+        let candidates: Vec<crate::target_offer::TargetCandidate> = self
+            .targets
+            .iter()
+            .map(|target| crate::target_offer::TargetCandidate {
+                id: target.name.clone(),
+                capability_tags: target
+                    .skills
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(target.role.clone()))
+                    .map(|tag| tag.to_lowercase())
+                    .collect(),
+                model_ready: true,
+                granted: true,
+            })
+            .collect();
+        crate::target_offer::offer_targets(&allowed, &candidates, wanted_tags, k)
+    }
 }
 
 /// Warum ein Aufrufer gerade gar nicht delegieren kann (Plan R9, Teil C).
@@ -460,6 +491,98 @@ mod tests {
 
         assert_eq!(spawner.finished.load(Ordering::SeqCst), 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delegation_offer_tests {
+    use super::{DelegationTargetInfo, DelegationTargets};
+    use crate::target_offer::MAX_TARGET_OFFERS;
+    use std::collections::BTreeSet;
+
+    fn tags(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    fn target(name: &str, role: &str, skills: &[&str]) -> DelegationTargetInfo {
+        DelegationTargetInfo {
+            name: name.to_owned(),
+            role: role.to_owned(),
+            skills: skills.iter().map(|skill| (*skill).to_owned()).collect(),
+            ..DelegationTargetInfo::default()
+        }
+    }
+
+    fn numbered_targets(count: usize) -> DelegationTargets {
+        DelegationTargets {
+            targets: (0..count)
+                .map(|index| target(&format!("t{index:02}"), "worker", &[]))
+                .collect(),
+            ..DelegationTargets::default()
+        }
+    }
+
+    #[test]
+    fn offers_prefer_tag_matches_and_never_exceed_eight() {
+        let mut targets = numbered_targets(10);
+        for index in [7_usize, 8, 9] {
+            if let Some(entry) = targets.targets.get_mut(index) {
+                entry.skills = vec!["Rust-Review".to_owned()];
+            }
+        }
+
+        let offers = targets.offers(&tags(&["rust-review"]), 100);
+
+        assert_eq!(offers.len(), MAX_TARGET_OFFERS);
+        assert_eq!(
+            offers.iter().take(3).cloned().collect::<Vec<_>>(),
+            vec!["t07".to_owned(), "t08".to_owned(), "t09".to_owned()]
+        );
+    }
+
+    #[test]
+    fn offers_match_the_role_label_case_insensitively() {
+        let targets = DelegationTargets {
+            targets: vec![
+                target("alpha", "worker", &[]),
+                target("beta", "Child-Orchestrator", &[]),
+            ],
+            ..DelegationTargets::default()
+        };
+
+        assert_eq!(
+            targets.offers(&tags(&["child-orchestrator"]), 1),
+            vec!["beta".to_owned()]
+        );
+    }
+
+    #[test]
+    fn offers_subset_of_visible_names() {
+        let mut targets = numbered_targets(6);
+        targets.withheld_by_plan_mode = vec![target("hidden", "worker", &["rust-review"])];
+
+        let visible: BTreeSet<String> = targets.names().into_iter().collect();
+        let offers = targets.offers(&tags(&["rust-review", "worker"]), 4);
+
+        assert_eq!(offers.len(), 4);
+        assert!(offers.iter().all(|name| visible.contains(name)));
+        assert!(!offers.iter().any(|name| name == "hidden"));
+    }
+
+    #[test]
+    fn offers_with_no_tags_are_deterministic() {
+        let targets = DelegationTargets {
+            targets: vec![
+                target("zeta", "worker", &[]),
+                target("alpha", "worker", &[]),
+                target("mid", "worker", &[]),
+            ],
+            ..DelegationTargets::default()
+        };
+
+        let expected = vec!["alpha".to_owned(), "mid".to_owned(), "zeta".to_owned()];
+        assert_eq!(targets.offers(&BTreeSet::new(), 8), expected);
+        assert_eq!(targets.offers(&BTreeSet::new(), 8), expected);
     }
 }
 

@@ -32,12 +32,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_job_core::{
-    JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState, Lease,
-    LeaseToken, StoredJob,
+    BudgetUsage, JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState,
+    Lease, LeaseToken, StoredJob,
 };
 use harw_job_store::{
-    Conflict, LEASE_EXPIRED_EXHAUSTED_REASON, RecordStore, StaleLease, StoreError, mechanics,
-    validate_id,
+    Conflict, LEASE_EXPIRED_EXHAUSTED_REASON, RecordLock, RecordStore, StaleLease, StoreError,
+    mechanics, validate_id,
 };
 use harw_types::{ApprovalActor, WorkId};
 use jiff::{SignedDuration, Timestamp};
@@ -51,6 +51,68 @@ const APPROVALS_KIND: &str = "approvals";
 /// Reason recorded when an explicit [`JobStore::reclaim`] exhausts the retry
 /// budget (unchanged wire text).
 const RECLAIM_EXHAUSTED_REASON: &str = "job reclaimed and retry budget is exhausted";
+
+/// Further attempts of [`JobStore::hold_live_lease`] on a contended job lock
+/// (the same budget the worker's usage flush uses).
+const HOLD_LOCK_RETRIES: u32 = 5;
+
+/// Pause before retry `n` of [`JobStore::hold_live_lease`] is `n` times this
+/// (20 + 40 + … + 100 ms, 300 ms at most in total).
+const HOLD_LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Proof that a job lease is the current claim, with the deadline until
+/// which it stays live.
+///
+/// The guard holds the job's per-record lock, the same lock every lease
+/// mutation (`claim`, `renew`, `record_usage`, `complete`, `cancel`,
+/// `reclaim`, `reconcile_expired`, …) takes, so none of them can replace
+/// the lease until the guard is dropped — they are refused as
+/// [`SessionStoreError::JobLockContended`] (the heartbeat retries, the
+/// expiry scan skips the job for this pass). A record lock cannot stop the
+/// wall clock, though: the lease still expires at [`JobLeaseGuard::deadline`]
+/// (a full TTL after [`JobStore::hold_live_lease`] renewed it). A caller
+/// therefore checks [`JobLeaseGuard::still_live`] immediately before it
+/// publishes the commit the guard protects. Dropping the guard releases the
+/// lock. Keep it for one short commit only.
+#[derive(Debug)]
+#[must_use = "the lease is only held while the guard lives"]
+pub struct JobLeaseGuard {
+    _lock: RecordLock,
+    work_id: WorkId,
+    deadline: Timestamp,
+}
+
+impl JobLeaseGuard {
+    /// When the held lease expires (its renewed `expires_at`). While the
+    /// guard lives nobody can renew or replace the lease, so this is exact.
+    #[must_use]
+    pub fn deadline(&self) -> Timestamp {
+        self.deadline
+    }
+
+    /// `Ok` while the held lease has not expired (`now < deadline`).
+    ///
+    /// # Errors
+    /// [`SessionStoreError::JobLeaseExpired`] once the deadline has passed:
+    /// the protected commit must not be published.
+    pub fn still_live(&self) -> SessionStoreResult<()> {
+        if Timestamp::now() < self.deadline {
+            Ok(())
+        } else {
+            Err(SessionStoreError::JobLeaseExpired {
+                work_id: self.work_id.clone(),
+                expired_at: self.deadline,
+            })
+        }
+    }
+
+    /// Test seam: moves the deadline (e.g. into the past) without waiting.
+    #[cfg(test)]
+    fn with_deadline(mut self, deadline: Timestamp) -> Self {
+        self.deadline = deadline;
+        self
+    }
+}
 
 /// Query for an eventually-consistent job list snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +364,114 @@ impl JobStore {
         let work_id = request.token.work_id.clone();
         self.with_locked(&work_id, |record| {
             mechanics::renew(record, &request.token, request.now).map_err(SessionStoreError::from)
+        })
+    }
+
+    /// Persists the running job's budget usage under the current lease.
+    ///
+    /// Fenced like [`JobStore::renew`]: only the holder of the current,
+    /// non-expired lease may record usage, so a stale worker can never
+    /// overwrite the usage of a reclaimed attempt. Usage is monotonic; a
+    /// regression is rejected with [`SessionStoreError::JobRuntime`] and
+    /// writes nothing. Returns the usage that is stored after the call.
+    /// Publishes no lifecycle event, because the job state does not change.
+    pub fn record_usage(
+        &self,
+        work_id: &WorkId,
+        token: &LeaseToken,
+        usage: &BudgetUsage,
+    ) -> SessionStoreResult<BudgetUsage> {
+        if token.work_id != *work_id {
+            return Err(SessionStoreError::LeaseTokenMismatch {
+                work_id: work_id.clone(),
+            });
+        }
+        self.with_locked(work_id, |record| {
+            mechanics::record_usage(record, token, usage, Timestamp::now())
+                .map_err(SessionStoreError::from)
+        })
+    }
+
+    /// Renews the lease of `token` durably, takes the job's per-record lock,
+    /// verifies under it that `token` is still the current, non-expired
+    /// lease, and returns a [`JobLeaseGuard`] that keeps the lock until it is
+    /// dropped and knows the lease's deadline.
+    ///
+    /// 1. **Renew**: the same fenced [`mechanics::renew`] the heartbeat uses
+    ///    ([`JobStore::renew`]), after the terminal-state check of
+    ///    [`JobStore::record_usage`]. The lease's `expires_at` moves to
+    ///    `now + ttl` and is persisted, so the protected commit starts with a
+    ///    fresh, bounded window instead of whatever was left — a hold taken
+    ///    just before expiry does not inherit a few milliseconds.
+    /// 2. **Hold and re-verify**: the lock is taken and the record re-read
+    ///    under it; a cancellation or reclaim that slipped in between the
+    ///    renewal and the lock is seen here and refused. The deadline is the
+    ///    `expires_at` read under the lock.
+    ///
+    /// While the guard lives, the lease can be neither replaced nor renewed,
+    /// so a caller that commits *while* holding it and checks
+    /// [`JobLeaseGuard::still_live`] right before publishing commits under a
+    /// lease that is current and unexpired at that moment. What remains is
+    /// the time between that final check and the caller's atomic publish
+    /// (microseconds to an fsync), bounded by the renewed TTL. Lock order for
+    /// such callers: this job lock first, then their own record lock (the
+    /// intent-cycle store); never the other way round.
+    ///
+    /// A contended lock (typically the holder's own heartbeat renewing at
+    /// the same moment) is retried `HOLD_LOCK_RETRIES` (5) times with a
+    /// growing pause, so a live lease does not look dead. Blocking (it
+    /// sleeps between retries); call it from a blocking thread. Publishes no
+    /// lifecycle event (the job state does not change).
+    ///
+    /// # Errors
+    /// [`SessionStoreError::JobNotFound`],
+    /// [`SessionStoreError::JobAlreadyTerminal`],
+    /// [`SessionStoreError::LeaseTokenMismatch`] (no lease, another nonce or
+    /// epoch), [`SessionStoreError::JobLeaseExpired`] (nothing is renewed
+    /// then), [`SessionStoreError::JobLockContended`] once the retries are
+    /// used up, or a read/write error. The lock is released on every error.
+    pub fn hold_live_lease(&self, token: &LeaseToken) -> SessionStoreResult<JobLeaseGuard> {
+        let id = validate_id(token.work_id.as_str())?;
+        let mut attempt = 0_u32;
+        loop {
+            match self.renew_and_hold(id, token) {
+                Err(SessionStoreError::JobLockContended { .. }) if attempt < HOLD_LOCK_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(HOLD_LOCK_RETRY_PAUSE * attempt);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    // Ein Versuch von `hold_live_lease`: erneuern (persistiert), dann sperren
+    // und unter der Sperre erneut prüfen.
+    fn renew_and_hold(&self, id: &str, token: &LeaseToken) -> SessionStoreResult<JobLeaseGuard> {
+        self.with_locked(&token.work_id, |record| {
+            if mechanics::is_terminal(record.job.state) {
+                return Err(SessionStoreError::JobAlreadyTerminal {
+                    work_id: token.work_id.clone(),
+                    state: record.job.state,
+                });
+            }
+            mechanics::renew(record, token, Timestamp::now()).map_err(SessionStoreError::from)
+        })?;
+        let store = self.store()?;
+        let lock = store.lock(id)?;
+        // Unter der Sperre: der Datensatz kann sich bis zum Drop des Guards
+        // nicht ändern. Geprüft wird nur die In-Memory-Kopie.
+        let mut record = store.load(id)?;
+        if mechanics::is_terminal(record.job.state) {
+            return Err(SessionStoreError::JobAlreadyTerminal {
+                work_id: token.work_id.clone(),
+                state: record.job.state,
+            });
+        }
+        let deadline = mechanics::verify_lease(&mut record, token, Timestamp::now())?.expires_at;
+        Ok(JobLeaseGuard {
+            _lock: lock,
+            work_id: token.work_id.clone(),
+            deadline,
         })
     }
 
@@ -1986,6 +2156,487 @@ mod tests {
         ));
         let after = store.get(&work_id)?;
         assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[test]
+    fn record_usage_roundtrips_through_get() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let usage = BudgetUsage {
+            tokens: 1_200,
+            wall: SignedDuration::from_secs(7),
+            tool_calls: 3,
+        };
+
+        let stored = store.record_usage(&work_id, &claim.token, &usage)?;
+
+        assert_eq!(stored, usage);
+        assert_eq!(store.get(&work_id)?.job.usage, usage);
+        Ok(())
+    }
+
+    #[test]
+    fn record_usage_rejects_regression_with_job_runtime_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage-regress");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let usage = BudgetUsage {
+            tokens: 500,
+            wall: SignedDuration::from_secs(5),
+            tool_calls: 2,
+        };
+        store.record_usage(&work_id, &claim.token, &usage)?;
+        let before = store.get(&work_id)?;
+
+        let regressed = BudgetUsage {
+            tokens: 499,
+            ..usage.clone()
+        };
+        assert!(matches!(
+            store.record_usage(&work_id, &claim.token, &regressed),
+            Err(SessionStoreError::JobRuntime { .. })
+        ));
+        let negative_wall = BudgetUsage {
+            wall: SignedDuration::from_secs(-1),
+            ..usage.clone()
+        };
+        assert!(matches!(
+            store.record_usage(&work_id, &claim.token, &negative_wall),
+            Err(SessionStoreError::JobRuntime { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_record_usage_after_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage-stale");
+        store.admit(&record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+        let first = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now,
+            },
+        )?;
+        let after_expiry = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("now + 2s"))?;
+        assert_eq!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .len(),
+            1
+        );
+        let second = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-b".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: after_expiry
+                    .checked_add(SignedDuration::from_secs(2))
+                    .map_err(ctx("after_expiry + 2s"))?,
+            },
+        )?;
+        assert!(second.token.epoch > first.token.epoch);
+        let before = store.get(&work_id)?;
+
+        let usage = BudgetUsage {
+            tokens: 10,
+            wall: SignedDuration::from_secs(1),
+            tool_calls: 1,
+        };
+        assert!(matches!(
+            store.record_usage(&work_id, &first.token, &usage),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn hold_live_lease_renews_the_lease_for_a_commit_window() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-verify-live");
+        store.admit(&StoredJob {
+            not_before: Timestamp::now()
+                .checked_sub(SignedDuration::from_secs(60))
+                .map_err(ctx("now - 60s"))?,
+            ..record(work_id.as_str())?
+        })?;
+        // Vor 30 s für 60 s beansprucht: noch 30 s übrig.
+        let claimed_at = Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(30))
+            .map_err(ctx("now - 30s"))?;
+        let claim = claim_for(&store, &work_id, claimed_at)?;
+        let before = store.get(&work_id)?;
+        let before_expiry = before
+            .lease
+            .as_ref()
+            .map(|lease| lease.expires_at)
+            .ok_or(TestError::Missing("claimed lease"))?;
+        let events_after_claim = recorded_events(&sink).len();
+
+        let held = store.hold_live_lease(&claim.token)?;
+        let after = store.get(&work_id)?;
+        let renewed = after
+            .lease
+            .as_ref()
+            .ok_or(TestError::Missing("held lease"))?;
+        assert!(
+            renewed.expires_at > before_expiry,
+            "the hold starts a fresh window"
+        );
+        assert_eq!(held.deadline(), renewed.expires_at);
+        assert_eq!(renewed.token(), claim.token, "same epoch and nonce");
+        assert_eq!(after.revision, before.revision.saturating_add(1));
+        assert_eq!(after.job.state, JobState::Running);
+        held.still_live()?;
+        drop(held);
+        // Beim Drop freigegeben: der nächste Halter bekommt die Sperre sofort.
+        let second = store.hold_live_lease(&claim.token)?;
+        drop(second);
+        assert_eq!(
+            recorded_events(&sink).len(),
+            events_after_claim,
+            "a hold publishes no lifecycle event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn near_expiry_hold_lets_a_delayed_commit_pass_and_refuses_after_the_deadline() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-hold-near-expiry");
+        store.admit(&StoredJob {
+            not_before: Timestamp::now()
+                .checked_sub(SignedDuration::from_secs(60))
+                .map_err(ctx("now - 60s"))?,
+            ..record(work_id.as_str())?
+        })?;
+        // 2 s TTL, vor 1,7 s beansprucht (erst unmittelbar vor dem Claim
+        // berechnet): ohne Erneuerung blieben ~300 ms.
+        let claimed_at = Timestamp::now()
+            .checked_sub(SignedDuration::from_millis(1_700))
+            .map_err(ctx("now - 1.7s"))?;
+        let claim = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(2),
+                now: claimed_at,
+            },
+        )?;
+        let original_expiry = claim.lease.expires_at;
+
+        let held = store.hold_live_lease(&claim.token)?;
+        assert!(held.deadline() > original_expiry, "renewed under the hold");
+        // Ein Commit 400 ms später — nach dem ursprünglichen Ablauf — ist
+        // noch durch das erneuerte Fenster gedeckt.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(Timestamp::now() > original_expiry);
+        held.still_live()?;
+
+        // Ist die Frist verstrichen, darf nichts mehr veröffentlicht werden.
+        let past = Timestamp::now()
+            .checked_sub(SignedDuration::from_millis(1))
+            .map_err(ctx("now - 1ms"))?;
+        let overdue = held.with_deadline(past);
+        assert!(matches!(
+            overdue.still_live(),
+            Err(SessionStoreError::JobLeaseExpired { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn held_lease_keeps_every_lease_mutation_out_until_dropped() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-hold-fence");
+        store.admit(&record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+        let claim = claim_for(&store, &work_id, now)?;
+        let after_expiry = now
+            .checked_add(SignedDuration::from_secs(120))
+            .map_err(ctx("now + 120s"))?;
+
+        fn contended<T>(result: &SessionStoreResult<T>) -> bool {
+            matches!(result, Err(SessionStoreError::JobLockContended { .. }))
+        }
+        let held = store.hold_live_lease(&claim.token)?;
+        // Stand nach der Erneuerung durch den Halter.
+        let before = store.get(&work_id)?;
+        let renewed = store.renew(&RenewalRequest {
+            token: claim.token.clone(),
+            now,
+        });
+        assert!(contended(&renewed), "{renewed:?}");
+        let reclaimed = store.reclaim(&work_id, now, operator());
+        assert!(contended(&reclaimed), "{reclaimed:?}");
+        let cancelled = store.cancel(
+            &work_id,
+            &CancelRequest {
+                cancelled_at: now,
+                cancelled_by: operator(),
+                reason: "stop".to_owned(),
+            },
+        );
+        assert!(contended(&cancelled), "{cancelled:?}");
+        let completed = store.complete(
+            &work_id,
+            &CompleteRequest {
+                token: claim.token.clone(),
+                completed_at: now,
+                outcome: JobOutcome::Succeeded {
+                    result: serde_json::json!({}),
+                },
+            },
+        );
+        assert!(contended(&completed), "{completed:?}");
+        assert!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .is_empty(),
+            "the expiry scan skips a held job"
+        );
+        // Ein zweiter Halter wartet seine Wiederholungen ab und meldet dann
+        // Konkurrenz — nie eine verlorene Lease.
+        let second = store.hold_live_lease(&claim.token);
+        assert!(
+            matches!(second, Err(SessionStoreError::JobLockContended { .. })),
+            "{second:?}"
+        );
+        assert_eq!(store.get(&work_id)?, before, "nothing slipped in");
+
+        drop(held);
+        store.renew(&RenewalRequest {
+            token: claim.token.clone(),
+            now,
+        })?;
+        assert_eq!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .len(),
+            1,
+            "after the drop the expiry scan reclaims the job"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hold_live_lease_waits_out_a_brief_contention() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let work_id = WorkId::from_str("work-hold-brief");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+
+        // Steht für einen Heartbeat, der die Job-Sperre kurz hält.
+        let first = store.hold_live_lease(&claim.token)?;
+        let (started, started_seen) = std::sync::mpsc::channel();
+        let second = {
+            let store = Arc::clone(&store);
+            let token = claim.token.clone();
+            std::thread::spawn(move || {
+                let _signalled = started.send(());
+                store.hold_live_lease(&token).map(|_held| ())
+            })
+        };
+        started_seen.recv().map_err(ctx("second holder started"))?;
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        drop(first);
+
+        second
+            .join()
+            .map_err(|_| TestError::Missing("second holder thread"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn hold_live_lease_refuses_an_expired_claim_before_any_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-verify-expired");
+        let past = Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(120))
+            .map_err(ctx("now - 120s"))?;
+        store.admit(&StoredJob {
+            not_before: past,
+            ..record(work_id.as_str())?
+        })?;
+        // Zwei Minuten alter Claim mit 1 s TTL: jetzt abgelaufen, aber nie
+        // reclaimed — Epoche und Nonce sind weiterhin die des Datensatzes.
+        let claim = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now: past,
+            },
+        )?;
+        let before = store.get(&work_id)?;
+        assert_eq!(before.job.state, JobState::Running);
+        assert_eq!(before.lease_epoch, claim.token.epoch);
+        assert_eq!(
+            before.lease.as_ref().map(Lease::token),
+            Some(claim.token.clone()),
+            "the expired lease is still the recorded one"
+        );
+
+        assert!(matches!(
+            store.hold_live_lease(&claim.token),
+            Err(SessionStoreError::JobLeaseExpired { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before, "a refusal writes nothing");
+        // Eine Ablehnung gibt die Sperre sofort frei: eine Lease-Mutation bekommt sie.
+        let after_expiry = Timestamp::now();
+        assert_eq!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hold_live_lease_refuses_foreign_tokens_and_finished_jobs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-verify-foreign");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let before = store.get(&work_id)?;
+
+        let wrong_nonce = LeaseToken {
+            nonce: "forged-nonce".to_owned(),
+            ..claim.token.clone()
+        };
+        assert!(matches!(
+            store.hold_live_lease(&wrong_nonce),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let older_epoch = LeaseToken {
+            epoch: claim.token.epoch.saturating_sub(1),
+            ..claim.token.clone()
+        };
+        assert!(matches!(
+            store.hold_live_lease(&older_epoch),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        let unknown_job = LeaseToken {
+            work_id: WorkId::from_str("work-verify-missing"),
+            ..claim.token.clone()
+        };
+        assert!(matches!(
+            store.hold_live_lease(&unknown_job),
+            Err(SessionStoreError::JobNotFound { .. })
+        ));
+        assert_eq!(store.get(&work_id)?, before, "refusals write nothing");
+
+        store.complete(
+            &work_id,
+            &CompleteRequest {
+                token: claim.token.clone(),
+                completed_at: Timestamp::now(),
+                outcome: JobOutcome::Succeeded {
+                    result: serde_json::json!({}),
+                },
+            },
+        )?;
+        assert!(matches!(
+            store.hold_live_lease(&claim.token),
+            Err(SessionStoreError::JobAlreadyTerminal { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn record_usage_publishes_no_lifecycle_event() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-usage-quiet");
+        store.admit(&record(work_id.as_str())?)?;
+        let claim = claim_for(&store, &work_id, Timestamp::now())?;
+        let events_after_claim = recorded_events(&sink).len();
+
+        store.record_usage(
+            &work_id,
+            &claim.token,
+            &BudgetUsage {
+                tokens: 42,
+                wall: SignedDuration::from_secs(2),
+                tool_calls: 1,
+            },
+        )?;
+
+        assert_eq!(recorded_events(&sink).len(), events_after_claim);
+        Ok(())
+    }
+
+    #[test]
+    fn claim_after_reclaim_sees_the_recorded_usage() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-usage-carry");
+        store.admit(&record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+        let first = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now,
+            },
+        )?;
+        let usage = BudgetUsage {
+            tokens: 900,
+            wall: SignedDuration::from_secs(4),
+            tool_calls: 5,
+        };
+        store.record_usage(&work_id, &first.token, &usage)?;
+        let after_expiry = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("now + 2s"))?;
+        assert_eq!(
+            store
+                .reconcile_expired(after_expiry, 100, None)?
+                .expired
+                .len(),
+            1
+        );
+
+        let second = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-b".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: after_expiry
+                    .checked_add(SignedDuration::from_secs(2))
+                    .map_err(ctx("after_expiry + 2s"))?,
+            },
+        )?;
+
+        assert_eq!(second.job.usage, usage);
         Ok(())
     }
 }

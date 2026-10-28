@@ -2153,7 +2153,7 @@ pub(super) fn attribute_changes(
 
 /// Führt einen geclaimten `work_driver`-Job aus (siehe Moduldoku).
 pub(super) async fn execute_work_driver_claim(
-    claim: JobClaim,
+    mut claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
     job_store: Arc<JobStore>,
@@ -2208,14 +2208,31 @@ pub(super) async fn execute_work_driver_claim(
         _ => "work-driver".to_owned(),
     };
 
+    // Offene Usage eines früheren Versuchs zuerst verrechnen (Review P1 zu
+    // #151): der Ledger geht vom verrechneten Stand aus, ein Reclaim startet nie
+    // mit frischem Budget.
+    if let Err(reason) = super::settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(work_id = %work_id.as_str(), reason = %reason, "work-driver usage accounting unresolved");
+        return JobOutcome::Failed { reason };
+    }
+
     // Budgets: Token-Ledger des Jobs (von `work_driver.enqueue` aus der Spec
     // gespiegelt) für alle Modellrunden des Laufs; die Wandzeit bindet jeden
     // Worker-Turn an das Laufende.
-    let ledger = PromptTokenLedger::new(claim.job.budget.clone(), claim.job.usage.clone());
+    let ledger = PromptTokenLedger::persisted(
+        claim.job.budget.clone(),
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(super::USAGE_FLUSH_INTERVAL);
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: Arc::clone(&provider),
-        ledger,
+        ledger: Arc::clone(&ledger),
     });
+    // Jeder Werkzeugaufruf der Worker-Turns wird vor seiner Ausführung im
+    // Ledger gebucht und festgeschrieben (Review P1-b zu #151).
+    let tool_meter = super::ledger_tool_meter(&ledger);
     let run_wall = claim.job.budget.max_wall.unwrap_or(DEFAULT_RUN_WALL);
     let elapsed = Timestamp::now().duration_since(record.submitted_at);
     let remaining =
@@ -2261,6 +2278,7 @@ pub(super) async fn execute_work_driver_claim(
         control: Arc::clone(&control),
         deadline,
         role_instructions: config.worker_instructions.clone(),
+        tool_meter: Arc::clone(&tool_meter),
     };
     let sandboxed = context
         .verify_runner
@@ -2300,6 +2318,7 @@ pub(super) async fn execute_work_driver_claim(
         session_id: SessionId::from_str(format!("work-driver-{}-judge", work_id.as_str())),
         control: Arc::clone(&control),
         deadline,
+        tool_meter,
     };
     let pacer = CancellablePacer {
         control: Arc::clone(&control),
@@ -2317,7 +2336,7 @@ pub(super) async fn execute_work_driver_claim(
     };
     let cancellation = control.cancellation();
     let cancelled = move || *cancellation.borrow();
-    match run_rounds(
+    let outcome = match run_rounds(
         &job_store,
         &work_id,
         &driver_input,
@@ -2332,7 +2351,9 @@ pub(super) async fn execute_work_driver_claim(
         RoundsEnd::Yielded => JobOutcome::Failed {
             reason: "work-driver stopped without an outcome".to_owned(),
         },
-    }
+    };
+    // Nicht festschreibbare Usage macht auch einen Erfolg zum Fehlschlag.
+    ledger.finish(outcome).await
 }
 
 /// Was der Lauf aus der Konfiguration braucht.
@@ -2656,6 +2677,8 @@ struct JobTurnSpawner<'a> {
     /// Anweisungen der Worker-Rolle aus ihrer Definition
     /// (`AgentRoster::instructions`), falls vorhanden.
     role_instructions: Option<String>,
+    /// Bucht jeden Werkzeugaufruf im Ledger des Laufs, bevor er läuft.
+    tool_meter: Arc<dyn harw_core::ToolCallMeter>,
 }
 
 impl WorkerSpawner for JobTurnSpawner<'_> {
@@ -2684,6 +2707,7 @@ impl JobTurnSpawner<'_> {
                     model,
                     &self.control,
                     self.deadline,
+                    &self.tool_meter,
                 )
                 .await
             }
@@ -2866,7 +2890,8 @@ async fn cancellation_requested(mut cancellation: tokio::sync::watch::Receiver<b
 
 /// Ein Worker-Turn in seiner durablen Session, mit Wanduhr und Abbruch. Der
 /// Verlauf der Session wird nie gelesen oder verändert, nur der letzte
-/// Assistententext.
+/// Assistententext. `tool_meter` sitzt am `TurnControl` des Turns und bucht
+/// jeden Werkzeugaufruf, bevor er läuft.
 async fn drive_worker_turn(
     setup: TurnSetup,
     session_id: SessionId,
@@ -2874,6 +2899,7 @@ async fn drive_worker_turn(
     model: Arc<dyn ModelProvider>,
     control: &Arc<WorkerExecutionControl>,
     deadline: tokio::time::Instant,
+    tool_meter: &Arc<dyn harw_core::ToolCallMeter>,
 ) -> WorkerReply {
     let TurnSetup {
         mut session,
@@ -2881,14 +2907,11 @@ async fn drive_worker_turn(
         pause,
     } = setup;
     let durable_store: Arc<dyn StateStore> = Arc::clone(&state_store);
+    let input = TurnInput::user(prompt).with_control(
+        harw_core::turn_loop::TurnControl::new().with_tool_call_meter(Arc::clone(tool_meter)),
+    );
     let mut turn = tokio::spawn(async move {
-        run_turn(
-            &mut session,
-            model.as_ref(),
-            state_store.as_ref(),
-            TurnInput::user(prompt),
-        )
-        .await
+        run_turn(&mut session, model.as_ref(), state_store.as_ref(), input).await
     });
     let _abort = AbortOnDrop(turn.abort_handle());
     let joined = tokio::select! {
@@ -3006,6 +3029,9 @@ struct ConversationJudge<'a> {
     session_id: SessionId,
     control: Arc<WorkerExecutionControl>,
     deadline: tokio::time::Instant,
+    /// Derselbe Werkzeug-Meter wie die Worker: der Bewerter-Turn hat keine
+    /// Werkzeuge, aber jeder Job-Turn trägt einen Meter.
+    tool_meter: Arc<dyn harw_core::ToolCallMeter>,
 }
 
 impl Judge for ConversationJudge<'_> {
@@ -3049,6 +3075,7 @@ impl Judge for ConversationJudge<'_> {
                         model,
                         &self.control,
                         self.deadline,
+                        &self.tool_meter,
                     )
                     .await
                 }

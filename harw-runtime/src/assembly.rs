@@ -3326,6 +3326,16 @@ impl RuntimeAssemblyBuilder {
         //      dies **nicht** über
         //      `harw_memory::context_provider::MemoryContextProvider`
         //      läuft).
+        //      W03d-1-Audit: „nur Wurzel“ ist hier ausdrückliche Politik, kein
+        //      Versehen. Dieser Provider hängt allein an der Wurzel-Registry;
+        //      `children.rs::build_registry` registriert ihn für kein Kind
+        //      (gepinnt durch `child_registry_has_no_memory_facts_provider`).
+        //      Die Fakten (`harw_memory::Fact`) tragen weder Autor noch
+        //      Sichtbarkeitsbereich; ein Kind könnte sie nicht nach Identität
+        //      filtern lassen. Eine Ausweitung auf Kinder wäre deshalb eine
+        //      Politikänderung samt identitätsgebundener Sicht
+        //      (`harw_knowledge::caller_identity::CallerIdentity`), nicht bloß
+        //      ein weiterer `context_provider`-Aufruf.
         let registry_builder = if config.harness.memory.enabled
             && (project_facts.is_some() || global_facts.is_some())
         {
@@ -5362,7 +5372,9 @@ fn build_spawner(
         std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
     > = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
-    // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
+    // Fabriken (Agent-Id = laufgebundene Id `<rolle>.<uuid>` je Kind, von der
+    // Fabrik in `build_registry` gemintet — PL-90 W03d; die Id "child" hier
+    // ist nur der Vorgabewert ohne Zuordnung; Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
     let child_diary = knowledge.as_ref().map(|(store, _)| {
         Arc::new(

@@ -286,6 +286,10 @@ pub struct MemoryContextProvider<M: Memory> {
     /// `None`, wenn diesem Provider kein Index übergeben wurde — dann
     /// trägt der Dateiwissen-Abschnitt nichts zu [`Self::fragments`] bei.
     file_index: Option<Arc<FileKnowledgeIndex>>,
+    /// Session-Gate (PL-90 W03d-1): ist es `true` und weicht
+    /// `ctx.session_id` von der STM-Session ab, wird kein STM-Inhalt
+    /// ausgeliefert. Default `false` (bisheriges Verhalten).
+    enforce_session_match: bool,
 }
 
 impl<M: Memory> MemoryContextProvider<M> {
@@ -315,6 +319,7 @@ impl<M: Memory> MemoryContextProvider<M> {
             global_facts: None,
             memory_token_budget: DEFAULT_MEMORY_TOKEN_BUDGET,
             file_index: None,
+            enforce_session_match: false,
         }
     }
 
@@ -350,6 +355,7 @@ impl<M: Memory> MemoryContextProvider<M> {
             global_facts,
             memory_token_budget: DEFAULT_MEMORY_TOKEN_BUDGET,
             file_index: None,
+            enforce_session_match: false,
         }
     }
 
@@ -365,6 +371,26 @@ impl<M: Memory> MemoryContextProvider<M> {
     #[must_use]
     pub fn with_memory_token_budget(mut self, budget: usize) -> Self {
         self.memory_token_budget = budget;
+        self
+    }
+
+    /// Schaltet das Session-Gate für den STM-Abschnitt ein oder aus
+    /// (PL-90 W03d-1, Default aus).
+    ///
+    /// # Beschreibung
+    /// Ist das Gate an und weicht `ctx.session_id` in [`Self::fragments`] von
+    /// der Session des STM ab, wird kein STM-Inhalt ausgeliefert (die
+    /// Selektion läuft gegen einen leeren STM); HOT und WARM bleiben
+    /// unverändert. Ohne Gate bleibt das Verhalten wie bisher.
+    ///
+    /// # Arguments
+    /// - `enforce` (`bool`): `true` erzwingt die Session-Übereinstimmung.
+    ///
+    /// # Returns
+    /// `self` mit gesetztem Gate (Builder-Stil, verkettbar).
+    #[must_use]
+    pub fn with_session_gate(mut self, enforce: bool) -> Self {
+        self.enforce_session_match = enforce;
         self
     }
 
@@ -422,8 +448,30 @@ impl<M: Memory> MemoryContextProvider<M> {
         now: time::OffsetDateTime,
         produced_at: jiff::Timestamp,
     ) -> Vec<Fragment> {
+        // Session-Gate (PL-90 W03d-1): Gehört der Turn nicht zur Session des
+        // STM, wird gegen einen leeren STM der Aufrufer-Session selektiert —
+        // HOT/WARM bleiben, STM-Inhalt fremder Sessions fließt nie ein — auch nicht
+        // über die Stichwortableitung der Fakten-Suche.
+        let gated_stm;
+        let stm = if self.enforce_session_match {
+            let stm_session = self.stm.session_id();
+            if stm_session == ctx.session_id.as_str() {
+                &self.stm
+            } else {
+                tracing::debug!(
+                    ctx_session = %ctx.session_id,
+                    stm_session = %stm_session,
+                    "STM-Session passt nicht zur Turn-Session — STM wird ausgelassen"
+                );
+                gated_stm = ShortTermMemory::new(ctx.session_id.as_str(), 1, 1);
+                &gated_stm
+            }
+        } else {
+            &self.stm
+        };
+
         let mut fragments = Vec::new();
-        self.push_fact_fragments(&mut fragments, produced_at);
+        self.push_fact_fragments(&mut fragments, stm, produced_at);
 
         let role = selection_role_for(ctx);
         let request = SelectionRequest {
@@ -435,8 +483,7 @@ impl<M: Memory> MemoryContextProvider<M> {
             min_promotion_score: None,
         };
 
-        let result = match select_for_turn_no_signals(self.store.as_ref(), &self.stm, request, now)
-        {
+        let result = match select_for_turn_no_signals(self.store.as_ref(), stm, request, now) {
             Ok(result) => result,
             Err(error) => {
                 tracing::debug!(
@@ -493,7 +540,8 @@ impl<M: Memory> MemoryContextProvider<M> {
     /// Überschrift "Bekannte Fallstricke" (eine Zeile `- <description>` je
     /// Fakt, Rückfall auf `name` bei leerer Beschreibung); (3)
     /// Stichworttreffer aus [`FactStore::search`] gegen den jüngsten
-    /// `user`-STM-Eintrag ([`Self::search_keywords`]), Projekt vor Global,
+    /// `user`-STM-Eintrag ([`Self::search_keywords`], gegen den übergebenen — ggf. durch das
+    /// Session-Gate geleerten — STM), Projekt vor Global,
     /// so lange bis [`Self::memory_token_budget`] erschöpft ist; (4) falls
     /// [`Self::file_index`] gesetzt ist und Stichworte vorliegen, Treffer aus
     /// [`FileKnowledgeIndex::search`] (Limit [`FILE_INDEX_SEARCH_LIMIT`])
@@ -515,7 +563,12 @@ impl<M: Memory> MemoryContextProvider<M> {
     /// gezählt; ein Fehler dabei wird nur geloggt (`tracing::warn!`), nie
     /// propagiert. Fehler beim Lesen des Dateiwissen-Index sind ebenfalls
     /// nur `tracing::warn!`.
-    fn push_fact_fragments(&self, out: &mut Vec<Fragment>, produced_at: jiff::Timestamp) {
+    fn push_fact_fragments(
+        &self,
+        out: &mut Vec<Fragment>,
+        stm: &ShortTermMemory,
+        produced_at: jiff::Timestamp,
+    ) {
         let mut used_tokens = 0usize;
         let mut delivered: HashSet<(FactScope, String)> = HashSet::new();
         let mut project_delivered: Vec<String> = Vec::new();
@@ -631,7 +684,7 @@ impl<M: Memory> MemoryContextProvider<M> {
 
         // Stichworte werden für (3) und den Dateiwissen-Abschnitt (Addendum
         // B) gemeinsam benötigt — einmal aus dem STM abgeleitet.
-        let keywords_opt = self.search_keywords();
+        let keywords_opt = Self::search_keywords(stm);
 
         // (3) Stichworttreffer — Projekt vor Global, bis das Budget voll ist.
         if let Some(keywords) = &keywords_opt {
@@ -763,9 +816,8 @@ impl<M: Memory> MemoryContextProvider<M> {
     /// `None`, wenn kein Nutzer-Eintrag im STM vorliegt oder keine
     /// hinreichend langen Wörter übrig bleiben — Schritt (3) entfällt dann
     /// vollständig.
-    fn search_keywords(&self) -> Option<Vec<String>> {
-        let text = self
-            .stm
+    fn search_keywords(stm: &ShortTermMemory) -> Option<Vec<String>> {
+        let text = stm
             .snapshot()
             .into_iter()
             .rev()
@@ -1014,6 +1066,142 @@ mod tests {
         );
         assert!(fragments.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // ── Session-Gate (PL-90 W03d-1) ──────────────────────────────────────
+
+    const GATE_STM_TEXT: &str = "geheimer-stm-text-der-session-1";
+
+    fn gate_provider(
+        root: &std::path::Path,
+        enforce: bool,
+    ) -> TestResult<MemoryContextProvider<FileMemoryStore>> {
+        std::fs::write(root.join("HOT.md"), "Regel 1: keine Doppelantworten.\n")
+            .map_err(ctx("write HOT.md"))?;
+        let store = Arc::new(FileMemoryStore::open(root).map_err(ctx("open memory store"))?);
+        let stm = ShortTermMemory::new("session-1", 32, 2_048);
+        stm.push(StmRole::User, 80, GATE_STM_TEXT);
+        Ok(
+            MemoryContextProvider::new(store, stm, ContextPolicy::Balanced)
+                .with_session_gate(enforce),
+        )
+    }
+
+    fn turn_ctx_for(session: &str) -> TestResult<TurnInputContext> {
+        Ok(TurnInputContext {
+            session_id: harw_types::SessionId::parse(session).map_err(ctx("parse session id"))?,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_session_gate_on_matching_session_keeps_stm() -> TestResult {
+        let root = tmp_root("gate-match")?;
+        let fragments = gate_provider(&root, true)?.fragments(
+            &turn_ctx_for("session-1")?,
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        assert!(
+            fragments
+                .iter()
+                .any(|f| f.section.as_str() == SECTION_STM && f.body.contains(GATE_STM_TEXT)),
+            "passende Session liefert den STM-Text"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_gate_on_mismatching_session_drops_stm_but_keeps_hot() -> TestResult {
+        let root = tmp_root("gate-mismatch")?;
+        let fragments = gate_provider(&root, true)?.fragments(
+            &turn_ctx_for("session-2")?,
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        assert!(
+            fragments.iter().all(|f| !f.body.contains(GATE_STM_TEXT)),
+            "kein Fragment darf den STM-Text einer fremden Session enthalten"
+        );
+        assert!(
+            fragments.iter().any(|f| f.section.as_str() == SECTION_HOT),
+            "HOT bleibt trotz Session-Abweichung erhalten"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_gate_off_keeps_stm_for_mismatching_session() -> TestResult {
+        let root = tmp_root("gate-off")?;
+        let fragments = gate_provider(&root, false)?.fragments(
+            &turn_ctx_for("session-2")?,
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        assert!(
+            fragments
+                .iter()
+                .any(|f| f.section.as_str() == SECTION_STM && f.body.contains(GATE_STM_TEXT)),
+            "ohne Gate bleibt das bisherige Verhalten (STM wird geliefert)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_gate_on_mismatch_derives_no_fact_keywords_from_foreign_stm() -> TestResult {
+        let mem_root = tmp_root("gate-keywords-mem")?;
+        let project_root = tmp_root("gate-keywords-project")?;
+        let project_store = Arc::new(
+            FactStore::open(&project_root, FactScope::Project).map_err(ctx("open project"))?,
+        );
+        project_store
+            .write(&make_fact(
+                "zeppelin-fakt",
+                FactType::Fact,
+                FactScope::Project,
+                "Zeppeline und ihre Geschichte.",
+            ))
+            .map_err(ctx("write fact"))?;
+
+        let build = |enforce: bool| -> TestResult<MemoryContextProvider<FileMemoryStore>> {
+            let store =
+                Arc::new(FileMemoryStore::open(&mem_root).map_err(ctx("open memory store"))?);
+            let stm = ShortTermMemory::new("session-1", 32, 2_048);
+            stm.push(StmRole::User, 80, "Erzähl mir etwas über Zeppelin");
+            Ok(MemoryContextProvider::with_facts(
+                store,
+                stm,
+                ContextPolicy::Balanced,
+                Some(Arc::clone(&project_store)),
+                None,
+            )
+            .with_session_gate(enforce))
+        };
+        let search_hits = |fragments: &[Fragment]| {
+            fragments
+                .iter()
+                .filter(|f| f.section.as_str() == SECTION_FACT_SEARCH)
+                .count()
+        };
+        let foreign = turn_ctx_for("session-2")?;
+        let epoch = time::OffsetDateTime::UNIX_EPOCH;
+        let ts = jiff::Timestamp::UNIX_EPOCH;
+
+        let gated = build(true)?.fragments(&foreign, epoch, ts);
+        assert_eq!(
+            search_hits(&gated),
+            0,
+            "fremder STM-Text darf keine Stichworttreffer formen"
+        );
+        let ungated = build(false)?.fragments(&foreign, epoch, ts);
+        assert_eq!(search_hits(&ungated), 1, "ohne Gate bleibt die Suche aktiv");
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&project_root);
         Ok(())
     }
 

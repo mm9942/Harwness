@@ -28,7 +28,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
-use std::path::{Component, Path};
 use std::sync::Arc;
 
 use harw_authority::{AuthorityContext, Permission};
@@ -38,7 +37,8 @@ use harw_types::ContentDigest;
 use serde::{Deserialize, Serialize};
 
 use crate::cycle_explorer::{
-    DEFAULT_MAX_READ_BYTES, ReadOnlyExplorerExecutor, ReadTargetMap, read_beneath,
+    DEFAULT_MAX_READ_BYTES, ExplorerReadCache, ReadOnlyExplorerExecutor, ReadTargetMap, normalized,
+    read_beneath,
 };
 use crate::cycle_runtime::{CycleStepExecutor, InFlightStep, StepFailure, StepReconciliation};
 use crate::intent_cycle::{
@@ -245,6 +245,21 @@ impl ExplorerCycleExecutor {
         }
     }
 
+    /// Hands successful read texts to `cache` (see
+    /// [`ReadOnlyExplorerExecutor::with_cache`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: ExplorerReadCache) -> Self {
+        // `ReadOnlyExplorerExecutor::with_cache` consumes the executor, so the
+        // field is swapped for an equivalent fresh one and the original is
+        // rebuilt with the cache. The fresh stand-in is dropped immediately.
+        let explorer = std::mem::replace(
+            &mut self.explorer,
+            ReadOnlyExplorerExecutor::new(self.authority.clone(), self.targets.clone()),
+        );
+        self.explorer = explorer.with_cache(cache);
+        self
+    }
+
     /// Plans a verification: the target ids bound to the evidence's locator
     /// that both the step admission and at least one check name.
     fn verify_plan(
@@ -370,19 +385,6 @@ impl CycleStepExecutor for ExplorerCycleExecutor {
         self.explorer.rebind_authority(authority);
         self.authority = authority.clone();
     }
-}
-
-/// Workspace-relative path as the explorer records it as evidence locator:
-/// normal components joined by `/` (`a//b` and `a/b` are the same file).
-fn normalized(path: &str) -> String {
-    Path::new(path)
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// Turns one fresh read into observations (pure).

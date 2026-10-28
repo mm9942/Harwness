@@ -484,6 +484,11 @@ pub(crate) struct AgentLive {
     pub reasoning_preview: String,
     pub started: Instant,
     pub finished: Option<Instant>,
+    /// Zeitpunkt der letzten bedeutsamen Beobachtung (Phasenwechsel,
+    /// Werkzeug-/Nachrichtenereignis) für die Anzeigereihenfolge der
+    /// Kind-Statuszeilen. Token-Deltas, Nutzungs- und Kontextzähler zählen
+    /// bewusst nicht: geschwätzige Läufe sollen nicht nach oben rutschen.
+    pub last_meaningful: Instant,
     /// Ausgabe-Tokens beim letzten Messpunkt, für die tok/s-Rate.
     rate_mark: (Instant, u64),
     pub tokens_per_sec: f64,
@@ -519,6 +524,7 @@ impl AgentLive {
             reasoning_preview: String::new(),
             started: now,
             finished: None,
+            last_meaningful: now,
             rate_mark: (now, 0),
             tokens_per_sec: 0.0,
             trace: AgentTrace::default(),
@@ -567,6 +573,7 @@ impl AgentLive {
         let now = Instant::now();
         self.started = now;
         self.finished = None;
+        self.last_meaningful = now;
         self.failure_reason = None;
         self.failure_seen = false;
         self.rate_mark = (now, self.usage().output_tokens);
@@ -725,6 +732,9 @@ impl AgentMonitor {
                     AgentOrchestrationStatus::Failed => AgentPhase::Failed,
                     AgentOrchestrationStatus::Cancelled => AgentPhase::Cancelled,
                 };
+                if live.phase != before {
+                    live.last_meaningful = Instant::now();
+                }
                 if let Some(detail) = &orch.detail {
                     live.trace.push_status(detail);
                 }
@@ -942,6 +952,15 @@ impl AgentMonitor {
                 live.trace.push_status("Turn abgebrochen");
             }
             _ => return false,
+        }
+        if !matches!(
+            turn,
+            TurnEvent::AssistantDelta { .. }
+                | TurnEvent::ReasoningDelta { .. }
+                | TurnEvent::UsageUpdated { .. }
+                | TurnEvent::ContextUpdated { .. }
+        ) {
+            live.last_meaningful = Instant::now();
         }
         true
     }

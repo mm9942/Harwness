@@ -565,18 +565,33 @@ impl ApprovalStore {
         if path_is_symlink(&path)? {
             return Err(corrupt("resolution file is a symlink".to_owned()));
         }
-        let bytes = match read_pending(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // `read_pending` meldet auch Symlink (ELOOP) und Nicht-Datei als
-                // NotFound; nur ein wirklich fehlender Eintrag ist `None`.
-                return match std::fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(other) => Err(SessionStoreError::Io(other)),
-                    Ok(_) => Err(corrupt("resolution entry is not a regular file".to_owned())),
-                };
+        // Zwei Versuche: `.resolved.json` erscheint per atomarem Rename. Liegt
+        // der Rename eines parallelen `resolve` genau zwischen dem fehlschlagenden
+        // Lesen und der Metadaten-Prüfung, ist die Datei inzwischen regulär —
+        // dann wird einmal neu gelesen statt sie fälschlich als defekt zu melden.
+        let mut attempt = 0;
+        let bytes = loop {
+            attempt += 1;
+            match read_pending(&path) {
+                Ok(bytes) => break bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // `read_pending` meldet auch Symlink (ELOOP) und Nicht-Datei als
+                    // NotFound; nur ein wirklich fehlender Eintrag ist `None`.
+                    match std::fs::symlink_metadata(&path) {
+                        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(None);
+                        }
+                        Err(other) => return Err(SessionStoreError::Io(other)),
+                        Ok(meta) if meta.file_type().is_file() && attempt < 2 => continue,
+                        Ok(_) => {
+                            return Err(corrupt(
+                                "resolution entry is not a regular file".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(SessionStoreError::Io(error)),
             }
-            Err(error) => return Err(SessionStoreError::Io(error)),
         };
         let record: ApprovalResolutionRecord =
             serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
@@ -1319,6 +1334,150 @@ mod tests {
             store.resolution(&request.session, &request.request),
             Err(SessionStoreError::ApprovalCorrupt { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolution_directory_is_error_not_none() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request)?;
+        let path = store.resolved_path(&request.session, &request.request)?;
+        std::fs::create_dir(&path)?;
+        assert!(matches!(
+            store.resolution(&request.session, &request.request),
+            Err(SessionStoreError::ApprovalCorrupt { .. })
+        ));
+        assert!(path.is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolution_fifo_is_error_without_a_writer() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request)?;
+        let path = store.resolved_path(&request.session, &request.request)?;
+        // Like harw-fsutil's FIFO tests, use mkfifo(1) without adding a dependency.
+        // No writer is opened; a blocking read must fail the receive deadline.
+        let status = std::process::Command::new("mkfifo").arg(&path).status()?;
+        assert!(status.success(), "mkfifo failed: {status}");
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = store.resolution(&request.session, &request.request);
+            let _ = send.send(result);
+        });
+        let result = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(ctx("FIFO reader must not block"))?;
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::Io(_)) | Err(SessionStoreError::ApprovalCorrupt { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolution_valid_and_dangling_symlinks_are_not_authority() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request)?;
+        let resolution = store.resolve(
+            &request.session,
+            &request.request,
+            ReviewDecision::Approved,
+            None,
+            &request.actor,
+            &at_offset_mins(1)?,
+        )?;
+        let path = store.resolved_path(&request.session, &request.request)?;
+        let external = temp.path().join("external-resolved.json");
+        std::fs::rename(&path, &external)?;
+        let original = std::fs::read(&external)?;
+        assert_eq!(original, serde_json::to_vec(&resolution)?);
+        symlink(&external, &path)?;
+        for dangling in [false, true] {
+            if dangling {
+                std::fs::remove_file(&external)?;
+            }
+            assert!(matches!(
+                store.resolution(&request.session, &request.request),
+                Err(SessionStoreError::ApprovalCorrupt { .. })
+            ));
+            // The retry uses this same no-follow reader; valid JSON at the
+            // target must never be read through a symlink.
+            assert_eq!(
+                read_pending(&path).err().map(|error| error.kind()),
+                Some(std::io::ErrorKind::NotFound)
+            );
+            if !dangling {
+                assert_eq!(std::fs::read(&external)?, original);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolution_rejects_foreign_session() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request)?;
+        let mut resolution = store.resolve(
+            &request.session,
+            &request.request,
+            ReviewDecision::Rejected,
+            None,
+            &request.actor,
+            &at_offset_mins(1)?,
+        )?;
+        resolution.session = SessionId::from_str("session-other");
+        let path = store.resolved_path(&request.session, &request.request)?;
+        std::fs::write(&path, serde_json::to_vec(&resolution)?)?;
+        assert!(matches!(
+            store.resolution(&request.session, &request.request),
+            Err(SessionStoreError::ApprovalCorrupt { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejected_resolution_survives_reopen_and_cannot_be_approved() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request)?;
+        let rejected = store.resolve(
+            &request.session,
+            &request.request,
+            ReviewDecision::Rejected,
+            None,
+            &request.actor,
+            &at_offset_mins(1)?,
+        )?;
+        let reopened = ApprovalStore::new(temp.path());
+        assert!(matches!(
+            reopened.resolve(
+                &request.session,
+                &request.request,
+                ReviewDecision::Approved,
+                None,
+                &request.actor,
+                &at_offset_mins(2)?,
+            ),
+            Err(SessionStoreError::ApprovalAlreadyResolved { .. })
+        ));
+        assert_eq!(
+            reopened.resolution(&request.session, &request.request)?,
+            Some(rejected)
+        );
         Ok(())
     }
 

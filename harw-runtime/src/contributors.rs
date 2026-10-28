@@ -144,10 +144,10 @@ pub trait AssemblyContributor: Send + Sync {
 /// - [`InfrastructureContributor`]: die `infra.*`-Operationen, wenn
 ///   `[infrastructure]` konfiguriert ist (No-op ohne die Sektion).
 /// - [`GatewayDiagnosticsContributor`][]: `gateway.health`/`gateway.logs`/
-/// - [`CloudOpsContributor`]: the `cloud.*` operations of the cloud home
-///   stack (`cloud.status`, `cloud.enrollments.list`, `cloudctl.*`) for the
-///   UIA root (no-op for any other root).
 ///   `gateway.channels.*` für eine UIA-Wurzel (No-op für jede andere Wurzel).
+/// - [`CloudOpsContributor`]: die `cloud.*`-Operationen des Cloud-Home-Stacks
+///   (`cloud.status`, `cloud.enrollments.list`, `cloudctl.*`) für die
+///   UIA-Wurzel (No-op für jede andere Wurzel).
 /// - [`BrowserRootContributor`] (Feature `browser`): `browser.*` für die
 ///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
 #[must_use]
@@ -419,9 +419,9 @@ mod tests {
 
     #[test]
     fn default_contributors_include_infrastructure() {
-        // MCP + Infrastruktur + Gateway-Diagnose, plus Browser mit Feature
-        // `browser`.
-        let expected = if cfg!(feature = "browser") { 4 } else { 3 };
+        // MCP + Infrastruktur + Gateway-Diagnose + Cloud-Ops, plus Browser
+        // mit Feature `browser`.
+        let expected = if cfg!(feature = "browser") { 5 } else { 4 };
         assert_eq!(default_contributors().len(), expected);
     }
 

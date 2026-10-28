@@ -133,6 +133,15 @@ pub enum CommandEnd {
     Failed(String),
 }
 
+/// The stream a shared output budget cut first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
 /// What a command produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutcome {
@@ -148,6 +157,13 @@ pub struct CommandOutcome {
     pub combined: Vec<u8>,
     /// Output was dropped (budget or slow consumer).
     pub truncated: bool,
+    /// The stream the shared output budget cut first. `Some` whenever the port
+    /// itself truncated the output (`truncated` as set by the collector);
+    /// `None` when nothing was truncated or the provenance is unknown. The
+    /// stdout and stderr lengths do not identify the cut stream: the budget is
+    /// spent across both streams in frame-arrival order, so the shorter stream
+    /// can be the one that was cut.
+    pub truncated_stream: Option<OutputStream>,
     /// Frames this consumer missed (the output is then head/tail of the job
     /// result, not the live stream).
     pub lagged: u64,
@@ -176,6 +192,7 @@ impl CommandOutcome {
             stderr: Vec::new(),
             combined: Vec::new(),
             truncated: false,
+            truncated_stream: None,
             lagged: 0,
             elapsed: started.elapsed(),
         }
@@ -374,6 +391,10 @@ struct Collector {
     stderr: Vec<u8>,
     combined: Vec<u8>,
     truncated: bool,
+    /// The stream the budget cut first, recorded at the first cut only. The
+    /// budget is spent across both streams in frame-arrival order, so the
+    /// stream lengths alone do not say which stream was cut.
+    cut: Option<OutputStream>,
     lagged: u64,
 }
 
@@ -386,6 +407,13 @@ impl Collector {
         self.used += take;
         if take < chunk.len() {
             self.truncated = true;
+            if self.cut.is_none() {
+                self.cut = Some(if stdout {
+                    OutputStream::Stdout
+                } else {
+                    OutputStream::Stderr
+                });
+            }
         }
         if stdout {
             self.stdout.extend_from_slice(kept);
@@ -539,6 +567,9 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                             stderr: result.stderr,
                             combined: Vec::new(),
                             truncated: result.stdout_omitted > 0 || result.stderr_omitted > 0,
+                            // The job caps each stream on its own here; there is
+                            // no shared budget whose first cut could be named.
+                            truncated_stream: None,
                             lagged: 0,
                             elapsed: started.elapsed(),
                         }
@@ -587,6 +618,7 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                 stderr: Vec::new(),
                 combined: Vec::new(),
                 truncated: false,
+                cut: None,
                 lagged: 0,
             };
             let mut wait = Box::pin(handle.wait());
@@ -626,6 +658,7 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
             let (mut stdout, mut stderr, mut combined) =
                 (collector.stdout, collector.stderr, collector.combined);
             let mut truncated = collector.truncated;
+            let mut truncated_stream = collector.cut;
             if collector.lagged > 0 {
                 // The live stream missed frames: the job result's head/tail is
                 // the better record.
@@ -633,6 +666,15 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                 stderr = result.stderr.clone();
                 combined = [stdout.clone(), stderr.clone()].concat();
                 truncated = truncated || result.stdout_omitted > 0 || result.stderr_omitted > 0;
+                // The job result names the omitted stream; it replaces the
+                // collector's view together with the output itself.
+                truncated_stream = if result.stdout_omitted > 0 {
+                    Some(OutputStream::Stdout)
+                } else if result.stderr_omitted > 0 {
+                    Some(OutputStream::Stderr)
+                } else {
+                    truncated_stream
+                };
             }
             let (end, exit_code) = end_of(&result, cancelled, over_budget);
             CommandOutcome {
@@ -642,6 +684,7 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                 stderr,
                 combined,
                 truncated,
+                truncated_stream,
                 lagged: collector.lagged,
                 elapsed: started.elapsed(),
             }

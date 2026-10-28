@@ -920,6 +920,7 @@ fn test_legacy_commands_are_hidden_but_still_known() -> TestResult {
         "agent",
         "knowledge",
         "jobs",
+        "cycle",
         "channel",
         "debug",
     ] {
@@ -1552,6 +1553,62 @@ fn test_jobs_list_show_cancel_retry_parse() -> TestResult {
         );
         assert!(ok, "`jobs {verb} job-9` falsch geparst: {:?}", cli.command);
     }
+    Ok(())
+}
+
+#[test]
+fn test_cycle_list_status_stop_parse() -> TestResult {
+    let list =
+        Cli::try_parse_from(["harw", "cycle", "list"]).map_err(ctx("`harw cycle list` parsen"))?;
+    assert!(matches!(
+        list.command,
+        Some(Command::Cycle {
+            action: CycleAction::List {
+                state: None,
+                limit: None
+            }
+        })
+    ));
+
+    let filtered = Cli::try_parse_from(["harw", "cycle", "list", "running", "--limit", "20"])
+        .map_err(ctx("`harw cycle list running --limit 20` sollte parsen"))?;
+    assert!(matches!(
+        filtered.command,
+        Some(Command::Cycle {
+            action: CycleAction::List { state: Some(state), limit: Some(20) }
+        }) if state == "running"
+    ));
+
+    let status = Cli::try_parse_from(["harw", "cycle", "status", "x"])
+        .map_err(ctx("`harw cycle status x` sollte parsen"))?;
+    assert!(matches!(
+        status.command,
+        Some(Command::Cycle {
+            action: CycleAction::Status { id }
+        }) if id == "x"
+    ));
+
+    let stop = Cli::try_parse_from(["harw", "cycle", "stop", "x", "--reason", "r"])
+        .map_err(ctx("`harw cycle stop x --reason r` sollte parsen"))?;
+    assert!(matches!(
+        stop.command,
+        Some(Command::Cycle {
+            action: CycleAction::Stop { id, reason: Some(reason) }
+        }) if id == "x" && reason == "r"
+    ));
+
+    let stop_plain = Cli::try_parse_from(["harw", "cycle", "stop", "x"])
+        .map_err(ctx("`harw cycle stop x` sollte parsen"))?;
+    assert!(matches!(
+        stop_plain.command,
+        Some(Command::Cycle {
+            action: CycleAction::Stop { reason: None, .. }
+        })
+    ));
+
+    // Ein Verb ohne Auftrags-ID und ein unbekanntes Verb sind Parse-Fehler.
+    assert!(Cli::try_parse_from(["harw", "cycle", "status"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "cycle", "kill", "x"]).is_err());
     Ok(())
 }
 

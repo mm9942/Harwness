@@ -43,6 +43,7 @@ Agents and knowledge
             | memory [ARGS…] | proposals [ARGS…]
   jobs list [FILTER] | show ID | approve ID [--note TEXT]
        | deny ID [--reason TEXT] | cancel ID | retry ID
+  cycle list [STATE [--limit N]] | status ID | stop ID [--reason TEXT]
 
 Services
   gateway [install|start|stop|restart|enable|disable|status]
@@ -171,7 +172,7 @@ error.
 - **Tables** (e.g. `harw session list`) become an array of objects whose
   keys are the column headers.
 - **Single values** (e.g. `harw session show ID`) become an object.
-- **Operations** (`harw jobs …`, `harw agent skills|plugins`,
+- **Operations** (`harw jobs …`, `harw cycle …`, `harw agent skills|plugins`,
   `harw knowledge memory|proposals`) return their structured data where
   available, otherwise `{"text": "…"}` with the text output.
 
@@ -258,6 +259,7 @@ permanently.
 | `/skills`, `/plugins` (chat only) | `harw agent skills …`, `harw agent plugins …` |
 | `/memory`, `/context-proposal` (chat only) | `harw knowledge memory …`, `harw knowledge proposals …` |
 | Jobs, chat only | `harw jobs list\|show\|approve\|deny\|cancel\|retry` |
+| `/cycle` (chat only) | `harw cycle list\|status\|stop` |
 | `harw -r SESSION` | still valid; also `harw session resume SESSION` |
 | `HARW_PROFILE=NAME harw …` | still valid; also `harw --profile NAME …` |
 

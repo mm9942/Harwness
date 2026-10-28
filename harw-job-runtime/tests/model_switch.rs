@@ -10,9 +10,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use harw_provider::{
-    invoke_primary, InvocationRequest, InvocationResponse, ModelBuilder, ProviderAuth,
-    ProviderBuilder, ProviderError, ProviderInvoker, ProviderRegistry, ProviderResult,
-    VecProviderRegistry,
+    InvocationRequest, InvocationResponse, ModelBuilder, ProviderAuth, ProviderBuilder,
+    ProviderError, ProviderInvoker, ProviderRegistry, ProviderResult, VecProviderRegistry,
+    invoke_primary,
 };
 use harw_types::{ModelId, ModelName, ProviderId, ProviderName};
 use url::Url;
@@ -29,7 +29,10 @@ struct RecordingInvoker {
 
 impl RecordingInvoker {
     fn seen(&self) -> Vec<InvocationRequest> {
-        self.seen.lock().map(|guard| guard.clone()).unwrap_or_default()
+        self.seen
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -86,7 +89,13 @@ fn model_switch_reaches_the_selected_provider_and_model() -> TestResult {
     registry
         .register(primary)
         .map_err(|e| format!("register primary: {e}"))?;
-    let secondary = record("remote-provider", "Remote Provider", false, "model-b", "Model B")?;
+    let secondary = record(
+        "remote-provider",
+        "Remote Provider",
+        false,
+        "model-b",
+        "Model B",
+    )?;
     registry
         .register(secondary)
         .map_err(|e| format!("register secondary: {e}"))?;
@@ -97,8 +106,8 @@ fn model_switch_reaches_the_selected_provider_and_model() -> TestResult {
     // inside the invocation path itself.
     let request = InvocationRequest::new(ProviderName::from("Remote Provider"))
         .with_model(ModelName::from("model-b"));
-    let response = invoke_primary(&registry, &invoker, request)
-        .map_err(|e| format!("invoke_primary: {e}"))?;
+    let response =
+        invoke_primary(&registry, &invoker, request).map_err(|e| format!("invoke_primary: {e}"))?;
 
     assert_eq!(response.provider.as_str(), "Remote Provider");
     assert_eq!(response.model.as_ref().map(|m| m.as_str()), Some("model-b"));

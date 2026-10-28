@@ -25,6 +25,10 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste transitiv über ratatui (nur Compile-Zeit)" },
     # Nicht mehr gepflegt, Proc-Macro über `hax-lib-macros` (libcrux-Kette).
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 transitiv über hax-lib-macros (nur Compile-Zeit)" },
+    # Nicht mehr gepflegt, kein sicheres Upgrade: `derivative` nur transitiv
+    # über `pingora-core` (optionales Feature `proxy` von `harw-cloud-gateway`),
+    # reines Derive-Proc-Macro zur Übersetzungszeit.
+    { id = "RUSTSEC-2024-0388", reason = "derivative transitiv über pingora-core (harw-cloud-gateway proxy, nur Compile-Zeit)" },
     # Nicht mehr gepflegt, kein sicheres Upgrade: `serde_yaml` im Cloud-Home-
     # Gateway (`harw-cloud-gateway`, liest nur die lokale, vom Operator
     # geschriebene Gateway-Konfiguration) und transitiv über `pingora-core`

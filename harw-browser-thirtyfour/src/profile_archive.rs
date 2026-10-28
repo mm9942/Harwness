@@ -197,7 +197,11 @@ mod tests {
         let encoded =
             encode_firefox_profile(profile.path()).map_err(ctx("profile encoding succeeds"))?;
         let mut archive = decoded_archive(&encoded)?;
-        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        let names: Vec<String> = archive
+            .file_names()
+            .map(|name| name.map(|name| name.into_owned()))
+            .collect::<Result<_, _>>()
+            .map_err(ctx("archive entry names decode"))?;
 
         assert!(names.contains(&"storage/".to_owned()));
         assert!(names.contains(&"storage/default/".to_owned()));

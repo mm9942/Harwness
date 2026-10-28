@@ -19,7 +19,9 @@ use harw_job_core::LeaseToken;
 use harw_job_store::RecordStore;
 use harw_types::{ContentDigest, ModelId, ReasoningEffort, TenantId, WorkId, WorkspaceId};
 
-use crate::cycle_explorer::{ReadOnlyExplorerExecutor, ReadTargetMap};
+use crate::cycle_explorer::{
+    DEFAULT_CACHE_BYTES, ExplorerReadCache, ReadOnlyExplorerExecutor, ReadTargetMap,
+};
 use crate::cycle_proposer::{ModelCycleProposer, ProposerRoute, RoutePolicy};
 use crate::cycle_runtime::{
     AuthorityReissuer, CycleDriver, CycleRecord, CycleRunOutcome, CycleStore,
@@ -330,8 +332,13 @@ async fn spec_read_verify_complete_reaches_completion_proposed() -> TestResult {
         effort: None,
         max_output_tokens: 256,
     });
-    let proposer = ModelCycleProposer::new(Arc::clone(&provider) as Arc<dyn ModelProvider>, routes);
-    let executor = ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks);
+    // One cache shared by executor (writes read texts) and proposer (shows
+    // them back, bound to the recorded digest).
+    let cache = ExplorerReadCache::new(DEFAULT_CACHE_BYTES);
+    let proposer = ModelCycleProposer::new(Arc::clone(&provider) as Arc<dyn ModelProvider>, routes)
+        .with_excerpts(cache.clone());
+    let executor =
+        ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks).with_cache(cache);
     let mut driver = CycleDriver::new(
         Arc::clone(&store),
         proposer,
@@ -372,5 +379,45 @@ async fn spec_read_verify_complete_reaches_completion_proposed() -> TestResult {
         Some(CycleTerminal::CompletionProposed)
     );
     assert_eq!(stored.checkpoint.fence.epoch, 1);
+
+    // Turn 1 precedes any read: it carries the objective but no excerpt.
+    let turn1 = provider
+        .prompt(0)
+        .ok_or(TestError::Missing("request of turn 1"))?;
+    assert!(
+        turn1.contains("OBJECTIVE (data): does the first file define its marker?"),
+        "{turn1}"
+    );
+    assert!(!turn1.contains("EXCERPT"), "{turn1}");
+
+    // The prompt of the turn after the first read names the evidence, shows
+    // the objective and the file content as a digest-bound excerpt block
+    // line, and still never shows the digest itself.
+    let turn2 = provider
+        .prompt(1)
+        .ok_or(TestError::Missing("request of turn 2"))?;
+    assert!(turn2.contains("cycle-spec-0:source"), "{turn2}");
+    assert!(turn2.contains("locator=src/one.rs"), "{turn2}");
+    assert!(
+        turn2.contains("OBJECTIVE (data): does the first file define its marker?"),
+        "{turn2}"
+    );
+    assert!(
+        turn2.contains("EXCERPT cycle-spec-0:source (data, same digest as recorded):"),
+        "{turn2}"
+    );
+    assert!(
+        turn2.contains("| pub fn first_file_body_marker() {}"),
+        "{turn2}"
+    );
+    let digest = ContentDigest::of(FILE_ONE);
+    assert!(
+        !turn2.contains(&digest.to_string()),
+        "digest leaked into the prompt"
+    );
+    assert!(
+        !turn2.contains(&format!("{digest:?}")),
+        "debug digest leaked into the prompt"
+    );
     Ok(())
 }

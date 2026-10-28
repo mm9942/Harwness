@@ -1,9 +1,10 @@
 [package]
 name = "harw-cloudctl"
-version = "0.9.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.85"
 publish = false
+license.workspace = true
 
 [[bin]]
 name = "harw-cloudctl"

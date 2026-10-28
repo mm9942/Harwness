@@ -225,8 +225,42 @@ pub(crate) fn replace_atomic(
 ) -> io::Result<()> {
     exists_no_symlink(dir, name, description)?;
     let temp = write_temp(dir, owner, bytes)?;
-    if let Err(error) = dir.rename(&temp, dir, name) {
+    rename_into_place(dir, &temp, name)
+}
+
+/// [`replace_atomic`] with a last-moment veto: `before_rename` runs after
+/// the temp file is completely written and `sync_all`ed — a stalled fsync
+/// has already happened — and immediately before the rename that publishes
+/// it. This is the last point at which the replacement can still be
+/// refused; the rename itself is atomic. On a refusal the temp file is
+/// removed, `name` is untouched and the refusal is returned.
+///
+/// # Errors
+/// The refusal of `before_rename`, or an I/O error (a symlinked target is
+/// rejected with `InvalidInput`) as [`StoreError::Io`].
+pub(crate) fn replace_atomic_checked<E: From<StoreError>>(
+    dir: &Dir,
+    name: &str,
+    owner: &str,
+    bytes: &[u8],
+    description: &str,
+    before_rename: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let io_error = |error: io::Error| E::from(StoreError::Io(error));
+    exists_no_symlink(dir, name, description).map_err(io_error)?;
+    let temp = write_temp(dir, owner, bytes).map_err(io_error)?;
+    if let Err(refusal) = before_rename() {
         remove_quietly(dir, &temp);
+        return Err(refusal);
+    }
+    rename_into_place(dir, &temp, name).map_err(io_error)
+}
+
+/// Renames the synced `temp` over `name`, then syncs the directory. The temp
+/// file is removed if the rename fails.
+fn rename_into_place(dir: &Dir, temp: &str, name: &str) -> io::Result<()> {
+    if let Err(error) = dir.rename(temp, dir, name) {
+        remove_quietly(dir, temp);
         return Err(error);
     }
     // The rename replaced a directory entry; without this sync a crash could

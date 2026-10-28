@@ -1618,12 +1618,24 @@ mod tests {
             // bleibt über ALWAYS_ASK_TOOLS immer freigabepflichtig.
             "process.list",
             "process.kill",
+            // Obsidian-Vault-Werkzeuge (`harw-tool-obsidian`): im Full-Profil
+            // unbedingt registriert (harw-registry-defaults/src/profile.rs
+            // `OBSIDIAN_TOOLS` und `ObsidianToolProvider::new()`), kein
+            // Feature- oder Config-Gate.
+            "obsidian.map",
+            "obsidian.read",
+            "obsidian.search",
+            "obsidian.links",
+            "obsidian.write",
             // Weitere `harw-ops`-Operationen mit `model_tool(...)`:
             // `/provider-concurrency` (harw-ops/src/provider.rs,
             // approval = "always") und `/sandbox-lease`
             // (harw-ops/src/sandbox_lease.rs).
             "provider-concurrency",
             "sandbox-lease",
+            // `work.result` (harw-ops/src/work_result.rs): liest das Ergebnis
+            // eines eigenen, abgeschlossenen Jobs der gebundenen Workspace.
+            "work.result",
             // Workbench-Werkzeuge (harw-registry-defaults/src/workbench_tools.rs):
             // Notizen und Hypothesen der Sitzung, Recht `ReadWorkspace`.
             "workbench.note",
