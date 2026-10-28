@@ -842,6 +842,36 @@ required_env = ["EMBEDDED_TEST_MISSING_VAR"]
     }
 
     #[test]
+    fn single_agent_mode_does_not_cross_embedded_config_boundary() -> TestResult {
+        let home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        for relative in ["config.toml", "profiles/default/config.toml"] {
+            write_layer_file(home.path(), relative, "single_agent_mode = true\n")?;
+        }
+        for entry in [EntryKind::CompiledAgent, EntryKind::Tui, EntryKind::OneShot] {
+            let definition = if entry == EntryKind::CompiledAgent {
+                SIMPLE_DEF.to_owned()
+            } else {
+                SIMPLE_DEF
+                    .replace("role = \"worker\"", "role = \"user-interface\"")
+                    .replace(
+                        "specialization = \"embedded-cfg\"",
+                        "specialization = \"terminal-ui\"",
+                    )
+            };
+            let agent = embedded_agent(&definition, "acme.agent.embedded-cfg@1")?;
+            let mut spec = spec_with_embedded(home.path(), cwd.path(), agent);
+            spec.entry = entry;
+            let config = load_config_embedded(&spec).map_err(TestError::Runtime)?;
+            assert!(
+                !config.harness.single_agent_mode,
+                "{entry:?}: embedded configuration must not import home/profile settings",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn load_config_embedded_never_reads_a_conflicting_agent_from_home() -> TestResult {
         let home = TempDir::new()?;
         let cwd = TempDir::new()?;

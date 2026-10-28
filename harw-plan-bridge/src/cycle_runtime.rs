@@ -38,6 +38,9 @@
 //!   lease asks the executor to [reconcile](CycleStepExecutor::reconcile) it:
 //!   not started → dropped, completed → its observations are committed,
 //!   uncertain → the cycle escalates instead of guessing or repeating.
+//!   An executor reporting [`StepFailure::uncertain`] also retains the journal
+//!   without requiring a crash or cancellation: the job blocks, and an explicit
+//!   retry must reconcile the original key before proposing anything else.
 //! - **Driver:** [`CycleDriver`] separates the model ([`CycleProposer`],
 //!   proposes only) from trusted execution ([`CycleStepExecutor`]). Refused
 //!   proposals are fed back a bounded number of times, then the cycle
@@ -857,24 +860,43 @@ pub struct StepFailure {
     /// `true` when the failure is temporary (provider overloaded, rate
     /// limited): the cycle must stay non-terminal so a new lease can retry.
     pub retryable: bool,
+    /// The executor cannot prove that no external effect happened. The driver
+    /// retains its journal and stops; only reconciliation may settle the step.
+    pub effect_uncertain: bool,
 }
 
 impl StepFailure {
-    /// A permanent failure (missing capability, auth, bad output).
+    /// A permanent failure with no external effect (missing capability, auth, bad output).
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             retryable: false,
+            effect_uncertain: false,
         }
     }
 
-    /// A temporary failure; the driver commits no terminal state for it.
+    /// An executor lost the result of a possibly completed or partial effect.
+    /// Never a retry grant: the in-flight journal must survive until a trusted
+    /// executor reconciles its idempotency key. Use this for a write timeout,
+    /// lost acknowledgement, or any error after an effect may have started.
+    #[must_use]
+    pub fn uncertain(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retryable: false,
+            effect_uncertain: true,
+        }
+    }
+
+    /// A temporary failure with no external effect. For proposers, the driver
+    /// commits no terminal state; executor failures still count as stalls.
     #[must_use]
     pub fn retryable(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             retryable: true,
+            effect_uncertain: false,
         }
     }
 }
@@ -919,10 +941,12 @@ pub trait CycleStepExecutor: Send {
     /// enforces its own authority, approval and write-path checks; an
     /// admitted `ProposePatch` is not a write grant.
     ///
-    /// `Err` must mean that no effect happened (e.g. a capability failure);
-    /// the step is then committed without observations and counts as a
-    /// stall. If `cancel` fires while an effect may be partial, return `Ok`
-    /// with what was observed, or `Err` and let reconciliation decide.
+    /// Ordinary `Err` must mean that no effect happened (e.g. a capability
+    /// failure); the step is committed without observations and counts as a
+    /// stall. If an effect may have happened, return [`StepFailure::uncertain`]
+    /// instead: the driver retains the journal and blocks the job until
+    /// reconciliation, even without cancellation. Do not return incomplete
+    /// observations as success. A cancellation error also retains the journal.
     fn execute(
         &mut self,
         step: &InFlightStep,
@@ -1025,6 +1049,9 @@ pub enum CycleRunError {
     Join(String),
     /// Temporary proposer outage; nothing terminal was committed.
     ProposerUnavailable(String),
+    /// An executor could not establish its effect. The in-flight journal is
+    /// retained and the job is blocked, never automatically retried.
+    EffectUncertain,
 }
 
 impl fmt::Display for CycleRunError {
@@ -1039,6 +1066,9 @@ impl fmt::Display for CycleRunError {
             Self::ProposerUnavailable(reason) => {
                 write!(f, "proposer temporarily unavailable (retryable): {reason}")
             }
+            Self::EffectUncertain => f.write_str(
+                "intent cycle effect is uncertain; journal retained for reconciliation",
+            ),
         }
     }
 }
@@ -1296,6 +1326,14 @@ impl<P: CycleProposer, E: CycleStepExecutor> CycleDriver<P, E> {
                         // Leave the journal entry: the next lease reconciles.
                         tracing::info!(cycle_id, reason = %failure.reason, "intent cycle step interrupted");
                         return Ok(CycleRunOutcome::Cancelled { checkpoint });
+                    }
+                    Err(failure) if failure.effect_uncertain => {
+                        // A lost acknowledgement is not evidence of no effect.
+                        // Do not advance the checkpoint, learn a false failure,
+                        // or let the proposer issue another write. Recovery
+                        // reuses the journal's original idempotency key.
+                        tracing::warn!(cycle_id, "intent cycle effect uncertain; journal retained");
+                        return Err(CycleRunError::EffectUncertain);
                     }
                     Err(failure) => {
                         tracing::warn!(cycle_id, reason = %failure.reason, "intent cycle step failed without effect");
@@ -1567,6 +1605,9 @@ pub fn job_outcome(cycle_id: &str, outcome: Result<CycleRunOutcome, CycleRunErro
         }
         Ok(CycleRunOutcome::Cancelled { .. }) => JobOutcome::Cancelled {
             reason: "intent cycle cancelled".to_owned(),
+        },
+        Err(CycleRunError::EffectUncertain) => JobOutcome::Blocked {
+            reason: CycleRunError::EffectUncertain.to_string(),
         },
         Err(error) => JobOutcome::Failed {
             reason: error.to_string(),
@@ -2718,6 +2759,150 @@ mod tests {
             assert_eq!(entry.key, payload.event_id.dedupe_key());
             assert_eq!(entry.epoch, 1);
         }
+        Ok(())
+    }
+
+    /// A real external effect followed by a lost acknowledgement. The durable
+    /// checkpoint must not describe this as a no-effect failure.
+    struct LostAcknowledgement {
+        target: PathBuf,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CycleStepExecutor for LostAcknowledgement {
+        async fn execute(
+            &mut self,
+            _step: &InFlightStep,
+            _admission: &CycleAdmission,
+            _state: &CycleCheckpoint,
+            _cancel: &CancelToken,
+        ) -> Result<CycleObservations, StepFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(&self.target, b"owned edit")
+                .map_err(|error| StepFailure::uncertain(error.to_string()))?;
+            Err(StepFailure::uncertain("write acknowledgement lost"))
+        }
+
+        async fn reconcile(&mut self, _step: &InFlightStep) -> StepReconciliation {
+            match std::fs::read(&self.target) {
+                Ok(bytes) if bytes == b"owned edit" => {
+                    StepReconciliation::Completed(CycleObservations::default())
+                }
+                _ => StepReconciliation::Uncertain,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_effect_preserves_journal_and_reconciles_without_reexecution() -> TestResult {
+        let cycle_id = "cycle-lost-write-ack";
+        let fx = fixture(cycle_id)?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let target = fx._temp.path().join("owned.rs");
+        let mut driver = CycleDriver::new(
+            Arc::clone(&fx.store),
+            Script::new(vec![Ok(wait())]),
+            LostAcknowledgement {
+                target: target.clone(),
+                calls: Arc::clone(&calls),
+            },
+            Arc::new(FixedReissuer(rights()?)),
+        );
+        let result = driver
+            .run(cycle_id, &token(&fx.work_id, 1), &fx.admission, &CancelToken::new())
+            .await;
+        assert!(matches!(result, Err(CycleRunError::EffectUncertain)));
+        assert!(matches!(
+            job_outcome(cycle_id, result),
+            JobOutcome::Blocked { .. }
+        ));
+        let interrupted = fx.store.load(cycle_id).map_err(ctx("load interrupted"))?;
+        assert!(
+            interrupted.in_flight.is_some(),
+            "unknown effects must retain the journal"
+        );
+        assert_eq!(interrupted.checkpoint.fence.sequence, 0);
+        assert_eq!(interrupted.checkpoint.transitions_used, 0);
+        assert!(interrupted.checkpoint.terminal.is_none());
+        assert_eq!(
+            interrupted.outbox.len(),
+            0,
+            "must not learn a no-effect failure"
+        );
+        assert_eq!(
+            std::fs::read(&target).map_err(ctx("read effect"))?,
+            b"owned edit"
+        );
+        drop(driver);
+
+        // Reopen durable state, as a new worker after an explicit operator retry.
+        let reopened = Arc::new(CycleStore::new(
+            RecordStore::create_ambient(&fx.cycles_dir).map_err(ctx("reopen cycle store"))?,
+        ));
+        let mut resumed = CycleDriver::new(
+            Arc::clone(&reopened),
+            Script::new(vec![Ok(CycleProposal::Blocked {
+                reason: "owner review required".to_owned(),
+            })]),
+            LostAcknowledgement {
+                target,
+                calls: Arc::clone(&calls),
+            },
+            Arc::new(FixedReissuer(rights()?)),
+        );
+        resumed
+            .run(cycle_id, &token(&fx.work_id, 2), &fx.admission, &CancelToken::new())
+            .await
+            .map_err(ctx("resume reconciles"))?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "effect must not execute twice");
+        let recovered = reopened.load(cycle_id).map_err(ctx("load recovered"))?;
+        assert!(recovered.in_flight.is_none());
+        assert_eq!(recovered.checkpoint.fence.epoch, 2);
+        assert_eq!(recovered.checkpoint.fence.sequence, 2);
+        assert_eq!(recovered.checkpoint.terminal, Some(CycleTerminal::Blocked));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncertain_effect_that_cannot_be_reconciled_escalates_without_another_execution()
+    -> TestResult {
+        let cycle_id = "cycle-unknown-effect";
+        let fx = fixture(cycle_id)?;
+        let mut executor = Executor::new(vec![Err(StepFailure::uncertain("lost reply"))]);
+        executor.reconciliation = StepReconciliation::Uncertain;
+        let executed = Arc::clone(&executor.executed);
+        let mut driver = driver(&fx, Script::new(vec![Ok(wait())]), executor, rights()?);
+        let lease = token(&fx.work_id, 1);
+        assert!(matches!(
+            driver
+                .run(cycle_id, &lease, &fx.admission, &CancelToken::new())
+                .await,
+            Err(CycleRunError::EffectUncertain)
+        ));
+        // Even an explicit retry with the same lease enters reconciliation,
+        // not execute or the proposer, and unresolved effects escalate.
+        let result = driver
+            .run(cycle_id, &lease, &fx.admission, &CancelToken::new())
+            .await
+            .map_err(ctx("reconciliation escalates"))?;
+        assert!(matches!(
+            result,
+            CycleRunOutcome::Terminal {
+                terminal: CycleTerminal::Escalated,
+                ..
+            }
+        ));
+        assert_eq!(
+            executed.lock().map_err(|_| TestError::Missing("execution counter"))?.len(),
+            1
+        );
+        let record = fx.store.load(cycle_id).map_err(ctx("load escalation"))?;
+        assert_eq!(record.checkpoint.fence.sequence, 1);
+        assert!(record.in_flight.is_none());
+        assert_eq!(record.outbox.len(), 1);
+        let entry = record.outbox.pending().first()
+            .ok_or(TestError::Missing("uncertain observation"))?;
+        assert_ne!(entry.payload.category, ObservationCategory::ToolFailedNoEffect);
         Ok(())
     }
 

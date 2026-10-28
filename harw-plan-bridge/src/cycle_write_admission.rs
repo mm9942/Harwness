@@ -268,7 +268,8 @@ pub enum PatchRefusal {
     /// The target id is not in the trusted [`WriteTargetMap`] (checked by
     /// both [`PatchProposal::from_admitted`] and [`admit_patch`]).
     UnknownTarget,
-    /// The target (or the intent) is not admitted by the [`CycleAdmission`].
+    /// The target (or the intent) is not admitted by the [`CycleAdmission`],
+    /// or the target lies outside the current authority's exact-file scope.
     TargetNotAdmitted,
     /// The referenced evidence id is not in the checkpoint.
     MissingEvidence,
@@ -530,6 +531,15 @@ pub fn admit_patch(
     };
     if normalized(mapped) != proposal.relative_path() {
         return Err(PatchRefusal::EvidenceLocatorMismatch);
+    }
+    // A target in the cycle ceiling is not necessarily in this worker's
+    // exact-file grant. Do not treat scoped WriteWorkspace as whole-project
+    // authority, even before a future executor consumes this proof.
+    let write_scope = authority.write_scope();
+    if !write_scope.is_workspace()
+        && !write_scope.allows_path(Path::new(proposal.relative_path()))
+    {
+        return Err(PatchRefusal::TargetNotAdmitted);
     }
     // The permission above was checked on `authority`; the file must be
     // looked at in that same workspace and nowhere else.
@@ -1196,6 +1206,26 @@ mod tests {
                 ),
                 Err(PatchRefusal::TargetNotAdmitted)
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn patch_admission_respects_exact_file_authority_not_just_write_permission() -> TestResult {
+        let case = Case::new(&write_rights(), &["code"])?;
+        let proposal = case.proposal(&["code"], "ev-1")?;
+        for (path, allowed) in [("src/lib.rs", true), ("docs/guide.md", false)] {
+            let write_scope = harw_authority::FileWriteScope::exact_files([path])
+                .map_err(ctx("exact write scope"))?;
+            let request = harw_authority::PermissionRequest::from_permissions(write_rights())
+                .with_write_scope(write_scope);
+            let scoped = case.authority.restrict(&request);
+            let result = admit_patch(&proposal, &case.admission, &case.targets, &scoped, &case.scope);
+            if allowed {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result, Err(PatchRefusal::TargetNotAdmitted));
+            }
         }
         Ok(())
     }

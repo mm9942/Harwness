@@ -853,6 +853,15 @@ fn merge_top_level(
     let present = |field: &str| field_present(raw, &[field]);
 
     profile_replaces(
+        &mut trusted.single_agent_mode,
+        incoming.single_agent_mode,
+        present("single_agent_mode"),
+        role,
+        "single_agent_mode",
+        layer_path,
+    );
+
+    profile_replaces(
         &mut trusted.workspace_root,
         incoming.workspace_root.clone(),
         present("workspace_root"),
@@ -3171,6 +3180,29 @@ mod tests {
     // [tui] child_stream (Runde 5, Teil I): ProfileReplaces; Vorgabe
     // `orchestrators`, ein nicht vertrautes Projekt wird ignoriert, ein
     // unbekannter Wert parst nicht.
+    #[test]
+    fn test_single_agent_mode_trusted_precedence() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.single_agent_mode);
+        for (value, role, expected) in [
+            ("single_agent_mode = true", LayerRole::Baseline, true),
+            ("", LayerRole::Refinement, true),
+            ("single_agent_mode = false", LayerRole::UntrustedProject, true),
+            ("single_agent_mode = false", LayerRole::Refinement, false),
+            ("single_agent_mode = true", LayerRole::UntrustedProject, false),
+        ] {
+            merge_layer_into(
+                &mut trusted,
+                toml::from_str(value).map_err(ctx("parse single agent config"))?,
+                &raw_from(value)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(trusted.single_agent_mode, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_tui_child_stream_profile_replaces() -> TestResult {
         use crate::ChildStreamModeToml;

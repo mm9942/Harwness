@@ -3233,15 +3233,17 @@ fn ensure_same_workspace_root(
 ) -> Result<(), String> {
     let bound = assembled.workspace().canonical_root();
     let required = derived.workspace().canonical_root();
-    if bound == required {
-        Ok(())
-    } else {
-        Err(format!(
+    if bound != required {
+        return Err(format!(
             "plan node workspace root mismatch: assembly bound {}, contract requires {}",
             bound.display(),
             required.display()
-        ))
+        ));
     }
+    if !assembled.write_scope().is_subset_of(derived.write_scope()) {
+        return Err("plan node file authority exceeds derived contract scope".to_owned());
+    }
+    Ok(())
 }
 
 // Job-Art und Verengung eines Plan-Knotens (docs/design/runtime-contracts.md §extension):
@@ -3253,13 +3255,18 @@ fn plan_node_narrowing(
     sandbox: &SandboxSpec,
 ) -> (JobEntry, RuntimeNarrowing) {
     let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
-    let profile = profile_for_node_kind(kind, may_write);
+    let profile = if may_write && !sandbox.write_scope().is_workspace() {
+        RegistryProfile::WorkspaceEdit
+    } else {
+        profile_for_node_kind(kind, may_write)
+    };
     (
         JobEntry::PlanNode { kind, may_write },
         RuntimeNarrowing {
             registry_profile: profile,
             identity: plan_node_identity(payload, profile, kind),
             permissions: sandbox.permissions().clone(),
+            write_scope: sandbox.write_scope().clone(),
             // R0-F: bind the root sandbox to exactly the derived workspace root,
             // not to the project root discovered above it.
             workspace_root: Some(sandbox.workspace().canonical_root().to_path_buf()),
@@ -3826,9 +3833,28 @@ fn derive_plan_node_sandbox(
         ))
         .permissions()
         .clone();
+    // A legacy mutation contract is not opt-in to the unavailable scoped
+    // writer pilot. Only an already scoped trusted authority selects it.
+    let write_scope = if node_permissions.contains(Permission::WriteWorkspace)
+        && !inherited.write_scope().is_workspace()
+    {
+        let paths = contract.allowed_paths.iter().map(|rule| match rule {
+            PathRule::Exact(path) => Ok(path.clone()),
+            _ => Err("writable plan nodes require exact-file contracts; directory, suffix and glob rules are not isolated".to_owned()),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let scope = harw_authority::FileWriteScope::exact_files(paths)
+            .map_err(|error| format!("invalid plan-node write scope: {error}"))?;
+        if !scope.is_subset_of(inherited.write_scope()) {
+            return Err("plan contract write paths exceed inherited file authority".to_owned());
+        }
+        scope
+    } else {
+        inherited.write_scope().clone()
+    };
     let derived = inherited.restrict(
         &PermissionRequest::from_permissions(node_permissions.iter())
-            .with_network_scope(node.network_scope().clone()),
+            .with_network_scope(node.network_scope().clone())
+            .with_write_scope(write_scope),
     );
     derived.ensure_child_of(inherited).map_err(|error| {
         format!(
@@ -3897,13 +3923,11 @@ struct FileFingerprint {
 ///
 /// # Description
 /// Der Schnappschuss deckt das **gesamte** Arbeitsverzeichnis ab, nicht nur
-/// die von `contract.allowed_paths` benannten Pfade. Grund: die abgeleitete
-/// Sandbox (`derive_plan_node_sandbox`) gewährt `WriteWorkspace` nur grob für
-/// den ganzen Workspace — sie kennt keine Durchsetzung auf Pfadebene. Ein
-/// Turn könnte also technisch überall im Workspace schreiben; würde der
-/// Schnappschuss nur die erlaubten Pfade beobachten, bliebe jede Datei
-/// außerhalb davon unsichtbar und `validate_patch` bekäme sie nie zu sehen —
-/// genau die Lücke, die diese Prüfung schließen soll (Befund K36).
+/// die von `contract.allowed_paths` benannten Pfade. Legacy-Worker besitzen
+/// Workspace-Schreibrechte; der Schnappschuss erkennt nachträgliche Änderungen,
+/// garantiert aber keine Isolation zwischen parallelen Workern. Explizit
+/// dateibeschränkte Autorität bleibt erhalten; ihr Schreib-Backend-Pilot ist
+/// bis zu einer isolierten Implementierung fail-closed.
 ///
 /// # Arguments
 /// - `workspace_root` (`&Path`): kanonische Wurzel der abgeleiteten Sandbox.
@@ -4862,7 +4886,7 @@ mod tests {
                 Permission::NetworkAccess,
             ],
         )?;
-        let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
 
         let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
             .map_err(ctx("derivation must succeed"))?;
@@ -4872,6 +4896,53 @@ mod tests {
         assert!(!derived.permissions().contains(Permission::ExecuteProcess));
         assert!(!derived.permissions().contains(Permission::NetworkAccess));
         assert!(derived.ensure_child_of(&inherited).is_ok());
+        assert!(derived.write_scope().is_workspace(), "a legacy contract is not pilot opt-in");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_plan_directory_contract_keeps_workspace_write_authority() -> TestResult {
+        let dir = temp_dir()?;
+        let inherited = sandbox_with(dir.path(), &[
+            Permission::ReadWorkspace, Permission::WriteWorkspace,
+        ])?;
+        let contract = contract_for("legacy", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
+            .map_err(ctx("legacy directory contract"))?;
+        assert!(derived.write_scope().is_workspace());
+        assert!(derived.permissions().contains(Permission::WriteWorkspace));
+        Ok(())
+    }
+
+    #[test]
+    fn writable_plan_nodes_reject_non_exact_contract_rules() -> TestResult {
+        let dir = temp_dir()?;
+        let inherited = sandbox_with(dir.path(), &[
+            Permission::ReadWorkspace, Permission::WriteWorkspace,
+        ])?;
+        let inherited = inherited.restrict(
+            &PermissionRequest::from_permissions(inherited.permissions().iter()).with_write_scope(
+                harw_authority::FileWriteScope::exact_files(["src/lib.rs"])
+                    .map_err(ctx("exact scope"))?,
+            ),
+        );
+        let exact_contract = contract_for("exact", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        let exact = derive_plan_node_sandbox(&inherited, &exact_contract, PlanNodeKind::Coding, true)
+            .map_err(ctx("explicit exact contract"))?;
+        assert!(!exact.write_scope().is_workspace());
+        assert!(exact.write_scope().allows_path(Path::new("src/lib.rs")));
+        assert!(!exact.write_scope().allows_path(Path::new("Cargo.toml")));
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("exact"), &exact_contract)?)
+            .map_err(ctx("explicit exact payload"))?;
+        let (_, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Coding, &exact);
+        assert_eq!(narrowing.registry_profile, RegistryProfile::WorkspaceEdit);
+        assert_eq!(narrowing.write_scope, exact.write_scope().clone());
+        for rule in [PathRule::DirectoryPrefix("src".to_owned()),
+            PathRule::Glob("src/*.rs".to_owned()),
+            PathRule::ExtensionSuffix(".rs".to_owned())] {
+            let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned()), rule]);
+            assert!(derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true).is_err());
+        }
         Ok(())
     }
 
@@ -5122,7 +5193,7 @@ mod tests {
             snapshot.keys().cloned().collect::<Vec<_>>(),
             vec!["outside.rs".to_owned(), "src/lib.rs".to_owned()],
             "der ganze Workspace muss erfasst werden, nicht nur die erlaubten Pfade \
-             (Befund K36: die Sandbox schneidet nicht auf Pfadebene)"
+             (Befund K36: vollständige Erkennung unabhängig von Autorisierung)"
         );
         Ok(())
     }

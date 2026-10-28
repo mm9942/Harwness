@@ -47,7 +47,9 @@ use harw_sandbox::EgressUrl;
 /// as `if let Some(err) = require_permission(...) { return Ok(err); }`.
 ///
 /// # Description
-/// Checks whether `ctx.sandbox().permissions().contains(required)`. When the
+/// Checks whether `ctx.sandbox().permissions().contains(required)`. A generic
+/// `WriteWorkspace` check also requires workspace-wide scope; exact-file writers
+/// must use [`require_file_write`] after resolving their destination. When the
 /// check fails (permission absent) a structured error message of the form
 /// `"{tool_name} denied: {required:?} permission missing"` is returned inside a
 /// `ToolOutput::Error`. When the check passes, `None` is returned and the caller
@@ -59,7 +61,8 @@ use harw_sandbox::EgressUrl;
 /// - `tool_name` (`&str`): symbolic tool name used verbatim in the error message.
 ///
 /// # Returns
-/// - `None` when the permission is granted — proceed with execution.
+/// - `None` when the permission and, for generic writes, workspace-wide scope
+///   are granted — proceed with execution.
 /// - `Some(ToolOutput::error(...))` with a message of the form
 ///   `"{tool_name} denied: {required:?} permission missing"`.
 ///
@@ -88,7 +91,13 @@ pub fn require_permission(
     required: Permission,
     tool_name: &str,
 ) -> Option<ToolOutput> {
-    if ctx.sandbox().permissions().contains(required) {
+    if required == Permission::WriteWorkspace && !ctx.sandbox().write_scope().is_workspace() {
+        // A coarse permission check cannot authorize a file-scoped write.
+        // Legacy writers fail closed until they use a target-aware boundary.
+        Some(ToolOutput::error(format!(
+            "{tool_name} denied: exact-file write scope requires target-aware enforcement"
+        )))
+    } else if ctx.sandbox().permissions().contains(required) {
         None
     } else if required == Permission::NetworkAccess {
         Some(ToolOutput::error(format!(
@@ -99,6 +108,46 @@ pub fn require_permission(
             "{tool_name} denied: {required:?} permission missing"
         )))
     }
+}
+
+/// Checks write permission AND the exact workspace-relative target.
+///
+/// The caller must resolve workspace-contained symlinks first and perform the
+/// actual write beneath the same workspace using no-follow directory handles.
+/// Exact-file mutations currently fail closed even for an allowed path: the
+/// existing backend does not exclude concurrent parent-directory topology changes.
+/// Workspace-wide legacy writes retain their existing behavior.
+/// This is not a lease, approval, or preimage check; it cannot replace those
+/// independent gates. Generic writers must keep using [`require_permission`],
+/// which refuses file-scoped authority rather than treating it as full access.
+#[must_use]
+pub fn require_file_write(
+    ctx: &ToolExecutionContext,
+    relative_path: &std::path::Path,
+    tool_name: &str,
+) -> Option<ToolOutput> {
+    if !ctx.sandbox().permissions().contains(Permission::WriteWorkspace) {
+        return Some(ToolOutput::error(format!(
+            "{tool_name} denied: WriteWorkspace permission missing"
+        )));
+    }
+    let scope = ctx.sandbox().write_scope();
+    if !scope.is_workspace() {
+        if !scope.allows_path(relative_path) {
+            return Some(ToolOutput::error(format!(
+                "{tool_name} denied: target outside the exact-file write scope"
+            )));
+        }
+        // A lexical file ceiling alone is not mutation isolation. Existing
+        // writers may fall back to path-based parent reopening without /proc;
+        // even a pinned parent can be moved by a concurrent topology writer.
+        // Until an isolated writer owns that topology, do not expose scoped
+        // mutation merely because the permission/path checks succeeded.
+        return Some(ToolOutput::error(format!(
+            "{tool_name} denied: exact-file mutation requires an isolated writer backend"
+        )));
+    }
+    None
 }
 
 /// Prüft Netzzugriff auf genau einen Host: `Permission::NetworkAccess` UND
@@ -302,6 +351,20 @@ mod tests {
 
     fn make_ctx(spec: SandboxSpec) -> ToolExecutionContext {
         ToolExecutionContext::new(SessionId::new(), TurnId::new(), spec)
+    }
+
+    #[test]
+    fn scoped_writer_cannot_use_a_generic_workspace_write_guard() -> TestResult {
+        let (_base, sandbox) = make_sandbox("file_scoped_writer", vec![Permission::WriteWorkspace])?;
+        let scope = harw_authority::FileWriteScope::exact_files(["owned.rs"])
+            .map_err(ctx("exact scope"))?;
+        let request = harw_authority::PermissionRequest::from_permissions([Permission::WriteWorkspace])
+            .with_write_scope(scope);
+        let context = make_ctx(sandbox.restrict(&request));
+        assert!(require_permission(&context, Permission::WriteWorkspace, "other.writer").is_some());
+        assert!(require_file_write(&context, std::path::Path::new("owned.rs"), "fs.edit").is_some());
+        assert!(require_file_write(&context, std::path::Path::new("neighbor.rs"), "fs.edit").is_some());
+        Ok(())
     }
 
     /// Granted permission → `None` so callers may proceed.

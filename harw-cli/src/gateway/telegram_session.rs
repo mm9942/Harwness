@@ -557,6 +557,7 @@ fn telegram_turn_spec(
 fn telegram_turn_narrowing(workspace_root: &Path) -> RuntimeNarrowing {
     let profile = EntryKind::GatewayTelegram.profile();
     RuntimeNarrowing {
+        write_scope: harw_authority::FileWriteScope::workspace(),
         registry_profile: profile.registry_profile,
         identity: IdentityOverrides::default(),
         permissions: profile.permissions,

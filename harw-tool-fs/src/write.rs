@@ -135,12 +135,8 @@ impl FsWriteExecutor {
         call: &ToolCall,
     ) -> Result<ToolOutput, ToolsError> {
         // Permission check — fail closed
-        if let Some(err) = harw_tools::sandbox_guard::require_permission(
-            ctx,
-            Permission::WriteWorkspace,
-            "fs.write",
-        ) {
-            return Ok(err);
+        if !ctx.sandbox().permissions().contains(Permission::WriteWorkspace) {
+            return Ok(ToolOutput::error("fs.write denied: WriteWorkspace permission missing"));
         }
 
         // Parse arguments
@@ -174,6 +170,11 @@ impl FsWriteExecutor {
                     )));
                 }
             };
+        // Scope applies to the resolved destination, not the spelling of an
+        // in-workspace symlink supplied by the model.
+        if let Some(denied) = harw_tools::sandbox_guard::require_file_write(ctx, &relative, "fs.write") {
+            return Ok(denied);
+        }
         if let Some(protected) = protected_component(&relative) {
             return Ok(ToolOutput::error(format!(
                 "fs.write: '{}' liegt im geschützten Bereich '{protected}/' und wird nicht \
@@ -305,6 +306,43 @@ mod tests {
             name: harw_tools::spec::ToolName::new("fs.write"),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn exact_scope_refuses_mutation_until_topology_isolation_exists() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("owned.rs"), "old")?;
+        fs::write(fixture.ws.join("neighbor.rs"), "foreign")?;
+        std::os::unix::fs::symlink("neighbor.rs", fixture.ws.join("alias.rs"))?;
+        let scoped = fixture.scoped_writer(&["owned.rs", "alias.rs"])?;
+        for path in ["neighbor.rs", "alias.rs", "new.rs"] {
+            let output = FsWriteExecutor.write_file(&scoped, &make_call(serde_json::json!({
+                "path": path, "content": "must not write"
+            })))?;
+            assert!(matches!(output, ToolOutput::Error { .. }), "path {path}");
+        }
+        assert_eq!(fs::read_to_string(fixture.ws.join("neighbor.rs"))?, "foreign");
+        assert!(!fixture.ws.join("new.rs").exists());
+        let output = FsWriteExecutor.write_file(&scoped, &make_call(serde_json::json!({
+            "path": "owned.rs", "content": "owned change"
+        })))?;
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("isolated writer backend")),
+            other => return Err(TestError::Unexpected(format!("scoped write must fail closed: {other:?}"))),
+        }
+        assert_eq!(fs::read_to_string(fixture.ws.join("owned.rs"))?, "old");
+        // An admitted path with no parent must still reach the backend denial,
+        // not an attempted parent open or an unsafe path-based fallback.
+        let scoped = fixture.scoped_writer(&["missing/new.rs"])?;
+        let output = FsWriteExecutor.write_file(&scoped, &make_call(serde_json::json!({
+            "path": "missing/new.rs", "content": "must not create"
+        })))?;
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("isolated writer backend")),
+            other => return Err(TestError::Unexpected(format!("scoped creation must fail closed: {other:?}"))),
+        }
+        assert!(!fixture.ws.join("missing").exists());
+        Ok(())
     }
 
     #[test]

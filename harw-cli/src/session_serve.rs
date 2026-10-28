@@ -235,6 +235,7 @@ impl CoreSessionFactory for GatewayCoreFactory {
             // Rights follow the connection's tier: the entry's `{R, W, X}`
             // ceiling is cut, never widened.
             .narrowing(RuntimeNarrowing {
+                write_scope: harw_authority::FileWriteScope::workspace(),
                 registry_profile: harw_registry_defaults::RegistryProfile::Full,
                 identity: harw_registry_defaults::IdentityOverrides::default(),
                 permissions: permissions_for_tier(self.tier),

@@ -28,6 +28,12 @@
 //! verlangt eine vorhandene reguläre UTF-8-Datei und ersetzt `old_string`
 //! (ohne `replace_all` genau ein Treffer).
 //!
+//! Exact-file write ceilings from the trusted sandbox are checked by both
+//! writers after symlink resolution and before opening the destination. Scoped
+//! mutations currently fail closed even for an allowed path: a topology-isolated
+//! writer backend is not implemented. Tool arguments cannot replace or expand
+//! that ceiling. Legacy workspace-wide writes keep their existing behavior.
+//!
 //! # Nebenläufigkeit
 //! Alle Typen sind `Send + Sync`. Lesende Tools sind als `parallel_safe`
 //! markiert. Walks und Datei-IO laufen in `tokio::task::spawn_blocking`.

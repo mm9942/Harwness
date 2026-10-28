@@ -70,22 +70,13 @@
 //!   Definition (`AgentRoster::instructions`) stehen im stabilen Präfix des
 //!   Workers.
 //! - `owned_paths` leer → nur lesen (`{ReadWorkspace}`).
-//! - `owned_paths` = Workspace-Scope (`harw_plan_bridge::WORKSPACE_SCOPE`,
-//!   Kriterium ohne Pfad) → schreiben überall, wo kein anderer Worker Pfade
-//!   besitzt: höchstens ein solcher Worker je gleichzeitig laufendem Block,
-//!   die Pfade aller anderen Worker sind für ihn verboten.
-//! - `owned_paths` gesetzt → `{ReadWorkspace, WriteWorkspace}`. Die
-//!   Rechte-/Sandbox-Schicht kennt **keine** pfadgenaue Schreibfreigabe;
-//!   durchgesetzt wird der Schreibbereich deshalb mit dem vorhandenen
-//!   Plan-Knoten-Mechanismus (Workspace-Schnappschuss vor/nach jedem
-//!   gleichzeitig laufenden Block der Welle, `validate_patch` gegen die
-//!   `owned_paths` **dieses Blocks** — nicht die der ganzen Welle, sonst
-//!   deckte die erlaubte Vereinigung auch `owned_paths` ab, die erst in
-//!   einem späteren oder einem schon abgeschlossenen Block derselben Welle
-//!   laufen). Ein Verstoß blockiert die Worker der Welle und eskaliert an
-//!   den Menschen (fail closed); Worker, die *gleichzeitig* im selben Block
-//!   laufen, bleiben dabei nur über ihre deklarierten `owned_paths`
-//!   unterscheidbar (s. o., keine pfadgenaue Sandbox).
+//! - Legacy-Worker behalten Workspace-Schreibrechte und die bestehende
+//!   nachträgliche Block-Schnappschussprüfung. Diese Prüfung ist keine
+//!   Isolation zwischen parallelen Workern; `owned_paths` allein ist kein
+//!   Opt-in in den noch nicht verfügbaren isolierten Schreib-Backend-Pilot.
+//! - Bereits explizit dateibeschränkte Autorität bleibt eingeschränkt. Der
+//!   Pilot verweigert Mutationen bis ein isoliertes Backend verfügbar ist;
+//!   Standard-Worker werden dadurch nicht stillschweigend deaktiviert.
 //!
 //! # Provider-Grenzen
 //! Worker laufen im Prozess über **denselben** Provider wie der Rest des
@@ -2769,7 +2760,9 @@ impl JobTurnSpawner<'_> {
         };
         let sandbox = job_sandbox(entry, &self.runtime_root.cwd)?;
         let writable: &[String] = if writes { &request.owned_paths } else { &[] };
+        let sandbox = restrict_worker_write_paths(&sandbox, writable)?;
         let narrowing = RuntimeNarrowing {
+            write_scope: sandbox.write_scope().clone(),
             registry_profile: profile,
             identity: worker_identity(
                 &request.role,
@@ -2803,6 +2796,29 @@ impl JobTurnSpawner<'_> {
             vec![report_tool],
         )
     }
+}
+
+// Preserve legacy workspace authority; narrow only an explicitly scoped
+// caller. The scoped writer pilot remains fail-closed until isolation exists.
+fn restrict_worker_write_paths(
+    sandbox: &harw_authority::SandboxSpec,
+    paths: &[String],
+) -> Result<harw_authority::SandboxSpec, String> {
+    // Existing WorkDriver contracts (including the workspace marker) retain
+    // their historical behavior. Only trusted pre-scoped authority opts in;
+    // the exact writer backend remains unavailable and fails closed.
+    if sandbox.write_scope().is_workspace() {
+        return Ok(sandbox.clone());
+    }
+    let scope = harw_authority::FileWriteScope::exact_files(paths.iter().cloned())
+        .map_err(|error| format!("worker requires exact owned file paths: {error}"))?;
+    if !scope.is_subset_of(sandbox.write_scope()) {
+        return Err("worker owned paths exceed inherited file authority".to_owned());
+    }
+    Ok(sandbox.restrict(
+        &harw_authority::PermissionRequest::from_permissions(sandbox.permissions().iter())
+            .with_write_scope(scope),
+    ))
 }
 
 /// Hängt `work_driver.report` in die Montage **eines** WorkDriver-Worker-Turns
@@ -3651,6 +3667,28 @@ mod tests {
                 pacing: &self.pacing,
             }
         }
+    }
+
+    #[test]
+    fn worker_scope_is_opt_in_and_legacy_workspace_marker_still_works() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sandbox = job_sandbox(JobEntry::PlanNode {
+            kind: PlanNodeKind::Coding, may_write: true,
+        }, temp.path()).map_err(ctx("worker sandbox"))?;
+        let legacy = restrict_worker_write_paths(&sandbox, &[".".to_owned()])
+            .map_err(ctx("legacy workspace marker"))?;
+        assert!(legacy.write_scope().is_workspace());
+        let sandbox = sandbox.restrict(
+            &harw_authority::PermissionRequest::from_permissions(sandbox.permissions().iter())
+                .with_write_scope(harw_authority::FileWriteScope::exact_files(["src/lib.rs"])
+                    .map_err(ctx("explicit scope"))?),
+        );
+        let scoped = restrict_worker_write_paths(&sandbox, &["src/lib.rs".to_owned()])
+            .map_err(ctx("restrict worker paths"))?;
+        assert!(scoped.write_scope().allows_path(Path::new("src/lib.rs")));
+        assert!(!scoped.write_scope().allows_path(Path::new("Cargo.toml")));
+        assert!(restrict_worker_write_paths(&sandbox, &[".".to_owned()]).is_err());
+        Ok(())
     }
 
     // ── Fixtures ──────────────────────────────────────────────────────────

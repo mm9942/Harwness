@@ -118,10 +118,8 @@ impl FsEditExecutor {
         ctx: &ToolExecutionContext,
         call: &ToolCall,
     ) -> Result<ToolOutput, ToolsError> {
-        if let Some(err) =
-            harw_tools::sandbox_guard::require_permission(ctx, Permission::WriteWorkspace, TOOL)
-        {
-            return Ok(err);
+        if !ctx.sandbox().permissions().contains(Permission::WriteWorkspace) {
+            return Ok(ToolOutput::error("fs.edit denied: WriteWorkspace permission missing"));
         }
 
         let args: FsEditArgs = match serde_json::from_value::<FsEditArgs>(call.arguments.clone()) {
@@ -161,6 +159,12 @@ impl FsEditExecutor {
                     )));
                 }
             };
+        // Check the resolved target, never just the caller's symlink alias.
+        // A scoped writer can only use this target-aware path; generic writer
+        // guards refuse its authority.
+        if let Some(denied) = harw_tools::sandbox_guard::require_file_write(ctx, &relative, TOOL) {
+            return Ok(denied);
+        }
         if let Some(protected) = protected_component(&relative) {
             return Ok(ToolOutput::error(format!(
                 "fs.edit: '{}' liegt im geschützten Bereich '{protected}/' und wird nicht \
@@ -398,6 +402,29 @@ mod tests {
                 "JSON erwartet, erhalten: {other:?}"
             ))),
         }
+    }
+
+    #[test]
+    fn exact_scope_refuses_edit_until_topology_isolation_exists() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("owned.rs"), "old")?;
+        fs::write(fixture.ws.join("neighbor.rs"), "old")?;
+        std::os::unix::fs::symlink("neighbor.rs", fixture.ws.join("alias.rs"))?;
+        let scoped = fixture.scoped_writer(&["owned.rs", "alias.rs"])?;
+        for path in ["neighbor.rs", "alias.rs"] {
+            let output = FsEditExecutor.edit_file(&scoped, &call("fs.edit", serde_json::json!({
+                "path": path, "old_string": "old", "new_string": "unauthorized"
+            })))?;
+            assert!(matches!(output, ToolOutput::Error { .. }), "path {path}");
+        }
+        assert_eq!(fs::read_to_string(fixture.ws.join("neighbor.rs"))?, "old");
+        let output = FsEditExecutor.edit_file(&scoped, &call("fs.edit", serde_json::json!({
+            "path": "owned.rs", "old_string": "old", "new_string": "owned change"
+        })))?;
+        let reason = expect_error(output)?;
+        assert!(reason.contains("isolated writer backend"));
+        assert_eq!(fs::read_to_string(fixture.ws.join("owned.rs"))?, "old");
+        Ok(())
     }
 
     #[test]
