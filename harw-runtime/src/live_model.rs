@@ -94,6 +94,11 @@ struct LiveState {
     /// Daraus aufgelöste Kind-Modellstellen
     /// ([`crate::children::resolve_internal_models_for_children`]).
     resolved: HashMap<InternalModelPoint, ResolvedInternalModel>,
+    /// Route (Provider oder leer, Modell), für die zuletzt eine
+    /// Abkündigungswarnung gemeldet wurde; ändert sich die Route (oder
+    /// entfällt die Abkündigung), wird der Merker zurückgesetzt. Hält die
+    /// Warnung bei der Prüfung an jeder Turn-Grenze auf einmal je Route.
+    warned_route: Option<(String, String)>,
 }
 
 /// Live-Modellwahl einer Montage (siehe Moduldoku).
@@ -137,6 +142,7 @@ impl LiveModelRouting {
                 main: None,
                 internal_models,
                 resolved,
+                warned_route: None,
             }),
             backends: None,
             home: None,
@@ -177,12 +183,18 @@ impl LiveModelRouting {
     ///
     /// # Lebenszyklus
     /// Fail-closed für abgeschaltete (retired) Modelle: Provider (genannt,
-    /// sonst Katalog, sonst Vorgabe-Provider) und Modell-ID werden gegen den
-    /// Lebenszyklus geprüft, bevor die Wahl gespeichert wird; ein
-    /// abgeschaltetes Modell wird abgelehnt und der bisherige Stand bleibt
-    /// unverändert. Ein abgekündigtes (deprecated) Modell wird mit einer
-    /// Warnung im Log zugelassen. Das Zurücksetzen (`model: None`) schlägt nie
-    /// fehl.
+    /// sonst Katalog, sonst Vorgabe-Provider; jeweils auf den kanonischen
+    /// Namen normalisiert) und Modell-ID werden gegen den Lebenszyklus
+    /// geprüft, bevor die Wahl gespeichert wird; ein abgeschaltetes Modell
+    /// wird abgelehnt und der bisherige Stand bleibt unverändert. Die Prüfung
+    /// läuft an jeder Turn-Grenze auch für eine **unveränderte** Wahl: wurde
+    /// ein vorher abgekündigtes Modell inzwischen abgeschaltet, wird die
+    /// Wahl abgelehnt und die Live-Wahl entfernt (neue Kinder fallen auf den
+    /// Stand des Starts zurück). Dasselbe gilt, wenn eine **andere** Wahl
+    /// abgelehnt wird, während die installierte Wahl inzwischen selbst
+    /// abgeschaltet ist; eine noch gültige installierte Wahl bleibt. Ein abgekündigtes (deprecated) Modell wird
+    /// mit einer Warnung im Log zugelassen — einmal je Route, nicht bei jeder
+    /// Turn-Grenze. Das Zurücksetzen (`model: None`) schlägt nie fehl.
     ///
     /// # Errors
     /// [`RetiredModelError`], wenn das gewählte Modell abgeschaltet ist; sie
@@ -192,33 +204,97 @@ impl LiveModelRouting {
         provider: Option<String>,
         model: Option<String>,
     ) -> Result<(), RetiredModelError> {
+        let warning = self
+            .select_live_main_at(provider, model, lifecycle::OffsetDateTime::now_utc())
+            .inspect_err(|error| {
+                tracing::warn!(%error, "runtime.live_model.main_refused");
+            })?;
+        if let Some(warning) = warning {
+            tracing::warn!(%warning, "runtime.live_model.deprecated");
+        }
+        Ok(())
+    }
+
+    /// Kern von [`Self::set_live_main`] mit injizierter Uhr `now`.
+    ///
+    /// # Rückgabe
+    /// `Ok(Some(warnung))` nur, wenn für diese Route noch keine
+    /// Abkündigungswarnung gemeldet wurde (der Aufrufer protokolliert sie);
+    /// sonst `Ok(None)`.
+    ///
+    /// # Errors
+    /// [`RetiredModelError`], wenn das Angebot zu `now` abgeschaltet ist. Eine
+    /// geänderte Wahl lässt eine noch gültige installierte Wahl unverändert;
+    /// eine abgelehnte Wahl räumt auch eine installierte Wahl ab, die zu `now`
+    /// selbst abgeschaltet ist (die abgelehnte Wahl selbst, falls sie schon
+    /// installiert war, eingeschlossen).
+    fn select_live_main_at(
+        &self,
+        provider: Option<String>,
+        model: Option<String>,
+        now: lifecycle::OffsetDateTime,
+    ) -> Result<Option<String>, RetiredModelError> {
         let route = model
             .filter(|model| !model.trim().is_empty())
             .map(|model| LiveMainRoute {
                 provider: provider.filter(|provider| !provider.trim().is_empty()),
                 model,
             });
-        // Die TUI ruft diese Methode an jeder Turn-Grenze auf: eine unveränderte
-        // Wahl wurde bereits geprüft, sonst würde jede Runde dieselbe Warnung
-        // wiederholen.
-        let unchanged = self
-            .state
-            .read()
-            .ok()
-            .is_some_and(|state| state.main == route);
-        if unchanged {
-            return Ok(());
-        }
-        if let Some(route) = &route {
-            self.enforce_lifecycle(route.provider.as_deref(), &route.model)
-                .inspect_err(|error| {
-                    tracing::warn!(%error, "runtime.live_model.main_refused");
-                })?;
-        }
-        if let Ok(mut state) = self.state.write() {
-            state.main = route;
-        }
-        Ok(())
+        let Some(route) = route else {
+            if let Ok(mut state) = self.state.write() {
+                state.main = None;
+                state.warned_route = None;
+            }
+            return Ok(None);
+        };
+        let warning = match check_explicit_selection_at(
+            &self.config,
+            route.provider.as_deref(),
+            &route.model,
+            now,
+        ) {
+            Ok(warning) => warning,
+            Err(error) => {
+                // Fail-closed: eine installierte Wahl, die inzwischen
+                // abgeschaltet wurde — die abgelehnte selbst (unverändert
+                // gemeldet) oder eine frühere, die ein Wechsel nicht ersetzt —,
+                // darf für neue Kinder nicht weitergelten. Eine noch gültige
+                // installierte Wahl bleibt als letzter guter Stand.
+                if let Ok(mut state) = self.state.write() {
+                    let stale = state.main.as_ref().is_some_and(|installed| {
+                        installed == &route
+                            || check_explicit_selection_at(
+                                &self.config,
+                                installed.provider.as_deref(),
+                                &installed.model,
+                                now,
+                            )
+                            .is_err()
+                    });
+                    if stale {
+                        state.main = None;
+                        state.warned_route = None;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let key = (
+            route.provider.clone().unwrap_or_default(),
+            route.model.clone(),
+        );
+        let fresh = match self.state.write() {
+            Ok(mut state) => {
+                let fresh = warning.is_some() && state.warned_route.as_ref() != Some(&key);
+                state.warned_route = warning.is_some().then_some(key);
+                state.main = Some(route);
+                fresh
+            }
+            // Vergiftete Sperre: nichts wird gespeichert, also auch nichts
+            // dedupliziert.
+            Err(_) => warning.is_some(),
+        };
+        Ok(warning.filter(|_| fresh))
     }
 
     /// Provider/Modell, das ein jetzt gestartetes ungepinntes Kind anspricht;
@@ -431,6 +507,13 @@ impl LiveModelControl for LiveModelRouting {
 /// Provider, gegen dessen Lebenszyklus eine Wahl geprüft wird: der genannte,
 /// sonst der des Katalogs, sonst der Vorgabe-Provider der Konfiguration;
 /// `None`, wenn keiner bekannt ist (dann gibt es nichts zu prüfen).
+///
+/// Jede Quelle kann ein Schlüssel der Provider-Tabelle statt des `name` sein
+/// (`[providers.mistral-key] name = "mistral"`); die Lebenszyklus-Tabelle
+/// vergleicht aber exakt mit dem Anbieternamen. Darum wird das Ergebnis auf
+/// den kanonischen Namen normalisiert ([`canonical_provider_name`]) — sonst
+/// umginge ein abweichender Schlüssel die Prüfung eines abgeschalteten
+/// Modells.
 fn lifecycle_provider_in(
     config: &ResolvedConfig,
     provider: Option<&str>,
@@ -440,6 +523,7 @@ fn lifecycle_provider_in(
         .map(str::to_owned)
         .or_else(|| catalog_provider_of(config, model))
         .or_else(|| config.harness.default_provider.clone())
+        .map(|name| canonical_provider_name(config, &name).to_owned())
 }
 
 /// Provider und Modell-ID des Angebots, gegen das der Lebenszyklus geprüft
@@ -529,7 +613,8 @@ fn resolve_model_id_for_provider(config: &ResolvedConfig, provider: &str, model:
 /// Provider-Angebote (zur aktuellen Uhrzeit).
 ///
 /// # Beschreibung
-/// Löst Provider (genannt, sonst Katalog, sonst Vorgabe-Provider) und
+/// Löst Provider (genannt, sonst Katalog, sonst Vorgabe-Provider; stets als
+/// kanonischer Name, nie als Schlüssel der Provider-Tabelle) und
 /// Modell-ID (Katalog-Schlüssel, `id` oder Alias) wie die Live-Wahl auf
 /// ([`LiveModelRouting::set_live_main`]) und prüft mit
 /// [`lifecycle::enforce_explicit`]. Bei genanntem Provider wird
@@ -1510,6 +1595,331 @@ mod tests {
         assert_eq!(error.provider, "openai");
         assert_eq!(error.model, "gpt-4o-2024-08-06");
         assert!(error.to_string().contains("gpt-6-luna"), "{error}");
+        Ok(())
+    }
+
+    /// Gebündeltes, abgeschaltetes Mistral-Angebot ohne Ersatz (retired
+    /// 2026-09-30) für die Tests der Provider-Normalisierung.
+    const KEYED_MODEL: &str = "labs-leanstral-1-5";
+
+    /// Provider-Tabelle mit abweichendem Schlüssel
+    /// (`[providers.mistral-key] name = "mistral"`); optional mit einem
+    /// Katalogeintrag für [`KEYED_MODEL`] und einem Vorgabe-Provider.
+    fn keyed_config(with_catalog: bool, default_provider: Option<&str>) -> ResolvedConfig {
+        let mut config = ResolvedConfig {
+            harness: HarnessConfig {
+                default_provider: default_provider.map(str::to_owned),
+                ..HarnessConfig::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        config
+            .providers
+            .insert("mistral-key".to_owned(), loopback_provider("mistral", None));
+        if with_catalog {
+            config.models.insert(
+                "leanstral".to_owned(),
+                model_toml(KEYED_MODEL, "mistral-key", &[]),
+            );
+        }
+        config
+    }
+
+    /// Erwartet eine Ablehnung wegen Retirement und liefert den Fehler.
+    fn refused_with(
+        result: Result<Option<String>, RetiredModelError>,
+    ) -> TestResult<RetiredModelError> {
+        match result {
+            Err(error) => Ok(error),
+            Ok(warning) => Err(TestError::Unexpected(format!(
+                "ein abgeschaltetes Modell wurde angenommen (Warnung: {warning:?})"
+            ))),
+        }
+    }
+
+    /// Der Lebenszyklus-Provider ist für jede Quelle (genannt, Katalog,
+    /// Vorgabe) der kanonische Name, nie der Schlüssel der Provider-Tabelle;
+    /// ein unbekannter Verweis bleibt unverändert.
+    #[test]
+    fn lifecycle_provider_is_the_canonical_name_for_every_source() {
+        let config = keyed_config(true, Some("mistral-key"));
+        for named in ["mistral-key", "mistral"] {
+            assert_eq!(
+                lifecycle_provider_in(&config, Some(named), KEYED_MODEL).as_deref(),
+                Some("mistral"),
+                "genannt: {named}"
+            );
+        }
+        assert_eq!(
+            lifecycle_provider_in(&config, None, KEYED_MODEL).as_deref(),
+            Some("mistral"),
+            "Katalog"
+        );
+        assert_eq!(
+            lifecycle_provider_in(&config, None, "free-form").as_deref(),
+            Some("mistral"),
+            "Vorgabe-Provider"
+        );
+        assert_eq!(
+            lifecycle_provider_in(&config, Some("other"), KEYED_MODEL).as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            lifecycle_provider_in(&ResolvedConfig::default(), None, "free-form"),
+            None
+        );
+    }
+
+    /// Ein abgeschaltetes Modell wird abgelehnt, egal ob der Provider als
+    /// Schlüssel, als Name, über den Katalogeintrag oder über den
+    /// Vorgabe-Provider (Schlüssel oder Name) benannt wird — in der
+    /// Live-Wahl und in der gemeinsamen Prüfung der TUI-Turn-Grenze.
+    #[test]
+    fn retired_model_is_refused_however_the_provider_is_named() -> TestResult {
+        let after = utc(2026, 10, 15, 0)?;
+        let cases = [
+            (keyed_config(true, None), Some("mistral-key")),
+            (keyed_config(true, None), Some("mistral")),
+            (keyed_config(true, None), None),
+            (keyed_config(false, Some("mistral-key")), None),
+            (keyed_config(false, Some("mistral")), None),
+        ];
+        for (config, named) in cases {
+            let checked = check_explicit_selection_at(&config, named, KEYED_MODEL, after);
+            let error = refused_with(checked)?;
+            assert_eq!(error.provider, "mistral", "{named:?}");
+            assert_eq!(error.model, KEYED_MODEL);
+
+            let routing = LiveModelRouting::new(Arc::new(config));
+            let selected = routing.select_live_main_at(
+                named.map(str::to_owned),
+                Some(KEYED_MODEL.to_owned()),
+                after,
+            );
+            let error = refused_with(selected)?;
+            assert_eq!(error.provider, "mistral", "{named:?}");
+            assert!(routing.live_main().is_none(), "{named:?}");
+        }
+        Ok(())
+    }
+
+    /// Der öffentliche Pfad (echte Uhr; das Angebot ist seit 2026-09-30
+    /// abgeschaltet) lehnt das Modell über Schlüssel und Namen gleich ab.
+    #[test]
+    fn set_live_main_refuses_a_retired_model_named_by_provider_key() -> TestResult {
+        for named in ["mistral-key", "mistral"] {
+            let routing = LiveModelRouting::new(Arc::new(keyed_config(true, None)));
+            let Err(error) =
+                routing.set_live_main(Some(named.to_owned()), Some(KEYED_MODEL.to_owned()))
+            else {
+                return Err(TestError::Unexpected(format!(
+                    "{named}: ein abgeschaltetes Modell darf nicht gewählt werden"
+                )));
+            };
+            assert_eq!(error.provider, "mistral", "{named}");
+            assert_eq!(error.model, KEYED_MODEL);
+            assert!(routing.live_main().is_none(), "{named}");
+        }
+        Ok(())
+    }
+
+    /// Die Rollenwahl eines abgeschalteten Modells scheitert mit Schlüssel,
+    /// Namen und über den Vorgabe-Provider gleichermaßen und ändert nichts;
+    /// ein aktives Modell desselben Providers wird angenommen.
+    #[test]
+    fn internal_model_refuses_a_retired_model_named_by_provider_key() -> TestResult {
+        let point = InternalModelPoint::RootOrchestrator;
+        let cases = [
+            (keyed_config(true, None), Some("mistral-key")),
+            (keyed_config(true, None), Some("mistral")),
+            (keyed_config(false, Some("mistral-key")), None),
+        ];
+        for (config, named) in cases {
+            let routing = LiveModelRouting::new(Arc::new(config));
+            let before = routing.resolved_internal_model(point);
+            let choice = |model: &str| InternalModelChoice {
+                provider: named.map(str::to_owned),
+                model: Some(model.to_owned()),
+            };
+            assert!(
+                !routing.set_internal_model(point, Some(choice(KEYED_MODEL))),
+                "{named:?}"
+            );
+            assert_eq!(routing.resolved_internal_model(point), before, "{named:?}");
+            assert!(
+                routing.set_internal_model(point, Some(choice("mistral-large-3"))),
+                "{named:?}: ein aktives Modell wird angenommen"
+            );
+        }
+        Ok(())
+    }
+
+    /// Die Auflösung einer Kind-Stelle (zur injizierten Uhr nach dem
+    /// Retirement) fällt für jede Herkunft zurück, egal ob die Route den
+    /// Schlüssel, den Namen oder keinen Provider (Vorgabe) trägt.
+    #[test]
+    fn internal_route_falls_back_for_a_retired_model_named_by_provider_key() -> TestResult {
+        let after = utc(2026, 10, 15, 0)?;
+        let config = keyed_config(true, Some("mistral-key"));
+        for provider in [Some("mistral-key"), Some("mistral"), None] {
+            for source in [
+                InternalModelSource::Explicit,
+                InternalModelSource::OpenRouterDefault,
+                InternalModelSource::MainModel,
+            ] {
+                let route = ResolvedInternalModel {
+                    point: InternalModelPoint::RootOrchestrator,
+                    provider: provider.map(str::to_owned),
+                    model: Some(KEYED_MODEL.to_owned()),
+                    source,
+                };
+                let reason = fall_back_reason(internal_route_decision(&config, &route, after))?;
+                assert!(reason.contains(KEYED_MODEL), "{provider:?}: {reason}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Eine im Retirement-Fenster gewählte Route wird an der nächsten
+    /// Turn-Grenze nicht still weiterverwendet: unverändert gemeldet, aber
+    /// inzwischen abgeschaltet → abgelehnt, und die Live-Wahl für neue Kinder
+    /// ist entfernt (Stand des Starts).
+    #[test]
+    fn unchanged_deprecated_route_is_refused_once_it_is_retired() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(ResolvedConfig::default()));
+        let provider = Some(WINDOW_PROVIDER.to_owned());
+        let model = Some(WINDOW_MODEL.to_owned());
+        let installed = Some((provider.clone(), WINDOW_MODEL.to_owned()));
+
+        let warning = routing
+            .select_live_main_at(provider.clone(), model.clone(), utc(2026, 10, 30, 12)?)
+            .map_err(ctx("im Retirement-Fenster angenommen"))?
+            .ok_or(TestError::Missing("Warnung im Retirement-Fenster"))?;
+        assert!(warning.contains("zai-glm-5-3"), "{warning}");
+        assert_eq!(routing.live_main(), installed);
+
+        // Eine Stunde vor dem Retirement: unverändert angenommen, ohne
+        // wiederholte Warnung.
+        let again = routing
+            .select_live_main_at(provider.clone(), model.clone(), utc(2026, 10, 31, 11)?)
+            .map_err(ctx("vor dem Retirement weiter angenommen"))?;
+        assert_eq!(again, None);
+        assert_eq!(routing.live_main(), installed);
+
+        for now in [utc(2026, 10, 31, 12)?, utc(2026, 11, 1, 0)?] {
+            let error =
+                refused_with(routing.select_live_main_at(provider.clone(), model.clone(), now))?;
+            assert_eq!(error.model, WINDOW_MODEL);
+            assert!(error.to_string().contains("zai-glm-5-3"), "{error}");
+            assert!(
+                routing.live_main().is_none(),
+                "die abgeschaltete Route darf nicht mehr für neue Kinder gelten ({now})"
+            );
+        }
+        Ok(())
+    }
+
+    /// Eine abgelehnte, geänderte Wahl lässt eine noch gültige installierte
+    /// Route unberührt (fail-closed ohne Verlust des letzten guten Stands).
+    #[test]
+    fn refused_change_keeps_a_still_valid_installed_route() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(ResolvedConfig::default()));
+        let now = utc(2026, 11, 1, 0)?;
+        routing
+            .select_live_main_at(Some("openai".to_owned()), Some("gpt-5".to_owned()), now)
+            .map_err(ctx("aktives Modell angenommen"))?;
+        let error = refused_with(routing.select_live_main_at(
+            Some(WINDOW_PROVIDER.to_owned()),
+            Some(WINDOW_MODEL.to_owned()),
+            now,
+        ))?;
+        assert_eq!(error.model, WINDOW_MODEL);
+        assert_eq!(
+            routing.live_main(),
+            Some((Some("openai".to_owned()), "gpt-5".to_owned()))
+        );
+        Ok(())
+    }
+
+    /// Wird nach dem Retirement eine **andere** abgeschaltete Wahl eingereicht,
+    /// räumt die Ablehnung auch die installierte Route ab, die inzwischen
+    /// selbst abgeschaltet ist: ein direkter Aufrufer behält kein
+    /// abgeschaltetes Modell für neue Kinder.
+    #[test]
+    fn refused_change_also_clears_an_installed_route_that_is_itself_retired() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(keyed_config(true, None)));
+        routing
+            .select_live_main_at(
+                Some(WINDOW_PROVIDER.to_owned()),
+                Some(WINDOW_MODEL.to_owned()),
+                utc(2026, 10, 30, 12)?,
+            )
+            .map_err(ctx("im Retirement-Fenster angenommen"))?;
+        assert!(routing.live_main().is_some());
+
+        let error = refused_with(routing.select_live_main_at(
+            Some("mistral-key".to_owned()),
+            Some(KEYED_MODEL.to_owned()),
+            utc(2026, 11, 1, 0)?,
+        ))?;
+        assert_eq!(error.model, KEYED_MODEL);
+        assert!(
+            routing.live_main().is_none(),
+            "die inzwischen abgeschaltete installierte Route darf nicht bleiben"
+        );
+        Ok(())
+    }
+
+    /// Die Abkündigungswarnung kommt einmal je Route, nicht bei jeder
+    /// Turn-Grenze; ein Routenwechsel oder das Zurücksetzen setzt den Merker
+    /// zurück. Der öffentliche Pfad nimmt dieselbe Route wiederholt an.
+    #[test]
+    fn repeated_deprecated_route_warns_only_once_per_route() -> TestResult {
+        let routing = LiveModelRouting::new(Arc::new(ResolvedConfig::default()));
+        let now = utc(2026, 10, 30, 12)?;
+        let select = |provider: &str, model: &str| {
+            routing
+                .select_live_main_at(Some(provider.to_owned()), Some(model.to_owned()), now)
+                .map_err(ctx("Wahl angenommen"))
+        };
+
+        assert!(select(WINDOW_PROVIDER, WINDOW_MODEL)?.is_some());
+        for _ in 0..3 {
+            assert_eq!(select(WINDOW_PROVIDER, WINDOW_MODEL)?, None);
+        }
+        assert!(routing.live_main().is_some());
+
+        // Routenwechsel auf ein aktives Angebot setzt den Merker zurück: die
+        // Rückkehr warnt erneut.
+        assert_eq!(select("openai", "gpt-5")?, None);
+        assert!(select(WINDOW_PROVIDER, WINDOW_MODEL)?.is_some());
+
+        // Eine andere abgekündigte Route warnt für sich — ebenfalls einmal.
+        assert!(select("anthropic", "claude-mythos-preview")?.is_some());
+        assert_eq!(select("anthropic", "claude-mythos-preview")?, None);
+
+        // Das Zurücksetzen löscht den Merker.
+        routing
+            .set_live_main(None, None)
+            .map_err(ctx("Zurücksetzen"))?;
+        assert!(routing.live_main().is_none());
+        assert!(select("anthropic", "claude-mythos-preview")?.is_some());
+
+        for _ in 0..2 {
+            routing
+                .set_live_main(
+                    Some("anthropic".to_owned()),
+                    Some("claude-mythos-preview".to_owned()),
+                )
+                .map_err(ctx("öffentlicher Pfad"))?;
+        }
+        assert_eq!(
+            routing.live_main(),
+            Some((
+                Some("anthropic".to_owned()),
+                "claude-mythos-preview".to_owned()
+            ))
+        );
         Ok(())
     }
 }
