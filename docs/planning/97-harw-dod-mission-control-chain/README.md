@@ -14,6 +14,7 @@ related:
   - ../50-dod-integration/README.md
   - ../20-job-runtime/HARW_LINUX_JOB_RUNTIME_FOUNDATION.md
   - ../96-capability-closure/README.md
+  - ../90-intent-driven-composed-agents/07-coding-cycles-orchestration-plan.md
 ---
 
 # Harw-DoD final suite · tool triggers · TUI Mission Control — implementation plan
@@ -1436,3 +1437,90 @@ before starting B4** and scale B4 down to whatever is actually missing.
 
 If the owner disagrees with any decision above, change the corresponding WP
 before starting it; nothing else in the plan depends on the alternative.
+
+## 8. Amendments after the PR #153 coordination (2026-10-29)
+
+PR #153 (PL-90 §07, coding cycles, isolated workers and model supervision)
+builds on the execution chain of this plan. The owner asked both sessions to
+coordinate. The points below were verified against the tree and amend the
+work packages above. Where they disagree with §3 or §4, this section wins.
+
+### 8.1 Cross-plan contract
+- PL-90 §07 W2 (per-worker file isolation) and W3 (verification sandbox)
+  consume the E1/E2 chain. E1/E2 must therefore leave a typed hook for a
+  per-worker write scope. They must not grow a second scheduler or a
+  second security policy.
+- B1 as built: the injected `skills.triggered` fragments and the injector's
+  dedupe state live in the per-session turn state and in `injection` records
+  of the session store. A durable supervisor (PL-90 §07 W3) that replays a
+  transcript after restart must restore both. Child sessions do not get a
+  `SkillInjector` today. That is a known gap for B2/D4, not a silent default.
+
+### 8.2 Execution chain (E1, E2, E3, E5)
+- **E1/E2, per-job write scope.** Add an optional, versioned per-job write
+  list (a `JobSpec` field). When it is present, the coordinator maps it into
+  `FilesystemPolicy.read_write` before `plan_landlock_mapped`, instead of
+  deriving the policy only from `policy_for(spec.sandbox_profile,
+  workspace_root)` in `harw-job-runtime/src/coordinator/linux.rs`. An unknown
+  version is refused, never ignored. A path that does not exist is skipped by
+  the Landlock planner (`harw-job-linux/src/sandbox.rs`), so new files need
+  an explicit parent-directory rule.
+- **E2, fail-closed fallback.** The "`select_backend` returns `None`: legacy
+  behaviour, logged once" fallback applies only to legacy unscoped calls. A job
+  that carries a per-worker scope or `SandboxRequirement::Required` must be
+  refused when no backend is available (PR #153 invariant 5, W2).
+- **E1, features.** Drop "harw-command/harw-runtime must enable the `bwrap`
+  feature". `harw-cli/Cargo.toml` already enables `harw-job-runtime/bwrap`, and
+  resolver 2 unifies features into the `harw` binary. The real production
+  entry is `install_host_default` in `harw-command/src/global.rs`, called from
+  `harw-runtime/src/job_wiring.rs` and `harw-cli/src/chat.rs`; it belongs in the
+  E1 file list. The call in `host_escalation_wiring.rs` is a test.
+- **E1, install lists.** "harw-install's asset list" means the real binary
+  lists: `scripts/package-release.sh`, the `Makefile` release and uninstall
+  targets, `harw-install/src/uninstall.rs`, `.github/workflows/release.yml` and
+  `scripts/install.sh --binary`. `DEPLOYMENT_ASSETS` covers only `deploy/`
+  files with byte parity (`harw-install/src/deployment.rs`).
+- **E2, file list.** `ShellJobLauncher` is in `harw-tool-job/src/launcher.rs`
+  and delegates to `ShellToolProvider::prepare_background_launch`; it is not in
+  `manager.rs`.
+- **E3, user unit.** Cover `harw-serve.service` as well. It is rendered by
+  `harw-install/src/service_systemd.rs` and runs the job worker and verifier,
+  so it needs `Delegate=yes` or a documented sub-cgroup plus the cgroup root
+  (`[jobs] cgroup_root` or `HARW_VERIFY_CGROUP_ROOT`) in the unit.
+- **E5, readiness states.** `ExecutionChainReport` distinguishes PR #153 W4's
+  four states. *Installed*: `harw`, `killer`, the runner and `harw-job-exec`
+  are present. *Configured*: config checks pass and the cgroup root resolves.
+  *Running*: `harw service status` and `harw-dod.target`. *Ready*: the
+  `HostReport` dimensions, plus whether the serve worker's root (its cwd is the
+  HARW home) matches a project workspace.
+
+### 8.3 TUI jobs (C4, C4b)
+- `JobEvent::Started` already carries `origin_call_id`, `origin_tool` and
+  `owner_agent` (`harw-tool-job/src/event.rs`). `ManagedJobOrigin` (C4a) is
+  provenance only and never an authority input, because legacy records are
+  read leniently. Whether durable `harw-job-store` jobs get their own origin
+  variant or stay out of the managed-jobs window is an open question for
+  PR #153.
+- The Jobs window `x` key dispatches by origin. Managed jobs use
+  `/jobs stop <id>`. Durable jobs use the existing cancel or stop operation
+  under `JobMutationScope` (`harw-ops/src/job_tenant.rs`). The C4b hard stop
+  must not bypass the durable lease and claim path.
+
+### 8.4 Registry and DoD facts
+- A gated tool has more touchpoints than array membership: the
+  `tool_permission()` branch in `harw-registry-defaults/src/authority.rs`, the
+  must-ask test list in `harw-registry-defaults/src/lib.rs` and
+  `harw-ops/tests/approval_declaration_gate.rs`. Registry edits in B2/D3 are
+  sequenced with PR #153 W1.
+- `harw dod warden enable` does not exist before D3. Today the toggle is
+  `make -C dod enable-warden`, which does not persist because
+  `harw-warden.socket` has no `[Install]` section.
+- Invariant S1 in `harw-ops/src/approval.rs` is file-scoped. `harw-plan-bridge`
+  depends on the `harw-dod-escalate` library, but no harw crate depends on
+  `harw-dod-warden`.
+- `docs/setup/dod.md` claims there is "no enable/start action". That is
+  stale: the `dod/Makefile` `install` and `stage` targets both run
+  `scripts/service.sh enable` (`systemctl enable --now harw-dod.target`). The
+  `DESTDIR` stage path starting services conflicts with PR #153's "no silent
+  services" policy and is flagged for D3/X1.
+
