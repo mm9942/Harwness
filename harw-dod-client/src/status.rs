@@ -123,8 +123,7 @@ pub enum WardenState {
     Disabled,
     /// The socket is listening, or enabled with its guard file in place.
     Enabled,
-    /// systemd could not be asked and the guard file does not rule the
-    /// Warden out.
+    /// Available evidence does not determine whether the socket is enabled.
     Unknown,
 }
 
@@ -192,10 +191,23 @@ impl DodStatus {
                 .any(|unit| unit.is_installed() == Some(true) || unit.is_active())
     }
 
+    /// `true` when the findings and health files come from the system
+    /// export directory only the sentinel writes
+    /// ([`crate::paths::ExportSource::is_verified`]). A `false` snapshot
+    /// may still carry findings (the home fallback or a configured
+    /// `export_dir`); consumers that present them as Harw-DoD facts show
+    /// `export_paths.source` and its [`crate::paths::ExportSource::hint`]
+    /// next to them.
+    #[must_use]
+    pub const fn export_verified(&self) -> bool {
+        self.export_paths.source.is_verified()
+    }
+
     /// `high + critical` findings in the window, or `None` when DoD is not
     /// installed ([`Self::suite_installed`]) or the findings export is
     /// unreadable (the TUI hides its status mark then). When
-    /// `findings.complete` is `false` the count is a lower bound.
+    /// `findings.complete` is `false` the count is a lower bound. The count
+    /// does not check [`Self::export_verified`]; the caller labels the mark.
     #[must_use]
     pub fn attention_count(&self) -> Option<u32> {
         (self.suite_installed() && self.findings_export == ExportState::Readable)
@@ -253,6 +265,16 @@ pub fn status(ctx: &DodClientContext) -> DodStatus {
                 (summary, export)
             }
         };
+    // An unreadable system export is reported as such, with the operator
+    // hint, never replaced by the home fallback (see `resolve_export_paths`).
+    let (health_export, findings_export) = if export_paths.source.is_verified() {
+        (health_export, findings_export)
+    } else {
+        (
+            with_source_hint(health_export, export_paths.source),
+            with_source_hint(findings_export, export_paths.source),
+        )
+    };
     DodStatus {
         install: install_state(&ctx.libexec_dir),
         config,
@@ -263,6 +285,16 @@ pub fn status(ctx: &DodClientContext) -> DodStatus {
         findings,
         findings_export,
         export_paths,
+    }
+}
+
+/// Appends the source hint to an unreadable state; other states are kept.
+fn with_source_hint(state: ExportState, source: crate::paths::ExportSource) -> ExportState {
+    match (state, source.hint()) {
+        (ExportState::Unreadable { reason }, Some(hint)) => ExportState::Unreadable {
+            reason: sanitize(&format!("{reason}; {hint}"), MAX_REASON_BYTES * 2, ' '),
+        },
+        (state, _) => state,
     }
 }
 
@@ -297,8 +329,8 @@ pub fn install_state(libexec_dir: &Path) -> InstallState {
 ///   without the guard file (`ConditionPathExists=` is evaluated only when
 ///   the unit starts, so removing the flag leaves a listening socket up);
 /// - socket enabled (`UnitFileState=enabled`/`enabled-runtime`) and the
-///   guard file present or not checkable (e.g. `/etc/harw-dod` is `0750`)
-///   ⇒ [`WardenState::Enabled`] (`make -C dod enable-warden` state);
+///   guard file present ⇒ [`WardenState::Enabled`] (`make -C dod
+///   enable-warden` state); an uncheckable guard ⇒ [`WardenState::Unknown`];
 /// - any other reported socket state ⇒ [`WardenState::Disabled`].
 ///
 /// Only when systemd cannot be asked does the guard file decide alone:
@@ -307,10 +339,11 @@ pub fn install_state(libexec_dir: &Path) -> InstallState {
 /// status must never claim enforcement it cannot see.
 #[must_use]
 pub fn warden_state(flag: &Path, units: &[UnitState]) -> WardenState {
-    let flag_absent = matches!(
-        fs::symlink_metadata(flag),
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-    );
+    let flag_present = match fs::symlink_metadata(flag) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    };
     let socket = units
         .iter()
         .find(|unit| unit.unit == WARDEN_SOCKET_UNIT)
@@ -325,14 +358,20 @@ pub fn warden_state(flag: &Path, units: &[UnitState]) -> WardenState {
                 unit_file_state.as_deref(),
                 Some("enabled" | "enabled-runtime")
             );
-            if active_state == "active" || (socket_enabled && !flag_absent) {
+            if active_state == "active" {
                 WardenState::Enabled
+            } else if socket_enabled {
+                match flag_present {
+                    Some(true) => WardenState::Enabled,
+                    Some(false) => WardenState::Disabled,
+                    None => WardenState::Unknown,
+                }
             } else {
                 WardenState::Disabled
             }
         }
         Some(UnitStatus::NotAvailable | UnitStatus::Unknown { .. }) | None => {
-            if flag_absent {
+            if flag_present == Some(false) {
                 WardenState::Disabled
             } else {
                 WardenState::Unknown
@@ -457,6 +496,76 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_system_export_is_not_replaced_by_planted_home_findings() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("home");
+        let planted = home.join("dod").join("export");
+        fs::create_dir_all(&planted)?;
+        fs::write(
+            planted.join("findings.jsonl"),
+            concat!(
+                r#"{"finding_id":"f-1","host":"h","rule_id":"egress","severity":"critical","summary":"planted","observed_at":"2026-10-28T09:00:00Z"}"#,
+                "
+",
+            ),
+        )?;
+        let system = root.path().join("system-export");
+        fs::create_dir(&system)?;
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o000))?;
+        let listable = fs::read_dir(&system).is_ok();
+        let libexec = root.path().join("libexec");
+        fs::create_dir(&libexec)?;
+        for binary in DOD_BINARIES {
+            fs::write(libexec.join(binary), "")?;
+            fs::set_permissions(libexec.join(binary), fs::Permissions::from_mode(0o755))?;
+        }
+        let empty_path = root.path().join("bin");
+        fs::create_dir(&empty_path)?;
+        let now = OffsetDateTime::parse("2026-10-28T10:00:00Z", &Rfc3339)?;
+        let ctx = DodClientContext {
+            harw_home: home,
+            export_dir: None,
+            system_export_dir: system.clone(),
+            config_path: Some(root.path().join("absent-config.toml")),
+            libexec_dir: libexec,
+            warden_flag: root.path().join("warden.enable"),
+            search_path: Some(empty_path.into_os_string()),
+            findings_window: DEFAULT_FINDINGS_WINDOW,
+            now,
+        };
+        let snapshot = status(&ctx);
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o750))?;
+        if listable {
+            // Root can list a 0o000 directory; the ordinary rule applies and
+            // the planted home file is out of the picture either way.
+            assert_eq!(snapshot.export_paths.source, ExportSource::System);
+            assert_eq!(snapshot.findings.total(), 0);
+            return Ok(());
+        }
+        assert_eq!(snapshot.export_paths.source, ExportSource::SystemUnreadable);
+        assert!(!snapshot.export_verified());
+        assert_eq!(
+            snapshot.export_paths.findings,
+            system.join("findings.jsonl")
+        );
+        // The planted critical finding below the home is never counted.
+        assert_eq!(snapshot.findings.total(), 0);
+        assert!(!snapshot.findings.complete);
+        assert_eq!(snapshot.attention_count(), None);
+        match &snapshot.findings_export {
+            ExportState::Unreadable { reason } => {
+                assert!(reason.contains("harw-dod-readers"), "{reason}");
+            }
+            other => return Err(format!("expected unreadable, got {other:?}").into()),
+        }
+        assert!(matches!(
+            snapshot.health_export,
+            ExportState::Unreadable { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn nothing_installed_reports_missing_parts_and_hides_the_mark() -> TestResult {
         let root = tempfile::tempdir()?;
         let mut ctx = DodClientContext::new(
@@ -557,6 +666,54 @@ mod tests {
     }
 
     #[test]
+    fn inaccessible_guard_stays_unknown_in_public_status() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let protected = root.path().join("protected");
+        fs::create_dir(&protected)?;
+        let flag = protected.join("warden.enable");
+        fs::write(&flag, "")?;
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o000))?;
+        let error = fs::symlink_metadata(&flag).err();
+
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin)?;
+        let systemctl = bin.join("systemctl");
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 6 ]; do\n  [ $i -eq 4 ] && state=enabled || state=disabled\n  printf 'ActiveState=inactive\\nSubState=dead\\nUnitFileState=%s\\n\\n' \"$state\"\n  i=$((i + 1))\ndone\n",
+        )?;
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))?;
+        let mut ctx = DodClientContext::new(root.path().join("home"), OffsetDateTime::UNIX_EPOCH);
+        ctx.warden_flag = flag;
+        ctx.search_path = Some(bin.into_os_string());
+        ctx.system_export_dir = root.path().join("export");
+        ctx.libexec_dir = root.path().join("libexec");
+        ctx.config_path = Some(root.path().join("config"));
+        let snapshot = status(&ctx);
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o700))?;
+
+        // Privileged test runners can bypass directory permissions.
+        if error
+            .as_ref()
+            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            assert_eq!(
+                snapshot.units[4],
+                UnitState {
+                    unit: "harw-warden.socket".to_owned(),
+                    status: UnitStatus::Reported {
+                        active_state: "inactive".to_owned(),
+                        sub_state: "dead".to_owned(),
+                        unit_file_state: Some("enabled".to_owned()),
+                    },
+                }
+            );
+            assert_eq!(snapshot.warden, WardenState::Unknown);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn warden_state_combines_the_socket_unit_and_the_guard_file() -> TestResult {
         let root = tempfile::tempdir()?;
         let present = root.path().join("warden.enable");
@@ -579,7 +736,8 @@ mod tests {
         // Enabled socket: starts with the flag, stays down without it.
         assert_eq!(warden_state(&present, &enabled), WardenState::Enabled);
         assert_eq!(warden_state(&present, &runtime), WardenState::Enabled);
-        assert_eq!(warden_state(&unknowable, &enabled), WardenState::Enabled);
+        assert_eq!(warden_state(&unknowable, &enabled), WardenState::Unknown);
+        assert_eq!(warden_state(&unknowable, &runtime), WardenState::Unknown);
         assert_eq!(warden_state(&absent, &enabled), WardenState::Disabled);
         // Flag present, socket disabled, inactive or not installed.
         assert_eq!(warden_state(&present, &off), WardenState::Disabled);

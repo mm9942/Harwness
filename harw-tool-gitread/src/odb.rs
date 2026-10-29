@@ -34,7 +34,12 @@ pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_DELTA_DEPTH: usize = 100;
 
 /// Größte Pack-Indexdatei.
-pub const MAX_IDX_BYTES: u64 = 128 * 1024 * 1024;
+///
+/// Wird je Pack vollständig gelesen; größere `.idx` werden übersprungen
+/// (deren Objekte gelten dann als fehlend). Gleiche Begründung wie
+/// [`crate::index::MAX_INDEX_BYTES`]: ohne Rückfrage erreichbarer Speicher
+/// pro Aufruf bleibt begrenzt (PL-97-Sicherheitsreview, Befund 6).
+pub const MAX_IDX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Obergrenze der Objekt-Cache-Größe in Bytes.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
