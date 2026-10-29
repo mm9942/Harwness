@@ -44,9 +44,9 @@ use std::time::{Duration, Instant};
 
 use harw_config::DodSection;
 use harw_dod_client::{
-    ActiveProfile, ConfigReport, DodClientContext, DodStatus, ExportState, FindingLine,
-    FindingsSummary, FindingsTail, HealthReport, InstallState, MAX_TAIL_BYTES, ProfileScope,
-    SensorHealthState, UnitState, UnitStatus, WardenState, read_findings_tail,
+    ActiveProfile, ConfigReport, DodClientContext, DodStatus, ExportSource, ExportState,
+    FindingLine, FindingsSummary, FindingsTail, HealthReport, InstallState, MAX_TAIL_BYTES,
+    ProfileScope, SensorHealthState, UnitState, UnitStatus, WardenState, read_findings_tail,
 };
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
@@ -662,11 +662,34 @@ pub fn status_view(snapshot: &DodSnapshot) -> Value {
         "attention": status.attention_count(),
         "export": {
             "source": status.export_paths.source,
+            "verified": status.export_verified(),
+            "hint": status.export_paths.source.hint(),
             "findings": bounded_path(&status.export_paths.findings),
             "health": bounded_path(&status.export_paths.health),
         },
         "notes": snapshot.notes,
     })
+}
+
+fn provenance_view(source: ExportSource) -> Value {
+    json!({
+        "source": source,
+        "verified": source.is_verified(),
+        "hint": source.hint(),
+    })
+}
+
+fn provenance_text(source: ExportSource) -> String {
+    let label = match source {
+        ExportSource::System => "system",
+        ExportSource::SystemUnreadable => "system unreadable",
+        ExportSource::Override => "override ([dod] export_dir)",
+        ExportSource::Home => "harw home",
+    };
+    match source.hint() {
+        Some(hint) => format!("Export source: {label} (unverified); {hint}"),
+        None => format!("Export source: {label} (verified)"),
+    }
 }
 
 /// `n` or `≥ n` when the count is a lower bound.
@@ -769,8 +792,10 @@ pub fn status_text(snapshot: &DodSnapshot) -> String {
             harw_dod_client::ExportSource::Override => "[dod] export_dir",
             harw_dod_client::ExportSource::System => "system",
             harw_dod_client::ExportSource::Home => "harw home",
+            harw_dod_client::ExportSource::SystemUnreadable => "system unreadable",
         }
     ));
+    lines.push(provenance_text(status.export_paths.source));
     if let Some(attention) = status.attention_count() {
         lines.push(format!(
             "attention  {} high/critical in the window",
@@ -815,6 +840,8 @@ impl Default for FindingsQuery {
 /// The findings matching a [`FindingsQuery`], newest first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingsSelection {
+    /// Provenance of the export, retained even for empty or unreadable selections.
+    pub source: ExportSource,
     /// Read state of the findings export.
     pub export: ExportState,
     /// Path of the findings export.
@@ -840,6 +867,7 @@ pub fn select_findings(snapshot: &DodSnapshot, query: &FindingsQuery) -> Finding
         .and_then(|since| snapshot.as_of.checked_sub(since));
     let Some(tail) = &snapshot.findings else {
         return FindingsSelection {
+            source: status.export_paths.source,
             export: status.findings_export.clone(),
             path: status.export_paths.findings.clone(),
             shown: Vec::new(),
@@ -874,6 +902,7 @@ pub fn select_findings(snapshot: &DodSnapshot, query: &FindingsQuery) -> Finding
             .is_some_and(|oldest| oldest < bound)
     });
     FindingsSelection {
+        source: status.export_paths.source,
         export: status.findings_export.clone(),
         path: status.export_paths.findings.clone(),
         matched: matching.len(),
@@ -908,6 +937,7 @@ pub fn finding_view(line: &FindingLine) -> Value {
 pub fn findings_view(selection: &FindingsSelection) -> Value {
     json!({
         "export": export_state_view(&selection.export),
+        "provenance": provenance_view(selection.source),
         "path": bounded_path(&selection.path),
         "query": {
             "limit": selection.query.limit,
@@ -924,6 +954,14 @@ pub fn findings_view(selection: &FindingsSelection) -> Value {
 /// Human-readable selection (`/dod findings`, `harw dod findings`).
 #[must_use]
 pub fn findings_text(selection: &FindingsSelection) -> String {
+    format!(
+        "{}\n{}",
+        provenance_text(selection.source),
+        findings_body_text(selection)
+    )
+}
+
+fn findings_body_text(selection: &FindingsSelection) -> String {
     if selection.export != ExportState::Readable {
         return format!(
             "Findings export {} ({}).",
@@ -1049,6 +1087,10 @@ pub fn sensors_view(snapshot: &DodSnapshot) -> Value {
     };
     if let Some(object) = view.as_object_mut() {
         object.insert("path".to_owned(), Value::String(path));
+        object.insert(
+            "provenance".to_owned(),
+            provenance_view(snapshot.status.export_paths.source),
+        );
     }
     view
 }
@@ -1056,6 +1098,14 @@ pub fn sensors_view(snapshot: &DodSnapshot) -> Value {
 /// Human-readable sensor health (`/dod sensors`, `harw dod sensors`).
 #[must_use]
 pub fn sensors_text(snapshot: &DodSnapshot) -> String {
+    format!(
+        "{}\n{}",
+        provenance_text(snapshot.status.export_paths.source),
+        sensors_body_text(snapshot)
+    )
+}
+
+fn sensors_body_text(snapshot: &DodSnapshot) -> String {
     let Some(report) = &snapshot.status.health else {
         return format!(
             "Sentinel health export {} ({}).",
@@ -1884,6 +1934,67 @@ mod tests {
 
     fn ctx_err(context: &'static str) -> impl FnOnce(OpError) -> TestError {
         move |error| TestError::Unexpected(format!("{context}: {error:?}"))
+    }
+
+    #[tokio::test]
+    async fn dod_surfaces_preserve_export_provenance() -> TestResult {
+        for (source, verified) in [
+            (ExportSource::System, true),
+            (ExportSource::Override, false),
+            (ExportSource::Home, false),
+            (ExportSource::SystemUnreadable, false),
+        ] {
+            for export_case in 0..4 {
+                let mut snapshot = fixture_snapshot()?;
+                snapshot.status.export_paths.source = source;
+                if export_case == 1 {
+                    snapshot.findings = Some(FindingsTail {
+                        lines: Vec::new(),
+                        truncated: false,
+                    });
+                } else if export_case >= 2 {
+                    let state = if export_case == 2 {
+                        ExportState::Missing
+                    } else {
+                        ExportState::Unreadable {
+                            reason: "permission denied".to_owned(),
+                        }
+                    };
+                    snapshot.status.findings_export = state.clone();
+                    snapshot.status.health_export = state;
+                    snapshot.status.health = None;
+                    snapshot.findings = None;
+                }
+                let context = op_ctx(snapshot)?;
+                for (operation, command) in [
+                    (&DodStatusOperation as &dyn Operation, "status"),
+                    (&DodFindingsOperation as &dyn Operation, "findings"),
+                    (&DodSensorsOperation as &dyn Operation, "sensors"),
+                ] {
+                    let view = call_tool(operation, &context, json!({})).await?;
+                    let provenance = if command == "status" {
+                        &view["export"]
+                    } else {
+                        &view["provenance"]
+                    };
+                    assert_eq!(provenance["source"], json!(source), "{command}");
+                    assert_eq!(provenance["verified"], json!(verified), "{command}");
+                    assert_eq!(provenance["hint"], json!(source.hint()), "{command}");
+                    let output = call_command(&context, &[command])
+                        .await
+                        .map_err(ctx_err("provenance command"))?;
+                    if let Some(hint) = source.hint() {
+                        assert!(output.text.contains(hint), "{command}: {}", output.text);
+                        assert!(
+                            output.text.contains("unverified"),
+                            "{command}: {}",
+                            output.text
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

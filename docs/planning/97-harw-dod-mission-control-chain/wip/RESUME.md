@@ -31,3 +31,30 @@ optional `args.lanes`, `args.busy`). Zone order after this snapshot:
 finish C2, E1b, D3, B3, E3c → B2, C3 ∥ C4, E2a → E2b, E3 (after D3), D4,
 M3, D5, E4, C4b, E5, C5, B5, X1. Before each commit run the zone gates and
 stage only that zone's files (Cargo.lock per package).
+
+## Local consolidation verification (2026-10-29, E1b only)
+
+The four E1b notes above describe the original snapshot, not the current
+integration branch. Plain Bwrap root-workspace refusal, failed-output-open
+attempt cleanup, and `HARW_VERIFY_BACKEND` documentation were already present
+and their focused regressions pass. Report integrity needed one additional
+execution-time guard: backend selection alone cannot guarantee Landlock is
+actually applied, and direct backend construction bypasses selection.
+
+The mapped inner policy now uses `hard_requirement()` regardless of the job's
+`None`/`BestEffort`/`Required` choice. Missing or partial filesystem enforcement
+therefore aborts before executing the job. Selection requires ABI >= 5 for
+this composition (the project's full-enforcement target); auto-selection may
+still choose plain Bwrap, while explicit composition selects no backend.
+Existing `None`/`BestEffort` semantics can then run without a sandbox; `Required`
+refuses. This does not produce a composed trampoline report. No policy
+permissions were widened. The report remains outside job-granted paths.
+
+Verification: all 23 executor mapping tests and 99 runtime unit tests passed
+(3 existing environment-dependent tests ignored); the subprocess regression
+checks that a best-effort/none job either runs with a protected report or is
+refused before execution. Full privileged namespace/cgroup integration remains
+host-dependent: the chain smoke test self-skipped because this environment has
+no trusted Bubblewrap at the fixed paths. These checks do not mark the entire
+E1b work package complete. The full `harw-job-exec` suite passed (26 unit and
+12 subprocess tests); strict all-target Clippy passed for all three crates.

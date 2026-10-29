@@ -2398,6 +2398,7 @@ dependencies = [
  "harw-dod-client",
  "harw-dod-encrypt",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-home",
  "harw-infra-client",
  "harw-install",
@@ -2440,6 +2441,7 @@ dependencies = [
  "harw-tailscale",
  "harw-tool-doc",
  "harw-tool-lens",
+ "harw-tools",
  "harw-tui",
  "harw-types",
  "harw-web",
@@ -2475,6 +2477,7 @@ name = "harw-cloud-enroll"
 version = "0.9.1"
 dependencies = [
  "harw-types",
+ "jiff",
  "serde",
  "serde_json",
  "tracing",
@@ -2496,12 +2499,17 @@ dependencies = [
 name = "harw-cloud-ops"
 version = "0.9.1"
 dependencies = [
+ "harw-authority",
  "harw-cloud-gateway",
+ "harw-home",
  "harw-macros",
+ "harw-node-listener",
  "harw-operations",
  "harw-tools",
+ "harw-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2510,6 +2518,7 @@ name = "harw-cloudctl"
 version = "0.9.1"
 dependencies = [
  "harw-cloud-gateway",
+ "harw-install",
  "serde_json",
  "tokio",
 ]
@@ -3671,6 +3680,7 @@ dependencies = [
  "harw-protocol",
  "harw-test-support",
  "rustix 1.1.5",
+ "serde",
  "tempfile",
 ]
 
@@ -3771,6 +3781,7 @@ version = "0.9.1"
 dependencies = [
  "bytes",
  "futures-util",
+ "harw-fsutil",
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
@@ -3962,6 +3973,7 @@ dependencies = [
 name = "harw-plan"
 version = "0.9.1"
 dependencies = [
+ "fs4",
  "harw-macros",
  "harw-types",
  "serde",
@@ -4226,6 +4238,7 @@ dependencies = [
  "harw-lens-types",
  "harw-macros",
  "harw-mcp-client",
+ "harw-media",
  "harw-memory",
  "harw-model-catalog",
  "harw-observe",
@@ -4242,6 +4255,7 @@ dependencies = [
  "harw-session-store",
  "harw-tool-container",
  "harw-tool-container-run",
+ "harw-tool-fs",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-remote",
@@ -4419,6 +4433,7 @@ name = "harw-session-driver"
 version = "0.9.1"
 dependencies = [
  "harw-core",
+ "harw-extension-api",
  "harw-protocol",
  "harw-session-host",
  "harw-session-store",
@@ -4433,6 +4448,7 @@ dependencies = [
 name = "harw-session-host"
 version = "0.9.1"
 dependencies = [
+ "fs4",
  "harw-authority",
  "harw-fsutil",
  "harw-protocol",
@@ -4660,6 +4676,8 @@ dependencies = [
  "harw-fsutil",
  "harw-home",
  "harw-macros",
+ "harw-media",
+ "harw-protocol",
  "harw-sandbox",
  "harw-tools",
  "harw-types",

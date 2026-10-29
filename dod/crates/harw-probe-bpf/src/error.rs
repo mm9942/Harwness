@@ -215,7 +215,10 @@ impl fmt::Display for ProbeError {
                 "refusing to start: --cgroup-root '{path}' must be an absolute directory other than '/' without '..' components"
             ),
             Self::CgroupScopeRejected(source) => {
-                write!(f, "refusing to attach: the resolved cgroup scope is invalid: {source}")
+                write!(
+                    f,
+                    "refusing to attach: the resolved cgroup scope is invalid: {source}"
+                )
             }
             Self::LandlockUnavailable => write!(
                 f,
@@ -367,7 +370,9 @@ mod tests {
             error: harw_dod_config::ConfigError::MissingActiveProfile,
         };
         let text = err.to_string();
-        assert!(text.starts_with("refusing to start: DoD configuration '/etc/harw-dod/config.toml'"));
+        assert!(
+            text.starts_with("refusing to start: DoD configuration '/etc/harw-dod/config.toml'")
+        );
         assert!(text.contains("no active_profile"));
         assert!(std::error::Error::source(&err).is_some());
     }

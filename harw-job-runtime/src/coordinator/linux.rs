@@ -165,8 +165,9 @@ pub enum LinuxSandboxBackend {
     /// verifies the cgroup and applies `NO_NEW_PRIVS`, the capability drop
     /// and Landlock planned against the namespace view (module docs).
     ///
-    /// Meant for hosts with a usable Landlock ABI (`select_backend` only
-    /// picks it then): Landlock is what keeps the job out of its attempt
+    /// Requires Landlock ABI 5 or later (`select_backend` only picks it
+    /// then), with actual full enforcement checked before exec even for
+    /// best-effort jobs: Landlock keeps the job out of its attempt
     /// directory, which is bound read-write for the plan and the report.
     #[cfg(feature = "bwrap")]
     BwrapTrampoline {
@@ -2483,6 +2484,14 @@ mod chain_tests {
         );
         assert_eq!(inner.rlimits, rlimit_set(&spec));
         assert_eq!(inner.sandbox_requirement, SandboxRequirement::BestEffort);
+        let decoded =
+            harw_job_exec::ExecPlanV1::from_json(&inner.to_json().map_err(ctx("serialize inner"))?)
+                .map_err(ctx("decode inner"))?;
+        assert_eq!(
+            decoded.sandbox.as_ref().map(|policy| policy.landlock),
+            Some(harw_job_linux::LandlockMode::HardRequirement),
+            "report protection survives the trampoline plan handoff"
+        );
         let policy = inner
             .sandbox
             .as_ref()

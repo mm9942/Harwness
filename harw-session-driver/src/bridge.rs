@@ -40,7 +40,8 @@ use harw_protocol::approvals::ApprovalKind;
 use harw_protocol::{ApprovalRequest, SessionEvent, TurnEvent};
 use harw_session_host::HostError;
 use harw_session_host::driver::{
-    CancelSignal, DriverEvent, DriverFuture, EventSink, Setting, TurnDriver, TurnInput, TurnOutcome,
+    CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver,
+    TurnInput, TurnOutcome,
 };
 use harw_session_store::{
     ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, SessionStoreError,
@@ -104,6 +105,25 @@ pub struct ParkedApproval {
 /// with a scripted fake. All calls are per session; the driver guarantees one
 /// leg (turn or resume) at a time per session (host arbiter).
 pub trait CoreRuntime: Send + Sync + 'static {
+    /// Trusted host admission; production runtimes must use it in assembly.
+    fn prepare_execution(
+        &self,
+        _session_id: &SessionId,
+        _admission: ExecutionAdmission,
+    ) -> Result<(), DriverBridgeError> {
+        Err(DriverBridgeError::Runtime(
+            "runtime does not support creator execution admission".into(),
+        ))
+    }
+
+    /// Roll back an unpublished creation's process-local state.
+    fn discard_unpublished_session(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), DriverBridgeError> {
+        Ok(())
+    }
+
     /// Prepare the session (idempotent).
     fn open_session<'a>(
         &'a self,
@@ -493,6 +513,29 @@ fn resolution_of(record: &ApprovalResolutionRecord) -> ApprovalResolution {
 }
 
 impl TurnDriver for CoreTurnDriver {
+    fn prepare_execution(
+        &self,
+        session_id: &SessionId,
+        admission: ExecutionAdmission,
+    ) -> DriverFuture<'_, ()> {
+        let result = self
+            .runtime
+            .prepare_execution(session_id, admission)
+            .map_err(HostError::from);
+        Box::pin(async move { result })
+    }
+
+    fn discard_unpublished_session(&self, session_id: &SessionId) -> Result<(), HostError> {
+        self.controls()?.remove(session_id);
+        self.parked
+            .lock()
+            .map_err(|_| HostError::Driver("parked approval table poisoned".into()))?
+            .remove(session_id);
+        self.runtime
+            .discard_unpublished_session(session_id)
+            .map_err(HostError::from)
+    }
+
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()> {
         let session_id = session_id.clone();
         let title = title.map(str::to_owned);
@@ -607,6 +650,20 @@ pub struct CoreSession {
 /// The approval actor in the session's spawn context is what the durable
 /// approval record binds; the responding connection's actor must match it.
 pub trait CoreSessionFactory: Send + Sync + 'static {
+    /// Build using the host's current, authenticated creator ceiling. An
+    /// effectful factory must override this instead of discarding authority.
+    fn build_with_execution(
+        &self,
+        _session_id: &SessionId,
+        _title: Option<&str>,
+        _wiring: SessionWiring,
+        _admission: &ExecutionAdmission,
+    ) -> Result<CoreSession, DriverBridgeError> {
+        Err(DriverBridgeError::Runtime(
+            "factory does not support creator execution admission".into(),
+        ))
+    }
+
     /// Build the session `session_id`.
     ///
     /// # Errors
@@ -628,10 +685,17 @@ struct Slot {
     turn_events: mpsc::UnboundedReceiver<TurnEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmissionState {
+    generation: u64,
+    admission: Option<ExecutionAdmission>,
+}
+
 /// [`CoreRuntime`] over `harw-core`: `run_turn_durable` for turns,
 /// `resume_after_approval` for resumes.
 pub struct HarwCoreRuntime {
     factory: Arc<dyn CoreSessionFactory>,
+    admissions: Mutex<HashMap<SessionId, AdmissionState>>,
     approvals: ApprovalStore,
     slots: Mutex<SlotMap>,
     models: Mutex<HashMap<SessionId, String>>,
@@ -649,6 +713,7 @@ impl HarwCoreRuntime {
     pub fn new(factory: Arc<dyn CoreSessionFactory>, sessions_root: &std::path::Path) -> Self {
         Self {
             factory,
+            admissions: Mutex::new(HashMap::new()),
             approvals: ApprovalStore::new(sessions_root),
             slots: Mutex::new(HashMap::new()),
             models: Mutex::new(HashMap::new()),
@@ -679,9 +744,32 @@ impl HarwCoreRuntime {
         }
         let (event_tx, session_events) = mpsc::unbounded_channel();
         let (turn_tx, turn_events) = mpsc::unbounded_channel();
-        let mut core =
-            self.factory
-                .build(session_id, title, SessionWiring { event_tx, turn_tx })?;
+        let admission = self
+            .admissions
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("admission table poisoned".into()))?
+            .get(session_id)
+            .cloned();
+        // A recorded rollback is not a never-admitted legacy session. Never
+        // recreate a wider legacy runtime from the durable tombstone.
+        if admission
+            .as_ref()
+            .is_some_and(|state| state.admission.is_none())
+        {
+            return Err(DriverBridgeError::Runtime(
+                "session admission was discarded; trusted re-admission required".into(),
+            ));
+        }
+        let wiring = SessionWiring { event_tx, turn_tx };
+        let mut core = match admission
+            .as_ref()
+            .and_then(|state| state.admission.as_ref())
+        {
+            Some(admission) => self
+                .factory
+                .build_with_execution(session_id, title, wiring, admission)?,
+            None => self.factory.build(session_id, title, wiring)?,
+        };
         core.session
             .hydrate_from_store(core.store.as_ref())
             .await
@@ -692,6 +780,19 @@ impl HarwCoreRuntime {
             session_events,
             turn_events,
         }));
+        // Hydration awaits external storage. Admission may have changed while
+        // it ran; never publish a legacy/wider core under a newer admission.
+        // Keep the admission lock through insertion (the same lock order as
+        // prepare_execution) so installation and publication are atomic.
+        let admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("admission table poisoned".into()))?;
+        if admissions.get(session_id) != admission.as_ref() {
+            return Err(DriverBridgeError::Runtime(
+                "execution admission changed during session hydration; retry with current authority".into(),
+            ));
+        }
         Ok(Arc::clone(
             self.slots()?
                 .entry(session_id.clone())
@@ -740,6 +841,74 @@ where
 }
 
 impl CoreRuntime for HarwCoreRuntime {
+    fn prepare_execution(
+        &self,
+        session_id: &SessionId,
+        admission: ExecutionAdmission,
+    ) -> Result<(), DriverBridgeError> {
+        let mut admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("admission table poisoned".into()))?;
+        match admissions
+            .get(session_id)
+            .and_then(|state| state.admission.as_ref())
+        {
+            Some(previous) if previous == &admission => return Ok(()),
+            Some(_) => {
+                return Err(DriverBridgeError::Runtime(
+                    "creator authority changed; cached runtime cannot safely reuse its permissions"
+                        .into(),
+                ));
+            }
+            None => {}
+        }
+        // Recovery may already have hydrated a dedicated-host session for
+        // transcript/approval inspection. Rehydrate it with trusted authority
+        // before allowing new effects; the persisted record grants no rights.
+        let generation = admissions
+            .get(session_id)
+            .map_or(0, |state| state.generation)
+            .checked_add(1)
+            .ok_or_else(|| DriverBridgeError::Runtime("admission generation exhausted".into()))?;
+        self.slots()?.remove(session_id);
+        admissions.insert(
+            session_id.clone(),
+            AdmissionState {
+                generation,
+                admission: Some(admission),
+            },
+        );
+        Ok(())
+    }
+
+    fn discard_unpublished_session(&self, session_id: &SessionId) -> Result<(), DriverBridgeError> {
+        let mut admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("admission table poisoned".into()))?;
+        let generation = admissions
+            .get(session_id)
+            .map_or(0, |state| state.generation)
+            .checked_add(1)
+            .ok_or_else(|| DriverBridgeError::Runtime("admission generation exhausted".into()))?;
+        self.slots()?.remove(session_id);
+        // Keep a tombstone so an older asynchronous hydration cannot publish
+        // after rollback (including the None -> scoped -> None ABA case).
+        admissions.insert(
+            session_id.clone(),
+            AdmissionState {
+                generation,
+                admission: None,
+            },
+        );
+        self.models
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("model table poisoned".into()))?
+            .remove(session_id);
+        Ok(())
+    }
+
     fn open_session<'a>(
         &'a self,
         session_id: &'a SessionId,
@@ -886,6 +1055,102 @@ mod tests {
         let root = dir.path().to_path_buf();
         let driver = CoreTurnDriver::new(CoreDriverConfig::new(root)).map_err(|e| e.to_string())?;
         assert_eq!(driver.model_name(&SessionId::new()), None);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_races {
+    use super::*;
+    use harw_core::ConversationHistory;
+    use harw_core::state_store::StateStoreResult;
+    use harw_protocol::items::TurnItem;
+    use tokio::sync::Notify;
+
+    struct DelayedHistory {
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl StateStore for DelayedHistory {
+        fn save_turn<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: &'a TurnItem,
+        ) -> Pin<Box<dyn Future<Output = StateStoreResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn load_history<'a>(
+            &'a self,
+            _: &'a SessionId,
+        ) -> Pin<Box<dyn Future<Output = StateStoreResult<ConversationHistory>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(ConversationHistory::new())
+            })
+        }
+    }
+
+    struct DelayedFactory(Arc<DelayedHistory>);
+
+    impl CoreSessionFactory for DelayedFactory {
+        fn build(
+            &self,
+            session_id: &SessionId,
+            _: Option<&str>,
+            wiring: SessionWiring,
+        ) -> Result<CoreSession, DriverBridgeError> {
+            Ok(CoreSession {
+                session: AgentSession::new_with_id(
+                    session_id.clone(),
+                    harw_types::roles::AgentRole::Assistant,
+                    None,
+                    harw_extension_api::ExtensionRegistryBuilder::default().build(),
+                    wiring.event_tx,
+                ),
+                model: Arc::new(harw_core::EchoModelProvider::new("unused")),
+                store: Arc::clone(&self.0) as Arc<dyn StateStore>,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_during_legacy_hydration_cannot_publish_stale_runtime()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dir = tempfile::tempdir()?;
+        let history = Arc::new(DelayedHistory {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let runtime = Arc::new(HarwCoreRuntime::new(
+            Arc::new(DelayedFactory(Arc::clone(&history))),
+            dir.path(),
+        ));
+        let session_id = SessionId::new();
+        let loading = {
+            let runtime = Arc::clone(&runtime);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { runtime.open_session(&session_id, None).await })
+        };
+        history.entered.notified().await;
+        // Installing/clearing admission while legacy hydration awaits storage
+        // changes its generation. The discarded core must never be published.
+        runtime.discard_unpublished_session(&session_id)?;
+        history.release.notify_one();
+        assert!(loading.await?.is_err());
+        assert!(runtime.slots()?.get(&session_id).is_none());
+        // The rollback tombstone also refuses later lazy legacy recreation.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                runtime.open_session(&session_id, None),
+            )
+            .await?
+            .is_err()
+        );
         Ok(())
     }
 }

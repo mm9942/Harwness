@@ -835,7 +835,11 @@ impl BwrapLauncher {
             }
         }
         append_destination_dirs(&mut args, workspace)?;
-        let write_allowed = sandbox.permissions().contains(Permission::WriteWorkspace);
+        // An exact-file grant cannot be represented by a writable workspace
+        // bind. Keep the mount read-only; scoped writes must go through the
+        // target-aware filesystem tools instead.
+        let write_allowed = sandbox.permissions().contains(Permission::WriteWorkspace)
+            && sandbox.write_scope().is_workspace();
         args.push(if write_allowed {
             OsString::from("--bind")
         } else {

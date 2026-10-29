@@ -837,3 +837,6 @@ mod test_support;
 
 #[cfg(test)]
 mod cycle_w03_tests;
+
+/// Explicit, scoped source-collection prerequisites.
+pub mod source_collection;

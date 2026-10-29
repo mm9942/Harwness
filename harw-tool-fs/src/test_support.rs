@@ -135,6 +135,23 @@ impl Fixture {
         })
     }
 
+    /// Context for a file-isolated writer; no scope is accepted from tool JSON.
+    pub fn scoped_writer(&self, paths: &[&str]) -> TestResult<ToolExecutionContext> {
+        let parent = self.ctx(vec![Permission::ReadWorkspace, Permission::WriteWorkspace])?;
+        let scope = harw_authority::FileWriteScope::exact_files(paths.iter().copied())
+            .map_err(ctx("exact file scope"))?;
+        let request = harw_authority::PermissionRequest::from_permissions([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+        ])
+        .with_write_scope(scope);
+        Ok(ToolExecutionContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            parent.sandbox().restrict(&request),
+        ))
+    }
+
     /// Symlinks nach außen (`link_dir`, `link_file`) und Schleifen (`loop`,
     /// `nested/up`).
     pub fn plant_escapes(&self) -> TestResult {

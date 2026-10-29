@@ -718,11 +718,12 @@ fn retry_transient(result: Result<usize, ProbeError>) -> Result<(), ProbeError> 
 /// # Returns
 /// Die vorhandenen Kernel-Schnittstellenverzeichnisse, in der Reihenfolge
 /// von [`KERNEL_INTERFACE_ROOTS`].
-fn fs_scope_roots() -> Vec<PathBuf> {
+fn fs_scope_roots() -> Vec<landlock::FsRoot> {
     KERNEL_INTERFACE_ROOTS
         .iter()
         .map(PathBuf::from)
         .filter(|root| root.is_dir())
+        .map(landlock::FsRoot::read)
         .collect()
 }
 
@@ -770,6 +771,8 @@ mod tests {
     fn test_fs_scope_roots_contains_only_kernel_interfaces_never_bpf_object_dirs() {
         let object_dir = Path::new(DEFAULT_BPF_OBJECT_DIR);
         for root in fs_scope_roots() {
+            assert_eq!(root.access, crate::landlock::RootAccess::Read);
+            let root = root.path;
             assert!(root.is_absolute());
             assert!(
                 KERNEL_INTERFACE_ROOTS

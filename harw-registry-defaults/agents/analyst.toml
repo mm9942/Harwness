@@ -23,6 +23,7 @@ aggregates_child_returns = true
 [tools]
 admitted = [
   "fs.read",
+  "fs.view_image",
   "fs.list",
   "fs.search",
   "fs.glob",

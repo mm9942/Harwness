@@ -75,7 +75,8 @@
 //!    rebase `Path(old)` -> `Path(new)`. The mutation seals the read burst of
 //!    `old` and opens the edit/read loop that the rebase then rebinds to
 //!    `new`. A rebase must not carry a failure: one that does is not applied
-//!    ([`Anomaly::RebaseFailed`]); report the failed call instead.
+//!    ([`Anomaly::RebaseFailed`]); a cancelled rebase is not applied either.
+//!    Report the failed or cancelled call instead.
 //! 5. **One sequencer.** `ingest_seq` is unique and increasing per stream;
 //!    re-delivered or older events are refused and counted
 //!    ([`Reducer::stale_events`]), never reordered.

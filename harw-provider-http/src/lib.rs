@@ -80,16 +80,20 @@
 
 pub mod anthropic;
 mod anthropic_caps;
+mod anthropic_replay;
 pub mod budget;
 pub mod cache_strategy;
+mod chat_reasoning;
 pub mod discovery;
 mod error;
 mod images;
 pub mod rate_limiter;
+mod responses_reasoning;
 pub mod retry;
 pub mod routing;
 mod sse;
 mod text_tool_calls;
+mod thinking_profiles;
 mod tool_call_ids;
 mod tool_names;
 
@@ -107,10 +111,9 @@ use harw_tools::{FunctionToolSpec, JsonSchema, ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 pub use anthropic::{
@@ -1639,6 +1642,8 @@ pub struct OpenAiResponsesProvider {
     transport: Transport,
     request_timeout: Duration,
     reasoning_replay: ReasoningReplay,
+    chat_reasoning_cache: chat_reasoning::ChatReasoningCache,
+    chat_reasoning_overrides: std::collections::HashMap<String, harw_config::ChatReasoningReplay>,
     /// Modell-ID → Prompt-Caching-Override (`ModelToml::prompt_caching`),
     /// befüllt aus `config.models` beim Bau über [`Self::from_named_config`].
     /// Leer, wenn der Provider über [`Self::new`]/[`Self::with_transport`]
@@ -1714,65 +1719,7 @@ struct ReplayEntry {
     blocks: Vec<Value>,
 }
 
-/// Provider-lokaler, begrenzter Speicher für zurückzuspielende Reasoning-Items.
-///
-/// # Description
-/// `ConversationHistory` hat (Stand W3) keinen Träger für opake
-/// Reasoning-Blöcke; bis A-LOOP `ModelResponse::reasoning` persistiert, merkt
-/// sich der Provider die Blöcke je Tool-Call-Runde und spielt sie zurück,
-/// sobald der Verlauf die zugehörigen `function_call`s enthält. Nur Einträge
-/// desselben Providers **und** Modells werden verwendet.
-///
-/// # Concurrency
-/// `Mutex` nur für kurze Kopier-/Einfügeoperationen, nie über `await` gehalten;
-/// Poisoning wird toleriert (reiner Cache).
-#[derive(Debug, Default)]
-struct ReasoningReplay {
-    entries: Mutex<VecDeque<ReplayEntry>>,
-}
-
-impl ReasoningReplay {
-    // Merkt eine Runde; älteste Einträge fallen bei Überlauf heraus.
-    fn remember(&self, entry: ReplayEntry) {
-        if entry.call_ids.is_empty() || entry.blocks.is_empty() {
-            return;
-        }
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        while entries.len() >= MAX_REASONING_REPLAY_ENTRIES {
-            entries.pop_front();
-        }
-        entries.push_back(entry);
-    }
-
-    // Liefert die Runden, deren Tool-Calls im Verlauf von `request` stehen.
-    fn for_request(&self, provider: &str, model: &str, request: &ModelRequest) -> Vec<ReplayEntry> {
-        let call_ids: BTreeSet<&str> = request
-            .history
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                TurnItem::ToolCall(call) => Some(call.call_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        if call_ids.is_empty() {
-            return Vec::new();
-        }
-        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        entries
-            .iter()
-            .filter(|entry| {
-                entry.provider == provider
-                    && entry.model == model
-                    && entry
-                        .call_ids
-                        .iter()
-                        .any(|id| call_ids.contains(id.as_str()))
-            })
-            .cloned()
-            .collect()
-    }
-}
+use responses_reasoning::ReasoningReplay;
 
 impl OpenAiResponsesProvider {
     /// Baut einen Provider aus expliziten Werten.
@@ -1830,6 +1777,8 @@ impl OpenAiResponsesProvider {
             transport,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
+            chat_reasoning_cache: chat_reasoning::ChatReasoningCache::default(),
+            chat_reasoning_overrides: std::collections::HashMap::new(),
             cache_overrides: std::collections::HashMap::new(),
             stream_policy: sse::StreamPolicy::default(),
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
@@ -2093,6 +2042,22 @@ impl OpenAiResponsesProvider {
         http_provider.stream_idle_timeout =
             Duration::from_secs(provider.effective_stream_idle_timeout_secs());
         http_provider.chat_compat = ChatCompat::from_provider(provider);
+        for configured in config
+            .models
+            .values()
+            .filter(|model| model.provider == provider_name)
+        {
+            if let Some(mode) = configured.capabilities.chat_reasoning_replay {
+                http_provider
+                    .chat_reasoning_overrides
+                    .insert(configured.id.clone(), mode);
+                for alias in &configured.aliases {
+                    http_provider
+                        .chat_reasoning_overrides
+                        .insert(alias.clone(), mode);
+                }
+            }
+        }
         http_provider.toolless_models = toolless_models(provider_name, config);
         http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
@@ -4172,11 +4137,21 @@ impl OpenAiResponsesProvider {
         // [`Self::gateway_identity_headers`]) — geliehen von `request`, das
         // bis nach dem Response-Parsing im Scope bleibt.
         let identity = request.identity();
+        // Credential-pool endpoint overrides are distinct replay namespaces.
+        let chat_replay_namespace = format!("{}@{}", self.provider_id, base_url);
+        let chat_reasoning_mode = chat_reasoning::resolve_mode(
+            base_url,
+            model,
+            self.chat_reasoning_overrides.get(model).copied(),
+        );
         let (url, mut wire) = match self.transport {
             Transport::Responses => {
-                let replay = self
-                    .reasoning_replay
-                    .for_request(&self.provider_id, model, &request);
+                let replay = self.reasoning_replay.for_request(
+                    &self.provider_id,
+                    model,
+                    base_url,
+                    &request,
+                )?;
                 tracing::debug!(
                     model,
                     replayed_reasoning_rounds = replay.len(),
@@ -4194,6 +4169,14 @@ impl OpenAiResponsesProvider {
                     self.cache_overrides.get(model).copied(),
                 );
                 let mut body = build_chat_body_with(&request, model, self.chat_compat);
+                if chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent {
+                    self.chat_reasoning_cache.apply(
+                        &chat_replay_namespace,
+                        model,
+                        &request,
+                        &mut body,
+                    )?;
+                }
                 cache_strategy::apply_chat_cache_control(&mut body, strategy);
                 tracing::debug!(model, strategy = strategy.label(), "sending chat request");
                 (format!("{base_url}/chat/completions"), body)
@@ -4213,6 +4196,17 @@ impl OpenAiResponsesProvider {
             if self.transport == Transport::Chat {
                 wire["stream_options"] = serde_json::json!({ "include_usage": true });
             }
+        }
+
+        if self.transport == Transport::Chat {
+            thinking_profiles::apply_options(
+                &mut wire,
+                base_url,
+                model,
+                request.reasoning_effort,
+                stream_sink.is_some(),
+                !request.tools.is_empty(),
+            )?;
         }
 
         // Client-seitige RPM/TPM-Budgets (siehe [`budget`]) und
@@ -4343,12 +4337,11 @@ impl OpenAiResponsesProvider {
             serde_json::from_str(&body)?
         };
         let names = tool_names::ToolNameCodec::for_request(&request);
+        let mut response_replay = None;
         let mut response = match self.transport {
             Transport::Responses => {
                 let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
-                if let Some(entry) = replay {
-                    self.reasoning_replay.remember(entry);
-                }
+                response_replay = replay;
                 response
             }
             Transport::Chat => {
@@ -4373,6 +4366,27 @@ impl OpenAiResponsesProvider {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
         budget_permit.reconcile(&response.usage);
+        if let Some(replay) = response_replay {
+            self.reasoning_replay
+                .remember(replay, base_url, &request, &response)?;
+        }
+        if self.transport == Transport::Chat
+            && chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent
+            && !matches!(
+                response.stop,
+                StopReason::MaxTokens
+                    | StopReason::ContentFilter
+                    | StopReason::ContextWindowExceeded
+            )
+        {
+            self.chat_reasoning_cache.remember(
+                &chat_replay_namespace,
+                model,
+                &request,
+                &response,
+                &value,
+            )?;
+        }
         Ok(response)
     }
 }

@@ -30,6 +30,7 @@ pub mod handoff;
 // Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
 pub mod host_escalation_wiring;
 // Crypto-Infrastruktur H4: Infrastruktur-Clients aus `[infrastructure]`.
+pub mod image_model;
 pub mod infrastructure;
 pub mod job_ledger;
 // Plan R9, Teil F: Job-Verwaltung der Sitzung und Zustellung ihrer Ereignisse.

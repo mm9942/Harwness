@@ -168,6 +168,48 @@ fn test_read_only_analysis_denies_workspace_writes_when_landlock_enforces() -> T
 }
 
 #[test]
+fn test_hard_filesystem_policy_protects_report_for_best_effort_job() -> TestResult {
+    for requirement in [SandboxRequirement::None, SandboxRequirement::BestEffort] {
+        let workspace = scratch()?;
+        let plans = scratch()?;
+        let marker = workspace.path().join("ran");
+        let mut policy =
+            SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, workspace.path())
+                .hard_requirement();
+        // Namespace networking is handled by bwrap in the composition.
+        policy.network = harw_job_linux::NetworkPolicy::Allow;
+        let plan = sh(r#"printf ran > "$MARKER"; printf forged > "$REPORT""#)
+            .with_sandbox(policy, requirement);
+        let mut launch = TrampolineCommand::new(Path::new(TRAMPOLINE), &plan, plans.path())
+            .map_err(ctx("prepare protected report"))?;
+        let report_path = launch.report_path().to_path_buf();
+        let output = launch
+            .command_mut()
+            .env("MARKER", &marker)
+            .env("REPORT", &report_path)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(ctx("spawn protected report"))?;
+        if marker.exists() {
+            let report = launch
+                .read_report()
+                .map_err(ctx("read protected report"))?
+                .ok_or_else(|| TestError("job ran without a trustworthy report".to_owned()))?;
+            assert_eq!(report.filesystem, EnforcementState::Enforced);
+            assert!(!output.status.success(), "job must not rewrite its report");
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(exit_code::SANDBOX_REFUSED)),
+                "unsupported filesystem must refuse before exec: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_required_requirement_refuses_before_exec() -> TestResult {
     let workspace = scratch()?;
     let marker_dir = scratch()?;

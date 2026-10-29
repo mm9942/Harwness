@@ -329,6 +329,7 @@ macro_rules! row {
 pub const CATALOG: &[CapabilityEntry] = &[
     // fs
     row!("fs.read", FS, Read),
+    row!("fs.view_image", FS, Read),
     row!("fs.list", FS, Read),
     row!("fs.search", FS, Read),
     row!("fs.glob", FS, Read),

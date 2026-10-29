@@ -61,6 +61,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        single_agent_mode,
         uia_worker_model,
         policy_profile,
         logging: _,
@@ -112,6 +113,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        single_agent_mode,
         uia_worker_model,
         policy_profile,
         project_root_markers,
@@ -125,6 +127,7 @@ fn test_field_table_exhaustive_harness_config() {
         "active_uia_definition",
         "uia_provider",
         "uia_model",
+        "single_agent_mode",
         "uia_worker_model",
         "policy_profile",
         "project_root_markers",
@@ -594,6 +597,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         sub_orchestrator,
         auto_classifier,
         work_driver_judge,
+        image_understanding,
     } = InternalModelsToml::default();
     let _ = (
         use_openrouter_defaults,
@@ -609,6 +613,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         sub_orchestrator,
         auto_classifier,
         work_driver_judge,
+        image_understanding,
     );
     for path in [
         "internal_models.use_openrouter_defaults",
@@ -625,6 +630,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         // Runde 5, Teil E.
         "internal_models.auto_classifier",
         "internal_models.work_driver_judge",
+        "internal_models.image_understanding",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

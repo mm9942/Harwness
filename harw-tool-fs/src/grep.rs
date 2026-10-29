@@ -295,7 +295,15 @@ impl GrepRun<'_> {
 )]
 async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolOutput, ToolsError> {
     let root = context.sandbox().workspace().canonical_root().to_path_buf();
-    run_blocking("fs.grep", move || Ok(grep_blocking(&root, &args))).await
+    // Keep the per-call lease in the actual blocking work even if the
+    // awaiting future is cancelled. A root PathBuf alone retains no guard.
+    let context = context.clone();
+    run_blocking("fs.grep", move || {
+        let output = grep_blocking(&root, &args);
+        drop(context);
+        Ok(output)
+    })
+    .await
 }
 
 /// Synchroner, vollständig in-process laufender Kern von [`fs_grep`].

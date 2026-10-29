@@ -1282,8 +1282,8 @@ fn read_skill_manifest(dir: &Path) -> Result<String, String> {
     if metadata.len() > limit {
         return Err(too_large());
     }
-    let file =
-        std::fs::File::open(&path).map_err(|error| format!("{SKILL_MANIFEST} nicht lesbar: {error}"))?;
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("{SKILL_MANIFEST} nicht lesbar: {error}"))?;
     let mut source = String::new();
     file.take(limit.saturating_add(1))
         .read_to_string(&mut source)
@@ -2443,8 +2443,8 @@ mod tests {
         /// über die vertrauten Layer — samt Projekt-Einstellungsverzeichnis,
         /// sobald es `settings.toml` hat — und nennt diese Quelle.
         #[tokio::test]
-        async fn skills_preview_without_an_index_rebuilds_it_from_the_trusted_layers()
-        -> TestResult {
+        async fn skills_preview_without_an_index_rebuilds_it_from_the_trusted_layers() -> TestResult
+        {
             let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
             let home = crate::config_util::test_home_context(temp.path())?;
             let settings_dir = home
@@ -2497,7 +2497,8 @@ mod tests {
 
             let with = with.map_err(ctx("/skills preview with settings"))?;
             assert!(
-                with.text.contains("Index: neu gebaut wie in der Laufzeit-Montage"),
+                with.text
+                    .contains("Index: neu gebaut wie in der Laufzeit-Montage"),
                 "{}",
                 with.text
             );
@@ -2672,7 +2673,10 @@ mod tests {
             let huge = temp.path().join("huge-manifest");
             std::fs::create_dir_all(&huge).map_err(ctx("create dir"))?;
             let mut body = "name = \"huge\"\n".to_owned();
-            body.push_str(&format!("# {}\n", "x".repeat(super::super::MAX_SKILL_MANIFEST_BYTES)));
+            body.push_str(&format!(
+                "# {}\n",
+                "x".repeat(super::super::MAX_SKILL_MANIFEST_BYTES)
+            ));
             std::fs::write(huge.join("skill.toml"), body).map_err(ctx("write skill.toml"))?;
             assert_error(&huge, "skill.toml größer als 65536 Bytes");
 

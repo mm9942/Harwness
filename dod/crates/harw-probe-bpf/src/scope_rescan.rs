@@ -27,6 +27,14 @@
 //! grow every round. A persisting condition therefore never repeats every
 //! interval, and is never silent either.
 //!
+//! # Partial map updates
+//! Writers are not transactional, even within one handle. A failed round keeps
+//! the inverse delta until every handle has restored the last confirmed scope.
+//! New plans are applied only after that reconciliation; failed reconciliation
+//! remains degraded even if a fresh walk would otherwise produce an empty plan.
+//! This state is bounded by one delta and never silently reports recovery while
+//! maps may disagree. It does not make the sequential kernel updates atomic.
+//!
 //! # Roots missing at start
 //! A configured root that did not resolve when the probe started
 //! (`crate::profile::resolve_scope`) has no kernel id and is therefore not
@@ -66,9 +74,9 @@ pub const SCOPE_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 pub struct ScopeRescanStats {
     /// Rescan rounds run.
     pub rounds: u64,
-    /// Descendant ids inserted into the maps.
+    /// Descendant ids in committed insertion deltas (excluding rollback writes).
     pub inserted_total: u64,
-    /// Descendant ids retired from the maps.
+    /// Descendant ids in committed retirement deltas (excluding rollback writes).
     pub retired_total: u64,
     /// Cgroups not inserted because the map was full, summed over rounds.
     pub overflow_total: u64,
@@ -137,6 +145,10 @@ pub struct ScopeRescan {
     /// Configured roots that did not resolve at start; counted as
     /// unavailable in every round.
     unresolved_roots: usize,
+    /// Inverse of the last uncommitted delta. A writer may fail after changing
+    /// entries, so all handles must acknowledge this rollback before replanning.
+    /// Bounded by one scope delta, even under persistent failure and cgroup churn.
+    pending_rollback: Option<ScopeDelta>,
 }
 
 impl ScopeRescan {
@@ -165,6 +177,7 @@ impl ScopeRescan {
             stats,
             last_health: ScopeHealth::default(),
             unresolved_roots: 0,
+            pending_rollback: None,
         }
     }
 
@@ -196,8 +209,12 @@ impl ScopeRescan {
 
     /// Walks, plans, applies the delta to every handle and commits it when
     /// every handle accepted it. A rejected update leaves the tracked scope
-    /// unchanged, so the next round plans (and re-applies, idempotently) the
-    /// same change.
+    /// unchanged and retains its inverse delta. Before the next new update,
+    /// every handle must acknowledge that rollback (including the failed handle,
+    /// which may have partially mutated). Only then can a fresh plan be applied.
+    ///
+    /// `handles` must be the same attached objects for the lifetime of this
+    /// rescan. An empty handle set cannot acknowledge a nonempty update.
     pub fn rescan(
         &mut self,
         writer: &dyn BpfScopeWriter,
@@ -205,6 +222,16 @@ impl ScopeRescan {
         now: Instant,
     ) -> RescanRound {
         self.next_due = now.checked_add(self.interval).unwrap_or(now);
+        // Restore the last confirmed state first: re-planning directly after a
+        // partial failure can forget an inserted id that has since disappeared,
+        // or a removed id that is observed again. No new writes while uncertain.
+        let rollback_failed = self
+            .pending_rollback
+            .as_ref()
+            .is_some_and(|delta| !Self::apply_to_all(writer, handles, delta));
+        if !rollback_failed {
+            self.pending_rollback = None;
+        }
         let report = cgroup_walk::walk_descendants(
             &HostCgroupFs,
             &self.cgroup_root,
@@ -215,23 +242,26 @@ impl ScopeRescan {
         let delta = plan.delta.clone();
         let overflowed = plan.overflowed;
 
-        let mut apply_failed = false;
-        if !delta.is_empty() {
-            for handle in handles {
-                if let Err(error) = writer.apply_scope_delta(handle, &delta) {
-                    apply_failed = true;
-                    tracing::debug!(
-                        attach_point = handle.attach_point(),
-                        error = %error,
-                        "bpf scope map update rejected; retrying in the next rescan"
-                    );
-                }
+        let mut apply_failed = rollback_failed;
+        if !rollback_failed {
+            // Retain the inverse BEFORE calling the writer: even Err may mean
+            // some entries changed. Keep it until all handles and the tracker
+            // have accepted this round. Roots never occur in either list.
+            if !delta.is_empty() {
+                self.pending_rollback = Some(ScopeDelta {
+                    insert: delta.remove.clone(),
+                    remove: delta.insert.clone(),
+                });
             }
-        }
-        if !apply_failed && self.scope.commit(plan).is_err() {
-            // Kann nicht eintreten (der Plan stammt aus genau diesem Zustand);
-            // sicherheitshalber wie eine abgelehnte Aktualisierung behandeln.
-            apply_failed = true;
+            apply_failed = !Self::apply_to_all(writer, handles, &delta);
+            if !apply_failed && self.scope.commit(plan).is_err() {
+                // The plan belongs to this state; still fail closed if that
+                // invariant is ever violated, retaining the rollback.
+                apply_failed = true;
+            }
+            if !apply_failed {
+                self.pending_rollback = None;
+            }
         }
 
         let health = ScopeHealth {
@@ -253,6 +283,30 @@ impl ScopeRescan {
             health,
             newly_degraded,
         }
+    }
+
+    /// Attempts every handle, treating even partial per-object writes as
+    /// uncertain until all acknowledge success. Rollbacks use this same path.
+    fn apply_to_all(
+        writer: &dyn BpfScopeWriter,
+        handles: &[&BpfHandle],
+        delta: &ScopeDelta,
+    ) -> bool {
+        if delta.is_empty() {
+            return true;
+        }
+        let mut succeeded = !handles.is_empty();
+        for handle in handles {
+            if let Err(error) = writer.apply_scope_delta(handle, delta) {
+                succeeded = false;
+                tracing::debug!(
+                    attach_point = handle.attach_point(),
+                    error = %error,
+                    "bpf scope map update rejected; reconciliation required"
+                );
+            }
+        }
+        succeeded
     }
 
     /// Updates the cumulative counters for one round.
@@ -333,17 +387,52 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use harw_dod_bpf::cgroup_walk::{HostCgroupFs, WalkLimits, host_path, resolve_cgroup};
     use harw_dod_bpf::{
-        BpfHandle, BpfProgramSource, DescendantScope, FixtureBpfLoader, MAX_SCOPE_CGROUP_IDS,
-        ScopeMapOp,
+        BpfError, BpfHandle, BpfProgramSource, BpfScopeWriter, DescendantScope, FixtureBpfLoader,
+        MAX_SCOPE_CGROUP_IDS, ScopeDelta, ScopeMapOp,
     };
     use harw_types::SensorId;
 
     use super::{SCOPE_RESCAN_INTERVAL, ScopeHealth, ScopeRescan};
     use crate::test_support::{TestError, TestResult, ctx};
+
+    /// Injects failure after one entry has changed, mirroring a kernel map
+    /// syscall failure halfway through an otherwise valid delta.
+    struct PartialWriter<'a> {
+        loader: &'a FixtureBpfLoader,
+        fail_calls: BTreeSet<usize>,
+        calls: AtomicUsize,
+    }
+
+    impl BpfScopeWriter for PartialWriter<'_> {
+        fn apply_scope_delta(
+            &self,
+            handle: &BpfHandle,
+            delta: &ScopeDelta,
+        ) -> Result<(), BpfError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.fail_calls.contains(&call) {
+                let partial = if let Some(id) = delta.remove.first() {
+                    ScopeDelta {
+                        remove: vec![*id],
+                        insert: Vec::new(),
+                    }
+                } else {
+                    ScopeDelta {
+                        insert: delta.insert.first().copied().into_iter().collect(),
+                        remove: Vec::new(),
+                    }
+                };
+                self.loader.apply_scope_delta(handle, &partial)?;
+                return Err(BpfError::ScopeMapUpdateFailed);
+            }
+            self.loader.apply_scope_delta(handle, delta)
+        }
+    }
 
     /// Gefälschter cgroup-Baum unter einem Tempdir, wie die Sonde ihn über
     /// `--cgroup-root` sähe.
@@ -576,6 +665,122 @@ mod tests {
     }
 
     #[test]
+    fn failed_insert_then_disappearance_reconciles_every_handle() -> TestResult {
+        let tree = FakeTree::new()?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let before = probe.map()?;
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+        probe.loader.fail_next_scope_updates(1);
+        assert!(probe.rescan().health.apply_failed);
+        assert!(probe.map().is_err(), "fixture must actually diverge");
+        tree.rmcg("/harw.slice/harw-job-1")?;
+
+        let recovered = probe.rescan();
+        assert!(!recovered.health.is_degraded());
+        assert_eq!(probe.map()?, before);
+        assert!(!probe.map()?.contains(&job));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_reconciliation_cannot_report_recovery_on_an_empty_new_plan() -> TestResult {
+        let tree = FakeTree::new()?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let before = probe.map()?;
+        tree.mkcg("/harw.slice/harw-job-1")?;
+        probe.loader.fail_next_scope_updates(1);
+        assert!(probe.rescan().health.apply_failed);
+        tree.rmcg("/harw.slice/harw-job-1")?;
+        probe.loader.fail_next_scope_updates(probe.handles.len());
+        let failed_again = probe.rescan();
+        assert!(failed_again.health.apply_failed);
+        assert!(!failed_again.newly_degraded, "degradation persists");
+        assert!(probe.map().is_err());
+        assert!(!probe.rescan().health.is_degraded());
+        assert_eq!(probe.map()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_removal_is_restored_before_an_incomplete_walk() -> TestResult {
+        let tree = FakeTree::new()?;
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let before = probe.map()?;
+        tree.rmcg("/harw.slice/harw-job-1")?;
+        probe.loader.fail_next_scope_updates(1);
+        assert!(probe.rescan().health.apply_failed);
+        assert!(probe.map().is_err());
+        // An incomplete walk must preserve the last confirmed membership.
+        probe.rescan.limits.max_entries = 0;
+        let incomplete = probe.rescan();
+        assert!(incomplete.health.incomplete);
+        assert!(!incomplete.health.apply_failed);
+        assert_eq!(probe.map()?, before);
+        assert!(probe.map()?.contains(&job));
+        probe.rescan.limits = WalkLimits::default();
+        assert!(!probe.rescan().health.is_degraded());
+        assert!(!probe.map()?.contains(&job));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_entry_failure_and_failed_fresh_plan_keep_their_own_rollback() -> TestResult {
+        let tree = FakeTree::new()?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let root = tree.id("/harw.slice")?;
+        tree.mkcg("/harw.slice/old-1")?;
+        tree.mkcg("/harw.slice/old-2")?;
+        let writer = PartialWriter {
+            loader: &probe.loader,
+            fail_calls: BTreeSet::from([1, 5]),
+            calls: AtomicUsize::new(0),
+        };
+        let handles: Vec<_> = probe.handles.iter().collect();
+        let first = probe.rescan.rescan(&writer, &handles, probe.start);
+        assert!(first.health.apply_failed);
+        assert!(probe.map().is_err(), "partial entry writes must diverge");
+        // Keep the inode distinct from the old IDs while changing desired scope.
+        let new = tree.mkcg("/harw.slice/new")?;
+        tree.rmcg("/harw.slice/old-1")?;
+        tree.rmcg("/harw.slice/old-2")?;
+        let second = probe.rescan.rescan(&writer, &handles, probe.start);
+        assert!(
+            second.health.apply_failed,
+            "fresh plan also failed after rollback"
+        );
+        assert!(!second.newly_degraded);
+        assert_eq!(second.delta.insert, vec![new]);
+        assert!(probe.rescan.pending_rollback.is_some());
+        tree.rmcg("/harw.slice/new")?;
+        let third = probe.rescan.rescan(&writer, &handles, probe.start);
+        assert!(!third.health.is_degraded());
+        assert_eq!(probe.map()?, BTreeSet::from([root]));
+        assert!(probe.rescan.pending_rollback.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_removal_then_same_cgroup_returns_restores_all_maps() -> TestResult {
+        let tree = FakeTree::new()?;
+        tree.mkcg("/harw.slice/job")?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let before = probe.map()?;
+        let source = host_path(tree.root(), "/harw.slice/job");
+        let away = host_path(tree.root(), "/away");
+        std::fs::rename(&source, &away).map_err(ctx("move cgroup out of scope"))?;
+        probe.loader.fail_next_scope_updates(1);
+        assert!(probe.rescan().health.apply_failed);
+        assert!(probe.map().is_err());
+        std::fs::rename(&away, &source).map_err(ctx("return same cgroup"))?;
+        let recovered = probe.rescan();
+        assert!(recovered.delta.is_empty(), "tracker already knows this ID");
+        assert!(!recovered.health.is_degraded());
+        assert_eq!(probe.map()?, before);
+        Ok(())
+    }
+
+    #[test]
     fn incomplete_walk_never_retires() -> TestResult {
         let tree = FakeTree::new()?;
         tree.mkcg("/harw.slice/harw-job-1")?;
@@ -598,8 +803,7 @@ mod tests {
     /// nicht verfügbar gezählt; der bereits beim Start gemeldete Zustand wird
     /// weder erneut gemeldet noch fälschlich als erholt geloggt.
     #[test]
-    fn root_missing_at_start_keeps_every_round_degraded_and_is_not_reported_again() -> TestResult
-    {
+    fn root_missing_at_start_keeps_every_round_degraded_and_is_not_reported_again() -> TestResult {
         let tree = FakeTree::new()?;
         let Probe {
             loader,

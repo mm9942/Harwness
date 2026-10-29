@@ -606,6 +606,7 @@ pub fn apply_goal_action(goal: &mut Goal, action: &GoalAction, now: OffsetDateTi
 /// auf die Varianten gematcht statt auf String-Literale verglichen.
 fn verification_satisfied_by(step: &VerificationStep, evidence: &[&EvidenceRef]) -> bool {
     match step {
+        VerificationStep::CollectSources { .. } => false,
         VerificationStep::Command { cmd, .. } => evidence.iter().any(|e| {
             matches!(e.kind, EvidenceKind::CargoTest | EvidenceKind::Clippy) && &e.locator == cmd
         }),

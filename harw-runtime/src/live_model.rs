@@ -312,6 +312,15 @@ impl LiveModelRouting {
         Some((provider, live.model))
     }
 
+    /// Raw explicit image choice. Unlike child routing this never substitutes a
+    /// retired selection with a different provider or model.
+    pub fn image_model_choice(&self) -> Result<Option<InternalModelChoice>, String> {
+        self.state
+            .read()
+            .map(|state| state.internal_models.image_understanding.clone())
+            .map_err(|_| "image model routing lock unavailable".to_owned())
+    }
+
     /// Das Modell für ein neu gestartetes Kind auf dem Hauptmodell.
     ///
     /// # Rückgabe

@@ -234,7 +234,8 @@ pub struct ActivityEvent {
     /// on `Started` or `Progress` marks the constituent failed, and a rebase
     /// carrying one is not applied but kept visible as a failed
     /// [`crate::Anomaly::RebaseFailed`] standalone instance. `Succeeded` and
-    /// `Cancelled` count only on `Finished`; boundaries ignore the outcome.
+    /// `Cancelled` count on `Finished`; a cancelled rebase is not applied and
+    /// stays visible as cancelled. Boundaries ignore the outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
 }

@@ -185,6 +185,23 @@ impl HostRevoker {
         self
     }
 
+    /// Authenticated live and detached creator identities retained by the host.
+    #[must_use]
+    pub fn authenticated_identities(&self) -> Vec<harw_session_host::ClientIdentity> {
+        self.host.authenticated_identities()
+    }
+
+    /// Cut existing authority after a policy edit, without banning the device
+    /// or changing its registry. A fresh authentication may use its new policy.
+    pub fn invalidate_device_policy(&self, device: &DeviceId) -> usize {
+        self.host.invalidate_device_policy(device);
+        let senders = self.live.senders_for(device);
+        for sender in &senders {
+            sender.send_replace(true);
+        }
+        senders.len()
+    }
+
     /// Override the close grace (tests).
     #[must_use]
     pub fn with_grace(mut self, grace: Duration) -> Self {

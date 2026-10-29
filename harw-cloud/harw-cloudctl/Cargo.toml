@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 harw-cloud-gateway = { path = "../harw-cloud-gateway" }
+harw-install = { path = "../../harw-install" }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt"] }
 

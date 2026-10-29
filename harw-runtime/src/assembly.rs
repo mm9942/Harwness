@@ -66,8 +66,8 @@ use std::time::Duration;
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_authority::{
-    NetworkScope, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
-    WorkspaceRegistry,
+    FileWriteScope, NetworkScope, PermissionRequest, PermissionSet, SandboxSpec,
+    WorkspaceRegistration, WorkspaceRegistry,
 };
 use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
@@ -89,7 +89,7 @@ use harw_home::paths::{active_profile_name, profile_dir};
 use harw_home::project::{ProjectHome, ProjectRoot, discover_project as discover_home_project};
 use harw_memory::Memory;
 use harw_operations::adapter::ModelToolProvider;
-use harw_operations::operation::{Operation, Surface};
+use harw_operations::operation::Surface;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, SharedSessionController};
 use harw_plan::{
@@ -937,6 +937,8 @@ fn root_context_program(
 ///   Agentennamen.
 /// - `permissions`: Obergrenze der Sandbox-Rechte; die Wurzel-Sandbox wird mit
 ///   ihr **geschnitten** ([`SandboxSpec::restrict`]), nie ersetzt.
+/// - `write_scope`: intersects exact workspace-relative writable files with
+///   the root authority. Scoped writers cannot regain unrestricted process execution.
 /// - `workspace_root`: bindet die Wurzel-Sandbox an genau dieses Verzeichnis
 ///   statt an den erkannten Projekt-Root. Der kanonische Pfad muss gleich dem
 ///   kanonischen Projekt-Root oder ein Nachfahre davon sein (Vergleich über
@@ -955,6 +957,9 @@ pub struct RuntimeNarrowing {
     pub identity: IdentityOverrides,
     /// Obergrenze der Sandbox-Rechte; wird mit den Profilrechten geschnitten.
     pub permissions: PermissionSet,
+    /// Workspace-relative exact-file write ceiling. Intersected with existing
+    /// authority; never grants writes or restores process execution rights.
+    pub write_scope: FileWriteScope,
     /// Bindet die Root-Sandbox an genau dieses Verzeichnis statt an den erkannten Projekt-Root.
     /// Muss kanonisch gleich dem erkannten Root oder ein Nachfahre davon sein (nur enger), sonst
     /// [`RuntimeError::Sandbox`].
@@ -1322,7 +1327,7 @@ fn narrowed_registry_profile(
 ///
 /// # Beschreibung
 /// Ohne Verengung bleibt `sandbox` unverändert. Mit Verengung entsteht
-/// `sandbox.restrict(&narrowing.permissions)`; das Ergebnis wird zusätzlich
+/// `sandbox.restrict` over permissions and the file-write scope; the result is also checked
 /// gegen die Profilrechte geprüft, damit auch eine künftige Änderung an
 /// [`crate::sandbox::root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
 /// ergibt, als die Tabelle dem Einstieg zuspricht.
@@ -1349,7 +1354,8 @@ fn narrowed_sandbox(
             };
             let narrowed = sandbox.restrict(
                 &PermissionRequest::from_permissions(narrowing.permissions.iter())
-                    .with_network_scope(scope),
+                    .with_network_scope(scope)
+                    .with_write_scope(narrowing.write_scope.clone()),
             );
             if narrowed.network_scope().is_empty()
                 && narrowed
@@ -1367,6 +1373,13 @@ fn narrowed_sandbox(
         }
         None => sandbox,
     };
+    if narrowing
+        .is_some_and(|requested| !sandbox.write_scope().is_subset_of(&requested.write_scope))
+    {
+        return Err(RuntimeError::Sandbox {
+            detail: "runtime sandbox widened the requested file write scope".to_owned(),
+        });
+    }
     if sandbox.permissions().is_subset_of(&profile.permissions) {
         Ok(sandbox)
     } else {
@@ -1846,6 +1859,16 @@ impl RuntimeAssemblyBuilder {
                 )
             }
             None => load_config_with_agents(&spec)?,
+        };
+        // Explicit trusted opt-in changes only task topology. Reuse the same
+        // durable root session, tool registry, approval chain and budgets.
+        // No managed spawner also means no background-agent tools or durable
+        // child submitter (both are mounted only when a spawner exists).
+        let spawner_policy = if config.harness.single_agent_mode {
+            tracing::info!("runtime.single_agent_mode: managed child delegation disabled");
+            SpawnerPolicy::None
+        } else {
+            profile.spawner
         };
         let config = Arc::new(config);
         let config_agents = Arc::new(config_agents);
@@ -2788,7 +2811,7 @@ impl RuntimeAssemblyBuilder {
             })
             .transpose()?;
         let (spawner, spawner_roles, agent_job_submitter_slot) = build_spawner(
-            profile.spawner,
+            spawner_policy,
             SpawnerInputs {
                 config: &config,
                 project: &project,
@@ -3017,6 +3040,17 @@ impl RuntimeAssemblyBuilder {
             // R18 D-B: nur mit `RuntimeAssemblyBuilder::gateway_port`.
             gateway: gateway_port,
         });
+        let services = services.with_image_inspector(Arc::new(
+            crate::image_model::RuntimeImageInspector::new(
+                Arc::clone(&config),
+                Arc::clone(&live_models),
+                Arc::clone(&default_tree_model),
+                effective_root_provider_id(&config, uia_ir.is_some()),
+                root_model_id.clone(),
+                budget.max_total_tokens.min(2048) as u32,
+                budget.max_total_tokens,
+            ),
+        ));
         // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
         // `with_home_context` legt nur dann einen eigenen an, wenn hier
         // keiner gesetzt wurde.
@@ -3118,6 +3152,11 @@ impl RuntimeAssemblyBuilder {
             profile.operations,
             &operations,
             &services,
+            (spec.entry == EntryKind::Tui)
+                .then(|| {
+                    harw_cloud_ops::context::LocalProfileOperator::from_principal(&spec.principal)
+                })
+                .flatten(),
         );
         // Runde 5, Teil H: `agent.result` an der Wurzel — nur mit Spawner und
         // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine
@@ -4031,38 +4070,49 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
 /// (z. B. in einem Test-Fixture ohne `TurnControl`), bleibt
 /// `OpContext::cancel_token` `None`.
 fn install_operation_model_tools(
-    builder: ExtensionRegistryBuilder,
+    mut builder: ExtensionRegistryBuilder,
     surface: OperationSurface,
     operations: &Arc<OperationRegistry>,
     services: &Arc<RuntimeServices>,
+    local_cloud_operator: Option<harw_cloud_ops::context::LocalProfileOperator>,
 ) -> ExtensionRegistryBuilder {
-    match surface {
-        OperationSurface::CommandsOnly | OperationSurface::None => builder,
-        OperationSurface::AllWithModelTools => {
-            let exposed: Vec<Arc<dyn Operation>> = operations.iter().map(Arc::clone).collect();
-            let services = Arc::clone(services);
-            let provider = ModelToolProvider::new(exposed, move |execution_context| {
-                let ctx = OpContext::new(
-                    execution_context.session_id().clone(),
-                    execution_context.turn_id().clone(),
-                    execution_context.sandbox().clone(),
-                    services.service_map(ServiceSurface::ModelTool),
-                );
-                // Der Turn-Loop hängt seinen `CancelToken` an jeden
-                // `ToolExecutionContext` (`control.cancel_token()`, siehe
-                // `harw-core::turn_loop`); ohne diesen Schritt bekäme jede
-                // Operation — u. a. `AgentToolAdapter::invoke` und
-                // `fanout_children` in `harw-core-bridge` — nie den echten
-                // Turn-Abbruch zu sehen und müsste immer auf einen frischen,
-                // nie abgebrochenen Token zurückfallen.
-                match execution_context.cancel() {
-                    Some(cancel) => ctx.with_cancel_token(cancel.clone()),
-                    None => ctx,
-                }
-            });
-            builder.tool_provider(Arc::new(provider))
-        }
+    if surface != OperationSurface::AllWithModelTools {
+        return builder;
     }
+    // Local profile administration is a separate read-only capability, not
+    // a synthetic workspace tenant. All other operations keep their existing
+    // caller semantics. Hosted/remote turns receive no local capability.
+    let (cloud_read, other): (Vec<_>, Vec<_>) = operations.iter().cloned().partition(|operation| {
+        matches!(
+            operation.meta().name,
+            "cloud.status" | "cloud.enrollments.list"
+        )
+    });
+    for (exposed, local_operator) in [(other, None), (cloud_read, local_cloud_operator)] {
+        if exposed.is_empty() {
+            continue;
+        }
+        let services = Arc::clone(services);
+        let provider = ModelToolProvider::new(exposed, move |execution_context| {
+            let mut service_map = services.service_map(ServiceSurface::ModelTool);
+            if let Some(operator) = local_operator {
+                service_map.insert(operator);
+            }
+            let ctx = OpContext::new(
+                execution_context.session_id().clone(),
+                execution_context.turn_id().clone(),
+                execution_context.sandbox().clone(),
+                service_map,
+            );
+            // Preserve turn cancellation for both provider groups.
+            match execution_context.cancel() {
+                Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                None => ctx,
+            }
+        });
+        builder = builder.tool_provider(Arc::new(provider));
+    }
+    builder
 }
 
 /// Die Namen aller in `registry` sichtbaren Werkzeuge, sortiert und
@@ -8472,6 +8522,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_single_agent_mode_keeps_governed_tools_without_child_spawner() -> TestResult {
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let fixture = build_fixture()?;
+            let config_path = fixture.home.join("profiles/default/config.toml");
+            let existing =
+                std::fs::read_to_string(&config_path).map_err(ctx("read fixture config"))?;
+            std::fs::write(
+                &config_path,
+                format!("{existing}\nsingle_agent_mode = true\n"),
+            )
+            .map_err(ctx("enable single agent mode"))?;
+            // Deliberately no event sender: a managed spawner would reject
+            // this build, so the real production assembly path is exercised.
+            let mut builder = fixture_builder(entry, &fixture);
+            builder.spec.approval_override = Some(ApprovalMode::AlwaysAsk);
+            let assembly = builder.build().map_err(ctx("single agent assembly"))?;
+            assert!(assembly.spawner().is_none());
+            assert_eq!(
+                assembly.services().approval_mode().get(),
+                ApprovalMode::AlwaysAsk,
+            );
+            let rights = assembly.rights_snapshot();
+            for tool in ["fs.read", "fs.write", "fs.edit", "shell.exec"] {
+                assert!(
+                    rights.tools.iter().any(|name| name == tool),
+                    "missing {tool}",
+                );
+            }
+            for tool in harw_core_bridge::AGENT_BACKGROUND_TOOLS {
+                assert!(!rights.tools.iter().any(|name| name == *tool));
+            }
+        }
+        Ok(())
+    }
+
     /// #22 Welle 3C: ein gesetztes `RuntimeSpec::child_backend` erreicht den
     /// gebauten `ManagedAgentSpawner`. `ManagedAgentSpawner::child_backend()`
     /// ist `pub(crate)` zu `harw-core` und von hier nicht lesbar, deshalb
@@ -8690,6 +8776,68 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_narrowing_preserves_exact_file_write_scope() -> TestResult {
+        use harw_authority::Permission;
+        let fixture = build_fixture()?;
+        let scope =
+            FileWriteScope::exact_files(["src/owned.rs"]).map_err(ctx("exact file scope"))?;
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::Full,
+                identity: IdentityOverrides::default(),
+                permissions: PermissionSet::from_policy([
+                    Permission::ReadWorkspace,
+                    Permission::WriteWorkspace,
+                    Permission::ExecuteProcess,
+                ]),
+                write_scope: scope.clone(),
+                workspace_root: Some(fixture.project.clone()),
+            })
+            .build()
+            .map_err(ctx("exact-file runtime assembly"))?;
+        assert_eq!(assembly.sandbox().write_scope(), &scope);
+        assert!(
+            assembly
+                .sandbox()
+                .write_scope()
+                .allows_path(Path::new("src/owned.rs"))
+        );
+        assert!(
+            !assembly
+                .sandbox()
+                .write_scope()
+                .allows_path(Path::new("src/other.rs"))
+        );
+        assert!(
+            assembly
+                .sandbox()
+                .permissions()
+                .contains(Permission::WriteWorkspace)
+        );
+        assert!(
+            !assembly
+                .sandbox()
+                .permissions()
+                .contains(Permission::ExecuteProcess)
+        );
+        // A later broad request cannot restore write authority lost above.
+        let restricted_again = assembly
+            .sandbox()
+            .restrict(&PermissionRequest::from_permissions([
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ]));
+        assert_eq!(restricted_again.write_scope(), &scope);
+        assert!(
+            !restricted_again
+                .permissions()
+                .contains(Permission::ExecuteProcess)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_narrowing_readonly_on_full_entry_drops_write_tools() -> TestResult {
         let fixture = build_fixture()?;
         let baseline = fixture_builder(EntryKind::LocalEcho, &fixture)
@@ -8703,6 +8851,7 @@ mod tests {
 
         let narrowed = fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -8760,6 +8909,7 @@ mod tests {
         let fixture = build_fixture()?;
         let Err(error) = fixture_builder(EntryKind::JobPrompt, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: every_permission(),
@@ -8833,6 +8983,7 @@ mod tests {
         // NoTools → NoTools montiert und bleibt werkzeuglos.
         let same = fixture_builder(EntryKind::JobPrompt, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: NoTools,
                 identity: IdentityOverrides::default(),
                 permissions: every_permission(),
@@ -8858,6 +9009,7 @@ mod tests {
             let profile = entry.profile();
             let assembly = fixture_builder(entry, &fixture)
                 .narrowing(RuntimeNarrowing {
+                    write_scope: FileWriteScope::workspace(),
                     registry_profile: profile.registry_profile,
                     identity: IdentityOverrides::default(),
                     permissions: every_permission(),
@@ -8881,6 +9033,7 @@ mod tests {
         // Eine engere Obergrenze schneidet; ein fremdes Recht kommt nie hinzu.
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -8903,6 +9056,7 @@ mod tests {
         let fixture = build_fixture()?;
         let mut spec = fixture_builder(EntryKind::LocalEcho, &fixture).spec;
         let narrowing = RuntimeNarrowing {
+            write_scope: FileWriteScope::workspace(),
             registry_profile: RegistryProfile::ReadOnlyExplore,
             identity: IdentityOverrides {
                 agent_name: Some("plan-node".to_owned()),
@@ -8951,6 +9105,7 @@ mod tests {
         builder.spec.cwd.clone_from(&workspace);
         let assembly = builder
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -8988,6 +9143,7 @@ mod tests {
         // Gleichheit mit dem Projekt-Root ist ebenfalls zugelassen.
         let same = fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: every_permission(),
@@ -9014,6 +9170,7 @@ mod tests {
         std::fs::create_dir_all(&sibling).map_err(ctx("sibling"))?;
 
         let narrowing_to = |root: PathBuf| RuntimeNarrowing {
+            write_scope: FileWriteScope::workspace(),
             registry_profile: RegistryProfile::Full,
             identity: IdentityOverrides::default(),
             permissions: every_permission(),
@@ -9234,6 +9391,7 @@ mod tests {
         builder.spec.cwd.clone_from(&workspace);
         let assembly = builder
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -9322,6 +9480,7 @@ mod tests {
             OperationSurface::AllWithModelTools
         );
         let narrowing_to = |registry_profile: RegistryProfile| RuntimeNarrowing {
+            write_scope: FileWriteScope::workspace(),
             registry_profile,
             identity: IdentityOverrides::default(),
             permissions: every_permission(),

@@ -1,2 +1,0 @@
-# Gedächtnis (project)
-

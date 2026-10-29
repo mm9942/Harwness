@@ -1,6 +1,6 @@
 [
   {
-    "description": "Liest eine Textdatei mit Zeilennummern. Genau ein Modus; alle nicht benutzten Parameter auf null setzen (null = nicht gesetzt): (1) Zeilenmodus, Standard: `line` (Vorgabe 1) + `limit` (Vorgabe 400, max 2000). (2) Tail: `tail` = letzte N Zeilen, z. B. für Logs (`limit` begrenzt zusätzlich). (3) Byte-Modus (Rückfall): `offset`/`max_bytes`. Für bestimmte Stellen zuerst `fs.grep` (liefert Zeilennummern), dann `fs.read` mit `line`. Kein `sed`/`head`/`tail`/`grep` über `shell.exec` nötig. Für PDFs `doc.read_pdf` verwenden.",
+    "description": "Liest eine Textdatei mit Zeilennummern. Genau ein Modus; alle nicht benutzten Parameter auf null setzen (null = nicht gesetzt): (1) Zeilenmodus, Standard: `line` (Vorgabe 1) + `limit` (Vorgabe 400, max 2000). (2) Tail: `tail` = letzte N Zeilen, z. B. für Logs (`limit` begrenzt zusätzlich). (3) Byte-Modus (Rückfall): `offset`/`max_bytes`. Für bestimmte Stellen zuerst `fs.grep` (liefert Zeilennummern), dann `fs.read` mit `line`. Kein `sed`/`head`/`tail`/`grep` über `shell.exec` nötig. Für PDFs `doc.read_pdf`, für Bilder `fs.view_image` verwenden.",
     "name": "fs.read",
     "parameters": {
       "additionalProperties": false,
@@ -28,6 +28,34 @@
         "tail": {
           "description": "Tail mode: return the last N lines (e.g. logs) with real line numbers, max 2000. null (or 0) = not set. Requires 'offset'/'max_bytes' null and 'line' null (or 1).",
           "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "Open a PNG, JPEG, GIF or WebP image from the workspace to inspect its actual visual content. The next request receives native image input, then you can continue reasoning and tool use. Uses existing read permissions, image size and pixel limits; GIF uses its first frame. Text-only models receive an explicit vision_unavailable result; never infer visual observations from image metadata. No model switching occurs.",
+    "name": "fs.view_image",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "description": "Image detail: low, high, or auto. Omit for provider default.",
+          "enum": [
+            "low",
+            "high",
+            "auto"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "Image file path relative to the workspace root.",
+          "type": "string"
         }
       },
       "required": [

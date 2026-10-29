@@ -107,7 +107,7 @@ inside the namespace:
 
 The returned `BwrapTrampolinePlan` holds the `bwrap` plan, the namespace
 view as a `harw_job_linux::PathMap` (module docs of `executor.rs`), the
-inner policy `policy.mapped(&path_map)` (network left to the namespace) and
+inner policy `policy.mapped(&path_map).hard_requirement()` (network left to the namespace) and
 the policy paths without a rule inside (`unmapped_paths`, usually the
 withheld ones). It refuses a plan whose read-only binds would keep write or
 execute through an ancestor's Landlock rule (e.g. a read-only workspace
@@ -116,6 +116,16 @@ attempt directory. The job runtime's `LinuxSandboxBackend::BwrapTrampoline`
 writes the inner plan, starts `bwrap` through an outer trampoline that joins
 the job cgroup first, and merges this crate's predicted report with the
 inner report (`harw_job_exec::merge_reports`).
+
+The inner policy requires fully enforced Landlock filesystem rules even for
+`None`/`BestEffort` jobs. The writable report directory must become inaccessible
+before the job runs: a host probe alone cannot establish that. Unsupported or
+partial actual enforcement aborts before `exec`. Backend selection therefore
+requires ABI 5 or later for the composition; `auto` can still select plain
+Bubblewrap on older kernels. An explicit unavailable composition selects no
+backend (not a weaker sandbox). Existing runtime semantics still apply:
+`Required` refuses, while `None`/`BestEffort` can run with backend `None`.
+Such unsandboxed jobs do not use a composed trampoline report.
 
 ## Tests
 

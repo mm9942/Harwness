@@ -14,7 +14,7 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 51 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 52 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `work.result`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
@@ -223,6 +223,7 @@ pub mod infra;
 // Server-derived reach for durable job mutations (Slash vs model tool).
 pub mod job_authority;
 // H12: Mandanten-Sichtbarkeit durabler Jobs (gemeinsam für ps/work/attach/…).
+pub mod image;
 pub(crate) mod job_tenant;
 pub mod jobs;
 pub mod kanban;
@@ -346,7 +347,7 @@ macro_rules! register_ops {
     };
 }
 
-/// Registriert alle 47 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 52 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -376,7 +377,7 @@ macro_rules! register_ops {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 51);
+/// assert_eq!(registry.len(), 52);
 /// assert!(registry.find_by_command("/dod").is_some());
 /// assert!(registry.find_by_name("dod.findings").is_some());
 /// assert!(registry.find_by_name("help").is_some());
@@ -434,6 +435,7 @@ register_ops! {
         Arc::new(skills::SkillsOperation),
         Arc::new(plugins::PluginsOperation),
         Arc::new(model::ModelOperation),
+        Arc::new(image::ImageInspectOperation),
         Arc::new(provider::ProviderOperation),
         // UIA-specific pinned provider/model selection (`uia_provider`/
         // `uia_model`), independent of `default_provider`/`default_model` —
@@ -1043,10 +1045,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_forty_six_operations() {
+    fn register_all_adds_fifty_two_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 51);
+        assert_eq!(reg.len(), 52);
     }
 
     #[test]
@@ -1416,8 +1418,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            51,
-            "first register_all must produce exactly 51 ops"
+            52,
+            "first register_all must produce exactly 52 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -1431,8 +1433,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            51,
-            "registry must stay at 51 after a rejected duplicate"
+            52,
+            "registry must stay at 52 after a rejected duplicate"
         );
     }
 }

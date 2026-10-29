@@ -1,56 +1,53 @@
-//! Persistente Datei-Implementierung des `PlanStore`-Traits.
+//! Persistent, transaction-framed implementation of [`PlanStore`].
 //!
-//! Verantwortungsbereich: `FilePlanStore` — schreibt Pläne atomar als
-//! `rev-<n>.json` samt Integritätssiegel `rev-<n>.seal` und pflegt eine
-//! append-only `history.jsonl` unter `<root>/plans/<plan_id>/`.
+//! A plan lives below `<root>/plans/<plan_id>/`: append-only `history.jsonl`
+//! is authoritative; `rev-<n>.json` and `.seal` are periodic checkpoints.
+//! Each new batch is one bounded, checksummed, LF-terminated WAL record.
+//! Legacy per-event lines remain readable, including mixed legacy/new logs.
+//! Only an unterminated EOF may be truncated during locked recovery. A
+//! malformed complete record, digest mismatch or revision gap fails closed.
 //!
-//! Atomares Schreiben erfolgt via Tmp-Datei + `fsync` + `std::fs::rename` +
-//! Verzeichnis-`fsync` (Design-Doc §4). Veröffentlichungsreihenfolge je
-//! `apply`/`apply_batch`: Snapshot und Siegel stagen → alle History-Zeilen in
-//! **einem** Append schreiben (bei Fehler auf die alte Länge kürzen) → Siegel
-//! veröffentlichen → Snapshot veröffentlichen → RAM-Cache aktualisieren.
-//!
-//! # Pfad-Sicherheit (F-013, G-032)
-//! Jede `PlanId` wird vor dem `join` unter `<root>/plans/` gegen die Grammatik
-//! aus [`PlanId::parse`] geprüft — auch IDs, die über das ungeprüfte
-//! `PlanId::new` entstanden sind. Beim Laden werden nur Verzeichnisse
-//! berücksichtigt, deren Name eine gültige `PlanId` ist, und der geladene Plan
-//! muss dieselbe ID tragen.
-//!
-//! # Integritätssiegel
-//! Siehe [`seal`]: BLAKE3-Digest des Snapshots plus Kettenwert über die
-//! Vorgänger-Revision. Das Siegel ist **ungeschlüsselt** — es erkennt
-//! Beschädigung und naive Manipulation (Snapshot editiert, Siegel gelöscht
-//! oder vertauscht), nicht aber einen Angreifer mit Schreibrecht auf
-//! `HARW_HOME`, der Snapshot und Siegel konsistent neu berechnet.
-//!
-//! Die Mutationslogik selbst liegt **nicht** hier, sondern in
-//! `crate::mutation` (über `crate::store::stage_actions`) — dieselbe Funktion,
-//! die auch `InMemoryPlanStore` aufruft.
-//!
-//! # Mehrere Pläne (Runde 5, Teil P)
-//! Jeder Plan liegt wie bisher in seinem eigenen Verzeichnis
-//! `<root>/plans/<plan_id>/` mit eigener Revisionsfolge, eigenen Siegeln und
-//! eigener `history.jsonl`. Neu ist der Katalog-Index
-//! `<root>/plan-index.json` ([`crate::catalog::PlanIndex`]): aktiver Plan,
-//! Archiv-Flags und Freigabestand. Beim Start werden **alle** gültigen
-//! Plan-Verzeichnisse geladen. Fehlt der Index (Altbestand), ist der Plan
-//! aktiv, den der Einzelplan-Store gewählt hätte; der Index entsteht erst bei
-//! der ersten Katalogänderung — das Lesen eines Altbestands schreibt nichts.
-//! Ein beschädigter **aktiver** Plan bricht das Öffnen ab (wie bisher); ein
-//! beschädigter inaktiver Plan wird mit `warn!` übersprungen und ist dann
-//! nicht wählbar.
+//! # Commit and recovery
+//! Snapshot/seal files are staged first. The checked publication hook runs
+//! immediately before the WAL append. Success requires WAL and directory
+//! synchronization; after that point checkpoint/compaction errors are
+//! maintenance warnings, not rejected mutations. The initial record includes
+//! the exact created plan (including tenant), so no checkpoint is needed for
+//! crash recovery. A failed append is durably rolled back or returns
+//! [`PlanError::CommitIndeterminate`] and fences this instance until reopening.
+//! Create and catalog activation are separate records: activation failure
+//! after Create also requires explicit recovery, never blind replay.
 //!
 //! # Concurrency
-//! `Send + Sync` über `RwLock`; synchronisiert Threads, nicht Prozesse.
+//! Lock order is caller JobLeaseGuard (when present), local write lock, then
+//! nonblocking root OS lock. The publication callback must not reenter the
+//! plan store or acquire another job lock. All fallible reads and mutations
+//! refresh durable state under that root lock. Normal refresh reads only the
+//! new WAL suffix; startup and checkpoint-less recovery scan full history.
+//! `revision()` is only a cached hint, never a CAS/admission authority.
 //!
-//! # Errors
-//! [`PlanError::Io`], [`PlanError::Serde`], [`PlanError::SealMismatch`],
-//! [`PlanError::InvalidId`] sowie alle Validierungs- und Batch-Fehler.
+//! # Trust and compatibility
+//! The root directory, lock inode and existing WAL prefixes must remain under
+//! trusted runtime ownership. Locks serialize cooperating new writers; older
+//! binaries must not write the new format. This is not protection from a
+//! process that can replace store files/locks. Digests and checkpoint seals
+//! detect corruption, not an attacker who can recompute them. Plan IDs are
+//! validated before constructing paths. Snapshot-only legacy stores remain
+//! readable but cannot mutate until their audit history is restored. Legacy
+//! partial batches cannot be reconstructed retroactively. Records, including
+//! legacy ones, are bounded to 16 MiB; oversized records are rejected.
 //!
-//! Exportierte Typen: [`FilePlanStore`].
+//! The catalog `<root>/plan-index.json` stores selection, archival and
+//! approvals. Corrupt inactive snapshots remain unavailable rather than being
+//! overwritten. Reads may repair a torn tail and synchronize recovery; they
+//! never invent missing committed events. Mutation semantics remain centralized
+//! in [`crate::store::stage_actions`], shared with the in-memory implementation.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use fs4::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -365,6 +362,8 @@ pub(crate) mod seal {
 
 /// Ein Plan im Katalog samt History, Revisionsfolge und Siegelkette.
 struct Slot {
+    bootstrap: Option<Plan>,
+    receipts: Vec<crate::parent_progress::ParentProgressReceipt>,
     /// Aktueller Planzustand (gecacht im RAM).
     plan: Plan,
     /// Event-History (gecacht).
@@ -375,6 +374,8 @@ struct Slot {
     seal: Option<seal::SealLink>,
     /// Katalogdaten (Archiv, Freigabestand).
     meta: PlanMeta,
+    /// Validated byte boundary in the append-only WAL.
+    wal_offset: u64,
 }
 
 /// Interner Zustand des File-Stores.
@@ -438,7 +439,11 @@ impl StagedWrite {
             let _ = std::fs::remove_file(&self.temporary);
             return Err(error.into());
         }
-        FilePlanStore::sync_parent_directory(&self.target)
+        FilePlanStore::sync_parent_directory(&self.target).map_err(|_| {
+            PlanError::CommitIndeterminate {
+                path: self.target.display().to_string(),
+            }
+        })
     }
 
     /// Verwirft den noch nicht sichtbaren Snapshot nach einem fehlgeschlagenen
@@ -454,12 +459,12 @@ impl StagedWrite {
 /// # Description
 /// Schreibt jeden Plan-Zustand als `<root>/plans/<plan_id>/rev-<n>.json` mit
 /// Siegel `rev-<n>.seal`. Events werden append-only in
-/// `<root>/plans/<plan_id>/history.jsonl` geschrieben. Ein Batch erzeugt einen
-/// Snapshot (Revision der letzten Aktion) und N History-Zeilen in einem Append.
+/// `<root>/plans/<plan_id>/history.jsonl` geschrieben. Each batch is one WAL
+/// frame; checkpoints are periodic, not one per event.
 ///
 /// # Concurrency
-/// `Send + Sync` durch `RwLock<Inner>`. Lese-Operationen halten Lese-Lock;
-/// `apply`/`apply_batch` halten den Schreib-Lock.
+/// `Send + Sync` through the local lock plus a nonblocking root OS lock.
+/// Fallible reads refresh under the same writer boundary as mutations.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -477,6 +482,7 @@ impl StagedWrite {
 pub struct FilePlanStore {
     inner: RwLock<Inner>,
     config: PlanToolConfig,
+    indeterminate: AtomicBool,
 }
 
 /// Ergebnis von [`FilePlanStore::load`]: der aus `<root>/plans/` und
@@ -488,10 +494,107 @@ struct LoadedCatalog {
 
 /// Ein aus seinem Verzeichnis geladener Plan (ohne Katalogdaten).
 struct LoadedPlan {
+    bootstrap: Option<Plan>,
+    receipts: Vec<crate::parent_progress::ParentProgressReceipt>,
     plan: Plan,
     history: Vec<PlanEvent>,
     next_revision: RevisionId,
     seal: Option<seal::SealLink>,
+    wal_offset: u64,
+}
+
+struct Published {
+    seal: Option<seal::SealLink>,
+    wal_offset: u64,
+}
+
+/// Local guard precedes the nonblocking OS lock. The descriptor is never shared.
+struct LockedInner<'a> {
+    inner: std::sync::RwLockWriteGuard<'a, Inner>,
+    _file: RootLock,
+}
+
+/// Explicit unlock matters when another thread forks while this descriptor
+/// is open: merely closing the parent descriptor can leave its inherited
+/// open-file-description lock alive in the child until exec.
+struct RootLock {
+    file: std::fs::File,
+}
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            warn!(%error, "Plan store root unlock failed; closing descriptor");
+        }
+    }
+}
+
+impl Deref for LockedInner<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
+}
+
+impl DerefMut for LockedInner<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.inner
+    }
+}
+
+/// Minimal boundary for deterministic short-write/fsync/rollback fault tests.
+trait WalSink: Write {
+    fn durable(&mut self) -> std::io::Result<()>;
+    fn rollback(&mut self, original_len: u64) -> std::io::Result<()>;
+}
+
+struct FileWalSink<'a> {
+    file: &'a mut std::fs::File,
+    path: &'a Path,
+}
+
+impl Write for FileWalSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl WalSink for FileWalSink<'_> {
+    fn durable(&mut self) -> std::io::Result<()> {
+        self.file.sync_all()?;
+        FilePlanStore::sync_parent_directory(self.path)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+    fn rollback(&mut self, original_len: u64) -> std::io::Result<()> {
+        self.file.set_len(original_len)?;
+        self.durable()
+    }
+}
+
+/// Success means durable commit; ordinary error means durable rollback;
+/// indeterminate means neither can be established and the instance is fenced.
+fn append_transaction(
+    sink: &mut impl WalSink,
+    bytes: &[u8],
+    original_len: u64,
+    path: &Path,
+) -> PlanResult<()> {
+    let result = sink
+        .write_all(bytes)
+        .and_then(|()| sink.flush())
+        .and_then(|()| sink.durable());
+    if let Err(error) = result {
+        if sink.rollback(original_len).is_err() {
+            return Err(PlanError::CommitIndeterminate {
+                path: path.display().to_string(),
+            });
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 impl FilePlanStore {
@@ -526,9 +629,16 @@ impl FilePlanStore {
     ///   sein Verzeichnis.
     pub fn with_config(root: impl AsRef<Path>, config: PlanToolConfig) -> PlanResult<Self> {
         config.require_enabled().map_err(PlanError::Config)?;
-        let root = root.as_ref().to_path_buf();
-        std::fs::create_dir_all(&root)?;
+        let root = if root.as_ref().is_absolute() {
+            root.as_ref().to_path_buf()
+        } else {
+            std::env::current_dir()?.join(root)
+        };
+        Self::create_root_durably(&root)?;
+        let _lock = Self::lock_root(&root)?;
         let loaded = Self::load(&root)?;
+        std::fs::File::open(&root)?.sync_all()?;
+        Self::sync_parent_directory(&root)?;
         // Wie bisher wird der aktive Plan gegen die Konfiguration geprüft;
         // inaktive Pläne erst, wenn sie per Mutation wieder angefasst werden.
         if let Some(active) = &loaded.active
@@ -545,6 +655,7 @@ impl FilePlanStore {
                 root,
             }),
             config,
+            indeterminate: AtomicBool::new(false),
         })
     }
 
@@ -572,8 +683,66 @@ impl FilePlanStore {
             });
         }
 
+        let candidates = Self::candidates(root)?;
+
+        // Aktiver Plan: laut Index, sonst die Wahl des Einzelplan-Stores.
+        let active = match &index {
+            Some(index) => index
+                .active_id()
+                .filter(|id| candidates.iter().any(|(candidate, _, _)| candidate == id)),
+            None => candidates
+                .iter()
+                .max_by(|(left_id, left_rev, _), (right_id, right_rev, _)| {
+                    left_rev
+                        .cmp(right_rev)
+                        .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+                })
+                .map(|(id, _, _)| id.clone()),
+        };
+
+        let mut plans = Vec::with_capacity(candidates.len());
+        for (plan_id, file_revision, snapshot_path) in candidates {
+            let is_active = active.as_ref() == Some(&plan_id);
+            match Self::load_plan(root, &plan_id, file_revision, snapshot_path.as_deref()) {
+                Ok(loaded) => {
+                    let meta = index
+                        .as_ref()
+                        .map(|index| index.meta(&plan_id))
+                        .unwrap_or_default();
+                    plans.push(Slot {
+                        plan: loaded.plan,
+                        history: loaded.history,
+                        bootstrap: loaded.bootstrap,
+                        receipts: loaded.receipts,
+                        next_revision: loaded.next_revision,
+                        seal: loaded.seal,
+                        meta,
+                        wal_offset: loaded.wal_offset,
+                    });
+                }
+                Err(error) if is_active => return Err(error),
+                Err(error) => {
+                    warn!(
+                        plan_id = %plan_id,
+                        error = %error,
+                        "Inaktiver Plan ist nicht lesbar und wird übersprungen"
+                    );
+                }
+            }
+        }
+        plans.sort_by(|left, right| {
+            left.plan
+                .created_at
+                .cmp(&right.plan.created_at)
+                .then_with(|| left.plan.id.as_str().cmp(right.plan.id.as_str()))
+        });
+        Ok(LoadedCatalog { plans, active })
+    }
+
+    fn candidates(root: &Path) -> PlanResult<Vec<(PlanId, RevisionId, Option<PathBuf>)>> {
+        let plans_root = root.join("plans");
         // (Plan-ID, höchste Snapshot-Revision, Pfad dieses Snapshots)
-        let mut candidates: Vec<(PlanId, RevisionId, PathBuf)> = Vec::new();
+        let mut candidates: Vec<(PlanId, RevisionId, Option<PathBuf>)> = Vec::new();
         for entry in std::fs::read_dir(&plans_root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -611,59 +780,17 @@ impl FilePlanStore {
                 }
             }
             if let Some((revision, path)) = newest {
-                candidates.push((plan_id, revision, path));
-            }
-        }
-
-        // Aktiver Plan: laut Index, sonst die Wahl des Einzelplan-Stores.
-        let active = match &index {
-            Some(index) => index
-                .active_id()
-                .filter(|id| candidates.iter().any(|(candidate, _, _)| candidate == id)),
-            None => candidates
-                .iter()
-                .max_by(|(left_id, left_rev, _), (right_id, right_rev, _)| {
-                    left_rev
-                        .cmp(right_rev)
-                        .then_with(|| left_id.as_str().cmp(right_id.as_str()))
-                })
-                .map(|(id, _, _)| id.clone()),
-        };
-
-        let mut plans = Vec::with_capacity(candidates.len());
-        for (plan_id, file_revision, snapshot_path) in candidates {
-            let is_active = active.as_ref() == Some(&plan_id);
-            match Self::load_plan(root, &plan_id, file_revision, &snapshot_path) {
-                Ok(loaded) => {
-                    let meta = index
-                        .as_ref()
-                        .map(|index| index.meta(&plan_id))
-                        .unwrap_or_default();
-                    plans.push(Slot {
-                        plan: loaded.plan,
-                        history: loaded.history,
-                        next_revision: loaded.next_revision,
-                        seal: loaded.seal,
-                        meta,
-                    });
-                }
-                Err(error) if is_active => return Err(error),
-                Err(error) => {
-                    warn!(
-                        plan_id = %plan_id,
-                        error = %error,
-                        "Inaktiver Plan ist nicht lesbar und wird übersprungen"
-                    );
+                candidates.push((plan_id, revision, Some(path)));
+            } else if entry.path().join("history.jsonl").is_file() {
+                let wal = Self::read_wal(root, &plan_id, 0, RevisionId::new(0))?;
+                // An interrupted first Create has no committed state. Repair
+                // its torn tail, but do not register a phantom plan.
+                if !wal.events.is_empty() {
+                    candidates.push((plan_id, wal.last_revision, None));
                 }
             }
         }
-        plans.sort_by(|left, right| {
-            left.plan
-                .created_at
-                .cmp(&right.plan.created_at)
-                .then_with(|| left.plan.id.as_str().cmp(right.plan.id.as_str()))
-        });
-        Ok(LoadedCatalog { plans, active })
+        Ok(candidates)
     }
 
     /// Lädt einen Plan aus seinem Verzeichnis: neuester Snapshot (gegen sein
@@ -673,63 +800,217 @@ impl FilePlanStore {
         root: &Path,
         plan_id: &PlanId,
         file_revision: RevisionId,
-        snapshot_path: &Path,
+        snapshot_path: Option<&Path>,
     ) -> PlanResult<LoadedPlan> {
-        let bytes = std::fs::read(snapshot_path)?;
-        let plan_dir = Self::plan_dir(root, plan_id)?;
-        let dir_sealed = seal::directory_is_sealed(&plan_dir)?;
-        let seal_link = seal::verify(snapshot_path, file_revision.value(), &bytes, dir_sealed)?;
-        let plan: Plan = serde_json::from_slice(&bytes)?;
-        if &plan.id != plan_id {
-            return Err(PlanError::InvalidId {
-                field: "plan.id",
-                value: plan.id.into_inner(),
-            });
-        }
-
-        let history_path = Self::history_path(root, plan_id)?;
-        let history = if history_path.exists() {
-            let reader = BufReader::new(std::fs::File::open(history_path)?);
-            reader
-                .lines()
-                .filter_map(|line| match line {
-                    Ok(line) if line.trim().is_empty() => None,
-                    Ok(line) => {
-                        Some(serde_json::from_str::<PlanEvent>(&line).map_err(PlanError::Serde))
-                    }
-                    Err(error) => Some(Err(PlanError::Io(error))),
-                })
-                .collect::<PlanResult<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        // Der Snapshot ist nur ein Checkpoint. Alle späteren Events sind die
-        // maßgebliche Fortsetzung und werden ohne neue History-Einträge erneut
-        // auf den geladenen Zustand angewendet.
-        let mut plan = plan;
-        for event in &history {
-            if event.revision <= plan.revision {
-                continue;
+        let (snapshot, seal_link) = if let Some(path) = snapshot_path {
+            let bytes = std::fs::read(path)?;
+            let dir_sealed = Self::has_sealed_snapshot(&Self::plan_dir(root, plan_id)?)?;
+            let link = seal::verify(path, file_revision.value(), &bytes, dir_sealed)?;
+            let plan: Plan = serde_json::from_slice(&bytes)?;
+            if &plan.id != plan_id || plan.revision != file_revision {
+                return Err(Self::invalid_history("Snapshot identity/revision mismatch"));
             }
-            apply_mutation(&mut plan, &event.action, &event.actor, event.applied_at);
-            plan.updated_at = event.applied_at;
-            plan.revision = event.revision;
+            (Some(plan), link)
+        } else {
+            (None, None)
+        };
+        let wal = Self::read_wal(root, plan_id, 0, RevisionId::new(0))?;
+        if let Some(plan) = &snapshot {
+            if !wal.events.is_empty() && !wal.committed_revisions.contains(&plan.revision) {
+                return Err(Self::invalid_history(
+                    "Snapshot is not a committed WAL boundary",
+                ));
+            }
         }
-        let history_revision = history
-            .iter()
-            .map(|event| event.revision)
-            .max()
-            .unwrap_or(RevisionId::new(0));
-        let next_revision = file_revision
-            .max(plan.revision)
-            .max(history_revision)
-            .next();
+        let mut plan = snapshot
+            .or(wal.bootstrap.clone())
+            .ok_or_else(|| Self::invalid_history("WAL has no bootstrap or snapshot"))?;
+        for event in &wal.events {
+            if event.revision > plan.revision {
+                apply_mutation(&mut plan, &event.action, &event.actor, event.applied_at);
+                plan.updated_at = event.applied_at;
+                plan.revision = event.revision;
+            }
+        }
+        let next_revision = Self::next_revision(plan.revision)?;
         Ok(LoadedPlan {
             plan,
-            history,
+            history: wal.events,
+            bootstrap: wal.bootstrap,
+            receipts: wal.receipts,
             next_revision,
             seal: seal_link,
+            wal_offset: wal.valid_len,
         })
+    }
+
+    /// A seal staged/published before its snapshot is only an orphan. It
+    /// must not retroactively turn an older legacy snapshot into corruption.
+    /// Any seal paired with a real snapshot still enables strict verification.
+    fn has_sealed_snapshot(dir: &Path) -> PlanResult<bool> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry.path().extension().is_some_and(|ext| ext == "seal")
+                && entry.path().with_extension("json").is_file()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn require_complete_history(slot: &Slot) -> PlanResult<()> {
+        if slot.history.last().map(|event| event.revision) != Some(slot.plan.revision) {
+            return Err(Self::invalid_history(
+                "Snapshot without complete audit history is read-only; restore history before mutation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn invalid_history(message: &'static str) -> PlanError {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
+    }
+
+    fn next_revision(revision: RevisionId) -> PlanResult<RevisionId> {
+        revision
+            .value()
+            .checked_add(1)
+            .map(RevisionId::new)
+            .ok_or_else(|| Self::invalid_history("Plan revision exhausted"))
+    }
+
+    /// Must be called with the root lock. Repair only an unterminated EOF,
+    /// never a malformed complete transaction; synchronize recovery before use.
+    fn read_wal(
+        root: &Path,
+        id: &PlanId,
+        offset: u64,
+        base: RevisionId,
+    ) -> PlanResult<crate::file_wal::WalRead> {
+        let path = Self::history_path(root, id)?;
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && offset == 0 => {
+                return crate::file_wal::read(std::io::Cursor::new(Vec::<u8>::new()), id, base);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if file.metadata()?.len() < offset {
+            return Err(Self::invalid_history(
+                "Previously committed WAL was truncated",
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut wal = crate::file_wal::read(BufReader::new(&file), id, base)?;
+        wal.valid_len += offset;
+        if wal.torn_tail {
+            file.set_len(wal.valid_len)?;
+        }
+        // Also resolves an earlier process's indeterminate write on reopen.
+        if offset == 0 || wal.torn_tail || wal.valid_len > offset {
+            file.sync_all()?;
+            Self::sync_parent_directory(&path)?;
+        }
+        Ok(wal)
+    }
+
+    fn refresh(inner: &mut Inner) -> PlanResult<()> {
+        let index = Self::read_index(&inner.root)?;
+        // Resolve another writer's indeterminate catalog rename before the
+        // freshly read selection/approvals become visible in this instance.
+        std::fs::File::open(&inner.root)?.sync_all()?;
+        let plans_root = inner.root.join("plans");
+        if !plans_root.exists() {
+            return if inner.plans.is_empty() {
+                Ok(())
+            } else {
+                Err(Self::invalid_history(
+                    "Previously loaded plan directory disappeared",
+                ))
+            };
+        }
+        let candidates = Self::candidates(&inner.root)?;
+        for (id, revision, path) in &candidates {
+            if let Some(slot) = inner.plans.iter_mut().find(|slot| &slot.plan.id == id) {
+                let base = slot
+                    .history
+                    .last()
+                    .map(|event| event.revision)
+                    .unwrap_or(RevisionId::new(0));
+                let wal = Self::read_wal(&inner.root, id, slot.wal_offset, base)?;
+                for event in &wal.events {
+                    if event.revision > slot.plan.revision {
+                        apply_mutation(
+                            &mut slot.plan,
+                            &event.action,
+                            &event.actor,
+                            event.applied_at,
+                        );
+                        slot.plan.updated_at = event.applied_at;
+                        slot.plan.revision = event.revision;
+                    }
+                }
+                slot.next_revision = Self::next_revision(slot.plan.revision)?;
+                slot.history.extend(wal.events);
+                slot.receipts.extend(wal.receipts);
+                slot.wal_offset = wal.valid_len;
+            } else {
+                let loaded = match Self::load_plan(&inner.root, id, *revision, path.as_deref()) {
+                    Ok(loaded) => loaded,
+                    Err(error)
+                        if index.as_ref().and_then(PlanIndex::active_id).as_ref() != Some(id)
+                            && index.is_some() =>
+                    {
+                        warn!(%error, plan_id = %id, "Unreadable inactive plan remains unavailable");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                inner.plans.push(Slot {
+                    plan: loaded.plan,
+                    history: loaded.history,
+                    bootstrap: loaded.bootstrap,
+                    receipts: loaded.receipts,
+                    next_revision: loaded.next_revision,
+                    seal: loaded.seal,
+                    meta: PlanMeta::default(),
+                    wal_offset: loaded.wal_offset,
+                });
+            }
+        }
+        inner
+            .plans
+            .retain(|slot| candidates.iter().any(|(id, _, _)| id == &slot.plan.id));
+        for slot in &mut inner.plans {
+            slot.meta = index
+                .as_ref()
+                .map(|index| index.meta(&slot.plan.id))
+                .unwrap_or_default();
+        }
+        inner.active = match index {
+            Some(index) => index
+                .active_id()
+                .filter(|id| inner.plans.iter().any(|slot| &slot.plan.id == id)),
+            None => candidates
+                .iter()
+                .max_by(|(a, ar, _), (b, br, _)| {
+                    ar.cmp(br).then_with(|| a.as_str().cmp(b.as_str()))
+                })
+                .map(|(id, _, _)| id.clone()),
+        };
+        inner.plans.sort_by(|a, b| {
+            a.plan
+                .created_at
+                .cmp(&b.plan.created_at)
+                .then_with(|| a.plan.id.as_str().cmp(b.plan.id.as_str()))
+        });
+        Ok(())
     }
 
     /// `true`, wenn `dir` mindestens einen Snapshot `rev-<n>.json` enthält.
@@ -849,44 +1130,50 @@ impl FilePlanStore {
         Ok(())
     }
 
-    /// Hängt alle `events` in **einem** Write an die `history.jsonl` an.
+    /// Appends one bounded transaction record after the publication check.
     ///
     /// # Errors
-    /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Schreibfehler; die Datei
-    ///   wird dann auf ihre vorherige Länge gekürzt.
-    fn append_events(root: &Path, plan_id: &PlanId, events: &[PlanEvent]) -> PlanResult<()> {
-        let path = Self::history_path(root, plan_id)?;
+    /// An ordinary error means no committed append; an uncertain rollback
+    /// returns `CommitIndeterminate`, requiring locked reopen and inspection.
+    fn append_events_checked(
+        root: &Path,
+        candidate: &Plan,
+        events: &[PlanEvent],
+        receipt: Option<&crate::parent_progress::ParentProgressReceipt>,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<u64> {
+        let path = Self::history_path(root, &candidate.id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Publish both newly created directory links before acknowledging
+            // the first WAL. fsync(file) alone does not make these durable.
+            Self::sync_parent_directory(parent)?;
+            if let Some(grandparent) = parent.parent() {
+                Self::sync_parent_directory(grandparent)?;
+            }
         }
-        let mut buffer = String::new();
-        for event in events {
-            buffer.push_str(&serde_json::to_string(event)?);
-            buffer.push('\n');
-        }
-        let mut f = std::fs::OpenOptions::new()
+        let buffer = match receipt {
+            Some(receipt) => crate::file_wal::encode_progress(candidate, events, receipt)?,
+            None => crate::file_wal::encode(candidate, events)?,
+        };
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
-        let original_len = f.metadata()?.len();
-        let append_result = (|| -> PlanResult<()> {
-            f.write_all(buffer.as_bytes())?;
-            f.flush()?;
-            f.sync_all()?;
-            Self::sync_parent_directory(&path)?;
-            Ok(())
-        })();
-        if let Err(error) = append_result {
-            // A failed write may have appended a partial line. Restore the
-            // pre-append length before exposing the error to the caller.
-            if f.set_len(original_len).is_ok() {
-                // Best effort: der ursprüngliche Schreibfehler wird gemeldet.
-                let _ = f.sync_all();
-                let _ = Self::sync_parent_directory(&path);
-            }
-            return Err(error);
-        }
-        Ok(())
+        let original_len = file.metadata()?.len();
+        // Job lease is already held by the caller. No job lock is acquired
+        // here. This is the final check before the authoritative WAL append.
+        before_publish()?;
+        append_transaction(
+            &mut FileWalSink {
+                file: &mut file,
+                path: &path,
+            },
+            &buffer,
+            original_len,
+            &path,
+        )?;
+        Ok(original_len + buffer.len() as u64)
     }
 
     /// Persistiert Events und schreibt nur bei einem Checkpoint Snapshot plus
@@ -944,18 +1231,46 @@ impl FilePlanStore {
     }
 
     fn publish(
+        &self,
         root: &Path,
         candidate: &Plan,
         events: &[PlanEvent],
-    ) -> PlanResult<Option<seal::SealLink>> {
+    ) -> PlanResult<Published> {
+        self.publish_checked(root, candidate, events, &|| Ok(()))
+    }
+
+    fn publish_checked(
+        &self,
+        root: &Path,
+        candidate: &Plan,
+        events: &[PlanEvent],
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<Published> {
+        self.publish_progress_checked(root, candidate, events, None, before_publish)
+    }
+    fn publish_progress_checked(
+        &self,
+        root: &Path,
+        candidate: &Plan,
+        events: &[PlanEvent],
+        receipt: Option<&crate::parent_progress::ParentProgressReceipt>,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<Published> {
         if !Self::checkpoint_required(candidate, events) {
-            Self::append_events(root, &candidate.id, events)?;
-            return Ok(None);
+            let wal_offset = self.record_outcome(Self::append_events_checked(
+                root,
+                candidate,
+                events,
+                receipt,
+                before_publish,
+            ))?;
+            return Ok(Published {
+                seal: None,
+                wal_offset,
+            });
         }
         let bytes = serde_json::to_vec_pretty(candidate)?;
         let plan_path = Self::plan_path(root, &candidate.id, candidate.revision)?;
-        // Checkpoints are self-contained because compaction deletes their
-        // predecessor snapshots and seals.
         let (seal_bytes, link) = seal::build(None, candidate.revision.value(), &bytes)?;
         let staged_snapshot = Self::stage_atomic_write(&plan_path, &bytes)?;
         let staged_seal = match seal::stage(&seal::seal_path(&plan_path), &seal_bytes) {
@@ -965,45 +1280,116 @@ impl FilePlanStore {
                 return Err(error);
             }
         };
-        if let Err(error) = Self::append_events(root, &candidate.id, events) {
-            staged_seal.discard();
-            staged_snapshot.discard();
-            return Err(error);
-        }
+        let wal_offset = match self.record_outcome(Self::append_events_checked(
+            root,
+            candidate,
+            events,
+            receipt,
+            before_publish,
+        )) {
+            Ok(offset) => offset,
+            Err(error) => {
+                staged_seal.discard();
+                staged_snapshot.discard();
+                return Err(error);
+            }
+        };
+        // WAL is committed. A later checkpoint failure must not report the
+        // mutation as rejected or leave RAM behind durable history.
         if let Err(error) = staged_seal.commit() {
             staged_snapshot.discard();
-            return Err(error);
+            warn!(%error, "Committed plan WAL; checkpoint seal maintenance failed");
+            return Ok(Published {
+                seal: None,
+                wal_offset,
+            });
         }
-        staged_snapshot.commit()?;
-        Self::compact_checkpoints(root, &candidate.id, candidate.revision)?;
-        Ok(Some(link))
+        if let Err(error) = staged_snapshot.commit() {
+            warn!(%error, "Committed plan WAL; checkpoint snapshot maintenance failed");
+            return Ok(Published {
+                seal: None,
+                wal_offset,
+            });
+        }
+        if let Err(error) = Self::compact_checkpoints(root, &candidate.id, candidate.revision) {
+            warn!(%error, "Committed plan WAL; checkpoint compaction failed");
+        }
+        Ok(Published {
+            seal: Some(link),
+            wal_offset,
+        })
     }
 }
 
 impl FilePlanStore {
-    // Lese-Lock mit einheitlichem Fehler.
-    fn read_inner(&self) -> PlanResult<std::sync::RwLockReadGuard<'_, Inner>> {
-        self.inner
-            .read()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))
+    fn create_root_durably(root: &Path) -> PlanResult<()> {
+        let mut missing = Vec::new();
+        for path in root.ancestors() {
+            if path.try_exists()? {
+                break;
+            }
+            missing.push(path.to_path_buf());
+        }
+        std::fs::create_dir_all(root)?;
+        for path in missing.iter().rev() {
+            std::fs::File::open(path)?.sync_all()?;
+            Self::sync_parent_directory(path)?;
+        }
+        Ok(())
     }
 
-    // Schreib-Lock mit einheitlichem Fehler.
-    fn write_inner(&self) -> PlanResult<std::sync::RwLockWriteGuard<'_, Inner>> {
-        self.inner
+    fn lock_root(root: &Path) -> PlanResult<RootLock> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".plan-store.lock"))?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => Ok(RootLock { file }),
+            Err(fs4::TryLockError::WouldBlock) => Err(PlanError::StoreContended),
+            Err(fs4::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn read_inner(&self) -> PlanResult<LockedInner<'_>> {
+        self.write_inner()
+    }
+
+    fn write_inner(&self) -> PlanResult<LockedInner<'_>> {
+        let mut inner = self
+            .inner
             .write()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock poisoned")))?;
+        if self.indeterminate.load(Ordering::Acquire) {
+            return Err(PlanError::StoreRecoveryRequired);
+        }
+        let file = Self::lock_root(&inner.root)?;
+        Self::refresh(&mut inner)?;
+        if let Some(slot) = inner.active_slot() {
+            self.config
+                .validate_plan(&slot.plan)
+                .map_err(PlanError::Config)?;
+        }
+        Ok(LockedInner { inner, _file: file })
+    }
+
+    fn record_outcome<T>(&self, outcome: PlanResult<T>) -> PlanResult<T> {
+        if matches!(&outcome, Err(PlanError::CommitIndeterminate { .. })) {
+            self.indeterminate.store(true, Ordering::Release);
+        }
+        outcome
     }
 
     /// Wendet eine Katalogänderung an: RAM-Zustand ändern, neuen Index
     /// dauerhaft schreiben; scheitert das Schreiben, werden Katalogdaten und
     /// aktiver Plan auf den vorherigen Stand zurückgesetzt.
-    fn commit_catalog(inner: &mut Inner, change: impl FnOnce(&mut Inner)) -> PlanResult<()> {
+    fn commit_catalog(&self, inner: &mut Inner, change: impl FnOnce(&mut Inner)) -> PlanResult<()> {
         let previous_meta: Vec<PlanMeta> = inner.plans.iter().map(|slot| slot.meta).collect();
         let previous_active = inner.active.clone();
         change(inner);
         let index = inner.index();
-        if let Err(error) = Self::write_index(&inner.root, &index) {
+        if let Err(error) = self.record_outcome(Self::write_index(&inner.root, &index)) {
             for (slot, meta) in inner.plans.iter_mut().zip(previous_meta) {
                 slot.meta = meta;
             }
@@ -1068,25 +1454,27 @@ impl FilePlanStore {
                 actor: actor.to_owned(),
                 applied_at: now,
             };
-            let link = Self::publish(&inner.root, &plan, std::slice::from_ref(&event))?;
+            let published = self.publish(&inner.root, &plan, std::slice::from_ref(&event))?;
             inner.plans.push(Slot {
-                plan,
+                plan: plan.clone(),
                 history: vec![event.clone()],
+                bootstrap: Some(plan.clone()),
+                receipts: Vec::new(),
                 next_revision: revision.next(),
-                seal: link,
+                seal: published.seal,
                 meta: PlanMeta::default(),
+                wal_offset: published.wal_offset,
             });
             inner.active = Some(plan_id.clone());
-            // Der Plan ist bereits dauerhaft; ein fehlgeschlagener
-            // Index-Write kostet nur die Aktiv-Markierung nach einem
-            // Neustart, deshalb hier nur `warn!`.
+            // Plan creation and catalog activation are separate durable
+            // records. If activation fails, do not report full Create success
+            // or let the next implicit apply silently target the old plan.
             let index = inner.index();
             if let Err(error) = Self::write_index(&inner.root, &index) {
-                warn!(
-                    plan_id = %plan_id,
-                    error = %error,
-                    "Plan-Index konnte nach Create nicht geschrieben werden"
-                );
+                warn!(%error, %plan_id, "Plan committed but catalog activation failed");
+                return self.record_outcome(Err(PlanError::CommitIndeterminate {
+                    path: Self::index_path(&inner.root).display().to_string(),
+                }));
             }
             return Ok(event);
         }
@@ -1098,29 +1486,91 @@ impl FilePlanStore {
         let Some(slot) = inner.plans.get_mut(position) else {
             return Err(PlanError::PlanNotFound);
         };
+        Self::require_complete_history(slot)?;
         let revision = slot.next_revision;
+        Self::next_revision(revision)?;
         // Validierung + Mutation auf einem Kandidaten — einzige Mutationsstelle,
         // geteilt mit `InMemoryPlanStore`. Sichtbar erst nach dem dauerhaften
         // History-Append.
         let (candidate, events) =
             stage_actions(&slot.plan, vec![action], actor, &self.config, revision, now)
                 .map_err(|(_, error)| error)?;
-        let link = Self::publish(&root, &candidate, &events)?;
+        let published = self.publish(&root, &candidate, &events)?;
         let Some(event) = events.into_iter().next() else {
             return Err(PlanError::PlanNotFound);
         };
         debug!(revision = %revision, actor = actor, "Persistente Aktion angewendet");
         slot.next_revision = revision.next();
         slot.plan = candidate;
-        if let Some(link) = link {
+        if let Some(link) = published.seal {
             slot.seal = Some(link);
         }
+        slot.wal_offset = published.wal_offset;
         slot.history.push(event.clone());
         Ok(event)
     }
 }
 
 impl PlanStore for FilePlanStore {
+    fn reconcile_parent_progress(
+        &self,
+        admission: &crate::parent_progress::ParentAdmission,
+    ) -> PlanResult<crate::parent_progress::ParentProgressView> {
+        let inner = self.read_inner()?;
+        let slot = inner.active_slot().ok_or(PlanError::PlanNotFound)?;
+        crate::parent_progress::reconcile(
+            slot.bootstrap.as_ref(),
+            &slot.history,
+            &slot.receipts,
+            &slot.plan,
+            admission,
+            &self.config,
+        )
+    }
+    fn commit_parent_progress_checked(
+        &self,
+        request: &crate::parent_progress::CollectSourcesProgress,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<crate::parent_progress::ParentProgressReceipt> {
+        let mut inner = self.write_inner()?;
+        self.config.require_enabled().map_err(PlanError::Config)?;
+        let root = inner.root.clone();
+        let position = inner.active_position().ok_or(PlanError::PlanNotFound)?;
+        let slot = inner
+            .plans
+            .get_mut(position)
+            .ok_or(PlanError::PlanNotFound)?;
+        Self::require_complete_history(slot)?;
+        let view = crate::parent_progress::reconcile(
+            slot.bootstrap.as_ref(),
+            &slot.history,
+            &slot.receipts,
+            &slot.plan,
+            &request.admission,
+            &self.config,
+        )?;
+        match crate::parent_progress::stage(&view, &slot.receipts, request, &self.config)? {
+            crate::parent_progress::StagedProgress::Existing(receipt) => Ok(receipt),
+            crate::parent_progress::StagedProgress::New(plan, events, receipt) => {
+                let published = self.publish_progress_checked(
+                    &root,
+                    &plan,
+                    &events,
+                    Some(&receipt),
+                    before_publish,
+                )?;
+                slot.next_revision = plan.revision.next();
+                slot.plan = plan;
+                if let Some(link) = published.seal {
+                    slot.seal = Some(link);
+                }
+                slot.wal_offset = published.wal_offset;
+                slot.history.extend(events);
+                slot.receipts.push(receipt.clone());
+                Ok(receipt)
+            }
+        }
+    }
     fn current(&self) -> PlanResult<Plan> {
         let inner = self.read_inner()?;
         inner
@@ -1129,6 +1579,8 @@ impl PlanStore for FilePlanStore {
             .ok_or(PlanError::PlanNotFound)
     }
 
+    // Infallible compatibility API: cached hint only. Mutations use the
+    // refreshed, fallible CAS path, never this value as authority.
     fn revision(&self) -> RevisionId {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         match inner.active_slot() {
@@ -1158,6 +1610,17 @@ impl PlanStore for FilePlanStore {
         actor: &str,
         expected_rev: RevisionId,
     ) -> PlanResult<PlanRevision> {
+        self.apply_batch_checked(plan, actions, actor, expected_rev, &|| Ok(()))
+    }
+
+    fn apply_batch_checked(
+        &self,
+        plan: &PlanId,
+        actions: Vec<PlanAction>,
+        actor: &str,
+        expected_rev: RevisionId,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<PlanRevision> {
         let mut inner = self.write_inner()?;
         self.config.require_enabled().map_err(PlanError::Config)?;
 
@@ -1170,12 +1633,22 @@ impl PlanStore for FilePlanStore {
         };
         let current = check_batch_target(Some(&slot.plan), plan, expected_rev)?;
         if actions.is_empty() {
+            before_publish()?;
             return Ok(PlanRevision {
                 revision: current.revision,
                 events: Vec::new(),
             });
         }
 
+        Self::require_complete_history(slot)?;
+        let count = u64::try_from(actions.len())
+            .map_err(|_| Self::invalid_history("Batch revision overflow"))?;
+        current
+            .revision
+            .value()
+            .checked_add(count)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| Self::invalid_history("Batch revision overflow"))?;
         let now = OffsetDateTime::now_utc();
         let (candidate, events) = stage_actions(
             current,
@@ -1190,13 +1663,14 @@ impl PlanStore for FilePlanStore {
             source: Box::new(source),
         })?;
 
-        let link = Self::publish(&root, &candidate, &events)?;
+        let published = self.publish_checked(&root, &candidate, &events, before_publish)?;
         let revision = candidate.revision;
         slot.next_revision = revision.next();
         slot.plan = candidate;
-        if let Some(link) = link {
+        if let Some(link) = published.seal {
             slot.seal = Some(link);
         }
+        slot.wal_offset = published.wal_offset;
         slot.history.extend(events.iter().cloned());
         info!(
             plan_id = %plan,
@@ -1216,34 +1690,12 @@ impl PlanStore for FilePlanStore {
             return Ok(Vec::new());
         };
 
-        // Lese von Disk (history.jsonl) des aktiven Plans; fehlt die Datei,
-        // gilt der RAM-Cache.
-        let path = Self::history_path(&inner.root, &slot.plan.id)?;
-        if !path.exists() {
-            return Ok(slot
-                .history
-                .iter()
-                .filter(|event| since.is_none_or(|since_rev| event.revision >= since_rev))
-                .cloned()
-                .collect());
-        }
-        let f = std::fs::File::open(&path)?;
-        let reader = BufReader::new(f);
-        let mut events = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let ev: PlanEvent = serde_json::from_str(&line)?;
-            if let Some(since_rev) = since
-                && ev.revision < since_rev
-            {
-                continue;
-            }
-            events.push(ev);
-        }
-        Ok(events)
+        Ok(slot
+            .history
+            .iter()
+            .filter(|event| since.is_none_or(|revision| event.revision >= revision))
+            .cloned()
+            .collect())
     }
 
     fn list_plans(&self) -> PlanResult<Vec<PlanSummary>> {
@@ -1281,8 +1733,13 @@ impl PlanStore for FilePlanStore {
     fn switch_plan(&self, id: &PlanId, actor: &str) -> PlanResult<Plan> {
         let mut inner = self.write_inner()?;
         let position = inner.position_of(id)?;
+        if let Some(slot) = inner.plans.get(position) {
+            self.config
+                .validate_plan(&slot.plan)
+                .map_err(PlanError::Config)?;
+        }
         let target = id.clone();
-        Self::commit_catalog(&mut inner, |inner| {
+        self.commit_catalog(&mut inner, |inner| {
             if let Some(slot) = inner.plans.get_mut(position) {
                 slot.meta.archived = false;
             }
@@ -1300,7 +1757,7 @@ impl PlanStore for FilePlanStore {
         let mut inner = self.write_inner()?;
         let position = inner.position_of(id)?;
         let target = id.clone();
-        Self::commit_catalog(&mut inner, |inner| {
+        self.commit_catalog(&mut inner, |inner| {
             if let Some(slot) = inner.plans.get_mut(position) {
                 slot.meta.archived = true;
             }
@@ -1315,7 +1772,7 @@ impl PlanStore for FilePlanStore {
     fn set_approval(&self, id: &PlanId, approval: PlanApproval, actor: &str) -> PlanResult<()> {
         let mut inner = self.write_inner()?;
         let position = inner.position_of(id)?;
-        Self::commit_catalog(&mut inner, |inner| {
+        self.commit_catalog(&mut inner, |inner| {
             if let Some(slot) = inner.plans.get_mut(position) {
                 slot.meta.approval = approval;
             }
@@ -1640,7 +2097,9 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(store.revision(), RevisionId::new(1));
-        assert!(store.current()?.nodes.is_empty());
+        // Fallible reads no longer hide a broken authoritative WAL behind
+        // a stale RAM snapshot.
+        assert!(store.current().is_err());
         assert!(
             !dir.path()
                 .join("plans")
@@ -1927,6 +2386,47 @@ mod tests {
     }
 
     #[test]
+    fn checked_publication_rejects_after_staging_without_replayable_events() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = seeded_store(&dir, "p-fenced")?;
+        let before = store.current()?;
+        let history = std::fs::read(dir.path().join("plans/p-fenced/history.jsonl"))?;
+        let check = || -> PlanResult<()> {
+            // Invalidation forces a checkpoint: both temporary files have
+            // been written and fsynced before this authoritative boundary.
+            let count = std::fs::read_dir(dir.path().join("plans/p-fenced"))?
+                .collect::<Result<Vec<_>, _>>()?
+                .len();
+            assert!(count >= 5, "snapshot and seal must already be staged");
+            Err(PlanError::Io(std::io::Error::other(
+                "lease expired during staging",
+            )))
+        };
+        assert!(
+            store
+                .apply_batch_checked(
+                    &before.id,
+                    vec![PlanAction::Invalidate {
+                        ids: vec![TaskId::new("t1")],
+                        condition: crate::types::InvalidationCondition::ManualInvalidate,
+                    }],
+                    "worker",
+                    before.revision,
+                    &check,
+                )
+                .is_err()
+        );
+        assert_eq!(store.revision(), before.revision);
+        assert_eq!(
+            std::fs::read(dir.path().join("plans/p-fenced/history.jsonl"))?,
+            history
+        );
+        drop(store);
+        assert_eq!(make_store(&dir)?.current()?.revision, before.revision);
+        Ok(())
+    }
+
+    #[test]
     fn test_apply_batch_persists_one_snapshot_and_all_events() -> TestResult {
         let dir = TempDir::new()?;
         let store = seeded_store(&dir, "p-batch")?;
@@ -1947,7 +2447,7 @@ mod tests {
         )?;
 
         assert_eq!(result.revision, RevisionId::new(4));
-        assert_eq!(history_lines(&dir, "p-batch")?, 4);
+        assert_eq!(history_lines(&dir, "p-batch")?, 3); // One framed line for the two-action batch.
         let plan_dir = dir.path().join("plans").join("p-batch");
         assert!(!plan_dir.join("rev-4.json").exists());
         assert!(plan_dir.join("rev-1.json").exists());
@@ -2249,6 +2749,476 @@ mod tests {
             ),
             Err(PlanError::PlanExists { .. })
         ));
+        Ok(())
+    }
+    #[test]
+    fn independent_instances_reject_stale_compare_and_swap() -> TestResult {
+        let dir = TempDir::new()?;
+        let first = make_store(&dir)?;
+        let id = PlanId::new("multiwriter");
+        first.apply(
+            PlanAction::Create {
+                plan_id: id.clone(),
+                goal: "g".into(),
+            },
+            "owner",
+        )?;
+        let second = make_store(&dir)?;
+        first.apply_batch(
+            &id,
+            vec![PlanAction::AddNode {
+                node: make_node("one"),
+            }],
+            "one",
+            RevisionId::new(1),
+        )?;
+        let stale = second.apply_batch(
+            &id,
+            vec![PlanAction::AddNode {
+                node: make_node("two"),
+            }],
+            "two",
+            RevisionId::new(1),
+        );
+        assert!(matches!(stale, Err(PlanError::RevisionConflict { .. })));
+        assert_eq!(second.current()?.revision, RevisionId::new(2));
+        second.apply_batch(
+            &id,
+            vec![PlanAction::AddNode {
+                node: make_node("two"),
+            }],
+            "two",
+            RevisionId::new(2),
+        )?;
+        assert_eq!(first.current()?.revision, RevisionId::new(3));
+        assert_eq!(first.history(None)?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_failure_after_wal_commit_is_successful_and_visible() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        let id = PlanId::new("checkpoint-failure");
+        store.apply(
+            PlanAction::Create {
+                plan_id: id.clone(),
+                goal: "g".into(),
+            },
+            "owner",
+        )?;
+        for n in 2..10 {
+            store.apply(
+                PlanAction::AddNode {
+                    node: make_node(&format!("n{n}")),
+                },
+                "owner",
+            )?;
+        }
+        let target = dir.path().join("plans/checkpoint-failure/rev-10.json");
+        store.apply_batch_checked(
+            &id,
+            vec![PlanAction::AddNode {
+                node: make_node("n10"),
+            }],
+            "owner",
+            RevisionId::new(9),
+            &|| {
+                std::fs::create_dir(&target)?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(store.current()?.revision, RevisionId::new(10));
+        assert_eq!(make_store(&dir)?.current()?.revision, RevisionId::new(10));
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_batch_never_recovers_a_prefix() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        let id = PlanId::new("torn-batch");
+        store.apply(
+            PlanAction::Create {
+                plan_id: id.clone(),
+                goal: "g".into(),
+            },
+            "owner",
+        )?;
+        let path = dir.path().join("plans/torn-batch/history.jsonl");
+        let before = std::fs::read(&path)?;
+        store.apply_batch(
+            &id,
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("one"),
+                },
+                PlanAction::AddNode {
+                    node: make_node("two"),
+                },
+            ],
+            "owner",
+            RevisionId::new(1),
+        )?;
+        let after = std::fs::read(&path)?;
+        // Preserve the first complete JSONL record after Create, but not the
+        // complete batch. Old per-event WAL accepts revision two here.
+        let suffix = &after[before.len()..];
+        let boundary = suffix
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or(TestError::Missing("newline"))?
+            + 1;
+        let cut = if boundary < suffix.len() {
+            before.len() + boundary
+        } else {
+            after.len() - 1
+        };
+        std::fs::write(&path, &after[..cut])?;
+        let recovered = make_store(&dir)?;
+        assert_eq!(recovered.current()?.revision, RevisionId::new(1));
+        Ok(())
+    }
+    #[test]
+    fn bootstrap_recovers_exact_tenant_without_checkpoint() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        let tenant = harw_types::TenantId::new();
+        store.create_for_tenant(
+            PlanId::new("bootstrap"),
+            "goal".into(),
+            Some(tenant),
+            "owner",
+        )?;
+        let expected = serde_json::to_value(store.current()?)?;
+        std::fs::remove_file(dir.path().join("plans/bootstrap/rev-1.json"))?;
+        std::fs::remove_file(dir.path().join("plans/bootstrap/rev-1.seal"))?;
+        let recovered = make_store(&dir)?;
+        assert_eq!(serde_json::to_value(recovered.current()?)?, expected);
+        recovered.apply(PlanAction::Inspect, "owner")?;
+        assert_eq!(make_store(&dir)?.current()?.revision, RevisionId::new(2));
+        Ok(())
+    }
+
+    #[test]
+    fn torn_first_create_is_uncommitted_and_id_can_be_retried() -> TestResult {
+        for empty in [false, true] {
+            let dir = TempDir::new()?;
+            let store = make_store(&dir)?;
+            create(&store, "first", "initial")?;
+            let path = dir.path().join("plans/first/history.jsonl");
+            let bytes = std::fs::read(&path)?;
+            std::fs::write(
+                &path,
+                if empty {
+                    &bytes[..0]
+                } else {
+                    &bytes[..bytes.len() / 2]
+                },
+            )?;
+            std::fs::remove_file(dir.path().join("plans/first/rev-1.json"))?;
+            std::fs::remove_file(dir.path().join("plans/first/rev-1.seal"))?;
+            std::fs::remove_file(dir.path().join("plan-index.json"))?;
+            let recovered = make_store(&dir)?;
+            assert!(matches!(recovered.current(), Err(PlanError::PlanNotFound)));
+            create(&recovered, "first", "retry")?;
+            assert_eq!(make_store(&dir)?.current()?.goal_statement, "retry");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_seal_does_not_invalidate_legacy_checkpoint_after_committed_batch() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        create(&store, "legacy-orphan", "g")?;
+        std::fs::remove_file(dir.path().join("plans/legacy-orphan/rev-1.seal"))?;
+        for _ in 2..10 {
+            store.apply(PlanAction::Inspect, "owner")?;
+        }
+        let target = dir.path().join("plans/legacy-orphan/rev-10.json");
+        store.apply_batch_checked(
+            &PlanId::new("legacy-orphan"),
+            vec![PlanAction::Inspect],
+            "owner",
+            RevisionId::new(9),
+            &|| {
+                std::fs::create_dir(&target)?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(make_store(&dir)?.current()?.revision, RevisionId::new(10));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_only_legacy_is_readable_but_cannot_append_unrecoverable_history() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        create(&store, "snapshot-only", "g")?;
+        std::fs::remove_file(dir.path().join("plans/snapshot-only/history.jsonl"))?;
+        let recovered = make_store(&dir)?;
+        assert_eq!(recovered.current()?.revision, RevisionId::new(1));
+        assert!(recovered.apply(PlanAction::Inspect, "owner").is_err());
+        assert!(
+            recovered
+                .apply_batch(
+                    &PlanId::new("snapshot-only"),
+                    vec![PlanAction::Inspect],
+                    "owner",
+                    RevisionId::new(1)
+                )
+                .is_err()
+        );
+        assert_eq!(make_store(&dir)?.current()?.revision, RevisionId::new(1));
+        Ok(())
+    }
+
+    #[test]
+    fn independent_catalog_updates_do_not_lose_metadata() -> TestResult {
+        let dir = TempDir::new()?;
+        let first = make_store(&dir)?;
+        create(&first, "a", "a")?;
+        let second = make_store(&dir)?;
+        create(&second, "b", "b")?;
+        first.set_approval(&PlanId::new("a"), PlanApproval::Proposed, "owner")?;
+        second.archive_plan(&PlanId::new("b"), "owner")?;
+        assert_eq!(
+            second.plan_meta(&PlanId::new("a"))?.approval,
+            PlanApproval::Proposed
+        );
+        assert!(first.plan_meta(&PlanId::new("b"))?.archived);
+        assert!(matches!(first.current(), Err(PlanError::PlanNotFound)));
+        Ok(())
+    }
+
+    #[test]
+    fn indeterminate_outcome_blocks_operations_until_locked_reopen() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        create(&store, "old", "old")?;
+        let index = dir.path().join("plan-index.json");
+        // Valid readable index cannot be sabotaged before refresh. Its parent
+        // publication is instead exercised directly through the post-WAL
+        // outcome handler; actual rename failure is covered for checkpoints.
+        let outcome: PlanResult<()> = store.record_outcome(Err(PlanError::CommitIndeterminate {
+            path: index.display().to_string(),
+        }));
+        assert!(matches!(
+            outcome,
+            Err(PlanError::CommitIndeterminate { .. })
+        ));
+        assert!(matches!(
+            store.current(),
+            Err(PlanError::StoreRecoveryRequired)
+        ));
+        assert!(matches!(
+            store.apply(PlanAction::Inspect, "owner"),
+            Err(PlanError::StoreRecoveryRequired)
+        ));
+        assert_eq!(make_store(&dir)?.current()?.revision, RevisionId::new(1));
+        Ok(())
+    }
+
+    #[test]
+    fn root_lock_is_nonblocking_across_independent_instances_and_processes() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        let lock = FilePlanStore::lock_root(dir.path())?;
+        assert!(matches!(store.current(), Err(PlanError::StoreContended)));
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::StoreContended)
+        ));
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "file_store::tests::subprocess_lock_probe",
+                "--nocapture",
+            ])
+            .env("HARW_PLAN_LOCK_PROBE_ROOT", dir.path())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        drop(lock);
+        create(&store, "released", "works")?;
+        Ok(())
+    }
+
+    #[test]
+    fn subprocess_lock_probe() -> TestResult {
+        if let Some(root) = std::env::var_os("HARW_PLAN_LOCK_PROBE_ROOT") {
+            assert!(matches!(
+                FilePlanStore::new(root),
+                Err(PlanError::StoreContended)
+            ));
+        }
+        Ok(())
+    }
+
+    struct FaultSink {
+        bytes: Vec<u8>,
+        fail_write_at: Option<usize>,
+        fail_sync_once: bool,
+        fail_rollback: bool,
+    }
+    impl Write for FaultSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let count = self
+                .fail_write_at
+                .map(|at| at.saturating_sub(self.bytes.len()).min(bytes.len()))
+                .unwrap_or(bytes.len());
+            if count == 0 {
+                return Err(std::io::Error::other("injected short write"));
+            }
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl WalSink for FaultSink {
+        fn durable(&mut self) -> std::io::Result<()> {
+            if std::mem::take(&mut self.fail_sync_once) {
+                Err(std::io::Error::other("injected fsync failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn rollback(&mut self, len: u64) -> std::io::Result<()> {
+            self.bytes.truncate(len as usize);
+            if self.fail_rollback {
+                return Err(std::io::Error::other("injected rollback fsync failure"));
+            }
+            self.durable()
+        }
+    }
+
+    #[test]
+    fn append_faults_are_rolled_back_or_marked_indeterminate() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        for fail_write_at in [Some(5), None] {
+            for fail_rollback in [false, true] {
+                let mut sink = FaultSink {
+                    bytes: b"old".to_vec(),
+                    fail_write_at,
+                    fail_sync_once: fail_write_at.is_none(),
+                    fail_rollback,
+                };
+                let result = append_transaction(&mut sink, b"transaction\n", 3, dir.path());
+                assert_eq!(sink.bytes, b"old");
+                if fail_rollback {
+                    assert!(matches!(result, Err(PlanError::CommitIndeterminate { .. })));
+                    let result = store.record_outcome(result);
+                    assert!(matches!(result, Err(PlanError::CommitIndeterminate { .. })));
+                    assert!(matches!(
+                        store.current(),
+                        Err(PlanError::StoreRecoveryRequired)
+                    ));
+                } else {
+                    assert!(matches!(result, Err(PlanError::Io(_))));
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn real_legacy_event_lines_accept_new_framed_suffix() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        create(&store, "mixed", "g")?;
+        store.apply(PlanAction::Inspect, "owner")?;
+        let mut legacy = Vec::new();
+        for event in store.history(None)? {
+            serde_json::to_writer(&mut legacy, &event)?;
+            legacy.push(b'\n');
+        }
+        std::fs::write(dir.path().join("plans/mixed/history.jsonl"), legacy)?;
+        let reopened = make_store(&dir)?;
+        reopened.apply(PlanAction::Inspect, "owner")?;
+        let recovered = make_store(&dir)?;
+        assert_eq!(recovered.history(None)?.len(), 3);
+        assert_eq!(recovered.current()?.revision, RevisionId::new(3));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_inside_framed_batch_is_rejected() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        create(&store, "boundary", "g")?;
+        store.apply_batch(
+            &PlanId::new("boundary"),
+            vec![PlanAction::Inspect, PlanAction::Inspect],
+            "owner",
+            RevisionId::new(1),
+        )?;
+        let mut partial = store.current()?;
+        partial.revision = RevisionId::new(2);
+        let path = dir.path().join("plans/boundary/rev-2.json");
+        let bytes = serde_json::to_vec(&partial)?;
+        let (seal, _) = seal::build(None, 2, &bytes)?;
+        std::fs::write(&path, bytes)?;
+        std::fs::write(path.with_extension("seal"), seal)?;
+        assert!(FilePlanStore::new(dir.path()).is_err());
+        Ok(())
+    }
+    #[test]
+    fn missing_relative_root_and_ancestors_are_created_durably() -> TestResult {
+        let cwd = std::env::current_dir()?;
+        let temporary = TempDir::new_in(&cwd)?;
+        let relative = temporary
+            .path()
+            .strip_prefix(&cwd)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?
+            .join("nested/plans");
+        assert!(!relative.is_absolute());
+        let store = FilePlanStore::new(&relative)?;
+        create(&store, "relative", "works")?;
+        assert_eq!(
+            FilePlanStore::new(relative)?.current()?.id,
+            PlanId::new("relative")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_enforces_local_node_limit_after_another_writer_grows_plan() -> TestResult {
+        let dir = TempDir::new()?;
+        let strict = FilePlanStore::with_config(dir.path(), config_with_max_nodes(1))?;
+        create(&strict, "limits", "g")?;
+        let wider = make_store(&dir)?;
+        wider.apply_batch(
+            &PlanId::new("limits"),
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("one"),
+                },
+                PlanAction::AddNode {
+                    node: make_node("two"),
+                },
+            ],
+            "owner",
+            RevisionId::new(1),
+        )?;
+        assert!(matches!(
+            strict.current(),
+            Err(PlanError::Config(
+                PlanToolConfigError::NodeLimitExceeded { .. }
+            ))
+        ));
+        assert!(matches!(
+            strict.apply(PlanAction::Inspect, "owner"),
+            Err(PlanError::Config(
+                PlanToolConfigError::NodeLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(wider.current()?.revision, RevisionId::new(3));
         Ok(())
     }
 }

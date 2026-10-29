@@ -252,6 +252,11 @@ impl BwrapExecutor {
     /// namespace provides, and must not report a weaker one that would
     /// make its own requirement check refuse an enforced job.
     ///
+    /// The inner policy requires full Landlock filesystem enforcement,
+    /// independently of the job requirement, to protect the report from the
+    /// job. Unsupported/partial enforcement refuses execution, not merely
+    /// backend selection; the host probe is not a security boundary.
+    ///
     /// # Errors
     /// Every error of [`plan`](Self::plan), and:
     /// - [`BwrapExecutorError::InvalidPath`] for a relative or non-normal
@@ -294,7 +299,11 @@ impl BwrapExecutor {
             });
         }
         let unmapped = path_map.unmapped_paths(&policy.filesystem);
-        let mut inner_policy = policy.mapped(&path_map);
+        // The attempt directory is writable for the trusted trampoline to
+        // publish its report. It must become inaccessible before the job
+        // executes, even for None/BestEffort jobs or stale host probes.
+        // Partial old ABIs are not sufficient (e.g. unmediated truncate).
+        let mut inner_policy = policy.mapped(&path_map).hard_requirement();
         inner_policy.network = inner_network(&policy.network, bwrap.network_mode());
         Ok(BwrapTrampolinePlan {
             bwrap,

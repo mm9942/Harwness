@@ -100,6 +100,7 @@ const R18_FEATURES: &[&str] = &[features::TOOLS, features::GATEWAY];
 
 /// One live connection as `gateway.connections.list` shows it.
 struct ConnEntry {
+    identity: ClientIdentity,
     label: String,
     principal: PrincipalSummary,
     tenant: Option<TenantId>,
@@ -149,6 +150,7 @@ struct HostInner {
     transcripts: Arc<dyn TranscriptSource>,
     approvals: Arc<dyn ApprovalBackend>,
     driver: Arc<dyn TurnDriver>,
+    execution_creators: Mutex<HashMap<SessionId, ClientIdentity>>,
     slots: Mutex<HashMap<SessionId, Arc<Slot>>>,
     revoked_devices: Mutex<HashSet<DeviceId>>,
     revoked_connections: Mutex<HashSet<ConnectionId>>,
@@ -217,6 +219,7 @@ impl SessionHost {
                 transcripts,
                 approvals,
                 driver,
+                execution_creators: Mutex::new(HashMap::new()),
                 slots: Mutex::new(HashMap::new()),
                 revoked_devices: Mutex::new(HashSet::new()),
                 revoked_connections: Mutex::new(HashSet::new()),
@@ -249,6 +252,7 @@ impl SessionHost {
                 .check_agent_registration(agent, identity.tenant.as_ref())?;
         }
         let entry = ConnEntry {
+            identity: identity.clone(),
             label: identity.label.clone(),
             principal: identity.principal_summary(),
             tenant: identity.tenant.clone(),
@@ -286,6 +290,68 @@ impl SessionHost {
         }
         self.inner
             .close_matching(|entry| entry.device.as_ref() == Some(device), revoked_frame);
+    }
+
+    /// Authenticated facts still retained by this host, including detached
+    /// session creators. Only trusted policy monitors should consume these.
+    #[must_use]
+    pub fn authenticated_identities(&self) -> Vec<ClientIdentity> {
+        let mut identities = BTreeMap::new();
+        if let Ok(connections) = self.inner.connections.lock() {
+            identities.extend(
+                connections
+                    .iter()
+                    .map(|(id, entry)| (*id, entry.identity.clone())),
+            );
+        }
+        if let Ok(creators) = self.inner.execution_creators.lock() {
+            identities.extend(
+                creators
+                    .values()
+                    .map(|identity| (identity.connection, identity.clone())),
+            );
+        }
+        identities
+            .into_values()
+            .filter(|identity| !self.inner.is_revoked(identity))
+            .collect()
+    }
+
+    /// Devices whose authenticated facts remain live in this process, including
+    /// creators whose transports detached. Used by trusted policy refresh.
+    #[must_use]
+    pub fn authenticated_devices(&self) -> Vec<DeviceId> {
+        self.authenticated_identities()
+            .into_iter()
+            .filter_map(|identity| identity.device)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Invalidate old credentials when trusted device policy changes or cannot
+    /// be read. This revokes existing connection ids, including detached creator
+    /// facts, without banning freshly authenticated connections for the device.
+    pub fn invalidate_device_policy(&self, device: &DeviceId) {
+        let mut connections = self
+            .inner
+            .connections_where(|entry| entry.device.as_ref() == Some(device));
+        if let Ok(creators) = self.inner.execution_creators.lock() {
+            connections.extend(
+                creators
+                    .values()
+                    .filter(|identity| identity.device.as_ref() == Some(device))
+                    .map(|identity| identity.connection),
+            );
+        }
+        connections.sort_unstable();
+        connections.dedup();
+        for connection in connections {
+            self.inner.revoke_connection(connection);
+        }
+        if let Ok(mut creators) = self.inner.execution_creators.lock() {
+            creators.retain(|_, identity| identity.device.as_ref() != Some(device));
+        }
     }
 
     /// Revoke one connection (for example when its security context
@@ -462,6 +528,86 @@ impl HostInner {
         device || connection || agent
     }
 
+    /// A record supplies a ceiling only. The process keeps authenticated
+    /// creator facts across transport detach, but never across a restart.
+    /// Every new execution checks live revocation and agent registration.
+    fn execution_admission(
+        &self,
+        record: &HostedSessionRecord,
+    ) -> Result<Option<crate::driver::ExecutionAdmission>, HostError> {
+        if record.creator_execution.is_none() {
+            // Dedicated-host compatibility for legacy transcripts. A shared
+            // listener must not admit legacy records without a trusted migration.
+            return Ok(None);
+        }
+        let connections = self
+            .connections
+            .lock()
+            .map_err(|_| HostError::Storage("connection table poisoned".into()))?;
+        let mut creators = self
+            .execution_creators
+            .lock()
+            .map_err(|_| HostError::Storage("execution creator table poisoned".into()))?;
+        let cached = creators.get(&record.session_id).cloned();
+        let identities = connections
+            .values()
+            .filter(|entry| entry.granted.is_some())
+            .map(|entry| &entry.identity)
+            .chain(cached.iter());
+        let mut admitted: Option<crate::driver::ExecutionAdmission> = None;
+        let mut refreshed = None;
+        for identity in identities {
+            if self.is_revoked(identity) {
+                continue;
+            }
+            if let Some(agent) = &identity.agent {
+                if self
+                    .check_agent_registration(agent, identity.tenant.as_ref())
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            if let Ok(request) =
+                record.revalidate_creator_execution(identity, harw_types::PermissionTier::Owner)
+            {
+                if admitted
+                    .as_ref()
+                    .is_none_or(|previous| request.maximum_tier <= previous.maximum_tier())
+                {
+                    refreshed = Some(identity.clone());
+                }
+                // Multiple authenticated credentials can only narrow.
+                admitted = Some(match admitted {
+                    Some(previous) => crate::driver::ExecutionAdmission::new(
+                        identity.principal.clone(),
+                        request.maximum_tier.min(previous.maximum_tier()),
+                        request.approval_actor,
+                    ),
+                    None => crate::driver::ExecutionAdmission::new(
+                        identity.principal.clone(),
+                        request.maximum_tier,
+                        request.approval_actor,
+                    ),
+                });
+            }
+        }
+        if let Some(identity) = refreshed {
+            creators.insert(record.session_id.clone(), identity);
+        }
+        admitted.map(Some).ok_or_else(|| {
+            HostError::Denied("execution requires fresh authenticated creator authority".into())
+        })
+    }
+
+    async fn prepare_execution(&self, slot: &Slot) -> Result<(), HostError> {
+        let admission = self.execution_admission(&slot.lock()?.record)?;
+        if let Some(admission) = admission {
+            self.driver.prepare_execution(&slot.id, admission).await?;
+        }
+        Ok(())
+    }
+
     fn is_draining(&self) -> bool {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -570,6 +716,16 @@ impl HostInner {
                 state.arbiter.drop_origin(connection);
             }
             state.broadcast_presence(&slot.id);
+            // Revocation also invalidates a detached creator's authority.
+            // Cancellation does not depend on that creator still having an
+            // attachment or on who submitted the current turn.
+            if state.record.creator_execution.is_some()
+                && self.execution_admission(&state.record).is_err()
+            {
+                if let Some(cancel) = &state.cancel {
+                    let _ = cancel.send(true);
+                }
+            }
         }
     }
 
@@ -816,6 +972,12 @@ fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
                     cancel_rx,
                 )
             };
+            if let Err(error) = host.prepare_execution(&slot).await {
+                if !settle(&host, &slot, &TurnOutcome::Failed(error.to_string())) {
+                    return;
+                }
+                continue;
+            }
             for setting in settings {
                 if let Err(error) = host.driver.apply_setting(&slot.id, setting).await {
                     tracing::warn!(%error, "session host: setting failed");
@@ -922,6 +1084,10 @@ fn resume_parked(host: Arc<HostInner>, slot: Arc<Slot>) {
             host: Arc::downgrade(&host),
             slot: Arc::clone(&slot),
         });
+        if let Err(error) = host.prepare_execution(&slot).await {
+            settle(&host, &slot, &TurnOutcome::Failed(error.to_string()));
+            return;
+        }
         let outcome = host
             .driver
             .resume_after_approval(&slot.id, cancel_rx, sink)
@@ -931,6 +1097,39 @@ fn resume_parked(host: Arc<HostInner>, slot: Arc<Slot>) {
             pump(host, slot);
         }
     });
+}
+
+/// Synchronous rollback also runs when a caller drops the create future.
+/// A creation never executes a model/tool turn. Retained transcript metadata,
+/// if a custom driver writes it, has no hosted record and grants no authority.
+struct UnpublishedCreation<'a> {
+    host: &'a HostInner,
+    session_id: SessionId,
+    armed: bool,
+}
+
+impl Drop for UnpublishedCreation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut slots) = self.host.slots.lock() {
+            slots.remove(&self.session_id);
+        }
+        if let Err(cleanup) = self
+            .host
+            .driver
+            .discard_unpublished_session(&self.session_id)
+        {
+            tracing::error!(%cleanup, "session host: failed creation runtime cleanup");
+        }
+        if let Ok(mut creators) = self.host.execution_creators.lock() {
+            creators.remove(&self.session_id);
+        }
+        if let Err(cleanup) = self.host.records.remove(&self.session_id) {
+            tracing::error!(%cleanup, "session host: failed creation record cleanup");
+        }
+    }
 }
 
 /// One client's view of the host: a [`SessionPort`] (and, R18, a
@@ -1272,6 +1471,13 @@ impl HostConnection {
             session_id,
             tenant: self.identity.tenant.clone(),
             owner_principal: self.identity.principal.id().to_owned(),
+            creator_execution: Some(crate::record::CreatorExecutionRequest {
+                binding: Some(crate::record::CreatorExecutionBinding::from_identity(
+                    &self.identity,
+                )),
+                maximum_tier: self.identity.principal.tier(),
+                approval_actor: self.identity.actor.clone(),
+            }),
             workspace: params.workspace.clone(),
             title,
             created_at: now,
@@ -1836,14 +2042,26 @@ impl SessionPort for HostConnection {
         Box::pin(
             async move {
                 let record = self.create_sync(&params)?;
+                let mut publication = UnpublishedCreation {
+                    host: &self.host,
+                    session_id: record.session_id.clone(),
+                    armed: true,
+                };
+                if let Some(admission) = self.host.execution_admission(&record)? {
+                    self.host
+                        .driver
+                        .prepare_execution(&record.session_id, admission)
+                        .await?;
+                }
                 self.host
                     .driver
                     .create_session(&record.session_id, record.title.as_deref())
                     .await?;
                 self.host.records.save(&record)?;
                 let slot = self.host.insert_slot(record)?;
-                let state = slot.lock()?;
-                Ok(self.host.summary(&state))
+                let summary = self.host.summary(&*slot.lock()?);
+                publication.armed = false;
+                Ok(summary)
             }
             .map_err_port(),
         )
