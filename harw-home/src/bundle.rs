@@ -1006,58 +1006,59 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/osint-web-research/skill.toml"),
     },
     // ── Nutzungs-Skills der Kommando-Werkzeuge (PL-93, PL-97 B4) ─────────
-    // Liegen in ihren Werkzeug-Crates (`<crate>/skills/<name>/`) und werden
-    // von dort eingebettet, ohne Kopie unter `assets/`: eine Quelle, kein
-    // Auseinanderlaufen. `tests::TOOL_CRATE_SKILLS` führt die Zuordnung,
-    // `test_tool_crate_skills_are_embedded_verbatim` prüft Vollständigkeit
-    // und Byte-Gleichheit.
+    // Quelle sind ihre Werkzeug-Crates (`<crate>/skills/<name>/`); hier liegt
+    // eine vendorte Kopie unter `assets/skills/`, weil `include_str!` das
+    // Paket nicht verlassen darf (`cargo package` baut aus einem isolierten
+    // Tarball, PR #154). `tests::TOOL_CRATE_SKILLS` führt die Zuordnung,
+    // `test_vendored_tool_crate_skills_match_their_source` prüft
+    // Vollständigkeit und Byte-Gleichheit mit der Quelle (Drift-Test).
     BundledFile {
         relative_path: "skills/cargo-tools/instructions.md",
-        contents: include_str!("../../harw-tool-cargo/skills/cargo-tools/instructions.md"),
+        contents: include_str!("../assets/skills/cargo-tools/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/cargo-tools/skill.toml",
-        contents: include_str!("../../harw-tool-cargo/skills/cargo-tools/skill.toml"),
+        contents: include_str!("../assets/skills/cargo-tools/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/cargo-tools/triggers.toml",
-        contents: include_str!("../../harw-tool-cargo/skills/cargo-tools/triggers.toml"),
+        contents: include_str!("../assets/skills/cargo-tools/triggers.toml"),
     },
     BundledFile {
         relative_path: "skills/fsread-tools/instructions.md",
-        contents: include_str!("../../harw-tool-fsread/skills/fsread-tools/instructions.md"),
+        contents: include_str!("../assets/skills/fsread-tools/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/fsread-tools/skill.toml",
-        contents: include_str!("../../harw-tool-fsread/skills/fsread-tools/skill.toml"),
+        contents: include_str!("../assets/skills/fsread-tools/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/fsread-tools/triggers.toml",
-        contents: include_str!("../../harw-tool-fsread/skills/fsread-tools/triggers.toml"),
+        contents: include_str!("../assets/skills/fsread-tools/triggers.toml"),
     },
     BundledFile {
         relative_path: "skills/git-read-tools/instructions.md",
-        contents: include_str!("../../harw-tool-gitread/skills/git-read-tools/instructions.md"),
+        contents: include_str!("../assets/skills/git-read-tools/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/git-read-tools/skill.toml",
-        contents: include_str!("../../harw-tool-gitread/skills/git-read-tools/skill.toml"),
+        contents: include_str!("../assets/skills/git-read-tools/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/git-read-tools/triggers.toml",
-        contents: include_str!("../../harw-tool-gitread/skills/git-read-tools/triggers.toml"),
+        contents: include_str!("../assets/skills/git-read-tools/triggers.toml"),
     },
     BundledFile {
         relative_path: "skills/sys-tools/instructions.md",
-        contents: include_str!("../../harw-tool-sys/skills/sys-tools/instructions.md"),
+        contents: include_str!("../assets/skills/sys-tools/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/sys-tools/skill.toml",
-        contents: include_str!("../../harw-tool-sys/skills/sys-tools/skill.toml"),
+        contents: include_str!("../assets/skills/sys-tools/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/sys-tools/triggers.toml",
-        contents: include_str!("../../harw-tool-sys/skills/sys-tools/triggers.toml"),
+        contents: include_str!("../assets/skills/sys-tools/triggers.toml"),
     },
 ];
 
@@ -1066,11 +1067,9 @@ mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
 
-    /// Jede Datei unter `assets/` muss im Bundle stehen — sonst läge sie im
-    /// Repo, käme aber nie beim Nutzer an.
-    /// Die Nutzungs-Skills, die in ihren Werkzeug-Crates liegen (PL-93,
-    /// PL-97 B4): `(Skill-Verzeichnis, Werkzeug-Crate)`. Ihre Dateien bettet
-    /// [`BUNDLED_FILES`] direkt aus `<Crate>/skills/<Verzeichnis>/` ein.
+    /// Die Nutzungs-Skills, deren Quelle in ihren Werkzeug-Crates liegt
+    /// (PL-93, PL-97 B4): `(Skill-Verzeichnis, Werkzeug-Crate)`. Ihre
+    /// vendorte Kopie liegt unter `assets/skills/<Verzeichnis>/`.
     const TOOL_CRATE_SKILLS: &[(&str, &str)] = &[
         ("cargo-tools", "harw-tool-cargo"),
         ("fsread-tools", "harw-tool-fsread"),
@@ -1078,16 +1077,8 @@ mod tests {
         ("sys-tools", "harw-tool-sys"),
     ];
 
-    /// Werkzeug-Crate eines Bundle-Pfads `skills/<dir>/…`, falls der Skill
-    /// aus einer Werkzeug-Crate stammt.
-    fn tool_crate_of(relative_path: &str) -> Option<&'static str> {
-        let dir = relative_path.strip_prefix("skills/")?.split('/').next()?;
-        TOOL_CRATE_SKILLS
-            .iter()
-            .find(|(name, _)| *name == dir)
-            .map(|(_, krate)| *krate)
-    }
-
+    /// Jede Datei unter `assets/` muss im Bundle stehen — sonst läge sie im
+    /// Repo, käme aber nie beim Nutzer an.
     #[test]
     fn test_every_asset_file_is_embedded() -> TestResult {
         let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
@@ -1095,11 +1086,8 @@ mod tests {
         collect_files(&assets, &assets, &mut on_disk)?;
         on_disk.sort();
 
-        // Skills aus Werkzeug-Crates liegen nicht unter `assets/` (siehe
-        // `test_tool_crate_skills_are_embedded_verbatim`).
         let mut embedded: Vec<String> = bundled_files()
             .iter()
-            .filter(|file| tool_crate_of(file.relative_path).is_none())
             .map(|file| file.relative_path.to_owned())
             .collect();
         embedded.sort();
@@ -1111,53 +1099,86 @@ mod tests {
         Ok(())
     }
 
-    /// PL-97 B4: jede Datei unter `<Werkzeug-Crate>/skills/<dir>/` steht im
-    /// Bundle, byte-gleich mit der Quelle, und kein Werkzeug-Skill liegt
-    /// zusätzlich als Kopie unter `assets/skills/`.
+    /// PR #154 [P1]: kein `include_str!` darf das Paket `harw-home`
+    /// verlassen, sonst bricht `cargo package` (isolierter Tarball).
     #[test]
-    fn test_tool_crate_skills_are_embedded_verbatim() -> TestResult {
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn test_bundle_includes_stay_inside_the_package() -> TestResult {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bundle.rs"),
+        )
+        .map_err(ctx("bundle.rs lesbar"))?;
+        let escaping = ["include_str!(\"../..", "include_bytes!(\"../.."];
+        for line in source.lines() {
+            assert!(
+                !escaping.iter().any(|needle| line.contains(needle)),
+                "Einbettung verlässt das Paket: {}",
+                line.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Drift-Test (PL-97 B4, PR #154): die vendorte Kopie unter
+    /// `assets/skills/<dir>/` ist byte-gleich mit der Quelle unter
+    /// `<Werkzeug-Crate>/skills/<dir>/` — gleiche Dateimenge, gleicher
+    /// Inhalt. Außerhalb des Workspaces (Test aus dem gepackten Crate ohne
+    /// Geschwister-Crates) gibt es keine Quelle zum Vergleichen.
+    #[test]
+    fn test_vendored_tool_crate_skills_match_their_source() -> TestResult {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest_dir
             .parent()
             .ok_or(crate::test_support::TestError::Missing("Workspace-Wurzel"))?;
+        if !workspace.join("harw-home").join("Cargo.toml").is_file() {
+            // Kein Workspace-Checkout (entpacktes Crate heißt `harw-home-<ver>`):
+            // nichts zu vergleichen.
+            return Ok(());
+        }
         for (dir, krate) in TOOL_CRATE_SKILLS {
             let source = workspace.join(krate).join("skills").join(dir);
-            let mut on_disk = Vec::new();
-            collect_files(&source, &source, &mut on_disk)?;
-            on_disk.sort();
-            let mut embedded: Vec<&str> = bundled_files()
-                .iter()
-                .filter_map(|file| {
-                    file.relative_path
-                        .strip_prefix("skills/")
-                        .and_then(|rest| rest.strip_prefix(*dir))
-                        .and_then(|rest| rest.strip_prefix('/'))
-                })
-                .collect();
-            embedded.sort_unstable();
-            assert_eq!(on_disk, embedded, "{krate}/skills/{dir} und Bundle");
+            // Fehlende oder umbenannte Quell-Crate muss laut scheitern, nicht still bestehen.
+            assert!(
+                source.is_dir(),
+                "Quelle {krate}/skills/{dir} fehlt im Workspace — Werkzeug-Crate umbenannt \
+                 oder verschoben? TOOL_CRATE_SKILLS und assets/skills/{dir} anpassen"
+            );
+            let vendored = manifest_dir.join("assets/skills").join(dir);
+            let mut source_files = Vec::new();
+            collect_files(&source, &source, &mut source_files)?;
+            source_files.sort();
+            let mut vendored_files = Vec::new();
+            collect_files(&vendored, &vendored, &mut vendored_files)?;
+            vendored_files.sort();
+            assert_eq!(
+                source_files, vendored_files,
+                "Dateimenge von assets/skills/{dir} weicht von {krate}/skills/{dir} ab"
+            );
             for name in ["skill.toml", "instructions.md", "triggers.toml"] {
-                assert!(embedded.contains(&name), "{dir}/{name} fehlt im Bundle");
-            }
-            for file in bundled_files()
-                .iter()
-                .filter(|file| tool_crate_of(file.relative_path) == Some(*krate))
-            {
-                let relative = file
-                    .relative_path
-                    .strip_prefix(&format!("skills/{dir}/"))
-                    .ok_or(crate::test_support::TestError::Missing("Skill-Pfad"))?;
-                let on_disk = std::fs::read_to_string(source.join(relative))
-                    .map_err(ctx("Werkzeug-Skill lesbar"))?;
-                assert_eq!(
-                    file.contents, on_disk,
-                    "{} weicht von {krate} ab",
-                    file.relative_path
+                assert!(
+                    vendored_files.iter().any(|file| file == name),
+                    "{dir}/{name} fehlt"
                 );
             }
-            let copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/skills")
-                .join(dir);
-            assert!(!copy.exists(), "{dir} liegt doppelt unter assets/skills");
+            for relative in &source_files {
+                let original =
+                    std::fs::read(source.join(relative)).map_err(ctx("Werkzeug-Skill lesbar"))?;
+                let copy =
+                    std::fs::read(vendored.join(relative)).map_err(ctx("vendorte Kopie lesbar"))?;
+                assert!(
+                    original == copy,
+                    "assets/skills/{dir}/{relative} weicht von {krate}/skills/{dir}/{relative} ab \
+                     — Kopie aus der Werkzeug-Crate erneuern"
+                );
+                let embedded = bundled_files()
+                    .iter()
+                    .find(|file| file.relative_path == format!("skills/{dir}/{relative}"))
+                    .ok_or(crate::test_support::TestError::Missing("Bundle-Eintrag"))?;
+                assert_eq!(
+                    embedded.contents.as_bytes(),
+                    original.as_slice(),
+                    "skills/{dir}/{relative} im Bundle"
+                );
+            }
         }
         Ok(())
     }
