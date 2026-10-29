@@ -64,12 +64,34 @@ const FIXED_KEYS: &[(&str, &str)] = &[
     ("Agenten-Panel (fokussiert): fertige auf-/zuklappen", "f"),
     ("Agenten-Panel (fokussiert): Fehlschläge quittieren", "c"),
     (
+        "Agenten-Panel (fokussiert): Agent an LIVE anheften / lösen",
+        "p",
+    ),
+    (
+        "Jobs-Fenster (fokussiert): Auswahl / blättern",
+        "↑/↓, k/j, Bild↑/Bild↓, Pos1/Ende",
+    ),
+    ("Jobs-Fenster (fokussiert): Job-Details öffnen", "Enter"),
+    (
+        "Finished/Failed (fokussiert): Kategorien auf-/zuklappen",
+        "Enter, f",
+    ),
+    ("Finished/Failed (fokussiert): Fehlschläge quittieren", "c"),
+    (
+        "LIVE-Fenster (Hochformat)",
+        "nur Anzeige: nie fokussiert, nie gescrollt, nimmt keine Tasten",
+    ),
+    (
+        "Composer mit Text: Wort zurück / vor",
+        "Alt+B / Alt+F (Vorrang vor focus_finished)",
+    ),
+    (
         "Dialog: Text scrollen (Optionen bleiben sichtbar)",
         "Strg+↑/↓ (scroll_panel_up/down), Mausrad",
     ),
     (
         "Mausrad",
-        "scrollt Dialog, Agenten-Panel oder Verlauf unter dem Zeiger",
+        "scrollt Dialog, Agenten-, Jobs-, Finished-Fenster oder Verlauf unter dem Zeiger",
     ),
 ];
 
@@ -777,6 +799,14 @@ mod tests {
         assert!(text.contains("ctrl+down"), "{text}");
         assert!(text.contains("w/s"), "{text}");
         assert!(text.contains("Mausrad"), "{text}");
+        // PL-97 C2: neue Aktionen samt Belegung und feste Fenstertasten.
+        assert!(text.contains("Jobs-Fenster fokussieren"), "{text}");
+        assert!(text.contains("alt+j"), "{text}");
+        assert!(text.contains("alt+f"), "{text}");
+        assert!(text.contains("alt+l"), "{text}");
+        assert!(text.contains("an LIVE anheften"), "{text}");
+        assert!(text.contains("Finished/Failed (fokussiert)"), "{text}");
+        assert!(text.contains("Composer mit Text"), "{text}");
         Ok(())
     }
 }

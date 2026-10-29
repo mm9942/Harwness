@@ -26,12 +26,13 @@
 //! Geometrie-Crate `harw-tui-layout` hineinschaut: [`classify_screen`]
 //! wandelt deren Klassifikation (breite Seitenspalte, oben angedockter
 //! Portrait-Dock oder Zusammenfassungs-/Kompakt-Fallback) in
-//! `ratatui::layout::Rect` um, [`split_dock_areas`] entsprechend die interne
-//! Aufteilung des Docks, [`portrait_live_strip`] die Höhenverteilung des
-//! Mini-Live-Streifens zwischen Dock und Chat (über
-//! [`harw_tui_layout::chat_first`]). `PaneFocus`, `PanelState`, `PanelKey`, [`split`] und
-//! `split_right_column` bleiben unverändert und beschreiben weiterhin nur
-//! die breite Seitenspalten-Darstellung von oben.
+//! `ratatui::layout::Rect` um, [`classify_mission`] entsprechend die
+//! Mission-Control-Geometrie (PL-97 C2: Agenten- und Jobs-Fenster,
+//! Finished/Failed-Streifen, LIVE-Streifen und Chat über
+//! [`harw_tui_layout::classify_mission`]). [`split`] und
+//! `split_right_column` beschreiben weiterhin nur die breite
+//! Seitenspalten-Darstellung von oben; `F4` läuft in der Reihenfolge
+//! [`crate::mission::FOCUS_ORDER`] über alle sichtbaren Flächen.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -110,103 +111,100 @@ pub(crate) enum DockAreas {
     Split { agents: Rect, jobs: Rect },
 }
 
-/// Teilt den Dock-Bereich gemäß [`harw_tui_layout::split_dock`] und wandelt
-/// das Ergebnis in [`DockAreas`] um.
-pub(crate) fn split_dock_areas(dock: Rect) -> DockAreas {
-    let to_layout_rect = |r: Rect| harw_tui_layout::Rect {
-        x: r.x,
-        y: r.y,
-        width: r.width,
-        height: r.height,
-    };
-    let to_rect = |r: harw_tui_layout::Rect| Rect {
-        x: r.x,
-        y: r.y,
-        width: r.width,
-        height: r.height,
-    };
-    match harw_tui_layout::split_dock(to_layout_rect(dock)) {
-        harw_tui_layout::DockSplit::Combined(r) => DockAreas::Combined(to_rect(r)),
-        harw_tui_layout::DockSplit::Split { agents, jobs } => DockAreas::Split {
-            agents: to_rect(agents),
-            jobs: to_rect(jobs),
-        },
-    }
-}
-
-/// Mini-Live-Streifen des Portrait-Docks (PL-94 W02) und der danach
-/// verbleibende Chat-Bereich, bereits als `ratatui::layout::Rect`.
+/// Rows the caller reserves or wants for [`classify_mission`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PortraitLive {
-    /// Streifen (Kopfzeile plus Körper) direkt unter dem Dock; `None`, wenn
-    /// nichts anzuzeigen ist oder der Chat sonst unter seine Mindesthöhe fiele.
-    pub live: Option<Rect>,
-    /// Zeilen des Körpers unterhalb der Kopfzeile: `0` bei reiner Kopfzeile
-    /// und ohne Streifen, höchstens `MINI_LIVE_MAX_BODY_LINES`.
-    pub body_lines: u16,
-    /// Chat-Bereich: der gesamte Rest unterhalb des Streifens.
-    pub chat: Rect,
+pub(crate) struct MissionRows {
+    /// Status line rows above the composer.
+    pub status: u16,
+    /// Composer rows (or the height of the dialog that replaces it).
+    pub composer: u16,
+    /// LIVE body lines the content can fill (0 = header only).
+    pub live_body_lines: u16,
+    /// Finished/Failed rows: 1 collapsed, more when expanded.
+    pub finished: u16,
 }
 
-/// Verteilt den Bereich unter dem Portrait-Dock auf Mini-Live-Streifen und
-/// Chat (PL-94 W02 U0/U1) mithilfe von [`harw_tui_layout::chat_first`].
-///
-/// # Beschreibung
-/// `chat_first` gibt dem Chat immer zuerst seine Mindesthöhe
-/// (`MINI_LIVE_MIN_CHAT_ROWS`) und verteilt nur den Rest an die Blöcke darüber
-/// (Karten, Finished-Streifen, Live-Kopf, Live-Körper). Den Dock berechnet
-/// weiterhin [`classify_screen`]; er vertritt hier die Karten-Zeile und den
-/// Finished-Streifen. Damit `chat_first` dieselbe Rangfolge und dieselbe
-/// Chat-Untergrenze anwendet, bekommt es eine um genau diese Zeilen
-/// (`CARDS_ROWS` plus 1) verlängerte Fläche; übernommen werden nur
-/// Live-Streifen und Chat. Der Körper wird auf `body_lines_wanted` und
-/// `MINI_LIVE_MAX_BODY_LINES` begrenzt und schrumpft vor dem Chat: zuerst
-/// entfällt der Körper, dann die Kopfzeile.
-///
-/// Ohne Wunsch (`body_lines_wanted == 0`) oder bei leerer Fläche gibt es
-/// keinen Streifen und `chat == below_dock`.
-pub(crate) fn portrait_live_strip(below_dock: Rect, body_lines_wanted: u16) -> PortraitLive {
-    let without = PortraitLive {
-        live: None,
-        body_lines: 0,
-        chat: below_dock,
-    };
-    if body_lines_wanted == 0 || below_dock.width == 0 || below_dock.height == 0 {
-        return without;
-    }
-    let dock_rows = harw_tui_layout::CARDS_ROWS.saturating_add(1);
-    let layout = harw_tui_layout::chat_first(harw_tui_layout::ChatFirstInput {
-        area: harw_tui_layout::Rect {
-            x: 0,
-            y: 0,
-            width: below_dock.width,
-            height: below_dock.height.saturating_add(dock_rows),
-        },
-        live_body_lines_wanted: body_lines_wanted,
-        min_chat_rows: harw_tui_layout::MINI_LIVE_MIN_CHAT_ROWS,
+/// Ratatui form of [`harw_tui_layout::MissionLayout`]: the same placement,
+/// rects as `ratatui::layout::Rect` offset by the input area's origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MissionAreas {
+    /// Chosen Mission Control arrangement.
+    pub placement: harw_tui_layout::MissionPlacement,
+    /// Chat area (always present, possibly empty).
+    pub chat: Rect,
+    /// Active Agents window; with `jobs == None` it holds the combined
+    /// agents-and-jobs list.
+    pub agents: Option<Rect>,
+    /// Active Jobs window.
+    pub jobs: Option<Rect>,
+    /// Finished/Failed window or strip.
+    pub finished: Option<Rect>,
+    /// LIVE window or strip (header plus body lines).
+    pub live: Option<Rect>,
+    /// LIVE body lines below the header (0 for a header-only strip).
+    pub live_body_lines: u16,
+    /// Explorer column left of the chat.
+    pub explorer: Option<Rect>,
+    /// Workbench (side-column placements only; never in the portrait stack).
+    pub workbench: Option<Rect>,
+    /// Status row(s).
+    pub status: Rect,
+    /// Composer (or the dialog replacing it).
+    pub composer: Rect,
+}
+
+/// Classifies `area` with [`harw_tui_layout::classify_mission`] for the
+/// visible panels of `state` and converts the result into
+/// [`MissionAreas`] (PL-97 §3.3.2/§3.3.3).
+pub(crate) fn classify_mission(area: Rect, state: &PanelState, rows: MissionRows) -> MissionAreas {
+    let layout = harw_tui_layout::classify_mission(harw_tui_layout::MissionInput {
+        cols: area.width,
+        rows: area.height,
+        status_rows: rows.status,
+        composer_rows: rows.composer,
+        live_body_lines_wanted: rows.live_body_lines,
+        finished_rows_wanted: rows.finished,
+        agents_visible: state.agents_visible,
+        workbench_visible: state.workbench_visible,
+        explorer_visible: state.explorer_visible,
     });
-    let Some(live) = layout.live else {
-        return without;
+    let to_rect = |r: harw_tui_layout::Rect| Rect {
+        x: area.x.saturating_add(r.x),
+        y: area.y.saturating_add(r.y),
+        width: r.width,
+        height: r.height,
     };
-    let body_lines = match layout.live_mode {
-        harw_tui_layout::LiveMode::Body { lines } => lines,
-        harw_tui_layout::LiveMode::Header | harw_tui_layout::LiveMode::Hidden => 0,
-    };
-    PortraitLive {
-        live: Some(Rect {
-            x: below_dock.x,
-            y: below_dock.y,
-            width: below_dock.width,
-            height: live.height,
-        }),
-        body_lines,
-        chat: Rect {
-            x: below_dock.x,
-            y: below_dock.y.saturating_add(live.height),
-            width: below_dock.width,
-            height: layout.chat.height,
+    MissionAreas {
+        placement: layout.placement,
+        chat: to_rect(layout.chat),
+        agents: layout.agents.map(to_rect),
+        jobs: layout.jobs.map(to_rect),
+        finished: layout.finished.map(to_rect),
+        live: layout.live.map(to_rect),
+        live_body_lines: match layout.live_mode {
+            harw_tui_layout::LiveMode::Body { lines } => lines,
+            harw_tui_layout::LiveMode::Header | harw_tui_layout::LiveMode::Hidden => 0,
         },
+        explorer: layout.explorer.map(to_rect),
+        workbench: layout.workbench.map(to_rect),
+        status: to_rect(layout.status),
+        composer: to_rect(layout.composer),
     }
+}
+
+/// Which Mission Control windows were on screen in the last frame (from
+/// `FrameRegions`); [`PanelState`] only focuses visible windows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MissionPresence {
+    /// A separate Active Jobs window exists.
+    pub jobs: bool,
+    /// The Finished/Failed window exists.
+    pub finished: bool,
+    /// The LIVE window is focusable (expanded, outside the portrait stack).
+    pub live: bool,
+    /// The portrait stack is drawn without its card row (the chat keeps its
+    /// floor on a short body): the agents list is not on screen.
+    pub agents_hidden: bool,
 }
 
 /// Welche Fläche Tastatureingaben bekommt.
@@ -217,6 +215,25 @@ pub(crate) enum PaneFocus {
     Explorer,
     Agents,
     Workbench,
+    /// The Active Jobs window (Mission Control, PL-97 C2).
+    Jobs,
+    /// The Finished/Failed window.
+    Finished,
+    /// The LIVE window (focusable only while expanded outside the portrait
+    /// stack).
+    Live,
+}
+
+impl PaneFocus {
+    /// `true` for the agents panel and every Mission Control window: they
+    /// disappear together with `F3`.
+    #[must_use]
+    pub(crate) fn is_mission(self) -> bool {
+        matches!(
+            self,
+            Self::Agents | Self::Jobs | Self::Finished | Self::Live
+        )
+    }
 }
 
 /// Sichtbarkeit und Fokus der Panels.
@@ -229,6 +246,13 @@ pub(crate) struct PanelState {
     /// Ein Panel im Vollbild (ersetzt Chat und das andere Panel).
     pub maximized: bool,
     pub focus: PaneFocus,
+    /// Mission Control windows of the last frame (focus targets).
+    pub mission: MissionPresence,
+    /// Mission Control windows the portrait stack shows with the windows on
+    /// screen and no detail view covering the card row -- also after `F3`
+    /// hid them or while a panel is maximized. `Alt+J`/`Alt+F` decide by it,
+    /// so they never act on the stale presence of a frame without windows.
+    pub revealed: MissionPresence,
 }
 
 impl Default for PanelState {
@@ -239,6 +263,8 @@ impl Default for PanelState {
             workbench_visible: false,
             maximized: false,
             focus: PaneFocus::Chat,
+            mission: MissionPresence::default(),
+            revealed: MissionPresence::default(),
         }
     }
 }
@@ -257,9 +283,10 @@ pub(crate) enum PanelKey {
 impl PanelState {
     /// Globale Panel-Tasten gemäß `bindings`. In der Standard-Belegung
     /// ([`KeyBindings::default`]): `F2` Explorer, `F3` Agenten, `F5`
-    /// Workbench, `F4` Fokus, `Ctrl+E` Explorer fokussieren, `F11` Vollbild
-    /// des fokussierten Panels. `Esc` (nicht umbelegbar) gibt den Fokus aus
-    /// dem Agenten- oder Workbench-Panel an den Chat zurück.
+    /// Workbench, `F4` Fokus, `Ctrl+E` Explorer fokussieren, `Alt+J` Jobs,
+    /// `Alt+F` Finished/Failed, `F11` Vollbild des fokussierten Panels.
+    /// `Esc` (nicht umbelegbar) gibt den Fokus aus dem Agenten-, einem
+    /// Mission- oder dem Workbench-Fenster an den Chat zurück.
     pub(crate) fn handle_key(&mut self, key: KeyEvent, bindings: &KeyBindings) -> PanelKey {
         match bindings.action_for(&key) {
             Some(KeyAction::ToggleExplorer) => {
@@ -272,7 +299,7 @@ impl PanelState {
             }
             Some(KeyAction::ToggleAgents) => {
                 self.agents_visible = !self.agents_visible;
-                if !self.agents_visible && self.focus == PaneFocus::Agents {
+                if !self.agents_visible && self.focus.is_mission() {
                     self.focus = PaneFocus::Chat;
                     self.maximized = false;
                 }
@@ -295,7 +322,38 @@ impl PanelState {
                 self.focus = PaneFocus::Explorer;
                 return PanelKey::Changed;
             }
-            Some(KeyAction::MaximizePanel) if self.focus != PaneFocus::Chat => {
+            // PL-97 C2: ohne eigenes Fenster (kombinierte Liste, breite
+            // Seitenspalte) landen Jobs und Finished/Failed im Agenten-Panel.
+            Some(KeyAction::FocusJobs) => {
+                let presence = self.revealed;
+                self.agents_visible = true;
+                self.maximized = false;
+                self.focus = if presence.jobs {
+                    PaneFocus::Jobs
+                } else {
+                    Self::agents_or_chat(presence)
+                };
+                return PanelKey::Changed;
+            }
+            Some(KeyAction::FocusFinished) => {
+                let presence = self.revealed;
+                self.agents_visible = true;
+                self.maximized = false;
+                self.focus = if presence.finished {
+                    PaneFocus::Finished
+                } else {
+                    Self::agents_or_chat(presence)
+                };
+                return PanelKey::Changed;
+            }
+            // Vollbild nur für die klassischen Panels; die Mission-Fenster
+            // öffnen ihre Details selbst (Enter).
+            Some(KeyAction::MaximizePanel)
+                if matches!(
+                    self.focus,
+                    PaneFocus::Explorer | PaneFocus::Agents | PaneFocus::Workbench
+                ) =>
+            {
                 self.maximized = !self.maximized;
                 return PanelKey::Changed;
             }
@@ -304,7 +362,7 @@ impl PanelState {
         match key.code {
             // Im Explorer gehört Esc zuerst dem Panel (Filter/Vorschau
             // schließen); das Panel gibt den Fokus selbst zurück.
-            KeyCode::Esc if matches!(self.focus, PaneFocus::Agents | PaneFocus::Workbench) => {
+            KeyCode::Esc if self.focus.is_mission() || self.focus == PaneFocus::Workbench => {
                 self.focus = PaneFocus::Chat;
                 self.maximized = false;
                 PanelKey::Changed
@@ -314,23 +372,38 @@ impl PanelState {
         }
     }
 
+    /// Ersatzziel ohne eigenes Jobs- bzw. Finished-Fenster: das
+    /// Agenten-Panel (kombinierte Liste, Seitenspalte), ohne sichtbare
+    /// Kartenzeile der Chat.
+    fn agents_or_chat(presence: MissionPresence) -> PaneFocus {
+        if presence.agents_hidden {
+            PaneFocus::Chat
+        } else {
+            PaneFocus::Agents
+        }
+    }
+
+    /// Ob `focus` gerade ein sichtbares Ziel ist (der Chat immer).
+    pub(crate) fn can_focus(&self, focus: PaneFocus) -> bool {
+        match focus {
+            PaneFocus::Chat => true,
+            PaneFocus::Explorer => self.explorer_visible,
+            PaneFocus::Agents => self.agents_visible && !self.mission.agents_hidden,
+            PaneFocus::Workbench => self.workbench_visible,
+            PaneFocus::Jobs => self.agents_visible && self.mission.jobs,
+            PaneFocus::Finished => self.agents_visible && self.mission.finished,
+            PaneFocus::Live => self.agents_visible && self.mission.live,
+        }
+    }
+
     fn cycle_focus(&mut self) {
-        let order = [
-            PaneFocus::Chat,
-            PaneFocus::Explorer,
-            PaneFocus::Agents,
-            PaneFocus::Workbench,
-        ];
+        let order = crate::mission::FOCUS_ORDER;
         let start = order.iter().position(|f| *f == self.focus).unwrap_or(0);
         for step in 1..=order.len() {
-            let next = order[(start + step) % order.len()];
-            let visible = match next {
-                PaneFocus::Chat => true,
-                PaneFocus::Explorer => self.explorer_visible,
-                PaneFocus::Agents => self.agents_visible,
-                PaneFocus::Workbench => self.workbench_visible,
+            let Some(next) = order.get((start + step) % order.len()).copied() else {
+                continue;
             };
-            if visible {
+            if self.can_focus(next) {
                 self.focus = next;
                 if next == PaneFocus::Chat {
                     self.maximized = false;
@@ -360,12 +433,16 @@ pub(crate) fn split(area: Rect, state: &PanelState) -> PaneAreas {
                 agents: None,
                 workbench: None,
             },
-            PaneFocus::Agents => PaneAreas {
-                explorer: None,
-                chat: None,
-                agents: Some(area),
-                workbench: None,
-            },
+            // Mission-Fenster zeigen im Vollbild (Job-Detailansicht) die
+            // Fläche des Agenten-Panels.
+            PaneFocus::Agents | PaneFocus::Jobs | PaneFocus::Finished | PaneFocus::Live => {
+                PaneAreas {
+                    explorer: None,
+                    chat: None,
+                    agents: Some(area),
+                    workbench: None,
+                }
+            }
             PaneFocus::Workbench => PaneAreas {
                 explorer: None,
                 chat: None,
@@ -525,100 +602,237 @@ mod tests {
         Ok(())
     }
 
+    /// Reference rows: one status row, three composer rows, finished strip
+    /// collapsed.
+    fn mission_rows(live_body_lines: u16) -> MissionRows {
+        MissionRows {
+            status: 1,
+            composer: 3,
+            live_body_lines,
+            finished: 1,
+        }
+    }
+
+    /// PL-97 C2: das Kartenfenster wird ab 68 Spalten in Agenten- und
+    /// Jobs-Fenster geteilt, darunter bleibt es eine kombinierte Liste.
     #[test]
     fn split_dock_areas_splits_at_68_and_combines_below_it() -> TestResult {
-        let dock = Rect::new(0, 0, 68, 12);
-        match split_dock_areas(dock) {
-            DockAreas::Split { agents, jobs } => {
-                assert_eq!(agents.width + jobs.width, dock.width);
-                assert_eq!(jobs.x, dock.x + agents.width);
-            }
-            other => return Err(format!("expected Split, got {other:?}").into()),
-        }
+        let state = PanelState::default();
+        let split = classify_mission(Rect::new(0, 0, 68, 40), &state, mission_rows(0));
+        let agents = split.agents.ok_or("agents window at 68 columns")?;
+        let jobs = split.jobs.ok_or("jobs window at 68 columns")?;
+        assert_eq!(agents.width + jobs.width, 68);
+        assert_eq!(jobs.x, agents.x + agents.width);
+        assert_eq!((agents.y, agents.height), (jobs.y, jobs.height));
 
-        let dock = Rect::new(0, 0, 67, 12);
-        match split_dock_areas(dock) {
-            DockAreas::Combined(r) => assert_eq!(r, dock),
-            other => return Err(format!("expected Combined, got {other:?}").into()),
-        }
+        let combined = classify_mission(Rect::new(0, 0, 67, 40), &state, mission_rows(0));
+        assert_eq!(combined.agents, Some(Rect::new(0, 0, 67, 4)));
+        assert_eq!(combined.jobs, None);
         Ok(())
     }
 
-    /// 46×78 (Referenz-Portrait aus W02): der Dock bleibt bei 15 Zeilen, der
-    /// Streifen kommt aus `chat_first` und der Chat behält den Rest.
+    /// 46×78 (Referenz-Portrait aus W02): Karten (4 Zeilen), Finished-Streifen,
+    /// LIVE-Streifen aus `chat_first`, der Chat behält den Rest; alle Flächen
+    /// folgen dem Ursprung der Eingabefläche.
     #[test]
     fn portrait_live_strip_follows_chat_first_at_46x78() -> TestResult {
-        let screen = classify_screen(Rect::new(0, 0, 46, 78), 1, 3);
-        assert!(matches!(
-            screen.placement,
-            harw_tui_layout::Placement::PortraitDock { .. }
-        ));
-        // Arbeitsfläche 78 - (1 + 3) = 74, Dock = 74 / 3 = 24 -> geklemmt auf 15.
-        assert_eq!(screen.chat, Rect::new(0, 15, 46, 59));
-
-        let two = portrait_live_strip(screen.chat, 2);
-        assert_eq!(two.live, Some(Rect::new(0, 15, 46, 3)));
-        assert_eq!(two.body_lines, 2);
-        assert_eq!(two.chat, Rect::new(0, 18, 46, 56));
+        let state = PanelState::default();
+        let two = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(2));
+        assert_eq!(
+            two.placement,
+            harw_tui_layout::MissionPlacement::PortraitStack
+        );
+        assert_eq!(two.agents, Some(Rect::new(0, 0, 46, 4)));
+        assert_eq!(two.finished, Some(Rect::new(0, 4, 46, 1)));
+        assert_eq!(two.live, Some(Rect::new(0, 5, 46, 3)));
+        assert_eq!(two.live_body_lines, 2);
+        assert_eq!(two.chat, Rect::new(0, 8, 46, 66));
+        assert_eq!(two.status, Rect::new(0, 74, 46, 1));
+        assert_eq!(two.composer, Rect::new(0, 75, 46, 3));
 
         // Mehr als `MINI_LIVE_MAX_BODY_LINES` Wunschzeilen werden gekappt.
         let max = harw_tui_layout::MINI_LIVE_MAX_BODY_LINES;
-        let many = portrait_live_strip(screen.chat, 99);
-        assert_eq!(many.body_lines, max);
-        assert_eq!(many.live, Some(Rect::new(0, 15, 46, 1 + max)));
-        assert_eq!(many.chat, Rect::new(0, 16 + max, 46, 58 - max));
+        let many = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(99));
+        assert_eq!(many.live_body_lines, max);
+        assert_eq!(many.live, Some(Rect::new(0, 5, 46, 1 + max)));
+        assert_eq!(many.chat, Rect::new(0, 6 + max, 46, 68 - max));
 
-        // Ohne Wunsch bleibt der Chat unverändert.
-        let none = portrait_live_strip(screen.chat, 0);
-        assert_eq!(none.live, None);
-        assert_eq!(none.chat, screen.chat);
+        // Ohne Inhalt bleibt nur die Kopfzeile.
+        let none = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(0));
+        assert_eq!(none.live, Some(Rect::new(0, 5, 46, 1)));
+        assert_eq!(none.live_body_lines, 0);
+        assert_eq!(none.chat, Rect::new(0, 6, 46, 68));
+
+        let shifted = classify_mission(Rect::new(3, 2, 46, 78), &state, mission_rows(2));
+        assert_eq!(shifted.live, Some(Rect::new(3, 7, 46, 3)));
+        assert_eq!(shifted.chat, Rect::new(3, 10, 46, 66));
         Ok(())
     }
 
     /// Der Chat behält seine Mindesthöhe: bei knappem Platz entfällt zuerst
-    /// der Körper, dann die Kopfzeile, nie ein Chat-Zeilenanteil darunter.
+    /// der LIVE-Körper, dann die Kopfzeile, nie ein Chat-Zeilenanteil darunter.
     #[test]
     fn portrait_live_strip_collapses_body_then_header_before_the_chat() -> TestResult {
         let floor = harw_tui_layout::MINI_LIVE_MIN_CHAT_ROWS;
         let max = harw_tui_layout::MINI_LIVE_MAX_BODY_LINES;
-        for height in 0..=80u16 {
-            for wanted in 0..=6u16 {
-                let below = Rect::new(3, 7, 46, height);
-                let out = portrait_live_strip(below, wanted);
-                match out.live {
-                    None => {
-                        assert_eq!(out.chat, below, "h={height} w={wanted}");
-                        assert_eq!(out.body_lines, 0, "h={height} w={wanted}");
-                    }
-                    Some(strip) => {
-                        assert!(wanted > 0, "h={height} w={wanted}");
-                        assert_eq!((strip.x, strip.y, strip.width), (3, 7, 46));
-                        assert_eq!(strip.height, 1 + out.body_lines, "h={height} w={wanted}");
-                        assert!(out.body_lines <= wanted.min(max), "h={height} w={wanted}");
-                        assert_eq!(out.chat.y, strip.y + strip.height, "h={height} w={wanted}");
-                        assert_eq!(
-                            strip.height + out.chat.height,
-                            height,
-                            "h={height} w={wanted}"
-                        );
-                        assert!(out.chat.height >= floor, "h={height} w={wanted}");
+        let state = PanelState::default();
+        for height in 28..=60u16 {
+            for composer in 3..=24u16 {
+                for wanted in 0..=6u16 {
+                    let rows = MissionRows {
+                        status: 1,
+                        composer,
+                        live_body_lines: wanted,
+                        finished: 1,
+                    };
+                    let out = classify_mission(Rect::new(0, 0, 46, height), &state, rows);
+                    let ctx = format!("h={height} c={composer} w={wanted}");
+                    assert_eq!(out.composer.height, composer.min(height), "{ctx}");
+                    let Some(strip) = out.live else {
+                        continue;
+                    };
+                    assert_eq!(strip.height, 1 + out.live_body_lines, "{ctx}");
+                    assert!(out.live_body_lines <= wanted.min(max), "{ctx}");
+                    assert_eq!(out.chat.y, strip.y + strip.height, "{ctx}");
+                    assert!(out.chat.height >= floor, "{ctx}");
+                    if out.live_body_lines < wanted.min(max) {
+                        assert_eq!(out.chat.height, floor, "body shrinks first: {ctx}");
                     }
                 }
             }
         }
-        // Genau an den Kanten: 8 Zeilen tragen keinen Streifen, 9 nur die
-        // Kopfzeile, 10 die Kopfzeile mit einer Körperzeile.
-        let at = |height| portrait_live_strip(Rect::new(0, 0, 46, height), 2);
-        assert_eq!(at(8).live, None);
+        // Genau an den Kanten (Karten 4 + Finished 1 + Chat 8 = 13 Zeilen):
+        // 13 Zeilen tragen keinen Streifen, 14 nur die Kopfzeile, 15 die
+        // Kopfzeile mit einer Körperzeile.
+        let at = |body: u16| {
+            let rows = MissionRows {
+                status: 1,
+                composer: 28 - 1 - body,
+                live_body_lines: 2,
+                finished: 1,
+            };
+            classify_mission(Rect::new(0, 0, 46, 28), &state, rows)
+        };
+        assert_eq!(at(13).live, None);
         assert_eq!(
-            (at(9).live.map(|r| r.height), at(9).body_lines),
+            (at(14).live.map(|r| r.height), at(14).live_body_lines),
             (Some(1), 0)
         );
         assert_eq!(
-            (at(10).live.map(|r| r.height), at(10).body_lines),
+            (at(15).live.map(|r| r.height), at(15).live_body_lines),
             (Some(2), 1)
         );
         Ok(())
+    }
+
+    /// PL-97 §3.3.3: `F4` läuft Chat → Agenten → Jobs → Finished → (LIVE nur
+    /// fokussierbar) → Explorer → Workbench → Chat; nicht sichtbare
+    /// Mission-Fenster werden übersprungen; `Esc` gibt an den Chat zurück.
+    #[test]
+    fn focus_cycle_visits_the_mission_windows_in_plan_order() {
+        let bindings = KeyBindings::default();
+        let mut state = PanelState {
+            explorer_visible: true,
+            workbench_visible: true,
+            mission: MissionPresence {
+                jobs: true,
+                finished: true,
+                ..MissionPresence::default()
+            },
+            ..PanelState::default()
+        };
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            state.handle_key(key(KeyCode::F(4)), &bindings);
+            seen.push(state.focus);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                PaneFocus::Agents,
+                PaneFocus::Jobs,
+                PaneFocus::Finished,
+                PaneFocus::Explorer,
+                PaneFocus::Workbench,
+                PaneFocus::Chat,
+            ]
+        );
+        state.mission.live = true;
+        state.focus = PaneFocus::Finished;
+        state.handle_key(key(KeyCode::F(4)), &bindings);
+        assert_eq!(
+            state.focus,
+            PaneFocus::Live,
+            "focusable LIVE joins the cycle"
+        );
+
+        state.focus = PaneFocus::Jobs;
+        assert!(matches!(
+            state.handle_key(key(KeyCode::F(11)), &bindings),
+            PanelKey::ForFocused(_)
+        ));
+        assert!(!state.maximized, "no full screen for mission windows");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Esc), &bindings),
+            PanelKey::Changed
+        );
+        assert_eq!(state.focus, PaneFocus::Chat);
+    }
+
+    /// `Alt+J`/`Alt+F` fokussieren Jobs bzw. Finished/Failed; ohne eigenes
+    /// Fenster landen sie im Agenten-Panel. `F3` gibt den Fokus zurück; sind
+    /// die Fenster ausgeblendet, entscheidet die Lage nach dem Einblenden
+    /// ([`PanelState::revealed`]), nicht das letzte Bild ohne Fenster.
+    #[test]
+    fn alt_j_and_alt_f_focus_jobs_and_finished() {
+        let bindings = KeyBindings::default();
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let windows = MissionPresence {
+            jobs: true,
+            finished: true,
+            ..MissionPresence::default()
+        };
+        let mut state = PanelState::default();
+        assert_eq!(state.handle_key(alt('j'), &bindings), PanelKey::Changed);
+        assert_eq!(
+            state.focus,
+            PaneFocus::Agents,
+            "no jobs window: agents panel"
+        );
+        state.mission = windows;
+        state.revealed = windows;
+        state.handle_key(alt('j'), &bindings);
+        assert_eq!(state.focus, PaneFocus::Jobs);
+        state.handle_key(alt('f'), &bindings);
+        assert_eq!(state.focus, PaneFocus::Finished);
+        state.handle_key(key(KeyCode::F(3)), &bindings);
+        assert!(!state.agents_visible);
+        assert_eq!(state.focus, PaneFocus::Chat, "hiding releases the focus");
+
+        // Das Bild ohne Fenster kennt keine Mission-Fenster mehr; das
+        // Einblenden richtet sich nach `revealed`.
+        state.mission = MissionPresence::default();
+        state.revealed = windows;
+        state.handle_key(alt('f'), &bindings);
+        assert!(state.agents_visible, "Alt+F shows the windows again");
+        assert_eq!(state.focus, PaneFocus::Finished);
+        state.handle_key(key(KeyCode::F(3)), &bindings);
+        state.handle_key(alt('j'), &bindings);
+        assert_eq!(state.focus, PaneFocus::Jobs, "not the stale agents panel");
+
+        // Ohne Kartenzeile (kurzer Körper) gibt es kein Agenten-Ziel.
+        state.mission = MissionPresence {
+            finished: true,
+            agents_hidden: true,
+            ..MissionPresence::default()
+        };
+        state.revealed = state.mission;
+        state.focus = PaneFocus::Chat;
+        state.handle_key(alt('j'), &bindings);
+        assert_eq!(state.focus, PaneFocus::Chat, "no visible agents list");
+        assert!(!state.can_focus(PaneFocus::Agents));
+        state.handle_key(key(KeyCode::F(4)), &bindings);
+        assert_eq!(state.focus, PaneFocus::Finished, "F4 skips the hidden list");
     }
 
     #[test]

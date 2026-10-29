@@ -62,6 +62,8 @@ pub(crate) mod markdown;
 pub(crate) mod matrix_view;
 pub(crate) mod mention;
 pub(crate) mod mention_popup;
+// PL-97 C2: Mission-Control-Fenster (Agenten, Jobs, Finished/Failed, LIVE).
+pub(crate) mod mission;
 pub(crate) mod mode_picker;
 pub mod model_picker;
 pub(crate) mod model_roles_view;

@@ -2355,6 +2355,8 @@ mod tests {
             "-=immediate,show=immediate,today=immediate,search=immediate,agents=immediate",
         ),
         ("diff", "immediate", ""),
+        // PL-97 D3: `/dod` liest nur (Status, Funde, Sensoren).
+        ("dod", "immediate", ""),
         (
             "dream",
             "deferred",
@@ -2413,7 +2415,8 @@ mod tests {
         (
             "skills",
             "deferred",
-            "-=immediate,list=immediate,show=immediate",
+            // PL-97 B3: `preview`/`validate` sind lesend und laufen sofort.
+            "-=immediate,list=immediate,show=immediate,preview=immediate,validate=immediate",
         ),
         ("status", "immediate", ""),
         ("stop", "immediate", ""),
