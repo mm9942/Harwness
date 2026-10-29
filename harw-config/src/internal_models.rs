@@ -71,11 +71,13 @@ pub enum InternalModelPoint {
     /// Providers ([`fast_model_for_active_provider`]) — wie
     /// [`Self::AutoClassifier`].
     WorkDriverJudge,
+    /// Bildverständnis; ohne explizite Wahl nur das bildfähige Hauptmodell.
+    ImageUnderstanding,
 }
 
 impl InternalModelPoint {
     /// Alle Stellen in stabiler Reihenfolge (u. a. für Iteration/Merge).
-    pub const ALL: [InternalModelPoint; 12] = [
+    pub const ALL: [InternalModelPoint; 13] = [
         InternalModelPoint::SessionTitle,
         InternalModelPoint::CompactionSummary,
         InternalModelPoint::MemoryConsolidation,
@@ -88,6 +90,7 @@ impl InternalModelPoint {
         InternalModelPoint::SubOrchestrator,
         InternalModelPoint::AutoClassifier,
         InternalModelPoint::WorkDriverJudge,
+        InternalModelPoint::ImageUnderstanding,
     ];
 
     /// TOML-/Config-Schlüssel dieser Stelle, z. B. `"session_title"`.
@@ -106,6 +109,7 @@ impl InternalModelPoint {
             Self::SubOrchestrator => "sub_orchestrator",
             Self::AutoClassifier => "auto_classifier",
             Self::WorkDriverJudge => "work_driver_judge",
+            Self::ImageUnderstanding => "image_understanding",
         }
     }
 
@@ -143,6 +147,9 @@ impl InternalModelPoint {
             Self::AutoClassifier => {
                 "Beurteilt im Auto-Modus Werkzeugaufrufe (erlauben, fragen, ablehnen)."
             }
+            Self::ImageUnderstanding => {
+                "Versteht Bilder mit einem ausdrücklich gewählten Bildmodell oder dem bildfähigen Hauptmodell."
+            }
             Self::WorkDriverJudge => {
                 "WorkDriver-Richter: bewertet in einem Zug ohne Werkzeuge, ob eine Arbeitsrunde bestanden hat."
             }
@@ -162,6 +169,7 @@ impl InternalModelPoint {
                 | Self::SubOrchestrator
                 | Self::AutoClassifier
                 | Self::WorkDriverJudge
+                | Self::ImageUnderstanding
         )
     }
 
@@ -188,7 +196,8 @@ impl InternalModelPoint {
             | Self::DreamReflection
             | Self::WorkerSimple
             | Self::AutoClassifier
-            | Self::WorkDriverJudge => "nvidia/nemotron-3.5-lightning",
+            | Self::WorkDriverJudge
+            | Self::ImageUnderstanding => "nvidia/nemotron-3.5-lightning",
         }
     }
 }
@@ -243,6 +252,9 @@ pub struct InternalModelsToml {
     /// WorkDriver-Richter-Worker: `[internal_models.work_driver_judge]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_driver_judge: Option<InternalModelChoice>,
+    /// Bildmodell; kein automatischer externer Provider-Fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_understanding: Option<InternalModelChoice>,
 }
 
 impl Default for InternalModelsToml {
@@ -261,6 +273,7 @@ impl Default for InternalModelsToml {
             sub_orchestrator: None,
             auto_classifier: None,
             work_driver_judge: None,
+            image_understanding: None,
         }
     }
 }
@@ -282,6 +295,7 @@ impl InternalModelsToml {
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator.as_ref(),
             InternalModelPoint::AutoClassifier => self.auto_classifier.as_ref(),
             InternalModelPoint::WorkDriverJudge => self.work_driver_judge.as_ref(),
+            InternalModelPoint::ImageUnderstanding => self.image_understanding.as_ref(),
         }
     }
 
@@ -300,6 +314,7 @@ impl InternalModelsToml {
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator = choice,
             InternalModelPoint::AutoClassifier => self.auto_classifier = choice,
             InternalModelPoint::WorkDriverJudge => self.work_driver_judge = choice,
+            InternalModelPoint::ImageUnderstanding => self.image_understanding = choice,
         }
     }
 }
@@ -699,10 +714,47 @@ mod tests {
     }
 
     #[test]
+    fn image_understanding_never_defaults_to_openrouter_and_roundtrips() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
+        let point = InternalModelPoint::ImageUnderstanding;
+        assert!(!point.uses_openrouter_default());
+        assert_eq!(
+            resolve_internal_model(&config, point).source,
+            InternalModelSource::MainModel
+        );
+        config.harness.internal_models.set_choice(
+            point,
+            Some(InternalModelChoice {
+                provider: Some("vision-provider".to_owned()),
+                model: Some("vision-model".to_owned()),
+            }),
+        );
+        let encoded =
+            toml::to_string(&config.harness.internal_models).map_err(ctx("encode image choice"))?;
+        assert!(encoded.contains("image_understanding"));
+        let decoded: InternalModelsToml =
+            toml::from_str(&encoded).map_err(ctx("decode image choice"))?;
+        assert_eq!(
+            decoded.image_understanding,
+            config.harness.internal_models.image_understanding
+        );
+        assert_eq!(
+            resolve_internal_model(&config, point).source,
+            InternalModelSource::Explicit
+        );
+        config.harness.internal_models.set_choice(point, None);
+        assert_eq!(
+            resolve_internal_model(&config, point).source,
+            InternalModelSource::MainModel
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_all_points_have_unique_keys_and_roundtrip() {
         // Runde 5, Teil E: +1 für `auto_classifier`; +1 für
         // `work_driver_judge` (WorkDriver-Richter).
-        assert_eq!(InternalModelPoint::ALL.len(), 12);
+        assert_eq!(InternalModelPoint::ALL.len(), 13);
         for point in InternalModelPoint::ALL {
             assert_eq!(InternalModelPoint::parse(point.key()), Some(point));
             let mut toml = InternalModelsToml::default();

@@ -3647,6 +3647,7 @@ dependencies = [
  "harw-protocol",
  "harw-test-support",
  "rustix 1.1.5",
+ "serde",
  "tempfile",
 ]
 
@@ -4197,6 +4198,7 @@ dependencies = [
  "harw-lens-types",
  "harw-macros",
  "harw-mcp-client",
+ "harw-media",
  "harw-memory",
  "harw-model-catalog",
  "harw-observe",
@@ -4213,6 +4215,7 @@ dependencies = [
  "harw-session-store",
  "harw-tool-container",
  "harw-tool-container-run",
+ "harw-tool-fs",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-remote",
@@ -4631,6 +4634,8 @@ dependencies = [
  "harw-fsutil",
  "harw-home",
  "harw-macros",
+ "harw-media",
+ "harw-protocol",
  "harw-sandbox",
  "harw-tools",
  "harw-types",

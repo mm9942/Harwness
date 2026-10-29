@@ -166,6 +166,8 @@ pub struct AnthropicMessagesProvider {
     /// Wirkung) bis `build_named_provider` sie über
     /// [`Self::configure_budgets`] setzt.
     budgets: crate::budget::ProviderBudgets,
+    /// Exact, identity-bound native assistant rounds; never exposed in logs.
+    thinking_replay: crate::anthropic_replay::AnthropicReplayCache,
 }
 
 impl AnthropicMessagesProvider {
@@ -203,6 +205,7 @@ impl AnthropicMessagesProvider {
             credential_pool: None,
             stream_policy: crate::sse::StreamPolicy::default(),
             budgets: crate::budget::ProviderBudgets::default(),
+            thinking_replay: crate::anthropic_replay::AnthropicReplayCache::default(),
         })
     }
 
@@ -1109,6 +1112,9 @@ impl AnthropicMessagesProvider {
             crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
         let mut wire = build_messages_body(model, self.max_tokens, &request);
         crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
+        // Restore after cache decoration so signed native content stays untouched.
+        self.thinking_replay
+            .apply(&self.provider_id, &messages_url, model, &request, &mut wire)?;
         let stream_sink = request
             .stream
             .as_ref()
@@ -1228,6 +1234,14 @@ impl AnthropicMessagesProvider {
             .await?;
             let value = accumulator.finish()?;
             let response = self.interpret_body(&request, model, &value)?;
+            self.thinking_replay.remember(
+                &self.provider_id,
+                &messages_url,
+                model,
+                &request,
+                &response,
+                &value,
+            )?;
             budget_permit.reconcile(&response.usage);
             return Ok(response);
         }
@@ -1297,6 +1311,14 @@ impl AnthropicMessagesProvider {
 
         let value: Value = serde_json::from_str(&body)?;
         let response = self.interpret_body(&request, model, &value)?;
+        self.thinking_replay.remember(
+            &self.provider_id,
+            &messages_url,
+            model,
+            &request,
+            &response,
+            &value,
+        )?;
         budget_permit.reconcile(&response.usage);
         Ok(response)
     }

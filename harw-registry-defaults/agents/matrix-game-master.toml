@@ -62,6 +62,7 @@ exclude = ["full_parent_transcript", "sibling_transcripts"]
 [tools]
 admitted = [
   "fs.read",
+  "fs.view_image",
   "fs.list",
   "fs.search",
   "fs.glob",

@@ -10,6 +10,8 @@
 //! | `/models` / `/models show` | Tabelle aller Rollen (Provider, Modell, Quelle, Effort) plus Live-Modell der Sitzung |
 //! | `/models set <rolle> <ziel>` | Persistiert das Modell der Rolle in der Profil-`config.toml` |
 //! | `/models reset <rolle>` | Entfernt die explizite Wahl der Rolle (zurück auf ihren Standard) |
+//! | `/models image <ziel>` | Wählt das Bildmodell (`image-understanding`) im Profil; bestätigt Bildfähigkeit vor dem Speichern |
+//! | `/models image [show\|reset]` | Zeigt die Bildmodellwahl oder entfernt sie; ohne Wahl nur bildfähiges Hauptmodell, kein externer Standard |
 //! | `/models worker` | Wahl je UIA-Worker-Rolle („wie UIA“ oder Provider/Modell), Runde 5 Teil G |
 //! | `/models worker <rolle\|all> <uia\|ziel>` | Setzt die Wahl einer bzw. aller UIA-Worker-Rollen |
 //!
@@ -501,6 +503,36 @@ fn render_show(
     }
 }
 
+/// Explicit image choices require declared vision capability before persistence.
+fn validate_image_target(
+    config: &ResolvedConfig,
+    provider: &str,
+    model: &str,
+) -> Result<(), OpError> {
+    let configured = config.models.values().find(|entry| {
+        entry.id == model && canonical_provider_name(config, &entry.provider) == provider
+    });
+    let image_input = configured
+        .and_then(|entry| entry.capabilities.image_input)
+        .or_else(|| {
+            configured
+                .filter(|entry| entry.input_types.iter().any(|kind| kind == "image"))
+                .map(|_| true)
+        })
+        .or_else(|| {
+            harw_model_catalog::descriptor::bootstrap_descriptors()
+                .into_iter()
+                .find(|entry| entry.provider.as_str() == provider && entry.model.as_str() == model)
+                .map(|entry| entry.capabilities.image_input)
+        });
+    if image_input != Some(true) {
+        return Err(OpError::InvalidArguments(format!(
+            "{provider}/{model} ist kein bestätigtes Bildmodell. Wähle ein Modell mit image_input = true; GLM-5.3 unterstützt nur Text."
+        )));
+    }
+    Ok(())
+}
+
 /// Führt `set <rolle> <ziel> [effort]` aus.
 fn handle_set(
     ctx: &OpContext,
@@ -510,6 +542,9 @@ fn handle_set(
     effort_level: Option<harw_types::ReasoningEffort>,
 ) -> Result<OpOutput, OpError> {
     let (provider, model) = resolve_target(config, target)?;
+    if role == ModelRole::ImageUnderstanding {
+        validate_image_target(config, &provider, &model)?;
+    }
     // Lebenszyklus der ausdrücklichen Wahl, noch vor Provider-Bau und
     // Persistenz: ein abgeschaltetes Modell wird abgelehnt und lässt Profil-
     // Config und laufende Montage unverändert, ein abgekündigtes wird mit
@@ -581,6 +616,7 @@ fn handle_set(
         text,
         data: Some(json!({
             "action": "set",
+            "source": "explizit gewählt",
             "role": role.key(),
             "provider": provider,
             "model": model,
@@ -680,6 +716,31 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
         .unwrap_or("show");
 
     match action {
+        "image" => {
+            if args.target.is_some() || args.effort.is_some() {
+                return Err(OpError::InvalidArguments(
+                    "Aufruf: /models image [show|reset|modell|provider/modell]".to_owned(),
+                ));
+            }
+            match args
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some("reset" | "clear") => handle_reset(ctx, ModelRole::ImageUnderstanding),
+                None | Some("show" | "list") => {
+                    let config = crate::provider::resolved_config(ctx)?;
+                    let row =
+                        harw_config::resolve_role_model(&config, ModelRole::ImageUnderstanding);
+                    Ok(render_show(&[row], None, None))
+                }
+                Some(target) => {
+                    let config = crate::provider::resolved_config(ctx)?;
+                    handle_set(ctx, &config, ModelRole::ImageUnderstanding, target, None)
+                }
+            }
+        }
         "show" | "list" => {
             let config = crate::provider::resolved_config(ctx)?;
             let rows = harw_config::resolve_role_models(&config);
@@ -727,7 +788,7 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
             )
         }
         other => Err(OpError::InvalidArguments(format!(
-            "Unbekanntes /models-Sub-Kommando: '{other}'. Gültig: show, \
+            "Unbekanntes /models-Sub-Kommando: '{other}'. Gültig: show, image [show|reset|modell|provider/modell], \
              set <rolle> <modell|provider/modell>, reset <rolle>, \
              worker [<rolle|all> <uia|modell|provider/modell>]."
         ))),
@@ -913,6 +974,75 @@ mod tests {
             .data
             .as_ref()
             .ok_or(TestError::Missing("OpOutput.data"))
+    }
+
+    #[tokio::test]
+    async fn image_shortcut_persists_vision_selection_and_reset() -> TestResult {
+        let mut config = test_config();
+        let mut vision = model("vision-model", "provider-a", &["vision"]);
+        vision.capabilities.image_input = Some(true);
+        config.models.insert("vision".to_owned(), vision);
+        let fixture = fixture(config, None)?;
+        let output = run(&fixture, &["image", "vision"])
+            .await
+            .map_err(ctx("image set"))?;
+        assert_eq!(data(&output)?["role"], "image-understanding");
+        assert_eq!(data(&output)?["provider"], "provider-a");
+        assert_eq!(data(&output)?["model"], "vision-model");
+        run(&fixture, &["image", "reset"])
+            .await
+            .map_err(ctx("image reset"))?;
+        assert_eq!(
+            fixture.recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::ImageUnderstanding,
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("vision-model".to_owned()),
+                },
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::ImageUnderstanding,
+                    provider: None,
+                    model: None,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_role_rejects_unknown_or_text_only_without_persistence() -> TestResult {
+        let mut config = test_config();
+        config
+            .providers
+            .insert("zai".to_owned(), provider("zai", true));
+        let fixture = fixture(config, None)?;
+        for tokens in [
+            vec!["image", "provider-a/model-a-2026"],
+            vec!["set", "image-understanding", "zai/glm-5.3"],
+        ] {
+            assert!(matches!(
+                run(&fixture, &tokens).await,
+                Err(OpError::InvalidArguments(_))
+            ));
+        }
+        assert!(fixture.recorder.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_show_reports_single_role_and_source() -> TestResult {
+        let fixture = fixture(test_config(), None)?;
+        let output = run(&fixture, &["image", "show"])
+            .await
+            .map_err(ctx("image show"))?;
+        let rows = data(&output)?["roles"]
+            .as_array()
+            .ok_or(TestError::Missing("roles"))?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["role"], "image-understanding");
+        assert!(rows[0].get("source").is_some());
+        Ok(())
     }
 
     #[test]

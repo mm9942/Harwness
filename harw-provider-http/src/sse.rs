@@ -1095,4 +1095,56 @@ mod tests {
         assert_eq!(events[0], ModelStreamEvent::TextDelta("x".into()));
         Ok(())
     }
+    #[test]
+    fn native_thinking_stream_keeps_exact_reasoning_with_fragmented_retrieval_call() -> TestResult {
+        let chunks = [
+            serde_json::json!({"id":"thinking","choices":[{"delta":{"reasoning_content":"  Need "}}]}),
+            serde_json::json!({"id":"thinking","choices":[{"delta":{"reasoning_content":"context\n"}}]}),
+            serde_json::json!({"id":"thinking","choices":[{"delta":{"tool_calls":[{"index":0,"id":"context-1","type":"function","function":{"name":"lookup","arguments":"{\"query\":"}}]}}]}),
+            serde_json::json!({"id":"thinking","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"reference\"}"}}]},"finish_reason":"tool_calls"}]}),
+        ];
+        let (sink, seen) = recording_sink();
+        let mut acc = ChatStreamAccumulator::default();
+        for chunk in chunks {
+            acc.push(
+                &SseFrame {
+                    event: None,
+                    data: chunk.to_string(),
+                },
+                Some(&sink),
+            )?;
+        }
+        acc.push(
+            &SseFrame {
+                event: None,
+                data: "[DONE]".into(),
+            },
+            Some(&sink),
+        )?;
+        let body = acc.finish()?;
+        assert!(body["choices"][0]["message"]["content"].is_null());
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"],
+            "  Need context\n"
+        );
+        let parsed = crate::interpret_chat(&body, "thinking-provider", "thinking-model", &[])?;
+        assert!(parsed.message.is_none());
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            serde_json::json!({"query":"reference"})
+        );
+        let events = seen.lock().map(|events| events.clone()).unwrap_or_default();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::ReasoningDelta(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::ToolCallDelta { .. }))
+        );
+        Ok(())
+    }
 }

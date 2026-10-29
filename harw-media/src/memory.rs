@@ -30,8 +30,21 @@ impl MemorySource {
     /// See [`crate::MediaStore::put`].
     pub fn put(&self, bytes: &[u8]) -> Result<MediaRef, MediaError> {
         let (media, clean) = ingest(bytes, self.limits)?;
-        if let Ok(mut images) = self.images.lock() {
-            images.insert(media.digest().to_string(), clean);
+        let mut images = self.images.lock().map_err(|_| MediaError::Corrupt)?;
+        // Hard resident-byte bound, including repeated model-initiated image reads.
+        const MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+        let key = media.digest().to_string();
+        if !images.contains_key(&key) {
+            let mut resident: usize = images.values().map(Vec::len).sum();
+            while resident.saturating_add(clean.len()) > MAX_RESIDENT_BYTES {
+                let Some(old) = images.keys().next().cloned() else {
+                    break;
+                };
+                if let Some(bytes) = images.remove(&old) {
+                    resident = resident.saturating_sub(bytes.len());
+                }
+            }
+            images.insert(key, clean);
         }
         Ok(media)
     }
@@ -40,9 +53,19 @@ impl MemorySource {
 impl MediaSource for MemorySource {
     fn load(&self, media: &MediaRef) -> Result<Vec<u8>, MediaError> {
         let images = self.images.lock().map_err(|_| MediaError::Corrupt)?;
-        images
+        let bytes = images
             .get(&media.digest().to_string())
-            .cloned()
-            .ok_or(MediaError::NotFound)
+            .ok_or(MediaError::NotFound)?;
+        if u64::try_from(bytes.len()).ok() != Some(media.bytes()) {
+            return Err(MediaError::Corrupt);
+        }
+        let seen = crate::inspect::inspect(bytes)?;
+        if seen.format != media.format()
+            || seen.width != media.width()
+            || seen.height != media.height()
+        {
+            return Err(MediaError::Corrupt);
+        }
+        Ok(bytes.clone())
     }
 }

@@ -67,11 +67,13 @@ pub enum ModelRole {
     AutoClassifier,
     /// R14: interner Bewerter des work drivers (DEC-002).
     WorkDriverJudge,
+    /// Bildverständnis mit explizitem Modell oder bildfähigem Hauptmodell.
+    ImageUnderstanding,
 }
 
 impl ModelRole {
     /// Alle Rollen in stabiler Anzeige-Reihenfolge.
-    pub const ALL: [ModelRole; 14] = [
+    pub const ALL: [ModelRole; 15] = [
         ModelRole::Uia,
         ModelRole::UiaWorker,
         ModelRole::Orchestrator,
@@ -86,6 +88,7 @@ impl ModelRole {
         ModelRole::DreamReflection,
         ModelRole::AutoClassifier,
         ModelRole::WorkDriverJudge,
+        ModelRole::ImageUnderstanding,
     ];
 
     /// Kurzer, stabiler Schlüssel für Befehle (`/models set <rolle> …`).
@@ -106,6 +109,7 @@ impl ModelRole {
             Self::DreamReflection => "dream",
             Self::AutoClassifier => "auto-classifier",
             Self::WorkDriverJudge => "work-driver-judge",
+            Self::ImageUnderstanding => "image-understanding",
         }
     }
 
@@ -127,6 +131,7 @@ impl ModelRole {
             Self::DreamReflection => "Traum-Reflexion",
             Self::AutoClassifier => "Auto-Modus-Klassifizierer",
             Self::WorkDriverJudge => "work-driver-Bewerter",
+            Self::ImageUnderstanding => "Bildverständnis",
         }
     }
 
@@ -166,6 +171,7 @@ impl ModelRole {
             Self::DreamReflection => Some(InternalModelPoint::DreamReflection),
             Self::AutoClassifier => Some(InternalModelPoint::AutoClassifier),
             Self::WorkDriverJudge => Some(InternalModelPoint::WorkDriverJudge),
+            Self::ImageUnderstanding => Some(InternalModelPoint::ImageUnderstanding),
         }
     }
 
@@ -346,7 +352,8 @@ fn resolve_provider_model(config: &ResolvedConfig, role: ModelRole) -> ProviderM
         | ModelRole::CompactionSummary
         | ModelRole::SessionTitle
         | ModelRole::MemoryConsolidation
-        | ModelRole::DreamReflection => {
+        | ModelRole::DreamReflection
+        | ModelRole::ImageUnderstanding => {
             let Some(point) = role.internal_point() else {
                 return default_model(config);
             };
@@ -450,7 +457,8 @@ fn resolve_effort(
         | ModelRole::MemoryConsolidation
         | ModelRole::DreamReflection
         | ModelRole::AutoClassifier
-        | ModelRole::WorkDriverJudge => None,
+        | ModelRole::WorkDriverJudge
+        | ModelRole::ImageUnderstanding => None,
     };
     if let Some(effort) = non_empty(role_weight) {
         return Some(effort);

@@ -47,7 +47,9 @@ pub mod symlink;
 #[cfg(test)]
 mod test_support;
 mod tree;
+pub mod view_image;
 pub mod write;
+pub use view_image::FsViewImageExecutor;
 
 pub use edit::FsEditExecutor;
 pub use error::FsToolError;

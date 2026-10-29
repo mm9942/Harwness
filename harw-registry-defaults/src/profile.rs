@@ -938,12 +938,19 @@ pub fn is_orchestrator_role(role: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Die lesenden Werkzeuge von `harw-tool-fs`.
-pub(crate) const FS_READ_ONLY_TOOLS: &[&str] =
-    &["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"];
+pub(crate) const FS_READ_ONLY_TOOLS: &[&str] = &[
+    "fs.read",
+    "fs.view_image",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+];
 
 /// Die vollständige Werkzeugliste von `harw-tool-fs`, in Provider-Reihenfolge.
 const FS_FULL_TOOLS: &[&str] = &[
     "fs.read",
+    "fs.view_image",
     "fs.write",
     "fs.edit",
     "fs.list",
@@ -3920,6 +3927,7 @@ mod tests {
             registered_names(&assembled),
             vec![
                 "fs.read",
+                "fs.view_image",
                 "fs.list",
                 "fs.search",
                 "fs.glob",
@@ -4116,6 +4124,7 @@ mod tests {
     fn test_matrix_reader_profile_exact_tool_surface() -> TestResult {
         let expected = vec![
             "fs.read",
+            "fs.view_image",
             "fs.list",
             "fs.search",
             "fs.glob",
@@ -4137,6 +4146,7 @@ mod tests {
     fn test_workspace_edit_profile_exact_tool_surface() -> TestResult {
         let expected = vec![
             "fs.read",
+            "fs.view_image",
             "fs.write",
             "fs.edit",
             "fs.list",
@@ -4210,6 +4220,7 @@ mod tests {
     fn test_uia_latex_writer_profile_exact_tool_surface() -> TestResult {
         let expected = vec![
             "fs.read",
+            "fs.view_image",
             "fs.write",
             "fs.edit",
             "fs.list",
@@ -4273,6 +4284,7 @@ mod tests {
             tools,
             vec![
                 "fs.read",
+                "fs.view_image",
                 "fs.list",
                 "fs.search",
                 "fs.glob",
@@ -4954,6 +4966,7 @@ mod tests {
         let expected: BTreeSet<&str> = [
             "shell.exec",
             "fs.read",
+            "fs.view_image",
             "fs.list",
             "fs.search",
             "fs.glob",

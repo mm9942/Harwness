@@ -2979,6 +2979,17 @@ impl RuntimeAssemblyBuilder {
             // R18 D-B: nur mit `RuntimeAssemblyBuilder::gateway_port`.
             gateway: gateway_port,
         });
+        let services = services.with_image_inspector(Arc::new(
+            crate::image_model::RuntimeImageInspector::new(
+                Arc::clone(&config),
+                Arc::clone(&live_models),
+                Arc::clone(&default_tree_model),
+                effective_root_provider_id(&config, uia_ir.is_some()),
+                root_model_id.clone(),
+                budget.max_total_tokens.min(2048) as u32,
+                budget.max_total_tokens,
+            ),
+        ));
         // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
         // `with_home_context` legt nur dann einen eigenen an, wenn hier
         // keiner gesetzt wurde.

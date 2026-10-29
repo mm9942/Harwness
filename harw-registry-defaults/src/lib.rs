@@ -182,6 +182,7 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // (Kinder laufen mit `allow_pause = false`), ohne den Escape im
     // `FullAccess`-Modus zu schließen.
     "fs.read",
+    "fs.view_image",
     "fs.list",
     "fs.search",
     "fs.glob",
@@ -1046,6 +1047,7 @@ mod tests {
         // Ohne Browser — auch unter Feature `browser` (W5 RD: nur mit Grant).
         let expected_tools = vec![
             "fs.read".to_owned(),
+            "fs.view_image".to_owned(),
             "fs.write".to_owned(),
             "fs.edit".to_owned(),
             "fs.list".to_owned(),

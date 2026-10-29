@@ -396,6 +396,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // Runde 5, Teil E: Modell des Auto-Modus-Klassifizierers.
     FieldScope { path: "internal_models.auto_classifier", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.work_driver_judge", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.image_understanding", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
     // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -535,7 +536,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_195_entries() {
+    fn test_field_table_has_exactly_196_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -554,7 +555,7 @@ mod merge_rule_tests {
         // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
         // [session_listener]: +6, alle GlobalOnly.
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
-        assert_eq!(FIELD_TABLE.len(), 195);
+        assert_eq!(FIELD_TABLE.len(), 196);
     }
 
     #[test]
@@ -576,7 +577,7 @@ mod merge_rule_tests {
         // [memory]: +11 (`memory.*`).
         // [retention]: +20 ProfileReplaces, +30 MinBound.
         // h7/h9: +2 (`tui.status_expiry`, `tui.goal_mode`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 96);
+        assert_eq!(count(MergeRule::ProfileReplaces), 97);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

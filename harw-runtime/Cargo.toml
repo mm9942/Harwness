@@ -13,6 +13,8 @@ default = ["browser"]
 browser = ["harw-registry-defaults/browser"]
 
 [dependencies]
+harw-media = { path = "../harw-media" }
+harw-tool-fs = { path = "../harw-tool-fs" }
 harw-explorer = { path = "../harw-explorer" }
 harw-command = { path = "../harw-command" }
 harw-authority = { path = "../harw-authority" }
@@ -90,7 +92,7 @@ harw-tool-container-run = { path = "../harw-tool-container-run" }
 harw-tool-remote = { path = "../harw-tool-remote" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
-tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 harw-mcp-client = { path = "../harw-mcp-client" }
 tracing = { workspace = true }
 # secrecy 0.10 wie harw-provider-http/harw-model-catalog (Version = Cargo.lock)
