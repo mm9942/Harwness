@@ -31,8 +31,8 @@ pub struct Requested {
     pub network: NetworkIntent,
     /// Requested memory ceiling in bytes.
     pub memory: Option<u64>,
-    /// A CPU weight or pids ceiling was requested (neither is expressible
-    /// in a pod spec).
+    /// A limit of the whole job the pod spec does not carry was requested:
+    /// `memory_high`, `cpu_weight`, `cpu_max`, `pids_max` or `io_weight`.
     pub inexpressible_limits: bool,
 }
 
@@ -410,8 +410,11 @@ fn resource_limits(doc: &PodDoc, want: &Requested) -> EnforcementState {
         (None, false) => EnforcementState::Enforced,
         (Some(true), false) => EnforcementState::Enforced,
         (Some(false), _) => EnforcementState::NotEnforced,
-        // A CPU weight or pids ceiling cannot be expressed per pod.
-        (_, true) => EnforcementState::Partial,
+        // `memory_high`, `cpu_weight`, `cpu_max`, `pids_max` and `io_weight`
+        // are not in the pod spec: weaker than requested next to an applied
+        // memory ceiling, and nothing applied without one.
+        (Some(true), true) => EnforcementState::Partial,
+        (None, true) => EnforcementState::NotEnforced,
     }
 }
 
@@ -552,6 +555,14 @@ mod tests {
         assert_eq!(
             report_from_pod(&hardened(), &cpu, true).resource_limits,
             EnforcementState::Partial
+        );
+        let only_inexpressible = Requested {
+            memory: None,
+            ..cpu
+        };
+        assert_eq!(
+            report_from_pod(&hardened(), &only_inexpressible, true).resource_limits,
+            EnforcementState::NotEnforced
         );
     }
 

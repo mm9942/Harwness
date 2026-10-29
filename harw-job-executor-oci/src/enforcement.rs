@@ -21,6 +21,10 @@ pub struct Requested {
     pub cpu_shares: Option<u64>,
     /// Requested pids ceiling.
     pub pids: Option<u32>,
+    /// A requested limit of the whole job this backend does not pass to the
+    /// engine (`memory_high`, `cpu_max`, `io_weight`): never read back, so
+    /// the resource dimension is never `Enforced` while one is asked for.
+    pub unmapped_limits: bool,
 }
 
 /// Network intent of a sandbox profile.
@@ -163,6 +167,7 @@ fn resource_limits(doc: &InspectDoc, want: &Requested) -> EnforcementState {
         want.memory.map(|m| host.memory == Some(m)),
         want.cpu_shares.map(|s| host.cpu_shares == Some(s)),
         want.pids.map(|p| host.pids_limit == Some(i64::from(p))),
+        want.unmapped_limits.then_some(false),
     ];
     let asked: Vec<bool> = checks.into_iter().flatten().collect();
     if asked.is_empty() || asked.iter().all(|ok| *ok) {
@@ -220,6 +225,7 @@ mod tests {
             memory: Some(1 << 28),
             cpu_shares: Some(1024),
             pids: Some(64),
+            unmapped_limits: false,
         }
     }
 
@@ -236,6 +242,29 @@ mod tests {
         let report = report_from_inspect(&doc, &want());
         assert_eq!(report.resource_limits, EnforcementState::Partial);
         assert_eq!(report.filesystem, EnforcementState::Enforced);
+    }
+
+    #[test]
+    fn an_unmapped_limit_is_never_enforced() {
+        let only_unmapped = Requested {
+            memory: None,
+            cpu_shares: None,
+            pids: None,
+            unmapped_limits: true,
+            ..want()
+        };
+        assert_eq!(
+            report_from_inspect(&hardened(), &only_unmapped).resource_limits,
+            EnforcementState::NotEnforced
+        );
+        let mixed = Requested {
+            unmapped_limits: true,
+            ..want()
+        };
+        assert_eq!(
+            report_from_inspect(&hardened(), &mixed).resource_limits,
+            EnforcementState::Partial
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 use harw_container_model::{
     LABEL_ATTEMPT, LABEL_EPOCH, LABEL_OWNER, LABEL_TENANT, LABEL_WORK_ID, OwnerLabels, PodInstance,
 };
-use harw_job_core::{ExitOutcome, JobSpec, SandboxProfileName};
+use harw_job_core::{ExitOutcome, JobSpec, ResourceRequest, SandboxProfileName};
 use harw_job_runtime::RuntimeError;
 use harw_job_runtime::coordinator::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
@@ -241,6 +241,41 @@ fn profile_name(profile: SandboxProfileName) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Whether `resources` asks for a limit of the whole job the pod manifest
+/// does not carry: only `memory_max` becomes a container limit; a CPU weight
+/// or bandwidth (`cpu_weight`, `cpu_max`), a pids ceiling, a memory
+/// throttling threshold (`memory_high`) and an I/O weight (`io_weight`) are
+/// not set, so the report never claims the resource dimension `Enforced`.
+///
+/// The request is destructured without a rest pattern, so a new
+/// [`ResourceRequest`] field does not compile until it is classified here.
+fn inexpressible_limits(resources: &ResourceRequest) -> bool {
+    let ResourceRequest {
+        // A container limit (`pod::manifest`), read back as `Requested::memory`.
+        memory_max: _,
+        // Not in the pod manifest.
+        memory_high,
+        cpu_weight,
+        cpu_max,
+        pids_max,
+        io_weight,
+        // Enforced by the coordinator's attempt deadline, not by the pod.
+        wall_timeout: _,
+        // Per-process rlimits: knowingly not handled by this backend yet
+        // (neither applied nor reported; PL-97 follow-up).
+        address_space_max: _,
+        cpu_time_max: _,
+        file_size_max: _,
+        open_files_max: _,
+        require_rlimits: _,
+    } = resources;
+    memory_high.is_some()
+        || cpu_weight.is_some()
+        || cpu_max.is_some()
+        || pids_max.is_some()
+        || io_weight.is_some()
+}
+
 fn exit_outcome(code: Option<i64>) -> ExitOutcome {
     code.and_then(|c| i32::try_from(c).ok())
         .map_or(ExitOutcome::Unknown, ExitOutcome::Exited)
@@ -405,8 +440,7 @@ impl K8sExecutor {
         let requested = Requested {
             network: pod::intent(spec.sandbox_profile),
             memory: spec.resources.memory_max,
-            inexpressible_limits: spec.resources.cpu_weight.is_some()
-                || spec.resources.pids_max.is_some(),
+            inexpressible_limits: inexpressible_limits(&spec.resources),
         };
         let manifest = pod::manifest(cfg, spec, &name, &image.reference(), &labels)?;
 

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use harw_container_model::{ContainerInstance, EngineKind, ImageDigest};
+use harw_job_core::spec::CpuBandwidth;
 use harw_job_core::{
-    AttemptId, ExitOutcome, JobSpec, ResourceRequest, RunnerId, SandboxProfileName,
-    SandboxRequirement,
+    AttemptId, EnforcementState, ExitOutcome, JobSpec, ResourceRequest, RunnerId,
+    SandboxProfileName, SandboxRequirement,
 };
 use harw_job_runtime::RuntimeError;
 use harw_job_runtime::coordinator::{AttemptContext, AttemptEvent, Executor, Probe};
@@ -127,6 +128,87 @@ fn unmet_required_fails_before_the_body_starts() -> TestResult {
         &context(1)?,
     );
     assert!(ok.is_ok());
+    Ok(())
+}
+
+/// PL-97 E2a follow-up: `memory_high`, `cpu_max` and `io_weight` are not
+/// passed to the engine; a request of only these is never `Enforced`, so a
+/// `Required` job is refused before the container starts.
+#[test]
+fn unmapped_resource_fields_are_never_reported_enforced() -> TestResult {
+    let engine = FakeEngine::start(Behavior::default())?;
+    let exec = executor(&engine)?;
+    let cases = [
+        (
+            "memory_high",
+            ResourceRequest {
+                memory_high: Some(1 << 28),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "cpu_max",
+            ResourceRequest {
+                cpu_max: Some(CpuBandwidth::cpus(1)),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "io_weight",
+            ResourceRequest {
+                io_weight: Some(50),
+                ..ResourceRequest::default()
+            },
+        ),
+    ];
+    let job = |requirement, resources: &ResourceRequest| {
+        JobSpec::command("echo")
+            .sandbox(SandboxProfileName::NoNetwork)
+            .sandbox_requirement(requirement)
+            .resources(resources.clone())
+            .build()
+            .map_err(ctx("spec"))
+    };
+    for (epoch, (field, resources)) in (1..).zip(&cases) {
+        let result = exec.start(
+            &job(SandboxRequirement::Required, resources)?,
+            &context(epoch)?,
+        );
+        assert!(
+            matches!(result, Err(RuntimeError::SandboxRequirementNotMet { ref shortfalls, .. })
+                if shortfalls == &["resource_limits"]),
+            "{field}: {result:?}"
+        );
+    }
+    assert!(!engine.saw("POST", "/start"), "no start call");
+    assert_eq!(engine.container_count(), 0, "unused containers removed");
+
+    // BestEffort runs, and the report says what was not applied.
+    for (epoch, (field, resources)) in (10..).zip(&cases) {
+        let started = exec
+            .start(
+                &job(SandboxRequirement::BestEffort, resources)?,
+                &context(epoch)?,
+            )
+            .map_err(ctx("best effort"))?;
+        let report = started.sandbox.ok_or(TestError::Missing("report"))?;
+        assert_eq!(
+            report.resource_limits,
+            EnforcementState::NotEnforced,
+            "{field}"
+        );
+    }
+    // Next to an applied and read-back memory ceiling: partial.
+    let mixed = ResourceRequest {
+        memory_max: Some(1 << 28),
+        cpu_max: Some(CpuBandwidth::cpus(1)),
+        ..ResourceRequest::default()
+    };
+    let started = exec
+        .start(&job(SandboxRequirement::BestEffort, &mixed)?, &context(20)?)
+        .map_err(ctx("mixed"))?;
+    let report = started.sandbox.ok_or(TestError::Missing("report"))?;
+    assert_eq!(report.resource_limits, EnforcementState::Partial);
     Ok(())
 }
 

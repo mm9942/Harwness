@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use harw_container_model::{ImageDigest, PodInstance};
+use harw_job_core::spec::CpuBandwidth;
 use harw_job_core::{
-    AttemptId, ExitOutcome, JobSpec, ResourceRequest, RunnerId, SandboxProfileName,
-    SandboxRequirement,
+    AttemptId, EnforcementState, ExitOutcome, JobSpec, ResourceRequest, RunnerId,
+    SandboxProfileName, SandboxRequirement,
 };
 use harw_job_runtime::RuntimeError;
 use harw_job_runtime::coordinator::{AttemptContext, AttemptEvent, Executor, Probe};
@@ -110,6 +111,87 @@ fn unattested_network_fails_required_before_the_gate_is_lifted() -> TestResult {
         exec.start(&spec(SandboxRequirement::BestEffort, None)?, &context(1)?)
             .is_ok()
     );
+    Ok(())
+}
+
+/// PL-97 E2a follow-up: a pod spec carries none of `memory_high`, `cpu_max`
+/// and `io_weight`; a request of only these is never `Enforced`, so a
+/// `Required` job is refused before the gate is lifted.
+#[test]
+fn inexpressible_resource_fields_are_never_reported_enforced() -> TestResult {
+    let api = FakeApi::start(Behavior::default())?;
+    let exec = executor(&api, true)?;
+    let cases = [
+        (
+            "memory_high",
+            ResourceRequest {
+                memory_high: Some(1 << 28),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "cpu_max",
+            ResourceRequest {
+                cpu_max: Some(CpuBandwidth::cpus(1)),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "io_weight",
+            ResourceRequest {
+                io_weight: Some(50),
+                ..ResourceRequest::default()
+            },
+        ),
+    ];
+    let job = |requirement, resources: &ResourceRequest| {
+        JobSpec::command("echo")
+            .sandbox(SandboxProfileName::NoNetwork)
+            .sandbox_requirement(requirement)
+            .resources(resources.clone())
+            .build()
+            .map_err(ctx("spec"))
+    };
+    for (epoch, (field, resources)) in (1..).zip(&cases) {
+        let result = exec.start(
+            &job(SandboxRequirement::Required, resources)?,
+            &context(epoch)?,
+        );
+        assert!(
+            matches!(result, Err(RuntimeError::SandboxRequirementNotMet { ref shortfalls, .. })
+                if shortfalls == &["resource_limits"]),
+            "{field}: {result:?}"
+        );
+    }
+    assert!(!api.saw("PATCH", "/pods/"), "gate never lifted");
+    assert_eq!(api.pod_count(), 0, "gated pods deleted");
+
+    // BestEffort runs, and the report says nothing was applied.
+    for (epoch, (field, resources)) in (10..).zip(&cases) {
+        let started = exec
+            .start(
+                &job(SandboxRequirement::BestEffort, resources)?,
+                &context(epoch)?,
+            )
+            .map_err(ctx("best effort"))?;
+        let report = started.sandbox.ok_or(TestError::Missing("report"))?;
+        assert_eq!(
+            report.resource_limits,
+            EnforcementState::NotEnforced,
+            "{field}"
+        );
+    }
+    // Next to an applied and read-back memory ceiling: partial.
+    let mixed = ResourceRequest {
+        memory_max: Some(1 << 28),
+        cpu_max: Some(CpuBandwidth::cpus(1)),
+        ..ResourceRequest::default()
+    };
+    let started = exec
+        .start(&job(SandboxRequirement::BestEffort, &mixed)?, &context(20)?)
+        .map_err(ctx("mixed"))?;
+    let report = started.sandbox.ok_or(TestError::Missing("report"))?;
+    assert_eq!(report.resource_limits, EnforcementState::Partial);
     Ok(())
 }
 

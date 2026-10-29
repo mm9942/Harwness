@@ -10,7 +10,7 @@ use harw_container_model::{
     ContainerId, ContainerInstance, ImageDigest, LABEL_ATTEMPT, LABEL_EPOCH, LABEL_OWNER,
     LABEL_TENANT, LABEL_WORK_ID, OwnerLabels,
 };
-use harw_job_core::{ExitOutcome, JobSpec, SandboxProfileName, SandboxReport};
+use harw_job_core::{ExitOutcome, JobSpec, ResourceRequest, SandboxProfileName, SandboxReport};
 use harw_job_runtime::RuntimeError;
 use harw_job_runtime::coordinator::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
@@ -65,6 +65,37 @@ fn network_for(profile: SandboxProfileName) -> (&'static str, NetworkIntent) {
 
 fn cpu_shares(weight: u16) -> u64 {
     (u64::from(weight) * 1024 / 100).clamp(2, 262_144)
+}
+
+/// Whether `resources` asks for a limit of the whole job that
+/// [`create_body`] does not pass to the engine: `memory_high` (no field of
+/// the engine API), `cpu_max` and `io_weight` (not mapped, so nothing to read
+/// back). The report then never claims the resource dimension `Enforced`.
+///
+/// The request is destructured without a rest pattern, so a new
+/// [`ResourceRequest`] field does not compile until it is classified here.
+fn unmapped_limits(resources: &ResourceRequest) -> bool {
+    let ResourceRequest {
+        // Passed to the engine (`create_body`) and read back (`Requested`).
+        memory_max: _,
+        cpu_weight: _,
+        pids_max: _,
+        // No field of the engine API.
+        memory_high,
+        // Not mapped to `CpuQuota`/`CpuPeriod` or `BlkioWeight`.
+        cpu_max,
+        io_weight,
+        // Enforced by the coordinator's attempt deadline, not by the engine.
+        wall_timeout: _,
+        // Per-process rlimits: knowingly not handled by this backend yet
+        // (neither applied nor reported; PL-97 follow-up).
+        address_space_max: _,
+        cpu_time_max: _,
+        file_size_max: _,
+        open_files_max: _,
+        require_rlimits: _,
+    } = resources;
+    memory_high.is_some() || cpu_max.is_some() || io_weight.is_some()
 }
 
 fn work_dir(spec: &JobSpec) -> Result<String, OciError> {
@@ -383,6 +414,7 @@ impl OciExecutor {
             memory: spec.resources.memory_max,
             cpu_shares: spec.resources.cpu_weight.map(cpu_shares),
             pids: spec.resources.pids_max,
+            unmapped_limits: unmapped_limits(&spec.resources),
         };
         let body = create_body(cfg, spec, &image.reference(), &labels, network)?;
 

@@ -13,7 +13,12 @@
 //! - `memory_max` → not mapped. XNU accepts `RLIMIT_AS`/`RLIMIT_DATA` but does
 //!   not enforce them against `mmap`-based allocation; claiming a memory
 //!   ceiling would be a lie.
+//! - `memory_high` → not mapped (no rlimit throttles memory; the same XNU
+//!   caveat as `memory_max` applies).
 //! - `cpu_weight` → not mapped (no rlimit; `nice` is a different contract).
+//! - `cpu_max` → not mapped. `RLIMIT_CPU` caps the total CPU time of one
+//!   process, not the job's bandwidth per period.
+//! - `io_weight` → not mapped (no rlimit; Darwin has no per-job I/O weight).
 //! - `wall_timeout` → not an rlimit; enforced by the supervisor through
 //!   [`crate::TerminationPolicy`], not reported here.
 
@@ -134,19 +139,46 @@ impl RlimitPlan {
             .map_err(|error| ProcessError::InvalidArgument {
                 reason: error.to_string(),
             })?;
+        // Destructured without a rest pattern: a new `ResourceRequest`
+        // field does not compile until it is classified here.
+        let ResourceRequest {
+            memory_max,
+            memory_high,
+            cpu_weight,
+            cpu_max,
+            pids_max,
+            io_weight,
+            // Enforced by the supervisor (`crate::TerminationPolicy`).
+            wall_timeout: _,
+            // Per-process rlimits: knowingly not mapped yet (PL-97
+            // follow-up); the runtime's Darwin executor refuses a job that
+            // sets `require_rlimits` with any of them.
+            address_space_max: _,
+            cpu_time_max: _,
+            file_size_max: _,
+            open_files_max: _,
+            require_rlimits: _,
+        } = request;
         let mut set = RlimitSet::new();
         let mut unmapped = Vec::new();
         let mut mapped_any = false;
-        if let Some(pids) = request.pids_max {
-            let pids = u64::from(pids);
+        if let Some(pids) = pids_max {
+            let pids = u64::from(*pids);
             set.set(RlimitResource::Processes, Some(pids), Some(pids))?;
             mapped_any = true;
         }
-        if request.memory_max.is_some() {
-            unmapped.push("memory_max");
-        }
-        if request.cpu_weight.is_some() {
-            unmapped.push("cpu_weight");
+        // Every requested limit of the whole job without a faithful rlimit
+        // is listed, so a request of only these is never `Enforced`.
+        for (field, requested) in [
+            ("memory_max", memory_max.is_some()),
+            ("memory_high", memory_high.is_some()),
+            ("cpu_weight", cpu_weight.is_some()),
+            ("cpu_max", cpu_max.is_some()),
+            ("io_weight", io_weight.is_some()),
+        ] {
+            if requested {
+                unmapped.push(field);
+            }
         }
         let resource_limits = if mapped_any {
             // RLIMIT_NPROC is per user, never per job.
@@ -170,6 +202,7 @@ mod tests {
     use super::{RlimitPlan, RlimitResource, RlimitSet, RlimitValue};
     use crate::error::ProcessError;
     use crate::test_support::{TestResult, ctx};
+    use harw_job_core::spec::CpuBandwidth;
     use harw_job_core::{EnforcementState, ResourceRequest};
 
     #[test]
@@ -243,6 +276,57 @@ mod tests {
             RlimitPlan::from_request(&invalid),
             Err(ProcessError::InvalidArgument { .. })
         ));
+        Ok(())
+    }
+
+    /// PL-97 E2a follow-up: `memory_high`, `cpu_max` and `io_weight` have no
+    /// Darwin rlimit; a request of only these is unmapped, never `Enforced`.
+    #[test]
+    fn test_plan_lists_memory_high_cpu_max_and_io_weight_as_unmapped() -> TestResult {
+        let cases = [
+            (
+                "memory_high",
+                ResourceRequest {
+                    memory_high: Some(1 << 28),
+                    ..ResourceRequest::default()
+                },
+            ),
+            (
+                "cpu_max",
+                ResourceRequest {
+                    cpu_max: Some(CpuBandwidth::cpus(1)),
+                    ..ResourceRequest::default()
+                },
+            ),
+            (
+                "io_weight",
+                ResourceRequest {
+                    io_weight: Some(50),
+                    ..ResourceRequest::default()
+                },
+            ),
+        ];
+        for (field, request) in cases {
+            let plan = RlimitPlan::from_request(&request).map_err(ctx(field))?;
+            assert_eq!(
+                plan.resource_limits,
+                EnforcementState::Unsupported,
+                "{field}"
+            );
+            assert_eq!(plan.unmapped, vec![field]);
+            assert!(plan.set.is_empty(), "{field}");
+        }
+
+        let all = ResourceRequest {
+            memory_high: Some(1 << 28),
+            cpu_max: Some(CpuBandwidth::cpus(2)),
+            pids_max: Some(32),
+            io_weight: Some(10),
+            ..ResourceRequest::default()
+        };
+        let plan = RlimitPlan::from_request(&all).map_err(ctx("mixed plan"))?;
+        assert_eq!(plan.resource_limits, EnforcementState::Partial);
+        assert_eq!(plan.unmapped, vec!["memory_high", "cpu_max", "io_weight"]);
         Ok(())
     }
 }
