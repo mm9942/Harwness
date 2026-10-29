@@ -10,6 +10,11 @@
 //! Begründungszeilen. Ausführen (Worker starten, Nachrichten schicken, bauen,
 //! den Bewerter fragen) ist Aufgabe des Aufrufers.
 //!
+//! Plangebundene Aufrufer verwenden [`WorkDriver::decide_with_plan`]: dieser
+//! additive Einstieg begrenzt neue und fortgesetzte Coding-Schritte auf
+//! eindeutig zugeordnete, bereite Knoten mit abgeschlossenen Abhängigkeiten.
+//! Er ersetzt weder Plan-Statusübergänge noch atomare Admission/Isolation.
+//!
 //! # Die Arbeitsweise, die hier kodiert ist
 //! Der Treiber bildet eine bewährte Arbeitsweise mit parallelen Agenten ab:
 //!
@@ -109,11 +114,11 @@
 //! # }
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use harw_plan::goal::{Goal, GoalReport, GoalStatus};
 use harw_plan::ids::PathOrSymbol;
-use harw_plan::types::{Criterion, Plan, VerificationStep};
+use harw_plan::types::{Criterion, Plan, PlanNodeKind, PlanNodeStatus, VerificationStep};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
@@ -606,7 +611,8 @@ pub struct WorkDriveInput<'a> {
     /// Vorgeschlagene Scopes (aus `write_scope` der Plan-Knoten, siehe
     /// [`scope_hints_from_plan`]); für ein Kriterium ohne Hinweis leitet der
     /// Treiber einen Scope aus dessen Artefakt-Schritten ab, ohne solche den
-    /// Workspace-Scope ([`WORKSPACE_SCOPE`]).
+    /// Workspace-Scope ([`WORKSPACE_SCOPE`]). `decide_with_plan` ignoriert
+    /// diese Hinweise und leitet sie selbst aus dem geprüften Snapshot ab.
     pub scope_hints: &'a [WorkScope],
     /// Verbrauch bis `now`.
     pub usage: BudgetUsageSnapshot,
@@ -756,6 +762,44 @@ impl WorkDriver {
     /// Einen [`WorkDrivePlan`]; leer (mit Begründung), wenn das Goal terminal
     /// ist oder nur auf laufende Worker gewartet wird.
     pub fn decide(input: &WorkDriveInput<'_>) -> WorkDrivePlan {
+        Self::decide_inner(input, None)
+    }
+
+    /// Entscheidet mit einem gebundenen Plan-Snapshot statt unverbindlichen Hinweisen.
+    ///
+    /// Fehlende oder mehrdeutige Kriteriumszuordnungen, unfertige Abhängigkeiten
+    /// und nicht ausführbare Knoten erzeugen keinen Workspace-Fallback. Neue
+    /// Coding-/Integration-/Docs-Worker brauchen `Ready`; Fortsetzungen dürfen
+    /// außerdem `InProgress` sein und müssen ihren unveränderten Scope behalten.
+    /// Recherche, Verträge und Statusübergänge bleiben beim Plan-Controller.
+    ///
+    /// Dies ist eine Scheduling-Prüfung, keine Autorität oder atomare Admission:
+    /// der Aufrufer muss Planrevision, Abbruch und Rechte vor Effekten erneut
+    /// prüfen. Bereits laufende Worker werden hier nicht gestoppt. Ein am Goal
+    /// gepinnter anderer Planstand muss vor weiteren Vorschlägen reconciliert
+    /// werden. Alte Worker werden nicht umgebunden oder aus der Historie entfernt:
+    /// bei geändertem Scope/Plan oder ausgeschöpften alten Worker-Plätzen muss
+    /// der Lauf gestoppt und mit aktueller Planbindung neu aufgenommen werden;
+    /// eine Operator-Notiz allein ist keine Re-Admission. Ohne Plan bleibt [`Self::decide`] unverändert verfügbar.
+    pub fn decide_with_plan(input: &WorkDriveInput<'_>, plan: &Plan) -> WorkDrivePlan {
+        if is_terminal(input.goal.status) {
+            return Self::decide(input);
+        }
+        let schedule = match PlanSchedule::new(input.goal, plan) {
+            Ok(schedule) => schedule,
+            Err(reason) => return plan_reconciliation(reason),
+        };
+        let hints: Vec<WorkScope> = schedule.dispatch.values().cloned().collect();
+        let guarded = WorkDriveInput {
+            scope_hints: &hints,
+            ..*input
+        };
+        let mut result = Self::decide_inner(&guarded, Some(&schedule));
+        schedule.guard_steps(&guarded, &mut result);
+        result
+    }
+
+    fn decide_inner(input: &WorkDriveInput<'_>, schedule: Option<&PlanSchedule>) -> WorkDrivePlan {
         let mut out = WorkDrivePlan::default();
         if is_terminal(input.goal.status) {
             out.rationale.push(format!(
@@ -767,7 +811,11 @@ impl WorkDriver {
 
         let mut workers: Vec<&WorkerState> = input.workers.iter().collect();
         workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
-        let view = GoalView::new(input);
+        let mut view = GoalView::new(input);
+        if let Some(schedule) = schedule {
+            view.dispatchable
+                .retain(|index| schedule.dispatch.contains_key(index));
+        }
         let quiescent = workers.iter().all(|worker| is_settled(worker));
 
         if quiescent && view.ready_to_propose(input) {
@@ -803,10 +851,205 @@ impl WorkDriver {
     }
 }
 
+/// Ausschließlich aus dem aktuellen Plan abgeleitete Scheduling-Sicht.
+struct PlanSchedule {
+    dispatch: BTreeMap<usize, WorkScope>,
+    continuation: BTreeMap<usize, WorkScope>,
+    revision: harw_plan::RevisionId,
+}
+
+impl PlanSchedule {
+    fn new(goal: &Goal, plan: &Plan) -> Result<Self, String> {
+        if plan.goal_id.as_deref() != Some(goal.id.as_str())
+            || plan.tenant != goal.tenant
+            || goal.plan_id.as_ref().is_some_and(|id| id != &plan.id)
+            || goal
+                .plan_revision
+                .is_some_and(|revision| revision != plan.revision)
+        {
+            return Err(
+                "Plan/Goal-Bindung oder gepinnte Revision passt nicht; zuerst reconciliieren."
+                    .to_owned(),
+            );
+        }
+        let unique: BTreeSet<_> = plan.nodes.iter().map(|node| node.id.as_str()).collect();
+        if unique.len() != plan.nodes.len() {
+            return Err("Mehrdeutige Plan-Knoten-IDs; zuerst reconciliieren.".to_owned());
+        }
+        let mut schedule = Self {
+            dispatch: BTreeMap::new(),
+            continuation: BTreeMap::new(),
+            revision: plan.revision,
+        };
+        for (index, criterion) in goal.acceptance_criteria.iter().enumerate() {
+            let mut matches = plan.nodes.iter().filter(|node| {
+                node.acceptance_criteria
+                    .iter()
+                    .any(|own| same_criterion(own, criterion))
+            });
+            let Some(node) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_some()
+                || !matches!(
+                    node.kind,
+                    PlanNodeKind::Coding | PlanNodeKind::Integration | PlanNodeKind::Docs
+                )
+                || !matches!(
+                    node.status,
+                    PlanNodeStatus::Ready | PlanNodeStatus::InProgress
+                )
+                || !harw_plan::graph::blocked_by(plan, &node.id).is_empty()
+            {
+                continue;
+            }
+            let paths: Vec<String> = node
+                .write_scope
+                .iter()
+                .map(|entry| match entry {
+                    PathOrSymbol::Path(path) | PathOrSymbol::Symbol { path, .. } => path.clone(),
+                })
+                .collect();
+            let owned_paths = normalize_paths(&paths);
+            // Teilweise verstandene Scopes werden nicht stillschweigend verkleinert
+            // oder über den Workspace-Fallback erweitert.
+            if paths.iter().any(|path| {
+                !is_relative_path(path)
+                    || path.contains(['*', '?', '[', '\\'])
+                    || normalize_paths(std::slice::from_ref(path)).is_empty()
+            }) || owned_paths.is_empty()
+                || owned_paths.iter().any(|path| {
+                    !is_relative_path(path)
+                        || path == WORKSPACE_SCOPE
+                        || path.contains(['*', '?', '['])
+                })
+            {
+                continue;
+            }
+            let scope = WorkScope {
+                id: format!("plan-{}@{}", node.id.as_str(), plan.revision),
+                summary: node.objective.clone(),
+                owned_paths,
+                criteria: vec![index],
+            };
+            if node.status == PlanNodeStatus::Ready {
+                schedule.dispatch.insert(index, scope.clone());
+            }
+            schedule.continuation.insert(index, scope);
+        }
+        Ok(schedule)
+    }
+
+    fn scope_matches(scopes: &BTreeMap<usize, WorkScope>, scope: &WorkScope) -> bool {
+        if scope.criteria.is_empty()
+            || scope
+                .criteria
+                .iter()
+                .any(|index| !scopes.contains_key(index))
+        {
+            return false;
+        }
+        let paths: Vec<String> = scope
+            .criteria
+            .iter()
+            .filter_map(|index| scopes.get(index))
+            .flat_map(|expected| expected.owned_paths.iter().cloned())
+            .collect();
+        normalize_paths(&scope.owned_paths) == normalize_paths(&paths)
+    }
+
+    fn scope_identity(scopes: &BTreeMap<usize, WorkScope>, scope: &WorkScope) -> Option<String> {
+        let identities: BTreeSet<&str> = scope
+            .criteria
+            .iter()
+            .map(|index| scopes.get(index).map(|scope| scope.id.as_str()))
+            .collect::<Option<_>>()?;
+        serde_json::to_string(&identities)
+            .ok()
+            .map(|ids| format!("plan-scopes:{ids}"))
+    }
+
+    fn guard_steps(&self, input: &WorkDriveInput<'_>, result: &mut WorkDrivePlan) {
+        let before = result.steps.len();
+        result.steps.retain_mut(|step| match step {
+            WorkDriveStep::Delegate { scope, task, .. } => {
+                if !Self::scope_matches(&self.dispatch, scope) {
+                    return false;
+                }
+                let Some(identity) = Self::scope_identity(&self.dispatch, scope) else {
+                    return false;
+                };
+                scope.id = identity;
+                *task = render_task(input.goal, scope, &[]);
+                true
+            }
+            WorkDriveStep::Continue { worker_id, .. }
+            | WorkDriveStep::Respawn { worker_id, .. } => input
+                .workers
+                .iter()
+                .find(|worker| &worker.worker_id == worker_id)
+                .is_some_and(|worker| {
+                    Self::scope_matches(&self.continuation, &worker.scope)
+                        && Self::scope_identity(&self.continuation, &worker.scope).as_deref()
+                            == Some(worker.scope.id.as_str())
+                        && claimed_criteria(worker)
+                            .iter()
+                            .all(|index| worker.scope.criteria.contains(index))
+                }),
+            _ => true,
+        });
+        let blocked = input
+            .report
+            .criteria_open
+            .iter()
+            .any(|index| !self.dispatch.contains_key(index));
+        let idle_with_open_work = result.steps.is_empty()
+            && !input.report.criteria_open.is_empty()
+            && !input
+                .workers
+                .iter()
+                .any(|worker| worker.last_result.is_none());
+        if before != result.steps.len() || blocked || idle_with_open_work {
+            result.rationale.push(format!(
+                "Planrevision {}: nicht ausführbare, unklare oder geänderte Scopes zurückgestellt.",
+                self.revision
+            ));
+            // Aktive Worker dürfen enden; danach braucht der Controller einen
+            // neuen Planstand statt einer Endlosschleife oder breiterer Rechte.
+            if result.steps.is_empty()
+                && !input
+                    .workers
+                    .iter()
+                    .any(|worker| worker.last_result.is_none())
+            {
+                result
+                    .rationale
+                    .retain(|line| line != "Nichts zu tun: warte auf laufende Worker.");
+                result.steps.push(WorkDriveStep::Escalate {
+                    worker_id: None,
+                    question: "Plan/Worker-Belegung zuerst reconciliieren: offene Kriterien haben keinen sicher ausführbaren nächsten Schritt (Knotenbereitschaft, Scope oder belegte Worker-Plätze). Bei veralteten Scopes oder abgeschlossenen Vorgänger-Workern: Lauf stoppen und mit aktueller Planbindung neu aufnehmen. Eine Operator-Notiz allein bindet alte Worker nicht neu.".to_owned(),
+                });
+            }
+        }
+    }
+}
+
+fn plan_reconciliation(reason: String) -> WorkDrivePlan {
+    WorkDrivePlan {
+        steps: vec![WorkDriveStep::Escalate {
+            worker_id: None,
+            question: reason.clone(),
+        }],
+        rationale: vec![reason],
+    }
+}
+
 /// Vorberechnete Sicht auf offene Kriterien.
 struct GoalView {
     /// Alle offenen, im Goal existierenden Kriterien.
     open: BTreeSet<usize>,
+    /// Offene Kriterien, die aktuell delegiert werden dürfen.
+    dispatchable: BTreeSet<usize>,
     /// Offene Kriterien, die Evidenz entscheiden kann.
     evidence_open: Vec<usize>,
     /// Offene Kriterien, die nur der Bewerter entscheiden kann.
@@ -831,6 +1074,7 @@ impl GoalView {
                     .is_some_and(needs_judge)
             });
         Self {
+            dispatchable: open.clone(),
             open,
             evidence_open,
             judge_open,
@@ -1303,7 +1547,7 @@ fn delegate_uncovered(
         .collect();
     let judge_met = input.judge.is_some_and(|verdict| verdict.passed);
     let uncovered: Vec<usize> = view
-        .open
+        .dispatchable
         .iter()
         .copied()
         .filter(|idx| !covered.contains(idx))
@@ -1482,14 +1726,18 @@ fn scope_for(
 /// - einen Schreibbereich (`write_scope`) mit mindestens einem konkreten
 ///   Pfad hat — Glob-Muster (`*`, `?`, `[`) werden übersprungen, weil der
 ///   Schreibbereichs-Abgleich des Aufrufers nur Datei- und
-///   Verzeichnispfade kennt (fail closed: lieber kein Hinweis als ein zu
-///   weiter), bei Symbol-Einträgen zählt deren Datei — und
+///   Verzeichnispfade kennt; bei Symbol-Einträgen zählt deren Datei — und
 /// - mindestens ein Akzeptanzkriterium des Goals trägt: gleiche
 ///   (getrimmte, nicht leere) Beschreibung oder gleiche, nicht leere
 ///   Verifikationsschritte.
 ///
 /// `summary` ist das Ziel des Knotens. Die Reihenfolge folgt dem Plan;
 /// [`WorkDriver::decide`] sortiert Hinweise ohnehin nach `id`.
+///
+/// Dies sind unverbindliche Hinweise: Status, Art, Abhängigkeiten und
+/// Revisionsbindung werden hier nicht geprüft. Ein leerer Hinweis verhindert
+/// den Fallback von `decide` nicht. Für plangebundene Ausführung ist deshalb
+/// [`WorkDriver::decide_with_plan`] erforderlich.
 ///
 /// # Arguments
 /// - `goal`: das getriebene Goal (Kriterien-Indizes beziehen sich darauf).
@@ -1634,6 +1882,9 @@ fn render_check(step: &VerificationStep) -> String {
         }
         VerificationStep::Artifact { path } => format!("file `{path}` exists"),
         VerificationStep::TraceEvent { name } => format!("trace event `{name}`"),
+        VerificationStep::CollectSources { sources } => {
+            format!("collect admitted sources: {}", sources.join(", "))
+        }
         VerificationStep::Manual { note } => format!("manual review: {note}"),
     }
 }
@@ -2709,6 +2960,407 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    fn scheduling_plan(nodes: Vec<PlanNode>) -> TestResult<Plan> {
+        Ok(Plan {
+            id: harw_plan::PlanId::parse("p-drive")
+                .map_err(|error| TestError::Unexpected(error.to_string()))?,
+            revision: harw_plan::RevisionId::new(1),
+            parent_revision: None,
+            goal_statement: "Treiberziel".to_owned(),
+            goal_id: Some("g-drive".to_owned()),
+            nodes,
+            created_at: now(),
+            updated_at: now(),
+            tenant: None,
+        })
+    }
+
+    #[test]
+    fn plan_readiness_blocks_dependencies_without_workspace_fallback() -> TestResult {
+        let fx = Fixture::new(goal_n(1), report(1, &[0]));
+        let mut coding = plan_node(
+            "coding",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        coding.dependencies.push(harw_plan::TaskId::new("research"));
+        let plan = scheduling_plan(vec![coding])?;
+        let decision = WorkDriver::decide_with_plan(&fx.input(), &plan);
+        assert!(delegates(&decision).is_empty(), "{decision:?}");
+        assert!(matches!(
+            only_step(&decision)?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_runs_only_independent_ready_scopes() -> TestResult {
+        let fx = Fixture::new(goal_n(3), report(3, &[0, 1, 2]));
+        let mut nodes: Vec<_> = fx
+            .goal
+            .acceptance_criteria
+            .iter()
+            .enumerate()
+            .map(|(index, criterion)| {
+                plan_node(
+                    &format!("n{index}"),
+                    vec![PathOrSymbol::new(format!("src/{index}.rs"))],
+                    vec![criterion.clone()],
+                )
+            })
+            .collect();
+        if let Some(node) = nodes.get_mut(0) {
+            node.dependencies.push(harw_plan::TaskId::new("research"));
+        }
+        let plan = scheduling_plan(nodes)?;
+        let decision = WorkDriver::decide_with_plan(&fx.input(), &plan);
+        let criteria: Vec<_> = delegates(&decision)
+            .iter()
+            .map(|scope| scope.criteria.clone())
+            .collect();
+        assert_eq!(criteria, vec![vec![1], vec![2]], "{decision:?}");
+        assert!(
+            !decision
+                .steps
+                .iter()
+                .any(|step| matches!(step, WorkDriveStep::Escalate { .. }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_rejects_missing_or_ambiguous_mapping() -> TestResult {
+        let fx = Fixture::new(goal_n(1), report(1, &[0]));
+        let node = plan_node(
+            "n1",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        let other = plan_node(
+            "n2",
+            vec![PathOrSymbol::new("src/b.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        for nodes in [vec![], vec![node, other]] {
+            let decision = WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(nodes)?);
+            assert!(delegates(&decision).is_empty(), "{decision:?}");
+            assert!(matches!(
+                only_step(&decision)?,
+                WorkDriveStep::Escalate { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_rejects_terminal_draft_and_non_coding_nodes() -> TestResult {
+        let fx = Fixture::new(goal_n(1), report(1, &[0]));
+        for status in [
+            harw_plan::PlanNodeStatus::Draft,
+            harw_plan::PlanNodeStatus::Completed,
+            harw_plan::PlanNodeStatus::Invalidated,
+            harw_plan::PlanNodeStatus::Superseded,
+            harw_plan::PlanNodeStatus::Blocked,
+            harw_plan::PlanNodeStatus::InProgress,
+        ] {
+            let mut node = plan_node(
+                "n",
+                vec![PathOrSymbol::new("src/a.rs")],
+                fx.goal.acceptance_criteria.clone(),
+            );
+            node.status = status;
+            let decision = WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![node])?);
+            assert!(delegates(&decision).is_empty(), "{status:?}: {decision:?}");
+        }
+        let mut node = plan_node(
+            "research",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        node.kind = harw_plan::PlanNodeKind::Research;
+        assert!(
+            delegates(&WorkDriver::decide_with_plan(
+                &fx.input(),
+                &scheduling_plan(vec![node])?
+            ))
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_rejects_stale_revision_and_foreign_goal() -> TestResult {
+        let mut fx = Fixture::new(goal_n(1), report(1, &[0]));
+        let plan = scheduling_plan(vec![plan_node(
+            "n",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        )])?;
+        fx.goal.plan_revision = Some(harw_plan::RevisionId::new(2));
+        assert!(matches!(
+            only_step(&WorkDriver::decide_with_plan(&fx.input(), &plan))?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        fx.goal.plan_revision = None;
+        let mut foreign = plan;
+        foreign.goal_id = Some("other-goal".to_owned());
+        assert!(matches!(
+            only_step(&WorkDriver::decide_with_plan(&fx.input(), &foreign))?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_completed_dependency_allows_ready_coding() -> TestResult {
+        let fx = Fixture::new(goal_n(1), report(1, &[0]));
+        let mut research = plan_node("research", Vec::new(), Vec::new());
+        research.kind = PlanNodeKind::Research;
+        research.status = PlanNodeStatus::Completed;
+        let mut coding = plan_node(
+            "coding",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        coding.dependencies.push(research.id.clone());
+        let decision =
+            WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![research, coding])?);
+        assert_eq!(delegates(&decision).len(), 1, "{decision:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_rejects_unrepresentable_scopes_and_judge_fallback() -> TestResult {
+        let fx = Fixture::new(goal_n(1), report(1, &[0]));
+        for paths in [
+            vec![],
+            vec!["."],
+            vec!["src/a.rs", "src/**"],
+            vec!["../outside"],
+            vec!["/", "src/a.rs"],
+            vec!["./", "src/a.rs"],
+        ] {
+            let node = plan_node(
+                "n",
+                paths.into_iter().map(PathOrSymbol::new).collect(),
+                fx.goal.acceptance_criteria.clone(),
+            );
+            let decision = WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![node])?);
+            assert!(delegates(&decision).is_empty(), "{decision:?}");
+        }
+        let mut fx = Fixture::new(goal(vec![manual_criterion("docs")]), report(1, &[0]));
+        fx.verification = VerificationState::Passed;
+        fx.judge = Some(JudgeVerdict {
+            passed: false,
+            comment: "missing".to_owned(),
+            missing: vec!["docs".to_owned()],
+        });
+        let node = plan_node(
+            "n",
+            vec![PathOrSymbol::new("docs/a.md")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        let decision = WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![node])?);
+        assert!(delegates(&decision).is_empty(), "{decision:?}");
+        assert!(matches!(
+            only_step(&decision)?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_continues_matching_in_progress_worker_but_not_changed_scope() -> TestResult {
+        let mut fx = Fixture::new(goal_n(1), report(1, &[0]));
+        fx.workers.push(worker(
+            "w1",
+            &[0],
+            &["src/a.rs"],
+            Some(WorkerOutcome::Partial),
+        ));
+        let mut node = plan_node(
+            "n",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        let ready = scheduling_plan(vec![node.clone()])?;
+        let schedule = PlanSchedule::new(&fx.goal, &ready).map_err(TestError::Unexpected)?;
+        if let Some(worker) = fx.workers.first_mut() {
+            worker.scope.id = PlanSchedule::scope_identity(&schedule.dispatch, &worker.scope)
+                .ok_or(TestError::Missing("scope identity"))?;
+        }
+        node.status = PlanNodeStatus::InProgress;
+        let plan = scheduling_plan(vec![node.clone()])?;
+        let decision = WorkDriver::decide_with_plan(&fx.input(), &plan);
+        assert!(matches!(
+            only_step(&decision)?,
+            WorkDriveStep::Continue { .. }
+        ));
+        node.write_scope = vec![PathOrSymbol::new("src/b.rs")];
+        let changed = WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![node])?);
+        assert!(matches!(
+            only_step(&changed)?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_overlapping_tasks_merge_with_all_node_identities() -> TestResult {
+        let mut fx = Fixture::new(goal_n(2), report(2, &[0, 1]));
+        let nodes: Vec<_> = fx
+            .goal
+            .acceptance_criteria
+            .iter()
+            .enumerate()
+            .map(|(index, criterion)| {
+                plan_node(
+                    &format!("n{index}"),
+                    vec![PathOrSymbol::new("src/shared.rs")],
+                    vec![criterion.clone()],
+                )
+            })
+            .collect();
+        let plan = scheduling_plan(nodes)?;
+        let admitted = WorkDriver::decide_with_plan(&fx.input(), &plan);
+        assert_eq!(delegates(&admitted).len(), 1, "{admitted:?}");
+        let scope = delegates(&admitted)
+            .first()
+            .copied()
+            .ok_or(TestError::Missing("delegate"))?
+            .clone();
+        assert_eq!(scope.criteria, vec![0, 1]);
+        assert!(scope.id.contains("plan-n0@1") && scope.id.contains("plan-n1@1"));
+        let mut old_worker = worker(
+            "w1",
+            &[0, 1],
+            &["src/shared.rs"],
+            Some(WorkerOutcome::Partial),
+        );
+        old_worker.scope = scope;
+        fx.workers.push(old_worker);
+        assert!(matches!(
+            only_step(&WorkDriver::decide_with_plan(&fx.input(), &plan))?,
+            WorkDriveStep::Continue { .. }
+        ));
+        let mut replaced = plan;
+        if let Some(node) = replaced.nodes.get_mut(1) {
+            node.id = harw_plan::TaskId::new("replacement");
+        }
+        assert!(matches!(
+            only_step(&WorkDriver::decide_with_plan(&fx.input(), &replaced))?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_replacement_or_new_revision_cannot_resume_old_worker() -> TestResult {
+        let mut fx = Fixture::new(goal_n(1), report(1, &[0]));
+        let node = plan_node(
+            "original",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        let original = scheduling_plan(vec![node.clone()])?;
+        let admitted = WorkDriver::decide_with_plan(&fx.input(), &original);
+        let admitted_scope = delegates(&admitted)
+            .first()
+            .copied()
+            .ok_or(TestError::Missing("delegate"))?
+            .clone();
+        let mut old_worker = worker("w1", &[0], &["src/a.rs"], Some(WorkerOutcome::Partial));
+        old_worker.scope = admitted_scope;
+        fx.workers.push(old_worker);
+        let mut replacement = node;
+        replacement.id = harw_plan::TaskId::new("replacement");
+        let replaced =
+            WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![replacement])?);
+        assert!(matches!(
+            only_step(&replaced)?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        let mut newer = original;
+        newer.revision = harw_plan::RevisionId::new(2);
+        let revised = WorkDriver::decide_with_plan(&fx.input(), &newer);
+        assert!(matches!(
+            only_step(&revised)?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_finished_predecessor_requires_reconciliation_instead_of_stalling()
+    -> TestResult {
+        for (capacity, next_path) in [(1, "src/a.rs"), (1, "src/b.rs"), (2, "src/a.rs")] {
+            let mut fx = Fixture::new(goal_n(2), report(2, &[1]));
+            fx.limits.max_parallel_workers = capacity;
+            fx.verification = VerificationState::Passed;
+            fx.workers.push(worker(
+                "previous",
+                &[0],
+                &["src/a.rs"],
+                Some(WorkerOutcome::Done),
+            ));
+            let mut previous = plan_node(
+                "previous",
+                vec![PathOrSymbol::new("src/a.rs")],
+                vec![fx.goal.acceptance_criteria[0].clone()],
+            );
+            previous.status = PlanNodeStatus::Completed;
+            let mut next = plan_node(
+                "next",
+                vec![PathOrSymbol::new(next_path)],
+                vec![fx.goal.acceptance_criteria[1].clone()],
+            );
+            next.dependencies.push(previous.id.clone());
+            let plan = scheduling_plan(vec![previous, next])?;
+            let decision = WorkDriver::decide_with_plan(&fx.input(), &plan);
+            assert!(
+                matches!(only_step(&decision)?, WorkDriveStep::Escalate { .. }),
+                "{decision:?}"
+            );
+            assert_eq!(
+                fx.workers.len(),
+                1,
+                "durable worker history is not retired by a pure decision"
+            );
+            assert!(
+                !decision
+                    .rationale
+                    .iter()
+                    .any(|line| line == "Nichts zu tun: warte auf laufende Worker.")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plan_readiness_stops_stale_worker_continuation() -> TestResult {
+        let mut fx = Fixture::new(goal_n(1), report(1, &[0]));
+        fx.workers.push(worker(
+            "w1",
+            &[0],
+            &["src/a.rs"],
+            Some(WorkerOutcome::Partial),
+        ));
+        let mut node = plan_node(
+            "n",
+            vec![PathOrSymbol::new("src/a.rs")],
+            fx.goal.acceptance_criteria.clone(),
+        );
+        node.dependencies
+            .push(harw_plan::TaskId::new("invalidated-contract"));
+        let decision = WorkDriver::decide_with_plan(&fx.input(), &scheduling_plan(vec![node])?);
+        assert!(matches!(
+            only_step(&decision)?,
+            WorkDriveStep::Escalate { .. }
+        ));
+        Ok(())
     }
 
     #[test]

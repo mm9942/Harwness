@@ -2042,11 +2042,24 @@ mod tests {
             .map_err(ctx("append approval policy"))?;
         drop(config_file);
 
+        // Dieser Test prüft die Freigabekette, nicht die Kontextgrenze. Der
+        // ScriptedModel hat ein explizites Fenster für die vollständige
+        // Werkzeugfläche; Override darf in Produktion weiterhin auf das
+        // konservative 32k-Fenster für unbekannte Modelle zurückfallen.
+        let models_dir = fixture.home.join("models");
+        std::fs::create_dir_all(&models_dir).map_err(ctx("create fixture models directory"))?;
+        std::fs::write(
+            models_dir.join("policy-test.toml"),
+            "id = \"policy-test\"\nprovider = \"scripted\"\ncontext_window = 131072\n",
+        )
+        .map_err(ctx("write scripted model context window"))?;
+        let mut policy_startup = startup(InteractionMode::Chat);
+        policy_startup.model = Some("policy-test".to_owned());
         let inputs = fixture_inputs(
             &fixture,
             EntryKind::OneShot,
             IngressSurface::Cli,
-            startup(InteractionMode::Chat),
+            policy_startup,
         )?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();

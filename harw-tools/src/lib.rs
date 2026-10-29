@@ -25,6 +25,7 @@ pub mod call;
 pub mod context_load;
 pub mod error;
 pub mod executor;
+pub mod lifetime_guard;
 pub mod output;
 pub mod provider_macro;
 pub mod sandbox_guard;
@@ -42,6 +43,7 @@ pub use executor::{
     EXECUTED_ON_FIELD, ExecutionPlacement, PlacedToolExecutor, PlacedToolExecutorFuture,
     PlacedToolOutput, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, TracedToolExecutor,
 };
+pub use lifetime_guard::ToolLifetimeGuard;
 pub use output::ToolOutput;
 pub use sandbox_guard::{host_from_url, require_host_access, require_permission};
 pub use schema::{AdditionalProperties, JsonSchema, JsonSchemaType};

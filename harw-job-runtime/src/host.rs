@@ -681,6 +681,12 @@ impl SelectionFacts {
                 BackendKind::Bwrap | BackendKind::None => {}
             }
         }
+        if kind == BackendKind::BwrapTrampoline && self.landlock_abi.is_some_and(|abi| abi < 5) {
+            missing.push(
+                "Landlock ABI 5 or later required: the attempt directory needs full filesystem enforcement"
+                    .to_owned(),
+            );
+        }
         if !missing.is_empty() {
             return Err(missing);
         }
@@ -1633,6 +1639,27 @@ mod tests {
                 needs_network: false,
             }
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bwrap"))]
+    #[test]
+    fn test_composition_requires_full_filesystem_abi() -> TestResult {
+        let fixture = SelectionFixture::new()?;
+        for abi in 1..5 {
+            let host = HostReport::from_facts(linux(Some(abi), true, false));
+            let mut prefs = fixture.prefs();
+            assert_eq!(select_backend(&host, &prefs).chosen, BackendKind::Bwrap);
+            prefs.request = BackendRequest::Only(BackendKind::BwrapTrampoline);
+            let explicit = select_backend(&host, &prefs);
+            assert_eq!(explicit.chosen, BackendKind::None);
+            assert!(
+                explicit
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("ABI 5"))
+            );
+        }
+        Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "bwrap"))]

@@ -828,11 +828,39 @@ pub(crate) fn apply_atomically<F>(
 where
     F: FnMut(&Plan) -> Vec<PlanAction>,
 {
+    apply_atomically_checked(store, actor, |snapshot| Ok(build(snapshot)))
+}
+
+/// Prüft Vorbedingungen auf jedem frischen CAS-Snapshot, auch nach Konflikten.
+pub(crate) fn apply_atomically_checked<F>(
+    store: &dyn PlanStore,
+    actor: &str,
+    build: F,
+) -> Result<Vec<PlanEvent>, PlanBridgeError>
+where
+    F: FnMut(&Plan) -> Result<Vec<PlanAction>, PlanBridgeError>,
+{
+    apply_atomically_fenced(store, actor, build, None)
+}
+
+/// The publication check is evaluated at the store's authoritative commit boundary.
+pub(crate) fn apply_atomically_fenced<F>(
+    store: &dyn PlanStore,
+    actor: &str,
+    mut build: F,
+    before_publish: Option<&dyn Fn() -> harw_plan::PlanResult<()>>,
+) -> Result<Vec<PlanEvent>, PlanBridgeError>
+where
+    F: FnMut(&Plan) -> Result<Vec<PlanAction>, PlanBridgeError>,
+{
     let mut attempt: usize = 1;
     loop {
         let snapshot = store.current()?;
-        let actions = build(&snapshot);
+        let actions = build(&snapshot)?;
         if actions.is_empty() {
+            if let Some(check) = before_publish {
+                check()?;
+            }
             tracing::debug!(
                 plan_id = %snapshot.id,
                 revision = %snapshot.revision,
@@ -840,7 +868,13 @@ where
             );
             return Ok(Vec::new());
         }
-        match store.apply_batch(&snapshot.id, actions, actor, snapshot.revision) {
+        let applied = match before_publish {
+            Some(check) => {
+                store.apply_batch_checked(&snapshot.id, actions, actor, snapshot.revision, check)
+            }
+            None => store.apply_batch(&snapshot.id, actions, actor, snapshot.revision),
+        };
+        match applied {
             Ok(applied) => return Ok(applied.events),
             Err(PlanError::RevisionConflict {
                 plan,

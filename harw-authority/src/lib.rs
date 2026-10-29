@@ -16,6 +16,11 @@ use harw_types::{TenantId, WorkspaceId};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+mod file_write_scope;
+pub use file_write_scope::{FileWriteScope, FileWriteScopeError};
+
+#[cfg(test)]
+mod file_write_scope_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -58,11 +63,98 @@ impl Permission {
 /// A request has no authority of its own.  It becomes a grant only after a
 /// [`PolicyBootstrap`] evaluates it against a trusted policy, or after an
 /// existing [`AuthorityContext`] restricts itself with it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionRequest {
     requested: BTreeSet<Permission>,
+    network_scope: NetworkScope,
+    write_scope: FileWriteScope,
+}
+
+// Legacy requests keep their original sequence in `requested`. Scoped requests
+// deliberately use a versioned object there: old binaries expect a sequence
+// and refuse it instead of ignoring an additive scope field and widening a
+// recovered grant. Never flatten this object without a migration review.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RequestedRef<'a> {
+    Legacy(&'a BTreeSet<Permission>),
+    Scoped {
+        schema_version: u32,
+        permissions: &'a BTreeSet<Permission>,
+        write_scope: &'a FileWriteScope,
+    },
+}
+
+#[derive(Serialize)]
+struct PermissionRequestRef<'a> {
+    requested: RequestedRef<'a>,
+    network_scope: &'a NetworkScope,
+}
+
+impl Serialize for PermissionRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let requested = if self.write_scope.is_workspace() {
+            RequestedRef::Legacy(&self.requested)
+        } else {
+            RequestedRef::Scoped {
+                schema_version: 2,
+                permissions: &self.requested,
+                write_scope: &self.write_scope,
+            }
+        };
+        PermissionRequestRef {
+            requested,
+            network_scope: &self.network_scope,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedRequestWire {
+    schema_version: u32,
+    permissions: BTreeSet<Permission>,
+    write_scope: FileWriteScope,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RequestedWire {
+    Legacy(BTreeSet<Permission>),
+    Scoped(ScopedRequestWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionRequestWire {
+    requested: RequestedWire,
     #[serde(default)]
     network_scope: NetworkScope,
+}
+
+impl<'de> Deserialize<'de> for PermissionRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = PermissionRequestWire::deserialize(deserializer)?;
+        let (requested, write_scope) = match wire.requested {
+            RequestedWire::Legacy(permissions) => (permissions, FileWriteScope::workspace()),
+            RequestedWire::Scoped(scoped)
+                if scoped.schema_version == 2 && !scoped.write_scope.is_workspace() =>
+            {
+                (scoped.permissions, scoped.write_scope)
+            }
+            RequestedWire::Scoped(_) => {
+                return Err(serde::de::Error::custom(
+                    "unsupported scoped permission request",
+                ));
+            }
+        };
+        Ok(Self {
+            requested,
+            network_scope: wire.network_scope,
+            write_scope,
+        })
+    }
 }
 
 impl PermissionRequest {
@@ -76,7 +168,20 @@ impl PermissionRequest {
         Self {
             requested: permissions.into_iter().collect(),
             network_scope: NetworkScope::empty(),
+            write_scope: FileWriteScope::workspace(),
         }
+    }
+
+    /// Sets a narrowing write ceiling; this remains a non-authoritative request.
+    #[must_use]
+    pub fn with_write_scope(mut self, write_scope: FileWriteScope) -> Self {
+        self.write_scope = write_scope;
+        self
+    }
+
+    #[must_use]
+    pub fn write_scope(&self) -> &FileWriteScope {
+        &self.write_scope
     }
 
     /// Sets the requested network upper bound.  This remains only a request.
@@ -847,10 +952,16 @@ pub struct AuthorityContext {
     workspace: WorkspaceBinding,
     permissions: PermissionSet,
     network_scope: NetworkScope,
+    write_scope: FileWriteScope,
     origin: AuthorityOrigin,
 }
 
 impl AuthorityContext {
+    #[must_use]
+    pub fn write_scope(&self) -> &FileWriteScope {
+        &self.write_scope
+    }
+
     #[must_use]
     pub fn workspace(&self) -> &WorkspaceBinding {
         &self.workspace
@@ -871,14 +982,18 @@ impl AuthorityContext {
         &self.origin
     }
 
-    /// Derives a child context by intersecting every permission and network
-    /// scope dimension with a non-authoritative request.
+    /// Derives a child context by intersecting permissions, network scope and
+    /// write scope with a non-authoritative request. Exact-file writers lose
+    /// process, container, plugin and network capabilities until those backends
+    /// implement the same path ceiling.
     #[must_use]
     pub fn restrict(&self, request: &PermissionRequest) -> Self {
+        let write_scope = self.write_scope.intersection(&request.write_scope);
         Self {
             workspace: self.workspace.clone(),
-            permissions: self.permissions.restrict(request),
+            permissions: scoped_permissions(self.permissions.restrict(request), &write_scope),
             network_scope: self.network_scope.intersection(&request.network_scope),
+            write_scope,
             origin: self.origin.clone(),
         }
     }
@@ -906,7 +1021,8 @@ impl AuthorityContext {
     pub fn is_subset_of(&self, parent: &Self) -> bool {
         if self.workspace == parent.workspace {
             return self.permissions.is_subset_of(&parent.permissions)
-                && self.network_scope.is_subset_of(&parent.network_scope);
+                && self.network_scope.is_subset_of(&parent.network_scope)
+                && self.write_scope.is_subset_of(&parent.write_scope);
         }
         matches!(self.origin, AuthorityOrigin::HarnessReadView)
             && self.workspace.tenant == parent.workspace.tenant
@@ -921,10 +1037,24 @@ impl AuthorityContext {
         AuthoritySnapshot {
             workspace: self.workspace.reference(),
             request: PermissionRequest::from_permissions(self.permissions.iter())
-                .with_network_scope(self.network_scope.clone()),
+                .with_network_scope(self.network_scope.clone())
+                .with_write_scope(self.write_scope.clone()),
             origin: self.origin.clone(),
         }
     }
+}
+
+/// Exact-file writers cannot use an unscoped process, container, plugin or
+/// network backend to escape typed file checks. This is deliberately narrowing-only;
+/// scoped process execution needs a separate backend contract.
+fn scoped_permissions(mut permissions: PermissionSet, scope: &FileWriteScope) -> PermissionSet {
+    if !scope.is_workspace() {
+        permissions.granted.remove(&Permission::ExecuteProcess);
+        permissions.granted.remove(&Permission::ManageContainers);
+        permissions.granted.remove(&Permission::ManagePlugins);
+        permissions.granted.remove(&Permission::NetworkAccess);
+    }
+    permissions
 }
 
 /// Rechte-Obergrenze einer Harness-Lesesicht: `{ReadWorkspace}` ∩ `parent`.
@@ -985,6 +1115,11 @@ pub struct SandboxSpec {
 }
 
 impl SandboxSpec {
+    #[must_use]
+    pub fn write_scope(&self) -> &FileWriteScope {
+        self.authority.write_scope()
+    }
+
     /// Creates a sandbox specification from a trusted runtime profile.
     ///
     /// Runtime profiles are compiled into the binary; dynamic callers must
@@ -996,6 +1131,7 @@ impl SandboxSpec {
                 workspace,
                 permissions,
                 network_scope: NetworkScope::empty(),
+                write_scope: FileWriteScope::workspace(),
                 origin: AuthorityOrigin::Runtime,
             },
         }
@@ -1020,6 +1156,7 @@ impl SandboxSpec {
                 workspace,
                 permissions,
                 network_scope,
+                write_scope: FileWriteScope::workspace(),
                 origin: AuthorityOrigin::Runtime,
             },
         }
@@ -1079,6 +1216,7 @@ impl SandboxSpec {
                 workspace,
                 permissions,
                 network_scope,
+                write_scope: FileWriteScope::workspace(),
                 origin: AuthorityOrigin::TestOnly,
             },
         }
@@ -1120,6 +1258,7 @@ impl SandboxSpec {
                 workspace: view,
                 permissions,
                 network_scope: NetworkScope::empty(),
+                write_scope: FileWriteScope::workspace(),
                 origin: AuthorityOrigin::HarnessReadView,
             },
         };
@@ -1190,7 +1329,9 @@ impl PolicyBootstrap {
     }
 
     /// Issues a context only when the entire request is within this bootstrap's
-    /// already validated policy.  The workspace binding is part of the grant.
+    /// already validated policy. The workspace binding is part of the grant.
+    /// Exact-file requests additionally drop unscoped process/container/plugin/
+    /// network capabilities; a path ceiling never adds any capability.
     pub fn issue(
         &self,
         workspace: WorkspaceBinding,
@@ -1203,8 +1344,12 @@ impl PolicyBootstrap {
         }
         Ok(AuthorityContext {
             workspace,
-            permissions: PermissionSet::from_validated_policy(request.iter()),
+            permissions: scoped_permissions(
+                PermissionSet::from_validated_policy(request.iter()),
+                &request.write_scope,
+            ),
             network_scope: request.network_scope.clone(),
+            write_scope: request.write_scope.clone(),
             origin: AuthorityOrigin::Policy {
                 source: self.source,
                 policy_digest: self.policy_digest.clone(),
@@ -2002,6 +2147,7 @@ network_targets = []
                 workspace,
                 permissions: PermissionSet::from_test_permissions(permissions),
                 network_scope,
+                write_scope: FileWriteScope::workspace(),
                 origin,
             },
         }
@@ -2169,6 +2315,7 @@ network_targets = []
             workspace: test_workspace(),
             permissions: PermissionSet::from_test_permissions(permissions),
             network_scope,
+            write_scope: FileWriteScope::workspace(),
             origin: AuthorityOrigin::TestOnly,
         }
     }

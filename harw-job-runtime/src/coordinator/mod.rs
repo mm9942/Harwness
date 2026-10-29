@@ -26,6 +26,8 @@
 //!   `Running` → heartbeat every TTL/3 → deadline / cancel / lease loss →
 //!   finalize (`Succeeded`, `Failed`, `TimedOut`, `Cancelled`, `Lost`).
 //!   [`Coordinator::recover`] resumes after a restart.
+//!   [`Coordinator::start_existing`] dispatches an already persisted process
+//!   record through the same fenced lifecycle without allocating another id.
 //! - [`AttemptRecord`]: the per-attempt sidecar with lifecycle, recovery
 //!   identity and enforcement report.
 //! - [`RuntimeError`]: typed failures (§22).

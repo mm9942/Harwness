@@ -30,6 +30,7 @@ default = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
+harw-fsutil = { path = "../harw-fsutil" }
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
 harw-retention = { path = "../harw-retention" }
@@ -72,6 +73,8 @@ harw-tui = { path = "../harw-tui" }
 harw-memory = { path = "../harw-memory" }
 harw-types = { path = "../harw-types" }
 harw-extension-api = { path = "../harw-extension-api" }
+# Exact-source WorkDriver collection tool and retained execution context.
+harw-tools = { path = "../harw-tools" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-mcp-server = { path = "../harw-mcp-server" }
 harw-mcp-client = { path = "../harw-mcp-client" }

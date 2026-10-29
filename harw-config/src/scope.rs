@@ -298,6 +298,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "active_agent_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "active_uia_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "uia_provider", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "single_agent_mode", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "uia_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "uia_worker_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "policy_profile", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
@@ -409,6 +410,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // Runde 5, Teil E: Modell des Auto-Modus-Klassifizierers.
     FieldScope { path: "internal_models.auto_classifier", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.work_driver_judge", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.image_understanding", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
     // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -560,7 +562,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_199_entries() {
+    fn test_field_table_has_exactly_202_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -579,11 +581,13 @@ mod merge_rule_tests {
         // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
         // [session_listener]: +6, alle GlobalOnly.
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
+        // +1 for explicit trusted single-agent task topology.
+        // +1 for `internal_models.image_understanding`.
         // PL-97 B1: +4 für `skills.*`.
         // PL-97 E2: +1 für `sandbox.execution`.
         // PL-97 R1: +1 für `tui.reasoning`.
         // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
-        assert_eq!(FIELD_TABLE.len(), 203);
+        assert_eq!(FIELD_TABLE.len(), 205);
     }
 
     #[test]
@@ -607,9 +611,11 @@ mod merge_rule_tests {
         // h7/h9: +2 (`tui.status_expiry`, `tui.goal_mode`).
         // PL-97 B1: +4 (`skills.*`).
         // PL-97 E2: +1 (`sandbox.execution`).
+        // +1 for explicit trusted single-agent task topology.
+        // +1 for `internal_models.image_understanding`.
         // PL-97 R1: +1 (`tui.reasoning`).
         // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 104);
+        assert_eq!(count(MergeRule::ProfileReplaces), 106);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

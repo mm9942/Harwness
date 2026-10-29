@@ -123,6 +123,18 @@ pub fn parse_peers(text: &str) -> (PinnedPeers, usize) {
 /// key itself is public, nothing secret is read.
 #[must_use]
 pub(crate) fn peer_fingerprints(text: &str) -> std::collections::BTreeMap<String, String> {
+    peer_key_fingerprints(text)
+        .into_iter()
+        .map(|(node, hash)| {
+            let short: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            (node, format!("blake3:{short}"))
+        })
+        .collect()
+}
+
+/// Full BLAKE3 fingerprints of owner-pinned public keys, for persisted creator
+/// binding. The source must be the exact validated verifier startup snapshot.
+pub(crate) fn peer_key_fingerprints(text: &str) -> std::collections::BTreeMap<String, [u8; 32]> {
     let mut out = std::collections::BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -139,12 +151,7 @@ pub(crate) fn peer_fingerprints(text: &str) -> std::collections::BTreeMap<String
         if PinnedPeers::new().pin(id, bytes.clone()).is_err() {
             continue;
         }
-        let hash = blake3::hash(&bytes);
-        let short: String = hash.as_bytes()[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        out.insert(node.trim().to_owned(), format!("blake3:{short}"));
+        out.insert(node.trim().to_owned(), *blake3::hash(&bytes).as_bytes());
     }
     out
 }
@@ -263,7 +270,8 @@ pub async fn start_from_config(
     config.tier = plan.tier;
     config.approval_device = plan.approval_device;
     let remote_dir = state_dir.join("remote");
-    let peers_text = std::fs::read_to_string(remote_dir.join(PEERS_FILE)).unwrap_or_default();
+    let peers_text = crate::session_serve_remote::read_peer_pins(&remote_dir.join(PEERS_FILE))?;
+    config.peer_pins_digest = Some(*blake3::hash(peers_text.as_bytes()).as_bytes());
     let (peers, skipped) = parse_peers(&peers_text);
     if skipped > 0 {
         tracing::warn!(

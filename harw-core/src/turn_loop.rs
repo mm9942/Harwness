@@ -4224,6 +4224,7 @@ async fn resume_after_approval_with_store(
                                     control.cancel_token(),
                                 ) {
                                     Ok(execution_context) => {
+                                        let execution_context = execution_context.with_lifetime_guard(permit.lifetime_guard());
                                         let started = std::time::Instant::now();
                                         let (outcome, placement) = tokio::select! {
                                             biased;
@@ -5409,6 +5410,7 @@ async fn drive_turn(
                             control.cancel_token(),
                         ) {
                             Ok(execution_context) => {
+                                let execution_context = execution_context.with_lifetime_guard(permit.lifetime_guard());
                                 let started = std::time::Instant::now();
                                 // Fix B (Moduldoku „Siebter Nachtrag"): racet
                                 // den Aufruf selbst gegen `control`s
@@ -5924,8 +5926,9 @@ async fn assemble_round_request(
     let skill_fragments = prepare_skill_injection(session)
         .map(|round| round.fragments)
         .unwrap_or_default();
-    let instructions = load_instructions(session).await;
+    let mut instructions = load_instructions(session).await;
     let mut tools = collect_tools(session)?;
+    let mut workflow_delegation_available = false;
 
     // Nachtrag F (Delegationsprojektion): EIN deterministischer
     // Kontextblock, NACH den Tools angehängt (stabiler Teil — die Liste
@@ -5948,6 +5951,7 @@ async fn assemble_round_request(
             Ok(delegation) => {
                 append_handoff_tools(session, &mut tools, &delegation.targets);
                 let names = delegation.names();
+                workflow_delegation_available = !names.is_empty();
                 restrict_delegate_wave_roles(&mut tools, &names);
                 let via_delegate_tool =
                     tools.iter().any(|spec| spec.name() == AGENTS_DELEGATE_TOOL);
@@ -5969,6 +5973,26 @@ async fn assemble_round_request(
             Err(error) => {
                 tracing::debug!(reason = %error, "turn_loop.delegation_targets_unavailable");
             }
+        }
+    }
+
+    // Workflow guidance is derived from the final tool surface, not the
+    // baseline identity captured before composition. Static text only: no
+    // repository content or user text is promoted to instruction trust. The
+    // same admitted tool set/mode produces identical bytes for prompt caches.
+    // This guidance neither grants authority nor changes organization routing.
+    if session.activation().is_instructions_enabled("workflow") {
+        let names: Vec<&str> = tools
+            .iter()
+            .map(ToolSpec::name)
+            .filter(|name| *name != "delegate_wave" || workflow_delegation_available)
+            .collect();
+        let workflow = harw_instructions::workflow_capabilities(
+            &names,
+            session.mode() == crate::mode::InteractionMode::Plan,
+        );
+        if !workflow.is_empty() {
+            instructions.fragments.push(workflow);
         }
     }
 
@@ -6892,7 +6916,9 @@ async fn try_execute_parallel_calls(
             }
             continue;
         };
-        let execution_context = execution_context.clone();
+        let execution_context = execution_context
+            .clone()
+            .with_lifetime_guard(permit.lifetime_guard());
         let tool_name = call.name.to_string();
         let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
         let arguments_for_capture = call.arguments.clone();
@@ -7970,6 +7996,255 @@ mod tests {
     // ------------------------------------------------------------------
     // collect_tools filter tests
     // ------------------------------------------------------------------
+
+    async fn workflow_request(session: &AgentSession) -> TestResult<ModelRequest> {
+        let turn_id = harw_types::TurnId::new();
+        let input = TurnInputContext {
+            session_id: session.id().clone(),
+            turn_id: turn_id.clone(),
+            metadata: serde_json::Value::Null,
+        };
+        assemble_round_request(
+            session,
+            &input,
+            &TurnControl::new(),
+            &turn_id,
+            &harw_types::TokenUsage::default(),
+            None,
+            None,
+        )
+        .await
+        .map_err(ctx("assemble workflow request"))
+    }
+
+    #[tokio::test]
+    async fn workflow_uses_composed_tools_and_activation_at_request_time() -> TestResult {
+        // No baseline tool inventory: these tools arrive via registry composition.
+        let names = [
+            "fs.read",
+            "plan",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ];
+        let full = make_session(
+            StubToolProvider::with_names(&names),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let request = workflow_request(&full).await?;
+        assert!(
+            request
+                .instruction_fragments
+                .iter()
+                .any(|text| text.contains("### Governed durable execution"))
+        );
+        let repeated = workflow_request(&full).await?;
+        assert_eq!(
+            request.instruction_fragments,
+            repeated.instruction_fragments
+        );
+
+        let mut activation = SessionActivation::new(ToolProfile::Full);
+        activation.disable_tool(ToolName::new("work_driver.enqueue"));
+        let disabled = make_session(StubToolProvider::with_names(&names), activation);
+        let request = workflow_request(&disabled).await?;
+        assert!(
+            !request
+                .instruction_fragments
+                .iter()
+                .any(|text| text.contains("### Governed durable execution"))
+        );
+        Ok(())
+    }
+
+    /// Exercise the merged request path, not the workflow/skill renderers in
+    /// isolation: triggered evidence must never join trusted workflow text.
+    #[tokio::test]
+    async fn workflow_and_skills_preserve_trust_ledger_and_cache_prefix() -> TestResult {
+        use crate::skill_injection::{SkillInjectionSettings, SkillInjector};
+        use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName, TrustClass};
+        use harw_context_ledger::{LedgerKind, MemoryLedger};
+
+        let bundle = [
+            (
+                "skills/trusted/skill.toml",
+                "name = \"trusted\"\ndescription = \"Trusted fixture\"\n",
+            ),
+            (
+                "skills/trusted/triggers.toml",
+                "[triggers]\nkeywords = [\"merge fixture\"]\n",
+            ),
+            (
+                "skills/trusted/instructions.md",
+                "# Trusted\n\n## When to use\n\nBUNDLED_MERGE_MARKER\n",
+            ),
+            (
+                "skills/imported/skill.toml",
+                "name = \"imported\"\ndescription = \"Imported fixture\"\n",
+            ),
+            (
+                "skills/imported/triggers.toml",
+                "[triggers]\nkeywords = [\"merge fixture\"]\n",
+            ),
+            (
+                "skills/imported/instructions.md",
+                "# Imported\n\n## When to use\n\nIMPORTED_MERGE_MARKER\n",
+            ),
+        ];
+        let index = Arc::new(harw_catalog::SkillIndex::build_with_bundle(&[], &bundle));
+        for with_program in [false, true] {
+            let injector = Arc::new(
+                SkillInjector::new(
+                    Arc::clone(&index),
+                    SkillInjectionSettings {
+                        inject_imported: true,
+                        ..SkillInjectionSettings::default()
+                    },
+                )
+                .with_imported_skills(["imported"]),
+            );
+            let ledger = Arc::new(MemoryLedger::new());
+            let mut spawn = test_spawn_context()?;
+            spawn.ceiling = Some(ContextCeiling {
+                sections: harw_context::ceiling::ROOT_CONTEXT_SECTIONS
+                    .iter()
+                    .map(|name| SectionName::try_new(*name))
+                    .collect::<Result<_, _>>()?,
+                max_trust: TrustClass::Instruction,
+                budget: ContextBudgetSpec {
+                    total: harw_lens_types::BudgetSpec { total: 1_000_000 },
+                    per_section: Default::default(),
+                },
+            });
+            let mut session = make_session(
+                StubToolProvider::with_names(&[
+                    "fs.read",
+                    "plan",
+                    "work_driver.enqueue",
+                    "work_driver.status",
+                    "work_driver.stop",
+                ]),
+                SessionActivation::new(ToolProfile::Full),
+            )
+            .with_spawn_context(spawn)
+            .with_skill_injector(Some(injector))
+            .with_context_ledger(Some(ledger.clone()));
+            if with_program {
+                session = session.with_context_program(Default::default());
+            }
+            session.history_mut().push_user_text("hello");
+            let before = workflow_request(&session).await?;
+            assert!(
+                before
+                    .instruction_fragments
+                    .iter()
+                    .any(|text| { text.contains("### Governed durable execution") })
+            );
+            session.history_mut().push_user_text("merge fixture");
+            let injected = workflow_request(&session).await?;
+            let repeated = workflow_request(&session).await?;
+            assert_eq!(before.system_prompt, injected.system_prompt);
+            assert!(
+                injected
+                    .instruction_fragments
+                    .starts_with(&before.instruction_fragments)
+            );
+            assert_eq!(
+                injected.instruction_fragments,
+                repeated.instruction_fragments
+            );
+            assert_eq!(injected.data_block, repeated.data_block);
+            let instructions = injected.instruction_fragments.join("\n");
+            assert!(instructions.contains("BUNDLED_MERGE_MARKER"));
+            assert!(!instructions.contains("IMPORTED_MERGE_MARKER"));
+            assert!(!injected.system_prompt.contains("IMPORTED_MERGE_MARKER"));
+            assert!(
+                injected
+                    .data_block
+                    .as_deref()
+                    .is_some_and(|data| { data.contains("IMPORTED_MERGE_MARKER") })
+            );
+            for (label, trust) in [
+                ("skill:trusted", "instruction"),
+                ("skill:imported", "evidence"),
+            ] {
+                assert!(
+                    injected
+                        .context_assembly
+                        .included_fragment_labels
+                        .iter()
+                        .any(|value| value == label)
+                );
+                let entries: Vec<_> = ledger
+                    .entries()
+                    .into_iter()
+                    .filter(|entry| entry.label == label)
+                    .collect();
+                assert_eq!(
+                    entries.len(),
+                    2,
+                    "one record per assembled request: {label}"
+                );
+                assert!(entries.iter().all(|entry| {
+                    entry.kind == LedgerKind::Offered && entry.trust.as_deref() == Some(trust)
+                }));
+            }
+            let ledger_json = serde_json::to_string(&ledger.entries())?;
+            assert!(!ledger_json.contains("BUNDLED_MERGE_MARKER"));
+            assert!(!ledger_json.contains("IMPORTED_MERGE_MARKER"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_plan_mode_and_missing_spawner_do_not_advertise_execution() -> TestResult {
+        let names = [
+            "fs.read",
+            "fs.write",
+            "delegate_wave",
+            "plan",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ];
+        let session = make_session(
+            StubToolProvider::with_names(&names),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_mode(crate::mode::InteractionMode::Plan);
+        let request = workflow_request(&session).await?;
+        let text = request.instruction_fragments.join("\n");
+        assert!(!text.contains("### Governed durable execution"));
+        assert!(!text.contains("### Direct implementation"));
+        assert!(!text.contains("### Parallel delegation"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_without_spawner_preserves_role_routing_and_can_be_disabled() -> TestResult {
+        let names = ["fs.read", "fs.write", "delegate_wave"];
+        let session = make_session(
+            StubToolProvider::with_names(&names),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let request = workflow_request(&session).await?;
+        let text = request.instruction_fragments.join("\n");
+        assert!(!text.contains("### Parallel delegation"));
+        assert!(text.contains("Organization routing rules take precedence"));
+        assert!(text.contains("missing delegation is a blocker"));
+
+        let mut activation = SessionActivation::new(ToolProfile::Full);
+        activation.disable_instructions("workflow");
+        let disabled = make_session(StubToolProvider::with_names(&names), activation);
+        let request = workflow_request(&disabled).await?;
+        assert!(
+            !request
+                .instruction_fragments
+                .iter()
+                .any(|text| text.contains("### Direct implementation"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_collect_tools_full_profile_includes_all() -> TestResult {
@@ -9478,10 +9753,14 @@ mod tests {
     impl ToolExecutor for FenceExecutor {
         fn execute<'a>(
             &'a self,
-            _ctx: &'a ToolExecutionContext,
+            ctx: &'a ToolExecutionContext,
             call: &'a ToolCall,
         ) -> ToolExecutorFuture<'a> {
             Box::pin(async move {
+                assert!(
+                    ctx.lifetime_guard().is_some(),
+                    "admitted guard must reach executor"
+                );
                 push_fence(&self.log, fence_labels(call.name.as_str()).0);
                 if let Some(barrier) = &self.barrier {
                     barrier.wait().await;
@@ -9550,6 +9829,189 @@ mod tests {
         fn parallel_safe(&self, name: &ToolName) -> bool {
             self.parallel && self.names.contains(name)
         }
+    }
+
+    /// Models the filesystem tools' spawn_blocking boundary. The outer tool
+    /// future may disappear, while this closure still owns execution context.
+    struct BlockingFenceProvider {
+        log: FenceLog,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl ToolProvider for BlockingFenceProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            ["alpha", "beta"]
+                .into_iter()
+                .map(|name| {
+                    ToolSpec::Function(FunctionToolSpec {
+                        name: ToolName::new(name),
+                        description: "blocking fence".to_owned(),
+                        parameters: JsonSchema::default(),
+                        strict: false,
+                    })
+                })
+                .collect()
+        }
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            matches!(name.as_str(), "alpha" | "beta").then(|| {
+                Arc::new(BlockingFenceExecutor {
+                    log: Arc::clone(&self.log),
+                    started: self.started.clone(),
+                    finished: self.finished.clone(),
+                    release: Arc::clone(&self.release),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+        fn parallel_safe(&self, name: &ToolName) -> bool {
+            matches!(name.as_str(), "alpha" | "beta")
+        }
+    }
+
+    struct BlockingFenceExecutor {
+        log: FenceLog,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl ToolExecutor for BlockingFenceExecutor {
+        fn execute<'a>(
+            &'a self,
+            context: &'a ToolExecutionContext,
+            call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            let context = context.clone();
+            let log = Arc::clone(&self.log);
+            let started = self.started.clone();
+            let finished = self.finished.clone();
+            let release = Arc::clone(&self.release);
+            let label = fence_labels(call.name.as_str()).0;
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    release
+                        .lock()
+                        .map_err(|e| ToolsError::ExecutionFailed(e.to_string()))?
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| ToolsError::ExecutionFailed(e.to_string()))?;
+                    push_fence(&log, label);
+                    drop(context);
+                    let _ = finished.send(());
+                    Ok(ToolOutput::text("effect finished"))
+                })
+                .await
+                .map_err(|e| ToolsError::ExecutionFailed(e.to_string()))?
+            })
+        }
+    }
+
+    async fn check_blocking_effect_survives_abort(
+        parallel: bool,
+        cancel_cooperatively: bool,
+    ) -> TestResult {
+        let log = fence_log();
+        let (started, mut start_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished, mut finish_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockingFenceProvider {
+            log: Arc::clone(&log),
+            started,
+            finished,
+            release: Arc::new(Mutex::new(release_rx)),
+        });
+        let mut session =
+            guarded_session(provider, Arc::new(CountingApproval::allow_everything()))?;
+        let mut calls = vec![call(&ToolCallId::new(), "alpha")];
+        if parallel {
+            calls.push(call(&ToolCallId::new(), "beta"));
+        }
+        let count = calls.len();
+        let model = ScriptedModel::new(vec![response_with(calls)]);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let control = TurnControl::new().with_tool_call_meter(FenceMeter::new(count, &log));
+        let cancel = control.cancel_token().clone();
+        let turn = tokio::spawn(async move {
+            run_turn(
+                &mut session,
+                &model,
+                &store,
+                TurnInput::user("run").with_control(control),
+            )
+            .await
+        });
+        for _ in 0..count {
+            tokio::time::timeout(Duration::from_secs(5), start_rx.recv())
+                .await
+                .map_err(ctx("blocking effect starts"))?
+                .ok_or(TestError::Missing("blocking start signal"))?;
+        }
+        if cancel_cooperatively {
+            cancel.cancel(CancelReason::User);
+            let outcome = tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .map_err(ctx("cancel finishes the async turn"))?
+                .map_err(ctx("join cancelled turn"))?
+                .map_err(ctx("cancelled outcome"))?;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+        } else {
+            turn.abort();
+            let result = turn.await;
+            assert!(result.is_err_and(|error| error.is_cancelled()));
+        }
+        let before_release = fence_entries(&log);
+        // Release blocking work even when an assertion below would fail.
+        for _ in 0..count {
+            release.send(()).map_err(ctx("release blocking effect"))?;
+        }
+        for _ in 0..count {
+            tokio::time::timeout(Duration::from_secs(5), finish_rx.recv())
+                .await
+                .map_err(ctx("blocking effect finishes"))?
+                .ok_or(TestError::Missing("blocking finish signal"))?;
+        }
+        assert!(
+            before_release.is_empty(),
+            "lease released before effect: {before_release:?}"
+        );
+        let entries = fence_entries(&log);
+        for name in if parallel {
+            vec!["alpha", "beta"]
+        } else {
+            vec!["alpha"]
+        } {
+            let (executed, dropped) = fence_labels(name);
+            let effect = entries
+                .iter()
+                .position(|e| *e == executed)
+                .ok_or(TestError::Missing("effect log"))?;
+            let released = entries
+                .iter()
+                .position(|e| *e == dropped)
+                .ok_or(TestError::Missing("guard drop log"))?;
+            assert!(effect < released, "{entries:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocking_effect_keeps_permit_after_outer_turn_abort() -> TestResult {
+        check_blocking_effect_survives_abort(false, false).await
+    }
+
+    #[tokio::test]
+    async fn parallel_blocking_effects_keep_permits_after_outer_turn_abort() -> TestResult {
+        check_blocking_effect_survives_abort(true, false).await
+    }
+
+    #[tokio::test]
+    async fn blocking_effect_keeps_permit_after_cooperative_cancel() -> TestResult {
+        check_blocking_effect_survives_abort(false, true).await
+    }
+
+    #[tokio::test]
+    async fn parallel_blocking_effects_keep_permits_after_cooperative_cancel() -> TestResult {
+        check_blocking_effect_survives_abort(true, true).await
     }
 
     /// Modell, das jede Runde protokolliert und mit Text antwortet.

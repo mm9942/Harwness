@@ -1,4 +1,4 @@
-//! `FsToolProvider` — aggregierter ToolProvider für alle sieben FS-Tools.
+//! `FsToolProvider` — aggregierter ToolProvider für alle acht FS-Tools.
 //!
 //! # Verantwortung
 //! Dieses Modul fasst `fs.read`, `fs.write`, `fs.edit`, `fs.list`,
@@ -57,7 +57,7 @@ use std::sync::Arc;
 /// Standard-Maximum für lesbare Bytes in `fs.read`.
 pub const DEFAULT_MAX_READ_BYTES: u64 = 65_536;
 
-/// Aggregierter ToolProvider für alle sieben Filesystem-Tools.
+/// Aggregierter ToolProvider für alle acht Filesystem-Tools.
 ///
 /// # Description
 /// Stellt `fs.read`, `fs.write`, `fs.edit`, `fs.list`, `fs.search`, `fs.glob`
@@ -90,10 +90,11 @@ pub struct FsToolProvider {
 }
 
 impl FsToolProvider {
-    /// Names of the seven tools, in [`ToolProvider::tools`] order (the same
+    /// Names of the eight tools, in [`ToolProvider::tools`] order (the same
     /// table `harw_tools::tool_provider!` generates for macro providers).
     pub const TOOL_NAMES: &'static [&'static str] = &[
         "fs.read",
+        "fs.view_image",
         "fs.write",
         "fs.edit",
         "fs.list",
@@ -111,6 +112,7 @@ impl FsToolProvider {
     /// Descriptive only: never a permission, never part of a `ToolSpec`.
     pub const TOOL_ACTIVITIES: &'static [Option<harw_tools::ActivityDescriptor>] = &[
         FsReadExecutor::ACTIVITY,
+        crate::FsViewImageExecutor::ACTIVITY,
         FsWriteExecutor::ACTIVITY,
         FsEditExecutor::ACTIVITY,
         FsListExecutor::ACTIVITY,
@@ -157,10 +159,10 @@ impl Default for FsToolProvider {
 }
 
 impl ToolProvider for FsToolProvider {
-    /// Gibt die Liste aller sieben FS-Tools zurück.
+    /// Gibt die Liste aller acht FS-Tools zurück.
     ///
     /// # Returns
-    /// `Vec<ToolSpec>` mit sieben Einträgen: `fs.read`, `fs.write`, `fs.edit`,
+    /// `Vec<ToolSpec>` mit acht Einträgen: `fs.read`, `fs.view_image`, `fs.write`, `fs.edit`,
     /// `fs.list`, `fs.search`, `fs.glob`, `fs.grep`.
     ///
     /// # Concurrency
@@ -168,6 +170,7 @@ impl ToolProvider for FsToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
         vec![
             fs_read_spec(),
+            fs_view_image_spec(),
             fs_write_spec(),
             fs_edit_spec(),
             fs_list_spec(),
@@ -192,6 +195,7 @@ impl ToolProvider for FsToolProvider {
             "fs.read" => Some(Arc::new(FsReadExecutor {
                 max_bytes: self.max_read_bytes,
             })),
+            "fs.view_image" => Some(Arc::new(crate::FsViewImageExecutor)),
             "fs.write" => Some(Arc::new(FsWriteExecutor)),
             "fs.edit" => Some(Arc::new(FsEditExecutor)),
             "fs.list" => Some(Arc::new(FsListExecutor {
@@ -222,7 +226,7 @@ impl ToolProvider for FsToolProvider {
     fn parallel_safe(&self, name: &ToolName) -> bool {
         matches!(
             name.as_str(),
-            "fs.read" | "fs.list" | "fs.search" | "fs.glob" | "fs.grep"
+            "fs.read" | "fs.view_image" | "fs.list" | "fs.search" | "fs.glob" | "fs.grep"
         )
     }
 }
@@ -243,6 +247,44 @@ fn protected_areas_description() -> String {
     } else {
         format!(".git/, .harw/ and {named}/")
     }
+}
+
+fn fs_view_image_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "path".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Image file path relative to the workspace root.".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "detail".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Image detail: low, high, or auto. Omit for provider default.".to_owned(),
+            ),
+            enum_values: Some(vec![
+                serde_json::json!("low"),
+                serde_json::json!("high"),
+                serde_json::json!("auto"),
+            ]),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("fs.view_image"),
+        description: "Opens a PNG, JPEG, GIF or WebP image from the workspace to inspect its actual visual content. The next request receives native image input, then you can continue reasoning and tool use. Uses existing read permissions, image size and pixel limits; GIF uses its first frame. Text-only models receive an explicit vision_unavailable result; never infer visual observations from image metadata. No model switching occurs.".to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object), properties: Some(props),
+            required: Some(vec!["path".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
 }
 
 fn fs_read_spec() -> ToolSpec {
@@ -328,7 +370,7 @@ fn fs_read_spec() -> ToolSpec {
              Zeilen, z. B. für Logs (`limit` begrenzt zusätzlich). (3) Byte-Modus (Rückfall): \
              `offset`/`max_bytes`. Für bestimmte Stellen zuerst `fs.grep` (liefert \
              Zeilennummern), dann `fs.read` mit `line`. Kein `sed`/`head`/`tail`/`grep` über \
-             `shell.exec` nötig. Für PDFs `doc.read_pdf` verwenden."
+             `shell.exec` nötig. Für PDFs `doc.read_pdf`, für Bilder `fs.view_image` verwenden."
                 .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -606,10 +648,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_tool_provider_lists_seven_tools() -> TestResult {
+    fn test_fs_tool_provider_lists_eight_tools() -> TestResult {
         let provider = FsToolProvider::new();
         let tools = provider.tools();
-        assert_eq!(tools.len(), 7, "expected exactly 7 tools");
+        assert_eq!(tools.len(), 8, "expected exactly 8 tools");
+        assert!(tools.iter().any(|tool| tool.name() == "fs.view_image"));
 
         let names: HashSet<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains("fs.read"), "missing fs.read");
@@ -772,8 +815,8 @@ mod tests {
             );
         }
         // Die makro-generierten Tools liefern denselben Deskriptor wie die Tabelle.
-        assert_eq!(FsGlobTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[5]);
-        assert_eq!(FsGrepTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[6]);
+        assert_eq!(FsGlobTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[6]);
+        assert_eq!(FsGrepTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[7]);
         assert_eq!(FsGlobTool::SKILL, None);
         Ok(())
     }

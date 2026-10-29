@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 
+use fs4::FileExt;
 use harw_protocol::items::{ContentPart, TurnItem, UserMessageItem};
 use harw_protocol::{ApprovalKind, ApprovalRequest, Cursor};
 use harw_session_host::approvals::{ApprovalBackend, ResolveOutcome};
@@ -490,5 +491,69 @@ fn torn_transcript_fails_closed_until_repaired() -> TestResult {
         source.head(&session()),
         Err(HostError::Storage(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn bounded_startup_repair_handles_torn_clean_and_missing_sessions() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = TranscriptStore::new(temp.path());
+    store.append(&item_record(0)?)?;
+    let torn_path = temp.path().join("session-a.jsonl");
+    let mut torn = std::fs::OpenOptions::new().append(true).open(&torn_path)?;
+    torn.write_all(b"{\"torn\"")?;
+    drop(torn);
+
+    let source = DurableTranscripts::open(temp.path())?;
+    let ids = [
+        session(),
+        SessionId::from_str("clean"),
+        SessionId::from_str("missing"),
+    ];
+    let outcomes = source.repair_tails(&ids)?;
+    assert_eq!(outcomes.len(), 3);
+    assert!(matches!(
+        outcomes[0].1,
+        harw_session_store::store::TailRepair::Repaired { .. }
+    ));
+    assert_eq!(outcomes[1].1, harw_session_store::store::TailRepair::Clean);
+    assert_eq!(outcomes[2].1, harw_session_store::store::TailRepair::Clean);
+    assert_eq!(source.head(&session())?, 1);
+    Ok(())
+}
+
+#[test]
+fn bounded_startup_repair_refuses_contended_and_corrupt_transcripts() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = TranscriptStore::new(temp.path());
+    store.append(&item_record(0)?)?;
+    let path = temp.path().join("session-a.jsonl");
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    file.write_all(b"{\"torn\"")?;
+    drop(file);
+
+    let lock_path = temp.path().join("session-a.jsonl.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    FileExt::try_lock(&lock)?;
+    let before = std::fs::read(&path)?;
+    let source = DurableTranscripts::open(temp.path())?;
+    let error = source.repair_tails(&[session()]).unwrap_err();
+    assert!(matches!(error, HostError::Storage(_)));
+    assert_eq!(
+        std::fs::read(&path)?,
+        before,
+        "contended repair changed bytes"
+    );
+    FileExt::unlock(&lock)?;
+
+    std::fs::write(&path, b"not-json\n")?;
+    let error = source.repair_tails(&[session()]).unwrap_err();
+    assert!(matches!(error, HostError::Storage(_)));
+    assert_eq!(std::fs::read(&path)?, b"not-json\n");
     Ok(())
 }

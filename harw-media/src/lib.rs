@@ -20,8 +20,11 @@ mod fixtures;
 mod inspect;
 mod limits;
 mod memory;
+mod process;
 mod sanitize;
 mod store;
+pub mod tool_image;
+pub use process::{install_media_source, load_installed_media};
 
 pub use error::MediaError;
 pub use inspect::{Inspected, inspect, sniff};

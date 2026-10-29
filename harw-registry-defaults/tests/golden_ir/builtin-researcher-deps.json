@@ -18,6 +18,7 @@
   "tools": {
     "admitted": [
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -190,6 +191,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "fsread.cat",
       "fsread.df",
       "fsread.diff",
@@ -306,7 +308,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/researcher-deps.toml",
-          "line": 127,
+          "line": 128,
           "column": 11
         },
         "path": "context.program"
@@ -315,6 +317,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "c0288dd94229b1bedc186be5784e9f45b73b64fafc4de9a4ac51a1c5333265de"
+    "digest": "a12f5828b42ead7082ef062eefefbe9f7ec77698d974719a323a526dd2aba229"
   }
 }

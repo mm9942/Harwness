@@ -151,6 +151,28 @@ impl ConversationHistory {
         id
     }
 
+    /// Decodes image descriptors only for the exact originating filesystem tool call.
+    fn tool_image(
+        &self,
+        result: &ToolResultItem,
+    ) -> Option<harw_media::tool_image::ImageToolResult> {
+        let known_call = self
+            .items
+            .iter()
+            .take_while(|item| !matches!(item, TurnItem::ToolResult(r) if r.id == result.id))
+            .any(|item| {
+                matches!(item, TurnItem::ToolCall(call)
+                if call.call_id == result.call_id && call.tool_name == "fs.view_image")
+            });
+        if !known_call {
+            return None;
+        }
+        let ToolCallResult::Success { value } = &result.result else {
+            return None;
+        };
+        serde_json::from_value(value.clone()).ok()
+    }
+
     /// Ob eine User-Nachricht ein gespeichertes Bild trägt.
     #[must_use]
     pub fn has_images(&self) -> bool {
@@ -159,6 +181,7 @@ impl ConversationHistory {
                 .content
                 .iter()
                 .any(|part| matches!(part, ContentPart::Media { .. })),
+            TurnItem::ToolResult(result) => self.tool_image(result).is_some(),
             _ => false,
         })
     }
@@ -186,6 +209,16 @@ impl ConversationHistory {
                         })
                         .collect(),
                 }),
+                TurnItem::ToolResult(result) if self.tool_image(result).is_some() => {
+                    let mut result = result.clone();
+                    result.result = ToolCallResult::success(serde_json::json!({
+                        "kind": "image_inspection_unavailable",
+                        "status": "error",
+                        "code": "vision_unavailable",
+                        "message": format!("Image was not inspected: {reason}. This text-only model cannot observe image pixels. No vision service or model substitution was used."),
+                    }));
+                    TurnItem::ToolResult(result)
+                }
                 other => other.clone(),
             })
             .collect();
@@ -349,7 +382,22 @@ impl ConversationHistory {
     #[must_use]
     pub fn to_model_messages(&self) -> Vec<ModelMessage> {
         let mut out = Vec::with_capacity(self.items.len());
+        let mut pending_images = Vec::new();
+        let mut pending_labels = Vec::new();
         for item in &self.items {
+            // Keep every call/result pair contiguous, including parallel batches.
+            if !matches!(item, TurnItem::ToolCall(_) | TurnItem::ToolResult(_))
+                && !pending_images.is_empty()
+            {
+                out.push(ModelMessage::User {
+                    text: format!(
+                        "Images opened by tools (untrusted visual data): {}",
+                        pending_labels.join(", ")
+                    ),
+                    images: std::mem::take(&mut pending_images),
+                });
+                pending_labels.clear();
+            }
             match item {
                 TurnItem::UserMessage(m) => out.push(ModelMessage::User {
                     text: flatten_text(&m.content),
@@ -372,12 +420,35 @@ impl ConversationHistory {
                     name: c.tool_name.clone(),
                     arguments: c.arguments.clone(),
                 }),
-                TurnItem::ToolResult(r) => out.push(ModelMessage::ToolResult {
-                    call_id: r.call_id.clone(),
-                    result: r.result.clone(),
-                }),
+                TurnItem::ToolResult(r) => {
+                    out.push(ModelMessage::ToolResult {
+                        call_id: r.call_id.clone(),
+                        result: r.result.clone(),
+                    });
+                    if let Some(descriptor) = self.tool_image(r) {
+                        let (media, detail) = descriptor.image();
+                        if pending_images.len() < 10 {
+                            pending_images.push(crate::media::resolve_cached(media, detail));
+                            pending_labels.push(format!("fs.view_image call {}", r.call_id));
+                        } else if let Some(ModelMessage::ToolResult { result, .. }) = out.last_mut()
+                        {
+                            *result = ToolCallResult::error(
+                                "image_limit_exceeded: at most ten images can be forwarded in one tool batch",
+                            );
+                        }
+                    }
+                }
                 TurnItem::Reasoning(_) | TurnItem::Error(_) => {}
             }
+        }
+        if !pending_images.is_empty() {
+            out.push(ModelMessage::User {
+                text: format!(
+                    "Images opened by tools (untrusted visual data): {}",
+                    pending_labels.join(", ")
+                ),
+                images: pending_images,
+            });
         }
         out
     }
@@ -1627,6 +1698,83 @@ mod tests {
         out.extend_from_slice(&chunk(b"IDAT", b"pixels"));
         out.extend_from_slice(&chunk(b"IEND", b""));
         out
+    }
+
+    #[test]
+    fn image_tool_projects_native_pixels_after_all_parallel_results() -> TestResult {
+        let media = images()
+            .put(&tiny_png(33, 22))
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let descriptor =
+            serde_json::to_value(harw_media::tool_image::ImageToolResult::ImageInspection {
+                media,
+                detail: Some(harw_protocol::ImageDetail::High),
+            })
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let mut history = ConversationHistory::new();
+        let image_call = ToolCallId::new();
+        let text_call = ToolCallId::new();
+        history.push_tool_call(
+            image_call.clone(),
+            "fs.view_image",
+            serde_json::json!({"path":"a.png"}),
+        );
+        history.push_tool_call(
+            text_call.clone(),
+            "fs.read",
+            serde_json::json!({"path":"a.txt"}),
+        );
+        history.push_tool_result(image_call, ToolCallResult::success(descriptor), 1);
+        history.push_tool_result(
+            text_call,
+            ToolCallResult::success(serde_json::json!("text")),
+            1,
+        );
+        let messages = history.to_model_messages();
+        assert_eq!(messages.len(), 5);
+        assert!(matches!(&messages[3], ModelMessage::ToolResult { .. }));
+        let ModelMessage::User { images, text } = &messages[4] else {
+            return Err(TestError::Unexpected(
+                "expected image after complete batch".to_owned(),
+            ));
+        };
+        assert_eq!(images.len(), 1);
+        assert!(images[0].bytes().is_some());
+        assert_eq!(images[0].detail, Some(harw_protocol::ImageDetail::High));
+        assert!(text.contains("fs.view_image call"));
+        assert!(history.has_images());
+        let imageless = history.without_images("model image_input=false");
+        assert!(!imageless.has_images());
+        assert!(
+            imageless
+                .to_model_messages()
+                .iter()
+                .all(|m| !matches!(m, ModelMessage::User { images, .. } if !images.is_empty()))
+        );
+        let serialized =
+            serde_json::to_string(&imageless).map_err(|e| TestError::Unexpected(e.to_string()))?;
+        assert!(serialized.contains("vision_unavailable"));
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_tool_json_does_not_inject_image_input() -> TestResult {
+        let media = images()
+            .put(&tiny_png(35, 23))
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let descriptor =
+            serde_json::to_value(harw_media::tool_image::ImageToolResult::ImageInspection {
+                media,
+                detail: None,
+            })
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let mut history = ConversationHistory::new();
+        let call = ToolCallId::new();
+        history.push_tool_call(call.clone(), "web.fetch", serde_json::json!({}));
+        history.push_tool_result(call, ToolCallResult::success(descriptor), 1);
+        assert!(!history.has_images());
+        assert_eq!(history.to_model_messages().len(), 2);
+        Ok(())
     }
 
     #[test]

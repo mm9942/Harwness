@@ -210,6 +210,45 @@ impl ServiceManager for SystemdServiceManager {
         }
         Ok(())
     }
+
+    fn start(&self, name: &str) -> Result<(), ServiceError> {
+        self.control(name, "start")
+    }
+
+    fn stop(&self, name: &str) -> Result<(), ServiceError> {
+        self.control(name, "stop")
+    }
+
+    fn restart(&self, name: &str) -> Result<(), ServiceError> {
+        self.control(name, "restart")
+    }
+}
+
+impl SystemdServiceManager {
+    fn control(&self, name: &str, action: &str) -> Result<(), ServiceError> {
+        self.control_with(name, action, |args| {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = Self::systemctl(&arg_refs)?;
+            if !out.status.success() {
+                return Err(ServiceError::Command {
+                    command: format!("systemctl --user {}", args.join(" ")),
+                    detail: String::from_utf8_lossy(&out.stderr).into_owned(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn control_with(
+        &self,
+        name: &str,
+        action: &str,
+        execute: impl FnOnce(&[String]) -> Result<(), ServiceError>,
+    ) -> Result<(), ServiceError> {
+        validate_service_name(name)?;
+        let args = control_args(action, name);
+        execute(&args)
+    }
 }
 
 /// Pfad der Unit-Datei `<home>/.config/systemd/user/<name>.service` (rein).
@@ -231,6 +270,27 @@ fn unit_path_in(home: &Path, name: &str) -> PathBuf {
 /// - `name` (`&str`): Dienstname (= Unit-Name ohne `.service`).
 fn disable_args(name: &str) -> Vec<String> {
     vec!["disable".to_owned(), "--now".to_owned(), name.to_owned()]
+}
+
+fn control_args(action: &str, name: &str) -> Vec<String> {
+    vec![action.to_owned(), name.to_owned()]
+}
+
+fn validate_service_name(name: &str) -> Result<(), ServiceError> {
+    if !valid_service_identifier(name) {
+        return Err(ServiceError::Unsupported {
+            detail: format!("invalid systemd user service name: {name:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn valid_service_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b'-'))
 }
 
 /// Argumente für `systemctl --user daemon-reload` (rein, ohne Programmnamen
@@ -444,6 +504,45 @@ mod tests {
             disable_args("harw"),
             vec!["disable".to_owned(), "--now".to_owned(), "harw".to_owned()]
         );
+    }
+
+    #[test]
+    fn test_control_actions_are_user_scoped_and_typed() {
+        for action in ["start", "stop", "restart"] {
+            assert_eq!(control_args(action, "harw"), vec![action, "harw"]);
+        }
+    }
+
+    #[test]
+    fn test_control_executes_expected_arguments() -> TestResult {
+        let mut received = Vec::new();
+        SystemdServiceManager::new()
+            .control_with("harw.service", "restart", |argv| {
+                received = argv.to_vec();
+                Ok(())
+            })
+            .map_err(ctx("control args execute"))?;
+        assert_eq!(received, vec!["restart", "harw.service"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_service_names_cannot_inject_systemctl_options() {
+        for name in [
+            "",
+            "--help",
+            "../harw",
+            "harw service",
+            "harw\nservice",
+            "harw\u{1b}service",
+            "harw\0service",
+        ] {
+            assert!(matches!(
+                validate_service_name(name),
+                Err(ServiceError::Unsupported { .. })
+            ));
+        }
+        assert!(validate_service_name("harw.service").is_ok());
     }
 
     #[test]

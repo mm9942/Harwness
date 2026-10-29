@@ -1024,6 +1024,7 @@ fn write_discovered_model_file(
             // Unknown: images are sent and a model without image input answers
             // with a visible server error (see `ModelCapabilitiesToml::image_input`).
             image_input: None,
+            chat_reasoning_replay: None,
         },
         default_reasoning_effort: None,
     };

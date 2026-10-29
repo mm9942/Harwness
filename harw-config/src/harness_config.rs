@@ -42,6 +42,11 @@ pub struct HarnessConfig {
     /// `default_model`. `None` → die UIA nutzt `default_model` wie bisher.
     #[serde(default)]
     pub uia_model: Option<String>,
+    /// Keep task execution in the durable root agent instead of spawning
+    /// managed child agents. Tool rights, approvals and budgets are unchanged.
+    /// Internal policy/compaction helpers are not task-agent delegation.
+    #[serde(default)]
+    pub single_agent_mode: bool,
     /// Alter Pin für das Modell der uia-worker-Rollenfamilie (`uia-worker`,
     /// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`).
     /// Seit Runde 5, Teil G gilt er nur noch für Rollen ohne eigenen Eintrag

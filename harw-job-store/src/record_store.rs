@@ -198,6 +198,31 @@ impl<R> RecordStore<R> {
         Ok(())
     }
 
+    /// Publishes a sidecar after a last-moment authority check.
+    ///
+    /// The caller must hold the owning record lock for the entire call.
+    /// `commit_ok` runs after the temporary file is synced, immediately
+    /// before rename. Refusal leaves the previous sidecar unchanged.
+    /// This is not a transaction with the owning record.
+    ///
+    /// # Errors
+    /// Invalid kind/id, I/O errors, or the caller's commit refusal.
+    pub fn write_sidecar_checked<E: From<StoreError>>(
+        &self,
+        kind: &str,
+        id: &str,
+        bytes: &[u8],
+        commit_ok: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let kind = sidecar_kind(kind)?;
+        let id = validate_id(id)?;
+        self.root.create_dir_all(kind).map_err(StoreError::from)?;
+        // Persist a newly created sidecar directory before publishing into it.
+        fsops::sync_dir(&self.root).map_err(StoreError::from)?;
+        let dir = self.root.open_dir(kind).map_err(StoreError::from)?;
+        fsops::replace_atomic_checked(&dir, &record_name(id), id, bytes, "sidecar", commit_ok)
+    }
+
     /// Reads sidecar `<kind>/<id>.json`; `Ok(None)` if absent. Lock-free.
     ///
     /// # Errors
@@ -635,6 +660,30 @@ mod tests {
         }
         names.sort();
         Ok(names)
+    }
+
+    #[test]
+    fn sidecar_commit_veto_keeps_previous_bytes_and_cleans_temp() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store: RecordStore<Counter> = RecordStore::create_ambient(temp.path())?;
+        store.write_sidecar("state", "c-1", b"old")?;
+        let dir = temp.path().join("state");
+        let before = entry_names(&dir)?;
+        let refused: Result<(), Outcome> =
+            store.write_sidecar_checked("state", "c-1", b"new", || {
+                let names = entry_names(&dir).map_err(|_| Outcome::Refused("read failed"))?;
+                assert!(names.iter().any(|name| temp_owner(name) == Some("c-1")));
+                Err(Outcome::Refused("expired after sync"))
+            });
+        assert!(matches!(
+            refused,
+            Err(Outcome::Refused("expired after sync"))
+        ));
+        assert_eq!(store.read_sidecar("state", "c-1")?, Some(b"old".to_vec()));
+        assert_eq!(entry_names(&dir)?, before);
+        store.write_sidecar_checked::<StoreError>("state", "c-1", b"new", || Ok(()))?;
+        assert_eq!(store.read_sidecar("state", "c-1")?, Some(b"new".to_vec()));
+        Ok(())
     }
 
     #[test]

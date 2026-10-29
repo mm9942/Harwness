@@ -90,6 +90,17 @@ pub enum PlanBridgeError {
         task: TaskId,
     },
 
+    /// Job-Rückkanal passt nicht zur aktuellen Zuweisung oder zum Status.
+    #[msg("Job-Rückkanal '{work_id}' für Knoten '{task}' abgelehnt: {reason}")]
+    JobCallbackRejected {
+        /// Adressierter Knoten.
+        task: TaskId,
+        /// Vom Rückkanal gemeldete WorkId.
+        work_id: String,
+        /// Inhaltsfreier Ablehnungsgrund.
+        reason: &'static str,
+    },
+
     /// Eine Goal-Aussage wurde verlangt, obwohl kein Goal an den Plan
     /// gebunden ist.
     #[msg("Kein Goal an diesen Plan gebunden")]

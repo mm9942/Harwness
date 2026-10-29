@@ -43,6 +43,15 @@ struct FloodDriver {
 }
 
 impl TurnDriver for FloodDriver {
+    // This test double performs no privileged runtime/tool effects.
+    fn prepare_execution(
+        &self,
+        _: &harw_types::SessionId,
+        _: harw_session_host::driver::ExecutionAdmission,
+    ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -99,6 +108,8 @@ fn identity() -> ClientIdentity {
         tenant: None,
         caps: caps_for_tier(PermissionTier::Operator),
         device: None,
+        authenticated_node: None,
+        authenticated_key_fingerprint: None,
         actor: ApprovalActor::Operator {
             id: "uid:1000".into(),
         },

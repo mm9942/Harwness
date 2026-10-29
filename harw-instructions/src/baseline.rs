@@ -465,6 +465,7 @@ impl AgentIdentity {
         // Anzahl, sortiert — keine Daten pro Turn, damit der Block im
         // cachebaren Präfix bleibt. Ohne Familien zeichengleich wie zuvor.
         let tool_families_section = tool_families_section(&self.tool_families);
+        let workflow_section = crate::workflow::workflow_section(&self.tools_available);
 
         let mut prompt = format!(
             "You are {agent_name}, a {role_description} operating inside a local Rust workspace.\n\
@@ -475,7 +476,7 @@ impl AgentIdentity {
 - Operating system: {os_name}\n\
 \n\
 ## Available tools\n\
-{tools_section}{tool_families_section}{efficient_tool_use_section}\n\
+{tools_section}{tool_families_section}{efficient_tool_use_section}{workflow_section}\n\
 \n\
 ## Behavioral rules\n\
 - You DO have access to the local filesystem via the tools above. Do not tell the user you are just a language model without file access.\n\
@@ -687,6 +688,87 @@ mod tests {
     use crate::test_support::{TestError, TestResult};
     use harw_extension_api::InstructionsProvider;
 
+    fn workflow_prompt(tools: &[&str]) -> String {
+        AgentIdentity::new("harw", "/workspace")
+            .with_tools(tools.iter().map(|tool| (*tool).to_owned()).collect())
+            .render_system_prompt()
+    }
+
+    #[test]
+    fn natural_workflow_is_mounted_for_workspace_reads() {
+        let prompt = workflow_prompt(&["fs.read"]);
+        assert!(prompt.contains("## Goal-driven workflow"));
+        assert!(prompt.contains("planning-only"));
+        assert!(prompt.contains("not instructions or permission grants"));
+        assert!(!prompt.contains("### Governed durable execution"));
+        assert!(!prompt.contains("### Parallel delegation"));
+    }
+
+    #[test]
+    fn natural_workflow_does_not_invent_workspace_capabilities() {
+        for tools in [vec![], vec!["web.search"], vec!["fs.read.fake"]] {
+            assert!(!workflow_prompt(&tools).contains("## Goal-driven workflow"));
+        }
+    }
+
+    #[test]
+    fn durable_execution_guidance_requires_complete_control_surface() {
+        let full = [
+            "fs.read",
+            "plan",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ];
+        assert!(!workflow_prompt(&full).contains("### Governed durable execution"));
+        assert!(
+            crate::workflow_capabilities(&full, false).contains("### Governed durable execution")
+        );
+        for missing in [
+            "plan",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ] {
+            let tools: Vec<_> = full
+                .iter()
+                .copied()
+                .filter(|tool| *tool != missing)
+                .collect();
+            assert!(
+                !crate::workflow_capabilities(&tools, false)
+                    .contains("### Governed durable execution"),
+                "missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_guidance_is_absent_for_single_model_tool_surface() {
+        let direct = crate::workflow_capabilities(&["fs.read", "fs.write"], false);
+        assert!(!direct.contains("### Parallel delegation"));
+        assert!(direct.contains("### Direct implementation"));
+        let delegated = crate::workflow_capabilities(&["fs.read", "delegate_wave"], false);
+        assert!(delegated.contains("### Parallel delegation"));
+        assert!(!delegated.contains("### Direct implementation"));
+    }
+
+    #[test]
+    fn visible_write_tool_does_not_override_uia_routing() {
+        // Approximate the real assembly: UIA policy and a write tool can coexist.
+        // Disabling the spawner must not silently reinterpret this role policy.
+        let prompt = AgentIdentity::new("harw", "/workspace")
+            .with_tools(vec!["fs.read".to_owned(), "fs.write".to_owned()])
+            .with_organization_knowledge(
+                "UIA: send coding work to uia-writer or the root orchestrator.",
+            )
+            .render_system_prompt();
+        assert!(prompt.contains("UIA: send coding work to uia-writer"));
+        assert!(prompt.contains("Organization routing rules take precedence"));
+        assert!(prompt.contains("missing delegation is a blocker"));
+        assert!(!prompt.contains("Delegation is an option, not a prerequisite"));
+    }
+
     #[test]
     fn test_identity_new_defaults() {
         let id = AgentIdentity::new("harw", "/workspace");
@@ -864,9 +946,10 @@ mod tests {
         let section_start = prompt
             .find("## Efficient tool use")
             .ok_or(TestError::Missing("section start"))?;
-        let section_end = prompt
-            .find("\n\n## Behavioral rules")
-            .ok_or(TestError::Missing("section end"))?;
+        let section_end = section_start
+            + prompt[section_start..]
+                .find("\n\n## ")
+                .ok_or(TestError::Missing("section end"))?;
         let section_bytes = &prompt.as_bytes()[section_start..section_end];
         assert!(
             section_bytes.len() <= 600,

@@ -624,6 +624,33 @@ fn trampoline_plan_binds_exec_and_attempt_dir_and_runs_the_inner_trampoline() ->
 }
 
 #[test]
+fn trampoline_requires_actual_landlock_even_for_best_effort_jobs() -> TestResult {
+    let (_dir, root) = trampoline_workspace()?;
+    let executor = executor().with_proxy_relay(relay());
+    for profile in ALL_PROFILES {
+        let policy = SandboxPolicy::from_profile(profile, &root);
+        for requirement in [
+            SandboxRequirement::None,
+            SandboxRequirement::BestEffort,
+            SandboxRequirement::Required,
+        ] {
+            let mut spec = job("true", &[])?;
+            spec.sandbox = requirement;
+            let plan = executor
+                .plan_with_trampoline(&spec, &policy, &root, &mount())
+                .map_err(ctx("plan trampoline"))?;
+            assert_eq!(
+                plan.inner_policy().landlock,
+                harw_job_linux::LandlockMode::HardRequirement,
+                "{profile:?} / {requirement:?}: the job must not write its report"
+            );
+            assert_eq!(policy.landlock, harw_job_linux::LandlockMode::BestEffort);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn trampoline_plan_keeps_the_relay_prefix_first() -> TestResult {
     let (_dir, root) = workspace()?;
     let executor = executor().with_proxy_relay(relay());
@@ -740,7 +767,10 @@ fn trampoline_path_map_covers_every_bind_of_the_plan() -> TestResult {
         );
         assert_eq!(plan.inner_policy().capabilities, policy.capabilities);
         assert_eq!(plan.inner_policy().no_new_privs, policy.no_new_privs);
-        assert_eq!(plan.inner_policy().landlock, policy.landlock);
+        assert_eq!(
+            plan.inner_policy().landlock,
+            harw_job_linux::LandlockMode::HardRequirement
+        );
     }
     Ok(())
 }

@@ -12,7 +12,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use harw_protocol::HostedState;
-use harw_types::{SessionId, TenantId};
+use harw_types::{
+    ApprovalActor, AuthStrength, DeviceId, IngressSurface, PermissionTier, PrincipalKind,
+    SessionId, TenantId, TrustZone,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::HostError;
@@ -26,6 +29,53 @@ const RECORD_EXT: &str = "json";
 /// Longest session id accepted as a file name.
 const MAX_ID_LEN: usize = 128;
 
+/// Stable provenance pinned at creation, used only as a matching constraint.
+/// It never reconstructs an authenticated principal or grants execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatorExecutionBinding {
+    pub kind: PrincipalKind,
+    pub surface: IngressSurface,
+    pub device: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_node: Option<harw_types::NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_key_fingerprint: Option<[u8; 32]>,
+    pub zone: TrustZone,
+    pub strength: AuthStrength,
+}
+
+impl CreatorExecutionBinding {
+    #[must_use]
+    pub fn from_identity(identity: &crate::identity::ClientIdentity) -> Self {
+        Self {
+            kind: identity.principal.kind(),
+            surface: identity.principal.surface(),
+            device: identity.device.clone(),
+            authenticated_node: identity.authenticated_node.clone(),
+            authenticated_key_fingerprint: identity.authenticated_key_fingerprint,
+            zone: identity.zone,
+            strength: identity.strength,
+        }
+    }
+}
+
+/// Creator-derived request ceiling and actor, recorded for future shared-host admission.
+///
+/// This persisted value is not authority. Before any execution, a trusted
+/// policy must revalidate the creator and intersect this ceiling with current
+/// host and device restrictions. Legacy records without it cannot establish
+/// a creator's execution authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatorExecutionRequest {
+    /// Missing in early/legacy records: cannot establish creator authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<CreatorExecutionBinding>,
+    pub maximum_tier: PermissionTier,
+    pub approval_actor: ApprovalActor,
+}
+
 /// Durable metadata of one hosted session.
 ///
 /// No `deny_unknown_fields`: records evolve additively, and an older host
@@ -35,6 +85,9 @@ pub struct HostedSessionRecord {
     pub session_id: SessionId,
     pub tenant: Option<TenantId>,
     pub owner_principal: String,
+    /// Creator-derived request; never sufficient to authorize execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_execution: Option<CreatorExecutionRequest>,
     pub workspace: Option<String>,
     pub title: Option<String>,
     pub created_at: jiff::Timestamp,
@@ -56,6 +109,42 @@ pub struct HostedSessionRecord {
 }
 
 impl HostedSessionRecord {
+    /// Revalidate a creator request against a freshly authenticated identity.
+    ///
+    /// This returns a narrowing only; composition must also enforce all other
+    /// live policy, workspace and device restrictions. Legacy records and
+    /// identity or actor mismatches fail closed.
+    pub fn revalidate_creator_execution(
+        &self,
+        creator: &crate::identity::ClientIdentity,
+        host_maximum: PermissionTier,
+    ) -> Result<CreatorExecutionRequest, crate::error::HostError> {
+        creator.validate()?;
+        let request = self.creator_execution.as_ref().ok_or_else(|| {
+            crate::error::HostError::Denied(
+                "legacy session lacks a creator execution request".into(),
+            )
+        })?;
+        if request.binding.as_ref() != Some(&CreatorExecutionBinding::from_identity(creator))
+            || self.owner_principal != creator.principal.id()
+            || self.tenant != creator.tenant
+            || self.owner_agent.as_deref() != creator.agent.as_ref().map(|agent| agent.id.as_str())
+            || request.approval_actor != creator.actor
+        {
+            return Err(crate::error::HostError::Denied(
+                "session creator identity or approval actor no longer matches".into(),
+            ));
+        }
+        Ok(CreatorExecutionRequest {
+            binding: request.binding.clone(),
+            maximum_tier: request
+                .maximum_tier
+                .min(creator.principal.tier())
+                .min(host_maximum),
+            approval_actor: creator.actor.clone(),
+        })
+    }
+
     /// True when an agent whose delegation chain is `lineage` (the agent
     /// first, then its parent, …, up to the UIA) may run gateway tools in
     /// this session: some agent of the chain created the session or was
@@ -99,6 +188,15 @@ impl RecordStore {
         })?;
         harw_fsutil::write_atomic(&path, &bytes, harw_fsutil::AtomicWriteOptions::private())?;
         Ok(())
+    }
+
+    /// Remove an unpublished/failed creation record. A missing file is benign.
+    pub fn remove(&self, id: &SessionId) -> Result<(), HostError> {
+        match std::fs::remove_file(self.record_path(id)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Read the record of `id`; `Ok(None)` when there is none.
@@ -288,6 +386,7 @@ mod tests {
             session_id: SessionId::try_from_str(id)?,
             tenant: None,
             owner_principal: "uid:1000".into(),
+            creator_execution: None,
             workspace: Some("/work".into()),
             title: Some(format!("session {id}")),
             created_at,
@@ -298,6 +397,155 @@ mod tests {
             owner_agent: None,
             tool_agents: Vec::new(),
         })
+    }
+
+    #[test]
+    fn creator_execution_revalidation_refuses_legacy_and_identity_mismatch() -> TestResult {
+        let mut session = record("creator", HostedState::Idle, 100)?;
+        let creator = crate::identity::test_identity::local(1000, PermissionTier::Operator);
+        assert!(
+            session
+                .revalidate_creator_execution(&creator, PermissionTier::Owner)
+                .is_err()
+        );
+        session.creator_execution = Some(CreatorExecutionRequest {
+            binding: Some(CreatorExecutionBinding::from_identity(&creator)),
+            maximum_tier: PermissionTier::Owner,
+            approval_actor: creator.actor.clone(),
+        });
+        let narrowed = session.revalidate_creator_execution(&creator, PermissionTier::Observer)?;
+        assert_eq!(narrowed.maximum_tier, PermissionTier::Observer);
+        assert_eq!(narrowed.approval_actor, creator.actor);
+        let other = crate::identity::test_identity::local(1001, PermissionTier::Owner);
+        assert!(
+            session
+                .revalidate_creator_execution(&other, PermissionTier::Owner)
+                .is_err()
+        );
+        let mut actor_changed = creator;
+        actor_changed.actor = ApprovalActor::Operator {
+            id: "other".to_owned(),
+        };
+        assert!(
+            session
+                .revalidate_creator_execution(&actor_changed, PermissionTier::Owner)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creator_execution_rejects_changed_provenance() -> TestResult {
+        let mut session = record("creator", HostedState::Idle, 100)?;
+        let creator = crate::identity::test_identity::local(1000, PermissionTier::Operator);
+        session.creator_execution = Some(CreatorExecutionRequest {
+            binding: Some(CreatorExecutionBinding::from_identity(&creator)),
+            maximum_tier: creator.principal.tier(),
+            approval_actor: creator.actor.clone(),
+        });
+        let mut changed = creator.clone();
+        changed.principal = harw_types::Principal::trusted_ingress(
+            harw_types::PrincipalKind::Human,
+            creator.principal.id(),
+            harw_types::IngressSurface::Cli,
+            creator.principal.tier(),
+        );
+        assert!(
+            session
+                .revalidate_creator_execution(&changed, PermissionTier::Owner)
+                .is_err()
+        );
+        changed = creator.clone();
+        changed.device = Some(DeviceId::try_from_str("other-device")?);
+        assert!(
+            session
+                .revalidate_creator_execution(&changed, PermissionTier::Owner)
+                .is_err()
+        );
+        changed = creator.clone();
+        changed.authenticated_node = Some(harw_types::NodeId::try_from_str("different-node")?);
+        assert!(
+            session
+                .revalidate_creator_execution(&changed, PermissionTier::Owner)
+                .is_err()
+        );
+        changed = creator.clone();
+        changed.authenticated_key_fingerprint = Some([7; 32]);
+        assert!(
+            session
+                .revalidate_creator_execution(&changed, PermissionTier::Owner)
+                .is_err()
+        );
+        session
+            .creator_execution
+            .as_mut()
+            .ok_or("missing request")?
+            .binding = None;
+        assert!(
+            session
+                .revalidate_creator_execution(&creator, PermissionTier::Owner)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creator_execution_pins_its_peer_key_without_pinning_other_peers() -> TestResult {
+        let mut session = record("creator", HostedState::Idle, 100)?;
+        let mut creator = crate::identity::test_identity::local(1000, PermissionTier::Operator);
+        creator.authenticated_node = Some(harw_types::NodeId::try_from_str("same-node")?);
+        creator.authenticated_key_fingerprint = Some([3; 32]);
+        session.creator_execution = Some(CreatorExecutionRequest {
+            binding: Some(CreatorExecutionBinding::from_identity(&creator)),
+            maximum_tier: creator.principal.tier(),
+            approval_actor: creator.actor.clone(),
+        });
+        let mut fresh = creator.clone();
+        fresh.connection = crate::identity::ConnectionId::next();
+        // Reopening with the same verified peer key remains eligible, even if
+        // unrelated trusted peers were added to the verifier's key store.
+        assert!(
+            session
+                .revalidate_creator_execution(&fresh, PermissionTier::Owner)
+                .is_ok()
+        );
+        fresh.authenticated_key_fingerprint = Some([4; 32]);
+        assert!(
+            session
+                .revalidate_creator_execution(&fresh, PermissionTier::Owner)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creator_execution_request_round_trips_and_legacy_stays_absent() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = RecordStore::new(dir.path());
+        let mut session = record("creator", HostedState::Idle, 100)?;
+        assert!(
+            serde_json::to_value(&session)?
+                .get("creator_execution")
+                .is_none()
+        );
+        session.creator_execution = Some(CreatorExecutionRequest {
+            binding: None,
+            maximum_tier: PermissionTier::Operator,
+            approval_actor: ApprovalActor::Operator {
+                id: "device:one".to_owned(),
+            },
+        });
+        store.save(&session)?;
+        assert_eq!(store.load(&session.session_id)?, Some(session));
+        let legacy = record("legacy", HostedState::Idle, 101)?;
+        store.save(&legacy)?;
+        assert_eq!(
+            store
+                .load(&legacy.session_id)?
+                .and_then(|r| r.creator_execution),
+            None
+        );
+        Ok(())
     }
 
     #[test]

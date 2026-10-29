@@ -2,8 +2,9 @@
 //!
 //! Only what offer producers need today: what a runtime backend *delivers*
 //! per sandbox dimension ([`RuntimeOffer`]) and what a node currently
-//! offers ([`NodeOffer`]). Requirements, grants, the filter and the score
-//! are later rounds.
+//! offers ([`NodeOffer`]). [`filter_runtime`] checks required dimensions of
+//! one explicitly selected backend. Grants, scoring and execution remain
+//! responsibilities of the existing admission and job owners.
 //!
 //! # Fail closed (DEC-021)
 //! An offer carries its observation time and a time to live. A stale offer,
@@ -13,7 +14,12 @@
 
 #![forbid(unsafe_code)]
 
+mod filter;
 mod offer;
+
+pub use filter::{
+    RequiredDimensions, RuntimeRejection, RuntimeRequirements, SandboxDimension, filter_runtime,
+};
 
 pub use offer::{
     DimensionStates, Enforcement, NodeOffer, NodeState, RuntimeBackend, RuntimeOffer, UnixMillis,

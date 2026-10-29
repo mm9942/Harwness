@@ -337,8 +337,25 @@ egress_allow_cidrs = ["192.0.2.0/24"]
             std::process::id()
         ));
         let report = read_system_config(Some(&missing))?;
-        // `/` is root-owned and not group/world-writable on every supported
-        // host, so the walk reaches the absent directory.
+        // Rootless containers can expose `/` as non-root-owned. Preserve
+        // the production trust rejection instead of assuming host ownership.
+        use std::os::unix::fs::MetadataExt as _;
+        let root = fs::metadata("/")?;
+        if root.uid() == 0 && root.mode() & 0o022 == 0 {
+            assert_eq!(report, ConfigReport::Missing { path: missing });
+        } else {
+            assert!(matches!(report, ConfigReport::Untrusted { path, .. } if path == missing));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn not_found_load_error_is_classified_as_missing() -> TestResult {
+        let missing = path();
+        let report = classify(
+            missing.clone(),
+            Err(ConfigError::Io(io::Error::from(io::ErrorKind::NotFound))),
+        )?;
         assert_eq!(report, ConfigReport::Missing { path: missing });
         Ok(())
     }

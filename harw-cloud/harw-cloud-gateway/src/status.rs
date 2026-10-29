@@ -25,8 +25,12 @@ pub struct PortStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudStatus {
-    /// Whether the gateway reports at least one listening port.
-    pub running: bool,
+    /// Whether any configured port accepts TCP connections; not peer identity.
+    pub any_port_listening: bool,
+    /// Service identity is not established by a TCP probe. Always unknown.
+    pub running: Option<bool>,
+    /// Authenticated operation readiness is not established by a TCP probe.
+    pub ready: Option<bool>,
     /// Per-port probe results.
     pub ports: Vec<PortStatus>,
 }
@@ -34,7 +38,7 @@ pub struct CloudStatus {
 /// Probe all mapped ports of the given gateway configuration.
 ///
 /// Each port is probed with a short TCP connect against `127.0.0.1`;
-/// `running` is true if at least one port is listening.
+/// Reachability is reported separately; running and ready remain unknown.
 pub async fn probe(config: &GatewayConfig) -> CloudStatus {
     let mut ports = Vec::with_capacity(config.ports.len());
     for mapping in &config.ports {
@@ -53,8 +57,13 @@ pub async fn probe(config: &GatewayConfig) -> CloudStatus {
             listening,
         });
     }
-    let running = ports.iter().any(|p| p.listening);
-    CloudStatus { running, ports }
+    let any_port_listening = ports.iter().any(|p| p.listening);
+    CloudStatus {
+        any_port_listening,
+        running: None,
+        ready: None,
+        ports,
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +88,9 @@ mod tests {
             }],
         };
         let status = probe(&config).await;
-        assert!(!status.running);
+        assert!(!status.any_port_listening);
+        assert_eq!(status.running, None);
+        assert_eq!(status.ready, None);
         assert_eq!(status.ports.len(), 1);
         assert_eq!(status.ports[0].name, "probe");
         assert!(!status.ports[0].listening);
@@ -99,7 +110,9 @@ mod tests {
             }],
         };
         let status = probe(&config).await;
-        assert!(status.running);
+        assert!(status.any_port_listening);
+        assert_eq!(status.running, None);
+        assert_eq!(status.ready, None);
         assert!(status.ports[0].listening);
     }
 }

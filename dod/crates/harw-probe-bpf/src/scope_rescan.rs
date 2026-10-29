@@ -488,17 +488,53 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use harw_dod_bpf::cgroup_walk::{HostCgroupFs, WalkLimits, host_path, resolve_cgroup};
     use harw_dod_bpf::{
-        BpfHandle, BpfProgramSource, DescendantScope, FixtureBpfLoader, MAX_SCOPE_CGROUP_IDS,
-        ScopeMapOp,
+        BpfError, BpfHandle, BpfProgramSource, BpfScopeWriter, DescendantScope, FixtureBpfLoader,
+        MAX_SCOPE_CGROUP_IDS, ScopeDelta, ScopeMapOp,
     };
     use harw_types::SensorId;
 
     use super::{SCOPE_RESCAN_INTERVAL, ScopeHealth, ScopeRescan};
     use crate::test_support::{TestError, TestResult, ctx};
+
+    /// Schreiber, der bei den Aufrufen in `fail_calls` (1-basiert) nur einen
+    /// Eintrag ändert und dann scheitert, wie ein Kernel-Map-Syscall, der
+    /// mitten in einem sonst gültigen Delta fehlschlägt.
+    struct PartialWriter<'a> {
+        loader: &'a FixtureBpfLoader,
+        fail_calls: BTreeSet<usize>,
+        calls: AtomicUsize,
+    }
+
+    impl BpfScopeWriter for PartialWriter<'_> {
+        fn apply_scope_delta(
+            &self,
+            handle: &BpfHandle,
+            delta: &ScopeDelta,
+        ) -> Result<(), BpfError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.fail_calls.contains(&call) {
+                let partial = if let Some(id) = delta.remove.first() {
+                    ScopeDelta {
+                        remove: vec![*id],
+                        insert: Vec::new(),
+                    }
+                } else {
+                    ScopeDelta {
+                        insert: delta.insert.first().copied().into_iter().collect(),
+                        remove: Vec::new(),
+                    }
+                };
+                self.loader.apply_scope_delta(handle, &partial)?;
+                return Err(BpfError::ScopeMapUpdateFailed);
+            }
+            self.loader.apply_scope_delta(handle, delta)
+        }
+    }
 
     /// Gefälschter cgroup-Baum unter einem Tempdir, wie die Sonde ihn über
     /// `--cgroup-root` sähe.
@@ -825,6 +861,73 @@ mod tests {
             probe.rescan.scope.installed_ids(),
             BTreeSet::from([root, job])
         );
+        assert_eq!(probe.rescan.stats.divergent_handles, 0);
+        Ok(())
+    }
+
+    /// Portiert aus alice/consolidate-20261029: ein teilweise gescheitertes
+    /// Zurückziehen wird auch in einer unvollständigen Runde (die selbst nichts
+    /// zurückzieht) auf den bestätigten Stand gebracht, ohne `apply_failed`.
+    #[test]
+    fn failed_removal_is_restored_before_an_incomplete_walk() -> TestResult {
+        let tree = FakeTree::new()?;
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let before = probe.map()?;
+        tree.rmcg("/harw.slice/harw-job-1")?;
+        probe.loader.fail_next_scope_updates(1);
+        assert!(probe.rescan().health.apply_failed);
+        assert!(probe.map().is_err(), "fixture must actually diverge");
+
+        probe.rescan.limits.max_entries = 0;
+        let incomplete = probe.rescan();
+        assert!(incomplete.health.incomplete);
+        assert!(!incomplete.health.apply_failed);
+        assert!(incomplete.delta.remove.is_empty());
+        assert_eq!(probe.map()?, before);
+        assert!(probe.map()?.contains(&job));
+
+        probe.rescan.limits = WalkLimits::default();
+        assert!(!probe.rescan().health.is_degraded());
+        assert!(!probe.map()?.contains(&job));
+        Ok(())
+    }
+
+    /// Portiert aus alice/consolidate-20261029: der ablehnende Griff ändert
+    /// selbst einen Teil seines Deltas, und auch die nächste, neu geplante
+    /// Runde scheitert dort teilweise. Erholung erst, wenn alle Maps wieder dem
+    /// verfolgten Scope entsprechen.
+    #[test]
+    fn partial_entry_failure_and_failed_fresh_plan_converge() -> TestResult {
+        let tree = FakeTree::new()?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let root = tree.id("/harw.slice")?;
+        tree.mkcg("/harw.slice/old-1")?;
+        tree.mkcg("/harw.slice/old-2")?;
+        let writer = PartialWriter {
+            loader: &probe.loader,
+            fail_calls: BTreeSet::from([1, 3]),
+            calls: AtomicUsize::new(0),
+        };
+        let handles: Vec<_> = probe.handles.iter().collect();
+        let first = probe.rescan.rescan(&writer, &handles, probe.start);
+        assert!(first.health.apply_failed);
+        assert!(probe.map().is_err(), "partial entry writes must diverge");
+
+        let new = tree.mkcg("/harw.slice/new")?;
+        tree.rmcg("/harw.slice/old-1")?;
+        tree.rmcg("/harw.slice/old-2")?;
+        let second = probe.rescan.rescan(&writer, &handles, probe.start);
+        assert!(second.health.apply_failed, "the fresh plan failed as well");
+        assert!(!second.newly_degraded);
+        assert_eq!(second.delta.insert, vec![new]);
+        assert_eq!(probe.rescan.stats.divergent_handles, 2);
+
+        tree.rmcg("/harw.slice/new")?;
+        let third = probe.rescan.rescan(&writer, &handles, probe.start);
+        assert!(!third.health.is_degraded());
+        assert_eq!(probe.map()?, BTreeSet::from([root]));
+        assert_eq!(probe.rescan.scope.installed_ids(), BTreeSet::from([root]));
         assert_eq!(probe.rescan.stats.divergent_handles, 0);
         Ok(())
     }

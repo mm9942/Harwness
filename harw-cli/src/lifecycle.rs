@@ -1594,6 +1594,10 @@ mod tests {
         // als Menge statt per `starts_with`-Präfix verglichen.
         let base: HashSet<&str> = [
             "fs.read",
+            // Native Bilddaten und explizite Vision-Delegation (PR #158).
+            // `image.inspect` bleibt trotz lesender Oberfläche freigabepflichtig.
+            "fs.view_image",
+            "image.inspect",
             "fs.write",
             "fs.edit",
             "fs.list",

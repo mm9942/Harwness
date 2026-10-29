@@ -261,6 +261,10 @@ pub struct ClientIdentity {
     pub caps: ClientCaps,
     /// Enrolled device, for remote callers.
     pub device: Option<DeviceId>,
+    /// Node authenticated by the transport (remote listener), never request JSON.
+    pub authenticated_node: Option<harw_types::NodeId>,
+    /// Fingerprint of the key actually trusted by the transport verifier.
+    pub authenticated_key_fingerprint: Option<[u8; 32]>,
     /// Host-derived approval actor. Never taken from the wire.
     pub actor: ApprovalActor,
     /// Display label for presence.
@@ -481,6 +485,8 @@ pub(crate) mod test_identity {
             tenant: None,
             caps: caps_for_tier(tier),
             device: None,
+            authenticated_node: None,
+            authenticated_key_fingerprint: None,
             actor: ApprovalActor::Operator {
                 id: format!("uid:{uid}"),
             },
