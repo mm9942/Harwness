@@ -1,0 +1,17 @@
+# file-edit-read-loop@1: fs.edit(A) then 3x fs.read(A) is one loop
+# (A · edit x1 · read x3). A read burst of B is sealed by a write of B, which
+# opens a loop of B; the failed write stays visible in the compact counters.
+{"ingest_seq":1,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"edit","resource_field":"path","effect":"mutate"},"resource":{"path":"src/lib.rs"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"edit","resource_field":"path","effect":"mutate"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"started"}
+{"ingest_seq":4,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":5,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"started"}
+{"ingest_seq":6,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}
+# a completion without a recorded start still joins
+{"ingest_seq":7,"owner":{"session":"root","turn":1,"call":"c4"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":8,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"README.md"},"lifecycle":"started"}
+{"ingest_seq":9,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"README.md"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":10,"owner":{"session":"root","turn":1,"call":"c6"},"descriptor":{"domain":"filesystem","verb":"write","resource_field":"path","effect":"mutate"},"resource":{"path":"README.md"},"lifecycle":"started"}
+{"ingest_seq":11,"owner":{"session":"root","turn":1,"call":"c6"},"descriptor":{"domain":"filesystem","verb":"write","resource_field":"path","effect":"mutate"},"resource":{"path":"README.md"},"lifecycle":"finished","outcome":{"failed":{"class":"permission"}}}
+{"ingest_seq":12,"owner":{"session":"root","turn":1,"call":"c7"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"README.md"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":13,"owner":{"session":"root","turn":1},"descriptor":{"domain":"scope","verb":"boundary","effect":"control"},"lifecycle":{"boundary":"turn_end"}}

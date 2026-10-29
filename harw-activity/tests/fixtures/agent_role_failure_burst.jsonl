@@ -1,0 +1,19 @@
+# agent-role-failure-burst@1: three reviewer children of root fail with the same
+# class (one burst); a reviewer crash is a different class (own burst); a
+# classless failure never aggregates; a running explorer and a successful run
+# stay individual standalone instances only. The end of root's turn closes the
+# window, so a later timeout opens a new burst.
+{"ingest_seq":1,"owner":{"session":"a1","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a1"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"a2","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a2"},"lifecycle":"started"}
+{"ingest_seq":3,"owner":{"session":"a3","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a3"},"lifecycle":"started"}
+{"ingest_seq":4,"owner":{"session":"e1","role":"explorer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"e1"},"lifecycle":"started"}
+{"ingest_seq":5,"owner":{"session":"a1","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a1"},"lifecycle":"finished","outcome":{"failed":{"class":"timeout"}}}
+{"ingest_seq":6,"owner":{"session":"a2","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a2"},"lifecycle":"finished","outcome":{"failed":{"class":"timeout"}}}
+{"ingest_seq":7,"owner":{"session":"a4","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a4"},"lifecycle":"started"}
+{"ingest_seq":8,"owner":{"session":"a4","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a4"},"lifecycle":"finished","outcome":{"failed":{"class":"crash"}}}
+{"ingest_seq":9,"owner":{"session":"a3","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a3"},"lifecycle":"finished","outcome":{"failed":{"class":"timeout"}}}
+{"ingest_seq":10,"owner":{"session":"a5","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a5"},"lifecycle":"finished","outcome":{"failed":{}}}
+{"ingest_seq":11,"owner":{"session":"a6","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a6"},"lifecycle":"finished","outcome":"succeeded"}
+# root's turn ends: the failure window closes
+{"ingest_seq":12,"owner":{"session":"root","turn":1},"descriptor":{"domain":"scope","verb":"boundary","effect":"control"},"lifecycle":{"boundary":"turn_end"}}
+{"ingest_seq":13,"owner":{"session":"a7","role":"reviewer","parent":"root"},"descriptor":{"domain":"agent","verb":"run","effect":"execute"},"resource":{"agent":"a7"},"lifecycle":"finished","outcome":{"failed":{"class":"timeout"}}}
