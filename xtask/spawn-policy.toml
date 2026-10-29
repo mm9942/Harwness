@@ -36,3 +36,4 @@
 "harw-tool-shell/src/exec/background.rs" = "recipe: builds the command; the job runtime starts it (PL-93)"
 "harw-tui/src/app/plan_mode.rs" = "tooling: interactive helper (editor/clipboard) that needs the user's terminal, not a workload"
 "harw-tui/src/clipboard.rs" = "tooling: interactive helper (editor/clipboard) that needs the user's terminal, not a workload"
+"harw-tui/src/process_tree.rs" = "tooling: read-only `ps -A -o pid=,ppid=,stat=` process-table snapshot for the 2x Ctrl+C emergency stop when /proc is unavailable; not a workload"
