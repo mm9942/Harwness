@@ -123,8 +123,7 @@ pub enum WardenState {
     Disabled,
     /// The socket is listening, or enabled with its guard file in place.
     Enabled,
-    /// systemd could not be asked and the guard file does not rule the
-    /// Warden out.
+    /// Available evidence does not determine whether the socket is enabled.
     Unknown,
 }
 
@@ -330,8 +329,8 @@ pub fn install_state(libexec_dir: &Path) -> InstallState {
 ///   without the guard file (`ConditionPathExists=` is evaluated only when
 ///   the unit starts, so removing the flag leaves a listening socket up);
 /// - socket enabled (`UnitFileState=enabled`/`enabled-runtime`) and the
-///   guard file present or not checkable (e.g. `/etc/harw-dod` is `0750`)
-///   ⇒ [`WardenState::Enabled`] (`make -C dod enable-warden` state);
+///   guard file present ⇒ [`WardenState::Enabled`] (`make -C dod
+///   enable-warden` state); an uncheckable guard ⇒ [`WardenState::Unknown`];
 /// - any other reported socket state ⇒ [`WardenState::Disabled`].
 ///
 /// Only when systemd cannot be asked does the guard file decide alone:
@@ -340,10 +339,11 @@ pub fn install_state(libexec_dir: &Path) -> InstallState {
 /// status must never claim enforcement it cannot see.
 #[must_use]
 pub fn warden_state(flag: &Path, units: &[UnitState]) -> WardenState {
-    let flag_absent = matches!(
-        fs::symlink_metadata(flag),
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-    );
+    let flag_present = match fs::symlink_metadata(flag) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    };
     let socket = units
         .iter()
         .find(|unit| unit.unit == WARDEN_SOCKET_UNIT)
@@ -358,14 +358,20 @@ pub fn warden_state(flag: &Path, units: &[UnitState]) -> WardenState {
                 unit_file_state.as_deref(),
                 Some("enabled" | "enabled-runtime")
             );
-            if active_state == "active" || (socket_enabled && !flag_absent) {
+            if active_state == "active" {
                 WardenState::Enabled
+            } else if socket_enabled {
+                match flag_present {
+                    Some(true) => WardenState::Enabled,
+                    Some(false) => WardenState::Disabled,
+                    None => WardenState::Unknown,
+                }
             } else {
                 WardenState::Disabled
             }
         }
         Some(UnitStatus::NotAvailable | UnitStatus::Unknown { .. }) | None => {
-            if flag_absent {
+            if flag_present == Some(false) {
                 WardenState::Disabled
             } else {
                 WardenState::Unknown
@@ -660,6 +666,54 @@ mod tests {
     }
 
     #[test]
+    fn inaccessible_guard_stays_unknown_in_public_status() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let protected = root.path().join("protected");
+        fs::create_dir(&protected)?;
+        let flag = protected.join("warden.enable");
+        fs::write(&flag, "")?;
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o000))?;
+        let error = fs::symlink_metadata(&flag).err();
+
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin)?;
+        let systemctl = bin.join("systemctl");
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 6 ]; do\n  [ $i -eq 4 ] && state=enabled || state=disabled\n  printf 'ActiveState=inactive\\nSubState=dead\\nUnitFileState=%s\\n\\n' \"$state\"\n  i=$((i + 1))\ndone\n",
+        )?;
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))?;
+        let mut ctx = DodClientContext::new(root.path().join("home"), OffsetDateTime::UNIX_EPOCH);
+        ctx.warden_flag = flag;
+        ctx.search_path = Some(bin.into_os_string());
+        ctx.system_export_dir = root.path().join("export");
+        ctx.libexec_dir = root.path().join("libexec");
+        ctx.config_path = Some(root.path().join("config"));
+        let snapshot = status(&ctx);
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o700))?;
+
+        // Privileged test runners can bypass directory permissions.
+        if error
+            .as_ref()
+            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            assert_eq!(
+                snapshot.units[4],
+                UnitState {
+                    unit: "harw-warden.socket".to_owned(),
+                    status: UnitStatus::Reported {
+                        active_state: "inactive".to_owned(),
+                        sub_state: "dead".to_owned(),
+                        unit_file_state: Some("enabled".to_owned()),
+                    },
+                }
+            );
+            assert_eq!(snapshot.warden, WardenState::Unknown);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn warden_state_combines_the_socket_unit_and_the_guard_file() -> TestResult {
         let root = tempfile::tempdir()?;
         let present = root.path().join("warden.enable");
@@ -682,7 +736,8 @@ mod tests {
         // Enabled socket: starts with the flag, stays down without it.
         assert_eq!(warden_state(&present, &enabled), WardenState::Enabled);
         assert_eq!(warden_state(&present, &runtime), WardenState::Enabled);
-        assert_eq!(warden_state(&unknowable, &enabled), WardenState::Enabled);
+        assert_eq!(warden_state(&unknowable, &enabled), WardenState::Unknown);
+        assert_eq!(warden_state(&unknowable, &runtime), WardenState::Unknown);
         assert_eq!(warden_state(&absent, &enabled), WardenState::Disabled);
         // Flag present, socket disabled, inactive or not installed.
         assert_eq!(warden_state(&present, &off), WardenState::Disabled);
