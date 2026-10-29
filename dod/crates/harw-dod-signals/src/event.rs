@@ -79,6 +79,65 @@ pub struct Actor {
     pub cgroup: Option<CgroupId>,
 }
 
+/// Prefix that marks an [`Actor::cgroup`] value as a **raw kernel cgroup
+/// id** forwarded by a privileged probe, not as a resolved cgroup path.
+///
+/// # Description
+/// PL-97 E4: the BPF probe sees only the numeric cgroup id in its wire
+/// header; mapping it to a path is the unprivileged sentinel's job. The id
+/// travels in the existing `cgroup` field (`"cgroup-id:<decimal>"`) instead
+/// of a new field, because [`Actor`] is `deny_unknown_fields`: a new field
+/// would make an older sentinel reject every event, while this encoding is
+/// accepted by every reader of the existing schema. A resolved path is
+/// always absolute (starts with `/`), so the two forms never collide.
+pub const RAW_CGROUP_ID_PREFIX: &str = "cgroup-id:";
+
+impl Actor {
+    /// Encodes a raw kernel cgroup id for [`Actor::cgroup`].
+    ///
+    /// # Arguments
+    /// - `cgroup_id` (`u64`): the kernel cgroup id (cgroup v2: the inode
+    ///   number of the cgroup directory). `0` is never a valid id.
+    ///
+    /// # Returns
+    /// `Some` raw-id marker (see [`RAW_CGROUP_ID_PREFIX`]); `None` for `0`
+    /// (an absent id stays absent).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_signals::Actor;
+    ///
+    /// let actor = Actor { uid: 1000, auid: None, cgroup: Actor::raw_cgroup(42) };
+    /// assert_eq!(actor.raw_cgroup_id(), Some(42));
+    /// assert_eq!(Actor::raw_cgroup(0), None);
+    /// ```
+    #[must_use]
+    pub fn raw_cgroup(cgroup_id: u64) -> Option<CgroupId> {
+        if cgroup_id == 0 {
+            return None;
+        }
+        CgroupId::try_from_str(format!("{RAW_CGROUP_ID_PREFIX}{cgroup_id}")).ok()
+    }
+
+    /// Decodes a raw kernel cgroup id from [`Actor::cgroup`].
+    ///
+    /// # Returns
+    /// The id when `cgroup` carries a well-formed raw-id marker (decimal,
+    /// non-zero); `None` for no cgroup, a resolved path or anything else.
+    #[must_use]
+    pub fn raw_cgroup_id(&self) -> Option<u64> {
+        let digits = self
+            .cgroup
+            .as_ref()?
+            .as_str()
+            .strip_prefix(RAW_CGROUP_ID_PREFIX)?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u64>().ok().filter(|id| *id != 0)
+    }
+}
+
 /// Wie schwer eine Strukturabweichung wiegt.
 ///
 /// # Description
@@ -453,5 +512,34 @@ mod tests {
             actor.auid.ok_or(TestError::Missing("auid present"))?
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_raw_cgroup_id_round_trips_and_rejects_other_values() {
+        let actor = Actor {
+            uid: 1,
+            auid: None,
+            cgroup: Actor::raw_cgroup(4_242),
+        };
+        assert_eq!(
+            actor.cgroup.as_ref().map(CgroupId::as_str),
+            Some("cgroup-id:4242")
+        );
+        assert_eq!(actor.raw_cgroup_id(), Some(4_242));
+        assert_eq!(Actor::raw_cgroup(0), None);
+        for other in [
+            "/sys/fs/cgroup/harw.slice",
+            "cgroup-id:",
+            "cgroup-id:+1",
+            "cgroup-id:0",
+            "cgroup-1",
+        ] {
+            let actor = Actor {
+                uid: 1,
+                auid: None,
+                cgroup: Some(CgroupId::from_str(other)),
+            };
+            assert_eq!(actor.raw_cgroup_id(), None, "{other}");
+        }
     }
 }

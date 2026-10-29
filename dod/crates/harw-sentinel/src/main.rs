@@ -258,6 +258,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cgroup_resolve;
 mod cli;
 mod error;
 mod export;
@@ -832,6 +833,8 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         sentinel.record_external_event(event);
     }
 
+    let mut resolver = cgroup_resolve::CgroupResolver::new(cli.cgroup_root.clone());
+
     if cli.once {
         poll_once(
             &mut sentinel,
@@ -839,6 +842,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             sink.as_ref(),
             exporter.as_mut(),
             health.as_mut(),
+            Some(&mut resolver),
         );
         return Ok(());
     }
@@ -850,6 +854,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             sink.as_ref(),
             exporter.as_mut(),
             health.as_mut(),
+            Some(&mut resolver),
         );
         std::thread::sleep(timing.interval());
     }
@@ -889,12 +894,17 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 ///   health document (`--health-export`); rewritten at the end of the cycle
 ///   from health snapshots taken around `poll_all`. `None` writes nothing
 ///   and takes no snapshot.
+/// - `resolver` (`Option<&mut cgroup_resolve::CgroupResolver>`): maps the raw
+///   cgroup ids forwarded by the probes to cgroup paths beneath
+///   `--cgroup-root` (PL-97 E4); `None` leaves every received actor without
+///   a cgroup.
 fn poll_once(
     sentinel: &mut Sentinel,
     inbox: Option<&IpcInboxHandle>,
     sink: &dyn TelemetrySink,
     exporter: Option<&mut export::FindingsExporter>,
     health: Option<&mut health_export::HealthExporter>,
+    resolver: Option<&mut cgroup_resolve::CgroupResolver>,
 ) {
     let now = Timestamp::now();
     // Nur mit Gesundheitsexport: Zustand je Sensor vor dem Abruf festhalten,
@@ -911,7 +921,7 @@ fn poll_once(
         tracing::warn!(?event, "security event observed");
     }
 
-    drain_external_events(sentinel, inbox);
+    drain_external_events(sentinel, inbox, resolver);
 
     match sentinel.freeze(now) {
         Ok(evidence) => {
@@ -1087,7 +1097,11 @@ fn build_findings_exporter(
 /// `inbox.lock()`-Aufruf selbst; `sentinel.record_external_event` läuft
 /// danach lock-frei.
 #[cfg(target_os = "linux")]
-fn drain_external_events(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>) {
+fn drain_external_events(
+    sentinel: &mut Sentinel,
+    inbox: Option<&IpcInboxHandle>,
+    mut resolver: Option<&mut cgroup_resolve::CgroupResolver>,
+) {
     let Some(inbox) = inbox else {
         return;
     };
@@ -1135,7 +1149,15 @@ fn drain_external_events(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>
         );
     }
 
-    for item in received {
+    if let Some(resolver) = resolver.as_deref_mut() {
+        resolver.begin_batch();
+    }
+    for mut item in received {
+        // Rohe cgroup-ID der Sonde -> Pfad unter `--cgroup-root`, oder
+        // keine cgroup (PL-97 E4, siehe `cgroup_resolve`).
+        if let Some(actor) = item.event.actor.as_mut() {
+            cgroup_resolve::resolve_actor_cgroup(actor, resolver.as_deref_mut());
+        }
         tracing::debug!(
             sensor = %item.event.sensor.as_str(),
             peer_pid = item.peer.pid,
@@ -1149,7 +1171,12 @@ fn drain_external_events(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>
 /// (siehe [`IpcInboxHandle`], [`spawn_ipc_if_available`]) — diese Funktion
 /// ist entsprechend ein reines No-Op.
 #[cfg(not(target_os = "linux"))]
-fn drain_external_events(_sentinel: &mut Sentinel, _inbox: Option<&IpcInboxHandle>) {}
+fn drain_external_events(
+    _sentinel: &mut Sentinel,
+    _inbox: Option<&IpcInboxHandle>,
+    _resolver: Option<&mut cgroup_resolve::CgroupResolver>,
+) {
+}
 
 /// Bindet den IPC-Empfangssocket, falls möglich, startet seine
 /// Annahmeschleife im Hintergrund und gibt das Inbox-Handle zurück.
@@ -1599,6 +1626,7 @@ egress_allow_cidrs = []
                 &harw_observe::NullSink,
                 None,
                 None,
+                None,
             );
 
             assert_eq!(sentinel.buffer().event_len(), 1);
@@ -1607,6 +1635,69 @@ egress_allow_cidrs = []
                 .map_err(ctx("well-formed buffer content always encodes"))?;
             assert_eq!(evidence.events.len(), 1);
             assert_eq!(evidence.events[0].sensor.as_str(), "probe-fs-0");
+            Ok(())
+        }
+
+        #[test]
+        fn test_received_raw_cgroup_id_is_resolved_beneath_the_cgroup_root() -> TestResult {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let tree = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let job = tree.path().join("harw.slice").join("harw-job-7");
+            std::fs::create_dir_all(&job).map_err(ctx("fixture cgroup"))?;
+            let job_id = std::fs::symlink_metadata(&job)
+                .map_err(ctx("fixture metadata"))?
+                .ino();
+            let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
+            {
+                let mut guard = inbox.lock().map_err(ctx("uncontended lock"))?;
+                for cgroup in [
+                    harw_dod_signals::Actor::raw_cgroup(job_id),
+                    harw_dod_signals::Actor::raw_cgroup(u64::MAX),
+                ] {
+                    let mut event = sample_probe_event("probe-bpf-0");
+                    event.actor = Some(harw_dod_signals::Actor {
+                        uid: 1000,
+                        auid: None,
+                        cgroup,
+                    });
+                    guard.push(ipc::ReceivedEvent {
+                        event,
+                        peer: sample_peer(),
+                    });
+                }
+            }
+            let mut resolver = cgroup_resolve::CgroupResolver::new(tree.path().to_path_buf());
+            let mut sentinel = Sentinel::new(
+                Vec::new(),
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
+            poll_once(
+                &mut sentinel,
+                Some(&inbox),
+                &harw_observe::NullSink,
+                None,
+                None,
+                Some(&mut resolver),
+            );
+
+            let cgroups: Vec<Option<String>> = sentinel
+                .buffer()
+                .events()
+                .map(|event| {
+                    event
+                        .actor
+                        .as_ref()
+                        .and_then(|actor| actor.cgroup.as_ref())
+                        .map(|id| id.as_str().to_owned())
+                })
+                .collect();
+            assert_eq!(
+                cgroups,
+                vec![job.to_str().map(str::to_owned), None],
+                "a resolved id carries its absolute path, an unknown id none"
+            );
             Ok(())
         }
 
@@ -1633,6 +1724,7 @@ egress_allow_cidrs = []
                 &mut sentinel,
                 Some(&inbox),
                 &harw_observe::NullSink,
+                None,
                 None,
                 None,
             );
@@ -1690,6 +1782,7 @@ egress_allow_cidrs = []
                     &harw_observe::NullSink,
                     None,
                     Some(&mut health),
+                    None,
                 );
             }
             assert_eq!(health.written(), 2);
@@ -1722,7 +1815,14 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, None, &harw_observe::NullSink, None, None);
+            poll_once(
+                &mut sentinel,
+                None,
+                &harw_observe::NullSink,
+                None,
+                None,
+                None,
+            );
             assert_eq!(sentinel.buffer().event_len(), 0);
         }
     }

@@ -79,7 +79,11 @@
 //!   *verworfen* (fehlerhaft) und degradiert den Sensor für diese Runde.
 //!
 //! Der Akteur entspricht `harw_dod_flow::to_security_event`: `uid` aus dem
-//! Wire-Kopf, `auid` und `cgroup` unbekannt (`None`). `observed_at` ist die
+//! Wire-Kopf, `auid` unbekannt (`None`). `cgroup` trägt die **rohe**
+//! cgroup-ID des Wire-Kopfs als `harw_dod_signals::Actor::raw_cgroup`
+//! (`"cgroup-id:<n>"`, PL-97 E4); eine fehlende ID (`0`) bleibt `None`. Den
+//! Pfad dazu löst erst der unprivilegierte Sentinel unter seiner
+//! `--cgroup-root` auf — die Sonde rät keinen Pfad. `observed_at` ist die
 //! vom Lader gemessene Abbildung des Kernel-`ktime`; die
 //! `TimeConfidence` hat im `SecurityEvent`-Schema kein Feld und geht auf
 //! diesem Sendeweg verloren.
@@ -341,7 +345,9 @@ fn convert_wire_event(
                 actor: Some(Actor {
                     uid: exec.task.uid,
                     auid: None,
-                    cgroup: None,
+                    // Rohe cgroup-ID aus dem Wire-Kopf; den Pfad löst erst
+                    // der unprivilegierte Sentinel auf (PL-97 E4).
+                    cgroup: Actor::raw_cgroup(exec.task.cgroup_id),
                 }),
                 kind: EventKind::ProcessExec {
                     path,
@@ -374,7 +380,14 @@ fn convert_wire_event(
                 }
             };
             match harw_dod_flow::to_security_event(&flow, sensor, timed.observed_at, scope) {
-                Some(event) => Conversion::Report(event),
+                Some(mut event) => {
+                    // `to_security_event` kennt keine cgroup; die rohe ID
+                    // aus dem Wire-Kopf wird hier nachgetragen (PL-97 E4).
+                    if let Some(actor) = event.actor.as_mut() {
+                        actor.cgroup = Actor::raw_cgroup(connect.task.cgroup_id);
+                    }
+                    Conversion::Report(event)
+                }
                 None => Conversion::NotReportable,
             }
         }
@@ -1122,8 +1135,13 @@ mod wire_tests {
             Some(Actor {
                 uid: 1_000,
                 auid: None,
-                cgroup: None
+                cgroup: Actor::raw_cgroup(77)
             })
+        );
+        assert_eq!(
+            event.actor.as_ref().and_then(Actor::raw_cgroup_id),
+            Some(77),
+            "the wire header's cgroup id is forwarded"
         );
         assert_eq!(
             event.kind,
@@ -1217,7 +1235,23 @@ mod wire_tests {
                 port: 443,
             }
         );
-        assert_eq!(event.actor.map(|actor| actor.uid), Some(1_000));
+        assert_eq!(event.actor.as_ref().map(|actor| actor.uid), Some(1_000));
+        assert_eq!(
+            event.actor.as_ref().and_then(Actor::raw_cgroup_id),
+            Some(77),
+            "the wire header's cgroup id is forwarded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_cgroup_id_stays_none() -> TestResult {
+        let mut record = timed(WireEventType::Exec, 0, exec_payload(b"/usr/bin/true")?);
+        record.event.task.cgroup_id = 0;
+        let Conversion::Report(event) = convert_wire_event(&record, &sensor(), None) else {
+            return Err(TestError::Unexpected("exec must be reported".into()));
+        };
+        assert_eq!(event.actor.and_then(|actor| actor.cgroup), None);
         Ok(())
     }
 

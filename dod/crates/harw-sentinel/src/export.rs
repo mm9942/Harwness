@@ -23,9 +23,11 @@
 //! `schema_version` is a version-1 line with exactly the six fields above,
 //! and every known reader (`harw-security-hub`'s `DodFinding`, harw's
 //! `security_signals` context source) ignores unknown fields, so v1 and v2
-//! lines parse alike. Today no finding carries a cgroup attribution yet
-//! (`Finding<RuleChecked>` has no actor; the id-to-path resolver is PL-97
-//! E4), so `scope` is omitted from every line until that lands.
+//! lines parse alike. `scope` is set when the finding can be attributed to
+//! the resolved cgroup of the observed actor (PL-97 E4: the probe forwards
+//! the raw cgroup id, `crate::cgroup_resolve` maps it to the absolute path
+//! beneath `--cgroup-root`, `crate::findings` attributes the finding); it
+//! is omitted otherwise.
 //!
 //! Die Feldtypen sind dieselben, die der Hub deserialisiert:
 //! [`harw_types::FindingId`], [`harw_types::HostId`],
@@ -608,12 +610,18 @@ impl FindingsExporter {
 
     /// Schreibt eine Zeile für `finding`.
     ///
+    /// `scope` is the optional cgroup attribution (schema version 2; see
+    /// `crate::findings` for how it is derived).
+    ///
     /// # Returns
     /// `true`, wenn die Zeile geschrieben wurde; `false` nach einem
     /// gezählten und geloggten Fehler.
-    pub fn export(&mut self, sink: &dyn TelemetrySink, finding: &Finding<RuleChecked>) -> bool {
-        // `Finding<RuleChecked>` trägt (noch) keine cgroup-Zuordnung; `scope`
-        // bleibt deshalb leer, bis PL-97 E4 den id→Pfad-Auflöser liefert.
+    pub fn export(
+        &mut self,
+        sink: &dyn TelemetrySink,
+        finding: &Finding<RuleChecked>,
+        scope: Option<&str>,
+    ) -> bool {
         self.export_fields(
             sink,
             finding.id(),
@@ -621,7 +629,7 @@ impl FindingsExporter {
             finding.severity(),
             finding.summary(),
             finding.observed_at(),
-            None,
+            scope,
         )
     }
 
