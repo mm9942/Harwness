@@ -195,6 +195,127 @@ fn inexpressible_resource_fields_are_never_reported_enforced() -> TestResult {
     Ok(())
 }
 
+/// The four per-process rlimit requests, one per case.
+fn rlimit_cases() -> [(&'static str, ResourceRequest); 4] {
+    [
+        (
+            "address_space_max",
+            ResourceRequest {
+                address_space_max: Some(1 << 30),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "cpu_time_max",
+            ResourceRequest {
+                cpu_time_max: Some(60),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "file_size_max",
+            ResourceRequest {
+                file_size_max: Some(1 << 20),
+                ..ResourceRequest::default()
+            },
+        ),
+        (
+            "open_files_max",
+            ResourceRequest {
+                open_files_max: Some(256),
+                ..ResourceRequest::default()
+            },
+        ),
+    ]
+}
+
+/// PL-97 E2c follow-up: a pod spec carries no per-process rlimit, so a
+/// request of one is never `Enforced` (a `Required` job is refused before
+/// the gate is lifted), and a job with `require_rlimits` is refused before
+/// the pod is even created.
+#[test]
+fn rlimits_are_never_reported_enforced_and_required_rlimits_fail_closed() -> TestResult {
+    let api = FakeApi::start(Behavior::default())?;
+    let exec = executor(&api, true)?;
+    let job = |requirement, resources: ResourceRequest| {
+        JobSpec::command("echo")
+            .sandbox(SandboxProfileName::NoNetwork)
+            .sandbox_requirement(requirement)
+            .resources(resources)
+            .build()
+            .map_err(ctx("spec"))
+    };
+
+    // `require_rlimits`: refused before the create, for every requirement.
+    for (epoch, (field, resources)) in (1..).zip(rlimit_cases()) {
+        for requirement in [SandboxRequirement::Required, SandboxRequirement::BestEffort] {
+            let demanding = ResourceRequest {
+                require_rlimits: true,
+                ..resources.clone()
+            };
+            let result = exec.start(&job(requirement, demanding)?, &context(epoch)?);
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Unsupported {
+                        operation: "rlimits",
+                        ..
+                    })
+                ),
+                "{field} {requirement:?}: {result:?}"
+            );
+        }
+    }
+    assert!(!api.saw("POST", "/pods"), "nothing was created");
+    assert_eq!(api.pod_count(), 0);
+
+    // Without `require_rlimits`, a `Required` job fails on the report.
+    for (epoch, (field, resources)) in (10..).zip(rlimit_cases()) {
+        let result = exec.start(
+            &job(SandboxRequirement::Required, resources)?,
+            &context(epoch)?,
+        );
+        assert!(
+            matches!(result, Err(RuntimeError::SandboxRequirementNotMet { ref shortfalls, .. })
+                if shortfalls == &["resource_limits"]),
+            "{field}: {result:?}"
+        );
+    }
+    assert!(!api.saw("PATCH", "/pods/"), "gate never lifted");
+    assert_eq!(api.pod_count(), 0, "gated pods deleted");
+
+    // BestEffort runs, and the report says nothing was applied.
+    for (epoch, (field, resources)) in (20..).zip(rlimit_cases()) {
+        let started = exec
+            .start(
+                &job(SandboxRequirement::BestEffort, resources)?,
+                &context(epoch)?,
+            )
+            .map_err(ctx("best effort"))?;
+        let report = started.sandbox.ok_or(TestError::Missing("report"))?;
+        assert_eq!(
+            report.resource_limits,
+            EnforcementState::NotEnforced,
+            "{field}"
+        );
+    }
+
+    // `require_rlimits` without any rlimit demands nothing.
+    let nothing_demanded = ResourceRequest {
+        require_rlimits: true,
+        ..ResourceRequest::default()
+    };
+    let started = exec
+        .start(
+            &job(SandboxRequirement::Required, nothing_demanded)?,
+            &context(30)?,
+        )
+        .map_err(ctx("require_rlimits alone"))?;
+    let report = started.sandbox.ok_or(TestError::Missing("report"))?;
+    assert_eq!(report.resource_limits, EnforcementState::Enforced);
+    Ok(())
+}
+
 #[test]
 fn a_webhook_that_privileges_the_pod_is_caught_by_the_readback() -> TestResult {
     let api = FakeApi::start(Behavior {

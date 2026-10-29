@@ -19,8 +19,15 @@
 //! - `cpu_max` → not mapped. `RLIMIT_CPU` caps the total CPU time of one
 //!   process, not the job's bandwidth per period.
 //! - `io_weight` → not mapped (no rlimit; Darwin has no per-job I/O weight).
+//! - `cpu_time_max` → `RLIMIT_CPU`, `file_size_max` → `RLIMIT_FSIZE`,
+//!   `open_files_max` → `RLIMIT_NOFILE` (soft = hard = the request). These
+//!   are per-process limits XNU enforces as asked.
+//! - `address_space_max` → not mapped (`RLIMIT_AS`; the same XNU caveat as
+//!   `memory_max` applies).
 //! - `wall_timeout` → not an rlimit; enforced by the supervisor through
 //!   [`crate::TerminationPolicy`], not reported here.
+//! - `require_rlimits` → not part of the plan; the caller refuses a job that
+//!   sets it while no trampoline applies the set.
 
 use std::collections::BTreeMap;
 
@@ -148,43 +155,58 @@ impl RlimitPlan {
             cpu_max,
             pids_max,
             io_weight,
+            address_space_max,
+            cpu_time_max,
+            file_size_max,
+            open_files_max,
             // Enforced by the supervisor (`crate::TerminationPolicy`).
             wall_timeout: _,
-            // Per-process rlimits: knowingly not mapped yet (PL-97
-            // follow-up); the runtime's Darwin executor refuses a job that
-            // sets `require_rlimits` with any of them.
-            address_space_max: _,
-            cpu_time_max: _,
-            file_size_max: _,
-            open_files_max: _,
+            // Not a limit: the runtime's Darwin executor refuses a job that
+            // sets it with any rlimit while no trampoline applies the set.
             require_rlimits: _,
         } = request;
         let mut set = RlimitSet::new();
         let mut unmapped = Vec::new();
-        let mut mapped_any = false;
+        // Mapped, but weaker than requested.
+        let mut weaker = false;
+        // Mapped exactly as requested.
+        let mut faithful = false;
         if let Some(pids) = pids_max {
             let pids = u64::from(*pids);
             set.set(RlimitResource::Processes, Some(pids), Some(pids))?;
-            mapped_any = true;
+            // RLIMIT_NPROC is per user, never per job.
+            weaker = true;
         }
-        // Every requested limit of the whole job without a faithful rlimit
-        // is listed, so a request of only these is never `Enforced`.
+        for (resource, limit) in [
+            (RlimitResource::Cpu, *cpu_time_max),
+            (RlimitResource::FileSize, *file_size_max),
+            (RlimitResource::OpenFiles, open_files_max.map(u64::from)),
+        ] {
+            if let Some(limit) = limit {
+                set.set(resource, Some(limit), Some(limit))?;
+                faithful = true;
+            }
+        }
+        // Every requested limit without a faithful rlimit is listed, so a
+        // request of only these is never `Enforced`.
         for (field, requested) in [
             ("memory_max", memory_max.is_some()),
             ("memory_high", memory_high.is_some()),
             ("cpu_weight", cpu_weight.is_some()),
             ("cpu_max", cpu_max.is_some()),
             ("io_weight", io_weight.is_some()),
+            ("address_space_max", address_space_max.is_some()),
         ] {
             if requested {
                 unmapped.push(field);
             }
         }
-        let resource_limits = if mapped_any {
-            // RLIMIT_NPROC is per user, never per job.
+        let resource_limits = if weaker || (faithful && !unmapped.is_empty()) {
+            // Part of the request is applied, or only weaker than asked.
             EnforcementState::Partial
         } else if unmapped.is_empty() {
-            // Nothing requested (wall_timeout is the supervisor's job).
+            // Nothing requested, or only limits applied as asked
+            // (wall_timeout is the supervisor's job).
             EnforcementState::Enforced
         } else {
             EnforcementState::Unsupported
@@ -327,6 +349,104 @@ mod tests {
         let plan = RlimitPlan::from_request(&all).map_err(ctx("mixed plan"))?;
         assert_eq!(plan.resource_limits, EnforcementState::Partial);
         assert_eq!(plan.unmapped, vec!["memory_high", "cpu_max", "io_weight"]);
+        Ok(())
+    }
+
+    /// PL-97 E2c follow-up: `cpu_time_max`, `file_size_max` and
+    /// `open_files_max` become their rlimit (soft = hard); `address_space_max`
+    /// has no faithful Darwin rlimit and is listed as unmapped.
+    #[test]
+    fn test_plan_maps_the_per_process_rlimits() -> TestResult {
+        let fixed = |limit| {
+            Some(RlimitValue {
+                soft: Some(limit),
+                hard: Some(limit),
+            })
+        };
+        let cases = [
+            (
+                RlimitResource::Cpu,
+                60,
+                ResourceRequest {
+                    cpu_time_max: Some(60),
+                    ..ResourceRequest::default()
+                },
+            ),
+            (
+                RlimitResource::FileSize,
+                1 << 20,
+                ResourceRequest {
+                    file_size_max: Some(1 << 20),
+                    ..ResourceRequest::default()
+                },
+            ),
+            (
+                RlimitResource::OpenFiles,
+                256,
+                ResourceRequest {
+                    open_files_max: Some(256),
+                    ..ResourceRequest::default()
+                },
+            ),
+        ];
+        for (resource, limit, request) in cases {
+            let plan = RlimitPlan::from_request(&request).map_err(ctx("faithful plan"))?;
+            assert_eq!(plan.set.get(resource), fixed(limit), "{resource:?}");
+            assert_eq!(plan.set.iter().count(), 1, "{resource:?}");
+            assert!(plan.unmapped.is_empty(), "{resource:?}");
+            assert_eq!(
+                plan.resource_limits,
+                EnforcementState::Enforced,
+                "{resource:?}"
+            );
+        }
+
+        let address_space = ResourceRequest {
+            address_space_max: Some(1 << 30),
+            ..ResourceRequest::default()
+        };
+        let plan = RlimitPlan::from_request(&address_space).map_err(ctx("address space"))?;
+        assert_eq!(plan.resource_limits, EnforcementState::Unsupported);
+        assert_eq!(plan.unmapped, vec!["address_space_max"]);
+        assert!(plan.set.is_empty());
+
+        // Every rlimit at once: the faithful ones are set, the address space
+        // stays unmapped, so the verdict is partial.
+        let all = ResourceRequest {
+            address_space_max: Some(1 << 30),
+            cpu_time_max: Some(60),
+            file_size_max: Some(1 << 20),
+            open_files_max: Some(256),
+            require_rlimits: true,
+            ..ResourceRequest::default()
+        };
+        let plan = RlimitPlan::from_request(&all).map_err(ctx("all rlimits"))?;
+        assert_eq!(plan.resource_limits, EnforcementState::Partial);
+        assert_eq!(plan.unmapped, vec!["address_space_max"]);
+        assert_eq!(plan.set.get(RlimitResource::Cpu), fixed(60));
+        assert_eq!(plan.set.get(RlimitResource::FileSize), fixed(1 << 20));
+        assert_eq!(plan.set.get(RlimitResource::OpenFiles), fixed(256));
+        assert_eq!(plan.set.iter().count(), 3);
+
+        // Next to a pids ceiling (per user) the verdict stays partial.
+        let with_pids = ResourceRequest {
+            pids_max: Some(32),
+            open_files_max: Some(256),
+            ..ResourceRequest::default()
+        };
+        let plan = RlimitPlan::from_request(&with_pids).map_err(ctx("pids and nofile"))?;
+        assert_eq!(plan.resource_limits, EnforcementState::Partial);
+        assert!(plan.unmapped.is_empty());
+        assert_eq!(plan.set.iter().count(), 2);
+
+        let zero = ResourceRequest {
+            open_files_max: Some(0),
+            ..ResourceRequest::default()
+        };
+        assert!(matches!(
+            RlimitPlan::from_request(&zero),
+            Err(ProcessError::InvalidArgument { .. })
+        ));
         Ok(())
     }
 }

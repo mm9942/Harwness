@@ -21,9 +21,10 @@ pub struct Requested {
     pub cpu_shares: Option<u64>,
     /// Requested pids ceiling.
     pub pids: Option<u32>,
-    /// A requested limit of the whole job this backend does not pass to the
-    /// engine (`memory_high`, `cpu_max`, `io_weight`): never read back, so
-    /// the resource dimension is never `Enforced` while one is asked for.
+    /// A requested limit this backend does not pass to the engine
+    /// (`memory_high`, `cpu_max`, `io_weight` or a per-process rlimit):
+    /// never read back, so the resource dimension is never `Enforced` while
+    /// one is asked for.
     pub unmapped_limits: bool,
 }
 
