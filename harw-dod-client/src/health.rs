@@ -110,14 +110,13 @@ pub struct HealthReport {
 }
 
 impl HealthReport {
-    /// `true` when the report is older than `max_age` at `now` (the
-    /// sentinel stopped writing it).
+    /// `true` when the report is older than `max_age` at `now`, or its
+    /// timestamp is more than five seconds in the future. The bounded skew
+    /// allowance tolerates small clock adjustments without trusting future data.
     #[must_use]
     pub fn is_stale(&self, now: OffsetDateTime, max_age: Duration) -> bool {
-        time::Duration::try_from(max_age)
-            .ok()
-            .and_then(|age| now.checked_sub(age))
-            .is_some_and(|bound| self.written_at < bound)
+        let age = now - self.written_at;
+        age < -time::Duration::seconds(5) || (age.is_positive() && age.unsigned_abs() > max_age)
     }
 
     /// Number of sensors in [`SensorHealthState::Degraded`].
@@ -244,6 +243,31 @@ mod tests {
         let json = serde_json::to_string(&report)?;
         let again: HealthReport = serde_json::from_str(&json)?;
         assert_eq!(again, report);
+        Ok(())
+    }
+
+    #[test]
+    fn health_freshness_bounds_past_age_and_future_clock_skew() -> TestResult {
+        let report: HealthReport = serde_json::from_str(SAMPLE)?;
+        let max_age = Duration::from_secs(60);
+        for (offset_seconds, stale) in [
+            (-3600, true),
+            (-6, true),
+            (-5, false),
+            (0, false),
+            (60, false),
+            (61, true),
+        ] {
+            let now = report.written_at + time::Duration::seconds(offset_seconds);
+            assert_eq!(
+                report.is_stale(now, max_age),
+                stale,
+                "offset {offset_seconds}"
+            );
+        }
+        // An enormous age allowance must still reject future-dated reports.
+        assert!(report.is_stale(report.written_at - time::Duration::hours(1), Duration::MAX));
+        assert!(!report.is_stale(report.written_at + time::Duration::hours(1), Duration::MAX));
         Ok(())
     }
 
