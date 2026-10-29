@@ -367,6 +367,7 @@ async fn rp_t1_only_a_no_tools_narrowing_is_allowed_next_to_remote_tools() -> Te
         })
         .session_events(events)
         .narrowing(RuntimeNarrowing {
+            write_scope: harw_authority::FileWriteScope::workspace(),
             registry_profile: RegistryProfile::Full,
             identity: IdentityOverrides::default(),
             permissions: PermissionSet::from_policy([Permission::ReadWorkspace]),

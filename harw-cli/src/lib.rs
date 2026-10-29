@@ -934,7 +934,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             ),
             None => Ok(()),
         },
-        Some(Command::Attach(args)) => attach_cmd::run(&args),
+        Some(Command::Attach(args)) => attach_cmd::run(&args, home_override),
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
             let home = home::resolve_home(home_override)?;

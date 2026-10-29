@@ -65,6 +65,7 @@ description = "Schnellhelfer der UIA fuer kleine, klar umrissene Pakete: eine Fr
 [tools]
 admitted = [
   "fs.read",
+  "fs.view_image",
   "fs.list",
   "fs.search",
   "fs.glob",

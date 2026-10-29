@@ -9,6 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-media = { path = "../harw-media" }
+harw-protocol = { path = "../harw-protocol" }
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-home = { path = "../harw-home" }

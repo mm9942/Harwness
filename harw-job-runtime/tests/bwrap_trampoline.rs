@@ -111,6 +111,11 @@ fn probe() -> TestResult<Result<Chain, String>> {
     let Some(landlock_abi) = host.landlock.usable_abi() else {
         return Ok(Err("no usable Landlock ABI".to_owned()));
     };
+    if landlock_abi < 5 {
+        return Ok(Err(
+            "composition requires Landlock ABI 5 or later".to_owned()
+        ));
+    }
     let Some(trampoline) = trampoline() else {
         return Ok(Err(
             "no harw-job-exec binary (set HARW_JOB_EXEC_BIN or `cargo build -p harw-job-exec`)"

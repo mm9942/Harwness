@@ -57,16 +57,18 @@
 //!   leben: Ein Guard muss mehrere gleichzeitige Inhaber vertragen (etwa die
 //!   Lese-Seite einer Sperre oder ein Zähler). Wartet eine Zulassung auf das
 //!   Ende eines früheren Guards, serialisiert das die Antwort.
-//! - Bricht ein Cancel einen laufenden Aufruf ab, fällt sein Permit mit ihm.
+//! - Beim Cancel fällt der Dispatcher-Permit. Sein Guard bleibt jedoch in
+//!   geklonten ToolExecutionContexts bis zum Ende tatsächlicher Blocking-Arbeit
+//!   erhalten. Das beendet diese Arbeit nicht und ist kein Quieszenznachweis.
 //! - Ein abgewiesener Aufruf bekommt keinen Permit.
 //!
 //! # Concurrency
 //! Der Turn-Loop ruft den Meter nacheinander und wartet jeweils auf das
 //! Ergebnis; ein Meter darf trotzdem von mehreren Turns geteilt werden
 //! (`Send + Sync`). Er sollte kurz bleiben: Während der Meter arbeitet, läuft
-//! der Turn nicht weiter. Der [`ToolCallPermit`] ist `Send`, nicht `Sync`:
-//! der Turn-Loop besitzt ihn und reicht ihn nur als Wert weiter (in den Job
-//! eines parallelen Aufrufs).
+//! der Turn nicht weiter. Der [`ToolCallPermit`] ist `Send + Sync`. Sein
+//! Guard wird opaque geteilt: der Dispatcher und abgekoppelte Blocking-Arbeit
+//! halten ihn gemeinsam, ohne den enthaltenen Wert zu lesen.
 
 use std::any::Any;
 use std::fmt;
@@ -81,16 +83,21 @@ use std::pin::Pin;
 /// # Beschreibung
 /// Siehe „Lease-Zaun" in der Moduldokumentation. Der Guard wird nie
 /// gelesen, nur gehalten: Er wirkt allein dadurch, dass er lebt, und
-/// über sein `Drop`, sobald der Dispatcher den Permit fallen lässt.
+/// über sein `Drop`, sobald Dispatcher und sämtliche Context-Kopien enden.
 ///
 /// # Concurrency
-/// `Send`, nicht `Sync` (der Guard ist ein beliebiger `Send`-Wert).
+/// `Send + Sync`; ein beliebiger `Send`-Guard wird opaque geteilt, nie gelesen.
 pub struct ToolCallPermit {
-    // Gehalten, nie gelesen: fällt mit dem Permit.
-    guard: Option<Box<dyn Any + Send>>,
+    // Gehalten, nie gelesen: die letzte Context-/Permit-Kopie gibt frei.
+    guard: Option<harw_tools::ToolLifetimeGuard>,
 }
 
 impl ToolCallPermit {
+    /// Clones only the effect lifetime; it never creates new admission or rights.
+    pub(crate) fn lifetime_guard(&self) -> Option<harw_tools::ToolLifetimeGuard> {
+        self.guard.clone()
+    }
+
     /// Ein Permit ohne Guard: der Aufruf darf laufen, nichts wird gehalten.
     ///
     /// # Returns
@@ -100,18 +107,20 @@ impl ToolCallPermit {
         Self { guard: None }
     }
 
-    /// Ein Permit, der `guard` hält, bis der Dispatcher ihn nach der
-    /// Ausführung des Aufrufs fallen lässt.
+    /// Ein Permit, der `guard` gemeinsam mit den Ausführungskontexten hält,
+    /// bis auch die tatsächliche Blocking-Arbeit beendet ist.
     ///
     /// # Arguments
     /// - `guard`: beliebiger Wert des Meters (etwa eine Lease-Sperre); er
-    ///   wird nie gelesen und erst mit dem Permit fallen gelassen.
+    ///   wird nie gelesen und erst mit der letzten Lifetime-Kopie freigegeben.
     ///
     /// # Returns
     /// Einen Permit, der `guard` hält.
     #[must_use]
     pub fn guarded(guard: Box<dyn Any + Send>) -> Self {
-        Self { guard: Some(guard) }
+        Self {
+            guard: Some(harw_tools::ToolLifetimeGuard::new(guard)),
+        }
     }
 }
 

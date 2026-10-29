@@ -59,11 +59,13 @@ pub mod catalog;
 pub mod config;
 pub mod error;
 pub mod file_store;
+mod file_wal;
 pub mod goal;
 pub mod goal_store;
 pub mod graph;
 pub mod ids;
 pub mod memory_store;
+pub mod parent_progress;
 pub mod store;
 // H12: Mandanten-Sicht auf Plan- und Goal-Stores.
 pub mod tenant_scope;

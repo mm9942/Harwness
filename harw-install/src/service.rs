@@ -151,6 +151,27 @@ pub trait ServiceManager {
     /// - [`ServiceError::Command`]: wenn ein externes Kommando fehlschlägt.
     /// - [`ServiceError::Unsupported`]: auf nicht unterstützten Plattformen.
     fn uninstall(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// Starts an installed service without changing its enablement.
+    fn start(&self, _name: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            detail: format!("start is not supported by {:?}", self.kind()),
+        })
+    }
+
+    /// Stops a running service without removing its definition.
+    fn stop(&self, _name: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            detail: format!("stop is not supported by {:?}", self.kind()),
+        })
+    }
+
+    /// Restarts a service without changing its enablement.
+    fn restart(&self, _name: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            detail: format!("restart is not supported by {:?}", self.kind()),
+        })
+    }
 }
 
 /// Wählt anhand der Plattform den passenden [`ServiceManager`].

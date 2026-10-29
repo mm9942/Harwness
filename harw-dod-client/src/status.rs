@@ -447,6 +447,9 @@ mod tests {
             now,
         };
 
+        // The configuration reader may reject a non-root-owned `/` in a
+        // rootless container. This test verifies assembly, not host ownership.
+        let expected_config = crate::config::read_system_config(Some(&missing_config))?;
         let snapshot = status(&ctx);
         assert_eq!(snapshot.export_paths.source, ExportSource::Home);
         assert_eq!(
@@ -460,12 +463,7 @@ mod tests {
                 missing: vec!["harw-probe-fs".into(), "harw-warden".into()],
             }
         );
-        assert_eq!(
-            snapshot.config,
-            ConfigReport::Missing {
-                path: missing_config
-            }
-        );
+        assert_eq!(snapshot.config, expected_config);
         assert_eq!(snapshot.units.len(), DOD_UNITS.len());
         assert!(
             snapshot

@@ -491,6 +491,7 @@ pub struct RuntimeServicesParts {
 /// `Send + Sync`; typischerweise hinter einem `Arc` geteilt.
 pub struct RuntimeServices {
     parts: RuntimeServicesParts,
+    image_inspector: Option<harw_ops::image::SharedImageInspector>,
     home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
     knowledge: Option<Arc<KnowledgeStore>>,
     agent_events: Option<Arc<AgentEventHub>>,
@@ -549,6 +550,7 @@ impl RuntimeServices {
     pub fn new(parts: RuntimeServicesParts) -> Self {
         Self {
             parts,
+            image_inspector: None,
             home_context: None,
             knowledge: None,
             agent_events: None,
@@ -560,6 +562,16 @@ impl RuntimeServices {
             job_manager: None,
             work_driver_caller: None,
         }
+    }
+
+    /// Binds the explicitly routed auxiliary vision service to model tools.
+    #[must_use]
+    pub fn with_image_inspector(
+        mut self,
+        inspector: harw_ops::image::SharedImageInspector,
+    ) -> Self {
+        self.image_inspector = Some(inspector);
+        self
     }
 
     /// Plan R9, Teil F: legt die Job-Verwaltung der Sitzung als
@@ -936,6 +948,11 @@ impl RuntimeServices {
     fn assemble(&self, surface: ServiceSurface) -> (ServiceMap, Vec<&'static str>) {
         let mut map = ServiceMap::new();
         let mut names = Vec::new();
+        if surface == ServiceSurface::ModelTool
+            && let Some(inspector) = &self.image_inspector
+        {
+            insert_service(&mut map, &mut names, Arc::clone(inspector));
+        }
         if let Some(context) = &self.home_context {
             insert_service(&mut map, &mut names, Arc::clone(context));
         }

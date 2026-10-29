@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use harw_protocol::{ApprovalRequest, SessionEvent, TurnEvent};
-use harw_types::{ApprovalActor, SessionId};
+use harw_types::{ApprovalActor, PermissionTier, Principal, SessionId};
 
 use crate::error::HostError;
 use crate::identity::ConnectionId;
@@ -184,8 +184,74 @@ pub enum Setting {
     Effort(String),
 }
 
+/// Trusted, host-derived execution ceiling. Never deserialized from a request or
+/// restored as authority from a hosted-session record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionAdmission {
+    principal: Principal,
+    maximum_tier: PermissionTier,
+    approval_actor: ApprovalActor,
+}
+
+impl ExecutionAdmission {
+    pub(crate) fn new(
+        principal: Principal,
+        maximum_tier: PermissionTier,
+        approval_actor: ApprovalActor,
+    ) -> Self {
+        Self {
+            principal,
+            maximum_tier,
+            approval_actor,
+        }
+    }
+
+    /// Authenticated principal narrowed to the host composition's ceiling.
+    #[must_use]
+    pub fn principal_with_ceiling(&self, ceiling: PermissionTier) -> Principal {
+        Principal::trusted_ingress(
+            self.principal.kind(),
+            self.principal.id(),
+            self.principal.surface(),
+            self.principal.tier().min(self.maximum_tier).min(ceiling),
+        )
+    }
+
+    /// Current creator tier intersected with the persisted request ceiling.
+    #[must_use]
+    pub fn maximum_tier(&self) -> PermissionTier {
+        self.maximum_tier
+    }
+
+    /// Actor from the authenticated creator connection.
+    #[must_use]
+    pub fn approval_actor(&self) -> &ApprovalActor {
+        &self.approval_actor
+    }
+}
+
 /// The runtime behind the host.
 pub trait TurnDriver: Send + Sync + 'static {
+    /// Install freshly revalidated creator authority before building or running
+    /// a core session. Drivers that execute effects must enforce this ceiling.
+    fn prepare_execution(
+        &self,
+        _session_id: &SessionId,
+        _admission: ExecutionAdmission,
+    ) -> DriverFuture<'_, ()> {
+        Box::pin(async {
+            Err(HostError::Denied(
+                "driver does not support creator execution admission".into(),
+            ))
+        })
+    }
+
+    /// Drop process-local state for a creation that was never published.
+    /// This never deletes an established session's transcript.
+    fn discard_unpublished_session(&self, _session_id: &SessionId) -> Result<(), HostError> {
+        Ok(())
+    }
+
     /// Prepare durable state for a new session (transcript, meta).
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()>;
 

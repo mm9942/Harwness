@@ -759,6 +759,15 @@ pub async fn run_job_worker_once(
 // its commit in list order. Returns the jobs that reached a terminal state.
 async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -> usize {
     let mut completed = lane.reap();
+    if let Some(plan) = services.plan_services.as_ref() {
+        if let Err(error) = PlanJobBridge::recover_pending_admissions(
+            plan.plan(),
+            &services.store,
+            Timestamp::now(),
+        ) {
+            tracing::warn!(error = %error, "could not publish staged plan-node admissions");
+        }
+    }
     let page = match services.store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
         ..JobListQuery::default()
@@ -2805,7 +2814,7 @@ impl Drop for RoundReservation<'_> {
 
 /// Bucht jeden Werkzeugaufruf eines Job-Turns im [`PromptTokenLedger`],
 /// schreibt ihn unter der aktuellen Lease fest, BEVOR das Werkzeug läuft
-/// (Review P1-b zu #151), und hält die Lease, bis die Ausführung zurückkehrt
+/// (Review P1-b zu #151), und hält die Lease bis zum Ende der Ausführung
 /// (Lease-Zaun, Review P1 4394111171).
 ///
 /// # Description
@@ -2822,12 +2831,16 @@ impl Drop for RoundReservation<'_> {
 ///
 /// Der zurückgegebene `harw_core::ToolCallPermit` hält einen [`LeaseHold`] —
 /// die Job-Sperre, die auch jeder Reclaim braucht. Der Dispatcher lässt den
-/// Permit erst fallen, wenn die Ausführung des Aufrufs zurückgekehrt ist; ein
-/// Reclaim zwischen Buchung und Seiteneffekt ist damit ausgeschlossen, er
-/// wird hinter den Seiteneffekt serialisiert und findet danach eine Lease, die
+/// Permit erst fallen, wenn die Ausführung des Aufrufs zurückgekehrt ist.
+/// Der ToolExecutionContext teilt dessen Guard; Blocking-Executoren müssen
+/// ihn bis zum Ende ihrer tatsächlichen Arbeit halten, auch nach Abbruch des
+/// wartenden Futures. Die lokalen FS-Executoren erfüllen diesen Vertrag.
+/// Ein Reclaim wird dadurch hinter den gehaltenen Seiteneffekt serialisiert
+/// und findet danach eine Lease, die
 /// dem alten Worker nicht mehr gehört (sein nächster Flush scheitert
 /// geschlossen). Gleichzeitige Permits (parallele Aufrufe einer Antwort)
-/// teilen sich einen Halt.
+/// teilen sich einen Halt. Das ist kein Quieszenznachweis: externe Prozesse,
+/// entfernte Tools und fremde Executoren brauchen eigene Abschlussverträge.
 ///
 /// Heartbeat: Der Halt erneuert die Lease beim Nehmen um eine volle TTL
 /// (`JobStore::hold_live_lease`). Solange er lebt, scheitert das Renew des
@@ -2838,6 +2851,9 @@ impl Drop for RoundReservation<'_> {
 /// verbleibende Lease, beendet den Job deshalb: der Runner meldet den
 /// Lease-Verlust und bricht ab, und der nächste Flush des Ledgers scheitert
 /// am Lease-Zaun, statt einen veralteten Worker weiterlaufen zu lassen.
+/// Bereits gestartete Blocking-Arbeit wird durch diesen Abbruch nicht gestoppt:
+/// ihre Context-Kopie hält den Reclaim-Zaun bis zum tatsächlichen Ende weiter,
+/// ohne die TTL zu erneuern. Der Halt ist weder Completion noch Retirement.
 ///
 /// # Concurrency
 /// `Send + Sync`: nur ein `Arc`; der Turn-Loop ruft den Meter nacheinander,
@@ -3020,6 +3036,10 @@ async fn execute_plan_node_claim(
     context: &JobWorkerContext,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
+    let callback_claim = PlanNodeCallbackClaim {
+        jobs: Arc::clone(&job_store),
+        token: claim.token.clone(),
+    };
 
     let Some(services) = plan_services else {
         tracing::error!(
@@ -3040,6 +3060,17 @@ async fn execute_plan_node_claim(
             return JobOutcome::Blocked { reason };
         }
     };
+    if let Err(error) = PlanJobBridge::validate_execution_binding(
+        services.plan(),
+        &payload.plan_id,
+        &payload.task_id,
+        &work_id,
+        payload.assignment_attempt,
+    ) {
+        return JobOutcome::Blocked {
+            reason: format!("plan-node admission binding rejected before execution: {error}"),
+        };
+    }
     let kind = match node_kind(services.plan(), &payload.task_id) {
         Ok(kind) => kind,
         Err(reason) => {
@@ -3071,7 +3102,13 @@ async fn execute_plan_node_claim(
                     reason = %reason,
                     "plan-node contract demands more authority than the job holds"
                 );
-                return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+                return fail_plan_node(
+                    &services,
+                    &payload.task_id,
+                    &callback_claim,
+                    payload.assignment_attempt,
+                    reason,
+                );
             }
         };
 
@@ -3106,7 +3143,8 @@ async fn execute_plan_node_claim(
         return report_plan_node_outcome(
             &services,
             &payload.task_id,
-            &work_id,
+            &callback_claim,
+            payload.assignment_attempt,
             JobOutcome::Blocked {
                 reason: MISSING_RUNTIME_ROOT.to_owned(),
             },
@@ -3123,7 +3161,13 @@ async fn execute_plan_node_claim(
             reason = %reason,
             "plan-node job usage accounting unresolved"
         );
-        return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+        return fail_plan_node(
+            &services,
+            &payload.task_id,
+            &callback_claim,
+            payload.assignment_attempt,
+            reason,
+        );
     }
     let ledger = PromptTokenLedger::persisted(
         claim.job.budget.clone(),
@@ -3167,7 +3211,13 @@ async fn execute_plan_node_claim(
                 reason = %reason,
                 "plan-node runtime assembly failed"
             );
-            return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+            return fail_plan_node(
+                &services,
+                &payload.task_id,
+                &callback_claim,
+                payload.assignment_attempt,
+                reason,
+            );
         }
     };
 
@@ -3217,7 +3267,14 @@ async fn execute_plan_node_claim(
     // macht auch einen Erfolg zum Fehlschlag.
     let outcome = ledger.finish(outcome).await;
 
-    report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome, &admission)
+    report_plan_node_outcome(
+        &services,
+        &payload.task_id,
+        &callback_claim,
+        payload.assignment_attempt,
+        outcome,
+        &admission,
+    )
 }
 
 // Fail-closed check of a plan node's assembled sandbox (J1-F). Since R0-F the
@@ -3233,15 +3290,17 @@ fn ensure_same_workspace_root(
 ) -> Result<(), String> {
     let bound = assembled.workspace().canonical_root();
     let required = derived.workspace().canonical_root();
-    if bound == required {
-        Ok(())
-    } else {
-        Err(format!(
+    if bound != required {
+        return Err(format!(
             "plan node workspace root mismatch: assembly bound {}, contract requires {}",
             bound.display(),
             required.display()
-        ))
+        ));
     }
+    if !assembled.write_scope().is_subset_of(derived.write_scope()) {
+        return Err("plan node file authority exceeds derived contract scope".to_owned());
+    }
+    Ok(())
 }
 
 // Job-Art und Verengung eines Plan-Knotens (docs/design/runtime-contracts.md §extension):
@@ -3253,13 +3312,18 @@ fn plan_node_narrowing(
     sandbox: &SandboxSpec,
 ) -> (JobEntry, RuntimeNarrowing) {
     let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
-    let profile = profile_for_node_kind(kind, may_write);
+    let profile = if may_write && !sandbox.write_scope().is_workspace() {
+        RegistryProfile::WorkspaceEdit
+    } else {
+        profile_for_node_kind(kind, may_write)
+    };
     (
         JobEntry::PlanNode { kind, may_write },
         RuntimeNarrowing {
             registry_profile: profile,
             identity: plan_node_identity(payload, profile, kind),
             permissions: sandbox.permissions().clone(),
+            write_scope: sandbox.write_scope().clone(),
             // R0-F: bind the root sandbox to exactly the derived workspace root,
             // not to the project root discovered above it.
             workspace_root: Some(sandbox.workspace().canonical_root().to_path_buf()),
@@ -3537,9 +3601,10 @@ fn paused_turn_outcome(outcome: &TurnOutcome, disposition: PauseDisposition) -> 
 ///
 /// # Description
 /// Mirrors exactly what `harw_plan_bridge::job_bridge::node_payload` writes.
-/// Every field is required: a plan job whose payload lost a field is a broken
-/// contract between bridge and worker, and guessing a default there would
-/// silently execute a node under an authority nobody wrote down.
+/// Execution fields are required: a plan job whose payload lost a field is a
+/// broken contract between bridge and worker. Only the new `dispatch_owner`
+/// field may be absent for existing legacy jobs; that routing default grants
+/// no authority and never relaxes the remaining contract checks.
 ///
 /// The node's *kind* is deliberately absent from the payload — it is read from
 /// the live plan instead (see [`node_kind`]), because the plan, not a stored
@@ -3551,6 +3616,8 @@ struct PlanNodePayload {
     task_id: TaskId,
     /// The plan revision the payload was produced from.
     plan_revision: u64,
+    /// Immutable assignment attempt captured at admission (not a JobClaim attempt).
+    assignment_attempt: u32,
     /// The mutation contract; the only source of the derived sandbox.
     contract: MutationContract,
     /// Human-readable objective of the node.
@@ -3576,9 +3643,17 @@ impl PlanNodePayload {
             ));
         };
 
+        harw_plan_bridge::job_bridge::PlanDispatchOwner::from_job_input(input)?
+            .require_legacy_execution()?;
+
         let plan_id = required_str(object, "plan_id")?.to_owned();
         let task_id = TaskId::new(required_str(object, "task_id")?);
         let plan_revision = required_u64(object, "plan_revision")?;
+        if !object.contains_key("assignment_attempt") {
+            return Err("legacy plan-node payload missing assignment_attempt; blocked without execution; cancel the old job, explicitly invalidate then reopen its unfinished plan node and re-admit it with the current runtime".to_owned());
+        }
+        let assignment_attempt = u32::try_from(required_u64(object, "assignment_attempt")?)
+            .map_err(|_| field_error("assignment_attempt", "must fit u32"))?;
         let contract: MutationContract =
             serde_json::from_value(required_field(object, "contract")?.clone())
                 .map_err(|error| field_error("contract", &error.to_string()))?;
@@ -3601,6 +3676,7 @@ impl PlanNodePayload {
             plan_id,
             task_id,
             plan_revision,
+            assignment_attempt,
             contract,
             objective,
             acceptance_criteria,
@@ -3826,9 +3902,28 @@ fn derive_plan_node_sandbox(
         ))
         .permissions()
         .clone();
+    // A legacy mutation contract is not opt-in to the unavailable scoped
+    // writer pilot. Only an already scoped trusted authority selects it.
+    let write_scope = if node_permissions.contains(Permission::WriteWorkspace)
+        && !inherited.write_scope().is_workspace()
+    {
+        let paths = contract.allowed_paths.iter().map(|rule| match rule {
+            PathRule::Exact(path) => Ok(path.clone()),
+            _ => Err("writable plan nodes require exact-file contracts; directory, suffix and glob rules are not isolated".to_owned()),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let scope = harw_authority::FileWriteScope::exact_files(paths)
+            .map_err(|error| format!("invalid plan-node write scope: {error}"))?;
+        if !scope.is_subset_of(inherited.write_scope()) {
+            return Err("plan contract write paths exceed inherited file authority".to_owned());
+        }
+        scope
+    } else {
+        inherited.write_scope().clone()
+    };
     let derived = inherited.restrict(
         &PermissionRequest::from_permissions(node_permissions.iter())
-            .with_network_scope(node.network_scope().clone()),
+            .with_network_scope(node.network_scope().clone())
+            .with_write_scope(write_scope),
     );
     derived.ensure_child_of(inherited).map_err(|error| {
         format!(
@@ -3897,13 +3992,11 @@ struct FileFingerprint {
 ///
 /// # Description
 /// Der Schnappschuss deckt das **gesamte** Arbeitsverzeichnis ab, nicht nur
-/// die von `contract.allowed_paths` benannten Pfade. Grund: die abgeleitete
-/// Sandbox (`derive_plan_node_sandbox`) gewährt `WriteWorkspace` nur grob für
-/// den ganzen Workspace — sie kennt keine Durchsetzung auf Pfadebene. Ein
-/// Turn könnte also technisch überall im Workspace schreiben; würde der
-/// Schnappschuss nur die erlaubten Pfade beobachten, bliebe jede Datei
-/// außerhalb davon unsichtbar und `validate_patch` bekäme sie nie zu sehen —
-/// genau die Lücke, die diese Prüfung schließen soll (Befund K36).
+/// die von `contract.allowed_paths` benannten Pfade. Legacy-Worker besitzen
+/// Workspace-Schreibrechte; der Schnappschuss erkennt nachträgliche Änderungen,
+/// garantiert aber keine Isolation zwischen parallelen Workern. Explizit
+/// dateibeschränkte Autorität bleibt erhalten; ihr Schreib-Backend-Pilot ist
+/// bis zu einer isolierten Implementierung fail-closed.
 ///
 /// # Arguments
 /// - `workspace_root` (`&Path`): kanonische Wurzel der abgeleiteten Sandbox.
@@ -4128,6 +4221,28 @@ fn admit_newly_ready_nodes(
     admission: &ReadyNodeAdmission,
     work_id: &str,
 ) {
+    // Nicht allein dem Aufrufer vertrauen: der persistierte Quelljob entscheidet
+    // über das Routing. Prerequisites dürfen nie den Legacy-Coding-Pfad starten.
+    let source = WorkId::try_from_str(work_id)
+        .map_err(|error| error.to_string())
+        .and_then(|id| {
+            admission
+                .job_store
+                .get(&id)
+                .map_err(|error| error.to_string())
+        });
+    let allowed = source.and_then(|record| {
+        if !is_plan_node_kind(&record.job.kind) {
+            return Err("follow-up source is not a plan-node job".to_owned());
+        }
+        // Ein fehlender Owner ist nur mit einem vollständigen alten
+        // Ausführungsvertrag zulässig, nicht als Default für beliebige Jobs.
+        PlanNodePayload::parse(&record.input).map(|_| ())
+    });
+    if let Err(error) = allowed {
+        tracing::error!(work_id = %work_id, error = %error, "legacy plan follow-up refused");
+        return;
+    }
     let template = JobAdmissionTemplate::new(
         admission.scope.clone(),
         admission.budget.clone(),
@@ -4163,14 +4278,21 @@ fn admit_newly_ready_nodes(
     }
 }
 
+// Trusted claim credential retained separately from the model payload.
+struct PlanNodeCallbackClaim {
+    jobs: Arc<JobStore>,
+    token: harw_job_runtime::LeaseToken,
+}
+
 // Invalidates the node and returns the matching job outcome.
 fn fail_plan_node(
     services: &PlanNodeServices,
     task: &TaskId,
-    work_id: &str,
+    claim: &PlanNodeCallbackClaim,
+    assignment_attempt: u32,
     reason: String,
 ) -> JobOutcome {
-    report_plan_node_failure(services, task, work_id, &reason);
+    report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
     JobOutcome::Failed { reason }
 }
 
@@ -4179,37 +4301,48 @@ fn fail_plan_node(
 fn report_plan_node_failure(
     services: &PlanNodeServices,
     task: &TaskId,
-    work_id: &str,
+    claim: &PlanNodeCallbackClaim,
+    assignment_attempt: u32,
     reason: &str,
 ) {
-    if let Err(error) =
-        PlanJobBridge::on_job_failed(services.plan(), task, work_id, reason, services.actor())
-    {
+    if let Err(error) = PlanJobBridge::on_job_failed_claimed(
+        services.plan(),
+        &claim.jobs,
+        &claim.token,
+        task,
+        assignment_attempt,
+        reason,
+        services.actor(),
+    ) {
         tracing::error!(
             task = %task,
-            work_id = %work_id,
+            work_id = %claim.token.work_id,
             error = %error,
             "could not invalidate the plan node of a failed job"
         );
     }
 }
 
-// Maps a terminal job outcome onto the plan. Every non-success path reports,
-// so no node is left `InProgress` by a finished job.
+// Maps a terminal job outcome onto the plan while its exact claim is live.
+// Revoked claims deliberately leave the plan untouched; a trusted recovery
+// path must reconcile a node left InProgress after cancellation or reclaim.
 fn report_plan_node_outcome(
     services: &PlanNodeServices,
     task: &TaskId,
-    work_id: &str,
+    claim: &PlanNodeCallbackClaim,
+    assignment_attempt: u32,
     outcome: JobOutcome,
     admission: &ReadyNodeAdmission,
 ) -> JobOutcome {
     match outcome {
         JobOutcome::Succeeded { result } => {
             let summary = plan_node_summary(&result);
-            match PlanJobBridge::on_job_completed(
+            match PlanJobBridge::on_job_completed_claimed(
                 services.plan(),
+                &claim.jobs,
+                &claim.token,
                 task,
-                work_id,
+                assignment_attempt,
                 &summary,
                 services.actor(),
                 offset_from_timestamp(Timestamp::now()),
@@ -4217,18 +4350,18 @@ fn report_plan_node_outcome(
                 Ok(()) => {
                     tracing::info!(
                         task = %task,
-                        work_id = %work_id,
+                        work_id = %claim.token.work_id,
                         "plan node completed by durable job"
                     );
                     // Befund K37: erst jetzt, mit dem Knoten sicher `Completed`,
                     // können Folgeknoten überhaupt bereit geworden sein.
-                    admit_newly_ready_nodes(services, admission, work_id);
+                    admit_newly_ready_nodes(services, admission, claim.token.work_id.as_str());
                     JobOutcome::Succeeded { result }
                 }
                 Err(error) => {
                     tracing::error!(
                         task = %task,
-                        work_id = %work_id,
+                        work_id = %claim.token.work_id,
                         error = %error,
                         "job succeeded but the plan node could not be completed"
                     );
@@ -4236,21 +4369,21 @@ fn report_plan_node_outcome(
                         "job succeeded but the plan node could not be completed: {}",
                         sanitize_failure(&error.to_string())
                     );
-                    report_plan_node_failure(services, task, work_id, &reason);
+                    report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
                     JobOutcome::Failed { reason }
                 }
             }
         }
         JobOutcome::Failed { reason } => {
-            report_plan_node_failure(services, task, work_id, &reason);
+            report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
             JobOutcome::Failed { reason }
         }
         JobOutcome::Blocked { reason } => {
-            report_plan_node_failure(services, task, work_id, &reason);
+            report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
             JobOutcome::Blocked { reason }
         }
         JobOutcome::Cancelled { reason } => {
-            report_plan_node_failure(services, task, work_id, &reason);
+            report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
             JobOutcome::Cancelled { reason }
         }
     }
@@ -4359,6 +4492,10 @@ fn verification_line(step: &VerificationStep) -> String {
         VerificationStep::Artifact { path } => format!("artifact `{path}` must exist"),
         VerificationStep::TraceEvent { name } => format!("trace event `{name}` must be emitted"),
         VerificationStep::Manual { note } => format!("manual check: {note}"),
+        VerificationStep::CollectSources { sources } => format!(
+            "collect {} admitted sources through the parent prerequisite runner",
+            sources.len()
+        ),
     }
 }
 
@@ -4605,6 +4742,7 @@ mod tests {
             object.insert("task_id".to_owned(), serde_json::json!(task));
         }
         object.insert("plan_revision".to_owned(), serde_json::json!(2));
+        object.insert("assignment_attempt".to_owned(), serde_json::json!(0));
         object.insert("contract".to_owned(), contract_value);
         object.insert("objective".to_owned(), serde_json::json!("do the thing"));
         object.insert("acceptance_criteria".to_owned(), serde_json::json!([]));
@@ -4810,6 +4948,48 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_node_payload_rejects_missing_or_invalid_assignment_attempt() -> TestResult {
+        let contract = contract_for("t-1", &[]);
+        for value in [
+            None,
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(4294967296_u64)),
+            Some(serde_json::json!("0")),
+        ] {
+            let mut input = plan_node_input(Some("t-1"), &contract)?;
+            let object = input.as_object_mut().ok_or(TestError::Missing("object"))?;
+            object.remove("assignment_attempt");
+            if let Some(value) = value {
+                object.insert("assignment_attempt".to_owned(), value);
+            }
+            assert!(PlanNodePayload::parse(&input).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_node_payload_rejects_nonlegacy_dispatch_owner() -> TestResult {
+        let contract = contract_for("t-1", &[]);
+        for owner in [
+            serde_json::json!({"kind": "work_driver_prerequisite", "parent_work_id": "parent", "parent_lease_epoch": 1}),
+            serde_json::json!({"kind": "unknown"}),
+            serde_json::Value::Null,
+            serde_json::json!({"kind": "legacy_plan_jobs", "parent_work_id": "forged"}),
+        ] {
+            let mut input = plan_node_input(Some("t-1"), &contract)?;
+            input
+                .as_object_mut()
+                .ok_or(TestError::Missing("object"))?
+                .insert("dispatch_owner".to_owned(), owner);
+            assert!(
+                PlanNodePayload::parse(&input).is_err(),
+                "owner must not authorize legacy execution"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_plan_node_payload_parse_accepts_a_bridge_payload() -> TestResult {
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
         let payload = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?)
@@ -4817,6 +4997,7 @@ mod tests {
         assert_eq!(payload.task_id, TaskId::new("t-1"));
         assert_eq!(payload.plan_id, "p-test");
         assert_eq!(payload.plan_revision, 2);
+        assert_eq!(payload.assignment_attempt, 0);
         assert_eq!(payload.objective, "do the thing");
         assert_eq!(payload.write_scope, vec!["src/lib.rs".to_owned()]);
         assert_eq!(payload.contract.allowed_paths.len(), 1);
@@ -4862,7 +5043,7 @@ mod tests {
                 Permission::NetworkAccess,
             ],
         )?;
-        let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
 
         let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
             .map_err(ctx("derivation must succeed"))?;
@@ -4872,6 +5053,64 @@ mod tests {
         assert!(!derived.permissions().contains(Permission::ExecuteProcess));
         assert!(!derived.permissions().contains(Permission::NetworkAccess));
         assert!(derived.ensure_child_of(&inherited).is_ok());
+        assert!(
+            derived.write_scope().is_workspace(),
+            "a legacy contract is not pilot opt-in"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_plan_directory_contract_keeps_workspace_write_authority() -> TestResult {
+        let dir = temp_dir()?;
+        let inherited = sandbox_with(
+            dir.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        )?;
+        let contract = contract_for("legacy", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
+            .map_err(ctx("legacy directory contract"))?;
+        assert!(derived.write_scope().is_workspace());
+        assert!(derived.permissions().contains(Permission::WriteWorkspace));
+        Ok(())
+    }
+
+    #[test]
+    fn writable_plan_nodes_reject_non_exact_contract_rules() -> TestResult {
+        let dir = temp_dir()?;
+        let inherited = sandbox_with(
+            dir.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        )?;
+        let inherited = inherited.restrict(
+            &PermissionRequest::from_permissions(inherited.permissions().iter()).with_write_scope(
+                harw_authority::FileWriteScope::exact_files(["src/lib.rs"])
+                    .map_err(ctx("exact scope"))?,
+            ),
+        );
+        let exact_contract = contract_for("exact", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        let exact =
+            derive_plan_node_sandbox(&inherited, &exact_contract, PlanNodeKind::Coding, true)
+                .map_err(ctx("explicit exact contract"))?;
+        assert!(!exact.write_scope().is_workspace());
+        assert!(exact.write_scope().allows_path(Path::new("src/lib.rs")));
+        assert!(!exact.write_scope().allows_path(Path::new("Cargo.toml")));
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("exact"), &exact_contract)?)
+            .map_err(ctx("explicit exact payload"))?;
+        let (_, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Coding, &exact);
+        assert_eq!(narrowing.registry_profile, RegistryProfile::WorkspaceEdit);
+        assert_eq!(narrowing.write_scope, exact.write_scope().clone());
+        for rule in [
+            PathRule::DirectoryPrefix("src".to_owned()),
+            PathRule::Glob("src/*.rs".to_owned()),
+            PathRule::ExtensionSuffix(".rs".to_owned()),
+        ] {
+            let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned()), rule]);
+            assert!(
+                derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
+                    .is_err()
+            );
+        }
         Ok(())
     }
 
@@ -5122,7 +5361,7 @@ mod tests {
             snapshot.keys().cloned().collect::<Vec<_>>(),
             vec!["outside.rs".to_owned(), "src/lib.rs".to_owned()],
             "der ganze Workspace muss erfasst werden, nicht nur die erlaubten Pfade \
-             (Befund K36: die Sandbox schneidet nicht auf Pfadebene)"
+             (Befund K36: vollständige Erkennung unabhängig von Autorisierung)"
         );
         Ok(())
     }
@@ -5368,10 +5607,25 @@ mod tests {
         // Simuliert den erfolgreichen Abschluss des `t-1`-Jobs — genau der
         // Aufruf, den `execute_plan_node_claim` nach einem erfolgreichen Turn
         // macht.
+        let live_claim = jobs
+            .claim(
+                &WorkId::from_str(&work_id),
+                &ClaimRequest {
+                    worker_id: "callback-test".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("callback claim"))?;
+        let callback_claim = PlanNodeCallbackClaim {
+            jobs: Arc::clone(&jobs),
+            token: live_claim.token,
+        };
         let outcome = report_plan_node_outcome(
             &services,
             &task,
-            &work_id,
+            &callback_claim,
+            0,
             JobOutcome::Succeeded {
                 result: serde_json::json!({"assistant": "t-1 done"}),
             },
@@ -5409,6 +5663,89 @@ mod tests {
             .map_err(ctx(
                 "der für t-2 admittierte Job muss im Job-Speicher stehen",
             ))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_followup_refuses_prerequisite_unknown_and_missing_source() -> TestResult {
+        for owner in [
+            serde_json::json!({"kind": "work_driver_prerequisite", "parent_work_id": "parent", "parent_lease_epoch": 1}),
+            serde_json::json!({"kind": "unknown"}),
+            serde_json::Value::Null,
+        ] {
+            let temp = temp_dir()?;
+            let plan = InMemoryPlanStore::new();
+            plan.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-test"),
+                    goal: "test".into(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+            plan.apply(
+                PlanAction::AddNode {
+                    node: harw_plan::plan_node!("ready", write: ["src/ready.rs"]),
+                },
+                "test",
+            )
+            .map_err(ctx("node"))?;
+            let plan: Arc<dyn PlanStore> = Arc::new(plan);
+            let revision = plan.revision();
+            let services = PlanNodeServices::new(
+                Arc::clone(&plan),
+                sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
+                "test".into(),
+            );
+            let jobs = Arc::new(JobStore::new(temp.path()));
+            let mut input =
+                plan_node_input(Some("source-task"), &contract_for("source-task", &[]))?;
+            input
+                .as_object_mut()
+                .ok_or(TestError::Missing("object"))?
+                .insert("dispatch_owner".into(), owner);
+            let record =
+                ready_record_of_kind("source", JobKind::Custom(PLAN_NODE_JOB_KIND.into()), input)?;
+            let admission = ReadyNodeAdmission {
+                job_store: Arc::clone(&jobs),
+                scope: record.scope.clone(),
+                budget: record.job.budget.clone(),
+                retry: record.job.retry.clone(),
+                base_revision: RepoRevision("sha".into()),
+            };
+            admit_newly_ready_nodes(&services, &admission, "missing-source");
+            assert_eq!(
+                plan.revision(),
+                revision,
+                "missing source must not dispatch"
+            );
+            admit(
+                &jobs,
+                &ready_record_of_kind(
+                    "malformed-ownerless",
+                    JobKind::Custom(PLAN_NODE_JOB_KIND.into()),
+                    serde_json::json!({}),
+                )?,
+            )?;
+            admit_newly_ready_nodes(&services, &admission, "malformed-ownerless");
+            assert_eq!(
+                plan.revision(),
+                revision,
+                "missing owner must not legitimize malformed source"
+            );
+            admit(&jobs, &record)?;
+            admit_newly_ready_nodes(&services, &admission, "source");
+            assert_eq!(
+                plan.revision(),
+                revision,
+                "nonlegacy owner must not dispatch coding"
+            );
+            assert!(
+                plan.current().map_err(ctx("current"))?.nodes[0]
+                    .assignment
+                    .is_none()
+            );
+        }
         Ok(())
     }
 
@@ -5482,10 +5819,25 @@ mod tests {
 
         // Darf weder scheitern noch panicken, obwohl kein Folgeknoten bereit
         // wird.
+        let live_claim = jobs
+            .claim(
+                &WorkId::from_str(&work_id),
+                &ClaimRequest {
+                    worker_id: "callback-test".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("callback claim"))?;
+        let callback_claim = PlanNodeCallbackClaim {
+            jobs: Arc::clone(&jobs),
+            token: live_claim.token,
+        };
         let outcome = report_plan_node_outcome(
             &services,
             &task,
-            &work_id,
+            &callback_claim,
+            0,
             JobOutcome::Succeeded {
                 result: serde_json::json!({"assistant": "done"}),
             },
@@ -5589,6 +5941,223 @@ mod tests {
             ));
         };
         assert!(reason.contains("task_id"), "unclear message: {reason}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prerequisite_owner_blocks_before_model_without_parent_authority() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        admit(
+            &store,
+            &ready_record_of_kind(
+                "plan-job",
+                JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+                {
+                    let mut input = plan_node_input(Some("t-1"), &contract)?;
+                    input.as_object_mut().ok_or(TestError::Missing("object"))?.insert("dispatch_owner".into(), serde_json::json!({"kind": "work_driver_prerequisite", "parent_work_id": "forged-parent", "parent_lease_epoch": 1}));
+                    input
+                },
+            )?,
+        )?;
+        let provider = Arc::new(RecordingModelProvider::new());
+        let services = plan_services(
+            temp.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        )?;
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            Some(services),
+            job_context(temp.path())?,
+        )
+        .await;
+
+        assert_eq!(completed, 1, "the plan job must reach a terminal state");
+        assert!(
+            provider.recorded().is_empty(),
+            "a malformed plan payload must never reach the model"
+        );
+        let JobOutcome::Blocked { reason } = completion_of(&store, "plan-job")? else {
+            return Err(TestError::Unexpected(
+                "a prerequisite job must block".into(),
+            ));
+        };
+        assert!(reason.contains("parent-claim"), "unclear message: {reason}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_poller_recovers_bound_pending_plan_job_after_publication_gap() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let plan = InMemoryPlanStore::new();
+        plan.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-test"),
+                goal: "test".to_owned(),
+            },
+            "test",
+        )
+        .map_err(ctx("create"))?;
+        let mut node = harw_plan::testing::base_node("t-1");
+        node.write_scope.clear();
+        node.assignment = Some(harw_plan::types::Assignment {
+            worker: "test".to_owned(),
+            attempt: 0,
+            job: Some("staged-plan-job".to_owned()),
+        });
+        let contract = harw_plan::admission::contract_from_node(
+            &node,
+            RepoRevision("sha".to_owned()),
+            RevisionId::new(2),
+        );
+        let input = serde_json::json!({
+            "plan_id": "p-test", "task_id": "t-1", "plan_revision": 2,
+            "assignment_attempt": 0, "contract": contract, "objective": node.objective,
+            "acceptance_criteria": [], "read_scope": [], "write_scope": [], "forbidden_scope": []
+        });
+        plan.apply(PlanAction::AddNode { node }, "test")
+            .map_err(ctx("add"))?;
+        for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
+            plan.apply(
+                PlanAction::SetStatus {
+                    id: TaskId::new("t-1"),
+                    status,
+                    reason: None,
+                },
+                "test",
+            )
+            .map_err(ctx("status"))?;
+        }
+        let mut record = ready_record_of_kind(
+            "staged-plan-job",
+            JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+            input,
+        )?;
+        record.job.state = JobState::Pending;
+        admit(&store, &record)?;
+        let plan: Arc<dyn PlanStore> = Arc::new(plan);
+        let services = Arc::new(PlanNodeServices::new(
+            Arc::clone(&plan),
+            sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
+            "test".to_owned(),
+        ));
+        // Isolate recovery from first-use scaffold writes: project bootstrap
+        // otherwise adds .gitignore during assembly and the empty contract
+        // correctly rejects that unrelated write in the patch diff.
+        std::fs::write(
+            temp.path().join("workspace/.gitignore"),
+            format!("{}/\n", harw_home::paths::project_dir_name()),
+        )
+        .map_err(ctx("initialize ignore rule"))?;
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::new(EchoModelProvider::new("done")),
+            Some(services),
+            job_context(temp.path())?,
+        )
+        .await;
+        assert_eq!(completed, 1, "poll must publish and run the staged job");
+        let outcome = completion_of(&store, "staged-plan-job")?;
+        assert!(
+            matches!(outcome, JobOutcome::Succeeded { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            plan.current().map_err(ctx("current"))?.nodes[0].status,
+            PlanNodeStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_node_legacy_or_stale_attempt_is_durably_blocked_before_model() -> TestResult
+    {
+        for attempt in [None, Some(1_u32)] {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let mut input = plan_node_input(Some("t-1"), &contract_for("t-1", &[]))?;
+            let object = input.as_object_mut().ok_or(TestError::Missing("object"))?;
+            object.remove("assignment_attempt");
+            if let Some(attempt) = attempt {
+                object.insert("assignment_attempt".to_owned(), serde_json::json!(attempt));
+            }
+            admit(
+                &store,
+                &ready_record_of_kind(
+                    "stale-plan-job",
+                    JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+                    input,
+                )?,
+            )?;
+            let plan = InMemoryPlanStore::new();
+            plan.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-test"),
+                    goal: "test".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+            let mut node = harw_plan::testing::base_node("t-1");
+            node.assignment = Some(harw_plan::types::Assignment {
+                worker: "test".to_owned(),
+                attempt: 2,
+                job: Some("stale-plan-job".to_owned()),
+            });
+            plan.apply(PlanAction::AddNode { node }, "test")
+                .map_err(ctx("add"))?;
+            for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
+                plan.apply(
+                    PlanAction::SetStatus {
+                        id: TaskId::new("t-1"),
+                        status,
+                        reason: None,
+                    },
+                    "test",
+                )
+                .map_err(ctx("status"))?;
+            }
+            let plan: Arc<dyn PlanStore> = Arc::new(plan);
+            let revision = plan.revision();
+            let services = Arc::new(PlanNodeServices::new(
+                Arc::clone(&plan),
+                sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
+                "test".to_owned(),
+            ));
+            let provider = Arc::new(RecordingModelProvider::new());
+            assert_eq!(
+                run_job_worker_once(
+                    Arc::clone(&store),
+                    Arc::new(JobExecutionRegistry::new()),
+                    Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                    Some(services),
+                    job_context(temp.path())?
+                )
+                .await,
+                1
+            );
+            assert!(provider.recorded().is_empty());
+            assert_eq!(plan.revision(), revision);
+            let JobOutcome::Blocked { reason } = completion_of(&store, "stale-plan-job")? else {
+                return Err(TestError::Unexpected(
+                    "stale or legacy job must remain durably blocked".to_owned(),
+                ));
+            };
+            if attempt.is_none() {
+                assert!(
+                    reason.contains("assignment_attempt") && reason.contains("re-admit"),
+                    "{reason}"
+                );
+            } else {
+                assert!(reason.contains("attempt differs"), "{reason}");
+            }
+        }
         Ok(())
     }
 
@@ -6908,6 +7477,11 @@ mod tests {
         // the store's current revision.
         let mut node = harw_plan::testing::base_node("t-1");
         node.kind = PlanNodeKind::Research;
+        node.assignment = Some(harw_plan::types::Assignment {
+            worker: "test-runtime".to_owned(),
+            attempt: 0,
+            job: Some("marked-parent-job".to_owned()),
+        });
         let node_id = node.id.clone();
         let expected_rev = plan.revision();
         plan.apply_batch(
@@ -6915,8 +7489,13 @@ mod tests {
             vec![
                 PlanAction::AddNode { node },
                 PlanAction::SetStatus {
-                    id: node_id,
+                    id: node_id.clone(),
                     status: PlanNodeStatus::Ready,
+                    reason: None,
+                },
+                PlanAction::SetStatus {
+                    id: node_id,
+                    status: PlanNodeStatus::InProgress,
                     reason: None,
                 },
             ],

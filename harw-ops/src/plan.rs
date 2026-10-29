@@ -524,17 +524,30 @@ pub enum PlanArgs {
         objective: Option<String>,
     },
     /// `plan patch <task-id> <feld> <wert…>` — ändert ein Feld
-    /// (objective|kind|wave|write-scope|read-scope).
+    /// (objective|kind|wave|write-scope|read-scope|collection-sources|goal-criteria).
     Patch {
         /// Bezeichner des zu ändernden Knotens.
         #[serde(default)]
         #[raw(nth = 0)]
         id: Option<String>,
-        /// Zu änderndes Feld.
+        /// objective|kind|wave|write-scope|read-scope|collection-sources|goal-criteria.
+        /// collection-sources ersetzt Lese-Scope UND Akzeptanzkriterien durch
+        /// reine Quellenabdeckung (keine semantische Recherchebewertung).
+        /// Nur für read-only research/explore ohne Output-Verträge verwenden.
+        /// Kein Statuswechsel und keine Schreibrechte; Plan-Freigabe und genaue
+        /// Goal/Plan-Bindung bleiben nötig. Nachgelagertes Coding kann weiterhin
+        /// am erforderlichen isolierten Schreib-Backend blockieren.
+        /// goal-criteria kopiert ausgewählte Kriterien des aktuell gebundenen,
+        /// mandantengeschnittenen Goals (nullbasierte Indizes). Keine frei
+        /// gelieferten Kriterien/Befehle; ersetzt nur die Knoten-Kriterien.
+        /// Danach Plan erneut prüfen/freigeben und die neue Revision binden.
         #[serde(default)]
         #[raw(nth = 1)]
         field: Option<String>,
         /// Neuer Wert; bei Scope-Feldern eine Komma- oder Leerzeichen-Liste.
+        /// collection-sources: 1–32 exakte relative Dateien, keine Symbole,
+        /// Globs, Verzeichnissuche oder Geheimnispfade. Beispiel: docs/a.md,src/b.rs.
+        /// goal-criteria: 1–64 eindeutige nullbasierte Goal-Indizes, z. B. 0,2.
         #[serde(default)]
         #[raw(join_from = 2)]
         value: Option<String>,
@@ -874,23 +887,27 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
         }
 
         PlanArgs::Patch { id, field, value } => {
-            let usage = "plan patch <task-id> <objective|kind|wave|write-scope|read-scope> <wert…>";
+            let usage = "plan patch <task-id> <objective|kind|wave|write-scope|read-scope|collection-sources|goal-criteria> <wert…>";
             let id = require_arg(id, usage)?;
             let field = require_arg(field, usage)?;
             let value = require_arg(value, usage)?;
-            let patch = build_patch(&field, &value)?;
-            let event = apply(
-                store,
-                PlanAction::UpdateNode {
-                    id: TaskId::new(id.as_str()),
-                    patch,
-                },
-                &actor,
-            )?;
-            format!(
-                "Knoten '{id}': Feld '{field}' gesetzt (Revision {}).",
-                event.revision
-            )
+            let revision = if normalize(&field) == "goal_criteria" {
+                let goals = require_service!(ctx.goal_store(), "Goal-Store");
+                let scoped_goals = ScopedGoalStore::new(goals.as_ref(), ctx.tenant().cloned());
+                patch_goal_criteria(store, &scoped_goals, &id, &value, &actor)?
+            } else {
+                let patch = build_patch(&field, &value)?;
+                apply(
+                    store,
+                    PlanAction::UpdateNode {
+                        id: TaskId::new(id.as_str()),
+                        patch,
+                    },
+                    &actor,
+                )?
+                .revision
+            };
+            format!("Knoten '{id}': Feld '{field}' gesetzt (Revision {revision}).")
         }
 
         PlanArgs::Dep { child, parent } => {
@@ -1288,14 +1305,119 @@ fn build_patch(field: &str, value: &str) -> Result<NodePatch, OpError> {
         }
         "write_scope" => patch.write_scope = Some(scope_list(value)),
         "read_scope" => patch.read_scope = Some(scope_list(value)),
+        "collection_sources" => {
+            let sources: Vec<String> = split_list(value)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if sources.is_empty() || sources.len() > 32 {
+                return Err(OpError::InvalidArguments(
+                    "collection-sources benötigt 1–32 exakte relative Dateipfade".to_owned(),
+                ));
+            }
+            for source in &sources {
+                harw_plan_bridge::source_collection::validate_source_path(source)
+                    .map_err(OpError::InvalidArguments)?;
+            }
+            patch.read_scope = Some(sources.iter().cloned().map(PathOrSymbol::Path).collect());
+            patch.acceptance_criteria = Some(vec![harw_plan::Criterion {
+                description: "Collect the exact admitted source bytes; this does not establish semantic correctness".to_owned(),
+                verification: vec![harw_plan::VerificationStep::CollectSources { sources }],
+            }]);
+        }
         other => {
             return Err(OpError::InvalidArguments(format!(
                 "unbekanntes Feld '{other}'; erwartet eines von: objective, kind, wave, \
-                 write-scope, read-scope"
+                 write-scope, read-scope, collection-sources, goal-criteria"
             )));
         }
     }
     Ok(patch)
+}
+
+/// Kopiert ausschließlich Kriterien des bereits gebundenen, gescopten Goals.
+/// Die zweite vollständige Goal-Lesung ist eine Publikationsvorbedingung vor
+/// dem Plan-CAS, keine atomare Goal/Plan-Transaktion. Goal-Store-Frische bleibt
+/// die Garantie des Backends; ein Wechsel nach der letzten Lesung ist weiterhin
+/// möglich. Freigabe, erneute Bindung und Laufzeitprüfung bleiben erforderlich.
+/// Kein anderer Store-Lock wird unter dem Plan-Lock angefordert.
+fn patch_goal_criteria(
+    plans: &dyn PlanStore,
+    goals: &dyn harw_plan::goal::GoalStore,
+    id: &str,
+    indices: &str,
+    actor: &str,
+) -> Result<RevisionId, OpError> {
+    let plan = current_plan(plans)?;
+    find_node(&plan, id)?;
+    let goal = goals.current().map_err(map_plan_error)?;
+    if plan.goal_id.as_deref() != Some(goal.id.as_str())
+        || plan.tenant != goal.tenant
+        || goal.plan_id.as_ref().is_some_and(|bound| bound != &plan.id)
+    {
+        return Err(OpError::InvalidArguments(
+            "goal-criteria benötigt das zum Plan gehörende Goal desselben Mandanten".to_owned(),
+        ));
+    }
+    if indices.len() > 1024 {
+        return Err(OpError::InvalidArguments(
+            "goal-criteria: Indexliste zu lang".to_owned(),
+        ));
+    }
+    let entries = split_list(indices);
+    if entries.is_empty() || entries.len() > 64 {
+        return Err(OpError::InvalidArguments(
+            "goal-criteria benötigt 1–64 eindeutige nullbasierte Indizes".to_owned(),
+        ));
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    for entry in entries {
+        if !entry.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(OpError::InvalidArguments("goal-criteria akzeptiert nur nullbasierte Ganzzahl-Indizes, keine Kriterien oder Befehle".to_owned()));
+        }
+        let index = entry.parse::<usize>().map_err(|_| {
+            OpError::InvalidArguments("goal-criteria: Index außerhalb des Wertebereichs".to_owned())
+        })?;
+        if index >= goal.acceptance_criteria.len() || !selected.insert(index) {
+            return Err(OpError::InvalidArguments(
+                "goal-criteria: Index doppelt oder außerhalb der aktuellen Goal-Kriterien"
+                    .to_owned(),
+            ));
+        }
+    }
+    let criteria = selected
+        .into_iter()
+        .map(|index| goal.acceptance_criteria[index].clone())
+        .collect();
+    let original = serde_json::to_vec(&goal)
+        .map_err(|error| OpError::Execution(format!("goal snapshot: {error}")))?;
+    // Keine Goal-Mutation und keine storeübergreifende Sperre: nur dieselbe
+    // vollständige Quelle erneut beobachten, direkt vor dem erwarteten Plan-CAS.
+    let latest = goals.current().map_err(map_plan_error)?;
+    let observed = serde_json::to_vec(&latest)
+        .map_err(|error| OpError::Execution(format!("goal snapshot: {error}")))?;
+    if original != observed {
+        return Err(OpError::InvalidArguments(
+            "Goal während goal-criteria geändert; aktuelle Kriterien prüfen und erneut versuchen"
+                .to_owned(),
+        ));
+    }
+    plans
+        .apply_batch(
+            &plan.id,
+            vec![PlanAction::UpdateNode {
+                id: TaskId::new(id),
+                patch: NodePatch {
+                    acceptance_criteria: Some(criteria),
+                    ..NodePatch::default()
+                },
+            }],
+            actor,
+            plan.revision,
+        )
+        .map(|result| result.revision)
+        .map_err(map_plan_error)
 }
 
 /// Wandelt eine Komma-/Leerzeichen-Liste in Scope-Einträge.
@@ -2545,6 +2667,294 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn goal_criteria_fixture() -> TestResult<(Arc<InMemoryPlanStore>, harw_plan::goal::Goal)> {
+        use harw_plan::goal::{Goal, GoalId, GoalStatus};
+        let plans = Arc::new(InMemoryPlanStore::new());
+        plans
+            .apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("criteria-plan"),
+                    goal: "goal".into(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+        plans
+            .apply(
+                PlanAction::AddNode {
+                    node: harw_plan::testing::base_node("code"),
+                },
+                "test",
+            )
+            .map_err(ctx("add"))?;
+        plans
+            .apply(
+                PlanAction::BindGoal {
+                    goal_id: "criteria-goal".into(),
+                },
+                "test",
+            )
+            .map_err(ctx("bind"))?;
+        let goal = Goal {
+            id: GoalId::new("criteria-goal"),
+            revision: 1,
+            statement: "approved goal".into(),
+            non_goals: vec![],
+            invariants: vec![],
+            constraints: vec![],
+            open_questions: vec![],
+            acceptance_criteria: vec![harw_plan::Criterion {
+                description: "approved test".into(),
+                verification: vec![harw_plan::VerificationStep::Command {
+                    cmd: "cargo test --lib".into(),
+                    expect_exit: 0,
+                }],
+            }],
+            status: GoalStatus::Active,
+            plan_id: Some(PlanId::new("criteria-plan")),
+            plan_revision: Some(plans.revision()),
+            evidence: vec![],
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
+        };
+        Ok((plans, goal))
+    }
+
+    struct GoalReadSeam {
+        goal: harw_plan::goal::Goal,
+        reads: std::sync::atomic::AtomicUsize,
+        changed_goal: bool,
+        race_plan: Option<Arc<InMemoryPlanStore>>,
+    }
+    impl harw_plan::goal::GoalStore for GoalReadSeam {
+        fn current(&self) -> harw_plan::PlanResult<harw_plan::goal::Goal> {
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut goal = self.goal.clone();
+            if read > 0 {
+                if self.changed_goal {
+                    goal.statement.push_str("changed without revision bump");
+                }
+                if let Some(plans) = &self.race_plan {
+                    plans.apply(
+                        PlanAction::UpdateNode {
+                            id: TaskId::new("code"),
+                            patch: harw_plan::actions::NodePatch {
+                                objective: Some("racing edit".into()),
+                                ..Default::default()
+                            },
+                        },
+                        "racer",
+                    )?;
+                }
+            }
+            Ok(goal)
+        }
+        fn revision(&self) -> u64 {
+            self.goal.revision
+        }
+        fn apply(
+            &self,
+            _: harw_plan::goal::GoalAction,
+            _: &str,
+        ) -> harw_plan::PlanResult<harw_plan::goal::GoalEvent> {
+            Err(harw_plan::PlanError::GoalNotFound)
+        }
+        fn history(
+            &self,
+            _: Option<u64>,
+        ) -> harw_plan::PlanResult<Vec<harw_plan::goal::GoalEvent>> {
+            Ok(vec![])
+        }
+    }
+    fn goal_read_seam(goal: harw_plan::goal::Goal) -> GoalReadSeam {
+        GoalReadSeam {
+            goal,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            changed_goal: false,
+            race_plan: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_criteria_model_frontdoor_uses_scoped_goal_not_caller_commands() -> TestResult {
+        let (plans, goal) = goal_criteria_fixture()?;
+        let goals: Arc<dyn harw_plan::goal::GoalStore> = Arc::new(goal_read_seam(goal.clone()));
+        let plan_store: Arc<dyn PlanStore> = plans.clone();
+        let mut services = ServiceMap::new();
+        services.insert(plan_store);
+        services.insert(goals);
+        services.insert(PlanToolConfig::enabled_defaults());
+        let (op, root) = context_with(services)?;
+        let result = run_model(
+            &op,
+            PlanArgs::Patch {
+                id: Some("code".into()),
+                field: Some("goal-criteria".into()),
+                value: Some("0".into()),
+            },
+        )
+        .await;
+        cleanup(root);
+        result.map_err(ctx("model patch"))?;
+        let actual = plans.current().map_err(ctx("current"))?;
+        assert_eq!(
+            serde_json::to_value(&actual.nodes[0].acceptance_criteria).map_err(ctx("actual"))?,
+            serde_json::to_value(&goal.acceptance_criteria).map_err(ctx("expected"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn goal_criteria_copies_only_bound_goal_selection_without_scope_changes() -> TestResult {
+        let (plans, goal) = goal_criteria_fixture()?;
+        let before = plans.current().map_err(ctx("before"))?;
+        let source = goal_read_seam(goal.clone());
+        super::patch_goal_criteria(plans.as_ref(), &source, "code", "0", "test")
+            .map_err(ctx("patch"))?;
+        let after = plans.current().map_err(ctx("after"))?;
+        assert_eq!(
+            serde_json::to_value(&after.nodes[0].acceptance_criteria).map_err(ctx("actual"))?,
+            serde_json::to_value(&goal.acceptance_criteria).map_err(ctx("expected"))?
+        );
+        assert_eq!(after.nodes[0].write_scope, before.nodes[0].write_scope);
+        assert_eq!(after.nodes[0].status, before.nodes[0].status);
+        assert_eq!(after.nodes[0].kind, before.nodes[0].kind);
+        Ok(())
+    }
+
+    #[test]
+    fn goal_criteria_rejects_wrong_goal_indices_and_both_read_races() -> TestResult {
+        for indices in ["", "0,0", "1", "-1", "test", "0;rm"] {
+            let (plans, goal) = goal_criteria_fixture()?;
+            let revision = plans.revision();
+            assert!(
+                super::patch_goal_criteria(
+                    plans.as_ref(),
+                    &goal_read_seam(goal),
+                    "code",
+                    indices,
+                    "test"
+                )
+                .is_err()
+            );
+            assert_eq!(plans.revision(), revision);
+        }
+        for mismatch in 0..3 {
+            let (plans, mut goal) = goal_criteria_fixture()?;
+            match mismatch {
+                0 => goal.id = harw_plan::goal::GoalId::new("wrong-goal"),
+                1 => goal.plan_id = Some(PlanId::new("other-plan")),
+                _ => goal.tenant = Some(harw_types::TenantId::from_str("foreign")),
+            }
+            assert!(
+                super::patch_goal_criteria(
+                    plans.as_ref(),
+                    &goal_read_seam(goal),
+                    "code",
+                    "0",
+                    "test"
+                )
+                .is_err()
+            );
+        }
+        for race_goal in [true, false] {
+            let (plans, goal) = goal_criteria_fixture()?;
+            let mut seam = goal_read_seam(goal);
+            seam.changed_goal = race_goal;
+            if !race_goal {
+                seam.race_plan = Some(plans.clone());
+            }
+            assert!(
+                super::patch_goal_criteria(plans.as_ref(), &seam, "code", "0", "test").is_err()
+            );
+            assert!(
+                plans.current().map_err(ctx("current"))?.nodes[0]
+                    .acceptance_criteria
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collection_sources_is_documented_in_the_model_schema() -> TestResult {
+        let schema = <PlanCall as harw_operations::OpArgsSchema>::json_schema();
+        let text = serde_json::to_string(&schema).map_err(ctx("schema"))?;
+        assert!(text.contains("collection-sources"));
+        assert!(text.contains("goal-criteria"));
+        assert!(text.contains("nullbasierte"));
+        assert!(text.contains("keine semantische"));
+        assert!(text.contains("Schreib-Backend"));
+        Ok(())
+    }
+
+    #[test]
+    fn collection_sources_patch_is_typed_and_rejects_expanding_paths() -> TestResult {
+        let patch = super::build_patch("collection-sources", "docs/b.md,docs/a.md docs/a.md")
+            .map_err(ctx("collection patch"))?;
+        assert_eq!(
+            patch.read_scope,
+            Some(vec![
+                harw_plan::ids::PathOrSymbol::Path("docs/a.md".into()),
+                harw_plan::ids::PathOrSymbol::Path("docs/b.md".into()),
+            ])
+        );
+        let criteria = patch
+            .acceptance_criteria
+            .ok_or(TestError::Missing("collection criteria"))?;
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(&criteria[0].verification[..],
+            [harw_plan::VerificationStep::CollectSources { sources }] if sources == &["docs/a.md", "docs/b.md"]));
+        assert!(patch.write_scope.is_none());
+        assert!(patch.kind.is_none());
+        for bad in [
+            "",
+            ", ,",
+            "../outside",
+            "/etc/passwd",
+            "docs/**",
+            "file.rs::Symbol",
+            ".env",
+            "a/./b",
+        ] {
+            assert!(
+                super::build_patch("collection-sources", bad).is_err(),
+                "{bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collection_sources_command_patch_reaches_real_plan_store() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
+        let created = run_command(&ctx, &["create", "p-collect", "Read", "docs"]).await;
+        let added = run_command(&ctx, &["add", "collect", "research", "Collect", "sources"]).await;
+        let patched = run_command(
+            &ctx,
+            &["patch", "collect", "collection-sources", "docs/a.md"],
+        )
+        .await;
+        let plan = store.current();
+        cleanup(root);
+        created.map_err(crate::test_support::ctx("create"))?;
+        added.map_err(crate::test_support::ctx("add"))?;
+        patched.map_err(crate::test_support::ctx("patch"))?;
+        let plan = plan.map_err(crate::test_support::ctx("current"))?;
+        let contracts = harw_plan_bridge::source_collection::SourceCollectionContract::capture_all(
+            &plan,
+            harw_types::ContentDigest::of(b"admission"),
+        )
+        .map_err(crate::test_support::ctx("capture authored contract"))?;
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].required_sources(), vec!["docs/a.md"]);
+        let node = plan.nodes.first().ok_or(TestError::Missing("node"))?;
+        assert_eq!(node.status, PlanNodeStatus::Draft);
+        assert!(node.write_scope.is_empty());
         Ok(())
     }
 

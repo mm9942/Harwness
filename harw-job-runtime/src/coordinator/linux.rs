@@ -3471,6 +3471,16 @@ mod chain_tests {
         );
         assert_eq!(inner.rlimits, rlimit_set(&spec));
         assert_eq!(inner.sandbox_requirement, SandboxRequirement::BestEffort);
+        // Ported from alice/consolidate-20261029: even a best-effort job's
+        // inner Landlock layer is a hard requirement (it protects the
+        // report), and that survives the JSON handoff to the trampoline.
+        let decoded = ExecPlanV1::from_json(&inner.to_json().map_err(ctx("serialize inner"))?)
+            .map_err(ctx("decode inner"))?;
+        assert_eq!(
+            decoded.sandbox.as_ref().map(|policy| policy.landlock),
+            Some(harw_job_linux::LandlockMode::HardRequirement),
+            "report protection survives the trampoline plan handoff"
+        );
         let policy = inner
             .sandbox
             .as_ref()
