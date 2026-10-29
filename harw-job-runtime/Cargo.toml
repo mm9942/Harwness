@@ -13,7 +13,8 @@ description = "Job coordinator (Job-Runtime-Doc §14/§15): claims jobs from a f
 # backend pulls `harw-sandbox`/`harw-authority` and stays opt-in.
 [features]
 default = []
-# `LinuxSandboxBackend::Bwrap` through `harw-job-executor-bwrap`.
+# `LinuxSandboxBackend::Bwrap` and `LinuxSandboxBackend::BwrapTrampoline`
+# through `harw-job-executor-bwrap`.
 bwrap = ["dep:harw-job-executor-bwrap"]
 
 [dependencies]

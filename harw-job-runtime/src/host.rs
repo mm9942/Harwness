@@ -48,8 +48,32 @@
 //! `sandbox-exec` if `/usr/bin/sandbox-exec` exists, else for the
 //! unsandboxed mode. Every other OS gets a report in which nothing is
 //! enforced.
+//!
+//! # Backend selection (PL-97 E1)
+//! `select_backend` (Linux) turns a [`HostReport`] and
+//! [`BackendPreferences`] into the `LinuxSandboxBackend` the executor uses.
+//! It is the one resolver shared by the host command port and the
+//! sandboxed verify runner. With [`BackendRequest::Auto`] it tries, in this
+//! order:
+//!
+//! | Backend | Needs |
+//! |---|---|
+//! | [`BackendKind::BwrapTrampoline`] | trusted `bwrap`, user namespaces, a usable Landlock ABI (it keeps the job out of its read-write attempt directory), the `harw-job-exec` binary, a private plan directory, no unrelayed network need |
+//! | [`BackendKind::Bwrap`] | trusted `bwrap`, user namespaces, no unrelayed network need |
+//! | [`BackendKind::LandlockTrampoline`] | a usable Landlock ABI, the `harw-job-exec` binary, a private plan directory |
+//! | [`BackendKind::None`] | nothing |
+//!
+//! Every step, taken or skipped, is recorded in `BackendSelection::reasons`
+//! — the choice is never silent. "Trusted `bwrap`" means one at the fixed
+//! root-owned paths of `harw-sandbox` (never `PATH`), unlike the
+//! informational [`HostReport::bwrap_available`]. The trampoline is looked
+//! up next to the running executable only (never `PATH`), unless an
+//! explicit path is given. [`predicted_dimensions`] gives the per-dimension
+//! table an operator sees for a choice.
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use harw_job_core::{EnforcementState, SandboxProfileName, SandboxReport};
 use serde::{Deserialize, Serialize};
@@ -277,6 +301,510 @@ fn darwin_best(sandbox_exec_available: bool) -> SandboxReport {
     sandbox.report_for(&SandboxProfileName::NoNetwork)
 }
 
+/// File name of the `harw-job-exec` trampoline binary.
+pub const TRAMPOLINE_NAME: &str = "harw-job-exec";
+
+/// The Linux sandbox backends, strongest first — the order
+/// `select_backend` tries them in for [`BackendRequest::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendKind {
+    /// Bubblewrap around the `harw-job-exec` trampoline: namespaces outside,
+    /// Landlock, `NO_NEW_PRIVS`, capability drop and rlimits inside, cgroup
+    /// joined before `bwrap` starts (`LinuxSandboxBackend::BwrapTrampoline`).
+    BwrapTrampoline,
+    /// Bubblewrap alone (`LinuxSandboxBackend::Bwrap`).
+    Bwrap,
+    /// The `harw-job-exec` trampoline with Landlock, without namespaces
+    /// (`LinuxSandboxBackend::LandlockTrampoline`). Named `landlock` on
+    /// command lines, in logs and on the wire.
+    #[serde(rename = "landlock")]
+    LandlockTrampoline,
+    /// No sandbox backend (`LinuxSandboxBackend::None`).
+    None,
+}
+
+impl BackendKind {
+    /// Every kind, in selection order.
+    pub const ALL: [Self; 4] = [
+        Self::BwrapTrampoline,
+        Self::Bwrap,
+        Self::LandlockTrampoline,
+        Self::None,
+    ];
+
+    /// The name used on command lines and in logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BwrapTrampoline => "bwrap-trampoline",
+            Self::Bwrap => "bwrap",
+            Self::LandlockTrampoline => "landlock",
+            Self::None => "none",
+        }
+    }
+
+    /// Whether the backend runs the job in a Bubblewrap namespace.
+    #[must_use]
+    pub const fn uses_bwrap(self) -> bool {
+        matches!(self, Self::BwrapTrampoline | Self::Bwrap)
+    }
+
+    /// Whether the backend runs the `harw-job-exec` trampoline.
+    #[must_use]
+    pub const fn uses_trampoline(self) -> bool {
+        matches!(self, Self::BwrapTrampoline | Self::LandlockTrampoline)
+    }
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A backend name that is none of `auto`, `bwrap-trampoline`, `bwrap`,
+/// `landlock` or `none`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownBackend(pub String);
+
+impl fmt::Display for UnknownBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown sandbox backend '{}' (expected auto, bwrap-trampoline, bwrap, landlock or none)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownBackend {}
+
+impl FromStr for BackendKind {
+    type Err = UnknownBackend;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == text.trim())
+            .ok_or_else(|| UnknownBackend(text.to_owned()))
+    }
+}
+
+/// Which backend `select_backend` may choose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum BackendRequest {
+    /// The strongest available one ([`BackendKind::ALL`] order).
+    #[default]
+    Auto,
+    /// Exactly this one. When it is not available the selection ends in
+    /// [`BackendKind::None`] with the reason recorded; there is no fallback
+    /// to another backend.
+    Only(BackendKind),
+}
+
+impl fmt::Display for BackendRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Only(kind) => kind.fmt(f),
+        }
+    }
+}
+
+impl FromStr for BackendRequest {
+    type Err = UnknownBackend;
+
+    /// `auto`, or a [`BackendKind`] name.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.trim() == "auto" {
+            Ok(Self::Auto)
+        } else {
+            text.parse().map(Self::Only)
+        }
+    }
+}
+
+/// Where `select_backend` takes an executable from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ExecutableSource {
+    /// The default lookup: `bwrap` at the fixed root-owned paths of
+    /// `harw-sandbox`; the trampoline next to the running executable (or
+    /// in [`BackendPreferences::exe_dir`]). `PATH` is never searched.
+    #[default]
+    Discover,
+    /// Exactly this path (an explicit override): it must be absolute and
+    /// an executable regular file. The caller vouches for its trust.
+    Path(PathBuf),
+    /// Not available.
+    Disabled,
+}
+
+/// Inputs of `select_backend` besides the host facts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendPreferences {
+    /// Which backend may be chosen.
+    pub request: BackendRequest,
+    /// Where `bwrap` comes from.
+    pub bwrap: ExecutableSource,
+    /// Where the `harw-job-exec` trampoline comes from.
+    pub trampoline: ExecutableSource,
+    /// Directory of [`ExecutableSource::Discover`] for the trampoline.
+    /// `None`: the directory of the running executable.
+    pub exe_dir: Option<PathBuf>,
+    /// Private (`0700`) directory for trampoline plan and report files;
+    /// the trampoline backends need it to exist. `None`: they are skipped.
+    pub plan_dir: Option<PathBuf>,
+    /// The jobs need network access (e.g. `SandboxProfileName::WorkspaceBuild`).
+    /// The Bubblewrap backends only offer proxy-only egress through a relay,
+    /// which `select_backend` does not configure, so with this set they are
+    /// skipped instead of refusing every such job later.
+    pub needs_network: bool,
+}
+
+/// What `kind` can enforce on `host`, per dimension, for an operator
+/// table: `namespace`, `filesystem`, `network`, `no_new_privs`,
+/// `capabilities`, `resource_limits` and `cgroup`. Pure.
+///
+/// Network is the state for a policy that denies network. `cgroup` is the
+/// job's own cgroup: `Enforced` when the process joins it before `exec`
+/// (the trampoline backends), `Partial` when it is attached right after
+/// spawn, `NotEnforced` without a delegated root
+/// (`cgroup_root_configured`, confirmed by [`HostReport::cgroup_v2_delegated`]).
+#[must_use]
+pub fn predicted_dimensions(
+    kind: BackendKind,
+    host: &HostReport,
+    cgroup_root_configured: bool,
+) -> [(&'static str, EnforcementState); 7] {
+    use EnforcementState::{Enforced, NotEnforced, Partial, Unsupported};
+    let abi = host.landlock.usable_abi().unwrap_or(0);
+    let landlock_filesystem = match abi {
+        0 => Unsupported,
+        1..=4 => Partial,
+        _ => Enforced,
+    };
+    let landlock_network = match abi {
+        0 => Unsupported,
+        1..=3 => NotEnforced,
+        _ => Partial,
+    };
+    let delegated = cgroup_root_configured && host.cgroup_v2_delegated;
+    let (namespace, filesystem, network, privileges) = match kind {
+        BackendKind::BwrapTrampoline => (
+            Enforced,
+            stronger(Partial, landlock_filesystem),
+            Enforced,
+            Enforced,
+        ),
+        BackendKind::Bwrap => (Enforced, Partial, Enforced, Enforced),
+        BackendKind::LandlockTrampoline => {
+            (NotEnforced, landlock_filesystem, landlock_network, Enforced)
+        }
+        BackendKind::None => (NotEnforced, NotEnforced, NotEnforced, NotEnforced),
+    };
+    let cgroup = match (delegated, kind.uses_trampoline()) {
+        (false, _) => NotEnforced,
+        (true, true) => Enforced,
+        (true, false) => Partial,
+    };
+    [
+        ("namespace", namespace),
+        ("filesystem", filesystem),
+        ("network", network),
+        ("no_new_privs", privileges),
+        ("capabilities", privileges),
+        (
+            "resource_limits",
+            if delegated { Enforced } else { Partial },
+        ),
+        ("cgroup", cgroup),
+    ]
+}
+
+/// The outcome of `select_backend`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct BackendSelection {
+    /// The backend to put into `LinuxExecutorOptions::sandbox`.
+    pub backend: crate::coordinator::LinuxSandboxBackend,
+    /// Its kind.
+    pub chosen: BackendKind,
+    /// One line per backend that was tried: why it was skipped, or that
+    /// it was selected (with caveats).
+    pub reasons: Vec<String>,
+}
+
+/// Chooses the sandbox backend for `host` (see the module docs). Never
+/// fails and never silent: every candidate gets a line in
+/// [`BackendSelection::reasons`].
+///
+/// Side effects: none besides the read-only lookups (`bwrap` discovery,
+/// file metadata, `std::env::current_exe`).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn select_backend(host: &HostReport, prefs: &BackendPreferences) -> BackendSelection {
+    let facts = SelectionFacts::resolve(host, prefs);
+    let candidates: Vec<BackendKind> = match prefs.request {
+        BackendRequest::Auto => BackendKind::ALL.to_vec(),
+        BackendRequest::Only(kind) => vec![kind],
+    };
+    let mut reasons = Vec::new();
+    for kind in candidates {
+        match facts.backend(kind) {
+            Ok((backend, note)) => {
+                reasons.push(match note {
+                    Some(note) => format!("{kind}: selected ({note})"),
+                    None => format!("{kind}: selected"),
+                });
+                return BackendSelection {
+                    backend,
+                    chosen: kind,
+                    reasons,
+                };
+            }
+            Err(missing) => reasons.push(format!("{kind}: skipped: {}", missing.join("; "))),
+        }
+    }
+    reasons.push(format!(
+        "none: selected because '{}' was requested explicitly and there is no fallback; \
+         jobs that request a sandbox run without one (`required` jobs are refused)",
+        prefs.request
+    ));
+    BackendSelection {
+        backend: crate::coordinator::LinuxSandboxBackend::None,
+        chosen: BackendKind::None,
+        reasons,
+    }
+}
+
+/// The resolved inputs of one `select_backend` call.
+#[cfg(target_os = "linux")]
+struct SelectionFacts {
+    linux: bool,
+    user_namespaces: bool,
+    landlock_abi: Option<u8>,
+    needs_network: bool,
+    #[cfg(feature = "bwrap")]
+    bwrap: Result<harw_job_executor_bwrap::BwrapExecutor, String>,
+    trampoline: Result<PathBuf, String>,
+    plan_dir: Result<PathBuf, String>,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectionFacts {
+    fn resolve(host: &HostReport, prefs: &BackendPreferences) -> Self {
+        Self {
+            linux: host.target_os == "linux",
+            user_namespaces: host.user_namespaces != Some(false),
+            landlock_abi: host.landlock.usable_abi(),
+            needs_network: prefs.needs_network,
+            #[cfg(feature = "bwrap")]
+            bwrap: resolve_bwrap(&prefs.bwrap),
+            trampoline: resolve_trampoline(&prefs.trampoline, prefs.exe_dir.as_deref()),
+            plan_dir: resolve_plan_dir(prefs.plan_dir.as_deref()),
+        }
+    }
+
+    /// The backend of `kind`, with an optional caveat, or everything that
+    /// is missing for it.
+    fn backend(
+        &self,
+        kind: BackendKind,
+    ) -> Result<(crate::coordinator::LinuxSandboxBackend, Option<String>), Vec<String>> {
+        use crate::coordinator::LinuxSandboxBackend;
+        let mut missing = Vec::new();
+        if !self.linux && kind != BackendKind::None {
+            missing.push("not a Linux host".to_owned());
+        }
+        if kind.uses_bwrap() {
+            if !self.user_namespaces {
+                missing.push("unprivileged user namespaces are disabled".to_owned());
+            }
+            if self.needs_network {
+                missing.push(
+                    "the jobs need network access and bubblewrap only offers proxy-only \
+                     egress through a relay, which is not configured"
+                        .to_owned(),
+                );
+            }
+        }
+        #[cfg(feature = "bwrap")]
+        let bwrap = match (&self.bwrap, kind.uses_bwrap()) {
+            (Ok(bwrap), true) => Some(bwrap.clone()),
+            (Err(why), true) => {
+                missing.push(why.clone());
+                None
+            }
+            (_, false) => None,
+        };
+        if cfg!(not(feature = "bwrap")) && kind.uses_bwrap() {
+            missing.push("built without the `bwrap` feature".to_owned());
+        }
+        let trampoline = match (&self.trampoline, &self.plan_dir, kind.uses_trampoline()) {
+            (Ok(trampoline), Ok(plan_dir), true) => Some((trampoline.clone(), plan_dir.clone())),
+            (trampoline, plan_dir, true) => {
+                for error in [trampoline.as_ref().err(), plan_dir.as_ref().err()]
+                    .into_iter()
+                    .flatten()
+                {
+                    missing.push(error.clone());
+                }
+                None
+            }
+            (_, _, false) => None,
+        };
+        if self.landlock_abi.is_none() {
+            match kind {
+                BackendKind::LandlockTrampoline => {
+                    missing.push("no usable Landlock ABI".to_owned());
+                }
+                // Landlock is what keeps the job away from its attempt
+                // directory (bound read-write for the plan and report).
+                // Without it the job could rewrite its own report or plant
+                // a FIFO in its place.
+                BackendKind::BwrapTrampoline => missing.push(
+                    "no usable Landlock ABI: the attempt directory (plan and report) \
+                     would be writable by the job"
+                        .to_owned(),
+                ),
+                BackendKind::Bwrap | BackendKind::None => {}
+            }
+        }
+        if !missing.is_empty() {
+            return Err(missing);
+        }
+        match (kind, trampoline) {
+            #[cfg(feature = "bwrap")]
+            (BackendKind::BwrapTrampoline, Some((trampoline, plan_dir))) => match bwrap {
+                Some(bwrap) => Ok((
+                    LinuxSandboxBackend::BwrapTrampoline {
+                        bwrap,
+                        trampoline,
+                        plan_dir,
+                    },
+                    None,
+                )),
+                None => Err(vec!["no trusted bwrap".to_owned()]),
+            },
+            #[cfg(feature = "bwrap")]
+            (BackendKind::Bwrap, _) => match bwrap {
+                Some(bwrap) => Ok((LinuxSandboxBackend::Bwrap(bwrap), None)),
+                None => Err(vec!["no trusted bwrap".to_owned()]),
+            },
+            (BackendKind::LandlockTrampoline, Some((trampoline, plan_dir))) => Ok((
+                LinuxSandboxBackend::LandlockTrampoline {
+                    trampoline,
+                    plan_dir,
+                },
+                None,
+            )),
+            (BackendKind::None, _) => Ok((
+                LinuxSandboxBackend::None,
+                Some(
+                    "no sandbox backend: jobs that request a sandbox run without one \
+                     (`required` jobs are refused)"
+                        .to_owned(),
+                ),
+            )),
+            _ => Err(vec!["unavailable".to_owned()]),
+        }
+    }
+}
+
+/// A trusted `bwrap` per `source`.
+#[cfg(all(target_os = "linux", feature = "bwrap"))]
+fn resolve_bwrap(
+    source: &ExecutableSource,
+) -> Result<harw_job_executor_bwrap::BwrapExecutor, String> {
+    match source {
+        ExecutableSource::Discover => harw_job_executor_bwrap::BwrapExecutor::discover()
+            .map_err(|error| format!("no trusted bwrap: {error}")),
+        ExecutableSource::Path(path) => check_executable("bwrap", path)
+            .map(|()| harw_job_executor_bwrap::BwrapExecutor::from_executable(path.clone())),
+        ExecutableSource::Disabled => Err("bwrap is disabled".to_owned()),
+    }
+}
+
+/// The trampoline binary per `source`.
+#[cfg(target_os = "linux")]
+fn resolve_trampoline(
+    source: &ExecutableSource,
+    exe_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    match source {
+        ExecutableSource::Discover => {
+            let dir = match exe_dir {
+                Some(dir) => Some(dir.to_path_buf()),
+                None => std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+            };
+            let Some(dir) = dir.filter(|dir| dir.is_absolute()) else {
+                return Err(format!(
+                    "no {TRAMPOLINE_NAME}: the directory of the running executable is unknown"
+                ));
+            };
+            let candidate = dir.join(TRAMPOLINE_NAME);
+            check_executable(TRAMPOLINE_NAME, &candidate)
+                .map(|()| candidate)
+                .map_err(|why| format!("{why} (looked next to the running executable)"))
+        }
+        ExecutableSource::Path(path) => {
+            check_executable(TRAMPOLINE_NAME, path).map(|()| path.clone())
+        }
+        ExecutableSource::Disabled => Err(format!("{TRAMPOLINE_NAME} is disabled")),
+    }
+}
+
+/// An absolute executable regular file, or why not.
+#[cfg(target_os = "linux")]
+fn check_executable(name: &str, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !path.is_absolute() {
+        return Err(format!("{name} path '{}' is not absolute", path.display()));
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() && meta.permissions().mode() & 0o111 != 0 => Ok(()),
+        Ok(_) => Err(format!(
+            "{name} '{}' is not an executable regular file",
+            path.display()
+        )),
+        Err(error) => Err(format!("no {name} at '{}': {error}", path.display())),
+    }
+}
+
+/// The plan directory: absolute, an existing directory, no group/other
+/// access bits.
+#[cfg(target_os = "linux")]
+fn resolve_plan_dir(dir: Option<&Path>) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(dir) = dir else {
+        return Err("no plan directory configured".to_owned());
+    };
+    if !dir.is_absolute() {
+        return Err(format!(
+            "plan directory '{}' is not absolute",
+            dir.display()
+        ));
+    }
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() && meta.permissions().mode() & 0o077 == 0 => {
+            Ok(dir.to_path_buf())
+        }
+        Ok(meta) if meta.is_dir() => Err(format!(
+            "plan directory '{}' is not private (mode {:o}, expected 0700)",
+            dir.display(),
+            meta.permissions().mode() & 0o777
+        )),
+        Ok(_) => Err(format!(
+            "plan directory '{}' is not a directory",
+            dir.display()
+        )),
+        Err(error) => Err(format!("plan directory '{}': {error}", dir.display())),
+    }
+}
+
 fn probe_facts(cgroup_root: Option<&Path>) -> HostFacts {
     let mut facts = HostFacts {
         target_os: std::env::consts::OS.to_owned(),
@@ -451,6 +979,450 @@ mod tests {
         });
         assert!(!other.filesystem.is_enforced());
         assert!(!other.capabilities.is_enforced());
+    }
+
+    #[test]
+    fn test_backend_names_round_trip() -> TestResult {
+        for kind in BackendKind::ALL {
+            let parsed: BackendKind = kind.as_str().parse().map_err(ctx("parse kind"))?;
+            assert_eq!(parsed, kind);
+            // One spelling everywhere: the wire form is the CLI name.
+            let wire = serde_json::to_string(&kind).map_err(ctx("encode kind"))?;
+            assert_eq!(wire, format!("\"{}\"", kind.as_str()));
+            let decoded: BackendKind = serde_json::from_str(&wire).map_err(ctx("decode kind"))?;
+            assert_eq!(decoded, kind);
+            let request: BackendRequest = kind.to_string().parse().map_err(ctx("parse request"))?;
+            assert_eq!(request, BackendRequest::Only(kind));
+        }
+        assert_eq!(
+            "auto"
+                .parse::<BackendRequest>()
+                .map_err(ctx("parse auto"))?,
+            BackendRequest::Auto
+        );
+        assert_eq!(BackendRequest::default().to_string(), "auto");
+        let unknown = "landlock-trampoline".parse::<BackendRequest>();
+        assert!(
+            matches!(&unknown, Err(UnknownBackend(name)) if name == "landlock-trampoline"),
+            "{unknown:?}"
+        );
+        assert!(BackendKind::BwrapTrampoline.uses_bwrap() && BackendKind::Bwrap.uses_bwrap());
+        assert!(!BackendKind::LandlockTrampoline.uses_bwrap());
+        assert!(BackendKind::LandlockTrampoline.uses_trampoline());
+        assert!(!BackendKind::Bwrap.uses_trampoline() && !BackendKind::None.uses_trampoline());
+        Ok(())
+    }
+
+    #[test]
+    fn test_predicted_dimensions_per_backend() {
+        use EnforcementState::{Enforced, NotEnforced, Partial, Unsupported};
+        let full = HostReport::from_facts(linux(Some(5), true, true));
+        let state = |kind, host: &HostReport, cgroup| -> Vec<EnforcementState> {
+            predicted_dimensions(kind, host, cgroup)
+                .iter()
+                .map(|(_, state)| *state)
+                .collect()
+        };
+        let names: Vec<&str> = predicted_dimensions(BackendKind::None, &full, false)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "namespace",
+                "filesystem",
+                "network",
+                "no_new_privs",
+                "capabilities",
+                "resource_limits",
+                "cgroup"
+            ]
+        );
+        assert_eq!(
+            state(BackendKind::BwrapTrampoline, &full, true),
+            [Enforced; 7]
+        );
+        assert_eq!(
+            state(BackendKind::Bwrap, &full, true),
+            [
+                Enforced, Partial, Enforced, Enforced, Enforced, Enforced, Partial
+            ]
+        );
+        assert_eq!(
+            state(BackendKind::LandlockTrampoline, &full, true),
+            [
+                NotEnforced,
+                Enforced,
+                Partial,
+                Enforced,
+                Enforced,
+                Enforced,
+                Enforced
+            ]
+        );
+        // Without a configured (delegated) root: rlimits only, no job cgroup.
+        assert_eq!(
+            state(BackendKind::BwrapTrampoline, &full, false),
+            [
+                Enforced,
+                Enforced,
+                Enforced,
+                Enforced,
+                Enforced,
+                Partial,
+                NotEnforced
+            ]
+        );
+        // Landlock ABI 3: the trampoline layer is only partial.
+        let old = HostReport::from_facts(linux(Some(3), true, false));
+        assert_eq!(
+            state(BackendKind::LandlockTrampoline, &old, true),
+            [
+                NotEnforced,
+                Partial,
+                NotEnforced,
+                Enforced,
+                Enforced,
+                Partial,
+                NotEnforced
+            ]
+        );
+        let none = HostReport::from_facts(linux(None, true, false));
+        assert_eq!(
+            state(BackendKind::BwrapTrampoline, &none, false)[1],
+            Partial,
+            "mounts still confine the filesystem without Landlock"
+        );
+        assert_eq!(
+            state(BackendKind::LandlockTrampoline, &none, false)[1],
+            Unsupported
+        );
+        assert_eq!(
+            state(BackendKind::None, &full, true),
+            [
+                NotEnforced,
+                NotEnforced,
+                NotEnforced,
+                NotEnforced,
+                NotEnforced,
+                Enforced,
+                Partial
+            ]
+        );
+    }
+
+    /// Fake executables and a private plan directory for the selection
+    /// decision table.
+    #[cfg(all(target_os = "linux", feature = "bwrap"))]
+    struct SelectionFixture {
+        _dir: tempfile::TempDir,
+        bin: PathBuf,
+        bwrap: PathBuf,
+        trampoline: PathBuf,
+        plan_dir: PathBuf,
+        /// A directory with mode `0755` (not usable as a plan directory).
+        open_dir: PathBuf,
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bwrap"))]
+    impl SelectionFixture {
+        fn new() -> TestResult<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin).map_err(ctx("bin dir"))?;
+            let mut tools = Vec::new();
+            for name in ["bwrap", TRAMPOLINE_NAME] {
+                let path = bin.join(name);
+                std::fs::write(&path, b"#!/bin/sh\n").map_err(ctx("write tool"))?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(ctx("chmod tool"))?;
+                tools.push(path);
+            }
+            let plan_dir = dir.path().join("plans");
+            std::fs::create_dir(&plan_dir).map_err(ctx("plan dir"))?;
+            std::fs::set_permissions(&plan_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(ctx("chmod plan dir"))?;
+            let open_dir = dir.path().join("open");
+            std::fs::create_dir(&open_dir).map_err(ctx("open dir"))?;
+            std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o755))
+                .map_err(ctx("chmod open dir"))?;
+            let [bwrap, trampoline] = <[PathBuf; 2]>::try_from(tools)
+                .map_err(|_| crate::test_support::TestError::Missing("two tools"))?;
+            Ok(Self {
+                _dir: dir,
+                bin,
+                bwrap,
+                trampoline,
+                plan_dir,
+                open_dir,
+            })
+        }
+
+        /// Everything available, nothing discovered from the real host.
+        fn prefs(&self) -> BackendPreferences {
+            BackendPreferences {
+                request: BackendRequest::Auto,
+                bwrap: ExecutableSource::Path(self.bwrap.clone()),
+                trampoline: ExecutableSource::Path(self.trampoline.clone()),
+                exe_dir: None,
+                plan_dir: Some(self.plan_dir.clone()),
+                needs_network: false,
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bwrap"))]
+    #[test]
+    fn test_select_backend_decision_table() -> TestResult {
+        use crate::test_support::TestError;
+        let fixture = SelectionFixture::new()?;
+        let full = HostReport::from_facts(linux(Some(5), true, false));
+        let no_landlock = HostReport::from_facts(linux(None, true, false));
+        let mut no_userns_facts = linux(Some(5), true, false);
+        no_userns_facts.user_namespaces = Some(false);
+        let no_userns = HostReport::from_facts(no_userns_facts);
+        let mut unknown_userns_facts = linux(Some(5), true, false);
+        unknown_userns_facts.user_namespaces = None;
+        let unknown_userns = HostReport::from_facts(unknown_userns_facts);
+        let macos = HostReport::from_facts(HostFacts {
+            target_os: "macos".to_owned(),
+            ..linux(Some(5), true, false)
+        });
+        let base = fixture.prefs();
+        let open_plan_dir = fixture.open_dir.clone();
+        let with = |change: &dyn Fn(&mut BackendPreferences)| {
+            let mut prefs = base.clone();
+            change(&mut prefs);
+            prefs
+        };
+        // (case, host, preferences, expected backend, expected skip count)
+        let cases: Vec<(&str, &HostReport, BackendPreferences, BackendKind, usize)> = vec![
+            (
+                "everything",
+                &full,
+                base.clone(),
+                BackendKind::BwrapTrampoline,
+                0,
+            ),
+            (
+                "unknown userns counts as available",
+                &unknown_userns,
+                base.clone(),
+                BackendKind::BwrapTrampoline,
+                0,
+            ),
+            (
+                "no landlock: bubblewrap alone",
+                &no_landlock,
+                base.clone(),
+                BackendKind::Bwrap,
+                1,
+            ),
+            (
+                "explicit composition without landlock: no fallback",
+                &no_landlock,
+                with(&|prefs| {
+                    prefs.request = BackendRequest::Only(BackendKind::BwrapTrampoline);
+                }),
+                BackendKind::None,
+                1,
+            ),
+            (
+                "no trampoline",
+                &full,
+                with(&|prefs| prefs.trampoline = ExecutableSource::Disabled),
+                BackendKind::Bwrap,
+                1,
+            ),
+            (
+                "plan dir not private",
+                &full,
+                with(&|prefs| prefs.plan_dir = Some(open_plan_dir.clone())),
+                BackendKind::Bwrap,
+                1,
+            ),
+            (
+                "no bwrap",
+                &full,
+                with(&|prefs| prefs.bwrap = ExecutableSource::Disabled),
+                BackendKind::LandlockTrampoline,
+                2,
+            ),
+            (
+                "no user namespaces",
+                &no_userns,
+                base.clone(),
+                BackendKind::LandlockTrampoline,
+                2,
+            ),
+            (
+                "network without relay",
+                &full,
+                with(&|prefs| prefs.needs_network = true),
+                BackendKind::LandlockTrampoline,
+                2,
+            ),
+            (
+                "no bwrap, no landlock",
+                &no_landlock,
+                with(&|prefs| prefs.bwrap = ExecutableSource::Disabled),
+                BackendKind::None,
+                3,
+            ),
+            (
+                "relative trampoline override",
+                &no_landlock,
+                with(&|prefs| {
+                    prefs.trampoline = ExecutableSource::Path(PathBuf::from(TRAMPOLINE_NAME));
+                }),
+                BackendKind::Bwrap,
+                1,
+            ),
+            (
+                "trampoline discovered in exe_dir",
+                &full,
+                with(&|prefs| {
+                    prefs.trampoline = ExecutableSource::Discover;
+                    prefs.exe_dir = Some(fixture.bin.clone());
+                }),
+                BackendKind::BwrapTrampoline,
+                0,
+            ),
+            (
+                "explicit landlock",
+                &full,
+                with(&|prefs| {
+                    prefs.request = BackendRequest::Only(BackendKind::LandlockTrampoline);
+                }),
+                BackendKind::LandlockTrampoline,
+                0,
+            ),
+            (
+                "explicit bwrap without bwrap: no fallback",
+                &full,
+                with(&|prefs| {
+                    prefs.request = BackendRequest::Only(BackendKind::Bwrap);
+                    prefs.bwrap = ExecutableSource::Disabled;
+                }),
+                BackendKind::None,
+                1,
+            ),
+            (
+                "explicit none",
+                &full,
+                with(&|prefs| prefs.request = BackendRequest::Only(BackendKind::None)),
+                BackendKind::None,
+                0,
+            ),
+            ("not linux", &macos, base.clone(), BackendKind::None, 3),
+        ];
+        for (case, host, prefs, expected, skipped) in cases {
+            let selection = select_backend(host, &prefs);
+            if selection.chosen != expected || selection.backend.kind() != expected {
+                return Err(TestError::Unexpected(format!(
+                    "{case}: expected {expected}, got {} / {:?}: {:?}",
+                    selection.chosen, selection.backend, selection.reasons
+                )));
+            }
+            let skips = selection
+                .reasons
+                .iter()
+                .filter(|reason| reason.contains(": skipped: "))
+                .count();
+            assert_eq!(skips, skipped, "{case}: {:?}", selection.reasons);
+            // Never silent: one line per tried candidate, the last names
+            // the choice.
+            let last = selection
+                .reasons
+                .last()
+                .ok_or(TestError::Missing("reasons"))?;
+            assert!(
+                last.starts_with(&format!("{expected}: selected")),
+                "{case}: {last}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bwrap"))]
+    #[test]
+    fn test_select_backend_paths_and_reasons() -> TestResult {
+        use crate::coordinator::LinuxSandboxBackend;
+        use crate::test_support::TestError;
+        let fixture = SelectionFixture::new()?;
+        let full = HostReport::from_facts(linux(Some(5), true, false));
+        let selection = select_backend(&full, &fixture.prefs());
+        match &selection.backend {
+            LinuxSandboxBackend::BwrapTrampoline {
+                bwrap,
+                trampoline,
+                plan_dir,
+            } => {
+                assert_eq!(bwrap.executable(), fixture.bwrap.as_path());
+                assert_eq!(trampoline, &fixture.trampoline);
+                assert_eq!(plan_dir, &fixture.plan_dir);
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        // A skipped candidate names everything that is missing.
+        let mut prefs = fixture.prefs();
+        prefs.bwrap = ExecutableSource::Disabled;
+        prefs.trampoline = ExecutableSource::Disabled;
+        let mut facts = linux(None, true, false);
+        facts.user_namespaces = Some(false);
+        let selection = select_backend(&HostReport::from_facts(facts), &prefs);
+        assert_eq!(selection.chosen, BackendKind::None);
+        let first = selection
+            .reasons
+            .first()
+            .ok_or(TestError::Missing("first reason"))?;
+        assert!(first.starts_with("bwrap-trampoline: skipped: "), "{first}");
+        assert!(first.contains("user namespaces are disabled"), "{first}");
+        assert!(first.contains("bwrap is disabled"), "{first}");
+        assert!(first.contains("harw-job-exec is disabled"), "{first}");
+        let landlock = selection
+            .reasons
+            .get(2)
+            .ok_or(TestError::Missing("landlock reason"))?;
+        assert!(landlock.contains("no usable Landlock ABI"), "{landlock}");
+        assert!(first.contains("attempt directory"), "{first}");
+        // No Landlock: the composition is skipped (the job could write its
+        // attempt directory), bubblewrap alone is chosen.
+        let selection = select_backend(
+            &HostReport::from_facts(linux(None, true, false)),
+            &fixture.prefs(),
+        );
+        assert_eq!(selection.chosen, BackendKind::Bwrap);
+        let first = selection
+            .reasons
+            .first()
+            .ok_or(TestError::Missing("reason"))?;
+        assert!(first.starts_with("bwrap-trampoline: skipped: "), "{first}");
+        assert!(first.contains("no usable Landlock ABI"), "{first}");
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "bwrap")))]
+    #[test]
+    fn test_select_backend_without_the_bwrap_feature_says_so() {
+        let selection = select_backend(
+            &HostReport::from_facts(linux(None, true, false)),
+            &BackendPreferences {
+                trampoline: ExecutableSource::Disabled,
+                ..BackendPreferences::default()
+            },
+        );
+        assert_eq!(selection.chosen, BackendKind::None);
+        assert!(
+            selection
+                .reasons
+                .first()
+                .is_some_and(|reason| reason.contains("built without the `bwrap` feature")),
+            "{:?}",
+            selection.reasons
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -6,7 +6,7 @@
 //! starts attempts through a platform [`coordinator::Executor`]
 //! (`LinuxExecutor` on Linux: pidfd process group, optional
 //! cgroup v2 boundary, sandbox backend none / Landlock trampoline /
-//! Bubblewrap; `DarwinExecutor` on macOS), supervises them through
+//! Bubblewrap / Bubblewrap ∘ trampoline; `DarwinExecutor` on macOS), supervises them through
 //! `harw-job-tokio`, renews the lease every TTL/3, enforces deadline and
 //! cancellation, finalizes outcomes and recovers attempts after a restart
 //! without ever signalling an unverified process.
@@ -15,6 +15,12 @@
 //! [`host::HostReport::probe`] reports, without side effects, which
 //! sandbox backends this host offers and the strongest per-dimension
 //! [`SandboxReport`] a job can get here (runtime admission).
+//!
+//! # Backend selection (PL-97 E1)
+//! `select_backend` (Linux) is the one resolver from a [`HostReport`] and
+//! [`BackendPreferences`] to the `LinuxSandboxBackend` of the executor:
+//! Bubblewrap ∘ trampoline, else Bubblewrap, else the Landlock trampoline,
+//! else none — every step recorded in `BackendSelection::reasons`.
 //!
 //! # Compatibility re-exports
 //! Since Job-Doc Phase 1 the job model (budget, lease, retry, lifecycle,
@@ -54,7 +60,12 @@ pub mod lanes;
 pub mod offer;
 pub mod permits;
 
-pub use host::{HostFacts, HostLandlock, HostReport};
+pub use host::{
+    BackendKind, BackendPreferences, BackendRequest, ExecutableSource, HostFacts, HostLandlock,
+    HostReport, TRAMPOLINE_NAME, UnknownBackend, predicted_dimensions,
+};
+#[cfg(target_os = "linux")]
+pub use host::{BackendSelection, select_backend};
 pub use lanes::{JobLanes, LaneStatus};
 pub use permits::{MAX_PERMITS, MIN_PERMITS, Permit, PermitStatus, ResizablePermits};
 

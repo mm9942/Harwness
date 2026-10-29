@@ -16,6 +16,40 @@
 //! 5. capture the [`LinuxRecoveryIdentity`] *after* the attach;
 //! 6. adopt into Tokio (`AsyncFd` on the pidfd) and supervise.
 //!
+//! # Bubblewrap ∘ trampoline (PL-97 E1)
+//! [`LinuxSandboxBackend::BwrapTrampoline`] chains two trampoline stages
+//! around `bwrap` (feature `bwrap`):
+//!
+//! ```text
+//! harw-job-exec --plan <attempt>/outer.json          outer stage, process-group leader
+//!   CgroupJoin::Attach (first) → rlimits → exec bwrap   no Landlock, no sandbox
+//!   bwrap --unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts …
+//!         --ro-bind <harw-job-exec> /run/harw-job/exec
+//!         --bind <attempt> /run/harw-job/attempt -- [relay prefix]
+//!     /run/harw-job/exec --plan /run/harw-job/attempt/inner.json --report …/report.json
+//!       CgroupJoin::Verify → rlimits → NO_NEW_PRIVS → capability drop →
+//!       Landlock (policy mapped to the namespace view) → exec <program>
+//! ```
+//!
+//! Because the outer stage joins the job cgroup before it `exec`s `bwrap`,
+//! `bwrap` and every descendant are born inside the cgroup: there is no
+//! spawn-to-attach window, and the inner stage's verification (the
+//! sandbox keeps the caller's cgroup namespace) proves it. The outer
+//! attach from the supervisor (`spawn_in_cgroup`) stays as before and is
+//! a no-op for the already joined process. The inner stage re-applies the
+//! same rlimits (idempotent) so its report states them. The attempt
+//! report is `harw_job_exec::merge_reports(bwrap predicted, inner report)`
+//! with the resource dimension capped by the cgroup domain, known after the
+//! job ran. A `Required` job is checked against the namespace layer and the
+//! resource domain before anything runs; the inner stage checks the rest
+//! itself (exit `126`). Each attempt gets a private directory below the
+//! backend's `plan_dir` for both plans and the report; it is removed after
+//! the job ended or a failed start. Only the inner Landlock layer keeps
+//! the job out of that directory (no inner policy path grants write access
+//! there), so the backend refuses every sandboxed job on a host without a
+//! usable Landlock ABI before the directory exists; the report is read
+//! only if it is still a regular file.
+//!
 //! # Exit-status shim (optional)
 //! pidfds do not survive a restart, and a reattached process is not our
 //! child, so its exit status is unobservable. With
@@ -45,8 +79,8 @@
 //!   termination signal reaches the primary only; descendants are killed
 //!   with the job cgroup (when it could be reopened).
 //! - Between spawn and cgroup attach the child runs for a few microseconds
-//!   outside the cgroup unless the trampoline backend is used (it joins
-//!   the cgroup itself before `exec`).
+//!   outside the cgroup unless a trampoline backend is used (it joins the
+//!   cgroup itself before `exec`).
 //! - A job cgroup whose last member keeps running past `remove_cgroup`'s
 //!   retry budget is not removed there and then; it is recorded instead of
 //!   only logged. Once the first attempt starts, and only when a cgroup
@@ -58,6 +92,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(feature = "bwrap")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,6 +119,7 @@ use super::executor::{
     Executor, Probe, StartedAttempt, check_requirement, requests_resource_limits,
     unsandboxed_report,
 };
+use crate::host::BackendKind;
 
 /// Shell used by the exit-status shim.
 const SHIM_SHELL: &str = "/bin/sh";
@@ -125,6 +162,43 @@ pub enum LinuxSandboxBackend {
     /// Bubblewrap through `harw-job-executor-bwrap` (feature `bwrap`).
     #[cfg(feature = "bwrap")]
     Bwrap(harw_job_executor_bwrap::BwrapExecutor),
+    /// Bubblewrap around the `harw-job-exec` trampoline (feature `bwrap`,
+    /// PL-97 E1): an outer trampoline joins the job cgroup and applies the
+    /// rlimits, then `exec`s `bwrap`; inside the namespace the trampoline
+    /// verifies the cgroup and applies `NO_NEW_PRIVS`, the capability drop
+    /// and Landlock planned against the namespace view (module docs).
+    ///
+    /// Needs a usable Landlock ABI: Landlock is what keeps the job out of
+    /// its attempt directory, which is bound read-write for the plan and
+    /// the report. `select_backend` only picks it then, and a launch on a
+    /// host without one is refused (`RuntimeError::Unsupported`) before
+    /// anything is created or bound.
+    #[cfg(feature = "bwrap")]
+    BwrapTrampoline {
+        /// The trusted `bwrap` (and optional proxy relay).
+        bwrap: harw_job_executor_bwrap::BwrapExecutor,
+        /// Absolute path of the `harw-job-exec` binary (outer stage, and
+        /// bound read-only into the sandbox for the inner stage).
+        trampoline: PathBuf,
+        /// Private (`0700`) directory; every attempt gets its own
+        /// subdirectory for both plans and the report.
+        plan_dir: PathBuf,
+    },
+}
+
+impl LinuxSandboxBackend {
+    /// The kind of this backend (for selection reports and logs).
+    #[must_use]
+    pub fn kind(&self) -> BackendKind {
+        match self {
+            Self::None => BackendKind::None,
+            Self::LandlockTrampoline { .. } => BackendKind::LandlockTrampoline,
+            #[cfg(feature = "bwrap")]
+            Self::Bwrap(_) => BackendKind::Bwrap,
+            #[cfg(feature = "bwrap")]
+            Self::BwrapTrampoline { .. } => BackendKind::BwrapTrampoline,
+        }
+    }
 }
 
 /// Options of the [`LinuxExecutor`].
@@ -192,6 +266,10 @@ pub struct LinuxExecutor {
     /// Guards [`LinuxExecutor::ensure_leftover_sweep`] so the background
     /// sweep task is spawned at most once.
     sweep_spawned: AtomicBool,
+    /// Usable Landlock ABI of this host for the `BwrapTrampoline` backend,
+    /// probed on its first launch ([`LinuxExecutor::chain_landlock_abi`]).
+    #[cfg(feature = "bwrap")]
+    landlock_probe: std::sync::OnceLock<Option<u8>>,
 }
 
 /// What to exec, before it becomes a [`Command`].
@@ -259,6 +337,214 @@ struct Prepared {
     trampoline_report: Option<PathBuf>,
     /// Trampoline plan file to discard on a failed spawn.
     trampoline_plan: Option<PathBuf>,
+    /// Predicted report of the namespace layer, merged with the trampoline
+    /// report after exit (`BwrapTrampoline`).
+    merge_with: Option<SandboxReport>,
+    /// Per-attempt directory to remove after exit or a failed start
+    /// (`BwrapTrampoline`).
+    attempt_dir: Option<PathBuf>,
+}
+
+impl Prepared {
+    /// A launch without trampoline files.
+    fn plain(launch: Launch, report: SandboxReport) -> Self {
+        Self {
+            launch,
+            report: Some(report),
+            trampoline_report: None,
+            trampoline_plan: None,
+            merge_with: None,
+            attempt_dir: None,
+        }
+    }
+
+    /// Removes the files of a launch that never started.
+    fn discard_files(&self) {
+        discard_launch_files(self.trampoline_plan.as_deref(), self.attempt_dir.as_deref());
+    }
+}
+
+/// Removes the trampoline plan and the attempt directory of a launch that
+/// never started (or was abandoned). The outer plan of `BwrapTrampoline`
+/// carries the job environment, so every early return after a successful
+/// `prepare` goes through here.
+fn discard_launch_files(plan: Option<&Path>, attempt_dir: Option<&Path>) {
+    if let Some(plan) = plan {
+        let _ = std::fs::remove_file(plan);
+    }
+    if let Some(dir) = attempt_dir {
+        remove_attempt_dir(dir);
+    }
+}
+
+/// File name of the outer trampoline plan in an attempt directory.
+#[cfg(feature = "bwrap")]
+const OUTER_PLAN_FILE: &str = "outer.json";
+
+/// Attempts to find an unused attempt-directory name before giving up.
+#[cfg(feature = "bwrap")]
+const ATTEMPT_DIR_ATTEMPTS: u32 = 16;
+
+/// Per-process sequence number for attempt-directory names.
+#[cfg(feature = "bwrap")]
+static ATTEMPT_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Creates a fresh `0700` directory `<plan_dir>/harw-job-<attempt>.<pid>.<seq>`.
+#[cfg(feature = "bwrap")]
+fn create_attempt_dir(plan_dir: &Path, ctx: &AttemptContext) -> Result<PathBuf, RuntimeError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let stem = cgroup_name(ctx);
+    let mut last = plan_dir.to_path_buf();
+    for _ in 0..ATTEMPT_DIR_ATTEMPTS {
+        let sequence = ATTEMPT_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = plan_dir.join(format!("{stem}.{}.{sequence}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => last = dir,
+            Err(error) => {
+                return Err(RuntimeError::Sandbox {
+                    detail: format!("attempt directory {}: {error}", dir.display()),
+                });
+            }
+        }
+    }
+    Err(RuntimeError::Sandbox {
+        detail: format!(
+            "no unused attempt directory name (last tried {})",
+            last.display()
+        ),
+    })
+}
+
+/// Removes an attempt directory and everything in it. Best effort.
+fn remove_attempt_dir(dir: &Path) {
+    if let Err(error) = std::fs::remove_dir_all(dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %dir.display(), %error, "cannot remove attempt directory");
+        }
+    }
+}
+
+/// Writes `plan` as a new `0600` file (the trampoline refuses anything
+/// else).
+#[cfg(feature = "bwrap")]
+fn write_plan(path: &Path, plan: &harw_job_exec::ExecPlanV1) -> Result<(), RuntimeError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let sandbox_error = |detail: String| RuntimeError::Sandbox { detail };
+    let bytes = plan
+        .to_json()
+        .map_err(|error| sandbox_error(error.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| sandbox_error(format!("plan file {}: {error}", path.display())))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| sandbox_error(format!("plan file {}: {error}", path.display())))
+}
+
+/// The job cgroup as the chain plans need it.
+#[cfg(feature = "bwrap")]
+#[derive(Debug, Clone, Copy)]
+struct ChainCgroup<'a> {
+    /// The delegated root (`CgroupJoin::root`).
+    root: &'a Path,
+    /// The job cgroup's child name (`CgroupJoin::relative`).
+    name: &'a str,
+    /// `CgroupHandle::proc_path` (`CgroupVerify::expected_proc_path`).
+    proc_path: &'a str,
+}
+
+/// The two trampoline plans of a `BwrapTrampoline` launch.
+#[cfg(feature = "bwrap")]
+#[derive(Debug)]
+struct ChainPlans {
+    /// Outer stage: join the cgroup, rlimits, `exec` `bwrap`.
+    outer: harw_job_exec::ExecPlanV1,
+    /// Inner stage: verify the cgroup, rlimits, sandbox, `exec` the job.
+    inner: harw_job_exec::ExecPlanV1,
+    /// Predicted report of the namespace layer.
+    bwrap_report: SandboxReport,
+    /// Policy paths without a rule inside the namespace.
+    unmapped: Vec<PathBuf>,
+    /// Policy paths `bwrap` deliberately does not bind.
+    withheld: Vec<PathBuf>,
+}
+
+/// Maps a planning error of the Bubblewrap executor.
+#[cfg(feature = "bwrap")]
+fn bwrap_error(error: harw_job_executor_bwrap::BwrapExecutorError) -> RuntimeError {
+    match error {
+        harw_job_executor_bwrap::BwrapExecutorError::Unsupported { .. } => {
+            RuntimeError::Unsupported {
+                operation: "bwrap sandbox",
+                detail: error.to_string(),
+            }
+        }
+        other => RuntimeError::Sandbox {
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// Plans both stages of a `BwrapTrampoline` launch (module docs). Pure
+/// apart from canonicalizing the workspace root.
+#[cfg(feature = "bwrap")]
+fn chain_plans(
+    bwrap: &harw_job_executor_bwrap::BwrapExecutor,
+    mount: &harw_job_executor_bwrap::TrampolineMount,
+    spec: &JobSpec,
+    workspace_root: &Path,
+    cgroup: Option<ChainCgroup<'_>>,
+    resource_limits: EnforcementState,
+) -> Result<ChainPlans, RuntimeError> {
+    let policy = policy_for(spec.sandbox_profile, workspace_root);
+    let plan = bwrap
+        .plan_with_trampoline(spec, &policy, workspace_root, mount)
+        .map_err(bwrap_error)?;
+    // The outer plan is JSON: the bwrap argv must be UTF-8.
+    let bwrap_args = plan
+        .bwrap()
+        .args()
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| RuntimeError::Sandbox {
+                    detail: format!("bwrap argument {arg:?} is not valid UTF-8"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut outer = harw_job_exec::ExecPlanV1::new(plan.bwrap().executable()).with_args(bwrap_args);
+    let mut inner = harw_job_exec::ExecPlanV1::new(&spec.program)
+        .with_args(spec.args.iter().cloned())
+        .with_sandbox(plan.inner_policy().clone(), spec.sandbox);
+    if spec.resources.requests_rlimits() {
+        let rlimits = rlimit_set(spec);
+        outer = outer.with_rlimits(rlimits.clone());
+        inner = inner.with_rlimits(rlimits);
+    }
+    if let Some(cgroup) = cgroup {
+        outer = outer.with_cgroup(harw_job_exec::CgroupJoin {
+            root: cgroup.root.to_path_buf(),
+            relative: cgroup.name.to_owned(),
+            limits: Some(resource_limits),
+        });
+        inner = inner.with_cgroup(harw_job_exec::CgroupVerify {
+            expected_proc_path: PathBuf::from(cgroup.proc_path),
+            limits: Some(resource_limits),
+        });
+    }
+    Ok(ChainPlans {
+        outer,
+        inner,
+        bwrap_report: plan.bwrap().report(),
+        unmapped: plan.unmapped_paths().to_vec(),
+        withheld: plan.withheld_paths().to_vec(),
+    })
 }
 
 fn process_error(operation: &'static str, program: &str, error: ProcessError) -> RuntimeError {
@@ -502,6 +788,11 @@ impl AttemptControl for SupervisorControl {
 /// What the forwarding task does after the process ended.
 struct AfterExit {
     trampoline_report: Option<PathBuf>,
+    /// Predicted namespace-layer report to merge the trampoline report
+    /// into (`BwrapTrampoline`).
+    merge_with: Option<SandboxReport>,
+    /// Per-attempt directory removed after the report was read.
+    attempt_dir: Option<PathBuf>,
     resource_limits: EnforcementState,
     /// Job cgroup of a recovered attempt, killed and removed after exit.
     recovered_cgroup: Option<RecoveredCgroup>,
@@ -601,7 +892,48 @@ fn reopen_job_cgroup(
 impl AfterExit {
     fn late_report(&self) -> Option<SandboxReport> {
         let path = self.trampoline_report.as_ref()?;
-        let report = match harw_job_exec::read_report(path) {
+        // Only a regular file is read: a FIFO (or a symlink to one) planted
+        // in the report's place would block the read below forever. With
+        // `BwrapTrampoline` no sandboxed process is left at this point (the
+        // pid namespace ended with its init), so the check cannot race with
+        // the job.
+        let regular = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_file() => true,
+            Ok(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "trampoline report is not a regular file; the report is ignored"
+                );
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot stat trampoline report");
+                false
+            }
+        };
+        let report = if regular {
+            self.read_trampoline_report(path)
+        } else {
+            None
+        };
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %path.display(), %error, "cannot remove trampoline report");
+            }
+        }
+        // Both layers restrict the same process: per dimension the stronger
+        // one counts, resource limits come from the trampoline only.
+        report.map(|inner| match &self.merge_with {
+            Some(bwrap) => harw_job_exec::merge_reports(bwrap, &inner),
+            None => inner,
+        })
+    }
+
+    /// Reads the trampoline report at `path` (a regular file), with the
+    /// resource dimension capped by the cgroup domain.
+    fn read_trampoline_report(&self, path: &Path) -> Option<SandboxReport> {
+        match harw_job_exec::read_report(path) {
             Ok(Some(report)) => Some(SandboxReport {
                 // The trampoline only knows what its plan told it; without a
                 // cgroup it cannot know the spec asked for limits.
@@ -613,13 +945,7 @@ impl AfterExit {
                 tracing::warn!(path = %path.display(), %error, "cannot read trampoline report");
                 None
             }
-        };
-        if let Err(error) = std::fs::remove_file(path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(path = %path.display(), %error, "cannot remove trampoline report");
-            }
         }
-        report
     }
 }
 
@@ -670,6 +996,9 @@ async fn forward(
         cgroup.kill_and_remove(&after.leftovers).await;
     }
     let sandbox = after.late_report();
+    if let Some(dir) = after.attempt_dir.take() {
+        remove_attempt_dir(&dir);
+    }
     let _ = sender
         .send(AttemptEvent::Exited {
             outcome: exit,
@@ -686,11 +1015,20 @@ impl LinuxExecutor {
     /// variant) when the cgroup root cannot be used;
     /// [`RuntimeError::InvalidConfig`] for relative backend paths.
     pub fn new(options: LinuxExecutorOptions) -> Result<Self, RuntimeError> {
-        if let LinuxSandboxBackend::LandlockTrampoline {
-            trampoline,
-            plan_dir,
-        } = &options.sandbox
-        {
+        let trampoline_paths = match &options.sandbox {
+            LinuxSandboxBackend::LandlockTrampoline {
+                trampoline,
+                plan_dir,
+            } => Some((trampoline, plan_dir)),
+            #[cfg(feature = "bwrap")]
+            LinuxSandboxBackend::BwrapTrampoline {
+                trampoline,
+                plan_dir,
+                ..
+            } => Some((trampoline, plan_dir)),
+            _ => None,
+        };
+        if let Some((trampoline, plan_dir)) = trampoline_paths {
             if !trampoline.is_absolute() || !plan_dir.is_absolute() {
                 return Err(RuntimeError::InvalidConfig {
                     detail: "trampoline and plan_dir must be absolute paths".to_owned(),
@@ -713,7 +1051,19 @@ impl LinuxExecutor {
             cgroup,
             leftovers: LeftoverRegistry::default(),
             sweep_spawned: AtomicBool::new(false),
+            #[cfg(feature = "bwrap")]
+            landlock_probe: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The usable Landlock ABI of this host for the `BwrapTrampoline`
+    /// backend, probed once per executor
+    /// (`harw_job_linux::sandbox::landlock_support`, a throwaway thread).
+    #[cfg(feature = "bwrap")]
+    fn chain_landlock_abi(&self) -> Option<u8> {
+        *self
+            .landlock_probe
+            .get_or_init(|| harw_job_linux::sandbox::landlock_support().usable_abi())
     }
 
     /// The options.
@@ -827,12 +1177,10 @@ impl LinuxExecutor {
                 };
                 let rlimits = apply_prlimit(&mut launch, spec);
                 require_rlimits(spec, rlimits)?;
-                Ok(Prepared {
+                Ok(Prepared::plain(
                     launch,
-                    report: Some(unsandboxed_report(worse(resource_limits, rlimits))),
-                    trampoline_report: None,
-                    trampoline_plan: None,
-                })
+                    unsandboxed_report(worse(resource_limits, rlimits)),
+                ))
             }
             (
                 true,
@@ -884,6 +1232,8 @@ impl LinuxExecutor {
                     report: None,
                     trampoline_report: Some(launch.report_path().to_path_buf()),
                     trampoline_plan: Some(launch.plan_path().to_path_buf()),
+                    merge_with: None,
+                    attempt_dir: None,
                 })
             }
             #[cfg(feature = "bwrap")]
@@ -891,17 +1241,7 @@ impl LinuxExecutor {
                 let policy = policy_for(spec.sandbox_profile, &ctx.workspace_root);
                 let plan = bwrap
                     .plan(spec, &policy, &ctx.workspace_root)
-                    .map_err(|error| match error {
-                        harw_job_executor_bwrap::BwrapExecutorError::Unsupported { .. } => {
-                            RuntimeError::Unsupported {
-                                operation: "bwrap sandbox",
-                                detail: error.to_string(),
-                            }
-                        }
-                        other => RuntimeError::Sandbox {
-                            detail: other.to_string(),
-                        },
-                    })?;
+                    .map_err(bwrap_error)?;
                 let mut launch = Launch {
                     program: plan.executable().as_os_str().to_owned(),
                     args: plan.args().to_vec(),
@@ -917,12 +1257,31 @@ impl LinuxExecutor {
                     resource_limits: worse(resource_limits, rlimits),
                     ..plan.report()
                 };
-                Ok(Prepared {
-                    launch,
-                    report: Some(report),
-                    trampoline_report: None,
-                    trampoline_plan: None,
-                })
+                Ok(Prepared::plain(launch, report))
+            }
+            #[cfg(feature = "bwrap")]
+            (
+                true,
+                LinuxSandboxBackend::BwrapTrampoline {
+                    bwrap,
+                    trampoline,
+                    plan_dir,
+                },
+            ) => {
+                // Only the inner Landlock layer keeps the job out of its
+                // attempt directory (bound read-write for the report):
+                // without a usable ABI nothing is created or bound.
+                require_landlock_for_chain(self.chain_landlock_abi())?;
+                let attempt_dir = create_attempt_dir(plan_dir, ctx)?;
+                let mount = harw_job_executor_bwrap::TrampolineMount {
+                    exec_path: trampoline.clone(),
+                    attempt_dir,
+                };
+                let prepared = prepare_chain(spec, ctx, cgroup, resource_limits, bwrap, &mount);
+                if prepared.is_err() {
+                    remove_attempt_dir(&mount.attempt_dir);
+                }
+                prepared
             }
         }
     }
@@ -956,6 +1315,104 @@ impl LinuxExecutor {
         tokio::spawn(forward(handle, events, sender, after));
         AttemptRun::new(attempt_events, control)
     }
+}
+
+/// Refuses the `BwrapTrampoline` backend on a host without a usable
+/// Landlock ABI (PL-97 security review, finding 4): the attempt directory
+/// is bound read-write so the inner trampoline can create its report, and
+/// only Landlock keeps the job from rewriting that report afterwards
+/// (`merge_reports` trusts it). `select_backend` never picks the backend
+/// then; this guards a backend configured explicitly. Every sandboxed job
+/// is refused, `best_effort` ones too: a run whose report the job could
+/// forge would not be best effort but unknown.
+#[cfg(feature = "bwrap")]
+fn require_landlock_for_chain(abi: Option<u8>) -> Result<u8, RuntimeError> {
+    abi.ok_or_else(|| RuntimeError::Unsupported {
+        operation: "bwrap trampoline sandbox",
+        detail: "no usable Landlock ABI: the job could rewrite its trampoline report in the \
+                 read-write attempt directory; the bubblewrap trampoline backend needs Landlock \
+                 (select_backend chooses bubblewrap alone on such hosts)"
+            .to_owned(),
+    })
+}
+
+/// The `BwrapTrampoline` launch: plans both stages, checks what is known
+/// before anything runs, writes the plans into the attempt directory and
+/// starts the outer stage (module docs).
+#[cfg(feature = "bwrap")]
+fn prepare_chain(
+    spec: &JobSpec,
+    ctx: &AttemptContext,
+    cgroup: Option<&(Arc<CgroupV2Fs>, CgroupHandle)>,
+    resource_limits: EnforcementState,
+    bwrap: &harw_job_executor_bwrap::BwrapExecutor,
+    mount: &harw_job_executor_bwrap::TrampolineMount,
+) -> Result<Prepared, RuntimeError> {
+    let membership = cgroup.map(|(backend, handle)| ChainCgroup {
+        root: backend.root_path(),
+        name: handle.name(),
+        proc_path: handle.proc_path(),
+    });
+    let plans = chain_plans(
+        bwrap,
+        mount,
+        spec,
+        &ctx.workspace_root,
+        membership,
+        resource_limits,
+    )?;
+    // Lower bound before anything runs: the namespace layer's network and
+    // the resource domain. The inner stage checks the rest itself.
+    if spec.sandbox == SandboxRequirement::Required {
+        check_requirement(
+            spec.sandbox,
+            &SandboxReport {
+                network: plans.bwrap_report.network,
+                resource_limits,
+                ..SandboxReport::uniform(EnforcementState::Enforced)
+            },
+        )?;
+    }
+    // Withheld paths (`/sys`, `/run`, workspace ancestors) are expected to
+    // fall out; any other policy path without a rule inside is visible.
+    let unexpected: Vec<&PathBuf> = plans
+        .unmapped
+        .iter()
+        .filter(|path| !plans.withheld.contains(path))
+        .collect();
+    if !unexpected.is_empty() {
+        tracing::warn!(
+            unmapped = ?unexpected,
+            "policy paths that bwrap binds have no Landlock rule inside the namespace; \
+             the job cannot use them there"
+        );
+    } else if !plans.unmapped.is_empty() {
+        tracing::debug!(
+            unmapped = ?plans.unmapped,
+            withheld = ?plans.withheld,
+            "policy paths without a Landlock rule inside the bwrap namespace"
+        );
+    }
+    write_plan(&mount.inner_plan_path(), &plans.inner)?;
+    let outer_path = mount.attempt_dir.join(OUTER_PLAN_FILE);
+    write_plan(&outer_path, &plans.outer)?;
+    Ok(Prepared {
+        launch: Launch {
+            program: mount.exec_path.as_os_str().to_owned(),
+            args: vec![
+                OsString::from("--plan"),
+                outer_path.clone().into_os_string(),
+            ],
+            // bwrap sets the job environment and directory inside.
+            env: Vec::new(),
+            cwd: None,
+        },
+        report: None,
+        trampoline_report: Some(mount.inner_report_path()),
+        trampoline_plan: Some(outer_path),
+        merge_with: Some(plans.bwrap_report),
+        attempt_dir: Some(mount.attempt_dir.clone()),
+    })
 }
 
 /// Fixed search paths for `prlimit` (util-linux); `PATH` is never consulted.
@@ -1100,6 +1557,7 @@ impl Executor for LinuxExecutor {
         };
         if let Some(report) = &prepared.report {
             if let Err(error) = check_requirement(spec.sandbox, report) {
+                prepared.discard_files();
                 release(cgroup);
                 return Err(error);
             }
@@ -1130,9 +1588,10 @@ impl Executor for LinuxExecutor {
             // a path that does not exist is a failed spawn, as without it.
             let program = Path::new(&launch.program);
             if program.components().count() > 1 && !program.exists() {
-                if let Some(plan) = &prepared.trampoline_plan {
-                    let _ = std::fs::remove_file(plan);
-                }
+                discard_launch_files(
+                    prepared.trampoline_plan.as_deref(),
+                    prepared.attempt_dir.as_deref(),
+                );
                 release(cgroup);
                 return Err(RuntimeError::Spawn {
                     program: spec.program.clone(),
@@ -1157,9 +1616,23 @@ impl Executor for LinuxExecutor {
                         detail: format!("{}: {error}", path.display()),
                     })
             };
-            command
-                .stdout(open(&files.stdout)?)
-                .stderr(open(&files.stderr)?);
+            let opened = open(&files.stdout)
+                .and_then(|stdout| open(&files.stderr).map(|stderr| (stdout, stderr)));
+            match opened {
+                Ok((stdout, stderr)) => {
+                    command.stdout(stdout).stderr(stderr);
+                }
+                Err(error) => {
+                    // Nothing ran: discard the plans (the outer one carries
+                    // the job environment) and the unused job cgroup.
+                    discard_launch_files(
+                        prepared.trampoline_plan.as_deref(),
+                        prepared.attempt_dir.as_deref(),
+                    );
+                    release(cgroup);
+                    return Err(error);
+                }
+            }
         }
         if let Some(handoff) = &ctx.stdio_handoff {
             if handoff.stdin {
@@ -1194,9 +1667,10 @@ impl Executor for LinuxExecutor {
         let (group, mut stdio) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
-                if let Some(plan) = &prepared.trampoline_plan {
-                    let _ = std::fs::remove_file(plan);
-                }
+                discard_launch_files(
+                    prepared.trampoline_plan.as_deref(),
+                    prepared.attempt_dir.as_deref(),
+                );
                 return Err(error);
             }
         };
@@ -1240,6 +1714,10 @@ impl Executor for LinuxExecutor {
             Err(error) => {
                 let detail = error.error.to_string();
                 abandon(*error.target);
+                discard_launch_files(
+                    prepared.trampoline_plan.as_deref(),
+                    prepared.attempt_dir.as_deref(),
+                );
                 return Err(RuntimeError::Os {
                     operation: "adopt process",
                     detail,
@@ -1253,6 +1731,8 @@ impl Executor for LinuxExecutor {
             stdio.stderr,
             AfterExit {
                 trampoline_report: prepared.trampoline_report,
+                merge_with: prepared.merge_with,
+                attempt_dir: prepared.attempt_dir,
                 resource_limits,
                 recovered_cgroup: None,
                 note: None,
@@ -1341,6 +1821,8 @@ impl Executor for LinuxExecutor {
             None,
             AfterExit {
                 trampoline_report: None,
+                merge_with: None,
+                attempt_dir: None,
                 resource_limits: EnforcementState::NotEnforced,
                 recovered_cgroup,
                 note,
@@ -1371,9 +1853,8 @@ impl Executor for LinuxExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        CgroupRecovery, Launch, LeftoverCgroup, LeftoverRegistry, LinuxExecutor,
-        LinuxExecutorOptions, RecoveredCgroup, cgroup_name, remove_cgroup, reopen_job_cgroup,
-        weaker,
+        CgroupRecovery, Launch, LeftoverCgroup, LeftoverRegistry, LinuxExecutor, RecoveredCgroup,
+        cgroup_name, remove_cgroup, reopen_job_cgroup, weaker,
     };
     use crate::coordinator::executor::AttemptContext;
     use crate::test_support::{TestError, TestResult, ctx};
@@ -1384,7 +1865,7 @@ mod tests {
     use harw_types::WorkId;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// A backend whose `reopen` yields a handle with `proc_path` (or
@@ -1771,10 +2252,8 @@ mod tests {
     #[test]
     fn ensure_leftover_sweep_is_idempotent_and_skips_without_a_cgroup_root() {
         let executor = LinuxExecutor {
-            options: LinuxExecutorOptions::default(),
-            cgroup: None,
             leftovers: LeftoverRegistry::default(),
-            sweep_spawned: AtomicBool::new(false),
+            ..LinuxExecutor::default()
         };
         executor.ensure_leftover_sweep();
         assert!(executor.sweep_spawned.load(Ordering::SeqCst));
@@ -1794,13 +2273,11 @@ mod tests {
             busy_calls: 0, // free on the very first retry
         });
         let executor = LinuxExecutor {
-            options: LinuxExecutorOptions::default(),
-            cgroup: None,
             leftovers: Arc::new(Mutex::new(vec![LeftoverCgroup {
                 backend,
                 name: "harw-job-j-e1".to_owned(),
             }])),
-            sweep_spawned: AtomicBool::new(false),
+            ..LinuxExecutor::default()
         };
         assert_eq!(executor.leftover_cgroup_count(), 1);
         executor.sweep_leftover_cgroups().await;
@@ -1814,13 +2291,11 @@ mod tests {
     async fn sweep_leftover_cgroups_requeues_when_reopen_still_fails() -> TestResult {
         let backend: Arc<dyn CgroupBackend> = Arc::new(FakeBackend { proc_path: None });
         let executor = LinuxExecutor {
-            options: LinuxExecutorOptions::default(),
-            cgroup: None,
             leftovers: Arc::new(Mutex::new(vec![LeftoverCgroup {
                 backend,
                 name: "harw-job-j-e1".to_owned(),
             }])),
-            sweep_spawned: AtomicBool::new(false),
+            ..LinuxExecutor::default()
         };
         executor.sweep_leftover_cgroups().await;
         assert_eq!(executor.leftover_cgroup_count(), 1);
@@ -1881,16 +2356,545 @@ mod tests {
         }
 
         let executor = LinuxExecutor {
-            options: LinuxExecutorOptions::default(),
-            cgroup: None,
             leftovers: Arc::new(Mutex::new(vec![LeftoverCgroup {
                 backend: Arc::new(GoneBackend),
                 name: "harw-job-j-e1".to_owned(),
             }])),
-            sweep_spawned: AtomicBool::new(false),
+            ..LinuxExecutor::default()
         };
         executor.sweep_leftover_cgroups().await;
         assert_eq!(executor.leftover_cgroup_count(), 0);
         Ok(())
+    }
+}
+
+/// Plan and report tests of the `BwrapTrampoline` backend (PL-97 E1); no
+/// process is started.
+#[cfg(all(test, feature = "bwrap"))]
+mod chain_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use harw_job_core::{
+        AttemptId, EnforcementState as S, JobSpec, ResourceRequest, RunnerId, SandboxProfileName,
+        SandboxReport, SandboxRequirement,
+    };
+    use harw_job_exec::{CgroupJoin, CgroupMembership, CgroupVerify, ExecPlanV1};
+    use harw_job_executor_bwrap::{
+        BwrapExecutor, SANDBOX_ATTEMPT_DIR, SANDBOX_TRAMPOLINE_PATH, TrampolineMount,
+    };
+    use harw_types::WorkId;
+
+    use super::{
+        AfterExit, ChainCgroup, LeftoverRegistry, LinuxExecutor, LinuxExecutorOptions,
+        LinuxSandboxBackend, OUTER_PLAN_FILE, RuntimeError, chain_plans, rlimit_set,
+    };
+    use crate::coordinator::executor::AttemptContext;
+    use crate::host::BackendKind;
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    const TRAMPOLINE: &str = "/opt/harw/bin/harw-job-exec";
+
+    fn bwrap() -> BwrapExecutor {
+        BwrapExecutor::from_executable(PathBuf::from("/usr/bin/bwrap")).with_identity(1000, 1000)
+    }
+
+    fn spec(requirement: SandboxRequirement, resources: ResourceRequest) -> TestResult<JobSpec> {
+        JobSpec::command("make")
+            .arg("all")
+            .resources(resources)
+            .sandbox(SandboxProfileName::NoNetwork)
+            .sandbox_requirement(requirement)
+            .build()
+            .map_err(ctx("spec"))
+    }
+
+    fn rlimited() -> ResourceRequest {
+        ResourceRequest {
+            open_files_max: Some(256),
+            ..ResourceRequest::default()
+        }
+    }
+
+    /// A workspace and a private plan directory.
+    fn dirs() -> TestResult<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let workspace = dir.path().join("workspace");
+        let plans = dir.path().join("plans");
+        std::fs::create_dir(&workspace).map_err(ctx("workspace"))?;
+        std::fs::create_dir(&plans).map_err(ctx("plans"))?;
+        std::fs::set_permissions(&plans, std::fs::Permissions::from_mode(0o700))
+            .map_err(ctx("chmod plans"))?;
+        let workspace = workspace
+            .canonicalize()
+            .map_err(ctx("canonical workspace"))?;
+        Ok((dir, workspace, plans))
+    }
+
+    fn attempt_context(workspace: &Path) -> TestResult<AttemptContext> {
+        Ok(AttemptContext {
+            job_id: WorkId::from_str("j"),
+            attempt_id: AttemptId::new("j-e1").map_err(ctx("attempt"))?,
+            runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
+            workspace_root: workspace.to_path_buf(),
+            output_files: None,
+            stdio_handoff: None,
+        })
+    }
+
+    fn strings(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    fn has_triple(args: &[String], triple: [&str; 3]) -> bool {
+        args.windows(3)
+            .any(|window| strings(window).as_slice() == triple.as_slice())
+    }
+
+    /// A `BwrapTrampoline` executor over `plans` that sees `landlock_abi`
+    /// as the host's usable Landlock ABI (host-independent tests).
+    fn chain_executor(plans: &Path, landlock_abi: Option<u8>) -> TestResult<LinuxExecutor> {
+        let executor = LinuxExecutor::new(LinuxExecutorOptions {
+            sandbox: LinuxSandboxBackend::BwrapTrampoline {
+                bwrap: bwrap(),
+                trampoline: PathBuf::from(TRAMPOLINE),
+                plan_dir: plans.to_path_buf(),
+            },
+            ..LinuxExecutorOptions::default()
+        })
+        .map_err(ctx("executor"))?;
+        executor
+            .landlock_probe
+            .set(landlock_abi)
+            .map_err(|_| TestError::Unexpected("landlock ABI already probed".to_owned()))?;
+        Ok(executor)
+    }
+
+    fn plans_left(plans: &Path) -> TestResult<usize> {
+        Ok(std::fs::read_dir(plans)
+            .map_err(ctx("read plan dir"))?
+            .count())
+    }
+
+    #[test]
+    fn chain_plans_attach_outside_and_verify_inside() -> TestResult {
+        let (_dir, workspace, plans) = dirs()?;
+        let mount = TrampolineMount {
+            exec_path: PathBuf::from(TRAMPOLINE),
+            attempt_dir: plans.join("a1"),
+        };
+        let spec = spec(SandboxRequirement::BestEffort, rlimited())?;
+        let cgroup = ChainCgroup {
+            root: Path::new("/sys/fs/cgroup/harw.slice"),
+            name: "harw-job-j-e1",
+            proc_path: "/harw.slice/harw-job-j-e1",
+        };
+        let chain = chain_plans(
+            &bwrap(),
+            &mount,
+            &spec,
+            &workspace,
+            Some(cgroup),
+            S::Enforced,
+        )
+        .map_err(ctx("chain plans"))?;
+
+        // Outer stage: joins the cgroup first, applies the rlimits, execs bwrap.
+        let outer = &chain.outer;
+        assert_eq!(outer.program, Path::new("/usr/bin/bwrap"));
+        assert_eq!(
+            outer.cgroup,
+            Some(CgroupMembership::Attach(CgroupJoin {
+                root: PathBuf::from("/sys/fs/cgroup/harw.slice"),
+                relative: "harw-job-j-e1".to_owned(),
+                limits: Some(S::Enforced),
+            }))
+        );
+        assert_eq!(outer.rlimits, rlimit_set(&spec));
+        assert!(outer.sandbox.is_none(), "no Landlock outside the namespace");
+        assert_eq!(outer.sandbox_requirement, SandboxRequirement::None);
+        let args = &outer.args;
+        assert!(has_triple(
+            args,
+            ["--ro-bind", TRAMPOLINE, SANDBOX_TRAMPOLINE_PATH]
+        ));
+        let attempt = mount.attempt_dir.to_string_lossy().into_owned();
+        assert!(has_triple(args, ["--bind", &attempt, SANDBOX_ATTEMPT_DIR]));
+        for flag in [
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-uts",
+        ] {
+            assert!(args.iter().any(|arg| arg == flag), "{flag}: {args:?}");
+        }
+        assert!(!args.iter().any(|arg| arg == "--unshare-all"), "{args:?}");
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or(TestError::Missing("--"))?;
+        assert_eq!(
+            args.get(separator + 1..).map(strings),
+            Some(vec![
+                SANDBOX_TRAMPOLINE_PATH,
+                "--plan",
+                "/run/harw-job/attempt/inner.json",
+                "--report",
+                "/run/harw-job/attempt/report.json"
+            ])
+        );
+
+        // Inner stage: verifies the cgroup, then the sandbox, then the job.
+        let inner = &chain.inner;
+        assert_eq!(inner.program, Path::new("make"));
+        assert_eq!(inner.args, ["all"]);
+        assert_eq!(
+            inner.cgroup,
+            Some(CgroupMembership::Verify(CgroupVerify {
+                expected_proc_path: PathBuf::from("/harw.slice/harw-job-j-e1"),
+                limits: Some(S::Enforced),
+            }))
+        );
+        assert_eq!(inner.rlimits, rlimit_set(&spec));
+        assert_eq!(inner.sandbox_requirement, SandboxRequirement::BestEffort);
+        let policy = inner
+            .sandbox
+            .as_ref()
+            .ok_or(TestError::Missing("inner sandbox"))?;
+        // In-namespace paths only: the workspace bind keeps its path, /sys
+        // and /run are gone, the network is the namespace's job.
+        assert!(policy.filesystem.read_write.contains(&workspace));
+        assert!(
+            !policy
+                .filesystem
+                .read_only
+                .iter()
+                .any(|path| path.starts_with("/sys") || path.starts_with("/run"))
+        );
+        assert_eq!(policy.network, harw_job_linux::NetworkPolicy::Allow);
+        assert_eq!(
+            chain.unmapped,
+            [PathBuf::from("/run"), PathBuf::from("/sys")]
+        );
+        assert_eq!(
+            chain.withheld,
+            [PathBuf::from("/sys"), PathBuf::from("/run")]
+        );
+        assert_eq!(chain.bwrap_report.network, S::Enforced);
+        // Both plans are valid trampoline plans.
+        outer.validate().map_err(ctx("outer plan"))?;
+        inner.validate().map_err(ctx("inner plan"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn chain_plans_without_cgroup_root_have_no_membership() -> TestResult {
+        let (_dir, workspace, plans) = dirs()?;
+        let mount = TrampolineMount {
+            exec_path: PathBuf::from(TRAMPOLINE),
+            attempt_dir: plans.join("a1"),
+        };
+        let spec = spec(SandboxRequirement::BestEffort, ResourceRequest::default())?;
+        let chain = chain_plans(&bwrap(), &mount, &spec, &workspace, None, S::Enforced)
+            .map_err(ctx("chain plans"))?;
+        assert_eq!(chain.outer.cgroup, None);
+        assert_eq!(chain.inner.cgroup, None);
+        assert!(chain.outer.rlimits.is_empty() && chain.inner.rlimits.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_writes_both_plans_into_a_private_attempt_dir() -> TestResult {
+        let (_dir, workspace, plans) = dirs()?;
+        let executor = chain_executor(&plans, Some(6))?;
+        assert_eq!(
+            executor.options().sandbox.kind(),
+            BackendKind::BwrapTrampoline
+        );
+        let context = attempt_context(&workspace)?;
+        let spec = spec(SandboxRequirement::BestEffort, rlimited())?;
+        let prepared = executor
+            .prepare(&spec, &context, None, S::Enforced)
+            .map_err(ctx("prepare"))?;
+        let attempt_dir = prepared
+            .attempt_dir
+            .clone()
+            .ok_or(TestError::Missing("attempt dir"))?;
+        assert_eq!(attempt_dir.parent(), Some(plans.as_path()));
+        let name = attempt_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(TestError::Missing("attempt dir name"))?;
+        assert!(name.starts_with("harw-job-j-e1."), "{name}");
+        let mode = |path: &Path| -> TestResult<u32> {
+            Ok(std::fs::metadata(path)
+                .map_err(ctx("metadata"))?
+                .permissions()
+                .mode()
+                & 0o777)
+        };
+        assert_eq!(mode(&attempt_dir)?, 0o700);
+        let outer_path = attempt_dir.join(OUTER_PLAN_FILE);
+        let inner_path = attempt_dir.join("inner.json");
+        assert_eq!(mode(&outer_path)?, 0o600);
+        assert_eq!(mode(&inner_path)?, 0o600);
+        // The launch is the outer trampoline with its plan, nothing else.
+        assert_eq!(
+            prepared.launch.program,
+            std::ffi::OsString::from(TRAMPOLINE)
+        );
+        assert_eq!(
+            prepared.launch.args,
+            [
+                std::ffi::OsString::from("--plan"),
+                outer_path.clone().into_os_string()
+            ]
+        );
+        assert!(prepared.launch.env.is_empty() && prepared.launch.cwd.is_none());
+        assert_eq!(prepared.report, None, "known after the job ran");
+        assert_eq!(
+            prepared.trampoline_report,
+            Some(attempt_dir.join("report.json"))
+        );
+        // The files hold exactly the planned stages.
+        let mount = TrampolineMount {
+            exec_path: PathBuf::from(TRAMPOLINE),
+            attempt_dir: attempt_dir.clone(),
+        };
+        let chain = chain_plans(&bwrap(), &mount, &spec, &workspace, None, S::Enforced)
+            .map_err(ctx("chain plans"))?;
+        let read = |path: &Path| -> TestResult<ExecPlanV1> {
+            ExecPlanV1::from_json(&std::fs::read(path).map_err(ctx("read plan"))?)
+                .map_err(ctx("parse plan"))
+        };
+        assert_eq!(read(&outer_path)?, chain.outer);
+        assert_eq!(read(&inner_path)?, chain.inner);
+        assert_eq!(prepared.merge_with, Some(chain.bwrap_report));
+        prepared.discard_files();
+        assert!(!attempt_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_refuses_a_required_job_without_resource_domain_and_cleans_up() -> TestResult {
+        let (_dir, workspace, plans) = dirs()?;
+        let executor = chain_executor(&plans, Some(6))?;
+        let context = attempt_context(&workspace)?;
+        let spec = spec(
+            SandboxRequirement::Required,
+            ResourceRequest {
+                memory_max: Some(64 << 20),
+                ..ResourceRequest::default()
+            },
+        )?;
+        match executor.prepare(&spec, &context, None, S::NotEnforced) {
+            Err(RuntimeError::SandboxRequirementNotMet { shortfalls, .. }) => {
+                assert_eq!(shortfalls, ["resource_limits"]);
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => return Err(TestError::Unexpected("required job planned".to_owned())),
+        }
+        let left = std::fs::read_dir(&plans)
+            .map_err(ctx("read plan dir"))?
+            .count();
+        assert_eq!(left, 0, "the attempt directory is removed");
+        Ok(())
+    }
+
+    /// Security review finding 4 without Landlock: the job would see its
+    /// attempt directory read-write with nothing keeping it out, so the
+    /// backend refuses before an attempt directory exists or anything is
+    /// bound (the job's view never contains a writable report).
+    #[test]
+    fn without_landlock_no_attempt_dir_is_created_or_bound() -> TestResult {
+        use crate::coordinator::executor::Executor as _;
+        let (_dir, workspace, plans) = dirs()?;
+        let executor = chain_executor(&plans, None)?;
+        let context = attempt_context(&workspace)?;
+        for requirement in [SandboxRequirement::BestEffort, SandboxRequirement::Required] {
+            let spec = spec(requirement, ResourceRequest::default())?;
+            match executor.prepare(&spec, &context, None, S::Enforced) {
+                Err(RuntimeError::Unsupported { operation, detail }) => {
+                    assert_eq!(operation, "bwrap trampoline sandbox");
+                    assert!(detail.contains("Landlock"), "{detail}");
+                }
+                Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+                Ok(_) => {
+                    return Err(TestError::Unexpected(format!(
+                        "{requirement:?} job planned without Landlock"
+                    )));
+                }
+            }
+            assert_eq!(plans_left(&plans)?, 0, "{requirement:?}");
+            // `start` refuses the same way, before any process exists.
+            match executor.start(&spec, &context) {
+                Err(RuntimeError::Unsupported { .. }) => {}
+                Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+                Ok(_) => return Err(TestError::Unexpected("attempt started".to_owned())),
+            }
+            assert_eq!(plans_left(&plans)?, 0, "{requirement:?}");
+        }
+        // Unsandboxed jobs do not use the backend and still run plainly.
+        let plain = spec(SandboxRequirement::None, ResourceRequest::default())?;
+        let prepared = executor
+            .prepare(&plain, &context, None, S::Enforced)
+            .map_err(ctx("unsandboxed job"))?;
+        assert!(prepared.attempt_dir.is_none());
+        assert_eq!(super::require_landlock_for_chain(Some(1)).ok(), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn late_report_merges_the_namespace_layer_with_the_inner_report() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let report_path = dir.path().join("report.json");
+        // What the inner trampoline reports with Landlock ABI ≥ 5 and no
+        // network rules (the namespace's job).
+        let inner = SandboxReport::uniform(S::Enforced);
+        let mut bytes = serde_json::to_vec(&inner).map_err(ctx("encode report"))?;
+        bytes.push(b'\n');
+        std::fs::write(&report_path, bytes).map_err(ctx("write report"))?;
+        let bwrap_report = SandboxReport {
+            filesystem: S::Partial,
+            network: S::Enforced,
+            no_new_privs: S::Enforced,
+            capabilities: S::Enforced,
+            resource_limits: S::NotEnforced,
+        };
+        let after = AfterExit {
+            trampoline_report: Some(report_path.clone()),
+            merge_with: Some(bwrap_report),
+            attempt_dir: None,
+            // The cgroup domain fell short: capped below the inner report.
+            resource_limits: S::Partial,
+            recovered_cgroup: None,
+            note: None,
+            leftovers: LeftoverRegistry::default(),
+        };
+        let merged = after.late_report().ok_or(TestError::Missing("report"))?;
+        assert_eq!(
+            merged,
+            SandboxReport {
+                resource_limits: S::Partial,
+                ..SandboxReport::uniform(S::Enforced)
+            }
+        );
+        assert_eq!(
+            merged,
+            harw_job_exec::merge_reports(
+                &bwrap_report,
+                &SandboxReport {
+                    resource_limits: S::Partial,
+                    ..inner
+                }
+            )
+        );
+        assert!(!report_path.exists(), "the report is consumed");
+        // No report (e.g. bwrap failed before the inner stage): unknown.
+        assert_eq!(after.late_report(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn late_report_reads_only_a_regular_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let elsewhere = dir.path().join("forged.json");
+        let mut bytes =
+            serde_json::to_vec(&SandboxReport::uniform(S::Enforced)).map_err(ctx("encode"))?;
+        bytes.push(b'\n');
+        std::fs::write(&elsewhere, bytes).map_err(ctx("write forged report"))?;
+        let bwrap_report = SandboxReport {
+            filesystem: S::Partial,
+            resource_limits: S::NotEnforced,
+            ..SandboxReport::uniform(S::Enforced)
+        };
+        let after = |report: &Path| AfterExit {
+            trampoline_report: Some(report.to_path_buf()),
+            merge_with: Some(bwrap_report),
+            attempt_dir: None,
+            resource_limits: S::Enforced,
+            recovered_cgroup: None,
+            note: None,
+            leftovers: LeftoverRegistry::default(),
+        };
+        // A symlink in the report's place is not followed (it could name a
+        // FIFO that blocks the reader, or a forged report).
+        let link = dir.path().join("report.json");
+        std::os::unix::fs::symlink(&elsewhere, &link).map_err(ctx("symlink"))?;
+        assert_eq!(after(&link).late_report(), None);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the planted entry is removed"
+        );
+        // Neither is any other non-regular file.
+        let not_a_file = dir.path().join("dir-report.json");
+        std::fs::create_dir(&not_a_file).map_err(ctx("mkdir"))?;
+        assert_eq!(after(&not_a_file).late_report(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn start_cleans_up_when_the_output_files_cannot_be_opened() -> TestResult {
+        use crate::coordinator::executor::{Executor as _, OutputFiles};
+        let (dir, workspace, plans) = dirs()?;
+        let executor = chain_executor(&plans, Some(6))?;
+        let missing = dir.path().join("missing");
+        let context = AttemptContext {
+            output_files: Some(OutputFiles {
+                stdout: missing.join("stdout"),
+                stderr: missing.join("stderr"),
+            }),
+            ..attempt_context(&workspace)?
+        };
+        let spec = spec(SandboxRequirement::BestEffort, rlimited())?;
+        match executor.start(&spec, &context) {
+            Err(RuntimeError::Os { operation, .. }) => {
+                assert_eq!(operation, "open output file");
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => return Err(TestError::Unexpected("attempt started".to_owned())),
+        }
+        let left = std::fs::read_dir(&plans)
+            .map_err(ctx("read plan dir"))?
+            .count();
+        assert_eq!(
+            left, 0,
+            "the attempt directory (with both plans) is removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bwrap_trampoline_paths_must_be_absolute() {
+        for (trampoline, plan_dir) in [("harw-job-exec", "/plans"), ("/bin/harw-job-exec", "plans")]
+        {
+            let result = LinuxExecutor::new(LinuxExecutorOptions {
+                sandbox: LinuxSandboxBackend::BwrapTrampoline {
+                    bwrap: bwrap(),
+                    trampoline: PathBuf::from(trampoline),
+                    plan_dir: PathBuf::from(plan_dir),
+                },
+                ..LinuxExecutorOptions::default()
+            });
+            assert!(
+                matches!(result, Err(RuntimeError::InvalidConfig { .. })),
+                "{trampoline} {plan_dir}"
+            );
+        }
+        assert_eq!(LinuxSandboxBackend::None.kind(), BackendKind::None);
+        assert_eq!(
+            LinuxSandboxBackend::Bwrap(bwrap()).kind(),
+            BackendKind::Bwrap
+        );
+        assert_eq!(
+            LinuxSandboxBackend::LandlockTrampoline {
+                trampoline: PathBuf::from(TRAMPOLINE),
+                plan_dir: PathBuf::from("/plans"),
+            }
+            .kind(),
+            BackendKind::LandlockTrampoline
+        );
     }
 }

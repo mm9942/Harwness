@@ -335,8 +335,16 @@ evidence:
   `SandboxRequirement::Required`; the
   coordinator refuses to start it if the backend cannot enforce every
   dimension. Under `harw serve` the job worker builds this coordinator
-  itself: backend is the Landlock trampoline `harw-job-exec` (next to the
-  `harw` binary or on `PATH`), else `bwrap`; job records go to
+  itself. The backend comes from the shared resolver
+  `harw_job_runtime::select_backend`: in practice the Landlock trampoline
+  `harw-job-exec`, looked up next to the `harw` binary only (never on
+  `PATH`). The Bubblewrap backends are skipped for these jobs, because
+  `WorkspaceBuild` needs network and this path configures no egress
+  relay. `HARW_VERIFY_BACKEND=auto|bwrap-trampoline|bwrap|landlock|none`
+  chooses the request (default `auto`); an unknown value fails closed,
+  and an explicit `bwrap-trampoline` or `bwrap` ends in no backend (an
+  explicit request has no fallback). The choice, every skipped backend
+  and a per-dimension table are logged once. Job records go to
   `<home>/jobs/verify`, the workspace root is the `serve` working
   directory, and the environment is reduced to `PATH`, `HOME`,
   `CARGO_HOME` and `RUSTUP_HOME`. Without a sandbox backend every command
